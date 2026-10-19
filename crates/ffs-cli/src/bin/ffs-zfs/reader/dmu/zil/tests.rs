@@ -17,6 +17,14 @@ const LENGTH: u64 = 64 * 1024 * 1024;
 const FIRST: u64 = 0x10000;
 const SECOND: u64 = 0x20000;
 type Reads = Arc<Mutex<Vec<(u64, usize)>>>;
+type Faults = Arc<Mutex<BTreeMap<u64, Fault>>>;
+
+enum Fault {
+    Checksum,
+    Io,
+    Cancelled,
+    Replacement(Vec<u8>),
+}
 
 fn selection(txg: u64) -> Selection {
     Selection {
@@ -30,6 +38,7 @@ struct Memory {
     blocks: BTreeMap<u64, Vec<u8>>,
     reads: Reads,
     cancelled_at: Option<u64>,
+    faults: Faults,
 }
 impl ByteDevice for Memory {
     fn len_bytes(&self) -> u64 {
@@ -47,6 +56,21 @@ impl ByteDevice for Memory {
             .filter(|bytes| bytes.len() == out.len())
             .ok_or_else(|| FfsError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)))?;
         out.copy_from_slice(bytes);
+        if let Some(fault) = self.faults.lock().unwrap().get(&offset.0) {
+            match fault {
+                Fault::Checksum => out[0] ^= 1,
+                Fault::Io => {
+                    return Err(FfsError::Io(std::io::Error::from(
+                        std::io::ErrorKind::UnexpectedEof,
+                    )));
+                }
+                Fault::Cancelled => return Err(FfsError::Cancelled),
+                Fault::Replacement(replacement) => {
+                    assert_eq!(replacement.len(), out.len());
+                    out.copy_from_slice(replacement);
+                }
+            }
+        }
         Ok(())
     }
     fn write_all_at(&self, _: &Cx, _: ByteOffset, _: &[u8]) -> Result<()> {
@@ -70,6 +94,14 @@ fn config() -> VdevConfig {
     }
 }
 fn leaf(blocks: &[(u64, Vec<u8>)], cancelled_at: Option<u64>) -> (Pool, Reads) {
+    leaf_with_faults(blocks, cancelled_at, Arc::default())
+}
+
+fn leaf_with_faults(
+    blocks: &[(u64, Vec<u8>)],
+    cancelled_at: Option<u64>,
+    faults: Faults,
+) -> (Pool, Reads) {
     let reads = Arc::default();
     let device = Memory {
         blocks: blocks
@@ -78,6 +110,7 @@ fn leaf(blocks: &[(u64, Vec<u8>)], cancelled_at: Option<u64>) -> (Pool, Reads) {
             .collect(),
         reads: Arc::clone(&reads),
         cancelled_at,
+        faults,
     };
     let leaf = Leaf::from_device(&Cx::for_testing(), Box::new(device), BASE, LENGTH).unwrap();
     (leaf.into(), reads)
@@ -469,6 +502,14 @@ fn recovered_ranges_match_full_file_model_after_overwrites_shrink_regrowth_and_s
                     oracle.resize(oracle.len().max(*offset as usize + data.len()), 0);
                     oracle[*offset as usize..*offset as usize + data.len()].copy_from_slice(data);
                 }
+                Edit::Indirect {
+                    offset, data, end, ..
+                } => {
+                    let visible = oracle.len().max(*end as usize);
+                    oracle.resize(oracle.len().max(*offset as usize + data.len()), 0);
+                    oracle[*offset as usize..*offset as usize + data.len()].copy_from_slice(data);
+                    oracle.truncate(visible);
+                }
             }
             edits.push(edit);
         }
@@ -500,8 +541,7 @@ fn recovered_ranges_match_full_file_model_after_overwrites_shrink_regrowth_and_s
     }
 }
 
-fn data_pointer(bytes: &[u8], offset: u64, kind: u8, birth: u64) -> Vec<u8> {
-    let order = Endian::Little;
+fn data_pointer(bytes: &[u8], offset: u64, kind: u8, birth: u64, order: Endian) -> Vec<u8> {
     let mut raw = pointer(offset, 0, 7, bytes.len(), order, order);
     let property = word(&raw, 48, order).unwrap();
     put(
@@ -517,7 +557,14 @@ fn data_pointer(bytes: &[u8], offset: u64, kind: u8, birth: u64) -> Vec<u8> {
     raw
 }
 
-fn dnode(kind: u8, size: usize, pointer: &[u8], bonus_type: u8, bonus: &[u8]) -> Vec<u8> {
+fn dnode(
+    kind: u8,
+    size: usize,
+    pointer: &[u8],
+    bonus_type: u8,
+    bonus: &[u8],
+    order: Endian,
+) -> Vec<u8> {
     let mut raw = vec![0; 512];
     raw[0] = kind;
     raw[1] = 12;
@@ -525,22 +572,30 @@ fn dnode(kind: u8, size: usize, pointer: &[u8], bonus_type: u8, bonus: &[u8]) ->
     raw[3] = 1;
     raw[4] = bonus_type;
     raw[7] = 1;
-    raw[8..10].copy_from_slice(&((size / 512) as u16).to_le_bytes());
-    raw[10..12].copy_from_slice(&(bonus.len() as u16).to_le_bytes());
+    let encoded_size = match order {
+        Endian::Little => ((size / 512) as u16).to_le_bytes(),
+        Endian::Big => ((size / 512) as u16).to_be_bytes(),
+    };
+    let encoded_bonus = match order {
+        Endian::Little => (bonus.len() as u16).to_le_bytes(),
+        Endian::Big => (bonus.len() as u16).to_be_bytes(),
+    };
+    raw[8..10].copy_from_slice(&encoded_size);
+    raw[10..12].copy_from_slice(&encoded_bonus);
     raw[64..192].copy_from_slice(pointer);
     raw[192..192 + bonus.len()].copy_from_slice(bonus);
     raw
 }
 
-fn micro(name: &[u8], value: u64) -> Vec<u8> {
+fn micro(name: &[u8], value: u64, order: Endian) -> Vec<u8> {
     let mut bytes = vec![0; 512];
-    put(&mut bytes, 0, (1_u64 << 63) + 3, Endian::Little);
-    put(&mut bytes, 64, value, Endian::Little);
+    put(&mut bytes, 0, (1_u64 << 63) + 3, order);
+    put(&mut bytes, 64, value, order);
     bytes[78..78 + name.len()].copy_from_slice(name);
     bytes
 }
 
-fn file_metadata(directory: bool, size: u64) -> Vec<u8> {
+fn file_metadata(directory: bool, size: u64, order: Endian) -> Vec<u8> {
     let mut raw = vec![0; 264];
     for (at, value) in [
         (64, 2),
@@ -549,7 +604,7 @@ fn file_metadata(directory: bool, size: u64) -> Vec<u8> {
         (88, 2),
         (96, if directory { 2 } else { 1 }),
     ] {
-        put(&mut raw, at, value, Endian::Little);
+        put(&mut raw, at, value, order);
     }
     raw
 }
@@ -557,10 +612,7 @@ fn file_metadata(directory: bool, size: u64) -> Vec<u8> {
 /// Real Objects -> checked MOS -> DSL -> object set -> ZPL -> file recovery,
 /// backed by constructed blocks, with no private field override of ZPL state.
 fn recovery_graph(unsupported_namespace: bool) -> (Objects, Reads) {
-    use ffs_ondisk::zfs_dmu::Dnode;
     let order = Endian::Little;
-    let first = pointer(FIRST, 1, 9, 4096, order, order);
-    let next = pointer(SECOND, 2, 9, 4096, order, order);
     let mut records = vec![
         record(9, 43, 1, 2, b"NEW", order),
         record(10, 43, 2, 8, &[], order),
@@ -569,78 +621,146 @@ fn recovery_graph(unsupported_namespace: bool) -> (Objects, Reads) {
     if unsupported_namespace {
         records.push(record(1, 43, 4, 0, &[], order));
     }
-    let log = block(&first, order, &next, &records);
+    let (objects, reads, _) = recovery_graph_log(order, 9, &records, false, None, &[]);
+    (objects, reads)
+}
+
+fn recovery_graph_log(
+    order: Endian,
+    algorithm: u8,
+    records: &[Vec<u8>],
+    claimed: bool,
+    cancelled_at: Option<u64>,
+    extra: &[(u64, Vec<u8>)],
+) -> (Objects, Reads, Faults) {
+    use ffs_ondisk::zfs_dmu::Dnode;
+    let first = pointer(FIRST, 1, algorithm, 4096, order, order);
+    let next = pointer(SECOND, 2, algorithm, 4096, order, order);
+    let tail = pointer(0x30000, 3, algorithm, 4096, order, order);
+    let split = if claimed {
+        records.len() / 2
+    } else {
+        records.len()
+    };
+    let log = block(&first, order, &next, &records[..split]);
     let mut file = vec![0; 512];
     file[..16].copy_from_slice(b"abcdefghijklmnop");
-    let mut master = micro(b"ROOT", 2);
+    let mut master = micro(b"ROOT", 2, order);
     put(&mut master, 128, 4, order);
     master[142..149].copy_from_slice(b"VERSION");
-    let directory = micro(b"file", (8_u64 << 60) | 7);
+    let mut directory = micro(b"file", (8_u64 << 60) | 7, order);
+    put(&mut directory, 128, (8_u64 << 60) | 7, order);
+    directory[142..147].copy_from_slice(b"alias");
+    let mut base_file_metadata = file_metadata(false, 16, order);
+    put(&mut base_file_metadata, 96, 2, order);
     let mut table = vec![0; 16384];
     table[512..1024].copy_from_slice(&dnode(
         21,
         512,
-        &data_pointer(&master, 0x4c000, 21, 37),
+        &data_pointer(&master, 0x4c000, 21, 37, order),
         0,
         &[],
+        order,
     ));
     table[1024..1536].copy_from_slice(&dnode(
         20,
         512,
-        &data_pointer(&directory, 0x4c200, 20, 37),
+        &data_pointer(&directory, 0x4c200, 20, 37, order),
         17,
-        &file_metadata(true, 3),
+        &file_metadata(true, 4, order),
+        order,
     ));
     table[7 * 512..8 * 512].copy_from_slice(&dnode(
         19,
         512,
-        &data_pointer(&file, 0x4c400, 19, 37),
+        &data_pointer(&file, 0x4c400, 19, 37, order),
         17,
-        &file_metadata(false, 16),
+        &base_file_metadata,
+        order,
     ));
     let mut os = vec![0; 1024];
     os[..512].copy_from_slice(&dnode(
         10,
         16384,
-        &data_pointer(&table, 0x48000, 10, 38),
+        &data_pointer(&table, 0x48000, 10, 38, order),
         0,
         &[],
+        order,
     ));
     os[512..704].copy_from_slice(&header(&first, order));
+    if claimed {
+        // A persisted claim at TXG42 follows previously synced TXG41. Claim
+        // includes the allocated terminal pointer even though its LWB is not
+        // readable; native parse remembers max block before attempting I/O.
+        for (at, value) in [
+            (512, 42),
+            (656, 3),
+            (664, 3),
+            (
+                672,
+                records
+                    .last()
+                    .map_or(0, |row| word(row, 24, order).unwrap()),
+            ),
+        ] {
+            put(&mut os, at, value, order);
+        }
+    }
     put(&mut os, 704, 2, order);
-    let pool_directory = micro(b"root_dataset", 2);
+    let pool_directory = micro(b"root_dataset", 2, order);
     let mut directory_bonus = vec![0; 256];
     put(&mut directory_bonus, 8, 3, order);
     let mut dataset_bonus = vec![0; 320];
     for (at, value) in [(0, 2), (56, 5), (72, 16384), (112, 987), (120, 4)] {
         put(&mut dataset_bonus, at, value, order);
     }
-    dataset_bonus[128..256].copy_from_slice(&data_pointer(&os, 0x45000, 11, 39));
+    dataset_bonus[128..256].copy_from_slice(&data_pointer(
+        &os,
+        0x45000,
+        11,
+        if claimed { 42 } else { 39 },
+        order,
+    ));
     let mut mos = vec![0; 16384];
     mos[512..1024].copy_from_slice(&dnode(
         1,
         512,
-        &data_pointer(&pool_directory, 0x44000, 1, 39),
+        &data_pointer(&pool_directory, 0x44000, 1, 39, order),
         0,
         &[],
+        order,
     ));
-    mos[1024..1536].copy_from_slice(&dnode(12, 512, &[0; 128], 12, &directory_bonus));
-    mos[1536..2048].copy_from_slice(&dnode(16, 512, &[0; 128], 16, &dataset_bonus));
-    let meta = dnode(10, 16384, &data_pointer(&mos, 0x40000, 10, 40), 0, &[]);
-    let (leaf, reads) = leaf(
-        &[
-            (FIRST, log),
-            (SECOND, vec![0; 4096]),
-            (0x40000, mos),
-            (0x44000, pool_directory),
-            (0x45000, os),
-            (0x48000, table),
-            (0x4c000, master),
-            (0x4c200, directory),
-            (0x4c400, file),
-        ],
-        None,
+    mos[1024..1536].copy_from_slice(&dnode(12, 512, &[0; 128], 12, &directory_bonus, order));
+    mos[1536..2048].copy_from_slice(&dnode(16, 512, &[0; 128], 16, &dataset_bonus, order));
+    let meta = dnode(
+        10,
+        16384,
+        &data_pointer(&mos, 0x40000, 10, if claimed { 42 } else { 40 }, order),
+        0,
+        &[],
+        order,
     );
+    let faults = Arc::default();
+    let mut blocks = vec![
+        (FIRST, log),
+        (
+            SECOND,
+            if claimed {
+                block(&next, order, &tail, &records[split..])
+            } else {
+                vec![0; 4096]
+            },
+        ),
+        (0x40000, mos),
+        (0x44000, pool_directory),
+        (0x45000, os),
+        (0x48000, table),
+        (0x4c000, master),
+        (0x4c200, directory),
+        (0x4c400, file),
+    ];
+    blocks.extend_from_slice(extra);
+    let (leaf, reads) = leaf_with_faults(&blocks, cancelled_at, Arc::clone(&faults));
     let objects = Objects {
         pool: leaf,
         config: config(),
@@ -650,7 +770,7 @@ fn recovery_graph(unsupported_namespace: bool) -> (Objects, Reads) {
         cache: std::collections::VecDeque::new(),
         cached_bytes: 0,
     };
-    (objects, reads)
+    (objects, reads, faults)
 }
 
 #[test]
@@ -794,4 +914,328 @@ fn native_embedded_checksums_match_independent_closed_form_fletcher_vectors() {
                 .unwrap()
         );
     }
+}
+
+fn create_record(
+    kind: u64,
+    seq: u64,
+    parent: u64,
+    object: u64,
+    name: &[u8],
+    order: Endian,
+) -> Vec<u8> {
+    let mut raw = vec![0; (105 + name.len()).next_multiple_of(8)];
+    let length = raw.len() as u64;
+    for (at, value) in [
+        (0, kind),
+        (8, length),
+        (16, 43),
+        (24, seq),
+        (32, parent),
+        (40, object),
+        (48, if kind == 2 { 0o040_755 } else { 0o100_644 }),
+        (56, 1000),
+        (64, 1000),
+        (72, 43),
+        (80, 1_700_000_000),
+    ] {
+        put(&mut raw, at, value, order);
+    }
+    raw[104..104 + name.len()].copy_from_slice(name);
+    raw
+}
+
+fn remove_record(kind: u64, seq: u64, parent: u64, name: &[u8], order: Endian) -> Vec<u8> {
+    let mut raw = vec![0; (41 + name.len()).next_multiple_of(8)];
+    let length = raw.len() as u64;
+    for (at, value) in [(0, kind), (8, length), (16, 43), (24, seq), (32, parent)] {
+        put(&mut raw, at, value, order);
+    }
+    raw[40..40 + name.len()].copy_from_slice(name);
+    raw
+}
+
+fn rename_record(
+    seq: u64,
+    source: u64,
+    destination: u64,
+    from: &[u8],
+    to: &[u8],
+    order: Endian,
+) -> Vec<u8> {
+    let mut raw = vec![0; (50 + from.len() + to.len()).next_multiple_of(8)];
+    let length = raw.len() as u64;
+    for (at, value) in [
+        (0, 8),
+        (8, length),
+        (16, 43),
+        (24, seq),
+        (32, source),
+        (40, destination),
+    ] {
+        put(&mut raw, at, value, order);
+    }
+    raw[48..48 + from.len()].copy_from_slice(from);
+    raw[49 + from.len()..49 + from.len() + to.len()].copy_from_slice(to);
+    raw
+}
+
+fn seven_operation_records(order: Endian) -> Vec<Vec<u8>> {
+    let mut write = record(9, 43, 4, 0, b"hello-zil-world", order);
+    put(&mut write, 32, 9, order);
+    let mut truncate = record(10, 43, 5, 9, &[], order);
+    put(&mut truncate, 32, 9, order);
+    vec![
+        create_record(2, 1, 2, 8, b"made", order),
+        create_record(2, 2, 2, 10, b"gone_dir", order),
+        create_record(1, 3, 8, 9, b"file", order),
+        write,
+        truncate,
+        rename_record(6, 8, 8, b"file", b"renamed", order),
+        create_record(1, 7, 2, 11, b"gone", order),
+        remove_record(5, 8, 2, b"gone", order),
+        remove_record(6, 9, 2, b"gone_dir", order),
+    ]
+}
+
+fn names(view: &mut super::super::zpl::Zpl, cx: &Cx, object: u64) -> Vec<Vec<u8>> {
+    let mut names: Vec<_> = view
+        .list(cx, object)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn native_seven_operation_replay_uses_selected_mos_and_is_repeatable_without_source_writes() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for algorithm in [5, 9] {
+            for claimed in [false, true] {
+                let records = seven_operation_records(order);
+                let (mut objects, reads, _) =
+                    recovery_graph_log(order, algorithm, &records, claimed, None, &[]);
+                let mut view = objects.zpl(&cx, &[]).unwrap();
+                assert_eq!(
+                    names(&mut view, &cx, 2),
+                    [b"alias".to_vec(), b"file".to_vec()]
+                );
+                let first = view.replay_zil(&cx).unwrap();
+                assert_eq!(first.records_replayed, 9);
+                assert_eq!(first.blocks_visited, if claimed { 2 } else { 1 });
+                assert_eq!(
+                    objects.intent_log(&cx, &[]).unwrap().termination,
+                    if claimed {
+                        Termination::ClaimedBoundary
+                    } else {
+                        Termination::UnverifiedTail
+                    }
+                );
+                assert_eq!((first.last_txg, first.last_seq), (43, 9));
+                for _ in 0..2 {
+                    assert_eq!(
+                        names(&mut view, &cx, 2),
+                        [b"alias".to_vec(), b"file".to_vec(), b"made".to_vec()]
+                    );
+                    assert_eq!(names(&mut view, &cx, 8), [b"renamed".to_vec()]);
+                    assert_eq!(view.resolve(&cx, b"/made/renamed").unwrap(), 9);
+                    assert_eq!(view.read(&cx, 9, 0, 64).unwrap(), b"hello-zil");
+                    for path in [b"/made/file".as_slice(), b"/gone", b"/gone_dir"] {
+                        assert!(matches!(
+                            view.resolve(&cx, path),
+                            Err(FfsError::NotFound(_))
+                        ));
+                    }
+                    let root = view.stat(&cx, 2).unwrap().0;
+                    let dir = view.stat(&cx, 8).unwrap().0;
+                    let file = view.stat(&cx, 9).unwrap().0;
+                    assert_eq!((root.size, root.links), (5, 3));
+                    assert_eq!((dir.size, dir.links, dir.parent), (3, 2, 2));
+                    assert_eq!(
+                        (file.size, file.links, file.parent, file.generation),
+                        (9, 1, 8, 43)
+                    );
+                    assert_eq!(view.replay_zil(&cx).unwrap(), first);
+                }
+                let mut committed = objects.zpl(&cx, &[]).unwrap();
+                assert_eq!(
+                    names(&mut committed, &cx, 2),
+                    [b"alias".to_vec(), b"file".to_vec()]
+                );
+                assert_eq!(committed.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+                assert!(
+                    reads
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|(at, count)| *at >= BASE + DATA_OFFSET
+                            && *at + *count as u64 <= BASE + LENGTH)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_replay_failures_preserve_the_entire_previously_published_view() {
+    let cx = Cx::for_testing();
+    let order = Endian::Little;
+    let records = seven_operation_records(order);
+    let (mut objects, _, faults) = recovery_graph_log(order, 9, &records, true, None, &[]);
+    let mut view = objects.zpl(&cx, &[]).unwrap();
+    let stats = view.replay_zil(&cx).unwrap();
+    let second = pointer(SECOND, 2, 9, 4096, order, order);
+    let tail = pointer(0x30000, 3, 9, 4096, order, order);
+    let mut bad_sequence = records[4..].to_vec();
+    put(&mut bad_sequence[0], 24, 1, order);
+    let mut wrong_identity = tail.clone();
+    put(&mut wrong_identity, 96, 12, order);
+    let mut bad_late_operation = records[4..].to_vec();
+    *bad_late_operation.last_mut().unwrap() = remove_record(6, 9, 2, b"made", order);
+    let failures = [
+        Fault::Checksum,
+        Fault::Io,
+        Fault::Cancelled,
+        Fault::Replacement(block(&second, order, &tail, &bad_sequence)),
+        Fault::Replacement(block(&second, order, &wrong_identity, &records[4..])),
+        Fault::Replacement(block(&second, order, &tail, &bad_late_operation)),
+    ];
+    for fault in failures {
+        faults
+            .lock()
+            .unwrap()
+            .insert(BASE + DATA_OFFSET + SECOND, fault);
+        assert!(view.replay_zil(&cx).is_err());
+        assert_eq!(view.zil_replay_stats(), Some(&stats));
+        assert_eq!(
+            names(&mut view, &cx, 2),
+            [b"alias".to_vec(), b"file".to_vec(), b"made".to_vec()]
+        );
+        assert_eq!(view.read(&cx, 9, 0, 64).unwrap(), b"hello-zil");
+        assert_eq!(view.resolve(&cx, b"/made/renamed").unwrap(), 9);
+    }
+    faults.lock().unwrap().clear();
+    assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+}
+
+#[test]
+fn native_namespace_transitions_preserve_hardlinks_tombstones_and_directory_parents() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let mut write = record(9, 43, 6, 0, b"Y", order);
+        put(&mut write, 32, 11, order);
+        let mut free = record(10, 43, 11, 1, &[], order);
+        put(&mut free, 32, 11, order);
+        put(&mut free, 48, 4, order);
+        let mut after = record(9, 43, 12, 8, b"Z", order);
+        put(&mut after, 32, 11, order);
+        let records = vec![
+            create_record(1, 1, 2, 8, b"replacement", order),
+            rename_record(2, 2, 2, b"replacement", b"file", order),
+            remove_record(5, 3, 2, b"file", order),
+            create_record(1, 4, 2, 11, b"file", order),
+            rename_record(5, 2, 2, b"file", b"file", order),
+            write,
+            create_record(2, 7, 2, 9, b"made", order),
+            create_record(2, 8, 9, 10, b"child", order),
+            rename_record(9, 9, 2, b"child", b"moved", order),
+            remove_record(6, 10, 2, b"made", order),
+            free,
+            after,
+        ];
+        let (mut objects, _, _) = recovery_graph_log(order, 9, &records, true, None, &[]);
+        let mut view = objects.zpl(&cx, &[]).unwrap();
+        view.replay_zil(&cx).unwrap();
+        assert_eq!(
+            names(&mut view, &cx, 2),
+            [b"alias".to_vec(), b"file".to_vec(), b"moved".to_vec()]
+        );
+        assert_eq!(view.resolve(&cx, b"/file").unwrap(), 11);
+        assert_eq!(view.resolve(&cx, b"/alias").unwrap(), 7);
+        assert_eq!(view.stat(&cx, 7).unwrap().0.links, 1);
+        assert_eq!(view.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+        assert_eq!(view.read(&cx, 11, 0, 64).unwrap(), b"Y\0\0\0\0\0\0\0Z");
+        assert_eq!(view.stat(&cx, 10).unwrap().0.parent, 2);
+        let root = view.stat(&cx, 2).unwrap().0;
+        assert_eq!((root.size, root.links), (5, 3));
+        assert!(matches!(
+            view.resolve(&cx, b"/made"),
+            Err(FfsError::NotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn native_namespace_late_rejections_never_publish_earlier_valid_operations() {
+    let cx = Cx::for_testing();
+    let order = Endian::Little;
+    let prefix = vec![
+        create_record(2, 1, 2, 8, b"made", order),
+        create_record(2, 2, 8, 9, b"child", order),
+    ];
+    let mut invalid_range = record(10, 43, 3, i64::MAX as u64, &[], order);
+    put(&mut invalid_range, 48, 1, order);
+    let mut unknown = remove_record(5, 3, 2, b"file", order);
+    put(&mut unknown, 0, 1_u64 << 63 | 5, order);
+    for last in [
+        rename_record(3, 2, 9, b"made", b"cycle", order),
+        remove_record(6, 3, 2, b"made", order),
+        remove_record(5, 3, 2, b"made", order),
+        rename_record(3, 2, 8, b"absent", b"other", order),
+        invalid_range,
+        unknown,
+    ] {
+        let mut records = prefix.clone();
+        records.push(last);
+        let (mut objects, _, _) = recovery_graph_log(order, 9, &records, true, None, &[]);
+        let mut view = objects.zpl(&cx, &[]).unwrap();
+        assert!(view.replay_zil(&cx).is_err());
+        assert!(view.zil_replay_stats().is_none());
+        assert_eq!(
+            names(&mut view, &cx, 2),
+            [b"alias".to_vec(), b"file".to_vec()]
+        );
+        assert!(matches!(
+            view.resolve(&cx, b"/made"),
+            Err(FfsError::NotFound(_))
+        ));
+        assert_eq!(view.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+    }
+}
+
+#[test]
+fn native_namespace_range_free_preserves_tail_extends_eof_and_propagates_surviving_base_errors() {
+    let cx = Cx::for_testing();
+    let order = Endian::Little;
+    let mut free = record(10, 43, 2, 20, &[], order);
+    put(&mut free, 48, 2, order);
+    let records = [record(9, 43, 1, 2, b"NEW", order), free];
+    let (mut objects, reads, faults) = recovery_graph_log(order, 9, &records, true, None, &[]);
+    let mut view = objects.zpl(&cx, &[]).unwrap();
+    view.replay_zil(&cx).unwrap();
+    assert_eq!(view.stat(&cx, 7).unwrap().0.size, 22);
+    for fault in [Fault::Checksum, Fault::Io, Fault::Cancelled] {
+        faults
+            .lock()
+            .unwrap()
+            .insert(BASE + DATA_OFFSET + 0x4c400, fault);
+        reads.lock().unwrap().clear();
+        assert_eq!(view.read(&cx, 7, 2, 3).unwrap(), b"NEW");
+        assert!(
+            !reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(at, _)| *at == BASE + DATA_OFFSET + 0x4c400)
+        );
+        assert!(view.read(&cx, 7, 0, 64).is_err());
+    }
+    faults.lock().unwrap().clear();
+    assert_eq!(
+        view.read(&cx, 7, 0, 64).unwrap(),
+        b"abNEWfghijklmnop\0\0\0\0\0\0"
+    );
 }

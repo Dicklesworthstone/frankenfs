@@ -96,7 +96,7 @@ fn indirect_data_keeps_each_native_byte_order_and_decodes_before_overlay() {
 }
 
 #[test]
-fn partial_indirect_records_and_bad_native_identity_fail_during_admission() {
+fn crossing_indirect_ranges_and_bad_native_identity_fail_during_admission() {
     let cx = Cx::for_testing();
     for order in [Endian::Little, Endian::Big] {
         let bp = data_bp(&[b'R'; 512], 512, 2, order, order);
@@ -104,7 +104,7 @@ fn partial_indirect_records_and_bad_native_identity_fail_during_admission() {
             let mut row = indirect(&bp, 0, 512, order);
             match case {
                 0 => put(&mut row.raw, 40, 1, order),
-                1 => put(&mut row.raw, 48, 511, order),
+                1 => put(&mut row.raw, 48, 513, order),
                 2 => put(&mut row.raw, 48, 0, order),
                 3 => put(&mut row.raw, 32, 1_u64 << 48, order),
                 4 => put(&mut row.raw, 64 + 80, 0, order),
@@ -135,6 +135,91 @@ fn partial_indirect_records_and_bad_native_identity_fail_during_admission() {
             Plan::new(&cx, &[good, namespace]),
             Err(FfsError::UnsupportedFeature(_))
         ));
+    }
+}
+
+#[test]
+fn partial_indirect_restores_checked_block_prefix_with_exact_logged_eof() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let mut bytes = vec![b'R'; 512];
+        bytes[..8].copy_from_slice(b"PREFIX!!");
+        let bp = data_bp(&bytes, 512, 2, order, order);
+        let rows = [indirect(&bp, 513, 7, order)];
+        let plan = Plan::new(&cx, &rows).unwrap();
+        let (pool, _) = leaf(&[(PAYLOAD, bytes.clone())], None);
+        let payloads = plan.load(&cx, &pool, &config(), 7).unwrap();
+        let changes = edits(&cx, &rows, &payloads, 7).unwrap();
+        assert_eq!(changes[0].size_after(0), 520);
+        assert_eq!(changes[0].size_after(800), 800);
+        // lr_blkoff is deliberately u64::MAX in this real record. The checked
+        // payload begins at block offset512, not user offset513 or blkoff.
+        let actual = super::super::recovery::read(&cx, 0, 508, 12, &changes, |_, _| {
+            panic!("new sparse bytes")
+        })
+        .unwrap();
+        assert_eq!(actual, b"\0\0\0\0PREFIX!!");
+        let hidden = super::super::recovery::read(&cx, 800, 520, 4, &changes, |_, _| {
+            panic!("checked indirect block replaces these bytes")
+        })
+        .unwrap();
+        assert_eq!(hidden, b"RRRR");
+        let mut bad = indirect(&bp, i64::MAX as u64 - 2, 3, order);
+        put(&mut bad.raw, 40, i64::MAX as u64, order);
+        assert!(Plan::new(&cx, &[bad]).is_err());
+    }
+}
+
+#[test]
+fn native_namespace_replay_reads_full_and_partial_indirect_payloads_without_clipping_sparse_files()
+{
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for partial in [false, true] {
+            let bytes = vec![b'R'; 512];
+            let offset = 32 * 1024 * 1024 + if partial { 1 } else { 0 };
+            let length = if partial { 7 } else { 512 };
+            let write = indirect(
+                &data_bp(&bytes, 512, 2, order, order),
+                offset,
+                length,
+                order,
+            );
+            let records = vec![
+                write.raw,
+                record(9, 43, 2, offset + length + 2, b"!", order),
+            ];
+            let (mut objects, reads, faults) =
+                recovery_graph_log(order, 9, &records, true, None, &[(PAYLOAD, bytes)]);
+            let mut view = objects.zpl(&cx, &[]).unwrap();
+            let stats = view.replay_zil(&cx).unwrap();
+            assert_eq!(stats.records_replayed, 2);
+            assert_eq!(view.stat(&cx, 7).unwrap().0.size, offset + length + 3);
+            assert_eq!(view.read(&cx, 7, 0, 16).unwrap(), b"abcdefghijklmnop");
+            let start = offset - offset % 512;
+            let visible = (offset + length - start) as usize;
+            let mut expected = vec![b'R'; visible];
+            expected.extend_from_slice(b"\0\0!");
+            assert_eq!(view.read(&cx, 7, start, 1024).unwrap(), expected);
+            assert!(
+                reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, count)| *count <= 16384)
+            );
+            for fault in [Fault::Checksum, Fault::Io, Fault::Cancelled] {
+                faults
+                    .lock()
+                    .unwrap()
+                    .insert(BASE + DATA_OFFSET + PAYLOAD, fault);
+                assert!(view.replay_zil(&cx).is_err());
+                assert_eq!(view.zil_replay_stats(), Some(&stats));
+                assert_eq!(view.read(&cx, 7, start, 1024).unwrap(), expected);
+            }
+            let mut committed = objects.zpl(&cx, &[]).unwrap();
+            assert_eq!(committed.stat(&cx, 7).unwrap().0.size, 16);
+        }
     }
 }
 
@@ -182,6 +267,12 @@ fn indirect_data_budget_is_preflighted_across_all_selected_writes() {
     let (pool, reads) = leaf(&[], None);
     assert!(matches!(
         plan.load(&cx, &pool, &config(), 7),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    assert!(reads.lock().unwrap().is_empty());
+    let (objects, reads) = recovery_graph(false);
+    assert!(matches!(
+        plan.load_all(&cx, &objects),
         Err(FfsError::UnsupportedFeature(_))
     ));
     assert!(reads.lock().unwrap().is_empty());

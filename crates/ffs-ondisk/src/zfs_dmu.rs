@@ -372,8 +372,6 @@ impl ZilBlock {
         while pos + 32 <= records_limit {
             let txtype = order.u64(raw, pos)?;
             let reclen = order.u64(raw, pos + 8)?;
-            let txg = order.u64(raw, pos + 16)?;
-            let seq = order.u64(raw, pos + 24)?;
             if txtype == 0 || reclen < 32 || !reclen.is_multiple_of(8) {
                 break;
             }
@@ -382,134 +380,155 @@ impl ZilBlock {
                 .filter(|&end| end <= records_limit)
                 .ok_or_else(|| invalid("ZIL record exceeds block used bytes"))?;
             let rec = &raw[pos..rec_end];
-            let payload = match txtype & 0x1f {
-                1 | 2 | 4 | 14..=19 => {
-                    if rec.len() < 104 {
-                        return Err(invalid("truncated ZIL lr_create_t"));
-                    }
-                    let dir_obj = order.u64(rec, 32)?;
-                    let file_obj = order.u64(rec, 40)? & ((1_u64 << 48) - 1);
-                    let mode = order.u64(rec, 48)?;
-                    let uid = order.u64(rec, 56)?;
-                    let gid = order.u64(rec, 64)?;
-                    let generation = order.u64(rec, 72)?;
-                    let crtime = [order.u64(rec, 80)?, order.u64(rec, 88)?];
-                    let (name, symlink_target) = cstr_pair(&rec[104..])?;
-                    let is_dir =
-                        matches!(txtype & 0x1f, 2 | 17..=19) || (mode & 0o170_000) == 0o040_000;
-                    ZilRecordPayload::Create {
-                        dir_obj,
-                        file_obj,
-                        mode,
-                        uid,
-                        gid,
-                        generation,
-                        crtime,
-                        name,
-                        symlink_target,
-                        is_dir,
-                    }
-                }
-                5 | 6 => {
-                    if rec.len() < 40 {
-                        return Err(invalid("truncated ZIL lr_remove_t"));
-                    }
-                    let dir_obj = order.u64(rec, 32)?;
-                    let (name, _) = cstr_pair(&rec[40..])?;
-                    ZilRecordPayload::Remove {
-                        dir_obj,
-                        name,
-                        is_dir: (txtype & 0x1f) == 6,
-                    }
-                }
-                8 => {
-                    if rec.len() < 48 {
-                        return Err(invalid("truncated ZIL lr_rename_t"));
-                    }
-                    let src_dir_obj = order.u64(rec, 32)?;
-                    let dst_dir_obj = order.u64(rec, 40)?;
-                    let (src_name, dst_opt) = cstr_pair(&rec[48..])?;
-                    let dst_name = dst_opt
-                        .ok_or_else(|| invalid("missing destination name in ZIL lr_rename_t"))?;
-                    ZilRecordPayload::Rename {
-                        src_dir_obj,
-                        dst_dir_obj,
-                        src_name,
-                        dst_name,
-                    }
-                }
-                9 | 20 => {
-                    if rec.len() < 192 {
-                        return Err(invalid("truncated ZIL lr_write_t"));
-                    }
-                    let file_obj = order.u64(rec, 32)?;
-                    let offset = order.u64(rec, 40)?;
-                    let length = order.u64(rec, 48)?;
-                    let blkoff = order.u64(rec, 56)?;
-                    let blkptr = BlockPointer::parse(&rec[64..192], order)?;
-                    let inline_data = if rec.len() > 192 {
-                        let avail = (rec.len() - 192).min(length as usize);
-                        rec[192..192 + avail].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    ZilRecordPayload::Write {
-                        file_obj,
-                        offset,
-                        length,
-                        blkoff,
-                        blkptr,
-                        inline_data,
-                    }
-                }
-                10 => {
-                    if rec.len() < 56 {
-                        return Err(invalid("truncated ZIL lr_truncate_t"));
-                    }
-                    ZilRecordPayload::Truncate {
-                        file_obj: order.u64(rec, 32)?,
-                        offset: order.u64(rec, 40)?,
-                        length: order.u64(rec, 48)?,
-                    }
-                }
-                11 => {
-                    if rec.len() < 96 {
-                        return Err(invalid("truncated ZIL lr_setattr_t"));
-                    }
-                    let mtime = if rec.len() >= 112 {
-                        [order.u64(rec, 96)?, order.u64(rec, 104)?]
-                    } else {
-                        [0, 0]
-                    };
-                    ZilRecordPayload::Setattr {
-                        file_obj: order.u64(rec, 32)?,
-                        mask: order.u64(rec, 40)?,
-                        mode: order.u64(rec, 48)?,
-                        uid: order.u64(rec, 56)?,
-                        gid: order.u64(rec, 64)?,
-                        size: order.u64(rec, 72)?,
-                        atime: [order.u64(rec, 80)?, order.u64(rec, 88)?],
-                        mtime,
-                    }
-                }
-                _ => {
-                    pos = rec_end;
-                    continue;
-                }
-            };
-            records.push(ZilRecord {
-                txtype,
-                reclen,
-                txg,
-                seq,
-                payload,
-            });
+            if !matches!(txtype & 0x1f, 1 | 2 | 4..=6 | 8..=11 | 14..=20) {
+                pos = rec_end;
+                continue;
+            }
+            let record = ZilRecord::parse(rec, order)?;
+            records.push(record);
             pos = rec_end;
         }
         Ok(Self {
             next_blk,
             nused,
             records,
+        })
+    }
+}
+
+impl ZilRecord {
+    /// Decode one complete record independently of legacy/slim block framing.
+    /// Consumers replaying records must first admit the exact operation flags
+    /// and native layout; inspection retains its recognized-type decoding.
+    pub fn parse(rec: &[u8], order: Endian) -> Result<Self, ParseError> {
+        if rec.len() < 32 || !rec.len().is_multiple_of(8) {
+            return Err(invalid("invalid complete ZIL record length"));
+        }
+        let txtype = order.u64(rec, 0)?;
+        let reclen = order.u64(rec, 8)?;
+        if reclen != rec.len() as u64 {
+            return Err(invalid("ZIL record length disagrees with its span"));
+        }
+        let txg = order.u64(rec, 16)?;
+        let seq = order.u64(rec, 24)?;
+        let payload = match txtype & 0x1f {
+            1 | 2 | 4 | 14..=19 => {
+                if rec.len() < 104 {
+                    return Err(invalid("truncated ZIL lr_create_t"));
+                }
+                let dir_obj = order.u64(rec, 32)?;
+                let file_obj = order.u64(rec, 40)? & ((1_u64 << 48) - 1);
+                let mode = order.u64(rec, 48)?;
+                let uid = order.u64(rec, 56)?;
+                let gid = order.u64(rec, 64)?;
+                let generation = order.u64(rec, 72)?;
+                let crtime = [order.u64(rec, 80)?, order.u64(rec, 88)?];
+                let (name, symlink_target) = cstr_pair(&rec[104..])?;
+                let is_dir =
+                    matches!(txtype & 0x1f, 2 | 17..=19) || (mode & 0o170_000) == 0o040_000;
+                ZilRecordPayload::Create {
+                    dir_obj,
+                    file_obj,
+                    mode,
+                    uid,
+                    gid,
+                    generation,
+                    crtime,
+                    name,
+                    symlink_target,
+                    is_dir,
+                }
+            }
+            5 | 6 => {
+                if rec.len() < 40 {
+                    return Err(invalid("truncated ZIL lr_remove_t"));
+                }
+                let dir_obj = order.u64(rec, 32)?;
+                let (name, _) = cstr_pair(&rec[40..])?;
+                ZilRecordPayload::Remove {
+                    dir_obj,
+                    name,
+                    is_dir: (txtype & 0x1f) == 6,
+                }
+            }
+            8 => {
+                if rec.len() < 48 {
+                    return Err(invalid("truncated ZIL lr_rename_t"));
+                }
+                let src_dir_obj = order.u64(rec, 32)?;
+                let dst_dir_obj = order.u64(rec, 40)?;
+                let (src_name, dst_opt) = cstr_pair(&rec[48..])?;
+                let dst_name = dst_opt
+                    .ok_or_else(|| invalid("missing destination name in ZIL lr_rename_t"))?;
+                ZilRecordPayload::Rename {
+                    src_dir_obj,
+                    dst_dir_obj,
+                    src_name,
+                    dst_name,
+                }
+            }
+            9 | 20 => {
+                if rec.len() < 192 {
+                    return Err(invalid("truncated ZIL lr_write_t"));
+                }
+                let file_obj = order.u64(rec, 32)?;
+                let offset = order.u64(rec, 40)?;
+                let length = order.u64(rec, 48)?;
+                let blkoff = order.u64(rec, 56)?;
+                let blkptr = BlockPointer::parse(&rec[64..192], order)?;
+                let inline_data = if rec.len() > 192 {
+                    let avail = (rec.len() - 192).min(length as usize);
+                    rec[192..192 + avail].to_vec()
+                } else {
+                    Vec::new()
+                };
+                ZilRecordPayload::Write {
+                    file_obj,
+                    offset,
+                    length,
+                    blkoff,
+                    blkptr,
+                    inline_data,
+                }
+            }
+            10 => {
+                if rec.len() < 56 {
+                    return Err(invalid("truncated ZIL lr_truncate_t"));
+                }
+                ZilRecordPayload::Truncate {
+                    file_obj: order.u64(rec, 32)?,
+                    offset: order.u64(rec, 40)?,
+                    length: order.u64(rec, 48)?,
+                }
+            }
+            11 => {
+                if rec.len() < 96 {
+                    return Err(invalid("truncated ZIL lr_setattr_t"));
+                }
+                let mtime = if rec.len() >= 112 {
+                    [order.u64(rec, 96)?, order.u64(rec, 104)?]
+                } else {
+                    [0, 0]
+                };
+                ZilRecordPayload::Setattr {
+                    file_obj: order.u64(rec, 32)?,
+                    mask: order.u64(rec, 40)?,
+                    mode: order.u64(rec, 48)?,
+                    uid: order.u64(rec, 56)?,
+                    gid: order.u64(rec, 64)?,
+                    size: order.u64(rec, 72)?,
+                    atime: [order.u64(rec, 80)?, order.u64(rec, 88)?],
+                    mtime,
+                }
+            }
+            _ => return Err(invalid("unknown ZIL record payload")),
+        };
+        Ok(Self {
+            txtype,
+            reclen,
+            txg,
+            seq,
+            payload,
         })
     }
 }

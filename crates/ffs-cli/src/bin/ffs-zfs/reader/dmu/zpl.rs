@@ -9,6 +9,7 @@ mod zil_records;
 
 pub use path::PathPolicy;
 
+use super::zil::{self, OwnedEdit};
 use super::{
     BTreeSet, BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result,
     VecDeque, checkpoint, corrupt, parse, unsupported,
@@ -16,11 +17,11 @@ use super::{
 use ffs_ondisk::zfs_dmu::{ZapEntry, ZilHeader, ZilRecordPayload};
 use ffs_ondisk::zfs_zpl::{Attributes, Kind, Metadata, SA_BYTES, SaRegistry, directory_reference};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const MAX_PATH: usize = 65_536;
 const MAX_COMPONENTS: usize = 256;
 const MAX_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_ZIL_BLOCKS: usize = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZilReplayStats {
@@ -28,6 +29,14 @@ pub struct ZilReplayStats {
     pub records_replayed: usize,
     pub last_txg: u64,
     pub last_seq: u64,
+    /// Native unclaimed logs normally end at an allocated unwritten LWB.
+    pub unverified_tail: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RecoveredFile {
+    original_size: u64,
+    edits: Vec<OwnedEdit>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,7 +44,8 @@ struct ZilOverlay {
     stats: ZilReplayStats,
     objects: BTreeMap<u64, Metadata>,
     dir_entries: BTreeMap<u64, BTreeMap<Vec<u8>, Option<u64>>>,
-    file_data: BTreeMap<u64, Vec<u8>>,
+    file_edits: BTreeMap<u64, Arc<RecoveredFile>>,
+    created: BTreeSet<u64>,
     removed_objects: BTreeSet<u64>,
 }
 
@@ -212,39 +222,58 @@ impl Zpl {
     /// Replay the ZIL intent-log chain (`zh_log`) into an in-memory ZPL overlay.
     pub fn replay_zil(&mut self, cx: &Cx) -> Result<ZilReplayStats> {
         checkpoint(cx)?;
-        let mut overlay = ZilOverlay::default();
-        if !self.zil_header.has_work() {
-            let stats = overlay.stats.clone();
-            self.zil_overlay = Some(overlay);
-            return Ok(stats);
+        let (mos, components) = self
+            .mos
+            .as_mut()
+            .ok_or_else(|| unsupported("ZIL replay requires a selected filesystem head"))?;
+        let log = mos.intent_log(cx, components)?;
+        if log.dataset_guid != self.dataset_guid || log.selected_txg != self.objects.txg {
+            return Err(corrupt("ZIL selection differs from its ZPL owner"));
         }
-        let mut bp = self.zil_header.log.clone();
-        let min_seq = self.zil_header.replay_seq;
-        while !bp.hole() && overlay.stats.blocks_visited < MAX_ZIL_BLOCKS {
+        // Native zil_check_log_chain accepts an unclaimed checksum-invalid
+        // terminal LWB. The scanner distinguishes that from I/O/cancellation,
+        // malformed verified records and a damaged claimed chain.
+        let mut records = Vec::new();
+        for (index, record) in log
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.pending)
+        {
+            records.push((
+                index,
+                zil_records::verified(cx, record.bytes(), record.order())?,
+            ));
+        }
+        let plan = zil::indirect::Plan::for_namespace(cx, &log.records)?;
+        let mut data = plan.load_all(cx, &self.objects)?;
+        let mut overlay = ZilOverlay {
+            stats: ZilReplayStats {
+                blocks_visited: log.verified_blocks,
+                unverified_tail: log.termination == zil::Termination::UnverifiedTail,
+                ..ZilReplayStats::default()
+            },
+            ..ZilOverlay::default()
+        };
+        for (index, record) in records {
             checkpoint(cx)?;
-            let Some((raw, order)) = self.objects.read_zil_block(cx, &bp)? else {
-                break;
+            let write = if matches!(&record.payload, ZilRecordPayload::Write { .. }) {
+                Some(zil::indirect::take_write(
+                    &log.records[index],
+                    index,
+                    &mut data,
+                )?)
+            } else {
+                None
             };
-            let zblk = zil_records::parse(cx, &raw, order)?;
-            overlay.stats.blocks_visited += 1;
-            for rec in zblk.records {
-                checkpoint(cx)?;
-                if rec.seq <= min_seq {
-                    continue;
-                }
-                self.apply_zil_record(cx, &mut overlay, &rec.payload)?;
-                overlay.stats.records_replayed += 1;
-                overlay.stats.last_txg = overlay.stats.last_txg.max(rec.txg);
-                overlay.stats.last_seq = overlay.stats.last_seq.max(rec.seq);
-            }
-            if zblk.next_blk == bp {
-                break;
-            }
-            bp = zblk.next_blk;
+            self.apply_zil_record(cx, &mut overlay, &record.payload, write)?;
+            overlay.stats.records_replayed += 1;
+            overlay.stats.last_txg = overlay.stats.last_txg.max(record.txg);
+            overlay.stats.last_seq = record.seq;
         }
         let stats = overlay.stats.clone();
-        self.zil_overlay = Some(overlay);
         checkpoint(cx)?;
+        self.zil_overlay = Some(overlay);
         Ok(stats)
     }
 
@@ -253,37 +282,248 @@ impl Zpl {
         cx: &Cx,
         overlay: &mut ZilOverlay,
         object_id: u64,
-    ) -> Option<Metadata> {
-        if let Some(meta) = overlay.objects.get(&object_id) {
-            return Some(meta.clone());
+    ) -> Result<Metadata> {
+        checkpoint(cx)?;
+        if overlay.removed_objects.contains(&object_id) {
+            return Err(FfsError::NotFound(format!(
+                "ZFS object {object_id} removed in ZIL"
+            )));
         }
-        let Ok((_, meta)) = self.file(cx, object_id) else {
-            return None;
-        };
+        if let Some(meta) = overlay.objects.get(&object_id) {
+            return Ok(meta.clone());
+        }
+        let (_, meta) = self.committed_file(cx, object_id, false)?;
         overlay.objects.insert(object_id, meta.clone());
-        Some(meta)
+        Ok(meta)
     }
 
-    fn ensure_overlay_file_data(&mut self, cx: &Cx, overlay: &mut ZilOverlay, object_id: u64) {
-        if overlay.file_data.contains_key(&object_id) {
-            return;
+    fn apply_file_edit(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        object_id: u64,
+        edit: OwnedEdit,
+    ) -> Result<()> {
+        let mut meta = self.ensure_overlay_metadata(cx, overlay, object_id)?;
+        if meta.kind != Kind::Regular {
+            return Err(unsupported("ZIL data edit requires a regular file"));
         }
-        let data = if let Ok((object, meta)) = self.file(cx, object_id)
-            && meta.kind == Kind::Regular
-        {
-            self.contents(
-                cx,
-                object_id,
-                &object,
-                meta.size,
-                0,
-                (meta.size as usize).min(MAX_READ_BYTES),
-            )
-            .unwrap_or_default()
+        let original_size = meta.size;
+        meta.size = edit.borrowed().size_after(meta.size);
+        let file = overlay.file_edits.entry(object_id).or_insert_with(|| {
+            Arc::new(RecoveredFile {
+                original_size,
+                edits: Vec::new(),
+            })
+        });
+        Arc::make_mut(file).edits.push(edit);
+        overlay.objects.insert(object_id, meta);
+        Ok(())
+    }
+
+    fn staged_directory(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        number: u64,
+    ) -> Result<BTreeMap<Vec<u8>, u64>> {
+        if self.ensure_overlay_metadata(cx, overlay, number)?.kind != Kind::Directory {
+            return Err(FfsError::NotDirectory);
+        }
+        let mut entries = BTreeMap::new();
+        if !overlay.created.contains(&number) {
+            for entry in self.objects.zap(cx, number)? {
+                checkpoint(cx)?;
+                self.component(&entry.name)?;
+                let (object, tag) =
+                    directory_reference(entry.value).map_err(|error| parse(&error))?;
+                // A tombstone/replacement takes precedence even over a retired
+                // base object: do not read a superseded reference.
+                if overlay
+                    .dir_entries
+                    .get(&number)
+                    .is_some_and(|changes| changes.contains_key(&entry.name))
+                {
+                    continue;
+                }
+                let meta = self.ensure_overlay_metadata(cx, overlay, object)?;
+                if tag.is_some_and(|kind| kind != meta.kind) {
+                    return Err(corrupt("ZIL base directory tag disagrees with its target"));
+                }
+                entries.insert(entry.name, object);
+            }
+        }
+        if let Some(changes) = overlay.dir_entries.get(&number) {
+            for (name, target) in changes {
+                if let Some(object) = target {
+                    entries.insert(name.clone(), *object);
+                } else {
+                    entries.remove(name);
+                }
+            }
+        }
+        let mut bytes = 0_usize;
+        let mut directories = BTreeSet::new();
+        for (name, object) in &entries {
+            checkpoint(cx)?;
+            self.component(name)?;
+            let meta = self.ensure_overlay_metadata(cx, overlay, *object)?;
+            if meta.kind == Kind::Directory
+                && (*object == self.root
+                    || *object == number
+                    || meta.parent != number
+                    || !directories.insert(*object))
+            {
+                return Err(corrupt("ZIL directory contains an alias or foreign parent"));
+            }
+            bytes = bytes
+                .checked_add(name.len() + std::mem::size_of::<DirectoryEntry>())
+                .filter(|bytes| *bytes <= MAX_DIRECTORY_BYTES)
+                .ok_or_else(|| unsupported("ZIL directory exceeds 32 MiB"))?;
+        }
+        checkpoint(cx)?;
+        Ok(entries)
+    }
+
+    fn adjust_directory(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        number: u64,
+        entries: i64,
+        links: i64,
+    ) -> Result<()> {
+        let mut meta = self.ensure_overlay_metadata(cx, overlay, number)?;
+        if meta.kind != Kind::Directory {
+            return Err(FfsError::NotDirectory);
+        }
+        meta.size = meta
+            .size
+            .checked_add_signed(entries)
+            .filter(|size| *size >= 2)
+            .ok_or_else(|| corrupt("ZIL directory size underflow/overflow"))?;
+        meta.links = meta
+            .links
+            .checked_add_signed(links)
+            .filter(|links| *links >= 2)
+            .ok_or_else(|| corrupt("ZIL directory links underflow/overflow"))?;
+        overlay.objects.insert(number, meta);
+        Ok(())
+    }
+
+    fn remove_entry(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        dir: u64,
+        name: &[u8],
+        is_dir: bool,
+    ) -> Result<()> {
+        self.component(name)?;
+        let target = self
+            .staged_directory(cx, overlay, dir)?
+            .get(name)
+            .copied()
+            .ok_or_else(|| FfsError::NotFound("ZIL removal target".into()))?;
+        if target == self.root {
+            return Err(corrupt("ZIL cannot remove the root directory"));
+        }
+        let mut meta = self.ensure_overlay_metadata(cx, overlay, target)?;
+        if (meta.kind == Kind::Directory) != is_dir {
+            return Err(corrupt("ZIL remove/rmdir disagrees with target kind"));
+        }
+        if is_dir && !self.staged_directory(cx, overlay, target)?.is_empty() {
+            return Err(corrupt("ZIL rmdir target is not empty"));
+        }
+        self.adjust_directory(cx, overlay, dir, -1, -i64::from(is_dir))?;
+        overlay
+            .dir_entries
+            .entry(dir)
+            .or_default()
+            .insert(name.to_vec(), None);
+        meta.links = if is_dir {
+            0
         } else {
-            Vec::new()
+            meta.links
+                .checked_sub(1)
+                .ok_or_else(|| corrupt("ZIL file links underflow"))?
         };
-        overlay.file_data.insert(object_id, data);
+        if meta.links == 0 {
+            overlay.removed_objects.insert(target);
+            overlay.objects.remove(&target);
+            overlay.file_edits.remove(&target);
+        } else {
+            overlay.objects.insert(target, meta);
+        }
+        Ok(())
+    }
+
+    fn rename_entry(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        src: u64,
+        dst: u64,
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<()> {
+        self.component(from)?;
+        self.component(to)?;
+        let source = self
+            .staged_directory(cx, overlay, src)?
+            .get(from)
+            .copied()
+            .ok_or_else(|| FfsError::NotFound("ZIL rename source".into()))?;
+        let destination = self.staged_directory(cx, overlay, dst)?.get(to).copied();
+        if destination == Some(source) {
+            return Ok(()); // Native rename of one name/hardlink onto itself.
+        }
+        let mut meta = self.ensure_overlay_metadata(cx, overlay, source)?;
+        let directory = meta.kind == Kind::Directory;
+        if source == self.root {
+            return Err(corrupt("ZIL cannot rename the root directory"));
+        }
+        if directory {
+            let mut parent = dst;
+            let mut visited = BTreeSet::new();
+            loop {
+                checkpoint(cx)?;
+                if parent == source || !visited.insert(parent) || visited.len() > MAX_COMPONENTS {
+                    return Err(corrupt("ZIL directory rename forms a cycle"));
+                }
+                if parent == self.root {
+                    break;
+                }
+                let ancestor = self.ensure_overlay_metadata(cx, overlay, parent)?;
+                if ancestor.kind != Kind::Directory {
+                    return Err(corrupt("ZIL directory ancestry contains a non-directory"));
+                }
+                parent = ancestor.parent;
+            }
+        }
+        if let Some(target) = destination {
+            if (self.ensure_overlay_metadata(cx, overlay, target)?.kind == Kind::Directory)
+                != directory
+            {
+                return Err(corrupt("ZIL rename replacement changes directory kind"));
+            }
+            self.remove_entry(cx, overlay, dst, to, directory)?;
+        }
+        self.adjust_directory(cx, overlay, src, -1, -i64::from(directory))?;
+        self.adjust_directory(cx, overlay, dst, 1, i64::from(directory))?;
+        overlay
+            .dir_entries
+            .entry(src)
+            .or_default()
+            .insert(from.to_vec(), None);
+        overlay
+            .dir_entries
+            .entry(dst)
+            .or_default()
+            .insert(to.to_vec(), Some(source));
+        meta.parent = dst;
+        overlay.objects.insert(source, meta);
+        Ok(())
     }
 
     fn apply_zil_record(
@@ -291,6 +531,7 @@ impl Zpl {
         cx: &Cx,
         overlay: &mut ZilOverlay,
         payload: &ZilRecordPayload,
+        write: Option<OwnedEdit>,
     ) -> Result<()> {
         match payload {
             ZilRecordPayload::Create {
@@ -306,19 +547,44 @@ impl Zpl {
                 is_dir,
             } => {
                 self.component(name)?;
-                let kind = if symlink_target.is_some() || (*mode & 0o170_000) == 0o120_000 {
+                if *file_obj == 0
+                    || *file_obj >= 1_u64 << 48
+                    || *generation == 0
+                    || crtime[1] >= 1_000_000_000
+                {
+                    return Err(corrupt("invalid ZIL create identity, generation or time"));
+                }
+                if self
+                    .staged_directory(cx, overlay, *dir_obj)?
+                    .contains_key(name)
+                {
+                    return Err(corrupt("ZIL create name already exists"));
+                }
+                if !overlay.removed_objects.contains(file_obj) {
+                    if overlay.objects.contains_key(file_obj) {
+                        return Err(corrupt("ZIL create reuses a live object"));
+                    }
+                    match self.committed_file(cx, *file_obj, false) {
+                        Err(FfsError::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                        Ok(_) => return Err(corrupt("ZIL create reuses a committed live object")),
+                    }
+                }
+                let kind = if symlink_target.is_some() && (*mode & 0o170_000) == 0o120_000 {
                     Kind::Symlink
-                } else if *is_dir {
+                } else if *is_dir && (*mode & 0o170_000) == 0o040_000 {
                     Kind::Directory
-                } else {
+                } else if !is_dir && symlink_target.is_none() && (*mode & 0o170_000) == 0o100_000 {
                     Kind::Regular
+                } else {
+                    return Err(unsupported("ZIL plain create kind/mode is not implemented"));
                 };
                 let size = symlink_target
                     .as_ref()
                     .map_or(if *is_dir { 2 } else { 0 }, |t| t.len() as u64);
                 let ts = ffs_ondisk::zfs_zpl::Timestamp {
                     seconds: i64::from_le_bytes(crtime[0].to_le_bytes()),
-                    nanos: u32::try_from(crtime[1]).unwrap_or(0).min(999_999_999),
+                    nanos: crtime[1] as u32,
                 };
                 let meta = Metadata {
                     mode: (*mode) & 0o7777,
@@ -329,11 +595,15 @@ impl Zpl {
                     links: if *is_dir { 2 } else { 1 },
                     parent: *dir_obj,
                     flags: 0,
-                    generation: (*generation).max(1).min(self.objects.txg),
+                    generation: *generation,
                     times: [ts, ts, ts, ts],
                     inline_symlink: symlink_target.clone(),
                 };
                 overlay.removed_objects.remove(file_obj);
+                overlay.created.insert(*file_obj);
+                overlay.dir_entries.remove(file_obj);
+                overlay.file_edits.remove(file_obj);
+                self.adjust_directory(cx, overlay, *dir_obj, 1, i64::from(*is_dir))?;
                 overlay.objects.insert(*file_obj, meta);
                 overlay
                     .dir_entries
@@ -341,46 +611,21 @@ impl Zpl {
                     .or_default()
                     .insert(name.clone(), Some(*file_obj));
                 if kind == Kind::Regular {
-                    overlay.file_data.entry(*file_obj).or_default();
+                    overlay.file_edits.insert(
+                        *file_obj,
+                        Arc::new(RecoveredFile {
+                            original_size: 0,
+                            edits: Vec::new(),
+                        }),
+                    );
                 }
             }
             ZilRecordPayload::Remove {
                 dir_obj,
                 name,
-                is_dir: _,
+                is_dir,
             } => {
-                let target_obj = if let Some(Some(obj)) = overlay
-                    .dir_entries
-                    .get(dir_obj)
-                    .and_then(|m| m.get(name.as_slice()))
-                {
-                    Some(*obj)
-                } else if let Ok(entries) = self.objects.zap(cx, *dir_obj) {
-                    entries
-                        .into_iter()
-                        .find(|e| e.name == *name)
-                        .and_then(|e| directory_reference(e.value).ok().map(|(o, _)| o))
-                } else {
-                    None
-                };
-                overlay
-                    .dir_entries
-                    .entry(*dir_obj)
-                    .or_default()
-                    .insert(name.clone(), None);
-                if let Some(obj) = target_obj {
-                    let _ = self.ensure_overlay_metadata(cx, overlay, obj);
-                    let unlinked = if let Some(meta) = overlay.objects.get_mut(&obj) {
-                        meta.links = meta.links.saturating_sub(1);
-                        meta.links == 0
-                    } else {
-                        true
-                    };
-                    if unlinked {
-                        overlay.removed_objects.insert(obj);
-                        overlay.objects.remove(&obj);
-                    }
-                }
+                self.remove_entry(cx, overlay, *dir_obj, name, *is_dir)?;
             }
             ZilRecordPayload::Rename {
                 src_dir_obj,
@@ -388,73 +633,15 @@ impl Zpl {
                 src_name,
                 dst_name,
             } => {
-                self.component(dst_name)?;
-                let target_obj = if let Some(Some(obj)) = overlay
-                    .dir_entries
-                    .get(src_dir_obj)
-                    .and_then(|m| m.get(src_name.as_slice()))
-                {
-                    Some(*obj)
-                } else if let Ok(entries) = self.objects.zap(cx, *src_dir_obj) {
-                    entries
-                        .into_iter()
-                        .find(|e| e.name == *src_name)
-                        .and_then(|e| directory_reference(e.value).ok().map(|(o, _)| o))
-                } else {
-                    None
-                };
-                if let Some(obj) = target_obj {
-                    let _ = self.ensure_overlay_metadata(cx, overlay, obj);
-                    if let Some(meta) = overlay.objects.get_mut(&obj) {
-                        meta.parent = *dst_dir_obj;
-                    }
-                    overlay
-                        .dir_entries
-                        .entry(*src_dir_obj)
-                        .or_default()
-                        .insert(src_name.clone(), None);
-                    overlay
-                        .dir_entries
-                        .entry(*dst_dir_obj)
-                        .or_default()
-                        .insert(dst_name.clone(), Some(obj));
-                }
+                self.rename_entry(cx, overlay, *src_dir_obj, *dst_dir_obj, src_name, dst_name)?;
             }
-            ZilRecordPayload::Write {
-                file_obj,
-                offset,
-                length,
-                blkoff,
-                blkptr,
-                inline_data,
-            } => {
-                let write_bytes = if !inline_data.is_empty() {
-                    inline_data.clone()
-                } else if !blkptr.hole() {
-                    if let Some((blk_bytes, _)) = self.objects.read_zil_block(cx, blkptr)? {
-                        let start = (*blkoff as usize).min(blk_bytes.len());
-                        let end = start.saturating_add(*length as usize).min(blk_bytes.len());
-                        blk_bytes[start..end].to_vec()
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
-                self.ensure_overlay_file_data(cx, overlay, *file_obj);
-                let _ = self.ensure_overlay_metadata(cx, overlay, *file_obj);
-                if let Some(buf) = overlay.file_data.get_mut(file_obj) {
-                    let end = (*offset as usize)
-                        .saturating_add(write_bytes.len())
-                        .min(MAX_READ_BYTES);
-                    if end > buf.len() {
-                        buf.resize(end, 0);
-                    }
-                    let start = (*offset as usize).min(end);
-                    let count = end - start;
-                    buf[start..end].copy_from_slice(&write_bytes[..count]);
-                    if let Some(meta) = overlay.objects.get_mut(file_obj) {
-                        meta.size = meta.size.max(buf.len() as u64);
+            ZilRecordPayload::Write { file_obj, .. } => {
+                let edit = write.ok_or_else(|| corrupt("ZIL write was not admitted"))?;
+                // Native writes may be logged after the target was unlinked.
+                // Only ENOENT is ignorable, never read/parse/cancel errors.
+                if let Err(error) = self.apply_file_edit(cx, overlay, *file_obj, edit) {
+                    if !matches!(error, FfsError::NotFound(_)) {
+                        return Err(error);
                     }
                 }
             }
@@ -463,20 +650,19 @@ impl Zpl {
                 offset,
                 length,
             } => {
-                self.ensure_overlay_file_data(cx, overlay, *file_obj);
-                let _ = self.ensure_overlay_metadata(cx, overlay, *file_obj);
-                if let Some(buf) = overlay.file_data.get_mut(file_obj) {
-                    if *length == 0 {
-                        buf.resize((*offset as usize).min(MAX_READ_BYTES), 0);
-                        if let Some(meta) = overlay.objects.get_mut(file_obj) {
-                            meta.size = *offset;
-                        }
-                    } else {
-                        let start = (*offset as usize).min(buf.len());
-                        let end = start.saturating_add(*length as usize).min(buf.len());
-                        buf[start..end].fill(0);
+                let edit = if *length == 0 {
+                    OwnedEdit::Truncate {
+                        object: *file_obj,
+                        size: *offset,
                     }
-                }
+                } else {
+                    OwnedEdit::Free {
+                        object: *file_obj,
+                        offset: *offset,
+                        end: offset + length,
+                    }
+                };
+                self.apply_file_edit(cx, overlay, *file_obj, edit)?;
             }
             ZilRecordPayload::Setattr {
                 file_obj,
@@ -488,7 +674,26 @@ impl Zpl {
                 atime,
                 mtime,
             } => {
-                let _ = self.ensure_overlay_metadata(cx, overlay, *file_obj);
+                self.ensure_overlay_metadata(cx, overlay, *file_obj)?;
+                if mask & 8 != 0 {
+                    if *size > i64::MAX as u64 {
+                        return Err(corrupt("ZIL setattr size overflows"));
+                    }
+                    self.apply_file_edit(
+                        cx,
+                        overlay,
+                        *file_obj,
+                        OwnedEdit::Truncate {
+                            object: *file_obj,
+                            size: *size,
+                        },
+                    )?;
+                }
+                if mask & 16 != 0 && atime[1] >= 1_000_000_000
+                    || mask & 32 != 0 && mtime[1] >= 1_000_000_000
+                {
+                    return Err(corrupt("invalid ZIL setattr timestamp"));
+                }
                 if let Some(meta) = overlay.objects.get_mut(file_obj) {
                     if mask & 1 != 0 {
                         meta.mode = (*mode) & 0o7777;
@@ -505,13 +710,13 @@ impl Zpl {
                     if mask & 16 != 0 {
                         meta.times[0] = ffs_ondisk::zfs_zpl::Timestamp {
                             seconds: i64::from_le_bytes(atime[0].to_le_bytes()),
-                            nanos: u32::try_from(atime[1]).unwrap_or(0).min(999_999_999),
+                            nanos: atime[1] as u32,
                         };
                     }
                     if mask & 32 != 0 {
                         meta.times[1] = ffs_ondisk::zfs_zpl::Timestamp {
                             seconds: i64::from_le_bytes(mtime[0].to_le_bytes()),
-                            nanos: u32::try_from(mtime[1]).unwrap_or(0).min(999_999_999),
+                            nanos: mtime[1] as u32,
                         };
                     }
                 }
@@ -613,12 +818,30 @@ impl Zpl {
                 )));
             }
             if let Some(meta) = ov.objects.get(&number).cloned() {
-                let object = self.objects.load(cx, number).unwrap_or_else(|_| Object {
-                    node: self.objects.meta.clone(),
-                    ceiling: self.objects.root_birth,
-                });
+                let object = if ov.created.contains(&number) {
+                    Object {
+                        node: self.objects.meta.clone(),
+                        ceiling: self.objects.root_birth,
+                    }
+                } else {
+                    self.objects.load(cx, number)?
+                };
+                checkpoint(cx)?;
                 return Ok((object, meta));
             }
+        }
+        self.committed_file(cx, number, private_xattr)
+    }
+
+    fn committed_file(
+        &mut self,
+        cx: &Cx,
+        number: u64,
+        private_xattr: bool,
+    ) -> Result<(Object, Metadata)> {
+        checkpoint(cx)?;
+        if number == 0 {
+            return Err(corrupt("meta-dnode is not a ZPL file"));
         }
         let object = self.objects.load(cx, number)?;
         let node = &object.node;
@@ -674,15 +897,17 @@ impl Zpl {
 
     pub fn stat(&mut self, cx: &Cx, number: u64) -> Result<(Metadata, u64)> {
         let (object, metadata) = self.file(cx, number)?;
-        let used = if self
-            .zil_overlay
-            .as_ref()
-            .is_some_and(|ov| ov.file_data.contains_key(&number))
-        {
-            metadata.size.next_multiple_of(512)
-        } else {
-            object.node.used_bytes()
-        };
+        let used =
+            if self.zil_overlay.as_ref().is_some_and(|ov| {
+                ov.file_edits.contains_key(&number) || ov.created.contains(&number)
+            }) {
+                metadata
+                    .size
+                    .checked_next_multiple_of(512)
+                    .ok_or_else(|| corrupt("ZIL reported file allocation overflows"))?
+            } else {
+                object.node.used_bytes()
+            };
         Ok((metadata, used))
     }
 
@@ -710,9 +935,11 @@ impl Zpl {
         if parent.kind != Kind::Directory {
             return Err(FfsError::NotDirectory);
         }
-        let entries = if self.zil_overlay.as_ref().is_some_and(|ov| {
-            ov.objects.contains_key(&number) && self.objects.load(cx, number).is_err()
-        }) {
+        let entries = if self
+            .zil_overlay
+            .as_ref()
+            .is_some_and(|ov| ov.created.contains(&number))
+        {
             Vec::new()
         } else {
             self.objects.zap(cx, number)?
@@ -744,6 +971,12 @@ impl Zpl {
                         || !directories.insert(object))
                 {
                     return Err(corrupt("ZPL directory contains an alias or foreign parent"));
+                }
+                bytes += std::mem::size_of::<DirectoryEntry>()
+                    + entry.name.len()
+                    + metadata.inline_symlink.as_ref().map_or(0, Vec::len);
+                if bytes > MAX_DIRECTORY_BYTES {
+                    return Err(unsupported("ZPL directory result exceeds 32 MiB"));
                 }
                 result.push(DirectoryEntry {
                     name: entry.name,
@@ -796,6 +1029,12 @@ impl Zpl {
                 {
                     return Err(corrupt("ZPL directory contains an alias or foreign parent"));
                 }
+                bytes += std::mem::size_of::<DirectoryEntry>()
+                    + name.len()
+                    + metadata.inline_symlink.as_ref().map_or(0, Vec::len);
+                if bytes > MAX_DIRECTORY_BYTES {
+                    return Err(unsupported("ZPL directory result exceeds 32 MiB"));
+                }
                 result.push(DirectoryEntry {
                     name,
                     object,
@@ -821,15 +1060,35 @@ impl Zpl {
             return Err(unsupported("ZPL read exceeds 16 MiB"));
         }
         let length = file_size.saturating_sub(start).min(size as u64) as usize;
-        if let Some(ov) = &self.zil_overlay
-            && let Some(data) = ov.file_data.get(&number)
+        if let Some(file) = self
+            .zil_overlay
+            .as_ref()
+            .and_then(|ov| ov.file_edits.get(&number))
+            .cloned()
         {
-            let mut result = vec![0_u8; length];
-            let s = (start as usize).min(data.len());
-            let e = s.saturating_add(length).min(data.len());
-            result[..e - s].copy_from_slice(&data[s..e]);
-            return Ok(result);
+            let edits: Vec<_> = file.edits.iter().map(OwnedEdit::borrowed).collect();
+            return zil::recovery::read(
+                cx,
+                file.original_size,
+                start,
+                length,
+                &edits,
+                |at, count| self.committed_contents(cx, object, file.original_size, at, count),
+            );
         }
+        self.committed_contents(cx, object, file_size, start, length)
+    }
+
+    fn committed_contents(
+        &mut self,
+        cx: &Cx,
+        object: &Object,
+        file_size: u64,
+        start: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        let length = file_size.saturating_sub(start).min(size as u64) as usize;
         let mut result = Vec::new();
         result
             .try_reserve_exact(length)

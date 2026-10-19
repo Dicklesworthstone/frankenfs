@@ -6,8 +6,8 @@
 //! binds each block to that identity. This is not ordinary DMU I/O.
 //! No pool claim, replay-sequence update, allocation or backing write occurs.
 
-mod indirect;
-mod recovery;
+pub(super) mod indirect;
+pub(super) mod recovery;
 mod storage;
 
 use super::super::{Pool, VdevConfig};
@@ -226,6 +226,16 @@ pub struct IntentRecord {
     raw: Vec<u8>,
 }
 
+impl IntentRecord {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.raw
+    }
+
+    pub(super) const fn order(&self) -> Endian {
+        self.order
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct IntentLog {
     pub pool_guid: u64,
@@ -428,11 +438,17 @@ impl Objects {
 }
 
 #[derive(Debug)]
-enum Edit<'a> {
+pub(super) enum Edit<'a> {
     Write {
         object: u64,
         offset: u64,
         data: &'a [u8],
+    },
+    Indirect {
+        object: u64,
+        offset: u64,
+        data: &'a [u8],
+        end: u64,
     },
     Truncate {
         object: u64,
@@ -444,17 +460,85 @@ enum Edit<'a> {
         end: u64,
     },
 }
+
+/// Retain admitted log bytes, never an eager copy of the committed file.
+#[derive(Debug, Clone)]
+pub(super) enum OwnedEdit {
+    Write {
+        object: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    Indirect {
+        object: u64,
+        offset: u64,
+        data: Vec<u8>,
+        end: u64,
+    },
+    Truncate {
+        object: u64,
+        size: u64,
+    },
+    Free {
+        object: u64,
+        offset: u64,
+        end: u64,
+    },
+}
+
+impl OwnedEdit {
+    pub(super) fn borrowed(&self) -> Edit<'_> {
+        match self {
+            Self::Write {
+                object,
+                offset,
+                data,
+            } => Edit::Write {
+                object: *object,
+                offset: *offset,
+                data,
+            },
+            Self::Indirect {
+                object,
+                offset,
+                data,
+                end,
+            } => Edit::Indirect {
+                object: *object,
+                offset: *offset,
+                data,
+                end: *end,
+            },
+            Self::Truncate { object, size } => Edit::Truncate {
+                object: *object,
+                size: *size,
+            },
+            Self::Free {
+                object,
+                offset,
+                end,
+            } => Edit::Free {
+                object: *object,
+                offset: *offset,
+                end: *end,
+            },
+        }
+    }
+}
+
 impl Edit<'_> {
     fn object(&self) -> u64 {
         match self {
             Self::Write { object, .. }
+            | Self::Indirect { object, .. }
             | Self::Truncate { object, .. }
             | Self::Free { object, .. } => *object,
         }
     }
-    fn size_after(&self, size: u64) -> u64 {
+    pub(super) fn size_after(&self, size: u64) -> u64 {
         match self {
             Self::Write { offset, data, .. } => size.max(*offset + data.len() as u64),
+            Self::Indirect { end, .. } => size.max(*end),
             Self::Truncate { size, .. } => *size,
             Self::Free { end, .. } => size.max(*end),
         }
@@ -533,7 +617,7 @@ fn apply(cx: &Cx, bytes: &mut [u8], start: u64, mut size: u64, edits: &[Edit<'_>
     for edit in edits {
         checkpoint(cx)?;
         match edit {
-            Edit::Write { offset, data, .. } => {
+            Edit::Write { offset, data, .. } | Edit::Indirect { offset, data, .. } => {
                 if *offset > size {
                     let gap = overlap(start, bytes.len(), size, *offset);
                     charge_recovery(&mut remaining, gap.len())?;

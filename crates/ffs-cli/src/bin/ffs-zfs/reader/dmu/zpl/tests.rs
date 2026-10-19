@@ -711,7 +711,7 @@ fn dataset_views_do_not_reuse_mos_or_other_dataset_block_caches() {
 }
 
 #[test]
-fn zil_intent_log_replays_create_write_rename_truncate_and_remove_in_memory() {
+fn legacy_synthetic_zil_is_refused_without_publishing_a_replay_prefix() {
     let cx = Cx::for_testing();
     let order = Endian::Little;
     let (leaf, _meta) = graph(order, 0, 0, Arc::default(), None);
@@ -827,36 +827,23 @@ fn zil_intent_log_replays_create_write_rename_truncate_and_remove_in_memory() {
     assert_eq!(view.resolve(&cx, b"/alias.bin").unwrap(), 3);
     assert_eq!(view.resolve(&cx, b"/empty").unwrap(), 6);
 
-    // Replay ZIL:
-    let stats = view.replay_zil(&cx).unwrap();
-    assert_eq!(view.zil_replay_stats(), Some(&stats));
-    assert_eq!(stats.blocks_visited, 1);
-    assert_eq!(stats.records_replayed, 5);
-    assert_eq!(stats.last_txg, 62);
-    assert_eq!(stats.last_seq, 5);
-
-    // Verify TX_CREATE + TX_WRITE + TX_TRUNCATE on /created.txt:
-    let created_obj = view.resolve(&cx, b"/created.txt").unwrap();
-    assert_eq!(created_obj, 50);
-    let (meta50, _) = view.stat(&cx, created_obj).unwrap();
-    assert_eq!(meta50.size, 9);
-    assert_eq!(view.read(&cx, created_obj, 0, 64).unwrap(), b"hello-zil");
-
-    // Verify TX_REMOVE on /alias.bin:
+    // Keep the original bytes as a negative control: this synthetic log has
+    // legacy claim fields AND an ordinary checksum7 BP, not a native ZIL BP.
+    // Refusal alone does not isolate which invalid field was causal. The
+    // separate native fixture covers all seven operations positively.
+    assert!(view.replay_zil(&cx).is_err());
+    assert!(view.zil_replay_stats().is_none());
     assert!(matches!(
-        view.resolve(&cx, b"/alias.bin"),
+        view.resolve(&cx, b"/created.txt"),
         Err(FfsError::NotFound(_))
     ));
-
-    // Verify TX_RENAME of /empty -> /sub/renamed_empty:
+    assert_eq!(view.resolve(&cx, b"/alias.bin").unwrap(), 3);
+    assert_eq!(view.resolve(&cx, b"/empty").unwrap(), 6);
     assert!(matches!(
-        view.resolve(&cx, b"/empty"),
+        view.resolve(&cx, b"/sub/renamed_empty"),
         Err(FfsError::NotFound(_))
     ));
-    let renamed_obj = view.resolve(&cx, b"/sub/renamed_empty").unwrap();
-    assert_eq!(renamed_obj, 6);
-    let (meta6, _) = view.stat(&cx, renamed_obj).unwrap();
-    assert_eq!(meta6.parent, 4);
+    assert_eq!(view.stat(&cx, 6).unwrap().0.parent, 2);
 }
 
 mod mount;

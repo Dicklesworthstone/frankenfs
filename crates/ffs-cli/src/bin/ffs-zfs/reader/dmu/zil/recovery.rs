@@ -11,7 +11,7 @@ use super::{
 
 const MAX_BASE_READS: usize = 4096;
 
-pub(super) fn read(
+pub(in super::super) fn read(
     cx: &Cx,
     original_size: u64,
     start: u64,
@@ -48,7 +48,7 @@ pub(super) fn read(
     for edit in edits {
         checkpoint(cx)?;
         let changed = match edit {
-            Edit::Write { offset, data, .. } => {
+            Edit::Write { offset, data, .. } | Edit::Indirect { offset, data, .. } => {
                 overlap(start, length, *offset, *offset + data.len() as u64)
             }
             Edit::Truncate { size: next, .. } if *next < size => {
@@ -218,6 +218,15 @@ mod tests {
                         oracle.resize(oracle.len().max(*offset as usize + data.len()), 0);
                         oracle[*offset as usize..*offset as usize + data.len()]
                             .copy_from_slice(data);
+                    }
+                    Edit::Indirect {
+                        offset, data, end, ..
+                    } => {
+                        let visible = oracle.len().max(*end as usize);
+                        oracle.resize(oracle.len().max(*offset as usize + data.len()), 0);
+                        oracle[*offset as usize..*offset as usize + data.len()]
+                            .copy_from_slice(data);
+                        oracle.truncate(visible);
                     }
                 }
                 edits.push(edit);

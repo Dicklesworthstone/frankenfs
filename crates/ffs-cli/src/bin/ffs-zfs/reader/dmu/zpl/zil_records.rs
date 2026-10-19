@@ -1,17 +1,16 @@
-//! Strict admission for the existing trailing-chain ZIL replay profile.
-//!
-//! The inspection parser may return recognized records from a block. Replay
-//! cannot use that permissiveness: every used byte and operation must be known
-//! before any operation is applied. This does not add slim-chain framing,
-//! native ZIL checksum verification, claim processing or pool import.
+//! Strict per-record admission after native checksum/sequence verification.
+//! No unknown operation, type flag, suffix or missing payload may disappear
+//! from a successful replay. Block framing belongs to the native verifier.
 //!
 //! Layout: OpenZFS zfs-2.3.0 include/sys/zil.h and module/zfs/zfs_replay.c.
 
 use super::{Cx, Result, checkpoint, corrupt, parse as parse_error, unsupported};
-use ffs_ondisk::zfs::{Endian, MAX_BLOCK_BYTES};
-use ffs_ondisk::zfs_dmu::{ZilBlock, ZilRecordPayload};
+use ffs_ondisk::zfs::Endian;
+use ffs_ondisk::zfs_dmu::{ZilRecord, ZilRecordPayload};
 
+#[cfg(test)]
 const CHAIN_BYTES: usize = 184;
+#[cfg(test)]
 const MAX_RECORDS: usize = 65_536;
 
 fn word(raw: &[u8], at: usize, order: Endian) -> Result<u64> {
@@ -45,9 +44,101 @@ fn names_end(bytes: &[u8], mut at: usize, count: usize) -> Result<usize> {
     Ok(at)
 }
 
-pub(super) fn parse(cx: &Cx, raw: &[u8], order: Endian) -> Result<ZilBlock> {
+pub(super) fn verified(cx: &Cx, record: &[u8], order: Endian) -> Result<ZilRecord> {
     checkpoint(cx)?;
-    if raw.len() < 512 || raw.len() > MAX_BLOCK_BYTES || !raw.len().is_multiple_of(512) {
+    if record.len() < 32
+        || !record.len().is_multiple_of(8)
+        || word(record, 8, order)? != record.len() as u64
+    {
+        return Err(corrupt("invalid complete ZIL record span"));
+    }
+    let kind = word(record, 0, order)?;
+    if matches!(kind, 9 | 10) {
+        let object = word(record, 32, order)?;
+        let offset = word(record, 40, order)?;
+        let length = word(record, 48, order)?;
+        if object == 0
+            || object >= 1_u64 << 48
+            || offset > i64::MAX as u64
+            || length > i64::MAX as u64 - offset
+        {
+            return Err(corrupt("ZIL file identity or signed file range is invalid"));
+        }
+    }
+    // Do not mask unknown type bits into a different known operation.
+    // TX_CI, ACL/xvattr creates, WRITE2 and newer operations need their own
+    // semantics. None may silently disappear from a successful replay.
+    match kind {
+        1 | 2 | 4 => {
+            if record.len() < 104 {
+                return Err(corrupt("truncated plain ZIL create record"));
+            }
+            let foid = word(record, 40, order)?;
+            if foid & 0x00FF_0000_0000_0000 != 0 || foid >> 56 >= 32 {
+                return Err(unsupported("unsupported ZIL create object/slot encoding"));
+            }
+            if word(record, 96, order)? != 0 {
+                return Err(unsupported("ZIL device creation is not implemented"));
+            }
+            padded_record(
+                record,
+                names_end(record, 104, if kind == 4 { 2 } else { 1 })?,
+            )?;
+        }
+        5 | 6 => padded_record(record, names_end(record, 40, 1)?)?,
+        8 => padded_record(record, names_end(record, 48, 2)?)?,
+        9 => {
+            if record.len() < 192 {
+                return Err(corrupt("truncated ZIL write record"));
+            }
+            if record.len() > 192 {
+                let bytes = word(record, 48, order)?;
+                if bytes == 0 || bytes > (record.len() - 192) as u64 {
+                    return Err(corrupt("ZIL inline write is missing its declared bytes"));
+                }
+                padded_record(record, 192 + bytes as usize)?;
+            }
+        }
+        10 if record.len() == 56 => {}
+        11 if record.len() == 112 => {
+            if word(record, 40, order)? & !0x3F != 0 {
+                return Err(unsupported(
+                    "extended ZIL setattr masks need native decoding",
+                ));
+            }
+        }
+        10 | 11 => return Err(corrupt("invalid fixed-size ZIL truncate/setattr record")),
+        _ => {
+            return Err(unsupported(
+                "ZIL operation or type flags are not implemented for replay",
+            ));
+        }
+    }
+    let mut record = ZilRecord::parse(record, order).map_err(|error| parse_error(&error))?;
+    if let ZilRecordPayload::Create {
+        symlink_target,
+        is_dir,
+        ..
+    } = &mut record.payload
+    {
+        // A plain create has ONE name. Arbitrary alignment padding after
+        // it must not become a second string and hence a symbolic link.
+        if record.txtype != 4 {
+            *symlink_target = None;
+        }
+        *is_dir = record.txtype == 2;
+    }
+    checkpoint(cx)?;
+    Ok(record)
+}
+
+#[cfg(test)]
+fn parse(cx: &Cx, raw: &[u8], order: Endian) -> Result<ffs_ondisk::zfs_dmu::ZilBlock> {
+    checkpoint(cx)?;
+    if raw.len() < 512
+        || raw.len() > ffs_ondisk::zfs::MAX_BLOCK_BYTES
+        || !raw.len().is_multiple_of(512)
+    {
         return Err(corrupt("invalid ZIL block size"));
     }
     let trailer = raw.len() - CHAIN_BYTES;
@@ -57,96 +148,33 @@ pub(super) fn parse(cx: &Cx, raw: &[u8], order: Endian) -> Result<ZilBlock> {
             "ZIL used bytes overlap the chain trailer or are unaligned",
         ));
     }
-    let used = used as usize;
-    let mut at = 0_usize;
-    let mut count = 0_usize;
-    while at < used {
+    let mut at = 0;
+    let mut records = Vec::new();
+    while at < used as usize {
         checkpoint(cx)?;
-        count += 1;
-        if count > MAX_RECORDS {
-            return Err(unsupported("ZIL block exceeds 65536 records"));
+        if records.len() == MAX_RECORDS || used as usize - at < 32 {
+            return Err(corrupt("partial or excessive legacy ZIL records"));
         }
-        if used - at < 32 {
-            return Err(corrupt("partial ZIL record header inside used bytes"));
-        }
-        let kind = word(raw, at, order)?;
         let length = word(raw, at + 8, order)?;
-        if length < 32 || !length.is_multiple_of(8) || length > (used - at) as u64 {
+        if length < 32 || !length.is_multiple_of(8) || length > used - at as u64 {
             return Err(corrupt("invalid ZIL record length inside used bytes"));
         }
         let end = at + length as usize;
-        let record = &raw[at..end];
-        // Do not mask unknown type bits into a different known operation.
-        // TX_CI, ACL/xvattr creates, WRITE2 and newer operations need their own
-        // semantics. None may silently disappear from a successful replay.
-        match kind {
-            1 | 2 | 4 => {
-                if record.len() < 104 {
-                    return Err(corrupt("truncated plain ZIL create record"));
-                }
-                let foid = word(record, 40, order)?;
-                if foid & 0x00FF_0000_0000_0000 != 0 || foid >> 56 >= 32 {
-                    return Err(unsupported("unsupported ZIL create object/slot encoding"));
-                }
-                padded_record(
-                    record,
-                    names_end(record, 104, if kind == 4 { 2 } else { 1 })?,
-                )?;
-            }
-            5 | 6 => padded_record(record, names_end(record, 40, 1)?)?,
-            8 => padded_record(record, names_end(record, 48, 2)?)?,
-            9 => {
-                if record.len() < 192 {
-                    return Err(corrupt("truncated ZIL write record"));
-                }
-                if record.len() == 192 {
-                    return Err(unsupported("indirect ZIL writes require full-block replay"));
-                }
-                let bytes = word(record, 48, order)?;
-                if bytes == 0 || bytes > (record.len() - 192) as u64 {
-                    return Err(corrupt("ZIL inline write is missing its declared bytes"));
-                }
-                padded_record(record, 192 + bytes as usize)?;
-            }
-            10 if record.len() == 56 => {}
-            11 if record.len() == 112 => {
-                if word(record, 40, order)? & !0x3F != 0 {
-                    return Err(unsupported(
-                        "extended ZIL setattr masks need native decoding",
-                    ));
-                }
-            }
-            10 | 11 => return Err(corrupt("invalid fixed-size ZIL truncate/setattr record")),
-            _ => {
-                return Err(unsupported(
-                    "ZIL operation or type flags are not implemented for replay",
-                ));
-            }
+        if word(raw, at, order)? == 9 && length == 192 {
+            return Err(unsupported(
+                "legacy framing does not load indirect ZIL writes",
+            ));
         }
+        records.push(verified(cx, &raw[at..end], order)?);
         at = end;
     }
-    let mut block = ZilBlock::parse(raw, order).map_err(|error| parse_error(&error))?;
-    if block.records.len() != count {
-        return Err(corrupt("ZIL decoder did not consume every admitted record"));
-    }
-    for record in &mut block.records {
-        checkpoint(cx)?;
-        if let ZilRecordPayload::Create {
-            symlink_target,
-            is_dir,
-            ..
-        } = &mut record.payload
-        {
-            // A plain create has ONE name. Arbitrary alignment padding after
-            // it must not become a second string and hence a symbolic link.
-            if record.txtype != 4 {
-                *symlink_target = None;
-            }
-            *is_dir = record.txtype == 2;
-        }
-    }
     checkpoint(cx)?;
-    Ok(block)
+    Ok(ffs_ondisk::zfs_dmu::ZilBlock {
+        next_blk: ffs_ondisk::zfs::BlockPointer::parse(&raw[trailer + 8..trailer + 136], order)
+            .map_err(|error| parse_error(&error))?,
+        nused: used,
+        records,
+    })
 }
 
 #[cfg(test)]
@@ -292,7 +320,19 @@ mod tests {
         let cx = Cx::for_testing();
         for order in [Endian::Little, Endian::Big] {
             for (kind, body_size) in [(10, 24), (11, 80)] {
-                let bytes = record(kind, &vec![0; body_size], order);
+                let mut bytes = record(kind, &vec![0; body_size], order);
+                if kind == 10 {
+                    let zero_object = bytes.clone();
+                    assert!(
+                        parse(
+                            &cx,
+                            &block(&zero_object, zero_object.len() as u64, order),
+                            order
+                        )
+                        .is_err()
+                    );
+                    bytes[32..40].copy_from_slice(&order.encode(7));
+                }
                 assert_eq!(
                     parse(&cx, &block(&bytes, bytes.len() as u64, order), order)
                         .unwrap()

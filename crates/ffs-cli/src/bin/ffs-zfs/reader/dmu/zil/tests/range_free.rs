@@ -115,6 +115,14 @@ fn mixed_range_free_write_and_truncate_sequences_match_materialized_files() {
                     expected.resize(expected.len().max(*offset as usize + data.len()), 0);
                     expected[*offset as usize..*offset as usize + data.len()].copy_from_slice(data);
                 }
+                Edit::Indirect {
+                    offset, data, end, ..
+                } => {
+                    let visible = expected.len().max(*end as usize);
+                    expected.resize(expected.len().max(*offset as usize + data.len()), 0);
+                    expected[*offset as usize..*offset as usize + data.len()].copy_from_slice(data);
+                    expected.truncate(visible);
+                }
                 Edit::Truncate { size, .. } => expected.resize(*size as usize, 0),
                 Edit::Free { offset, end, .. } => {
                     expected.resize(expected.len().max(*end as usize), 0);
