@@ -3508,13 +3508,12 @@ Prose mentioning Tracked Capability Matrix does not start the section.
         assert_eq!(audit.unproven_rows, 0);
 
         for row in &rows {
-            let matches: Vec<_> = PARITY_CONTRACTS
+            let matches = PARITY_CONTRACTS
                 .iter()
                 .filter(|&&(cap, _, _, _)| cap == row.capability)
-                .collect();
+                .count();
             assert_eq!(
-                matches.len(),
-                1,
+                matches, 1,
                 "capability row {:?} must have exactly one PARITY_CONTRACTS entry",
                 row.capability
             );
