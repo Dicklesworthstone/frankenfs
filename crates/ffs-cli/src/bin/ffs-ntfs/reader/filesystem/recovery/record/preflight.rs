@@ -22,6 +22,16 @@ use table::RestartTable;
 
 const MAX_REFERENCED_RECORDS: usize = 4096;
 
+/// Owned inputs for exporting the exact analyzed history after private replay.
+/// This is not a publication token: the public semantic executor still checks
+/// that resident edits preserve allocation and bootstrap metadata.
+struct Analyzed {
+    state: analysis::State,
+    report: analysis::Report,
+    targets: Option<targets::State>,
+    history: Vec<LogRecord>,
+}
+
 #[derive(Default)]
 struct References {
     pending: Vec<(u64, u32)>,
@@ -349,6 +359,17 @@ pub(super) fn validate(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
     volume: Option<&NtfsVolume>,
 ) -> Result<()> {
+    analyze(cx, restart, stream_length, tail, read, volume).map(|_| ())
+}
+
+fn analyze(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    tail: &LogRecord,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    volume: Option<&NtfsVolume>,
+) -> Result<Analyzed> {
     checkpoint(cx)?;
     let mut references = References::default();
     let mut state = analysis::State::default();
@@ -475,7 +496,14 @@ pub(super) fn validate(
         skipped_mft_redo = replay_summary.as_ref().map(|summary| summary.skipped),
         "Validated NTFS transaction Analysis through the selected restart; replay remains required"
     );
-    checkpoint(cx)
+    checkpoint(cx)?;
+    drop(redo_plan);
+    Ok(Analyzed {
+        state,
+        report,
+        targets,
+        history,
+    })
 }
 
 #[cfg(test)]

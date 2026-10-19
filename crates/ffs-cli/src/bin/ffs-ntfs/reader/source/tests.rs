@@ -227,6 +227,8 @@ fn uncovered_failures_are_not_hidden_by_an_earlier_overlay_hit() {
 // hand-built NtfsVolume with a fictional MFT map. All bytes are constructed.
 const BASE: usize = 1024;
 const LENGTH: usize = 256 * 512;
+const LOG_PAGE: usize = 512;
+const LOG_LENGTH: usize = 32 * 1024;
 
 fn resident(kind: u32, value: &[u8]) -> Vec<u8> {
     let length = (24 + value.len()).next_multiple_of(8);
@@ -277,28 +279,37 @@ fn record(number: u32, attributes: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn clean_log() -> Vec<u8> {
-    let mut page = vec![0; 4096];
+    // The old 16 KiB/four-page fixture was below native minimum geometry.
+    // Use a complete 64-page v1.1 journal with a real inactive client list.
+    let mut page = vec![0; LOG_PAGE];
     page[..4].copy_from_slice(b"RSTR");
     page[4..6].copy_from_slice(&32_u16.to_le_bytes());
-    page[6..8].copy_from_slice(&9_u16.to_le_bytes());
-    page[16..20].copy_from_slice(&4096_u32.to_le_bytes());
-    page[20..24].copy_from_slice(&4096_u32.to_le_bytes());
+    page[6..8].copy_from_slice(&2_u16.to_le_bytes());
+    page[16..20].copy_from_slice(&(LOG_PAGE as u32).to_le_bytes());
+    page[20..24].copy_from_slice(&(LOG_PAGE as u32).to_le_bytes());
     page[24..26].copy_from_slice(&64_u16.to_le_bytes());
     page[26..28].copy_from_slice(&1_i16.to_le_bytes());
     page[28..30].copy_from_slice(&1_i16.to_le_bytes());
     page[32..34].copy_from_slice(&0x1357_u16.to_le_bytes());
     let area = &mut page[64..];
     area[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    area[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
     area[14..16].copy_from_slice(&2_u16.to_le_bytes());
-    area[20..22].copy_from_slice(&160_u16.to_le_bytes());
-    area[22..24].copy_from_slice(&48_u16.to_le_bytes());
-    area[24..32].copy_from_slice(&16384_u64.to_le_bytes());
+    area[16..20].copy_from_slice(&51_u32.to_le_bytes());
+    area[20..22].copy_from_slice(&224_u16.to_le_bytes());
+    area[22..24].copy_from_slice(&64_u16.to_le_bytes());
+    area[24..32].copy_from_slice(&(LOG_LENGTH as u64).to_le_bytes());
     area[36..38].copy_from_slice(&48_u16.to_le_bytes());
     area[38..40].copy_from_slice(&64_u16.to_le_bytes());
+    area[80..82].copy_from_slice(&u16::MAX.to_le_bytes());
+    area[82..84].copy_from_slice(&u16::MAX.to_le_bytes());
+    area[84..86].copy_from_slice(&9_u16.to_le_bytes());
+    area[92..96].copy_from_slice(&8_u32.to_le_bytes());
+    area[96..104].copy_from_slice(b"N\0T\0F\0S\0");
     let page = ffs_ondisk::ntfs::protect_record(&page).unwrap();
-    let mut log = vec![0; 16384];
-    log[..4096].copy_from_slice(&page);
-    log[4096..8192].copy_from_slice(&page);
+    let mut log = vec![0xFF; LOG_LENGTH];
+    log[..LOG_PAGE].copy_from_slice(&page);
+    log[LOG_PAGE..2 * LOG_PAGE].copy_from_slice(&page);
     log
 }
 
@@ -328,10 +339,15 @@ fn image(flags: u16, log: Option<Vec<u8>>) -> Vec<u8> {
     bytes[BASE + 4 * 512 + 3 * 1024..BASE + 4 * 512 + 4 * 1024]
         .copy_from_slice(&record(3, &[resident(VOLUME_INFORMATION, &info)]));
     if let Some(log) = log {
-        assert_eq!(log.len(), 16384);
+        assert_eq!(log.len(), LOG_LENGTH);
+        // Backward fragmentation retains the original read-error injection
+        // point and keeps the unowned target at LCN 220 outside the journal.
+        let mut attr = mapped(180, 64);
+        attr[64..72].copy_from_slice(&[0x21, 32, 180, 0, 0x11, 32, 0xD8, 0]);
         bytes[BASE + 4 * 512 + 2 * 1024..BASE + 4 * 512 + 3 * 1024]
-            .copy_from_slice(&record(2, &[mapped(180, 32)]));
-        bytes[BASE + 180 * 512..BASE + 212 * 512].copy_from_slice(&log);
+            .copy_from_slice(&record(2, &[attr]));
+        bytes[BASE + 180 * 512..BASE + 212 * 512].copy_from_slice(&log[..16_384]);
+        bytes[BASE + 140 * 512..BASE + 172 * 512].copy_from_slice(&log[16_384..]);
     }
     bytes
 }
@@ -352,7 +368,7 @@ fn native_bootstrap_and_explicit_clean_log_inspection_still_succeed_with_partiti
         if recover {
             let plan = volume.logfile_recovery.as_ref().unwrap();
             assert!(plan.restart.is_clean());
-            assert_eq!(plan.restart.file_size, 16384);
+            assert_eq!(plan.restart.file_size, LOG_LENGTH as u64);
             assert!(plan.redo_actions.is_empty() && plan.undo_actions.is_empty());
         } else {
             assert!(volume.logfile_recovery.is_none());
@@ -370,7 +386,7 @@ fn requested_recovery_propagates_missing_log_corruption_io_and_cancellation() {
             let trace = Arc::new(Mutex::new(Trace::default()));
             let log = match fault {
                 0 => None,
-                1 => Some(vec![0; 16384]),
+                1 => Some(vec![0; LOG_LENGTH]),
                 _ => Some(clean_log()),
             };
             if fault == 2 {
@@ -408,9 +424,10 @@ fn recovery_rejects_log_extent_disagreement_and_a_valid_prefix_of_a_larger_log()
     let mut bytes = image(0, Some(clean_log()));
     // A fully valid restart area must not describe bytes omitted from the
     // admitted stream. Update both pages without manufacturing bad USA checks.
-    for page in [0, 4096] {
+    for page in [0, LOG_PAGE] {
         let at = BASE + 180 * 512 + page;
-        bytes[at + 64 + 24..at + 64 + 32].copy_from_slice(&32768_u64.to_le_bytes());
+        bytes[at + 64 + 16..at + 64 + 20].copy_from_slice(&50_u32.to_le_bytes());
+        bytes[at + 64 + 24..at + 64 + 32].copy_from_slice(&65_536_u64.to_le_bytes());
     }
     assert!(open(bytes, &trace, true).is_err());
     let mut bytes = image(0, Some(clean_log()));
@@ -448,24 +465,36 @@ fn recovery_rejects_log_extent_disagreement_and_a_valid_prefix_of_a_larger_log()
 
 fn action_log(lcn: u64, offset: u16, data: &[u8]) -> Vec<u8> {
     let mut log = clean_log();
-    for start in [0, 4096] {
-        log[start + 64..start + 72].copy_from_slice(&12_u64.to_le_bytes());
-        log[start + 78..start + 80].copy_from_slice(&0_u16.to_le_bytes());
+    let second_at = 64 + (48 + 40 + data.len()).next_multiple_of(8);
+    let first_lsn = (1_u64 << 13) | ((4 * LOG_PAGE + 64) as u64 / 8);
+    let last_lsn = (1_u64 << 13) | ((4 * LOG_PAGE + second_at) as u64 / 8);
+    for start in [0, LOG_PAGE] {
+        log[start + 64..start + 72].copy_from_slice(&last_lsn.to_le_bytes());
+        log[start + 74..start + 76].copy_from_slice(&u16::MAX.to_le_bytes());
+        log[start + 76..start + 80].fill(0); // Active client, dirty restart.
+        log[start + 96..start + 100].copy_from_slice(&40_u32.to_le_bytes());
+        log[start + 128..start + 136].copy_from_slice(&first_lsn.to_le_bytes());
     }
-    let mut page = vec![0; 4096];
+    let mut page = vec![0; LOG_PAGE];
     page[..4].copy_from_slice(b"RCRD");
     page[4..6].copy_from_slice(&40_u16.to_le_bytes());
-    page[6..8].copy_from_slice(&9_u16.to_le_bytes());
+    page[6..8].copy_from_slice(&2_u16.to_le_bytes());
+    page[8..16].copy_from_slice(&last_lsn.to_le_bytes());
+    page[16..20].copy_from_slice(&1_u32.to_le_bytes());
+    page[20..22].copy_from_slice(&1_u16.to_le_bytes());
+    page[22..24].copy_from_slice(&1_u16.to_le_bytes());
+    page[32..40].copy_from_slice(&last_lsn.to_le_bytes());
     page[40..42].copy_from_slice(&0x1357_u16.to_le_bytes());
     let mut at = 64;
     for (lsn, previous, operation, patch) in [
-        (10_u64, 0_u64, 0x08_u16, data),
-        (11, 10, 0x1A, b"".as_slice()),
+        (first_lsn, 0_u64, 0x08_u16, data),
+        (last_lsn, first_lsn, 0x1A, b"".as_slice()),
     ] {
         let payload_length = 40 + patch.len();
         page[at..at + 8].copy_from_slice(&lsn.to_le_bytes());
         page[at + 8..at + 16].copy_from_slice(&previous.to_le_bytes());
         page[at + 24..at + 28].copy_from_slice(&(payload_length as u32).to_le_bytes());
+        page[at + 28..at + 30].copy_from_slice(&9_u16.to_le_bytes());
         page[at + 32..at + 36].copy_from_slice(&1_u32.to_le_bytes());
         page[at + 36..at + 40].copy_from_slice(&42_u32.to_le_bytes());
         let payload = &mut page[at + 48..at + 48 + payload_length];
@@ -473,6 +502,7 @@ fn action_log(lcn: u64, offset: u16, data: &[u8]) -> Vec<u8> {
         if !patch.is_empty() {
             payload[4..6].copy_from_slice(&40_u16.to_le_bytes());
             payload[6..8].copy_from_slice(&(patch.len() as u16).to_le_bytes());
+            payload[12..14].copy_from_slice(&24_u16.to_le_bytes());
             payload[14..16].copy_from_slice(&1_u16.to_le_bytes());
             payload[18..20].copy_from_slice(&offset.to_le_bytes());
             payload[32..40].copy_from_slice(&lcn.to_le_bytes());
@@ -482,7 +512,7 @@ fn action_log(lcn: u64, offset: u16, data: &[u8]) -> Vec<u8> {
     }
     page[24..26].copy_from_slice(&(at as u16).to_le_bytes());
     let page = ffs_ondisk::ntfs::protect_record(&page).unwrap();
-    log[8192..12288].copy_from_slice(&page);
+    log[4 * LOG_PAGE..5 * LOG_PAGE].copy_from_slice(&page);
     let plan = ffs_ondisk::ntfs::parse_ntfs_logfile(&log).unwrap();
     assert_eq!(plan.records_parsed, 2);
     assert_eq!(plan.committed_transactions, [42]);

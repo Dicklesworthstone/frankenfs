@@ -1,4 +1,4 @@
-//! Offline, native NTFS 3.1 MFT/stream reads. No mount, replay or device writes.
+//! Offline native NTFS 3.1 reads and explicit volatile recovery. No device writes.
 
 mod attributes;
 mod compression;
@@ -352,34 +352,12 @@ impl NtfsVolume {
 
     fn apply_logfile_recovery(&mut self, cx: &Cx) -> Result<()> {
         checkpoint(cx)?;
-        // An explicit recovery request must never succeed because a required
-        // record, stream, read or parse failed. Preserve the original error.
-        let log_record = self.record(cx, 2, None)?;
-        let log_stream = self.data_stream(cx, &log_record, &[])?;
-        if log_stream.initialized != log_stream.size
-            || !matches!(&log_stream.storage, Storage::Mapped(runs) if runs.iter().all(|run| run.lcn.is_some()))
-        {
-            return Err(unsupported(
-                "NTFS $LogFile must be fully initialized and physically mapped without a data transform",
-            ));
-        }
-        let log_len = usize::try_from(log_stream.size).map_err(|_| {
-            unsupported("NTFS $LogFile length exceeds the addressable read profile")
-        })?;
-        if !(8192..=MAX_READ).contains(&log_len) {
-            return Err(unsupported(
-                "NTFS $LogFile must fit the complete 8 KiB..16 MiB recovery read profile; prefix replay is refused",
-            ));
-        }
-        let log_bytes = self.read(cx, &log_stream, 0, log_len)?;
-        let plan =
-            ffs_ondisk::ntfs::parse_ntfs_logfile(&log_bytes).map_err(|error| parse(&error))?;
-        if plan.restart.file_size != log_stream.size {
-            return Err(corrupt(
-                0,
-                "NTFS $LogFile restart size disagrees with its complete DATA stream",
-            ));
-        }
+        // Use the same protected tail and checkpoint-aware Analysis as native
+        // preflight. Never fall back to a flat scan after a newer commit, table
+        // or target cannot be read. None is a completely verified erased log.
+        let Some(plan) = self.native_recovery_plan(cx)? else {
+            return Ok(());
+        };
         let overlay = recovery_apply::stage(cx, self, &plan)?;
         checkpoint(cx)?;
         // System records and changes to nonresident attributes are refused by
@@ -536,8 +514,8 @@ impl NtfsVolume {
     }
 }
 
-/// Apply identical MFT invariants during initial bootstrap and after overlay
-/// replay. A failed rebuild must not silently retain the pre-recovery map.
+/// Validate the immutable MFT bootstrap. The public resident-only recovery
+/// profile cannot change this map or silently retain a stale rebuilt view.
 fn validate_mft_stream(mft: &Stream, geometry: &NtfsGeometry) -> Result<()> {
     let Storage::Mapped(runs) = &mft.storage else {
         return Err(corrupt(0, "MFT DATA must be nonresident"));
@@ -569,10 +547,7 @@ fn data_read_admission(record: &NtfsFileRecord, attributes: &[NtfsAttribute<'_>]
     }
     if let Some(flags) = standard_flags(attributes)? {
         if flags & 0x400 != 0 {
-            return Err(corrupt(
-                0,
-                "NTFS reparse attribute flag has no reparse value",
-            ));
+            return Err(corrupt(0, "NTFS reparse attribute flag has no reparse value"));
         }
         // On directories ENCRYPTED is the default for newly created children.
         // A named directory stream retains its own ENCRYPTED attribute flag.

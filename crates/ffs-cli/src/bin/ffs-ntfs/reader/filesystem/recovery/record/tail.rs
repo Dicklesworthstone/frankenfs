@@ -472,6 +472,22 @@ pub(in super::super) fn validate_latest_volume(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
     volume: Option<&NtfsVolume>,
 ) -> Result<TailRecord> {
+    with_latest(cx, restart, stream_length, read, |boundary, source| {
+        let mut read = |offset, size| source(offset, size);
+        super::validate_dirty_volume(cx, boundary, stream_length, &mut read, volume)
+    })
+}
+
+/// Share one verified tail boundary and read budget with diagnostic preflight
+/// and public plan export. A caller cannot keep an unbounded borrowed reader or
+/// skip the original anchor/append-continuity checks to obtain a partial view.
+pub(super) fn with_latest<T>(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    finish: impl FnOnce(&Restart, &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>) -> Result<T>,
+) -> Result<T> {
     checkpoint(cx)?;
     for (reference, label) in [
         (restart.active_client_oldest_lsn, "oldest-client"),
@@ -525,9 +541,9 @@ pub(in super::super) fn validate_latest_volume(
             &mut restored,
         )?);
     }
-    let tail = super::validate_dirty_volume(cx, boundary, stream_length, &mut restored, volume)?;
+    let result = finish(boundary, &mut restored)?;
     checkpoint(cx)?;
-    Ok(tail)
+    Ok(result)
 }
 
 #[cfg(test)]

@@ -452,6 +452,7 @@ fn build_lfs_rcrd_entry(
     rec[8..16].copy_from_slice(&prev_lsn.to_le_bytes());
     rec[16..24].copy_from_slice(&undo_next_lsn.to_le_bytes());
     rec[24..28].copy_from_slice(&(client_len as u32).to_le_bytes());
+    rec[28..30].copy_from_slice(&9_u16.to_le_bytes());
     rec[32..36].copy_from_slice(&record_type.to_le_bytes());
     rec[36..40].copy_from_slice(&tx_id.to_le_bytes());
     let body = &mut rec[48..];
@@ -479,6 +480,13 @@ fn build_lfs_rcrd_entry(
 fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_overlay() {
     let cx = Cx::for_testing();
     let mut image = Image::new();
+    // A native log needs at least fifty pages. Extend only this fixture's
+    // selected partition and place the log beyond every existing data extent.
+    let recovery_length = 512 * 1024;
+    image.bytes.resize(BASE + recovery_length + 512, 0);
+    image.bytes[BASE + recovery_length..].fill(0xD2);
+    image.bytes[BASE + 40..BASE + 48]
+        .copy_from_slice(&((recovery_length / 512 - 1) as u64).to_le_bytes());
     // Supply real native allocation metadata to the semantic target adapter.
     // Both bootstrap copies retain the same fragmented MFT DATA mapping.
     let mft = file_record(0, &[
@@ -487,10 +495,13 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
     ]);
     image.put_record(0, &mft);
     image.bytes[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&mft);
-    image.put_record(6, &file_record(6, &[resident(DATA, 0, "", &[0xFF; 32])]));
+    image.put_record(6, &file_record(6, &[resident(DATA, 0, "", &[0xFF; 128])]));
     // Record 25 has uncommitted dirty resident data ("loser-bad") that Undo should revert to "CLEAN-25!".
     image.put_record(25, &file_record(25, &[resident(DATA, 0, "", b"loser-bad")]));
-    // Build a 16 KiB (4-page, 32-cluster) $LogFile at LCN 210..242.
+    // Native v1.1 RSTR, open-attribute checkpoint and a later commit/loser.
+    // Addresses include the native LSN sequence, not synthetic counters.
+    let lsns = [64_u64, 216, 328, 456, 552]
+        .map(|offset| (1_u64 << 15) | ((4 * 4096 + offset) / 8));
     let mut rstr_page = vec![0_u8; 4096];
     rstr_page[0..4].copy_from_slice(b"RSTR");
     rstr_page[4..6].copy_from_slice(&32_u16.to_le_bytes());
@@ -498,37 +509,74 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
     rstr_page[16..20].copy_from_slice(&4096_u32.to_le_bytes());
     rstr_page[20..24].copy_from_slice(&4096_u32.to_le_bytes());
     rstr_page[24..26].copy_from_slice(&64_u16.to_le_bytes());
-    rstr_page[28..30].copy_from_slice(&1_i16.to_le_bytes()); // major_version = 1
+    rstr_page[26..28].copy_from_slice(&1_i16.to_le_bytes());
+    rstr_page[28..30].copy_from_slice(&1_i16.to_le_bytes());
     rstr_page[32..34].copy_from_slice(&0x1111_u16.to_le_bytes());
     // Restart area at offset 64:
-    rstr_page[64..72].copy_from_slice(&300_u64.to_le_bytes()); // current_lsn
-    rstr_page[72..74].copy_from_slice(&1_u16.to_le_bytes()); // log_clients = 1
-    rstr_page[84..86].copy_from_slice(&128_u16.to_le_bytes()); // restart_area_length = 128
-    rstr_page[86..88].copy_from_slice(&64_u16.to_le_bytes()); // client_array_offset = 64
-    rstr_page[88..96].copy_from_slice(&16_384_u64.to_le_bytes()); // file_size
-    rstr_page[100..102].copy_from_slice(&48_u16.to_le_bytes()); // record_header_length = 48
-    rstr_page[102..104].copy_from_slice(&64_u16.to_le_bytes()); // log_page_data_offset = 64
+    rstr_page[64..72].copy_from_slice(&lsns[1].to_le_bytes());
+    rstr_page[72..74].copy_from_slice(&1_u16.to_le_bytes());
+    rstr_page[74..76].copy_from_slice(&u16::MAX.to_le_bytes());
+    rstr_page[80..84].copy_from_slice(&49_u32.to_le_bytes());
+    rstr_page[84..86].copy_from_slice(&224_u16.to_le_bytes());
+    rstr_page[86..88].copy_from_slice(&64_u16.to_le_bytes());
+    rstr_page[88..96].copy_from_slice(&204_800_u64.to_le_bytes());
+    rstr_page[96..100].copy_from_slice(&64_u32.to_le_bytes());
+    rstr_page[100..102].copy_from_slice(&48_u16.to_le_bytes());
+    rstr_page[102..104].copy_from_slice(&64_u16.to_le_bytes());
     // Client record at area + 64 = offset 128:
-    rstr_page[128..136].copy_from_slice(&100_u64.to_le_bytes()); // oldest_lsn = 100
-    rstr_page[136..144].copy_from_slice(&100_u64.to_le_bytes()); // client_restart_lsn = 100
+    rstr_page[128..136].copy_from_slice(&lsns[0].to_le_bytes());
+    rstr_page[136..144].copy_from_slice(&lsns[1].to_le_bytes());
+    rstr_page[144..146].copy_from_slice(&u16::MAX.to_le_bytes());
+    rstr_page[146..148].copy_from_slice(&u16::MAX.to_le_bytes());
+    rstr_page[148..150].copy_from_slice(&9_u16.to_le_bytes());
+    rstr_page[156..160].copy_from_slice(&8_u32.to_le_bytes());
+    rstr_page[160..168].copy_from_slice(b"N\0T\0F\0S\0");
     let rstr_protected = ffs_ondisk::ntfs::protect_record(&rstr_page).unwrap();
 
-    // Build RCRD page at page 2 (offset 8192):
+    let mut dump = vec![0; 152];
+    dump[..8].copy_from_slice(&lsns[0].to_le_bytes());
+    dump[24..28].copy_from_slice(&104_u32.to_le_bytes());
+    dump[28..30].copy_from_slice(&9_u16.to_le_bytes());
+    dump[32..36].copy_from_slice(&1_u32.to_le_bytes());
+    dump[36..40].copy_from_slice(&24_u32.to_le_bytes());
+    let body = &mut dump[48..];
+    body[..2].copy_from_slice(&0x1D_u16.to_le_bytes());
+    body[4..6].copy_from_slice(&40_u16.to_le_bytes());
+    body[6..8].copy_from_slice(&64_u16.to_le_bytes());
+    body[40..42].copy_from_slice(&40_u16.to_le_bytes());
+    body[42..44].copy_from_slice(&1_u16.to_le_bytes());
+    body[44..46].copy_from_slice(&1_u16.to_le_bytes());
+    body[64..68].copy_from_slice(&u32::MAX.to_le_bytes());
+    body[72..76].copy_from_slice(&DATA.to_le_bytes());
+    body[80..88].copy_from_slice(&(7_u64 << 48).to_le_bytes());
+    let mut checkpoint = vec![0; 112];
+    checkpoint[..8].copy_from_slice(&lsns[1].to_le_bytes());
+    checkpoint[24..28].copy_from_slice(&64_u32.to_le_bytes());
+    checkpoint[28..30].copy_from_slice(&9_u16.to_le_bytes());
+    checkpoint[32..36].copy_from_slice(&2_u32.to_le_bytes());
+    let body = &mut checkpoint[48..];
+    body[..4].copy_from_slice(&1_u32.to_le_bytes());
+    body[8..16].copy_from_slice(&lsns[1].to_le_bytes());
+    body[16..24].copy_from_slice(&lsns[0].to_le_bytes());
+    body[48..52].copy_from_slice(&64_u32.to_le_bytes());
+
+    // v1.1 reserves two restart pages and two tail slots before its ring.
     let mut rcrd_page = vec![0_u8; 4096];
     rcrd_page[0..4].copy_from_slice(b"RCRD");
     rcrd_page[4..6].copy_from_slice(&40_u16.to_le_bytes());
     rcrd_page[6..8].copy_from_slice(&9_u16.to_le_bytes());
-    rcrd_page[8..16].copy_from_slice(&300_u64.to_le_bytes());
+    rcrd_page[8..16].copy_from_slice(&lsns[4].to_le_bytes());
+    rcrd_page[16..20].copy_from_slice(&1_u32.to_le_bytes());
     rcrd_page[20..22].copy_from_slice(&1_u16.to_le_bytes());
     rcrd_page[22..24].copy_from_slice(&1_u16.to_le_bytes());
-    rcrd_page[32..40].copy_from_slice(&300_u64.to_le_bytes());
+    rcrd_page[32..40].copy_from_slice(&lsns[4].to_le_bytes());
     rcrd_page[40..42].copy_from_slice(&0x2222_u16.to_le_bytes());
 
     let rec24_lcn = ((Image::record_offset(24) - BASE) / 512) as u64;
     let rec25_lcn = ((Image::record_offset(25) - BASE) / 512) as u64;
     // Keep the native MFT VCN and attribute-relative offset distinct from LCN.
     let e1 = build_lfs_rcrd_entry(
-        (100, 0, 0),
+        (lsns[2], 0, 0),
         (1, 1),
         (0x07, 0x07),
         (48, rec24_lcn),
@@ -536,9 +584,11 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
         b"COMMITTED",
         b"resident!",
     );
-    let e2 = build_lfs_rcrd_entry((200, 100, 0), (1, 1), (0x1A, 0x00), (0, 0), 0, &[], &[]);
+    let e2 = build_lfs_rcrd_entry(
+        (lsns[3], lsns[2], 0), (1, 1), (0x1A, 0x00), (0, 0), 0, &[], &[],
+    );
     let e3 = build_lfs_rcrd_entry(
-        (300, 0, 0),
+        (lsns[4], 0, 0),
         (2, 1),
         (0x07, 0x07),
         (50, rec25_lcn),
@@ -547,21 +597,22 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
         b"CLEAN-25!",
     );
     let mut pos = 64_usize;
-    for entry in [&e1, &e2, &e3] {
+    for entry in [&dump, &checkpoint, &e1, &e2, &e3] {
         rcrd_page[pos..pos + entry.len()].copy_from_slice(entry);
         pos += entry.len();
     }
     rcrd_page[24..26].copy_from_slice(&(pos as u16).to_le_bytes());
     let rcrd_protected = ffs_ondisk::ntfs::protect_record(&rcrd_page).unwrap();
 
-    let log_base = BASE + 210 * 512;
+    let log_base = BASE + 256 * 512;
+    image.bytes[log_base..log_base + 204_800].fill(0xFF);
     image.bytes[log_base..log_base + 4096].copy_from_slice(&rstr_protected);
     image.bytes[log_base + 4096..log_base + 8192].copy_from_slice(&rstr_protected);
-    image.bytes[log_base + 8192..log_base + 12_288].copy_from_slice(&rcrd_protected);
-    // Put MFT record 2 ($LogFile) mapped to 32 clusters at LCN 210 (0xD2):
+    image.bytes[log_base + 16_384..log_base + 20_480].copy_from_slice(&rcrd_protected);
+    // 400 clusters at LCN 256, independently encoded with two-byte fields.
     image.put_record(
         2,
-        &file_record(2, &[mapped(&[0x21, 32, 210, 0, 0], 32, 16_384, 16_384, 0)]),
+        &file_record(2, &[mapped(&[0x22, 0x90, 1, 0, 1, 0], 400, 204_800, 204_800, 0)]),
     );
 
     // 1. Open without recovery: sees unrecovered on-disk bytes.
@@ -573,7 +624,7 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
             fail_at: None,
         }),
         BASE as u64,
-        LENGTH as u64,
+        recovery_length as u64,
         false,
     )
     .unwrap();
@@ -600,7 +651,7 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
             fail_at: None,
         }),
         BASE as u64,
-        LENGTH as u64,
+        recovery_length as u64,
         true,
     )
     .unwrap();

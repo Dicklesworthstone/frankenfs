@@ -196,6 +196,21 @@ impl State {
         self.plan(cx, |lsn| read_record(cx, restart, stream_length, lsn, read))
     }
 
+    /// Identities in the analyzed checkpoint-seeded table at this endpoint.
+    /// Forgotten slots are not reported as still-active winners or losers.
+    pub(super) fn transaction_ids(&self) -> (Vec<u32>, Vec<u32>) {
+        let mut committed = Vec::new();
+        let mut active = Vec::new();
+        for (&id, transaction) in &self.transactions {
+            match transaction.status {
+                Status::Committed => committed.push(id),
+                Status::Active => active.push(id),
+                Status::Prepared => {}
+            }
+        }
+        (committed, active)
+    }
+
     fn plan(&self, cx: &Cx, mut load: impl FnMut(u64) -> Result<LogRecord>) -> Result<Report> {
         checkpoint(cx)?;
         let mut report = Report {
