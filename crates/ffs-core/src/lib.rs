@@ -8370,32 +8370,33 @@ impl OpenFs {
                 let (gd_h, gd_m, gd_r) = self.ext4_group_desc_cache.stats();
                 let (it_h, it_m, it_r) = self.ext4_inode_table_block_cache.stats();
                 let (fd_h, fd_m, fd_r) = self.ext4_file_data_block_cache.stats();
-                let (ia_h, ia_m, ia_r) = self.ext4_inode_attr_cache.stats();
+                let (attr_hits, attr_misses, attr_resident) = self.ext4_inode_attr_cache.stats();
                 let (xb_h, xb_m, xb_r) = self.ext4_inode_xattr_block_cache.stats();
-                let (xc_h, xc_m, xc_r) = self.ext4_inode_xattr_cache.stats();
+                let (value_hits, value_misses, value_resident) =
+                    self.ext4_inode_xattr_cache.stats();
                 let (bb_h, bb_m, bb_r) = self.ext4_base_block_cache.stats();
 
                 hits = hits
                     .saturating_add(gd_h)
                     .saturating_add(it_h)
                     .saturating_add(fd_h)
-                    .saturating_add(ia_h)
+                    .saturating_add(attr_hits)
                     .saturating_add(xb_h)
-                    .saturating_add(xc_h)
+                    .saturating_add(value_hits)
                     .saturating_add(bb_h);
                 misses = misses
                     .saturating_add(gd_m)
                     .saturating_add(it_m)
                     .saturating_add(fd_m)
-                    .saturating_add(ia_m)
+                    .saturating_add(attr_misses)
                     .saturating_add(xb_m)
-                    .saturating_add(xc_m)
+                    .saturating_add(value_misses)
                     .saturating_add(bb_m);
                 t1_len = t1_len
                     .saturating_add(gd_r)
-                    .saturating_add(ia_r)
+                    .saturating_add(attr_resident)
                     .saturating_add(xb_r)
-                    .saturating_add(xc_r);
+                    .saturating_add(value_resident);
                 t2_len = t2_len
                     .saturating_add(it_r)
                     .saturating_add(fd_r)
@@ -8410,20 +8411,23 @@ impl OpenFs {
                 let (pn_h, pn_m, pn_r) = self.btrfs_parsed_node_cache.stats();
                 let (ie_h, ie_m, ie_r) = self.btrfs_ro_inode_extents.stats();
                 let (de_h, de_m, de_r) = self.btrfs_dir_entry_cache.stats();
-                let (dc_h, dc_m, dc_r) = self.btrfs_decompressed_extent_cache.stats();
+                let (decompressed_hits, decompressed_misses, decompressed_resident) =
+                    self.btrfs_decompressed_extent_cache.stats();
 
                 hits = hits
                     .saturating_add(pn_h)
                     .saturating_add(ie_h)
                     .saturating_add(de_h)
-                    .saturating_add(dc_h);
+                    .saturating_add(decompressed_hits);
                 misses = misses
                     .saturating_add(pn_m)
                     .saturating_add(ie_m)
                     .saturating_add(de_m)
-                    .saturating_add(dc_m);
+                    .saturating_add(decompressed_misses);
                 t1_len = t1_len.saturating_add(ie_r).saturating_add(de_r);
-                t2_len = t2_len.saturating_add(pn_r).saturating_add(dc_r);
+                t2_len = t2_len
+                    .saturating_add(pn_r)
+                    .saturating_add(decompressed_resident);
                 capacity = capacity
                     .saturating_add(BTRFS_TREE_NODE_CACHE_LIMIT)
                     .saturating_add(BTRFS_INODE_ATTR_CACHE_LIMIT)
@@ -122249,7 +122253,8 @@ mod overlay_byte_device_fast_path_tests {
     }
 
     #[test]
-    fn overlay_byte_device_forwards_capabilities_and_vectored_volatile_reads_bd_overlay_fast_paths() {
+    fn overlay_byte_device_forwards_capabilities_and_vectored_volatile_reads_bd_overlay_fast_paths()
+    {
         let cx = Cx::for_testing();
         let scalar_reads = Arc::new(AtomicUsize::new(0));
         let volatile_reads = Arc::new(AtomicUsize::new(0));
@@ -122348,4 +122353,3 @@ mod overlay_byte_device_fast_path_tests {
         assert_eq!(untouched, sentinel);
     }
 }
-
