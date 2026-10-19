@@ -107,9 +107,14 @@ pub(super) fn build(records: &[NtfsLogRecord]) -> Result<Plan, ParseError> {
         supported(record.redo_op)?;
         supported(record.undo_op)?;
         if !record.undo_op.patches_bytes()
-            && !matches!(record.undo_op, NtfsLogOp::Noop | NtfsLogOp::CompensationLogRecord)
+            && !matches!(
+                record.undo_op,
+                NtfsLogOp::Noop | NtfsLogOp::CompensationLogRecord
+            )
         {
-            return Err(bad("native undo opcode is not an inverse operation or compensation marker"));
+            return Err(bad(
+                "native undo opcode is not an inverse operation or compensation marker",
+            ));
         }
         if identities.insert(id) && identities.len() > MAX_SLOTS {
             return Err(bad("transaction input exceeds 4096 distinct slots"));
@@ -124,7 +129,9 @@ pub(super) fn build(records: &[NtfsLogRecord]) -> Result<Plan, ParseError> {
         }
         if let Some(transaction) = slots.get(&id) {
             if record.client_previous_lsn != transaction.last {
-                return Err(bad("transaction previous link omits its retained predecessor"));
+                return Err(bad(
+                    "transaction previous link omits its retained predecessor",
+                ));
             }
             if transaction.status != Status::Active
                 && !matches!(
@@ -134,13 +141,25 @@ pub(super) fn build(records: &[NtfsLogRecord]) -> Result<Plan, ParseError> {
             {
                 return Err(bad("native transaction changes after prepare or commit"));
             }
-            same_lifetime(&by_lsn, record.client_previous_lsn, record, transaction.first)?;
-            same_lifetime(&by_lsn, record.client_undo_next_lsn, record, transaction.first)?;
+            same_lifetime(
+                &by_lsn,
+                record.client_previous_lsn,
+                record,
+                transaction.first,
+            )?;
+            same_lifetime(
+                &by_lsn,
+                record.client_undo_next_lsn,
+                record,
+                transaction.first,
+            )?;
         } else {
             // A reused table slot starts a new lifetime. A prefix omitted by
             // this parser also needs a checkpoint seed, not a fabricated root.
             if record.client_previous_lsn != 0 || record.client_undo_next_lsn != 0 {
-                return Err(bad("new or reused transaction has an unresolved predecessor"));
+                return Err(bad(
+                    "new or reused transaction has an unresolved predecessor",
+                ));
             }
             slots.insert(
                 id,
@@ -185,7 +204,9 @@ pub(super) fn build(records: &[NtfsLogRecord]) -> Result<Plan, ParseError> {
     for (&id, transaction) in &slots {
         match transaction.status {
             Status::Prepared => {
-                return Err(bad("prepared native transaction requires an external decision"));
+                return Err(bad(
+                    "prepared native transaction requires an external decision",
+                ));
             }
             Status::Active => {
                 active.push(id);
@@ -200,7 +221,9 @@ pub(super) fn build(records: &[NtfsLogRecord]) -> Result<Plan, ParseError> {
     let mut visited = BTreeSet::new();
     while let Some((lsn, id)) = pending.pop() {
         if visited.len() >= MAX_RECORDS || !visited.insert(lsn) {
-            return Err(bad("undo chains revisit or exceed the retained record budget"));
+            return Err(bad(
+                "undo chains revisit or exceed the retained record budget",
+            ));
         }
         let transaction = slots
             .get(&id)

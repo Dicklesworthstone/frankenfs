@@ -902,10 +902,15 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
             let payload_end = payload_start
                 .checked_add(client_data_len)
                 .filter(|end| *end <= end_off)
-                .ok_or_else(|| invalid("ntfs.rcrd", "client record exceeds initialized page data"))?;
+                .ok_or_else(|| {
+                    invalid("ntfs.rcrd", "client record exceeds initialized page data")
+                })?;
             let payload = &page[payload_start..payload_end];
             if le16(&page, pos + 40)? != 0 {
-                return Err(invalid("ntfs.rcrd", "record flags require multi-page recovery"));
+                return Err(invalid(
+                    "ntfs.rcrd",
+                    "record flags require multi-page recovery",
+                ));
             }
             if record_type == 1 && payload.len() >= 40 {
                 let redo_op = NtfsLogOp::from_raw(le16(payload, 0)?);
@@ -934,9 +939,14 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
                 for (offset, length) in [(redo_offset, redo_length), (undo_offset, undo_length)] {
                     if (offset != 0 && (!offset.is_multiple_of(8) || offset < mapping_end))
                         || (length != 0 && offset == 0)
-                        || offset.checked_add(length).is_none_or(|end| end > payload.len())
+                        || offset
+                            .checked_add(length)
+                            .is_none_or(|end| end > payload.len())
                     {
-                        return Err(invalid("ntfs.rcrd", "recovery payload overlaps its header or LCNs"));
+                        return Err(invalid(
+                            "ntfs.rcrd",
+                            "recovery payload overlaps its header or LCNs",
+                        ));
                     }
                 }
                 let redo_data = if redo_length > 0 {
@@ -991,16 +1001,20 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
             pos += aligned.max(hdr_len);
         }
         if pos != end_off {
-            return Err(invalid("ntfs.rcrd", "partial record before the declared page boundary"));
+            return Err(invalid(
+                "ntfs.rcrd",
+                "partial record before the declared page boundary",
+            ));
         }
     }
 
     records.sort_by_key(|r| r.this_lsn);
     // Identical tail copies are harmless here. Conflicting copies must not
     // allow sort order to choose a transaction's commit or undo contents.
-    if records.windows(2).any(|pair| {
-        pair[0].this_lsn == pair[1].this_lsn && pair[0] != pair[1]
-    }) {
+    if records
+        .windows(2)
+        .any(|pair| pair[0].this_lsn == pair[1].this_lsn && pair[0] != pair[1])
+    {
         return Err(invalid("ntfs.logfile", "conflicting records share an LSN"));
     }
     records.dedup_by_key(|r| r.this_lsn);
@@ -1028,7 +1042,8 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
     // Pass 2: Redo (repeating history in ascending LSN order)
     let mut redo_actions = Vec::new();
     for rec in &records {
-        if rec.this_lsn >= min_rec_lsn && !rec.target_lcns.is_empty() && rec.redo_op.patches_bytes() {
+        if rec.this_lsn >= min_rec_lsn && !rec.target_lcns.is_empty() && rec.redo_op.patches_bytes()
+        {
             redo_actions.push(NtfsRecoveryAction {
                 lsn: rec.this_lsn,
                 transaction_id: rec.transaction_id,

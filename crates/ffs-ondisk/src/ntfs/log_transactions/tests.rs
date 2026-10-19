@@ -197,7 +197,10 @@ fn invalid_chain_order_missing_links_and_cross_owner_references_are_errors() {
             6 => records.swap(0, 1),
             _ => records[2].this_lsn = 20,
         }
-        assert!(build(&records).is_err(), "invalid chain mutation {mutation}");
+        assert!(
+            build(&records).is_err(),
+            "invalid chain mutation {mutation}"
+        );
     }
 }
 
@@ -215,8 +218,24 @@ fn committed_slots_cannot_be_modified_before_native_forget() {
 
 #[test]
 fn unsupported_operations_are_not_silently_omitted_from_the_recovery_plan() {
-    for raw in [0x0A, 0x15, 0x16, 0x17, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
-                0x21, 0x22, 0x23, 0x24, 0x25, 0x26, u16::MAX] {
+    for raw in [
+        0x0A,
+        0x15,
+        0x16,
+        0x17,
+        0x1C,
+        0x1D,
+        0x1E,
+        0x1F,
+        0x20,
+        0x21,
+        0x22,
+        0x23,
+        0x24,
+        0x25,
+        0x26,
+        u16::MAX,
+    ] {
         for undo in [false, true] {
             let mut record = update(10, 24, 0, 0);
             if undo {
@@ -314,7 +333,11 @@ fn wire_log(specs: &[WireLogRecordSpec]) -> Vec<u8> {
     page[16..20].copy_from_slice(&1_u32.to_le_bytes());
     page[20..22].copy_from_slice(&1_u16.to_le_bytes());
     page[22..24].copy_from_slice(&1_u16.to_le_bytes());
-    page[24..26].copy_from_slice(&u16::try_from(64 + specs.len() * RECORD).unwrap().to_le_bytes());
+    page[24..26].copy_from_slice(
+        &u16::try_from(64 + specs.len() * RECORD)
+            .unwrap()
+            .to_le_bytes(),
+    );
     page[32..40].copy_from_slice(&lsns.last().unwrap().to_le_bytes());
     for (index, &(redo, undo, id, previous, next)) in specs.iter().enumerate() {
         let at = 64 + index * RECORD;
@@ -403,7 +426,10 @@ fn torn_pages_truncated_commits_and_unknown_records_cannot_be_silently_skipped()
             _ => bad[commit + 40..commit + 42].copy_from_slice(&1_u16.to_le_bytes()),
         }
         let before = bad.clone();
-        assert!(parse_ntfs_logfile(&bad).is_err(), "damaged journal case {mutation}");
+        assert!(
+            parse_ntfs_logfile(&bad).is_err(),
+            "damaged journal case {mutation}"
+        );
         assert_eq!(bad, before);
     }
 }
@@ -442,6 +468,9 @@ fn payload_cannot_alias_the_header_lcn_array_or_an_overflowing_vcn_span() {
             5 => log[body + 32..body + 40].fill(0),
             _ => log[body + 24..body + 32].copy_from_slice(&u64::MAX.to_le_bytes()),
         }
-        assert!(parse_ntfs_logfile(&log).is_err(), "native layout mutation {mutation}");
+        assert!(
+            parse_ntfs_logfile(&log).is_err(),
+            "native layout mutation {mutation}"
+        );
     }
 }

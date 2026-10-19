@@ -18,10 +18,14 @@ pub enum FileOperation {
     WriteEnd,
     CreateAttribute,
     DeleteAttribute,
-    UpdateResident { resize: bool },
+    UpdateResident {
+        resize: bool,
+    },
     /// Replace a logged mapping-pairs suffix. The caller supplies the selected
     /// volume's cluster bound; this is not allocation/ownership authority.
-    UpdateMappingPairs { volume_clusters: u64 },
+    UpdateMappingPairs {
+        volume_clusters: u64,
+    },
     SetSizes,
     IndexRoot(IndexOperation),
 }

@@ -78,7 +78,9 @@ fn put(bytes: &mut [u8], (at, current, transaction, opcode, previous): Spec) {
 fn page(specs: &[Spec], token: u16) -> Vec<u8> {
     let &(last_at, last, _, _, _) = specs.last().unwrap();
     let mut bytes = plain(last, last, (last_at + RECORD) as u16);
-    for &spec in specs { put(&mut bytes, spec); }
+    for &spec in specs {
+        put(&mut bytes, spec);
+    }
     protect(bytes, token)
 }
 
@@ -88,13 +90,22 @@ fn install(log: &mut [u8], at: usize, page: &[u8]) {
 
 fn source(log: &[u8], at: u64, size: usize) -> Result<Vec<u8>> {
     let at = usize::try_from(at).map_err(|_| corrupt(0, "fixture offset overflow"))?;
-    let end = at.checked_add(size).ok_or_else(|| corrupt(0, "fixture range overflow"))?;
-    log.get(at..end).map(<[u8]>::to_vec).ok_or_else(|| corrupt(0, "fixture read outside log"))
+    let end = at
+        .checked_add(size)
+        .ok_or_else(|| corrupt(0, "fixture range overflow"))?;
+    log.get(at..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| corrupt(0, "fixture read outside log"))
 }
 
 fn check(restart: &Restart, log: &[u8]) -> Result<TailRecord> {
-    validate_latest_volume(&Cx::for_testing(), restart, log.len() as u64,
-        &mut |at, size| source(log, at, size), None)
+    validate_latest_volume(
+        &Cx::for_testing(),
+        restart,
+        log.len() as u64,
+        &mut |at, size| source(log, at, size),
+        None,
+    )
 }
 
 fn append_fixture(version: (u16, u16)) -> (Restart, Vec<u8>, u64) {
@@ -102,7 +113,11 @@ fn append_fixture(version: (u16, u16)) -> (Restart, Vec<u8>, u64) {
     let a = lsn(1, at + 64);
     let b = lsn(1, at + 64 + RECORD);
     let mut log = vec![0xFF; LOG];
-    install(&mut log, at, &page(&[(64, a, 24, 0, 0), (64 + RECORD, b, 24, 0x1A, a)], 0xCAFE));
+    install(
+        &mut log,
+        at,
+        &page(&[(64, a, 24, 0, 0), (64 + RECORD, b, 24, 0x1A, a)], 0xCAFE),
+    );
     (restart(version, a, a), log, b)
 }
 
@@ -121,8 +136,10 @@ fn commit_after_the_restart_boundary_is_analyzed_not_lost_or_undone() {
         let (restart, log, expected) = append_fixture(version);
         let before = log.clone();
         let native_area = restart.area.clone();
-        let view = discover(&Cx::for_testing(), &restart, LOG as u64,
-            &mut |at, size| source(&log, at, size)).unwrap();
+        let view = discover(&Cx::for_testing(), &restart, LOG as u64, &mut |at, size| {
+            source(&log, at, size)
+        })
+        .unwrap();
         assert_eq!(view.boundary.current_lsn, expected);
         assert_eq!(view.boundary.last_lsn_data_len, 40);
         assert!(view.pages.is_empty());
@@ -142,16 +159,29 @@ fn complete_single_page_tail_copies_supply_the_newer_page_in_both_native_version
             let at = first(version);
             let copy = tail_copy(log[at..at + PAGE].to_vec(), version, at);
             install(&mut log, slot * PAGE, &copy);
-            install(&mut log, at, &page(&[(64, restart.current_lsn, 24, 0, 0)], 0xBEEF));
+            install(
+                &mut log,
+                at,
+                &page(&[(64, restart.current_lsn, 24, 0, 0)], 0xBEEF),
+            );
             let before = log.clone();
-            let view = discover(&Cx::for_testing(), &restart, LOG as u64,
-                &mut |at, size| source(&log, at, size)).unwrap();
+            let view = discover(&Cx::for_testing(), &restart, LOG as u64, &mut |at, size| {
+                source(&log, at, size)
+            })
+            .unwrap();
             assert_eq!(view.boundary.current_lsn, expected);
             assert_eq!(view.pages.len(), 1);
-            let fixed = restore_page(&Cx::for_testing(), view.pages[&(at as u64)].clone(),
-                &restart, at as u64).unwrap();
+            let fixed = restore_page(
+                &Cx::for_testing(),
+                view.pages[&(at as u64)].clone(),
+                &restart,
+                at as u64,
+            )
+            .unwrap();
             assert_eq!(u64_at(&fixed.bytes, 8).unwrap(), expected);
-            if version.0 == 2 { assert_eq!(u32_at(&fixed.bytes, 60).unwrap(), 0); }
+            if version.0 == 2 {
+                assert_eq!(u32_at(&fixed.bytes, 60).unwrap(), 0);
+            }
             assert_eq!(check(&restart, &log).unwrap().redo_op, 0x1A);
             assert_eq!(log, before);
         }
@@ -163,9 +193,22 @@ fn newest_complete_copy_wins_but_equal_lsn_conflicts_are_not_scan_order_choices(
     for version in [(1, 1), (2, 0)] {
         let (restart, mut log, last) = append_fixture(version);
         let at = first(version);
-        let old = tail_copy(page(&[(64, restart.current_lsn, 24, 0, 0)], 0xCAFE), version, at);
-        let good = tail_copy(page(&[(64, restart.current_lsn, 24, 0, 0),
-            (64 + RECORD, last, 24, 0x1A, restart.current_lsn)], 0xBEEF), version, at);
+        let old = tail_copy(
+            page(&[(64, restart.current_lsn, 24, 0, 0)], 0xCAFE),
+            version,
+            at,
+        );
+        let good = tail_copy(
+            page(
+                &[
+                    (64, restart.current_lsn, 24, 0, 0),
+                    (64 + RECORD, last, 24, 0x1A, restart.current_lsn),
+                ],
+                0xBEEF,
+            ),
+            version,
+            at,
+        );
         for reverse in [false, true] {
             install(&mut log, 2 * PAGE, if reverse { &good } else { &old });
             install(&mut log, 3 * PAGE, if reverse { &old } else { &good });
@@ -173,12 +216,24 @@ fn newest_complete_copy_wins_but_equal_lsn_conflicts_are_not_scan_order_choices(
         }
         // Identical logical records survive different USA tokens.
         install(&mut log, 2 * PAGE, &good);
-        let equal = tail_copy(page(&[(64, restart.current_lsn, 24, 0, 0),
-            (64 + RECORD, last, 24, 0x1A, restart.current_lsn)], 0xABCD), version, at);
+        let equal = tail_copy(
+            page(
+                &[
+                    (64, restart.current_lsn, 24, 0, 0),
+                    (64 + RECORD, last, 24, 0x1A, restart.current_lsn),
+                ],
+                0xABCD,
+            ),
+            version,
+            at,
+        );
         install(&mut log, 3 * PAGE, &equal);
         check(&restart, &log).unwrap();
         log[3 * PAGE + 64 + RECORD + 36] ^= 1;
-        assert!(matches!(check(&restart, &log), Err(FfsError::Corruption { .. })));
+        assert!(matches!(
+            check(&restart, &log),
+            Err(FfsError::Corruption { .. })
+        ));
     }
 }
 
@@ -225,18 +280,31 @@ fn interleaved_bad_record_or_missing_successor_cannot_be_skipped_to_the_maximum_
     let b = lsn(1, at + 152);
     let c = lsn(1, at + 240);
     let mut log = vec![0xFF; LOG];
-    install(&mut log, at, &page(&[(64, a, 24, 0, 0), (152, b, 64, 0, 0),
-        (240, c, 24, 0x1A, a)], 0xCAFE));
+    install(
+        &mut log,
+        at,
+        &page(
+            &[(64, a, 24, 0, 0), (152, b, 64, 0, 0), (240, c, 24, 0x1A, a)],
+            0xCAFE,
+        ),
+    );
     log[at + 152 + 28..at + 152 + 30].copy_from_slice(&10_u16.to_le_bytes());
     assert!(check(&restart(version, a, a), &log).is_err());
     let mut log = vec![0xFF; LOG];
     let later = lsn(1, at + 2 * PAGE + 64);
     install(&mut log, at, &page(&[(64, a, 24, 0, 0)], 0xCAFE));
-    install(&mut log, at + 2 * PAGE, &page(&[(64, later, 24, 0x1A, a)], 0xBEEF));
+    install(
+        &mut log,
+        at + 2 * PAGE,
+        &page(&[(64, later, 24, 0x1A, a)], 0xBEEF),
+    );
     assert!(check(&restart(version, a, a), &log).is_err());
     let mut no_oldest = restart(version, a, a);
     no_oldest.active_client_oldest_lsn = None;
-    assert!(check(&no_oldest, &log).is_err(), "append continuity cannot depend on a seed pointer");
+    assert!(
+        check(&no_oldest, &log).is_err(),
+        "append continuity cannot depend on a seed pointer"
+    );
 }
 
 #[test]
@@ -253,7 +321,10 @@ fn torn_tail_slots_and_torn_ring_pages_are_not_downgraded_to_absent_data() {
             for sector in 1..=PAGE / 512 {
                 let mut bad = log.clone();
                 bad[damaged + sector * 512 - 1] ^= 1;
-                assert!(matches!(check(&restart, &bad), Err(FfsError::Corruption { .. })));
+                assert!(matches!(
+                    check(&restart, &bad),
+                    Err(FfsError::Corruption { .. })
+                ));
             }
         }
     }
@@ -266,12 +337,18 @@ fn incomplete_newest_record_and_multi_page_tail_transfers_are_explicit_refusals(
     let at = first(version);
     // An incomplete higher-LSN record cannot become a successful earlier view.
     log[at + 32..at + 40].copy_from_slice(&restart.current_lsn.to_le_bytes());
-    assert!(matches!(check(&restart, &log), Err(FfsError::UnsupportedFeature(_))));
+    assert!(matches!(
+        check(&restart, &log),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
     let (restart, mut log, _) = append_fixture(version);
     let mut copy = tail_copy(log[at..at + PAGE].to_vec(), version, at);
     copy[20..22].copy_from_slice(&2_u16.to_le_bytes());
     install(&mut log, 2 * PAGE, &copy);
-    assert!(matches!(check(&restart, &log), Err(FfsError::UnsupportedFeature(_))));
+    assert!(matches!(
+        check(&restart, &log),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
     assert!(last > restart.current_lsn);
 }
 
@@ -304,7 +381,10 @@ fn invalid_tail_destinations_cannot_redirect_recovery_into_reserved_or_unbounded
         let mut copy = log[at..at + PAGE].to_vec();
         copy[60..64].copy_from_slice(&target.to_le_bytes());
         install(&mut bad, 2 * PAGE, &copy);
-        assert!(matches!(check(&restart, &bad), Err(FfsError::Corruption { .. })));
+        assert!(matches!(
+            check(&restart, &bad),
+            Err(FfsError::Corruption { .. })
+        ));
     }
 }
 
@@ -314,7 +394,10 @@ fn source_failures_short_reads_and_cancellation_abort_without_any_partial_tail_r
     for fail_at in [0, 3, 34] {
         for kind in 0..3 {
             let mut reads = 0;
-            let result = validate_latest_volume(&Cx::for_testing(), &restart, LOG as u64,
+            let result = validate_latest_volume(
+                &Cx::for_testing(),
+                &restart,
+                LOG as u64,
                 &mut |at, size| {
                     let fail = reads == fail_at;
                     reads += 1;
@@ -326,7 +409,9 @@ fn source_failures_short_reads_and_cancellation_abort_without_any_partial_tail_r
                         };
                     }
                     source(&log, at, size)
-                }, None);
+                },
+                None,
+            );
             match kind {
                 0 => assert!(matches!(result, Err(FfsError::Cancelled))),
                 1 => assert!(matches!(result, Err(FfsError::Io(_)))),
@@ -342,16 +427,36 @@ fn scan_budget_is_checked_before_io_and_partial_reads_cannot_bypass_overrides() 
     let (mut restart, log, _) = append_fixture((2, 0));
     restart.file_size = (MAX_PAGES + 1) * PAGE as u64;
     let mut reads = 0;
-    assert!(discover(&Cx::for_testing(), &restart, restart.file_size, &mut |_, _| {
-        reads += 1;
-        Ok(Vec::new())
-    }).is_err());
+    assert!(
+        discover(
+            &Cx::for_testing(),
+            &restart,
+            restart.file_size,
+            &mut |_, _| {
+                reads += 1;
+                Ok(Vec::new())
+            }
+        )
+        .is_err()
+    );
     assert_eq!(reads, 0);
     restart.file_size = LOG as u64;
-    let view = discover(&Cx::for_testing(), &restart, LOG as u64,
-        &mut |at, size| source(&log, at, size)).unwrap();
-    assert!(view.read(&Cx::for_testing(), first((2, 0)) as u64 + 1, PAGE - 1,
-        &mut |_, _| { reads += 1; Ok(Vec::new()) }).is_err());
+    let view = discover(&Cx::for_testing(), &restart, LOG as u64, &mut |at, size| {
+        source(&log, at, size)
+    })
+    .unwrap();
+    assert!(
+        view.read(
+            &Cx::for_testing(),
+            first((2, 0)) as u64 + 1,
+            PAGE - 1,
+            &mut |_, _| {
+                reads += 1;
+                Ok(Vec::new())
+            }
+        )
+        .is_err()
+    );
     assert_eq!(reads, 0);
 }
 

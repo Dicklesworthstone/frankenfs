@@ -9,9 +9,9 @@
 //! are refused. No native page, restart area, dirty flag or mount policy changes.
 
 use super::{
-    Cx, NtfsVolume, RecordPage, Restart, Result, TailRecord, checkpoint, corrupt,
-    lsn_to_vbo, preflight, read_exact, read_record, restore_page, u16_at, u32_at,
-    u64_at, unsupported, validate_lsn_reference,
+    Cx, NtfsVolume, RecordPage, Restart, Result, TailRecord, checkpoint, corrupt, lsn_to_vbo,
+    preflight, read_exact, read_record, restore_page, u16_at, u32_at, u64_at, unsupported,
+    validate_lsn_reference,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -33,16 +33,27 @@ impl Page {
             let usa = usize::from(u16_at(&fixed.bytes, 4)?);
             let usa_end = usa + usize::from(u16_at(&fixed.bytes, 6)?) * 2;
             if usa < 64 && usa_end > 60 {
-                return Err(corrupt(at, "$LogFile v2 USA overlaps the tail destination field"));
+                return Err(corrupt(
+                    at,
+                    "$LogFile v2 USA overlaps the tail destination field",
+                ));
             }
         }
         let last = u64_at(&fixed.bytes, 8)?;
         let completed = u64_at(&fixed.bytes, 32)?;
         let has_end = u32_at(&fixed.bytes, 16)? & super::PAGE_RECORD_END != 0;
         if last == 0 || completed > last || (!has_end && completed != 0) {
-            return Err(corrupt(at, "$LogFile tail page has inconsistent completion markers"));
+            return Err(corrupt(
+                at,
+                "$LogFile tail page has inconsistent completion markers",
+            ));
         }
-        Ok(Self { raw, fixed, last, completed: if has_end { completed } else { 0 } })
+        Ok(Self {
+            raw,
+            fixed,
+            last,
+            completed: if has_end { completed } else { 0 },
+        })
     }
 
     /// USA tokens, transfer positions and unused slack are not log contents.
@@ -83,7 +94,10 @@ impl View {
         if size as u64 != u64::from(self.boundary.log_page)
             || !offset.is_multiple_of(u64::from(self.boundary.log_page))
         {
-            return Err(corrupt(offset, "$LogFile tail view requires complete aligned pages"));
+            return Err(corrupt(
+                offset,
+                "$LogFile tail view requires complete aligned pages",
+            ));
         }
         let result = if let Some(page) = self.pages.get(&offset) {
             page.clone()
@@ -112,7 +126,9 @@ fn generation(restart: &Restart, lsn: u64, oldest: u64) -> Result<()> {
     let selected = restart.current_lsn >> address_bits;
     let observed = lsn >> address_bits;
     if observed > selected && observed - selected > 1 {
-        return Err(unsupported("$LogFile tail generations exceed one comparable ring wrap"));
+        return Err(unsupported(
+            "$LogFile tail generations exceed one comparable ring wrap",
+        ));
     }
     Ok(())
 }
@@ -134,25 +150,33 @@ fn discover(
         || restart.current_lsn == 0
         || !matches!(restart.version, (1, 1) | (2, 0))
     {
-        return Err(unsupported("$LogFile tail discovery requires a bounded native record-ring geometry"));
+        return Err(unsupported(
+            "$LogFile tail discovery requires a bounded native record-ring geometry",
+        ));
     }
     // The v2 tail destination is at 0x3c. A larger-page USA would overlap it;
     // its alternative layout needs independent native evidence, not a guess.
     if restart.version == (2, 0) && page_bytes != 4096 {
-        return Err(unsupported("$LogFile v2 tail discovery currently requires 4 KiB pages"));
+        return Err(unsupported(
+            "$LogFile v2 tail discovery currently requires 4 KiB pages",
+        ));
     }
     let reserved = if restart.version.0 == 2 { 34_u64 } else { 4 };
     let first_page = reserved * page_bytes;
     let total_pages = restart.file_size / page_bytes;
     if total_pages <= reserved || total_pages > MAX_PAGES || restart.file_size > IO_BUDGET {
-        return Err(unsupported("$LogFile tail discovery exceeds its page or byte scan budget"));
+        return Err(unsupported(
+            "$LogFile tail discovery exceeds its page or byte scan budget",
+        ));
     }
     validate_lsn_reference(restart, restart.current_lsn, "selected-checkpoint")?;
-    let oldest = restart.active_client_oldest_lsn.filter(|lsn| *lsn != 0)
+    let oldest = restart
+        .active_client_oldest_lsn
+        .filter(|lsn| *lsn != 0)
         .unwrap_or(restart.current_lsn);
     validate_lsn_reference(restart, oldest, "retained-tail-start")?;
-    let page_size = usize::try_from(page_bytes)
-        .map_err(|_| corrupt(0, "$LogFile tail page size overflows"))?;
+    let page_size =
+        usize::try_from(page_bytes).map_err(|_| corrupt(0, "$LogFile tail page size overflows"))?;
     let data_off = usize::from(restart.data_off);
     let mut copies: BTreeMap<u64, Page> = BTreeMap::new();
 
@@ -163,16 +187,22 @@ fn discover(
         checkpoint(cx)?;
         let at = slot * page_bytes;
         let mut raw = read_exact(cx, restart.file_size, at, page_size, read)?;
-        if blank(&raw) { continue; }
+        if blank(&raw) {
+            continue;
+        }
         let destination = if restart.version.0 == 1 {
             u64_at(&raw, 8)?
         } else {
             u64::from(u32_at(&raw, 60)?)
         };
-        if destination < first_page || destination >= restart.file_size
+        if destination < first_page
+            || destination >= restart.file_size
             || !destination.is_multiple_of(page_bytes)
         {
-            return Err(corrupt(at, "$LogFile tail copy has an invalid native destination"));
+            return Err(corrupt(
+                at,
+                "$LogFile tail copy has an invalid native destination",
+            ));
         }
         // Validate every original trailer before normalizing any header field.
         let fixed = restore_page(cx, raw.clone(), restart, destination)?;
@@ -180,17 +210,25 @@ fn discover(
             let usa = usize::from(u16_at(&fixed.bytes, 4)?);
             let usa_end = usa + usize::from(u16_at(&fixed.bytes, 6)?) * 2;
             if usa < 64 && usa_end > 60 {
-                return Err(corrupt(at, "$LogFile v2 tail normalization would overwrite its USA"));
+                return Err(corrupt(
+                    at,
+                    "$LogFile v2 tail normalization would overwrite its USA",
+                ));
             }
         }
         if u16_at(&fixed.bytes, 20)? != 1 || u16_at(&fixed.bytes, 22)? != 1 {
-            return Err(unsupported("$LogFile multi-page tail transfers need bank-coherent recovery"));
+            return Err(unsupported(
+                "$LogFile multi-page tail transfers need bank-coherent recovery",
+            ));
         }
         let completed = u64_at(&fixed.bytes, 32)?;
-        if fixed.next_record_off == 0 || completed == 0
+        if fixed.next_record_off == 0
+            || completed == 0
             || u32_at(&fixed.bytes, 16)? & super::PAGE_RECORD_END == 0
         {
-            return Err(unsupported("$LogFile tail copy does not establish a complete record boundary"));
+            return Err(unsupported(
+                "$LogFile tail copy does not establish a complete record boundary",
+            ));
         }
         if restart.version.0 == 1 {
             // v1 borrows the page LSN word for its destination while in a tail
@@ -202,14 +240,21 @@ fn discover(
         }
         let page = Page::parse(cx, restart, destination, raw)?;
         if page.last != page.completed {
-            return Err(unsupported("$LogFile tail copy contains an incomplete newest record"));
+            return Err(unsupported(
+                "$LogFile tail copy contains an incomplete newest record",
+            ));
         }
         generation(restart, page.last, oldest)?;
         if let Some(previous) = copies.get(&destination) {
-            if previous.last > page.last { continue; }
+            if previous.last > page.last {
+                continue;
+            }
             if previous.last == page.last {
                 if !previous.same_contents(&page, data_off) {
-                    return Err(corrupt(at, "$LogFile equal-LSN tail copies have conflicting contents"));
+                    return Err(corrupt(
+                        at,
+                        "$LogFile equal-LSN tail copies have conflicting contents",
+                    ));
                 }
                 continue;
             }
@@ -217,14 +262,21 @@ fn discover(
         copies.insert(destination, page);
     }
 
-    let mut view = View { boundary: restart.clone(), pages: BTreeMap::new() };
+    let mut view = View {
+        boundary: restart.clone(),
+        pages: BTreeMap::new(),
+    };
     let mut completed = restart.current_lsn;
     let mut started = restart.current_lsn;
     for number in reserved..total_pages {
         checkpoint(cx)?;
         let at = number * page_bytes;
         let raw = read_exact(cx, restart.file_size, at, page_size, read)?;
-        let ring = if blank(&raw) { None } else { Some(Page::parse(cx, restart, at, raw)?) };
+        let ring = if blank(&raw) {
+            None
+        } else {
+            Some(Page::parse(cx, restart, at, raw)?)
+        };
         let chosen = if let Some(copy) = copies.remove(&at) {
             let use_copy = match &ring {
                 None => true,
@@ -232,7 +284,10 @@ fn discover(
                 Some(ring) if copy.last < ring.last => false,
                 Some(ring) => {
                     if !copy.same_contents(ring, data_off) {
-                        return Err(corrupt(at, "$LogFile tail and ring disagree at the same LSN"));
+                        return Err(corrupt(
+                            at,
+                            "$LogFile tail and ring disagree at the same LSN",
+                        ));
                     }
                     false
                 }
@@ -240,27 +295,39 @@ fn discover(
             if use_copy {
                 view.pages.insert(at, copy.raw.clone());
                 Some(copy)
-            } else { ring }
-        } else { ring };
+            } else {
+                ring
+            }
+        } else {
+            ring
+        };
         let Some(page) = chosen else { continue };
-        for lsn in [page.last, page.completed].into_iter().filter(|lsn| *lsn != 0) {
+        for lsn in [page.last, page.completed]
+            .into_iter()
+            .filter(|lsn| *lsn != 0)
+        {
             generation(restart, lsn, oldest)?;
         }
         started = started.max(page.last);
         completed = completed.max(page.completed);
     }
     if started > completed {
-        return Err(unsupported("$LogFile has a newer incomplete record; partial-tail salvage is not admitted"));
+        return Err(unsupported(
+            "$LogFile has a newer incomplete record; partial-tail salvage is not admitted",
+        ));
     }
     let address_bits = 64 - restart.seq_num_bits;
     let old_sequence = oldest >> address_bits;
     let end_sequence = completed >> address_bits;
     let old_vbo = lsn_to_vbo(oldest, restart.seq_num_bits)?;
     let end_vbo = lsn_to_vbo(completed, restart.seq_num_bits)?;
-    if end_sequence < old_sequence || end_sequence - old_sequence > 1
+    if end_sequence < old_sequence
+        || end_sequence - old_sequence > 1
         || (end_sequence != old_sequence && end_vbo >= old_vbo)
     {
-        return Err(unsupported("$LogFile durable tail has overwritten or outlived the retained window"));
+        return Err(unsupported(
+            "$LogFile durable tail has overwritten or outlived the retained window",
+        ));
     }
     if completed != restart.current_lsn {
         // Do not copy a page marker into restart metadata blindly. The actual
@@ -272,7 +339,10 @@ fn discover(
         let within = usize::try_from(end_vbo - at)
             .map_err(|_| corrupt(at, "$LogFile tail offset overflows"))?;
         if u64_at(&fixed.bytes, within)? != completed {
-            return Err(corrupt(at, "$LogFile tail marker does not identify its claimed record"));
+            return Err(corrupt(
+                at,
+                "$LogFile tail marker does not identify its claimed record",
+            ));
         }
         view.boundary.current_lsn = completed;
         view.boundary.last_lsn_data_len = u32_at(&fixed.bytes, within + 24)?;
@@ -303,8 +373,9 @@ pub(in super::super) fn validate_latest_volume(
     }
     let remaining = Cell::new(IO_BUDGET);
     let charge = |size: usize| -> Result<()> {
-        let left = remaining.get().checked_sub(size as u64)
-            .ok_or_else(|| unsupported("$LogFile tail and preflight exceed the 64 MiB read budget"))?;
+        let left = remaining.get().checked_sub(size as u64).ok_or_else(|| {
+            unsupported("$LogFile tail and preflight exceed the 64 MiB read budget")
+        })?;
         remaining.set(left);
         Ok(())
     };
@@ -319,17 +390,29 @@ pub(in super::super) fn validate_latest_volume(
     let mut restored = |offset, size| {
         // Cached copies still consume work. A reference graph must not turn
         // one private page into unlimited free reassembly or cloned payloads.
-        if view.pages.contains_key(&offset) { charge(size)?; }
+        if view.pages.contains_key(&offset) {
+            charge(size)?;
+        }
         view.read(cx, offset, size, &mut bounded)
     };
-    read_record(cx, restart, stream_length, restart.current_lsn, &mut restored)?;
+    read_record(
+        cx,
+        restart,
+        stream_length,
+        restart.current_lsn,
+        &mut restored,
+    )?;
     let boundary = &view.boundary;
     // Check append continuity independently of checkpoint-table seeding. In
     // particular, an absent oldest/client-restart pointer must not let the
     // existing diagnostic preflight start at the new tail and skip a gap.
     if boundary.current_lsn != restart.current_lsn {
         drop(preflight::scan::collect(
-            cx, boundary, stream_length, restart.current_lsn, &mut restored,
+            cx,
+            boundary,
+            stream_length,
+            restart.current_lsn,
+            &mut restored,
         )?);
     }
     let tail = super::validate_dirty_volume(cx, boundary, stream_length, &mut restored, volume)?;

@@ -1,5 +1,7 @@
 use super::*;
-use crate::ntfs::recovery::{FileEdit, FileEditResult, FileOperation, RecoveryPass, apply_file_edit};
+use crate::ntfs::recovery::{
+    FileEdit, FileEditResult, FileOperation, RecoveryPass, apply_file_edit,
+};
 use crate::ntfs::{NtfsFileRecord, NtfsRun, restore_record};
 
 fn nonresident(pairs: &[u8], first: u64, highest: u64, flags: u16, name: &[u16]) -> Vec<u8> {
@@ -105,7 +107,10 @@ fn change(
 fn attributes(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let data = restore_record(raw, b"FILE").unwrap();
     let size = usize::try_from(le32(&data, 68).unwrap()).unwrap();
-    (data[64..64 + size].to_vec(), data[64 + size..96 + size].to_vec())
+    (
+        data[64..64 + size].to_vec(),
+        data[64 + size..96 + size].to_vec(),
+    )
 }
 
 fn runs(raw: &[u8]) -> Vec<RunTuple> {
@@ -287,7 +292,16 @@ fn volume_edges_aliases_and_signed_vcn_overflows_are_checked() {
         0,
         &[],
     ));
-    assert!(change(&near_limit, RecoveryPass::Redo(20), 64, &[0x11, 2, 10, 0], 4096).is_err());
+    assert!(
+        change(
+            &near_limit,
+            RecoveryPass::Redo(20),
+            64,
+            &[0x11, 2, 10, 0],
+            4096
+        )
+        .is_err()
+    );
     let mut negative_length = vec![0x18];
     negative_length.extend_from_slice(&u64::MAX.to_le_bytes());
     negative_length.extend_from_slice(&[10, 0]);

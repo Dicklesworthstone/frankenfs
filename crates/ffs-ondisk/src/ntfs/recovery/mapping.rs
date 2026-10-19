@@ -72,7 +72,9 @@ pub(super) fn edit(
     let sparse_allowed = attr.flags & (SPARSE | COMPRESSED) != 0;
     let mapping_at = usize::from(le16(data, at + 32)?);
     if relative < mapping_at || relative > size || payload.is_empty() {
-        return Err(bad("mapping-pairs suffix has an invalid offset or is empty"));
+        return Err(bad(
+            "mapping-pairs suffix has an invalid offset or is empty",
+        ));
     }
     let end = relative
         .checked_add(payload.len())
