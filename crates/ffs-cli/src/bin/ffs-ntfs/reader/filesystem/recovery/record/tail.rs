@@ -76,6 +76,86 @@ impl Page {
             && end >= data_off
             && self.fixed.bytes[data_off..end] == other.fixed.bytes[data_off..end]
     }
+
+    /// Native base_lsn ordering includes the destination-adjusted endpoint.
+    /// A continuation after wrap still carries the preceding record's LSN.
+    fn progress(&self, restart: &Restart, destination: u64) -> Result<u64> {
+        record_location(restart, self.last)?;
+        let page_bytes = u64::from(restart.log_page);
+        let address_bits = 64 - restart.seq_num_bits;
+        let origin = lsn_to_vbo(self.last, restart.seq_num_bits)? & !(page_bytes - 1);
+        let sequence = (self.last >> address_bits)
+            .checked_add(u64::from(destination < origin))
+            .filter(|sequence| *sequence < (1_u64 << restart.seq_num_bits))
+            .ok_or_else(|| unsupported("$LogFile tail sequence rollover is not admitted"))?;
+        let used = if self.last == self.completed {
+            u64::from(self.fixed.next_record_off)
+        } else {
+            page_bytes
+        };
+        if used < u64::from(restart.data_off) || used > page_bytes {
+            return Err(corrupt(
+                destination,
+                "$LogFile tail has no bounded initialized endpoint",
+            ));
+        }
+        let address = destination
+            .checked_add(used)
+            .map(|end| end / 8)
+            .filter(|address| *address < (1_u64 << address_bits))
+            .ok_or_else(|| corrupt(destination, "$LogFile tail endpoint overlaps sequence bits"))?;
+        Ok((sequence << address_bits) | address)
+    }
+
+    /// A newer publication may extend a page, not rewrite its completed prefix.
+    /// Both bank selection and ring selection must enforce the same relation.
+    fn compare(
+        &self,
+        other: &Self,
+        restart: &Restart,
+        destination: u64,
+    ) -> Result<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+
+        let order = self.last.cmp(&other.last);
+        let this_end = self.progress(restart, destination)?;
+        let other_end = other.progress(restart, destination)?;
+        if order != this_end.cmp(&other_end) {
+            return Err(corrupt(
+                destination,
+                "$LogFile tail record order contradicts its page endpoints",
+            ));
+        }
+        if order == Ordering::Equal {
+            if !self.same_contents(other, usize::from(restart.data_off)) {
+                return Err(corrupt(
+                    destination,
+                    "$LogFile equal-LSN pages have conflicting contents",
+                ));
+            }
+        } else if this_end >> (64 - restart.seq_num_bits)
+            == other_end >> (64 - restart.seq_num_bits)
+        {
+            let (older, newer) = if order == Ordering::Less {
+                (self, other)
+            } else {
+                (other, self)
+            };
+            if older.last == older.completed {
+                let start = usize::from(restart.data_off);
+                let end = usize::from(older.fixed.next_record_off);
+                // Ignore changing page headers, USA tokens and unused slack,
+                // but not any byte of a previously completed client record.
+                if older.fixed.bytes[start..end] != newer.fixed.bytes[start..end] {
+                    return Err(corrupt(
+                        destination,
+                        "$LogFile append rewrites an initialized record prefix",
+                    ));
+                }
+            }
+        }
+        Ok(order)
+    }
 }
 
 fn blank(raw: &[u8]) -> bool {
@@ -185,7 +265,6 @@ fn discover(
     validate_lsn_reference(restart, oldest, "retained-tail-start")?;
     let page_size =
         usize::try_from(page_bytes).map_err(|_| corrupt(0, "$LogFile tail page size overflows"))?;
-    let data_off = usize::from(restart.data_off);
     let transfers::Copies {
         pages: mut copies,
         groups,
@@ -210,17 +289,11 @@ fn discover(
         let chosen = if let Some(copy) = copies.remove(&at) {
             let decision = match &ring {
                 None => transfers::Selection::Copy,
-                Some(ring) if copy.last > ring.last => transfers::Selection::Copy,
-                Some(ring) if copy.last < ring.last => transfers::Selection::Ring,
-                Some(ring) => {
-                    if !copy.same_contents(ring, data_off) {
-                        return Err(corrupt(
-                            at,
-                            "$LogFile tail and ring disagree at the same LSN",
-                        ));
-                    }
-                    transfers::Selection::Equal
-                }
+                Some(ring) => match copy.compare(ring, restart, at)? {
+                    std::cmp::Ordering::Greater => transfers::Selection::Copy,
+                    std::cmp::Ordering::Less => transfers::Selection::Ring,
+                    std::cmp::Ordering::Equal => transfers::Selection::Equal,
+                },
             };
             decisions.insert(at, decision);
             if matches!(decision, transfers::Selection::Copy) {
