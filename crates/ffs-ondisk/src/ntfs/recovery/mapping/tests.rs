@@ -201,7 +201,7 @@ fn named_compressed_continuations_keep_native_fields_and_absolute_first_lcn() {
 fn empty_initial_mapping_is_native_minus_one_but_empty_continuations_fail() {
     let raw = image(&nonresident(&[0x11, 2, 100, 0], 0, 1, 0, &[]));
     let result = change(&raw, RecoveryPass::Redo(20), 64, &[0], 4096).unwrap();
-    assert!(runs(&result).is_empty());
+    assert_eq!(runs(&result), Vec::<RunTuple>::new());
     assert_eq!(
         crate::ntfs::le64(&attributes(&result).0, 24).unwrap(),
         u64::MAX

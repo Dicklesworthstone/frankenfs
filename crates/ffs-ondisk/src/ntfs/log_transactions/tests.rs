@@ -99,8 +99,8 @@ fn commit_preserves_winner_data_and_forget_is_not_itself_a_commit() {
     ];
     let plan = build(&records).unwrap();
     assert_eq!(plan.committed, [24]);
-    assert!(plan.active.is_empty());
-    assert!(plan.undo_actions.is_empty());
+    assert_eq!(plan.active, Vec::<u32>::new());
+    assert_eq!(plan.undo_actions, Vec::<NtfsRecoveryAction>::new());
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn prepared_work_needs_a_decision_but_a_retained_commit_resolves_it() {
     records.push(control(30, 24, 20, 0, NtfsLogOp::CommitTransaction));
     let plan = build(&records).unwrap();
     assert_eq!(plan.committed, [24]);
-    assert!(plan.undo_actions.is_empty());
+    assert_eq!(plan.undo_actions, Vec::<NtfsRecoveryAction>::new());
 }
 
 #[test]
@@ -268,7 +268,9 @@ fn protect(mut page: Vec<u8>, usa: usize, token: u16) -> Vec<u8> {
     page
 }
 
-fn wire_log(specs: &[(u16, u16, u32, Option<usize>, Option<usize>)]) -> Vec<u8> {
+type WireLogRecordSpec = (u16, u16, u32, Option<usize>, Option<usize>);
+
+fn wire_log(specs: &[WireLogRecordSpec]) -> Vec<u8> {
     const SIZE: usize = 262_144;
     const PAGE: usize = 4096;
     const RECORD: usize = 104; // LFS header + 40-byte header + two aligned payloads.
@@ -353,7 +355,7 @@ fn native_wire_commit_is_not_undone_and_open_attribute_is_not_forget() {
     let plan = parse_ntfs_logfile(&log).unwrap();
     assert_eq!(plan.committed_transactions, [24]);
     assert_eq!(plan.redo_actions.len(), 1);
-    assert!(plan.undo_actions.is_empty());
+    assert_eq!(plan.undo_actions, Vec::<NtfsRecoveryAction>::new());
     assert_eq!(log, before);
     let unsupported = wire_log(&[(7, 7, 24, None, None), (0x1C, 0, 24, Some(0), Some(0))]);
     assert!(parse_ntfs_logfile(&unsupported).is_err());
