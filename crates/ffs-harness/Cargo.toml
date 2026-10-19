@@ -37,6 +37,7 @@ tracing = { workspace = true }
 xattr = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
 criterion = { workspace = true }

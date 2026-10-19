@@ -18,6 +18,7 @@ parking_lot = { workspace = true }
 smallvec = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 proptest = { workspace = true }
 

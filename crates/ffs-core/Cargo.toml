@@ -61,6 +61,7 @@ zstd = { workspace = true }
 lzo = "0.1"
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 arc-swap = { workspace = true }
 criterion = { workspace = true }
 libc = { workspace = true }

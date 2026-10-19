@@ -21,6 +21,7 @@ smallvec = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 blake3 = { workspace = true }
 proptest = { workspace = true }

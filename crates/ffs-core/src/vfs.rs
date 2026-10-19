@@ -2799,7 +2799,8 @@ pub trait FsOps: Send + Sync {
     /// Acquire request scope before executing a VFS operation.
     ///
     /// Default behavior is a no-op for read-only backends.
-    fn begin_request_scope(&self, _cx: &Cx, _op: RequestOp) -> ffs_error::Result<RequestScope> {
+    fn begin_request_scope(&self, cx: &Cx, _op: RequestOp) -> ffs_error::Result<RequestScope> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         Ok(RequestScope::empty())
     }
 

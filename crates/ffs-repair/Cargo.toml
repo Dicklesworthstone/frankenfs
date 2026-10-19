@@ -27,6 +27,7 @@ tempfile = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 insta = { workspace = true }
 proptest = { workspace = true }

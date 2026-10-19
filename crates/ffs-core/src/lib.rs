@@ -104,7 +104,6 @@ use std::io::IoSliceMut;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
@@ -950,7 +949,14 @@ pub fn detect_all_filesystems(image: &[u8]) -> Result<DetectedFilesystem, Detect
             cx.checkpoint().map_err(|_| FfsError::Cancelled)
         }
     }
-    let cx = Cx::for_request();
+    static DETECT_RUNTIME: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+    let runtime = DETECT_RUNTIME.get_or_init(|| {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("ffs-core detection runtime must initialize")
+    });
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::new().with_poll_quota(100_000));
     detect_all_filesystems_on_device(&cx, &SliceByteDevice(image))
 }
 
@@ -4893,8 +4899,11 @@ enum MetadataCompactionCommand {
 /// newest value at each home location. Shutdown is explicit and joined before
 /// the WAL checkpoint is truncated, so no orphan worker can outlive `OpenFs`.
 struct MetadataCompactor {
-    sender: std::sync::mpsc::Sender<MetadataCompactionCommand>,
-    join: Option<JoinHandle<()>>,
+    sender: asupersync::channel::mpsc::UnboundedSender<MetadataCompactionCommand>,
+    runtime: Arc<asupersync::runtime::Runtime>,
+    region: Option<asupersync::cx::ChildRegion>,
+    task: Option<asupersync::runtime::TaskHandle<()>>,
+    cleanup_cx: Cx,
 }
 
 impl MetadataCompactor {
@@ -4907,21 +4916,39 @@ impl MetadataCompactor {
     const QUIESCENCE_WINDOW: Duration = Duration::from_millis(10);
 
     fn start(cx: &Cx, byte_device: Arc<dyn ByteDevice>, block_size: u32) -> Result<Self, FfsError> {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let thread_cx = cx.clone();
-        let join = std::thread::Builder::new()
-            .name("ffs-metadata-compact".to_owned())
-            .spawn(move || {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let (sender, mut receiver) = asupersync::channel::mpsc::unbounded_channel();
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .blocking_threads(0, 1)
+            .build()
+            .map(Arc::new)
+            .map_err(|err| {
+                FfsError::Format(format!("metadata compactor runtime init failed: {err}"))
+            })?;
+        let root_cx = runtime.request_cx_with_budget(cx.budget());
+        let cleanup_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let region = runtime
+            .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+            .map_err(|err| {
+                FfsError::Format(format!("metadata compactor region init failed: {err}"))
+            })?;
+        let task = region
+            .cx()
+            .spawn(move |worker_cx| async move {
                 let block_device = ByteDeviceBlockAdapter {
                     dev: byte_device.as_ref(),
                     block_size,
                 };
-                Self::run(&thread_cx, &block_device, &receiver);
+                Self::run(&worker_cx, &block_device, &mut receiver).await;
             })
-            .map_err(FfsError::from)?;
+            .map_err(|err| FfsError::Format(format!("metadata compactor spawn failed: {err}")))?;
         Ok(Self {
             sender,
-            join: Some(join),
+            runtime,
+            region: Some(region),
+            task: Some(task),
+            cleanup_cx,
         })
     }
 
@@ -4929,11 +4956,9 @@ impl MetadataCompactor {
         if batch.is_empty() {
             return;
         }
-        if self
-            .sender
-            .send(MetadataCompactionCommand::Batch(batch))
-            .is_err()
-        {
+        if let Ok(permit) = self.sender.try_reserve() {
+            let _ = permit.send(MetadataCompactionCommand::Batch(batch));
+        } else {
             warn!(
                 target: "ffs::mvcc::metadata_log",
                 "metadata compactor stopped; WAL remains authoritative"
@@ -4942,23 +4967,28 @@ impl MetadataCompactor {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.sender.send(MetadataCompactionCommand::Shutdown);
-        if let Some(join) = self.join.take()
-            && join.join().is_err()
+        if let Ok(permit) = self.sender.try_reserve() {
+            let _ = permit.send(MetadataCompactionCommand::Shutdown);
+        }
+        if let Some(mut task) = self.task.take()
+            && self.runtime.block_on(task.join(&self.cleanup_cx)).is_err()
         {
             warn!(
                 target: "ffs::mvcc::metadata_log",
                 "metadata compactor thread panicked; final checkpoint will retry all blocks"
             );
         }
+        if let Some(region) = self.region.take() {
+            let _ = self.runtime.block_on(region.close());
+        }
     }
 
-    fn run(
+    async fn run(
         cx: &Cx,
         device: &dyn BlockDevice,
-        receiver: &std::sync::mpsc::Receiver<MetadataCompactionCommand>,
+        receiver: &mut asupersync::channel::mpsc::UnboundedReceiver<MetadataCompactionCommand>,
     ) {
-        while let Ok(first) = receiver.recv() {
+        while let Ok(first) = receiver.recv(cx).await {
             let mut stop_after_batch = false;
             let mut latest = BTreeMap::<BlockNumber, Arc<[u8]>>::new();
             match first {
@@ -4969,14 +4999,19 @@ impl MetadataCompactor {
             }
 
             loop {
-                match receiver.recv_timeout(Self::QUIESCENCE_WINDOW) {
-                    Ok(MetadataCompactionCommand::Batch(batch)) => latest.extend(batch),
-                    Ok(MetadataCompactionCommand::Shutdown)
-                    | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                match asupersync::time::timeout(
+                    cx.now(),
+                    Self::QUIESCENCE_WINDOW,
+                    receiver.recv(cx),
+                )
+                .await
+                {
+                    Ok(Ok(MetadataCompactionCommand::Batch(batch))) => latest.extend(batch),
+                    Ok(Ok(MetadataCompactionCommand::Shutdown) | Err(_)) => {
                         stop_after_batch = true;
                         break;
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(_) => break,
                 }
             }
 
@@ -92590,7 +92625,10 @@ mod tests {
             compactor.enqueue(vec![(BlockNumber(1), Arc::<[u8]>::from(vec![0x3D; 512]))]);
             drop(authority);
             compactor.shutdown();
-            assert!(compactor.join.is_none(), "shutdown must join the worker");
+            assert!(
+                compactor.task.is_none() && compactor.region.is_none(),
+                "shutdown must join the worker and close the region"
+            );
 
             let mut expected = original;
             let expected_events = if reject_write {
@@ -92609,6 +92647,72 @@ mod tests {
                 expected_events,
                 "compaction must honor the supplied write/sync authority"
             );
+        }
+    }
+
+    #[test]
+    fn begin_request_scope_rejects_cancelled_cx_bd_lza2g() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("build runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::new().with_poll_quota(16));
+        let dev = TestDevice::from_vec(build_ext4_image(0));
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open ext4");
+        cx.set_cancel_requested(true);
+        let err = fs
+            .begin_request_scope(&cx)
+            .expect_err("cancelled Cx must fail begin_request_scope");
+        assert!(
+            matches!(err, FfsError::Cancelled),
+            "expected FfsError::Cancelled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn production_crates_have_no_unstructured_threads_or_test_cx_bd_in31y() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates_root = manifest_dir.parent().expect("crates dir");
+        let target_files = [
+            "ffs-block/src/cache.rs",
+            "ffs-block/src/lib.rs",
+            "ffs-core/src/lib.rs",
+            "ffs-core/src/fs_ops.rs",
+            "ffs-core/src/vfs.rs",
+            "ffs-fuse/src/lib.rs",
+            "ffs-fuse/src/franken_fuse.rs",
+            "ffs-mvcc/src/rcu.rs",
+            "ffs-repair/src/pipeline.rs",
+            "ffs-cli/src/main.rs",
+            "ffs-cli/src/mount_worker.rs",
+        ];
+        let forbidden = [
+            "std::thread::spawn",
+            "thread::Builder",
+            "std::sync::mpsc",
+            "Cx::for_testing(",
+            "Cx::for_request(",
+        ];
+        for rel in target_files {
+            let path = crates_root.join(rel);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            let prod = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            for (line_no, line) in prod.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for needle in forbidden {
+                    assert!(
+                        !trimmed.contains(needle),
+                        "{}:{} contains forbidden unstructured concurrency / test Cx token `{needle}`: {trimmed}",
+                        rel,
+                        line_no + 1
+                    );
+                }
+            }
         }
     }
 

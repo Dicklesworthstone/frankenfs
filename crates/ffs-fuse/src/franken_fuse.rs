@@ -865,7 +865,10 @@ impl FrankenFuse {
     /// cancellation/rollback boundaries are audited could strand partial work.
     /// Calls made outside a live dispatch retain an independent context.
     fn cx_for_request() -> Cx {
-        let cx = Cx::for_request();
+        let budget = crate::fuse_root_cx()
+            .budget_for_timeout(crate::FUSE_REQUEST_TIMEOUT)
+            .with_poll_quota(crate::FUSE_REQUEST_POLL_QUOTA);
+        let cx = crate::fuse_runtime().request_cx_with_budget(budget);
         if let Some(interrupt) = fuser::current_read_request_interrupt() {
             let request_cx = cx.clone();
             interrupt.on_interrupt(move || request_cx.set_cancel_requested(true));
@@ -3212,7 +3215,10 @@ impl FrankenFuse {
             // must not cancel their mandatory commit after taking the batch
             // out of its slot. This adapter-owned context deliberately does
             // not inherit the new observer's cancellation or deadline.
-            let flush_cx = Cx::for_request();
+            let flush_budget = crate::fuse_root_cx()
+                .budget_for_timeout(crate::FUSE_REQUEST_TIMEOUT)
+                .with_poll_quota(crate::FUSE_REQUEST_POLL_QUOTA);
+            let flush_cx = crate::fuse_runtime().request_cx_with_budget(flush_budget);
             self.flush_writeback_batch(&flush_cx)?;
         }
         // Only read the clock when something will read the counter (bd-xfe7z).

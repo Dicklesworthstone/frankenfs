@@ -2539,28 +2539,44 @@ impl FlushDaemonConfig {
 }
 
 /// Handle for a running background flush daemon.
-#[derive(Debug)]
 pub struct FlushDaemon {
     stop: Arc<FlushDaemonStop>,
-    join: Option<JoinHandle<()>>,
+    runtime: Arc<asupersync::runtime::Runtime>,
+    region: Option<asupersync::cx::ChildRegion>,
+    task: Option<asupersync::runtime::TaskHandle<()>>,
+    cleanup_cx: Cx,
+}
+
+impl std::fmt::Debug for FlushDaemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlushDaemon")
+            .field("stop", &self.stop)
+            .field("region_open", &self.region.is_some())
+            .field("task_active", &self.task.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FlushDaemon {
     /// Request shutdown and block until the daemon exits.
     pub fn shutdown(mut self) {
+        self.stop_and_drain();
+    }
+
+    fn stop_and_drain(&mut self) {
         self.stop.request_stop();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        if let Some(mut task) = self.task.take() {
+            let _ = self.runtime.block_on(task.join(&self.cleanup_cx));
+        }
+        if let Some(region) = self.region.take() {
+            let _ = self.runtime.block_on(region.close());
         }
     }
 }
 
 impl Drop for FlushDaemon {
     fn drop(&mut self) {
-        self.stop.request_stop();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        self.stop_and_drain();
     }
 }
 
@@ -3268,15 +3284,25 @@ impl<D: BlockDevice> ArcCache<D> {
         D: 'static,
     {
         let config = config.validate()?;
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .blocking_threads(0, 1)
+            .build()
+            .map(Arc::new)
+            .map_err(|err| FfsError::Format(format!("flush daemon runtime init failed: {err}")))?;
+        let root_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let cleanup_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let region = runtime
+            .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+            .map_err(|err| FfsError::Format(format!("flush daemon region init failed: {err}")))?;
         let stop = Arc::new(FlushDaemonStop::new());
         let cache = Arc::clone(self);
         let stop_signal = Arc::clone(&stop);
+        let shutdown_flush_cx = cleanup_cx.clone();
 
-        let join = thread::Builder::new()
-            .name("ffs-flush-daemon".to_owned())
-            .spawn(move || {
-                // Daemon uses a long-lived context for periodic background work.
-                let cx = Cx::for_testing();
+        let task = region
+            .cx()
+            .spawn_blocking(move |cx| {
                 let mut cycle_seq = 0_u64;
                 let mut daemon_throttled = false;
 
@@ -3288,7 +3314,7 @@ impl<D: BlockDevice> ArcCache<D> {
                     cache.run_flush_daemon_cycle(&cx, &config, cycle_seq, &mut daemon_throttled);
                 }
 
-                if let Err(err) = cache.flush_dirty(&cx) {
+                if let Err(err) = cache.flush_dirty(&shutdown_flush_cx) {
                     error!(
                         event = "flush_shutdown_failed",
                         error = %err,
@@ -3296,11 +3322,14 @@ impl<D: BlockDevice> ArcCache<D> {
                     );
                 }
             })
-            .map_err(FfsError::from)?;
+            .map_err(|err| FfsError::Format(format!("flush daemon spawn failed: {err}")))?;
 
         Ok(FlushDaemon {
             stop,
-            join: Some(join),
+            runtime,
+            region: Some(region),
+            task: Some(task),
+            cleanup_cx,
         })
     }
 

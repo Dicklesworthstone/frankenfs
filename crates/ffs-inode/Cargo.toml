@@ -18,6 +18,7 @@ crc32c = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 proptest = { workspace = true }
 

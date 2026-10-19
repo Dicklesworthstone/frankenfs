@@ -40,12 +40,31 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
+
+/// Default per-request wall-clock deadline for FUSE dispatch contexts (`bd-lza2g`).
+pub const FUSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default per-request poll quota for FUSE dispatch contexts (`bd-lza2g`).
+pub const FUSE_REQUEST_POLL_QUOTA: u32 = 1_000_000;
+
+pub(crate) fn fuse_runtime() -> &'static asupersync::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<asupersync::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .blocking_threads(0, 8)
+            .build()
+            .expect("ffs-fuse asupersync runtime must initialize")
+    })
+}
+
+pub(crate) fn fuse_root_cx() -> &'static Cx {
+    static ROOT_CX: std::sync::OnceLock<Cx> = std::sync::OnceLock::new();
+    ROOT_CX.get_or_init(|| fuse_runtime().request_cx_with_budget(asupersync::Budget::INFINITE))
+}
 
 /// Whether memo-served requests increment `requests_total` (bd-d9378).
 ///
@@ -5079,7 +5098,7 @@ impl NegativeDentryHints {
 
 #[derive(Debug, Clone)]
 struct KernelNotifyQueue {
-    sender: std::sync::mpsc::Sender<KernelNotification>,
+    sender: asupersync::channel::mpsc::UnboundedSender<KernelNotification>,
     negative_entries: Arc<Mutex<NegativeDentryHints>>,
 }
 
@@ -5091,29 +5110,40 @@ impl KernelNotifyQueue {
     /// fails, and the filesystem stays correct because entry/attr TTLs still
     /// expire. A mount must not fail because a cache-eviction helper did.
     fn spawn(notifier: fuser::Notifier) -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel::<KernelNotification>();
-        if let Err(error) = std::thread::Builder::new()
-            .name("ffs-fuse-notify".to_owned())
-            .spawn(move || {
-                for message in receiver {
-                    match message {
-                        KernelNotification::Entry { parent, name } => {
-                            if let Err(error) = notifier.inval_entry(parent, &name) {
-                                debug!(parent, name = ?name, error = %error,
-                                    "FUSE kernel entry invalidation failed");
+        let (sender, mut receiver) =
+            asupersync::channel::mpsc::unbounded_channel::<KernelNotification>();
+        let runtime = fuse_runtime();
+        let root_cx = fuse_root_cx();
+        match runtime
+            .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+        {
+            Ok(region) => {
+                let region_cx = region.cx().clone();
+                if let Err(error) = region_cx.spawn_blocking(move |worker_cx| {
+                    while let Ok(message) = fuse_runtime().block_on(receiver.recv(&worker_cx)) {
+                        match message {
+                            KernelNotification::Entry { parent, name } => {
+                                if let Err(error) = notifier.inval_entry(parent, &name) {
+                                    debug!(parent, name = ?name, error = %error,
+                                        "FUSE kernel entry invalidation failed");
+                                }
                             }
-                        }
-                        KernelNotification::Inode { ino } => {
-                            if let Err(error) = notifier.inval_inode(ino, 0, 0) {
-                                debug!(ino, error = %error,
-                                    "FUSE kernel inode invalidation failed");
+                            KernelNotification::Inode { ino } => {
+                                if let Err(error) = notifier.inval_inode(ino, 0, 0) {
+                                    debug!(ino, error = %error,
+                                        "FUSE kernel inode invalidation failed");
+                                }
                             }
                         }
                     }
+                    let _ = fuse_runtime().block_on(region.close());
+                }) {
+                    warn!(error = %error, "FUSE notification task failed to spawn; kernel cache entries will expire by TTL instead");
                 }
-            })
-        {
-            warn!(error = %error, "FUSE notification thread failed to spawn;                 kernel cache entries will expire by TTL instead");
+            }
+            Err(error) => {
+                warn!(error = %error, "FUSE notification region failed to open; kernel cache entries will expire by TTL instead");
+            }
         }
         Self {
             sender,
@@ -5122,8 +5152,11 @@ impl KernelNotifyQueue {
     }
 
     #[cfg(test)]
-    fn for_test() -> (Self, std::sync::mpsc::Receiver<KernelNotification>) {
-        let (sender, receiver) = std::sync::mpsc::channel();
+    fn for_test() -> (
+        Self,
+        asupersync::channel::mpsc::UnboundedReceiver<KernelNotification>,
+    ) {
+        let (sender, receiver) = asupersync::channel::mpsc::unbounded_channel();
         (
             Self {
                 sender,
@@ -5150,15 +5183,19 @@ impl KernelNotifyQueue {
         // attributed to a real send or ruled out. A relaxed counter on a path
         // that already allocates an OsString and crosses a channel.
         NOTIFY_ENTRY_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = self.sender.send(KernelNotification::Entry {
-            parent,
-            name: name.to_owned(),
-        });
+        if let Ok(permit) = self.sender.try_reserve() {
+            let _ = permit.send(KernelNotification::Entry {
+                parent,
+                name: name.to_owned(),
+            });
+        }
     }
 
     fn inode(&self, ino: u64) {
         NOTIFY_INODE_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = self.sender.send(KernelNotification::Inode { ino });
+        if let Ok(permit) = self.sender.try_reserve() {
+            let _ = permit.send(KernelNotification::Inode { ino });
+        }
     }
 }
 
@@ -5326,7 +5363,41 @@ enum IoctlTraceMsg {
     /// messages, then signals on the supplied reply channel.  Used by tests
     /// (and any caller that needs a happens-before guarantee for an external
     /// reader of the trace file).
-    Flush(SyncSender<std::io::Result<()>>),
+    Flush(asupersync::channel::oneshot::Sender<std::io::Result<()>>),
+}
+
+#[derive(Debug)]
+struct IoctlTraceWorker {
+    region: asupersync::cx::ChildRegion,
+    task: asupersync::runtime::TaskHandle<()>,
+}
+
+impl IoctlTraceWorker {
+    fn spawn(
+        path: PathBuf,
+        mut receiver: asupersync::channel::mpsc::Receiver<IoctlTraceMsg>,
+    ) -> Result<Self, String> {
+        let runtime = fuse_runtime();
+        let root_cx = fuse_root_cx();
+        let region = runtime
+            .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+            .map_err(|err| err.to_string())?;
+        let task = region
+            .cx()
+            .spawn(move |worker_cx| async move {
+                ioctl_trace_writer_loop(&worker_cx, &path, &mut receiver).await;
+            })
+            .map_err(|err| err.to_string())?;
+        Ok(Self { region, task })
+    }
+
+    fn join(mut self) -> Result<(), asupersync::runtime::JoinError> {
+        let runtime = fuse_runtime();
+        let cleanup_cx = fuse_root_cx();
+        let res = runtime.block_on(self.task.join(cleanup_cx));
+        let _ = runtime.block_on(self.region.close());
+        res
+    }
 }
 
 /// Off-thread ioctl trace sink.
@@ -5345,8 +5416,8 @@ enum IoctlTraceMsg {
 #[derive(Debug)]
 struct IoctlTraceProbe {
     path: PathBuf,
-    sender: Option<SyncSender<IoctlTraceMsg>>,
-    worker: Option<JoinHandle<()>>,
+    sender: Option<asupersync::channel::mpsc::Sender<IoctlTraceMsg>>,
+    worker: Option<IoctlTraceWorker>,
     dropped_events: Arc<AtomicU64>,
 }
 
@@ -5386,18 +5457,16 @@ impl IoctlTraceProbe {
             return Self::disabled(path, dropped_events);
         }
 
-        let (sender, receiver) = sync_channel::<IoctlTraceMsg>(IOCTL_TRACE_CHANNEL_CAPACITY);
+        let (sender, receiver) =
+            asupersync::channel::mpsc::channel::<IoctlTraceMsg>(IOCTL_TRACE_CHANNEL_CAPACITY);
         let worker_path = path.clone();
-        let worker = match thread::Builder::new()
-            .name("ffs-ioctl-trace".into())
-            .spawn(move || ioctl_trace_writer_loop(&worker_path, &receiver))
-        {
+        let worker = match IoctlTraceWorker::spawn(worker_path, receiver) {
             Ok(worker) => Some(worker),
             Err(error) => {
                 warn!(
                     path = %path.display(),
                     %error,
-                    "disabling ioctl trace because writer thread could not be spawned"
+                    "disabling ioctl trace because writer task could not be spawned"
                 );
                 None
             }
@@ -5416,15 +5485,14 @@ impl IoctlTraceProbe {
         let Some(sender) = self.sender.as_ref() else {
             return;
         };
-        if sender
-            .try_send(IoctlTraceMsg::Record {
+        if let Ok(permit) = sender.try_reserve() {
+            let _ = permit.send(IoctlTraceMsg::Record {
                 ino,
                 cmd,
                 in_len,
                 out_size,
-            })
-            .is_err()
-        {
+            });
+        } else {
             self.record_dropped_event();
         }
     }
@@ -5439,14 +5507,16 @@ impl IoctlTraceProbe {
                 "ioctl trace writer terminated",
             )
         })?;
-        let (reply_tx, reply_rx) = sync_channel(1);
-        sender.send(IoctlTraceMsg::Flush(reply_tx)).map_err(|_| {
+        let (reply_tx, mut reply_rx) = asupersync::channel::oneshot::channel();
+        let cx = fuse_root_cx();
+        let permit = fuse_runtime().block_on(sender.reserve(cx)).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "ioctl trace writer terminated",
             )
         })?;
-        reply_rx.recv().map_err(|_| {
+        let _ = permit.send(IoctlTraceMsg::Flush(reply_tx));
+        fuse_runtime().block_on(reply_rx.recv(cx)).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "ioctl trace writer dropped flush reply",
@@ -5533,7 +5603,11 @@ fn open_ioctl_trace_file(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
+async fn ioctl_trace_writer_loop(
+    cx: &Cx,
+    path: &Path,
+    receiver: &mut asupersync::channel::mpsc::Receiver<IoctlTraceMsg>,
+) {
     let mut file = match open_ioctl_trace_file(path) {
         Ok(file) => file,
         Err(error) => {
@@ -5545,16 +5619,18 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
             // Drain the channel to unblock senders that may be holding
             // `try_send` slots; flush replies still complete so callers do
             // not deadlock on a missing trace file.
-            for msg in receiver {
-                if let IoctlTraceMsg::Flush(reply) = msg {
-                    let _ = reply.send(Err(std::io::Error::new(error.kind(), error.to_string())));
+            while let Ok(msg) = receiver.recv(cx).await {
+                if let IoctlTraceMsg::Flush(reply) = msg
+                    && let Ok(permit) = reply.reserve(cx)
+                {
+                    let _ = permit.send(Err(std::io::Error::new(error.kind(), error.to_string())));
                 }
             }
             return;
         }
     };
     let mut write_error: Option<std::io::Error> = None;
-    while let Ok(msg) = receiver.recv() {
+    while let Ok(msg) = receiver.recv(cx).await {
         match msg {
             IoctlTraceMsg::Record {
                 ino,
@@ -5573,7 +5649,9 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
                 let result = write_error.as_ref().map_or(Ok(()), |error| {
                     Err(std::io::Error::new(error.kind(), error.to_string()))
                 });
-                let _ = reply.send(result);
+                if let Ok(permit) = reply.reserve(cx) {
+                    let _ = permit.send(result);
+                }
             }
         }
     }
@@ -8559,15 +8637,31 @@ impl MountHandle {
             );
 
             let timeout = self.config.unmount_timeout;
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                drop(session);
-                let _ = tx.send(());
-            });
-
-            if rx.recv_timeout(timeout).is_err() {
-                warn!("unmount timed out after {:?}", timeout);
+            let runtime = fuse_runtime();
+            let root_cx = fuse_root_cx();
+            let (tx, mut rx) = asupersync::channel::oneshot::channel();
+            if let Ok(region) = runtime
+                .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+            {
+                let notify_cx = root_cx.clone();
+                let _ = region.cx().spawn_blocking(move |_worker_cx| {
+                    drop(session);
+                    if let Ok(permit) = tx.reserve(&notify_cx) {
+                        let _ = permit.send(());
+                    }
+                });
+                let completed = runtime.block_on(async {
+                    asupersync::time::timeout(root_cx.now(), timeout, rx.recv(root_cx)).await
+                });
+                if matches!(completed, Ok(Ok(()))) {
+                    let _ = runtime.block_on(region.close());
+                    info!(mountpoint = %self.mountpoint.display(), "unmount complete");
+                } else {
+                    let _ = region.cancel(asupersync::types::CancelReason::timeout());
+                    warn!("unmount timed out after {:?}", timeout);
+                }
             } else {
+                drop(session);
                 info!(mountpoint = %self.mountpoint.display(), "unmount complete");
             }
         }
@@ -10760,7 +10854,7 @@ mod tests {
         // knob reroutes rather than removes), and an unseen name is never
         // notified or remembered.
         let fuse = writable_fuse();
-        let (notifier, receiver) = KernelNotifyQueue::for_test();
+        let (notifier, mut receiver) = KernelNotifyQueue::for_test();
         *fuse
             .inner
             .kernel_notifier
@@ -10780,7 +10874,7 @@ mod tests {
         assert!(
             matches!(
                 receiver.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
+                Err(asupersync::channel::mpsc::RecvError::Empty)
             ),
             "with the knob unset the create side must not notify: the create \
              reply already instantiated the dentry"
@@ -19169,25 +19263,27 @@ mod tests {
     fn ioctl_trace_flush_reports_write_failure() {
         // Exercise an actual kernel write failure, bypassing the public path
         // validator that correctly refuses special devices as trace destinations.
-        let (sender, receiver) = sync_channel(4);
-        let worker = std::thread::spawn(move || {
-            ioctl_trace_writer_loop(Path::new("/dev/full"), &receiver);
-        });
+        let (sender, receiver) = asupersync::channel::mpsc::channel(4);
+        let worker =
+            IoctlTraceWorker::spawn(PathBuf::from("/dev/full"), receiver).expect("spawn worker");
         sender
+            .try_reserve()
+            .expect("record reserve")
             .send(IoctlTraceMsg::Record {
                 ino: 1,
                 cmd: EXT4_IOC_GETFLAGS,
                 in_len: 0,
                 out_size: 4,
-            })
-            .expect("record enqueue");
+            });
+        let cx = fuse_root_cx();
         for _ in 0..2 {
-            let (reply_tx, reply_rx) = sync_channel(1);
-            sender
-                .send(IoctlTraceMsg::Flush(reply_tx))
-                .expect("flush enqueue");
-            let error = reply_rx
-                .recv()
+            let (reply_tx, mut reply_rx) = asupersync::channel::oneshot::channel();
+            fuse_runtime()
+                .block_on(sender.reserve(cx))
+                .expect("flush reserve")
+                .send(IoctlTraceMsg::Flush(reply_tx));
+            let error = fuse_runtime()
+                .block_on(reply_rx.recv(cx))
                 .expect("flush reply")
                 .expect_err("write failed");
             assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
@@ -19206,7 +19302,7 @@ mod tests {
             "ffs_ioctl_backpressure_{}_{unique}.log",
             std::process::id()
         ));
-        let (sender, receiver) = sync_channel(1);
+        let (sender, receiver) = asupersync::channel::mpsc::channel(1);
         let mut probe = IoctlTraceProbe {
             path: path.clone(),
             sender: Some(sender),
@@ -19217,9 +19313,7 @@ mod tests {
         // overflowed the queue, then let the normal writer drain it.
         probe.record(1, EXT4_IOC_GETFLAGS, 0, 4);
         probe.record(2, EXT4_IOC_GETFLAGS, 0, 4);
-        probe.worker = Some(std::thread::spawn(move || {
-            ioctl_trace_writer_loop(&path, &receiver);
-        }));
+        probe.worker = Some(IoctlTraceWorker::spawn(path, receiver).expect("spawn worker"));
         let error = probe.flush_sync().expect_err("incomplete trace must fail");
         assert!(error.to_string().contains("lost 1 events"));
         let trace = std::fs::read_to_string(&probe.path).expect("read partial trace");
@@ -26302,5 +26396,28 @@ AllowOther"#;
             Some(b"unexpected-format-read".to_vec())
         );
         assert_eq!(getxattr_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cx_for_request_uses_finite_budget_and_poll_quota_bd_lza2g() {
+        let cx = FrankenFuse::cx_for_request();
+        let budget = cx.budget();
+        assert!(
+            budget.deadline.is_some(),
+            "FrankenFuse::cx_for_request must attach a finite wall-clock deadline"
+        );
+        assert_eq!(
+            budget.poll_quota, FUSE_REQUEST_POLL_QUOTA,
+            "FrankenFuse::cx_for_request must attach FUSE_REQUEST_POLL_QUOTA"
+        );
+        assert!(
+            cx.checkpoint().is_ok(),
+            "fresh request Cx must pass initial checkpoint"
+        );
+        cx.set_cancel_requested(true);
+        assert!(
+            cx.checkpoint().is_err(),
+            "cancelled request Cx must fail checkpoint"
+        );
     }
 }

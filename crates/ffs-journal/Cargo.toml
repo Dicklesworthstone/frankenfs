@@ -20,6 +20,7 @@ tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 crc32c = { workspace = true }
 hex = { workspace = true }

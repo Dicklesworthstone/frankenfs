@@ -10,7 +10,7 @@ rust-version.workspace = true
 ffs-ondisk = { workspace = true }
 
 [dev-dependencies]
-asupersync = { workspace = true }
+asupersync = { workspace = true, features = ["test-internals"] }
 ffs-alloc = { workspace = true }
 ffs-block = { workspace = true }
 ffs-core = { workspace = true }

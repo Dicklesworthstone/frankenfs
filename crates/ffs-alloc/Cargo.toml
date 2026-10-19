@@ -24,6 +24,7 @@ asupersync = { workspace = true }
 smallvec = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 proptest = { workspace = true }
 sha2 = { workspace = true }

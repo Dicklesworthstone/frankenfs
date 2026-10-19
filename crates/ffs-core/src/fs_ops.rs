@@ -4748,7 +4748,8 @@ impl FsOps for OpenFs {
         }
     }
 
-    fn begin_request_scope(&self, _cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
+    fn begin_request_scope(&self, cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let _view = self.btrfs_semantic_view_guard()?;
         if op.is_write() {
             self.reject_btrfs_unsupported_mutation()?;

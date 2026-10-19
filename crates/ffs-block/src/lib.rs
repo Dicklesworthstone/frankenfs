@@ -32,7 +32,7 @@ use std::sync::Arc;
 #[cfg(feature = "s3fifo")]
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 
