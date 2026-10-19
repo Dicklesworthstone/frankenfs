@@ -558,9 +558,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let json_path = dir.path().join("console.json");
         let md_path = dir.path().join("console.md");
-        let config =
-            MountConsoleConfig::from_cli(true, Some(json_path.clone()), Some(md_path.clone()))
-                .expect("config");
+        let config = MountConsoleConfig::from_cli(true, Some(json_path), Some(md_path.clone()))
+            .expect("config");
 
         let mut obs = observation(RuntimeConsoleMode::Managed);
         obs.read_write = true;
