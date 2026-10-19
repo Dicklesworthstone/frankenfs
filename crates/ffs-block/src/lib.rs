@@ -690,6 +690,15 @@ impl FileByteDevice {
         Self::from_file(file, false)
     }
 
+    /// Open with write access, failing instead of falling back to read-only.
+    ///
+    /// Callers that are about to mutate the image use this so a missing write
+    /// permission surfaces at open time rather than at the first write.
+    pub fn open_read_write(path: impl AsRef<Path>) -> Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::from_file(file, true)
+    }
+
     fn from_file(file: File, writable: bool) -> Result<Self> {
         let block_device = file.metadata()?.file_type().is_block_device();
         let len = backing_len(&file)?;
