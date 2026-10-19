@@ -117,7 +117,9 @@ pub(super) fn build(records: &[NtfsLogRecord]) -> Result<Plan, ParseError> {
         if record.redo_op == NtfsLogOp::CompensationLogRecord {
             return Err(bad("compensation marker must be the native undo opcode"));
         }
-        if record.redo_op.patches_bytes() && record.target_lcn == 0 {
+        if record.redo_op.patches_bytes()
+            && (record.target_lcns.is_empty() || record.target_lcns.contains(&0))
+        {
             return Err(bad("native redo has no physical target"));
         }
         if let Some(transaction) = slots.get(&id) {
@@ -225,7 +227,7 @@ pub(super) fn build(records: &[NtfsLogRecord]) -> Result<Plan, ParseError> {
             && record.redo_op != NtfsLogOp::EndTopLevelAction
             && record.undo_op.patches_bytes()
         {
-            if record.target_lcn == 0 {
+            if record.target_lcns.is_empty() || record.target_lcns.contains(&0) {
                 return Err(bad("native undo has no physical target"));
             }
             undo_actions.push(NtfsRecoveryAction {
@@ -233,7 +235,9 @@ pub(super) fn build(records: &[NtfsLogRecord]) -> Result<Plan, ParseError> {
                 transaction_id: id,
                 is_undo: true,
                 op: record.undo_op,
-                target_lcn: record.target_lcn,
+                target_vcn: record.target_vcn,
+                target_lcns: record.target_lcns.clone(),
+                resident_resize: record.redo_data.len() != record.undo_data.len(),
                 cluster_block_offset: record.cluster_block_offset,
                 record_offset: record.record_offset,
                 attribute_offset: record.attribute_offset,

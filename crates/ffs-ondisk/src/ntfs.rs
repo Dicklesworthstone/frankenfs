@@ -793,19 +793,24 @@ pub struct NtfsLogRecord {
     pub attribute_offset: u16,
     pub cluster_block_offset: u16,
     pub target_vcn: u64,
-    pub target_lcn: u64,
+    /// All native mapping claims, in VCN order. A record may span fragmented
+    /// physical clusters; retaining only the first LCN loses target identity.
+    pub target_lcns: Vec<u64>,
     pub redo_data: Vec<u8>,
     pub undo_data: Vec<u8>,
 }
 
-/// One concrete byte-patch action produced by ARIES Redo or Undo.
+/// One semantic recovery action. Native offsets are opcode-specific; this is
+/// not permission to copy `data` to an arbitrary physical address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtfsRecoveryAction {
     pub lsn: u64,
     pub transaction_id: u32,
     pub is_undo: bool,
     pub op: NtfsLogOp,
-    pub target_lcn: u64,
+    pub target_vcn: u64,
+    pub target_lcns: Vec<u64>,
+    pub resident_resize: bool,
     pub cluster_block_offset: u16,
     pub record_offset: u16,
     pub attribute_offset: u16,
@@ -915,12 +920,25 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
                 let attribute_offset = le16(payload, 18)?;
                 let cluster_block_offset = le16(payload, 20)?;
                 let target_vcn = le64(payload, 24)?;
-                // First entry of the record's per-page LCN array.
-                let first_page_lcn = if lcns_to_follow > 0 {
-                    le64(payload, 32)?
-                } else {
-                    0
-                };
+                let mapping_end = 32 + usize::from(lcns_to_follow).max(1) * 8;
+                if mapping_end > payload.len() || le16(payload, 22)? != 0 {
+                    return Err(invalid("ntfs.rcrd", "truncated LCN array or reserved bits"));
+                }
+                let mut target_lcns = Vec::with_capacity(usize::from(lcns_to_follow));
+                for index in 0..usize::from(lcns_to_follow) {
+                    target_lcns.push(le64(payload, 32 + index * 8)?);
+                }
+                if target_vcn.checked_add(u64::from(lcns_to_follow)).is_none() {
+                    return Err(invalid("ntfs.rcrd", "target VCN range overflows"));
+                }
+                for (offset, length) in [(redo_offset, redo_length), (undo_offset, undo_length)] {
+                    if (offset != 0 && (!offset.is_multiple_of(8) || offset < mapping_end))
+                        || (length != 0 && offset == 0)
+                        || offset.checked_add(length).is_none_or(|end| end > payload.len())
+                    {
+                        return Err(invalid("ntfs.rcrd", "recovery payload overlaps its header or LCNs"));
+                    }
+                }
                 let redo_data = if redo_length > 0 {
                     payload
                         .get(redo_offset..redo_offset + redo_length)
@@ -956,7 +974,7 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
                         attribute_offset,
                         cluster_block_offset,
                         target_vcn,
-                        target_lcn: first_page_lcn,
+                        target_lcns,
                         redo_data,
                         undo_data,
                     });
@@ -994,8 +1012,10 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
     let mut dirty_pages: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
 
     for rec in &records {
-        if rec.target_lcn != 0 && rec.redo_op.patches_bytes() {
-            dirty_pages.entry(rec.target_lcn).or_insert(rec.this_lsn);
+        if rec.redo_op.patches_bytes() {
+            for &lcn in &rec.target_lcns {
+                dirty_pages.entry(lcn).or_insert(rec.this_lsn);
+            }
         }
     }
 
@@ -1008,13 +1028,15 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
     // Pass 2: Redo (repeating history in ascending LSN order)
     let mut redo_actions = Vec::new();
     for rec in &records {
-        if rec.this_lsn >= min_rec_lsn && rec.target_lcn != 0 && rec.redo_op.patches_bytes() {
+        if rec.this_lsn >= min_rec_lsn && !rec.target_lcns.is_empty() && rec.redo_op.patches_bytes() {
             redo_actions.push(NtfsRecoveryAction {
                 lsn: rec.this_lsn,
                 transaction_id: rec.transaction_id,
                 is_undo: false,
                 op: rec.redo_op,
-                target_lcn: rec.target_lcn,
+                target_vcn: rec.target_vcn,
+                target_lcns: rec.target_lcns.clone(),
+                resident_resize: rec.redo_data.len() != rec.undo_data.len(),
                 cluster_block_offset: rec.cluster_block_offset,
                 record_offset: rec.record_offset,
                 attribute_offset: rec.attribute_offset,

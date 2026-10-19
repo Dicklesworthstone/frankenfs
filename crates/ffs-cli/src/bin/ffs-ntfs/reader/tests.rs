@@ -438,12 +438,13 @@ fn build_lfs_rcrd_entry(
     (this_lsn, prev_lsn, undo_next_lsn): (u64, u64, u64),
     (tx_id, record_type): (u32, u32),
     (redo_op, undo_op): (u16, u16),
-    target_lcn: u64,
+    (target_vcn, target_lcn): (u64, u64),
     attribute_offset: u16,
     redo_data: &[u8],
     undo_data: &[u8],
 ) -> Vec<u8> {
-    let redo_off = 40_usize;
+    // A 1024-byte FILE spans two 512-byte clusters in this fixture.
+    let redo_off = 48_usize;
     let undo_off = (redo_off + redo_data.len()).next_multiple_of(8);
     let client_len = (undo_off + undo_data.len()).next_multiple_of(8);
     let mut rec = vec![0_u8; 48 + client_len];
@@ -461,11 +462,14 @@ fn build_lfs_rcrd_entry(
     body[8..10].copy_from_slice(&(undo_off as u16).to_le_bytes());
     body[10..12].copy_from_slice(&(undo_data.len() as u16).to_le_bytes());
     body[12..14].copy_from_slice(&0x18_u16.to_le_bytes());
-    body[14..16].copy_from_slice(&1_u16.to_le_bytes()); // lcns_to_follow = 1
-    body[16..18].copy_from_slice(&0_u16.to_le_bytes()); // record_offset = 0
-    body[18..20].copy_from_slice(&attribute_offset.to_le_bytes()); // attribute_offset
-    body[24..32].copy_from_slice(&target_lcn.to_le_bytes()); // target_vcn
-    body[32..40].copy_from_slice(&target_lcn.to_le_bytes()); // target_lcn
+    if target_lcn != 0 {
+        body[14..16].copy_from_slice(&2_u16.to_le_bytes());
+        body[16..18].copy_from_slice(&56_u16.to_le_bytes());
+        body[32..40].copy_from_slice(&target_lcn.to_le_bytes());
+        body[40..48].copy_from_slice(&(target_lcn + 1).to_le_bytes());
+    }
+    body[18..20].copy_from_slice(&attribute_offset.to_le_bytes());
+    body[24..32].copy_from_slice(&target_vcn.to_le_bytes());
     body[redo_off..redo_off + redo_data.len()].copy_from_slice(redo_data);
     body[undo_off..undo_off + undo_data.len()].copy_from_slice(undo_data);
     rec
@@ -475,6 +479,15 @@ fn build_lfs_rcrd_entry(
 fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_overlay() {
     let cx = Cx::for_testing();
     let mut image = Image::new();
+    // Supply real native allocation metadata to the semantic target adapter.
+    // Both bootstrap copies retain the same fragmented MFT DATA mapping.
+    let mft = file_record(0, &[
+        mapped(&[0x11, 16, 4, 0x11, 48, 36, 0], 64, 32 * 1024, 32 * 1024, 0),
+        resident(0xB0, 1, "", &[0xFF; 4]),
+    ]);
+    image.put_record(0, &mft);
+    image.bytes[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&mft);
+    image.put_record(6, &file_record(6, &[resident(DATA, 0, "", &[0xFF; 32])]));
     // Record 25 has uncommitted dirty resident data ("loser-bad") that Undo should revert to "CLEAN-25!".
     image.put_record(25, &file_record(25, &[resident(DATA, 0, "", b"loser-bad")]));
     // Build a 16 KiB (4-page, 32-cluster) $LogFile at LCN 210..242.
@@ -513,23 +526,23 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
 
     let rec24_lcn = ((Image::record_offset(24) - BASE) / 512) as u64;
     let rec25_lcn = ((Image::record_offset(25) - BASE) / 512) as u64;
-    // Resident attribute at offset 56 has value at offset 24 -> byte 80 in FILE record.
+    // Keep the native MFT VCN and attribute-relative offset distinct from LCN.
     let e1 = build_lfs_rcrd_entry(
         (100, 0, 0),
         (1, 1),
         (0x07, 0x07),
-        rec24_lcn,
-        80,
+        (48, rec24_lcn),
+        24,
         b"COMMITTED",
         b"resident!",
     );
-    let e2 = build_lfs_rcrd_entry((200, 100, 0), (1, 1), (0x1A, 0x00), 0, 0, &[], &[]);
+    let e2 = build_lfs_rcrd_entry((200, 100, 0), (1, 1), (0x1A, 0x00), (0, 0), 0, &[], &[]);
     let e3 = build_lfs_rcrd_entry(
         (300, 0, 0),
         (2, 1),
         (0x07, 0x07),
-        rec25_lcn,
-        80,
+        (50, rec25_lcn),
+        24,
         b"loser-bad",
         b"CLEAN-25!",
     );

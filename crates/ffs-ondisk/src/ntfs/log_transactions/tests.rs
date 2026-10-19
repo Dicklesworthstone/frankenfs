@@ -15,7 +15,7 @@ fn update(lsn: u64, id: u32, previous: u64, next: u64) -> NtfsLogRecord {
         attribute_offset: 24,
         cluster_block_offset: 0,
         target_vcn: 4,
-        target_lcn: 100,
+        target_lcns: vec![100],
         redo_data: vec![u8::try_from(lsn).unwrap()],
         undo_data: vec![u8::try_from(lsn).unwrap() + 100],
     }
@@ -25,7 +25,7 @@ fn control(lsn: u64, id: u32, previous: u64, next: u64, op: NtfsLogOp) -> NtfsLo
     let mut record = update(lsn, id, previous, next);
     record.redo_op = op;
     record.undo_op = NtfsLogOp::Noop;
-    record.target_lcn = 0;
+    record.target_lcns.clear();
     record.redo_data.clear();
     record.undo_data.clear();
     record
@@ -235,7 +235,7 @@ fn missing_identity_targets_and_work_budget_fail_without_partial_actions() {
         let mut record = update(10, 24, 0, 0);
         match mutation {
             0 => record.transaction_id = 0,
-            1 => record.target_lcn = 0,
+            1 => record.target_lcns.clear(),
             2 => record.record_type = 2,
             _ => record.redo_op = NtfsLogOp::CompensationLogRecord,
         }
@@ -403,5 +403,43 @@ fn torn_pages_truncated_commits_and_unknown_records_cannot_be_silently_skipped()
         let before = bad.clone();
         assert!(parse_ntfs_logfile(&bad).is_err(), "damaged journal case {mutation}");
         assert_eq!(bad, before);
+    }
+}
+
+#[test]
+fn public_plan_preserves_all_fragmented_lcns_and_the_native_target_vcn() {
+    let mut log = wire_log(&[(7, 7, 24, None, None)]);
+    let body = 4 * 4096 + 64 + 48;
+    log[body + 14..body + 16].copy_from_slice(&2_u16.to_le_bytes());
+    log[body + 24..body + 32].copy_from_slice(&84_u64.to_le_bytes());
+    log[body + 40..body + 48].copy_from_slice(&90_u64.to_le_bytes());
+    log[body + 4..body + 6].copy_from_slice(&48_u16.to_le_bytes());
+    log[body + 8..body + 10].copy_from_slice(&48_u16.to_le_bytes());
+    let plan = parse_ntfs_logfile(&log).unwrap();
+    for action in plan.redo_actions.iter().chain(&plan.undo_actions) {
+        assert_eq!(action.target_vcn, 84);
+        assert_eq!(action.target_lcns, [100, 90]);
+        assert!(!action.resident_resize);
+    }
+    assert_eq!(plan.dirty_lcns, [90, 100]);
+    assert_eq!((plan.redo_actions.len(), plan.undo_actions.len()), (1, 1));
+}
+
+#[test]
+fn payload_cannot_alias_the_header_lcn_array_or_an_overflowing_vcn_span() {
+    let good = wire_log(&[(7, 7, 24, None, None)]);
+    let body = 4 * 4096 + 64 + 48;
+    for mutation in 0..7 {
+        let mut log = good.clone();
+        match mutation {
+            0 => log[body + 14..body + 16].copy_from_slice(&4_u16.to_le_bytes()),
+            1 => log[body + 14..body + 16].copy_from_slice(&2_u16.to_le_bytes()),
+            2 => log[body + 4..body + 6].copy_from_slice(&32_u16.to_le_bytes()),
+            3 => log[body + 8..body + 10].copy_from_slice(&41_u16.to_le_bytes()),
+            4 => log[body + 22] = 1,
+            5 => log[body + 32..body + 40].fill(0),
+            _ => log[body + 24..body + 32].copy_from_slice(&u64::MAX.to_le_bytes()),
+        }
+        assert!(parse_ntfs_logfile(&log).is_err(), "native layout mutation {mutation}");
     }
 }

@@ -488,26 +488,24 @@ fn action_log(lcn: u64, offset: u16, data: &[u8]) -> Vec<u8> {
     assert_eq!(plan.committed_transactions, [42]);
     assert_eq!(plan.redo_actions.len(), 1);
     assert_eq!(plan.undo_actions, []);
-    assert_eq!(plan.redo_actions[0].target_lcn, lcn);
+    assert_eq!(plan.redo_actions[0].target_lcns, [lcn]);
     assert_eq!(plan.redo_actions[0].data, data);
     log
 }
 
 #[test]
-fn a_constructed_native_redo_plan_reads_its_overlay_without_changing_the_backing() {
-    let cx = Cx::for_testing();
+fn arbitrary_nonresident_physical_patches_are_not_native_recovery_operations() {
     let trace = Arc::new(Mutex::new(Trace::default()));
     let log = action_log(220, 3, b"overlay!");
-    let volume = open(image(1, Some(log)), &trace, true).unwrap();
-    assert_eq!(volume.logfile_recovery.as_ref().unwrap().redo_actions.len(), 1);
-    trace.lock().unwrap().reads.clear();
-    let mut value = [0; 8];
-    volume.source.read(&cx, 220 * 512 + 3, &mut value).unwrap();
-    assert_eq!(&value, b"overlay!");
-    assert_eq!(trace.lock().unwrap().reads, []);
-    let mut underlying = [0xFF; 8];
-    volume.source.device.read_exact_at(&cx, ByteOffset(220 * 512 + 3), &mut underlying).unwrap();
-    assert_eq!(underlying, [0; 8]);
+    // The old fixture named no stream or allocated target and relied on a raw
+    // memcpy fallback. Preserve it as a regression against that unsafe path.
+    assert!(matches!(
+        open(image(1, Some(log)), &trace, true),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    assert!(!trace.lock().unwrap().reads.iter().any(|&(at, _)| {
+        at == (BASE + 220 * 512) as u64
+    }));
     assert_eq!(trace.lock().unwrap().mutations, 0);
 }
 

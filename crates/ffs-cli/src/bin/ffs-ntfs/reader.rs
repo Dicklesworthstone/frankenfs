@@ -5,6 +5,7 @@ mod compression;
 pub mod ea;
 pub mod filesystem;
 mod namespace;
+mod recovery_apply;
 pub mod security;
 mod source;
 mod wof;
@@ -379,73 +380,12 @@ impl NtfsVolume {
                 "NTFS $LogFile restart size disagrees with its complete DATA stream",
             ));
         }
-        let record_bytes = usize::try_from(self.geometry.record_bytes())
-            .map_err(|_| corrupt(0, "NTFS record size exceeds addressable memory"))?;
-        let cluster_bytes = u64::from(self.geometry.cluster_bytes());
-        for action in plan.redo_actions.iter().chain(plan.undo_actions.iter()) {
-            checkpoint(cx)?;
-            let lcn = action.target_lcn;
-            if lcn == 0 {
-                return Err(unsupported(
-                    "NTFS recovery action has no admitted target LCN",
-                ));
-            }
-            let target_off = lcn
-                .checked_mul(cluster_bytes)
-                .and_then(|offset| offset.checked_add(u64::from(action.cluster_block_offset) * 512))
-                .and_then(|offset| offset.checked_add(u64::from(action.record_offset)))
-                .ok_or_else(|| corrupt(0, "NTFS recovery target address overflow"))?;
-            let patch_off = target_off
-                .checked_add(u64::from(action.attribute_offset))
-                .ok_or_else(|| corrupt(target_off, "NTFS recovery patch address overflow"))?;
-            if action.data.is_empty() {
-                continue;
-            }
-            if target_off
-                .checked_add(record_bytes as u64)
-                .is_some_and(|end| end <= self.source.length)
-            {
-                let mut rec_buf = buffer(record_bytes)?;
-                self.source.read(cx, target_off, &mut rec_buf)?;
-                if &rec_buf[..4] == b"FILE" {
-                    let mut unprot = ffs_ondisk::ntfs::restore_record(&rec_buf, b"FILE")
-                        .map_err(|error| corrupt(target_off, error.to_string()))?;
-                    let rel = usize::from(action.attribute_offset);
-                    let end = rel
-                        .checked_add(action.data.len())
-                        .filter(|end| *end <= unprot.len())
-                        .ok_or_else(|| {
-                            corrupt(target_off, "NTFS recovery patch exceeds its FILE record")
-                        })?;
-                    unprot[rel..end].copy_from_slice(&action.data);
-                    let reprot = ffs_ondisk::ntfs::protect_record(&unprot)
-                        .map_err(|error| corrupt(target_off, error.to_string()))?;
-                    self.source.write_overlay(cx, target_off, &reprot)?;
-                    continue;
-                }
-            }
-            // Source validates the whole range before staging any sector.
-            // An invalid later action cannot become a silently omitted patch.
-            self.source.write_overlay(cx, patch_off, &action.data)?;
-        }
-        let primary_off = self
-            .geometry
-            .cluster_offset(self.geometry.mft_cluster())
-            .map_err(|error| parse(&error))?;
-        let mut raw = buffer(record_bytes)?;
-        self.source.read(cx, primary_off, &mut raw)?;
-        let primary = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
-        validate_identity(&primary, 0, None)?;
-        let mft = attributes::bootstrap_mft(&self.source, &self.geometry, cx, &primary)?;
-        validate_mft_stream(&mft, &self.geometry)?;
-        self.mft = mft;
-        if self.record(cx, 0, None)?.used_bytes() != primary.used_bytes() {
-            return Err(corrupt(
-                0,
-                "recovered MFT mapping does not reproduce record zero",
-            ));
-        }
+        let overlay = recovery_apply::stage(cx, self, &plan)?;
         checkpoint(cx)?;
+        // System records and changes to nonresident attributes are refused by
+        // this executor. The admitted MFT bootstrap therefore remains valid.
+        // No fallible work after publishing the complete volatile view.
+        recovery_apply::publish(cx, &mut self.source, overlay)?;
         self.logfile_recovery = Some(plan);
         Ok(())
     }
