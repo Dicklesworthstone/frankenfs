@@ -486,3 +486,323 @@ fn v2_tail_destination_must_not_alias_saved_usa_words() {
     }
     assert_eq!(log, before);
 }
+
+fn transfer_copy(mut raw: Vec<u8>, destination: usize, count: usize, position: usize) -> Vec<u8> {
+    // These native header fields do not overlap the USA or protected trailers.
+    raw[20..22].copy_from_slice(&u16::try_from(count).unwrap().to_le_bytes());
+    raw[22..24].copy_from_slice(&u16::try_from(position).unwrap().to_le_bytes());
+    raw[60..64].copy_from_slice(&u32::try_from(destination).unwrap().to_le_bytes());
+    raw
+}
+
+fn bank_fixture(count: usize, bank: usize) -> (Restart, Vec<u8>, u64) {
+    assert!((2..=16).contains(&count));
+    let at = first((2, 0));
+    let anchor = lsn(1, at + 64);
+    let mut previous = 0;
+    let mut log = vec![0xFF; LOG];
+    for index in 0..count {
+        let destination = at + index * PAGE;
+        let current = lsn(1, destination + 64);
+        let opcode = if index + 1 == count { 0x1A } else { 0 };
+        let raw = page(
+            &[(64, current, 24, opcode, previous)],
+            0xA000 + index as u16,
+        );
+        install(
+            &mut log,
+            (bank + index) * PAGE,
+            &transfer_copy(raw, destination, count, index + 1),
+        );
+        previous = current;
+    }
+    // The first page has already reached the ring; the other pages exist only
+    // in the complete tail transfer. Equal published bytes are safe to retain.
+    install(&mut log, at, &page(&[(64, anchor, 24, 0, 0)], 0xBEEF));
+    (restart((2, 0), anchor, anchor), log, previous)
+}
+
+#[test]
+fn complete_two_to_sixteen_page_transfers_in_either_bank_reach_transaction_analysis() {
+    for count in 2..=16 {
+        for bank in [2, 18] {
+            let (restart, log, expected) = bank_fixture(count, bank);
+            let before = log.clone();
+            let view = discover(&Cx::for_testing(), &restart, LOG as u64, &mut |at, size| {
+                source(&log, at, size)
+            })
+            .unwrap();
+            assert_eq!(view.boundary.current_lsn, expected);
+            assert_eq!(view.pages.len(), count - 1);
+            let tail = check(&restart, &log).unwrap();
+            assert_eq!((tail.transaction_id, tail.redo_op), (24, 0x1A));
+            assert_eq!(log, before, "bank recovery must not rewrite native storage");
+        }
+    }
+}
+
+#[test]
+fn duplicate_complete_banks_ignore_usa_tokens_but_not_log_contents() {
+    let (restart, mut log, expected) = bank_fixture(3, 2);
+    let at = first((2, 0));
+    let mut previous = 0;
+    for index in 0..3 {
+        let destination = at + index * PAGE;
+        let current = lsn(1, destination + 64);
+        let raw = page(
+            &[(64, current, 24, if index == 2 { 0x1A } else { 0 }, previous)],
+            0xB000 + index as u16,
+        );
+        install(
+            &mut log,
+            (18 + index) * PAGE,
+            &transfer_copy(raw, destination, 3, index + 1),
+        );
+        previous = current;
+    }
+    assert_eq!(check(&restart, &log).unwrap().redo_op, 0x1A);
+    let view = discover(&Cx::for_testing(), &restart, LOG as u64, &mut |at, size| {
+        source(&log, at, size)
+    })
+    .unwrap();
+    assert_eq!(view.boundary.current_lsn, expected);
+    // Keep valid fixups and an unchanged maximum LSN while changing one client.
+    log[19 * PAGE + 64 + 36] ^= 1;
+    assert!(matches!(
+        check(&restart, &log),
+        Err(FfsError::Corruption { .. })
+    ));
+}
+
+#[test]
+fn a_spanning_record_in_a_complete_tail_transfer_is_reassembled_before_analysis() {
+    let at = first((2, 0));
+    let a = lsn(1, at + 64);
+    let b = lsn(1, at + 152);
+    let c = lsn(1, at + PAGE + 368);
+    let mut log = vec![0xFF; LOG];
+    let mut start = plain(b, a, 152);
+    put(&mut start, (64, a, 24, 0, 0));
+    put(&mut start, (152, b, 64, 0, 0));
+    start[152 + 24..152 + 28].copy_from_slice(&4200_u32.to_le_bytes());
+    start[152 + 40..152 + 42].copy_from_slice(&1_u16.to_le_bytes());
+    let mut end = plain(c, c, 456);
+    put(&mut end, (368, c, 64, 0x1A, b));
+    install(
+        &mut log,
+        2 * PAGE,
+        &transfer_copy(protect(start, 0xABCD), at, 2, 1),
+    );
+    install(
+        &mut log,
+        3 * PAGE,
+        &transfer_copy(protect(end, 0xBCDE), at + PAGE, 2, 2),
+    );
+    install(&mut log, at, &page(&[(64, a, 24, 0, 0)], 0xCAFE));
+    let before = log.clone();
+    let metadata = restart((2, 0), a, a);
+    let tail = check(&metadata, &log).unwrap();
+    assert_eq!((tail.transaction_id, tail.redo_op), (64, 0x1A));
+    assert_eq!(log, before);
+    for mutation in 0..3 {
+        let mut bad = log.clone();
+        match mutation {
+            0 => bad[2 * PAGE + 152 + 40..2 * PAGE + 152 + 42].fill(0),
+            1 => {
+                bad[2 * PAGE + 152 + 28..2 * PAGE + 152 + 30].copy_from_slice(&10_u16.to_le_bytes())
+            }
+            _ => bad[3 * PAGE + 368..3 * PAGE + 376].fill(0),
+        }
+        assert!(
+            check(&metadata, &bad).is_err(),
+            "bad spanning record {mutation}"
+        );
+    }
+}
+
+#[test]
+fn incomplete_page_comparison_includes_bytes_after_an_earlier_completed_record() {
+    let at = first((2, 0));
+    let a = lsn(1, at + 64);
+    let b = lsn(1, at + 152);
+    let metadata = restart((2, 0), a, a);
+    let mut raw = plain(b, a, 152);
+    put(&mut raw, (64, a, 24, 0, 0));
+    put(&mut raw, (152, b, 64, 0, 0));
+    raw[152 + 24..152 + 28].copy_from_slice(&4200_u32.to_le_bytes());
+    raw[152 + 40..152 + 42].copy_from_slice(&1_u16.to_le_bytes());
+    let cx = Cx::for_testing();
+    let original = Page::parse(&cx, &metadata, at as u64, protect(raw.clone(), 0xABCD)).unwrap();
+    let equal = Page::parse(&cx, &metadata, at as u64, protect(raw.clone(), 0xBCDE)).unwrap();
+    assert!(original.same_contents(&equal, 64));
+    for changed in [200, 510, 511, 1022, PAGE - 1] {
+        let mut bad = raw.clone();
+        bad[changed] ^= 1;
+        let other = Page::parse(&cx, &metadata, at as u64, protect(bad, 0xCAFE)).unwrap();
+        assert!(
+            !original.same_contents(&other, 64),
+            "continuation byte {changed}"
+        );
+    }
+}
+
+#[test]
+fn incomplete_discontinuous_torn_and_cross_generation_transfers_never_return_a_view() {
+    let (restart, log, _) = bank_fixture(3, 2);
+    let continuation = 3 * PAGE;
+    for mutation in 0..8 {
+        let mut bad = log.clone();
+        match mutation {
+            0 => bad[continuation..continuation + PAGE].fill(0xFF),
+            1 => bad[continuation + 20..continuation + 22].copy_from_slice(&2_u16.to_le_bytes()),
+            2 => bad[continuation + 22..continuation + 24].copy_from_slice(&1_u16.to_le_bytes()),
+            3 => bad[continuation + 60..continuation + 64].copy_from_slice(
+                &u32::try_from(first((2, 0)) + 2 * PAGE)
+                    .unwrap()
+                    .to_le_bytes(),
+            ),
+            4 => bad[continuation + PAGE - 1] ^= 1,
+            5 => {
+                let future = lsn(2, first((2, 0)) + PAGE + 64);
+                bad[continuation + 8..continuation + 16].copy_from_slice(&future.to_le_bytes());
+                bad[continuation + 32..continuation + 40].copy_from_slice(&future.to_le_bytes());
+            }
+            6 => bad[4 * PAGE + 24..4 * PAGE + 26].fill(0),
+            _ => bad[2 * PAGE + 22..2 * PAGE + 24].copy_from_slice(&2_u16.to_le_bytes()),
+        }
+        let before = bad.clone();
+        assert!(
+            check(&restart, &bad).is_err(),
+            "invalid transfer {mutation}"
+        );
+        assert_eq!(bad, before);
+    }
+}
+
+#[test]
+fn bank_capacity_and_destination_wrap_are_not_completed_from_neighboring_storage() {
+    let (restart, log, _) = bank_fixture(2, 2);
+    let mut beyond_bank = vec![0xFF; LOG];
+    install(&mut beyond_bank, 17 * PAGE, &log[2 * PAGE..3 * PAGE]);
+    install(&mut beyond_bank, 18 * PAGE, &log[3 * PAGE..4 * PAGE]);
+    assert!(matches!(
+        check(&restart, &beyond_bank),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    let mut wrap = log;
+    wrap[2 * PAGE + 60..2 * PAGE + 64]
+        .copy_from_slice(&u32::try_from(LOG - PAGE).unwrap().to_le_bytes());
+    wrap[3 * PAGE + 60..3 * PAGE + 64]
+        .copy_from_slice(&u32::try_from(first((2, 0))).unwrap().to_le_bytes());
+    assert!(matches!(
+        check(&restart, &wrap),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+}
+
+#[test]
+fn competing_transfers_need_uniform_order_and_identical_destination_sets() {
+    let at = first((2, 0));
+    let anchor = lsn(1, at + 64);
+    let metadata = restart((2, 0), anchor, anchor);
+    for crossed in [false, true] {
+        let mut log = vec![0xFF; LOG];
+        for (bank, offsets) in [(2, [64, 152]), (18, [152, if crossed { 64 } else { 152 }])] {
+            for (index, offset) in offsets.into_iter().enumerate() {
+                let destination = at + index * PAGE;
+                let current = lsn(1, destination + offset);
+                // Include the same earlier record when this page has two.
+                let mut specs = vec![(64, lsn(1, destination + 64), 24, 0, 0)];
+                if offset != 64 {
+                    specs.push((offset, current, 64, 0, 0));
+                }
+                let raw = page(&specs, 0xABCD);
+                install(
+                    &mut log,
+                    (bank + index) * PAGE,
+                    &transfer_copy(raw, destination, 2, index + 1),
+                );
+            }
+        }
+        let result = transfers::read(&Cx::for_testing(), &metadata, anchor, &mut |at, size| {
+            source(&log, at, size)
+        });
+        if crossed {
+            assert!(matches!(result, Err(FfsError::UnsupportedFeature(_))));
+        } else {
+            let copies = result.unwrap();
+            assert_eq!(copies.pages[&(at as u64)].last, lsn(1, at + 152));
+            assert_eq!(copies.groups.len(), 1);
+        }
+    }
+    let (_, mut log, _) = bank_fixture(2, 2);
+    for index in 0..2 {
+        let destination = at + (index + 1) * PAGE;
+        let current = lsn(1, destination + 64);
+        let raw = page(&[(64, current, 24, 0, 0)], 0xBCDE);
+        install(
+            &mut log,
+            (18 + index) * PAGE,
+            &transfer_copy(raw, destination, 2, index + 1),
+        );
+    }
+    assert!(matches!(
+        transfers::read(&Cx::for_testing(), &metadata, anchor, &mut |at, size| {
+            source(&log, at, size)
+        }),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+}
+
+#[test]
+fn partially_newer_ring_cannot_be_spliced_with_an_older_tail_transfer() {
+    let (restart, mut log, _) = bank_fixture(3, 2);
+    let at = first((2, 0)) + PAGE;
+    let first_lsn = lsn(1, at + 64);
+    let later = lsn(1, at + 152);
+    install(
+        &mut log,
+        at,
+        &page(
+            &[
+                (64, first_lsn, 24, 0, restart.current_lsn),
+                (152, later, 64, 0, 0),
+            ],
+            0xCAFE,
+        ),
+    );
+    // Page two is newer on the ring but page three exists only in the bank.
+    // Both pages decode individually; combining them would mix publications.
+    match discover(&Cx::for_testing(), &restart, LOG as u64, &mut |at, size| {
+        source(&log, at, size)
+    }) {
+        Err(FfsError::UnsupportedFeature(detail)) => assert!(detail.contains("mixed-transfer")),
+        _ => panic!("mixed ring/bank publication was not refused"),
+    }
+}
+
+#[test]
+fn cancellation_while_loading_a_transfer_never_returns_its_valid_prefix() {
+    let (restart, log, _) = bank_fixture(16, 18);
+    for failed_page in 0..16 {
+        let failed_at = ((18 + failed_page) * PAGE) as u64;
+        let mut failed = false;
+        let result = validate_latest_volume(
+            &Cx::for_testing(),
+            &restart,
+            LOG as u64,
+            &mut |at, size| {
+                assert!(!failed, "no source reads are allowed after cancellation");
+                if at == failed_at {
+                    failed = true;
+                    Err(FfsError::Cancelled)
+                } else {
+                    source(&log, at, size)
+                }
+            },
+            None,
+        );
+        assert!(failed);
+        assert!(matches!(result, Err(FfsError::Cancelled)));
+    }
+}

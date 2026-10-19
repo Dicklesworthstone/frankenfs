@@ -125,8 +125,14 @@ fn successor(
         let header_end = position
             .offset
             .checked_add(usize::from(restart.record_header_len));
+        // When the last record continues onto another page, next_record_off
+        // can still describe the preceding completed record. The following
+        // LFS header and entire spanning payload must validate in read_record;
+        // an earlier completion marker is not the end of that record's data.
         if header_end.is_none_or(|end| end > page_size)
-            || (page.next_record_off != 0 && position.offset >= usize::from(page.next_record_off))
+            || (last == last_end
+                && page.next_record_off != 0
+                && position.offset >= usize::from(page.next_record_off))
         {
             return Err(corrupt(
                 position.page,

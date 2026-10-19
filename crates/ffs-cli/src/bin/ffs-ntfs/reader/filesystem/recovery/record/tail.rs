@@ -2,11 +2,13 @@
 //!
 //! Reference: Linux v6.17 fs/ntfs3/fslog.c, last_log_lsn and tail-page restore.
 //! A restart is a checkpoint, not necessarily the last durable log record. The
-//! bounded view below normalizes single-page tail copies only in private memory,
+//! bounded view below normalizes complete tail transfers only in private memory,
 //! then the existing chronological reader and checkpoint/transaction Analysis
 //! validate the entire retained interval. A largest page LSN alone is NOT proof.
-//! Torn/ambiguous copies, partial newer records and multi-page tail transfers
-//! are refused. No native page, restart area, dirty flag or mount policy changes.
+//! Torn/ambiguous copies and incomplete or mixed-publication transfers are
+//! refused. No native page, restart area, dirty flag or mount policy changes.
+
+mod transfers;
 
 use super::{
     Cx, NtfsVolume, RecordPage, Restart, Result, TailRecord, checkpoint, corrupt, lsn_to_vbo,
@@ -59,7 +61,14 @@ impl Page {
     /// USA tokens, transfer positions and unused slack are not log contents.
     /// Compare all initialized client bytes and their completion boundaries.
     fn same_contents(&self, other: &Self, data_off: usize) -> bool {
-        let end = usize::from(self.fixed.next_record_off);
+        // A page containing an incomplete record uses its entire data area,
+        // even when next_record_off marks an earlier completed record. Do not
+        // ignore the newer record's bytes when comparing a ring/tail pair.
+        let end = if self.fixed.next_record_off == 0 || self.last != self.completed {
+            self.fixed.bytes.len()
+        } else {
+            usize::from(self.fixed.next_record_off)
+        };
         self.last == other.last
             && self.completed == other.completed
             && self.fixed.next_record_off == other.fixed.next_record_off
@@ -162,7 +171,6 @@ fn discover(
         ));
     }
     let reserved = if restart.version.0 == 2 { 34_u64 } else { 4 };
-    let first_page = reserved * page_bytes;
     let total_pages = restart.file_size / page_bytes;
     if total_pages <= reserved || total_pages > MAX_PAGES || restart.file_size > IO_BUDGET {
         return Err(unsupported(
@@ -178,89 +186,11 @@ fn discover(
     let page_size =
         usize::try_from(page_bytes).map_err(|_| corrupt(0, "$LogFile tail page size overflows"))?;
     let data_off = usize::from(restart.data_off);
-    let mut copies: BTreeMap<u64, Page> = BTreeMap::new();
-
-    // v1 has two single-page tail slots; v2 has two banks of sixteen slots.
-    // A native multi-page I/O transfer needs bank-coherent selection; admitting
-    // its pages independently could splice two different publication attempts.
-    for slot in 2..reserved {
-        checkpoint(cx)?;
-        let at = slot * page_bytes;
-        let mut raw = read_exact(cx, restart.file_size, at, page_size, read)?;
-        if blank(&raw) {
-            continue;
-        }
-        let destination = if restart.version.0 == 1 {
-            u64_at(&raw, 8)?
-        } else {
-            u64::from(u32_at(&raw, 60)?)
-        };
-        if destination < first_page
-            || destination >= restart.file_size
-            || !destination.is_multiple_of(page_bytes)
-        {
-            return Err(corrupt(
-                at,
-                "$LogFile tail copy has an invalid native destination",
-            ));
-        }
-        // Validate every original trailer before normalizing any header field.
-        let fixed = restore_page(cx, raw.clone(), restart, destination)?;
-        if restart.version.0 == 2 {
-            let usa = usize::from(u16_at(&fixed.bytes, 4)?);
-            let usa_end = usa + usize::from(u16_at(&fixed.bytes, 6)?) * 2;
-            if usa < 64 && usa_end > 60 {
-                return Err(corrupt(
-                    at,
-                    "$LogFile v2 tail normalization would overwrite its USA",
-                ));
-            }
-        }
-        if u16_at(&fixed.bytes, 20)? != 1 || u16_at(&fixed.bytes, 22)? != 1 {
-            return Err(unsupported(
-                "$LogFile multi-page tail transfers need bank-coherent recovery",
-            ));
-        }
-        let completed = u64_at(&fixed.bytes, 32)?;
-        if fixed.next_record_off == 0
-            || completed == 0
-            || u32_at(&fixed.bytes, 16)? & super::PAGE_RECORD_END == 0
-        {
-            return Err(unsupported(
-                "$LogFile tail copy does not establish a complete record boundary",
-            ));
-        }
-        if restart.version.0 == 1 {
-            // v1 borrows the page LSN word for its destination while in a tail
-            // slot. Native publication restores it from last_end_lsn.
-            raw[8..16].copy_from_slice(&completed.to_le_bytes());
-        } else {
-            // v2 keeps the LSN and clears the separate tail destination field.
-            raw[60..64].fill(0);
-        }
-        let page = Page::parse(cx, restart, destination, raw)?;
-        if page.last != page.completed {
-            return Err(unsupported(
-                "$LogFile tail copy contains an incomplete newest record",
-            ));
-        }
-        generation(restart, page.last, oldest)?;
-        if let Some(previous) = copies.get(&destination) {
-            if previous.last > page.last {
-                continue;
-            }
-            if previous.last == page.last {
-                if !previous.same_contents(&page, data_off) {
-                    return Err(corrupt(
-                        at,
-                        "$LogFile equal-LSN tail copies have conflicting contents",
-                    ));
-                }
-                continue;
-            }
-        }
-        copies.insert(destination, page);
-    }
+    let transfers::Copies {
+        pages: mut copies,
+        groups,
+    } = transfers::read(cx, restart, oldest, read)?;
+    let mut decisions = BTreeMap::new();
 
     let mut view = View {
         boundary: restart.clone(),
@@ -278,10 +208,10 @@ fn discover(
             Some(Page::parse(cx, restart, at, raw)?)
         };
         let chosen = if let Some(copy) = copies.remove(&at) {
-            let use_copy = match &ring {
-                None => true,
-                Some(ring) if copy.last > ring.last => true,
-                Some(ring) if copy.last < ring.last => false,
+            let decision = match &ring {
+                None => transfers::Selection::Copy,
+                Some(ring) if copy.last > ring.last => transfers::Selection::Copy,
+                Some(ring) if copy.last < ring.last => transfers::Selection::Ring,
                 Some(ring) => {
                     if !copy.same_contents(ring, data_off) {
                         return Err(corrupt(
@@ -289,10 +219,11 @@ fn discover(
                             "$LogFile tail and ring disagree at the same LSN",
                         ));
                     }
-                    false
+                    transfers::Selection::Equal
                 }
             };
-            if use_copy {
+            decisions.insert(at, decision);
+            if matches!(decision, transfers::Selection::Copy) {
                 view.pages.insert(at, copy.raw.clone());
                 Some(copy)
             } else {
@@ -311,6 +242,7 @@ fn discover(
         started = started.max(page.last);
         completed = completed.max(page.completed);
     }
+    transfers::validate_selection(&groups, &decisions)?;
     if started > completed {
         return Err(unsupported(
             "$LogFile has a newer incomplete record; partial-tail salvage is not admitted",
