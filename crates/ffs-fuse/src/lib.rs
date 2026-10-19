@@ -4991,7 +4991,7 @@ fn resolve_create_invalidation(raw: Option<&str>) -> bool {
     })
 }
 
-/// One FUSE reverse notification, queued for the thread that owns the notifier.
+/// One FUSE reverse notification, queued for the worker that owns the notifier.
 #[derive(Debug)]
 enum KernelNotification {
     Entry {
@@ -5003,7 +5003,7 @@ enum KernelNotification {
     },
 }
 
-/// Handle to the thread that issues FUSE reverse notifications (bd-7s0p7).
+/// Handle to the worker that issues FUSE reverse notifications (bd-7s0p7).
 ///
 /// # Why these cannot be issued from the dispatch thread
 ///
@@ -5098,56 +5098,148 @@ impl NegativeDentryHints {
 
 #[derive(Debug, Clone)]
 struct KernelNotifyQueue {
-    sender: asupersync::channel::mpsc::UnboundedSender<KernelNotification>,
-    negative_entries: Arc<Mutex<NegativeDentryHints>>,
+    state: Arc<KernelNotifyState>,
+}
+
+#[derive(Debug)]
+struct KernelNotifyState {
+    sender: Option<asupersync::channel::mpsc::UnboundedSender<KernelNotification>>,
+    negative_entries: Mutex<NegativeDentryHints>,
+    worker: Option<KernelNotifyWorker>,
+}
+
+#[derive(Debug)]
+struct KernelNotifyWorker {
+    region: asupersync::cx::ChildRegion,
+    task: asupersync::runtime::TaskHandle<()>,
+}
+
+impl Drop for KernelNotifyState {
+    fn drop(&mut self) {
+        // The last producer owns shutdown. The child never owns this state or
+        // its region: joining or closing its own region would self-deadlock.
+        // Close admission first, drain the FIFO, then close from outside it.
+        drop(self.sender.take());
+        if let Some(KernelNotifyWorker { region, mut task }) = self.worker.take() {
+            let runtime = fuse_runtime();
+            if let Err(error) = runtime.block_on(task.join(fuse_root_cx())) {
+                warn!(?error, "FUSE notification worker failed while draining");
+            }
+            if let Err(error) = runtime.block_on(region.close()) {
+                warn!(?error, "FUSE notification region failed to close");
+            }
+        }
+    }
 }
 
 impl KernelNotifyQueue {
-    /// Take ownership of `notifier` on a dedicated thread and return a handle.
+    /// Take ownership of `notifier` on an off-thread worker and return a handle.
     ///
     /// A failure to spawn is logged and degrades to "no kernel notifications"
     /// rather than failing the mount: the receiver drops, every later `send`
     /// fails, and the filesystem stays correct because entry/attr TTLs still
     /// expire. A mount must not fail because a cache-eviction helper did.
     fn spawn(notifier: fuser::Notifier) -> Self {
+        Self::spawn_with_handler(move |message| match message {
+            KernelNotification::Entry { parent, name } => {
+                if let Err(error) = notifier.inval_entry(parent, &name) {
+                    debug!(parent, name = ?name, error = %error,
+                        "FUSE kernel entry invalidation failed");
+                }
+            }
+            KernelNotification::Inode { ino } => {
+                if let Err(error) = notifier.inval_inode(ino, 0, 0) {
+                    debug!(ino, error = %error,
+                        "FUSE kernel inode invalidation failed");
+                }
+            }
+        })
+    }
+
+    fn spawn_with_handler<F>(mut notify: F) -> Self
+    where
+        F: FnMut(KernelNotification) + Send + 'static,
+    {
         let (sender, mut receiver) =
             asupersync::channel::mpsc::unbounded_channel::<KernelNotification>();
         let runtime = fuse_runtime();
         let root_cx = fuse_root_cx();
-        match runtime
+        let worker = match runtime
             .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
         {
             Ok(region) => {
-                let region_cx = region.cx().clone();
-                if let Err(error) = region_cx.spawn_blocking(move |worker_cx| {
-                    while let Ok(message) = fuse_runtime().block_on(receiver.recv(&worker_cx)) {
-                        match message {
-                            KernelNotification::Entry { parent, name } => {
-                                if let Err(error) = notifier.inval_entry(parent, &name) {
-                                    debug!(parent, name = ?name, error = %error,
-                                        "FUSE kernel entry invalidation failed");
-                                }
+                let task = region.cx().spawn(move |worker_cx| async move {
+                    // Idle queues must not occupy the shared blocking pool.
+                    // Only the notifier syscall runs there, one message at a
+                    // time so entry/inode invalidations retain FIFO order.
+                    while let Ok(message) = receiver.recv(&worker_cx).await {
+                        let (completed_tx, mut completed_rx) =
+                            asupersync::channel::oneshot::channel();
+                        let completion_cx = fuse_root_cx();
+                        let mut blocking = match worker_cx.spawn_blocking(move |_cx| {
+                            let Ok(permit) = completed_tx.reserve(completion_cx) else {
+                                return;
+                            };
+                            // The dependency's blocking join can finish early
+                            // under cancellation. This independent receipt
+                            // follows actual callback completion or unwinding;
+                            // a wrapper result alone never acknowledges I/O.
+                            let completed =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                    notify(message);
+                                    notify
+                                }));
+                            let _ = permit.send(completed);
+                        }) {
+                            Ok(task) => task,
+                            Err(error) => {
+                                warn!(?error, "FUSE notification callback failed to spawn");
+                                break;
                             }
-                            KernelNotification::Inode { ino } => {
-                                if let Err(error) = notifier.inval_inode(ino, 0, 0) {
-                                    debug!(ino, error = %error,
-                                        "FUSE kernel inode invalidation failed");
-                                }
+                        };
+                        let completed = completed_rx.recv(fuse_root_cx()).await;
+                        if let Err(error) = blocking.join(fuse_root_cx()).await {
+                            warn!(?error, "FUSE notification callback task failed");
+                            break;
+                        }
+                        match completed {
+                            Ok(Ok(handler)) => notify = handler,
+                            Ok(Err(_)) => {
+                                warn!("FUSE notification handler panicked");
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(?error, "FUSE notification callback receipt lost");
+                                break;
                             }
                         }
                     }
-                    let _ = fuse_runtime().block_on(region.close());
-                }) {
-                    warn!(error = %error, "FUSE notification task failed to spawn; kernel cache entries will expire by TTL instead");
+                });
+                match task {
+                    Ok(task) => Some(KernelNotifyWorker { region, task }),
+                    Err(error) => {
+                        warn!(error = %error, "FUSE notification task failed to spawn; kernel cache entries will expire by TTL instead");
+                        if let Err(error) = runtime.block_on(region.close()) {
+                            warn!(
+                                ?error,
+                                "FUSE notification region failed to close after spawn refusal"
+                            );
+                        }
+                        None
+                    }
                 }
             }
             Err(error) => {
                 warn!(error = %error, "FUSE notification region failed to open; kernel cache entries will expire by TTL instead");
+                None
             }
-        }
+        };
         Self {
-            sender,
-            negative_entries: Arc::new(Mutex::new(NegativeDentryHints::default())),
+            state: Arc::new(KernelNotifyState {
+                sender: Some(sender),
+                negative_entries: Mutex::new(NegativeDentryHints::default()),
+                worker,
+            }),
         }
     }
 
@@ -5159,21 +5251,25 @@ impl KernelNotifyQueue {
         let (sender, receiver) = asupersync::channel::mpsc::unbounded_channel();
         (
             Self {
-                sender,
-                negative_entries: Arc::new(Mutex::new(NegativeDentryHints::default())),
+                state: Arc::new(KernelNotifyState {
+                    sender: Some(sender),
+                    negative_entries: Mutex::new(NegativeDentryHints::default()),
+                    worker: None,
+                }),
             },
             receiver,
         )
     }
 
     fn remember_negative_entry(&self, parent: u64, name: &OsStr) {
-        if let Ok(mut hints) = self.negative_entries.lock() {
+        if let Ok(mut hints) = self.state.negative_entries.lock() {
             hints.remember(parent, name);
         }
     }
 
     fn take_negative_entry(&self, parent: u64, name: &OsStr) -> bool {
-        self.negative_entries
+        self.state
+            .negative_entries
             .lock()
             .map_or(true, |mut hints| hints.take(parent, name))
     }
@@ -5183,7 +5279,9 @@ impl KernelNotifyQueue {
         // attributed to a real send or ruled out. A relaxed counter on a path
         // that already allocates an OsString and crosses a channel.
         NOTIFY_ENTRY_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(permit) = self.sender.try_reserve() {
+        if let Some(sender) = self.state.sender.as_ref()
+            && let Ok(permit) = sender.try_reserve()
+        {
             let _ = permit.send(KernelNotification::Entry {
                 parent,
                 name: name.to_owned(),
@@ -5193,7 +5291,9 @@ impl KernelNotifyQueue {
 
     fn inode(&self, ino: u64) {
         NOTIFY_INODE_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(permit) = self.sender.try_reserve() {
+        if let Some(sender) = self.state.sender.as_ref()
+            && let Ok(permit) = sender.try_reserve()
+        {
             let _ = permit.send(KernelNotification::Inode { ino });
         }
     }
@@ -10831,6 +10931,148 @@ mod tests {
             read_u64(ATTR_VALID_OFFSET),
             NEGATIVE_ENTRY_TTL.as_secs(),
             "fuser must carry the same short TTL in the paired attr field"
+        );
+    }
+
+    #[test]
+    fn kernel_notify_last_owner_drains_and_retires_handler_bd_in31y() {
+        struct Retired(Arc<AtomicUsize>);
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
+        }
+
+        let retired = Arc::new(AtomicUsize::new(0));
+        let retirement = Retired(Arc::clone(&retired));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let worker_observed = Arc::clone(&observed);
+        let (started, mut started_rx) = asupersync::channel::oneshot::channel();
+        let mut started = Some(started);
+        let queue = KernelNotifyQueue::spawn_with_handler(move |message| {
+            let _retirement = &retirement;
+            let event = match message {
+                KernelNotification::Entry { parent, name } => (parent, Some(name)),
+                KernelNotification::Inode { ino } => (ino, None),
+            };
+            worker_observed
+                .lock()
+                .expect("notification events")
+                .push(event);
+            if let Some(started) = started.take() {
+                started
+                    .reserve(fuse_root_cx())
+                    .expect("worker-start receipt")
+                    .send(())
+                    .expect("worker-start receipt delivered");
+            }
+        });
+        let last_owner = queue.clone();
+        queue.entry(17, OsStr::new("before-clone-drop"));
+        fuse_runtime()
+            .block_on(asupersync::time::timeout(
+                fuse_root_cx().now(),
+                Duration::from_secs(5),
+                started_rx.recv(fuse_root_cx()),
+            ))
+            .expect("notification worker must actually start")
+            .expect("worker-start receipt must arrive");
+
+        drop(queue);
+        assert_eq!(retired.load(Ordering::Acquire), 0);
+        last_owner.inode(23);
+        last_owner.entry(29, OsStr::new("after-clone-drop"));
+        drop(last_owner);
+
+        assert_eq!(
+            retired.load(Ordering::Acquire),
+            1,
+            "last queue owner must drain the worker and retire its handler"
+        );
+        assert_eq!(
+            *observed.lock().expect("notification events"),
+            vec![
+                (17, Some(OsString::from("before-clone-drop"))),
+                (23, None),
+                (29, Some(OsString::from("after-clone-drop"))),
+            ],
+            "queued notifications must drain in FIFO order"
+        );
+    }
+
+    #[test]
+    fn kernel_notify_idle_queues_leave_blocking_pool_available_bd_in31y() {
+        let mut queues = Vec::new();
+        // Ten times the shared pool capacity. Each real worker must process
+        // an event before becoming idle; merely admitting tasks proves less.
+        for ino in 0..80 {
+            let (started, mut started_rx) = asupersync::channel::oneshot::channel();
+            let mut started = Some(started);
+            let queue = KernelNotifyQueue::spawn_with_handler(move |_message| {
+                if let Some(started) = started.take() {
+                    started
+                        .reserve(fuse_root_cx())
+                        .expect("worker-start receipt")
+                        .send(())
+                        .expect("worker-start receipt delivered");
+                }
+            });
+            queue.inode(ino);
+            fuse_runtime()
+                .block_on(asupersync::time::timeout(
+                    fuse_root_cx().now(),
+                    Duration::from_secs(5),
+                    started_rx.recv(fuse_root_cx()),
+                ))
+                .expect("each notification worker must actually start")
+                .expect("worker-start receipt must arrive");
+            queues.push(queue);
+        }
+
+        let mut probe = fuse_root_cx()
+            .spawn_blocking(|_cx| 41)
+            .expect("admit independent blocking work");
+        assert_eq!(
+            fuse_runtime()
+                .block_on(asupersync::time::timeout(
+                    fuse_root_cx().now(),
+                    Duration::from_secs(5),
+                    probe.join(fuse_root_cx()),
+                ))
+                .expect("idle notification workers must leave blocking capacity")
+                .expect("independent blocking work must succeed"),
+            41
+        );
+        drop(queues);
+    }
+
+    #[test]
+    fn kernel_notify_panicked_handler_retires_before_shutdown_returns_bd_in31y() {
+        struct Retired(Arc<AtomicUsize>);
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
+        }
+
+        let retired = Arc::new(AtomicUsize::new(0));
+        let retirement = Retired(Arc::clone(&retired));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let queue = KernelNotifyQueue::spawn_with_handler(move |_message| {
+            let _retirement = &retirement;
+            worker_calls.fetch_add(1, Ordering::Relaxed);
+            panic!("planted notification callback failure");
+        });
+        queue.inode(17);
+        queue.inode(23);
+        drop(queue);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            retired.load(Ordering::Acquire),
+            1,
+            "a panicked callback must release its captures before teardown returns"
         );
     }
 

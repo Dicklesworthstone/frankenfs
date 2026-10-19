@@ -155,7 +155,7 @@ impl FrankenFuse {
     }
 
     fn install_kernel_notifier(&self, notifier: fuser::Notifier) {
-        // bd-7s0p7: the notifier is handed to a dedicated thread rather than
+        // bd-7s0p7: the notifier is handed to an off-thread worker rather than
         // stored for the dispatch thread to use. See `KernelNotifyQueue`.
         let queue = KernelNotifyQueue::spawn(notifier);
         let mut guard = match self.inner.kernel_notifier.lock() {
@@ -165,7 +165,11 @@ impl FrankenFuse {
                 poisoned.into_inner()
             }
         };
-        *guard = Some(queue);
+        let previous = guard.replace(queue);
+        drop(guard);
+        // Last-owner teardown drains callbacks; never wait for them while
+        // holding the notifier slot mutex.
+        drop(previous);
     }
 
     fn kernel_notifier(&self) -> Option<KernelNotifyQueue> {
