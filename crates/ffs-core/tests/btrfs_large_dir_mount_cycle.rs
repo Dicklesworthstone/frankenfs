@@ -185,7 +185,7 @@ fn btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s() {
     std::fs::copy(&control_image, &candidate_image).expect("copy fresh btrfs fixture");
     let cx = Cx::for_testing();
 
-    let populate = |fs: &OpenFs| {
+    let populate = |fs: &OpenFs| -> ffs_error::Result<()> {
         for i in 0..CREATE_COUNT {
             fs.create(
                 &cx,
@@ -194,28 +194,25 @@ fn btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s() {
                 0o644,
                 0,
                 0,
-            )
-            .unwrap_or_else(|error| panic!("create fill{i:05}.dat failed: {error}"));
+            )?;
         }
-        let sentinel = fs
-            .create(
-                &cx,
-                BTRFS_ROOT_DIR,
-                OsStr::new("growth-sentinel"),
-                0o644,
-                0,
-                0,
-            )
-            .expect("create kernel-readback sentinel");
-        fs.write(&cx, sentinel.ino, 0, SENTINEL)
-            .expect("write kernel-readback sentinel");
+        let sentinel = fs.create(
+            &cx,
+            BTRFS_ROOT_DIR,
+            OsStr::new("growth-sentinel"),
+            0o644,
+            0,
+            0,
+        )?;
+        fs.write(&cx, sentinel.ino, 0, SENTINEL)?;
+        Ok(())
     };
 
     {
         let control = open_rw(&cx, &control_image).expect("open growth-disabled control");
         control.set_btrfs_grow_chunks(false);
-        populate(&control);
-        let error = FsOps::flush_on_destroy(&control, &cx)
+        let error = populate(&control)
+            .and_then(|()| FsOps::flush_on_destroy(&control, &cx))
             .expect_err("fixture must exhaust the initial metadata chunk with growth disabled");
         assert_eq!(
             error.to_errno(),
@@ -230,7 +227,7 @@ fn btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s() {
             candidate.btrfs_grow_chunks_enabled(),
             "metadata chunk growth is the shipped default (bd-uxh7t)"
         );
-        populate(&candidate);
+        populate(&candidate).expect("chunk growth must make populate succeed");
         FsOps::flush_on_destroy(&candidate, &cx)
             .expect("chunk growth must make the identical workload commit");
     }
