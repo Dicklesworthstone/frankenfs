@@ -1312,7 +1312,7 @@ enum Command {
         /// Requires `--runtime-mode managed`.
         /// Console output is operational observability only: it never promotes
         /// `swarm.responsiveness` or `adaptive_runtime` readiness.
-        #[arg(long = "console")]
+        #[arg(long = "console", visible_alias = "mount-console")]
         console: bool,
         /// Write the runtime console snapshot as machine JSON (requires `--console`).
         ///
@@ -1557,6 +1557,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Launch the FrankenFS telemetry dashboard (TUI, ASCII console, or JSON snapshot).
+    Tui {
+        /// Path to the filesystem image (ext4 or btrfs).
+        image: PathBuf,
+        /// Emit a single live telemetry snapshot as JSON and exit.
+        #[arg(long = "snapshot-json")]
+        snapshot_json: bool,
+        /// Run an initial scrub pass to populate live scrub/repair telemetry.
+        #[arg(long)]
+        scrub: bool,
+        /// Interactive TUI refresh interval in milliseconds.
+        #[arg(long = "refresh-ms", default_value_t = 1000)]
+        refresh_ms: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1659,6 +1673,7 @@ impl Command {
             Self::Parity { .. } => "parity",
             Self::Evidence { .. } => "evidence",
             Self::Mkfs { .. } => "mkfs",
+            Self::Tui { .. } => "tui",
         }
     }
 }
@@ -2818,6 +2833,12 @@ fn run() -> Result<()> {
             label,
             json,
         } => mkfs_cmd(&output, size_mb, block_size, &label, json),
+        Command::Tui {
+            image,
+            snapshot_json,
+            scrub,
+            refresh_ms,
+        } => tui_cmd(&image, snapshot_json, scrub, refresh_ms),
     };
 
     let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -7481,6 +7502,7 @@ struct ManagedMountParams<'a> {
     adaptive_runtime_plan: Option<&'a MountAdaptiveRuntimePlan>,
     adaptive_runtime_summary: &'a MountAdaptiveRuntimeSummaryConfig,
     console: &'a MountConsoleConfig,
+    repair_metrics: Option<&'a ffs_repair::pipeline::RepairPipelineMetrics>,
     unmount_timeout_secs: u64,
     operation_id: &'a str,
     scenario_id: &'a str,
@@ -7611,6 +7633,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
         "managed_mount_start"
     );
 
+    let fs_for_console = Arc::clone(&open_fs);
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
     let handle = mount_managed(fs_ops, params.mountpoint, &config).with_context(|| {
         format!(
@@ -7641,6 +7664,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
         params.console,
         &mount_console_observation(
             params,
+            Some(fs_for_console.as_ref()),
             RuntimeConsoleMode::Managed,
             MountConsoleRuntimeMetrics::from_snapshot(&metrics),
             Vec::new(),
@@ -7693,6 +7717,7 @@ impl MountConsoleRuntimeMetrics {
 /// Assemble a `MountConsoleObservation` from a finished managed/per-core mount.
 fn mount_console_observation(
     params: &ManagedMountParams<'_>,
+    open_fs: Option<&OpenFs>,
     runtime_mode: RuntimeConsoleMode,
     metrics: MountConsoleRuntimeMetrics,
     per_core: Vec<MountConsoleCore>,
@@ -7703,6 +7728,26 @@ fn mount_console_observation(
         .backpressure
         .as_ref()
         .map_or(DegradationLevel::Normal, |gate| gate.level());
+    let uptime_seconds = shutdown_at
+        .duration_since(started_at)
+        .map_or(0, |duration| duration.as_secs());
+    let dashboard_snapshot = open_fs.map(|fs| {
+        let mut collector = ffs_tui::LiveTelemetryCollector::new();
+        let repair_snap = params
+            .repair_metrics
+            .map(ffs_repair::pipeline::RepairPipelineMetrics::snapshot);
+        let mountpoint_label = params.mountpoint.display().to_string();
+        collector.sample_open_fs(
+            fs,
+            &mountpoint_label,
+            uptime_seconds,
+            Some(metrics.bytes_read),
+            0,
+            params.adaptive_runtime_plan.map(|plan| plan.fsm.as_ref()),
+            None,
+            repair_snap.as_ref(),
+        )
+    });
     MountConsoleObservation {
         operation_id: params.operation_id.to_owned(),
         scenario_id: params.scenario_id.to_owned(),
@@ -7724,12 +7769,14 @@ fn mount_console_observation(
             params.runtime,
             params.read_write,
         ),
+        dashboard_snapshot,
     }
 }
 
 /// Emit the runtime console artifact for a finished per-core mount.
 fn emit_per_core_mount_console(
     params: &ManagedMountParams<'_>,
+    open_fs: Option<&OpenFs>,
     metrics: &ffs_fuse::MetricsSnapshot,
     aggregate: &ffs_fuse::per_core::AggregateMetrics,
     started_at: std::time::SystemTime,
@@ -7758,6 +7805,7 @@ fn emit_per_core_mount_console(
         params.console,
         &mount_console_observation(
             params,
+            open_fs,
             RuntimeConsoleMode::PerCore,
             MountConsoleRuntimeMetrics::from_snapshot(metrics),
             per_core,
@@ -7805,6 +7853,7 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
     };
 
+    let fs_for_console = Arc::clone(&open_fs);
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
     let handle = mount_managed_per_core(fs_ops, params.mountpoint, &config).with_context(|| {
         format!(
@@ -7870,7 +7919,14 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
         "per_core_mount_shutdown_complete"
     );
 
-    emit_per_core_mount_console(params, &metrics, &aggregate, mount_started, mount_ended)?;
+    emit_per_core_mount_console(
+        params,
+        Some(fs_for_console.as_ref()),
+        &metrics,
+        &aggregate,
+        mount_started,
+        mount_ended,
+    )?;
 
     let observation = build_mount_per_core_shutdown_observation(metrics, worker_count, &aggregate);
     emit_mount_adaptive_runtime_shutdown_summary(
@@ -7987,6 +8043,7 @@ struct MountBackgroundScrubPlan {
 
 struct MountBackgroundScrubGuard {
     worker: MountIoWorker<ScrubDaemonMetrics>,
+    pipeline_metrics: ffs_repair::pipeline::RepairPipelineMetrics,
     operation_id: String,
     scenario_id: String,
 }
@@ -8199,6 +8256,7 @@ struct MountBackgroundScrubThreadConfig<'a> {
     ledger_path: Option<&'a Path>,
     repair_writes_enabled: bool,
     mounted_repair_writeback: Option<Arc<OpenFs>>,
+    pipeline_metrics: ffs_repair::pipeline::RepairPipelineMetrics,
     operation_id: &'a str,
     scenario_id: &'a str,
 }
@@ -8264,7 +8322,8 @@ fn run_mount_background_scrub_daemon(
     .with_repair_writes_enabled(repair_writes_enabled)
     // bd-jufod: every validator chosen above judges block content, so a
     // decoded block it rejects (stale or damaged symbols) is never written.
-    .with_decoded_block_verification(true);
+    .with_decoded_block_verification(true)
+    .with_metrics(config.pipeline_metrics);
     if let Some(open_fs) = config.mounted_repair_writeback {
         pipeline = pipeline.with_recovery_writeback(Arc::new(MountedRecoveryWriteback { open_fs }));
     }
@@ -8351,6 +8410,8 @@ fn start_mount_background_scrub(
     let interval = Duration::from_secs(config.interval_secs);
     let image_path = image_path.to_path_buf();
     let ledger_path = config.ledger_path.clone();
+    let pipeline_metrics = ffs_repair::pipeline::RepairPipelineMetrics::new();
+    let thread_pipeline_metrics = pipeline_metrics.clone();
     let thread_operation_id = operation_id.to_owned();
     let thread_scenario_id = scenario_id.to_owned();
 
@@ -8377,6 +8438,7 @@ fn start_mount_background_scrub(
                 ledger_path: ledger_path.as_deref(),
                 repair_writes_enabled,
                 mounted_repair_writeback,
+                pipeline_metrics: thread_pipeline_metrics,
                 operation_id: &thread_operation_id,
                 scenario_id: &thread_scenario_id,
             },
@@ -8402,6 +8464,7 @@ fn start_mount_background_scrub(
 
     Ok(Some(MountBackgroundScrubGuard {
         worker,
+        pipeline_metrics,
         operation_id: operation_id.to_owned(),
         scenario_id: scenario_id.to_owned(),
     }))
@@ -8835,6 +8898,9 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                     adaptive_runtime_plan: adaptive_runtime_plan.as_ref(),
                     adaptive_runtime_summary: &options.adaptive_runtime_summary,
                     console: &options.console,
+                    repair_metrics: background_scrub_guard
+                        .as_ref()
+                        .map(|guard| &guard.pipeline_metrics),
                     unmount_timeout_secs: runtime.managed_unmount_timeout_secs(),
                     operation_id: &operation_id,
                     scenario_id,
@@ -10371,6 +10437,108 @@ fn mkfs_cmd_with_program(
         block_size,
         label = %actual_label,
         "mkfs_complete"
+    );
+
+    Ok(())
+}
+
+// ── TUI command ───────────────────────────────────────────────────────────
+
+fn build_live_tui_snapshot(
+    image_path: &Path,
+    run_scrub: bool,
+) -> Result<ffs_tui::DashboardSnapshot> {
+    let cx = cli_cx();
+    let open_fs = OpenFs::open(&cx, image_path)
+        .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
+
+    // Warm the caches by reading root directory metadata so live cache
+    // hit/miss/residency telemetry reflects actual filesystem inspection.
+    let root_ino = match &open_fs.flavor {
+        FsFlavor::Ext4(_) => InodeNumber(2),
+        FsFlavor::Btrfs(_) => InodeNumber(256),
+    };
+    let _ = open_fs.getattr(&cx, root_ino);
+    if let Ok(entries) = open_fs.readdir(&cx, root_ino, 0) {
+        for entry in entries.iter().take(16) {
+            let _ = open_fs.getattr(&cx, entry.ino);
+        }
+    }
+
+    let scrub_report = if run_scrub {
+        let byte_dev = FileByteDevice::open(image_path)
+            .with_context(|| format!("failed to open image for scrub: {}", image_path.display()))?;
+        let image_len = byte_dev.len_bytes();
+        let block_size = match &open_fs.flavor {
+            FsFlavor::Ext4(sb) => sb.block_size,
+            FsFlavor::Btrfs(sb) => {
+                choose_btrfs_scrub_block_size(image_len, sb.nodesize, sb.sectorsize).with_context(
+                    || {
+                        format!(
+                            "failed to derive aligned btrfs scrub block size (len_bytes={image_len}, nodesize={}, sectorsize={})",
+                            sb.nodesize, sb.sectorsize
+                        )
+                    },
+                )?
+            }
+        };
+        let block_dev = ByteBlockDevice::new(byte_dev, block_size)
+            .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+        let validator = match &open_fs.flavor {
+            FsFlavor::Ext4(sb) => offline_ext4_scrub_validator(&cx, image_path, &block_dev, sb)?,
+            FsFlavor::Btrfs(_) => scrub_validator(&open_fs.flavor, block_size),
+        };
+        let report = Scrubber::new(&block_dev, &*validator)
+            .scrub_all(&cx)
+            .with_context(|| "live TUI scrub pass failed")?;
+        Some(report)
+    } else {
+        None
+    };
+
+    let mut collector = ffs_tui::LiveTelemetryCollector::new();
+    let image_label = image_path.display().to_string();
+    Ok(collector.sample_open_fs(
+        &open_fs,
+        &image_label,
+        0,
+        None,
+        0,
+        None,
+        scrub_report.as_ref(),
+        None,
+    ))
+}
+
+fn tui_cmd(image_path: &Path, snapshot_json: bool, run_scrub: bool, refresh_ms: u64) -> Result<()> {
+    let command_span = info_span!(
+        target: "ffs::cli::tui",
+        "tui",
+        image = %image_path.display(),
+        snapshot_json,
+        run_scrub,
+        refresh_ms
+    );
+    let _command_guard = command_span.enter();
+    let started = Instant::now();
+    info!(target: "ffs::cli::tui", "tui_start");
+
+    let snap = build_live_tui_snapshot(image_path, run_scrub)?;
+
+    if snapshot_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snap).context("serialize live TUI snapshot")?
+        );
+    } else {
+        let dashboard = ffs_tui::Dashboard::with_snapshot(snap);
+        print!("{}", dashboard.render_ascii());
+    }
+
+    info!(
+        target: "ffs::cli::tui",
+        duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "tui_complete"
     );
 
     Ok(())
@@ -21398,6 +21566,69 @@ mod tests {
         let zfs_json: serde_json::Value = serde_json::to_value(&zfs).unwrap();
         assert_eq!(zfs_json["filesystem"], "zfs");
         assert_eq!(zfs_json["pool_name"], "tank");
+    }
+
+    #[test]
+    fn cli_parses_tui_command_and_mount_console_alias() {
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "tui",
+            "/tmp/fs.img",
+            "--snapshot-json",
+            "--scrub",
+            "--refresh-ms",
+            "500",
+        ])
+        .expect("ffs tui should parse");
+        assert_eq!(cli.command.name(), "tui");
+        match cli.command {
+            Command::Tui {
+                image,
+                snapshot_json,
+                scrub,
+                refresh_ms,
+            } => {
+                assert_eq!(image, PathBuf::from("/tmp/fs.img"));
+                assert!(snapshot_json);
+                assert!(scrub);
+                assert_eq!(refresh_ms, 500);
+            }
+            other => panic!("expected Command::Tui, got {}", other.name()),
+        }
+
+        let mount_cli = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "--runtime-mode",
+            "managed",
+            "--mount-console",
+            "/tmp/fs.img",
+            "/tmp/mnt",
+        ])
+        .expect("--mount-console alias should parse");
+        match mount_cli.command {
+            Command::Mount { console, .. } => assert!(console),
+            other => panic!("expected Command::Mount, got {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn build_live_tui_and_mount_console_snapshot_populates_real_cache_and_scrub_telemetry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image_path = dir.path().join("test.ext4");
+        std::fs::write(&image_path, build_test_ext4_image_with_state(0x0001)).expect("write image");
+
+        let snap = super::build_live_tui_snapshot(&image_path, true)
+            .expect("live TUI snapshot should succeed on synthetic ext4 image");
+        assert_eq!(snap.fs_type, "ext4");
+        assert!(snap.cache_capacity > 0);
+        assert!(
+            snap.scrub_blocks_scanned > 0,
+            "scrub=true must populate live scrub_blocks_scanned"
+        );
+        let rendered = ffs_tui::Dashboard::with_snapshot(snap).render_ascii();
+        assert!(rendered.contains("=== FrankenFS Live Telemetry ==="));
+        assert!(rendered.contains("ext4"));
     }
 
     // ── Property-based tests ────────────────────────────────────────────────

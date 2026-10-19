@@ -8,7 +8,16 @@ rust-version.workspace = true
 
 [dependencies]
 ffs = { workspace = true }
+ffs-block = { workspace = true }
+ffs-mvcc = { workspace = true }
+ffs-repair = { workspace = true }
 ftui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+ffs-types = { workspace = true }
 
 [lints]
 workspace = true

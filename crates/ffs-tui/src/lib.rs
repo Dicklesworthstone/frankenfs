@@ -28,7 +28,7 @@ const SPARKLINE_CHARS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '�
 ///
 /// Stores the most recent `capacity` data points. New values push out the
 /// oldest when full.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SparklineHistory {
     values: std::collections::VecDeque<f64>,
     capacity: usize,
@@ -111,11 +111,7 @@ impl Default for SparklineHistory {
 // ── Metric snapshot ─────────────────────────────────────────────────────────
 
 /// Point-in-time snapshot of all metrics displayed by the dashboard.
-///
-/// This is a plain data struct with no dependencies on internal subsystem
-/// crates (ffs-block, ffs-mvcc, ffs-repair). The caller populates it from
-/// whatever metric sources are available.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DegradationEvent {
     pub timestamp: String,
     pub from: DegradationLevel,
@@ -123,7 +119,7 @@ pub struct DegradationEvent {
     pub reason: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DashboardSnapshot {
     // Mount status
     pub fs_type: String,
@@ -173,6 +169,145 @@ pub struct DashboardSnapshot {
 }
 
 impl DashboardSnapshot {
+    /// Sample a live [`DashboardSnapshot`] directly from an [`ffs::OpenFs`] instance.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn from_open_fs(fs: &ffs::OpenFs, mount_point: &str, uptime_seconds: u64) -> Self {
+        let cache = fs.cache_telemetry();
+        let mvcc = fs.mvcc_telemetry();
+        let block_size = u64::from(fs.block_size());
+        let bytes_written_total = mvcc.committed_block_writes.saturating_mul(block_size);
+        let bytes_read_total = cache
+            .hits
+            .saturating_add(cache.misses)
+            .saturating_mul(block_size);
+        let memory_pressure = if cache.capacity > 0 {
+            normalized_pressure(cache.resident as f64 / cache.capacity as f64)
+        } else {
+            0.0
+        };
+
+        Self {
+            fs_type: fs.fs_type_label().to_owned(),
+            mount_point: mount_point.to_owned(),
+            uptime_seconds,
+            bytes_read_total,
+            bytes_written_total,
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
+            cache_evictions: cache.evictions,
+            cache_resident: cache.resident,
+            cache_capacity: cache.capacity,
+            cache_t1_len: cache.t1_len,
+            cache_t2_len: cache.t2_len,
+            mvcc_snapshot_seq: mvcc.snapshot_seq,
+            mvcc_active_snapshots: mvcc.active_snapshots,
+            mvcc_watermark: mvcc.watermark,
+            mvcc_version_count: mvcc.version_count,
+            mvcc_versioned_blocks: mvcc.versioned_blocks,
+            degradation_level: fs.degradation_level(),
+            cpu_pressure: 0.0,
+            memory_pressure,
+            io_queue_depth: 0,
+            degradation_events: Vec::new(),
+            scrub_blocks_scanned: 0,
+            scrub_blocks_corrupt: 0,
+            scrub_blocks_io_error: 0,
+            scrub_findings_count: 0,
+            repair_symbol_freshness_secs: None,
+            hit_rate_history: SparklineHistory::new(),
+            commit_rate_history: SparklineHistory::new(),
+            io_throughput_history: SparklineHistory::new(),
+        }
+    }
+
+    /// Overlay [`ffs_block::CacheMetrics`] from a [`ffs_block::ByteBlockCache`] or [`ffs_block::ArcCache`].
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn with_block_cache_metrics(mut self, metrics: &ffs_block::CacheMetrics) -> Self {
+        self.cache_hits = metrics.hits;
+        self.cache_misses = metrics.misses;
+        self.cache_evictions = metrics.evictions;
+        self.cache_resident = metrics.resident;
+        self.cache_capacity = metrics.capacity;
+        self.cache_t1_len = metrics.t1_len;
+        self.cache_t2_len = metrics.t2_len;
+        if metrics.capacity > 0 {
+            self.memory_pressure =
+                normalized_pressure(metrics.resident as f64 / metrics.capacity as f64);
+        }
+        self
+    }
+
+    /// Overlay live metrics directly from an [`ffs_mvcc::MvccStore`].
+    #[must_use]
+    pub fn with_mvcc_store(mut self, store: &ffs_mvcc::MvccStore) -> Self {
+        self.mvcc_snapshot_seq = store.current_snapshot().high.0;
+        self.mvcc_active_snapshots = store.active_snapshot_count();
+        self.mvcc_watermark = store.watermark().map(|c| c.0);
+        self.mvcc_version_count = store.version_count();
+        self.mvcc_versioned_blocks = store.tracked_block_count();
+        self
+    }
+
+    /// Overlay live degradation level and headroom-derived CPU pressure from a [`ffs::DegradationFsm`].
+    #[must_use]
+    pub fn with_degradation_fsm(mut self, fsm: &ffs::DegradationFsm) -> Self {
+        let fsm_level = fsm.level();
+        if fsm_level > self.degradation_level {
+            self.degradation_level = fsm_level;
+        }
+        self.cpu_pressure = normalized_pressure(1.0 - f64::from(fsm.headroom()));
+        self
+    }
+
+    /// Overlay scrub telemetry from a [`ffs_repair::scrub::ScrubReport`].
+    #[must_use]
+    pub fn with_scrub_report(mut self, report: &ffs_repair::scrub::ScrubReport) -> Self {
+        self.scrub_blocks_scanned = report.blocks_scanned;
+        self.scrub_blocks_corrupt = report.blocks_corrupt;
+        self.scrub_blocks_io_error = report.blocks_io_error;
+        self.scrub_findings_count = report.findings.len();
+        self
+    }
+
+    /// Overlay scrub telemetry from [`ffs_repair::pipeline::ScrubDaemonMetrics`].
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn with_scrub_daemon_metrics(
+        mut self,
+        metrics: &ffs_repair::pipeline::ScrubDaemonMetrics,
+    ) -> Self {
+        self.scrub_blocks_scanned = metrics.blocks_scanned_total;
+        self.scrub_blocks_corrupt = metrics.blocks_corrupt_found;
+        self.scrub_blocks_io_error = metrics.blocks_unrecoverable;
+        self.scrub_findings_count = metrics
+            .blocks_corrupt_found
+            .saturating_add(metrics.blocks_unrecoverable)
+            as usize;
+        self
+    }
+
+    /// Overlay scrub/repair telemetry from a [`ffs_repair::pipeline::RepairMetricsSnapshot`].
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    pub fn with_repair_pipeline_metrics(
+        mut self,
+        metrics: &ffs_repair::pipeline::RepairMetricsSnapshot,
+    ) -> Self {
+        self.scrub_blocks_scanned = metrics.blocks_scanned;
+        self.scrub_blocks_corrupt = metrics.corruption_detected;
+        self.scrub_blocks_io_error = metrics.blocks_unrecoverable;
+        self.scrub_findings_count = metrics
+            .corruption_detected
+            .saturating_add(metrics.blocks_unrecoverable)
+            as usize;
+        if metrics.symbol_staleness_max_seconds > 0 {
+            self.repair_symbol_freshness_secs = Some(metrics.symbol_staleness_max_seconds as f64);
+        }
+        self
+    }
+
     /// Cache hit ratio in the range [0.0, 1.0].
     #[must_use]
     pub fn cache_hit_ratio(&self) -> f64 {
@@ -189,6 +324,147 @@ impl DashboardSnapshot {
     pub fn io_pressure(&self) -> f64 {
         let normalized = self.io_queue_depth as f64 / IO_QUEUE_PRESSURE_CAP as f64;
         normalized_pressure(normalized)
+    }
+
+    /// Render a deterministic multi-panel plain-text / ASCII dashboard for
+    /// non-interactive terminals, `ffs tui`, and `--mount-console`.
+    #[must_use]
+    pub fn render_ascii(&self) -> String {
+        let mount_text = build_mount_panel_text(self);
+        let cache_text = build_cache_panel_text(self);
+        let mvcc_text = build_mvcc_panel_text(self);
+        let scrub_text = build_scrub_panel_text(self);
+        let health_text = build_system_health_text(self).to_plain_text();
+
+        format!(
+            "=== FrankenFS Live Telemetry ===\n\
+             [Mount Status]\n{mount_text}\n\n\
+             [ARC Cache]\n{cache_text}\n\n\
+             [MVCC]\n{mvcc_text}\n\n\
+             [Scrub / Repair]\n{scrub_text}\n\n\
+             [System Health]\n{health_text}\n"
+        )
+    }
+}
+
+/// Stateful collector that samples live FrankenFS subsystems on each tick and
+/// maintains rolling sparkline histories and degradation event transitions.
+#[derive(Debug, Clone)]
+pub struct LiveTelemetryCollector {
+    hit_rate_history: SparklineHistory,
+    commit_rate_history: SparklineHistory,
+    io_throughput_history: SparklineHistory,
+    degradation_events: Vec<DegradationEvent>,
+    last_degradation_level: DegradationLevel,
+    last_commits_total: u64,
+    last_io_bytes: u64,
+    last_uptime_seconds: u64,
+    initialized: bool,
+}
+
+impl Default for LiveTelemetryCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LiveTelemetryCollector {
+    /// Create a new live telemetry collector with default 60-sample rolling windows.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            hit_rate_history: SparklineHistory::new(),
+            commit_rate_history: SparklineHistory::new(),
+            io_throughput_history: SparklineHistory::new(),
+            degradation_events: Vec::new(),
+            last_degradation_level: DegradationLevel::Normal,
+            last_commits_total: 0,
+            last_io_bytes: 0,
+            last_uptime_seconds: 0,
+            initialized: false,
+        }
+    }
+
+    /// Sample live telemetry from [`ffs::OpenFs`] and optional companion monitors.
+    #[must_use]
+    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+    pub fn sample_open_fs(
+        &mut self,
+        fs: &ffs::OpenFs,
+        mount_point: &str,
+        uptime_seconds: u64,
+        bytes_read_override: Option<u64>,
+        io_queue_depth: usize,
+        fsm: Option<&ffs::DegradationFsm>,
+        scrub_report: Option<&ffs_repair::scrub::ScrubReport>,
+        repair_metrics: Option<&ffs_repair::pipeline::RepairMetricsSnapshot>,
+    ) -> DashboardSnapshot {
+        let mut snap = DashboardSnapshot::from_open_fs(fs, mount_point, uptime_seconds);
+        if let Some(bytes_read) = bytes_read_override {
+            snap.bytes_read_total = bytes_read;
+        }
+        snap.io_queue_depth = io_queue_depth;
+        if let Some(fsm) = fsm {
+            snap = snap.with_degradation_fsm(fsm);
+        }
+        if let Some(report) = scrub_report {
+            snap = snap.with_scrub_report(report);
+        }
+        if let Some(metrics) = repair_metrics {
+            snap = snap.with_repair_pipeline_metrics(metrics);
+        }
+
+        let mvcc = fs.mvcc_telemetry();
+        let io_bytes = snap
+            .bytes_read_total
+            .saturating_add(snap.bytes_written_total);
+        let elapsed_secs = uptime_seconds
+            .saturating_sub(self.last_uptime_seconds)
+            .max(1) as f64;
+
+        if self.initialized && snap.degradation_level != self.last_degradation_level {
+            let h = uptime_seconds / 3600;
+            let m = (uptime_seconds % 3600) / 60;
+            let s = uptime_seconds % 60;
+            self.degradation_events.push(DegradationEvent {
+                timestamp: format!("{h:02}:{m:02}:{s:02}"),
+                from: self.last_degradation_level,
+                to: snap.degradation_level,
+                reason: "pressure".to_owned(),
+            });
+            if self.degradation_events.len() > MAX_RECENT_EVENTS {
+                self.degradation_events.remove(0);
+            }
+        }
+        self.last_degradation_level = snap.degradation_level;
+
+        self.hit_rate_history.push(snap.cache_hit_ratio());
+        let commit_delta = if self.initialized {
+            mvcc.commits_total.saturating_sub(self.last_commits_total)
+        } else {
+            mvcc.commits_total
+        };
+        self.commit_rate_history
+            .push(commit_delta as f64 / elapsed_secs);
+
+        let io_delta_bytes = if self.initialized {
+            io_bytes.saturating_sub(self.last_io_bytes)
+        } else {
+            io_bytes
+        };
+        let io_mb_per_sec = (io_delta_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+        self.io_throughput_history.push(io_mb_per_sec);
+
+        self.last_commits_total = mvcc.commits_total;
+        self.last_io_bytes = io_bytes;
+        self.last_uptime_seconds = uptime_seconds;
+        self.initialized = true;
+
+        snap.hit_rate_history = self.hit_rate_history.clone();
+        snap.commit_rate_history = self.commit_rate_history.clone();
+        snap.io_throughput_history = self.io_throughput_history.clone();
+        snap.degradation_events.clone_from(&self.degradation_events);
+        snap
     }
 }
 
@@ -281,6 +557,12 @@ impl Dashboard {
     pub fn snapshot(&self) -> &DashboardSnapshot {
         &self.snapshot
     }
+
+    /// Render the current dashboard snapshot as a multi-panel ASCII string.
+    #[must_use]
+    pub fn render_ascii(&self) -> String {
+        self.snapshot.render_ascii()
+    }
 }
 
 impl Default for Dashboard {
@@ -347,11 +629,7 @@ impl Model for Dashboard {
 
 // ── Panel renderers ─────────────────────────────────────────────────────────
 
-fn render_cache_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
-    let block = Block::bordered().title("ARC Cache");
-    let inner = block.inner(area);
-    block.render(area, frame);
-
+fn build_cache_panel_text(snap: &DashboardSnapshot) -> String {
     let hit_pct = snap.cache_hit_ratio() * 100.0;
     let sparkline = snap.hit_rate_history.render(20, 1.0);
     let sparkline_line = if sparkline.is_empty() {
@@ -359,7 +637,7 @@ fn render_cache_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
     } else {
         format!("\nHit rate:   {sparkline}")
     };
-    let text = format!(
+    format!(
         "Hit ratio:  {hit_pct:>6.1}%\n\
          Hits:       {:>10}\n\
          Misses:     {:>10}\n\
@@ -373,15 +651,18 @@ fn render_cache_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
         snap.cache_capacity,
         snap.cache_t1_len,
         snap.cache_t2_len,
-    );
-    Paragraph::new(text).render(inner, frame);
+    )
 }
 
-fn render_mount_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
-    let block = Block::bordered().title("Mount Status");
+fn render_cache_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
+    let block = Block::bordered().title("ARC Cache");
     let inner = block.inner(area);
     block.render(area, frame);
+    Paragraph::new(build_cache_panel_text(snap)).render(inner, frame);
+}
 
+#[allow(clippy::cast_precision_loss)]
+fn build_mount_panel_text(snap: &DashboardSnapshot) -> String {
     let fs_type = if snap.fs_type.is_empty() {
         "unknown"
     } else {
@@ -405,37 +686,51 @@ fn render_mount_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
         format!("\nI/O:        {io_sparkline}")
     };
 
-    let text = format!(
+    format!(
         "Type:       {fs_type}\n\
          Mount:      {mount}\n\
          Uptime:     {uptime_h:02}:{uptime_m:02}:{uptime_s:02}\n\
          Read:       {read_mb:>8.1} MB\n\
          Written:    {write_mb:>8.1} MB{sparkline_line}"
-    );
-    Paragraph::new(text).render(inner, frame);
+    )
+}
+
+fn render_mount_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
+    let block = Block::bordered().title("Mount Status");
+    let inner = block.inner(area);
+    block.render(area, frame);
+    Paragraph::new(build_mount_panel_text(snap)).render(inner, frame);
+}
+
+fn build_mvcc_panel_text(snap: &DashboardSnapshot) -> String {
+    let wm = snap
+        .mvcc_watermark
+        .map_or_else(|| "-".to_owned(), |w| w.to_string());
+    let commit_sparkline = snap.commit_rate_history.render(20, 100.0);
+    let sparkline_line = if commit_sparkline.is_empty() {
+        String::new()
+    } else {
+        format!("\nCommits/s:   {commit_sparkline}")
+    };
+    format!(
+        "Snapshot:    {:>10}\n\
+         Active snap: {:>10}\n\
+         Watermark:   {:>10}\n\
+         Versions:    {:>10}\n\
+         Blocks (v):  {:>10}{sparkline_line}",
+        snap.mvcc_snapshot_seq,
+        snap.mvcc_active_snapshots,
+        wm,
+        snap.mvcc_version_count,
+        snap.mvcc_versioned_blocks,
+    )
 }
 
 fn render_mvcc_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
     let block = Block::bordered().title("MVCC");
     let inner = block.inner(area);
     block.render(area, frame);
-
-    let wm = snap
-        .mvcc_watermark
-        .map_or_else(|| "-".to_owned(), |w| w.to_string());
-    let text = format!(
-        "Snapshot:    {:>10}\n\
-         Active snap: {:>10}\n\
-         Watermark:   {:>10}\n\
-         Versions:    {:>10}\n\
-         Blocks (v):  {:>10}",
-        snap.mvcc_snapshot_seq,
-        snap.mvcc_active_snapshots,
-        wm,
-        snap.mvcc_version_count,
-        snap.mvcc_versioned_blocks,
-    );
-    Paragraph::new(text).render(inner, frame);
+    Paragraph::new(build_mvcc_panel_text(snap)).render(inner, frame);
 }
 
 fn render_system_health_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
@@ -445,11 +740,7 @@ fn render_system_health_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut 
     Paragraph::new(build_system_health_text(snap)).render(inner, frame);
 }
 
-fn render_scrub_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
-    let block = Block::bordered().title("Scrub / Repair");
-    let inner = block.inner(area);
-    block.render(area, frame);
-
+fn build_scrub_panel_text(snap: &DashboardSnapshot) -> String {
     let status = if snap.scrub_blocks_scanned == 0 {
         "No scrub data"
     } else if snap.scrub_blocks_corrupt == 0 && snap.scrub_blocks_io_error == 0 {
@@ -457,7 +748,7 @@ fn render_scrub_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
     } else {
         "Issues found"
     };
-    let text = format!(
+    format!(
         "Status:       {status}\n\
          Scanned:      {:>10}\n\
          Corrupt:      {:>10}\n\
@@ -467,8 +758,14 @@ fn render_scrub_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
         snap.scrub_blocks_corrupt,
         snap.scrub_blocks_io_error,
         snap.scrub_findings_count,
-    );
-    Paragraph::new(text).render(inner, frame);
+    )
+}
+
+fn render_scrub_panel(snap: &DashboardSnapshot, area: Rect, frame: &mut Frame) {
+    let block = Block::bordered().title("Scrub / Repair");
+    let inner = block.inner(area);
+    block.render(area, frame);
+    Paragraph::new(build_scrub_panel_text(snap)).render(inner, frame);
 }
 
 fn build_system_health_text(snap: &DashboardSnapshot) -> Text<'_> {
@@ -1267,5 +1564,91 @@ mod tests {
         };
         let has_issues = snap.scrub_blocks_corrupt > 0 || snap.scrub_blocks_io_error > 0;
         assert!(has_issues);
+    }
+
+    #[test]
+    fn live_subsystem_builders_and_ascii_render_work() {
+        let cache_metrics = ffs_block::CacheMetrics {
+            hits: 80,
+            misses: 20,
+            evictions: 5,
+            dirty_flushes: 0,
+            t1_len: 24,
+            t2_len: 40,
+            b1_len: 2,
+            b2_len: 3,
+            resident: 64,
+            dirty_blocks: 0,
+            dirty_bytes: 0,
+            writeback_queue_depth: 0,
+            oldest_dirty_age_ticks: None,
+            capacity: 100,
+            p: 32,
+            b1_ghost_hits: 1,
+            b2_ghost_hits: 1,
+        };
+        let mut mvcc_store = ffs_mvcc::MvccStore::new();
+        let mut txn = mvcc_store.begin();
+        txn.stage_write(ffs_types::BlockNumber(1), vec![0xAA; 4096]);
+        let _ = mvcc_store.commit(txn).expect("commit succeeds");
+
+        let repair_metrics = ffs_repair::pipeline::RepairMetricsSnapshot {
+            groups_scrubbed: 4,
+            corruption_detected: 2,
+            decode_attempts: 2,
+            decode_successes: 2,
+            symbol_refresh_count: 8,
+            symbol_staleness_max_seconds: 15,
+            blocks_scanned: 512,
+            blocks_recovered: 2,
+            blocks_unrecoverable: 1,
+            scrub_rounds_completed: 1,
+        };
+
+        let snap = DashboardSnapshot {
+            fs_type: "ext4".to_owned(),
+            mount_point: "/mnt/test".to_owned(),
+            uptime_seconds: 3661,
+            bytes_read_total: 10 * 1024 * 1024,
+            bytes_written_total: 2 * 1024 * 1024,
+            ..Default::default()
+        }
+        .with_block_cache_metrics(&cache_metrics)
+        .with_mvcc_store(&mvcc_store)
+        .with_repair_pipeline_metrics(&repair_metrics);
+
+        assert_eq!(snap.cache_hits, 80);
+        assert_eq!(snap.cache_misses, 20);
+        assert_eq!(snap.cache_resident, 64);
+        assert_eq!(snap.cache_capacity, 100);
+        assert!((snap.memory_pressure - 0.64).abs() < 1e-6);
+        assert_eq!(snap.mvcc_snapshot_seq, 1);
+        assert_eq!(snap.mvcc_version_count, 1);
+        assert_eq!(snap.mvcc_versioned_blocks, 1);
+        assert_eq!(snap.scrub_blocks_scanned, 512);
+        assert_eq!(snap.scrub_blocks_corrupt, 2);
+        assert_eq!(snap.scrub_blocks_io_error, 1);
+        assert_eq!(snap.scrub_findings_count, 3);
+
+        let ascii = snap.render_ascii();
+        assert!(ascii.contains("=== FrankenFS Live Telemetry ==="));
+        assert!(ascii.contains("[Mount Status]"));
+        assert!(ascii.contains("Type:       ext4"));
+        assert!(ascii.contains("Mount:      /mnt/test"));
+        assert!(ascii.contains("Uptime:     01:01:01"));
+        assert!(ascii.contains("[ARC Cache]"));
+        assert!(ascii.contains("Hit ratio:    80.0%"));
+        assert!(ascii.contains("[MVCC]"));
+        assert!(ascii.contains("[Scrub / Repair]"));
+        assert!(ascii.contains("Status:       Issues found"));
+        assert!(ascii.contains("[System Health]"));
+
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        let roundtrip: DashboardSnapshot =
+            serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(roundtrip.fs_type, "ext4");
+        assert_eq!(roundtrip.cache_hits, 80);
+        assert_eq!(roundtrip.mvcc_snapshot_seq, 1);
+        assert_eq!(roundtrip.scrub_blocks_scanned, 512);
     }
 }

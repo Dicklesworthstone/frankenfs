@@ -26,6 +26,7 @@ ffs-mvcc = { workspace = true }
 ffs-harness = { workspace = true }
 ffs-ondisk = { workspace = true }
 ffs-repair = { workspace = true }
+ffs-tui = { workspace = true }
 ffs-types = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }

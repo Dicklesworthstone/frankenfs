@@ -111,6 +111,7 @@ pub struct MountConsoleObservation {
     pub per_core: Vec<MountConsoleCore>,
     pub clean_shutdown: bool,
     pub reproduction_command: String,
+    pub dashboard_snapshot: Option<ffs_tui::DashboardSnapshot>,
 }
 
 /// Emit the console artifact(s) for a finished mount.
@@ -126,6 +127,10 @@ pub fn emit_mount_console(
 ) -> Result<()> {
     if !config.is_enabled() {
         return Ok(());
+    }
+
+    if let Some(ref dashboard) = observation.dashboard_snapshot {
+        eprint!("{}", dashboard.render_ascii());
     }
 
     let json_path = config.json_path.clone().unwrap_or_else(|| {
@@ -170,7 +175,12 @@ pub fn emit_mount_console(
     write_console_artifact(&json_path, json.as_bytes(), "runtime console JSON")?;
 
     if let Some(summary_path) = &config.summary_path {
-        let markdown = render_runtime_console_report_markdown(&validation);
+        let mut markdown = render_runtime_console_report_markdown(&validation);
+        if let Some(ref dashboard) = observation.dashboard_snapshot {
+            markdown.push_str("\n## Live TUI Telemetry Snapshot\n\n```text\n");
+            markdown.push_str(&dashboard.render_ascii());
+            markdown.push_str("```\n");
+        }
         write_console_artifact(
             summary_path,
             markdown.as_bytes(),
@@ -229,6 +239,15 @@ fn build_console_observation(
         }
     };
 
+    let bytes_written = if observation.read_write {
+        observation
+            .dashboard_snapshot
+            .as_ref()
+            .map_or(0, |snap| snap.bytes_written_total)
+    } else {
+        0
+    };
+
     RuntimeConsoleObservation {
         operation_id: observation.operation_id.clone(),
         scenario_id: observation.scenario_id.clone(),
@@ -244,7 +263,7 @@ fn build_console_observation(
         requests_write: 0,
         requests_metadata: requests_total,
         bytes_read: observation.bytes_read,
-        bytes_written: 0,
+        bytes_written,
         errors_total: observation.requests_err,
         backpressure: RuntimeConsoleBackpressureObservation {
             throttled,
@@ -394,6 +413,7 @@ mod tests {
             clean_shutdown: true,
             reproduction_command: "ffs mount image.img /mnt --runtime-mode managed --console"
                 .to_owned(),
+            dashboard_snapshot: None,
         }
     }
 
@@ -531,5 +551,37 @@ mod tests {
         // 1_700_000_000 = 2023-11-14T22:13:20Z
         let formatted = format_rfc3339_utc(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         assert_eq!(formatted, "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn emit_mount_console_includes_live_dashboard_snapshot_in_summary_markdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json_path = dir.path().join("console.json");
+        let md_path = dir.path().join("console.md");
+        let config =
+            MountConsoleConfig::from_cli(true, Some(json_path.clone()), Some(md_path.clone()))
+                .expect("config");
+
+        let mut obs = observation(RuntimeConsoleMode::Managed);
+        obs.read_write = true;
+        obs.dashboard_snapshot = Some(ffs_tui::DashboardSnapshot {
+            fs_type: "ext4".to_owned(),
+            mount_point: "/mnt/live".to_owned(),
+            uptime_seconds: 42,
+            bytes_read_total: 65_536,
+            bytes_written_total: 16_384,
+            cache_hits: 90,
+            cache_misses: 10,
+            mvcc_snapshot_seq: 7,
+            scrub_blocks_scanned: 128,
+            ..Default::default()
+        });
+
+        emit_mount_console(&config, &obs).expect("emit console");
+        let md = std::fs::read_to_string(&md_path).expect("read markdown");
+        assert!(md.contains("## Live TUI Telemetry Snapshot"));
+        assert!(md.contains("=== FrankenFS Live Telemetry ==="));
+        assert!(md.contains("Hit ratio:    90.0%"));
+        assert!(md.contains("Scanned:             128"));
     }
 }

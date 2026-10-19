@@ -4437,7 +4437,23 @@ mod cache_shard_tests {
     }
 }
 
-type CacheShards<K, V> = Box<[Mutex<rustc_hash::FxHashMap<K, V>>]>;
+struct ShardedCacheShard<K, V> {
+    map: rustc_hash::FxHashMap<K, V>,
+    hits: u64,
+    misses: u64,
+}
+
+impl<K, V> Default for ShardedCacheShard<K, V> {
+    fn default() -> Self {
+        Self {
+            map: rustc_hash::FxHashMap::default(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+}
+
+type CacheShards<K, V> = Box<[Mutex<ShardedCacheShard<K, V>>]>;
 
 /// A lock-striped map cache: each key maps to one of `FFS_CACHE_SHARDS`
 /// independent `Mutex<BTreeMap>` shards, so point operations (get/insert/remove)
@@ -4475,27 +4491,34 @@ impl<K: std::hash::Hash + Eq + CacheShard, V: Clone> ShardedCache<K, V> {
     fn new() -> Self {
         Self {
             shards: (0..FFS_CACHE_SHARDS)
-                .map(|_| Mutex::new(rustc_hash::FxHashMap::default()))
+                .map(|_| Mutex::new(ShardedCacheShard::default()))
                 .collect(),
             len: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     #[inline]
-    fn shard(&self, key: &K) -> &Mutex<rustc_hash::FxHashMap<K, V>> {
+    fn shard(&self, key: &K) -> &Mutex<ShardedCacheShard<K, V>> {
         &self.shards[key.cache_shard() % FFS_CACHE_SHARDS]
     }
 
     /// Read-only hit path: lock only the key's shard and clone the value out.
-    /// Never touches the atomic count, so concurrent gets on other shards run
-    /// fully in parallel.
+    /// Never touches the cross-shard atomic count, so concurrent gets on other
+    /// shards run fully in parallel while updating shard-local hit/miss stats.
     fn get(&self, key: &K) -> Option<V> {
-        self.shard(key).lock().get(key).cloned()
+        let mut shard = self.shard(key).lock();
+        if let Some(val) = shard.map.get(key).cloned() {
+            shard.hits = shard.hits.saturating_add(1);
+            Some(val)
+        } else {
+            shard.misses = shard.misses.saturating_add(1);
+            None
+        }
     }
 
     /// Read-only presence probe: lock only the key's shard, clone nothing.
     fn contains_key(&self, key: &K) -> bool {
-        self.shard(key).lock().contains_key(key)
+        self.shard(key).lock().map.contains_key(key)
     }
 
     /// Insert only while the total entry count is below `limit`, preserving the
@@ -4507,7 +4530,7 @@ impl<K: std::hash::Hash + Eq + CacheShard, V: Clone> ShardedCache<K, V> {
         if self.len.load(std::sync::atomic::Ordering::Relaxed) >= limit {
             return;
         }
-        if self.shard(&key).lock().insert(key, value).is_none() {
+        if self.shard(&key).lock().map.insert(key, value).is_none() {
             self.len.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -4515,22 +4538,36 @@ impl<K: std::hash::Hash + Eq + CacheShard, V: Clone> ShardedCache<K, V> {
     /// Unconditional insert (no admission cap), for caches bounded by explicit
     /// invalidation rather than size. Keeps the atomic count accurate.
     fn insert(&self, key: K, value: V) {
-        if self.shard(&key).lock().insert(key, value).is_none() {
+        if self.shard(&key).lock().map.insert(key, value).is_none() {
             self.len.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     fn remove(&self, key: &K) {
-        if self.shard(key).lock().remove(key).is_some() {
+        if self.shard(key).lock().map.remove(key).is_some() {
             self.len.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     fn clear(&self) {
         for shard in &self.shards {
-            shard.lock().clear();
+            shard.lock().map.clear();
         }
         self.len.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Aggregate `(hits, misses, resident_entries)` across all shards.
+    fn stats(&self) -> (u64, u64, usize) {
+        let mut hits = 0_u64;
+        let mut misses = 0_u64;
+        let mut resident = 0_usize;
+        for shard_mutex in &self.shards {
+            let shard = shard_mutex.lock();
+            hits = hits.saturating_add(shard.hits);
+            misses = misses.saturating_add(shard.misses);
+            resident = resident.saturating_add(shard.map.len());
+        }
+        (hits, misses, resident)
     }
 }
 
@@ -7187,6 +7224,58 @@ fn push_ext4_indirect_run_chunks(
     }
 }
 
+/// Live cache telemetry aggregated across `OpenFs`'s extent, metadata, and block caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct OpenFsCacheTelemetry {
+    /// Total cache hits across all active `OpenFs` caches.
+    pub hits: u64,
+    /// Total cache misses across all active `OpenFs` caches.
+    pub misses: u64,
+    /// Total cache evictions across bounded `OpenFs` caches.
+    pub evictions: u64,
+    /// Total resident cache entries across all active `OpenFs` caches.
+    pub resident: usize,
+    /// Total configured entry capacity across bounded `OpenFs` caches.
+    pub capacity: usize,
+    /// Resident entries in metadata/extent tier (mapped to T1 in TUI dashboard).
+    pub t1_len: usize,
+    /// Resident entries in block/data tier (mapped to T2 in TUI dashboard).
+    pub t2_len: usize,
+}
+
+impl OpenFsCacheTelemetry {
+    /// Hit ratio in `[0.0, 1.0]`. Returns `0.0` if no accesses recorded.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn hit_ratio(&self) -> f64 {
+        let total = self.hits.saturating_add(self.misses);
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
+/// Live MVCC telemetry sampled from `OpenFs`'s backing `FsMvccStore`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct OpenFsMvccTelemetry {
+    /// Current head commit sequence (`current_snapshot().high`).
+    pub snapshot_seq: u64,
+    /// Number of currently registered active snapshots.
+    pub active_snapshots: usize,
+    /// Oldest active snapshot sequence (`watermark`), if any.
+    pub watermark: Option<u64>,
+    /// Total block versions retained across all version chains.
+    pub version_count: usize,
+    /// Number of distinct blocks with resident version chains.
+    pub versioned_blocks: usize,
+    /// Total block versions installed by committed transactions.
+    pub committed_block_writes: u64,
+    /// Total successfully committed transactions.
+    pub commits_total: u64,
+}
+
 impl OpenFs {
     /// Open a filesystem image at `path` with default options (validation enabled).
     pub fn open(cx: &Cx, path: impl AsRef<Path>) -> Result<Self, FfsError> {
@@ -8192,6 +8281,140 @@ impl OpenFs {
     #[must_use]
     pub fn extent_cache_stats(&self) -> ffs_extent::ExtentCacheStats {
         self.extent_cache.stats()
+    }
+
+    /// Aggregated live cache telemetry across `OpenFs`'s extent, metadata, and block caches.
+    #[must_use]
+    pub fn cache_telemetry(&self) -> OpenFsCacheTelemetry {
+        let ext = self.extent_cache.stats();
+        let mut hits = ext.hits;
+        let mut misses = ext.misses;
+        let evictions = ext.evictions;
+        let mut t1_len = ext.entries;
+        let mut t2_len = 0_usize;
+        let mut capacity = ext.capacity;
+
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                let (gd_h, gd_m, gd_r) = self.ext4_group_desc_cache.stats();
+                let (it_h, it_m, it_r) = self.ext4_inode_table_block_cache.stats();
+                let (fd_h, fd_m, fd_r) = self.ext4_file_data_block_cache.stats();
+                let (ia_h, ia_m, ia_r) = self.ext4_inode_attr_cache.stats();
+                let (xb_h, xb_m, xb_r) = self.ext4_inode_xattr_block_cache.stats();
+                let (xc_h, xc_m, xc_r) = self.ext4_inode_xattr_cache.stats();
+                let (bb_h, bb_m, bb_r) = self.ext4_base_block_cache.stats();
+
+                hits = hits
+                    .saturating_add(gd_h)
+                    .saturating_add(it_h)
+                    .saturating_add(fd_h)
+                    .saturating_add(ia_h)
+                    .saturating_add(xb_h)
+                    .saturating_add(xc_h)
+                    .saturating_add(bb_h);
+                misses = misses
+                    .saturating_add(gd_m)
+                    .saturating_add(it_m)
+                    .saturating_add(fd_m)
+                    .saturating_add(ia_m)
+                    .saturating_add(xb_m)
+                    .saturating_add(xc_m)
+                    .saturating_add(bb_m);
+                t1_len = t1_len
+                    .saturating_add(gd_r)
+                    .saturating_add(ia_r)
+                    .saturating_add(xb_r)
+                    .saturating_add(xc_r);
+                t2_len = t2_len
+                    .saturating_add(it_r)
+                    .saturating_add(fd_r)
+                    .saturating_add(bb_r);
+                capacity = capacity
+                    .saturating_add(EXT4_INODE_ATTR_CACHE_LIMIT)
+                    .saturating_add(EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT)
+                    .saturating_add(EXT4_BASE_BLOCK_CACHE_LIMIT)
+                    .saturating_add(ext4_file_data_block_cache_limit());
+            }
+            FsFlavor::Btrfs(_) => {
+                let (pn_h, pn_m, pn_r) = self.btrfs_parsed_node_cache.stats();
+                let (ie_h, ie_m, ie_r) = self.btrfs_ro_inode_extents.stats();
+                let (de_h, de_m, de_r) = self.btrfs_dir_entry_cache.stats();
+                let (dc_h, dc_m, dc_r) = self.btrfs_decompressed_extent_cache.stats();
+
+                hits = hits
+                    .saturating_add(pn_h)
+                    .saturating_add(ie_h)
+                    .saturating_add(de_h)
+                    .saturating_add(dc_h);
+                misses = misses
+                    .saturating_add(pn_m)
+                    .saturating_add(ie_m)
+                    .saturating_add(de_m)
+                    .saturating_add(dc_m);
+                t1_len = t1_len.saturating_add(ie_r).saturating_add(de_r);
+                t2_len = t2_len.saturating_add(pn_r).saturating_add(dc_r);
+                capacity = capacity
+                    .saturating_add(BTRFS_TREE_NODE_CACHE_LIMIT)
+                    .saturating_add(BTRFS_INODE_ATTR_CACHE_LIMIT)
+                    .saturating_add(BTRFS_DIR_ENTRY_CACHE_LIMIT)
+                    .saturating_add(BTRFS_DECOMPRESSED_EXTENT_CACHE_LIMIT);
+            }
+        }
+
+        let resident = t1_len.saturating_add(t2_len);
+        OpenFsCacheTelemetry {
+            hits,
+            misses,
+            evictions,
+            resident,
+            capacity: capacity.max(resident),
+            t1_len,
+            t2_len,
+        }
+    }
+
+    /// Live MVCC telemetry sampled from the backing `FsMvccStore`.
+    #[must_use]
+    pub fn mvcc_telemetry(&self) -> OpenFsMvccTelemetry {
+        let snapshot_seq = self.mvcc_store.current_snapshot().high.0;
+        let active_snapshots = self.mvcc_store.active_snapshot_count();
+        let watermark = self.mvcc_store.watermark().map(|c| c.0);
+        let version_count = self.mvcc_store.version_count();
+        let versioned_blocks = self.mvcc_store.tracked_block_count();
+        let committed_block_writes = self.mvcc_store.committed_block_writes();
+        let commits_total = snapshot_seq;
+
+        OpenFsMvccTelemetry {
+            snapshot_seq,
+            active_snapshots,
+            watermark,
+            version_count,
+            versioned_blocks,
+            committed_block_writes,
+            commits_total,
+        }
+    }
+
+    /// Canonical filesystem format label (`"ext4"` or `"btrfs"`).
+    #[must_use]
+    pub fn fs_type_label(&self) -> &'static str {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => "ext4",
+            FsFlavor::Btrfs(_) => "btrfs",
+        }
+    }
+
+    /// Current filesystem-level degradation state (`Emergency` if forced read-only,
+    /// `Critical` if btrfs commit out-of-space latch is set, otherwise `Normal`).
+    #[must_use]
+    pub fn degradation_level(&self) -> DegradationLevel {
+        if self.ext4_forced_read_only.load(Ordering::Relaxed) {
+            DegradationLevel::Emergency
+        } else if self.btrfs_commit_out_of_space.load(Ordering::Relaxed) {
+            DegradationLevel::Critical
+        } else {
+            DegradationLevel::Normal
+        }
     }
 
     /// Whether this is an ext4 filesystem.

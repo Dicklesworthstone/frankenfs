@@ -319,6 +319,12 @@ impl DegradationFsm {
         self.current.lock().transition_count
     }
 
+    /// Current system headroom in `[0.0, 1.0]` observed by the pressure source.
+    #[must_use]
+    pub fn headroom(&self) -> f32 {
+        self.pressure.headroom()
+    }
+
     /// Tick the FSM with a fresh pressure reading.
     ///
     /// Returns `Some(transition)` if the level changed, `None` otherwise.
