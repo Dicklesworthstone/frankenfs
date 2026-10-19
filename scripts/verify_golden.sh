@@ -364,12 +364,12 @@ if [ "$CHECKSUMS_ONLY" -eq 1 ]; then
     exit 1
 fi
 
-# ── 4. Parity report consistency ─────────────────────────────────
-echo "--- Parity report ---"
-if cargo_exec test -p ffs-harness -- parity_report_matches_feature_parity_md --quiet; then
-    pass "ParityReport matches FEATURE_PARITY.md"
+# ── 4. Parity evidence consumer ──────────────────────────────────
+echo "--- Parity evidence consumer ---"
+if cargo_exec run -p ffs-harness -- parity --verify parity-honesty --local; then
+    pass "parity evidence consumer checks passed"
 else
-    fail "ParityReport vs FEATURE_PARITY.md mismatch"
+    fail "parity evidence consumer checks failed or evidence unavailable"
 fi
 
 if cargo_exec run -p ffs-harness -- parity --verify ext4-journal --local; then

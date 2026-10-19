@@ -185,11 +185,11 @@ jobs:
             echo "::warning::No golden checksums found"
           fi
 
-      - name: Run parity report check
+      - name: Verify parity evidence consumer
         run: |
           set -euo pipefail
-          # Build and run parity check — ensures ParityReport matches FEATURE_PARITY.md
-          cargo test -p ffs-harness --lib parity_report_matches_feature_parity_md 2>&1
+          # Check the evidence consumer; this does not certify filesystem parity.
+          cargo run -p ffs-harness -- parity --verify parity-honesty --local 2>&1
 
       - name: Upload golden artifacts
         if: failure()
