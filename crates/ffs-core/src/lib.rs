@@ -5162,6 +5162,7 @@ fn trim_trailing_zero_blocks(bytes: &mut Vec<u8>, block_len: usize) {
 #[derive(Debug, Clone)]
 struct OverlayWrite {
     offset: u64,
+    end: u64,
     bytes: Vec<u8>,
 }
 
@@ -5243,6 +5244,7 @@ impl ByteDevice for SharedByteDevice {
 // release the base image's storage.
 struct OverlayByteDevice {
     inner: Box<dyn ByteDevice>,
+    has_writes: AtomicBool,
     writes: RwLock<Vec<OverlayWrite>>,
 }
 
@@ -5250,7 +5252,54 @@ impl OverlayByteDevice {
     fn new(inner: Box<dyn ByteDevice>) -> Self {
         Self {
             inner,
+            has_writes: AtomicBool::new(false),
             writes: RwLock::new(Vec::new()),
+        }
+    }
+
+    fn validate_read_range(offset: ByteOffset, len: usize) -> Result<u64, FfsError> {
+        let len_u64 = u64::try_from(len)
+            .map_err(|_| FfsError::Format("read buffer length does not fit u64".to_owned()))?;
+        offset
+            .0
+            .checked_add(len_u64)
+            .ok_or_else(|| FfsError::Format("read range overflow".to_owned()))
+    }
+
+    fn validate_vectored_read_range(
+        offset: ByteOffset,
+        bufs: &[std::io::IoSliceMut<'_>],
+    ) -> Result<(), FfsError> {
+        let mut cursor = offset.0;
+        for buf in bufs {
+            cursor = Self::validate_read_range(ByteOffset(cursor), buf.len())?;
+        }
+        Ok(())
+    }
+
+    fn apply_writes_to_slice(
+        writes: &[OverlayWrite],
+        range_start: u64,
+        range_end: u64,
+        buf: &mut [u8],
+    ) {
+        if range_start == range_end {
+            return;
+        }
+        for write in writes {
+            if write.end <= range_start || write.offset >= range_end {
+                continue;
+            }
+            let overlap_start = write.offset.max(range_start);
+            let overlap_end = write.end.min(range_end);
+            let src_start =
+                usize::try_from(overlap_start - write.offset).expect("overlap within write.bytes");
+            let src_end =
+                usize::try_from(overlap_end - write.offset).expect("overlap within write.bytes");
+            let dst_start =
+                usize::try_from(overlap_start - range_start).expect("overlap within buf");
+            let dst_end = usize::try_from(overlap_end - range_start).expect("overlap within buf");
+            buf[dst_start..dst_end].copy_from_slice(&write.bytes[src_start..src_end]);
         }
     }
 }
@@ -5260,45 +5309,60 @@ impl ByteDevice for OverlayByteDevice {
         self.inner.len_bytes()
     }
 
+    fn supports_vectored_reads(&self) -> bool {
+        self.inner.supports_vectored_reads()
+    }
+
+    fn preserves_read_exact_at_destination_on_error(&self) -> bool {
+        self.inner.preserves_read_exact_at_destination_on_error()
+    }
+
+    fn preserves_read_vectored_destinations_on_error(&self) -> bool {
+        self.inner.preserves_read_vectored_destinations_on_error()
+    }
+
     fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<(), FfsError> {
+        let range_end = Self::validate_read_range(offset, buf.len())?;
         self.inner.read_exact_at(cx, offset, buf)?;
-        let range_start = offset.0;
-        let range_end =
-            range_start
-                .checked_add(u64::try_from(buf.len()).map_err(|_| {
-                    FfsError::Format("read buffer length does not fit u64".to_owned())
-                })?)
-                .ok_or_else(|| FfsError::Format("read range overflow".to_owned()))?;
-
-        let writes = self.writes.read();
-        for write in writes.iter() {
-            let write_start = write.offset;
-            let write_end = write_start
-                .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
-                    FfsError::Format("overlay write length does not fit u64".to_owned())
-                })?)
-                .ok_or_else(|| FfsError::Format("overlay write range overflow".to_owned()))?;
-
-            if write_end <= range_start || write_start >= range_end {
-                continue;
-            }
-
-            let overlap_start = write_start.max(range_start);
-            let overlap_end = write_end.min(range_end);
-
-            let src_start = usize::try_from(overlap_start.saturating_sub(write_start))
-                .map_err(|_| FfsError::Format("overlay source offset overflow".to_owned()))?;
-            let src_end = usize::try_from(overlap_end.saturating_sub(write_start))
-                .map_err(|_| FfsError::Format("overlay source end overflow".to_owned()))?;
-            let dst_start = usize::try_from(overlap_start.saturating_sub(range_start))
-                .map_err(|_| FfsError::Format("overlay destination offset overflow".to_owned()))?;
-            let dst_end = usize::try_from(overlap_end.saturating_sub(range_start))
-                .map_err(|_| FfsError::Format("overlay destination end overflow".to_owned()))?;
-
-            buf[dst_start..dst_end].copy_from_slice(&write.bytes[src_start..src_end]);
+        if self.has_writes.load(Ordering::Acquire) {
+            let writes = self.writes.read();
+            Self::apply_writes_to_slice(&writes, offset.0, range_end, buf);
         }
-        drop(writes);
+        Ok(())
+    }
 
+    fn read_exact_at_volatile(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        buf: &mut [u8],
+    ) -> Result<(), FfsError> {
+        let range_end = Self::validate_read_range(offset, buf.len())?;
+        self.inner.read_exact_at_volatile(cx, offset, buf)?;
+        if self.has_writes.load(Ordering::Acquire) {
+            let writes = self.writes.read();
+            Self::apply_writes_to_slice(&writes, offset.0, range_end, buf);
+        }
+        Ok(())
+    }
+
+    fn read_vectored_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+    ) -> Result<(), FfsError> {
+        Self::validate_vectored_read_range(offset, bufs)?;
+        self.inner.read_vectored_exact_at(cx, offset, bufs)?;
+        if self.has_writes.load(Ordering::Acquire) {
+            let writes = self.writes.read();
+            let mut cursor = offset.0;
+            for buf in bufs {
+                let next = cursor + u64::try_from(buf.len()).expect("validated above");
+                Self::apply_writes_to_slice(&writes, cursor, next, buf);
+                cursor = next;
+            }
+        }
         Ok(())
     }
 
@@ -5318,11 +5382,18 @@ impl ByteDevice for OverlayByteDevice {
                 self.inner.len_bytes()
             )));
         }
+        if buf.is_empty() {
+            return Ok(());
+        }
 
-        self.writes.write().push(OverlayWrite {
+        let mut writes = self.writes.write();
+        writes.push(OverlayWrite {
             offset: offset.0,
+            end: range_end,
             bytes: buf.to_vec(),
         });
+        self.has_writes.store(true, Ordering::Release);
+        drop(writes);
         Ok(())
     }
 
@@ -92885,7 +92956,7 @@ mod tests {
             OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open ext4");
         cx.set_cancel_requested(true);
         let err = fs
-            .begin_request_scope(&cx)
+            .begin_request_scope(&cx, RequestOp::Read)
             .expect_err("cancelled Cx must fail begin_request_scope");
         assert!(
             matches!(err, FfsError::Cancelled),
@@ -122086,3 +122157,195 @@ mod btrfs_mutation_permission_tests {
         assert!(!btrfs_mutation_permitted(false, true));
     }
 }
+
+#[cfg(test)]
+mod overlay_byte_device_fast_path_tests {
+    use super::*;
+    use std::io::IoSliceMut;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingVectoredDevice {
+        bytes: Vec<u8>,
+        scalar_reads: Arc<AtomicUsize>,
+        volatile_reads: Arc<AtomicUsize>,
+        vectored_reads: Arc<AtomicUsize>,
+    }
+
+    impl ByteDevice for CountingVectoredDevice {
+        fn len_bytes(&self) -> u64 {
+            u64::try_from(self.bytes.len()).expect("len fits u64")
+        }
+
+        fn supports_vectored_reads(&self) -> bool {
+            true
+        }
+
+        fn preserves_read_exact_at_destination_on_error(&self) -> bool {
+            true
+        }
+
+        fn preserves_read_vectored_destinations_on_error(&self) -> bool {
+            true
+        }
+
+        fn read_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ByteOffset,
+            buf: &mut [u8],
+        ) -> Result<(), FfsError> {
+            self.scalar_reads.fetch_add(1, Ordering::Relaxed);
+            let start = usize::try_from(offset.0)
+                .map_err(|_| FfsError::Format("offset overflow".to_owned()))?;
+            let end = start
+                .checked_add(buf.len())
+                .filter(|&end| end <= self.bytes.len())
+                .ok_or_else(|| FfsError::Format("out of bounds".to_owned()))?;
+            buf.copy_from_slice(&self.bytes[start..end]);
+            Ok(())
+        }
+
+        fn read_exact_at_volatile(
+            &self,
+            cx: &Cx,
+            offset: ByteOffset,
+            buf: &mut [u8],
+        ) -> Result<(), FfsError> {
+            self.volatile_reads.fetch_add(1, Ordering::Relaxed);
+            self.read_exact_at(cx, offset, buf)
+        }
+
+        fn read_vectored_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ByteOffset,
+            bufs: &mut [IoSliceMut<'_>],
+        ) -> Result<(), FfsError> {
+            self.vectored_reads.fetch_add(1, Ordering::Relaxed);
+            let mut cursor = usize::try_from(offset.0)
+                .map_err(|_| FfsError::Format("offset overflow".to_owned()))?;
+            let total: usize = bufs.iter().map(|b| b.len()).sum();
+            if cursor
+                .checked_add(total)
+                .is_none_or(|end| end > self.bytes.len())
+            {
+                return Err(FfsError::Format("vectored read out of bounds".to_owned()));
+            }
+            for buf in bufs {
+                let next = cursor + buf.len();
+                buf.copy_from_slice(&self.bytes[cursor..next]);
+                cursor = next;
+            }
+            Ok(())
+        }
+
+        fn write_all_at(&self, _cx: &Cx, _offset: ByteOffset, _buf: &[u8]) -> Result<(), FfsError> {
+            Err(FfsError::ReadOnly)
+        }
+
+        fn sync(&self, _cx: &Cx) -> Result<(), FfsError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn overlay_byte_device_forwards_capabilities_and_vectored_volatile_reads_bd_overlay_fast_paths() {
+        let cx = Cx::for_testing();
+        let scalar_reads = Arc::new(AtomicUsize::new(0));
+        let volatile_reads = Arc::new(AtomicUsize::new(0));
+        let vectored_reads = Arc::new(AtomicUsize::new(0));
+        let base: Vec<u8> = (0_u8..64).collect();
+        let inner = CountingVectoredDevice {
+            bytes: base.clone(),
+            scalar_reads: Arc::clone(&scalar_reads),
+            volatile_reads: Arc::clone(&volatile_reads),
+            vectored_reads: Arc::clone(&vectored_reads),
+        };
+        let overlay = OverlayByteDevice::new(Box::new(inner));
+
+        // 1. Capability flags are forwarded from inner device.
+        assert!(overlay.supports_vectored_reads());
+        assert!(overlay.preserves_read_exact_at_destination_on_error());
+        assert!(overlay.preserves_read_vectored_destinations_on_error());
+        assert!(!overlay.has_writes.load(Ordering::Acquire));
+
+        // 2. Empty overlay uses volatile and vectored fast paths directly without scalar fallback.
+        let mut vol_buf = [0_u8; 16];
+        overlay
+            .read_exact_at_volatile(&cx, ByteOffset(8), &mut vol_buf)
+            .expect("volatile read on empty overlay");
+        assert_eq!(&vol_buf, &base[8..24]);
+        assert_eq!(volatile_reads.load(Ordering::Relaxed), 1);
+
+        let mut b0 = [0_u8; 6];
+        let mut b1 = [0_u8; 6];
+        let mut b2 = [0_u8; 6];
+        {
+            let mut slices = [
+                IoSliceMut::new(&mut b0),
+                IoSliceMut::new(&mut b1),
+                IoSliceMut::new(&mut b2),
+            ];
+            overlay
+                .read_vectored_exact_at(&cx, ByteOffset(10), &mut slices)
+                .expect("vectored read on empty overlay");
+        }
+        assert_eq!(&b0, &base[10..16]);
+        assert_eq!(&b1, &base[16..22]);
+        assert_eq!(&b2, &base[22..28]);
+        assert_eq!(vectored_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(scalar_reads.load(Ordering::Relaxed), 1); // Only the one from volatile_reads delegation
+
+        // 3. Patch across buffer boundaries (offsets 14..25) and verify scalar, volatile, and
+        // vectored reads produce identical bytes.
+        let patch = b"PATCHED_11B";
+        overlay
+            .write_all_at(&cx, ByteOffset(14), patch)
+            .expect("write patch to overlay");
+        assert!(overlay.has_writes.load(Ordering::Acquire));
+
+        let mut expected = base;
+        expected[14..25].copy_from_slice(patch);
+
+        let mut scalar_out = [0_u8; 18];
+        overlay
+            .read_exact_at(&cx, ByteOffset(10), &mut scalar_out)
+            .expect("scalar read with overlay patch");
+        assert_eq!(&scalar_out, &expected[10..28]);
+
+        let mut volatile_out = [0_u8; 18];
+        overlay
+            .read_exact_at_volatile(&cx, ByteOffset(10), &mut volatile_out)
+            .expect("volatile read with overlay patch");
+        assert_eq!(&volatile_out, &expected[10..28]);
+
+        let mut v0 = [0_u8; 6];
+        let mut v1 = [0_u8; 6];
+        let mut v2 = [0_u8; 6];
+        {
+            let mut slices = [
+                IoSliceMut::new(&mut v0),
+                IoSliceMut::new(&mut v1),
+                IoSliceMut::new(&mut v2),
+            ];
+            overlay
+                .read_vectored_exact_at(&cx, ByteOffset(10), &mut slices)
+                .expect("vectored read with cross-boundary overlay patch");
+        }
+        assert_eq!(&v0, &expected[10..16]);
+        assert_eq!(&v1, &expected[16..22]);
+        assert_eq!(&v2, &expected[22..28]);
+        assert_eq!(vectored_reads.load(Ordering::Relaxed), 2);
+
+        // 4. Out-of-bounds read preserves destination buffer on error.
+        let sentinel = [0xAA_u8; 8];
+        let mut untouched = sentinel;
+        assert!(
+            overlay
+                .read_exact_at(&cx, ByteOffset(u64::MAX - 2), &mut untouched)
+                .is_err()
+        );
+        assert_eq!(untouched, sentinel);
+    }
+}
+
