@@ -158,7 +158,7 @@ fn redo_all_then_undo_only_the_loser_keeps_an_independent_winner() {
 #[test]
 fn resident_growth_and_empty_payload_deletion_relocate_neighbors_and_fixups() {
     let mut input = Memory::new();
-    let bytes: Vec<_> = (0..601).map(|i| (i % 251) as u8).collect();
+    let bytes: Vec<_> = (0_u16..601).map(|i| (i % 251) as u8).collect();
     let mut growth = update(20, 24, &bytes);
     growth.resident_resize = true;
     let result = execute(&Cx::for_testing(), &mut input, &plan(vec![growth], vec![])).unwrap();

@@ -402,7 +402,7 @@ fn execute(cx: &Cx, input: &mut impl Input, plan: &NtfsLogFilePlan) -> Result<Ov
     // Export each sector through the actual MFT map, not first-LCN arithmetic.
     // No Source mutation occurs, including after late errors/cancellation.
     for (number, raw) in records {
-        for (index, sector) in raw.chunks_exact(512).enumerate() {
+        for (index, sector) in raw.as_chunks::<512>().0.iter().enumerate() {
             checkpoint(cx)?;
             let logical = u64::from(number) * layout.record_bytes as u64 + index as u64 * SECTOR;
             let vcn = logical / layout.cluster_bytes;
@@ -421,9 +421,7 @@ fn execute(cx: &Cx, input: &mut impl Input, plan: &NtfsLogFilePlan) -> Result<Ov
                         .is_some_and(|end| end <= layout.volume_bytes)
                 })
                 .ok_or_else(|| corrupt(0, "semantic FILE export exceeds the selected volume"))?;
-            let bytes: [u8; 512] = sector
-                .try_into()
-                .map_err(|_| corrupt(0, "short FILE export sector"))?;
+            let bytes = *sector;
             if overlay.insert(physical / SECTOR, bytes).is_some() {
                 return Err(corrupt(
                     physical,

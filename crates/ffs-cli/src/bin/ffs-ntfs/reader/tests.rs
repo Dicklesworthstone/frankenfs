@@ -438,7 +438,7 @@ fn build_lfs_rcrd_entry(
     (this_lsn, prev_lsn, undo_next_lsn): (u64, u64, u64),
     (tx_id, record_type): (u32, u32),
     (redo_op, undo_op): (u16, u16),
-    (target_vcn, target_lcn): (u64, u64),
+    (virtual_cluster, physical_cluster): (u64, u64),
     attribute_offset: u16,
     redo_data: &[u8],
     undo_data: &[u8],
@@ -462,14 +462,14 @@ fn build_lfs_rcrd_entry(
     body[8..10].copy_from_slice(&(undo_off as u16).to_le_bytes());
     body[10..12].copy_from_slice(&(undo_data.len() as u16).to_le_bytes());
     body[12..14].copy_from_slice(&0x18_u16.to_le_bytes());
-    if target_lcn != 0 {
+    if physical_cluster != 0 {
         body[14..16].copy_from_slice(&2_u16.to_le_bytes());
         body[16..18].copy_from_slice(&56_u16.to_le_bytes());
-        body[32..40].copy_from_slice(&target_lcn.to_le_bytes());
-        body[40..48].copy_from_slice(&(target_lcn + 1).to_le_bytes());
+        body[32..40].copy_from_slice(&physical_cluster.to_le_bytes());
+        body[40..48].copy_from_slice(&(physical_cluster + 1).to_le_bytes());
     }
     body[18..20].copy_from_slice(&attribute_offset.to_le_bytes());
-    body[24..32].copy_from_slice(&target_vcn.to_le_bytes());
+    body[24..32].copy_from_slice(&virtual_cluster.to_le_bytes());
     body[redo_off..redo_off + redo_data.len()].copy_from_slice(redo_data);
     body[undo_off..undo_off + undo_data.len()].copy_from_slice(undo_data);
     rec
