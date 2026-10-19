@@ -11,9 +11,9 @@
 mod transfers;
 
 use super::{
-    Cx, NtfsVolume, RecordPage, Restart, Result, TailRecord, checkpoint, corrupt, lsn_to_vbo,
-    preflight, read_exact, read_record, restore_page, u16_at, u32_at, u64_at, unsupported,
-    validate_lsn_reference,
+    Cx, NtfsVolume, RecordPage, Restart, Result, TailRecord, checkpoint, corrupt, lsn_page_offset,
+    lsn_to_vbo, preflight, read_exact, read_record, restore_page, u16_at, u32_at, u64_at,
+    unsupported, validate_lsn_reference,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -107,6 +107,75 @@ impl Page {
         Ok((sequence << address_bits) | address)
     }
 
+    fn completed_endpoint(
+        &self,
+        restart: &Restart,
+        destination: u64,
+        origin: &RecordPage,
+    ) -> Result<usize> {
+        record_location(restart, self.completed)?;
+        let page_bytes = u64::from(restart.log_page);
+        let data_off = u64::from(restart.data_off);
+        let vbo = lsn_to_vbo(self.completed, restart.seq_num_bits)?;
+        let origin_vbo = vbo & !(page_bytes - 1);
+        let offset = lsn_page_offset(self.completed, restart.log_page)?;
+        let header_end = offset
+            .checked_add(usize::from(restart.record_header_len))
+            .filter(|end| *end <= origin.bytes.len())
+            .ok_or_else(|| {
+                corrupt(
+                    destination,
+                    "$LogFile completed record header crosses its page",
+                )
+            })?;
+        if u64_at(&origin.bytes, offset)? != self.completed {
+            return Err(corrupt(
+                destination,
+                "$LogFile completed record endpoint has a different origin record",
+            ));
+        }
+        let length = u64::from(u32_at(&origin.bytes, offset + 24)?);
+        let flags = u16_at(&origin.bytes, offset + 40)?;
+        let first_capacity = page_bytes - header_end as u64;
+        if flags & !super::MULTI_PAGE != 0
+            || (flags & super::MULTI_PAGE != 0) != (length > first_capacity)
+            || length > restart.file_size
+            || data_off >= page_bytes
+        {
+            return Err(corrupt(
+                destination,
+                "$LogFile completed record endpoint has an invalid length or flags",
+            ));
+        }
+        // Match payload::read: only the first page contains this LFS header;
+        // every continuation skips data_off and may wrap to the first ring page.
+        let remaining = length.saturating_sub(first_capacity);
+        let capacity = page_bytes - data_off;
+        let continuations = remaining.div_ceil(capacity);
+        let first = (if restart.version.0 == 2 { 34 } else { 4 }) * page_bytes;
+        let ring_pages = (restart.file_size - first) / page_bytes;
+        if continuations >= ring_pages {
+            return Err(corrupt(
+                destination,
+                "$LogFile completed record endpoint revisits its first page",
+            ));
+        }
+        let final_page =
+            first + (((origin_vbo - first) / page_bytes + continuations) % ring_pages) * page_bytes;
+        let end = if remaining == 0 {
+            header_end as u64 + length
+        } else {
+            data_off + (remaining - 1) % capacity + 1
+        };
+        if final_page != destination || end > u64::from(self.fixed.next_record_off) {
+            return Err(corrupt(
+                destination,
+                "$LogFile completed record endpoint does not cover its payload",
+            ));
+        }
+        Ok(usize::from(self.fixed.next_record_off))
+    }
+
     /// A newer publication may extend a page, not rewrite its completed prefix.
     /// Both bank selection and ring selection must enforce the same relation.
     fn compare(
@@ -114,6 +183,7 @@ impl Page {
         other: &Self,
         restart: &Restart,
         destination: u64,
+        read_origin: &mut impl FnMut(bool, u64) -> Result<RecordPage>,
     ) -> Result<std::cmp::Ordering> {
         use std::cmp::Ordering;
 
@@ -143,7 +213,27 @@ impl Page {
             };
             if older.last == older.completed {
                 let start = usize::from(restart.data_off);
-                let end = usize::from(older.fixed.next_record_off);
+                let obsolete_before = restart
+                    .active_client_oldest_lsn
+                    .filter(|oldest| newer.last < *oldest);
+                let end = if let Some(oldest) = obsolete_before {
+                    validate_lsn_reference(restart, oldest, "retained-tail-start")?;
+                    // Both publications predate the retained client interval;
+                    // their origin may have been reused. Keep the original
+                    // advertised-prefix comparison without requiring that origin.
+                    usize::from(older.fixed.next_record_off)
+                } else {
+                    let origin_vbo = lsn_to_vbo(older.completed, restart.seq_num_bits)?
+                        & !(u64::from(restart.log_page) - 1);
+                    let restored;
+                    let origin = if origin_vbo == destination {
+                        &older.fixed
+                    } else {
+                        restored = read_origin(order == Ordering::Less, origin_vbo)?;
+                        &restored
+                    };
+                    older.completed_endpoint(restart, destination, origin)?
+                };
                 // Ignore changing page headers, USA tokens and unused slack,
                 // but not any byte of a previously completed client record.
                 if older.fixed.bytes[start..end] != newer.fixed.bytes[start..end] {
@@ -266,7 +356,7 @@ fn discover(
     let page_size =
         usize::try_from(page_bytes).map_err(|_| corrupt(0, "$LogFile tail page size overflows"))?;
     let transfers::Copies {
-        pages: mut copies,
+        pages: copies,
         groups,
     } = transfers::read(cx, restart, oldest, read)?;
     let mut decisions = BTreeMap::new();
@@ -286,10 +376,25 @@ fn discover(
         } else {
             Some(Page::parse(cx, restart, at, raw)?)
         };
-        let chosen = if let Some(copy) = copies.remove(&at) {
+        let chosen = if let Some(copy) = copies.get(&at) {
             let decision = match &ring {
                 None => transfers::Selection::Copy,
-                Some(ring) => match copy.compare(ring, restart, at)? {
+                Some(ring) => match copy.compare(ring, restart, at, &mut |from_copy, origin| {
+                    let raw = if from_copy
+                        && groups
+                            .iter()
+                            .any(|group| group.contains(&at) && group.contains(&origin))
+                    {
+                        copies.get(&origin).map(|page| page.raw.clone())
+                    } else {
+                        None
+                    };
+                    let raw = match raw {
+                        Some(raw) => raw,
+                        None => read_exact(cx, restart.file_size, origin, page_size, read)?,
+                    };
+                    restore_page(cx, raw, restart, origin)
+                })? {
                     std::cmp::Ordering::Greater => transfers::Selection::Copy,
                     std::cmp::Ordering::Less => transfers::Selection::Ring,
                     std::cmp::Ordering::Equal => transfers::Selection::Equal,
@@ -300,10 +405,10 @@ fn discover(
                 view.pages.insert(at, copy.raw.clone());
                 Some(copy)
             } else {
-                ring
+                ring.as_ref()
             }
         } else {
-            ring
+            ring.as_ref()
         };
         let Some(page) = chosen else { continue };
         for lsn in [page.last, page.completed]

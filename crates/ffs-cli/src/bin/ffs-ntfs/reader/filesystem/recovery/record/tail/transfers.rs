@@ -116,7 +116,13 @@ fn transfer(cx: &Cx, restart: &Restart, oldest: u64, pages: Vec<(u64, Page)>) ->
 
 /// Compare competing complete transfers only when their destination sets agree.
 /// Mixed ordering is not resolved by taking a per-page maximum.
-fn select(groups: &mut Vec<Transfer>, incoming: Transfer, restart: &Restart) -> Result<()> {
+fn select(
+    cx: &Cx,
+    groups: &mut Vec<Transfer>,
+    incoming: Transfer,
+    restart: &Restart,
+    source: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<()> {
     let first = incoming.pages[0].0;
     let last = incoming.pages[incoming.pages.len() - 1].0;
     for previous in groups.iter_mut() {
@@ -133,7 +139,24 @@ fn select(groups: &mut Vec<Transfer>, incoming: Transfer, restart: &Restart) -> 
         let mut newer = false;
         let mut older = false;
         for ((destination, a), (_, b)) in incoming.pages.iter().zip(&previous.pages) {
-            match a.compare(b, restart, *destination)? {
+            match a.compare(b, restart, *destination, &mut |from_incoming, origin| {
+                let pages = if from_incoming {
+                    &incoming.pages
+                } else {
+                    &previous.pages
+                };
+                let raw = match pages.iter().find(|(at, _)| *at == origin) {
+                    Some((_, page)) => page.raw.clone(),
+                    None => read_exact(
+                        cx,
+                        restart.file_size,
+                        origin,
+                        restart.log_page as usize,
+                        source,
+                    )?,
+                };
+                restore_page(cx, raw, restart, origin)
+            })? {
                 std::cmp::Ordering::Greater => newer = true,
                 std::cmp::Ordering::Less => older = true,
                 std::cmp::Ordering::Equal => {}
@@ -192,7 +215,13 @@ pub(super) fn read(
                 }
                 pages.push(copy_page(cx, restart, at, raw)?);
             }
-            select(&mut groups, transfer(cx, restart, oldest, pages)?, restart)?;
+            select(
+                cx,
+                &mut groups,
+                transfer(cx, restart, oldest, pages)?,
+                restart,
+                source,
+            )?;
             slot += count;
         }
     }
@@ -427,6 +456,320 @@ mod prefix_tests {
     }
 
     #[test]
+    fn malformed_completed_endpoints_cannot_hide_rewritten_redo_bd_ofjn7() {
+        for version in [(1, 1), (2, 0)] {
+            let at = first(version);
+            let second = if version.0 == 1 { 3 } else { 18 } * PAGE;
+            for end in [64_u16, 152, 160] {
+                for poisoned in [false, true] {
+                    for placement in 0..4 {
+                        let mut old = page(at, 1, false, 0xCAFE);
+                        old[24..26].copy_from_slice(&end.to_le_bytes());
+                        let mut newer = page(at, 1, true, 0xBEEF);
+                        if poisoned {
+                            newer[VALUE] ^= 1;
+                        }
+                        let mut log = vec![0xFF; LOG];
+                        match placement {
+                            0 => {
+                                install(&mut log, at, &old);
+                                install(&mut log, 2 * PAGE, &copy(newer, version, at));
+                            }
+                            1 => {
+                                install(&mut log, at, &newer);
+                                install(&mut log, 2 * PAGE, &copy(old, version, at));
+                            }
+                            2 => {
+                                install(&mut log, 2 * PAGE, &copy(old, version, at));
+                                install(&mut log, second, &copy(newer, version, at));
+                            }
+                            _ => {
+                                install(&mut log, 2 * PAGE, &copy(newer, version, at));
+                                install(&mut log, second, &copy(old, version, at));
+                            }
+                        }
+                        let before = log.clone();
+                        let result = check(&restart(version), &log);
+                        if end < 160 {
+                            assert!(matches!(
+                                result,
+                                Err(FfsError::Corruption { detail, .. })
+                                    if detail.contains("completed record endpoint")
+                            ));
+                        } else if poisoned {
+                            assert_prefix_error(result);
+                        } else {
+                            result.unwrap();
+                        }
+                        assert_eq!(log, before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_payload_endpoint_allows_native_alignment_padding_bd_ofjn7() {
+        for version in [(1, 1), (2, 0)] {
+            let at = first(version);
+            let mut older = page(at, 1, false, 7);
+            let mut newer = page(at, 1, true, 9);
+            // A 47-byte client payload ends at 159 and its next record starts
+            // at 160. The seven-byte redo remains entirely inside that payload.
+            for raw in [&mut older, &mut newer] {
+                raw[88..92].copy_from_slice(&47_u32.to_le_bytes());
+                raw[118..120].copy_from_slice(&7_u16.to_le_bytes());
+            }
+            let mut metadata = restart(version);
+            metadata.last_lsn_data_len = 47;
+            let mut log = vec![0xFF; LOG];
+            install(&mut log, at, &older);
+            install(&mut log, 2 * PAGE, &copy(newer, version, at));
+            let before = log.clone();
+            check(&metadata, &log).unwrap();
+            assert_eq!(log, before);
+        }
+    }
+
+    fn spanning_fixture(version: (u16, u16), wrap: bool) -> (Restart, Vec<u8>, Vec<u8>, usize) {
+        let origin = if wrap { LOG - PAGE } else { first(version) };
+        let destination = if wrap { first(version) } else { origin + PAGE };
+        let anchor = lsn(1, origin + 64);
+        let appended = lsn(if wrap { 2 } else { 1 }, destination + 280);
+        let mut payload = vec![0; 4200];
+        payload[..2].copy_from_slice(&7_u16.to_le_bytes());
+        payload[4..6].copy_from_slice(&4192_u16.to_le_bytes());
+        payload[6..8].copy_from_slice(&8_u16.to_le_bytes());
+        payload[12..14].copy_from_slice(&24_u16.to_le_bytes());
+        payload[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        payload[32..40].copy_from_slice(&100_u64.to_le_bytes());
+        payload[40..48].copy_from_slice(b"original");
+        payload[4192..].copy_from_slice(b"taildata");
+        let mut start = vec![0; PAGE];
+        start[..4].copy_from_slice(b"RCRD");
+        start[8..16].copy_from_slice(&anchor.to_le_bytes());
+        start[20..22].copy_from_slice(&1_u16.to_le_bytes());
+        start[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        start[64..72].copy_from_slice(&anchor.to_le_bytes());
+        start[88..92].copy_from_slice(&4200_u32.to_le_bytes());
+        start[92..94].copy_from_slice(&9_u16.to_le_bytes());
+        start[96..100].copy_from_slice(&1_u32.to_le_bytes());
+        start[100..104].copy_from_slice(&24_u32.to_le_bytes());
+        start[104..106].copy_from_slice(&1_u16.to_le_bytes());
+        start[112..].copy_from_slice(&payload[..3984]);
+        let mut older = vec![0; PAGE];
+        older[..4].copy_from_slice(b"RCRD");
+        older[8..16].copy_from_slice(&anchor.to_le_bytes());
+        older[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        older[20..22].copy_from_slice(&1_u16.to_le_bytes());
+        older[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        older[24..26].copy_from_slice(&280_u16.to_le_bytes());
+        older[32..40].copy_from_slice(&anchor.to_le_bytes());
+        older[64..280].copy_from_slice(&payload[3984..]);
+        let mut newer = older.clone();
+        newer[8..16].copy_from_slice(&appended.to_le_bytes());
+        newer[24..26].copy_from_slice(&368_u16.to_le_bytes());
+        newer[32..40].copy_from_slice(&appended.to_le_bytes());
+        newer[280..288].copy_from_slice(&appended.to_le_bytes());
+        newer[288..296].copy_from_slice(&anchor.to_le_bytes());
+        newer[304..308].copy_from_slice(&40_u32.to_le_bytes());
+        newer[308..310].copy_from_slice(&9_u16.to_le_bytes());
+        newer[312..316].copy_from_slice(&1_u32.to_le_bytes());
+        newer[316..320].copy_from_slice(&24_u32.to_le_bytes());
+        newer[328..330].copy_from_slice(&0x1A_u16.to_le_bytes());
+        for (raw, token) in [(&mut start, 0xCAFE_u16), (&mut older, 7), (&mut newer, 9)] {
+            raw[4..6].copy_from_slice(&40_u16.to_le_bytes());
+            raw[6..8].copy_from_slice(&9_u16.to_le_bytes());
+            raw[40..42].copy_from_slice(&token.to_le_bytes());
+            for sector in 1..=8 {
+                let at = sector * 512 - 2;
+                let saved = [raw[at], raw[at + 1]];
+                raw[40 + sector * 2..42 + sector * 2].copy_from_slice(&saved);
+                raw[at..at + 2].copy_from_slice(&token.to_le_bytes());
+            }
+        }
+        let mut log = vec![0xFF; LOG];
+        install(&mut log, origin, &start);
+        install(&mut log, destination, &older);
+        let mut metadata = restart(version);
+        metadata.current_lsn = anchor;
+        metadata.active_client_oldest_lsn = Some(anchor);
+        metadata.last_lsn_data_len = 4200;
+        (metadata, log, newer, destination)
+    }
+
+    #[test]
+    fn completed_spanning_payloads_keep_their_actual_end_across_wrap_bd_ofjn7() {
+        for version in [(1, 1), (2, 0)] {
+            for wrap in [false, true] {
+                let (metadata, source, appended, at) = spanning_fixture(version, wrap);
+                let second = if version.0 == 1 { 3 } else { 18 } * PAGE;
+                for end in [64_u16, 272, 280] {
+                    for poisoned in [false, true] {
+                        for placement in 0..4 {
+                            let mut older = source[at..at + PAGE].to_vec();
+                            older[24..26].copy_from_slice(&end.to_le_bytes());
+                            let mut newer = appended.clone();
+                            if poisoned {
+                                newer[272] ^= 1; // Actual final client bytes, not page slack.
+                            }
+                            let mut log = source.clone();
+                            match placement {
+                                0 => {
+                                    install(&mut log, at, &older);
+                                    install(&mut log, 2 * PAGE, &copy(newer, version, at));
+                                }
+                                1 => {
+                                    install(&mut log, at, &newer);
+                                    install(&mut log, 2 * PAGE, &copy(older, version, at));
+                                }
+                                2 => {
+                                    install(&mut log, 2 * PAGE, &copy(older, version, at));
+                                    install(&mut log, second, &copy(newer, version, at));
+                                }
+                                _ => {
+                                    install(&mut log, 2 * PAGE, &copy(newer, version, at));
+                                    install(&mut log, second, &copy(older, version, at));
+                                }
+                            }
+                            let before = log.clone();
+                            let result = check(&metadata, &log);
+                            if end < 280 {
+                                assert!(matches!(
+                                    result,
+                                    Err(FfsError::Corruption { detail, .. })
+                                        if detail.contains("completed record endpoint")
+                                ));
+                            } else if poisoned {
+                                assert_prefix_error(result);
+                            } else {
+                                result.unwrap();
+                            }
+                            assert_eq!(log, before);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_spans_read_their_own_transfer_origin_bd_ofjn7() {
+        let version = (2, 0);
+        let (metadata, source, newer, at) = spanning_fixture(version, false);
+        let origin = first(version);
+        let mut log = vec![0xFF; LOG];
+        for (bank, last) in [(2, source[at..at + PAGE].to_vec()), (18, newer)] {
+            let mut start = source[origin..origin + PAGE].to_vec();
+            start[20..22].copy_from_slice(&2_u16.to_le_bytes());
+            let mut last = last;
+            last[20..22].copy_from_slice(&2_u16.to_le_bytes());
+            last[22..24].copy_from_slice(&2_u16.to_le_bytes());
+            install(&mut log, bank * PAGE, &copy(start, version, origin));
+            install(&mut log, (bank + 1) * PAGE, &copy(last, version, at));
+        }
+        let before = log.clone();
+        check(&metadata, &log).unwrap();
+        assert_eq!(log, before);
+    }
+
+    #[test]
+    fn completed_span_origin_corruption_and_read_failures_propagate_bd_ofjn7() {
+        let version = (2, 0);
+        let (metadata, mut log, newer, at) = spanning_fixture(version, true);
+        let origin = LOG - PAGE;
+        let older = log[at..at + PAGE].to_vec();
+        install(&mut log, 2 * PAGE, &copy(older, version, at));
+        install(&mut log, 18 * PAGE, &copy(newer, version, at));
+        check(&metadata, &log).unwrap();
+        for mutation in 0..5 {
+            let mut bad = log.clone();
+            match mutation {
+                0 => bad[origin + 64] ^= 1,
+                1 => bad[origin + 88..origin + 92].copy_from_slice(&u32::MAX.to_le_bytes()),
+                2 => bad[origin + 104..origin + 106].copy_from_slice(&3_u16.to_le_bytes()),
+                3 => {
+                    bad[origin + 88..origin + 92].copy_from_slice(&3984_u32.to_le_bytes());
+                    bad[origin + 104..origin + 106].fill(0);
+                }
+                _ => bad[origin + 104..origin + 106].fill(0),
+            }
+            let before = bad.clone();
+            assert!(matches!(
+                check(&metadata, &bad),
+                Err(FfsError::Corruption { .. })
+            ));
+            assert_eq!(bad, before);
+        }
+        for fault in 0..3 {
+            let before = log.clone();
+            let mut failed = false;
+            let result = validate_latest_volume(
+                &Cx::for_testing(),
+                &metadata,
+                LOG as u64,
+                &mut |offset, size| {
+                    assert!(!failed, "origin failure must stop selection immediately");
+                    if offset == origin as u64 {
+                        failed = true;
+                        return match fault {
+                            0 => Err(FfsError::Cancelled),
+                            1 => Err(FfsError::Io(std::io::Error::other("origin read failure"))),
+                            _ => Ok(vec![0; size - 1]),
+                        };
+                    }
+                    load(&log, offset, size)
+                },
+                None,
+            );
+            match fault {
+                0 => assert!(matches!(result, Err(FfsError::Cancelled))),
+                1 => assert!(matches!(result, Err(FfsError::Io(_)))),
+                _ => assert!(matches!(result, Err(FfsError::Corruption { .. }))),
+            }
+            assert!(failed);
+            assert_eq!(log, before);
+        }
+    }
+
+    #[test]
+    fn obsolete_completed_spans_allow_reused_origins_but_keep_prefix_checks_bd_ofjn7() {
+        let version = (2, 0);
+        let (mut metadata, mut log, newer, at) = spanning_fixture(version, false);
+        let origin = first(version);
+        let older = log[at..at + PAGE].to_vec();
+        install(&mut log, 2 * PAGE, &copy(older, version, at));
+        install(&mut log, at, &newer);
+        install(&mut log, origin, &page(origin, 2, true, 0xBEEF));
+        metadata.current_lsn = lsn(2, origin + 160);
+        metadata.active_client_oldest_lsn = Some(lsn(2, origin + 64));
+        metadata.last_lsn_data_len = 40;
+        let before = log.clone();
+        check(&metadata, &log).unwrap();
+        assert_eq!(log, before);
+
+        // Only the new origin proof is unnecessary for two obsolete copies.
+        // The original prefix-byte refusal still applies to those copies.
+        let mut poisoned = log.clone();
+        poisoned[2 * PAGE + 272] ^= 1;
+        let poisoned_before = poisoned.clone();
+        assert_prefix_error(check(&metadata, &poisoned));
+        assert_eq!(poisoned, poisoned_before);
+
+        // An older unretained record does not exempt a newer retained one,
+        // and an absent client-oldest pointer never authorizes the exception.
+        for oldest in [Some(lsn(1, at + 280)), None] {
+            metadata.active_client_oldest_lsn = oldest;
+            assert!(matches!(
+                check(&metadata, &log),
+                Err(FfsError::Corruption { detail, .. })
+                    if detail.contains("completed record endpoint")
+            ));
+            assert_eq!(log, before);
+        }
+    }
+
+    #[test]
     fn correct_appends_ignore_fixup_tokens_and_unused_old_slack() {
         for version in [(1, 1), (2, 0)] {
             let at = first(version);
@@ -499,8 +842,12 @@ mod prefix_tests {
             raw[24..26].copy_from_slice(&end.to_le_bytes());
             let newer = Page::parse(&cx, &restart, at as u64, raw).unwrap();
             for result in [
-                old.compare(&newer, &restart, at as u64),
-                newer.compare(&old, &restart, at as u64),
+                old.compare(&newer, &restart, at as u64, &mut |_, _| {
+                    panic!("local records must not read another origin page")
+                }),
+                newer.compare(&old, &restart, at as u64, &mut |_, _| {
+                    panic!("local records must not read another origin page")
+                }),
             ] {
                 assert!(matches!(result, Err(FfsError::Corruption { .. })));
             }
@@ -517,11 +864,18 @@ mod prefix_tests {
         raw[VALUE] ^= 1;
         let newer = Page::parse(&cx, &restart, at as u64, raw).unwrap();
         assert_eq!(
-            newer.compare(&old, &restart, at as u64).unwrap(),
+            newer
+                .compare(&old, &restart, at as u64, &mut |_, _| {
+                    panic!("distinct generations must not compare old payloads")
+                })
+                .unwrap(),
             Ordering::Greater
         );
         assert_eq!(
-            old.compare(&newer, &restart, at as u64).unwrap(),
+            old.compare(&newer, &restart, at as u64, &mut |_, _| {
+                panic!("distinct generations must not compare old payloads")
+            })
+            .unwrap(),
             Ordering::Less
         );
     }
@@ -538,14 +892,13 @@ mod prefix_tests {
         raw[24..26].fill(0);
         raw[32..40].fill(0);
         let a = Page::parse(&cx, &restart, at as u64, raw.clone()).unwrap();
-        assert_eq!(
-            a.progress(&restart, at as u64).unwrap(),
-            lsn(2, at + PAGE)
-        );
+        assert_eq!(a.progress(&restart, at as u64).unwrap(), lsn(2, at + PAGE));
         raw[800] ^= 1;
         let b = Page::parse(&cx, &restart, at as u64, raw).unwrap();
         assert!(matches!(
-            a.compare(&b, &restart, at as u64),
+            a.compare(&b, &restart, at as u64, &mut |_, _| {
+                panic!("equal incomplete pages must compare their complete bytes")
+            }),
             Err(FfsError::Corruption { .. })
         ));
     }
@@ -574,9 +927,12 @@ mod prefix_tests {
         assert_eq!(log, before);
         // Exercise the same source without an injected failure as a positive
         // control: this is not a fixture which fails before the second bank.
-        discover(&Cx::for_testing(), &restart, LOG as u64, &mut |offset, size| {
-            load(&log, offset, size)
-        })
+        discover(
+            &Cx::for_testing(),
+            &restart,
+            LOG as u64,
+            &mut |offset, size| load(&log, offset, size),
+        )
         .unwrap();
     }
 }

@@ -177,7 +177,7 @@ fn matching_dirty_restarts_require_an_intact_current_native_record() {
                     // metadata, which has its own stricter validation.
                     bytes[at + 48..at + 56].fill(0);
                 }
-                "requested-record LSN does not address a retained record location"
+                "selected-checkpoint LSN does not address a retained record location"
             }
             1 => {
                 bytes[LOG_START + RECORD_PAGE + 511] ^= 1;
