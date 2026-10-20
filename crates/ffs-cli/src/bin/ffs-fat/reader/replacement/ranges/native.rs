@@ -5,6 +5,7 @@
 //! data in place. A failed or interrupted operation can leave a partial overwrite
 //! or leaked allocation and requires checking/recovery; it is not crash-atomic.
 
+mod collapse;
 mod copy;
 mod zero;
 
@@ -66,7 +67,7 @@ impl FatVolume {
         (self, epoch)
     }
 
-    /// Reserve native FAT-chain capacity, optionally retaining logical EOF.
+    /// Apply native allocation, zeroing or cluster-aligned range collapse.
     /// The caller must own the volume's writer gate through cache publication.
     /// This is ordered allocation, not a sparse mapping or atomic transaction.
     pub fn preallocate(
@@ -79,6 +80,9 @@ impl FatVolume {
         now: u64,
     ) -> Result<()> {
         checkpoint(cx)?;
+        if mode == libc::FALLOC_FL_COLLAPSE_RANGE {
+            return collapse::apply(cx, self, path, offset, length, now);
+        }
         if mode & libc::FALLOC_FL_ZERO_RANGE != 0 {
             return zero::apply(cx, self, path, offset, length, mode, now);
         }
