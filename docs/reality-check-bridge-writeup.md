@@ -1,5 +1,187 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Reality check — 2026-10-20 (HEAD `944903e78`)
+
+**Verdict: substantial experimental filesystem software, with an unfinished
+delivery contract.** There are real native readers for six formats, meaningful
+ext4/btrfs write and recovery machinery, a substantially expanded FAT writer,
+and sophisticated repair infrastructure. There is still no unified six-format
+library backend, native NTFS writer, native ZFS TXG writer, or demonstrated
+default self-healing contract. The remaining work includes implementation,
+integration and qualification; completing the pre-audit active tracker would
+not complete the published multi-format plan.
+
+This assessment supersedes the older dated assessments below where current
+source disagrees. It does not erase their evidence or reduce the specification.
+The audit and bridge work is `bd-16kxp`, initially in the **staged** graph at
+`artifacts/reality-check/20261020/bridge/.beads/`; see the tracker limitation below.
+
+### Scope, evidence and fresh execution
+
+The auditor read all 1,069 lines of `AGENTS.md` and all 212 lines of `README.md`.
+The measuring stick is the original specification and port plan, architecture,
+legacy behavior extraction, detailed ext4/btrfs guide, multi-format plan and
+implementation workpackages, and the current native read/create/resize/recovery,
+protection, security and performance profiles. Normative obligations were traced
+to production entry points, representative implementations and their tests.
+This is a claim-driven code audit, not a line-by-line correctness proof of the
+entire repository or a fresh execution of every historical receipt.
+
+Source was initially clean apart from eight pre-existing `.DS_Store` paths.
+Audit edits are limited to this existing report; generated receipts and a
+separate tracker copy live under the ignored artifact directory. No filesystem
+implementation, validator, golden, canonical tracker row or database was changed.
+
+| Fresh check | Actual result | Evidence and interpretation |
+|---|---|---|
+| `git rev-parse HEAD` | `944903e78abdffcafbbb79ff17360b973c32989c` | Source identity for this audit; later source changes require reassessment. |
+| `sbh check --need 20G` | **FAIL**, exit 1 | Data container had about 254.7 GB available but only 6.37% free, below the configured 8.06% pressure threshold. The gate failed despite the absolute free-byte count. Heavy builds were not started. |
+| `rch check` | **NOT READY** | Worker `vmi1156319` reported `disk_ratio_below_critical`. This is infrastructure evidence, not a Rust test failure. |
+| `cargo fmt --check` | **FAIL**, exit 1 | `artifacts/reality-check/20261020/fmt-check.log`; seven distinct source files after normalizing duplicate `#[path]` inclusions, including FAT resize and NTFS index replay. The check made no edits. |
+| Workspace check / strict Clippy / Rust tests / benchmarks | **NOT RUN** | Held by failed disk admission. No earlier RCH receipt is promoted to current-HEAD acceptance. No prebuilt native companion executable was found in the checked build locations. |
+| Source-aware tracker E2E | **FAIL**, 9/15 scenarios pass | `artifacts/e2e/20261020_180755_ffs_tracker_source_hygiene_NU9tYl/`; live JSONL classification/export succeeds, but installed `bv` rejects `--no-cache` (and lacks the wrapper's `--db` interface), breaking projection and recursive fixture checks. This is not a clean tracker-hygiene gate. |
+| `br --no-db dep cycles --json` | **PASS**, zero active cycles | `artifacts/reality-check/20261020/cycles-before.json`. JSONL reading works without opening the unsafe database. |
+| Normal `br ready --json` | **REFUSED** | Possible committed, uncheckpointed WAL frames. The WAL was preserved. |
+| Canonical `br --no-db create --dry-run ...` | **REFUSED** | Pending sync-merge inspection cannot safely open malformed `issues` autoindex slot 1. No bypass, rebuild or canonical JSONL replacement was attempted. |
+| `gh release list --limit 5 --json tagName,name,isDraft,publishedAt` | **PASS** | `artifacts/reality-check/20261020/releases.json`: public release `v0.2.0`, published 2026-07-11. Current six-format source is not established as a shipped release by that artifact. |
+
+`/data/projects/AGENTS.md` does not exist through this machine's current `/data`
+symlink. Its inlined integrity rules and the existing ancestor AGENTS files were
+read and honored. The unavailable file is a portability defect, not permission
+to ignore the inlined rules. The requested reality-check skill was applied;
+unavailable exploratory search tooling was replaced by local source inspection.
+
+### Vision checklist and code reality
+
+Here, **implemented** means the production path exists and was inspected;
+**partial** means named obligations remain; **unproven** means fresh end-to-end
+evidence is absent. None of those labels means current tests passed. Historical
+native-image receipts in `FEATURE_PARITY.md` remain useful bounded evidence.
+
+| # | Testable promise | Current source and remaining gap | Status / tracker coverage before this audit |
+|---|---|---|---|
+| V1 | Strict read-only inspection never writes backing storage, including recovery | `OpenFs::open_with_options` calls `FileByteDevice::open`, which first requests RW; `OpenOptions::default` selects journal `Apply`. Read, walk and TUI callers use this open. Companion NTFS/ZFS sidecars have a separate read-only constructor. | **Unsafe default remains**; existing active P0 `bd-read-means-read-xpx37`. |
+| V2 | Read real ext4 images and preserve native interpretation | Extensive checked parsers, inode/extent/directory/xattr paths, native reference and differential tests exist. Unknown features must remain explicit admission decisions. | **Implemented / fresh execution unproven**; `bd-z5bav`, `bd-vuzzq`, `bd-53dub`. |
+| V3 | ext4 namespace/data writes survive native journal recovery and reopen | JBD2 writer, periodic commits, pressure commits, mutation gate and native-tool tests exist. Current whole-workspace and complete crash/mount acceptance are not established here. | **Partial qualification**; `bd-z5bav`, `bd-dj725`, `bd-9rutw`. |
+| V4 | btrfs native reads, checksums, compression, redundant topology and selected subvolumes | Real chunk/device routing, checksums, degraded reads and subvolume code exist. Multi-device writes remain refused; advanced write/lifecycle parity is bounded. | **Implemented restricted reader / partial writer**; original declared exclusions remain in force. |
+| V5 | Concurrent filesystem operations have database-grade request semantics | Real sharded version stores, SSI/FCW and merge mechanisms exist. Namespace requests now enter a mutation gate; lower block adapters still perform eager independent commits. A journal boundary interlock is not proof of whole-request rollback or the claimed mounted concurrency benefit. | **Partial**; `bd-9rutw`, performance rows, `bd-z5bav`. |
+| V6 | RaptorQ is default durability, with owned storage and fresh restart-safe repair | `native_repair.rs` now has allocator-owned ext4 storage, validation and freshness machinery; explicit sidecar mounts also exist. Ordinary RW `--background-repair` is still refused, and native freshness is explicit ext4-only opt-in. | **Partial**; `bd-11a8t`, `bd-j7a4e`, `bd-jufod`. Do not repeat the older blanket claim that no reservation code exists. |
+| V7 | Real mounted FUSE operations, cancellation and joined shutdown | Auto worker count resolves to up to eight; vendored `Interrupt` dispatch now targets a request registry. CLI background I/O uses child regions, `spawn_blocking`, reserved completion and drain/join. | **Substantial implementation / full coverage unproven**; `bd-in31y`, `bd-z5bav`. Older claims of universally serial dispatch and absent interrupt handling are stale. |
+| V8 | FAT16/FAT32 native reads and complete ordinary mutation | Real readers, formatter/population, create/mkdir/unlink/rmdir/rename, range writes/truncate, lifetime state and `mount --rw` dispatch exist. Native ordering is intentionally not general crash atomicity. | **Implemented experimental surface / qualification incomplete**; closed `bd-nu8nf` does not prove all native interchange/crash cuts. No active complete FAT writer qualification task. |
+| V9 | FAT maintenance and evolution | Checker, bounded recovery, mirror/boot handling and resize exist. Resize creates a new image and only shrinks a free tail while retaining cluster IDs; it is not relocation/compaction or in-place resize. | **Partial full-plan maintenance**; no active task covers the remaining complete FAT maintenance target. |
+| V10 | NTFS read native names, streams, sparse/compressed/transformed data and metadata | MFT/attribute/index/UpCase, stream catalog, LZNT1 and WOF XPRESS/LZX, security/EA inspection and read-only FsOps exist. Mounted ownership is synthetic, not native ACL enforcement; EFS and other providers remain restricted. | **Implemented restricted reader / fresh native qualification unproven**. |
+| V11 | NTFS native recovery, including valid dirty read views | Public `--recover-logfile` stages a semantic volatile FILE overlay with strict restrictions. Mounted constructor still calls clean-log admission; unsupported nonresident/system edits and full dirty mounted recovery are unfinished. | **Partial**, not absent; `bd-ofjn7` owns the recovery gap. |
+| V12 | NTFS native journal-aware allocation, stream and namespace writes | No general native MFT/bitmap/index writer or writable FsOps path. An in-memory recovery overlay is not a native writer. | **Not implemented**; no active implementation task for the complete native writer. |
+| V13 | NTFS advanced semantics, checker/formatter/resize and Windows interchange | Some readers are advanced; security edits, compressed/EFS writes, secondary-index maintenance and native lifecycle utilities are much larger unfinished obligations. | **Partial / missing writer and lifecycle coverage**; no corresponding active work graph. |
+| V14 | ZFS discover a coherent committed pool view and read datasets/snapshots/zvols | Real read-only automatic uberblock selection, MOS/DSL/DMU/ZAP/ZPL, properties, allocation inspection, snapshots, zvol extraction and mount adapters exist. Explicit missing-mirror extraction is newer than the README and requires an explicit candidate. | **Implemented restricted extraction**. Automatic read-only selection is not writable pool import/ownership. |
+| V15 | ZFS recover native synchronous intent | ZIL inspection, bounded range recovery and namespace replay exist; `--replay-zil` reaches a volatile view. Native TXG replay/publication and complete recovery authority remain unimplemented. | **Partial**; `bd-ofjn7` covers read-overlay replay, not a writer. |
+| V16 | ZFS native allocator/TXG writer, shared references and dataset lifecycle | Allocation reporting reconstructs space maps but does not allocate. No native TXG writer, snapshot/clone mutation, reclamation or replication engine was found in the exposed companion surface. | **Not implemented**; no active native writer/lifecycle tasks. |
+| V17 | ZFS complete pinned topology, encryption, pool administration and block frontend | Restricted mirror/RAIDZ reading is real; lifecycle/resilver, dRAID/expanded/indirect layouts, native encryption, send/receive and a writable zvol transport remain separate substantial work. | **Partial / largely missing end-state work**; no active coverage for completion. |
+| V18 | One six-format public library and explicit backend admission | `FsFormatKind` recognizes six; `FsFlavor` and `OpenFs` still have two. New engines live inside CLI binaries and protected-mount includes their trees with `#[path]`. `ffs` only re-exports core. | **Integration gap**, already covered by `bd-native-image-library-s4tde`. |
+| V19 | Native commit tokens, MVCC and external protection agree across storage sets | Sidecar publication and single-image protection are substantive. Protected NTFS/ZFS variants are read-only; no native NTFS/ZFS writer tokens exist. One member's archive does not protect an entire pool. | **Partial**; existing repair work does not cover complete multi-device native-token integration. |
+| V20 | Canonical gates and parity report only what their executed behavior proves | Exact test mappings and nonempty-run checks exist. But gate5 calls OpenFs/recording replies on a synthetic image without `/dev/fuse`; gate7 runs inspect/info/fsck/TUI once, without mount/crash/hour-load/1 Hz monitoring. The six-format OpenFs row maps only a detection test. | **Proof-class mismatch**, covered in intent by `bd-wh1xk`; concrete current gaps must be added. |
+| V21 | Continuous observable live state at at least 1 Hz | `tui_cmd` builds one snapshot, renders once and exits; `refresh_ms` is logged but not used for a refresh loop. Mounted console sampling is a separate implementation. | **Partial**; no active task explicitly completes standalone continuous live TUI behavior. |
+| V22 | Performance targets hold under equivalent native semantics | Extensive historical kernel scorecards report losses, ties and transport-sensitive apparent wins. Changed checksum policy, workload shape and source identity prevent treating August ratios as current measurements. No new-format benchmark campaign establishes the full plan. | **Unproven at HEAD**; many existing performance tasks, not a reason to repeat stale ratios as current. |
+| V23 | Hostile-media access is bounded, isolated and accurately authorized | Safe first-party parsers and a sandbox launcher exist; security workplan explicitly leaves real-reader/cgroup/host qualification open. No new-format-specific cargo-fuzz targets were found in the 63-target inventory. | **Partial**; `bd-sandbox-native-readers-qx2om` plus missing native traversal/decoder fuzz coverage. |
+| V24 | A current tested release delivers the admitted profiles | Latest listed public release is July's v0.2.0. No current full-source, mounted/native, crash and artifact receipt was produced by this audit. | **Unproven**; `bd-z5bav` must include consumer/artifact proof for its admitted scope. |
+
+### The five questions
+
+1. **What works?** The project contains usable native-image paths, substantial
+   ext4/btrfs filesystem engines, an experimental FAT mutation engine, restricted
+   NTFS/ZFS readers and volatile recovery, FUSE adapters and real repair codecs,
+   ownership/freshness machinery and explicit protection tools. Historical
+   native-image and mounted receipts show this is much more than parser scaffolding.
+2. **What does not deliver the whole vision?** Strict default read authority,
+   whole-request mounted MVCC semantics/benefit, default automatic protection,
+   unified six-format library access, native NTFS/ZFS writers and their complete
+   lifecycle/advanced profiles, continuous standalone telemetry, and current
+   full-stack/native/release qualification remain unfinished.
+3. **What blocks completion?** Actual missing native transaction engines and
+   integration, plus unsafe read authority, incomplete proof at user-facing
+   boundaries, failed current formatting, unavailable admitted build capacity and
+   a guarded malformed tracker. The build/tracker limits do not explain away the
+   missing writers.
+4. **Would all existing active beads close it?** **No.** The canonical source has
+   4,323 rows: 4,252 closed, 53 open, 10 in progress, 7 blocked and 1 wont-fix.
+   The active set means all 70 nonterminal rows, including explicit `blocked`
+   statuses; the wrapper's 53 open/3 dependency-blocked counts are a narrower view.
+   Native writer/lifecycle goals largely exist only as document workpackages.
+   Ten in-progress rows are timestamp-stale under the wrapper's six-hour rule;
+   that is not permission to take their owners' work.
+5. **Which goals lack tasks?** Before this audit: complete FAT native mutation
+   qualification and remaining maintenance, NTFS native writes/advanced mutation
+   and lifecycle, ZFS TXG/dataset/pool/advanced writable profiles, coherent
+   multi-device protection, continuous standalone TUI and new-format execution
+   fuzzing. Closed broad reader/companion tasks are not active coverage for them.
+
+### Bridge plan, ordered by user value
+
+1. **Protect source data first.** Keep `bd-read-means-read-xpx37` with its owner.
+   Split read-only and writable authority at open, recover reads in a private
+   overlay, and prove unchanged source/archive hashes on clean, dirty, failed and
+   cancelled opens through both public binaries and the library. Do not merely
+   change the mount's `read_only` flag after opening a writable descriptor.
+2. **Obtain a reproducible current baseline and truthful boundary evidence.**
+   Reuse `bd-vuzzq`, `bd-ys3wb`, `bd-53dub`, `bd-wh1xk`, `bd-jtk24` and
+   `bd-z5bav`. Resolve the seven formatting files in their owner lane; pass
+   workspace check, strict Clippy and tests with admitted remote execution.
+   Real mounted, native checker/reopen and storage-fault results must remain
+   distinct from synthetic core tests. Do not weaken or casually edit gate code.
+3. **Finish original differentiated behavior.** Keep repair/native ownership and
+   freshness under `bd-11a8t`/`bd-j7a4e`; complete namespace semantics under
+   `bd-9rutw`; audit remaining lifecycle and request cancellation under
+   `bd-in31y`. Preserve recent region/interrupt/worker improvements. Measure
+   default mounted behavior rather than only the library algorithms.
+4. **Make existing six-format functionality consumable.** Execute
+   `bd-native-image-library-s4tde` using a small real backend seam, preserving
+   native names, view identity, refusal policy and explicit write authority.
+   Parser-level six-format detection cannot close this task.
+5. **Qualify and complete FAT.** Run the existing writer through public RW mounts,
+   independent native consumers and every relevant storage cut in both dialects.
+   Preserve the honest ordered-write contract. Finish only named missing
+   maintenance/relocation behavior, retaining existing safe free-tail resize.
+6. **Build native NTFS and ZFS transactions.** Complete the existing recovery
+   owner lane, then implement format-native allocation, publication and ordinary
+   mutations with explicit durable tokens, ENOSPC safety, initialization and
+   restart invariants. Full TXG sync is an acceptable first ZFS writer; a private
+   WAL cannot stand in for either native protocol. Complete advanced/lifecycle
+   obligations without making them prerequisites for every restricted reader.
+7. **Bind protection to native durable state and full device identity.** Extend
+   the existing sidecar state machine rather than inventing another archive.
+   Persist invalidation before native writes; seal only a stable committed view;
+   distinguish native-durable from protected-durable acknowledgment. Required
+   log/special devices and all pool members participate in identity/fault tests.
+8. **Prove the usable product.** Add native traversal fuzzing and continuous
+   telemetry, execute the admitted per-format mount/interchange/crash campaigns,
+   measure equivalent workload costs, and bind source/build/options to a real
+   release artifact and its consumer smoke run. Keep permissioned device/host
+   probes pending until their exact authorization exists.
+
+Code, inline/integration tests and diagnostic logging ship in the same logical
+implementation bead. Separate proof campaigns are appropriate where they require
+native systems or real storage; types/implementation/tests mini-closures are not.
+No estimate or bead count below is a completeness percentage or delivery date.
+
+### Tracker staging and import contract
+
+The canonical database, WAL and JSONL must be preserved. `br` refuses even a
+canonical no-DB dry run because its pending-merge inspection cannot establish
+safety. The audit therefore copied the **entire** 4,323-row JSONL, byte-for-byte,
+to an independent artifact workspace and uses `br --no-db` there. This is a
+reviewable proposed graph, not a recovery of database-only changes and not a
+canonical import. Existing row owners/statuses stay intact.
+
+Before canonical import, the owning tracker engine must reconcile/checkpoint its
+possible WAL commits and malformed schema without losing any committed state.
+Then compare the original JSONL hash and all intervening canonical changes;
+apply the new tasks, additive notes and dependencies through `br`, resolving
+conflicts against current ownership. Never copy the staged database/JSONL over
+the canonical family or rebuild it from JSONL while the guard remains unresolved.
+
+The final graph identifiers, ambition/refinement results and validation receipts
+are recorded below as the audit proceeds.
+
 ## Reality check — 2026-10-08 (HEAD 7edae28c)
 
 **Verdict.** FrankenFS has made major strides over the 443 commits since the 2026-09-23 audit (`75e0d3e8` → `7edae28c`). Headline progress includes: empirical xfstests test suite execution on CI with real passes (generic/273, 320, 591, 619, 626, 747), btrfs degraded RAID5/RAID6 tree rebuilding from parity (`bd-hk5w3`, `00025d42`), whole-file reflink dispatch (`1cb18d10`), SHA256 and BLAKE2b-256 btrfs checksums (`aea133c3`), btrfs transactional free-space-tree reservations (`8d8e62cf`), pinned freed data across commits (`7edae28c`), chattr +i/+a VFS enforcement (`80ebab63`), and streaming WAL appends (`3fc2767c`).
