@@ -131,11 +131,25 @@ struct CandidateArgs {
         value_name = "IMAGE"
     )]
     members: Vec<PathBuf>,
+    /// Explicitly absent child GUID of one exported mirror; repeat for every missing disk.
+    /// Requires an explicit candidate and never enables import, replay or healing.
+    #[arg(
+        long = "missing-mirror-member",
+        value_name = "GUID",
+        conflicts_with_all = ["auto_import", "replay_zil"]
+    )]
+    missing_mirror_members: Vec<u64>,
 }
 impl CandidateArgs {
     fn open(&self, cx: &Cx) -> Result<Pool> {
         if self.members.len() > 7 {
             bail!("at most seven additional member images are supported");
+        }
+        if !self.missing_mirror_members.is_empty() {
+            Pool::check_mirror_survivors(self.members.len() + 1, &self.missing_mirror_members)?;
+            if self.auto_import || self.replay_zil || self.pool_guid == 0 {
+                bail!("missing mirror members require explicit pool/candidate selection without import or replay");
+            }
         }
         let mut leaves = Vec::with_capacity(self.members.len() + 1);
         leaves.push(self.image.open(cx)?);
@@ -145,7 +159,17 @@ impl CandidateArgs {
                     .with_context(|| format!("opening ZFS member {}", path.display()))?,
             );
         }
-        Pool::from_leaves(leaves).context("opening explicitly supplied ZFS members")
+        if self.missing_mirror_members.is_empty() {
+            Pool::from_leaves(leaves).context("opening explicitly supplied ZFS members")
+        } else {
+            let pool = Pool::from_mirror_survivors(cx, leaves, self.missing_mirror_members.clone())
+                .context("admitting explicitly missing ZFS mirror members")?;
+            eprintln!(
+                "explicit missing-mirror extraction: pool_guid={} label={} slot={} absent_guids={:?}; selected committed view only, not newest-state authority or pool import",
+                self.pool_guid, self.label, self.slot, self.missing_mirror_members
+            );
+            Ok(pool)
+        }
     }
 
     fn expected_pool_guid(&self) -> Option<u64> {
@@ -658,6 +682,7 @@ mod tests {
             slot: 0,
             pool_guid: 1,
             members: vec![PathBuf::from("unopened-member.img"); 8],
+            missing_mirror_members: Vec::new(),
         };
         let Err(error) = candidate.open(&Cx::for_testing()) else {
             panic!("an oversized member set must fail before image I/O");
@@ -698,6 +723,7 @@ mod tests {
             slot: 0,
             pool_guid: 1,
             members: vec![outside],
+            missing_mirror_members: Vec::new(),
         };
         let mountpoint = mountpoint.canonicalize().unwrap();
         candidate.reject_hidden_images(&mountpoint).unwrap();
@@ -712,5 +738,83 @@ mod tests {
         candidate.members.clear();
         candidate.image.image = inside;
         assert!(candidate.reject_hidden_images(&mountpoint).is_err());
+    }
+
+    #[test]
+    fn missing_mirror_cli_keeps_explicit_identity_and_conflicts_with_import_and_replay() {
+        let options = [
+            "--offline-image", "--pool-guid", "123", "--label", "0", "--slot", "2",
+            "--missing-mirror-member", "1002", "--missing-mirror-member", "1003",
+        ];
+        for command in [
+            vec!["root", "first.img"],
+            vec!["object", "first.img", "7"],
+            vec!["object-read", "first.img", "7", "--bytes", "32"],
+            vec!["zap", "first.img", "7"],
+            vec!["datasets", "first.img"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("ffs-zfs").chain(command).chain(options))
+                .unwrap();
+            let (Command::Root { candidate }
+            | Command::Object { candidate, .. }
+            | Command::ObjectRead { candidate, .. }
+            | Command::Zap { candidate, .. }
+            | Command::Datasets { candidate }) = cli.command else {
+                panic!("raw candidate command");
+            };
+            assert_eq!(candidate.missing_mirror_members, [1002, 1003]);
+            assert_eq!((candidate.pool_guid, candidate.label, candidate.slot), (123, 0, 2));
+            assert!(!candidate.auto_import && !candidate.replay_zil);
+        }
+        for command in [
+            vec!["ls", "first.img", "/"],
+            vec!["read", "first.img", "/file"],
+            vec!["mount", "first.img", "/mnt/extraction"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("ffs-zfs").chain(command).chain(options)).is_ok());
+        }
+        for conflict in ["--auto-import", "--replay-zil", "--rw"] {
+            assert!(Cli::try_parse_from(["ffs-zfs", "root", "first.img"].into_iter()
+                .chain(options).chain([conflict])).is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "ffs-zfs", "root", "first.img", "--offline-image", "--missing-mirror-member", "1002"
+        ]).is_err());
+        assert!(Cli::try_parse_from([
+            "ffs-zfs", "inspect", "first.img", "--offline-image", "--missing-mirror-member", "1002"
+        ]).is_err());
+    }
+
+    #[test]
+    fn missing_mirror_invalid_requests_fail_before_any_image_open() {
+        for (missing, count, auto, replay, guid, reason) in [
+            (vec![0], 0, false, false, 123, "nonzero and unique"),
+            (vec![1002, 1002], 0, false, false, 123, "nonzero and unique"),
+            (vec![1002], 7, false, false, 123, "at most eight total"),
+            (vec![1002], 0, true, false, 123, "without import or replay"),
+            (vec![1002], 0, false, true, 123, "without import or replay"),
+            (vec![1002], 0, false, false, 0, "without import or replay"),
+        ] {
+            let candidate = CandidateArgs {
+                image: ImageArgs {
+                    image: PathBuf::from("unopened-mirror-primary.img"),
+                    offset: 0,
+                    length: None,
+                    offline_image: true,
+                    sidecar: None,
+                },
+                auto_import: auto,
+                replay_zil: replay,
+                label: 0,
+                slot: 2,
+                pool_guid: guid,
+                members: vec![PathBuf::from("unopened-mirror-member.img"); count],
+                missing_mirror_members: missing,
+            };
+            let Err(error) = candidate.open(&Cx::for_testing()) else {
+                panic!("invalid mirror selection must fail before image I/O");
+            };
+            assert!(error.to_string().contains(reason), "{error}");
+        }
     }
 }

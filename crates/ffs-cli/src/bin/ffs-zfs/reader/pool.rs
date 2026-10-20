@@ -6,6 +6,7 @@
 
 mod gang;
 mod import;
+mod missing_mirror;
 pub(super) mod raidz;
 
 use super::{
@@ -20,12 +21,16 @@ const MAX_MEMBERS: usize = 8;
 #[derive(Clone)]
 pub struct Pool {
     members: Vec<Leaf>,
+    // An exact, operator-declared complement of an exported mirror's children.
+    // Empty keeps complete-member admission; never infer missing devices.
+    missing_mirror_guids: Vec<u64>,
 }
 
 impl From<Leaf> for Pool {
     fn from(leaf: Leaf) -> Self {
         Self {
             members: vec![leaf],
+            missing_mirror_guids: Vec::new(),
         }
     }
 }
@@ -159,10 +164,16 @@ impl Pool {
                 "supply one leaf or two through eight redundant or striped members",
             ));
         }
-        Ok(Self { members })
+        Ok(Self {
+            members,
+            missing_mirror_guids: Vec::new(),
+        })
     }
 
     pub(super) fn standalone_leaf(&self) -> Option<&Leaf> {
+        if !self.missing_mirror_guids.is_empty() {
+            return None;
+        }
         match self.members.as_slice() {
             [leaf] => Some(leaf),
             _ => None,
@@ -194,11 +205,19 @@ impl Pool {
         allow_active_state: bool,
     ) -> Result<RootBlock> {
         checkpoint(cx)?;
-        if self.members.len() == 1 {
-            return self.members[0].root(cx, label_index, slot, pool_guid);
+        if !self.missing_mirror_guids.is_empty() && allow_active_state {
+            return Err(unsupported(
+                "missing mirror members require an explicit exported-pool candidate",
+            ));
+        }
+        if let Some(leaf) = self.standalone_leaf() {
+            return leaf.root(cx, label_index, slot, pool_guid);
         }
         let first_label = self.members[0].label(cx, label_index)?;
         if integer(&first_label.config, "vdev_children").unwrap_or(1) > 1 {
+            if !self.missing_mirror_guids.is_empty() {
+                return Err(unsupported("missing-member extraction requires one mirror"));
+            }
             return self.striped_root_with_mode(
                 cx,
                 label_index,
@@ -208,7 +227,7 @@ impl Pool {
             );
         }
         let (selected, _) = first_label.group_config_with_mode(pool_guid, allow_active_state)?;
-        if selected.member_guids.len() != self.members.len() {
+        if selected.member_guids.len() != self.members.len() + self.missing_mirror_guids.len() {
             return Err(unsupported(
                 "every configured redundant member must be explicitly supplied",
             ));
@@ -255,8 +274,10 @@ impl Pool {
             }
             member_guids.push(guid);
         }
-        // Membership, uniqueness and counts prove this is the complete group.
-        // Bind native child IDs and parity only after all labels have agreed.
+        self.validate_mirror_complement(&selected, &member_guids)?;
+        // Normal admission proves a complete group. Explicit mirror extraction
+        // instead proves the exact present/missing partition of that same group.
+        // Neither path drops missing GUIDs from the candidate's native GUID sum.
         let config = selected.mapped(&member_guids)?;
         let block = self.read_block(cx, &config, &candidate.root)?;
         if block.bytes.len() < 1024
