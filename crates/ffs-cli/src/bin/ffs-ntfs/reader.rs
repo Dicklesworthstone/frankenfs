@@ -547,7 +547,10 @@ fn data_read_admission(record: &NtfsFileRecord, attributes: &[NtfsAttribute<'_>]
     }
     if let Some(flags) = standard_flags(attributes)? {
         if flags & 0x400 != 0 {
-            return Err(corrupt(0, "NTFS reparse attribute flag has no reparse value"));
+            return Err(corrupt(
+                0,
+                "NTFS reparse attribute flag has no reparse value",
+            ));
         }
         // On directories ENCRYPTED is the default for newly created children.
         // A named directory stream retains its own ENCRYPTED attribute flag.

@@ -206,37 +206,37 @@ impl Page {
         } else if this_end >> (64 - restart.seq_num_bits)
             == other_end >> (64 - restart.seq_num_bits)
         {
-            let (older, newer) = if order == Ordering::Less {
+            let (prev_page, next_page) = if order == Ordering::Less {
                 (self, other)
             } else {
                 (other, self)
             };
-            if older.last == older.completed {
+            if prev_page.last == prev_page.completed {
                 let start = usize::from(restart.data_off);
                 let obsolete_before = restart
                     .active_client_oldest_lsn
-                    .filter(|oldest| newer.last < *oldest);
+                    .filter(|oldest| next_page.last < *oldest);
                 let end = if let Some(oldest) = obsolete_before {
                     validate_lsn_reference(restart, oldest, "retained-tail-start")?;
                     // Both publications predate the retained client interval;
                     // their origin may have been reused. Keep the original
                     // advertised-prefix comparison without requiring that origin.
-                    usize::from(older.fixed.next_record_off)
+                    usize::from(prev_page.fixed.next_record_off)
                 } else {
-                    let origin_vbo = lsn_to_vbo(older.completed, restart.seq_num_bits)?
+                    let origin_vbo = lsn_to_vbo(prev_page.completed, restart.seq_num_bits)?
                         & !(u64::from(restart.log_page) - 1);
                     let restored;
                     let origin = if origin_vbo == destination {
-                        &older.fixed
+                        &prev_page.fixed
                     } else {
                         restored = read_origin(order == Ordering::Less, origin_vbo)?;
                         &restored
                     };
-                    older.completed_endpoint(restart, destination, origin)?
+                    prev_page.completed_endpoint(restart, destination, origin)?
                 };
                 // Ignore changing page headers, USA tokens and unused slack,
                 // but not any byte of a previously completed client record.
-                if older.fixed.bytes[start..end] != newer.fixed.bytes[start..end] {
+                if prev_page.fixed.bytes[start..end] != next_page.fixed.bytes[start..end] {
                     return Err(corrupt(
                         destination,
                         "$LogFile append rewrites an initialized record prefix",
@@ -320,12 +320,13 @@ fn discover(
 ) -> Result<View> {
     checkpoint(cx)?;
     let page_bytes = u64::from(restart.log_page);
-    if !(512..=65_536).contains(&page_bytes)
-        || !page_bytes.is_power_of_two()
+    let valid_page_bytes = (512..=65_536).contains(&page_bytes) && page_bytes.is_power_of_two();
+    let valid_seq_bits = (3..64).contains(&restart.seq_num_bits);
+    if !valid_page_bytes
         || restart.system_page != restart.log_page
         || restart.file_size > stream_length
         || !restart.file_size.is_multiple_of(page_bytes)
-        || !(3..64).contains(&restart.seq_num_bits)
+        || !valid_seq_bits
         || restart.current_lsn == 0
         || !matches!(restart.version, (1, 1) | (2, 0))
     {

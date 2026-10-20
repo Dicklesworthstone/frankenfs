@@ -3,8 +3,8 @@
 //! No backing writes, native CLR publication or recovered-mount admission.
 //! Unknown required operations abort the complete stage, never a partial view.
 
-use super::super::super::super::super::super as reader;
 use super::super::super::super as journal;
+use super::super::super::super::super::super as reader;
 use super::super::super::tail;
 use super::super::{
     LogRecord, analyze, checkpoint, corrupt, read_record, targets, u16_at, u64_at, unsupported,
@@ -617,7 +617,9 @@ fn export(
             .get(&slot)
             .is_none_or(|attribute| attribute.opened > lsn)
         {
-            return Err(unsupported("native undo target incarnation no longer survives"));
+            return Err(unsupported(
+                "native undo target incarnation no longer survives",
+            ));
         }
         let count = usize::from(u16_at(&record.data, 14)?);
         let first = u64_at(&record.data, 24)?;
@@ -663,7 +665,9 @@ impl NtfsVolume {
         if !(journal::MIN_LOG..=reader::MAX_READ as u64).contains(&length)
             || !length.is_multiple_of(journal::SECTOR as u64)
         {
-            return Err(unsupported("native recovery journal exceeds its complete read profile"));
+            return Err(unsupported(
+                "native recovery journal exceeds its complete read profile",
+            ));
         }
         let mut source = |offset, size| self.read(cx, &stream, offset, size);
         let prefix = journal::read_exact(cx, length, 0, journal::SECTOR, &mut source)?;
