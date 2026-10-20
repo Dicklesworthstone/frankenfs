@@ -109,7 +109,7 @@ fn lsn(index: usize) -> u64 {
     (1_u64 << 15) | ((RING + POSITIONS[index]) as u64 / 8)
 }
 
-fn change(number: u64, redo: &[u8; 8], undo: &[u8; 8]) -> Vec<u8> {
+fn change(number: u64, redo: &[u8], undo: &[u8]) -> Vec<u8> {
     let mut data = vec![0; 64];
     data[..2].copy_from_slice(&7_u16.to_le_bytes());
     data[2..4].copy_from_slice(&7_u16.to_le_bytes());
@@ -460,7 +460,7 @@ fn checkpoint_only_loser_exports_undo_and_redo_before_the_analysis_start() {
     let plan = volume.logfile_recovery.as_ref().unwrap();
     assert_eq!(plan.restart.current_lsn, lsns[4]);
     assert_eq!(plan.aborted_transactions, [24]);
-    assert!(plan.committed_transactions.is_empty());
+    assert_eq!(plan.committed_transactions, [] as [u32; 0]);
     assert_eq!((plan.redo_actions.len(), plan.undo_actions.len()), (1, 1));
     assert_eq!(plan.redo_actions[0].lsn, lsns[1]);
     assert_eq!(plan.undo_actions[0].lsn, lsns[1]);

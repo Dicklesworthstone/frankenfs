@@ -366,7 +366,7 @@ fn false_tail_identity_future_epoch_and_overwritten_retention_are_rejected() {
     let mut bad_anchor = restart.clone();
     bad_anchor.last_lsn_data_len += 1;
     assert!(check(&bad_anchor, &log).is_err());
-    let mut future_checkpoint = restart.clone();
+    let mut future_checkpoint = restart;
     future_checkpoint.active_client_restart_lsn = Some(lsn(1, at + 152));
     assert!(check(&future_checkpoint, &log).is_err());
 }
@@ -609,7 +609,8 @@ fn a_spanning_record_in_a_complete_tail_transfer_is_reassembled_before_analysis(
         match mutation {
             0 => bad[2 * PAGE + 152 + 40..2 * PAGE + 152 + 42].fill(0),
             1 => {
-                bad[2 * PAGE + 152 + 28..2 * PAGE + 152 + 30].copy_from_slice(&10_u16.to_le_bytes())
+                bad[2 * PAGE + 152 + 28..2 * PAGE + 152 + 30]
+                    .copy_from_slice(&10_u16.to_le_bytes());
             }
             _ => bad[3 * PAGE + 368..3 * PAGE + 376].fill(0),
         }
