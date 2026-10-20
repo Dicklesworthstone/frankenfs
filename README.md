@@ -49,7 +49,7 @@ per-format profiles define the actual admission rules.
 | **FAT16** | `ffs-fat` | Native reads/catalog/extraction, read-only FUSE, allocation checking, fresh-image formatting/population, ordered offline replacement and short-/long-name file creation | New long names use a bounded UTF-16 profile with ASCII aliases. Existing subdirectories can grow; the fixed root cannot. No writable mount or crash replay. |
 | **FAT32** | `ffs-fat` | The FAT16 companion surface plus FAT32 root chains, selected-FAT handling and free-space hints | Create-only updates reserve complete name records and can grow roots/subdirectories with ordered native allocation. No atomic namespace transaction or writable mount. |
 | **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection and FUSE | The exact NTFS read profile controls admission. Native `$LogFile` recovery and general NTFS mutation are not implemented by these reads. |
-| **ZFS** | `ffs-zfs` | Native dataset/snapshot discovery and reads, admitted compression/checksums, selected mirror/RAIDZ and read-only mount profiles | Explicit offline pool/configuration selection is not native pool import. No native allocation/TXG writer or ZIL recovery claim. |
+| **ZFS** | `ffs-zfs` | Native dataset/snapshot discovery and reads, admitted compression/checksums, selected mirror/RAIDZ, explicitly incomplete exported-mirror extraction, and read-only mount profiles | Explicit offline pool/configuration selection is not native pool import. Missing-member extraction is committed-view-only; no automatic import, log recovery or write authority. |
 
 The new formats currently live in companion binaries. They are **not yet a
 unified six-format `OpenFs` backend**, and the ext4/btrfs MVCC/RaptorQ integration
@@ -141,6 +141,28 @@ dry-run/collision refusal and independent `fsck.fat -n` on fresh 64 MiB FAT16
 and FAT32 images. Windows, writable-mount, crash-replay and hardware power-cut
 qualification remain outstanding.
 
+## ZFS: extract from surviving mirror disks
+
+`--missing-mirror-member GUID` explicitly identifies every absent child of one
+exported mirror. The surviving images must agree on the complete native
+configuration and selected root; present and missing GUIDs must account for
+all children exactly. The existing checked block pipeline serves committed
+head and snapshot reads without inventing devices or weakening checksums.
+
+```sh
+# GUIDs and candidate numbers are placeholders, not automatic root selection.
+ffs-zfs read survivor.img /important.bin --dataset data --offline-image \
+  --pool-guid 123 --label 0 --slot 2 --missing-mirror-member 1002 > recovered.bin
+```
+
+This profile does not infer missing disks or choose the newest surviving TXG.
+It refuses active pools, incomplete RAIDZ/striped topology, automatic import and
+log recovery. It performs no backing writes or healing. One survivor remains a
+mirror-owned view rather than being reinterpreted as a standalone leaf.
+The ten new controls are authored, not runtime-qualified in this implementation
+session. See the [missing-mirror extraction profile](docs/ZFS_MISSING_MIRROR_PROFILE.md)
+for exact limits, examples, proof scope and required validation.
+
 ## Build and explore
 
 Use the checked-in Rust toolchain and the platform/dependency instructions in the
@@ -170,6 +192,7 @@ projection and rejection rules are in the corresponding profiles:
 | Existing-image FAT creation and directory growth | [Create-only profile](docs/FAT_CREATE_PROFILE.md) |
 | NTFS native reads and read-only mounts | [NTFS profile](docs/NTFS_READ_PROFILE.md) |
 | ZFS datasets, snapshots, topology and read-only mounts | [ZFS profile](docs/ZFS_READ_PROFILE.md) |
+| ZFS committed-view extraction from explicitly incomplete mirrors | [Missing-mirror profile](docs/ZFS_MISSING_MIRROR_PROFILE.md) |
 | ext4/btrfs architecture, operation and evidence | [Detailed guide](README_EXT4_BTRFS.md), [current parity ledger](FEATURE_PARITY.md) |
 
 ## Architecture and remaining priorities

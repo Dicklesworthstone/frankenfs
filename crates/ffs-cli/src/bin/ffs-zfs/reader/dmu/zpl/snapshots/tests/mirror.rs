@@ -324,3 +324,53 @@ fn followed_historical_file_errors_do_not_reopen_a_healthy_live_head() {
         assert_eq!(count(&reads[1], LIVE_FIRST), 0);
     }
 }
+
+#[test]
+fn missing_mirror_survivor_retains_independent_head_and_snapshot_filesystem_views() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        // Case 21 keeps file payloads embedded in their verified metadata. The
+        // second member has healthy MOS/DSL/snapshot metadata; the first does
+        // not participate and must never be reached through a retained owner.
+        let (complete, reads) = mirror_pool(order, 21, [Fault::None; 2]);
+        let survivor = complete.leaves()[1].clone();
+        drop(complete);
+        reads[0].lock().unwrap().clear();
+        reads[1].lock().unwrap().clear();
+        let pool = Pool::from_mirror_survivors(&cx, vec![survivor], vec![1001]).unwrap();
+        let mut objects = pool.objects(&cx, 0, 2, 123).unwrap();
+        let snapshots = objects.snapshots(&cx, &[]).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        let live = ZfsFs::new(&cx, objects.zpl(&cx, &[]).unwrap(), 1000, 1000).unwrap();
+        let before = ZfsFs::new(
+            &cx,
+            objects.zpl_snapshot(&cx, &[], b"before").unwrap(),
+            1000,
+            1000,
+        )
+        .unwrap();
+        drop(objects);
+        drop(pool);
+        let mut scope = RequestScope::empty();
+        let root = InodeNumber(1);
+        let head_file = live.lookup(&cx, &mut scope, root, OsStr::new("file")).unwrap();
+        let old_file = before.lookup(&cx, &mut scope, root, OsStr::new("file")).unwrap();
+        assert_eq!((head_file.size, old_file.size), (900, 2049));
+        for _ in 0..3 {
+            assert_eq!(live.read(&cx, &mut scope, head_file.ino, 0, 8).unwrap(), b"EEEEEEEE");
+            assert_eq!(before.read(&cx, &mut scope, old_file.ino, 0, 4096).unwrap(), old_bytes());
+            assert_eq!(
+                before.read(&cx, &mut scope, old_file.ino, 510, 1029).unwrap(),
+                old_bytes()[510..1539]
+            );
+            assert!(before.lookup(&cx, &mut scope, root, OsStr::new("gone")).is_ok());
+            assert!(matches!(
+                live.lookup(&cx, &mut scope, root, OsStr::new("gone")),
+                Err(FfsError::NotFound(_))
+            ));
+        }
+        assert!(reads[0].lock().unwrap().is_empty());
+        assert!(count(&reads[1], POOL_ROOT) > 0);
+        assert!(count(&reads[1], OLDER_ROOT) > 0);
+    }
+}
