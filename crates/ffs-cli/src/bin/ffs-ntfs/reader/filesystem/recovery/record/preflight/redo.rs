@@ -6,6 +6,7 @@
 //! journal claims, NOT physical ownership, page LSNs, or volume geometry.
 //! A candidate plan is never permission to write or to mount a dirty image.
 
+mod index_replay;
 mod replay;
 
 use super::{
@@ -68,7 +69,7 @@ impl Plan<'_> {
         input: ReplayInput<'_>,
         read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
     ) -> Result<ReplaySummary> {
-        replay::stage(cx, self, input, read)
+        index_replay::stage(cx, self, input, read)
     }
 
     pub(super) fn summary(&self) -> Summary {
