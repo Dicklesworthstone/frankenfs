@@ -300,3 +300,89 @@ fn scrub_raidz_unrecoverable_data_and_cancellation_never_become_clean() {
         }
     }
 }
+
+#[test]
+fn missing_raidz_filesystem_views_retain_head_and_snapshot_owners_after_pool_drop() {
+    use crate::reader::Pool;
+
+    let cx = Cx::for_testing();
+    for nparity in 1..=3 {
+        for order in [Endian::Little, Endian::Big] {
+            for case in [0, 21] {
+                let image = striped_pool(order, case, nparity);
+                let reads = image.reads();
+                let complete = image.open(&vec![Fault::None; width(nparity)], false);
+                let leaves = complete.leaves().iter().enumerate()
+                    .filter(|(index, _)| *index >= nparity)
+                    .rev().map(|(_, leaf)| leaf.clone()).collect();
+                let missing = (0..nparity).map(|id| 1001 + id as u64).collect();
+                let pool = Pool::from_raidz_survivors(&cx, leaves, missing).unwrap();
+                drop(complete);
+                let mut objects = pool.objects(&cx, 0, 2, 123).unwrap();
+                assert_eq!(objects.snapshots(&cx, &[]).unwrap().len(), 2);
+                let head = ZfsFs::new(&cx, objects.zpl(&cx, &[]).unwrap(), 1000, 1000).unwrap();
+                let before = ZfsFs::new(&cx, objects.zpl_snapshot(&cx, &[], b"before").unwrap(), 1000, 1000).unwrap();
+                let after = ZfsFs::new(&cx, objects.zpl_snapshot(&cx, &[], b"after").unwrap(), 1000, 1000).unwrap();
+                drop(objects);
+                drop(pool);
+                let mut scope = RequestScope::empty();
+                let root = InodeNumber(1);
+                let current = head.lookup(&cx, &mut scope, root, OsStr::new("file")).unwrap();
+                let old = before.lookup(&cx, &mut scope, root, OsStr::new("file")).unwrap();
+                let middle = after.lookup(&cx, &mut scope, root, OsStr::new("file")).unwrap();
+                assert_eq!((current.size, old.size, middle.size), (900, 2049, 600));
+                for _ in 0..3 {
+                    assert_eq!(head.read(&cx, &mut scope, current.ino, 0, 8).unwrap(), b"EEEEEEEE");
+                    assert_eq!(before.read(&cx, &mut scope, old.ino, 0, 4096).unwrap(), old_bytes());
+                    assert_eq!(before.read(&cx, &mut scope, old.ino, 510, 1029).unwrap(), old_bytes()[510..1539]);
+                    assert_eq!(after.read(&cx, &mut scope, middle.ino, 0, 8).unwrap(), b"CCCCCCCC");
+                    assert!(before.lookup(&cx, &mut scope, root, OsStr::new("gone")).is_ok());
+                    assert!(matches!(head.lookup(&cx, &mut scope, root, OsStr::new("gone")), Err(FfsError::NotFound(_))));
+                }
+                for log in &reads[..nparity] {
+                    assert!(log.lock().unwrap().is_empty(), "absent child was read");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_raidz_historical_read_failure_never_falls_back_to_live_data() {
+    use crate::reader::Pool;
+
+    let cx = Cx::for_testing();
+    for nparity in 1..=3 {
+        for cancel in [false, true] {
+            let mut image = striped_pool(Endian::Little, 0, nparity);
+            let absent = image.column(OLD_LAST, nparity).0;
+            let live: Vec<_> = image.map(LIVE_FIRST).columns().iter().enumerate()
+                .filter(|(_, column)| column.bytes != 0)
+                .map(|(index, _)| image.column(LIVE_FIRST, index)).collect();
+            let parity = image.column(OLD_LAST, 0);
+            let mut faults = vec![Fault::None; width(nparity)];
+            if cancel {
+                faults[parity.0] = Fault::Cancel(parity.1);
+            } else {
+                for ordinal in 0..nparity { image.poison(OLD_LAST, ordinal, 32 + ordinal * 11); }
+            }
+            let reads = image.reads();
+            let complete = image.open(&faults, false);
+            let leaves = complete.leaves().iter().enumerate()
+                .filter(|(index, _)| *index != absent)
+                .rev().map(|(_, leaf)| leaf.clone()).collect();
+            let pool = Pool::from_raidz_survivors(&cx, leaves, vec![1001 + absent as u64]).unwrap();
+            drop(complete);
+            let mut objects = pool.objects(&cx, 0, 2, 123).unwrap();
+            let mut before = objects.zpl_snapshot(&cx, &[], b"before").unwrap();
+            drop(objects);
+            drop(pool);
+            let result = before.read(&cx, 3, 0, 2049);
+            if cancel { assert!(matches!(result, Err(FfsError::Cancelled))); }
+            else { assert!(result.is_err()); }
+            assert_eq!(before.stat(&cx, 3).unwrap().0.size, 2049);
+            for address in live { assert_eq!(count(&reads, address), 0); }
+            assert!(reads[absent].lock().unwrap().is_empty());
+        }
+    }
+}

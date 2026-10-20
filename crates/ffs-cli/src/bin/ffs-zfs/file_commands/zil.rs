@@ -37,6 +37,9 @@ pub enum Command {
 }
 
 fn preflight(candidate: &CandidateArgs) -> Result<()> {
+    if !candidate.missing_raidz_members.is_empty() {
+        bail!("missing RAIDZ members admit committed-view extraction, not ZIL inspection or recovery");
+    }
     if !candidate.missing_mirror_members.is_empty() {
         bail!("missing mirror members admit committed-view extraction, not ZIL inspection or recovery");
     }

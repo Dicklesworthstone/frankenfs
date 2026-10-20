@@ -139,11 +139,27 @@ struct CandidateArgs {
         conflicts_with_all = ["auto_import", "replay_zil"]
     )]
     missing_mirror_members: Vec<u64>,
+    /// Explicitly absent child GUID of one exported RAIDZ1/2/3 group.
+    /// Repeat for every missing disk; missing count must fit native parity.
+    #[arg(
+        long = "missing-raidz-member",
+        value_name = "GUID",
+        conflicts_with_all = ["auto_import", "replay_zil", "missing_mirror_members"]
+    )]
+    missing_raidz_members: Vec<u64>,
 }
 impl CandidateArgs {
     fn open(&self, cx: &Cx) -> Result<Pool> {
         if self.members.len() > 7 {
             bail!("at most seven additional member images are supported");
+        }
+        if !self.missing_raidz_members.is_empty() {
+            Pool::check_raidz_survivors(self.members.len() + 1, &self.missing_raidz_members)?;
+            if !self.missing_mirror_members.is_empty()
+                || self.auto_import || self.replay_zil || self.pool_guid == 0
+            {
+                bail!("missing RAIDZ members require explicit pool/candidate selection without mirror declarations, import or replay");
+            }
         }
         if !self.missing_mirror_members.is_empty() {
             Pool::check_mirror_survivors(self.members.len() + 1, &self.missing_mirror_members)?;
@@ -159,7 +175,15 @@ impl CandidateArgs {
                     .with_context(|| format!("opening ZFS member {}", path.display()))?,
             );
         }
-        if self.missing_mirror_members.is_empty() {
+        if !self.missing_raidz_members.is_empty() {
+            let pool = Pool::from_raidz_survivors(cx, leaves, self.missing_raidz_members.clone())
+                .context("admitting explicitly missing ZFS RAIDZ members")?;
+            eprintln!(
+                "explicit missing-RAIDZ extraction: pool_guid={} label={} slot={} absent_guids={:?}; selected committed view only, not newest-state authority, log recovery or pool import",
+                self.pool_guid, self.label, self.slot, self.missing_raidz_members
+            );
+            Ok(pool)
+        } else if self.missing_mirror_members.is_empty() {
             Pool::from_leaves(leaves).context("opening explicitly supplied ZFS members")
         } else {
             let pool = Pool::from_mirror_survivors(cx, leaves, self.missing_mirror_members.clone())
@@ -683,6 +707,7 @@ mod tests {
             pool_guid: 1,
             members: vec![PathBuf::from("unopened-member.img"); 8],
             missing_mirror_members: Vec::new(),
+            missing_raidz_members: Vec::new(),
         };
         let Err(error) = candidate.open(&Cx::for_testing()) else {
             panic!("an oversized member set must fail before image I/O");
@@ -724,6 +749,7 @@ mod tests {
             pool_guid: 1,
             members: vec![outside],
             missing_mirror_members: Vec::new(),
+            missing_raidz_members: Vec::new(),
         };
         let mountpoint = mountpoint.canonicalize().unwrap();
         candidate.reject_hidden_images(&mountpoint).unwrap();
@@ -810,6 +836,7 @@ mod tests {
                 pool_guid: guid,
                 members: vec![PathBuf::from("unopened-mirror-member.img"); count],
                 missing_mirror_members: missing,
+                missing_raidz_members: Vec::new(),
             };
             let Err(error) = candidate.open(&Cx::for_testing()) else {
                 panic!("invalid mirror selection must fail before image I/O");
@@ -818,3 +845,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod missing_raidz_cli_tests;

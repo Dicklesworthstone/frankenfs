@@ -49,7 +49,7 @@ per-format profiles define the actual admission rules.
 | **FAT16** | `ffs-fat` | Native reads/catalog/extraction, read-only FUSE, allocation checking, fresh-image formatting/population, ordered offline replacement and short-/long-name file creation | New long names use a bounded UTF-16 profile with ASCII aliases. Existing subdirectories can grow; the fixed root cannot. No writable mount or crash replay. |
 | **FAT32** | `ffs-fat` | The FAT16 companion surface plus FAT32 root chains, selected-FAT handling and free-space hints | Create-only updates reserve complete name records and can grow roots/subdirectories with ordered native allocation. No atomic namespace transaction or writable mount. |
 | **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection and FUSE | The exact NTFS read profile controls admission. Native `$LogFile` recovery and general NTFS mutation are not implemented by these reads. |
-| **ZFS** | `ffs-zfs` | Native dataset/snapshot discovery and reads, admitted compression/checksums, selected mirror/RAIDZ, explicitly incomplete exported-mirror extraction, and read-only mount profiles | Explicit offline pool/configuration selection is not native pool import. Missing-member extraction is committed-view-only; no automatic import, log recovery or write authority. |
+| **ZFS** | `ffs-zfs` | Native dataset/snapshot discovery and reads, admitted compression/checksums, selected mirror/RAIDZ, explicitly incomplete exported-mirror and RAIDZ1/2/3 extraction, and read-only mount profiles | Explicit offline pool/configuration selection is not native pool import. Missing-member extraction is committed-view-only; no automatic import, log recovery or write authority. |
 
 The new formats currently live in companion binaries. They are **not yet a
 unified six-format `OpenFs` backend**, and the ext4/btrfs MVCC/RaptorQ integration
@@ -163,6 +163,29 @@ The ten new controls are authored, not runtime-qualified in this implementation
 session. See the [missing-mirror extraction profile](docs/ZFS_MISSING_MIRROR_PROFILE.md)
 for exact limits, examples, proof scope and required validation.
 
+### RAIDZ1/2/3 with explicitly absent children
+
+`--missing-raidz-member GUID` provides a separate committed-view extraction
+profile for an exported ordinary RAIDZ group. It retains native stripe width,
+child order, parity count and the full GUID sum, even when only one image
+survives. Missing columns have no supplied handle. Existing reconstruction
+accepts bytes only after the original checksum and transform validate; corrupt
+parity and additional read failures share the native parity budget.
+
+```sh
+# Three-child RAIDZ1: two actual images plus one declared absent native GUID.
+ffs-zfs read first.img /important.bin --member second.img --offline-image \
+  --pool-guid 123 --label 0 --slot 2 --missing-raidz-member 1003 > recovered.bin
+```
+
+All absent GUIDs must be declared, and their count must fit native parity.
+Automatic import, replay and mixed mirror/RAIDZ declarations are refused before
+image opens; no pool healing or latest-state authority is implied. Thirteen
+new native-image, CLI and head/snapshot controls are authored but not executed
+in this implementation session. See the
+[missing-RAIDZ extraction profile](docs/ZFS_MISSING_RAIDZ_PROFILE.md) for limits
+and validation still required before relying on the feature.
+
 ## Build and explore
 
 Use the checked-in Rust toolchain and the platform/dependency instructions in the
@@ -193,6 +216,7 @@ projection and rejection rules are in the corresponding profiles:
 | NTFS native reads and read-only mounts | [NTFS profile](docs/NTFS_READ_PROFILE.md) |
 | ZFS datasets, snapshots, topology and read-only mounts | [ZFS profile](docs/ZFS_READ_PROFILE.md) |
 | ZFS committed-view extraction from explicitly incomplete mirrors | [Missing-mirror profile](docs/ZFS_MISSING_MIRROR_PROFILE.md) |
+| ZFS committed-view extraction with missing RAIDZ1/2/3 children | [Missing-RAIDZ profile](docs/ZFS_MISSING_RAIDZ_PROFILE.md) |
 | ext4/btrfs architecture, operation and evidence | [Detailed guide](README_EXT4_BTRFS.md), [current parity ledger](FEATURE_PARITY.md) |
 
 ## Architecture and remaining priorities
