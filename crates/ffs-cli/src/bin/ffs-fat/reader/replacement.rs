@@ -640,6 +640,7 @@ fn set_hints(cx: &Cx, volume: &FatVolume, free: u32) -> Result<()> {
 }
 
 fn set_dirty(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
+    checkpoint(cx)?;
     if dirty {
         // Prepared plans can outlive preflight. Check the complete retained
         // mapping and ALL selected reserved records before the first write,
@@ -652,13 +653,33 @@ fn set_dirty(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
         FatKind::Fat16 => (37, 0x8000, 0xFFFF),
         FatKind::Fat32 => (65, 0x0800_0000, 0x0FFF_FFFF),
     };
-    // Linux's native BPB state and FAT[1]'s native clean bit both remain dirty
-    // until every data, directory, allocation and hint barrier has succeeded.
+    // Stage and validate BOTH transitions completely before the first write.
+    // In particular, a hard error in a later FAT copy must not be discovered
+    // after earlier boot/FAT records have already been marked clean.
+    // Geometry admits at most two boots and two FATs: bounded sector scratch,
+    // independent of volume size. Reserve readback too, before publication.
+    let mut sectors = Vec::new();
+    sectors
+        .try_reserve_exact(4)
+        .context("allocating native state publication")?;
+    let mut readback = allocate(geometry.sector_bytes() as usize)?;
+    let mut media = None;
     for number in std::iter::once(0_u16).chain(geometry.backup_boot_sector()) {
         let offset = u64::from(number) * u64::from(geometry.sector_bytes());
         let mut bytes = allocate(geometry.sector_bytes() as usize)?;
         volume.read_exact(cx, offset, &mut bytes)?;
-        if bytes[state_at] & 3 != u8::from(!dirty) {
+        let current = FatGeometry::parse(&bytes, geometry.volume_bytes())
+            .map_err(|error| anyhow!("invalid FAT geometry during state publication: {error}"))?;
+        if current != *geometry {
+            bail!("FAT geometry changed during state publication");
+        }
+        if (bytes[21] != 0xF0 && bytes[21] < 0xF8)
+            || media.is_some_and(|previous| previous != bytes[21])
+        {
+            bail!("native media descriptor changed during state publication");
+        }
+        media = Some(bytes[21]);
+        if bytes[state_at] != u8::from(!dirty) {
             bail!("native boot state changed during replacement");
         }
         if dirty {
@@ -666,8 +687,9 @@ fn set_dirty(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
         } else {
             bytes[state_at] &= !1;
         }
-        write_volume(cx, volume, offset, &bytes)?;
+        sectors.push((offset, bytes));
     }
+    let media = media.context("missing primary boot state")?;
     for copy in volume.copies() {
         let offset = geometry
             .entry_offset(copy, 2)
@@ -675,6 +697,14 @@ fn set_dirty(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
             - 2 * width as u64;
         let mut bytes = allocate(geometry.sector_bytes() as usize)?;
         volume.read_exact(cx, offset, &mut bytes)?;
+        let first = if width == 2 {
+            u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
+        } else {
+            u32::from_le_bytes(bytes[..4].try_into().expect("four-byte FAT entry"))
+        };
+        if first & value_mask != ((value_mask & !0xFF) | u32::from(media)) {
+            bail!("FAT reserved entry zero changed during state publication");
+        }
         let raw = if width == 2 {
             u32::from(u16::from_le_bytes([bytes[2], bytes[3]]))
         } else {
@@ -694,8 +724,26 @@ fn set_dirty(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
             raw | clean_mask
         };
         bytes[width..2 * width].copy_from_slice(&updated.to_le_bytes()[..width]);
-        write_volume(cx, volume, offset, &bytes)?;
+        sectors.push((offset, bytes));
     }
+
+    // Acknowledged writes can be dropped, torn or misdirected. Persist and
+    // compare the COMPLETE prepared sectors before a caller can overwrite
+    // live data, or acknowledge final clean state. Reading only the flag would
+    // miss damage to adjacent allocation entries or boot geometry.
+    // Callers retain their later hint/data/final barriers; no rollback or
+    // cleanup write is attempted if this barrier or its readback fails.
+    for (offset, bytes) in &sectors {
+        write_volume(cx, volume, *offset, bytes)?;
+    }
+    volume.device.sync(cx)?;
+    for (offset, expected) in &sectors {
+        volume.read_exact(cx, *offset, &mut readback)?;
+        if readback != *expected {
+            bail!("native state sector readback failed at volume byte {offset}");
+        }
+    }
+    checkpoint(cx)?;
     Ok(())
 }
 
@@ -975,4 +1023,6 @@ companion_bin_tests! {
     mod read_only_tests;
     #[cfg(test)]
     mod admission_tests;
+    #[cfg(test)]
+    mod state_tests;
 }
