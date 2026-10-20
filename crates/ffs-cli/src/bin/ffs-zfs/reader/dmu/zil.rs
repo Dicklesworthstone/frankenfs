@@ -538,9 +538,8 @@ impl Edit<'_> {
     pub(super) fn size_after(&self, size: u64) -> u64 {
         match self {
             Self::Write { offset, data, .. } => size.max(*offset + data.len() as u64),
-            Self::Indirect { end, .. } => size.max(*end),
+            Self::Indirect { end, .. } | Self::Free { end, .. } => size.max(*end),
             Self::Truncate { size, .. } => *size,
-            Self::Free { end, .. } => size.max(*end),
         }
     }
 }

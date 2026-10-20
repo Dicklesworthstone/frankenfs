@@ -227,7 +227,11 @@ impl Zpl {
             .as_mut()
             .ok_or_else(|| unsupported("ZIL replay requires a selected filesystem head"))?;
         let log = mos.intent_log(cx, components)?;
-        if log.dataset_guid != self.dataset_guid || log.selected_txg != self.objects.txg {
+        if log.dataset_guid != self.dataset_guid
+            || log.selected_txg != self.objects.txg
+            || log.header.claim_txg != self.zil_header.claim_txg
+            || log.header.replay_sequence != self.zil_header.replay_seq
+        {
             return Err(corrupt("ZIL selection differs from its ZPL owner"));
         }
         // Native zil_check_log_chain accepts an unclaimed checksum-invalid
@@ -639,10 +643,10 @@ impl Zpl {
                 let edit = write.ok_or_else(|| corrupt("ZIL write was not admitted"))?;
                 // Native writes may be logged after the target was unlinked.
                 // Only ENOENT is ignorable, never read/parse/cancel errors.
-                if let Err(error) = self.apply_file_edit(cx, overlay, *file_obj, edit) {
-                    if !matches!(error, FfsError::NotFound(_)) {
-                        return Err(error);
-                    }
+                if let Err(error) = self.apply_file_edit(cx, overlay, *file_obj, edit)
+                    && !matches!(error, FfsError::NotFound(_))
+                {
+                    return Err(error);
                 }
             }
             ZilRecordPayload::Truncate {

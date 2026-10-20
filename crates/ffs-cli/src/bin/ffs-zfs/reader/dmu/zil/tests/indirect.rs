@@ -177,7 +177,7 @@ fn native_namespace_replay_reads_full_and_partial_indirect_payloads_without_clip
     for order in [Endian::Little, Endian::Big] {
         for partial in [false, true] {
             let bytes = vec![b'R'; 512];
-            let offset = 32 * 1024 * 1024 + if partial { 1 } else { 0 };
+            let offset = 32 * 1024 * 1024 + u64::from(partial);
             let length = if partial { 7 } else { 512 };
             let write = indirect(
                 &data_bp(&bytes, 512, 2, order, order),
