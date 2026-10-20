@@ -48,6 +48,32 @@ impl Extension {
     fn clusters(&self) -> impl Iterator<Item = u32> + Clone {
         std::iter::once(self.cluster).chain(self.additional)
     }
+
+    /// Never attach an allocation chain whose acknowledged writes disappeared.
+    /// FatTable checks every selected mirror, ignoring only reserved high bits.
+    fn verify_links(&self, cx: &Cx, volume: &FatVolume, attached: bool) -> Result<()> {
+        let mut table = super::super::FatTable::new(volume);
+        for (index, cluster) in self.clusters().enumerate() {
+            let expected = if index == 0 {
+                self.additional.map_or(FatEntry::End, FatEntry::Next)
+            } else {
+                FatEntry::End
+            };
+            if table.entry(cx, cluster)? != expected {
+                bail!("directory extension link failed readback at cluster {cluster}");
+            }
+        }
+        let expected = if attached {
+            FatEntry::Next(self.cluster)
+        } else {
+            FatEntry::End
+        };
+        if table.entry(cx, self.tail)? != expected {
+            bail!("directory extension tail failed readback at cluster {}", self.tail);
+        }
+        checkpoint(cx)?;
+        Ok(())
+    }
 }
 
 /// Extra native state required when free slots become a namespace entry set.
@@ -83,6 +109,58 @@ fn patch_slot(
     }
     sector[within..within + 32].copy_from_slice(updated);
     write_volume(cx, volume, start, &sector)
+}
+
+/// Initialize at most two new directory clusters and verify every byte after
+/// synchronization, BEFORE any live directory or parent entry can reach them.
+/// mkdir supplies dot records; parent growth supplies all-zero end markers.
+/// Preserve the existing single barrier, with bounded scratch reserved first.
+fn initialize_directory(
+    cx: &Cx,
+    volume: &FatVolume,
+    clusters: &(impl Iterator<Item = u32> + Clone),
+    bytes: &[u8],
+) -> Result<()> {
+    checkpoint(cx)?;
+    if bytes.len() != volume.geometry.cluster_bytes() as usize {
+        bail!("directory initializer must cover one complete cluster");
+    }
+    let mut starts = [0_u64; 2];
+    let mut count = 0;
+    for (index, cluster) in clusters.clone().enumerate() {
+        if index == starts.len() {
+            bail!("directory initializer exceeds the two-cluster reservation bound");
+        }
+        let start = volume.cluster_offset(cluster)?;
+        if starts[..index].contains(&start) {
+            bail!("directory initializer repeats a reserved cluster");
+        }
+        starts[index] = start;
+        count = index + 1;
+    }
+    if count == 0 {
+        bail!("directory initializer requires reserved storage");
+    }
+    let mut readback = allocate(bytes.len())?;
+    for &start in &starts[..count] {
+        write_volume(cx, volume, start, bytes)?;
+    }
+    volume.device.sync(cx)?;
+    for &start in &starts[..count] {
+        volume.read_exact(cx, start, &mut readback)?;
+        if readback.as_slice() != bytes {
+            bail!("initialized directory data failed readback at volume byte {start}");
+        }
+    }
+    checkpoint(cx)?;
+    Ok(())
+}
+
+fn verify_slot(cx: &Cx, volume: &FatVolume, slot: &Slot, expected: &[u8; 32]) -> Result<()> {
+    if read_slot(cx, volume, slot.offset, false)?.bytes != *expected {
+        bail!("directory staging readback failed at volume byte {}", slot.offset);
+    }
+    Ok(())
 }
 
 impl Namespace {
@@ -131,10 +209,7 @@ impl Namespace {
     pub(super) fn stage(&self, cx: &Cx, volume: &FatVolume) -> Result<()> {
         if let Some(extension) = &self.extension {
             let bytes = allocate(volume.geometry.cluster_bytes() as usize)?;
-            for cluster in extension.clusters() {
-                write_volume(cx, volume, volume.cluster_offset(cluster)?, &bytes)?;
-            }
-            volume.device.sync(cx)?;
+            initialize_directory(cx, volume, &extension.clusters(), &bytes)?;
             let end = match volume.geometry.kind() {
                 FatKind::Fat16 => 0xFFFF,
                 FatKind::Fat32 => 0x0FFF_FFFF,
@@ -149,6 +224,7 @@ impl Namespace {
             });
             change_fat(cx, volume, &changes)?;
             volume.device.sync(cx)?;
+            extension.verify_links(cx, volume, false)?;
             // All new directory links are durable before an existing parent
             // can reach any of them. No data/namespace slot moves are needed.
             change_fat(
@@ -157,10 +233,14 @@ impl Namespace {
                 &std::iter::once((extension.tail, EXPECT_END, extension.cluster)),
             )?;
             volume.device.sync(cx)?;
+            extension.verify_links(cx, volume, true)?;
         }
         if let Some(slot) = &self.successor {
             patch_slot(cx, volume, slot.offset, &slot.initialized(), &[0; 32])?;
             volume.device.sync(cx)?;
+            // Consuming the old end marker must not expose stale successor
+            // records merely because the replacement terminator was dropped.
+            verify_slot(cx, volume, slot, &[0; 32])?;
         }
         if self.long_slots.is_empty() {
             checkpoint(cx)?;
@@ -190,6 +270,23 @@ impl Namespace {
         }
         volume.device.sync(cx)?;
 
+        // Prove the short entry and every hidden slot harmless BEFORE replacing
+        // the old end marker with LFN records. Keep the true old marker and the
+        // first slot unchanged until then, including a marker in the middle of
+        // a run that starts with deleted entries.
+        verify_slot(cx, volume, &self.entry, &deleted)?;
+        for (index, slot) in self.long_slots.iter().enumerate() {
+            let expected = if index == 0 || Some(index) == end_marker {
+                slot.initialized()
+            } else {
+                deleted
+            };
+            verify_slot(cx, volume, slot, &expected)?;
+        }
+        if let Some(slot) = &self.successor {
+            verify_slot(cx, volume, slot, &[0; 32])?;
+        }
+
         // Ordinal one is physically closest to the short entry. No old end
         // marker is consumed before the short/hidden-slot barrier above.
         for (index, slot) in self.long_slots.iter().enumerate().rev() {
@@ -208,6 +305,12 @@ impl Namespace {
             if actual != self.name.slot(self.long_slots.len() - index) {
                 bail!("native long-name readback differs from the reserved name");
             }
+        }
+        // LFN/SFN/end-marker records can share a sector. Read-modify-write
+        // staging must not resurrect the short entry or erase the terminator.
+        verify_slot(cx, volume, &self.entry, &deleted)?;
+        if let Some(slot) = &self.successor {
+            verify_slot(cx, volume, slot, &[0; 32])?;
         }
         checkpoint(cx)?;
         Ok(())

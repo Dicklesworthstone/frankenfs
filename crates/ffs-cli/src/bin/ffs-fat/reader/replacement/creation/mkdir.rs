@@ -266,13 +266,12 @@ impl DirectoryCreation {
             let dotdot = directory_entry(b"..         ", 0, self.parent_cluster, date, time);
             bytes[..32].copy_from_slice(&dot);
             bytes[32..64].copy_from_slice(&dotdot);
-            write_volume(
+            super::initialize_directory(
                 cx,
                 volume,
-                volume.cluster_offset(self.directory_cluster)?,
+                &std::iter::once(self.directory_cluster),
                 &bytes,
             )?;
-            volume.device.sync(cx)?;
 
             phase = "publishing new directory allocation";
             let end = match volume.geometry.kind() {
@@ -285,6 +284,14 @@ impl DirectoryCreation {
                 &std::iter::once((self.directory_cluster, 0, end)),
             )?;
             volume.device.sync(cx)?;
+
+            // A dropped allocation write must not publish a parent entry that
+            // references a free cluster. Use a fresh table, not the preflight
+            // cache populated before the dirty-state and allocation writes.
+            let mut table = super::super::FatTable::new(volume);
+            if table.entry(cx, self.directory_cluster)? != ffs_ondisk::fat::FatEntry::End {
+                bail!("new directory allocation failed readback before namespace publication");
+            }
 
             phase = "publishing parent directory storage";
             self.namespace.stage(cx, volume)?;

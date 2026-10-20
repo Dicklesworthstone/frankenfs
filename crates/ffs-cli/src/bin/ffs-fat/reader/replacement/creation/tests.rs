@@ -1,5 +1,7 @@
 //! Synthetic native-image and storage-fault controls, not native interchange proof.
 
+mod publication;
+
 use super::*;
 use ffs_error::FfsError;
 use ffs_ondisk::fat::{FatGeometry, short_name_checksum};
