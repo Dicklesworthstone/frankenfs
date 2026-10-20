@@ -10,6 +10,7 @@ macro_rules! companion_bin_tests {
 mod filesystem;
 mod formatter;
 mod reader;
+mod resize;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -239,6 +240,12 @@ fn extract_slots(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Resize into a new standalone image without modifying the offline source.
+    /// Preserves cluster numbers; shrinking requires a completely free tail.
+    Resize {
+        #[command(flatten)]
+        options: resize::ResizeArgs,
+    },
     /// Repair verified lost allocation, FSInfo hints and native dirty state offline.
     /// Does not restore interrupted file contents; keep a separate copy first.
     Recover {
@@ -359,6 +366,13 @@ fn main() -> Result<()> {
         .map_err(|err| anyhow::anyhow!("failed to build ffs-fat runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     match cli.command {
+        Command::Resize { options } => {
+            let report = resize::run(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report)
+                .context("FAT resize completed; writing its report failed")?;
+            writeln!(output).context("FAT resize completed; finishing its report failed")?;
+        }
         Command::Recover { options } => {
             let report = reader::recovery::run(&cx, &options)?;
             let mut output = io::stdout().lock();
