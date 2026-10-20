@@ -1,6 +1,13 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
-## Reality check — 2026-10-20 (HEAD `944903e78`)
+## Reality check — 2026-10-20 (initial `944903e78`, refreshed at `4b0b22161`)
+
+**Source refresh:** shared `main` advanced during the audit. Existing remote
+commits `e2d47b0ec` and `525e8309b` add FAT live-tail relocation and aligned native
+range collapse. They were inspected and retained through merge `4b0b22161`.
+FAT maintenance is now a qualification/completion gap against that landed code;
+the earlier missing-relocation conclusion at the initial snapshot is superseded.
+The other audited production paths are unchanged by those commits.
 
 **Verdict: substantial experimental filesystem software, with an unfinished
 delivery contract.** There are real native readers for six formats, meaningful
@@ -28,9 +35,11 @@ This is a claim-driven code audit, not a line-by-line correctness proof of the
 entire repository or a fresh execution of every historical receipt.
 
 Source was initially clean apart from eight pre-existing `.DS_Store` paths.
-Audit edits are limited to this existing report; generated receipts and a
-separate tracker copy live under the ignored artifact directory. No filesystem
-implementation, validator, golden, canonical tracker row or database was changed.
+Audit edits are limited to this existing report and the existing pending-task
+handoff; generated receipts and a separate tracker copy live under the ignored
+artifact directory. The audit authored no filesystem implementation, validator,
+golden, canonical tracker row or database changes; separately landed FAT changes
+were retained as described in the source refresh above.
 
 | Fresh check | Actual result | Evidence and interpretation |
 |---|---|---|
@@ -38,6 +47,7 @@ implementation, validator, golden, canonical tracker row or database was changed
 | `sbh check --need 20G` | **FAIL**, exit 1 | Data container had about 254.7 GB available but only 6.37% free, below the configured 8.06% pressure threshold. The gate failed despite the absolute free-byte count. Heavy builds were not started. |
 | `rch check` | **NOT READY** | Worker `vmi1156319` reported `disk_ratio_below_critical`. This is infrastructure evidence, not a Rust test failure. |
 | `cargo fmt --check` | **FAIL**, exit 1 | `artifacts/reality-check/20261020/fmt-check.log`; seven distinct source files after normalizing duplicate `#[path]` inclusions, including FAT resize and NTFS index replay. The check made no edits. |
+| Refreshed `cargo fmt --check` at `4b0b22161` | **FAIL**, exit 1 | `artifacts/reality-check/20261020/fmt-refreshed.log`; nine distinct source files, including the newly landed FAT relocation and collapse implementations. No formatting edits were made. |
 | Workspace check / strict Clippy / Rust tests / benchmarks | **NOT RUN** | Held by failed disk admission. No earlier RCH receipt is promoted to current-HEAD acceptance. No prebuilt native companion executable was found in the checked build locations. |
 | Source-aware tracker E2E | **FAIL**, 9/15 scenarios pass | `artifacts/e2e/20261020_180755_ffs_tracker_source_hygiene_NU9tYl/`; live JSONL classification/export succeeds, but installed `bv` rejects `--no-cache` (and lacks the wrapper's `--db` interface), breaking projection and recursive fixture checks. This is not a clean tracker-hygiene gate. |
 | `br --no-db dep cycles --json` | **PASS**, zero active cycles | `artifacts/reality-check/20261020/cycles-before.json`. JSONL reading works without opening the unsafe database. |
@@ -68,7 +78,7 @@ native-image receipts in `FEATURE_PARITY.md` remain useful bounded evidence.
 | V6 | RaptorQ is default durability, with owned storage and fresh restart-safe repair | `native_repair.rs` now has allocator-owned ext4 storage, validation and freshness machinery; explicit sidecar mounts also exist. Ordinary RW `--background-repair` is still refused, and native freshness is explicit ext4-only opt-in. | **Partial**; `bd-11a8t`, `bd-j7a4e`, `bd-jufod`. Do not repeat the older blanket claim that no reservation code exists. |
 | V7 | Real mounted FUSE operations, cancellation and joined shutdown | Auto worker count resolves to up to eight; vendored `Interrupt` dispatch now targets a request registry. CLI background I/O uses child regions, `spawn_blocking`, reserved completion and drain/join. | **Substantial implementation / full coverage unproven**; `bd-in31y`, `bd-z5bav`. Older claims of universally serial dispatch and absent interrupt handling are stale. |
 | V8 | FAT16/FAT32 native reads and complete ordinary mutation | Real readers, formatter/population, create/mkdir/unlink/rmdir/rename, range writes/truncate, lifetime state and `mount --rw` dispatch exist. Native ordering is intentionally not general crash atomicity. | **Implemented experimental surface / qualification incomplete**; closed `bd-nu8nf` does not prove all native interchange/crash cuts. No active complete FAT writer qualification task. |
-| V9 | FAT maintenance and evolution | Checker, bounded recovery, mirror/boot handling and resize exist. Resize creates a new image and only shrinks a free tail while retaining cluster IDs; it is not relocation/compaction or in-place resize. | **Partial full-plan maintenance**; no active task covers the remaining complete FAT maintenance target. |
+| V9 | FAT maintenance and evolution | Checker, bounded recovery, mirror/boot handling and resize exist. After the source refresh, explicit `--relocate` compacts live tail allocation into retained free slots while creating a new image; default resize still preserves cluster IDs and requires a free tail. In-place resize remains outside this profile. | **Implemented restricted relocation / native qualification incomplete**; staged `bd-50neb` now qualifies and completes this landed path. |
 | V10 | NTFS read native names, streams, sparse/compressed/transformed data and metadata | MFT/attribute/index/UpCase, stream catalog, LZNT1 and WOF XPRESS/LZX, security/EA inspection and read-only FsOps exist. Mounted ownership is synthetic, not native ACL enforcement; EFS and other providers remain restricted. | **Implemented restricted reader / fresh native qualification unproven**. |
 | V11 | NTFS native recovery, including valid dirty read views | Public `--recover-logfile` stages a semantic volatile FILE overlay with strict restrictions. Mounted constructor still calls clean-log admission; unsupported nonresident/system edits and full dirty mounted recovery are unfinished. | **Partial**, not absent; `bd-ofjn7` owns the recovery gap. |
 | V12 | NTFS native journal-aware allocation, stream and namespace writes | No general native MFT/bitmap/index writer or writable FsOps path. An in-memory recovery overlay is not a native writer. | **Not implemented**; no active implementation task for the complete native writer. |
@@ -140,7 +150,8 @@ native-image receipts in `FEATURE_PARITY.md` remain useful bounded evidence.
 5. **Qualify and complete FAT.** Run the existing writer through public RW mounts,
    independent native consumers and every relevant storage cut in both dialects.
    Preserve the honest ordered-write contract. Finish only named missing
-   maintenance/relocation behavior, retaining existing safe free-tail resize.
+   maintenance behavior and qualify the newly landed tail relocation, retaining
+   existing safe free-tail resize. Do not duplicate the new relocation engine.
 6. **Build native NTFS and ZFS transactions.** Complete the existing recovery
    owner lane, then implement format-native allocation, publication and ordinary
    mutations with explicit durable tokens, ENOSPC safety, initialization and
@@ -179,8 +190,138 @@ apply the new tasks, additive notes and dependencies through `br`, resolving
 conflicts against current ownership. Never copy the staged database/JSONL over
 the canonical family or rebuild it from JSONL while the guard remains unresolved.
 
-The final graph identifiers, ambition/refinement results and validation receipts
-are recorded below as the audit proceeds.
+The durable import packet is appended to `.beads/pending_tasks.md`. It contains
+the complete new task bodies, acceptance notes, dependencies and additive
+proposals for four existing owner lanes. This is an import proposal, not
+canonical task state. All graph mutations were made through `br` in the staged
+workspace; no hand-written canonical JSONL or database changes were made.
+
+### Final bridge graph and refinement
+
+There are **20 new staged records: 17 implementation/qualification/operations
+tasks, two epics and this audit task**. No implementation task was closed.
+`bd-8vjaj` tracks the complete six-format roadmap; existing `bd-z5bav` retains its
+original delivery scope. A restricted ext4/btrfs release need not wait for every
+advanced ZFS feature unless it claims those features.
+
+| Staged ID | Coherent work package | Main prerequisites |
+|---|---|---|
+| `bd-enpwq` | Preserve/reconcile tracker authority and restore source-aware triage | Owning engine can establish conserved committed state; no destructive rebuild |
+| `bd-uzt72` | FAT16/32 writable mount, native interchange and ordered crash qualification | Current baseline; read-authority P0 |
+| `bd-50neb` | Qualify/complete FAT maintenance and landed tail-relocating resize | Qualified FAT writer |
+| `bd-5osex` | Native NTFS journal publication and allocator/MFT transactions | Existing recovery owner; library integration; baseline |
+| `bd-wmzge` | Native NTFS namespace/streams and writable FsOps | Native NTFS transactions |
+| `bd-udh2o` | NTFS writable transforms/security/secondary metadata | Native NTFS ordinary operations |
+| `bd-8bacs` | NTFS checker, formatter and offline resize | Native NTFS ordinary operations |
+| `bd-f71fc` | Native ZFS allocator/TXG publication and durable tokens | Library integration; baseline; pending logs refused in the initial clean-only slice |
+| `bd-w4sht` | Writable ZFS datasets/ZPL and shared-reference lifecycle | Native TXG engine |
+| `bd-l6gty` | Advanced ZFS topology and resumable pool lifecycle | TXG and dataset/reference engines |
+| `bd-oscdu` | Authenticated ZFS transforms/encryption/key lifecycle | TXG and dataset/reference engines |
+| `bd-lc4bg` | ZFS send/receive, incremental/raw/resume | Dataset/reference engine; encryption for full raw scope |
+| `bd-k5jk6` | Real zvol block frontend and writable lifecycle | TXG and dataset/reference engines |
+| `bd-c18h5` | Aggregate the complete advanced ZFS profile | All four advanced packages plus the native writer |
+| `bd-wlfpt` | Whole-storage-set native-token/protection integration | Existing repair owner; native FAT/NTFS/ZFS writers |
+| `bd-qjqc4` | Continuous standalone live telemetry | Read authority; baseline |
+| `bd-uz4m0` | Bounded native-format engine/traversal/replay fuzzing | Extracted public engines; baseline |
+| `bd-us87k` | Current-build native interchange, crash and workflow-cost campaign | Native ordinary writers; facade; exact evidence; real-reader sandbox qualification |
+| `bd-8vjaj` | Complete declared six-format roadmap | All required packages and existing critical owner lanes |
+| `bd-16kxp` | This evidence-qualified audit and staged handoff | Source review, refinement, conservation and graph receipts |
+
+```mermaid
+flowchart TD
+  S[Read authority and current baseline] --> F[Six-format library admission]
+  F --> N[NTFS recovery and native transactions]
+  N --> NO[NTFS namespace and streams]
+  NO --> NA[NTFS advanced and maintenance]
+  F --> Z[Clean-profile ZFS native TXGs]
+  Z --> ZO[ZFS datasets and shared references]
+  ZO --> ZA[ZFS topology, encryption, replication and zvol]
+  S --> FAT[FAT mounted and native crash qualification]
+  FAT --> FM[FAT maintenance and relocation]
+  NO --> P[Native durable tokens and whole-set protection]
+  ZO --> P
+  FAT --> P
+  R[Existing default repair and freshness] --> P
+  NO --> C[Current-build native and mounted campaign]
+  ZO --> C
+  FAT --> C
+  E[Real boundary evidence and sandbox qualification] --> C
+  NA --> D[Full declared roadmap]
+  ZA --> D
+  FM --> D
+  P --> D
+  C --> D
+  L[Existing MVCC, lifecycle, evidence and local P0 blockers] --> D
+```
+
+The diagram is a readable subset; the staged Beads graph contains the exact
+dependencies. Combined NTFS/ZFS read-overlay work `bd-ofjn7` remains a blocker of
+the complete roadmap. It does not unnecessarily block developing an explicitly
+clean-only ZFS TXG writer; that slice must refuse pending ZIL before any write.
+No essential recovery requirement was removed from the final target.
+
+| Pass | Material outcome |
+|---|---|
+| Ambition 1 | Reframed completion around native authority, initialized-before-visible, reachable-before-free and acknowledged durable prefixes, with independent native consumers. |
+| Ambition 2 | Replaced an overbroad ZFS task with an aggregate and four coherent code-plus-tests packages; added the actual multi-format native/crash/cost campaign. |
+| Ambition 3 | Added dependency-ordered persistence/fault exploration and explicit committed/uncertain/protected outcomes; no formal-proof claim or speculative permission to repair. |
+| Refinement 1 | Checked all 24 goals, retained NTFS version/advanced obligations and separated complete-roadmap scope from the original delivery bead. |
+| Refinement 2 | Removed unnecessary ZFS development serialization while retaining full recovery as a final blocker; preserved existing owners/statuses and avoided parent/child dependency cycles. |
+| Refinement 3 | Strengthened real acknowledgment/fault-model, native-oracle and proof-class requirements; kept smoke tests useful without awarding mounted support. |
+| Refinement 4 | Added exact source/test-command anchors, independent physical/decoded/memory/retry budgets, late-failure/no-write controls, and missing critical-owner/P0 prerequisite links. |
+| Refinement 5 | Reread task bodies and dependencies; graph coverage found no missing dependency target, unreachable new work or missing named critical lane. No further plan-space change found within the audited vision. |
+
+The skill's frozen Phase 3a and Phase 5 instructions were used verbatim and are
+retained in the staged audit task's notes/comments. Every implementation task
+includes substantive tests and diagnostic requirements. Separate native/system
+qualification work does not permit closing an implementation with missing
+essential acceptance.
+
+### Final evidence limits and handoff
+
+- Supported `(cd artifacts/reality-check/20261020/bridge && bv --robot-triage)`
+  loads **4,343/4,343** rows with zero errors, skips or read errors. Its source
+  authority refers to the staged JSONL, not canonical database health or product
+  readiness. The original hygiene wrapper remains failing; it was not weakened.
+- `br --no-db dep cycles --json` reports **zero active cycles** on the refined
+  graph. `graph-coverage.json` finds all 19 planned work records and all 14 named
+  existing critical lanes reachable from `bd-8vjaj`, with no missing dependency.
+- All **4,323 original IDs** remain. Existing status, owner, description and
+  dependencies remain unchanged; additive staged notes/comments affect four
+  existing rows. Five unrelated rows normalize equivalent zero-fraction timestamp
+  spellings when `br` serializes them; that is not a canonical change.
+- Canonical JSONL remains byte-identical to the captured source, SHA-256
+  `e5d359ec158f3943d6784b166883d8be4e94cf57aba115cf409e9bc39bbb4e64`.
+  The audit does not claim to have recovered possible database-only WAL commits.
+- An AST `unimplemented!` scan over core/CLI/FUSE/MVCC/repair finds only the
+  test-only passthrough `RecordingSender` helper. Missing writers and weakly
+  evidenced gates are integration/design/proof gaps, not hidden macro stubs.
+- Current parity parsing finds **97 unique capability rows**. Nineteen added
+  rows cover new-format parsers and telemetry; structural 1:1 mapping still does
+  not prove a mounted six-format backend or complete native formats.
+- The public v0.2.0 release metadata has **no attached binary assets**. This audit
+  neither installed nor qualified a current release consumer. July source release
+  metadata cannot establish October functionality as shipped and tested.
+- Workspace compilation, strict Clippy, Rust tests, benchmarks, real mounted
+  execution and native/hardware crash campaigns were **not freshly executed**.
+  Failed build admission and formatting, the canonical tracker guard, and every
+  functional gap above remain visible. No filesystem readiness claim follows
+  from a completed audit or a validated work graph.
+
+The post-refinement source refresh revises `bd-50neb` and `bd-uzt72` to inspect
+and qualify the landed FAT relocation and native `COLLAPSE_RANGE` paths. The
+relocation increment has eleven authored regression functions; neither their
+presence nor the collapse model tests establish native/runtime execution here.
+The graph shape and final target are unchanged. UBS on the two Markdown files
+exits 3 because no supported language is selected; nothing was scanned, and no
+`UBS_ALLOW_NO_SCAN` override was used to turn that into a pass.
+
+The next functional priority is the existing read-authority P0, followed by a
+current reproducible baseline and real boundary evidence. Existing owners should
+continue their native repair, lifecycle and recovery work. Import the staged
+plan only after tracker authority is safely reconciled; then execute the native
+writer/library/qualification critical path without substituting report growth
+for working filesystem behavior.
 
 ## Reality check — 2026-10-08 (HEAD 7edae28c)
 
