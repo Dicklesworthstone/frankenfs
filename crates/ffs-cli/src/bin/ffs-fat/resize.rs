@@ -1,12 +1,14 @@
 //! Non-destructive offline resize into a fresh, standalone native volume image.
 //!
-//! Keep the dialect, cluster size and EVERY retained cluster number. Relocate
-//! physical FAT/root/data regions, not native directory records or chain links.
-//! Shrink only a provably free tail; compaction and in-place resize are separate
-//! operations. The source is strictly read-only, without sidecar read-repair.
+//! Keep the dialect and cluster size. By default, preserve every native cluster
+//! number and shrink only a provably free tail. Explicit --relocate constructs
+//! a checked read-only view moving live tail clusters into free retained slots.
+//! The source is strictly read-only, without sidecar read-repair or in-place I/O.
 //! Build and check a private read-only candidate before creating output. Keep
 //! the output primary boot sector absent until full byte readback and the native
 //! checker have succeeded. Interrupted output is retained, never auto-deleted.
+
+mod relocation;
 
 use super::reader::{FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS, checkpoint};
 use anyhow::{Context, Result, bail};
@@ -36,6 +38,10 @@ pub struct ResizeArgs {
     /// Exact output length in MiB. Dialect and cluster size are retained.
     #[arg(long)]
     size_mib: u64,
+    /// Move live tail clusters into free retained slots when shrinking.
+    /// Only the new output is changed; bad tail clusters are still refused.
+    #[arg(long)]
+    relocate: bool,
     /// Confirm the source stays offline and immutable for the complete operation.
     #[arg(long, required = true)]
     offline_image: bool,
@@ -559,6 +565,11 @@ pub fn run(cx: &Cx, args: &ResizeArgs) -> Result<serde_json::Value> {
         inner: Arc::new(FileDevice { file: Arc::clone(&input), length: stamp.length, writable: false }),
         base: args.image.offset, length: selected,
     };
+    let (source, relocated) = if args.relocate {
+        relocation::prepare(cx, source, length, args.image.oem_code_page)?
+    } else {
+        (source, 0)
+    };
     let plan = Plan::prepare(cx, source, length, args.image.oem_code_page)?;
     source_unchanged(&input, &args.image.image, stamp)?;
     let leaf = args.output.file_name().context("resize output needs a filename")?;
@@ -573,6 +584,12 @@ pub fn run(cx: &Cx, args: &ResizeArgs) -> Result<serde_json::Value> {
         Ok(_) => bail!("resize output already exists; it will never be overwritten"),
     }
     let mut report = plan.report(args.dry_run);
+    report["relocation_requested"] = args.relocate.into();
+    report["relocated_clusters"] = relocated.into();
+    report["cluster_numbers_preserved"] = (relocated == 0).into();
+    if args.relocate {
+        report["contract"] = "fresh standalone image with verified live-tail relocation; no in-place resize, dialect conversion, partition-table edit or sidecar transfer".into();
+    }
     report["output"] = path.to_string_lossy().into_owned().into();
     report["source_volume_offset"] = args.image.offset.into();
     checkpoint(cx)?;
