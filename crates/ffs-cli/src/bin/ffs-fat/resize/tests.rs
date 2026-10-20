@@ -222,7 +222,7 @@ fn resize_view_grows_and_shrinks_both_dialects_without_native_identity_changes()
                 let original = volume(&cx, Arc::new(slice.clone()));
                 let entries = original.list(&cx, Directory::Root).unwrap();
                 let original_chain = original.file_chain(&cx, &entries[0]).unwrap();
-                let payload = original.read(&cx, &original_chain, 0, 3 * sector).unwrap();
+                let payload = original.read(&cx, &original_chain, 0, 3 * sector as usize).unwrap();
                 for growing in [false, true] {
                     let delta = 500 * u64::from(sector);
                     let length = if growing { old.volume_bytes() + delta } else { old.volume_bytes() - delta };
@@ -236,7 +236,7 @@ fn resize_view_grows_and_shrinks_both_dialects_without_native_identity_changes()
                     for (left, right) in entries.iter().zip(&after) { assert_eq!(left.native, right.native); }
                     let chain = resized.file_chain(&cx, &after[0]).unwrap();
                     assert_eq!(chain.clusters, [5, 9, 6, 7]);
-                    assert_eq!(resized.read(&cx, &chain, 0, 3 * sector).unwrap(), payload);
+                    assert_eq!(resized.read(&cx, &chain, 0, 3 * sector as usize).unwrap(), payload);
                     assert_eq!(read(plan.as_ref(), plan.new.cluster_offset(7).unwrap(), sector as usize), vec![0x94; sector as usize]);
                     assert_eq!(read(plan.as_ref(), plan.new.cluster_offset(8).unwrap(), sector as usize), vec![0; sector as usize]);
                     assert_eq!(read(plan.as_ref(), 28, 4), [0; 4]);
@@ -544,3 +544,5 @@ fn resize_refuses_ambiguous_ownership_and_dirty_source_without_output_authority(
         assert_eq!(source.memory.lock().unwrap().syncs, 0);
     }
 }
+
+mod relocation;
