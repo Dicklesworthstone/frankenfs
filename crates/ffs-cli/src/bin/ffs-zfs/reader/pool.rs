@@ -7,6 +7,7 @@
 mod gang;
 mod import;
 mod missing_mirror;
+mod missing_raidz;
 pub(super) mod raidz;
 
 use super::{
@@ -24,6 +25,7 @@ pub struct Pool {
     // An exact, operator-declared complement of an exported mirror's children.
     // Empty keeps complete-member admission; never infer missing devices.
     missing_mirror_guids: Vec<u64>,
+    missing_raidz_guids: Vec<u64>,
 }
 
 impl From<Leaf> for Pool {
@@ -31,6 +33,7 @@ impl From<Leaf> for Pool {
         Self {
             members: vec![leaf],
             missing_mirror_guids: Vec::new(),
+            missing_raidz_guids: Vec::new(),
         }
     }
 }
@@ -167,11 +170,16 @@ impl Pool {
         Ok(Self {
             members,
             missing_mirror_guids: Vec::new(),
+            missing_raidz_guids: Vec::new(),
         })
     }
 
+    pub(super) fn has_missing_members(&self) -> bool {
+        !self.missing_mirror_guids.is_empty() || !self.missing_raidz_guids.is_empty()
+    }
+
     pub(super) fn standalone_leaf(&self) -> Option<&Leaf> {
-        if !self.missing_mirror_guids.is_empty() {
+        if self.has_missing_members() {
             return None;
         }
         match self.members.as_slice() {
@@ -205,9 +213,9 @@ impl Pool {
         allow_active_state: bool,
     ) -> Result<RootBlock> {
         checkpoint(cx)?;
-        if !self.missing_mirror_guids.is_empty() && allow_active_state {
+        if self.has_missing_members() && allow_active_state {
             return Err(unsupported(
-                "missing mirror members require an explicit exported-pool candidate",
+                "missing members require an explicit exported-pool candidate",
             ));
         }
         if let Some(leaf) = self.standalone_leaf() {
@@ -215,8 +223,8 @@ impl Pool {
         }
         let first_label = self.members[0].label(cx, label_index)?;
         if integer(&first_label.config, "vdev_children").unwrap_or(1) > 1 {
-            if !self.missing_mirror_guids.is_empty() {
-                return Err(unsupported("missing-member extraction requires one mirror"));
+            if self.has_missing_members() {
+                return Err(unsupported("missing-member extraction requires one ordinary mirror or RAIDZ group"));
             }
             return self.striped_root_with_mode(
                 cx,
@@ -227,7 +235,9 @@ impl Pool {
             );
         }
         let (selected, _) = first_label.group_config_with_mode(pool_guid, allow_active_state)?;
-        if selected.member_guids.len() != self.members.len() + self.missing_mirror_guids.len() {
+        if selected.member_guids.len()
+            != self.members.len() + self.missing_mirror_guids.len() + self.missing_raidz_guids.len()
+        {
             return Err(unsupported(
                 "every configured redundant member must be explicitly supplied",
             ));
@@ -275,10 +285,14 @@ impl Pool {
             member_guids.push(guid);
         }
         self.validate_mirror_complement(&selected, &member_guids)?;
-        // Normal admission proves a complete group. Explicit mirror extraction
-        // instead proves the exact present/missing partition of that same group.
-        // Neither path drops missing GUIDs from the candidate's native GUID sum.
-        let config = selected.mapped(&member_guids)?;
+        self.validate_raidz_complement(&selected, &member_guids)?;
+        // Preserve all configured children, including native RAIDZ width, and
+        // every GUID in the candidate sum. Missing routes are never Leaf values.
+        let config = if self.missing_raidz_guids.is_empty() {
+            selected.mapped(&member_guids)?
+        } else {
+            selected.mapped_raidz_survivors(&member_guids, &self.missing_raidz_guids)?
+        };
         let block = self.read_block(cx, &config, &candidate.root)?;
         if block.bytes.len() < 1024
             || candidate
@@ -296,7 +310,12 @@ impl Pool {
             data: block.bytes,
             physical_offset: block.physical_offset,
             copy_index: block.copy_index,
-            member_guid: member_guids[block.member_index],
+            // RAIDZ identifies the first native data column, even when it
+            // was reconstructed. Never index the survivor list with an absent
+            // route, or mislabel a surviving parity disk as that native child.
+            member_guid: block.raidz.as_ref().and_then(|stripe| {
+                stripe.columns.iter().find(|column| !column.parity && column.bytes != 0)
+            }).map_or(member_guids[block.member_index], |column| column.member_guid),
             raidz: block.raidz,
             config,
         })
