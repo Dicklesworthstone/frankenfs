@@ -2,6 +2,7 @@
 
 pub(in crate::reader) mod fixture;
 mod parity;
+mod missing;
 
 use super::*;
 use crate::reader::tests::mirror::{Fault, repack};
@@ -56,8 +57,8 @@ fn complete_raidz_groups_use_native_guids_and_return_original_psize_across_secto
                 assert!(stripe.columns[0].parity);
                 assert!(stripe.columns[1..].iter().all(|column| !column.parity));
                 for reads in &logs {
-                    assert!(reads.lock().unwrap().iter().all(|(offset, bytes)| {
-                        *offset >= BASE as u64 && *offset + *bytes as u64 <= (BASE + LENGTH) as u64
+                    assert!(reads.lock().unwrap().iter().all(|(offset, count)| {
+                        *offset >= BASE as u64 && *offset + *count as u64 <= (BASE + LENGTH) as u64
                     }));
                 }
             }

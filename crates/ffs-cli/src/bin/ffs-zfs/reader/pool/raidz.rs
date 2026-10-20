@@ -99,6 +99,9 @@ struct Stripe<'a> {
     header_allocations: &'a [u64],
     dva_offset: u64,
     copy_index: usize,
+    // A retained handle index for internal bookkeeping, never an absent route.
+    // Native provenance remains the full per-column RAIDZ report below.
+    report_member: usize,
 }
 
 struct Columns {
@@ -125,7 +128,8 @@ impl Pool {
         .map_err(|error| parse(&error))?;
         if !(1..=3).contains(&group.parity)
             || !(group.parity + 1..=8).contains(&members.len())
-            || members.len() != self.members.len()
+            || members.len() != self.members.len() + self.missing_raidz_guids.len()
+            || self.missing_raidz_guids.len() > group.parity
             || !(9..=16).contains(&config.ashift)
         {
             return Err(corrupt("invalid admitted RAIDZ member or parity geometry"));
@@ -142,14 +146,13 @@ impl Pool {
         let mut guids = BTreeSet::new();
         for member in members {
             checkpoint(cx)?;
-            let leaf = self
-                .members
-                .get(member.supplied_index)
-                .ok_or_else(|| corrupt("RAIDZ child maps outside supplied members"))?;
-            if !indices.insert(member.supplied_index)
-                || member.guid == 0
-                || !guids.insert(member.guid)
-            {
+            if member.guid == 0 || !guids.insert(member.guid) {
+                return Err(corrupt("RAIDZ child mapping repeats a native identity"));
+            }
+            let Some(leaf) = self.raidz_source(member)? else {
+                continue;
+            };
+            if !indices.insert(member.supplied_index) {
                 return Err(corrupt("RAIDZ child mapping repeats a supplied identity"));
             }
             let end = leaf.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
@@ -158,6 +161,11 @@ impl Pool {
                     "configured RAIDZ capacity exceeds a selected member",
                 ));
             }
+        }
+        if indices.len() != self.members.len()
+            || self.missing_raidz_guids.iter().any(|guid| !guids.contains(guid))
+        {
+            return Err(corrupt("RAIDZ routes omit a supplied or declared absent member"));
         }
         let mut maps = Vec::with_capacity(dvas.len());
         for dva in dvas {
@@ -232,6 +240,20 @@ impl Pool {
         let mut failures = Vec::new();
         for (copy_index, (dva, map)) in maps.iter().enumerate() {
             checkpoint(cx)?;
+            let first_data = &group.members[map.columns()[map.parity()].child_id];
+            let report_member = if self.raidz_source(first_data)?.is_some() {
+                first_data.supplied_index
+            } else {
+                let mut present = None;
+                for column in map.columns().iter().filter(|column| column.bytes != 0) {
+                    let member = &group.members[column.child_id];
+                    if self.raidz_source(member)?.is_some() {
+                        present = Some(member.supplied_index);
+                        break;
+                    }
+                }
+                present.ok_or_else(|| corrupt("RAIDZ stripe has no retained source"))?
+            };
             let stripe = Stripe {
                 map,
                 members: &group.members,
@@ -239,6 +261,7 @@ impl Pool {
                 header_allocations: &header_allocations,
                 dva_offset: dva.offset,
                 copy_index,
+                report_member,
             };
             match self.read_raidz_stripe(cx, &stripe) {
                 Ok(block) => {
@@ -267,8 +290,9 @@ impl Pool {
             }
             checkpoint(cx)?;
             let member = &stripe.members[column.child_id];
-            match self.members[member.supplied_index].read(
+            match self.read_raidz_member(
                 cx,
+                member,
                 DATA_OFFSET + column.offset,
                 column.bytes,
             ) {
@@ -308,8 +332,9 @@ impl Pool {
             checkpoint(cx)?;
             let parity = &stripe.map.columns()[index];
             let member = &stripe.members[parity.child_id];
-            match self.members[member.supplied_index].read(
+            match self.read_raidz_member(
                 cx,
+                member,
                 DATA_OFFSET + parity.offset,
                 parity.bytes,
             ) {
@@ -420,7 +445,7 @@ impl Stripe<'_> {
             bytes,
             physical_offset: DATA_OFFSET + first.offset,
             copy_index: self.copy_index,
-            member_index: self.members[first.child_id].supplied_index,
+            member_index: self.report_member,
             raidz: Some(RaidzReadInfo {
                 dva_offset: self.dva_offset,
                 allocated_bytes: self.map.allocated_bytes(),
