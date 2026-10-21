@@ -200,6 +200,16 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     ds_bonus[112..120].copy_from_slice(&order.encode(987));
     ds_bonus[120..128].copy_from_slice(&order.encode(if case == 9 { 1 } else { 4 }));
     ds_bonus[128..256].copy_from_slice(&pointer(&os, DATASET_ROOT, 11, 0, 25, order, other));
+    if (19..=24).contains(&case) {
+        ds_bonus[128..256].fill(0);
+        if case == 24 {
+            // A born hole is not an entirely absent native object-set root.
+            ds_bonus[208..216].copy_from_slice(&order.encode(1));
+        } else if case != 19 {
+            let at = 72 + usize::from(case - 20) * 8;
+            ds_bonus[at..at + 8].copy_from_slice(&order.encode(1));
+        }
+    }
     let ds_node = bonus(16, &ds_bonus, order);
     let mut table = vec![0; 16384];
     table[512..1024].copy_from_slice(&zap_node);
@@ -373,12 +383,51 @@ fn dsl_inventory_verifies_head_root_and_parent_relationships() {
             ),
             (2, 3, 987)
         );
-        assert_eq!((result[0].objectset_kind, result[0].root_birth), (2, 25));
+        assert_eq!(
+            (result[0].objectset_kind, result[0].root_birth),
+            (Some(2), 25)
+        );
         assert_eq!(result[0].components, [] as [Vec<u8>; 0]);
     }
     for case in [8, 9] {
         let (leaf, meta) = graph(Endian::Little, case, Arc::default(), None);
         assert!(objects(&leaf, meta).datasets(&cx).is_err());
+    }
+}
+
+#[test]
+fn uninitialized_dsl_heads_are_explicit_inventory_without_readable_roots() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let reads: Reads = Arc::default();
+        let (leaf, meta) = graph(order, 19, Arc::clone(&reads), None);
+        let mut view = objects(&leaf, meta);
+        let rows = view.datasets(&cx).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].head_object, rows[0].guid), (3, 987));
+        assert_eq!((rows[0].objectset_kind, rows[0].root_birth), (None, 0));
+        assert!(view.zpl(&cx, &[]).is_err());
+        assert!(view.zvol(&cx, &[], None).is_err());
+        assert!(view.intent_log(&cx, &[]).is_err());
+        assert!(view.snapshots(&cx, &[]).is_err());
+        assert!(
+            view.properties(&cx, &[], None, &["compression".into()])
+                .is_err()
+        );
+        assert!(
+            !reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(at, _)| *at == BASE as u64 + DATASET_ROOT)
+        );
+        for case in 20..=24 {
+            let (leaf, meta) = graph(order, case, Arc::default(), None);
+            assert!(
+                objects(&leaf, meta).datasets(&cx).is_err(),
+                "accounting case {case}"
+            );
+        }
     }
 }
 #[test]

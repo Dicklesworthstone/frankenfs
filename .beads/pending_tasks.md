@@ -526,8 +526,8 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Pass remote workspace/all-target compilation with exact source receipt.
 - [ ] Pass remote workspace/all-target strict Clippy without suppressions.
 - [ ] Execute required harness test and benchmark commands through RCH.
-- [ ] Execute all three extracted engine suites with every retained regression.
-- [ ] Execute facade controls, external FAT consumer controls and public doctests.
+- [x] Execute all three merged engine suites with every retained regression at `f844f950a`.
+- [x] Execute facade controls, external FAT consumer controls and public doctests at `f844f950a`.
 - [x] Execute regular-image/OS-RO/FIFO block-device controls and reader regressions.
 - [ ] Execute NTFS/ZFS companion and protected-mount tests with nonempty selections.
 - [ ] Exercise built public consumers and retain their source/build identity.
@@ -548,7 +548,14 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Run unchanged native ZFS file and snapshot profiles on fresh exported pools.
 - [x] Identify the native MOS mixed-value ZAP failure without changing scalar validation.
 - [ ] Fix typed MOS root selection, retain malformed-reference rejection and verify natively.
-- [ ] Diagnose the native FAT Unicode-name profile failure against the stored name bytes.
+- [x] Diagnose native FAT Unicode-name failure against actual stored name bytes.
+- [x] Independently review the fixture locale correction with all 80 old checks retained.
+- [x] Execute all six corrected native FAT scenarios from a C-locale parent on CSD.
+- [x] Execute the mixed-MOS ZFS correction: 304 unit tests and one compiled doctest.
+- [x] Retain the next native ZFS failure: uninitialized `$ORIGIN` head and native raw bytes.
+- [x] Model uninitialized heads explicitly; preserve initialized-root validation and read refusal.
+- [ ] Execute new uninitialized-head controls and rerun native ZFS profiles/public consumers.
+- [ ] Pass current immutable-source workspace check and strict Clippy after native fixes.
 - [ ] Rerun the NTFS native companion profile after the executed FILE-flag correction.
 - [ ] Diagnose remote harness Git-source-identity failures without weakening its gates.
 - [ ] Complete original native public-facade FAT16/32, NTFS and ZFS acceptance.

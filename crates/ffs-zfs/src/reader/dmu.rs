@@ -433,19 +433,32 @@ impl Objects {
                 if guid == 0 || creation_txg == 0 || creation_txg > self.txg {
                     return Err(corrupt("invalid dataset GUID or creation transaction"));
                 }
-                let bp = BlockPointer::parse(&n.bonus()[128..256], order)
-                    .map_err(|error| parse(&error))?;
-                if !matches!(bp.logical_bytes(), 1024 | 2048 | 4096) {
-                    return Err(corrupt("dataset object-set size exceeds native profile"));
-                }
-                let raw = self
-                    .checked(cx, &bp, 11, 0, bp.logical_bytes(), dataset.ceiling)?
-                    .ok_or_else(|| corrupt("head dataset has no object-set root"))?;
-                let objectset =
-                    ObjectSet::parse(&raw.bytes, raw.order).map_err(|error| parse(&error))?;
-                if !matches!(objectset.kind, 2 | 3) {
-                    return Err(unsupported("head is not a filesystem or volume object set"));
-                }
+                let root_bytes = &n.bonus()[128..256];
+                let bp = BlockPointer::parse(root_bytes, order).map_err(|error| parse(&error))?;
+                let objectset_kind = if root_bytes.iter().all(|&byte| byte == 0) {
+                    // OpenZFS creates $ORIGIN without ever initializing an
+                    // object set. Preserve the head in inventory, without
+                    // inventing a filesystem type or readable empty root.
+                    if n.bonus()[72..104].iter().any(|&byte| byte != 0) {
+                        return Err(corrupt(
+                            "uninitialized dataset has referenced or unique data",
+                        ));
+                    }
+                    None
+                } else {
+                    if !matches!(bp.logical_bytes(), 1024 | 2048 | 4096) {
+                        return Err(corrupt("dataset object-set size exceeds native profile"));
+                    }
+                    let raw = self
+                        .checked(cx, &bp, 11, 0, bp.logical_bytes(), dataset.ceiling)?
+                        .ok_or_else(|| corrupt("head dataset has no object-set root"))?;
+                    let objectset =
+                        ObjectSet::parse(&raw.bytes, raw.order).map_err(|error| parse(&error))?;
+                    if !matches!(objectset.kind, 2 | 3) {
+                        return Err(unsupported("head is not a filesystem or volume object set"));
+                    }
+                    Some(objectset.kind)
+                };
                 result.push(Dataset {
                     components: components.clone(),
                     directory_object: number,
@@ -453,7 +466,7 @@ impl Objects {
                     guid,
                     creation_txg,
                     flags,
-                    objectset_kind: objectset.kind,
+                    objectset_kind,
                     root_birth: bp.birth(),
                 });
             }
@@ -500,7 +513,9 @@ pub struct Dataset {
     pub guid: u64,
     pub creation_txg: u64,
     pub flags: u64,
-    pub objectset_kind: u64,
+    /// None means an uninitialized native head with an entirely zero root
+    /// pointer and no referenced/unique data. It has no readable object set.
+    pub objectset_kind: Option<u64>,
     pub root_birth: u64,
 }
 

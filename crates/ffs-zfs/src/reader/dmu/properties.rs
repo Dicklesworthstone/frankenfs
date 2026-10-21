@@ -493,8 +493,8 @@ impl Objects {
                 spec.snapshot
             } else {
                 match dataset.objectset_kind {
-                    2 => spec.filesystem,
-                    3 => spec.volume,
+                    Some(2) => spec.filesystem,
+                    Some(3) => spec.volume,
                     _ => false,
                 }
             };

@@ -82,7 +82,9 @@ impl Objects {
                 selected.flags,
                 self.txg,
                 object.ceiling,
-                selected.objectset_kind,
+                selected.objectset_kind.ok_or_else(|| {
+                    unsupported("zvol reads require an initialized native volume object set")
+                })?,
             )
         };
         if kind != OBJECTSET_TYPE || flags & 0x1_0000 != 0 {

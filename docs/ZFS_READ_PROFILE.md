@@ -386,6 +386,18 @@ scalar conversion failure. See OpenZFS's
 and [checksum-salt storage](https://github.com/openzfs/zfs/blob/zfs-2.4.1/module/zfs/spa.c).
 The correction's constructed and native qualification is pending.
 
+An uninitialized DSL head, including native `$ORIGIN`, has an entirely zero
+object-set block pointer. Inventory preserves that head with
+`objectset_kind: null` and its native zero `root_birth`; it does not claim an
+empty filesystem or discard the internal dataset. Referenced, compressed,
+uncompressed and unique byte counters must all be zero. Every existing
+directory/backreference, GUID, creation-TXG and state check still applies.
+Initialized heads retain the complete physical-size, pointer, checksum and
+object-set validation. ZPL, zvol and ZIL reads require an initialized object set.
+OpenZFS's [origin creation](https://github.com/openzfs/zfs/blob/zfs-2.4.1/module/zfs/dsl_pool.c)
+creates the head and origin snapshot without initializing data. Native
+qualification of this newly modeled state remains pending.
+
 The inventory is bounded to 4,096 DSL directories, depth 64 and 1 MiB cumulative
 path bytes. A corrupt or unsupported reached map fails the entire inventory;
 there is no partial-success list. DSL directory/dataset bonus layouts must be

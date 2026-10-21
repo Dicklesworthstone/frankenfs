@@ -94,7 +94,7 @@ impl Objects {
             .into_iter()
             .find(|row| row.components == components)
             .ok_or_else(|| FfsError::NotFound("ZFS head dataset".into()))?;
-        if dataset.objectset_kind != 2 || dataset.flags & 0x1_0000 != 0 {
+        if dataset.objectset_kind != Some(2) || dataset.flags & 0x1_0000 != 0 {
             return Err(unsupported(
                 "ZPL reads require a case-sensitive filesystem head",
             ));

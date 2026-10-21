@@ -55,7 +55,7 @@ impl AllocationArgs {
             records: self.max_records,
             metadata_bytes: self
                 .max_metadata_bytes
-                .unwrap_or(RecordOwnershipLimits::default().metadata_bytes),
+                .unwrap_or_else(|| RecordOwnershipLimits::default().metadata_bytes),
         };
         limits.validate()?;
         Ok(Some(limits))
@@ -144,9 +144,9 @@ fn combined_json(
         && ownership.is_none_or(RecordOwnershipReport::is_consistent))
     .into();
     let ownership_json =
-        match ownership {
-            None => Value::Null,
-            Some(report) => {
+        ownership.map_or_else(
+            || Value::Null,
+            |report| {
                 output["not_checked"][3] =
                     "complete logical stream assembly beyond catalog identity".into();
                 let issues: Vec<_> = report.issues.iter().map(|issue| value!({
@@ -171,8 +171,8 @@ fn combined_json(
                     "omitted_issues": report.omitted_issues,
                     "reclaimable_records": null,
                 })
-            }
-        };
+            },
+        );
     output["record_ownership"] = ownership_json;
     output
 }

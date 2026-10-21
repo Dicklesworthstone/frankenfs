@@ -39,7 +39,7 @@ fn run_native_companion_read_profile(profile: &str, binary: &str) {
     }
     fs::write(
         root.join("invocation.txt"),
-        format!("script={script:?}\nbinary={binary:?}\n"),
+        format!("script={}\nbinary={binary:?}\n", script.display()),
     )
     .unwrap();
     println!("retained companion profile output: {}", root.display());
@@ -50,7 +50,8 @@ fn run_native_companion_read_profile(profile: &str, binary: &str) {
     println!("{}", String::from_utf8_lossy(&output.stdout));
     assert!(
         output.status.success(),
-        "native companion profile {profile} failed; see {root:?}: {}",
+        "native companion profile {profile} failed; see {}: {}",
+        root.display(),
         String::from_utf8_lossy(&output.stderr)
     );
 }

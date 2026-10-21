@@ -151,6 +151,11 @@ impl Objects {
             .into_iter()
             .find(|row| row.components == components)
             .ok_or_else(|| FfsError::NotFound("ZFS head dataset".into()))?;
+        if dataset.objectset_kind.is_none() {
+            return Err(unsupported(
+                "snapshot reads require an initialized object set",
+            ));
+        }
         let dir = self.load(cx, dataset.directory_object)?;
         let origin = dir
             .node
@@ -240,7 +245,7 @@ impl Objects {
                 )?
                 .ok_or_else(|| corrupt("named snapshot has a missing object-set root"))?;
             let os = ObjectSet::parse(&block.bytes, block.order).map_err(|error| parse(&error))?;
-            if os.kind != dataset.objectset_kind {
+            if Some(os.kind) != dataset.objectset_kind {
                 return Err(corrupt(
                     "snapshot object-set kind differs from its owning dataset",
                 ));

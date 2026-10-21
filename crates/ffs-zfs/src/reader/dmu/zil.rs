@@ -411,7 +411,7 @@ impl Objects {
             .into_iter()
             .find(|row| row.components == components)
             .ok_or_else(|| FfsError::NotFound("ZFS head dataset".into()))?;
-        if dataset.objectset_kind != 2 {
+        if dataset.objectset_kind != Some(2) {
             return Err(unsupported(
                 "ZIL file recovery requires a filesystem head, not a snapshot or zvol",
             ));
