@@ -238,7 +238,11 @@ impl Plan {
         let result = (|| -> Result<serde_json::Value> {
             set_state(cx, diagnostic, true)?;
             set_hints(cx, volume, u32::MAX)?;
-            volume.device.sync(cx)?;
+            // set_state includes its own verified barrier. FAT16 has no hint
+            // sector; FAT32 must also persist the subsequent FSInfo update.
+            if volume.geometry.fs_info_sector().is_some() {
+                volume.device.sync(cx)?;
+            }
             phase = "retiring verified unbound long-name records";
             self.orphan_names.retire(cx, volume)?;
             phase = "reclaiming verified unreachable allocation";
@@ -281,7 +285,6 @@ impl Plan {
             }
             phase = "synchronizing final clean state";
             set_state(cx, diagnostic, false)?;
-            volume.device.sync(cx)?;
             phase = "verifying clean reader admission";
             let mut boot = [0; 512];
             volume.read_exact(cx, 0, &mut boot)?;
@@ -464,44 +467,151 @@ fn write_patch(
     Ok(())
 }
 
-fn set_state(cx: &Cx, diagnostic: &DiagnosticVolume, dirty: bool) -> Result<()> {
-    let volume = &diagnostic.volume;
-    let geometry = &volume.geometry;
-    let size = geometry.sector_bytes() as usize;
-    let (at, mask, clean) = match geometry.kind() {
-        FatKind::Fat16 => (37, 0xFFFF_u32, 0x8000_u32),
-        FatKind::Fat32 => (65, 0x0FFF_FFFF, 0x0800_0000),
-    };
-    for sector in std::iter::once(0_u16).chain(geometry.backup_boot_sector()) {
-        let offset = u64::from(sector) * size as u64;
-        let mut original = allocate(size)?;
-        volume.read_exact(cx, offset, &mut original)?;
-        if original[at] & !1 != 0 {
+/// A native state transition changes one byte in a captured sector. Retaining
+/// the complete sector lets readback detect neighboring metadata corruption,
+/// not merely the presence of the requested marker. No file payload is staged.
+struct StateSector {
+    offset: u64,
+    bytes: Vec<u8>,
+    byte: usize,
+    value: u8,
+}
+
+impl StateSector {
+    fn boot(
+        cx: &Cx,
+        diagnostic: &DiagnosticVolume,
+        number: u16,
+        dirty: bool,
+    ) -> Result<Self> {
+        let volume = &diagnostic.volume;
+        let size = volume.geometry.sector_bytes() as usize;
+        let offset = u64::from(number) * size as u64;
+        let mut bytes = allocate(size)?;
+        volume.read_exact(cx, offset, &mut bytes)?;
+        let parsed = ffs_ondisk::fat::FatGeometry::parse(&bytes, volume.geometry.volume_bytes())
+            .map_err(|error| corrupt(offset, error.to_string()))?;
+        if parsed != volume.geometry || bytes[21] != diagnostic.boot[21] {
+            bail!("boot geometry or media changed before recovery state publication");
+        }
+        let byte = if parsed.kind() == FatKind::Fat16 {
+            37
+        } else {
+            65
+        };
+        if bytes[byte] & !1 != 0 {
             bail!("unsupported boot state appeared during recovery");
         }
-        let mut updated = original.clone();
-        updated[at] = (updated[at] & !1) | u8::from(dirty);
-        write_patch(cx, volume, offset, &original, &updated)?;
+        let value = (bytes[byte] & !1) | u8::from(dirty);
+        Ok(Self {
+            offset,
+            bytes,
+            byte,
+            value,
+        })
     }
-    let width = geometry.kind().entry_bytes() as usize;
-    for copy in volume.copies() {
+
+    fn fat(cx: &Cx, diagnostic: &DiagnosticVolume, copy: u8, dirty: bool) -> Result<Self> {
+        let volume = &diagnostic.volume;
+        let geometry = &volume.geometry;
+        let width = geometry.kind().entry_bytes() as usize;
+        let (mask, clean, clean_byte) = match geometry.kind() {
+            FatKind::Fat16 => (0xFFFF_u32, 0x8000_u32, 0x80_u8),
+            FatKind::Fat32 => (0x0FFF_FFFF, 0x0800_0000, 0x08),
+        };
         let offset = geometry
             .entry_offset(copy, 2)
             .map_err(|error| corrupt(0, error.to_string()))?
             - 2 * width as u64;
-        let mut original = allocate(size)?;
-        volume.read_exact(cx, offset, &mut original)?;
-        let mut bytes = [0; 4];
-        bytes[..width].copy_from_slice(&original[width..2 * width]);
-        let raw = u32::from_le_bytes(bytes);
+        let mut bytes = allocate(geometry.sector_bytes() as usize)?;
+        volume.read_exact(cx, offset, &mut bytes)?;
+        let mut native = [0; 4];
+        native[..width].copy_from_slice(&bytes[..width]);
+        let expected_zero = (mask & !0xFF) | u32::from(diagnostic.boot[21]);
+        if u32::from_le_bytes(native) & mask != expected_zero {
+            bail!("reserved FAT media entry changed before recovery state publication");
+        }
+        native[..width].copy_from_slice(&bytes[width..2 * width]);
+        let raw = u32::from_le_bytes(native);
         if raw & mask & !clean != mask & !clean {
             bail!("reserved FAT error state appeared during recovery");
         }
-        let value = if dirty { raw & !clean } else { raw | clean };
-        let mut updated = original.clone();
-        updated[width..2 * width].copy_from_slice(&value.to_le_bytes()[..width]);
-        write_patch(cx, volume, offset, &original, &updated)?;
+        let byte = 2 * width - 1;
+        let value = if dirty {
+            bytes[byte] & !clean_byte
+        } else {
+            bytes[byte] | clean_byte
+        };
+        Ok(Self {
+            offset,
+            bytes,
+            byte,
+            value,
+        })
     }
+
+    fn verify(&self, cx: &Cx, volume: &FatVolume, scratch: &mut [u8]) -> Result<()> {
+        checkpoint(cx)?;
+        volume.read_exact(cx, self.offset, scratch)?;
+        if scratch[..] != self.bytes[..] {
+            bail!("recovery state sector failed exact readback at {}", self.offset);
+        }
+        Ok(())
+    }
+
+    fn publish(&mut self, cx: &Cx, volume: &FatVolume, scratch: &mut [u8]) -> Result<()> {
+        self.verify(cx, volume, scratch)?;
+        if self.bytes[self.byte] == self.value {
+            return Ok(());
+        }
+        self.bytes[self.byte] = self.value;
+        let physical = volume
+            .base
+            .checked_add(self.offset)
+            .context("recovery state physical offset overflow")?;
+        volume
+            .device
+            .write_all_at(cx, ByteOffset(physical), &self.bytes)?;
+        self.verify(cx, volume, scratch)
+    }
+}
+
+/// Validate the WHOLE selected state before changing any marker, then persist
+/// and read back every captured sector before the next repair phase can run.
+/// This also applies to clean publication: a late bad header must not result
+/// in earlier valid records being marked clean. This is not crash atomicity.
+fn set_state(cx: &Cx, diagnostic: &DiagnosticVolume, dirty: bool) -> Result<()> {
+    checkpoint(cx)?;
+    let volume = &diagnostic.volume;
+    // The admitted geometry has at most two boot records and two FAT copies.
+    // One sector per record plus one reusable readback sector bounds scratch.
+    let mut sectors = Vec::new();
+    sectors
+        .try_reserve_exact(4)
+        .context("reserving recovery state sectors")?;
+    for number in std::iter::once(0_u16).chain(volume.geometry.backup_boot_sector()) {
+        sectors.push(StateSector::boot(cx, diagnostic, number, dirty)?);
+    }
+    for copy in volume.copies() {
+        sectors.push(StateSector::fat(cx, diagnostic, copy, dirty)?);
+    }
+    let mut scratch = allocate(volume.geometry.sector_bytes() as usize)?;
+    // Recheck the entire captured set before the first write, then each sector
+    // again immediately before its write. The caller still needs sole ownership.
+    for sector in &sectors {
+        sector.verify(cx, volume, &mut scratch)?;
+    }
+    for sector in &mut sectors {
+        sector.publish(cx, volume, &mut scratch)?;
+    }
+    // Even an already-dirty view can contain pending, not yet durable state.
+    // Never certify a no-write transition without this barrier and readback.
+    checkpoint(cx)?;
+    volume.device.sync(cx)?;
+    for sector in &sectors {
+        sector.verify(cx, volume, &mut scratch)?;
+    }
+    checkpoint(cx)?;
     Ok(())
 }
 
@@ -647,4 +757,7 @@ pub fn recover(cx: &Cx, args: &RecoverArgs) -> Result<serde_json::Value> {
 companion_bin_tests! {
     #[cfg(test)]
     mod tests;
+
+    #[cfg(test)]
+    mod state_tests;
 }
