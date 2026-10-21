@@ -28,7 +28,59 @@ mutable volume nor a reopened pathname. Resolve the base file, select
 the stream's own size controls EOF, independently of unnamed DATA. The public
 `native_reader` example accepts mutually exclusive `read --stream note` and
 `read --stream-utf16 006e,006f,0074,0065`, using the existing lossless selector.
-These additions are source-reviewed; their new native execution remains pending.
+These additions are source-reviewed and have executed against native-produced
+images through the public consumer, as scoped below.
+
+## Executed offline native profile
+
+On 2026-10-21, the companion built from `ff3dca7ec` passed
+`scripts/verify_ntfs_read.py` against fresh ntfs-3g-produced images on Linux.
+All 203 retained commands exited zero. Coverage includes empty, resident and
+nonresident unnamed DATA, directory/path reads, the `note` stream and 32 named
+streams whose native ATTRIBUTE_LIST references extension records 68–93. Plain
+and bounded-image payload/range comparisons and whole-image hashes passed.
+The native compressed profiles passed at both 512-byte and 4096-byte cluster
+sizes, including raw-MFT USA validation, observed physical storage savings,
+independent `ntfscat` bytes and ranges crossing compression-unit boundaries.
+
+The native tool's MFT oracle explicitly requests `ntfscat --raw`: ordinary MFT
+output has already had MST fixups applied. That separately reviewed correction
+preserved the allocation validator and every existing check. The final native
+fixture and all command receipts are retained on CSD beneath
+`/data/ssd/tmp/ffs-native-verification-7CWV8iQw/ffs-ntfs-native-crowbc55`.
+Candidate SHA256 is
+`c0f6fc71775ca63c2ef17367446437f84163df1367da9ae67b75d15eedf36f9d`;
+profile SHA256 is
+`e73031b25c9c72a197013809b2678fa7716df713c99045ea69722580879d8f63`.
+
+The public `native_reader` was subsequently built remotely at `c555bb45e` and
+executed against those retained inputs without reformatting them. All 120 public
+commands met their expected outcomes: ordinary metadata/list/read/write-refusal,
+all 32 extension streams through textual selection, exact UTF-16 selection for
+`note` and `extension-31`, plain/bounded full and unaligned ranges, named-stream
+EOF/beyond-EOF and compressed reads. The complete probe executed 162 commands
+and 152 payload/metadata/EOF byte comparisons, with three
+expected typed `NotFound` refusals producing no stdout. All four image hashes
+remained unchanged. Public ELF SHA256 is
+`f60197490727d5182a678e9ee67160e23f2a7df4102048013430daf1d62f17e9`;
+RCH clean source tree is `1200ffd8fbf2f567c6ed96dd0b81f4ecf7ccaab2`.
+Receipts are retained separately in `ntfs-public-retained-exy0n47m` beneath the
+same private CSD root.
+
+A separate verifier executed 58 public calls, ten fresh `ntfscat` calls,
+three `ntfsls` calls and 41 `cmp` checks (38 nonempty, three empty). Its 112
+command statuses were 108 zero and four expected typed, zero-output refusals.
+It independently checked extension-record placement, both selected views,
+UTF-16 selectors, compressed boundary reads and unchanged hashes. Raw evidence
+is in `ffs-ntfs-public-independent-n76gqh06`; the parent checked actual status
+and negative-output receipts. This verifies the supplied binary's runtime
+behavior; the verifier did not independently attest its build provenance.
+
+These checks establish offline reads of native-produced images, without a
+FrankenFS mount, Windows-generated WOF/EFS interchange, writable NTFS or
+crash/recovery qualification. The example clamps EOF by the selected stream's
+size; its empty EOF output does not prove a direct backend EOF request. Repeated
+selections execute in separate processes, without same-process cache credit.
 
 ## Commands
 

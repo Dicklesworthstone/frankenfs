@@ -524,16 +524,16 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Bind both probes to actual publication bytes and assert fault injection occurred.
 - [x] Execute both corrected dropped-write controls with their original assertions.
 - [x] Pass remote workspace/all-target compilation with exact source receipt.
-- [ ] Pass remote workspace/all-target strict Clippy without suppressions.
-- [ ] Execute required harness test and benchmark commands through RCH.
+- [x] Pass remote workspace/all-target strict Clippy without suppressions (`ff3dca7ec`, then `919ad4caa`).
+- [x] Execute required harness test and benchmark commands through RCH; preserve the four test failures and both benchmark build deadlines. Passing these gates remains outstanding.
 - [x] Execute all three merged engine suites with every retained regression at `f844f950a`.
 - [x] Execute facade controls, external FAT consumer controls and public doctests at `f844f950a`.
 - [x] Execute regular-image/OS-RO/FIFO block-device controls and reader regressions.
-- [ ] Execute NTFS/ZFS companion and protected-mount tests with nonempty selections.
-- [ ] Exercise built public consumers and retain their source/build identity.
-- [ ] Run unchanged native FAT/NTFS read profiles with real oracle tools.
+- [x] Execute NTFS/ZFS companion and protected-mount tests with nonempty selections (21/39/61 at `bd2fac9c4`).
+- [x] Exercise built public consumers and retain their source/build identity (CSD FAT and ZFS evidence below; new NTFS stream consumer still pending).
+- [x] Run native FAT/NTFS read profiles with real oracle tools; preserve original checks through the independently reviewed locale/raw-MFT fixture corrections.
 - [x] Author an executable public-facade consumer with caller-owned runtime.
-- [ ] Compile and execute that consumer against independently produced native images.
+- [x] Compile and execute that consumer against independently produced FAT16 and ZFS images; native NTFS named-stream followthrough remains listed below.
 - [x] Author direct public-facade native-producer FAT16/FAT32/NTFS acceptance.
 - [x] Execute native producer comparisons; retain original images and oracle logs.
 - [x] Reproduce NTFS facade admission failure with a real mkntfs/ntfscp image.
@@ -547,7 +547,7 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Choose and preflight a trusted OpenZFS host with sufficient scratch storage.
 - [x] Run unchanged native ZFS file and snapshot profiles on fresh exported pools.
 - [x] Identify the native MOS mixed-value ZAP failure without changing scalar validation.
-- [ ] Fix typed MOS root selection, retain malformed-reference rejection and verify natively.
+- [x] Fix typed MOS root selection, retain malformed-reference rejection and verify natively (`d7a534c6f`, then complete native profiles at `bd2fac9c4`).
 - [x] Diagnose native FAT Unicode-name failure against actual stored name bytes.
 - [x] Independently review the fixture locale correction with all 80 old checks retained.
 - [x] Execute all six corrected native FAT scenarios from a C-locale parent on CSD.
@@ -562,10 +562,10 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Execute the standalone public consumer on a native FAT16 Unicode file on CSD.
 - [x] Verify worker artifact availability: completed RCH source workspaces are removed; old printed native artifact paths are unavailable. Preserve executed logs, award no current retention credit. CSD artifacts remain available.
 - [x] Pass immutable merged-source workspace check and strict Clippy at `ff3dca7ec` after native fixes.
-- [ ] Rerun the NTFS native companion profile after the executed FILE-flag correction.
+- [x] Rerun the NTFS native companion profile after the executed FILE-flag correction: all 203 commands passed on CSD, retained in `ffs-ntfs-native-crowbc55`.
 - [x] Diagnose NTFS compression oracle failure against primary ntfs-3g source; request raw MFT bytes, independently reviewed with all 47 assertions unchanged (`9f45c1478`).
-- [ ] Retrieve the merged-source NTFS consumer and prepare the exact CSD native rerun command.
-- [ ] Resolve the actual formatter approval rejection before any new NTFS formatting; no indirect retry/bypass.
+- [x] Retrieve the merged-source NTFS CLI consumer and prepare the exact CSD native rerun command (`ff3dca7ec`, SHA256 recorded below).
+- [x] Resolve the actual formatter approval rejection before new NTFS formatting: subsequent user approval applied only to the concrete pending scratch-file command.
 - [ ] Diagnose remote harness Git-source-identity failures without weakening its gates.
 - [ ] Complete original native public-facade FAT16/32, NTFS and ZFS acceptance.
 - [x] Review UBS findings and resolve actual production defects; retain test traps.
@@ -942,13 +942,18 @@ Named-stream followthrough, 2026-10-21:
   `db5f4fdb5ad358a599150bedef0034b00e042182`.
 - [x] Finish the current workspace/all-target check at `c51d483b5`: remote exit 0,
   receipt tree `d040847cf0dcb5a572e39b9a413cc476baa2cae2`.
-- [ ] Retrieve and hash the new public consumer from its exact RCH build.
-- [ ] Receive the pending explicit approval for the staged CSD native NTFS run.
-  The concrete command/profile/binary were presented; no answer is inferred.
-- [ ] Execute that corrected native NTFS profile; retain every image and log.
-- [ ] Exercise the new public stream consumer on those native images, including
+- [x] Retrieve and hash the new public consumer from its exact RCH build:
+  `c555bb45e`, clean tree `1200ffd8fbf2f567c6ed96dd0b81f4ecf7ccaab2`, Linux ELF
+  SHA256 `f60197490727d5182a678e9ee67160e23f2a7df4102048013430daf1d62f17e9`.
+- [x] Receive approval for the staged CSD native NTFS run: the user's subsequent
+  "OK, so please do everything you think is advisable based on all of that" was
+  applied to the concrete pending three-new-scratch-file command only.
+- [x] Execute that corrected native NTFS profile: remote exit 0, 203 commands
+  all exit 0, retained native images and logs in `ffs-ntfs-native-crowbc55`.
+- [x] Exercise the new public stream consumer on those native images, including
   both exact selectors, extension streams, bounded ranges and typed refusals.
-- [ ] Finish the warm harness benchmark, or report its actual failure/deadline.
+- [x] Collect the warm harness benchmark: exit 137 at its configured 3600-second
+  build deadline, without benchmark measurements. Both attempts failed; no win.
 - [ ] Resolve full harness source-identity execution separately from native
   functionality. No missing-Git fallback, skip or gate change has been made.
 
@@ -1066,3 +1071,219 @@ transcript `check-native-stream-c51.log`, receipt tree
 `d040847cf0dcb5a572e39b9a413cc476baa2cae2`. Strict Clippy at `919ad4caa`
 completed exit 0. The canonical import refusal and zero staged graph cycles
 were rechecked; no canonical database mutation occurred.
+
+Native NTFS continuation, 2026-10-21 19:15–19:19 UTC:
+
+The exact approved command executed at approximately 19:15 UTC was:
+
+```sh
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes csd 'sudo -n env TMPDIR=/data/ssd/tmp/ffs-native-verification-7CWV8iQw PATH=/usr/sbin:/usr/bin:/sbin:/bin python3 /data/ssd/tmp/ffs-native-verification-7CWV8iQw/verify_ntfs_read-e730.py --binary /data/ssd/tmp/ffs-native-verification-7CWV8iQw/ffs-ntfs-ff3'
+```
+
+Authorization text is quoted in the checklist above. This formatted only the
+three new exclusive 64 MiB regular files named by the presented profile; it
+did not authorize deletion, existing images/devices or broader formatting.
+Transcript `ntfs-csd-profile-approved-1915.log` and the native `result.json`
+both report `passed`. All 203 retained command statuses are zero. The candidate
+and profile SHA256 values remain those in the approval handoff above.
+
+Actual native coverage includes resident, empty and nonresident unnamed files,
+directory/path reads, the `note` stream and 32 other named streams. The native
+ATTRIBUTE_LIST identifies extension records 68–93 for base record 64, digest
+`b0575bbd813e47e7435c98f9e98c6b6c0c9d0fd65e464bb8f87a4ba6058b5fef`.
+Plain image SHA256 is
+`2e5c0a7fe0518bbf4283f9f3d4703cc8a87e36ea30425fdf96fc0a4e6c36647d`;
+bounded image SHA256 is
+`45dca5ac01f6dd0d3e0842aec7aaa3517f5d6e134abcce48eb6ebb4cc38bcef4`.
+Both compressed profiles passed their unchanged raw-MFT, actual storage-saving,
+native-oracle, candidate full/range and unchanged-image checks: 512-byte clusters
+(dense allocation 2048 bytes, image SHA256
+`6ff7b9112f96ac969110e0f636f2591ee1b8e2e93ef513cc29e40e82e923222f`)
+and 4096-byte clusters (16384 bytes,
+`815c0b055e4a230e91163e461c38aac3c418849562014fce53eaa927e9520b83`).
+The new public consumer was not supplied to this initial run; its subsequent
+native pass is recorded below. This is native-produced offline-image execution, not a
+FrankenFS mount, Windows interoperability or crash/recovery qualification.
+
+The `c51d483b5` consumer build failed with ENOSPC while writing `ffs-repair`
+incremental data. Its SSH completion was initially unconfirmed. The build
+service later cancelled original build `30074357740994722`, wrapper
+`rchw-2c6908d8-e121-47fe-a22d-69b85de511a7`, and recorded exit 130 with completed
+remote cleanup. The normal recovery command found no remaining lease; a fresh
+identity-qualified daemon status request confirms that same completed tuple.
+Evidence: `recover-c51-wrapper-1919.log` and `c51-build-completion-1920.json`.
+No lock, slot, process, cache or peer work was manually cleared. A smaller
+example-only build at immutable `c555bb45e` waited for normal admission on
+high-free-space `vmi1264463`, then refused with exit 103 at the queue deadline;
+no remote execution or local fallback occurred. Retried only that example
+through normal admission on `ts1`.
+The exact example-only job is `30074357740994769`, transcript
+`build-native-reader-c555-ts1-1924.log`. It completed remote exit 0 at 19:30 UTC;
+the earlier queue-only refusal is `build-native-reader-c555-1921.log`.
+
+`harness-bench-dcdc-warm.log` ended exit 137 at 17:44 UTC while building release
+code, without measurements. Repeating the same cold/pressure-bound build again
+is not justified. The four missing-Git harness failures remain open; source
+binding, negative cases and gates are unchanged. Staged graph cycles were
+rechecked empty. No functional Bead has been closed.
+
+Documentation-only verification: workspace formatting and `git diff --check`
+passed. UBS detected no supported language in these three Markdown paths and
+exited 3 without scanning; that is not a scanner pass. No repository Rust code,
+gate, assertion, fixture or golden changed in this continuation. The prior full
+workspace check and strict Clippy therefore remain source-applicable. The new
+native CLI execution adds offline qualification; source identity, performance,
+mounted behavior and the public named-stream acceptance remain distinct.
+
+Independent NTFS read-only execution subsequently passed on the same retained
+inputs: 141 commands (63 candidate, 14 native `ntfscat`, three native `ntfsls`,
+61 `cmp`), with 137 zero exits and four expected missing/wrong-case stream
+refusals that emitted no stdout. Fifty comparisons involved nonempty bytes;
+eleven checked empty/EOF results with explicit lengths. Native ATTRIBUTE_LIST
+inspection independently identified `extension-06/19/31` in records 68/81/93,
+sizes 1792/5120/8192. Plain/bounded full/range reads and 16 compressed boundary
+reads matched native output and original payloads. Independent raw-MFT USA and
+physical-compression checks passed; all four image hashes stayed unchanged.
+Raw receipts are separate from frozen producer evidence:
+`ffs-ntfs-independent-odwj800a`, result SHA256
+`6f48b2d0569d303929ba0c0c2d578877298bbd9501868d08ee29fe4b18396af7`.
+Root read the report and actual status/negative argv/stdout/stderr receipts.
+This independently verifies the supplied binary identity and runtime results;
+the verifier did not independently build-attest `ff3dca7ec`. No new production,
+public named-stream or mounted claim is inferred.
+
+Public native acceptance followthrough, 2026-10-21 19:30–19:40 UTC:
+
+- [x] Retrieve the new Linux ELF, wait for completed transfer and verify matching
+  local/CSD SHA256 `f60197490727d5182a678e9ee67160e23f2a7df4102048013430daf1d62f17e9`.
+  Build source is immutable `c555bb45e`; RCH source tree
+  `1200ffd8fbf2f567c6ed96dd0b81f4ecf7ccaab2`. No production source changed.
+- [x] Execute the public NTFS consumer against existing native inputs without
+  reformatting: 162 commands, including 120 public calls and 152 byte comparisons
+  over payloads, metadata and EOF; three expected typed zero-output `NotFound`
+  refusals. All 32 extension streams passed text selection; `note` and
+  `extension-31` also passed exact UTF-16 selection. Plain/bounded ranges,
+  compressed reads and typed write refusal passed; four whole-image hashes
+  unchanged. Transcript `ntfs-csd-public-c555-retained.log`; raw CSD root
+  `ntfs-public-retained-exy0n47m`, result SHA256
+  `b0f9c462e2f037f33b33b7ce1dc4db83685da741167ab848f9076548754d67eb`.
+- [x] Obtain separate public NTFS execution: 112 commands, including 58 public
+  calls, ten native `ntfscat`, three `ntfsls` and 41 `cmp` (38 nonempty, three
+  empty). Statuses 108 zero/four expected nonzero. Native catalog placement,
+  exact selectors, bounded reads, compressed boundaries, metadata and refusal
+  were checked. All four hashes unchanged. Root
+  `ffs-ntfs-public-independent-n76gqh06`, result SHA256
+  `f82fa134c7384a7f8595df47a1100f91d6a18250c969eefa096e5076ebdd0a2c`.
+- [x] Read actual receipts, then re-execute all 112 cited commands at the supplied
+  build, requiring matching stdout/status and typed, empty-output negatives.
+  Remote exit 0; root `ntfs-public-root-recheck-zdccmfkg`, transcript
+  `ntfs-public-independent-root-recheck.log`. This parent repetition is not
+  another independent origin or new native production.
+- [x] Independently execute the same C555 public ELF on native FAT16/32 plain
+  and bounded images and retained native ZFS files/snapshots: 164 commands,
+  108 public calls, six native FAT extractions and 50 `cmp` (40 nonempty/ten
+  empty). Statuses 158 zero/six expected typed zero-output negatives. FAT
+  Unicode names, full/ranges/stat/list/write-refusal passed. ZPL4 plain and
+  ZPL5 bounded files and separate-process before/head/after/before snapshot
+  selections passed. Eight complete image hashes stayed unchanged. Exactly
+  one new exclusive FAT32 wrapped copy was made; no formatting/import/mount.
+  Root `ffs-fat-zfs-public-independent-lndhzz5p`, result SHA256
+  `c86e0dd49c4ca9c424de4fdc14a928a97ce4de154b5777fa96d184cc1049b26f`.
+- [x] Re-execute all 164 cited commands after inspecting program/argument scope,
+  requiring matching stdout/status and exact negative stderr. Verify all eight
+  hashes before/after. Remote exit 0; root `fat-zfs-public-root-recheck-wsxbet6f`,
+  transcript `fat-zfs-public-independent-root-recheck.log`.
+- [x] Preserve the supplemental FAT probe failure: shell quoting removed quotes
+  from a Python dictionary key, causing `NameError` before any child command.
+  Root `fat-public-c555-0aiw3huk` and failed result are retained unchanged. Its
+  completed FAT16 wrapped scratch copy was reused read-only. The independent
+  valid probe and parent's re-execution provide the actual FAT results.
+- [ ] Execute the still-ignored native Rust producer test's newly added body
+  and the two explicit native Cargo integration wrappers; direct external
+  producer/public executions do not make those Rust selections executed.
+- [ ] Obtain a passing full harness in a genuine source-bound Git environment.
+  Four failures in the clean archive remain; no Git fallback or gate edit.
+- [ ] Complete required benchmark execution under supported resource/deadline
+  conditions; both prior builds hit 3600 seconds, without measurements.
+- [ ] Complete full task acceptance and independent closure; original staged
+  Bead remains `in_progress`, canonical WAL/database guarded and unchanged.
+
+The EOF results above are consumer-clamped; they do not establish direct backend
+EOF requests. The independent verifier checked the supplied binary identity and
+runtime behavior, not its build provenance. Existing native image inputs are
+shared origins; repeated reads do not constitute independent native production.
+Only the original `buildpool` remains imported on CSD. No mounted, writable,
+crash-recovery, field-performance or whole-project readiness claim is made.
+
+Bounded worksheets for this continuation (19:15–19:40 UTC):
+
+Creation gate: these receipts/probes and this requested tracking are PROCESS or
+ENABLER, not new production features. Running the product does not read them.
+Consumer: the operator and verifier of `bd-native-image-library-s4tde`. Gate:
+its original public native stream/view acceptance. Observed defect: the newly
+exposed stream API had only compiled/unit evidence and the formatter rerun had
+actually been rejected. Retirement: stop active probes/checklist when original
+acceptance is independently complete; retain evidence without file deletion.
+No integrity exception is needed (Part 3's four questions are inapplicable).
+Highest-value ready item is this library integration; an hour on unexecuted
+native acceptance beats another reporting framework. Verdict: minimal legitimate
+gate; retire these one-off probes after acceptance, add no framework.
+
+Real-work inventory from current diff and executed commands: no new production
+commits or functional closes in this window. Two user-facing documentation
+updates are USER, native producer/public execution and the necessary build
+recovery are two ENABLER units, requested TODO/Beads maintenance is one PROCESS
+unit; UNKNOWN zero. Ratios are diagnostic, not credit. Core purpose remains
+native filesystem behavior in memory-safe Rust through offline tools and FUSE.
+The two-minute demo is actual native extension-only NTFS bytes through the public
+facade; it now runs. Without PROCESS, runtime outcomes are identical. The public
+consumer actually exercised the integration; no speculative infrastructure was
+added. Read-authority P0 stays with its named owner without handoff, so work
+continued on this claimable critical path. Agent closes are zero; the verifier
+ran positive reads plus negatives. No plan edit or follow-up replaced unmet
+acceptance. Verdict: useful qualification, with bounded operational waste from
+oversized recovery reads and the avoidable shell-quoting failure. Keep the next
+block on remaining executed gates, not further evidence machinery.
+
+Honesty inventory, same window:
+1. No (checked all three repository diffs: Markdown only; no test/gate removal,
+   skip, ignore, suppression or history rewrite).
+2. No (checked probes invoke actual supplied ELF/native tools against retained
+   native images; wrapper copies preserve input bytes, no special product path).
+3. No (checked status/diff: no golden or fixture regeneration).
+4. No (checked repository/config diffs and commands: no gate/configuration,
+   tolerance, timeout or retry-budget relaxation; only normal RCH admission).
+5. No (checked all invoked operations and evidence: no fake Git environment,
+   hardcoded success or release-gate bypass; full harness failures stay failed).
+6. No (checked raw status counts and nonempty comparison counters; UBS exit 3
+   explicitly earns no scan credit, and ignored Rust selections earn none).
+7. No (checked completion sessions, transcripts and retained argv/status files;
+   the failed FAT probe is explicitly not an executed child command).
+8. No (checked documentation/claims: native-produced offline reads, repeated
+   retained inputs, consumer-clamped EOF and supplied build provenance are named).
+9. No (checked current TODO/report: ENOSPC, queue refusal, both benchmark
+   deadlines, four harness failures, ignored native tests and wrapper error retained).
+10. No (checked subprocess capture and external logs: cited stderr is retained).
+11. No (checked staged Bead comments/status: original remains in progress;
+    no new follow-up carries away an essential unmet condition).
+12. No (checked docs: evidence improved, promised scope was not reduced).
+13. No (checked agent reports: no tracker mutations or closes).
+14. No (checked all verifier dispatches: positive bytes, explicit negative,
+    unchanged hashes and no-claim boundaries were supplied).
+15. No (checked raw reports/negative receipts and independently re-executed
+    all 112 public NTFS and 164 FAT/ZFS cited commands with matching results).
+16. No (checked actual command classes: positive reads dominate, zero closes).
+17. No (checked report wording: independent runtime execution is distinguished
+    from shared inputs/source provenance; parent repetitions count once).
+18. No (checked counts enumerate every command in each declared probe; expected
+    nonzero outcomes and empty comparisons are separately disclosed, no cherry-picked rate).
+19. Explain the quoting mistake and oversized recovery output before replay:
+    both were avoidable operational waste, not product defects or passing proof.
+20. Strongest evidence: the C555 ELF/source receipt, fresh native oracles and
+    retained exact outputs, independently executed then re-executed by parent,
+    with whole backing hashes unchanged. A skeptic can rerun the retained argv.
+Older-session scope remains the bounded Cass followthrough recorded above; no
+new comprehensive historical claim is made. Disposition: no hidden gate change,
+false close or inflated proof found. The wrapper error is preserved/disclosed;
+RH-2 and RH-7/RH-9 countermeasures are explicit proof limits and the still-open
+original Bead. Avoid inline shell-embedded dictionary quoting in future probes.

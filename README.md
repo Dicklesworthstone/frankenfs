@@ -61,7 +61,8 @@ pool/candidate/dataset/snapshot/device selection. ext4 recovery stays in memory.
 Callers supply their own context and keep backing images offline and immutable.
 For NTFS, `ReadOnlyFs::ntfs_volume()` borrows the same admitted volume for exact
 UTF-16 named-stream selection, including streams stored in extension records.
-The new stream-access path is awaiting its native execution rerun.
+Native stream access has executed through the standalone public consumer on
+ntfs-3g-produced images, including streams held in extension records.
 
 The standalone [`native_reader` example](crates/ffs/examples/native_reader.rs)
 uses that public API for `stat`, NUL-delimited `list`, bounded `read` and an
@@ -81,9 +82,16 @@ native-producer facade test passed FAT16/FAT32/NTFS plain and bounded images.
 On OpenZFS 2.4.1, the corrected ZFS companion and public consumer at `bd2fac9c4`
 passed native ZPL 4/5 file and divergent head/snapshot profiles, including exact
 bytes, metadata, names and unchanged backing hashes. These are offline reads
-of natively produced images. FrankenFS-mounted behavior, NTFS named-stream
-selection through the facade and the remaining full harness gates are still
-open under `bd-native-image-library-s4tde`; this is not release acceptance.
+of natively produced images. The NTFS companion at `ff3dca7ec` also passed its
+native ntfs-3g profile: all 203 commands, 32 named streams spanning extension
+records and actual LZNT1 compression with 512-byte and 4 KiB clusters, including
+bounded reads and unchanged image hashes. The public consumer at `c555bb45e`
+then passed 120 commands over the retained NTFS inputs, including all 32
+extension streams, both exact selectors and write refusal; a separate verifier
+executed 58 public calls and fresh native comparisons. The same consumer also
+passed FAT16/FAT32 plain/bounded reads and selected ZPL 4/5 file/snapshot reads.
+FrankenFS-mounted behavior and the remaining full harness gates stay open under
+`bd-native-image-library-s4tde`; this is not release acceptance.
 Explicit native checks require their real producer tools:
 
 ```bash
