@@ -44,11 +44,19 @@ struct Contents<'a> {
 
 impl Contents<'_> {
     fn physical_bytes(&self) -> usize {
-        if self.header.is_some() { HEADER_BYTES } else { self.pointer.physical_bytes() }
+        if self.header.is_some() {
+            HEADER_BYTES
+        } else {
+            self.pointer.physical_bytes()
+        }
     }
 
     fn decoded_bytes(&self) -> usize {
-        if self.header.is_some() { HEADER_BYTES } else { self.pointer.logical_bytes() }
+        if self.header.is_some() {
+            HEADER_BYTES
+        } else {
+            self.pointer.logical_bytes()
+        }
     }
 
     fn verify(&self, bytes: &[u8]) -> Result<()> {
@@ -59,10 +67,14 @@ impl Contents<'_> {
             // of that identity. Valid-but-divergent replicas must not choose
             // different fragment graphs during the same audit.
             if actual.children() != expected.children() {
-                return Err(corrupt("gang header replica disagrees with the admitted fragment graph"));
+                return Err(corrupt(
+                    "gang header replica disagrees with the admitted fragment graph",
+                ));
             }
         } else {
-            self.pointer.decode(bytes).map_err(|error| super::parse(&error))?;
+            self.pointer
+                .decode(bytes)
+                .map_err(|error| super::parse(&error))?;
         }
         Ok(())
     }
@@ -88,7 +100,8 @@ fn plan(view: &Objects, contents: &Contents<'_>) -> Result<(Plan, u64)> {
         bp.gang_dvas(contents.header_allocations)
     } else {
         bp.regular_dvas()
-    }.map_err(|error| super::parse(&error))?;
+    }
+    .map_err(|error| super::parse(&error))?;
     let mut work = 0_u64;
     if let Some(group) = &view.config.raidz_members
         && group.parity != 0
@@ -131,10 +144,18 @@ fn plan(view: &Objects, contents: &Contents<'_>) -> Result<(Plan, u64)> {
                 .get(dva.vdev as usize)
                 .ok_or_else(|| corrupt("audit DVA has no admitted striped vdev"))?
                 .supplied_index;
-            replicas.push(Replica { member, copy, offset });
+            replicas.push(Replica {
+                member,
+                copy,
+                offset,
+            });
         } else {
             for member in 0..view.pool.leaves().len() {
-                replicas.push(Replica { member, copy, offset });
+                replicas.push(Replica {
+                    member,
+                    copy,
+                    offset,
+                });
             }
         }
     }
@@ -147,7 +168,7 @@ fn plan(view: &Objects, contents: &Contents<'_>) -> Result<(Plan, u64)> {
 
 fn fault(audit: &mut Audit, location: &str, error: FfsError) -> Result<()> {
     if matches!(error, FfsError::Cancelled) {
-        return Err(FfsError::Cancelled);
+        return Err(error);
     }
     // A gang tree can contain many nodes. Bound the per-DMU-pointer ledger
     // before it reaches the walker's separate issue cap. An explicit coverage
@@ -181,33 +202,51 @@ pub(super) fn verify(
         if work_bytes > remaining_work {
             return Ok(None);
         }
-        let mut audit = Audit { work_bytes, ..Audit::default() };
+        let mut audit = Audit {
+            work_bytes,
+            ..Audit::default()
+        };
         let mut planned_work = 0;
-        let result = view.pool.visit_gang_audit(cx, &view.config, bp, |pointer, header, allocations| {
-            let contents = Contents { pointer, header, header_allocations: allocations };
-            let (node_plan, node_work) = plan(view, &contents)?;
-            add_work(&mut planned_work, node_work)?;
-            // Keep at least half of the reservation for manifest acquisition.
-            // Aggregate ASIZE bounds the complete validated manifest, not a
-            // contiguous read beginning at the leader's first header.
-            if planned_work > work_bytes / 2 {
-                return Err(corrupt("gang audit plan exceeds its reserved work envelope"));
-            }
-            audit_plan(cx, view, &contents, node_plan, &mut audit)?;
-            Ok(audit.faults.len() <= MAX_POINTER_FAULTS)
-        });
+        let result =
+            view.pool
+                .visit_gang_audit(cx, &view.config, bp, |pointer, header, allocations| {
+                    let contents = Contents {
+                        pointer,
+                        header,
+                        header_allocations: allocations,
+                    };
+                    let (node_plan, node_work) = plan(view, &contents)?;
+                    add_work(&mut planned_work, node_work)?;
+                    // Keep at least half of the reservation for manifest acquisition.
+                    // Aggregate ASIZE bounds the complete validated manifest, not a
+                    // contiguous read beginning at the leader's first header.
+                    if planned_work > work_bytes / 2 {
+                        return Err(corrupt(
+                            "gang audit plan exceeds its reserved work envelope",
+                        ));
+                    }
+                    audit_plan(cx, view, &contents, node_plan, &mut audit)?;
+                    Ok(audit.faults.len() <= MAX_POINTER_FAULTS)
+                });
         if let Err(error) = result {
             fault(&mut audit, "gang tree audit", error)?;
         }
         checkpoint(cx)?;
         return Ok(Some(audit));
     }
-    let contents = Contents { pointer: bp, header: None, header_allocations: &[] };
+    let contents = Contents {
+        pointer: bp,
+        header: None,
+        header_allocations: &[],
+    };
     let (plan, work_bytes) = plan(view, &contents)?;
     if work_bytes > remaining_work {
         return Ok(None);
     }
-    let mut audit = Audit { work_bytes, ..Audit::default() };
+    let mut audit = Audit {
+        work_bytes,
+        ..Audit::default()
+    };
     audit_plan(cx, view, &contents, plan, &mut audit)?;
     checkpoint(cx)?;
     Ok(Some(audit))
@@ -224,19 +263,32 @@ fn audit_plan(
         Plan::Replicas(replicas) => {
             for replica in replicas {
                 checkpoint(cx)?;
-                let member = view.pool.leaves().get(replica.member)
+                let member = view
+                    .pool
+                    .leaves()
+                    .get(replica.member)
                     .ok_or_else(|| corrupt("audit replica has no supplied member"))?;
                 audit.copies += 1;
-                let result = member.read(cx, replica.offset, contents.physical_bytes())
+                let result = member
+                    .read(cx, replica.offset, contents.physical_bytes())
                     .and_then(|bytes| contents.verify(&bytes));
                 if let Err(error) = result {
-                    fault(audit, &format!("DVA {}, supplied member {}, offset {}",
-                        replica.copy, replica.member, replica.offset), error)?;
+                    fault(
+                        audit,
+                        &format!(
+                            "DVA {}, supplied member {}, offset {}",
+                            replica.copy, replica.member, replica.offset
+                        ),
+                        error,
+                    )?;
                 }
             }
         }
         Plan::Stripes(maps) => {
-            let group = view.config.raidz_members.as_ref()
+            let group = view
+                .config
+                .raidz_members
+                .as_ref()
                 .ok_or_else(|| corrupt("RAIDZ audit lost its admitted mapping"))?;
             for (copy, map) in maps.iter().enumerate() {
                 checkpoint(cx)?;
@@ -265,19 +317,28 @@ fn audit_stripe(
             continue;
         }
         audit.columns += 1;
-        let member = group.members.get(column.child_id)
+        let member = group
+            .members
+            .get(column.child_id)
             .ok_or_else(|| corrupt("audit column has no native child"))?;
-        let offset = DATA_OFFSET.checked_add(column.offset)
+        let offset = DATA_OFFSET
+            .checked_add(column.offset)
             .ok_or_else(|| corrupt("audit column address overflows"))?;
-        let result = match view.pool.leaves().get(member.supplied_index) {
-            Some(leaf) => leaf.read(cx, offset, column.bytes),
-            None => Err(corrupt(format!("absent RAIDZ child GUID {}", member.guid))),
-        };
+        let result = view.pool.leaves().get(member.supplied_index).map_or_else(
+            || Err(corrupt(format!("absent RAIDZ child GUID {}", member.guid))),
+            |leaf| leaf.read(cx, offset, column.bytes),
+        );
         match result {
             Ok(bytes) => columns.push(Some(bytes)),
             Err(error) => {
-                fault(audit, &format!("DVA {copy}, RAIDZ child {}, GUID {}, offset {offset}",
-                    column.child_id, member.guid), error)?;
+                fault(
+                    audit,
+                    &format!(
+                        "DVA {copy}, RAIDZ child {}, GUID {}, offset {offset}",
+                        column.child_id, member.guid
+                    ),
+                    error,
+                )?;
                 columns.push(None);
             }
         }
@@ -286,24 +347,34 @@ fn audit_stripe(
     // Verify the actual data columns, not reconstructed substitutes. A healthy
     // read elsewhere cannot validate these data/parity equations. When data is
     // missing or bad, retain the precise read errors and mark parity unverified.
-    let data = map.assemble(&slices, &[])
+    let data = map
+        .assemble(&slices, &[])
         .and_then(|bytes| contents.verify(&bytes));
     if let Err(error) = data {
-        fault(audit, &format!("DVA {copy}, unreconstructed RAIDZ data"), error)?;
+        fault(
+            audit,
+            &format!("DVA {copy}, unreconstructed RAIDZ data"),
+            error,
+        )?;
         audit.parity_unverified += group.parity as u64;
         return Ok(());
     }
-    for parity in 0..group.parity {
+    for (parity, column) in columns[..group.parity].iter().enumerate() {
         checkpoint(cx)?;
-        let Some(actual) = columns[parity].as_deref() else {
+        let Some(actual) = column.as_deref() else {
             audit.parity_unverified += 1;
             continue;
         };
         audit.parity_checked += 1;
         if !parity_matches(cx, &slices[group.parity..], actual, parity)? {
             let child = map.columns()[parity].child_id;
-            fault(audit, &format!("DVA {copy}, parity equation {parity}, child {child}"),
-                corrupt("mismatch against checksum-valid data; parity or unchecked padding may be damaged"))?;
+            fault(
+                audit,
+                &format!("DVA {copy}, parity equation {parity}, child {child}"),
+                corrupt(
+                    "mismatch against checksum-valid data; parity or unchecked padding may be damaged",
+                ),
+            )?;
         }
     }
     checkpoint(cx)
@@ -342,18 +413,26 @@ mod tests {
         fn product(mut a: u16, mut b: u16) -> u8 {
             let mut result = 0_u16;
             while b != 0 {
-                if b & 1 != 0 { result ^= a; }
+                if b & 1 != 0 {
+                    result ^= a;
+                }
                 a <<= 1;
-                if a & 0x100 != 0 { a ^= 0x11D; }
+                if a & 0x100 != 0 {
+                    a ^= 0x11D;
+                }
                 b >>= 1;
             }
             u8::try_from(result).unwrap()
         }
         let cx = Cx::for_testing();
         for width in 1..=7 {
-            let data: Vec<Vec<u8>> = (0..width).map(|column| {
-                (0..257 - column * 17).map(|byte| ((byte * 19 + column * 113) % 256) as u8).collect()
-            }).collect();
+            let data: Vec<Vec<u8>> = (0..width)
+                .map(|column| {
+                    (0..257 - column * 17)
+                        .map(|byte| ((byte * 19 + column * 113) % 256) as u8)
+                        .collect()
+                })
+                .collect();
             let mut slices: Vec<_> = data.iter().map(|bytes| Some(bytes.as_slice())).collect();
             slices.push(None); // native skip-only column has no polynomial term
             for row in 0..3 {
@@ -381,6 +460,9 @@ mod tests {
     fn parity_verification_preserves_cancellation() {
         let cx = Cx::for_testing();
         cx.cancel_with(asupersync::types::CancelKind::User, Some("parity audit"));
-        assert!(matches!(parity_matches(&cx, &[Some(&[0x80])], &[0x1D], 1), Err(FfsError::Cancelled)));
+        assert!(matches!(
+            parity_matches(&cx, &[Some(&[0x80])], &[0x1D], 1),
+            Err(FfsError::Cancelled)
+        ));
     }
 }
