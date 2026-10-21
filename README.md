@@ -69,12 +69,18 @@ cargo run -p ffs --example native_reader -- image.img stat /
 cargo run -p ffs --example native_reader -- image.img read /hello.txt --start 0 --bytes 4096
 ```
 
-Frozen candidates passed workspace/all-target compilation and the extracted
-engine unit suites: FAT 438, NTFS 336, ZFS 296, facade 40, plus both external FAT
-consumer tests. The Linux companion binaries and example also built and were
-retrieved. These results precede the latest shared-main merge; final merged
-checks and native interchange remain pending under `bd-native-image-library-s4tde`.
-Explicit native checks require their real producer tools and retain evidence:
+At merged revision `ff3dca7ec`, workspace/all-target checking and strict Clippy
+passed through RCH. Earlier executed engine suites passed FAT 452, NTFS 344,
+ZFS 305 and facade 40 tests, plus both external FAT consumer tests. The merged
+ZFS suite then passed all 315 unit tests and one compiled doctest. The explicit
+native-producer facade test passed FAT16/FAT32/NTFS plain and bounded images.
+On OpenZFS 2.4.1, the corrected ZFS companion and public consumer at `bd2fac9c4`
+passed native ZPL 4/5 file and divergent head/snapshot profiles, including exact
+bytes, metadata, names and unchanged backing hashes. These are offline reads
+of natively produced images. FrankenFS-mounted behavior, NTFS named-stream
+selection through the facade and the remaining full harness gates are still
+open under `bd-native-image-library-s4tde`; this is not release acceptance.
+Explicit native checks require their real producer tools:
 
 ```bash
 cargo test -p ffs native_producer_interchange_reads_and_refuses_mutation_through_public_facade -- --ignored --nocapture

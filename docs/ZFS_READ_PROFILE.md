@@ -603,6 +603,34 @@ These are implementation bounds, not maximum sizes of the native filesystem.
 
 ## Validation and evidence
 
+On 2026-10-21, the file and snapshot profiles both passed on OpenZFS 2.4.1
+using the companion and standalone public `ffs` consumer built from
+`bd2fac9c4b1ec7e06bb39a7ff52922e4757e6b20`. Each covered ZPL 4 and 5 on a
+plain exported leaf and a bounded partition. Native file bytes, stat fields,
+directory names, head/before/after snapshot identities and contents, sparse
+tails and unchanged backing hashes were checked. The public consumer also
+required write refusal and missing-snapshot refusal; the file profile used a
+real external host canary for symlink refusal. Snapshot invocations use separate
+processes, and the example clamps EOF using metadata. No FrankenFS FUSE mount,
+same-instance cache, striped-mirror native or field acceptance is implied.
+
+Retained CSD roots are
+`/data/ssd/tmp/ffs-native-verification-7CWV8iQw/ffs-zpl-native-5v585dlk` and
+`/data/ssd/tmp/ffs-native-verification-7CWV8iQw/ffs-snapshots-native-wxggvr7a`.
+Their `result.json` and per-command argv/stdout/stderr/status accompany every
+native image and oracle. Companion SHA256 is
+`1a6544a12f5dde8f14d0660e4a9875c3e5cce8ba04295ab64b0116160e9029f1`;
+public consumer SHA256 is
+`41e55bd78bae93298a3ecdd11a0784fa88b155c4f070848c64ffa21e316cf0f3`.
+The native failures preceding these passes are retained separately: MOS maps
+contain arrays beside `root_dataset`, and the native `$ORIGIN` head has no
+initialized object set. Current selection validates all reached structure,
+interprets only the required scalar reference and inventories an uninitialized
+head without granting it data-read authority. At merged `ff3dca7ec`, the full
+workspace/all-target check, strict Clippy, all 315 ZFS unit tests and one
+compiled doctest passed. Historical authoring-only
+evidence below describes the limits at the time of each earlier increment.
+
 Engine tests have moved into the `ffs-zfs` library, with separate CLI tests;
 these current verification commands do not imply a new execution result.
 

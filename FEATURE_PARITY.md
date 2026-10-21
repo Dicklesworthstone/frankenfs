@@ -15,12 +15,12 @@
 > ZFS/cancellation preflight; two new FAT consumer tests cover repeatable library
 > operations without global signal handlers. At frozen `3b464766e`, the facade
 > suite executed: 40 passed, zero failed or ignored, including all five new
-> facade controls. A later candidate at `f7984bc15` plus explicit overlays passed
-> workspace/all-target compilation. Pre-merge engine unit runs passed FAT 438,
-> NTFS 336 and ZFS 296 tests; both external FAT consumer tests passed. Merged
-> source qualification and original native acceptance remain pending;
-> native interchange, mounted
-> acceptance and extra parity credit are not claimed. The older
+> facade controls. Merged `ff3dca7ec` passed workspace/all-target checking and
+> strict Clippy through RCH. Earlier committed engine runs passed FAT 452,
+> NTFS 344 and ZFS 305 tests; both external FAT consumer tests passed. The merged
+> ZFS suite passed 315 unit tests and one compiled doctest. Original
+> acceptance remains open for NTFS named-stream facade selection and the full
+> harness gates. Mounted acceptance and extra parity credit are not claimed. The older
 > six-format `OpenFs` row below still has only its detection-test binding; this
 > source integration does not silently promote that binding to mounted proof.
 
@@ -30,10 +30,18 @@
 > At immutable `dcdc37e37`, the corrected parser selection passed 13 tests and
 > the unchanged native-producer facade test passed its FAT16/FAT32/NTFS plain
 > and bounded-image scenarios, including exact full/ranged/EOF bytes, write
-> refusal and unchanged source hashes. Native mounted, NTFS stream-selection
-> facade and ZFS acceptance remain open. The unchanged ZFS file/snapshot profiles
-> executed on OpenZFS 2.4.1 but failed because dataset discovery coerces unrelated
-> MOS ZAP arrays into scalar references; that native defect is being fixed.
+> refusal and unchanged source hashes. Actual OpenZFS 2.4.1 images then exposed
+> heterogeneous MOS ZAP values and uninitialized `$ORIGIN` heads. Both defects
+> were corrected without relaxing structural validation. At `bd2fac9c4`, the
+> native ZPL 4/5 file and snapshot profiles passed through both the companion and
+> standalone public facade: plain/bounded images, exact native bytes/stat/names,
+> divergent historical roots, sparse tails, write refusal and unchanged whole
+> backing hashes. Repeated snapshot selections are separate processes; the
+> example clamps EOF by metadata. This is neither same-instance cache nor
+> FrankenFS-mounted proof. Native NTFS namespace/ADS comparisons progressed
+> before its compression-fixture oracle incorrectly parsed already-fixed MFT
+> bytes as raw. The separately reviewed `--raw` oracle correction retains all
+> 47 assertions; a full native rerun remains pending.
 
 > **2026-09-08 audit status:** The following counts are legacy declared-contract
 > counts, not current executed results. In particular, the fast-commit row below
