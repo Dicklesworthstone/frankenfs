@@ -49,6 +49,7 @@ impl Pool {
             members,
             missing_mirror_guids: missing,
             missing_raidz_guids: Vec::new(),
+            top_levels: None,
         };
         let first = pool.members[0].label(cx, 0)?;
         let pool_guid = integer(&first.config, "pool_guid")?;
