@@ -347,7 +347,9 @@ impl Pool {
                     .ok_or_else(|| unsupported("DVA references an unconfigured top-level vdev"))?;
                 for &index in self.striped_sources(dva.vdev, vdev)? {
                     checkpoint(cx)?;
-                    let member = self.members.get(index)
+                    let member = self
+                        .members
+                        .get(index)
                         .ok_or_else(|| corrupt("gang fragment replica has no supplied image"))?;
                     member.validate_dva_for_vdev(
                         vdev.ashift,
@@ -491,7 +493,9 @@ impl Pool {
                 })?;
                 for &index in self.striped_sources(dva.vdev, vdev)? {
                     checkpoint(cx)?;
-                    let member = self.members.get(index)
+                    let member = self
+                        .members
+                        .get(index)
                         .ok_or_else(|| corrupt("gang header replica has no supplied image"))?;
                     let end = member.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
                     if vdev.allocated_bytes == 0

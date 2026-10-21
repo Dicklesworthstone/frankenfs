@@ -530,9 +530,17 @@ impl Pool {
                 .ok_or_else(|| unsupported("DVA references an unconfigured top-level vdev"))?;
             for &index in self.striped_sources(dva.vdev, vdev)? {
                 checkpoint(cx)?;
-                let member = self.members.get(index)
+                let member = self
+                    .members
+                    .get(index)
                     .ok_or_else(|| corrupt("striped replica has no supplied image"))?;
-                member.validate_dva_for_vdev(vdev.ashift, vdev.allocated_bytes, dva.vdev, bp, dva)?;
+                member.validate_dva_for_vdev(
+                    vdev.ashift,
+                    vdev.allocated_bytes,
+                    dva.vdev,
+                    bp,
+                    dva,
+                )?;
             }
         }
         let mut failures = Vec::new();
@@ -558,7 +566,10 @@ impl Pool {
                     }
                     Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
                     Err(error) => {
-                        failures.push(format!("DVA {copy_index} (vdev {}, supplied member {member_index}): {error}", dva.vdev));
+                        failures.push(format!(
+                            "DVA {copy_index} (vdev {}, supplied member {member_index}): {error}",
+                            dva.vdev
+                        ));
                     }
                 }
             }
