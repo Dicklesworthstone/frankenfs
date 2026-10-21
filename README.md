@@ -48,7 +48,7 @@ per-format profiles define the actual admission rules.
 | **btrfs** | Main `ffs-cli` / `OpenFs` path | Native reads and guarded experimental writes, transaction-commit and repair work | Native feature/topology admission and durability evidence still matter; not blanket kernel parity. |
 | **FAT16** | `ffs-fat` | Native reads/catalog/extraction, experimental ordinary/protected writable FUSE, allocation checks, formatting/population, and ordered offline file/directory/range mutation | New long names use bounded UTF-16 with ASCII aliases. Subdirectories can grow; the fixed root cannot. Native/mounted crash qualification remains open; ordered mutation is not a crash-atomic transaction. |
 | **FAT32** | `ffs-fat` | The FAT16 companion surface plus root chains, selected-FAT handling, free-space hints and offline resize/relocation | Namespace and range operations retain ordered native publication and explicit dirty failure states. Complete native/mounted qualification remains open. |
-| **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection and FUSE | The exact read profile controls admission. Restricted volatile `$LogFile` recovery exists; it grants no native write authority or general Windows recovery claim. General NTFS mutation remains unfinished. |
+| **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection, physical allocation checking and FUSE | The exact read profile controls admission. Restricted volatile `$LogFile` recovery exists; neither recovery nor allocation checking grants native write authority or a general Windows consistency claim. General NTFS mutation remains unfinished. |
 | **ZFS** | `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction and volatile ZIL recovery | Read-only root selection is not native writable pool ownership. Missing-member extraction is committed-view-only and forbids ZIL replay. Native allocation/TXG writing remains unfinished. |
 
 The companion engines are reusable libraries: `ffs-fat`, `ffs-ntfs` and
@@ -153,6 +153,31 @@ dry-run/collision refusal and independent `fsck.fat -n` on fresh 64 MiB FAT16
 and FAT32 images. Windows, writable-mount, crash-replay and hardware power-cut
 qualification remain outstanding.
 
+## NTFS: cross-check physical allocation
+
+`ffs-ntfs check-allocation` scans each allocated MFT record once and reconciles
+its nonresident mappings with the volume's `$Bitmap`. It reports cross-linked
+claims with record/attribute witnesses, mapped-but-free clusters and allocated
+space without an observed reference. Fragmented MFTs, extension records, sparse
+holes, metadata streams and preallocation use the existing native parsers.
+
+```sh
+ffs-ntfs check-allocation volume.img --offline-image
+ffs-ntfs check-allocation disk.img --offline-image \
+  --offset 1048576 --length 67108864 --max-clusters 33554432
+```
+
+This is read-only accounting, not full `chkdsk`, journal validation or repair.
+Incomplete record/mapping coverage suppresses unreferenced-allocation conclusions;
+unexplained space is never declared reclaimable. Bitmap failures and cancellation
+fail the operation. Discrepancies or limits print JSON and return nonzero.
+The command refuses sidecars and recovery overlays before opening images.
+The shared library exposes the same check without a serialization dependency.
+Ten library and four CLI/report controls are authored but not executed in this
+ environment; native interchange and the Rust gates remain unverified. See the
+[NTFS allocation-check profile](docs/NTFS_ALLOCATION_CHECK.md) for exact scope,
+resource limits and qualification requirements.
+
 ## ZFS: extract from surviving mirror disks
 
 `--missing-mirror-member GUID` explicitly identifies every absent child of one
@@ -248,6 +273,7 @@ projection and rejection rules are in the corresponding profiles:
 | FAT reads, names, mounts, checking and fresh-image creation | [FAT profile](docs/FAT_READ_PROFILE.md) |
 | Existing-image FAT creation and directory growth | [Create-only profile](docs/FAT_CREATE_PROFILE.md) |
 | NTFS native reads and read-only mounts | [NTFS profile](docs/NTFS_READ_PROFILE.md) |
+| NTFS MFT physical mappings versus native allocation bitmaps | [Allocation-check profile](docs/NTFS_ALLOCATION_CHECK.md) |
 | ZFS datasets, snapshots, topology and read-only mounts | [ZFS profile](docs/ZFS_READ_PROFILE.md) |
 | ZFS committed-view extraction from explicitly incomplete mirrors | [Missing-mirror profile](docs/ZFS_MISSING_MIRROR_PROFILE.md) |
 | ZFS committed-view extraction with missing RAIDZ1/2/3 children | [Missing-RAIDZ profile](docs/ZFS_MISSING_RAIDZ_PROFILE.md) |

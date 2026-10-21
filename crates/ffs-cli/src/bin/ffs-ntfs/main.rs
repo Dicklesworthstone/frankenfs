@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Native, read-only NTFS 3.1 inspection, directory traversal and stream extraction.
 
+mod allocation_commands;
 mod ea_name;
 
 use anyhow::{Context, Result, bail};
@@ -132,6 +133,11 @@ struct RecordArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Cross-check allocated FILE mappings against native bitmaps without repair.
+    CheckAllocation {
+        #[command(flatten)]
+        options: allocation_commands::AllocationArgs,
+    },
     /// Check geometry, MFT bootstrap/mirror agreement and volume version/flags.
     Inspect {
         #[command(flatten)]
@@ -392,6 +398,7 @@ fn main() -> Result<()> {
         .map_err(|err| anyhow::anyhow!("failed to build ffs-ntfs runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     match cli.command {
+        Command::CheckAllocation { options } => allocation_commands::run(&cx, &options)?,
         Command::Inspect { image } => {
             let volume = image.open(&cx)?;
             let g = &volume.geometry;
