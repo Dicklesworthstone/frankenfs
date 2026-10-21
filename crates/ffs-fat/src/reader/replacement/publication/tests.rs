@@ -517,3 +517,190 @@ fn every_write_sync_failure_and_write_cancellation_retains_original_payload() {
         }
     }
 }
+
+fn head(kind: FatKind, bytes: &[u8]) -> u32 {
+    let low = u32::from(u16::from_le_bytes([bytes[26], bytes[27]]));
+    if kind == FatKind::Fat16 {
+        low
+    } else {
+        low | (u32::from(u16::from_le_bytes([bytes[20], bytes[21]]) & 0x0FFF) << 16)
+    }
+}
+
+fn size(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes[28..32].try_into().unwrap())
+}
+
+#[test]
+fn replacement_separates_old_eof_new_head_and_final_length_publications() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for sector in [512, 4096] {
+            for empty in [false, true] {
+                let (device, geometry, root) = fixture(kind, sector, false);
+                let source = SliceSource(if empty { b"" } else { b"new file" });
+                let volume = device.open();
+                let prepared = plan(&cx, &volume, &source, false);
+                prepared.execute(&cx, &volume, &source, || Ok(())).unwrap();
+                let state = device.state.lock().unwrap();
+                let writes: Vec<_> = state.writes.iter().filter(|(_, at, _)| *at == root).collect();
+                assert_eq!(writes.len(), if empty { 2 } else { 3 });
+                assert_eq!(head(kind, &writes[0].2), 7);
+                assert_eq!(size(&writes[0].2), 0);
+                assert_eq!(head(kind, &writes[1].2), prepared.clusters.first().copied().unwrap_or(0));
+                assert_eq!(size(&writes[1].2), 0);
+                for pair in writes.windows(2) {
+                    // A sync and exact readback intervene before each next write.
+                    assert!(state.reads.iter().any(|&(attempt, at, length)| {
+                        attempt > pair[0].0 && attempt < pair[1].0
+                            && at == root && length == sector as usize
+                    }));
+                }
+                assert_eq!(&writes.last().unwrap().2[..32], &prepared.updated);
+                drop(state);
+                assert_eq!(payload(&device.open(), "/OLD.BIN"), source.0);
+                guards(&device, &geometry);
+            }
+        }
+    }
+}
+
+fn high_head_fixture() -> (Device, FatGeometry, u64) {
+    let (device, geometry, root) = fixture(FatKind::Fat32, 512, false);
+    let mut state = device.state.lock().unwrap();
+    // An interrupted high-word change used to select cluster 5 (KEEP.BIN)
+    // while the old nonzero size remained. Both chains independently validate.
+    for copy in 0..2 {
+        let high = (10 + u32::from(copy)) << 28;
+        for cluster in [7, 9] {
+            state.put(BASE + geometry.entry_offset(copy, cluster).unwrap(), &high.to_le_bytes());
+        }
+        state.put(BASE + geometry.entry_offset(copy, 65_541).unwrap(), &(high | 0x0FFF_FFFF).to_le_bytes());
+    }
+    state.put(root, &record(b"OLD     BIN", 65_541, 4, FatKind::Fat32));
+    state.put(BASE + geometry.cluster_offset(65_541).unwrap(), b"ORIG");
+    state.persist();
+    drop(state);
+    assert!(device.open().check(&Cx::for_testing()).unwrap().clean);
+    (device, geometry, root)
+}
+
+#[test]
+fn torn_fat32_head_cannot_expose_another_live_file_through_old_eof() {
+    let cx = Cx::for_testing();
+    let (probe, _, root) = high_head_fixture();
+    let source = SliceSource(b"replacement payload");
+    let volume = probe.open();
+    let prepared = plan(&cx, &volume, &source, false);
+    prepared.execute(&cx, &volume, &source, || Ok(())).unwrap();
+    let cut = probe.state.lock().unwrap().writes.iter()
+        .filter(|(_, at, _)| *at == root).nth(1).unwrap().0;
+    for tear in [20, 21, 22, 26, 27, 28, 31, 32] {
+        let (device, geometry, root) = high_head_fixture();
+        let volume = device.open();
+        let prepared = plan(&cx, &volume, &source, false);
+        device.state.lock().unwrap().fault = Some((cut, Fault::Error(tear)));
+        assert!(prepared.execute(&cx, &volume, &source, || Ok(())).is_err());
+        let record = device.bytes(root, 32);
+        assert_eq!(size(&record), 0);
+        if (22..=26).contains(&tear) { assert_eq!(head(FatKind::Fat32, &record), 5); }
+        assert_eq!(FatTable::new(&volume).entry(&cx, 65_541).unwrap(), FatEntry::End);
+        assert_eq!(device.bytes(BASE + geometry.cluster_offset(65_541).unwrap(), 4), b"ORIG");
+        guards(&device, &geometry);
+    }
+}
+
+#[test]
+fn creation_initializes_deleted_slot_before_exposing_any_new_name_byte() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for marker in [0, 0xE5] {
+            let (probe, _, root) = fixture(kind, 512, false);
+            {
+                let mut state = probe.state.lock().unwrap();
+                state.put(root + 64, &[marker]);
+                state.persist();
+            }
+            let source = SliceSource(b"new contents");
+            let volume = probe.open();
+            let prepared = creation::prepare(&cx, &volume, "/NEW.BIN", &source, NOW).unwrap();
+            assert_eq!(prepared.entry_offset + BASE, root + 64);
+            prepared.execute(&cx, &volume, &source, || Ok(())).unwrap();
+            let writes: Vec<_> = probe.state.lock().unwrap().writes.iter()
+                .filter(|(_, at, bytes)| *at == root && bytes[65..75] == prepared.updated[1..11])
+                .map(|(attempt, _, bytes)| (*attempt, bytes[64])).collect();
+            assert_eq!(writes.len(), 2);
+            assert_eq!(writes[0].1, 0xE5);
+            assert_eq!(writes[1].1, b'N');
+            for (stage, &(cut, _)) in writes.iter().enumerate() {
+                for tear in [0, 1, 11, 20, 22, 26, 28, 31, 32] {
+                    let (device, geometry, root) = fixture(kind, 512, false);
+                    {
+                        let mut state = device.state.lock().unwrap();
+                        state.put(root + 64, &[marker]);
+                        state.persist();
+                    }
+                    let volume = device.open();
+                    let prepared = creation::prepare(&cx, &volume, "/NEW.BIN", &source, NOW).unwrap();
+                    device.state.lock().unwrap().fault = Some((cut, Fault::Error(64 + tear)));
+                    assert!(prepared.execute(&cx, &volume, &source, || Ok(())).is_err());
+                    let bytes = device.bytes(root + 64, 32);
+                    if stage == 0 || tear == 0 {
+                        assert!(bytes[0] == 0 || bytes[0] == 0xE5);
+                    } else {
+                        assert_eq!(bytes, prepared.updated);
+                        assert_eq!(payload(&volume, "/NEW.BIN"), source.0);
+                    }
+                    guards(&device, &geometry);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn dropped_eof_or_head_guard_never_reaches_final_size_or_reclamation() {
+    let cx = Cx::for_testing();
+    let (probe, _, root) = fixture(FatKind::Fat16, 512, false);
+    let source = SliceSource(b"replacement");
+    let volume = probe.open();
+    let prepared = plan(&cx, &volume, &source, false);
+    prepared.execute(&cx, &volume, &source, || Ok(())).unwrap();
+    let cuts: Vec<_> = probe.state.lock().unwrap().writes.iter()
+        .filter(|(_, at, _)| *at == root).take(2).map(|(attempt, _, _)| *attempt).collect();
+    assert_eq!(cuts.len(), 2);
+    for (stage, cut) in cuts.into_iter().enumerate() {
+        let (device, _, root) = fixture(FatKind::Fat16, 512, false);
+        let volume = device.open();
+        let prepared = plan(&cx, &volume, &source, false);
+        device.state.lock().unwrap().fault = Some((cut, Fault::Drop));
+        assert!(prepared.execute(&cx, &volume, &source, || Ok(())).is_err());
+        let bytes = device.bytes(root, 32);
+        assert_eq!(size(&bytes), if stage == 0 { 519 } else { 0 });
+        assert_eq!(head(FatKind::Fat16, &bytes), 7);
+        let mut table = FatTable::new(&volume);
+        assert_eq!(table.entry(&cx, 7).unwrap(), FatEntry::Next(9));
+        assert_eq!(table.entry(&cx, 9).unwrap(), FatEntry::End);
+        assert_eq!(device.state.lock().unwrap().attempts, cut + 1);
+    }
+}
+
+#[test]
+fn mounted_empty_creation_guard_failure_quarantines_cached_namespace() {
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let (probe, _, root) = fixture(FatKind::Fat16, 512, false);
+    let fs = crate::FatFs::new_with_mode(&cx, probe.open(), 1000, 1000, true).unwrap();
+    fs.create(&cx, &mut RequestScope::empty(), InodeNumber(1), OsStr::new("NEW.BIN"), 0o644, 1000, 1000).unwrap();
+    let cut = probe.state.lock().unwrap().writes.iter()
+        .find(|(_, at, bytes)| *at == root && bytes[64] == 0xE5 && bytes[65] == b'E').unwrap().0;
+    let (device, _, root) = fixture(FatKind::Fat16, 512, false);
+    let fs = crate::FatFs::new_with_mode(&cx, device.open(), 1000, 1000, true).unwrap();
+    device.state.lock().unwrap().fault = Some((cut, Fault::Drop));
+    assert!(fs.create(&cx, &mut RequestScope::empty(), InodeNumber(1), OsStr::new("NEW.BIN"), 0o644, 1000, 1000).is_err());
+    assert_eq!(device.bytes(root + 64, 1), [0xE5]);
+    assert_eq!(fs.getattr(&cx, &mut RequestScope::empty(), InodeNumber(1)).unwrap_err().to_errno(), libc::EIO);
+}

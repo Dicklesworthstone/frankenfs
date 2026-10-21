@@ -150,7 +150,39 @@ impl EntryPublication {
         volume: &FatVolume,
         plan: &Replacement,
     ) -> Result<()> {
-        self.publish(cx, volume, &plan.original, &plan.updated)
+        if plan.creation.is_some() {
+            // A reused deleted slot can still contain another object's old
+            // cluster/length fields. Do not make its first name byte live
+            // before the COMPLETE new record is durable and verified.
+            let mut hidden = plan.updated;
+            hidden[0] = 0xE5;
+            self.publish(cx, volume, &plan.original, &hidden)?;
+            return self.publish(cx, volume, &hidden, &plan.updated);
+        }
+
+        // FAT32's high head word precedes its low word and logical EOF. A torn
+        // one-step replacement can combine heads, or expose the old length
+        // through the new chain. Keep the old head while hiding EOF first.
+        // Old -> zero and zero -> final also bound any mixed size bytes without
+        // requiring atomic 32-bit writes. This is NOT a rollback protocol.
+        let mut previous = plan.original;
+        let mut empty = previous;
+        empty[28..32].fill(0);
+        if empty != previous {
+            self.publish(cx, volume, &previous, &empty)?;
+            previous = empty;
+        }
+        let mut ready = plan.updated;
+        ready[28..32].fill(0);
+        if ready != previous {
+            self.publish(cx, volume, &previous, &ready)?;
+            previous = ready;
+        }
+        if plan.updated != previous {
+            self.publish(cx, volume, &previous, &plan.updated)?;
+        }
+        checkpoint(cx)?;
+        Ok(())
     }
 }
 
