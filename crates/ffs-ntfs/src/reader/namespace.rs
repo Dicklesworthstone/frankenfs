@@ -151,8 +151,8 @@ impl NtfsVolume {
         let target = self.record(cx, reference.record, Some(reference.sequence))?;
         let target_catalog = self.attributes(cx, &target)?;
         let attributes = target_catalog.all()?;
-        // Deduplicate additional selected identities before parsing the catalog
-        // once. Repeated index keys must not multiply FILE reads or turn this
+        // Deduplicate additional selected identities before the single FILE_NAME
+        // pass. Repeated index keys must not multiply FILE reads or turn this
         // into a keys-by-attributes comparison loop.
         let mut unmatched = BTreeSet::new();
         for name in other_names {
