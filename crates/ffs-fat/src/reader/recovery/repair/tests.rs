@@ -451,3 +451,4 @@ fn cancellation_after_publication_stops_recovery_without_cleaning_up() {
 mod boot;
 mod long_names;
 mod mirrors;
+mod parents;

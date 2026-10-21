@@ -42,6 +42,13 @@ fn main() -> Result<()> {
                 .context("FAT recovery completed; writing its report failed")?;
             writeln!(output).context("FAT recovery completed; finishing its report failed")?;
         }
+        Command::RepairParents { options } => {
+            let report = reader::recovery::repair_parents(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report)
+                .context("FAT parent repair completed; writing its report failed")?;
+            writeln!(output).context("FAT parent repair completed; finishing its report failed")?;
+        }
         Command::Replace { options } => {
             let report = reader::replacement::replace(&cx, &options)?;
             let mut output = io::stdout().lock();

@@ -256,6 +256,12 @@ pub enum Command {
         #[command(flatten)]
         options: reader::recovery::RecoverArgs,
     },
+    /// Repair recognizable . and .. pointers from unique rooted directory ownership.
+    /// Leaves changed images dirty; does not reclaim allocation or restore payload.
+    RepairParents {
+        #[command(flatten)]
+        options: reader::recovery::RepairParentsArgs,
+    },
     /// Replace an existing regular file using initialized, separately allocated clusters.
     /// Requires exclusive offline ownership; --dry-run performs only preflight reads.
     Replace {

@@ -5,7 +5,10 @@
 mod boot;
 mod long_names;
 mod mirrors;
+mod parents;
 mod salvage;
+
+pub use parents::{RepairParentsArgs, repair_parents};
 
 use super::super::{
     Directory, FatEntry, FatTable, MAX_CHAIN_CLUSTERS, MAX_DIRECTORY_SLOTS, allocate,

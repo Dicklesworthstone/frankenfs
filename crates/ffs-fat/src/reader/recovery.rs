@@ -5,7 +5,7 @@
 //! this module; its findings cannot turn into a mounted read or write capability.
 
 mod repair;
-pub use repair::{RecoverArgs, recover};
+pub use repair::{RecoverArgs, RepairParentsArgs, recover, repair_parents};
 
 use super::check::{CheckIssue, FatCheckReport};
 use super::{FatGeometry, FatKind, FatVolume, ImageArgs, ReadOnlyImage, checkpoint, corrupt};
