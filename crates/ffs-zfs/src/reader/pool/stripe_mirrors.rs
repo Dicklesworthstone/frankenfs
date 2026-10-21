@@ -25,10 +25,10 @@ struct Top {
 /// child in native mirror order; indices always address the owning Pool's leaves.
 #[derive(Clone)]
 pub(super) struct Topology {
-    config: VdevConfig,
+    pub(super) config: VdevConfig,
     sources: Vec<Vec<usize>>,
-    supplied_guids: Vec<u64>,
-    guid_sum: u64,
+    pub(super) supplied_guids: Vec<u64>,
+    pub(super) guid_sum: u64,
 }
 
 fn top(label: &Label, pool_guid: u64, count: usize, active: bool) -> Result<(Top, u64)> {
@@ -104,8 +104,49 @@ impl Pool {
                 "multi-vdev extraction requires every configured physical child",
             ));
         }
-        let first = self.members[0].label(cx, 0)?;
-        let count = usize::try_from(integer(&first.config, "vdev_children")?)
+        // Explicit candidate selection retains its strict four-label contract.
+        // Only automatic selection may discard an unreadable/bad-checksum copy.
+        let labels = self
+            .members
+            .iter()
+            .map(|member| {
+                (0..4)
+                    .map(|index| {
+                        checkpoint(cx)?;
+                        Ok((index, member.label(cx, index)?))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.admit_striped_labels(cx, &labels, pool_guid, active)
+    }
+
+    /// Join already checksum-verified label sets by native top-level identity.
+    /// Both explicit and automatic selection use these identical topology rules.
+    /// The sets must retain every valid copy, not just a preferred configuration.
+    pub(super) fn admit_striped_labels(
+        &self,
+        cx: &Cx,
+        labels: &[Vec<(usize, Label)>],
+        pool_guid: u64,
+        active: bool,
+    ) -> Result<Topology> {
+        checkpoint(cx)?;
+        if self.has_missing_members() {
+            return Err(unsupported(
+                "multi-vdev extraction requires every configured physical child",
+            ));
+        }
+        if labels.len() != self.members.len()
+            || labels.iter().any(|copies| copies.is_empty() || copies.len() > 4)
+        {
+            return Err(corrupt("each supplied member needs its verified label set"));
+        }
+        let first = labels
+            .first()
+            .and_then(|copies| copies.first())
+            .ok_or_else(|| corrupt("no supplied top-level labels"))?;
+        let count = usize::try_from(integer(&first.1.config, "vdev_children")?)
             .map_err(|_| corrupt("top-level vdev count overflows"))?;
         if !(2..=MAX_MEMBERS).contains(&count) || count > self.members.len() {
             return Err(unsupported(
@@ -115,15 +156,15 @@ impl Pool {
         let mut tops: Vec<Option<Top>> = vec![None; count];
         let mut supplied_guids = Vec::with_capacity(self.members.len());
         let mut seen_leaves = BTreeSet::new();
-        for member in &self.members {
+        for (member, copies) in self.members.iter().zip(labels) {
             checkpoint(cx)?;
-            let (selected, guid) = top(&member.label(cx, 0)?, pool_guid, count, active)?;
+            let (selected, guid) = top(&copies[0].1, pool_guid, count, active)?;
             if !seen_leaves.insert(guid) {
                 return Err(corrupt("supplied images repeat a physical leaf GUID"));
             }
-            for index in 1..4 {
+            for (_, label) in &copies[1..] {
                 checkpoint(cx)?;
-                let (other, other_guid) = top(&member.label(cx, index)?, pool_guid, count, active)?;
+                let (other, other_guid) = top(label, pool_guid, count, active)?;
                 if other != selected || other_guid != guid {
                     return Err(corrupt(
                         "physical member labels disagree on their complete top-level subtree",
@@ -302,7 +343,16 @@ impl Pool {
             .as_ref()
             .is_some_and(|group| group.parity == 0 && group.members.len() != self.members.len())
         {
-            let topology = self.admit_striped_mirrors(cx, config.pool_guid, true)?;
+            // Automatic import may have selected a healthy ring beside a bad
+            // config copy. Reopening that view must not revert to label zero or
+            // lose mirror children before MOS feature and dataset reads.
+            // Explicit selection already checked all four copies at its entry.
+            let labels = self
+                .members
+                .iter()
+                .map(|member| super::import::verified_labels(cx, member))
+                .collect::<Result<Vec<_>>>()?;
+            let topology = self.admit_striped_labels(cx, &labels, config.pool_guid, true)?;
             if topology.config != *config {
                 return Err(corrupt(
                     "selected root lost its native striped-mirror mapping",
