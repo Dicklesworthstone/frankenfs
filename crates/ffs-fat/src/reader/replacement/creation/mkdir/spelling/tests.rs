@@ -296,7 +296,8 @@ struct ImageState {
     operations: usize,
     fail: Option<usize>,
     tear: usize,
-    drop_write: Option<usize>,
+    drop_write_at: Option<u64>,
+    dropped_writes: Vec<(u64, usize)>,
     cancel: Option<usize>,
 }
 
@@ -313,7 +314,8 @@ impl FaultDevice {
                 operations: 0,
                 fail: None,
                 tear: 0,
-                drop_write: None,
+                drop_write_at: None,
+                dropped_writes: Vec::new(),
                 cancel: None,
             })),
             len,
@@ -353,7 +355,14 @@ impl ByteDevice for FaultDevice {
         } else {
             bytes.len()
         };
-        if state.drop_write != Some(state.operations) {
+        let dropped = state.drop_write_at.is_some_and(|target| {
+            target
+                .checked_sub(at.0)
+                .is_some_and(|within| within < count as u64)
+        });
+        if dropped {
+            state.dropped_writes.push((at.0, count));
+        } else {
             state.bytes[at.0 as usize..at.0 as usize + count].copy_from_slice(&bytes[..count]);
         }
         if state.cancel == Some(state.operations) {
@@ -481,11 +490,18 @@ fn cancelled_or_dropped_spelling_publication_is_never_reported_as_success() {
             .is_err()
         );
     }
-    // FAT16 dirty publication is BPB + two FAT copies + sync. The next write
-    // updates the target SFN; dropping an acknowledged write must fail readback.
+    // Target the native SFN case-flags byte, independent of how many dirty-state
+    // writes or barriers precede it. Dropping that acknowledged sector write
+    // must fail spelling readback, and the probe must prove it actually fired.
     let device = FaultDevice::new(bytes);
     let volume = device.volume();
-    device.0.lock().unwrap().drop_write = Some(5);
+    let entry = volume
+        .resolve(&Cx::for_testing(), "/HELLO.TXT")
+        .unwrap()
+        .unwrap();
+    let sector_bytes = u64::from(volume.geometry.sector_bytes());
+    let sector = volume.base + entry.offset / sector_bytes * sector_bytes;
+    device.0.lock().unwrap().drop_write_at = Some(volume.base + entry.offset + 12);
     assert!(
         rename_in_volume(
             &Cx::for_testing(),
@@ -497,6 +513,10 @@ fn cancelled_or_dropped_spelling_publication_is_never_reported_as_success() {
         .is_err()
     );
     assert_eq!(
+        device.0.lock().unwrap().dropped_writes,
+        [(sector, sector_bytes as usize)]
+    );
+    assert_eq!(
         volume
             .resolve(&Cx::for_testing(), "/HELLO.TXT")
             .unwrap()
@@ -504,6 +524,17 @@ fn cancelled_or_dropped_spelling_publication_is_never_reported_as_success() {
             .name()
             .unwrap(),
         "HELLO.TXT"
+    );
+    assert_eq!(
+        volume
+            .read(
+                &Cx::for_testing(),
+                &volume.file_chain(&Cx::for_testing(), &entry).unwrap(),
+                0,
+                4096,
+            )
+            .unwrap(),
+        PAYLOAD
     );
 }
 

@@ -401,7 +401,8 @@ struct Disk {
     operations: usize,
     fail: Option<usize>,
     tear: usize,
-    drop_write: Option<usize>,
+    drop_write_at: Option<u64>,
+    dropped_writes: Vec<(u64, usize)>,
 }
 
 #[derive(Clone)]
@@ -417,7 +418,8 @@ impl FaultDevice {
                 operations: 0,
                 fail: None,
                 tear: 0,
-                drop_write: None,
+                drop_write_at: None,
+                dropped_writes: Vec::new(),
             })),
             length,
         )
@@ -447,7 +449,14 @@ impl ByteDevice for FaultDevice {
         } else {
             bytes.len()
         };
-        if state.drop_write != Some(state.operations) {
+        let dropped = state.drop_write_at.is_some_and(|target| {
+            target
+                .checked_sub(at.0)
+                .is_some_and(|within| within < count as u64)
+        });
+        if dropped {
+            state.dropped_writes.push((at.0, count));
+        } else {
             state.bytes[at.0 as usize..at.0 as usize + count].copy_from_slice(&bytes[..count]);
         }
         if fail {
@@ -526,10 +535,28 @@ fn native_copy_fault_cuts_preserve_source_and_never_admit_partial_clean_output()
     }
     let device = FaultDevice::new(baseline);
     let volume = device.volume();
-    device.0.lock().unwrap().drop_write = Some(5);
+    // Drop the first destination payload write by native byte address. Dirty
+    // publication may add barriers without moving this fault onto a sync call.
+    let output = volume.resolve(&cx, "/OUTPUT.BIN").unwrap().unwrap();
+    let payload_at = volume.base
+        + volume
+            .geometry
+            .cluster_offset(output.native.first_cluster)
+            .unwrap()
+        + 120;
+    let first_count = (u64::from(volume.geometry.cluster_bytes()) - 120).min(1000) as usize;
+    device.0.lock().unwrap().drop_write_at = Some(payload_at);
     assert!(
         volume
             .copy_range(&cx, "/INPUT.BIN", 0, "/OUTPUT.BIN", 120, 1000, NOW)
             .is_err()
     );
+    assert_eq!(
+        device.0.lock().unwrap().dropped_writes,
+        [(payload_at, first_count)]
+    );
+    assert_eq!(read(&volume, "/INPUT.BIN"), input);
+    let actual = read(&volume, "/OUTPUT.BIN");
+    assert_eq!(&actual[..120], &old[..120]);
+    assert_eq!(&actual[1120..], &old[1120..]);
 }

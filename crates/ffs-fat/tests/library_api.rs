@@ -138,17 +138,36 @@ fn downstream_read_admission_refuses_dirty_native_images_and_cancelled_contexts(
         let volume = FatVolume::open(&cx, &image, 0, None).unwrap();
         let geometry = volume.geometry.clone();
         drop(volume);
-        let file = OpenOptions::new().write(true).open(&image).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .unwrap();
         for copy in 0..geometry.fat_count() {
-            let offset = geometry.entry_offset(copy, 1).unwrap();
-            match geometry.kind() {
-                FatKind::Fat16 => file
-                    .write_all_at(&0x7FFF_u16.to_le_bytes(), offset)
-                    .unwrap(),
-                FatKind::Fat32 => file
-                    .write_all_at(&0x07FF_FFFF_u32.to_le_bytes(), offset)
-                    .unwrap(),
-            }
+            // entry_offset admits data clusters only. Reserved FAT[1] is one
+            // native entry before FAT[2], within this explicitly selected copy.
+            let width = geometry.kind().entry_bytes();
+            let offset = geometry
+                .entry_offset(copy, 2)
+                .unwrap()
+                .checked_sub(u64::from(width))
+                .unwrap();
+            let mut original = [0; 4];
+            file.read_exact_at(&mut original[..width as usize], offset)
+                .unwrap();
+            let (value_mask, clean_mask) = match geometry.kind() {
+                FatKind::Fat16 => (0xFFFF, 0x8000),
+                FatKind::Fat32 => (0x0FFF_FFFF, 0x0800_0000),
+            };
+            let original = u32::from_le_bytes(original);
+            assert_eq!(original & value_mask, value_mask);
+            let dirty = (original & !clean_mask).to_le_bytes();
+            file.write_all_at(&dirty[..width as usize], offset).unwrap();
+            let mut readback = [0; 4];
+            file.read_exact_at(&mut readback[..width as usize], offset)
+                .unwrap();
+            assert_eq!(&readback[..width as usize], &dirty[..width as usize]);
+            assert_eq!(u32::from_le_bytes(readback) ^ original, clean_mask);
         }
         file.sync_all().unwrap();
         drop(file);
