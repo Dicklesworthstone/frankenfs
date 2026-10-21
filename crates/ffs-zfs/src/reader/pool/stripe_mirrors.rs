@@ -138,7 +138,9 @@ impl Pool {
             ));
         }
         if labels.len() != self.members.len()
-            || labels.iter().any(|copies| copies.is_empty() || copies.len() > 4)
+            || labels
+                .iter()
+                .any(|copies| copies.is_empty() || copies.len() > 4)
         {
             return Err(corrupt("each supplied member needs its verified label set"));
         }
