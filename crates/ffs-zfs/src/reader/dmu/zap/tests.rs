@@ -132,6 +132,37 @@ fn leaf(order: Endian, populated: bool, case: u8) -> Vec<u8> {
             _ => {}
         }
     }
+    if !populated && matches!(case, 12 | 13) {
+        // Native MOS maps contain a 32-byte checksum salt beside scalar
+        // root_dataset. Fixed CRC64 for this key, salt and 28-bit hash profile.
+        let hash = 0x18f1_2d30_0000_0000;
+        let name = b"org.illumos:checksum_salt\0";
+        raw[80..200].fill(0);
+        w16(&mut raw, 28, 13, order);
+        w16(&mut raw, 30, 1, order);
+        w16(&mut raw, 34, 5, order);
+        w16(&mut raw, 54, 0, order); // Hash prefix zero, bucket three.
+        raw[80] = 252;
+        raw[81] = 1;
+        w16(&mut raw, 82, u16::MAX, order);
+        w16(&mut raw, 84, 1, order);
+        w16(&mut raw, 86, 26, order);
+        w16(&mut raw, 88, 3, order);
+        w16(&mut raw, 90, 32, order);
+        w64(&mut raw, 96, hash, order);
+        raw[104] = 251;
+        raw[105..126].copy_from_slice(&name[..21]);
+        w16(&mut raw, 126, 2, order);
+        raw[128] = 251;
+        raw[129..134].copy_from_slice(&name[21..]);
+        w16(&mut raw, 150, u16::MAX, order);
+        raw[152] = 251;
+        raw[153..174].fill(0xA5);
+        w16(&mut raw, 174, 4, order);
+        raw[176] = 251;
+        raw[177..188].fill(0x5A);
+        w16(&mut raw, 198, if case == 13 { 3 } else { u16::MAX }, order);
+    }
     raw
 }
 
@@ -154,7 +185,7 @@ fn graph(order: Endian, layout: u8, case: u8, reads: Reads, failure: Option<u64>
         (32, if layout == 0 { 5 } else { 6 }),
         (56, count as u64),
         (64, 2),
-        (72, if case == 5 { 2 } else { 1 }),
+        (72, if matches!(case, 5 | 12 | 13) { 2 } else { 1 }),
         (80, 0x0123_4567_89ab_cdef),
     ] {
         w64(&mut blocks[0], at, value, order);
@@ -359,6 +390,33 @@ fn array_and_presence_values_are_not_silently_cast_to_object_references() {
         }
         assert!(objects.zap(&cx, 1).is_err());
         assert!(objects.datasets(&cx).is_err());
+    }
+}
+
+#[test]
+fn dsl_root_selection_validates_mixed_mos_values_without_coercing_unrelated_arrays() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for layout in 0..=2 {
+            let (leaf, meta) = graph(order, layout, 12, Arc::default(), None);
+            let mut objects = view(&leaf, meta);
+            let values = objects.zap_values(&cx, 1).unwrap();
+            assert_eq!(values.len(), 2);
+            let salt = &values[0];
+            assert_eq!(salt.name, b"org.illumos:checksum_salt");
+            assert_eq!(salt.integer_bytes, 1);
+            assert_eq!(salt.values, [vec![0xA5; 21], vec![0x5A; 11]].concat());
+            assert!(salt.scalar().is_err());
+            assert!(objects.zap(&cx, 1).is_err());
+            let datasets = objects.datasets(&cx).unwrap();
+            assert_eq!(datasets.len(), 1);
+            assert_eq!((datasets[0].directory_object, datasets[0].guid), (2, 987));
+
+            // A malformed unrelated value still invalidates the complete map;
+            // selecting a valid root must not hide a cyclic salt value chain.
+            let (leaf, meta) = graph(order, layout, 13, Arc::default(), None);
+            assert!(view(&leaf, meta).datasets(&cx).is_err());
+        }
     }
 }
 

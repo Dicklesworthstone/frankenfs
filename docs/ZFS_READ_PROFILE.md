@@ -374,6 +374,18 @@ Names are relative to the pool; the root has an empty name. Raw component arrays
 accompany lossless UTF-8 names. Internal DSL directories are not silently
 discarded. Snapshots and clone relationships are not enumerated.
 
+The MOS pool directory is a heterogeneous typed ZAP, not a map containing only
+object references. OpenZFS 2.4.1 stores a 32-byte checksum salt and TXG-history
+integer arrays beside `root_dataset`. Discovery structurally validates every reached map
+entry and chunk, then requires exactly one 8-byte integer only for the selected
+`root_dataset` key. An array, empty value or byte-width root reference still
+fails, as does a malformed unrelated array; scalar-only DSL child maps retain
+their existing contract. Native evidence on CSD exposed the prior whole-map
+scalar conversion failure. See OpenZFS's
+[MOS key definitions](https://github.com/openzfs/zfs/blob/zfs-2.4.1/include/sys/dmu.h)
+and [checksum-salt storage](https://github.com/openzfs/zfs/blob/zfs-2.4.1/module/zfs/spa.c).
+The correction's constructed and native qualification is pending.
+
 The inventory is bounded to 4,096 DSL directories, depth 64 and 1 MiB cumulative
 path bytes. A corrupt or unsupported reached map fails the entire inventory;
 there is no partial-success list. DSL directory/dataset bonus layouts must be

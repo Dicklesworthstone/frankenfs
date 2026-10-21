@@ -362,12 +362,16 @@ impl Objects {
         if directory.node.object_type() != 1 {
             return Err(corrupt("MOS object 1 is not the pool directory"));
         }
+        // The MOS directory is heterogeneous: checksum salt and TXG history
+        // arrays coexist with object references. Validate the complete typed
+        // map, then apply the reference contract only to root_dataset.
         let root = self
-            .zap(cx, 1)?
+            .zap_values(cx, 1)?
             .into_iter()
             .find(|entry| entry.name == b"root_dataset")
             .ok_or_else(|| corrupt("MOS pool directory has no root_dataset"))?
-            .value;
+            .scalar()
+            .map_err(|error| parse(&error))?;
         let mut pending = vec![(root, 0_u64, Vec::<Vec<u8>>::new())];
         let mut seen = BTreeSet::new();
         let mut dataset_ids = BTreeSet::new();
