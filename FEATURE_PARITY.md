@@ -83,7 +83,7 @@
 > correction preserves every path, classification and census assertion and earns
 > no capability credit. After restoring the accurate README source inventory,
 > the complete genuine-Git rerun passed 2,652 tests with zero failures and 11
-> ignored, including the checksum controls, census and public parity adversarial
+> ignored, including one compiled doctest, the checksum controls, census and public parity adversarial
 > targets. Its final source-content receipt is valid (build
 > `30074357740994971`, root
 > `7fa320e15e551fd22a4519099db37bbc9250fd8d3480192b519e7241cf071bb9`).
@@ -102,6 +102,18 @@
 > stayed unchanged. These are source-bound offline results; later shared-main
 > FAT recovery changes have separate qualification. EOF is consumer-clamped and
 > snapshot selections use separate processes.
+> The same ELF subsequently passed 52 more public calls on fresh native ext4
+> and btrfs images: two native producers, seven native check/readback commands,
+> eight native payload readbacks, 28 public payload comparisons, eight stat and
+> eight listing checks, four write refusals and four typed missing-path failures.
+> All 61 commands completed with exactly four expected nonzero statuses. Plain
+> and bounded backing hashes and all source/tool/ELF hashes stayed unchanged
+> during verification. The exact approved probe SHA is
+> `7fbdb0d7b3987fcefd3a0250594c7c5652ad845262b35f448f15cdc6ac8265cc`;
+> retained CSD evidence is `ext4-btrfs-public-native-2glw4nqx`, with the full
+> command in `.beads/pending_tasks.md`. Together these refreshes executed 280
+> public calls on five native formats. APFS native qualification, mounted
+> acceptance across formats and native write authority are separate.
 
 > **Native NTFS mounted slice, 2026-10-21:** the current RCH-delivered Linux CLI
 > candidate `3effe8ed21c9af9b5b0f537451e9f64fce869d58ce3d986ebbeb6eb0754d9d76`

@@ -104,7 +104,13 @@ remain open. The standalone public consumer built from `990539073` plus
 explicit overlays also passed 228 calls on retained native FAT16/FAT32, NTFS
 and ZFS images, including nine expected semantic failures and unchanged backing
 hashes. The full harness subsequently passed 2,652 tests, zero failures and 11
-ignored with a valid source receipt. Benchmark and later shared-source compiler
+ignored, including one compiled doctest, with a valid source receipt. The same
+public consumer then passed another 52 calls on freshly natively produced ext4
+and btrfs images: plain/bounded windows, eight native payload readbacks, 28
+payload comparisons, Unicode and empty files, ranged reads and four typed
+missing-path failures. All source, image, tool and executable hashes remained
+unchanged during verification. This adds offline read evidence for those two
+formats; APFS native acceptance is separate. Benchmark and later shared-source compiler
 gates remain open under `bd-native-image-library-s4tde`. These bounded results
 do not constitute release acceptance.
 Explicit native checks require their real producer tools:
