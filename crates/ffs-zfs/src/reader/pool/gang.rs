@@ -159,11 +159,7 @@ impl Pool {
         let dvas = pointer
             .gang_dvas(&header_allocations(config, pointer)?)
             .map_err(|error| parse(&error))?;
-        let replicas = if config.raidz_members.is_some() {
-            1
-        } else {
-            self.members.len() as u64
-        };
+        let replicas = self.replica_factor(config);
         let allocated = dvas
             .iter()
             .try_fold(0_u64, |sum, dva| sum.checked_add(dva.allocated_bytes));
@@ -349,13 +345,18 @@ impl Pool {
                     .members
                     .get(dva.vdev as usize)
                     .ok_or_else(|| unsupported("DVA references an unconfigured top-level vdev"))?;
-                self.members[vdev.supplied_index].validate_dva_for_vdev(
-                    vdev.ashift,
-                    vdev.allocated_bytes,
-                    dva.vdev,
-                    pointer,
-                    dva,
-                )?;
+                for &index in self.striped_sources(dva.vdev, vdev)? {
+                    checkpoint(cx)?;
+                    let member = self.members.get(index)
+                        .ok_or_else(|| corrupt("gang fragment replica has no supplied image"))?;
+                    member.validate_dva_for_vdev(
+                        vdev.ashift,
+                        vdev.allocated_bytes,
+                        dva.vdev,
+                        pointer,
+                        dva,
+                    )?;
+                }
             }
             return Ok(dvas
                 .into_iter()
@@ -488,15 +489,19 @@ impl Pool {
                 let vdev = group.members.get(dva.vdev as usize).ok_or_else(|| {
                     unsupported("foreign-vdev gang header requires another topology")
                 })?;
-                let member = &self.members[vdev.supplied_index];
-                let end = member.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
-                if vdev.allocated_bytes == 0
-                    || !vdev.allocated_bytes.is_multiple_of(allocated)
-                    || vdev.allocated_bytes > end - DATA_OFFSET
-                {
-                    return Err(corrupt(
-                        "configured gang allocation region exceeds a selected member",
-                    ));
+                for &index in self.striped_sources(dva.vdev, vdev)? {
+                    checkpoint(cx)?;
+                    let member = self.members.get(index)
+                        .ok_or_else(|| corrupt("gang header replica has no supplied image"))?;
+                    let end = member.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
+                    if vdev.allocated_bytes == 0
+                        || !vdev.allocated_bytes.is_multiple_of(allocated)
+                        || vdev.allocated_bytes > end - DATA_OFFSET
+                    {
+                        return Err(corrupt(
+                            "configured gang allocation region exceeds a selected member",
+                        ));
+                    }
                 }
                 if !dva.offset.is_multiple_of(allocated)
                     || !dva.allocated_bytes.is_multiple_of(allocated)
@@ -567,31 +572,33 @@ impl Pool {
             for (copy_index, dva) in dvas.iter().enumerate() {
                 checkpoint(cx)?;
                 let vdev = &group.members[dva.vdev as usize];
-                let member_index = vdev.supplied_index;
                 let offset = DATA_OFFSET + dva.offset;
-                let result = self.members[member_index]
-                    .read(cx, offset, HEADER_BYTES)
-                    .and_then(|bytes| {
-                        GangHeader::parse(&bytes, pointer, &header_allocations)
-                            .map_err(|error| parse(&error))?;
-                        Ok(bytes)
-                    });
-                match result {
-                    Ok(bytes) => {
-                        checkpoint(cx)?;
-                        return Ok(BlockRead {
-                            bytes,
-                            physical_offset: offset,
-                            copy_index,
-                            member_index,
-                            raidz: None,
+                for &member_index in self.striped_sources(dva.vdev, vdev)? {
+                    checkpoint(cx)?;
+                    let result = self.members[member_index]
+                        .read(cx, offset, HEADER_BYTES)
+                        .and_then(|bytes| {
+                            GangHeader::parse(&bytes, pointer, &header_allocations)
+                                .map_err(|error| parse(&error))?;
+                            Ok(bytes)
                         });
+                    match result {
+                        Ok(bytes) => {
+                            checkpoint(cx)?;
+                            return Ok(BlockRead {
+                                bytes,
+                                physical_offset: offset,
+                                copy_index,
+                                member_index,
+                                raidz: None,
+                            });
+                        }
+                        Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                        Err(error) => failures.push(format!(
+                            "header DVA {copy_index} (vdev {}, supplied member {member_index}): {error}",
+                            dva.vdev
+                        )),
                     }
-                    Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-                    Err(error) => failures.push(format!(
-                        "header DVA {copy_index} (vdev {}): {error}",
-                        dva.vdev
-                    )),
                 }
             }
             return Err(corrupt(format!(

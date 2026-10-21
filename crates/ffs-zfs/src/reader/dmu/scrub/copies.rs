@@ -139,16 +139,17 @@ fn plan(view: &Objects, contents: &Contents<'_>) -> Result<(Plan, u64)> {
             .checked_add(dva.offset)
             .ok_or_else(|| corrupt("replica audit offset overflows"))?;
         if let Some(group) = &view.config.raidz_members {
-            let member = group
+            let route = group
                 .members
                 .get(dva.vdev as usize)
-                .ok_or_else(|| corrupt("audit DVA has no admitted striped vdev"))?
-                .supplied_index;
-            replicas.push(Replica {
-                member,
-                copy,
-                offset,
-            });
+                .ok_or_else(|| corrupt("audit DVA has no admitted striped vdev"))?;
+            for &member in view.pool.striped_sources(dva.vdev, route)? {
+                replicas.push(Replica {
+                    member,
+                    copy,
+                    offset,
+                });
+            }
         } else {
             for member in 0..view.pool.leaves().len() {
                 replicas.push(Replica {

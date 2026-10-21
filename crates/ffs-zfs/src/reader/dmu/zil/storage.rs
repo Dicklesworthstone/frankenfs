@@ -195,26 +195,27 @@ fn plans(
                 .members
                 .get(dva.vdev as usize)
                 .ok_or_else(|| unsupported("ZIL DVA references an unconfigured top-level vdev"))?;
-            let leaf = pool
-                .leaves()
-                .get(member.supplied_index)
-                .ok_or_else(|| corrupt("ZIL top-level vdev has no supplied member"))?;
             if !(9..=16).contains(&member.ashift) {
                 return Err(corrupt("invalid ZIL top-level ashift"));
             }
-            leaf.validate_dva_for_vdev(
-                member.ashift,
-                member.allocated_bytes,
-                dva.vdev,
-                &pointer.bp,
-                dva,
-            )?;
-            plans.push(CopyPlan::Replica(Extent {
-                member: member.supplied_index,
-                offset: dva.offset,
-                allocated: dva.allocated_bytes,
-                bytes: pointer.bp.physical_bytes(),
-            }));
+            for &index in pool.striped_sources(dva.vdev, member)? {
+                checkpoint(cx)?;
+                let leaf = pool.leaves().get(index)
+                    .ok_or_else(|| corrupt("ZIL top-level replica has no supplied member"))?;
+                leaf.validate_dva_for_vdev(
+                    member.ashift,
+                    member.allocated_bytes,
+                    dva.vdev,
+                    &pointer.bp,
+                    dva,
+                )?;
+                plans.push(CopyPlan::Replica(Extent {
+                    member: index,
+                    offset: dva.offset,
+                    allocated: dva.allocated_bytes,
+                    bytes: pointer.bp.physical_bytes(),
+                }));
+            }
         } else {
             if !(9..=16).contains(&config.ashift) {
                 return Err(corrupt("invalid ZIL leaf/mirror ashift"));
@@ -361,4 +362,36 @@ pub(super) fn read_block(
     }
     checkpoint(cx)?;
     last_error.map_or(Ok(None), Err)
+}
+
+#[cfg(test)]
+mod striped_mirror_tests {
+    use super::*;
+    use crate::reader::Endian;
+    use crate::reader::pool::stripe_mirrors::tests::log_fixture;
+
+    #[test]
+    fn striped_mirror_zil_uses_embedded_verification_and_terminal_cancellation() {
+        for cancel in [false, true] {
+            let (pool, config, raw, expected, logs, address) = log_fixture(cancel);
+            let pointer = Pointer::parse(&raw, Endian::Little, 99).unwrap().unwrap();
+            let mut state = ReadState::default();
+            let result = read_block(&Cx::for_testing(), &pool, &config, &pointer, &mut state);
+            if cancel { assert!(matches!(result, Err(FfsError::Cancelled))); }
+            else { assert_eq!(result.unwrap().unwrap(), expected); }
+            assert_eq!(state.physical_bytes, 8192);
+            assert_eq!(state.allocations.len(), 2);
+            for log in &logs[..2] { assert!(log.lock().unwrap().is_empty()); }
+            for log in &logs[2..] { assert_eq!(*log.lock().unwrap(), [(address, 4096)]); }
+        }
+    }
+
+    #[test]
+    fn striped_mirror_zil_reserves_every_replica_before_any_log_read() {
+        let (pool, config, raw, _, logs, _) = log_fixture(false);
+        let pointer = Pointer::parse(&raw, Endian::Little, 99).unwrap().unwrap();
+        let mut state = ReadState { physical_bytes: MAX_LOG_BYTES - 4096, ..ReadState::default() };
+        assert!(matches!(read_block(&Cx::for_testing(), &pool, &config, &pointer, &mut state), Err(FfsError::UnsupportedFeature(_))));
+        for log in &logs { assert!(log.lock().unwrap().is_empty()); }
+    }
 }

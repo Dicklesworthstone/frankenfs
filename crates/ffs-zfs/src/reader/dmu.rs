@@ -106,6 +106,7 @@ impl Objects {
             return Err(corrupt("selected object set is not the MOS"));
         }
         let config = root.config;
+        let pool = pool.retain_striped_topology(cx, &config)?;
         checkpoint(cx)?;
         let mut view = Self {
             pool,

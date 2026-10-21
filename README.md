@@ -250,6 +250,28 @@ in this implementation session. See the
 [missing-RAIDZ extraction profile](docs/ZFS_MISSING_RAIDZ_PROFILE.md) for limits
 and validation still required before relying on the feature.
 
+### Multiple top-level mirrors and mixed leaf/mirror pools
+
+Explicit candidate reads now retain complete replica groups for multiple
+top-level mirrors, including mixtures with standalone file/disk vdevs. Supply
+every physical image with `--member`; native labels, not image argument order,
+define vdev IDs and mirror child order. The selected pool GUID, label and slot
+must agree across the complete exported topology. Per-vdev capacities and sector
+sizes are preserved, and usable capacity is counted once per top-level vdev.
+
+```sh
+ffs-zfs read first.img /important.bin --member second.img \
+  --member third.img --member fourth.img --offline-image \
+  --pool-guid 123 --label 0 --slot 2 --dataset data > recovered.bin
+```
+
+Ordinary blocks, gang headers/fragments, redundancy scrub and existing ZIL
+storage planning share the retained replica routing. A different vdev is not
+a fallback unless another declared DVA selects it. Missing children, automatic
+selection for mirrored stripes, multiple RAIDZ groups and native write/import
+authority remain outside this increment. Ten new Rust tests are authored but
+unexecuted here; see the [striped-mirror profile](docs/ZFS_STRIPED_MIRRORS.md).
+
 ### Check redundancy, not only readability
 
 `ffs-zfs scrub --verify-redundancy` rereads physical copies in the selected
@@ -309,6 +331,7 @@ projection and rejection rules are in the corresponding profiles:
 | ZFS committed-view extraction from explicitly incomplete mirrors | [Missing-mirror profile](docs/ZFS_MISSING_MIRROR_PROFILE.md) |
 | ZFS committed-view extraction with missing RAIDZ1/2/3 children | [Missing-RAIDZ profile](docs/ZFS_MISSING_RAIDZ_PROFILE.md) |
 | ZFS physical-copy and RAIDZ parity audit of selected DMU graphs | [Redundancy scrub profile](docs/ZFS_REDUNDANCY_SCRUB.md) |
+| ZFS complete multi-vdev mirror/leaf extraction | [Striped-mirror profile](docs/ZFS_STRIPED_MIRRORS.md) |
 | ext4/btrfs architecture, operation and evidence | [Detailed guide](README_EXT4_BTRFS.md), [current parity ledger](FEATURE_PARITY.md) |
 
 ## Architecture and remaining priorities

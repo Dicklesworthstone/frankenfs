@@ -9,6 +9,7 @@ mod import;
 mod missing_mirror;
 mod missing_raidz;
 pub(super) mod raidz;
+pub(super) mod stripe_mirrors;
 
 use super::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, FfsError, Label, Leaf, NvList, RaidzGroup,
@@ -16,6 +17,7 @@ use super::{
     corrupt, integer, parse, unsupported,
 };
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 const MAX_MEMBERS: usize = 8;
 
@@ -26,6 +28,7 @@ pub struct Pool {
     // Empty keeps complete-member admission; never infer missing devices.
     missing_mirror_guids: Vec<u64>,
     missing_raidz_guids: Vec<u64>,
+    top_levels: Option<Arc<stripe_mirrors::Topology>>,
 }
 
 impl From<Leaf> for Pool {
@@ -34,6 +37,7 @@ impl From<Leaf> for Pool {
             members: vec![leaf],
             missing_mirror_guids: Vec::new(),
             missing_raidz_guids: Vec::new(),
+            top_levels: None,
         }
     }
 }
@@ -171,6 +175,7 @@ impl Pool {
             members,
             missing_mirror_guids: Vec::new(),
             missing_raidz_guids: Vec::new(),
+            top_levels: None,
         })
     }
 
@@ -342,6 +347,9 @@ impl Pool {
     ) -> Result<RootBlock> {
         let count = self.members.len();
         let first_label = self.members[0].label(cx, label_index)?;
+        if integer(&first_label.config, "vdev_children")? != count as u64 {
+            return self.mirror_stripe_root(cx, label_index, slot, pool_guid, allow_active_state);
+        }
         let first_cfg = first_label.striped_leaf_config(pool_guid, count, allow_active_state)?;
         let candidate = self.members[0].uberblock(cx, &first_label, slot)?;
         let mut seen_guids = BTreeSet::from([pool_guid]);
@@ -520,32 +528,38 @@ impl Pool {
                 .members
                 .get(vdev_idx)
                 .ok_or_else(|| unsupported("DVA references an unconfigured top-level vdev"))?;
-            let member = &self.members[vdev.supplied_index];
-            member.validate_dva_for_vdev(vdev.ashift, vdev.allocated_bytes, dva.vdev, bp, dva)?;
+            for &index in self.striped_sources(dva.vdev, vdev)? {
+                checkpoint(cx)?;
+                let member = self.members.get(index)
+                    .ok_or_else(|| corrupt("striped replica has no supplied image"))?;
+                member.validate_dva_for_vdev(vdev.ashift, vdev.allocated_bytes, dva.vdev, bp, dva)?;
+            }
         }
         let mut failures = Vec::new();
         for (copy_index, dva) in dvas.iter().enumerate() {
             checkpoint(cx)?;
             let vdev = &group.members[dva.vdev as usize];
-            let member_index = vdev.supplied_index;
             let offset = DATA_OFFSET + dva.offset;
-            let result = self.members[member_index]
-                .read(cx, offset, bp.physical_bytes())
-                .and_then(|raw| bp.decode(&raw).map_err(|error| parse(&error)));
-            match result {
-                Ok(bytes) => {
-                    checkpoint(cx)?;
-                    return Ok(BlockRead {
-                        bytes,
-                        physical_offset: offset,
-                        copy_index,
-                        member_index,
-                        raidz: None,
-                    });
-                }
-                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-                Err(error) => {
-                    failures.push(format!("DVA {copy_index} (vdev {}): {error}", dva.vdev));
+            for &member_index in self.striped_sources(dva.vdev, vdev)? {
+                checkpoint(cx)?;
+                let result = self.members[member_index]
+                    .read(cx, offset, bp.physical_bytes())
+                    .and_then(|raw| bp.decode(&raw).map_err(|error| parse(&error)));
+                match result {
+                    Ok(bytes) => {
+                        checkpoint(cx)?;
+                        return Ok(BlockRead {
+                            bytes,
+                            physical_offset: offset,
+                            copy_index,
+                            member_index,
+                            raidz: None,
+                        });
+                    }
+                    Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                    Err(error) => {
+                        failures.push(format!("DVA {copy_index} (vdev {}, supplied member {member_index}): {error}", dva.vdev));
+                    }
                 }
             }
         }
