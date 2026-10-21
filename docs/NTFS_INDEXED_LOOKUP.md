@@ -16,6 +16,15 @@ its contents still pass complete enumeration. `readlink` retains the final link
 itself. The flag is not accepted by mount, checkers or record-number commands,
 and existing volume bounds, offline acknowledgement and stream selectors remain.
 
+`NtfsFs::new_indexed(cx, volume, uid, gid)` explicitly selects native index search
+for inode-relative `FsOps::lookup`. `NtfsFs::new` keeps its existing strict root
+enumeration. Both constructors retain journal, root and UpCase admission. Indexed
+construction checks the root index and child descriptors without reading the
+child blocks. Selected and negative lookups do not populate the complete-directory
+cache; `readdir` still enumerates and validates all targets before publishing one
+snapshot. Native inode generations, hard-link identity, relative symlinks,
+directory ancestry and lossless host-name projection remain required.
+
 ```sh
 ffs-ntfs read volume.img /large-directory/report.bin --offline-image --indexed-lookup
 ffs-ntfs read volume.img /large-directory/report.bin --offline-image \
@@ -31,6 +40,9 @@ case folding. All equal-folded separator intervals are explored, including both
 adjacent children. An exact native spelling wins over case-insensitive candidates;
 without an exact match, POSIX-namespace names do not match case-insensitively.
 Distinct matching record references are ambiguous, not an arbitrary first hit.
+When matching keys share one reference, every selected parent/sequence/namespace/
+UTF-16 name identity must exist in its FILE catalog, independent of key order.
+The catalog's FILE_NAME attributes are scanned once for all those identities.
 An early exact match does not suppress later errors in its relevant search range.
 
 Every loaded index node is parsed by the existing FILE_NAME/INDX machinery and
@@ -71,8 +83,16 @@ unchanged defaults, volume bounds, raw UTF-16 streams, ranges, offline admission
 and rejection of mutation/unrelated-command options. Test storage panics on writes
 and sync. Existing directory, path, recovery and CLI tests are retained unchanged.
 
-These tests were authored but could not be executed in the implementation
-environment: Cargo, rustc, rustfmt and RCH are absent; gate attempts exited 127.
+Two additional reader regressions require a missing same-reference identity to
+fail in either index order and a complete alias pair to remain readable. Seven
+FsOps regressions cover constructor admission, inode-relative names, aliases,
+hard links, read-only operations, full enumeration/cookies, unrelated damaged
+siblings, selected I/O failures, cancellation and native-name projection. These
+are constructed-image unit tests, not native-producer or mounted evidence.
+
+The original implementation environment lacked Cargo, rustc, rustfmt and RCH;
+its gate attempts exited 127. Execution of the combined reader repair, FsOps and
+CLI source is now pending through strict remote RCH in the development workspace.
 Source/hash checks and an independent interval-search model are not Rust execution,
 native NTFS interoperability, kernel FUSE evidence or performance measurements.
 Run the repository's unchanged gates before relying on the new path:

@@ -90,6 +90,11 @@ then passed 120 commands over the retained NTFS inputs, including all 32
 extension streams, both exact selectors and write refusal; a separate verifier
 executed 58 public calls and fresh native comparisons. The same consumer also
 passed FAT16/FAT32 plain/bounded reads and selected ZPL 4/5 file/snapshot reads.
+At `c6c93513b`, the explicit native Rust selection passed through RCH with
+freshly produced FAT16/FAT32/NTFS images, same-volume named-stream reads and
+both unchanged FAT/NTFS companion profile wrappers. Its captured output and
+source receipt are recorded in `.beads/pending_tasks.md`; this run predates the
+indexed-lookup repair and the indexed FsOps constructor below.
 FrankenFS-mounted behavior and the remaining full harness gates stay open under
 `bd-native-image-library-s4tde`; this is not release acceptance.
 Explicit native checks require their real producer tools:
@@ -238,11 +243,15 @@ ffs-ntfs read volume.img /large-directory/report.bin --offline-image \
 The search retains native UpCase matching, exact-spelling priority, ambiguity
 rejection, child allocation/fixup checks and complete selected-target identity
 validation. It examines every relevant equal-name branch before returning.
+Every matching identity for a selected file reference must occur in that file's
+catalog, including same-reference aliases in either index order.
+`NtfsFs::new_indexed` also selects this behavior for inode-relative `FsOps::lookup`;
+its `readdir` still validates and caches only complete directory enumerations.
 Unvisited branches and sibling records are not certified: this is an explicit
 lookup scope, not repair, whole-directory checking or a measured speedup.
-Seven native-image and three CLI regressions are authored but unexecuted in this
-implementation environment. Earlier validation receipts above do not qualify
-this new path. See the [indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md).
+Nine constructed-image reader, seven FsOps and three CLI regressions are authored;
+execution of this combined source remains pending. Earlier validation receipts
+above do not qualify this new path. See the [indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md).
 
 ## ZFS: extract from surviving mirror disks
 
