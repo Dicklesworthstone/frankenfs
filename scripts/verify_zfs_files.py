@@ -56,16 +56,29 @@ def compare_stat(report: dict, expected: dict, guid: str, version: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--facade-binary", type=Path,
+                        help="also execute the standalone public ffs native_reader example")
     parser.add_argument("--create-and-mount-scratch-pool", action="store_true", required=True)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     require(os.access(binary, os.X_OK), "candidate is not executable")
+    facade = args.facade_binary.resolve(strict=True) if args.facade_binary else None
+    if facade:
+        require(os.access(facade, os.X_OK), "public facade consumer is not executable")
     for tool in ("zpool", "zfs"):
         require(shutil.which(tool) is not None, f"required native tool missing: {tool}")
     root = Path(tempfile.mkdtemp(prefix="ffs-zpl-native-"))
     print(f"Retaining all images, file oracles and logs in {root}", flush=True)
+    # The native link's ../../ target exists outside the image. A refusal must
+    # not be an accidental ENOENT after following a host path.
+    canary = root / "outside-not-followed"
+    canary_bytes = b"retained host traversal canary\0" + secrets.token_bytes(32)
+    with canary.open("xb") as stream:
+        stream.write(canary_bytes)
     sequence = 0
     report = {"status": "running", "candidate_sha256": digest(binary), "scenarios": []}
+    if facade:
+        report["facade_sha256"] = digest(facade)
 
     def command(*argv: str | Path, fails: bool = False) -> bytes:
         nonlocal sequence
@@ -166,6 +179,36 @@ def main() -> None:
                     require(command(binary, "read", backing, "/sparse", *options, "--start", str(sparse_size - 3), "--bytes", "100") == b"\0" * 3, "sparse tail differs")
                     require(command(binary, "readlink", backing, "/external-link", *options) == b"../../outside-not-followed", "symlink bytes differ")
                     command(binary, "read", backing, "/external-link", *options, fails=True)
+                    if facade:
+                        view = [backing, *extra, "--zfs-dataset", "data"]
+                        raw_names = command(facade, *view, "list", "/")
+                        require(raw_names.endswith(b"\0"), "facade listing lacks its final delimiter")
+                        entries = raw_names[:-1].split(b"\0")
+                        require(len(entries) == len(set(entries))
+                                and set(entries) == names | {b".", b".."},
+                                "public facade directory names differ from native")
+                        for name in (long_name, "alias.bin", "sub/nested.bin"):
+                            path = "/" + name
+                            require(command(facade, *view, "stat", path)
+                                    == f"zfs\tRegularFile\t{len(payload)}\n".encode(),
+                                    "public facade metadata differs from native")
+                            require(command(facade, *view, "read", path) == payload,
+                                    "public facade file bytes differ from native")
+                        require(command(facade, *view, "read", "/" + long_name,
+                                        "--start", "507", "--bytes", "8199") == payload[507:8706],
+                                "public facade unaligned range differs")
+                        require(command(facade, *view, "read", "/" + long_name,
+                                        "--start", str(len(payload)), "--bytes", "5") == b"",
+                                "public facade EOF exposed bytes")
+                        require(command(facade, *view, "read", "/empty") == b"",
+                                "public facade empty file has data")
+                        require(command(facade, *view, "read", "/sparse", "--start",
+                                        str(sparse_size - 3), "--bytes", "100") == b"\0" * 3,
+                                "public facade sparse tail differs")
+                        command(facade, *view, "refuse-write", "/" + long_name)
+                        require(command(facade, *view, "read", "/external-link", fails=True) == b"",
+                                "public facade followed the external symlink")
+                        require(canary.read_bytes() == canary_bytes, "host traversal canary changed")
                     require(digest(backing) == backing_hash, "candidate modified selected or adjacent image bytes")
                 require(digest(image) == before, "exported image changed")
                 scenario = {"zpl_version": version, "pool_guid": pool_guid, "dataset_guid": dataset_guid,

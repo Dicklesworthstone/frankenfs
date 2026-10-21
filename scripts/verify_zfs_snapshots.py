@@ -67,16 +67,23 @@ def listing_names(report: dict) -> set[bytes]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--facade-binary", type=Path,
+                        help="also execute the standalone public ffs native_reader example")
     parser.add_argument("--create-and-mount-scratch-pool", action="store_true", required=True)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     require(os.access(binary, os.X_OK), "candidate is not executable")
+    facade = args.facade_binary.resolve(strict=True) if args.facade_binary else None
+    if facade:
+        require(os.access(facade, os.X_OK), "public facade consumer is not executable")
     for tool in ("zpool", "zfs"):
         require(shutil.which(tool) is not None, f"required native tool missing: {tool}")
     root = Path(tempfile.mkdtemp(prefix="ffs-snapshots-native-"))
     print(f"Retaining images, snapshot oracles and command logs in {root}", flush=True)
     sequence = 0
     report = {"status": "running", "candidate_sha256": digest(binary), "scenarios": []}
+    if facade:
+        report["facade_sha256"] = digest(facade)
 
     def command(*argv: str | Path, fails: bool = False) -> bytes:
         nonlocal sequence
@@ -218,8 +225,39 @@ def main() -> None:
                         require(command(binary, "readlink", backing, "/link", *view) == oracle["link"], "historical symlink differs")
                         if name == "before":
                             require(command(binary, "read", backing, "/sparse", *view, "--start", str((1 << 32) + 14), "--bytes", "100") == b"\0" * 3, "historical sparse tail differs")
+                        if facade:
+                            public = [backing, *extra, "--zfs-dataset", "data"]
+                            if name is not None:
+                                public += ["--zfs-snapshot", name]
+                            raw_names = command(facade, *public, "list", "/")
+                            require(raw_names.endswith(b"\0"), "facade listing lacks final delimiter")
+                            entries = raw_names[:-1].split(b"\0")
+                            require(len(entries) == len(set(entries))
+                                    and set(entries) == oracle["names"] | {b".", b".."},
+                                    "public facade selected another snapshot namespace")
+                            require(command(facade, *public, "stat", "/file.bin")
+                                    == f"zfs\tRegularFile\t{oracle['size']}\n".encode(),
+                                    "public facade historical metadata differs")
+                            for file in ("file.bin", "alias.bin"):
+                                require(command(facade, *public, "read", "/" + file)
+                                        == oracle["payload"], "public facade historical content differs")
+                            require(command(facade, *public, "read", "/file.bin", "--start", "507",
+                                            "--bytes", "8199") == oracle["payload"][507:8706],
+                                    "public facade historical unaligned range differs")
+                            require(command(facade, *public, "read", "/file.bin", "--start",
+                                            str(oracle["size"]), "--bytes", "1") == b"",
+                                    "public facade historical EOF exposed bytes")
+                            command(facade, *public, "refuse-write", "/file.bin")
+                            if name == "before":
+                                require(command(facade, *public, "read", "/sparse", "--start",
+                                                str((1 << 32) + 14), "--bytes", "100") == b"\0" * 3,
+                                        "public facade historical sparse tail differs")
                     command(binary, "read", backing, "/file.bin", *options, "--snapshot", "missing", fails=True)
                     command(binary, "read", backing, "/gone", *options, fails=True)
+                    if facade:
+                        public = [backing, *extra, "--zfs-dataset", "data"]
+                        command(facade, *public, "--zfs-snapshot", "missing", "read", "/file.bin", fails=True)
+                        command(facade, *public, "read", "/gone", fails=True)
                     require(digest(backing) == checksum, "snapshot verification modified image or adjacent partitions")
                 require(digest(image) == before_hash, "exported image changed")
                 report["scenarios"].append({"zpl_version": version, "snapshots": identities,
