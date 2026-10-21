@@ -315,10 +315,29 @@ ffs-zfs read first.img /important.bin --member second.img \
 
 Ordinary blocks, gang headers/fragments, redundancy scrub and existing ZIL
 storage planning share the retained replica routing. A different vdev is not
-a fallback unless another declared DVA selects it. Missing children, automatic
-selection for mirrored stripes, multiple RAIDZ groups and native write/import
+a fallback unless another declared DVA selects it. Missing children in these
+multi-vdev pools, multiple RAIDZ groups and native write/import
 authority remain outside this increment. Ten new Rust tests are authored but
 unexecuted here; see the [striped-mirror profile](docs/ZFS_STRIPED_MIRRORS.md).
+
+Complete mirror/leaf stripes also support `--auto-import`. Selection checks all
+surviving valid configurations, scans independently located rings using each
+member's sector geometry, and retains the complete replica routing for root,
+dataset and redundancy-scrub reads. Bad-checksum labels may be bypassed; valid
+configuration conflicts, missing children and equal-TXG root forks may not.
+Explicit candidate selection remains strict. The inherited highest-readable-TXG
+policy can return an older committed view when newer roots are unreadable; it
+does not establish newest-state or writable-pool authority.
+
+```sh
+ffs-zfs read first.img /important.bin --member second.img \
+  --member third.img --member fourth.img --offline-image \
+  --auto-import --pool-guid 123 --dataset data > recovered.bin
+```
+
+Eight additional Rust controls and a revised explicit/automatic equivalence
+control are authored but unexecuted in this implementation environment. See
+the profile above for the retained limits and required validation.
 
 ### Check redundancy, not only readability
 
