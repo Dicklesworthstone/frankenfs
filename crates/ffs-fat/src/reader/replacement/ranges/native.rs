@@ -187,6 +187,31 @@ impl Allocation {
         }
         Ok(Self { chain, added })
     }
+
+    /// Acknowledged allocation writes can be dropped or corrupt neighboring
+    /// entries. Use a fresh table after each barrier, never the preflight cache.
+    /// Before attachment the old prefix and added suffix are separate chains;
+    /// afterward every link must match the complete prepared file allocation.
+    fn verify_links(&self, cx: &Cx, volume: &FatVolume, attached: bool) -> Result<()> {
+        let old_len = self.chain.len() - self.added.len();
+        let mut table = FatTable::new(volume);
+        for (index, &cluster) in self.chain.iter().enumerate() {
+            checkpoint(cx)?;
+            let expected = if !attached && index + 1 == old_len {
+                FatEntry::End
+            } else {
+                self.chain
+                    .get(index + 1)
+                    .copied()
+                    .map_or(FatEntry::End, FatEntry::Next)
+            };
+            if table.entry(cx, cluster)? != expected {
+                bail!("native growth allocation failed readback at cluster {cluster}");
+            }
+        }
+        checkpoint(cx)?;
+        Ok(())
+    }
 }
 
 /// Return the only logical interval that must be initialized or overwritten.
@@ -417,7 +442,10 @@ fn apply_update(
                     }),
             )?;
             volume.device.sync(cx)?;
+            phase = "verifying detached growth allocation before attachment";
+            allocation.verify_links(cx, volume, false)?;
             if let Some(&tail) = old.clusters.last() {
+                phase = "attaching verified growth allocation";
                 change_fat(
                     cx,
                     volume,
@@ -425,6 +453,14 @@ fn apply_update(
                 )?;
                 volume.device.sync(cx)?;
             }
+        }
+
+        if !allocation.added.is_empty() || size > old.size {
+            // Also cover growth into previously owned preallocation: data writes
+            // must not let a damaged retained chain acquire a larger visible EOF.
+            // KEEP_SIZE still needs this gate when attaching reserved capacity.
+            phase = "verifying complete growth allocation before EOF publication";
+            allocation.verify_links(cx, volume, true)?;
         }
 
         phase = "publishing native length and metadata";

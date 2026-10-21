@@ -1,6 +1,8 @@
 //! Production truncation with native records and pending/durable storage cuts.
 //! Constructed images are not independent native-filesystem qualification.
 
+mod growth;
+
 use super::*;
 use ffs_core::{FsOps, RequestScope, SetAttrRequest};
 use ffs_types::InodeNumber;
