@@ -289,6 +289,7 @@ fn encode_btrfs_extent_regular(disk_bytenr: u64, num_bytes: u64) -> [u8; 53] {
 const BTRFS_TEST_IMAGE_SIZE: usize = 512 * 1024;
 const BTRFS_TEST_ROOT_TREE_LOGICAL: u64 = 0x4_000;
 const BTRFS_TEST_FS_TREE_LOGICAL: u64 = 0x8_000;
+const BTRFS_TEST_CHUNK_TREE_LOGICAL: u64 = 0xC_000;
 const BTRFS_TEST_FILE_DATA_LOGICAL: u64 = 0x12_000;
 const BTRFS_TEST_ROOT_ITEM_OFF: u32 = 3000;
 const BTRFS_TEST_ROOT_INODE_OFF: u32 = 3200;
@@ -316,7 +317,8 @@ fn build_btrfs_regular_extent_mount_image(
     image[sb_off + 0x48..sb_off + 0x50].copy_from_slice(&1_u64.to_le_bytes());
     image[sb_off + 0x50..sb_off + 0x58]
         .copy_from_slice(&BTRFS_TEST_ROOT_TREE_LOGICAL.to_le_bytes());
-    image[sb_off + 0x58..sb_off + 0x60].copy_from_slice(&0_u64.to_le_bytes());
+    image[sb_off + 0x58..sb_off + 0x60]
+        .copy_from_slice(&BTRFS_TEST_CHUNK_TREE_LOGICAL.to_le_bytes());
     image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(
         &u64::try_from(BTRFS_TEST_IMAGE_SIZE)
             .expect("test image size")
@@ -327,7 +329,21 @@ fn build_btrfs_regular_extent_mount_image(
     image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&BTRFS_TEST_NODESIZE.to_le_bytes());
     image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&BTRFS_TEST_NODESIZE.to_le_bytes());
     image[sb_off + 0x9C..sb_off + 0xA0].copy_from_slice(&BTRFS_TEST_NODESIZE.to_le_bytes());
+    image[sb_off + 0xA4..sb_off + 0xAC].copy_from_slice(&1_u64.to_le_bytes());
     image[sb_off + 0xC6] = 0;
+
+    let mut device_item = [0_u8; ffs_ondisk::btrfs::BTRFS_DEV_ITEM_SIZE];
+    device_item[0..8].copy_from_slice(&1_u64.to_le_bytes());
+    device_item[8..16].copy_from_slice(
+        &u64::try_from(BTRFS_TEST_IMAGE_SIZE)
+            .expect("test image size should fit in u64")
+            .to_le_bytes(),
+    );
+    device_item[24..28].copy_from_slice(&BTRFS_TEST_NODESIZE.to_le_bytes());
+    device_item[28..32].copy_from_slice(&BTRFS_TEST_NODESIZE.to_le_bytes());
+    device_item[32..36].copy_from_slice(&BTRFS_TEST_NODESIZE.to_le_bytes());
+    device_item[44..52].copy_from_slice(&1_u64.to_le_bytes());
+    image[sb_off + 0xC9..sb_off + 0xC9 + device_item.len()].copy_from_slice(&device_item);
 
     let mut chunk_array = Vec::new();
     chunk_array.extend_from_slice(&256_u64.to_le_bytes());
@@ -356,6 +372,45 @@ fn build_btrfs_regular_extent_mount_image(
     );
     let array_start = sb_off + 0x32B;
     image[array_start..array_start + chunk_array.len()].copy_from_slice(&chunk_array);
+
+    // Commit the same device identity and bootstrap mapping for strict admission.
+    // This block is disjoint from both trees, the superblock, and file data.
+    let mut chunk_leaf = vec![0_u8; nodesize];
+    write_btrfs_header(
+        &mut chunk_leaf,
+        BTRFS_TEST_CHUNK_TREE_LOGICAL,
+        2,
+        0,
+        BTRFS_CHUNK_TREE_OBJECTID,
+        1,
+    );
+    let device_item_off = nodesize - device_item.len();
+    let chunk_item = &chunk_array[17..];
+    let chunk_item_off = device_item_off - chunk_item.len();
+    write_btrfs_leaf_item(
+        &mut chunk_leaf,
+        0,
+        ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+        BTRFS_ITEM_DEV_ITEM,
+        1,
+        u32::try_from(device_item_off).expect("device item offset should fit in u32"),
+        u32::try_from(device_item.len()).expect("device item size should fit in u32"),
+    );
+    chunk_leaf[device_item_off..device_item_off + device_item.len()].copy_from_slice(&device_item);
+    write_btrfs_leaf_item(
+        &mut chunk_leaf,
+        1,
+        256,
+        BTRFS_ITEM_CHUNK,
+        0,
+        u32::try_from(chunk_item_off).expect("chunk item offset should fit in u32"),
+        u32::try_from(chunk_item.len()).expect("chunk item size should fit in u32"),
+    );
+    chunk_leaf[chunk_item_off..chunk_item_off + chunk_item.len()].copy_from_slice(chunk_item);
+    stamp_btrfs_tree_block_checksum(&mut chunk_leaf);
+    let chunk_leaf_off =
+        usize::try_from(BTRFS_TEST_CHUNK_TREE_LOGICAL).expect("chunk tree logical should fit");
+    image[chunk_leaf_off..chunk_leaf_off + chunk_leaf.len()].copy_from_slice(&chunk_leaf);
 
     let mut root_leaf = vec![0_u8; nodesize];
     write_btrfs_header(&mut root_leaf, BTRFS_TEST_ROOT_TREE_LOGICAL, 1, 0, 1, 1);
@@ -451,6 +506,9 @@ fn build_btrfs_regular_extent_mount_image(
     let file_data_off =
         usize::try_from(BTRFS_TEST_FILE_DATA_LOGICAL).expect("file data logical should fit");
     image[file_data_off..file_data_off + extent_bytes.len()].copy_from_slice(extent_bytes);
+    let sb_end = sb_off + ffs_types::BTRFS_SUPER_INFO_SIZE;
+    let csum = ffs_types::crc32c(&image[sb_off + 0x20..sb_end]);
+    image[sb_off..sb_off + 4].copy_from_slice(&csum.to_le_bytes());
     image
 }
 
@@ -770,6 +828,33 @@ fn send_stream_builder_special_files_roundtrip() {
     assert_eq!(parsed.commands[2].cmd, SendCommand::Mkfifo);
     assert_eq!(parsed.commands[3].cmd, SendCommand::Mksock);
     assert_eq!(parsed.commands[4].cmd, SendCommand::End);
+}
+
+#[test]
+fn btrfs_mount_fixture_keeps_superblock_checksum_admission_strict() {
+    let image = build_btrfs_subvolume_mount_image();
+    let sb_end = BTRFS_SUPER_INFO_OFFSET + ffs_types::BTRFS_SUPER_INFO_SIZE;
+    ffs_ondisk::verify_btrfs_superblock_checksum(&image[BTRFS_SUPER_INFO_OFFSET..sb_end])
+        .expect("fixture producer must emit a valid superblock checksum");
+    let (_fs, _tmp) = open_btrfs_test_image("checksummed.img", &image);
+
+    let tmp = tempfile::TempDir::new().expect("tmpdir for corrupt btrfs images");
+    let cx = Cx::for_testing();
+    for offset in [0, 0x70] {
+        let mut corrupt = image.clone();
+        corrupt[BTRFS_SUPER_INFO_OFFSET + offset] ^= 1;
+        let path = tmp.path().join(format!("corrupt-{offset}.img"));
+        std::fs::write(&path, corrupt).expect("write corrupt btrfs test image");
+        let Err(error) = OpenFs::open_with_options(&cx, &path, &OpenOptions::default()) else {
+            panic!("corrupt superblock checksum or covered payload must be refused");
+        };
+        assert!(
+            matches!(error, ffs_error::FfsError::Format(ref detail)
+                if detail.contains("superblock_csum")
+                    && detail.contains("superblock checksum mismatch")),
+            "offset {offset}: {error:?}"
+        );
+    }
 }
 
 #[test]
