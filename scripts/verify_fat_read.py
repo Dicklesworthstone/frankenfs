@@ -13,6 +13,7 @@ import argparse
 import errno
 import hashlib
 import json
+import locale
 import os
 from pathlib import Path
 import shutil
@@ -438,6 +439,23 @@ def main() -> None:
     parser.add_argument("--binary", type=Path, required=True, help="already-built ffs-fat executable")
     parser.add_argument("--mounted", action="store_true", help="require actual FUSE reads and EROFS refusal")
     args = parser.parse_args()
+    # mtools interprets argv using the native locale. Under C it writes the
+    # UTF-8 bytes of cafe-with-accent as two different Unicode characters.
+    # Select an available UTF-8 locale for this fixture process and its children;
+    # retain every Unicode-name assertion rather than changing expected names.
+    for native_locale in ("C.UTF-8", "en_US.UTF-8", "UTF-8"):
+        try:
+            locale.setlocale(locale.LC_ALL, native_locale)
+        except locale.Error:
+            continue
+        break
+    else:
+        raise RuntimeError("native Unicode fixtures require an installed UTF-8 locale")
+    check(locale.nl_langinfo(locale.CODESET).replace("-", "").lower() == "utf8",
+          "selected native tool locale is not UTF-8")
+    check(os.fsencode("café") == b"caf\xc3\xa9",
+          "Python argv encoding is not UTF-8; start the fixture with a UTF-8 locale")
+    os.environ["LC_ALL"] = native_locale
     binary = args.binary.resolve(strict=True)
     check(os.access(binary, os.X_OK), "candidate is not executable")
     tools = ["mkfs.fat", "fsck.fat", "mcopy", "mmd"]
@@ -449,7 +467,8 @@ def main() -> None:
     root = Path(tempfile.mkdtemp(prefix="ffs-fat-native-"))
     print(f"Retaining native images and command logs in {root}", flush=True)
     run = Run(binary, root)
-    report = {"candidate_sha256": digest(binary), "tool_paths": {tool: shutil.which(tool) for tool in tools},
+    report = {"candidate_sha256": digest(binary), "native_tool_locale": native_locale,
+              "tool_paths": {tool: shutil.which(tool) for tool in tools},
               "scenarios": []}
     try:
         for bits in (16, 32):
