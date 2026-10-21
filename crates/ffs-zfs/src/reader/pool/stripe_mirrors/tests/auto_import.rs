@@ -115,7 +115,10 @@ fn striped_mirror_auto_import_keeps_explicit_selection_strict() {
     Fixture::no_payload(&logs);
     assert_eq!(pool.import_active(&cx, None).unwrap().2.uberblock.txg, 43);
     assert_eq!(
-        pool.import_objects(&cx, None).unwrap().read(&cx, 1, 0, 512).unwrap(),
+        pool.import_objects(&cx, None)
+            .unwrap()
+            .read(&cx, 1, 0, 512)
+            .unwrap(),
         vec![0xA5; 512]
     );
 }
@@ -143,21 +146,31 @@ fn striped_mirror_auto_import_rejects_incomplete_and_conflicting_topology_before
             }
             5 => {
                 for cfg in &mut fixture.configs {
-                    cfg.fields.insert("vdev_children".into(), Value::Unsigned(3));
+                    cfg.fields
+                        .insert("vdev_children".into(), Value::Unsigned(3));
                 }
             }
             6 => fixture.lengths[0] -= LABEL_BYTES,
             7 => {
-                fixture.configs[3].fields.insert("state".into(), Value::Unsigned(0));
+                fixture.configs[3]
+                    .fields
+                    .insert("state".into(), Value::Unsigned(0));
             }
             8 => {
                 let Value::Lists(children) = tree(&mut fixture.configs[2])
-                    .fields.get_mut("children").unwrap() else { panic!("children"); };
+                    .fields
+                    .get_mut("children")
+                    .unwrap()
+                else {
+                    panic!("children");
+                };
                 children[0].fields.insert("id".into(), Value::Unsigned(7));
             }
             _ => {
                 for cfg in &mut fixture.configs {
-                    tree(cfg).fields.insert("type".into(), Value::String("replacing".into()));
+                    tree(cfg)
+                        .fields
+                        .insert("type".into(), Value::String("replacing".into()));
                 }
             }
         }
@@ -175,13 +188,21 @@ fn striped_mirror_auto_import_requires_every_valid_label_to_agree() {
     for case in 0..4 {
         let mut fixture = Fixture::new([2, 2], [9, 12], Endian::Big);
         if case == 3 {
-            for label in 0..4 { fixture.damage_label(1, label); }
+            for label in 0..4 {
+                fixture.damage_label(1, label);
+            }
         } else {
             let mut cfg = fixture.configs[1].clone();
             match case {
-                0 => { cfg.fields.insert("guid".into(), Value::Unsigned(1000)); }
-                1 => { cfg.fields.insert("txg".into(), Value::Unsigned(44)); }
-                _ => { cfg.fields.insert("pool_guid".into(), Value::Unsigned(456)); }
+                0 => {
+                    cfg.fields.insert("guid".into(), Value::Unsigned(1000));
+                }
+                1 => {
+                    cfg.fields.insert("txg".into(), Value::Unsigned(44));
+                }
+                _ => {
+                    cfg.fields.insert("pool_guid".into(), Value::Unsigned(456));
+                }
             }
             // The conflicting fourth label is correctly checksummed. It must
             // not be discarded like an unreadable or torn configuration copy.
@@ -230,7 +251,11 @@ fn striped_mirror_auto_import_filters_guid_sum_and_config_age_and_rejects_txg_fo
 #[test]
 fn striped_mirror_auto_import_distinguishes_label_io_failure_from_cancellation() {
     let cx = Cx::for_testing();
-    for offset in [LABEL_CONFIG_OFFSET, UBERBLOCK_RING_OFFSET, DATA_OFFSET + ROOT] {
+    for offset in [
+        LABEL_CONFIG_OFFSET,
+        UBERBLOCK_RING_OFFSET,
+        DATA_OFFSET + ROOT,
+    ] {
         for cancel in [false, true] {
             let fixture = Fixture::new([2, 2], [9, 12], Endian::Little);
             let logs = fixture.logs.clone();
@@ -246,8 +271,13 @@ fn striped_mirror_auto_import_distinguishes_label_io_failure_from_cancellation()
             if cancel {
                 assert!(matches!(result, Err(FfsError::Cancelled)));
                 if offset == DATA_OFFSET + ROOT {
-                    assert!(!logs[3].lock().unwrap().iter()
-                        .any(|(position, _)| *position == at(ROOT) as u64));
+                    assert!(
+                        !logs[3]
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(position, _)| *position == at(ROOT) as u64)
+                    );
                 } else {
                     Fixture::no_payload(&logs);
                 }
@@ -266,22 +296,38 @@ fn striped_mirror_auto_import_retains_all_replicas_for_redundancy_scrub() {
     fixture.poison(4, DATA);
     fixture.damage_label(4, 0);
     let logs = fixture.logs.clone();
-    let mut objects = fixture.pool(&[4, 2, 0, 3, 1], &[Fault::None; 5])
-        .import_objects(&cx, Some(123)).unwrap();
+    let mut objects = fixture
+        .pool(&[4, 2, 0, 3, 1], &[Fault::None; 5])
+        .import_objects(&cx, Some(123))
+        .unwrap();
     assert_eq!(objects.read(&cx, 1, 0, 512).unwrap(), vec![0xA5; 512]);
-    assert!(objects.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
-    let report = objects.scrub(&cx, ScrubLimits {
-        copy_bytes: Some(1 << 30),
-        ..ScrubLimits::default()
-    }).unwrap();
+    assert!(
+        objects
+            .scrub(&cx, ScrubLimits::default())
+            .unwrap()
+            .is_clean()
+    );
+    let report = objects
+        .scrub(
+            &cx,
+            ScrubLimits {
+                copy_bytes: Some(1 << 30),
+                ..ScrubLimits::default()
+            },
+        )
+        .unwrap();
     assert!(!report.is_clean());
     assert_eq!(report.errors, 2);
     assert_eq!(report.verified_blocks, 2);
     assert_eq!(report.copies_examined, 5);
     for (index, log) in logs.iter().enumerate() {
         let expected = if index < 3 { TABLE } else { DATA };
-        assert!(log.lock().unwrap().iter()
-            .any(|(offset, _)| *offset == at(expected) as u64));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|(offset, _)| *offset == at(expected) as u64)
+        );
     }
 }
 
@@ -297,13 +343,23 @@ fn striped_mirror_auto_import_never_uses_bytes_from_an_unrelated_top_level() {
     let pool = fixture.pool(&[3, 1, 0, 2], &[Fault::None; 4]);
     assert!(pool.import_active(&cx, Some(123)).is_err());
     for log in &logs[..2] {
-        assert!(!log.lock().unwrap().iter()
-            .any(|(position, _)| *position == at(ROOT) as u64));
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|(position, _)| *position == at(ROOT) as u64)
+        );
     }
     for log in &logs[2..] {
         // Equal ring copies are deduplicated; one failed root does not retry
         // the same physical DVA on the same member once per ring copy.
-        assert_eq!(log.lock().unwrap().iter()
-            .filter(|(position, _)| *position == at(ROOT) as u64).count(), 1);
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|(position, _)| *position == at(ROOT) as u64)
+                .count(),
+            1
+        );
     }
 }
