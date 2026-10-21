@@ -19,8 +19,16 @@
 > strict Clippy through RCH. Earlier committed engine runs passed FAT 452,
 > NTFS 344 and ZFS 305 tests; both external FAT consumer tests passed. The merged
 > ZFS suite passed 315 unit tests and one compiled doctest. Original
-> acceptance remains open for NTFS named-stream facade selection and the full
-> harness gates. Mounted acceptance and extra parity credit are not claimed. The older
+> NTFS named-stream facade selection subsequently passed on native-produced
+> plain and bounded images at `c6c93513b`: full, ranged, EOF and beyond-EOF reads,
+> exact UTF-16 selection, missing/wrong-case names and cancellation through the
+> same admitted volume. The unchanged native FAT and NTFS Cargo profile wrappers
+> also passed; NTFS executed 203 commands including 32 extension records and
+> compressed 512/4096-byte-cluster images. These are native offline-image results.
+> Acceptance remains open for the full harness and required benchmark gates.
+> Acceptance across all mounted formats and extra parity credit are not claimed.
+> The bounded native NTFS mounted result below covers its strict read-only slice.
+> The older
 > six-format `OpenFs` row below still has only its detection-test binding; this
 > source integration does not silently promote that binding to mounted proof.
 
@@ -41,7 +49,55 @@
 > FrankenFS-mounted proof. Native NTFS namespace/ADS comparisons progressed
 > before its compression-fixture oracle incorrectly parsed already-fixed MFT
 > bytes as raw. The separately reviewed `--raw` oracle correction retains all
-> 47 assertions; a full native rerun remains pending.
+> 47 assertions; the full native rerun subsequently passed at `c6c93513b` as
+> described above. Clean-overlay retirement removed the printed remote scratch
+> paths; the local full transcript, embedded profile JSON and source receipt
+> remain, rather than a claim that those raw scratch paths are still available.
+
+> **Indexed NTFS and full-harness findings, 2026-10-21:** constructed-image
+> tests exposed order-dependent acceptance of mismatched FILE_NAME aliases
+> sharing one file reference. The immutable old-code control executed one valid
+> alias pass and one missing-alias failure; the correction validates every
+> candidate identity. The combined source at `dba32085e` plus explicit overlays
+> passed all 360 NTFS tests, including nine indexed reader and seven indexed
+> FsOps tests, plus 40 facade tests and one compiled facade doctest. Its ignored
+> native-producer selection earns no native credit in that command. The later
+> borrowed-slice lint correction and current ZFS automatic import source passed
+> full workspace/all-target strict Clippy on `990539073` plus explicit overlays;
+> current unit-test and workspace-check reruns remain pending. A full genuine-Git
+> harness run passed 2,076 unit tests, then reached 98 conformance passes and five
+> failures in constructed Btrfs mount images with missing superblock checksums.
+> Its final source receipt also failed on Git index stat-cache changes. Neither
+> that partial execution nor supported terminal recovery constitutes a passing
+> full harness or a valid final source receipt. The constructed image producer
+> now emits a checksummed superblock and matching device/chunk inventory. The
+> rerun passed all 104 conformance tests, including the five previous failures
+> and a new valid-open/checksum-byte/covered-payload corruption control; two
+> ignored tests earn no credit. Later full-harness targets and final source
+> receipt remain pending. Production admission and old assertions are unchanged.
+
+> **Native NTFS mounted slice, 2026-10-21:** the current RCH-delivered Linux CLI
+> candidate `3effe8ed21c9af9b5b0f537451e9f64fce869d58ce3d986ebbeb6eb0754d9d76`
+> passed 27 indexed positive calls, three semantic negatives and 25 byte
+> comparisons against retained native plain/bounded and compressed images.
+> Four strict default read-only `NtfsFs` FUSE mounts then passed 24 mounted
+> full/range/EOF byte comparisons and eight EROFS/ENOENT refusals. All mounts
+> exited and unmounted successfully; all four whole backing hashes were
+> unchanged. The complete probe executed 47 captured commands and four owned
+> mount daemons. Its first attempt failed before mounting because the host's
+> fusermount3 profile excludes `/data/ssd`; private mountpoints under its allowed
+> `/tmp` location passed without changing policy or assertions. This proves the
+> indexed CLI reader and strict mounted adapter slice, with shared retained
+> native inputs. That probe does not prove indexed FsOps mounting, public facade mount
+> dispatch, multi-branch native index routing, writable safety or a speedup.
+> A separate exclusively created 64MiB native image with 256 distinct files
+> subsequently passed multi-branch CLI qualification: independent native raw
+> streams decode 13 reachable index nodes, 12 leaves and two levels of child
+> traversal. Strict and indexed routes passed 14 positive calls, including 12
+> full/ranged byte comparisons, and six typed missing-path negatives. Native
+> identities/listings and source payloads agree; all read-phase hashes stayed
+> unchanged. This separate result establishes functional routing, with no
+> performance, indexed FsOps mount, facade mount or FrankenFS writer claim.
 
 > **2026-09-08 audit status:** The following counts are legacy declared-contract
 > counts, not current executed results. In particular, the fast-commit row below
