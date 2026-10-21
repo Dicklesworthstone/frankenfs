@@ -51,21 +51,21 @@ impl Moves {
     }
 
     fn source(&self, cluster: u32) -> Option<u32> {
-        if let Some(item) = self.destination(cluster) {
-            Some(item.from)
-        } else if self.target(cluster) != cluster {
-            None // Vacated tail storage is not recoverable deleted-file data.
-        } else {
-            Some(cluster)
-        }
+        self.destination(cluster).map_or_else(
+            || {
+                // Vacated tail storage is not recoverable deleted-file data.
+                (self.target(cluster) == cluster).then_some(cluster)
+            },
+            |item| Some(item.from),
+        )
     }
 
     fn value(&self, kind: FatKind, cluster: u32, original: u32) -> u32 {
-        let value = if self.target(cluster) != cluster {
-            0
-        } else {
+        let value = if self.target(cluster) == cluster {
             self.destination(cluster)
                 .map_or(original, |item| item.value)
+        } else {
+            0
         };
         match kind.decode_entry(value) {
             FatEntry::Next(next) => self.target(next),

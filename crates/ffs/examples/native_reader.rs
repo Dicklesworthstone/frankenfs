@@ -1,0 +1,208 @@
+#![forbid(unsafe_code)]
+//! A standalone application consuming the public read-only native-image API.
+//! File reads emit exact bytes; directory listings emit NUL-delimited names.
+
+use asupersync::{Budget, Cx};
+use clap::{Parser, Subcommand};
+use ffs::{
+    FileType, InodeAttr, InodeNumber, ReadOnlyBackend, ReadOnlyFs, ReadOnlyOpenOptions,
+    RequestScope, ZfsReadOptions, open_read_only,
+};
+use ffs_error::FfsError;
+use std::error::Error;
+use std::ffi::OsString;
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+#[derive(Parser)]
+#[command(about = "Read an offline native image through the public ffs facade")]
+struct Args {
+    image: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    #[arg(long)]
+    length: Option<u64>,
+    /// Repeat for each raw ZFS dataset-name component.
+    #[arg(long)]
+    zfs_dataset: Vec<OsString>,
+    #[arg(long)]
+    zfs_snapshot: Option<OsString>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Stat {
+        path: PathBuf,
+    },
+    List {
+        path: PathBuf,
+    },
+    Read {
+        path: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        start: u64,
+        #[arg(long)]
+        bytes: Option<u64>,
+    },
+    /// Require a write attempt to fail with the read-only error. Use a scratch image.
+    RefuseWrite {
+        path: PathBuf,
+    },
+}
+
+fn invalid(detail: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, detail)
+}
+
+fn lookup(
+    cx: &Cx,
+    opened: &ReadOnlyFs,
+    scope: &mut RequestScope,
+    path: &Path,
+) -> Result<InodeAttr> {
+    let mut attr = opened.filesystem.getattr(cx, scope, InodeNumber(1))?;
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => {
+                attr = opened.filesystem.lookup(cx, scope, attr.ino, name)?;
+            }
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(invalid("use an image-root path without parent components").into());
+            }
+        }
+    }
+    // Exercise the independent getattr path as well as lookup's returned attrs.
+    Ok(opened.filesystem.getattr(cx, scope, attr.ino)?)
+}
+
+fn read(
+    cx: &Cx,
+    opened: &ReadOnlyFs,
+    scope: &mut RequestScope,
+    attr: &InodeAttr,
+    start: u64,
+    count: Option<u64>,
+) -> Result<()> {
+    if attr.kind != FileType::RegularFile {
+        return Err(
+            invalid("read requires a regular file; symbolic links are not followed").into(),
+        );
+    }
+    let end = match count {
+        Some(count) => start
+            .checked_add(count)
+            .ok_or_else(|| invalid("read range overflows"))?
+            .min(attr.size),
+        None => attr.size,
+    };
+    let mut position = start;
+    let mut output = io::stdout().lock();
+    while position < end {
+        let requested = u32::try_from((end - position).min(65_536))?;
+        let bytes = opened
+            .filesystem
+            .read(cx, scope, attr.ino, position, requested)?;
+        if bytes.is_empty() || bytes.len() > usize::try_from(requested)? {
+            return Err(
+                io::Error::other("native read did not cover its declared file range").into(),
+            );
+        }
+        output.write_all(&bytes)?;
+        position += u64::try_from(bytes.len())?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn list(cx: &Cx, opened: &ReadOnlyFs, scope: &mut RequestScope, ino: InodeNumber) -> Result<()> {
+    let mut offset = 0;
+    let mut output = io::stdout().lock();
+    loop {
+        let page = opened.filesystem.readdir(cx, scope, ino, offset)?;
+        if page.is_empty() {
+            break;
+        }
+        let next = page
+            .as_slice()
+            .last()
+            .ok_or_else(|| invalid("empty directory page"))?
+            .offset;
+        if next == offset {
+            return Err(io::Error::other("directory continuation made no progress").into());
+        }
+        for entry in &page {
+            output.write_all(&entry.name)?;
+            output.write_all(&[0])?;
+        }
+        offset = next;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    // The application owns the runtime and supplies its context to the library.
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()?;
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+    let backend = if args.zfs_dataset.is_empty() && args.zfs_snapshot.is_none() {
+        ReadOnlyBackend::Auto
+    } else {
+        ReadOnlyBackend::Zfs(ZfsReadOptions {
+            dataset: args
+                .zfs_dataset
+                .iter()
+                .map(|name| name.as_encoded_bytes().to_vec())
+                .collect(),
+            snapshot: args
+                .zfs_snapshot
+                .as_ref()
+                .map(|name| name.as_encoded_bytes().to_vec()),
+            ..ZfsReadOptions::default()
+        })
+    };
+    let opened = open_read_only(
+        &cx,
+        &args.image,
+        &ReadOnlyOpenOptions {
+            offset: args.offset,
+            length: args.length,
+            backend,
+            ..ReadOnlyOpenOptions::default()
+        },
+    )?;
+    let mut scope = RequestScope::empty();
+    match args.command {
+        Command::Stat { path } => {
+            let attr = lookup(&cx, &opened, &mut scope, &path)?;
+            println!("{}\t{:?}\t{}", opened.format, attr.kind, attr.size);
+        }
+        Command::List { path } => {
+            let attr = lookup(&cx, &opened, &mut scope, &path)?;
+            list(&cx, &opened, &mut scope, attr.ino)?;
+        }
+        Command::Read { path, start, bytes } => {
+            let attr = lookup(&cx, &opened, &mut scope, &path)?;
+            read(&cx, &opened, &mut scope, &attr, start, bytes)?;
+        }
+        Command::RefuseWrite { path } => {
+            let attr = lookup(&cx, &opened, &mut scope, &path)?;
+            match opened
+                .filesystem
+                .write(&cx, &mut scope, attr.ino, 0, b"forbidden")
+            {
+                Err(FfsError::ReadOnly) => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => return Err(io::Error::other("write unexpectedly succeeded").into()),
+            }
+        }
+    }
+    Ok(())
+}

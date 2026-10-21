@@ -6,8 +6,8 @@
 //! Native contract: Microsoft NTFS v3 Master File Table / ATTRIBUTE_LIST_ENTRY.
 
 use super::{
-    AllocationIssue, Cx, FfsError, MAX_ISSUES, MAX_RECORDS, NtfsValue, NtfsVolume, Result,
-    bit, buffer, checkpoint, corrupt, parse, read_bitmap, unsupported,
+    AllocationIssue, Cx, FfsError, MAX_ISSUES, MAX_RECORDS, NtfsValue, NtfsVolume, Result, bit,
+    buffer, checkpoint, corrupt, parse, read_bitmap, unsupported,
 };
 use crate::reader::attributes::{AttributeSet, read_list, resolve_catalog};
 use crate::reader::{ATTRIBUTE_LIST, NtfsFileRecord};
@@ -23,7 +23,10 @@ pub struct RecordOwnershipLimits {
 
 impl Default for RecordOwnershipLimits {
     fn default() -> Self {
-        Self { records: 1_048_576, metadata_bytes: 1 << 30 }
+        Self {
+            records: 1_048_576,
+            metadata_bytes: 1 << 30,
+        }
     }
 }
 
@@ -33,7 +36,8 @@ impl RecordOwnershipLimits {
             || !(1..=(1_u64 << 40)).contains(&self.metadata_bytes)
         {
             return Err(FfsError::Format(
-                "record ownership requires 1..=16777216 slots and 1..=1099511627776 metadata bytes".into(),
+                "record ownership requires 1..=16777216 slots and 1..=1099511627776 metadata bytes"
+                    .into(),
             ));
         }
         Ok(())
@@ -64,8 +68,11 @@ pub struct RecordOwnershipReport {
 impl RecordOwnershipReport {
     #[must_use]
     pub fn is_consistent(&self) -> bool {
-        self.complete && self.limit_reached.is_none() && self.errors == 0
-            && self.unsupported == 0 && self.extensions_without_owner == Some(0)
+        self.complete
+            && self.limit_reached.is_none()
+            && self.errors == 0
+            && self.unsupported == 0
+            && self.extensions_without_owner == Some(0)
     }
 
     fn stop(&mut self, reason: &'static str) {
@@ -74,21 +81,31 @@ impl RecordOwnershipReport {
     }
 
     fn issue(&mut self, record: u64, category: &'static str, detail: String) {
-        if category == "unsupported" { self.unsupported += 1; } else { self.errors += 1; }
+        if category == "unsupported" {
+            self.unsupported += 1;
+        } else {
+            self.errors += 1;
+        }
         if self.issues.len() == MAX_ISSUES {
             self.omitted_issues += 1;
             return;
         }
         self.issues.push(AllocationIssue {
-            category, record: Some(record), attribute_id: None,
-            other_record: None, other_attribute_id: None,
-            first_cluster: None, clusters: 0,
+            category,
+            record: Some(record),
+            attribute_id: None,
+            other_record: None,
+            other_attribute_id: None,
+            first_cluster: None,
+            clusters: 0,
             detail: detail.chars().take(512).collect(),
         });
     }
 
     fn failed_record(&mut self, number: u64, error: FfsError) -> Result<()> {
-        if matches!(error, FfsError::Cancelled) { return Err(FfsError::Cancelled); }
+        if matches!(error, FfsError::Cancelled) {
+            return Err(FfsError::Cancelled);
+        }
         self.complete = false;
         let category = match &error {
             FfsError::UnsupportedFeature(_) => "unsupported",
@@ -110,7 +127,9 @@ impl Work {
     fn reserve(&mut self, bytes: u64) -> Result<()> {
         if bytes > self.limit - self.used {
             self.stopped = true;
-            return Err(unsupported("record ownership metadata work budget exhausted"));
+            return Err(unsupported(
+                "record ownership metadata work budget exhausted",
+            ));
         }
         self.used += bytes;
         Ok(())
@@ -144,14 +163,22 @@ fn catalog<'a>(
     resolve_catalog(cx, &volume.geometry, base, list.as_deref(), |reference| {
         checkpoint(cx)?;
         if reference.record >= records || reference.record >= volume.record_count() {
-            return Err(corrupt(0, format!(
-                "catalog references MFT record {} outside initialized record bounds", reference.record,
-            )));
+            return Err(corrupt(
+                0,
+                format!(
+                    "catalog references MFT record {} outside initialized record bounds",
+                    reference.record,
+                ),
+            ));
         }
         if allocated.is_some_and(|bits| !bit(bits, reference.record)) {
-            return Err(corrupt(0, format!(
-                "catalog references MFT record {} marked free by $MFT::$BITMAP", reference.record,
-            )));
+            return Err(corrupt(
+                0,
+                format!(
+                    "catalog references MFT record {} marked free by $MFT::$BITMAP",
+                    reference.record,
+                ),
+            ));
         }
         work.reserve(u64::from(volume.geometry.record_bytes()))?;
         volume.record(cx, reference.record, Some(reference.sequence))
@@ -174,8 +201,13 @@ impl NtfsVolume {
     ) -> Result<RecordOwnershipReport> {
         checkpoint(cx)?;
         limits.validate()?;
-        if self.volume_flags != 0 || self.logfile_recovery.is_some() || !self.source.overlay.is_empty() {
-            return Err(unsupported("record ownership checking requires original clean-flag bytes without a recovery overlay"));
+        if self.volume_flags != 0
+            || self.logfile_recovery.is_some()
+            || !self.source.overlay.is_empty()
+        {
+            return Err(unsupported(
+                "record ownership checking requires original clean-flag bytes without a recovery overlay",
+            ));
         }
         let record_bytes = u64::from(self.geometry.record_bytes());
         let records = self.mft.size / record_bytes;
@@ -190,7 +222,11 @@ impl NtfsVolume {
             checkpoint(cx)?;
             return Ok(report);
         }
-        let mut work = Work { used: 0, limit: limits.metadata_bytes, stopped: false };
+        let mut work = Work {
+            used: 0,
+            limit: limits.metadata_bytes,
+            stopped: false,
+        };
         let bitmap = (|| -> Result<Vec<u8>> {
             work.reserve(record_bytes)?;
             let mft = self.record(cx, 0, None)?;
@@ -211,16 +247,24 @@ impl NtfsVolume {
             Err(error) => return Err(error),
         };
         if records == 0 || !bit(&allocated, 0) {
-            return Err(corrupt(0, "$MFT::$BITMAP does not allocate its own base record"));
+            return Err(corrupt(
+                0,
+                "$MFT::$BITMAP does not allocate its own base record",
+            ));
         }
         let mut extensions = buffer(allocated.len())?;
         let mut owned = buffer(allocated.len())?;
         for number in 0..records {
             checkpoint(cx)?;
             report.record_slots_examined += 1;
-            if !bit(&allocated, number) { continue; }
+            if !bit(&allocated, number) {
+                continue;
+            }
             if number >= report.initialized_records {
-                report.failed_record(number, corrupt(0, "allocated FILE is beyond initialized MFT data"))?;
+                report.failed_record(
+                    number,
+                    corrupt(0, "allocated FILE is beyond initialized MFT data"),
+                )?;
                 continue;
             }
             if work.reserve(record_bytes).is_err() {
@@ -229,7 +273,10 @@ impl NtfsVolume {
             }
             let record = match self.record(cx, number, None) {
                 Ok(record) => record,
-                Err(error) => { report.failed_record(number, error)?; continue; }
+                Err(error) => {
+                    report.failed_record(number, error)?;
+                    continue;
+                }
             };
             if record.base.record != 0 || record.base.sequence != 0 {
                 report.extension_records_examined += 1;
@@ -263,7 +310,9 @@ impl NtfsVolume {
         if report.complete {
             let mut unowned = 0;
             for number in 0..records {
-                if number.is_multiple_of(4096) { checkpoint(cx)?; }
+                if number.is_multiple_of(4096) {
+                    checkpoint(cx)?;
+                }
                 if bit(&extensions, number) && !bit(&owned, number) {
                     unowned += 1;
                     report.issue(number, "extension_without_owner",

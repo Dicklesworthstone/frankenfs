@@ -10,8 +10,8 @@ mod ownership;
 pub use ownership::{RecordOwnershipLimits, RecordOwnershipReport};
 
 use super::{
-    Cx, FfsError, NtfsVolume, NtfsValue, Result, Storage, Stream, buffer, checkpoint,
-    corrupt, decode_mapping_pairs, parse, unsupported,
+    Cx, FfsError, NtfsValue, NtfsVolume, Result, Storage, Stream, buffer, checkpoint, corrupt,
+    decode_mapping_pairs, parse, unsupported,
 };
 
 const MAX_RECORDS: u64 = 16_777_216;
@@ -124,7 +124,7 @@ impl AllocationReport {
 
     fn record_error(&mut self, number: u64, attribute: Option<u16>, error: FfsError) -> Result<()> {
         if matches!(error, FfsError::Cancelled) {
-            return Err(FfsError::Cancelled);
+            return Err(error);
         }
         self.complete = false;
         let category = match &error {
@@ -161,12 +161,19 @@ fn bit(bytes: &[u8], index: u64) -> bool {
 fn read_bitmap(cx: &Cx, volume: &NtfsVolume, stream: &Stream, bits: u64) -> Result<Vec<u8>> {
     let length = bits.div_ceil(8);
     if stream.size < length || stream.initialized != stream.size {
-        return Err(corrupt(0, "allocation bitmap is short or incompletely initialized"));
+        return Err(corrupt(
+            0,
+            "allocation bitmap is short or incompletely initialized",
+        ));
     }
     match &stream.storage {
         Storage::Resident(_) => (),
         Storage::Mapped(runs) if runs.iter().all(|run| run.lcn.is_some()) => (),
-        _ => return Err(unsupported("allocation checking requires plain, nonsparse bitmaps")),
+        _ => {
+            return Err(unsupported(
+                "allocation checking requires plain, nonsparse bitmaps",
+            ));
+        }
     }
     let length = usize::try_from(length).map_err(|_| corrupt(0, "bitmap length overflows"))?;
     let mut bytes = buffer(length)?;
@@ -190,8 +197,13 @@ impl NtfsVolume {
     pub fn check_allocations(&self, cx: &Cx, limits: AllocationLimits) -> Result<AllocationReport> {
         checkpoint(cx)?;
         limits.validate()?;
-        if self.volume_flags != 0 || self.logfile_recovery.is_some() || !self.source.overlay.is_empty() {
-            return Err(unsupported("allocation checking requires the original clean-flag image, not a recovery overlay"));
+        if self.volume_flags != 0
+            || self.logfile_recovery.is_some()
+            || !self.source.overlay.is_empty()
+        {
+            return Err(unsupported(
+                "allocation checking requires the original clean-flag image, not a recovery overlay",
+            ));
         }
         let records = self.mft.size / u64::from(self.geometry.record_bytes());
         let clusters = self.geometry.cluster_count();
@@ -226,7 +238,14 @@ impl NtfsVolume {
             }
             report.allocated_records_examined += 1;
             if number >= report.initialized_records {
-                report.record_error(number, None, corrupt(0, "MFT bitmap allocates a record beyond initialized MFT data"))?;
+                report.record_error(
+                    number,
+                    None,
+                    corrupt(
+                        0,
+                        "MFT bitmap allocates a record beyond initialized MFT data",
+                    ),
+                )?;
                 continue;
             }
             let record = match self.record(cx, number, None) {
@@ -252,12 +271,23 @@ impl NtfsVolume {
             for attr in attributes {
                 checkpoint(cx)?;
                 report.attributes_examined += 1;
-                let NtfsValue::NonResident(value) = attr.value else { continue };
+                let NtfsValue::NonResident(value) = attr.value else {
+                    continue;
+                };
                 if attr.flags & !(super::SPARSE | super::COMPRESSED | 0x4000) != 0 {
-                    report.record_error(number, Some(attr.id), unsupported("unknown nonresident storage flags in allocation scan"))?;
+                    report.record_error(
+                        number,
+                        Some(attr.id),
+                        unsupported("unknown nonresident storage flags in allocation scan"),
+                    )?;
                     continue;
                 }
-                let runs = match decode_mapping_pairs(value.mapping_pairs, value.first_vcn, value.last_vcn, clusters) {
+                let runs = match decode_mapping_pairs(
+                    value.mapping_pairs,
+                    value.first_vcn,
+                    value.last_vcn,
+                    clusters,
+                ) {
                     Ok(runs) => runs,
                     Err(error) => {
                         report.record_error(number, Some(attr.id), parse(&error))?;
@@ -269,18 +299,29 @@ impl NtfsVolume {
                     break 'records;
                 }
                 report.runs_examined += runs.len() as u64;
-                claims.try_reserve(runs.len())
+                claims
+                    .try_reserve(runs.len())
                     .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
                 for run in runs {
                     checkpoint(cx)?;
                     if let Some(first) = run.lcn {
-                        let end = first.checked_add(run.clusters)
+                        let end = first
+                            .checked_add(run.clusters)
                             .filter(|end| *end <= clusters)
                             .ok_or_else(|| corrupt(0, "allocation claim exceeds volume"))?;
-                        claims.push(Claim { first, end, record: number, attribute: attr.id });
+                        claims.push(Claim {
+                            first,
+                            end,
+                            record: number,
+                            attribute: attr.id,
+                        });
                     } else {
-                        report.sparse_clusters = report.sparse_clusters.checked_add(run.clusters)
-                            .ok_or_else(|| corrupt(0, "sparse allocation accounting overflows"))?;
+                        report.sparse_clusters = report
+                            .sparse_clusters
+                            .checked_add(run.clusters)
+                            .ok_or_else(|| {
+                            corrupt(0, "sparse allocation accounting overflows")
+                        })?;
                     }
                 }
             }
@@ -309,7 +350,12 @@ fn span_issue(report: &mut AllocationReport, category: &'static str, first: u64,
 
 /// Sorting and a sweep keep work O(runs log runs + volume clusters), even for
 /// adversarial million-way overlaps. Never visit every cluster of every run.
-fn reconcile(cx: &Cx, bitmap: &[u8], claims: &mut [Claim], report: &mut AllocationReport) -> Result<()> {
+fn reconcile(
+    cx: &Cx,
+    bitmap: &[u8],
+    claims: &mut [Claim],
+    report: &mut AllocationReport,
+) -> Result<()> {
     checkpoint(cx)?;
     claims.sort_unstable_by_key(|claim| (claim.first, claim.end, claim.record, claim.attribute));
     checkpoint(cx)?;
@@ -344,7 +390,9 @@ fn reconcile(cx: &Cx, bitmap: &[u8], claims: &mut [Claim], report: &mut Allocati
     let mut unexplained_start = None;
     let mut unexplained = 0;
     for cluster in 0..report.volume_clusters {
-        if cluster.is_multiple_of(4096) { checkpoint(cx)?; }
+        if cluster.is_multiple_of(4096) {
+            checkpoint(cx)?;
+        }
         while next < claims.len() && claims[next].first <= cluster {
             covered_end = covered_end.max(claims[next].end);
             next += 1;
@@ -371,7 +419,12 @@ fn reconcile(cx: &Cx, bitmap: &[u8], claims: &mut [Claim], report: &mut Allocati
         span_issue(report, "referenced_free", first, report.volume_clusters);
     }
     if let Some(first) = unexplained_start {
-        span_issue(report, "allocated_without_reference", first, report.volume_clusters);
+        span_issue(
+            report,
+            "allocated_without_reference",
+            first,
+            report.volume_clusters,
+        );
     }
     report.allocated_without_reference = report.complete.then_some(unexplained);
     checkpoint(cx)

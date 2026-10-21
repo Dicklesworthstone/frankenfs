@@ -6,9 +6,9 @@
 //! Native FAT has no sparse-hole representation or crash-atomic chain splice.
 
 use super::{
-    EXPECT_END, FatEntry, FatKind, FatTable, FatVolume, FfsError, MAX_CHAIN_CLUSTERS,
-    allocate, change_fat, checkpoint, modified_timestamp, reserve_clusters,
-    set_dirty, set_hints, validate_edit_state, write_volume,
+    EXPECT_END, FatEntry, FatKind, FatTable, FatVolume, FfsError, MAX_CHAIN_CLUSTERS, allocate,
+    change_fat, checkpoint, modified_timestamp, reserve_clusters, set_dirty, set_hints,
+    validate_edit_state, write_volume,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -22,7 +22,9 @@ fn verify_chain(cx: &Cx, volume: &FatVolume, chain: &[u32]) -> Result<()> {
     let mut table = FatTable::new(volume);
     for (index, &cluster) in chain.iter().enumerate() {
         checkpoint(cx)?;
-        let expected = chain.get(index + 1).map_or(FatEntry::End, |&next| FatEntry::Next(next));
+        let expected = chain
+            .get(index + 1)
+            .map_or(FatEntry::End, |&next| FatEntry::Next(next));
         if table.entry(cx, cluster)? != expected {
             bail!("native insertion chain failed readback at cluster {cluster}");
         }
@@ -64,10 +66,22 @@ impl Record {
         if sector[within..within + 32] != *original {
             bail!("insertion directory record changed before mutation");
         }
-        Ok(Self { offset, start, within, sector, readback })
+        Ok(Self {
+            offset,
+            start,
+            within,
+            sector,
+            readback,
+        })
     }
 
-    fn publish(&mut self, cx: &Cx, volume: &FatVolume, expected: &[u8; 32], updated: &[u8; 32]) -> Result<()> {
+    fn publish(
+        &mut self,
+        cx: &Cx,
+        volume: &FatVolume,
+        expected: &[u8; 32],
+        updated: &[u8; 32],
+    ) -> Result<()> {
         volume.read_exact(cx, self.start, &mut self.sector)?;
         if self.sector[self.within..self.within + 32] != *expected {
             bail!("insertion directory record changed before publication");
@@ -82,11 +96,21 @@ impl Record {
         Ok(())
     }
 
-    fn verify(&self, cx: &Cx, volume: &FatVolume, path: &str, expected: &[u8; 32], chain: &[u32]) -> Result<()> {
-        let entry = volume.resolve(cx, path)?.context("inserted file disappeared")?;
+    fn verify(
+        &self,
+        cx: &Cx,
+        volume: &FatVolume,
+        path: &str,
+        expected: &[u8; 32],
+        chain: &[u32],
+    ) -> Result<()> {
+        let entry = volume
+            .resolve(cx, path)?
+            .context("inserted file disappeared")?;
         let mut raw = [0; 32];
         volume.read_exact(cx, entry.offset, &mut raw)?;
-        if entry.offset != self.offset || raw != *expected
+        if entry.offset != self.offset
+            || raw != *expected
             || chain.first().copied() != Some(entry.native.first_cluster)
         {
             bail!("insertion changed native file identity or prepared metadata");
@@ -105,19 +129,28 @@ pub(super) fn apply(
 ) -> Result<()> {
     checkpoint(cx)?;
     let cluster_bytes = u64::from(volume.geometry.cluster_bytes());
-    if length == 0 || !offset.is_multiple_of(cluster_bytes)
-        || !length.is_multiple_of(cluster_bytes)
+    if length == 0 || !offset.is_multiple_of(cluster_bytes) || !length.is_multiple_of(cluster_bytes)
     {
         return Err(errno(libc::EINVAL).into());
     }
     let entry = volume.resolve(cx, path)?.ok_or(FfsError::IsDirectory)?;
-    if entry.native.is_directory() { return Err(FfsError::IsDirectory.into()); }
-    if entry.native.attributes & 1 != 0 { return Err(FfsError::PermissionDenied.into()); }
-    if entry.native.attributes & 0xC8 != 0 { bail!("unsupported native attributes on insertion target"); }
+    if entry.native.is_directory() {
+        return Err(FfsError::IsDirectory.into());
+    }
+    if entry.native.attributes & 1 != 0 {
+        return Err(FfsError::PermissionDenied.into());
+    }
+    if entry.native.attributes & 0xC8 != 0 {
+        bail!("unsupported native attributes on insertion target");
+    }
     // Inserting at/past EOF is not INSERT_RANGE. Preserve a nonempty suffix.
-    if offset >= u64::from(entry.native.size) { return Err(errno(libc::EINVAL).into()); }
-    let size = u64::from(entry.native.size).checked_add(length)
-        .and_then(|size| u32::try_from(size).ok()).ok_or_else(|| errno(libc::EFBIG))?;
+    if offset >= u64::from(entry.native.size) {
+        return Err(errno(libc::EINVAL).into());
+    }
+    let size = u64::from(entry.native.size)
+        .checked_add(length)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or_else(|| errno(libc::EFBIG))?;
     let (date, time) = modified_timestamp(now)?;
     validate_edit_state(cx, volume)?;
     let before = volume.check(cx)?;
@@ -127,15 +160,25 @@ pub(super) fn apply(
     let old = volume.file_chain(cx, &entry)?;
     let split = usize::try_from(offset / cluster_bytes).context("insertion offset overflow")?;
     let count = usize::try_from(length / cluster_bytes).context("insertion capacity overflow")?;
-    let total = old.clusters.len().checked_add(count)
-        .filter(|total| *total <= MAX_CHAIN_CLUSTERS).ok_or(FfsError::NoSpace)?;
-    if count as u64 > before.free_clusters { return Err(FfsError::NoSpace.into()); }
-    if split >= old.clusters.len() { bail!("insertion exceeds validated native chain"); }
+    let total = old
+        .clusters
+        .len()
+        .checked_add(count)
+        .filter(|total| *total <= MAX_CHAIN_CLUSTERS)
+        .ok_or(FfsError::NoSpace)?;
+    if count as u64 > before.free_clusters {
+        return Err(FfsError::NoSpace.into());
+    }
+    if split >= old.clusters.len() {
+        bail!("insertion exceeds validated native chain");
+    }
     // Do not consume existing beyond-EOF allocation: it shifts with the suffix.
     // Capture ALL space requirements before publishing even a dirty marker.
     let added = reserve_clusters(cx, volume, count, before.free_clusters)?;
     let mut chain = Vec::new();
-    chain.try_reserve_exact(total).context("reserving bounded insertion chain")?;
+    chain
+        .try_reserve_exact(total)
+        .context("reserving bounded insertion chain")?;
     chain.extend_from_slice(&old.clusters[..split]);
     chain.extend_from_slice(&added);
     chain.extend_from_slice(&old.clusters[split..]);
@@ -170,7 +213,11 @@ pub(super) fn apply(
             bail!("insertion reservation changed before mutation");
         }
     }
-    let end = if volume.geometry.kind() == FatKind::Fat16 { 0xFFFF } else { 0x0FFF_FFFF };
+    let end = if volume.geometry.kind() == FatKind::Fat16 {
+        0xFFFF
+    } else {
+        0x0FFF_FFFF
+    };
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
@@ -184,9 +231,15 @@ pub(super) fn apply(
         volume.device.sync(cx)?;
         verify_zeroes(cx, volume, &added, &mut readback)?;
         phase = "publishing detached initialized allocation";
-        change_fat(cx, volume, &added.iter().copied().enumerate().map(|(index, cluster)| {
-            (cluster, 0, added.get(index + 1).copied().unwrap_or(end))
-        }))?;
+        change_fat(
+            cx,
+            volume,
+            &added
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, cluster)| (cluster, 0, added.get(index + 1).copied().unwrap_or(end))),
+        )?;
         volume.device.sync(cx)?;
         verify_chain(cx, volume, &added)?;
         verify_chain(cx, volume, &old.clusters)?;
@@ -197,7 +250,11 @@ pub(super) fn apply(
         phase = "hiding EOF before chain insertion";
         record.publish(cx, volume, &original, &hidden)?;
         phase = "connecting the retained suffix";
-        change_fat(cx, volume, &std::iter::once((added[count - 1], EXPECT_END, old.clusters[split])))?;
+        change_fat(
+            cx,
+            volume,
+            &std::iter::once((added[count - 1], EXPECT_END, old.clusters[split])),
+        )?;
         volume.device.sync(cx)?;
         verify_chain(cx, volume, &chain[split..])?;
         verify_chain(cx, volume, &old.clusters)?;
@@ -205,7 +262,11 @@ pub(super) fn apply(
         if split == 0 {
             record.publish(cx, volume, &hidden, &hidden_new_head)?;
         } else {
-            change_fat(cx, volume, &std::iter::once((old.clusters[split - 1], old.clusters[split], added[0])))?;
+            change_fat(
+                cx,
+                volume,
+                &std::iter::once((old.clusters[split - 1], old.clusters[split], added[0])),
+            )?;
             volume.device.sync(cx)?;
         }
         record.verify(cx, volume, path, &hidden_new_head, &chain)?;
@@ -217,14 +278,21 @@ pub(super) fn apply(
         volume.device.sync(cx)?;
         phase = "verifying insertion ownership and accounting";
         let after = volume.check(cx)?;
-        if !after.clean || !after.complete || !after.namespace_complete
-            || after.free_clusters != free_after || after.files != before.files
+        if !after.clean
+            || !after.complete
+            || !after.namespace_complete
+            || after.free_clusters != free_after
+            || after.files != before.files
             || after.directories != before.directories
             || after.preallocated_clusters != before.preallocated_clusters
-            || before.referenced_clusters.checked_add(count as u64) != Some(after.referenced_clusters)
+            || before.referenced_clusters.checked_add(count as u64)
+                != Some(after.referenced_clusters)
             || before.allocated_clusters.checked_add(count as u64) != Some(after.allocated_clusters)
         {
-            bail!("insertion verification failed: {}", serde_json::to_string(&after)?);
+            bail!(
+                "insertion verification failed: {}",
+                serde_json::to_string(&after)?
+            );
         }
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;

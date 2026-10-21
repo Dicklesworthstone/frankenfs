@@ -262,7 +262,7 @@ fn invalid_missing_member_requests_and_cancellation_fail_before_path_open() {
             ..ZfsReadOptions::default()
         },
         ZfsReadOptions {
-            root: candidate.clone(),
+            root: candidate,
             missing: ZfsMissingMembers::Raidz(vec![1, 2, 3, 4]),
             ..ZfsReadOptions::default()
         },
@@ -298,4 +298,250 @@ fn invalid_missing_member_requests_and_cancellation_fail_before_path_open() {
         Err(FfsError::Cancelled)
     ));
     assert!(!absent.exists());
+}
+
+/// Separate native-producer proof from the constructed-image controls above.
+/// Explicit invocation is required; missing tools fail rather than skip cases.
+#[test]
+#[ignore = "requires dosfstools, mtools and ntfs-3g; retains native images and command logs"]
+fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade() {
+    use std::process::Command;
+
+    fn command(root: &Path, label: &str, tool: &str, arguments: &[&OsStr]) -> Vec<u8> {
+        // A caller may supply an isolated, provenance-checked mtools directory.
+        // Other tools retain ordinary executable lookup; no substitute oracle.
+        let executable = if matches!(tool, "mcopy" | "mmd") {
+            std::env::var_os("FFS_NATIVE_ORACLE_BIN")
+                .map_or_else(|| PathBuf::from(tool), |bin| PathBuf::from(bin).join(tool))
+        } else {
+            PathBuf::from(tool)
+        };
+        let output = Command::new(&executable)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("native oracle {executable:?} could not execute: {error}")
+            });
+        fs::write(root.join(format!("{label}.stdout")), &output.stdout).unwrap();
+        fs::write(root.join(format!("{label}.stderr")), &output.stderr).unwrap();
+        fs::write(
+            root.join(format!("{label}.command")),
+            format!("{executable:?} {arguments:?}\nstatus={}\n", output.status),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "native oracle {label} failed; see {root:?}"
+        );
+        output.stdout
+    }
+
+    let root = tempfile::Builder::new()
+        .prefix("ffs-facade-native-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!("retained native facade evidence: {}", root.display());
+    let cx = Cx::for_testing();
+    let payload: Vec<u8> = (0_u32..131_111)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    let source = root.join("source.bin");
+    fs::write(&source, &payload).unwrap();
+    for (kind, expected) in [
+        ("fat16", FsFormatKind::Fat16),
+        ("fat32", FsFormatKind::Fat32),
+        ("ntfs", FsFormatKind::Ntfs),
+    ] {
+        let directory = root.join(kind);
+        fs::create_dir(&directory).unwrap();
+        let image = directory.join("native.img");
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&image)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let name = OsStr::new("Native payload.bin");
+        if kind == "ntfs" {
+            // Force is confined to this new regular scratch file.
+            command(
+                &directory,
+                "format",
+                "mkntfs",
+                &[
+                    OsStr::new("-F"),
+                    OsStr::new("-Q"),
+                    OsStr::new("-s"),
+                    OsStr::new("512"),
+                    OsStr::new("-c"),
+                    OsStr::new("4096"),
+                    image.as_os_str(),
+                ],
+            );
+            command(
+                &directory,
+                "populate",
+                "ntfscp",
+                &[
+                    image.as_os_str(),
+                    source.as_os_str(),
+                    OsStr::new("/Native payload.bin"),
+                ],
+            );
+            assert_eq!(
+                command(
+                    &directory,
+                    "reference",
+                    "ntfscat",
+                    &[image.as_os_str(), OsStr::new("/Native payload.bin"),]
+                ),
+                payload
+            );
+        } else {
+            command(
+                &directory,
+                "format",
+                "mkfs.fat",
+                &[
+                    OsStr::new("-F"),
+                    OsStr::new(if kind == "fat16" { "16" } else { "32" }),
+                    image.as_os_str(),
+                ],
+            );
+            command(
+                &directory,
+                "populate",
+                "mcopy",
+                &[
+                    OsStr::new("-i"),
+                    image.as_os_str(),
+                    source.as_os_str(),
+                    OsStr::new("::/Native payload.bin"),
+                ],
+            );
+            let reference = directory.join("reference.bin");
+            command(
+                &directory,
+                "reference",
+                "mcopy",
+                &[
+                    OsStr::new("-i"),
+                    image.as_os_str(),
+                    OsStr::new("::/Native payload.bin"),
+                    reference.as_os_str(),
+                ],
+            );
+            assert_eq!(fs::read(reference).unwrap(), payload);
+            command(
+                &directory,
+                "check-before",
+                "fsck.fat",
+                &[OsStr::new("-n"), image.as_os_str()],
+            );
+        }
+        let native = fs::read(&image).unwrap();
+        let mut container = vec![0xA7; 4096];
+        container.extend_from_slice(&native);
+        container.extend_from_slice(&[0xD3; 8192]);
+        let bounded = directory.join("bounded.img");
+        fs::write(&bounded, &container).unwrap();
+        for (path, offset, length) in [
+            (&image, 0, None),
+            (&bounded, 4096, Some(native.len() as u64)),
+        ] {
+            let opened = open_read_only(
+                &cx,
+                path,
+                &ReadOnlyOpenOptions {
+                    offset,
+                    length,
+                    ..ReadOnlyOpenOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(opened.format, expected);
+            let mut scope = RequestScope::empty();
+            let file = opened
+                .filesystem
+                .lookup(&cx, &mut scope, InodeNumber(1), name)
+                .unwrap();
+            let stat = opened
+                .filesystem
+                .getattr(&cx, &mut scope, file.ino)
+                .unwrap();
+            assert_eq!(
+                (stat.kind, stat.size),
+                (FileType::RegularFile, payload.len() as u64)
+            );
+            assert!(
+                opened
+                    .filesystem
+                    .readdir(&cx, &mut scope, InodeNumber(1), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.name == name.as_encoded_bytes())
+            );
+            let mut actual = Vec::new();
+            while actual.len() < payload.len() {
+                let part = opened
+                    .filesystem
+                    .read(&cx, &mut scope, file.ino, actual.len() as u64, 8191)
+                    .unwrap();
+                assert!(
+                    !part.is_empty(),
+                    "native read ended before the known payload"
+                );
+                actual.extend_from_slice(&part);
+            }
+            assert_eq!(actual, payload);
+            assert_eq!(
+                opened
+                    .filesystem
+                    .read(&cx, &mut scope, file.ino, 507, 1031)
+                    .unwrap(),
+                payload[507..1538]
+            );
+            assert_eq!(
+                opened
+                    .filesystem
+                    .read(&cx, &mut scope, file.ino, payload.len() as u64, 8)
+                    .unwrap(),
+                [] as [u8; 0]
+            );
+            assert!(matches!(
+                opened
+                    .filesystem
+                    .write(&cx, &mut scope, file.ino, 0, b"forbidden"),
+                Err(FfsError::ReadOnly)
+            ));
+        }
+        assert!(
+            open_read_only(
+                &cx,
+                &bounded,
+                &ReadOnlyOpenOptions {
+                    offset: 4096,
+                    length: Some(512),
+                    ..ReadOnlyOpenOptions::default()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&image).unwrap(), native);
+        assert_eq!(fs::read(&bounded).unwrap(), container);
+        if kind != "ntfs" {
+            command(
+                &directory,
+                "check-after",
+                "fsck.fat",
+                &[OsStr::new("-n"), image.as_os_str()],
+            );
+            assert_eq!(fs::read(&image).unwrap(), native);
+        }
+        println!(
+            "native {kind}: plain/bounded lookup/getattr/readdir/full/ranged/EOF reads, RO refusal and unchanged bytes passed"
+        );
+    }
 }

@@ -17,6 +17,56 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+fn run_native_companion_read_profile(profile: &str, binary: &str) {
+    let root = tempfile::Builder::new()
+        .prefix("ffs-companion-profile-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts")
+        .join(profile);
+    let mut command = Command::new("python3");
+    command.arg(&script).arg("--binary").arg(binary);
+    // Keep an isolated, provenance-checked mtools install local to this child.
+    // The unchanged profile still requires and executes all its native tools.
+    if let Some(bin) = std::env::var_os("FFS_NATIVE_ORACLE_BIN") {
+        let mut paths = vec![PathBuf::from(bin)];
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        command.env("PATH", std::env::join_paths(paths).unwrap());
+    }
+    fs::write(
+        root.join("invocation.txt"),
+        format!("script={script:?}\nbinary={binary:?}\n"),
+    )
+    .unwrap();
+    println!("retained companion profile output: {}", root.display());
+    let output = command.output().expect("execute the native Python profile");
+    fs::write(root.join("stdout"), &output.stdout).unwrap();
+    fs::write(root.join("stderr"), &output.stderr).unwrap();
+    fs::write(root.join("status"), output.status.to_string()).unwrap();
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "native companion profile {profile} failed; see {root:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requires dosfstools and mtools; retains native images and command evidence"]
+fn native_companion_read_profile_fat() {
+    run_native_companion_read_profile("verify_fat_read.py", env!("CARGO_BIN_EXE_ffs-fat"));
+}
+
+#[test]
+#[ignore = "requires ntfs-3g tools; retains native images and command evidence"]
+fn native_companion_read_profile_ntfs() {
+    run_native_companion_read_profile("verify_ntfs_read.py", env!("CARGO_BIN_EXE_ffs-ntfs"));
+}
+
 #[test]
 fn parity_default_reports_declarations_without_execution_credit() {
     let output = run_ffs_cli(&["parity", "--json"]);

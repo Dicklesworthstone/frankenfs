@@ -152,7 +152,10 @@ fn live_tail_relocation_preserves_chain_order_metadata_and_preallocation_in_both
                     vec![0; sector as usize]
                 );
                 assert_eq!(source.memory.lock().unwrap().pages, before);
-                assert!(source.memory.lock().unwrap().writes.is_empty());
+                assert_eq!(
+                    source.memory.lock().unwrap().writes,
+                    [] as [(u64, usize); 0]
+                );
                 assert_eq!(source.memory.lock().unwrap().syncs, 0);
             }
         }
@@ -222,13 +225,13 @@ fn relocation_moves_fat32_root_and_nested_directories_with_native_dotdot_links()
             (parent.native.first_cluster, child.native.first_cluster),
             (3, 2)
         );
-        for (first, parent) in [(3, 0), (2, 3)] {
+        for (first, parent) in [(3, 0_u16), (2, 3)] {
             let dots = read(plan.as_ref(), plan.new.cluster_offset(first).unwrap(), 64);
             assert_eq!(&dots[..11], b".          ");
             assert_eq!(&dots[32..43], b"..         ");
             assert_eq!((dots[11], dots[43]), (0x17, 0x17));
             assert_eq!(u16::from_le_bytes([dots[26], dots[27]]), first as u16);
-            assert_eq!(u16::from_le_bytes([dots[58], dots[59]]), parent as u16);
+            assert_eq!(u16::from_le_bytes([dots[58], dots[59]]), parent);
             assert_eq!(u16::from_le_bytes([dots[20], dots[21]]) & 0xF000, 0xA000);
         }
         let file = resized
@@ -332,13 +335,16 @@ fn relocation_refuses_bad_tail_and_insufficient_capacity_but_never_uses_bad_lowe
         0xFFF7,
     );
     assert!(
-        relocate(&cx, slice.clone(), length, FatOemCodePage::Ascii)
+        relocate(&cx, slice, length, FatOemCodePage::Ascii)
             .err()
             .unwrap()
             .to_string()
             .contains("bad tail")
     );
-    assert!(source.memory.lock().unwrap().writes.is_empty());
+    assert_eq!(
+        source.memory.lock().unwrap().writes,
+        [] as [(u64, usize); 0]
+    );
 
     let (source, slice, geometry) = fixture(FatKind::Fat16, 512, false);
     let (_, target) = layout(&read(&slice, 0, 512), &geometry, length).unwrap();
@@ -370,7 +376,10 @@ fn relocation_refuses_bad_tail_and_insufficient_capacity_but_never_uses_bad_lowe
             .to_string()
             .contains("insufficient free")
     );
-    assert!(source.memory.lock().unwrap().writes.is_empty());
+    assert_eq!(
+        source.memory.lock().unwrap().writes,
+        [] as [(u64, usize); 0]
+    );
 }
 
 #[test]
@@ -498,7 +507,10 @@ fn relocated_publisher_reopens_and_faults_keep_the_source_and_withheld_primary()
         );
         assert_eq!(source.memory.lock().unwrap().pages, before);
     }
-    assert!(source.memory.lock().unwrap().writes.is_empty());
+    assert_eq!(
+        source.memory.lock().unwrap().writes,
+        [] as [(u64, usize); 0]
+    );
     assert_eq!(source.memory.lock().unwrap().syncs, 0);
 }
 
@@ -531,7 +543,10 @@ fn relocation_preflight_refuses_corruption_cancellation_and_ranges_without_write
             )
             .is_err()
         );
-        assert!(source.memory.lock().unwrap().writes.is_empty());
+        assert_eq!(
+            source.memory.lock().unwrap().writes,
+            [] as [(u64, usize); 0]
+        );
         assert_eq!(source.memory.lock().unwrap().syncs, 0);
     }
     let cx = Cx::for_testing();
@@ -602,7 +617,10 @@ fn relocation_cli_is_explicit_and_real_file_shrink_retains_source_bytes() {
             .clean
     );
     assert!(run(&cx, &options).is_err());
-    assert!(source.memory.lock().unwrap().writes.is_empty());
+    assert_eq!(
+        source.memory.lock().unwrap().writes,
+        [] as [(u64, usize); 0]
+    );
 }
 
 #[test]
@@ -623,7 +641,7 @@ fn relocation_moves_empty_file_preallocation_without_exposing_it_as_payload() {
         let chain = output.file_chain(&cx, &file).unwrap();
         assert_eq!(chain.size, 0);
         assert_eq!(chain.clusters.len(), 4);
-        assert!(output.read(&cx, &chain, 0, 4096).unwrap().is_empty());
+        assert_eq!(output.read(&cx, &chain, 0, 4096).unwrap(), [] as [u8; 0]);
         assert_eq!(output.check(&cx).unwrap().preallocated_clusters, 4);
         for (&cluster, byte) in chain.clusters.iter().zip([0x31, 0x52, 0x73, 0x94]) {
             assert_eq!(
@@ -635,7 +653,10 @@ fn relocation_moves_empty_file_preallocation_without_exposing_it_as_payload() {
                 vec![byte; 512]
             );
         }
-        assert!(source.memory.lock().unwrap().writes.is_empty());
+        assert_eq!(
+            source.memory.lock().unwrap().writes,
+            [] as [(u64, usize); 0]
+        );
     }
 }
 
@@ -694,5 +715,8 @@ fn relocation_rewrites_entries_inside_a_moved_fragment_of_a_retained_directory_c
     pointer(&mut expected, FatKind::Fat32, 4);
     assert_eq!(read(plan.as_ref(), file.offset, 32), expected);
     assert!(output.check(&cx).unwrap().clean);
-    assert!(source.memory.lock().unwrap().writes.is_empty());
+    assert_eq!(
+        source.memory.lock().unwrap().writes,
+        [] as [(u64, usize); 0]
+    );
 }

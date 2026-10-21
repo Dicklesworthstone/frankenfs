@@ -23762,16 +23762,15 @@ mod tests {
         let returned_early = early.is_ok();
         let finished_early = gate.finished.load(Ordering::Acquire);
         drop(release);
-        let completed = match early {
-            Ok(result) => result,
-            Err(_) => fuse_runtime()
+        let completed = early.unwrap_or_else(|_| {
+            fuse_runtime()
                 .block_on(asupersync::time::timeout(
                     fuse_root_cx().now(),
                     WATCHDOG.saturating_sub(started.elapsed()),
                     returned_rx.recv(fuse_root_cx()),
                 ))
-                .expect("managed unmount must finish after the destroy gate is released"),
-        };
+                .expect("managed unmount must finish after the destroy gate is released")
+        });
         let (result, retired_on_return) =
             completed.expect("actual managed-unmount completion receipt");
         result.expect("real session join must not panic");

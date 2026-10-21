@@ -3,7 +3,7 @@ use super::*;
 use ffs_error::FfsError;
 use std::collections::BTreeSet;
 
-const OWNER: u64 = (7_u64 << 48) | 42;
+const OWNER: u64 = (7_u64 << 48) | 0x2A;
 
 fn attribute() -> Attribute {
     Attribute {
@@ -17,7 +17,7 @@ fn attribute() -> Attribute {
 
 fn entry(name: u16) -> Vec<u8> {
     let mut bytes = vec![0; 88];
-    bytes[..8].copy_from_slice(&((7_u64 << 48) | 43).to_le_bytes());
+    bytes[..8].copy_from_slice(&((7_u64 << 48) | 0x2B).to_le_bytes());
     bytes[8..10].copy_from_slice(&88_u16.to_le_bytes());
     bytes[10..12].copy_from_slice(&68_u16.to_le_bytes());
     bytes[16..24].copy_from_slice(&OWNER.to_le_bytes());
@@ -498,7 +498,7 @@ fn filename_metadata_and_write_end_have_structural_inverses() {
     old.extend_from_slice(&terminal);
     let update = record(20, 0x10, 0x10, 64, &terminal, &old);
     let empty = execute(&cx, &mut source, &[action(&update, &attribute, false)]).unwrap();
-    assert!(names(&empty.blocks[&(OWNER, 1024)]).is_empty());
+    assert_eq!(names(&empty.blocks[&(OWNER, 1024)]), Vec::<Vec<u16>>::new());
     let restored = execute(
         &cx,
         &mut source,

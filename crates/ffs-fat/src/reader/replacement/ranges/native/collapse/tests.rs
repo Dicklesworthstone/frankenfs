@@ -453,7 +453,7 @@ fn collapse_honors_active_fat_and_preserves_every_reserved_high_nibble() {
     collapse(&device.open(), 0, 2).unwrap();
     assert_eq!(device.bytes(first, inactive.len()), inactive);
     let active = device.bytes(second, ((geometry.cluster_count() + 2) * 4) as usize);
-    for entry in active.chunks_exact(4) {
+    for entry in active.as_chunks::<4>().0 {
         assert_eq!(entry[3] & 0xF0, 0xB0);
     }
     assert!(device.open().check(&Cx::for_testing()).unwrap().clean);

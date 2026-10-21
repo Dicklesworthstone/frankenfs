@@ -388,17 +388,16 @@ fn node(
     let mut children = BTreeSet::new();
     for entry in parse_index_block(raw, vbn).map_err(|error| parse(&error))? {
         checkpoint(cx)?;
-        if let Some((file, name)) = entry.key {
-            if name.parent != owner
+        if let Some((file, name)) = entry.key
+            && (name.parent != owner
                 || file.sequence == 0
                 || file.record >= input.geometry().records
-                || !input.allocated(cx, None, true, file.record)?
-            {
-                return Err(corrupt(
-                    offset,
-                    "INDX key has a foreign parent or unallocated FILE reference",
-                ));
-            }
+                || !input.allocated(cx, None, true, file.record)?)
+        {
+            return Err(corrupt(
+                offset,
+                "INDX key has a foreign parent or unallocated FILE reference",
+            ));
         }
         if let Some(child) = entry.child_vcn {
             let address = child

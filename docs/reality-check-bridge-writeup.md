@@ -9,6 +9,17 @@ FAT maintenance is now a qualification/completion gap against that landed code;
 the earlier missing-relocation conclusion at the initial snapshot is superseded.
 The other audited production paths are unchanged by those commits.
 
+**Implementation followthrough, 2026-10-21:** source commit `93b8ca751` extracts
+the three native engine libraries, connects ordinary/protected consumers and
+adds `ffs::open_read_only`. A later frozen candidate passed workspace/all-target
+compilation; the frozen `3b464766e` facade suite passed 40 tests with no skips.
+Pre-merge unit runs also passed FAT 438, NTFS 336 and ZFS 296 tests, plus two
+external FAT consumer tests. The Linux companion binaries and example built
+and were retrieved. Final merged-source qualification and the original native
+public-facade acceptance remain open. The detailed active TODO and source/proof
+limits are in `.beads/pending_tasks.md`. This supersedes the missing-library
+source finding below, without closing its unexecuted acceptance requirements.
+
 **Verdict: substantial experimental filesystem software, with an unfinished
 delivery contract.** There are real native readers for six formats, meaningful
 ext4/btrfs write and recovery machinery, a substantially expanded FAT writer,

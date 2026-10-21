@@ -245,6 +245,7 @@ impl FatVolume {
 
     /// Keep one explicit name policy for every directory and cached entry in
     /// this volume. This changes presentation/lookup, never native bytes.
+    #[must_use]
     pub fn with_oem_code_page(mut self, code_page: FatOemCodePage) -> Self {
         self.oem_code_page = code_page;
         self

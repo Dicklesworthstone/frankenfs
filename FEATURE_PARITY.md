@@ -13,9 +13,14 @@
 > ext4/btrfs. Five new facade controls cover constructed native FAT16/32 and ext4
 > reads, mutation refusal, volume sentinels, retained locks, ambiguity and invalid
 > ZFS/cancellation preflight; two new FAT consumer tests cover repeatable library
-> operations without global signal handlers. These tests are authored, not yet
-> executed. Build admission remains failed; no current compilation, native
-> interchange, mounted acceptance or extra parity credit is claimed. The older
+> operations without global signal handlers. At frozen `3b464766e`, the facade
+> suite executed: 40 passed, zero failed or ignored, including all five new
+> facade controls. A later candidate at `f7984bc15` plus explicit overlays passed
+> workspace/all-target compilation. Pre-merge engine unit runs passed FAT 438,
+> NTFS 336 and ZFS 296 tests; both external FAT consumer tests passed. Merged
+> source qualification and original native acceptance remain pending;
+> native interchange, mounted
+> acceptance and extra parity credit are not claimed. The older
 > six-format `OpenFs` row below still has only its detection-test binding; this
 > source integration does not silently promote that binding to mounted proof.
 

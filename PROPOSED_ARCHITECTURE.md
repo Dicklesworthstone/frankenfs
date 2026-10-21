@@ -225,10 +225,13 @@ shared pure command schema; its binary owns execution and signal handling.
 The protected mount imports these crates instead of compiling private engine
 copies through `#[path]`. Existing engine tests remain with their implementation.
 
-The extraction and facade source are implemented; current compiler/runtime
-qualification is pending build admission, tracked by
-`bd-native-image-library-s4tde`. Source movement and formatting are not executed
-native or mounted acceptance evidence.
+The extraction and facade source are implemented. A frozen candidate passed
+workspace/all-target compilation; the earlier frozen facade suite passed 40
+tests with no skips. Pre-merge engine unit suites passed FAT 438, NTFS 336 and
+ZFS 296 tests; both external FAT consumer tests passed. Final merged-source
+qualification and native acceptance remain pending under
+`bd-native-image-library-s4tde`. Source movement, compiler
+checks and constructed-image tests do not establish native or mounted acceptance.
 
 ## 2. Dependency Graph
 

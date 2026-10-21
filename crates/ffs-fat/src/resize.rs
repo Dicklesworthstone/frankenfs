@@ -20,6 +20,7 @@ use ffs_ondisk::fat::{FatEntry, FatGeometry, FatKind, FatOemCodePage};
 use ffs_types::ByteOffset;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
@@ -281,8 +282,8 @@ fn layout(boot: &[u8], old: &FatGeometry, length: u64) -> Result<(Vec<u8>, FatGe
         FatKind::Fat16 => {
             let fat = u16::try_from(fat).context("FAT16 table exceeds native field width")?;
             updated[22..24].copy_from_slice(&fat.to_le_bytes());
-            if total <= u64::from(u16::MAX) {
-                updated[19..21].copy_from_slice(&(total as u16).to_le_bytes());
+            if let Ok(total) = u16::try_from(total) {
+                updated[19..21].copy_from_slice(&total.to_le_bytes());
                 updated[32..36].fill(0);
             }
         }
@@ -659,13 +660,12 @@ fn publish(
     if actual != expected {
         bail!("resize output SHA-256 readback differs from prepared bytes");
     }
-    plan.verify(
-        cx,
-        Arc::new(Candidate {
-            output: Arc::clone(&output),
-            primary: primary.clone(),
-        }),
-    )?;
+    let candidate = Arc::new(Candidate {
+        output,
+        primary: primary.clone(),
+    });
+    plan.verify(cx, candidate.clone())?;
+    let output = &candidate.output;
     output.read_exact_at(cx, ByteOffset(0), &mut bytes[..primary.len()])?;
     if bytes[..primary.len()].iter().any(|byte| *byte != 0) {
         bail!("withheld primary boot sector changed before publication");
@@ -678,7 +678,11 @@ fn publish(
     if bytes[..primary.len()] != primary {
         bail!("resize primary boot publication failed readback");
     }
-    Ok(expected.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut digest = String::with_capacity(64);
+    for byte in expected {
+        write!(&mut digest, "{byte:02x}")?;
+    }
+    Ok(digest)
 }
 
 pub fn run(cx: &Cx, args: &ResizeArgs) -> Result<serde_json::Value> {
@@ -747,7 +751,7 @@ pub fn run(cx: &Cx, args: &ResizeArgs) -> Result<serde_json::Value> {
         .output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
+        .unwrap_or_else(|| Path::new("."))
         .canonicalize()
         .context("resolve existing resize output directory")?;
     let parent = File::open(&parent_path)?;

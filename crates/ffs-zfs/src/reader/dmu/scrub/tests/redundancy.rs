@@ -4,11 +4,20 @@ use crate::reader::pool::raidz::NativeMap;
 use crate::reader::{Pool, RaidzGroup, RaidzMember};
 
 fn limits() -> ScrubLimits {
-    ScrubLimits { copy_bytes: Some(1 << 30), ..ScrubLimits::default() }
+    ScrubLimits {
+        copy_bytes: Some(1 << 30),
+        ..ScrubLimits::default()
+    }
 }
 
 fn leaf(storage: &Arc<Mutex<Storage>>) -> Leaf {
-    Leaf::from_device(&Cx::for_testing(), Box::new(Memory(Arc::clone(storage))), 0, LENGTH as u64).unwrap()
+    Leaf::from_device(
+        &Cx::for_testing(),
+        Box::new(Memory(Arc::clone(storage))),
+        0,
+        LENGTH as u64,
+    )
+    .unwrap()
 }
 
 fn mirror(fixture: &Fixture) -> (Objects, Arc<Mutex<Storage>>) {
@@ -31,7 +40,7 @@ fn redundancy_scrub_detects_bad_secondary_copies_while_preserving_readable_trave
             other.lock().unwrap().bytes[bad as usize] ^= 1;
             let before = other.lock().unwrap().bytes.clone();
             assert!(scrub(&view).is_clean());
-            assert!(other.lock().unwrap().reads.is_empty());
+            assert_eq!(other.lock().unwrap().reads, [] as [u64; 0]);
             // Warm unrelated caches cannot stand in for auditing the physical replicas.
             assert_eq!(view.read(&cx, 1, 0, 512).unwrap(), vec![0xA5; 512]);
             let report = view.scrub(&cx, limits()).unwrap();
@@ -41,7 +50,10 @@ fn redundancy_scrub_detects_bad_secondary_copies_while_preserving_readable_trave
             assert_eq!(report.verified_blocks, 5);
             assert_eq!(report.copies_examined, 10);
             assert!(report.issues[0].detail.contains("supplied member 1"));
-            assert_eq!(other.lock().unwrap().reads, [TABLE, INDIRECT, FIRST, SECOND, SPILL]);
+            assert_eq!(
+                other.lock().unwrap().reads,
+                [TABLE, INDIRECT, FIRST, SECOND, SPILL]
+            );
             assert_eq!(other.lock().unwrap().bytes, before);
         }
     }
@@ -55,7 +67,8 @@ fn redundancy_scrub_verifies_a_bad_second_dva_instead_of_first_copy_only() {
     let second = DATA_OFFSET + 0x24000;
     {
         let mut state = fixture.storage.lock().unwrap();
-        state.bytes[second as usize..second as usize + fixture.table.len()].copy_from_slice(&fixture.table);
+        state.bytes[second as usize..second as usize + fixture.table.len()]
+            .copy_from_slice(&fixture.table);
         state.bytes[second as usize] ^= 1;
     }
     let mut raw = node(10, DNODE_BLOCK_BYTES, 1, 0, fixture.order);
@@ -78,16 +91,36 @@ fn redundancy_budget_is_reserved_before_secondary_io_and_cancellation_is_termina
     let cx = Cx::for_testing();
     let fixture = Fixture::new(Endian::Little);
     let (view, other) = mirror(&fixture);
-    let report = view.scrub(&cx, ScrubLimits { copy_bytes: Some(65_535), ..limits() }).unwrap();
+    let report = view
+        .scrub(
+            &cx,
+            ScrubLimits {
+                copy_bytes: Some(65_535),
+                ..limits()
+            },
+        )
+        .unwrap();
     assert!(!report.is_clean());
     assert_eq!(report.limit_reached, Some("physical-copy work budget"));
     assert_eq!(report.copy_work_bytes, 0);
     assert_eq!(report.copies_examined, 0);
-    assert!(other.lock().unwrap().reads.is_empty());
+    assert_eq!(other.lock().unwrap().reads, [] as [u64; 0]);
     assert_eq!(fixture.storage.lock().unwrap().reads, [TABLE]);
-    assert!(view.scrub(&cx, ScrubLimits { copy_bytes: Some(0), ..limits() }).is_err());
+    assert!(
+        view.scrub(
+            &cx,
+            ScrubLimits {
+                copy_bytes: Some(0),
+                ..limits()
+            }
+        )
+        .is_err()
+    );
     other.lock().unwrap().cancel_at = Some(TABLE);
-    assert!(matches!(view.scrub(&cx, limits()), Err(FfsError::Cancelled)));
+    assert!(matches!(
+        view.scrub(&cx, limits()),
+        Err(FfsError::Cancelled)
+    ));
     assert_eq!(other.lock().unwrap().reads, [TABLE]);
     assert!(!fixture.storage.lock().unwrap().reads.contains(&INDIRECT));
 }
@@ -95,9 +128,13 @@ fn redundancy_budget_is_reserved_before_secondary_io_and_cancellation_is_termina
 fn multiply(mut a: u16, mut b: u16) -> u8 {
     let mut result = 0_u16;
     while b != 0 {
-        if b & 1 != 0 { result ^= a; }
+        if b & 1 != 0 {
+            result ^= a;
+        }
         a <<= 1;
-        if a & 0x100 != 0 { a ^= 0x11D; }
+        if a & 0x100 != 0 {
+            a ^= 0x11D;
+        }
         b >>= 1;
     }
     u8::try_from(result).unwrap()
@@ -123,7 +160,11 @@ impl StripeFixture {
         }
         // Independent coefficient-by-coefficient polynomial encoding. The
         // production verifier uses Horner evaluation, not these multiply calls.
-        let data: Vec<_> = map.columns().iter().filter(|column| column.data_offset.is_some()).collect();
+        let data: Vec<_> = map
+            .columns()
+            .iter()
+            .filter(|column| column.data_offset.is_some())
+            .collect();
         for row in 0..self.parity {
             let parity_column = &map.columns()[row];
             let mut encoded = vec![0; parity_column.bytes];
@@ -152,17 +193,32 @@ impl StripeFixture {
         let mut view = fixture.view();
         let width = parity + 3;
         let mut striped = Self {
-            states: (0..width).map(|_| Arc::new(Mutex::new(Storage {
-                bytes: vec![0; LENGTH], ..Storage::default()
-            }))).collect(),
-            parity, order, locations: Vec::new(),
+            states: (0..width)
+                .map(|_| {
+                    Arc::new(Mutex::new(Storage {
+                        bytes: vec![0; LENGTH],
+                        ..Storage::default()
+                    }))
+                })
+                .collect(),
+            parity,
+            order,
+            locations: Vec::new(),
         };
-        let mut indirect = fixture.storage.lock().unwrap().bytes[INDIRECT as usize..INDIRECT as usize + 4096].to_vec();
+        let mut indirect = fixture.storage.lock().unwrap().bytes
+            [INDIRECT as usize..INDIRECT as usize + 4096]
+            .to_vec();
         indirect[..128].copy_from_slice(&striped.store(&[0xA5; 512], FIRST, 19, 0, 20));
         indirect[256..384].copy_from_slice(&striped.store(&[0x5A; 512], SECOND, 19, 0, 20));
-        let mut table = fixture.table.clone();
+        let mut table = fixture.table;
         table[512 + 64..512 + 192].copy_from_slice(&striped.store(&indirect, INDIRECT, 19, 1, 30));
-        table[7 * 512 + 896..7 * 512 + 1024].copy_from_slice(&striped.store(&[0x7E; 512], SPILL, 44, 0, 30));
+        table[7 * 512 + 896..7 * 512 + 1024].copy_from_slice(&striped.store(
+            &[0x7E; 512],
+            SPILL,
+            44,
+            0,
+            30,
+        ));
         let mut meta = node(10, DNODE_BLOCK_BYTES, 1, 0, order);
         meta[64..192].copy_from_slice(&striped.store(&table, TABLE, 10, 0, 40));
         view.meta = Dnode::parse(&meta, order).unwrap();
@@ -170,20 +226,28 @@ impl StripeFixture {
         view.config.allocated_bytes *= width as u64;
         view.config.raidz_members = Some(RaidzGroup {
             parity,
-            members: (0..width).map(|index| RaidzMember {
-                supplied_index: width - index - 1,
-                guid: 1001 + index as u64,
-                ashift: 9,
-                allocated_bytes: view.config.allocated_bytes,
-            }).collect(),
+            members: (0..width)
+                .map(|index| RaidzMember {
+                    supplied_index: width - index - 1,
+                    guid: 1001 + index as u64,
+                    ashift: 9,
+                    allocated_bytes: view.config.allocated_bytes,
+                })
+                .collect(),
         });
         (striped, view)
     }
 
     fn poison(&self, key: u64, ordinal: usize) {
-        let map = &self.locations.iter().find(|(old, _)| *old == key).unwrap().1;
+        let map = &self
+            .locations
+            .iter()
+            .find(|(old, _)| *old == key)
+            .unwrap()
+            .1;
         let column = &map.columns()[ordinal];
-        self.states[column.child_id].lock().unwrap().bytes[(DATA_OFFSET + column.offset) as usize] ^= 0x5B;
+        self.states[column.child_id].lock().unwrap().bytes
+            [(DATA_OFFSET + column.offset) as usize] ^= 0x5B;
     }
 }
 
@@ -222,7 +286,11 @@ fn recovered_data_is_not_evidence_that_actual_columns_or_parity_are_intact() {
         assert_eq!(report.verified_blocks, 5);
         assert_eq!(report.parity_columns_unverified, parity as u64);
         assert_eq!(report.parity_columns_checked, 4 * parity as u64);
-        assert!(report.issues[0].detail.contains("unreconstructed RAIDZ data"));
+        assert!(
+            report.issues[0]
+                .detail
+                .contains("unreconstructed RAIDZ data")
+        );
     }
 }
 
@@ -246,8 +314,8 @@ fn readable_missing_mirror_is_not_reported_as_intact_redundancy() {
             &[0; 1024],
         );
         view.config.top_guid = MIRROR_GUID;
-        view.pool = Pool::from_mirror_survivors(&cx, vec![leaf(&fixture.storage)], vec![1002])
-            .unwrap();
+        view.pool =
+            Pool::from_mirror_survivors(&cx, vec![leaf(&fixture.storage)], vec![1002]).unwrap();
         let before = fixture.storage.lock().unwrap().bytes.clone();
         assert!(scrub(&view).is_clean());
         let report = view.scrub(&cx, limits()).unwrap();
@@ -262,9 +330,7 @@ fn readable_missing_mirror_is_not_reported_as_intact_redundancy() {
 
 #[test]
 fn readable_missing_raidz_never_certifies_absent_columns_and_does_not_read_them() {
-    use crate::reader::tests::mirror::{
-        MIRROR_GUID, install_labels, native_config, repack,
-    };
+    use crate::reader::tests::mirror::{MIRROR_GUID, install_labels, native_config, repack};
     use crate::reader::{NvList, Value};
 
     let cx = Cx::for_testing();
@@ -274,28 +340,45 @@ fn readable_missing_raidz_never_certifies_absent_columns_and_does_not_read_them(
             let width = fixture.states.len();
             let guids: Vec<_> = (0..width).map(|child| 1001 + child as u64).collect();
             for (child, storage) in fixture.states.iter().enumerate() {
-                let raw = native_config(
-                    guids[child], &guids, 9, view.config.allocated_bytes, 42,
-                );
+                let raw = native_config(guids[child], &guids, 9, view.config.allocated_bytes, 42);
                 let mut config = NvList::parse(&raw).unwrap();
                 let Value::List(tree) = config.fields.get_mut("vdev_tree").unwrap() else {
                     panic!("native fixture tree");
                 };
-                tree.fields.insert("type".into(), Value::String("raidz".into()));
-                tree.fields.insert("nparity".into(), Value::Unsigned(parity as u64));
+                tree.fields
+                    .insert("type".into(), Value::String("raidz".into()));
+                tree.fields
+                    .insert("nparity".into(), Value::Unsigned(parity as u64));
                 install_labels(
                     &mut storage.lock().unwrap().bytes,
-                    0, LENGTH as u64, order, &repack(&config), &[0; 1024],
+                    0,
+                    LENGTH as u64,
+                    order,
+                    &repack(&config),
+                    &[0; 1024],
                 );
             }
             let supplied: Vec<_> = (parity..width).rev().collect();
-            let leaves = supplied.iter().map(|&child| leaf(&fixture.states[child])).collect();
+            let leaves = supplied
+                .iter()
+                .map(|&child| leaf(&fixture.states[child]))
+                .collect();
             view.pool = Pool::from_raidz_survivors(&cx, leaves, guids[..parity].to_vec()).unwrap();
             view.config.top_guid = MIRROR_GUID;
             // The direct Objects fixture retains native child order; supplied
             // image order is reversed and absent children have no image handle.
-            for (child, route) in view.config.raidz_members.as_mut().unwrap().members.iter_mut().enumerate() {
-                route.supplied_index = supplied.iter().position(|&index| index == child)
+            for (child, route) in view
+                .config
+                .raidz_members
+                .as_mut()
+                .unwrap()
+                .members
+                .iter_mut()
+                .enumerate()
+            {
+                route.supplied_index = supplied
+                    .iter()
+                    .position(|&index| index == child)
                     .unwrap_or(usize::MAX);
             }
             assert!(scrub(&view).is_clean());
@@ -304,7 +387,7 @@ fn readable_missing_raidz_never_certifies_absent_columns_and_does_not_read_them(
             assert_eq!(report.verified_blocks, 5);
             assert!(!report.is_clean());
             for absent in &fixture.states[..parity] {
-                assert!(absent.lock().unwrap().reads.is_empty());
+                assert_eq!(absent.lock().unwrap().reads, [] as [u64; 0]);
             }
         }
     }

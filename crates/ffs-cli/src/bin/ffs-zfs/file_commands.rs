@@ -854,36 +854,80 @@ mod tests {
 
     #[test]
     fn redundancy_scrub_keeps_snapshot_members_and_independent_work_budget() {
-        let base = ["ffs-zfs", "scrub", "first.img", "--offline-image", "--auto-import"];
+        let base = [
+            "ffs-zfs",
+            "scrub",
+            "first.img",
+            "--offline-image",
+            "--auto-import",
+        ];
         let cli = Cli::try_parse_from(base.into_iter().chain([
-            "--verify-redundancy", "--max-copy-bytes", "65536",
-            "--snapshot", "before", "--member", "second.img",
-        ])).unwrap();
+            "--verify-redundancy",
+            "--max-copy-bytes",
+            "65536",
+            "--snapshot",
+            "before",
+            "--member",
+            "second.img",
+        ]))
+        .unwrap();
         let Command::File(FileCommand::Scrub {
-            candidate, snapshot, verify_redundancy, max_copy_bytes, ..
-        }) = cli.command else { panic!("scrub"); };
+            candidate,
+            snapshot,
+            verify_redundancy,
+            max_copy_bytes,
+            ..
+        }) = cli.command
+        else {
+            panic!("scrub");
+        };
         assert!(verify_redundancy);
         assert_eq!(max_copy_bytes, Some(65_536));
         assert_eq!(snapshot, Some(OsString::from("before")));
         assert_eq!(candidate.members, [PathBuf::from("second.img")]);
         assert!(Cli::try_parse_from(base.into_iter().chain(["--max-copy-bytes", "1"])).is_err());
-        assert!(Cli::try_parse_from(base.into_iter().chain([
-            "--verify-redundancy", "--max-copy-bytes", "0"
-        ])).is_err());
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--verify-redundancy",
+                "--max-copy-bytes",
+                "0"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
     fn redundancy_scrub_refuses_sidecar_and_log_replay_before_image_io() {
         for (extra, reason) in [
-            (vec!["--sidecar", "unopened.rq"], "does not admit sidecar healing"),
+            (
+                vec!["--sidecar", "unopened.rq"],
+                "does not admit sidecar healing",
+            ),
             (vec!["--replay-zil"], "not ZIL replay overlays"),
         ] {
-            let cli = Cli::try_parse_from([
-                "ffs-zfs", "scrub", "unopened.img", "--offline-image",
-                "--auto-import", "--verify-redundancy",
-            ].into_iter().chain(extra)).unwrap();
-            let Command::File(command) = cli.command else { panic!("scrub"); };
-            assert!(command.run(&Cx::for_testing()).unwrap_err().to_string().contains(reason));
+            let cli = Cli::try_parse_from(
+                [
+                    "ffs-zfs",
+                    "scrub",
+                    "unopened.img",
+                    "--offline-image",
+                    "--auto-import",
+                    "--verify-redundancy",
+                ]
+                .into_iter()
+                .chain(extra),
+            )
+            .unwrap();
+            let Command::File(command) = cli.command else {
+                panic!("scrub");
+            };
+            assert!(
+                command
+                    .run(&Cx::for_testing())
+                    .unwrap_err()
+                    .to_string()
+                    .contains(reason)
+            );
         }
     }
 }

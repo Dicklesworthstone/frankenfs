@@ -373,7 +373,7 @@ fn resize_view_grows_and_shrinks_both_dialects_without_native_identity_changes()
                 }
                 let state = source.memory.lock().unwrap();
                 assert_eq!(state.pages, source_before);
-                assert!(state.writes.is_empty());
+                assert_eq!(state.writes, [] as [(u64, usize); 0]);
                 assert_eq!(state.syncs, 0);
             }
         }
@@ -422,7 +422,10 @@ fn resize_refuses_live_tail_preallocation_bad_clusters_and_invalid_geometry() {
             for length in [0, 511, u64::MAX, 4096] {
                 assert!(Plan::prepare(&cx, slice.clone(), length, FatOemCodePage::Ascii).is_err());
             }
-            assert!(source.memory.lock().unwrap().writes.is_empty());
+            assert_eq!(
+                source.memory.lock().unwrap().writes,
+                [] as [(u64, usize); 0]
+            );
         }
     }
 }
@@ -454,7 +457,10 @@ fn resize_publication_verifies_all_bytes_before_primary_boot_and_can_reopen() {
         );
         assert_eq!(state.syncs, 2);
         drop(state);
-        assert!(source.memory.lock().unwrap().writes.is_empty());
+        assert_eq!(
+            source.memory.lock().unwrap().writes,
+            [] as [(u64, usize); 0]
+        );
         assert_eq!(source.memory.lock().unwrap().syncs, 0);
     }
 }
@@ -554,7 +560,10 @@ fn resize_source_read_failure_and_cancelled_preflight_perform_no_source_io_mutat
     cancelled.set_cancel_requested(true);
     assert!(Plan::prepare(&cancelled, slice, old.volume_bytes(), FatOemCodePage::Ascii).is_err());
     assert_eq!(source.memory.lock().unwrap().syncs, 0);
-    assert!(source.memory.lock().unwrap().writes.is_empty());
+    assert_eq!(
+        source.memory.lock().unwrap().writes,
+        [] as [(u64, usize); 0]
+    );
 }
 
 #[test]
@@ -586,7 +595,10 @@ fn resize_rejects_unknown_backup_state_and_unbounded_view_ranges() {
         .unwrap()
         .put(slice.base + 6 * 512 + 65, &[2]);
     assert!(Plan::prepare(&cx, slice, old.volume_bytes(), FatOemCodePage::Ascii).is_err());
-    assert!(source.memory.lock().unwrap().writes.is_empty());
+    assert_eq!(
+        source.memory.lock().unwrap().writes,
+        [] as [(u64, usize); 0]
+    );
 }
 
 #[test]
@@ -864,7 +876,10 @@ fn resize_refuses_ambiguous_ownership_and_dirty_source_without_output_authority(
             )
             .is_err()
         );
-        assert!(source.memory.lock().unwrap().writes.is_empty());
+        assert_eq!(
+            source.memory.lock().unwrap().writes,
+            [] as [(u64, usize); 0]
+        );
         assert_eq!(source.memory.lock().unwrap().syncs, 0);
     }
 }

@@ -60,8 +60,28 @@ Options preserve volume bounds, FAT OEM selection, btrfs roots/devices and ZFS
 pool/candidate/dataset/snapshot/device selection. ext4 recovery stays in memory.
 Callers supply their own context and keep backing images offline and immutable.
 
-This integration is implemented in source; its compiler and runtime verification
-remain pending under `bd-native-image-library-s4tde`. `OpenFs` itself still
+The standalone [`native_reader` example](crates/ffs/examples/native_reader.rs)
+uses that public API for `stat`, NUL-delimited `list`, bounded `read` and an
+explicit `refuse-write` scratch-image check. It owns its application runtime:
+
+```bash
+cargo run -p ffs --example native_reader -- image.img stat /
+cargo run -p ffs --example native_reader -- image.img read /hello.txt --start 0 --bytes 4096
+```
+
+Frozen candidates passed workspace/all-target compilation and the extracted
+engine unit suites: FAT 438, NTFS 336, ZFS 296, facade 40, plus both external FAT
+consumer tests. The Linux companion binaries and example also built and were
+retrieved. These results precede the latest shared-main merge; final merged
+checks and native interchange remain pending under `bd-native-image-library-s4tde`.
+Explicit native checks require their real producer tools and retain evidence:
+
+```bash
+cargo test -p ffs native_producer_interchange_reads_and_refuses_mutation_through_public_facade -- --ignored --nocapture
+cargo test -p ffs-cli --test cli_e2e native_companion_read_profile -- --ignored --nocapture --test-threads=1
+```
+
+`OpenFs` itself still
 dispatches ext4/btrfs, and their MVCC/RaptorQ integration must not be inferred to
 apply automatically to new-format native writes.
 

@@ -117,7 +117,9 @@ impl Walker<'_> {
         position: Position,
         bp: &BlockPointer,
     ) -> Result<()> {
-        let Some(limit) = self.limits.copy_bytes else { return Ok(()) };
+        let Some(limit) = self.limits.copy_bytes else {
+            return Ok(());
+        };
         if bp.embedded() {
             return Ok(());
         }

@@ -508,20 +508,226 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Add explicit six-format read-only options and ambiguity-checked dispatch.
 - [x] Enforce read-only backing authority before detection/recovery; no write options.
 - [x] Preserve explicit volume offsets, bounds, OEM names and ZFS view identity.
-- [x] Author facade native-image and adversarial authority controls (unexecuted).
+- [x] Author facade native-image and adversarial authority controls.
 - [x] Statically verify no module duplication, package cycles or lost old tests.
 - [x] Update architecture/parity documentation and nonempty library test commands.
 - [x] Pass workspace formatting; inspect normalized source and integration diffs.
 - [x] Fix FAT cancellation-test imports exposed by the first remote check.
 - [x] Remove protected-mount's production partial `Deref`; retain test assertions.
 - [x] Prevent FIFO blocking before regular-image admission; author real FD controls.
+- [x] Preserve shared-main library commit and merge with FAT insertion/ZFS scrub.
+- [x] Format six merged files; verify normalized source and test attributes unchanged.
+- [x] Execute the facade suite at frozen `3b464766e`: 40 passed, no skips.
+- [x] Fix seven production FAT Clippy findings without changing publication checks.
+- [ ] Finish remaining all-target Clippy findings, preserving every test condition.
+- [x] Independently diagnose the two FAT dropped-write probe failures.
+- [x] Bind both probes to actual publication bytes and assert fault injection occurred.
+- [x] Execute both corrected dropped-write controls with their original assertions.
 - [ ] Pass remote workspace/all-target compilation with exact source receipt.
 - [ ] Pass remote workspace/all-target strict Clippy without suppressions.
-- [ ] Execute engine, facade, consumer and CLI tests with nonempty selections.
+- [ ] Execute required harness test and benchmark commands through RCH.
+- [ ] Execute all three extracted engine suites with every retained regression.
+- [ ] Execute facade controls, external FAT consumer controls and public doctests.
+- [x] Execute regular-image/OS-RO/FIFO block-device controls and reader regressions.
+- [ ] Execute NTFS/ZFS companion and protected-mount tests with nonempty selections.
 - [ ] Exercise built public consumers and retain their source/build identity.
-- [ ] Review UBS findings and resolve actual production defects.
+- [ ] Run unchanged native FAT/NTFS read profiles with real oracle tools.
+- [x] Author an executable public-facade consumer with caller-owned runtime.
+- [ ] Compile and execute that consumer against independently produced native images.
+- [x] Author direct public-facade native-producer FAT16/FAT32/NTFS acceptance.
+- [ ] Execute native producer comparisons; retain original images and oracle logs.
+- [x] Diagnose external dirty-image fixture's reserved-cluster address error.
+- [x] Re-execute both external FAT consumer tests with proven dirty-bit planting.
+- [x] Wire unchanged native FAT/NTFS profiles to explicit Cargo integration tests.
+- [ ] Execute both native companion integration tests against actual binaries.
+- [ ] Complete original native public-facade FAT16/32, NTFS and ZFS acceptance.
+- [x] Review UBS findings and resolve actual production defects; retain test traps.
 - [ ] Re-execute acceptance in a fresh verification pass; keep unproved items open.
 - [ ] Record exact results in staged Beads, sync, commit and publish coherent work.
+
+Shared-main update: the source increment landed in `93b8ca751`, then merged
+with peer FAT range-insertion and ZFS redundancy-scrub work in `a03f7feee`.
+Both remote refs were at that merge when checked. The source commit explicitly
+keeps compiler/runtime acceptance pending. Six merged files needed standard
+formatting; each now equals rustfmt's output from its committed source and
+retains every test attribute. Workspace formatting passes on the merged tree.
+The running remote check captured an earlier source snapshot; final acceptance
+must use the merged source including the regular-image opener and peer work.
+Canonical `br sync --import-only` was retried after the merge and again refused
+the potentially committed WAL; no database/WAL replacement or deletion occurred.
+
+Verification source is now frozen at `3b464766e84456184fb46ff444bf514a033a8c26`
+with `RCH_REQUIRE_REMOTE=1 rch exec --base <that SHA> --clean-overlay --no-overlay
+-- cargo check -j 1 --workspace --all-targets`. This includes peer FAT truncate
+publication and NTFS allocation checking. RCH makes clean-baseline mode mutually
+exclusive with `--source-content-receipt`; this run uses committed-tree authority,
+not a dirty-source manifest. The preceding mutable-source run was superseded and
+cancelled (remote exit 143, not a pass); its final guard also rejected 20 source
+deltas introduced during execution. Its wrapper stopped, but two recovery
+attempts reported a remote source-retention error; the retained job record is
+`rchw-ee4eea67-ff44-419c-a562-550c1561e40e`. No shared daemon restart, lock removal,
+manual source cleanup or local fallback was attempted. The new pinned run is
+admitted on `vmi1152480` and remains pending.
+
+Ten local Rust files now have formatting-only differences from committed source;
+normalization and test-attribute equality were checked for each. Workspace fmt
+passes. UBS on these ten files completed (exit 1): two deliberate test traps
+rejecting allocation-check writes/flushes, 1,046 warnings and 310 info findings.
+The traps and assertions remain unchanged. No clean UBS result is claimed.
+
+Parallel remote gates, all at the same frozen revision: full workspace check on
+`vmi1152480`; strict workspace Clippy (`-D warnings`) on `hz2`; complete
+`ffs`/`ffs-fat`/`ffs-ntfs`/`ffs-zfs` test selection on `vmi1264463`. All use
+`RCH_REQUIRE_REMOTE=1`, ordinary admission and `-j 1`. Runtime test threads are
+bounded to two. These jobs are pending, not passes.
+
+Native FAT oracle setup completed on `vmi1152480`: Ubuntu's signed Noble
+`InRelease` and matching package-index SHA256 verified an isolated mtools
+`4.0.43-1build1` archive. Package SHA256 is
+`deb50411c17b001c2400dd8a0146f39d12070a2fe5e92d734b1c6d0e73119262`.
+It was unpacked into `/data/tmp/frankenfs-native-oracle-8d_3rpbv/unpacked`, with
+no system package installation. `mcopy -V` executed successfully; both mcopy/mmd
+resolve to ELF SHA256
+`4c8364b843223f44f008fa48f97ce48cce615799ac3d254069cff777d9110e0b`.
+This supplies required real oracle tools, not a FAT profile pass. Raw setup and
+signature/provenance files are retained with the private tool directory, and
+the local transcript is `~/Library/Logs/frankenfs-verification/native-oracle-setup.log`.
+
+Acceptance update (2026-10-21 02:42 UTC): the baseline workspace check hit its
+configured 3,600-second deadline (exit 137), so it is not a pass. A warm-cache
+candidate check now uses committed baseline `f7984bc153218737ecdf14a85a75b955e65fb9cf`
+plus 15 explicit file overlays. The local baseline/overlay SHA256 declaration is
+`a68779f108668d86785052d42f6176c950cf1c339e3f255af42aafd0e1d2a61e`;
+it is a source declaration, not a worker-verified dirty-source receipt.
+Candidate Clippy executed and failed additional production/test findings; all
+are being fixed with equivalent expressions and no suppression. Its keep-going
+run completed exit 101. The full native-library runtime job at `3b464766e`
+executed the facade suite: **40 passed, 0 failed, 0 ignored**, including all five
+new facade controls. Its complete FAT suite is running (430 selected tests);
+NTFS/ZFS, external consumers and doctests remain pending. Current-tree runtime
+acceptance still requires re-execution after the lint fixes. Full logs remain
+outside the transferred workspace in `~/Library/Logs/frankenfs-verification/`.
+
+Runtime update (03:06 UTC): the baseline FAT suite completed **428 passed,
+2 failed, 0 ignored**, taking 1,582.31 seconds after compilation. Cargo stopped
+before the NTFS/ZFS selections. The failures are
+`cancelled_or_dropped_spelling_publication_is_never_reported_as_success` and
+`native_copy_fault_cuts_preserve_source_and_never_admit_partial_clean_output`.
+Independent source traces agree that both hardcode dropped write number 5,
+which is now a sync: `set_dirty` internally writes three FAT16 sectors and
+syncs/readbacks before the caller's retained outer sync. Neither probe actually
+injected its intended write loss. The independent test-owner lane is replacing
+ordinal targeting with actual byte-address targeting and explicit drop evidence;
+all production barriers, cut loops and original failure assertions remain.
+No filesystem correctness defect or green corrected test is claimed yet.
+
+Final Clippy candidate currently uses baseline `f7984bc15` plus 24 explicit
+Rust overlays, local declaration
+`a761bb65bf2f6f51f309436bb9df2638ed355d0d717fb3354f1be9b3bf40235d`.
+All five later CLI/facade Clippy findings have equivalent source fixes. The
+chosen-worker attempt refused no free slots; ordinary selection admitted a new
+run on `vmi1152480`. Two earlier pinned test selections refused queue timeout
+and executed no tests. A newer full engine/block selection captured the old
+fault probes and is superseded for final acceptance. Its exact cancellation
+request (`rchw-88824dea-cd6b-4958-bb31-ee3154099894`) returned RCH-E504 daemon
+timeout; no shared daemon restart, lock clearing or manual process kill followed.
+The final source cut must include and re-execute the corrected probes.
+
+The original native public-facade acceptance includes NTFS/ZFS and remains
+unmet. Ordinary CLI profiles, constructed fixtures, static conservation and
+compiler results cannot close that requirement. No acceptance condition has
+been moved to another task. Available read-only inventories on `vmi1153651` and
+`vmi1264463` found neither OpenZFS tools nor a loaded ZFS module; three other
+direct probes refused unknown host keys and establish no tool-absence claim.
+
+The new `crates/ffs/examples/native_reader.rs` is an independent application
+entry point for the library, not another engine implementation. Creation gate:
+the native public-facade acceptance needs an executable consumer, and library
+users need a runnable example; no existing facade example entry point exists.
+It directly calls public lookup/getattr/readdir/read/write-refusal operations,
+owns its asupersync runtime, preserves raw directory names and supplies volume
+bounds plus explicit ZFS dataset/snapshot selections. It remains uncompiled and
+unexecuted until its named remote gates and native-image comparisons pass.
+The unchanged ordinary companion profiles remain separate acceptance controls.
+
+Executed result update, resumed 2026-10-21 15:05 UTC: the final v4 FAT library
+suite passed **438/438**, zero ignored, in 1,515.89 seconds, including both
+corrected dropped-write probes. Its external `library_api` target then had one
+pass and one failure: the new dirty-image fixture called `entry_offset(copy,1)`,
+but that API intentionally admits only data clusters. It failed before planting
+the intended dirty state. The independent test owner corrected reserved FAT[1]
+addressing through checked subtraction from FAT[2], preserving every original
+assertion and adding three native-byte checks proving only the clean bit changes.
+That external target is being re-executed; the earlier whole command is exit 101.
+
+The v4 non-FAT job completed exit 0: facade **40**, NTFS **336**, ZFS **296**;
+block unit **348 passed/1 ignored**, integration targets **6+2+6 passed**;
+facade and block doctests **1+1 passed** (NTFS/ZFS have zero doctests).
+The ignored block test requires a separately supplied loop device and sudo;
+it receives no coverage credit. Both actual OS-RO/FIFO controls passed.
+These are library/constructed-image tests, not native or mounted proof.
+
+Strict workspace/all-target Clippy at v3 completed exit 0, source overlay
+`b8975905988cc3194d1b34af2343035ca512bbecda9d6e24925614cdea591811`.
+Later corrected probes, external fixture and example require a final lint pass.
+The v4 check and v2 Linux consumer build timed out at the configured one-hour
+limit (exit 137). The companion test link failed with linker SIGBUS, not a test
+pass. All three are being retried through normal admission and warm caches.
+The example actually compiled and executed `--help` remotely (exit 0), but RCH
+then refused the foreign Linux ELF for the macOS output tree (delivery 102).
+No foreign-artifact guard override was used; a new build explicitly targets
+`x86_64-unknown-linux-gnu`. Help output does not prove native image consumption.
+
+The v6 external FAT consumer target completed exit 0: **2 passed, 0 failed,
+0 ignored**, including the corrected reserved FAT-entry fixture and its three
+byte-level planting checks. Its full transcript is `tests-library-api-v6.log`.
+The final v6 Clippy run found one style lint in the new example's directory
+loop; the equivalent reference iteration is fixed without a suppression, and
+the final strict gate remains pending. Two explicit ignored integration tests
+now run the unchanged FAT/NTFS native Python profiles against Cargo's actual
+companion executables. They retain stdout/stderr/status and require native
+tools; ordinary ignored selections earn no credit. A v8 workspace check,
+harness suite and explicit native-profile selection are admitted or queued
+through RCH at 29 explicit Rust overlays (local declaration
+`b1c17cd5f11523022e4956cf3a849987853f6fa19a17933e544985e0c81fb214`).
+The subsequent one-line example iteration fix requires a final lint pass.
+
+The v8 check refused before Cargo because the example changed during transfer;
+no check credit is taken. Its harness/native-profile requests timed out in
+admission and executed zero tests. A later concurrent merge of four peer
+commits changed four overlay paths, so the v9 Clippy/harness requests also
+correctly refused source drift. The v9 check/native-facade job had already
+transferred their earlier cut; their results cannot qualify the merged tree.
+The obsolete waiting v7 job was cancelled through the supported exact-wrapper
+command and terminal-acknowledged, exit 1; no manual process/lock removal.
+The independently reviewed FAT probes and dirty fixture are separately
+committed as `12069daf0`, citing the 438-unit/2-external evidence and the
+zero-to-one fault-injection split. Merge `d83c460fb` preserves the four peer
+commits. Two working files retained merge markers; manual resolution preserves
+native NTFS ownership checks and ZFS gang audit, plus both prior lint fixes.
+Standard formatting and diff checks pass. Qualification will use an immutable
+committed-source cut rather than dirty overlays, with no acceptance closure.
+
+The explicit Linux consumer build completed exit 0 and retrieved all five
+requested ELFs (four companions plus the public example), 448,933,447 bytes.
+This is build/delivery proof, not native-image execution. The new example's
+static UBS scan completed with zero critical/warning findings. Native-test
+scans retain one deliberate fixture failure trap; new merged production files
+have zero critical findings and 19 warnings (bounded indexing and diagnostic
+allocation), while merged tests retain three deliberate fixture failure traps.
+No suppression, partial override, golden regeneration or clean-scanner claim
+was introduced. All existing test/assertion counts survive the merged source;
+six newly formatted peer files are byte-equal to standard formatting of HEAD.
+
+The direct native-producer test in `native/tests.rs` creates only fresh retained
+regular scratch images with dosfstools/ntfs-3g, populates them with mtools/ntfscp,
+and checks independent extraction. It then exercises the public API on plain
+and bounded-container images, including exact full/ranged/EOF bytes, metadata,
+directory names, write refusal and unchanged whole images. It is explicitly
+ignored by ordinary suites because tools are required; the named `--ignored`
+invocation is required for credit and missing tools fail. It is now running
+with serial tests and the provenance-checked private mtools directory supplied
+explicitly. No ZFS/native/mounted/Windows inference is permitted from it.
 
 The checks above mark **source work**, not executed acceptance. All 181 relocated
 Rust files are accounted for; 166 equal the original after standard formatting,

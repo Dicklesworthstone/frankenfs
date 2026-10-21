@@ -307,7 +307,9 @@ fn shrink_in_volume(cx: &Cx, volume: &FatVolume, path: &str, size: u32, now: u64
             volume.device.sync(cx)?;
             volume.read_exact(cx, start, &mut readback)?;
             if readback != sector {
-                bail!("guarded shrink sector failed readback; no chain cut or reclamation attempted");
+                bail!(
+                    "guarded shrink sector failed readback; no chain cut or reclamation attempted"
+                );
             }
         }
         phase = "publishing the shorter directory entry";

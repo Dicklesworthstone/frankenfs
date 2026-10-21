@@ -62,7 +62,7 @@ fn missing_raidz_cli_routes_explicit_candidate_members_and_volume_bounds() {
         };
         assert_eq!(candidate.missing_raidz_members, [1003, 1004]);
         assert_eq!(candidate.members, [PathBuf::from("second.img")]);
-        assert!(candidate.missing_mirror_members.is_empty());
+        assert_eq!(candidate.missing_mirror_members, [] as [u64; 0]);
         assert_eq!(
             (candidate.pool_guid, candidate.label, candidate.slot),
             (123, 2, 7)

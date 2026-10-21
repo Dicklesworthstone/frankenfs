@@ -21,8 +21,7 @@ impl Replacement {
         installed: bool,
     ) -> Result<()> {
         checkpoint(cx)?;
-        let required = u64::from(self.size)
-            .div_ceil(u64::from(volume.geometry.cluster_bytes()));
+        let required = u64::from(self.size).div_ceil(u64::from(volume.geometry.cluster_bytes()));
         if self.clusters.len() as u64 != required {
             bail!("replacement reservation does not match the prepared length");
         }

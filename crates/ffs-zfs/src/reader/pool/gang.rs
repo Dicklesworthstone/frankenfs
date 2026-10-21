@@ -155,11 +155,7 @@ pub(super) fn header_allocations(config: &VdevConfig, pointer: &BlockPointer) ->
 }
 
 impl Pool {
-    fn gang_allocated_work(
-        &self,
-        config: &VdevConfig,
-        pointer: &BlockPointer,
-    ) -> Result<u64> {
+    fn gang_allocated_work(&self, config: &VdevConfig, pointer: &BlockPointer) -> Result<u64> {
         let dvas = pointer
             .gang_dvas(&header_allocations(config, pointer)?)
             .map_err(|error| parse(&error))?;
@@ -235,7 +231,11 @@ impl Pool {
         drop(admission);
         for node in nodes {
             checkpoint(cx)?;
-            if !visit(&node.pointer, node.header.as_ref(), &node.header_allocations)? {
+            if !visit(
+                &node.pointer,
+                node.header.as_ref(),
+                &node.header_allocations,
+            )? {
                 break;
             }
         }

@@ -409,7 +409,7 @@ fn state_readback_error_and_cancellation_never_start_following_mutation() {
     let cx = Cx::for_testing();
     cx.cancel_with(CancelKind::User, Some("before state publication"));
     assert!(set_dirty(&cx, &volume, true).is_err());
-    assert!(disk.lock().unwrap().events.is_empty());
+    assert_eq!(disk.lock().unwrap().events, [] as [Event; 0]);
     for cancel in [false, true] {
         {
             let mut state = disk.lock().unwrap();
