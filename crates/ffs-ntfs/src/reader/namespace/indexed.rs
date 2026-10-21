@@ -130,7 +130,7 @@ impl Search<'_, '_> {
 
     fn visit(
         &mut self,
-        entries: Vec<NtfsIndexEntry>,
+        entries: &[NtfsIndexEntry],
         depth: usize,
         lower: Option<&[u16]>,
         upper: Option<&[u16]>,
@@ -139,9 +139,9 @@ impl Search<'_, '_> {
         if depth > 32 {
             return Err(unsupported("NTFS index tree depth exceeds 32"));
         }
-        self.validate_node(&entries, lower, upper)?;
+        self.validate_node(entries, lower, upper)?;
         let mut previous = lower;
-        for entry in &entries {
+        for entry in entries {
             checkpoint(self.walker.cx)?;
             let boundary = entry
                 .key
@@ -154,7 +154,7 @@ impl Search<'_, '_> {
                     return Err(unsupported("NTFS index tree depth exceeds 32"));
                 }
                 let children = self.walker.read_child(vcn)?;
-                self.visit(children, depth + 1, previous, boundary)?;
+                self.visit(&children, depth + 1, previous, boundary)?;
             }
             if let Some(key) = &entry.key {
                 if key.1.name == self.name {
@@ -224,8 +224,7 @@ pub(super) fn lookup(
     name: &[u16],
     table: &[u16],
 ) -> Result<Option<NtfsReference>> {
-    lookup_entry(volume, cx, directory, name, table)
-        .map(|entry| entry.map(|entry| entry.reference))
+    lookup_entry(volume, cx, directory, name, table).map(|entry| entry.map(|entry| entry.reference))
 }
 
 fn lookup_entry(
@@ -258,7 +257,7 @@ fn lookup_entry(
         exact: Candidate::default(),
         folded: Candidate::default(),
     };
-    search.visit(entries, 0, None, None)?;
+    search.visit(&entries, 0, None, None)?;
     let candidate = if search.exact.key.is_some() {
         search.exact.finish()?
     } else {
