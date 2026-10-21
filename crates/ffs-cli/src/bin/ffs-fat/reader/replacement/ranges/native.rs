@@ -7,6 +7,7 @@
 
 mod collapse;
 mod copy;
+mod insert;
 mod zero;
 
 use super::super::super::{Entry, FatTable, FatVolume, FileChain, MAX_CHAIN_CLUSTERS};
@@ -67,7 +68,7 @@ impl FatVolume {
         (self, epoch)
     }
 
-    /// Apply native allocation, zeroing or cluster-aligned range collapse.
+    /// Apply native allocation, zeroing or cluster-aligned range insertion/collapse.
     /// The caller must own the volume's writer gate through cache publication.
     /// This is ordered allocation, not a sparse mapping or atomic transaction.
     pub fn preallocate(
@@ -80,6 +81,9 @@ impl FatVolume {
         now: u64,
     ) -> Result<()> {
         checkpoint(cx)?;
+        if mode == libc::FALLOC_FL_INSERT_RANGE {
+            return insert::apply(cx, self, path, offset, length, now);
+        }
         if mode == libc::FALLOC_FL_COLLAPSE_RANGE {
             return collapse::apply(cx, self, path, offset, length, now);
         }
