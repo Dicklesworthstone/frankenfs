@@ -122,7 +122,7 @@ fn record_ownership_preserves_native_sequence_base_and_attribute_identity_checks
         let mut image = Image::new(512);
         let mut list = list_value(&image);
         match case {
-            0 => list[48..56].copy_from_slice(&((8_u64 << 48) | 25).to_le_bytes()),
+            0 => list[48..56].copy_from_slice(&((8_u64 << 48) | 0x0019).to_le_bytes()),
             1 => list[56..58].copy_from_slice(&9_u16.to_le_bytes()),
             2 => list[40..48].copy_from_slice(&2_u64.to_le_bytes()),
             3 => list[48..56].copy_from_slice(&((7_u64 << 48) | 32).to_le_bytes()),
@@ -131,7 +131,7 @@ fn record_ownership_preserves_native_sequence_base_and_attribute_identity_checks
                 &record(
                     25,
                     &[mapped(512, 0, &[0x21, 1, 170, 0, 0], 1, 1, 0, false)],
-                    (8 << 48) | 24,
+                    (8 << 48) | 0x0018,
                 ),
             ),
         }

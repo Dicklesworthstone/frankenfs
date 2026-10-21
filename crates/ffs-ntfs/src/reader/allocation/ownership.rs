@@ -80,7 +80,7 @@ impl RecordOwnershipReport {
         self.limit_reached = Some(reason);
     }
 
-    fn issue(&mut self, record: u64, category: &'static str, detail: String) {
+    fn issue(&mut self, record: u64, category: &'static str, detail: &str) {
         if category == "unsupported" {
             self.unsupported += 1;
         } else {
@@ -104,7 +104,7 @@ impl RecordOwnershipReport {
 
     fn failed_record(&mut self, number: u64, error: FfsError) -> Result<()> {
         if matches!(error, FfsError::Cancelled) {
-            return Err(FfsError::Cancelled);
+            return Err(error);
         }
         self.complete = false;
         let category = match &error {
@@ -112,7 +112,7 @@ impl RecordOwnershipReport {
             FfsError::Io(_) => "io",
             _ => "record_catalog",
         };
-        self.issue(number, category, error.to_string());
+        self.issue(number, category, &error.to_string());
         Ok(())
     }
 }
@@ -316,7 +316,7 @@ impl NtfsVolume {
                 if bit(&extensions, number) && !bit(&owned, number) {
                     unowned += 1;
                     report.issue(number, "extension_without_owner",
-                        "allocated extension is absent from every validated base catalog; not authority to reclaim it".into());
+                        "allocated extension is absent from every validated base catalog; not authority to reclaim it");
                 }
             }
             report.extensions_without_owner = Some(unowned);

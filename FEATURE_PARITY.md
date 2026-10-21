@@ -27,8 +27,13 @@
 > **Native-producer finding, 2026-10-21:** the explicit facade test executed real
 > FAT16/FAT32 comparisons successfully, then failed NTFS admission on FILE
 > record flags. The parser omitted native metadata/view-index bits `0x4/0x8`.
-> A source-backed correction and exhaustive flag rejection controls are being
-> qualified; the overall native test is failed, and NTFS acceptance stays open.
+> At immutable `dcdc37e37`, the corrected parser selection passed 13 tests and
+> the unchanged native-producer facade test passed its FAT16/FAT32/NTFS plain
+> and bounded-image scenarios, including exact full/ranged/EOF bytes, write
+> refusal and unchanged source hashes. Native mounted, NTFS stream-selection
+> facade and ZFS acceptance remain open. The unchanged ZFS file/snapshot profiles
+> executed on OpenZFS 2.4.1 but failed because dataset discovery coerces unrelated
+> MOS ZAP arrays into scalar references; that native defect is being fixed.
 
 > **2026-09-08 audit status:** The following counts are legacy declared-contract
 > counts, not current executed results. In particular, the fast-commit row below

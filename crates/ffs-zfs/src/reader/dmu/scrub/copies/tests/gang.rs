@@ -13,14 +13,14 @@ const LENGTH: u64 = 8 * 1024 * 1024;
 const BASE: u64 = 4096;
 const HEADER: u64 = 0x40000;
 const TABLE: u64 = 0x80000;
-const FIRST: u64 = 0x100000;
-const SECOND: u64 = 0x140000;
-const THIRD: u64 = 0x180000;
-const FOURTH: u64 = 0x1c0000;
-const LEFT_HEADER: u64 = 0x200000;
-const RIGHT_HEADER: u64 = 0x240000;
-const EXTRA_HEADER: u64 = 0x280000;
-const DECOY: u64 = 0x2c0000;
+const FIRST: u64 = 0x0010_0000;
+const SECOND: u64 = 0x0014_0000;
+const THIRD: u64 = 0x0018_0000;
+const FOURTH: u64 = 0x001c_0000;
+const LEFT_HEADER: u64 = 0x0020_0000;
+const RIGHT_HEADER: u64 = 0x0024_0000;
+const EXTRA_HEADER: u64 = 0x0028_0000;
+const DECOY: u64 = 0x002c_0000;
 
 type RawPointer = [u8; 128];
 type ReadLog = Arc<Mutex<Vec<(usize, u64, usize)>>>;
@@ -212,55 +212,59 @@ impl Fixture {
     }
 
     fn store(&self, offset: u64, bytes: &[u8]) -> u64 {
-        if let Some(group) = &self.config.raidz_members {
-            let map = NativeMap::new(
-                offset,
-                bytes.len(),
-                self.config.ashift,
-                group.members.len(),
-                group.parity,
-            )
-            .unwrap();
-            let mut padded = bytes.to_vec();
-            padded.resize(map.aligned_bytes(), 0);
-            let data: Vec<_> = map
-                .columns()
-                .iter()
-                .filter(|c| c.data_offset.is_some())
-                .collect();
-            for column in &data {
-                let start = column.data_offset.unwrap();
-                self.store_at(
-                    column.child_id,
-                    column.offset,
-                    padded[start..start + column.bytes].to_vec(),
-                );
-            }
-            for row in 0..group.parity {
-                let column = &map.columns()[row];
-                let mut parity = vec![0; column.bytes];
-                // Coefficient products independently encode P/Q/R; the runtime
-                // auditor uses Horner evaluation rather than these products.
-                for (i, source) in data.iter().enumerate() {
-                    let mut coefficient = 1;
-                    for _ in 0..(data.len() - i - 1) * row {
-                        coefficient = product(u16::from(coefficient), 2);
-                    }
-                    let start = source.data_offset.unwrap();
-                    for (at, value) in parity.iter_mut().take(source.bytes).enumerate() {
-                        *value ^= product(u16::from(padded[start + at]), u16::from(coefficient));
-                    }
+        self.config.raidz_members.as_ref().map_or_else(
+            || {
+                for child in 0..self.states.len() {
+                    self.store_at(child, offset, bytes.to_vec());
                 }
-                self.store_at(column.child_id, column.offset, parity);
-            }
-            map.allocated_bytes()
-        } else {
-            for child in 0..self.states.len() {
-                self.store_at(child, offset, bytes.to_vec());
-            }
-            let sector = 1_u64 << self.config.ashift;
-            (bytes.len() as u64).div_ceil(sector) * sector
-        }
+                let sector = 1_u64 << self.config.ashift;
+                (bytes.len() as u64).div_ceil(sector) * sector
+            },
+            |group| {
+                let map = NativeMap::new(
+                    offset,
+                    bytes.len(),
+                    self.config.ashift,
+                    group.members.len(),
+                    group.parity,
+                )
+                .unwrap();
+                let mut padded = bytes.to_vec();
+                padded.resize(map.aligned_bytes(), 0);
+                let data: Vec<_> = map
+                    .columns()
+                    .iter()
+                    .filter(|c| c.data_offset.is_some())
+                    .collect();
+                for column in &data {
+                    let start = column.data_offset.unwrap();
+                    self.store_at(
+                        column.child_id,
+                        column.offset,
+                        padded[start..start + column.bytes].to_vec(),
+                    );
+                }
+                for row in 0..group.parity {
+                    let column = &map.columns()[row];
+                    let mut parity = vec![0; column.bytes];
+                    // Coefficient products independently encode P/Q/R; the runtime
+                    // auditor uses Horner evaluation rather than these products.
+                    for (i, source) in data.iter().enumerate() {
+                        let mut coefficient = 1;
+                        for _ in 0..(data.len() - i - 1) * row {
+                            coefficient = product(u16::from(coefficient), 2);
+                        }
+                        let start = source.data_offset.unwrap();
+                        for (at, value) in parity.iter_mut().take(source.bytes).enumerate() {
+                            *value ^=
+                                product(u16::from(padded[start + at]), u16::from(coefficient));
+                        }
+                    }
+                    self.store_at(column.child_id, column.offset, parity);
+                }
+                map.allocated_bytes()
+            },
+        )
     }
 
     fn fragment(&self, offset: u64, bytes: &[u8]) -> RawPointer {
@@ -278,7 +282,7 @@ impl Fixture {
             total + (self.order.u64(child, 0).unwrap() & 0x00ff_ffff) * 512
         });
         let mut parent = pointer(bytes, offset, allocated, kind, self.order);
-        word(&mut parent, 8, (1 << 63) | offset / 512, self.order);
+        word(&mut parent, 8, (1 << 63) | (offset / 512), self.order);
         let header = native_header(&parent, children, self.order);
         assert_eq!(self.store(offset, &header), header_bytes);
         parent
@@ -459,7 +463,7 @@ fn gang_redundancy_checks_second_header_dvas_and_nested_fragments() {
         let right = image.gang(RIGHT_HEADER, &physical[1024..], &children[2..], 0);
         let mut raw = image.gang(HEADER, &physical, &[left, right], 19);
         word(&mut raw, 16, 1, order);
-        word(&mut raw, 24, (1 << 63) | EXTRA_HEADER / 512, order);
+        word(&mut raw, 24, (1 << 63) | (EXTRA_HEADER / 512), order);
         image.store(EXTRA_HEADER, &native_header(&raw, &[left, right], order));
         let view = image.view(&raw, physical.len());
         assert!(view.scrub(&cx, limits()).unwrap().is_clean());

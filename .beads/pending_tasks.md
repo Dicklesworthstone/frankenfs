@@ -519,11 +519,11 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Format six merged files; verify normalized source and test attributes unchanged.
 - [x] Execute the facade suite at frozen `3b464766e`: 40 passed, no skips.
 - [x] Fix seven production FAT Clippy findings without changing publication checks.
-- [ ] Finish remaining all-target Clippy findings, preserving every test condition.
+- [x] Fix remaining known all-target Clippy findings, preserving every test condition.
 - [x] Independently diagnose the two FAT dropped-write probe failures.
 - [x] Bind both probes to actual publication bytes and assert fault injection occurred.
 - [x] Execute both corrected dropped-write controls with their original assertions.
-- [ ] Pass remote workspace/all-target compilation with exact source receipt.
+- [x] Pass remote workspace/all-target compilation with exact source receipt.
 - [ ] Pass remote workspace/all-target strict Clippy without suppressions.
 - [ ] Execute required harness test and benchmark commands through RCH.
 - [ ] Execute all three extracted engine suites with every retained regression.
@@ -535,15 +535,22 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Author an executable public-facade consumer with caller-owned runtime.
 - [ ] Compile and execute that consumer against independently produced native images.
 - [x] Author direct public-facade native-producer FAT16/FAT32/NTFS acceptance.
-- [ ] Execute native producer comparisons; retain original images and oracle logs.
+- [x] Execute native producer comparisons; retain original images and oracle logs.
 - [x] Reproduce NTFS facade admission failure with a real mkntfs/ntfscp image.
 - [x] Independently review native FILE flag definitions and exact admission split.
 - [x] Implement native metadata/view flag preservation with exhaustive unknown-bit controls.
-- [ ] Execute parser regressions and rerun the unchanged native-producer test.
+- [x] Execute parser regressions and rerun the unchanged native-producer test.
 - [x] Diagnose external dirty-image fixture's reserved-cluster address error.
 - [x] Re-execute both external FAT consumer tests with proven dirty-bit planting.
 - [x] Wire unchanged native FAT/NTFS profiles to explicit Cargo integration tests.
 - [ ] Execute both native companion integration tests against actual binaries.
+- [x] Choose and preflight a trusted OpenZFS host with sufficient scratch storage.
+- [x] Run unchanged native ZFS file and snapshot profiles on fresh exported pools.
+- [x] Identify the native MOS mixed-value ZAP failure without changing scalar validation.
+- [ ] Fix typed MOS root selection, retain malformed-reference rejection and verify natively.
+- [ ] Diagnose the native FAT Unicode-name profile failure against the stored name bytes.
+- [ ] Rerun the NTFS native companion profile after the executed FILE-flag correction.
+- [ ] Diagnose remote harness Git-source-identity failures without weakening its gates.
 - [ ] Complete original native public-facade FAT16/32, NTFS and ZFS acceptance.
 - [x] Review UBS findings and resolve actual production defects; retain test traps.
 - [ ] Re-execute acceptance in a fresh verification pass; keep unproved items open.
@@ -787,3 +794,35 @@ Changing logs are retained outside the transferred workspace under
 
 Remaining roadmap work stays under the 19 planned records above and the existing
 critical owner lanes. Native NTFS/ZFS writers are not implied by library access.
+
+Latest executed evidence (2026-10-21 16:04 UTC): immutable `dcdc37e37` passed
+workspace/all-target `cargo check` remotely (exit 0). Its NTFS parser selection
+passed **13 tests**, including exhaustive flag rejection and torn-record controls.
+The unchanged explicit native-producer facade test passed **1 test**, containing
+FAT16, FAT32 and NTFS plain/bounded native-image comparisons, exact full/ranged/EOF
+reads, write refusal and unchanged image/sentinel hashes. Native artifacts remain
+on `vmi1152480` at `.rch-tmp/ffs-facade-native-G4fgEu`; transcripts are
+`check-committed-dcdc.log`, `tests-ntfs-flags-dcdc.log` and
+`tests-native-producer-dcdc.log` in the external verification-log directory.
+This proves those native image cases; mounted, NTFS named-stream facade and ZFS
+acceptance remain open.
+
+The unchanged companion profiles at pre-fix `f844f950a` executed two tests and
+both failed: FAT16 Unicode lookup at command 014, NTFS root listing at command
+041. Preserve both failures pending diagnosis/rerun. On trusted CSD, OpenZFS
+2.4.1 created/populated/exported only fresh random scratch file pools beneath
+`/data/ssd/tmp/ffs-native-verification-7CWV8iQw`. The v6 companion failed both
+unchanged file and snapshot profiles before native payload comparison because
+MOS object 1 contains legitimate typed arrays (TXG history and checksum salt),
+while dataset discovery coerces the entire map to scalar references. Retained
+file/snapshot roots end in `ffs-zpl-native-qdvh13i4` and
+`ffs-snapshots-native-xxf0rk1_`. Existing pools were untouched; `buildpool` is the
+only remaining imported pool. No native ZFS pass is claimed.
+
+The harness command at `dcdc37e37` executed **2072 passed, 4 failed, 1 ignored**;
+four failures report missing Git source identity in the RCH workspace. Its gates
+remain unchanged. Full strict Clippy at `686206c79` failed on two equivalent
+NTFS ownership diagnostics and thirteen test-style findings, now manually fixed.
+The two test files retain all assertions and deliberate no-write/no-flush traps;
+UBS reports three such traps, 219 warnings and 26 informational findings, not a
+clean scan. Final strict lint and current-source verification remain pending.
