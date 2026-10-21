@@ -100,8 +100,13 @@ FUSE mounts on retained native plain, bounded and compressed images: 24 mounted
 byte comparisons and eight EROFS/ENOENT refusals, with successful unmounts and
 unchanged backing hashes. An independent rerun passed. This covers the strict
 NTFS adapter; indexed FsOps mounting and acceptance across all mounted formats
-remain open, alongside the full harness and benchmark gates under
-`bd-native-image-library-s4tde`. This is not release acceptance.
+remain open. The standalone public consumer built from `990539073` plus
+explicit overlays also passed 228 calls on retained native FAT16/FAT32, NTFS
+and ZFS images, including nine expected semantic failures and unchanged backing
+hashes. The full harness subsequently passed 2,652 tests, zero failures and 11
+ignored with a valid source receipt. Benchmark and later shared-source compiler
+gates remain open under `bd-native-image-library-s4tde`. These bounded results
+do not constitute release acceptance.
 Explicit native checks require their real producer tools:
 
 ```bash

@@ -25,7 +25,8 @@
 > same admitted volume. The unchanged native FAT and NTFS Cargo profile wrappers
 > also passed; NTFS executed 203 commands including 32 extension records and
 > compressed 512/4096-byte-cluster images. These are native offline-image results.
-> Acceptance remains open for the full harness and required benchmark gates.
+> The full harness subsequently passed; acceptance remains open for the required
+> benchmark and current shared-source compiler/formatting gates described below.
 > Acceptance across all mounted formats and extra parity credit are not claimed.
 > The bounded native NTFS mounted result below covers its strict read-only slice.
 > The older
@@ -80,9 +81,27 @@
 > receipt after command-scoped Git stat-cache refresh was disabled; its census
 > failure exposed stale LOC inventory in three meta modules. The numeric-only
 > correction preserves every path, classification and census assertion and earns
-> no capability credit. The current rerun passed that census target; remaining
-> full-harness targets are pending. Production admission and old assertions are
-> unchanged.
+> no capability credit. After restoring the accurate README source inventory,
+> the complete genuine-Git rerun passed 2,652 tests with zero failures and 11
+> ignored, including the checksum controls, census and public parity adversarial
+> targets. Its final source-content receipt is valid (build
+> `30074357740994971`, root
+> `7fa320e15e551fd22a4519099db37bbc9250fd8d3480192b519e7241cf071bb9`).
+> All 5,007 non-Beads root tracked files matched that frozen input before the
+> run. Later FAT parent-repair lint/formatting maintenance has separate pending
+> compiler gates; it is not silently included in that receipt. Production
+> admission and old assertions are unchanged.
+
+> **Current public-consumer refresh, 2026-10-21:** Linux ELF
+> `e862954f96cf7bfff76fd63d47465cd4b55dd0f1f3e3acb9c08e883b34e4ef48`,
+> built from `990539073` plus six explicit overlays, passed 120 public NTFS
+> calls and 108 public FAT/ZFS calls on retained native images, including nine
+> expected semantic failures. NTFS includes all 32 extension streams and both
+> exact selectors. FAT/ZFS replay retains all 164 original command expectations,
+> reruns six native FAT reads and compares 50 fresh outputs. All backing hashes
+> stayed unchanged. These are source-bound offline results; later shared-main
+> FAT recovery changes have separate qualification. EOF is consumer-clamped and
+> snapshot selections use separate processes.
 
 > **Native NTFS mounted slice, 2026-10-21:** the current RCH-delivered Linux CLI
 > candidate `3effe8ed21c9af9b5b0f537451e9f64fce869d58ce3d986ebbeb6eb0754d9d76`
