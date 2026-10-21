@@ -198,6 +198,28 @@ in this implementation session. See the
 [missing-RAIDZ extraction profile](docs/ZFS_MISSING_RAIDZ_PROFILE.md) for limits
 and validation still required before relying on the feature.
 
+### Check redundancy, not only readability
+
+`ffs-zfs scrub --verify-redundancy` rereads each ordinary physical copy in the
+selected dataset's DMU graph and checks RAIDZ P/Q/R parity against the actual
+checksum-valid data columns. A good alternate copy or successful reconstruction
+no longer conceals a damaged replica or parity sector in this explicit mode.
+Normal `scrub` retains its existing readability-only contract.
+
+```sh
+ffs-zfs scrub first.img --member second.img --offline-image \
+  --pool-guid 123 --label 0 --slot 2 --dataset data --snapshot before \
+  --verify-redundancy --max-copy-bytes 1073741824
+```
+
+The independent work budget is reserved before extra audit I/O. Missing members,
+unverified parity, unsupported gang-copy coverage and exhausted limits cannot
+produce a clean redundancy result. No writes, healing, resilvering or pool-wide
+coverage are implied; enclosing object-set roots, labels and other datasets stay
+outside this walk. Eleven new Rust controls are authored but not executed in
+this environment. See the [physical-copy audit profile](docs/ZFS_REDUNDANCY_SCRUB.md)
+for precise coverage, counters and qualification requirements.
+
 ## Build and explore
 
 Use the checked-in Rust toolchain and the platform/dependency instructions in the
@@ -229,6 +251,7 @@ projection and rejection rules are in the corresponding profiles:
 | ZFS datasets, snapshots, topology and read-only mounts | [ZFS profile](docs/ZFS_READ_PROFILE.md) |
 | ZFS committed-view extraction from explicitly incomplete mirrors | [Missing-mirror profile](docs/ZFS_MISSING_MIRROR_PROFILE.md) |
 | ZFS committed-view extraction with missing RAIDZ1/2/3 children | [Missing-RAIDZ profile](docs/ZFS_MISSING_RAIDZ_PROFILE.md) |
+| ZFS physical-copy and RAIDZ parity audit of selected DMU graphs | [Redundancy scrub profile](docs/ZFS_REDUNDANCY_SCRUB.md) |
 | ext4/btrfs architecture, operation and evidence | [Detailed guide](README_EXT4_BTRFS.md), [current parity ledger](FEATURE_PARITY.md) |
 
 ## Architecture and remaining priorities

@@ -5,6 +5,8 @@
 //! payloads (other datasets, snapshots, ZIL, or pool allocation metadata).
 //! Native layout reference: OpenZFS zfs-2.3.0 include/sys/dnode.h.
 
+mod copies;
+
 use super::{
     BlockPointer, CheckedBlock, Cx, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, FfsError, MAX_OBJECT,
     Objects, Result, checkpoint, corrupt, parse, unsupported,
@@ -19,6 +21,9 @@ pub struct ScrubLimits {
     pub pointers: u64,
     pub decoded_bytes: u64,
     pub objects: u64,
+    /// Some enables fresh physical-copy/parity verification with this work cap.
+    /// Independent of the ordinary decoded traversal budget; None preserves it.
+    pub copy_bytes: Option<u64>,
 }
 
 impl Default for ScrubLimits {
@@ -27,6 +32,7 @@ impl Default for ScrubLimits {
             pointers: 16_777_216,
             decoded_bytes: 1 << 40,
             objects: 1_048_576,
+            copy_bytes: None,
         }
     }
 }
@@ -60,6 +66,14 @@ pub struct ScrubReport {
     pub limit_reached: Option<&'static str>,
     pub issues: Vec<ScrubIssue>,
     pub omitted_issues: u64,
+    pub redundancy_requested: bool,
+    /// Conservative audit read/decode/parity work, not unique media bytes.
+    pub copy_work_bytes: u64,
+    pub copies_examined: u64,
+    pub raidz_columns_examined: u64,
+    pub parity_columns_checked: u64,
+    pub parity_columns_unverified: u64,
+    pub missing_native_members: usize,
 }
 
 impl ScrubReport {
@@ -69,6 +83,8 @@ impl ScrubReport {
             && self.unsupported == 0
             && self.incomplete_subtrees == 0
             && self.limit_reached.is_none()
+            && self.missing_native_members == 0
+            && self.parity_columns_unverified == 0
     }
 }
 
@@ -92,6 +108,37 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
+    /// Run only after checked() validates this pointer and returns traversal
+    /// bytes. The audit never supplies replacement bytes or populates caches.
+    fn audit_copies(
+        &mut self,
+        cx: &Cx,
+        object: u64,
+        position: Position,
+        bp: &BlockPointer,
+    ) -> Result<()> {
+        let Some(limit) = self.limits.copy_bytes else { return Ok(()) };
+        if bp.embedded() {
+            return Ok(());
+        }
+        let remaining = limit - self.report.copy_work_bytes;
+        match copies::verify(cx, self.view, bp, remaining) {
+            Ok(Some(audit)) => {
+                self.report.copy_work_bytes += audit.work_bytes;
+                self.report.copies_examined += audit.copies;
+                self.report.raidz_columns_examined += audit.columns;
+                self.report.parity_columns_checked += audit.parity_checked;
+                self.report.parity_columns_unverified += audit.parity_unverified;
+                for error in audit.faults {
+                    self.issue(object, position, &error, false)?;
+                }
+            }
+            Ok(None) => self.stop("physical-copy work budget"),
+            Err(error) => self.issue(object, position, &error, false)?,
+        }
+        checkpoint(cx)
+    }
+
     fn stop(&mut self, reason: &'static str) {
         if self.report.limit_reached.is_none() {
             self.report.limit_reached = Some(reason);
@@ -204,6 +251,7 @@ impl Walker<'_> {
                 Ok(Some(block)) => {
                     self.report.verified_blocks += 1;
                     self.report.verified_bytes += block.bytes.len() as u64;
+                    self.audit_copies(cx, tree.number, position, bp)?;
                 }
                 Ok(None) => self.issue(
                     tree.number,
@@ -266,6 +314,10 @@ impl Walker<'_> {
         };
         self.report.verified_blocks += 1;
         self.report.verified_bytes += block.bytes.len() as u64;
+        self.audit_copies(cx, tree.number, position, bp)?;
+        if self.report.limit_reached.is_some() {
+            return Ok(());
+        }
         if position.level == 0 {
             if tree.dnodes {
                 self.dnodes(cx, position.block, &block)?;
@@ -379,14 +431,16 @@ impl Objects {
     /// for reading the selected immutable backing again. Success is represented
     /// by report.is_clean(), not merely Ok(report). Cancellation is always Err.
     ///
-    /// Existing verified-copy recovery is used; not every mirror replica or
-    /// RAIDZ parity sector is read. This neither heals nor claims a pool-wide
+    /// Default mode uses verified-copy recovery. copy_bytes additionally audits
+    /// all ordinary physical copies and RAIDZ parity, without treating recovery
+    /// as evidence of intact redundancy. This neither heals nor claims a pool-wide
     /// allocation, ZIL, namespace, or cross-object-set consistency check.
     pub fn scrub(&self, cx: &Cx, limits: ScrubLimits) -> Result<ScrubReport> {
         checkpoint(cx)?;
         if limits.pointers == 0
             || limits.decoded_bytes == 0
             || limits.objects == 0
+            || limits.copy_bytes == Some(0)
             || limits.pointers > (1 << 32)
             || limits.objects > (1 << 32)
         {
@@ -418,6 +472,17 @@ impl Objects {
             limit_reached: None,
             issues: Vec::new(),
             omitted_issues: 0,
+            redundancy_requested: limits.copy_bytes.is_some(),
+            copy_work_bytes: 0,
+            copies_examined: 0,
+            raidz_columns_examined: 0,
+            parity_columns_checked: 0,
+            parity_columns_unverified: 0,
+            missing_native_members: if limits.copy_bytes.is_some() {
+                view.pool.missing_member_count()
+            } else {
+                0
+            },
         };
         let mut walker = Walker {
             view: &mut view,
@@ -433,6 +498,8 @@ impl Objects {
 companion_bin_tests! {
     #[cfg(test)]
     mod tests {
+        mod redundancy;
+
         use super::*;
         use crate::reader::{DATA_OFFSET, Endian, LABEL_BYTES, Leaf, VdevConfig};
         use ffs_block::ByteDevice;

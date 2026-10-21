@@ -15,6 +15,11 @@ use super::{
 pub(super) const ABSENT_RAIDZ_INDEX: usize = usize::MAX;
 
 impl Pool {
+    /// Readability from surviving copies is not intact native redundancy.
+    pub(in crate::reader) fn missing_member_count(&self) -> usize {
+        self.missing_mirror_guids.len() + self.missing_raidz_guids.len()
+    }
+
     /// Request-shape checks do not require opening an image. Native parity and
     /// GUID membership still have to be established from the surviving labels.
     pub fn check_raidz_survivors(supplied: usize, missing: &[u64]) -> Result<()> {
