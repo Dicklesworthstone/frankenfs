@@ -3,6 +3,7 @@
 //! Permissions are an explicit host projection, not an interpretation of ACLs.
 
 mod extents;
+mod indexed;
 mod recovery;
 
 use super::{
@@ -75,6 +76,7 @@ pub struct NtfsFs {
     upcase: Vec<u16>,
     uid: u32,
     gid: u32,
+    indexed_lookup: bool,
     cache: Mutex<Cache>,
 }
 
@@ -87,6 +89,24 @@ impl NtfsFs {
     }
 
     pub fn new(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
+        Self::build(cx, volume, uid, gid, false)
+    }
+
+    /// Explicit branch-directed LOOKUP for immutable native images. This does
+    /// not certify unvisited directory branches or unrelated FILE records.
+    /// READDIR remains a complete validated enumeration in both modes.
+    /// Native journal, root, provider and host projection admission is unchanged.
+    pub fn new_indexed(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
+        Self::build(cx, volume, uid, gid, true)
+    }
+
+    fn build(
+        cx: &Cx,
+        volume: NtfsVolume,
+        uid: u32,
+        gid: u32,
+        indexed_lookup: bool,
+    ) -> Result<Self> {
         checkpoint(cx)?;
         recovery::admit(cx, &volume)?;
         let record = volume.record(cx, 5, None)?;
@@ -124,12 +144,17 @@ impl NtfsFs {
             upcase,
             uid,
             gid,
+            indexed_lookup,
             cache: Mutex::new(Cache::default()),
         };
         if fs.describe(cx, ROOT)?.kind != FileType::Directory {
             return Err(corrupt(0, "NTFS mount root is a reparse object"));
         }
-        fs.directory(cx, ROOT)?;
+        if indexed_lookup {
+            fs.volume.admit_indexed_directory(cx, &record, &fs.upcase)?;
+        } else {
+            fs.directory(cx, ROOT)?;
+        }
         checkpoint(cx)?;
         Ok(fs)
     }
@@ -593,6 +618,9 @@ impl FsOps for NtfsFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> Result<InodeAttr> {
+        if self.indexed_lookup {
+            return self.lookup_indexed(cx, parent, name);
+        }
         if self.describe(cx, parent)?.kind != FileType::Directory {
             return Err(FfsError::NotDirectory);
         }

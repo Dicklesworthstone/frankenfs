@@ -8,7 +8,7 @@
 //! 2022.10.3 libntfs-3g/dir.c. This is independently written traversal code.
 
 use super::{
-    Cx, MAX_ENTRIES, NtfsFileName, NtfsFileRecord, NtfsIndexEntry, NtfsReference,
+    Cx, DirectoryEntry, MAX_ENTRIES, NtfsFileName, NtfsFileRecord, NtfsIndexEntry, NtfsReference,
     NtfsVolume, Result, Walker, checkpoint, corrupt, unsupported,
 };
 use std::cmp::Ordering;
@@ -62,17 +62,13 @@ struct Search<'a, 'volume> {
 }
 
 impl Search<'_, '_> {
-    fn visit(
+    fn validate_node(
         &mut self,
-        entries: Vec<NtfsIndexEntry>,
-        depth: usize,
+        entries: &[NtfsIndexEntry],
         lower: Option<&[u16]>,
         upper: Option<&[u16]>,
     ) -> Result<()> {
         checkpoint(self.walker.cx)?;
-        if depth > 32 {
-            return Err(unsupported("NTFS index tree depth exceeds 32"));
-        }
         // Validate the entire loaded node before trusting any separator or
         // candidate. Unvisited descendant contents are deliberately not read.
         let (terminal, keys) = entries
@@ -101,7 +97,7 @@ impl Search<'_, '_> {
             }
             previous = Some(&filename.name);
         }
-        for entry in &entries {
+        for entry in entries {
             checkpoint(self.walker.cx)?;
             if let Some(vcn) = entry.child_vcn {
                 self.walker.child_offset(vcn)?;
@@ -111,7 +107,22 @@ impl Search<'_, '_> {
             }
         }
 
-        previous = lower;
+        checkpoint(self.walker.cx)
+    }
+
+    fn visit(
+        &mut self,
+        entries: Vec<NtfsIndexEntry>,
+        depth: usize,
+        lower: Option<&[u16]>,
+        upper: Option<&[u16]>,
+    ) -> Result<()> {
+        checkpoint(self.walker.cx)?;
+        if depth > 32 {
+            return Err(unsupported("NTFS index tree depth exceeds 32"));
+        }
+        self.validate_node(&entries, lower, upper)?;
+        let mut previous = lower;
         for entry in &entries {
             checkpoint(self.walker.cx)?;
             let boundary = entry.key.as_ref().map_or(upper, |(_, key)| Some(key.name.as_slice()));
@@ -141,6 +152,50 @@ impl Search<'_, '_> {
     }
 }
 
+impl NtfsVolume {
+    /// Mount-only bridge: the filesystem retains the already validated native
+    /// UpCase table. Do not expose a caller-supplied collation table publicly.
+    pub(in crate::reader) fn lookup_indexed_entry(
+        &self,
+        cx: &Cx,
+        directory: &NtfsFileRecord,
+        name: &[u16],
+        table: &[u16],
+    ) -> Result<Option<DirectoryEntry>> {
+        lookup_entry(self, cx, directory, name, table)
+    }
+
+    /// Admit the root node and every descriptor it contains without reading
+    /// child blocks or sibling FILEs. This is not whole-directory validation.
+    pub(in crate::reader) fn admit_indexed_directory(
+        &self,
+        cx: &Cx,
+        directory: &NtfsFileRecord,
+        table: &[u16],
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        if table.len() != 65_536 {
+            return Err(corrupt(0, "invalid NTFS indexed mount UpCase table"));
+        }
+        let (mut walker, entries) = self.directory_index(cx, directory)?;
+        let mut search = Search {
+            walker: &mut walker,
+            parent: NtfsReference {
+                record: u64::from(directory.number),
+                sequence: directory.sequence,
+            },
+            name: &[],
+            table,
+            keys_examined: 0,
+            declared_children: BTreeSet::new(),
+            exact: Candidate::default(),
+            folded: Candidate::default(),
+        };
+        search.validate_node(&entries, None, None)?;
+        checkpoint(cx)
+    }
+}
+
 pub(super) fn lookup(
     volume: &NtfsVolume,
     cx: &Cx,
@@ -148,6 +203,17 @@ pub(super) fn lookup(
     name: &[u16],
     table: &[u16],
 ) -> Result<Option<NtfsReference>> {
+    lookup_entry(volume, cx, directory, name, table)
+        .map(|entry| entry.map(|entry| entry.reference))
+}
+
+fn lookup_entry(
+    volume: &NtfsVolume,
+    cx: &Cx,
+    directory: &NtfsFileRecord,
+    name: &[u16],
+    table: &[u16],
+) -> Result<Option<DirectoryEntry>> {
     checkpoint(cx)?;
     // Only the validated volume UpCase table reaches this internal boundary.
     // Keep an explicit length guard rather than indexing a truncated table.
@@ -175,8 +241,7 @@ pub(super) fn lookup(
         Some((reference, filename)) => {
             // Reuse complete catalog/sequence/FILE_NAME/provider validation,
             // but do not load unrelated siblings' MFT records.
-            volume.verify_directory_entry(cx, reference, filename)?;
-            Some(reference)
+            Some(volume.verify_directory_entry(cx, reference, filename)?)
         }
         None => None,
     };
