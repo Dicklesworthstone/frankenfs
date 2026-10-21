@@ -277,15 +277,43 @@ fn shrink_in_volume(cx: &Cx, volume: &FatVolume, path: &str, size: u32, now: u64
     if sector[within..within + 32] != original {
         bail!("shrink target changed before dirty publication");
     }
+    // A shorter little-endian length is not necessarily safe to write in one
+    // sector update: 0x00010000 -> 0x0000FFFF can tear into 0x0001FFFF.
+    // Publish their bitwise intersection first whenever the final size sets a
+    // previously clear bit. Both transitions then change bits in one direction,
+    // so a mixture of their old/new size bytes cannot exceed the relevant EOF.
+    // Unlike unconditionally hiding EOF, this keeps any common prefix visible.
+    // Truncate-to-zero must also persist zero EOF with the OLD head before
+    // clearing either half of a FAT32 head (or the FAT16 low word).
+    let guard_size = entry.native.size & size;
+    let needs_guard = guard_size != size || first != entry.native.first_cluster;
+    let mut guarded = original;
+    if needs_guard {
+        guarded[28..32].copy_from_slice(&guard_size.to_le_bytes());
+    }
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
         set_hints(cx, volume, u32::MAX)?;
         volume.device.sync(cx)?;
+        if needs_guard {
+            phase = "publishing a bounded EOF before the shorter directory entry";
+            volume.read_exact(cx, start, &mut sector)?;
+            if sector[within..within + 32] != original {
+                bail!("shrink target changed before guarded length publication");
+            }
+            sector[within..within + 32].copy_from_slice(&guarded);
+            write_volume(cx, volume, start, &sector)?;
+            volume.device.sync(cx)?;
+            volume.read_exact(cx, start, &mut readback)?;
+            if readback != sector {
+                bail!("guarded shrink sector failed readback; no chain cut or reclamation attempted");
+            }
+        }
         phase = "publishing the shorter directory entry";
         volume.read_exact(cx, start, &mut sector)?;
-        if sector[within..within + 32] != original {
-            bail!("shrink target changed after dirty publication");
+        if sector[within..within + 32] != guarded {
+            bail!("shrink target changed before final length publication");
         }
         sector[within..within + 32].copy_from_slice(&updated);
         write_volume(cx, volume, start, &sector)?;
@@ -435,6 +463,8 @@ companion_bin_tests! {
 mod tests {
     use super::super::{SliceSource, creation, hash_device, open_volume};
     use super::*;
+
+    mod shrink_publication;
 
     #[test]
     fn edited_source_matches_materialized_oracle_at_every_window() {
