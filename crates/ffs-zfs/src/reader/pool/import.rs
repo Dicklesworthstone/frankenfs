@@ -293,7 +293,10 @@ impl Pool {
             admit_single(&labels[0], pool_guid)?
         } else if integer(&first.1.config, "vdev_children")? > 1 {
             if labels.iter().any(|copies| {
-                copies[0].1.config.list("vdev_tree")
+                copies[0]
+                    .1
+                    .config
+                    .list("vdev_tree")
                     .is_some_and(|tree| tree.text("type") == Some("mirror"))
             }) {
                 // Physical image count is not top-level vdev count. Keep every
