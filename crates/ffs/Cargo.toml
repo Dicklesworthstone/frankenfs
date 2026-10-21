@@ -7,11 +7,22 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+asupersync = { workspace = true }
+ffs-block = { workspace = true }
 ffs-core = { workspace = true }
+ffs-error = { workspace = true }
+ffs-fat = { workspace = true }
+ffs-ntfs = { workspace = true }
+ffs-ondisk = { workspace = true }
+ffs-types = { workspace = true }
+ffs-zfs = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-asupersync = { workspace = true }
+asupersync = { workspace = true, features = ["test-internals"] }
+clap = { workspace = true }
 ffs-ondisk = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

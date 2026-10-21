@@ -187,7 +187,7 @@
 | 13 | `ffs-fuse` | FUSE interface: FuseBackend trait, MountOptions, FrankenFuseMount — delegates to `ffs-core::FsOps` implementations (currently `OpenFs`) and does not depend on domain crates directly | `ffs-core`, `ffs-types`, `ffs-error`, `asupersync`, `fuser`, `libc`, `serde`, `thiserror`, `tracing` | 7 |
 | 14 | `ffs-repair` | RaptorQ self-healing: generate/store repair symbols per block group, detect corruption via checksum, recover blocks, background scrub | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `blake3`, `crc32c` | 8 |
 | 15 | `ffs-core` | Engine integration: format detection (`FsFlavor`), `OpenFs` (`FsOps` implementation for ext4/btrfs dispatch), `FrankenFsEngine` MVCC utility APIs, DurabilityAutopilot (Bayesian redundancy), mount orchestration | `ffs-types`, `ffs-error`, `ffs-ondisk`, `ffs-block`, `ffs-mvcc`, `ffs-btrfs`, `asupersync`, `serde`, `thiserror` | 7 |
-| 16 | `ffs` | Public API facade: re-exports core functionality, stable external interface | `ffs-core` | 9 |
+| 16 | `ffs` | Public API facade: core exports plus ambiguity-checked, bounded read-only six-format opening through the native engines | `ffs-core`, `ffs-block`, `ffs-fat`, `ffs-ntfs`, `ffs-zfs`, `asupersync` | 9 |
 | 17 | `ffs-cli` | CLI binary: `ffs inspect`, `ffs info`, `ffs dump`, `ffs fsck`, `ffs repair`, `ffs mount`, `ffs scrub`, `ffs parity` | `ffs-core`, `ffs-block`, `ffs-fuse`, `ffs-harness`, `ffs-ondisk`, `ffs-repair`, `ffs-types`, `anyhow`, `asupersync`, `clap`, `serde`, `serde_json` | 9 |
 | 18 | `ffs-tui` | TUI monitoring: live cache stats, MVCC version counts, repair status, I/O throughput | `ffs`, `ftui` | 9 |
 | 19 | `ffs-harness` | Conformance testing harness: parity reports, sparse JSON fixtures, compare FrankenFS behavior against real ext4/btrfs images | `ffs-core`, `ffs-ondisk`, `ffs-types`, `anyhow`, `hex`, `serde`, `serde_json`; dev: `criterion` | 9 |
@@ -196,7 +196,39 @@
 
 ---
 
-The 22nd member, `ffs-ops` in `tools/ffs-ops`, provides operational validation commands and depends on `ffs-harness`, `anyhow`, and `serde_json`.
+The operational member `ffs-ops` in `tools/ffs-ops` provides validation commands
+and depends on `ffs-harness`, `anyhow`, and `serde_json`.
+
+The native companion engines also have dedicated library members:
+
+| Crate | Owned implementation | Consumers |
+|---|---|---|
+| `ffs-fat` | FAT16/32 reader, ordered writer, formatter, recovery, resize and `FatFs`; shared native selectors and command schema | `ffs-fat` binary, protected mount, `ffs` facade |
+| `ffs-ntfs` | NTFS native reader, volatile recovery, exact stream selectors and `NtfsFs` | `ffs-ntfs` binary, protected mount, `ffs` facade |
+| `ffs-zfs` | ZFS leaf/pool, DMU, ZPL/snapshots, volatile ZIL and `ZfsFs` | `ffs-zfs` binary, protected mount, `ffs` facade |
+
+`ffs::open_read_only` selects the existing `FsOps` implementation after probing
+all six signatures; explicit backend selection does not suppress ambiguity.
+The primary image and additional ZFS members use retained OS read-only regular
+file descriptors with shared locks and bounded `VolumeDevice` views. ext4
+recovery uses a volatile overlay, external journals are opened read-only, and
+the result exposes no format-specific `enable_writes`. NTFS keeps its clean-log
+mounted-view admission. ZFS retains explicit pool, candidate, dataset, snapshot,
+topology and optional volatile replay selections; historical snapshots open
+without requiring a valid live head. Native refusal rules still apply.
+
+This is a facade composition boundary: `OpenFs` and `FsFlavor` themselves remain
+ext4/btrfs. Native NTFS/ZFS writers, cross-format MVCC, automatic repair and live
+pool ownership are separate obligations. The new libraries own no runtime or
+process-wide signal policy. FAT retains its existing clap argument records and
+shared pure command schema; its binary owns execution and signal handling.
+The protected mount imports these crates instead of compiling private engine
+copies through `#[path]`. Existing engine tests remain with their implementation.
+
+The extraction and facade source are implemented; current compiler/runtime
+qualification is pending build admission, tracked by
+`bd-native-image-library-s4tde`. Source movement and formatting are not executed
+native or mounted acceptance evidence.
 
 ## 2. Dependency Graph
 

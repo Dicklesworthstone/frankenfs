@@ -35,6 +35,16 @@ pub fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
     super::prepare(cx, args)
 }
 
+/// Core-only fixtures must select the variant explicitly. Production dispatch
+/// stays on `FsOps` and cannot implicitly coerce a native reader into `OpenFs`.
+fn core(prepared: &Prepared) -> &OpenFs {
+    match prepared.fs.as_ref() {
+        ProtectedFs::Core(fs) => Some(fs.as_ref()),
+        ProtectedFs::Fat { .. } | ProtectedFs::Ntfs(_) | ProtectedFs::Zfs(_) => None,
+    }
+    .expect("this fixture requires the ext4/btrfs engine")
+}
+
 /// `ffs_repair::sidecar::verify`, after any in-flight child spawn has exec'd.
 pub fn verify(
     cx: &Cx,
@@ -267,9 +277,8 @@ fn filesystem_read_repairs_corrupt_data_before_returning_it() {
     let cx = Cx::for_testing();
     let block = fixture.first_block("/payload");
     let prepared = prepare(&cx, &fixture.args()).expect("open protected filesystem");
-    // `OpenFs::` explicitly: `Arc<OpenFs>` also implements `FsOps`, whose
-    // scope-taking methods method resolution would otherwise pick.
-    let inode = OpenFs::lookup(&prepared.fs, &cx, InodeNumber(2), OsStr::new("payload"))
+    // Select the core variant explicitly; `FsOps` has scope-taking methods.
+    let inode = OpenFs::lookup(core(&prepared), &cx, InodeNumber(2), OsStr::new("payload"))
         .unwrap()
         .ino;
     let original = fixture.read_block(block);
@@ -277,7 +286,7 @@ fn filesystem_read_repairs_corrupt_data_before_returning_it() {
     assert_ne!(fixture.read_block(block), original);
     assert_eq!(
         OpenFs::read(
-            &prepared.fs,
+            core(&prepared),
             &cx,
             inode,
             0,
@@ -303,7 +312,7 @@ fn filesystem_lookup_repairs_directory_metadata_before_parsing_it() {
     let prepared = prepare(&cx, &fixture.args()).unwrap();
     let original = fixture.read_block(block);
     fixture.damage_block(block);
-    let attr = OpenFs::lookup(&prepared.fs, &cx, InodeNumber(2), OsStr::new("payload")).unwrap();
+    let attr = OpenFs::lookup(core(&prepared), &cx, InodeNumber(2), OsStr::new("payload")).unwrap();
     assert_eq!(attr.size, u64::try_from(fixture.payload.len()).unwrap());
     assert_eq!(fixture.read_block(block), original);
     prepared.finish(&cx).unwrap();
@@ -354,7 +363,7 @@ fn readonly_filesystem_and_adapter_cannot_write_caller_data() {
         Err(FfsError::ReadOnly)
     ));
     let error = OpenFs::create(
-        &prepared.fs,
+        core(&prepared),
         &cx,
         InodeNumber(2),
         OsStr::new("no-write"),
@@ -437,20 +446,28 @@ impl Fixture {
 }
 
 fn create_written(prepared: &Prepared, cx: &Cx, parent: InodeNumber, data: &[u8]) -> InodeNumber {
-    let inode = OpenFs::create(&prepared.fs, cx, parent, OsStr::new("written"), 0o600, 0, 0)
-        .unwrap()
-        .ino;
-    let written = OpenFs::write(&prepared.fs, cx, inode, 0, data).unwrap();
+    let inode = OpenFs::create(
+        core(prepared),
+        cx,
+        parent,
+        OsStr::new("written"),
+        0o600,
+        0,
+        0,
+    )
+    .unwrap()
+    .ino;
+    let written = OpenFs::write(core(prepared), cx, inode, 0, data).unwrap();
     assert_eq!(usize::try_from(written).unwrap(), data.len());
     inode
 }
 
 fn assert_file(prepared: &Prepared, cx: &Cx, parent: InodeNumber, name: &str, data: &[u8]) {
-    let attr = OpenFs::lookup(&prepared.fs, cx, parent, OsStr::new(name)).unwrap();
+    let attr = OpenFs::lookup(core(prepared), cx, parent, OsStr::new(name)).unwrap();
     assert_eq!(attr.size, u64::try_from(data.len()).unwrap());
     assert_eq!(
         OpenFs::read(
-            &prepared.fs,
+            core(prepared),
             cx,
             attr.ino,
             0,
@@ -622,14 +639,13 @@ fn protected_journalled_ext4_uses_internal_writer_and_publishes_fsync_bd_7zjfh()
     let cx = Cx::for_testing();
     let prepared = prepare(&cx, &fixture.writable_args()).unwrap();
     assert!(
-        prepared
-            .fs
+        core(&prepared)
             .ext4_superblock()
             .unwrap()
             .has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL)
     );
     assert!(
-        prepared.fs.has_jbd2_writer(),
+        core(&prepared).has_jbd2_writer(),
         "protected journalled ext4 must not bypass the ordinary journal durability rule"
     );
     let data: Vec<u8> = (0_u32..65_553)
@@ -669,8 +685,8 @@ fn protected_journalled_ext4_refuses_missing_or_empty_journal_bd_7zjfh() {
         let mut fixture = Fixture::ext4_with_journal(true);
         let cx = Cx::for_testing();
         let original = prepare(&cx, &fixture.args()).unwrap();
-        assert_eq!(original.fs.ext4_superblock().unwrap().journal_inum, 8);
-        let original_inode = original.fs.read_inode(&cx, InodeNumber(8)).unwrap();
+        assert_eq!(core(&original).ext4_superblock().unwrap().journal_inum, 8);
+        let original_inode = core(&original).read_inode(&cx, InodeNumber(8)).unwrap();
         assert_ne!(original_inode.flags & ffs_types::EXT4_EXTENTS_FL, 0);
         let (original_header, _) =
             ffs_ondisk::parse_extent_tree(&original_inode.extent_bytes).unwrap();
@@ -703,10 +719,10 @@ fn protected_journalled_ext4_refuses_missing_or_empty_journal_bd_7zjfh() {
         let archive = std::fs::read(&fixture.sidecar).unwrap();
         let readonly = prepare(&cx, &fixture.args()).unwrap();
         if mutation == "set_super_value journal_inum 0" {
-            assert_eq!(readonly.fs.ext4_superblock().unwrap().journal_inum, 0);
+            assert_eq!(core(&readonly).ext4_superblock().unwrap().journal_inum, 0);
         } else {
-            assert_eq!(readonly.fs.ext4_superblock().unwrap().journal_inum, 8);
-            let inode = readonly.fs.read_inode(&cx, InodeNumber(8)).unwrap();
+            assert_eq!(core(&readonly).ext4_superblock().unwrap().journal_inum, 8);
+            let inode = core(&readonly).read_inode(&cx, InodeNumber(8)).unwrap();
             let (header, tree) = ffs_ondisk::parse_extent_tree(&inode.extent_bytes).unwrap();
             assert_eq!(header.magic, original_header.magic);
             assert_eq!(header.max_entries, original_header.max_entries);
@@ -739,7 +755,7 @@ fn filesystem_fsync_and_fdatasync_publish_each_new_protection_point() {
     let inode = create_written(&prepared, &cx, InodeNumber(2), &[0; 8193]);
     for (datasync, byte) in [(false, 0x37), (true, 0x92)] {
         let data = vec![byte; 8193];
-        let written = OpenFs::write(&prepared.fs, &cx, inode, 0, &data).unwrap();
+        let written = OpenFs::write(core(&prepared), &cx, inode, 0, &data).unwrap();
         assert_eq!(usize::try_from(written).unwrap(), data.len());
         FsOps::fsync(
             prepared.fs.as_ref(),

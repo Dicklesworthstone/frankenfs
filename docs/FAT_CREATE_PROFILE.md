@@ -139,10 +139,12 @@ passed RCH workspace/all-target check `j-30063538684821519`, strict Clippy
 `j-30063538684821516` and formatting on base `eeef44fe3` plus overlay
 `c58623d3232fa8c06bc8bdb3ca6de7d6da6b23952d887639b50a2e3280f36a81`.
 Earlier gate failures were fixed without removing any verification condition or
-test case. The unchanged required checks include:
+test case. Engine tests have moved into the `ffs-fat` library; these current
+verification commands do not imply a new execution result.
 
 ```sh
-rch exec -- cargo test -p ffs-cli --bin ffs-fat replacement
+rch exec -- cargo test -p ffs-fat --lib replacement
+rch exec -- cargo check -p ffs-cli --bin ffs-fat
 rch exec -- cargo check --workspace --all-targets
 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check

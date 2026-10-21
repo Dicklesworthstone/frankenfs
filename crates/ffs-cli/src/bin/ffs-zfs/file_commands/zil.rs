@@ -38,10 +38,14 @@ pub enum Command {
 
 fn preflight(candidate: &CandidateArgs) -> Result<()> {
     if !candidate.missing_raidz_members.is_empty() {
-        bail!("missing RAIDZ members admit committed-view extraction, not ZIL inspection or recovery");
+        bail!(
+            "missing RAIDZ members admit committed-view extraction, not ZIL inspection or recovery"
+        );
     }
     if !candidate.missing_mirror_members.is_empty() {
-        bail!("missing mirror members admit committed-view extraction, not ZIL inspection or recovery");
+        bail!(
+            "missing mirror members admit committed-view extraction, not ZIL inspection or recovery"
+        );
     }
     // The live sidecar can heal through a read. Reject before opening either
     // file, not merely after wrapping a potentially writable backing device.
@@ -133,16 +137,35 @@ mod tests {
             ("zil-inspect", Vec::new()),
             ("zil-read", vec!["/file", "--bytes", "1"]),
         ] {
-            let cli = Cli::try_parse_from([
-                "ffs-zfs", command, "unopened-mirror.img", "--offline-image",
-                "--pool-guid", "123", "--label", "0", "--slot", "2",
-                "--missing-mirror-member", "1002",
-            ].into_iter().chain(extra)).unwrap();
+            let cli = Cli::try_parse_from(
+                [
+                    "ffs-zfs",
+                    command,
+                    "unopened-mirror.img",
+                    "--offline-image",
+                    "--pool-guid",
+                    "123",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "2",
+                    "--missing-mirror-member",
+                    "1002",
+                ]
+                .into_iter()
+                .chain(extra),
+            )
+            .unwrap();
             let TopCommand::File(command) = cli.command else {
                 panic!("ZIL command");
             };
-            assert!(command.run(&Cx::for_testing()).unwrap_err().to_string()
-                .contains("not ZIL inspection or recovery"));
+            assert!(
+                command
+                    .run(&Cx::for_testing())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not ZIL inspection or recovery")
+            );
         }
     }
 

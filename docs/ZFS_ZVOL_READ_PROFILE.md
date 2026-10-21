@@ -73,8 +73,11 @@ but compilation, Rust test passage, Clippy and native OpenZFS validation are not
 Run the pinned workspace tests and compare read ranges, capacities and snapshots
 against volumes created by the pinned OpenZFS version before claiming support:
 
+Engine tests have moved into the `ffs-zfs` library, with separate CLI tests;
+these current verification commands do not imply a new execution result.
+
 ```sh
-rch exec -- cargo test -p ffs-cli --bin ffs-zfs -- zvol
+rch exec -- cargo test -p ffs-zfs --lib -- zvol
 rch exec -- cargo test -p ffs-cli --bin ffs-zfs
 rch exec -- cargo check --workspace --all-targets
 rch exec -- cargo clippy --workspace --all-targets -- -D warnings

@@ -4,6 +4,21 @@
 
 ## 1. Coverage Summary (Current)
 
+> **2026-10-21 native library integration (`bd-native-image-library-s4tde`):**
+> FAT, NTFS and ZFS engine source and existing tests now live in dedicated
+> library crates. Ordinary companions and protected mounts consume those same
+> engines. `ffs::open_read_only` composes their existing `FsOps` adapters with
+> ext4/btrfs after six-format ambiguity checking, using bounded read-only image
+> authority and explicit native view selection. `OpenFs` itself remains
+> ext4/btrfs. Five new facade controls cover constructed native FAT16/32 and ext4
+> reads, mutation refusal, volume sentinels, retained locks, ambiguity and invalid
+> ZFS/cancellation preflight; two new FAT consumer tests cover repeatable library
+> operations without global signal handlers. These tests are authored, not yet
+> executed. Build admission remains failed; no current compilation, native
+> interchange, mounted acceptance or extra parity credit is claimed. The older
+> six-format `OpenFs` row below still has only its detection-test binding; this
+> source integration does not silently promote that binding to mounted proof.
+
 > **2026-09-08 audit status:** The following counts are legacy declared-contract
 > counts, not current executed results. In particular, the fast-commit row below
 > is partial pending external crash-image verification. Public execution-bound

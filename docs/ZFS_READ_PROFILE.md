@@ -579,8 +579,12 @@ These are implementation bounds, not maximum sizes of the native filesystem.
 
 ## Validation and evidence
 
+Engine tests have moved into the `ffs-zfs` library, with separate CLI tests;
+these current verification commands do not imply a new execution result.
+
 ```sh
 rch exec -- cargo test -p ffs-ondisk zfs
+rch exec -- cargo test -p ffs-zfs
 rch exec -- cargo test -p ffs-cli --bin ffs-zfs
 python3 scripts/verify_zfs_root.py --binary target/debug/ffs-zfs --create-scratch-pool
 

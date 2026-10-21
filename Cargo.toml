@@ -16,6 +16,9 @@ members = [
     "crates/ffs-fuse",
     "crates/ffs-repair",
     "crates/ffs-core",
+    "crates/ffs-ntfs",
+    "crates/ffs-fat",
+    "crates/ffs-zfs",
     "crates/ffs",
     "crates/ffs-cli",
     "crates/ffs-tui",
@@ -128,6 +131,9 @@ ftui = "0.3.1"
 ffs = { path = "crates/ffs" }
 ffs-alloc = { path = "crates/ffs-alloc" }
 ffs-block = { path = "crates/ffs-block" }
+ffs-ntfs = { path = "crates/ffs-ntfs" }
+ffs-fat = { path = "crates/ffs-fat" }
+ffs-zfs = { path = "crates/ffs-zfs" }
 ffs-btree = { path = "crates/ffs-btree" }
 ffs-btrfs = { path = "crates/ffs-btrfs" }
 ffs-cli = { path = "crates/ffs-cli" }

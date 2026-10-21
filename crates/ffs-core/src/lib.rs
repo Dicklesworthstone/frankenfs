@@ -9254,7 +9254,7 @@ impl OpenFs {
         // Open the journal device image and read its first block to parse
         // the JBD2 superblock. We use the data FS block size as the read size;
         // the actual journal block size is only known after parsing.
-        let journal_dev = FileByteDevice::open(path)?;
+        let journal_dev = FileByteDevice::open_read_only(path)?;
         let read_size = sb.block_size;
 
         // Read the first block — JBD2 superblock is at the start of the journal.
@@ -9463,7 +9463,7 @@ impl OpenFs {
             return Ok(Some(ReplayOutcome::default()));
         }
 
-        let journal_file = FileByteDevice::open(path)?;
+        let journal_file = FileByteDevice::open_read_only(path)?;
         let block_len = usize::try_from(block_size)
             .map_err(|_| FfsError::Format("block size does not fit usize".to_owned()))?;
         let mut journal_sb_block = vec![0u8; block_len];

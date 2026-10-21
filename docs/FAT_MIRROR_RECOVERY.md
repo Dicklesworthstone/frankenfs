@@ -83,6 +83,10 @@ Rust compilation and these Rust tests have not executed in the authoring
 environment because Cargo is absent. Independent Python projection/fault models
 are supplementary evidence, not Rust, FUSE or native-OS qualification.
 
+Engine tests have moved into the `ffs-fat` library; these current verification
+commands do not imply a new execution result.
+
 ```sh
-cargo test -p ffs-cli --bin ffs-fat mirrors
+rch exec -- cargo test -p ffs-fat --lib mirrors
+rch exec -- cargo check -p ffs-cli --bin ffs-fat
 ```

@@ -6,29 +6,9 @@
 //! Caller writes require --rw; read-only remains the default. The ordinary
 //! mount command is unchanged, and startup differences never authorize rollback.
 
-macro_rules! companion_bin_tests {
-    ($($item:item)*) => {};
-}
-
-#[allow(unused, dead_code, clippy::all, clippy::pedantic, clippy::nursery)]
-#[path = "../ffs-fat"]
-mod fat {
-    pub mod filesystem;
-    pub mod reader;
-}
-
-#[allow(unused, dead_code, clippy::all, clippy::pedantic, clippy::nursery)]
-#[path = "../ffs-ntfs"]
-mod ntfs {
-    pub mod reader;
-}
-
-#[allow(unused, dead_code, clippy::all, clippy::pedantic, clippy::nursery)]
-#[path = "../ffs-zfs"]
-mod zfs {
-    pub mod filesystem;
-    pub mod reader;
-}
+use ffs_fat as fat;
+use ffs_ntfs as ntfs;
+use ffs_zfs as zfs;
 
 #[path = "../../mount_worker.rs"]
 mod mount_worker;
@@ -156,19 +136,6 @@ impl ProtectedFs {
             Self::Fat { fs, .. } => fs.as_ref(),
             Self::Ntfs(fs) => fs.as_ref(),
             Self::Zfs(fs) => fs.as_ref(),
-        }
-    }
-}
-
-impl std::ops::Deref for ProtectedFs {
-    type Target = OpenFs;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Core(fs) => fs.as_ref(),
-            Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => {
-                panic!("OpenFs deref is only valid on ext4/btrfs ProtectedFs::Core")
-            }
         }
     }
 }

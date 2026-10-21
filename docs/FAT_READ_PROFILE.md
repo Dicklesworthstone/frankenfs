@@ -162,7 +162,7 @@ reader evidence elsewhere in this document does not qualify replacement.
 The repository regression command is:
 
 ```sh
-rch exec -- cargo test -p ffs-cli --bin ffs-fat replacement
+rch exec -- cargo test -p ffs-fat --lib replacement
 ```
 
 ## New-image formatter
@@ -546,9 +546,13 @@ and do not provide a repair plan.
 
 ## Executable checks and evidence limits
 
+Engine and argument-schema tests have moved into the `ffs-fat` library; these
+current verification commands do not imply a new execution result.
+
 ```sh
 rch exec -- cargo test -p ffs-ondisk fat
-rch exec -- cargo test -p ffs-cli --bin ffs-fat
+rch exec -- cargo test -p ffs-fat
+rch exec -- cargo check -p ffs-cli --bin ffs-fat
 
 # Requires dosfstools and mtools; --mounted additionally requires usable FUSE.
 python3 scripts/verify_fat_read.py --binary target/debug/ffs-fat

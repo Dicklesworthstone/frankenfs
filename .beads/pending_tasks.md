@@ -476,3 +476,82 @@ Apply these only after source comparison and owner reconciliation. They do not r
 Shared `main` advanced after the initial `944903e78` snapshot. Commit `e2d47b0ec` adds explicit `--relocate` live-tail compaction through `resize/relocation.rs` and eleven authored regression functions; `525e8309b` adds aligned native `FALLOC_FL_COLLAPSE_RANGE` without retained-payload copies or spare allocation. Existing remote changes are retained in local merge `4b0b22161`; other audited production paths are unchanged.
 
 The staged `bd-50neb` title and its notes, and the notes of `bd-uzt72`, were revised through `br`. Their initial-snapshot missing-relocation paragraphs above are historical and superseded: qualify/fix the landed implementations, do not reimplement them. `bd-50neb` still needs native maintenance/interchange and source-preserving shrink/fault evidence. `bd-uzt72` must include actual mounted collapse, full-volume/fragmented/preallocation and dropped/torn/flush/cancel/cache-publication cases under the declared non-atomic contract. Neither authored tests nor inspected source closes these tasks. This is the additive source-refresh proposal for both records; their existing acceptance and dependencies are retained. Refreshed formatting at `4b0b22161` fails in nine distinct source files, including the landed relocation/collapse paths; the retained log is `artifacts/reality-check/20261020/fmt-refreshed.log`.
+
+### Implementation TODO — native library integration, 2026-10-21
+
+Work item: `bd-native-image-library-s4tde`, staged `in_progress`, assignee
+OliveCreek. Canonical claim was attempted and refused by the WAL/schema guard;
+canonical owner/status data is unchanged. This checklist is the operator-requested
+working TODO, not completion evidence. Retire it as an active checklist when the
+original task's complete acceptance is executed and verified; retain its history.
+
+Creation-gate worksheet: runtime does not consume this checklist. Consumer and
+gate: the user's explicit request for granular TODO tracking during this work.
+Observed defect: the audit found finished engines inaccessible through the
+facade and essential implementation absent from the active graph. Retirement:
+verified task acceptance, without deleting the file. No integrity exception is
+invoked. Highest-value ready work is this native API integration; keep checklist
+maintenance to minutes and spend the work block on executable integration.
+
+- [x] Read current instructions/README and refresh HEAD, dirty paths and leases.
+- [x] Recheck source-aware claimability; preserve canonical database/WAL refusal.
+- [x] Attempt canonical claim and mark the same item in progress in staged Beads.
+- [x] Ask the read-authority P0's recorded owner for a handoff; preserve ownership.
+- [x] Extract NTFS reader, FsOps and exact stream-name selector into a library.
+- [x] Keep every NTFS regression enabled and keep CLI-only tests in the binary.
+- [x] Connect ordinary and protected NTFS binaries to the same library instance.
+- [x] Extract ZFS pool/DMU/ZPL/FsOps engine without changing admission policy.
+- [x] Keep ZFS native fixtures/regressions and both consumers connected.
+- [x] Separate FAT engine/runtime boundaries; retain the shared pure clap schema.
+- [x] Preserve FAT mutation/health/lifetime/recovery tests and explicit authority.
+- [x] Connect FAT binary and protected mount to the same FAT library engine.
+- [x] Add explicit six-format read-only options and ambiguity-checked dispatch.
+- [x] Enforce read-only backing authority before detection/recovery; no write options.
+- [x] Preserve explicit volume offsets, bounds, OEM names and ZFS view identity.
+- [x] Author facade native-image and adversarial authority controls (unexecuted).
+- [x] Statically verify no module duplication, package cycles or lost old tests.
+- [x] Update architecture/parity documentation and nonempty library test commands.
+- [x] Pass workspace formatting; inspect normalized source and integration diffs.
+- [x] Fix FAT cancellation-test imports exposed by the first remote check.
+- [x] Remove protected-mount's production partial `Deref`; retain test assertions.
+- [x] Prevent FIFO blocking before regular-image admission; author real FD controls.
+- [ ] Pass remote workspace/all-target compilation with exact source receipt.
+- [ ] Pass remote workspace/all-target strict Clippy without suppressions.
+- [ ] Execute engine, facade, consumer and CLI tests with nonempty selections.
+- [ ] Exercise built public consumers and retain their source/build identity.
+- [ ] Review UBS findings and resolve actual production defects.
+- [ ] Re-execute acceptance in a fresh verification pass; keep unproved items open.
+- [ ] Record exact results in staged Beads, sync, commit and publish coherent work.
+
+The checks above mark **source work**, not executed acceptance. All 181 relocated
+Rust files are accounted for; 166 equal the original after standard formatting,
+12 have reviewed extraction/visibility/signal-boundary changes, and three add
+explicit imports required by their retained cancellation tests. All
+1,022 original engine test attributes remain enabled, with eight additional
+facade/FAT consumer/regular-image controls authored. NTFS/ZFS CLI tests remain in their binaries;
+FAT command-schema tests move with the shared library schema. All existing
+assertions are retained. Cargo dependency resolution and workspace formatting
+pass; external dependency versions are unchanged. Full staged UBS exceeded its
+diagnostic output cap and is incomplete. Four smaller static scans completed:
+73 FAT files (28 critical), 114 NTFS/ZFS files (49), one core file (zero), and
+ten integration files (one). Critical findings are test-only traps (including
+zero-write assertions) and two public NTFS magic comparisons, not secret
+comparisons. The actual protected-mount production `Deref` panic was removed.
+Scans still return findings; no scanner pass, suppression or partial override
+is claimed. Rust build phases run separately through RCH.
+
+The first remote compiler attempt executed and found six FAT test import errors;
+those source errors are fixed, with verification pending. The original wrapper
+lost SSH completion confirmation and was recovered/acknowledged (delivery exit
+255); it is not a passing receipt. Clippy and runtime acceptance are unexecuted. The local disk
+preflight fails its configured pressure ratio. The user replied "OK" to the
+specific remote-only verification request and instructed continued execution;
+that authorizes remote verification while local compilation remains disabled.
+RCH worker-pressure admission remains in force. A new workspace/all-target check
+was admitted on `vmi1152480` with `RCH_REQUIRE_REMOTE=1` and a source-content
+receipt. Later FIFO source changes also require a fresh final verification.
+Changing logs are retained outside the transferred workspace under
+`~/Library/Logs/frankenfs-verification/`. No functional Bead is closed.
+
+Remaining roadmap work stays under the 19 planned records above and the existing
+critical owner lanes. Native NTFS/ZFS writers are not implied by library access.

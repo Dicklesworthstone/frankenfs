@@ -1,23 +1,16 @@
 #![forbid(unsafe_code)]
 //! Native read-only ZFS label inspection and explicit MOS-root extraction.
 
-macro_rules! companion_bin_tests {
-    ($($item:item)*) => {
-        $($item)*
-    };
-}
-
 mod allocation_commands;
 mod file_commands;
-mod filesystem;
 mod properties_commands;
-mod reader;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
 use ffs_error::FfsError;
 use ffs_ondisk::zfs::UBERBLOCK_RING_BYTES;
+use ffs_zfs::{filesystem, reader};
 use reader::{Leaf, Pool};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -156,15 +149,21 @@ impl CandidateArgs {
         if !self.missing_raidz_members.is_empty() {
             Pool::check_raidz_survivors(self.members.len() + 1, &self.missing_raidz_members)?;
             if !self.missing_mirror_members.is_empty()
-                || self.auto_import || self.replay_zil || self.pool_guid == 0
+                || self.auto_import
+                || self.replay_zil
+                || self.pool_guid == 0
             {
-                bail!("missing RAIDZ members require explicit pool/candidate selection without mirror declarations, import or replay");
+                bail!(
+                    "missing RAIDZ members require explicit pool/candidate selection without mirror declarations, import or replay"
+                );
             }
         }
         if !self.missing_mirror_members.is_empty() {
             Pool::check_mirror_survivors(self.members.len() + 1, &self.missing_mirror_members)?;
             if self.auto_import || self.replay_zil || self.pool_guid == 0 {
-                bail!("missing mirror members require explicit pool/candidate selection without import or replay");
+                bail!(
+                    "missing mirror members require explicit pool/candidate selection without import or replay"
+                );
             }
         }
         let mut leaves = Vec::with_capacity(self.members.len() + 1);
@@ -769,8 +768,17 @@ mod tests {
     #[test]
     fn missing_mirror_cli_keeps_explicit_identity_and_conflicts_with_import_and_replay() {
         let options = [
-            "--offline-image", "--pool-guid", "123", "--label", "0", "--slot", "2",
-            "--missing-mirror-member", "1002", "--missing-mirror-member", "1003",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--missing-mirror-member",
+            "1002",
+            "--missing-mirror-member",
+            "1003",
         ];
         for command in [
             vec!["root", "first.img"],
@@ -785,11 +793,15 @@ mod tests {
             | Command::Object { candidate, .. }
             | Command::ObjectRead { candidate, .. }
             | Command::Zap { candidate, .. }
-            | Command::Datasets { candidate }) = cli.command else {
+            | Command::Datasets { candidate }) = cli.command
+            else {
                 panic!("raw candidate command");
             };
             assert_eq!(candidate.missing_mirror_members, [1002, 1003]);
-            assert_eq!((candidate.pool_guid, candidate.label, candidate.slot), (123, 0, 2));
+            assert_eq!(
+                (candidate.pool_guid, candidate.label, candidate.slot),
+                (123, 0, 2)
+            );
             assert!(!candidate.auto_import && !candidate.replay_zil);
         }
         for command in [
@@ -797,18 +809,44 @@ mod tests {
             vec!["read", "first.img", "/file"],
             vec!["mount", "first.img", "/mnt/extraction"],
         ] {
-            assert!(Cli::try_parse_from(std::iter::once("ffs-zfs").chain(command).chain(options)).is_ok());
+            assert!(
+                Cli::try_parse_from(std::iter::once("ffs-zfs").chain(command).chain(options))
+                    .is_ok()
+            );
         }
         for conflict in ["--auto-import", "--replay-zil", "--rw"] {
-            assert!(Cli::try_parse_from(["ffs-zfs", "root", "first.img"].into_iter()
-                .chain(options).chain([conflict])).is_err());
+            assert!(
+                Cli::try_parse_from(
+                    ["ffs-zfs", "root", "first.img"]
+                        .into_iter()
+                        .chain(options)
+                        .chain([conflict])
+                )
+                .is_err()
+            );
         }
-        assert!(Cli::try_parse_from([
-            "ffs-zfs", "root", "first.img", "--offline-image", "--missing-mirror-member", "1002"
-        ]).is_err());
-        assert!(Cli::try_parse_from([
-            "ffs-zfs", "inspect", "first.img", "--offline-image", "--missing-mirror-member", "1002"
-        ]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "root",
+                "first.img",
+                "--offline-image",
+                "--missing-mirror-member",
+                "1002"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "inspect",
+                "first.img",
+                "--offline-image",
+                "--missing-mirror-member",
+                "1002"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

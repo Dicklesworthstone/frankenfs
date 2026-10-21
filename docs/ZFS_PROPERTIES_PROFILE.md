@@ -107,8 +107,11 @@ rustc, rustfmt and RCH are unavailable in the authoring environment; compilation
 the Rust tests, Clippy, native OpenZFS comparisons and FUSE execution remain
 unverified. Required full-workspace validation includes:
 
+Engine tests have moved into the `ffs-zfs` library, with separate CLI tests;
+these current verification commands do not imply a new execution result.
+
 ```sh
-rch exec -- cargo test -p ffs-cli --bin ffs-zfs -- properties
+rch exec -- cargo test -p ffs-zfs --lib -- properties
 rch exec -- cargo test -p ffs-cli --bin ffs-zfs
 rch exec -- cargo check --workspace --all-targets
 rch exec -- cargo clippy --workspace --all-targets -- -D warnings

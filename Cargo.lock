@@ -885,8 +885,17 @@ name = "ffs"
 version = "0.2.0"
 dependencies = [
  "asupersync",
+ "clap",
+ "ffs-block",
  "ffs-core",
+ "ffs-error",
+ "ffs-fat",
+ "ffs-ntfs",
  "ffs-ondisk",
+ "ffs-types",
+ "ffs-zfs",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -973,13 +982,17 @@ dependencies = [
  "ffs-btrfs",
  "ffs-core",
  "ffs-error",
+ "ffs-fat",
  "ffs-fuse",
  "ffs-harness",
  "ffs-journal",
  "ffs-mvcc",
+ "ffs-ntfs",
  "ffs-ondisk",
  "ffs-repair",
+ "ffs-tui",
  "ffs-types",
+ "ffs-zfs",
  "libc",
  "nix 0.29.0",
  "proptest",
@@ -1085,6 +1098,26 @@ dependencies = [
  "parking_lot",
  "proptest",
  "smallvec",
+]
+
+[[package]]
+name = "ffs-fat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "asupersync",
+ "clap",
+ "ffs-block",
+ "ffs-core",
+ "ffs-error",
+ "ffs-ondisk",
+ "ffs-repair",
+ "ffs-types",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]
@@ -1217,6 +1250,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffs-ntfs"
+version = "0.1.0"
+dependencies = [
+ "asupersync",
+ "ffs-block",
+ "ffs-core",
+ "ffs-error",
+ "ffs-ondisk",
+ "ffs-types",
+ "libc",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "ffs-ondisk"
 version = "0.1.0"
 dependencies = [
@@ -1272,8 +1320,15 @@ dependencies = [
 name = "ffs-tui"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "ffs",
+ "ffs-block",
+ "ffs-mvcc",
+ "ffs-repair",
+ "ffs-types",
  "ftui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1299,6 +1354,22 @@ dependencies = [
  "ffs-ondisk",
  "ffs-types",
  "proptest",
+]
+
+[[package]]
+name = "ffs-zfs"
+version = "0.1.0"
+dependencies = [
+ "asupersync",
+ "ffs-block",
+ "ffs-core",
+ "ffs-error",
+ "ffs-ondisk",
+ "ffs-types",
+ "libc",
+ "serde",
+ "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]

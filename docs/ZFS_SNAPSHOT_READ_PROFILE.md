@@ -76,8 +76,11 @@ unchanged for the entire read session.
 
 ## Validation
 
+Engine tests have moved into the `ffs-zfs` library, with separate CLI tests;
+these current verification commands do not imply a new execution result.
+
 ```sh
-rch exec -- cargo test -p ffs-ondisk zfs_zap
+rch exec -- cargo test -p ffs-zfs -p ffs-ondisk --lib
 rch exec -- cargo test -p ffs-cli --bin ffs-zfs
 python3 scripts/verify_zfs_snapshots.py --binary target/debug/ffs-zfs --create-and-mount-scratch-pool
 ```

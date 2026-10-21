@@ -1,11 +1,22 @@
 #![forbid(unsafe_code)]
 //! FrankenFS public API facade.
 //!
-//! Re-exports core functionality from `ffs-core` through a stable external
-//! interface. This is the crate that downstream consumers (CLI, TUI, harness)
-//! depend on.
+//! Core functionality and one read-only native-image entry point for ext4,
+//! btrfs, FAT16, FAT32, NTFS and ZFS. Format-specific engines retain their own
+//! admission and write-authority contracts.
 
 pub use ffs_core::*;
+pub use ffs_types::InodeNumber;
+
+mod native;
+pub use native::{
+    ImageSource, ReadOnlyBackend, ReadOnlyFs, ReadOnlyOpenOptions, ZfsMissingMembers,
+    ZfsReadOptions, ZfsRootSelection, open_read_only,
+};
+
+pub use ffs_fat as fat;
+pub use ffs_ntfs as ntfs;
+pub use ffs_zfs as zfs;
 
 #[cfg(test)]
 mod tests {

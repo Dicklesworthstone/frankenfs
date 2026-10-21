@@ -46,14 +46,24 @@ per-format profiles define the actual admission rules.
 |---|---|---|---|
 | **ext4** | Main `ffs-cli` / `OpenFs` path | Native reads, experimental mounted writes, journal integration, MVCC and repair work | Writeback, recovery and release readiness remain evidence-gated; see the detailed guide and current parity ledger. |
 | **btrfs** | Main `ffs-cli` / `OpenFs` path | Native reads and guarded experimental writes, transaction-commit and repair work | Native feature/topology admission and durability evidence still matter; not blanket kernel parity. |
-| **FAT16** | `ffs-fat` | Native reads/catalog/extraction, read-only FUSE, allocation checking, fresh-image formatting/population, ordered offline replacement and short-/long-name file creation | New long names use a bounded UTF-16 profile with ASCII aliases. Existing subdirectories can grow; the fixed root cannot. No writable mount or crash replay. |
-| **FAT32** | `ffs-fat` | The FAT16 companion surface plus FAT32 root chains, selected-FAT handling and free-space hints | Create-only updates reserve complete name records and can grow roots/subdirectories with ordered native allocation. No atomic namespace transaction or writable mount. |
-| **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection and FUSE | The exact NTFS read profile controls admission. Native `$LogFile` recovery and general NTFS mutation are not implemented by these reads. |
-| **ZFS** | `ffs-zfs` | Native dataset/snapshot discovery and reads, admitted compression/checksums, selected mirror/RAIDZ, explicitly incomplete exported-mirror and RAIDZ1/2/3 extraction, and read-only mount profiles | Explicit offline pool/configuration selection is not native pool import. Missing-member extraction is committed-view-only; no automatic import, log recovery or write authority. |
+| **FAT16** | `ffs-fat` | Native reads/catalog/extraction, experimental ordinary/protected writable FUSE, allocation checks, formatting/population, and ordered offline file/directory/range mutation | New long names use bounded UTF-16 with ASCII aliases. Subdirectories can grow; the fixed root cannot. Native/mounted crash qualification remains open; ordered mutation is not a crash-atomic transaction. |
+| **FAT32** | `ffs-fat` | The FAT16 companion surface plus root chains, selected-FAT handling, free-space hints and offline resize/relocation | Namespace and range operations retain ordered native publication and explicit dirty failure states. Complete native/mounted qualification remains open. |
+| **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection and FUSE | The exact read profile controls admission. Restricted volatile `$LogFile` recovery exists; it grants no native write authority or general Windows recovery claim. General NTFS mutation remains unfinished. |
+| **ZFS** | `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction and volatile ZIL recovery | Read-only root selection is not native writable pool ownership. Missing-member extraction is committed-view-only and forbids ZIL replay. Native allocation/TXG writing remains unfinished. |
 
-The new formats currently live in companion binaries. They are **not yet a
-unified six-format `OpenFs` backend**, and the ext4/btrfs MVCC/RaptorQ integration
-must not be inferred to apply automatically to their native writes.
+The companion engines are reusable libraries: `ffs-fat`, `ffs-ntfs` and
+`ffs-zfs`. Their binaries and the protected mount import the same implementation.
+The `ffs` facade provides `open_read_only(cx, path, options)` for all six formats,
+returning the detected format and a `Box<dyn FsOps>`. It uses bounded read-only
+image handles, refuses ambiguous signatures and keeps native admission rules.
+Options preserve volume bounds, FAT OEM selection, btrfs roots/devices and ZFS
+pool/candidate/dataset/snapshot/device selection. ext4 recovery stays in memory.
+Callers supply their own context and keep backing images offline and immutable.
+
+This integration is implemented in source; its compiler and runtime verification
+remain pending under `bd-native-image-library-s4tde`. `OpenFs` itself still
+dispatches ext4/btrfs, and their MVCC/RaptorQ integration must not be inferred to
+apply automatically to new-format native writes.
 
 The historical `97/97` parity figure describes rows in the original feature
 table. It is not a six-format completeness percentage, a passing test count,
@@ -109,7 +119,9 @@ This is **ordered offline mutation, not an atomic transaction**. Interruption
 may leave a dirty image requiring native checking/recovery on another copy.
 Explicit `mkdir` initializes one empty native directory under an existing parent,
 including `.` and `..`, using the same parent-growth and publication protocol.
-Unlink/rename, writable mounts and native crash replay remain unfinished.
+Offline unlink/rmdir/rename and experimental writable mounts are implemented.
+Their mounted/native crash qualification remains open under `bd-uzt72`;
+bounded offline recovery does not establish general native crash replay.
 See the [creation and directory-growth contract](docs/FAT_CREATE_PROFILE.md).
 
 ### Evidence for this increment
@@ -244,7 +256,8 @@ For contributors, use the repository's prescribed remote execution workflow
 when available. The focused FAT checks are:
 
 ```sh
-rch exec -- cargo test -p ffs-cli --bin ffs-fat replacement
+rch exec -- cargo test -p ffs-fat
+rch exec -- cargo test -p ffs --lib native::tests
 rch exec -- cargo check -p ffs-cli --bin ffs-fat
 rch exec -- cargo clippy -p ffs-cli --bin ffs-fat --all-targets -- -D warnings
 cargo fmt --check

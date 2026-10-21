@@ -1,26 +1,18 @@
 #![forbid(unsafe_code)]
 //! Native, read-only NTFS 3.1 inspection, directory traversal and stream extraction.
 
-macro_rules! companion_bin_tests {
-    ($($item:item)*) => {
-        $($item)*
-    };
-}
-
 mod ea_name;
-mod reader;
-mod stream_name;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
 use ea_name::EaName;
+use ffs_ntfs::{StreamName, reader};
 use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint};
 use ffs_ondisk::ntfs::{DATA, NtfsFileRecord, NtfsValue};
 use reader::NtfsVolume;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use stream_name::StreamName;
 
 #[derive(Debug, Parser)]
 #[command(

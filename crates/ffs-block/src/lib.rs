@@ -690,6 +690,26 @@ impl FileByteDevice {
         Self::from_file(file, false)
     }
 
+    /// Open an offline regular image without requesting write access.
+    ///
+    /// Nonblocking open prevents a FIFO substituted for an image from waiting
+    /// for a writer before its descriptor can be checked. Type admission uses
+    /// that same retained descriptor, before device sizing or read advice.
+    pub fn open_regular_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(FfsError::UnsupportedFeature(
+                "image opening requires an offline regular file".to_owned(),
+            ));
+        }
+        Self::from_file(file, false)
+    }
+
     /// Open with write access, failing instead of falling back to read-only.
     ///
     /// Callers that are about to mutate the image use this so a missing write
@@ -5646,22 +5666,51 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir").keep();
         let path = dir.join("read-only-device.img");
         std::fs::write(&path, b"immutable seed").expect("seed file");
-        let dev = FileByteDevice::open_read_only(&path).expect("read-only device");
-        let mut data = [0; 14];
-        dev.read_exact_at(&cx, ByteOffset(0), &mut data).unwrap();
-        assert_eq!(&data, b"immutable seed");
-        assert!(!dev.writable);
-        assert!(dev.write_all_at(&cx, ByteOffset(0), b"changed").is_err());
-        // Test the actual file descriptor, independently of ByteDevice's guard,
-        // on a writable file (also meaningful when the tests run as root).
-        assert_eq!(
-            dev.file()
-                .write_at(b"changed", 0)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(nix::libc::EBADF)
-        );
+        for dev in [
+            FileByteDevice::open_read_only(&path).expect("read-only device"),
+            FileByteDevice::open_regular_read_only(&path).expect("read-only regular image"),
+        ] {
+            let mut data = [0; 14];
+            dev.read_exact_at(&cx, ByteOffset(0), &mut data).unwrap();
+            assert_eq!(&data, b"immutable seed");
+            assert!(!dev.writable);
+            assert!(dev.write_all_at(&cx, ByteOffset(0), b"changed").is_err());
+            // Test the actual descriptor, independently of ByteDevice's guard,
+            // on a writable file (also meaningful when the tests run as root).
+            assert_eq!(
+                dev.file()
+                    .write_at(b"changed", 0)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(nix::libc::EBADF)
+            );
+        }
         assert_eq!(std::fs::read(path).unwrap(), b"immutable seed");
+    }
+
+    #[test]
+    fn file_byte_device_regular_image_admission_refuses_fifo_and_other_special_files() {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let fifo = dir.join("not-an-image.fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).expect("create FIFO");
+        // No writer exists. Opening without O_NONBLOCK would hang before the
+        // descriptor-type check rather than return this admission error.
+        for path in [fifo.as_path(), dir.as_path(), Path::new("/dev/null")] {
+            assert!(matches!(
+                FileByteDevice::open_regular_read_only(path),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+        }
+        let image = dir.join("regular.img");
+        std::fs::write(&image, b"regular image").unwrap();
+        let alias = dir.join("regular-alias.img");
+        std::os::unix::fs::symlink(&image, &alias).unwrap();
+        let dev = FileByteDevice::open_regular_read_only(&alias).unwrap();
+        let mut bytes = [0; 13];
+        dev.read_exact_at(&Cx::for_testing(), ByteOffset(0), &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes, b"regular image");
+        assert_eq!(std::fs::read(&image).unwrap(), bytes);
     }
 
     #[test]

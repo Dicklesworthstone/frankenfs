@@ -100,9 +100,13 @@ failed to start. Source/hash/diff checks do not substitute for compilation.
 No gate, assertion, default admission rule or acceptance criterion is relaxed.
 Required validation remains, including:
 
+Engine tests have moved into the `ffs-zfs` library, with separate CLI tests;
+these current verification commands do not imply a new execution result.
+
 ```sh
-rch exec -- cargo test -p ffs-cli --bin ffs-zfs missing_raidz
-rch exec -- cargo test -p ffs-cli --bin ffs-zfs raidz
+rch exec -- cargo test -p ffs-zfs --lib missing_raidz
+rch exec -- cargo test -p ffs-zfs --lib raidz
+rch exec -- cargo test -p ffs-cli --bin ffs-zfs
 rch exec -- cargo check --workspace --all-targets
 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check

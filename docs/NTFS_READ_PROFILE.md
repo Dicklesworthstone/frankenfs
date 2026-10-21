@@ -626,9 +626,13 @@ separate work. The restricted mount above is not full NTFS qualification.
 
 ## Validation
 
+Engine tests have moved into the `ffs-ntfs` library, with separate CLI tests;
+these current verification commands do not imply a new execution result.
+
 ```sh
 rch exec -- cargo test -p ffs-ondisk ntfs
 rch exec -- cargo test -p ffs-ondisk lznt1
+rch exec -- cargo test -p ffs-ntfs
 rch exec -- cargo test -p ffs-cli --bin ffs-ntfs
 python3 scripts/verify_ntfs_read.py --binary target/debug/ffs-ntfs
 python3 scripts/verify_ntfs_mount.py --binary target/debug/ffs-ntfs
@@ -935,8 +939,9 @@ XPRESS results do not establish LZX integration passage. Remaining focused check
 
 ```sh
 rch exec -- cargo test -p ffs-ondisk lzx::
-rch exec -- cargo test -p ffs-cli --bin ffs-ntfs wof
-rch exec -- cargo clippy -p ffs-ondisk -p ffs-cli --all-targets -- -D warnings
+rch exec -- cargo test -p ffs-ntfs --lib wof
+rch exec -- cargo test -p ffs-cli --bin ffs-ntfs
+rch exec -- cargo clippy -p ffs-ondisk -p ffs-ntfs -p ffs-cli --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
@@ -981,5 +986,6 @@ is inferred from constructed fixtures. Focused repository commands are:
 
 ```sh
 rch exec -- cargo test -p ffs-ondisk ntfs::ea
+rch exec -- cargo test -p ffs-ntfs --lib ea
 rch exec -- cargo test -p ffs-cli --bin ffs-ntfs ea
 ```

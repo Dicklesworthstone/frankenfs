@@ -23,6 +23,9 @@ ffs-btrfs = { workspace = true }
 ffs-core = { workspace = true }
 ffs-fuse = { workspace = true }
 ffs-mvcc = { workspace = true }
+ffs-ntfs = { workspace = true }
+ffs-fat = { workspace = true }
+ffs-zfs = { workspace = true }
 ffs-harness = { workspace = true }
 ffs-ondisk = { workspace = true }
 ffs-repair = { workspace = true }

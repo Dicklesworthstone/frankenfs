@@ -96,9 +96,13 @@ commit, but queued workflow state is not a passing build or test result.
 No OpenZFS interchange, mounted kernel, hardware-failure or native recovery
 qualification is claimed. Run the unchanged repository gates, including:
 
+Engine tests have moved into the `ffs-zfs` library, with separate CLI tests;
+these current verification commands do not imply a new execution result.
+
 ```sh
-rch exec -- cargo test -p ffs-cli --bin ffs-zfs missing_mirror
-rch exec -- cargo test -p ffs-cli --bin ffs-zfs mirror
+rch exec -- cargo test -p ffs-zfs --lib missing_mirror
+rch exec -- cargo test -p ffs-zfs --lib mirror
+rch exec -- cargo test -p ffs-cli --bin ffs-zfs
 rch exec -- cargo check --workspace --all-targets
 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
