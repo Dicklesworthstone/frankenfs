@@ -1,5 +1,7 @@
 //! Bounded directory-tree walks and native $UpCase-based path lookup.
 
+mod indexed;
+
 use super::{
     Cx, FfsError, NtfsAttribute, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume,
     REPARSE_POINT, Result, Storage, Stream, checkpoint, corrupt, parse, relative_link_target,
@@ -21,9 +23,12 @@ pub struct DirectoryEntry {
 }
 
 impl NtfsVolume {
-    /// Enumerate the reachable native index tree, not a speculative MFT scan.
-    /// Every link is checked against its target record's FILE_NAME identity.
-    pub fn list_directory(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<Vec<DirectoryEntry>> {
+    /// Shared native index admission for full enumeration and directed lookup.
+    fn directory_index<'a>(
+        &'a self,
+        cx: &'a Cx,
+        record: &NtfsFileRecord,
+    ) -> Result<(Walker<'a>, Vec<NtfsIndexEntry>)> {
         checkpoint(cx)?;
         if !record.is_directory() {
             return Err(FfsError::NotDirectory);
@@ -74,7 +79,7 @@ impl NtfsVolume {
         } else {
             (None, Vec::new())
         };
-        let mut walker = Walker {
+        let walker = Walker {
             volume: self,
             cx,
             block_bytes: root.block_bytes,
@@ -84,7 +89,14 @@ impl NtfsVolume {
             visited: BTreeSet::new(),
             keys: Vec::new(),
         };
-        walker.visit(root.entries, 0)?;
+        Ok((walker, root.entries))
+    }
+
+    /// Enumerate the reachable native index tree, not a speculative MFT scan.
+    /// Every link is checked against its target record's FILE_NAME identity.
+    pub fn list_directory(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<Vec<DirectoryEntry>> {
+        let (mut walker, entries) = self.directory_index(cx, record)?;
+        walker.visit(entries, 0)?;
         for (byte_index, byte) in walker.bitmap.iter().enumerate() {
             for bit in 0..8 {
                 if byte & (1 << bit) != 0
@@ -123,51 +135,76 @@ impl NtfsVolume {
                     "duplicate directory name points at different file records",
                 ));
             }
-            let target = self.record(cx, reference.record, Some(reference.sequence))?;
-            let target_catalog = self.attributes(cx, &target)?;
-            let attributes = target_catalog.all()?;
-            let mut matched = false;
-            for attr in attributes.iter().filter(|attr| attr.kind == 0x30) {
-                if attr.flags != 0 || !attr.name.is_empty() {
-                    return Err(corrupt(0, "invalid FILE_NAME storage or attribute name"));
-                }
-                let NtfsValue::Resident(value) = &attr.value else {
-                    return Err(corrupt(0, "nonresident FILE_NAME"));
-                };
-                if NtfsFileName::parse(value).map_err(|error| parse(&error))? == filename {
-                    matched = true;
-                }
-            }
-            if !matched {
-                return Err(corrupt(
-                    0,
-                    "directory index does not match target FILE_NAME",
-                ));
-            }
-            result.push(DirectoryEntry {
-                reference,
-                filename,
-                directory: target.is_directory(),
-                reparse_tag: self
-                    .reparse_from_catalog(cx, &target_catalog)?
-                    .map(|point| point.tag),
-            });
+            result.push(self.verify_directory_entry(cx, reference, filename)?);
         }
         checkpoint(cx)?;
         Ok(result)
     }
 
+    fn verify_directory_entry(
+        &self,
+        cx: &Cx,
+        reference: NtfsReference,
+        filename: NtfsFileName,
+    ) -> Result<DirectoryEntry> {
+        let target = self.record(cx, reference.record, Some(reference.sequence))?;
+        let target_catalog = self.attributes(cx, &target)?;
+        let attributes = target_catalog.all()?;
+        let mut matched = false;
+        for attr in attributes.iter().filter(|attr| attr.kind == 0x30) {
+            if attr.flags != 0 || !attr.name.is_empty() {
+                return Err(corrupt(0, "invalid FILE_NAME storage or attribute name"));
+            }
+            let NtfsValue::Resident(value) = &attr.value else {
+                return Err(corrupt(0, "nonresident FILE_NAME"));
+            };
+            if NtfsFileName::parse(value).map_err(|error| parse(&error))? == filename {
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(corrupt(0, "directory index does not match target FILE_NAME"));
+        }
+        Ok(DirectoryEntry {
+            reference,
+            filename,
+            directory: target.is_directory(),
+            reparse_tag: self
+                .reparse_from_catalog(cx, &target_catalog)?
+                .map(|point| point.tag),
+        })
+    }
+
     pub fn resolve(&self, cx: &Cx, path: &str) -> Result<NtfsFileRecord> {
-        self.resolve_path(cx, path, true)
+        self.resolve_path(cx, path, true, false)
     }
 
     /// Resolve intermediate links but retain the final link's own native record
     /// for readlink/metadata inspection. Trailing slash still requires a directory.
     pub fn resolve_no_follow(&self, cx: &Cx, path: &str) -> Result<NtfsFileRecord> {
-        self.resolve_path(cx, path, false)
+        self.resolve_path(cx, path, false, false)
     }
 
-    fn resolve_path(&self, cx: &Cx, path: &str, follow_final: bool) -> Result<NtfsFileRecord> {
+    /// Resolve through the relevant native index branches, not every sibling's
+    /// FILE record. This checks the visited search range and selected target;
+    /// unlike resolve(), it does not certify unvisited directory branches.
+    pub fn resolve_indexed(&self, cx: &Cx, path: &str) -> Result<NtfsFileRecord> {
+        self.resolve_path(cx, path, true, true)
+    }
+
+    /// Directed lookup with the same final-link and confinement policy as
+    /// resolve_no_follow(). No fallback to a partial or unchecked result.
+    pub fn resolve_indexed_no_follow(&self, cx: &Cx, path: &str) -> Result<NtfsFileRecord> {
+        self.resolve_path(cx, path, false, true)
+    }
+
+    fn resolve_path(
+        &self,
+        cx: &Cx,
+        path: &str,
+        follow_final: bool,
+        indexed: bool,
+    ) -> Result<NtfsFileRecord> {
         checkpoint(cx)?;
         if path.len() > 65_536 || path.contains(['\\', '\0']) {
             return Err(FfsError::NameTooLong);
@@ -231,29 +268,11 @@ impl NtfsVolume {
             if name.len() > 255 {
                 return Err(FfsError::NameTooLong);
             }
-            let entries = self.list_directory(cx, &record)?;
-            let exact = entries.iter().any(|entry| entry.filename.name == name);
-            let mut found = None;
-            for entry in &entries {
-                let matches = if exact {
-                    entry.filename.name == name
-                } else {
-                    entry.filename.namespace != 0
-                        && entry.filename.name.len() == name.len()
-                        && entry
-                            .filename
-                            .name
-                            .iter()
-                            .zip(&name)
-                            .all(|(a, b)| table[usize::from(*a)] == table[usize::from(*b)])
-                };
-                if matches {
-                    if found.is_some_and(|old| old != entry.reference) {
-                        return Err(corrupt(0, "ambiguous NTFS case-insensitive name"));
-                    }
-                    found = Some(entry.reference);
-                }
-            }
+            let found = if indexed {
+                indexed::lookup(self, cx, &record, &name, &table)?
+            } else {
+                self.lookup_checked(cx, &record, &name, &table)?
+            };
             let reference = found.ok_or_else(|| {
                 FfsError::NotFound(format!(
                     "NTFS path component {component:?} in directory MFT record {}",
@@ -319,6 +338,39 @@ impl NtfsVolume {
         Ok(record)
     }
 
+    fn lookup_checked(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+        name: &[u16],
+        table: &[u16],
+    ) -> Result<Option<NtfsReference>> {
+        let entries = self.list_directory(cx, record)?;
+        let exact = entries.iter().any(|entry| entry.filename.name == name);
+        let mut found = None;
+        for entry in &entries {
+            let matches = if exact {
+                entry.filename.name == name
+            } else {
+                entry.filename.namespace != 0
+                    && entry.filename.name.len() == name.len()
+                    && entry
+                        .filename
+                        .name
+                        .iter()
+                        .zip(name)
+                        .all(|(a, b)| table[usize::from(*a)] == table[usize::from(*b)])
+            };
+            if matches {
+                if found.is_some_and(|old| old != entry.reference) {
+                    return Err(corrupt(0, "ambiguous NTFS case-insensitive name"));
+                }
+                found = Some(entry.reference);
+            }
+        }
+        Ok(found)
+    }
+
     fn upcase(&self, cx: &Cx) -> Result<Vec<u16>> {
         let record = self.record(cx, 10, None)?;
         let stream = self.data_stream(cx, &record, &[])?;
@@ -372,6 +424,54 @@ struct Walker<'a> {
     keys: Vec<(NtfsReference, NtfsFileName)>,
 }
 impl Walker<'_> {
+    /// Check a declared child's geometry and allocation without reading it.
+    fn child_offset(&self, vcn: u64) -> Result<u64> {
+        let offset = vcn
+            .checked_mul(u64::from(self.vcn_bytes))
+            .ok_or_else(|| corrupt(0, "index VBN overflow"))?;
+        if !offset.is_multiple_of(u64::from(self.block_bytes)) {
+            return Err(corrupt(offset, "unaligned index child"));
+        }
+        let block = offset / u64::from(self.block_bytes);
+        if block >= MAX_BLOCKS as u64 {
+            return Err(corrupt(offset, "excessive index child"));
+        }
+        let bitmap = self
+            .bitmap
+            .get((block / 8) as usize)
+            .ok_or_else(|| corrupt(offset, "index child outside bitmap"))?;
+        if bitmap & (1 << (block % 8)) == 0 {
+            return Err(corrupt(offset, "index child is not allocated in its bitmap"));
+        }
+        let stream = self
+            .allocation
+            .as_ref()
+            .ok_or_else(|| corrupt(offset, "missing index allocation"))?;
+        if offset
+            .checked_add(u64::from(self.block_bytes))
+            .is_none_or(|end| end > stream.initialized)
+        {
+            return Err(corrupt(offset, "index child outside initialized allocation"));
+        }
+        Ok(offset)
+    }
+
+    fn read_child(&mut self, vcn: u64) -> Result<Vec<NtfsIndexEntry>> {
+        checkpoint(self.cx)?;
+        let offset = self.child_offset(vcn)?;
+        if !self.visited.insert(offset / u64::from(self.block_bytes)) {
+            return Err(corrupt(offset, "cyclic, aliased or excessive index child"));
+        }
+        let stream = self
+            .allocation
+            .as_ref()
+            .ok_or_else(|| corrupt(offset, "missing index allocation"))?;
+        let raw = self
+            .volume
+            .read(self.cx, stream, offset, self.block_bytes as usize)?;
+        parse_index_block(&raw, vcn).map_err(|error| parse(&error))
+    }
+
     fn visit(&mut self, entries: Vec<NtfsIndexEntry>, depth: usize) -> Result<()> {
         checkpoint(self.cx)?;
         if depth > 32 {
@@ -380,43 +480,7 @@ impl Walker<'_> {
         for entry in entries {
             checkpoint(self.cx)?;
             if let Some(vcn) = entry.child_vcn {
-                let offset = vcn
-                    .checked_mul(u64::from(self.vcn_bytes))
-                    .ok_or_else(|| corrupt(0, "index VBN overflow"))?;
-                if !offset.is_multiple_of(u64::from(self.block_bytes)) {
-                    return Err(corrupt(offset, "unaligned index child"));
-                }
-                let block = offset / u64::from(self.block_bytes);
-                if block >= MAX_BLOCKS as u64 || !self.visited.insert(block) {
-                    return Err(corrupt(offset, "cyclic, aliased or excessive index child"));
-                }
-                let bitmap = self
-                    .bitmap
-                    .get((block / 8) as usize)
-                    .ok_or_else(|| corrupt(offset, "index child outside bitmap"))?;
-                if bitmap & (1 << (block % 8)) == 0 {
-                    return Err(corrupt(
-                        offset,
-                        "index child is not allocated in its bitmap",
-                    ));
-                }
-                let stream = self
-                    .allocation
-                    .as_ref()
-                    .ok_or_else(|| corrupt(offset, "missing index allocation"))?;
-                if offset
-                    .checked_add(u64::from(self.block_bytes))
-                    .is_none_or(|end| end > stream.initialized)
-                {
-                    return Err(corrupt(
-                        offset,
-                        "index child outside initialized allocation",
-                    ));
-                }
-                let raw = self
-                    .volume
-                    .read(self.cx, stream, offset, self.block_bytes as usize)?;
-                let children = parse_index_block(&raw, vcn).map_err(|error| parse(&error))?;
+                let children = self.read_child(vcn)?;
                 self.visit(children, depth + 1)?;
             }
             if let Some(key) = entry.key {
