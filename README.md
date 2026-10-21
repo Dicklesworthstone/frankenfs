@@ -95,8 +95,13 @@ freshly produced FAT16/FAT32/NTFS images, same-volume named-stream reads and
 both unchanged FAT/NTFS companion profile wrappers. Its captured output and
 source receipt are recorded in `.beads/pending_tasks.md`; this run predates the
 indexed-lookup repair and the indexed FsOps constructor below.
-FrankenFS-mounted behavior and the remaining full harness gates stay open under
-`bd-native-image-library-s4tde`; this is not release acceptance.
+A current RCH-built NTFS CLI subsequently passed four strict read-only kernel
+FUSE mounts on retained native plain, bounded and compressed images: 24 mounted
+byte comparisons and eight EROFS/ENOENT refusals, with successful unmounts and
+unchanged backing hashes. An independent rerun passed. This covers the strict
+NTFS adapter; indexed FsOps mounting and acceptance across all mounted formats
+remain open, alongside the full harness and benchmark gates under
+`bd-native-image-library-s4tde`. This is not release acceptance.
 Explicit native checks require their real producer tools:
 
 ```bash
@@ -249,9 +254,12 @@ catalog, including same-reference aliases in either index order.
 its `readdir` still validates and caches only complete directory enumerations.
 Unvisited branches and sibling records are not certified: this is an explicit
 lookup scope, not repair, whole-directory checking or a measured speedup.
-Nine constructed-image reader, seven FsOps and three CLI regressions are authored;
-execution of this combined source remains pending. Earlier validation receipts
-above do not qualify this new path. See the [indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md).
+The current remote run passed all 360 NTFS and 24 NTFS CLI tests, including the
+nine constructed-image reader, seven FsOps and three CLI regressions. Current
+native CLI checks also passed named/compressed reads and a separately produced
+256-file index with 13 reachable nodes, 12 leaves and two child levels. These
+functional results make no speed claim or indexed FsOps mount claim. See the
+[indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md).
 
 ## ZFS: extract from surviving mirror disks
 

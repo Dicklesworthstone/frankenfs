@@ -90,12 +90,30 @@ hard links, read-only operations, full enumeration/cookies, unrelated damaged
 siblings, selected I/O failures, cancellation and native-name projection. These
 are constructed-image unit tests, not native-producer or mounted evidence.
 
-The original implementation environment lacked Cargo, rustc, rustfmt and RCH;
-its gate attempts exited 127. Execution of the combined reader repair, FsOps and
-CLI source is now pending through strict remote RCH in the development workspace.
-Source/hash checks and an independent interval-search model are not Rust execution,
-native NTFS interoperability, kernel FUSE evidence or performance measurements.
-Run the repository's unchanged gates before relying on the new path:
+The original implementation environment's gate attempts exited 127. The current
+combined source at `990539073` plus explicit overlays subsequently passed strict
+remote RCH execution: all 360 NTFS and 24 NTFS CLI tests, including the nine reader,
+seven FsOps and three CLI controls above. The immutable old-code control passed
+the valid alias case and failed the missing-alias case; repaired source passes
+both orders. Full workspace checking, strict Clippy and formatting also passed.
+
+The current Linux CLI passed 27 native indexed positive calls, three typed
+negative calls and 25 byte comparisons on retained plain/bounded and compressed
+images. A separate exclusively created 64MiB native image with 256 files has
+13 allocated/reachable index nodes, 12 leaves and two levels of child traversal,
+independently decoded from native tool streams. Strict/indexed endpoints and
+middle keys passed 12 full/ranged comparisons and two listings; six missing-gap
+queries returned typed NotFound with empty stdout. Read-phase hashes stayed
+unchanged. No timing comparison or performance win is inferred.
+
+Four strict default `NtfsFs` read-only kernel FUSE mounts also passed 24 mounted
+byte comparisons and eight EROFS/ENOENT refusals, normal unmounts and unchanged
+hashes. An independent rerun passed the same inputs and test design; count that
+coverage once. These mounted results do not exercise `new_indexed`. The public
+facade mount path and indexed FsOps mounting remain outside this qualification.
+Source/hash checks and interval models alone remain static evidence. Full
+harness and benchmark acceptance are tracked separately from this bounded path.
+The repository's unchanged gate commands are:
 
 ```sh
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-ntfs indexed
@@ -103,7 +121,7 @@ RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-ntfs namespace
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-cli --bin ffs-ntfs indexed
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --workspace --all-targets
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
+RCH_REQUIRE_REMOTE=1 rch exec --job -- cargo fmt --check
 ```
 
 Native collation references: Linux v6.12 `fs/ntfs3/upcase.c` and `index.c`, and
