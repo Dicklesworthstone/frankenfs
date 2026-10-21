@@ -53,9 +53,37 @@ struct Admission {
     // Track gang allocations per native top-level vdev ID.
     // Header extents use their own allocation, never aggregate tree ASIZE.
     allocations: BTreeMap<u32, BTreeMap<u64, u64>>,
+    // Requested only by the physical-copy auditor. Ordinary reads retain the
+    // existing header map without allocating this second, bounded manifest.
+    audit_nodes: Option<Vec<AuditNode>>,
+}
+
+struct AuditNode {
+    pointer: BlockPointer,
+    header: Option<GangHeader>,
+    header_allocations: Vec<u64>,
 }
 
 impl Admission {
+    fn audit_node(
+        &mut self,
+        pointer: &BlockPointer,
+        header: Option<GangHeader>,
+        header_allocations: Vec<u64>,
+    ) -> Result<()> {
+        if let Some(nodes) = &mut self.audit_nodes {
+            nodes
+                .try_reserve(1)
+                .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+            nodes.push(AuditNode {
+                pointer: pointer.clone(),
+                header,
+                header_allocations,
+            });
+        }
+        Ok(())
+    }
+
     fn claim(&mut self, dva: &Dva, bytes: u64) -> Result<()> {
         let end = dva
             .offset
@@ -127,13 +155,11 @@ pub(super) fn header_allocations(config: &VdevConfig, pointer: &BlockPointer) ->
 }
 
 impl Pool {
-    pub(in super::super) fn read_gang_block(
+    fn gang_allocated_work(
         &self,
-        cx: &Cx,
         config: &VdevConfig,
         pointer: &BlockPointer,
-    ) -> Result<BlockRead> {
-        checkpoint(cx)?;
+    ) -> Result<u64> {
         let dvas = pointer
             .gang_dvas(&header_allocations(config, pointer)?)
             .map_err(|error| parse(&error))?;
@@ -145,14 +171,85 @@ impl Pool {
         let allocated = dvas
             .iter()
             .try_fold(0_u64, |sum, dva| sum.checked_add(dva.allocated_bytes));
-        if allocated
+        let allocated = allocated
             .and_then(|sum| sum.checked_mul(replicas))
-            .is_none_or(|bytes| bytes > MAX_GANG_ALLOCATED_BYTES)
+            .filter(|bytes| *bytes <= MAX_GANG_ALLOCATED_BYTES)
+            .ok_or_else(|| unsupported("ZFS gang tree exceeds the allocated read budget"))?;
+        Ok(allocated)
+    }
+
+    /// Reserve conservative byte-work for a complete gang-copy audit BEFORE
+    /// reading its manifest. Native aggregate ASIZE includes every header and
+    /// fragment copy. Mirror multiplicity is included by gang_allocated_work.
+    /// The multipliers cover manifest rereads, header recovery, copy decoding
+    /// and parity equations, not wall-clock time or unique physical I/O bytes.
+    pub(in super::super) fn gang_audit_work(
+        &self,
+        config: &VdevConfig,
+        pointer: &BlockPointer,
+    ) -> Result<u64> {
+        let allocated = self.gang_allocated_work(config, pointer)?;
+        // One 512-byte header has one data column at every admitted ashift.
+        // RAIDZ3 therefore has at most seven recovery hypotheses, not the
+        // 92 possible for an ordinary eight-column data block. The larger
+        // factor also covers padded-sector reconstruction and P/Q/R auditing.
+        let factor = if config
+            .raidz_members
+            .as_ref()
+            .is_some_and(|group| group.parity != 0)
         {
-            return Err(unsupported(
-                "ZFS gang tree exceeds the allocated read budget",
-            ));
+            256
+        } else {
+            8
+        };
+        allocated
+            .checked_mul(factor)
+            .ok_or_else(|| corrupt("gang audit work overflows"))
+    }
+
+    /// Visit copies only after the COMPLETE native header graph has passed
+    /// the same geometry, aggregate-size, overlap and depth checks as reads.
+    /// The caller first reserves gang_audit_work, and never uses this callback
+    /// to supply traversal data. Returning false records explicit incomplete
+    /// audit coverage at the caller; it does not change ordinary read admission.
+    pub(in super::super) fn visit_gang_audit(
+        &self,
+        cx: &Cx,
+        config: &VdevConfig,
+        pointer: &BlockPointer,
+        mut visit: impl FnMut(&BlockPointer, Option<&GangHeader>, &[u64]) -> Result<bool>,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        self.gang_allocated_work(config, pointer)?;
+        let mut admission = Admission {
+            audit_nodes: Some(Vec::new()),
+            ..Admission::default()
+        };
+        self.admit_gang(cx, config, pointer, 0, &mut admission)?;
+        let nodes = admission
+            .audit_nodes
+            .take()
+            .ok_or_else(|| corrupt("gang audit lost its native manifest"))?;
+        // Raw header buffers have served admission; only parsed identities
+        // need to survive the physical audit. No fragment has been read here.
+        drop(admission);
+        for node in nodes {
+            checkpoint(cx)?;
+            if !visit(&node.pointer, node.header.as_ref(), &node.header_allocations)? {
+                break;
+            }
         }
+        checkpoint(cx)
+    }
+
+    pub(in super::super) fn read_gang_block(
+        &self,
+        cx: &Cx,
+        config: &VdevConfig,
+        pointer: &BlockPointer,
+    ) -> Result<BlockRead> {
+        checkpoint(cx)?;
+        self.gang_allocated_work(config, pointer)?;
         let mut admission = Admission::default();
         self.admit_gang(cx, config, pointer, 0, &mut admission)?;
         // Read no fragment until the complete header graph, every declared
@@ -202,6 +299,7 @@ impl Pool {
             admission.claim(dva, *bytes)?;
         }
         if !pointer.gang() {
+            admission.audit_node(pointer, None, Vec::new())?;
             return Ok(());
         }
         let identity = allocations
@@ -212,6 +310,9 @@ impl Pool {
         let header_allocations: Vec<_> = allocations.iter().map(|(_, bytes)| *bytes).collect();
         let header = GangHeader::parse(&block.bytes, pointer, &header_allocations)
             .map_err(|error| parse(&error))?;
+        if admission.audit_nodes.is_some() {
+            admission.audit_node(pointer, Some(header.clone()), header_allocations)?;
+        }
         for child in header.children() {
             self.admit_gang(cx, config, child, depth + 1, admission)?;
         }

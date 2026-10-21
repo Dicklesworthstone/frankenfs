@@ -225,9 +225,10 @@ and validation still required before relying on the feature.
 
 ### Check redundancy, not only readability
 
-`ffs-zfs scrub --verify-redundancy` rereads each ordinary physical copy in the
-selected dataset's DMU graph and checks RAIDZ P/Q/R parity against the actual
-checksum-valid data columns. A good alternate copy or successful reconstruction
+`ffs-zfs scrub --verify-redundancy` rereads physical copies in the selected
+dataset's DMU graph, including bounded gang-header and fragment trees, and checks
+RAIDZ P/Q/R parity against the actual checksum-valid data columns. A good
+alternate copy or successful reconstruction
 no longer conceals a damaged replica or parity sector in this explicit mode.
 Normal `scrub` retains its existing readability-only contract.
 
@@ -238,11 +239,14 @@ ffs-zfs scrub first.img --member second.img --offline-image \
 ```
 
 The independent work budget is reserved before extra audit I/O. Missing members,
-unverified parity, unsupported gang-copy coverage and exhausted limits cannot
+unverified parity, divergent gang headers and exhausted limits cannot
 produce a clean redundancy result. No writes, healing, resilvering or pool-wide
 coverage are implied; enclosing object-set roots, labels and other datasets stay
-outside this walk. Eleven new Rust controls are authored but not executed in
-this environment. See the [physical-copy audit profile](docs/ZFS_REDUNDANCY_SCRUB.md)
+outside this walk. The eleven earlier audit controls plus seven new gang-tree
+controls are authored but not executed in this environment. Gang audit charges
+include a conservative whole-tree allowance before manifest I/O; an incomplete
+graph or saturated diagnostic ledger never becomes a clean audit. See the
+[physical-copy audit profile](docs/ZFS_REDUNDANCY_SCRUB.md)
 for precise coverage, counters and qualification requirements.
 
 ## Build and explore

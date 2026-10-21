@@ -45,6 +45,44 @@ audit never replaces traversal data or inserts unverified bytes into caches.
 Its coverage includes ordinary indirect blocks, dnode tables, data and admitted
 SA spills reachable from this selected meta-dnode.
 
+## Gang headers and fragmented blocks
+
+Gang pointers now use the same complete native graph admission as ordinary
+reads before their physical-copy audit starts. Every nested header and ordinary
+fragment is included; this is not a second gang parser. Existing depth, node,
+overlap, physical-byte, aggregate-allocation and topology checks remain in force.
+The admitted header graph is retained rather than rediscovered through each
+replica. No fragment-copy audit starts until the complete graph is admitted.
+
+Header copies are read as 512-byte native headers, not as the leader's PSIZE
+and not as the aggregate DVA ASIZE. Each uses the original DVA-zero and physical
+birth verifier, even when it is read from a later DVA. Each independently valid
+header must describe exactly the admitted child pointers; a divergent but
+self-checksummed header is an error and its alternative graph is never followed.
+Fragment copies retain their own physical checksums. Leader decompression and
+the complete leader checksum still belong to the ordinary verified read path.
+
+RAIDZ header stripes use the native header map and embedded checksum before
+checking their P/Q/R equations. Actual corrupt or missing data is not replaced
+with reconstructed bytes for the parity audit. Recovered readability therefore
+does not certify the damaged header, fragment or parity column. Leaf/mirror and
+striped routes retain their admitted member mapping and per-DVA header sizes.
+
+The whole gang audit reserves a conservative work allowance before even its
+extra manifest reads: eight times aggregate native allocation for leaf/mirror
+or stripe paths, and 256 times for RAIDZ. Mirror multiplicity and every declared
+DVA are included. The larger RAIDZ allowance covers padded-header recovery and
+all-copy parity work. These are deliberately conservative byte-work charges,
+not measured I/O, elapsed time, or a claim that all charged work was performed.
+Small explicit budgets can refuse a readable gang tree before any extra audit
+read. Native limits still cap each tree at 256 MiB aggregate allocation,
+65,536 nodes and 32 header levels.
+
+Per-logical-pointer diagnostics are capped at 128 retained defects plus an
+explicit unsupported-coverage marker. On saturation, the remaining gang nodes
+are not audited and the result cannot be clean. Cancellation remains terminal,
+including cancellation after the diagnostic ledger fills.
+
 ## Bounds, missing members, and results
 
 `--max-copy-bytes` is a separate conservative work cap over audit reads, assembly,
@@ -73,10 +111,9 @@ this mode. The legacy pool-wide `all_replicas_checked` remains false.
 This is not a pool-wide native scrub or a repair/resilver operation. Labels,
 uberblock rings, enclosing object-set roots, other datasets/snapshots, ZIL,
 space maps and references embedded in bonus data are not covered by this walk.
-Gang-block readability continues through the existing reader, but all-copy
-verification of gang headers and fragments is not yet implemented. Encountering
-a gang pointer records unsupported coverage and cannot produce a clean enhanced
-report. Native allocation/namespace/ACL consistency is a separate obligation.
+Gang headers and fragments reachable from a walked pointer are covered by the
+bounded protocol above. Native allocation/namespace/ACL consistency is still a
+separate obligation; this increment adds no pool writer or repair authority.
 
 The images must remain immutable/offline. No member write, sync, healing or
 atime update occurs. Sidecars remain refused before image open; this mode also
@@ -95,6 +132,14 @@ any read from an absent member. These are not full uberblock-import tests.
 Synthetic storage panics on writes/flushes.
 Existing readability tests and their assertions are retained.
 
+Seven additional authored gang controls exercise native DMU reads and scrub,
+both byte orders, 512/4096/65536-byte sectors, secondary header/fragment damage,
+nested trees, extra header DVAs, valid-but-divergent header refusal, complete
+pre-I/O work reservation, cancellation, manifest failure, bounded diagnostics,
+and actual-data/parity corruption on RAIDZ1/2/3. Their backing devices panic on
+write and sync. These tests have NOT run in this implementation environment;
+no Rust, mounted, native OpenZFS or power-failure qualification is inferred.
+
 These Rust tests have not been executed in this implementation environment.
 RCH and Cargo validation attempts exited 127 because the tools are absent.
 Exact baseline-blob checks and Git whitespace checks are source evidence only.
@@ -103,8 +148,9 @@ validation, not Rust execution, OpenZFS-produced image interchange or kernel
 FUSE evidence. Run the unchanged repository gates before relying on this mode:
 
 ```sh
-RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-cli --bin ffs-zfs redundancy
-RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-cli --bin ffs-zfs scrub
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-zfs redundancy
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-zfs scrub
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-zfs gang
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --workspace --all-targets
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
