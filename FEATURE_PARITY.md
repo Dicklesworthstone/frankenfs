@@ -63,8 +63,11 @@
 > FsOps tests, plus 40 facade tests and one compiled facade doctest. Its ignored
 > native-producer selection earns no native credit in that command. The later
 > borrowed-slice lint correction and current ZFS automatic import source passed
-> full workspace/all-target strict Clippy on `990539073` plus explicit overlays;
-> current unit-test and workspace-check reruns remain pending. A full genuine-Git
+> full workspace/all-target strict Clippy on `990539073` plus explicit overlays.
+> The current package rerun passed 747 tests: 40 facade, 24 NTFS CLI, 360 NTFS
+> reader and 323 ZFS, with one opt-in native test ignored. The complete fixture
+> and census overlay also passed workspace/all-target check, strict Clippy and
+> formatting. These package selections do not include doctests. A full genuine-Git
 > harness run passed 2,076 unit tests, then reached 98 conformance passes and five
 > failures in constructed Btrfs mount images with missing superblock checksums.
 > Its final source receipt also failed on Git index stat-cache changes. Neither
@@ -73,8 +76,13 @@
 > now emits a checksummed superblock and matching device/chunk inventory. The
 > rerun passed all 104 conformance tests, including the five previous failures
 > and a new valid-open/checksum-byte/covered-payload corruption control; two
-> ignored tests earn no credit. Later full-harness targets and final source
-> receipt remain pending. Production admission and old assertions are unchanged.
+> ignored tests earn no credit. A later failed run retained a valid final source
+> receipt after command-scoped Git stat-cache refresh was disabled; its census
+> failure exposed stale LOC inventory in three meta modules. The numeric-only
+> correction preserves every path, classification and census assertion and earns
+> no capability credit. The current rerun passed that census target; remaining
+> full-harness targets are pending. Production admission and old assertions are
+> unchanged.
 
 > **Native NTFS mounted slice, 2026-10-21:** the current RCH-delivered Linux CLI
 > candidate `3effe8ed21c9af9b5b0f537451e9f64fce869d58ce3d986ebbeb6eb0754d9d76`

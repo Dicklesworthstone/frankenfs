@@ -446,6 +446,22 @@ Passing those is necessary, not sufficient for filesystem readiness. Existing
 native-format compatibility, fault-injection, mounted and release gates remain
 in force; none are waived by adding a format or a new command.
 
+### Source inventory
+
+The current source-derived test inventory contains 24 crates under `crates/`,
+63 fuzz targets, 173 Rust benchmark files, 125 tracked E2E scripts and
+226 tracked insta snapshots. The evidence schema declares 23 evidence-event types.
+These are source counts, not executed-test or readiness results.
+The [fuzz inventory](fuzz/fuzz_targets/) has the badge count
+![63 fuzz targets](https://img.shields.io/badge/fuzz%20targets-63-brightgreen).
+The detailed guide retains [Decision 10: 125 E2E gate scripts](README_EXT4_BTRFS.md#decision-10-125-e2e-gate-scripts).
+
+The btrfs reader declares 23 command variants for send streams and item-type
+constants (24 currently). MVCC exposes 4 executable same-block merge mechanisms
+through the 5-outcome `MergeProofMechanism` enum; the remaining outcome refuses
+same-block merging. Enum and file counts do not qualify native interchange,
+durability or mounted behavior.
+
 ## License
 
 See [LICENSE](LICENSE) for the project's MIT + OpenAI/Anthropic Rider terms.
