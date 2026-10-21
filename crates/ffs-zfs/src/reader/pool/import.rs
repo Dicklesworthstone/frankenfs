@@ -149,10 +149,8 @@ fn admit_stripe(labels: &[Vec<(usize, Label)>], pool_guid: u64) -> Result<Admiss
             }
         }
         config_txg = config_txg.max(config.txg);
-        const INVALID_ID: usize = usize::MAX;
-        let id = usize::try_from(config.id).unwrap_or(INVALID_ID);
         let entry = by_id
-            .get_mut(id)
+            .get_mut(config.id as usize)
             .ok_or_else(|| corrupt("striped top-level vdev ID out of bounds"))?;
         if entry.is_some() {
             return Err(corrupt("duplicate striped top-level vdev ID"));
@@ -178,6 +176,7 @@ fn admit_stripe(labels: &[Vec<(usize, Label)>], pool_guid: u64) -> Result<Admiss
     config.top_guid = members[0].guid;
     config.ashift = members[0].ashift;
     config.allocated_bytes = members[0].allocated_bytes;
+    // The candidate must not predate ANY member's admitted configuration.
     config.txg = config_txg;
     config.raidz_members = Some(RaidzGroup { parity: 0, members });
     Ok(Admission {
@@ -198,6 +197,9 @@ impl Pool {
         for (member_index, member_labels) in labels.iter().enumerate() {
             let member = &self.members[member_index];
             let slot_bytes = member_labels[0].1.slot_bytes;
+            // Configuration and uberblock rings have independent checksums.
+            // All surviving configurations already agreed on ashift. Use that
+            // geometry to scan every ring, even beside a damaged config copy.
             for (label_index, label_offset) in label_offsets(member.length)
                 .map_err(|error| parse(&error))?
                 .into_iter()
@@ -247,11 +249,21 @@ impl Pool {
                 ));
             }
         }
+        // Identical roots would retry precisely the same DVAs on the same
+        // immutable devices. Deduplicate only AFTER checking for forks.
         candidates.dedup_by(|left, right| left.uberblock.txg == right.uberblock.txg);
         checkpoint(cx)?;
         Ok(candidates)
     }
 
+    /// Select the highest readable, checksum-verified TXG from every supplied
+    /// member's rings. Ring locations need not agree across replicas, and a
+    /// ring remains readable even when its adjacent configuration copy is bad.
+    ///
+    /// The returned label/slot belongs to the selected uberblock's source
+    /// member; `RootBlock::member_guid` continues to identify the data read.
+    /// All devices remain read-only. No ZIL replay, missing-member admission,
+    /// configuration-history resolution, or on-disk repair is performed.
     pub fn import_active(
         &self,
         cx: &Cx,
@@ -281,12 +293,11 @@ impl Pool {
             admit_single(&labels[0], pool_guid)?
         } else if integer(&first.1.config, "vdev_children")? > 1 {
             if labels.iter().any(|copies| {
-                copies[0]
-                    .1
-                    .config
-                    .list("vdev_tree")
+                copies[0].1.config.list("vdev_tree")
                     .is_some_and(|tree| tree.text("type") == Some("mirror"))
             }) {
+                // Physical image count is not top-level vdev count. Keep every
+                // mirror child while joining subtrees in native vdev-ID order.
                 let topology = Arc::new(self.admit_striped_labels(cx, &labels, pool_guid, true)?);
                 let admission = Admission {
                     config: topology.config.clone(),
@@ -296,6 +307,7 @@ impl Pool {
                 owner.top_levels = Some(topology);
                 admission
             } else {
+                // Keep the previously admitted plain-leaf stripe profile.
                 admit_stripe(&labels, pool_guid)?
             }
         } else {
@@ -521,6 +533,7 @@ companion_bin_tests! {
             let mut fixture = Fixture::new(Endian::Little);
             let config = native_config(GUIDS[0], &GUIDS, 9,
                 LENGTH as u64 - DATA_OFFSET - 2 * LABEL_BYTES, 42);
+            // All labels on member 1 now repeat member 0's physical identity.
             install_labels(&mut fixture.images[1], BASE, LENGTH as u64,
                 fixture.order, &config, &fixture.ub);
             let reads = Arc::default();
@@ -618,6 +631,7 @@ companion_bin_tests! {
             let reads = Arc::default();
             let pool = fixture.pool([Fault::None; 2], false, &reads);
             assert!(pool.import_active(&Cx::for_testing(), None).is_err());
+            // Two DVAs on two mirrors, not eight ring copies times four reads.
             assert_eq!(data_reads(&reads), 4);
         }
     }
