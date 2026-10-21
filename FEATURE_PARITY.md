@@ -24,6 +24,12 @@
 > six-format `OpenFs` row below still has only its detection-test binding; this
 > source integration does not silently promote that binding to mounted proof.
 
+> **Native-producer finding, 2026-10-21:** the explicit facade test executed real
+> FAT16/FAT32 comparisons successfully, then failed NTFS admission on FILE
+> record flags. The parser omitted native metadata/view-index bits `0x4/0x8`.
+> A source-backed correction and exhaustive flag rejection controls are being
+> qualified; the overall native test is failed, and NTFS acceptance stays open.
+
 > **2026-09-08 audit status:** The following counts are legacy declared-contract
 > counts, not current executed results. In particular, the fast-commit row below
 > is partial pending external crash-image verification. Public execution-bound

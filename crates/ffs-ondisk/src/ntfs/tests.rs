@@ -152,6 +152,48 @@ fn file_record_exposes_resident_data_and_native_reference_identity() {
 }
 
 #[test]
+fn file_record_retains_native_metadata_and_view_index_flags() {
+    for flags in 0_u16..=15 {
+        let mut raw = record();
+        raw[22..24].copy_from_slice(&flags.to_le_bytes());
+        let before = raw.clone();
+        let parsed = NtfsFileRecord::parse(&raw).unwrap();
+        assert_eq!(parsed.flags, flags);
+        assert_eq!(parsed.in_use(), flags & 1 != 0);
+        assert_eq!(parsed.is_directory(), flags & 2 != 0);
+        assert_eq!((parsed.number, parsed.sequence), (24, 7));
+        assert_eq!(parsed.base, NtfsReference::decode(0));
+        let attributes = parsed.attributes().unwrap();
+        assert_eq!(attributes.len(), 1);
+        assert!(matches!(attributes[0].value, NtfsValue::Resident(b"abc")));
+        assert_eq!(raw, before);
+    }
+}
+
+#[test]
+fn file_record_rejects_every_unknown_flag_encoding_and_torn_metadata_records() {
+    let mut raw = record();
+    for flags in 16_u16..=u16::MAX {
+        raw[22..24].copy_from_slice(&flags.to_le_bytes());
+        assert!(matches!(
+            NtfsFileRecord::parse(&raw),
+            Err(ParseError::InvalidField {
+                field: "ntfs.file_record",
+                reason: "unknown record flags"
+            })
+        ));
+    }
+    for flags in [0x0005_u16, 0x0009, 0x000D] {
+        let mut torn = record();
+        torn[22..24].copy_from_slice(&flags.to_le_bytes());
+        torn[1023] ^= 1;
+        let before = torn.clone();
+        assert!(NtfsFileRecord::parse(&torn).is_err());
+        assert_eq!(torn, before);
+    }
+}
+
+#[test]
 fn attributes_cannot_overlap_headers_escape_used_bytes_or_hide_bad_tails() {
     for (at, value) in [
         (20, 48),

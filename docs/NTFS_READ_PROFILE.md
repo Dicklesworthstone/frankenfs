@@ -120,6 +120,15 @@ have every 512-byte-stride update-sequence trailer checked before restoration.
 Attribute parsing checks used-byte boundaries, names, resident values,
 nonresident headers, unique instances and the terminating marker.
 
+FILE header flags retain the four native low bits: in-use `0x0001`, directory
+`0x0002`, the metadata marker `0x0004`, and non-directory view index `0x0008`.
+The latter two occur on native system records and do not confer directory or
+write authority. Higher bits remain invalid; all USA, attribute, identity and
+sequence checks still apply. This contract follows
+[Linux v6.19's record flags](https://github.com/torvalds/linux/blob/v6.19/fs/ntfs3/ntfs.h#L239-L245)
+and [ntfs-3g 2022.10.3's native layout](https://github.com/tuxera/ntfs-3g/blob/2022.10.3/include/ntfs-3g/layout.h#L234-L254).
+Recognizing a view-index record does not implement its named index as file DATA.
+
 The reader bootstraps the unnamed MFT DATA stream, requires record-zero
 agreement with MFTMirr, and reads subsequent records through the MFT runlist,
 including a fragmented MFT. It checks file-reference identity, sequence and

@@ -536,6 +536,10 @@ maintenance to minutes and spend the work block on executable integration.
 - [ ] Compile and execute that consumer against independently produced native images.
 - [x] Author direct public-facade native-producer FAT16/FAT32/NTFS acceptance.
 - [ ] Execute native producer comparisons; retain original images and oracle logs.
+- [x] Reproduce NTFS facade admission failure with a real mkntfs/ntfscp image.
+- [x] Independently review native FILE flag definitions and exact admission split.
+- [x] Implement native metadata/view flag preservation with exhaustive unknown-bit controls.
+- [ ] Execute parser regressions and rerun the unchanged native-producer test.
 - [x] Diagnose external dirty-image fixture's reserved-cluster address error.
 - [x] Re-execute both external FAT consumer tests with proven dirty-bit planting.
 - [x] Wire unchanged native FAT/NTFS profiles to explicit Cargo integration tests.
@@ -707,6 +711,28 @@ commits. Two working files retained merge markers; manual resolution preserves
 native NTFS ownership checks and ZFS gang audit, plus both prior lint fixes.
 Standard formatting and diff checks pass. Qualification will use an immutable
 committed-source cut rather than dirty overlays, with no acceptance closure.
+
+The v9 native-producer test actually executed one test and failed (exit 101).
+FAT16 and FAT32 completed both plain/bounded scenarios with exact payload,
+metadata, directory, refusal and unchanged-image checks. NTFS then failed during
+open: `Corruption { block: 18, detail: "invalid field: ntfs.file_record (unknown
+record flags)" }`. Evidence remains at the printed worker path ending in
+`.rch-tmp/ffs-facade-native-KjVEG9`. This is a real native reader defect, not a
+reason to filter metadata records or weaken the test. Linux v6.19 and ntfs-3g
+2022.10.3 both define flags 1, 2, 4 and 8. Independent read-only review agrees
+the parser must retain these bits, preserve directory/in-use masks, and reject
+all 65,520 higher-bit encodings. Two new unit controls cover all 16 recognized
+encodings, all unknown encodings, identity/payload/raw bytes and torn metadata
+records. The unchanged native-producer test must rerun after this correction.
+Native view-index content does not become unnamed DATA or writable authority.
+No native NTFS/ZFS/mounted claim or functional closure is made.
+
+The pre-merge companion job completed exit 0 with NTFS 18, protected-mount 61
+and ZFS 39 tests; FAT's binary has zero tests because its tests live in the
+library, so that empty target earns no coverage credit. The delivered five
+Linux files total 2,886,229,368 bytes; 448,933,447 is the reported transfer byte
+count, not their uncompressed total. Their actual SHA256s and file identities
+are retained in `delivered-consumers-v6.json`.
 
 The explicit Linux consumer build completed exit 0 and retrieved all five
 requested ELFs (four companions plus the public example), 448,933,447 bytes.

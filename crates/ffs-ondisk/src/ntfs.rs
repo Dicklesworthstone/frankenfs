@@ -24,6 +24,9 @@ pub const COMPRESSED: u16 = 0x0001;
 pub const ENCRYPTED: u16 = 0x4000;
 pub const SPARSE: u16 = 0x8000;
 const MAX_RECORD_BYTES: usize = 65_536;
+// Native FILE flags also include metadata (0x4) and view-index (0x8) markers.
+// Preserve them without interpreting either as directory or write authority.
+const FILE_RECORD_KNOWN_FLAGS: u16 = 0x000F;
 
 fn invalid(field: &'static str, reason: &'static str) -> ParseError {
     ParseError::InvalidField { field, reason }
@@ -280,7 +283,7 @@ impl NtfsFileRecord {
         let sequence = le16(&data, 16)?;
         let hard_links = le16(&data, 18)?;
         let flags = le16(&data, 22)?;
-        if flags & !3 != 0 {
+        if flags & !FILE_RECORD_KNOWN_FLAGS != 0 {
             return Err(invalid("ntfs.file_record", "unknown record flags"));
         }
         let base = NtfsReference::decode(le64(&data, 32)?);
