@@ -54,6 +54,12 @@ pub enum FileCommand {
         /// Maximum allocated dnodes examined, including malformed dnodes.
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=4_294_967_296))]
         max_objects: u64,
+        /// Audit every ordinary DVA/replica and RAIDZ parity, not just readable data.
+        #[arg(long)]
+        verify_redundancy: bool,
+        /// Independent read/decode/parity work cap; defaults to one TiB.
+        #[arg(long, requires = "verify_redundancy", value_parser = clap::value_parser!(u64).range(1..))]
+        max_copy_bytes: Option<u64>,
     },
     /// Mount one explicit head or snapshot as a read-only extraction view.
     Mount {
@@ -181,11 +187,16 @@ impl FileCommand {
                 max_pointers,
                 max_bytes,
                 max_objects,
+                verify_redundancy,
+                max_copy_bytes,
             } => {
                 // A healing sidecar can mutate backing storage during a read.
                 // This command certifies only the native read-only path.
                 if candidate.image.sidecar.is_some() {
                     bail!("read-only ZFS scrub does not admit sidecar healing");
+                }
+                if verify_redundancy && candidate.replay_zil {
+                    bail!("redundancy scrub verifies committed storage, not ZIL replay overlays");
                 }
                 let components = dataset_components(&dataset)?;
                 let mut pool = candidate.objects(cx)?;
@@ -198,6 +209,7 @@ impl FileCommand {
                     pointers: max_pointers,
                     decoded_bytes: max_bytes,
                     objects: max_objects,
+                    copy_bytes: verify_redundancy.then_some(max_copy_bytes.unwrap_or(1 << 40)),
                 };
                 let report = view.scrub(cx, limits)?;
                 let clean = report.is_clean();
@@ -212,9 +224,16 @@ impl FileCommand {
                     "snapshot_name_bytes": snapshot.as_deref().map(OsStrExt::as_bytes),
                     "clean": clean, "repaired_blocks": 0,
                     "all_replicas_checked": false,
+                    "selected_dmu_redundancy_verified": verify_redundancy && clean,
+                    "redundancy_requested": verify_redundancy,
                     "not_covered": [
                         "other datasets and snapshots", "pool allocation and space maps",
-                        "ZIL and pending synchronous intent", "all physical replicas and parity sectors",
+                        "ZIL and pending synchronous intent",
+                        if verify_redundancy {
+                            "copies outside the walked DMU graph, labels, object-set roots and gang trees"
+                        } else {
+                            "all physical replicas and parity sectors"
+                        },
                         "ZPL namespace, ACL and property semantics", "native repair and resilver"
                     ],
                     "report": report
@@ -780,6 +799,8 @@ mod tests {
             max_pointers,
             max_bytes,
             max_objects,
+            verify_redundancy,
+            max_copy_bytes,
         }) = parsed.command
         else {
             panic!("scrub command");
@@ -790,6 +811,8 @@ mod tests {
         assert_eq!(dataset, "data");
         assert_eq!(snapshot, Some(OsString::from("before")));
         assert_eq!((max_pointers, max_bytes, max_objects), (1000, 40960, 50));
+        assert!(!verify_redundancy);
+        assert_eq!(max_copy_bytes, None);
     }
 
     #[test]
@@ -827,5 +850,40 @@ mod tests {
         };
         let error = command.run(&Cx::for_testing()).unwrap_err();
         assert!(error.to_string().contains("does not admit sidecar healing"));
+    }
+
+    #[test]
+    fn redundancy_scrub_keeps_snapshot_members_and_independent_work_budget() {
+        let base = ["ffs-zfs", "scrub", "first.img", "--offline-image", "--auto-import"];
+        let cli = Cli::try_parse_from(base.into_iter().chain([
+            "--verify-redundancy", "--max-copy-bytes", "65536",
+            "--snapshot", "before", "--member", "second.img",
+        ])).unwrap();
+        let Command::File(FileCommand::Scrub {
+            candidate, snapshot, verify_redundancy, max_copy_bytes, ..
+        }) = cli.command else { panic!("scrub"); };
+        assert!(verify_redundancy);
+        assert_eq!(max_copy_bytes, Some(65_536));
+        assert_eq!(snapshot, Some(OsString::from("before")));
+        assert_eq!(candidate.members, [PathBuf::from("second.img")]);
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--max-copy-bytes", "1"])).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain([
+            "--verify-redundancy", "--max-copy-bytes", "0"
+        ])).is_err());
+    }
+
+    #[test]
+    fn redundancy_scrub_refuses_sidecar_and_log_replay_before_image_io() {
+        for (extra, reason) in [
+            (vec!["--sidecar", "unopened.rq"], "does not admit sidecar healing"),
+            (vec!["--replay-zil"], "not ZIL replay overlays"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "ffs-zfs", "scrub", "unopened.img", "--offline-image",
+                "--auto-import", "--verify-redundancy",
+            ].into_iter().chain(extra)).unwrap();
+            let Command::File(command) = cli.command else { panic!("scrub"); };
+            assert!(command.run(&Cx::for_testing()).unwrap_err().to_string().contains(reason));
+        }
     }
 }
