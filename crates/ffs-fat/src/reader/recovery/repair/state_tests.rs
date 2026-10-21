@@ -2,6 +2,8 @@
 //! images. Pending bytes and sync-time loss are distinct; this is not hardware
 //! or native-tool interoperability qualification.
 
+mod reclamation;
+
 use super::*;
 use ffs_ondisk::fat::{FatGeometry, FatOemCodePage};
 use std::collections::BTreeMap;

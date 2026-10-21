@@ -224,16 +224,41 @@ impl Plan {
         })
     }
 
-    fn execute(&self, cx: &Cx, diagnostic: &DiagnosticVolume) -> Result<serde_json::Value> {
+    /// A bounded diagnostic is not an authorization list. Equal counts (and
+    /// even an equal diagnostic report) can conceal different live owners or
+    /// different orphan successors. Rebuild the full reclamation set instead.
+    fn validate_lost(&self, cx: &Cx, volume: &FatVolume) -> Result<()> {
+        if collect_lost(cx, volume, &self.before)? != self.lost {
+            bail!("unreachable allocation changed after recovery preflight; refusing reclamation");
+        }
+        Ok(())
+    }
+
+    fn validate(&self, cx: &Cx, diagnostic: &DiagnosticVolume) -> Result<()> {
         checkpoint(cx)?;
+        // DiagnosticVolume retains its parsed geometry. A no-op must not report
+        // a cached clean result after the actual BPB has changed either.
+        for number in std::iter::once(0_u16)
+            .chain(diagnostic.volume.geometry.backup_boot_sector())
+        {
+            StateSector::boot(cx, diagnostic, number, true)?;
+        }
+        let actual = diagnostic.report(cx)?;
+        if serde_json::to_value(&actual)? != serde_json::to_value(&self.before)? {
+            bail!("diagnostic evidence changed after recovery preflight; image left unchanged");
+        }
+        self.orphan_names.validate(cx, &diagnostic.volume)?;
+        self.validate_lost(cx, &diagnostic.volume)
+    }
+
+    fn execute(&self, cx: &Cx, diagnostic: &DiagnosticVolume) -> Result<serde_json::Value> {
+        self.validate(cx, diagnostic)?;
         if self.before.clean {
             let mut report = self.report(false);
             report["changed"] = false.into();
             return Ok(report);
         }
         let volume = &diagnostic.volume;
-        // Repeat the entire namespace proof before even setting a dirty bit.
-        self.orphan_names.validate(cx, volume)?;
         let mut phase = "persisting native dirty state";
         let result = (|| -> Result<serde_json::Value> {
             set_state(cx, diagnostic, true)?;
@@ -245,6 +270,12 @@ impl Plan {
             }
             phase = "retiring verified unbound long-name records";
             self.orphan_names.retire(cx, volume)?;
+            // State-sector and LFN writes have crossed durability boundaries.
+            // Re-read rooted ownership before the first irreversible free,
+            // even when no orphan-name cleanup was requested. The old default
+            // Names evidence is empty and cannot certify this authority.
+            phase = "revalidating unreachable allocation before reclamation";
+            self.validate_lost(cx, volume)?;
             phase = "reclaiming verified unreachable allocation";
             free_lost(cx, volume, &self.lost)?;
             let free_after = self.before.free_clusters + self.lost.len() as u64;
