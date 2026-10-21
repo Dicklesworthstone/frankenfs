@@ -505,17 +505,13 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                     volume.read(&cx, &stream, 5, 7).unwrap(),
                     named_payload[5..12]
                 );
-                assert!(
-                    volume
-                        .read(&cx, &stream, stream.size, 9)
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    volume.read(&cx, &stream, stream.size, 9).unwrap(),
+                    [] as [u8; 0]
                 );
-                assert!(
-                    volume
-                        .read(&cx, &stream, stream.size + 5, 9)
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    volume.read(&cx, &stream, stream.size + 5, 9).unwrap(),
+                    [] as [u8; 0]
                 );
                 for absent in ["NOTE", "missing"] {
                     assert!(matches!(
