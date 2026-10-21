@@ -9,6 +9,7 @@
 
 mod creation;
 mod metadata;
+mod publication;
 mod ranges;
 pub use creation::{
     MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, rename_in_volume,
@@ -453,13 +454,17 @@ impl Replacement {
             namespace.validate(cx, volume)?;
         }
         source_stable()?;
+        self.verify_disjoint_links(cx, volume, false)?;
+        // Reserve bounded scratch before dirty publication. The staged-data
+        // verifier reuses this cluster buffer, independent of file length.
+        let mut buffer = allocate(volume.geometry.cluster_bytes() as usize)?;
+        let mut publication = publication::EntryPublication::new(volume, self.entry_offset)?;
         let mut phase = "publishing dirty state";
         let result = (|| -> Result<serde_json::Value> {
             set_dirty(cx, volume, true)?;
             set_hints(cx, volume, u32::MAX)?;
             volume.device.sync(cx)?;
             phase = "initializing disjoint data";
-            let mut buffer = allocate(volume.geometry.cluster_bytes() as usize)?;
             let mut copied = Sha256::new();
             let mut at = 0_u64;
             for cluster in &self.clusters {
@@ -480,6 +485,8 @@ impl Replacement {
             }
             source_stable()?;
             volume.device.sync(cx)?;
+            phase = "verifying disjoint data before allocation publication";
+            self.verify_staged_data(cx, volume, &mut buffer)?;
             phase = "publishing new allocation";
             let end = match volume.geometry.kind() {
                 FatKind::Fat16 => 0xFFFF,
@@ -502,22 +509,17 @@ impl Replacement {
                     }),
             )?;
             volume.device.sync(cx)?;
+            phase = "verifying detached allocation before namespace publication";
+            self.verify_disjoint_links(cx, volume, true)?;
             if let Some(namespace) = &self.creation {
                 phase = "initializing and publishing directory storage";
                 namespace.stage(cx, volume)?;
+                // Parent growth can share FAT sectors with either file chain.
+                // Never use cached pre-growth links to certify publication.
+                self.verify_disjoint_links(cx, volume, true)?;
             }
             phase = "publishing the replacement directory entry";
-            let sector_bytes = u64::from(volume.geometry.sector_bytes());
-            let start = self.entry_offset / sector_bytes * sector_bytes;
-            let within = (self.entry_offset - start) as usize;
-            let mut sector = allocate(sector_bytes as usize)?;
-            volume.read_exact(cx, start, &mut sector)?;
-            if sector[within..within + 32] != self.original {
-                bail!("directory entry changed before replacement publication");
-            }
-            sector[within..within + 32].copy_from_slice(&self.updated);
-            write_volume(cx, volume, start, &sector)?;
-            volume.device.sync(cx)?;
+            publication.publish_file(cx, volume, self)?;
             phase = "verifying published file contents";
             self.verify_payload(cx, volume)?;
             phase = "releasing old allocation";
@@ -531,6 +533,9 @@ impl Replacement {
             )?;
             set_hints(cx, volume, self.free_after as u32)?;
             volume.device.sync(cx)?;
+            // Reclamation can rewrite a sector containing new chain links.
+            // The structural checker alone is not a file-content oracle.
+            self.verify_payload(cx, volume)?;
             phase = "checking completed allocation and namespace";
             let verification = volume.check(cx)?;
             if !verification.clean || !verification.complete || !verification.namespace_complete {

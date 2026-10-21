@@ -29,6 +29,10 @@ pub(super) struct AttributeSet<'a> {
 }
 
 impl AttributeSet<'_> {
+    pub(super) fn extension_numbers(&self) -> impl Iterator<Item = u64> + '_ {
+        self.extensions.keys().copied()
+    }
+
     pub(super) fn all(&self) -> Result<Vec<NtfsAttribute<'_>>> {
         let mut result = Vec::new();
         for record in std::iter::once(self.base).chain(self.extensions.values()) {
@@ -133,7 +137,7 @@ impl NtfsVolume {
     }
 }
 
-fn read_list(
+pub(super) fn read_list(
     source: &Source,
     geometry: &NtfsGeometry,
     cx: &Cx,
@@ -170,7 +174,7 @@ fn read_list(
     Ok(Some(list))
 }
 
-fn resolve_catalog<'a>(
+pub(super) fn resolve_catalog<'a>(
     cx: &Cx,
     geometry: &NtfsGeometry,
     base: &'a NtfsFileRecord,
