@@ -133,7 +133,10 @@ def compressed_cases(command: Callable[..., bytes], binary: Path, root: Path) ->
         require(set(payloads) <= records.keys(), "native compressed fixture names are missing")
         with image.open("rb") as source:
             boot = source.read(512)
-        native_mft = command("ntfscat", "-i", "0", image)
+        # Normal ntfscat applies MST fixups to $MFT records. This independent
+        # parser checks the on-disk USA before applying it, so request raw
+        # attribute bytes explicitly (ntfs-3g 2022.10.3 ntfscat.c:339-353).
+        native_mft = command("ntfscat", "--raw", "-i", "0", image)
         allocated = native_compressed_allocation(native_mft, boot, records["dense.bin"], len(payloads["dense.bin"]))
         for name, expected in payloads.items():
             record = str(records[name])
