@@ -19,12 +19,25 @@ Native extended attributes can also be enumerated or extracted by record
 identity. The mounted view exposes native `user.*` EAs through read-only xattr
 operations while preserving other EA namespaces for explicit inspection.
 
+Library callers can use `ffs::open_read_only` and borrow
+`ReadOnlyFs::ntfs_volume()` for exact native DATA stream selection. This is the
+same volume used by the `FsOps` adapter, with its original bounded, locked,
+OS-read-only descriptor and clean-log admission. The borrow exposes neither a
+mutable volume nor a reopened pathname. Resolve the base file, select
+`NtfsVolume::data_stream(cx, record, utf16_name)` and read that validated stream;
+the stream's own size controls EOF, independently of unnamed DATA. The public
+`native_reader` example accepts mutually exclusive `read --stream note` and
+`read --stream-utf16 006e,006f,0074,0065`, using the existing lossless selector.
+These additions are source-reviewed; their new native execution remains pending.
+
 ## Commands
 
 Use the repository's prescribed RCH build workflow:
 
 ```sh
 rch exec -- cargo build -p ffs-cli --bin ffs-ntfs
+
+cargo run -p ffs --example native_reader -- volume.img read /file.txt --stream note
 
 ffs-ntfs inspect volume.img --offline-image
 ffs-ntfs ls volume.img / --offline-image

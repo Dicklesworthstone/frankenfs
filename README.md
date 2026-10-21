@@ -59,6 +59,9 @@ image handles, refuses ambiguous signatures and keeps native admission rules.
 Options preserve volume bounds, FAT OEM selection, btrfs roots/devices and ZFS
 pool/candidate/dataset/snapshot/device selection. ext4 recovery stays in memory.
 Callers supply their own context and keep backing images offline and immutable.
+For NTFS, `ReadOnlyFs::ntfs_volume()` borrows the same admitted volume for exact
+UTF-16 named-stream selection, including streams stored in extension records.
+The new stream-access path is awaiting its native execution rerun.
 
 The standalone [`native_reader` example](crates/ffs/examples/native_reader.rs)
 uses that public API for `stat`, NUL-delimited `list`, bounded `read` and an
@@ -67,6 +70,7 @@ explicit `refuse-write` scratch-image check. It owns its application runtime:
 ```bash
 cargo run -p ffs --example native_reader -- image.img stat /
 cargo run -p ffs --example native_reader -- image.img read /hello.txt --start 0 --bytes 4096
+cargo run -p ffs --example native_reader -- ntfs.img read /hello.txt --stream note
 ```
 
 At merged revision `ff3dca7ec`, workspace/all-target checking and strict Clippy

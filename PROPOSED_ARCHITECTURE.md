@@ -216,6 +216,11 @@ the result exposes no format-specific `enable_writes`. NTFS keeps its clean-log
 mounted-view admission. ZFS retains explicit pool, candidate, dataset, snapshot,
 topology and optional volatile replay selections; historical snapshots open
 without requiring a valid live head. Native refusal rules still apply.
+The facade retains an `Arc<NtfsFs>` behind both its existing `FsOps` dispatch and
+the borrowed `ntfs_volume()` accessor. Advanced callers select exact native DATA
+streams through that admitted volume; they do not reopen a path, bypass clean-log
+admission or obtain mutable access. Generic `FsOps` reads keep unnamed-DATA
+semantics. The application example uses the stream's own size for selected reads.
 
 This is a facade composition boundary: `OpenFs` and `FsFlavor` themselves remain
 ext4/btrfs. Native NTFS/ZFS writers, cross-format MVCC, automatic repair and live

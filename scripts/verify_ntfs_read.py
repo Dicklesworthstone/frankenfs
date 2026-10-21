@@ -285,6 +285,10 @@ def main() -> None:
             for selector, value in [("--stream", "note"), ("--stream-utf16", "006e,006f,0074,0065")]:
                 require(command(facade, image, "read", "/tiny.txt", selector, value) == named,
                         "public facade native named DATA differs")
+                for start in (len(named), len(named) + 5):
+                    require(command(facade, image, "read", "/tiny.txt", selector, value,
+                                    "--start", str(start), "--bytes", "17") == b"",
+                            "public facade named DATA EOF exposed bytes")
             for name in ("NOTE", "missing"):
                 command(facade, image, "read", "/tiny.txt", "--stream", name, failure="NotFound")
         for name, expected in extension_streams.items():
@@ -321,6 +325,9 @@ def main() -> None:
                     "bounded public facade unnamed DATA differs")
             require(command(*public, "read", "/tiny.txt", "--stream", "extension-31")
                     == extension_streams["extension-31"], "bounded public facade extension stream differs")
+            require(command(*public, "read", "/tiny.txt", "--stream", "extension-31",
+                            "--start", "507", "--bytes", "1031") == extension_streams["extension-31"][507:1538],
+                    "bounded public facade extension range differs")
             command(*public, "read", "/tiny.txt", "--stream", "missing", failure="NotFound")
         require(digest(disk) == disk_before, "candidate modified image or adjacent partition bytes")
         compression = compressed_cases(command, binary, root)

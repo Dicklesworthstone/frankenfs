@@ -511,6 +511,12 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                         .unwrap()
                         .is_empty()
                 );
+                assert!(
+                    volume
+                        .read(&cx, &stream, stream.size + 5, 9)
+                        .unwrap()
+                        .is_empty()
+                );
                 for absent in ["NOTE", "missing"] {
                     assert!(matches!(
                         volume.data_stream(
