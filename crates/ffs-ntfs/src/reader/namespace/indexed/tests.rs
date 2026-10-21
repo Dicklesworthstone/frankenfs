@@ -136,7 +136,9 @@ fn root(entries: &[Vec<u8>], internal: bool) -> Vec<u8> {
     raw[12] = 8;
     raw[16..20].copy_from_slice(&16_u32.to_le_bytes());
     raw[28..32].copy_from_slice(&u32::from(internal).to_le_bytes());
-    for entry in entries { raw.extend_from_slice(entry); }
+    for entry in entries {
+        raw.extend_from_slice(entry);
+    }
     let used = (raw.len() - 16) as u32;
     raw[20..24].copy_from_slice(&used.to_le_bytes());
     raw[24..28].copy_from_slice(&used.to_le_bytes());
@@ -168,18 +170,24 @@ struct Device {
 }
 
 impl ByteDevice for Device {
-    fn len_bytes(&self) -> u64 { self.bytes.len() as u64 }
+    fn len_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
     fn read_exact_at(&self, _: &Cx, at: ByteOffset, out: &mut [u8]) -> Result<()> {
         self.reads.lock().unwrap().push((at.0, out.len()));
         if let Some((offset, cancel)) = self.fail
             && offset == at.0
         {
-            return Err(if cancel { FfsError::Cancelled } else {
+            return Err(if cancel {
+                FfsError::Cancelled
+            } else {
                 FfsError::Io(std::io::Error::other("indexed fixture I/O failure"))
             });
         }
         let start = usize::try_from(at.0).unwrap();
-        let bytes = self.bytes.get(start..start + out.len())
+        let bytes = self
+            .bytes
+            .get(start..start + out.len())
             .ok_or_else(|| corrupt(0, "fixture read exceeds volume"))?;
         out.copy_from_slice(bytes);
         Ok(())
@@ -201,18 +209,32 @@ impl Image {
     }
 
     fn file(&mut self, number: u32, parent: u64, name: &str, namespace: u8) {
-        self.put(number as usize, &record(number, false, &[
-            resident(0x80, 0, "", b"native indexed payload"),
-            resident(0x30, 1, "", &filename(parent, name, namespace)),
-        ]));
+        self.put(
+            number as usize,
+            &record(
+                number,
+                false,
+                &[
+                    resident(0x80, 0, "", b"native indexed payload"),
+                    resident(0x30, 1, "", &filename(parent, name, namespace)),
+                ],
+            ),
+        );
     }
 
     fn index(&mut self, entries: &[Vec<u8>], bitmap: u8) {
-        self.put(5, &record(5, true, &[
-            resident(0x90, 0, "$I30", &root(entries, true)),
-            mapped(0xA0, 1, "$I30", &[0x21, 16, 220, 0, 0], 16, 8192),
-            resident(0xB0, 2, "$I30", &[bitmap]),
-        ]));
+        self.put(
+            5,
+            &record(
+                5,
+                true,
+                &[
+                    resident(0x90, 0, "$I30", &root(entries, true)),
+                    mapped(0xA0, 1, "$I30", &[0x21, 16, 220, 0, 0], 16, 8192),
+                    resident(0xB0, 2, "$I30", &[bitmap]),
+                ],
+            ),
+        );
     }
 
     fn new(external: bool) -> Self {
@@ -230,15 +252,24 @@ impl Image {
         boot[64] = 0xF6;
         boot[68] = 0xF4;
         boot[510..512].copy_from_slice(&[0x55, 0xAA]);
-        let mft = record(0, false, &[mapped(0x80, 0, "", &[0x11, 64, 4, 0], 64, 32768)]);
+        let mft = record(
+            0,
+            false,
+            &[mapped(0x80, 0, "", &[0x11, 64, 4, 0], 64, 32768)],
+        );
         image.put(0, &mft);
         image.0[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&mft);
         let mut version = [0; 12];
         version[8..10].copy_from_slice(&[3, 1]);
         image.put(3, &record(3, false, &[resident(0x70, 0, "", &version)]));
-        image.put(10, &record(10, false, &[
-            mapped(0x80, 0, "", &[0x22, 0, 1, 44, 1, 0], 256, 131_072),
-        ]));
+        image.put(
+            10,
+            &record(
+                10,
+                false,
+                &[mapped(0x80, 0, "", &[0x22, 0, 1, 44, 1, 0], 256, 131_072)],
+            ),
+        );
         for unit in 0..=u16::MAX {
             let upper = match unit {
                 97..=122 => unit - 32,
@@ -248,36 +279,80 @@ impl Image {
             let at = UPCASE + usize::from(unit) * 2;
             image.0[at..at + 2].copy_from_slice(&upper.to_le_bytes());
         }
-        image.put(24, &record(24, false, &[
-            resident(0x80, 0, "", b"native indexed payload"),
-            resident(0x30, 1, "", &filename(5, "A.txt", 1)),
-            resident(0x30, 2, "", &filename(5, "A~1.TXT", 2)),
-        ]));
-        for (number, name, ns) in [(25, "Z.txt", 1), (26, "M.txt", 1), (28, "Ä.bin", 1), (29, "mixed", 0)] {
+        image.put(
+            24,
+            &record(
+                24,
+                false,
+                &[
+                    resident(0x80, 0, "", b"native indexed payload"),
+                    resident(0x30, 1, "", &filename(5, "A.txt", 1)),
+                    resident(0x30, 2, "", &filename(5, "A~1.TXT", 2)),
+                ],
+            ),
+        );
+        for (number, name, ns) in [
+            (25, "Z.txt", 1),
+            (26, "M.txt", 1),
+            (28, "Ä.bin", 1),
+            (29, "mixed", 0),
+        ] {
             image.file(number, 5, name, ns);
         }
         image.file(30, 27, "child", 1);
-        image.put(27, &record(27, true, &[
-            resident(0x90, 0, "$I30", &root(&[key(30, 27, "child", 1, None), terminal(None)], false)),
-            resident(0x30, 1, "", &filename(5, "Subdir", 1)),
-        ]));
+        image.put(
+            27,
+            &record(
+                27,
+                true,
+                &[
+                    resident(
+                        0x90,
+                        0,
+                        "$I30",
+                        &root(&[key(30, 27, "child", 1, None), terminal(None)], false),
+                    ),
+                    resident(0x30, 1, "", &filename(5, "Subdir", 1)),
+                ],
+            ),
+        );
         let target: Vec<_> = "Subdir/child".encode_utf16().collect();
         let mut link = vec![0; 20];
         link[..4].copy_from_slice(&0xA000_000C_u32.to_le_bytes());
         link[4..6].copy_from_slice(&(12 + target.len() as u16 * 2).to_le_bytes());
         link[10..12].copy_from_slice(&(target.len() as u16 * 2).to_le_bytes());
         link[16..20].copy_from_slice(&1_u32.to_le_bytes());
-        for unit in target { link.extend_from_slice(&unit.to_le_bytes()); }
-        image.put(31, &record(31, false, &[
-            resident(0x30, 0, "", &filename(5, "link", 1)),
-            resident(0xC0, 1, "", &link),
-        ]));
-        let left = vec![key(24, 5, "A.txt", 1, None), key(24, 5, "A~1.TXT", 2, None), key(31, 5, "link", 1, None)];
-        let right = vec![key(29, 5, "mixed", 0, None), key(27, 5, "Subdir", 1, None), key(25, 5, "Z.txt", 1, None), key(28, 5, "Ä.bin", 1, None)];
+        for unit in target {
+            link.extend_from_slice(&unit.to_le_bytes());
+        }
+        image.put(
+            31,
+            &record(
+                31,
+                false,
+                &[
+                    resident(0x30, 0, "", &filename(5, "link", 1)),
+                    resident(0xC0, 1, "", &link),
+                ],
+            ),
+        );
+        let left = vec![
+            key(24, 5, "A.txt", 1, None),
+            key(24, 5, "A~1.TXT", 2, None),
+            key(31, 5, "link", 1, None),
+        ];
+        let right = vec![
+            key(29, 5, "mixed", 0, None),
+            key(27, 5, "Subdir", 1, None),
+            key(25, 5, "Z.txt", 1, None),
+            key(28, 5, "Ä.bin", 1, None),
+        ];
         if external {
             image.index(&[key(26, 5, "M.txt", 1, Some(0)), terminal(Some(8))], 3);
-            let mut left = left; left.push(terminal(None));
-            let mut right = right; right.push(terminal(None));
+            let mut left = left;
+            left.push(terminal(None));
+            let mut right = right;
+            right.push(terminal(None));
             image.0[LEFT..LEFT + 4096].copy_from_slice(&node(0, &left));
             image.0[RIGHT..RIGHT + 4096].copy_from_slice(&node(8, &right));
         } else {
@@ -285,16 +360,27 @@ impl Image {
             all.push(key(26, 5, "M.txt", 1, None));
             all.extend(right);
             all.push(terminal(None));
-            image.put(5, &record(5, true, &[resident(0x90, 0, "$I30", &root(&all, false))]));
+            image.put(
+                5,
+                &record(5, true, &[resident(0x90, 0, "$I30", &root(&all, false))]),
+            );
         }
         image
     }
 
     fn open(self, fail: Option<(u64, bool)>) -> (NtfsVolume, Reads) {
         let reads = Arc::default();
-        let volume = NtfsVolume::from_device(&Cx::for_testing(), Box::new(Device {
-            bytes: self.0, reads: Arc::clone(&reads), fail,
-        }), BASE as u64, LENGTH as u64).unwrap();
+        let volume = NtfsVolume::from_device(
+            &Cx::for_testing(),
+            Box::new(Device {
+                bytes: self.0,
+                reads: Arc::clone(&reads),
+                fail,
+            }),
+            BASE as u64,
+            LENGTH as u64,
+        )
+        .unwrap();
         reads.lock().unwrap().clear();
         (volume, reads)
     }
@@ -306,18 +392,38 @@ fn indexed_native_resident_external_alias_unicode_posix_and_symlink_paths() {
     for external in [false, true] {
         let (volume, _) = Image::new(external).open(None);
         for (path, expected) in [
-            ("/a.TXT", 24), ("/a~1.txt", 24), ("/ä.BIN", 28), ("/m.txt", 26),
-            ("/mixed", 29), ("/subdir/CHILD", 30), ("/link", 30),
+            ("/a.TXT", 24),
+            ("/a~1.txt", 24),
+            ("/ä.BIN", 28),
+            ("/m.txt", 26),
+            ("/mixed", 29),
+            ("/subdir/CHILD", 30),
+            ("/link", 30),
         ] {
             assert_eq!(volume.resolve(&cx, path).unwrap().number, expected);
             assert_eq!(volume.resolve_indexed(&cx, path).unwrap().number, expected);
         }
-        assert_eq!(volume.resolve_indexed_no_follow(&cx, "/link").unwrap().number, 31);
+        assert_eq!(
+            volume
+                .resolve_indexed_no_follow(&cx, "/link")
+                .unwrap()
+                .number,
+            31
+        );
         let target = volume.resolve_indexed(&cx, "/a.txt").unwrap();
         let stream = volume.data_stream(&cx, &target, &[]).unwrap();
-        assert_eq!(volume.read(&cx, &stream, 0, 4096).unwrap(), b"native indexed payload");
-        assert!(matches!(volume.resolve_indexed(&cx, "/MIXED"), Err(FfsError::NotFound(_))));
-        assert!(matches!(volume.resolve_indexed(&cx, "/a.txt/"), Err(FfsError::NotDirectory)));
+        assert_eq!(
+            volume.read(&cx, &stream, 0, 4096).unwrap(),
+            b"native indexed payload"
+        );
+        assert!(matches!(
+            volume.resolve_indexed(&cx, "/MIXED"),
+            Err(FfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            volume.resolve_indexed(&cx, "/a.txt/"),
+            Err(FfsError::NotDirectory)
+        ));
         assert!(volume.resolve_indexed(&cx, "/../a.txt").is_err());
     }
 }
@@ -332,7 +438,11 @@ fn indexed_reads_only_selected_branch_and_target_but_strict_keeps_full_validatio
         assert!(actual.iter().any(|&(at, _)| at == LEFT as u64));
         assert!(!actual.iter().any(|&(at, _)| at == RIGHT as u64));
         for sibling in [25, 26, 27, 28, 29, 30, 31] {
-            assert!(!actual.iter().any(|&(at, _)| at == record_at(sibling) as u64));
+            assert!(
+                !actual
+                    .iter()
+                    .any(|&(at, _)| at == record_at(sibling) as u64)
+            );
         }
         assert!(volume.resolve(&cx, "/a.txt").is_err());
     }
@@ -344,8 +454,10 @@ fn equal_range() -> Image {
         image.file(number, 5, name, 1);
     }
     image.index(&[key(26, 5, "Aa", 1, Some(0)), terminal(Some(8))], 3);
-    image.0[LEFT..LEFT + 4096].copy_from_slice(&node(0, &[key(24, 5, "AA", 1, None), terminal(None)]));
-    image.0[RIGHT..RIGHT + 4096].copy_from_slice(&node(8, &[key(25, 5, "aA", 1, None), terminal(None)]));
+    image.0[LEFT..LEFT + 4096]
+        .copy_from_slice(&node(0, &[key(24, 5, "AA", 1, None), terminal(None)]));
+    image.0[RIGHT..RIGHT + 4096]
+        .copy_from_slice(&node(8, &[key(25, 5, "aA", 1, None), terminal(None)]));
     image
 }
 
@@ -360,7 +472,10 @@ fn indexed_exact_priority_and_ambiguity_cross_equal_separators() {
         assert!(actual.iter().any(|&(at, _)| at == LEFT as u64));
         assert!(actual.iter().any(|&(at, _)| at == RIGHT as u64));
     }
-    assert!(matches!(volume.resolve_indexed(&cx, "/aa"), Err(FfsError::Corruption { .. })));
+    assert!(matches!(
+        volume.resolve_indexed(&cx, "/aa"),
+        Err(FfsError::Corruption { .. })
+    ));
     let (volume, _) = equal_range().open(Some((RIGHT as u64, false)));
     // An early exact match cannot hide a failure in the rest of its equal range.
     assert!(volume.resolve_indexed(&cx, "/AA").is_err());
@@ -374,16 +489,27 @@ fn indexed_rejects_duplicate_exact_targets_and_invalid_selected_identities() {
         match case {
             0 => {
                 image.file(25, 5, "A.txt", 1);
-                image.0[LEFT..LEFT + 4096].copy_from_slice(&node(0, &[
-                    key(24, 5, "A.txt", 1, None), key(25, 5, "A.txt", 1, None), terminal(None),
-                ]));
+                image.0[LEFT..LEFT + 4096].copy_from_slice(&node(
+                    0,
+                    &[
+                        key(24, 5, "A.txt", 1, None),
+                        key(25, 5, "A.txt", 1, None),
+                        terminal(None),
+                    ],
+                ));
             }
             1 => image.0[record_at(24) + 16] = 8,
             2 => image.file(24, 27, "A.txt", 1),
             _ => image.0[record_at(24) + 510] ^= 1,
         }
         let (volume, _) = image.open(None);
-        assert!(matches!(volume.resolve_indexed(&cx, "/a.txt"), Err(FfsError::Corruption { .. })), "case {case}");
+        assert!(
+            matches!(
+                volume.resolve_indexed(&cx, "/a.txt"),
+                Err(FfsError::Corruption { .. })
+            ),
+            "case {case}"
+        );
     }
 }
 
@@ -393,22 +519,37 @@ fn indexed_rejects_local_order_bounds_bitmap_alias_and_torn_index_damage() {
     for case in 0..6 {
         let mut image = Image::new(true);
         match case {
-            0 => image.0[LEFT..LEFT + 4096].copy_from_slice(&node(0, &[
-                key(31, 5, "link", 1, None), key(24, 5, "A.txt", 1, None), terminal(None),
-            ])),
-            1 => image.0[LEFT..LEFT + 4096].copy_from_slice(&node(0, &[
-                key(25, 5, "Z.txt", 1, None), terminal(None),
-            ])),
+            0 => image.0[LEFT..LEFT + 4096].copy_from_slice(&node(
+                0,
+                &[
+                    key(31, 5, "link", 1, None),
+                    key(24, 5, "A.txt", 1, None),
+                    terminal(None),
+                ],
+            )),
+            1 => image.0[LEFT..LEFT + 4096]
+                .copy_from_slice(&node(0, &[key(25, 5, "Z.txt", 1, None), terminal(None)])),
             2 => image.index(&[key(26, 5, "M.txt", 1, Some(0)), terminal(Some(8))], 2),
             3 => image.index(&[key(26, 5, "M.txt", 1, Some(0)), terminal(Some(0))], 3),
             4 => image.0[LEFT + 510] ^= 1,
-            _ => image.0[LEFT..LEFT + 4096].copy_from_slice(&node(0, &[
-                key(24, 27, "A.txt", 1, None), terminal(None),
-            ])),
+            _ => image.0[LEFT..LEFT + 4096]
+                .copy_from_slice(&node(0, &[key(24, 27, "A.txt", 1, None), terminal(None)])),
         }
         let (volume, reads) = image.open(None);
-        assert!(matches!(volume.resolve_indexed(&cx, "/a.txt"), Err(FfsError::Corruption { .. })), "case {case}");
-        assert!(!reads.lock().unwrap().iter().any(|&(at, _)| at == record_at(24) as u64));
+        assert!(
+            matches!(
+                volume.resolve_indexed(&cx, "/a.txt"),
+                Err(FfsError::Corruption { .. })
+            ),
+            "case {case}"
+        );
+        assert!(
+            !reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&(at, _)| at == record_at(24) as u64)
+        );
     }
 }
 
@@ -418,10 +559,25 @@ fn indexed_miss_and_separator_hit_do_not_open_irrelevant_children() {
     let (volume, reads) = Image::new(true).open(None);
     assert_eq!(volume.resolve_indexed(&cx, "/m.txt").unwrap().number, 26);
     // Equality includes both adjacent children: there could be a later exact match.
-    assert!(reads.lock().unwrap().iter().any(|&(at, _)| at == LEFT as u64));
-    assert!(reads.lock().unwrap().iter().any(|&(at, _)| at == RIGHT as u64));
+    assert!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(at, _)| at == LEFT as u64)
+    );
+    assert!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(at, _)| at == RIGHT as u64)
+    );
     reads.lock().unwrap().clear();
-    assert!(matches!(volume.resolve_indexed(&cx, "/B.txt"), Err(FfsError::NotFound(_))));
+    assert!(matches!(
+        volume.resolve_indexed(&cx, "/B.txt"),
+        Err(FfsError::NotFound(_))
+    ));
     let actual = reads.lock().unwrap();
     assert!(!actual.iter().any(|&(at, _)| at == RIGHT as u64));
     for number in 24..32 {
@@ -434,16 +590,87 @@ fn indexed_cancellation_is_terminal_and_malformed_upcase_is_not_bypassed() {
     let cx = Cx::for_testing();
     for location in [LEFT, record_at(24)] {
         let (volume, reads) = Image::new(true).open(Some((location as u64, true)));
-        assert!(matches!(volume.resolve_indexed(&cx, "/a.txt"), Err(FfsError::Cancelled)));
+        assert!(matches!(
+            volume.resolve_indexed(&cx, "/a.txt"),
+            Err(FfsError::Cancelled)
+        ));
         assert_eq!(reads.lock().unwrap().last().unwrap().0, location as u64);
     }
     let (volume, reads) = Image::new(true).open(None);
     let cancelled = Cx::for_testing();
     cancelled.cancel_with(asupersync::types::CancelKind::User, Some("indexed lookup"));
-    assert!(matches!(volume.resolve_indexed(&cancelled, "/a.txt"), Err(FfsError::Cancelled)));
+    assert!(matches!(
+        volume.resolve_indexed(&cancelled, "/a.txt"),
+        Err(FfsError::Cancelled)
+    ));
     assert!(reads.lock().unwrap().is_empty());
     let mut image = Image::new(true);
     image.0[UPCASE + 97 * 2..UPCASE + 97 * 2 + 2].copy_from_slice(&97_u16.to_le_bytes());
     let (volume, _) = image.open(None);
     assert!(volume.resolve_indexed(&cx, "/A.txt").is_err());
+}
+
+fn same_reference_filename_image(complete: bool, reversed: bool) -> Image {
+    let mut image = Image::new(true);
+    let mut attributes = vec![
+        resident(0x80, 0, "", b"native indexed payload"),
+        resident(0x30, 1, "", &filename(5, "A.TXT", 1)),
+    ];
+    if complete {
+        attributes.push(resident(0x30, 2, "", &filename(5, "A.TXT", 2)));
+    }
+    image.put(24, &record(24, false, &attributes));
+
+    let mut entries = vec![key(24, 5, "A.TXT", 1, None), key(24, 5, "A.TXT", 2, None)];
+    if reversed {
+        entries.reverse();
+    }
+    entries.push(terminal(None));
+    image.0[LEFT..LEFT + 4096].copy_from_slice(&node(0, &entries));
+    image
+}
+
+#[test]
+fn indexed_rejects_unmatched_same_reference_filename_in_both_orders() {
+    let cx = Cx::for_testing();
+    let mut indexed_results = Vec::new();
+
+    for reversed in [false, true] {
+        let (volume, _) = same_reference_filename_image(false, reversed).open(None);
+        for path in ["/A.TXT", "/a.txt"] {
+            assert!(
+                matches!(volume.resolve(&cx, path), Err(FfsError::Corruption { .. })),
+                "strict lookup accepted unmatched identity: reversed={reversed}, path={path}"
+            );
+            // Execute every order/query combination before asserting, so the
+            // planted-red output exposes the order-dependent admission.
+            indexed_results.push((
+                reversed,
+                path,
+                volume
+                    .resolve_indexed(&cx, path)
+                    .map(|record| record.number),
+            ));
+        }
+    }
+
+    assert!(
+        indexed_results
+            .iter()
+            .all(|(_, _, result)| matches!(result, Err(FfsError::Corruption { .. }))),
+        "indexed lookup accepted an unmatched FILE_NAME identity: {indexed_results:?}"
+    );
+}
+
+#[test]
+fn indexed_accepts_matching_same_reference_filenames_in_both_orders() {
+    let cx = Cx::for_testing();
+
+    for reversed in [false, true] {
+        let (volume, _) = same_reference_filename_image(true, reversed).open(None);
+        for path in ["/A.TXT", "/a.txt"] {
+            assert_eq!(volume.resolve(&cx, path).unwrap().number, 24);
+            assert_eq!(volume.resolve_indexed(&cx, path).unwrap().number, 24);
+        }
+    }
 }

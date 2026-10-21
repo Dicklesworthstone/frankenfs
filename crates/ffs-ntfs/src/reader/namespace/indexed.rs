@@ -30,23 +30,31 @@ fn within(name: &[u16], lower: Option<&[u16]>, upper: Option<&[u16]>, table: &[u
 #[derive(Default)]
 struct Candidate {
     key: Option<Key>,
+    other_names: Vec<NtfsFileName>,
     ambiguous: bool,
 }
 
 impl Candidate {
     fn observe(&mut self, key: &Key) {
         if let Some((reference, _)) = &self.key {
-            self.ambiguous |= *reference != key.0;
+            if *reference == key.0 {
+                // One reference can have several matching namespace/name
+                // identities. Every selected identity must exist in its FILE
+                // catalog, regardless of the order of the index entries.
+                self.other_names.push(key.1.clone());
+            } else {
+                self.ambiguous = true;
+            }
         } else {
             self.key = Some(key.clone());
         }
     }
 
-    fn finish(self) -> Result<Option<Key>> {
+    fn finish(self) -> Result<Self> {
         if self.ambiguous {
             return Err(corrupt(0, "ambiguous NTFS indexed name"));
         }
-        Ok(self.key)
+        Ok(self)
     }
 }
 
@@ -81,19 +89,29 @@ impl Search<'_, '_> {
         for entry in keys {
             checkpoint(self.walker.cx)?;
             if self.keys_examined == MAX_ENTRIES {
-                return Err(unsupported("NTFS indexed search exceeds 65536 examined keys"));
+                return Err(unsupported(
+                    "NTFS indexed search exceeds 65536 examined keys",
+                ));
             }
             self.keys_examined += 1;
-            let (reference, filename) = entry.key.as_ref()
+            let (reference, filename) = entry
+                .key
+                .as_ref()
                 .ok_or_else(|| corrupt(0, "interior terminal NTFS index entry"))?;
             if filename.parent != self.parent
                 || filename.name == [46, 46]
                 || (filename.name == [46] && *reference != self.parent)
             {
-                return Err(corrupt(0, "NTFS indexed key has an invalid parent or dot identity"));
+                return Err(corrupt(
+                    0,
+                    "NTFS indexed key has an invalid parent or dot identity",
+                ));
             }
             if !within(&filename.name, previous, upper, self.table) {
-                return Err(corrupt(0, "NTFS index keys violate native UpCase search bounds"));
+                return Err(corrupt(
+                    0,
+                    "NTFS index keys violate native UpCase search bounds",
+                ));
             }
             previous = Some(&filename.name);
         }
@@ -125,7 +143,10 @@ impl Search<'_, '_> {
         let mut previous = lower;
         for entry in &entries {
             checkpoint(self.walker.cx)?;
-            let boundary = entry.key.as_ref().map_or(upper, |(_, key)| Some(key.name.as_slice()));
+            let boundary = entry
+                .key
+                .as_ref()
+                .map_or(upper, |(_, key)| Some(key.name.as_slice()));
             if let Some(vcn) = entry.child_vcn
                 && within(self.name, previous, boundary, self.table)
             {
@@ -218,12 +239,18 @@ fn lookup_entry(
     // Only the validated volume UpCase table reaches this internal boundary.
     // Keep an explicit length guard rather than indexing a truncated table.
     if table.len() != 65_536 || name.is_empty() || name.len() > 255 {
-        return Err(corrupt(0, "invalid NTFS indexed search name or UpCase table"));
+        return Err(corrupt(
+            0,
+            "invalid NTFS indexed search name or UpCase table",
+        ));
     }
     let (mut walker, entries) = volume.directory_index(cx, directory)?;
     let mut search = Search {
         walker: &mut walker,
-        parent: NtfsReference { record: u64::from(directory.number), sequence: directory.sequence },
+        parent: NtfsReference {
+            record: u64::from(directory.number),
+            sequence: directory.sequence,
+        },
         name,
         table,
         keys_examined: 0,
@@ -237,11 +264,11 @@ fn lookup_entry(
     } else {
         search.folded.finish()?
     };
-    let result = match candidate {
+    let result = match candidate.key {
         Some((reference, filename)) => {
             // Reuse complete catalog/sequence/FILE_NAME/provider validation,
             // but do not load unrelated siblings' MFT records.
-            Some(volume.verify_directory_entry(cx, reference, filename)?)
+            Some(volume.verify_directory_entry(cx, reference, filename, &candidate.other_names)?)
         }
         None => None,
     };

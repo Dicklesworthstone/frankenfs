@@ -135,7 +135,7 @@ impl NtfsVolume {
                     "duplicate directory name points at different file records",
                 ));
             }
-            result.push(self.verify_directory_entry(cx, reference, filename)?);
+            result.push(self.verify_directory_entry(cx, reference, filename, &[])?);
         }
         checkpoint(cx)?;
         Ok(result)
@@ -146,24 +146,47 @@ impl NtfsVolume {
         cx: &Cx,
         reference: NtfsReference,
         filename: NtfsFileName,
+        other_names: &[NtfsFileName],
     ) -> Result<DirectoryEntry> {
         let target = self.record(cx, reference.record, Some(reference.sequence))?;
         let target_catalog = self.attributes(cx, &target)?;
         let attributes = target_catalog.all()?;
+        // Deduplicate additional selected identities before parsing the catalog
+        // once. Repeated index keys must not multiply FILE reads or turn this
+        // into a keys-by-attributes comparison loop.
+        let mut unmatched = BTreeSet::new();
+        for name in other_names {
+            checkpoint(cx)?;
+            unmatched.insert((
+                name.parent.record,
+                name.parent.sequence,
+                name.namespace,
+                name.name.clone(),
+            ));
+        }
         let mut matched = false;
         for attr in attributes.iter().filter(|attr| attr.kind == 0x30) {
+            checkpoint(cx)?;
             if attr.flags != 0 || !attr.name.is_empty() {
                 return Err(corrupt(0, "invalid FILE_NAME storage or attribute name"));
             }
             let NtfsValue::Resident(value) = &attr.value else {
                 return Err(corrupt(0, "nonresident FILE_NAME"));
             };
-            if NtfsFileName::parse(value).map_err(|error| parse(&error))? == filename {
-                matched = true;
-            }
+            let actual = NtfsFileName::parse(value).map_err(|error| parse(&error))?;
+            matched |= actual == filename;
+            unmatched.remove(&(
+                actual.parent.record,
+                actual.parent.sequence,
+                actual.namespace,
+                actual.name,
+            ));
         }
-        if !matched {
-            return Err(corrupt(0, "directory index does not match target FILE_NAME"));
+        if !matched || !unmatched.is_empty() {
+            return Err(corrupt(
+                0,
+                "directory index does not match target FILE_NAME",
+            ));
         }
         Ok(DirectoryEntry {
             reference,
@@ -441,7 +464,10 @@ impl Walker<'_> {
             .get((block / 8) as usize)
             .ok_or_else(|| corrupt(offset, "index child outside bitmap"))?;
         if bitmap & (1 << (block % 8)) == 0 {
-            return Err(corrupt(offset, "index child is not allocated in its bitmap"));
+            return Err(corrupt(
+                offset,
+                "index child is not allocated in its bitmap",
+            ));
         }
         let stream = self
             .allocation
@@ -451,7 +477,10 @@ impl Walker<'_> {
             .checked_add(u64::from(self.block_bytes))
             .is_none_or(|end| end > stream.initialized)
         {
-            return Err(corrupt(offset, "index child outside initialized allocation"));
+            return Err(corrupt(
+                offset,
+                "index child outside initialized allocation",
+            ));
         }
         Ok(offset)
     }
