@@ -1,5 +1,6 @@
 //! Offline native NTFS 3.1 reads and explicit volatile recovery. No device writes.
 
+pub mod allocation;
 mod attributes;
 mod compression;
 pub mod ea;
