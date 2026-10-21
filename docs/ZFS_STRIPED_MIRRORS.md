@@ -1,10 +1,11 @@
-# Explicit read-only views of striped ZFS mirrors
+# Read-only views of striped ZFS mirrors
 
 The shared `ffs-zfs` engine now admits a complete pool consisting of multiple
 ordinary mirror top-level vdevs, including mixtures of mirrors and standalone
-file/disk vdevs. Supply every physical image and explicitly select the pool GUID,
-label and uberblock slot. Existing single-leaf, single-mirror, single-RAIDZ and
-plain-leaf stripe profiles remain separate and retain their admission rules.
+file/disk vdevs. Supply every physical image and either explicitly select the
+pool GUID, label and uberblock slot or request automatic read-only selection.
+Existing single-leaf, single-mirror, single-RAIDZ and plain-leaf stripe profiles
+retain their admission rules.
 
 ```sh
 # Placeholder identities: replace with the actual pool/candidate values.
@@ -27,8 +28,10 @@ by their native vdev IDs, not argument order. Two through eight top-level vdevs
 and at most eight total physical members are admitted. Every mirror has two
 through eight ordinary file/disk children; all configured children are required.
 
-All four labels on each member must agree on its entire subtree and physical
-identity. Members of a mirror must agree on that subtree. Top-level IDs must be
+Explicit selection requires all four labels on each member to agree on its
+entire subtree and physical identity. Automatic selection uses all surviving
+checksum-valid labels as described below. Members of a mirror must agree on
+their subtree. Top-level IDs must be
 complete and contiguous; physical GUIDs and top-level GUIDs cannot alias another
 native identity. Different top-level ashifts, capacities and configuration TXGs
 are retained. Pool version, exported state and read-feature policy must agree,
@@ -39,6 +42,46 @@ label exclusions before payload reads, including otherwise-unused replicas and
 vdevs. The explicitly selected uberblock must agree across every supplied image
 and carry the complete native GUID sum. Native path strings remain metadata;
 only caller-supplied host paths are opened.
+
+## Automatic read-only root selection
+
+`--auto-import` now accepts the complete multi-mirror and mixed leaf/mirror
+topologies above. `Pool::import_active` and `Pool::import_objects` use the same
+shared topology admission as explicit selection; no second mapping algorithm
+or filesystem adapter is introduced.
+
+```sh
+ffs-zfs read first.img /important.bin \
+  --member second.img --member third.img --member fourth.img \
+  --offline-image --auto-import --pool-guid 123 --dataset data > recovered.bin
+```
+
+Every physical member must have at least one valid configuration. Only label
+I/O failures and checksum-invalid copies are disposable. Every checksum-valid
+copy must parse and agree with its member's complete subtree; disagreement,
+unsupported metadata and cancellation are not reasons to prefer a healthy copy.
+All top-level IDs, GUID uniqueness, mirror child membership, capacities and
+read-feature/state checks remain mandatory before root-data I/O. Automatic
+selection uses the existing active/exported read-only state policy; offline
+immutability is still required and no writable ownership is acquired.
+
+Every ring on every supplied member is scanned with that member's admitted
+slot geometry, including a ring beside a damaged configuration. Candidates
+need the complete pool/top-level/child GUID sum and must not predate any admitted
+configuration. Equal-TXG root conflicts are rejected before payload reads;
+identical candidate roots are deduplicated before trying physical copies.
+Mirror routing is installed before the MOS root read and reconstructed from
+the same verified labels before later object-set, dataset and snapshot access.
+A bad label zero cannot make a selected view lose its other mirror children.
+Redundancy scrub continues to inspect every replica after automatic selection.
+
+The pre-existing highest-readable-TXG policy is unchanged: an older candidate
+can be returned when newer root copies fail verification. This is an immutable
+committed-view reader, not a guarantee of newest or fully recovered state.
+Full configuration-history resolution, explicit-rewind lifecycle policy, log
+recovery and writable-pool admission remain separate roadmap obligations.
+Explicit `--label`/`--slot` selection still requires all four configurations and
+the same selected candidate on every member; it has no tolerant fallback.
 
 ## Reads and retained views
 
@@ -71,9 +114,7 @@ opening this topology.
 
 ## Explicit limits
 
-This increment does not implement automatic root selection for mirrored stripes.
-Use explicit `--pool-guid`, `--label` and `--slot`, not `--auto-import`. Native
-writable import, pool ownership, DTL reconciliation, newest-state authority,
+Native writable import, pool ownership, DTL reconciliation, newest-state authority,
 resilver/heal, device attach/replace, allocation/TXG writing and native replay
 remain separate obligations. The images must remain offline and immutable.
 
@@ -91,8 +132,23 @@ mixed leaves and mirrors, unequal mirror widths, reordered inputs, retained
 owners, exact capacity, corruption/fallback/cancellation, incomplete/conflicting
 members, foreign later DVAs, undersized otherwise-unused members, actual-copy
 scrub, gang fragments on different vdevs, and pre-I/O work-budget refusal.
-Fixture devices panic on backing writes and synchronization. Existing test
-assertions and native admission gates are not weakened.
+Fixture devices panic on backing writes and synchronization. The native
+admission gates remain in force.
+
+Automatic-selection coverage adds eight constructed-image tests and replaces
+the former unsupported-topology assertion with explicit/automatic config and
+payload equivalence plus a retained DMU read. The new controls cover mixed
+widths and sector geometries, both byte orders, permuted images, independently
+located ring candidates, damaged label zero, replica fallback, retained cold
+views, all-copy redundancy scrub, complete membership, valid-but-conflicting
+labels, missing label authority, GUID sums, configuration age, equal-TXG forks,
+I/O versus cancellation and no unrelated-vdev fallback. The existing single-
+group import tests and other explicit-topology test bodies are unchanged.
+
+The automatic-selection tests are authored but unexecuted in this environment.
+Source/hash and patch-application checks are not Rust execution or native
+OpenZFS qualification; the historical results elsewhere do not qualify this
+new path. No checker, release gate or canonical bead is relaxed or closed.
 
 These tests have not run in this implementation environment. RCH/Cargo test,
 workspace check, strict Clippy and format commands were attempted and could not
@@ -103,6 +159,7 @@ the repository's unchanged Rust gates remain required:
 
 ```sh
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-zfs striped_mirror
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-zfs auto_import
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-zfs
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --workspace --all-targets
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
