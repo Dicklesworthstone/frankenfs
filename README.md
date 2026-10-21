@@ -223,6 +223,27 @@ coverage leaves owner-absence conclusions unknown. This does not grant repair
 or native write authority. Eight library and three CLI/report regressions are
 authored but unexecuted here. See the [record ownership profile](docs/NTFS_RECORD_OWNERSHIP.md).
 
+### Resolve a path through its native index branches
+
+`read`, `readlink` and `ls` accept `--indexed-lookup` to locate a path without
+opening every unrelated sibling's FILE record. The shared library exposes
+`resolve_indexed` and `resolve_indexed_no_follow`. The existing strict resolver
+remains the default; `ls` still validates all entries in the requested directory.
+
+```sh
+ffs-ntfs read volume.img /large-directory/report.bin --offline-image \
+  --indexed-lookup --start 513 --bytes 1025
+```
+
+The search retains native UpCase matching, exact-spelling priority, ambiguity
+rejection, child allocation/fixup checks and complete selected-target identity
+validation. It examines every relevant equal-name branch before returning.
+Unvisited branches and sibling records are not certified: this is an explicit
+lookup scope, not repair, whole-directory checking or a measured speedup.
+Seven native-image and three CLI regressions are authored but unexecuted in this
+implementation environment. Earlier validation receipts above do not qualify
+this new path. See the [indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md).
+
 ## ZFS: extract from surviving mirror disks
 
 `--missing-mirror-member GUID` explicitly identifies every absent child of one
@@ -344,6 +365,7 @@ projection and rejection rules are in the corresponding profiles:
 | FAT reads, names, mounts, checking and fresh-image creation | [FAT profile](docs/FAT_READ_PROFILE.md) |
 | Existing-image FAT creation and directory growth | [Create-only profile](docs/FAT_CREATE_PROFILE.md) |
 | NTFS native reads and read-only mounts | [NTFS profile](docs/NTFS_READ_PROFILE.md) |
+| Opt-in NTFS index-directed path lookup | [Indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md) |
 | NTFS MFT physical mappings versus native allocation bitmaps | [Allocation-check profile](docs/NTFS_ALLOCATION_CHECK.md) |
 | ZFS datasets, snapshots, topology and read-only mounts | [ZFS profile](docs/ZFS_READ_PROFILE.md) |
 | ZFS committed-view extraction from explicitly incomplete mirrors | [Missing-mirror profile](docs/ZFS_MISSING_MIRROR_PROFILE.md) |

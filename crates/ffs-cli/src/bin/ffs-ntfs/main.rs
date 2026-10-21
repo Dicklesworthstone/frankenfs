@@ -4,6 +4,9 @@
 mod allocation_commands;
 mod ea_name;
 
+#[cfg(test)]
+mod indexed_tests;
+
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
@@ -149,12 +152,20 @@ enum Command {
         image: ImageArgs,
         #[arg(default_value = "/")]
         path: String,
+        /// Locate this directory through selected index branches; its listing
+        /// still validates every entry. Unvisited ancestor siblings are not checked.
+        #[arg(long)]
+        indexed_lookup: bool,
     },
     /// Resolve an image path with its native UpCase table and extract DATA.
     Read {
         #[command(flatten)]
         image: ImageArgs,
         path: String,
+        /// Search selected native index branches, not every sibling record.
+        /// This is not whole-directory consistency checking.
+        #[arg(long)]
+        indexed_lookup: bool,
         /// Exact Unicode stream name. Omit both selectors for unnamed DATA.
         #[arg(long, conflicts_with = "stream_utf16")]
         stream: Option<String>,
@@ -171,6 +182,10 @@ enum Command {
         #[command(flatten)]
         image: ImageArgs,
         path: String,
+        /// Search selected index branches while retaining the final link itself.
+        /// Unvisited sibling metadata is not checked.
+        #[arg(long)]
+        indexed_lookup: bool,
     },
     /// Enumerate logical DATA streams, including streams in extension records.
     Streams {
@@ -421,9 +436,17 @@ fn main() -> Result<()> {
                 "scope": "offline MFT/stream read profile; not a filesystem check or recovery validation"
             }))?;
         }
-        Command::Ls { image, path } => {
+        Command::Ls {
+            image,
+            path,
+            indexed_lookup,
+        } => {
             let volume = image.open(&cx)?;
-            let record = volume.resolve(&cx, &path)?;
+            let record = if indexed_lookup {
+                volume.resolve_indexed(&cx, &path)?
+            } else {
+                volume.resolve(&cx, &path)?
+            };
             let entries = volume.list_directory(&cx, &record)?;
             let report: Vec<_> = entries
                 .into_iter()
@@ -442,6 +465,7 @@ fn main() -> Result<()> {
         Command::Read {
             image,
             path,
+            indexed_lookup,
             stream,
             stream_utf16,
             start,
@@ -450,12 +474,24 @@ fn main() -> Result<()> {
             let stream =
                 StreamName::select(stream.as_deref(), stream_utf16).map_err(anyhow::Error::msg)?;
             let volume = image.open(&cx)?;
-            let record = volume.resolve(&cx, &path)?;
+            let record = if indexed_lookup {
+                volume.resolve_indexed(&cx, &path)?
+            } else {
+                volume.resolve(&cx, &path)?
+            };
             stream_to_stdout(&cx, &volume, &record, stream.as_units(), start, bytes)?;
         }
-        Command::Readlink { image, path } => {
+        Command::Readlink {
+            image,
+            path,
+            indexed_lookup,
+        } => {
             let volume = image.open(&cx)?;
-            let record = volume.resolve_no_follow(&cx, &path)?;
+            let record = if indexed_lookup {
+                volume.resolve_indexed_no_follow(&cx, &path)?
+            } else {
+                volume.resolve_no_follow(&cx, &path)?
+            };
             let target = volume.readlink(&cx, &record)?;
             let mut out = io::stdout().lock();
             out.write_all(&target)?;

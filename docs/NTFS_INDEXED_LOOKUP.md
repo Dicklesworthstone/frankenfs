@@ -10,6 +10,20 @@ rather than enumerating and opening every sibling FILE record.
 This is an additional search contract, not a relaxation of those operations or
 an assertion that unvisited metadata is intact.
 
+The CLI exposes the same explicit choice with `--indexed-lookup` on `read`,
+`readlink` and `ls`. For `ls`, this changes only locating the requested directory;
+its contents still pass complete enumeration. `readlink` retains the final link
+itself. The flag is not accepted by mount, checkers or record-number commands,
+and existing volume bounds, offline acknowledgement and stream selectors remain.
+
+```sh
+ffs-ntfs read volume.img /large-directory/report.bin --offline-image --indexed-lookup
+ffs-ntfs read volume.img /large-directory/report.bin --offline-image \
+  --indexed-lookup --stream-utf16 006e,006f,0074,0065 --start 513 --bytes 1025
+ffs-ntfs ls volume.img /large-directory --offline-image --indexed-lookup
+ffs-ntfs readlink volume.img /large-directory/link --offline-image --indexed-lookup
+```
+
 ## Native interpretation
 
 The search uses the complete validated volume `$UpCase` table, never host Unicode
@@ -52,8 +66,10 @@ Seven new constructed-image Rust tests cover resident and external indexes,
 short aliases, Unicode, exact/insensitive/POSIX names, equal separators, selected
 target sequence/parent/fixup failures, local ordering and inherited-bound damage,
 bitmap/alias refusal, no unrelated sibling reads, misses, symlinks, cancellation
-and malformed UpCase. Test storage panics on writes and sync. Existing directory,
-path and recovery tests are retained unchanged.
+and malformed UpCase. Three additional CLI controls cover explicit selection,
+unchanged defaults, volume bounds, raw UTF-16 streams, ranges, offline admission,
+and rejection of mutation/unrelated-command options. Test storage panics on writes
+and sync. Existing directory, path, recovery and CLI tests are retained unchanged.
 
 These tests were authored but could not be executed in the implementation
 environment: Cargo, rustc, rustfmt and RCH are absent; gate attempts exited 127.
@@ -64,6 +80,7 @@ Run the repository's unchanged gates before relying on the new path:
 ```sh
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-ntfs indexed
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-ntfs namespace
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p ffs-cli --bin ffs-ntfs indexed
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --workspace --all-targets
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
