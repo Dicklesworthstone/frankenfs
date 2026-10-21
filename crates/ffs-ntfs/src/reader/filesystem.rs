@@ -79,6 +79,13 @@ pub struct NtfsFs {
 }
 
 impl NtfsFs {
+    /// Borrow the admitted immutable volume for native stream/metadata access.
+    /// This retains the filesystem's backing capability and clean-log admission.
+    #[must_use]
+    pub fn volume(&self) -> &NtfsVolume {
+        &self.volume
+    }
+
     pub fn new(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
         checkpoint(cx)?;
         recovery::admit(cx, &volume)?;

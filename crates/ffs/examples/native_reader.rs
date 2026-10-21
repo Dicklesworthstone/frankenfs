@@ -47,6 +47,11 @@ enum Command {
         start: u64,
         #[arg(long)]
         bytes: Option<u64>,
+        /// Select exact native NTFS DATA; absent selectors use ordinary FsOps.
+        #[arg(long, conflicts_with = "stream_utf16")]
+        stream: Option<String>,
+        #[arg(long, value_parser = ffs::ntfs::StreamName::parse, conflicts_with = "stream")]
+        stream_utf16: Option<ffs::ntfs::StreamName>,
     },
     /// Require a write attempt to fail with the read-only error. Use a scratch image.
     RefuseWrite {
@@ -145,6 +150,44 @@ fn list(cx: &Cx, opened: &ReadOnlyFs, scope: &mut RequestScope, ino: InodeNumber
     Ok(())
 }
 
+fn read_stream(
+    cx: &Cx,
+    opened: &ReadOnlyFs,
+    path: &Path,
+    name: &ffs::ntfs::StreamName,
+    start: u64,
+    count: Option<u64>,
+) -> Result<()> {
+    let volume = opened
+        .ntfs_volume()
+        .ok_or_else(|| invalid("native stream selection requires NTFS"))?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| invalid("NTFS path must be UTF-8"))?;
+    let record = volume.resolve_no_follow(cx, path)?;
+    let stream = volume.data_stream(cx, &record, name.as_units())?;
+    let end = match count {
+        Some(count) => start
+            .checked_add(count)
+            .ok_or_else(|| invalid("read range overflows"))?
+            .min(stream.size),
+        None => stream.size,
+    };
+    let mut position = start;
+    let mut output = io::stdout().lock();
+    while position < end {
+        let requested = usize::try_from((end - position).min(65_536))?;
+        let bytes = volume.read(cx, &stream, position, requested)?;
+        if bytes.is_empty() || bytes.len() > requested {
+            return Err(io::Error::other("native stream ended before its declared size").into());
+        }
+        output.write_all(&bytes)?;
+        position += u64::try_from(bytes.len())?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     // The application owns the runtime and supplies its context to the library.
@@ -188,9 +231,24 @@ fn main() -> Result<()> {
             let attr = lookup(&cx, &opened, &mut scope, &path)?;
             list(&cx, &opened, &mut scope, attr.ino)?;
         }
-        Command::Read { path, start, bytes } => {
+        Command::Read {
+            path,
+            start,
+            bytes,
+            stream,
+            stream_utf16,
+        } => {
             let attr = lookup(&cx, &opened, &mut scope, &path)?;
-            read(&cx, &opened, &mut scope, &attr, start, bytes)?;
+            if stream.is_some() || stream_utf16.is_some() {
+                if attr.kind != FileType::RegularFile {
+                    return Err(invalid("stream read requires a regular file").into());
+                }
+                let name = ffs::ntfs::StreamName::select(stream.as_deref(), stream_utf16)
+                    .map_err(|error| invalid(&error))?;
+                read_stream(&cx, &opened, &path, &name, start, bytes)?;
+            } else {
+                read(&cx, &opened, &mut scope, &attr, start, bytes)?;
+            }
         }
         Command::RefuseWrite { path } => {
             let attr = lookup(&cx, &opened, &mut scope, &path)?;

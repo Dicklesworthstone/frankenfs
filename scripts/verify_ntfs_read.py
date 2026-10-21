@@ -160,9 +160,14 @@ def compressed_cases(command: Callable[..., bytes], binary: Path, root: Path) ->
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path, help="already-built ffs-ntfs executable")
+    parser.add_argument("--facade-binary", type=Path,
+                        help="also execute the public ffs native_reader, including exact named streams")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     require(os.access(binary, os.X_OK), "candidate is not executable")
+    facade = args.facade_binary.resolve(strict=True) if args.facade_binary else None
+    if facade:
+        require(os.access(facade, os.X_OK), "public facade consumer is not executable")
     tools = ["mkntfs", "ntfscp", "ntfsls", "ntfscat"]
     for tool in tools:
         require(shutil.which(tool) is not None, f"missing required native oracle: {tool}")
@@ -171,8 +176,10 @@ def main() -> None:
     sequence = 0
     report = {"status": "running", "candidate_sha256": digest(binary),
               "tools": {tool: shutil.which(tool) for tool in tools}, "streams_checked": []}
+    if facade:
+        report["facade_sha256"] = digest(facade)
 
-    def command(*args: str | Path) -> bytes:
+    def command(*args: str | Path, failure: str | None = None) -> bytes:
         nonlocal sequence
         sequence += 1
         argv = [str(arg) for arg in args]
@@ -183,7 +190,12 @@ def main() -> None:
         prefix.with_suffix(".stdout").write_bytes(result.stdout)
         prefix.with_suffix(".stderr").write_bytes(result.stderr)
         prefix.with_suffix(".status").write_text(str(result.returncode) + "\n")
-        require(result.returncode == 0, f"command failed: {argv!r}; see {prefix}.stderr")
+        if failure is None:
+            require(result.returncode == 0, f"command failed: {argv!r}; see {prefix}.stderr")
+        else:
+            require(result.returncode != 0 and result.stdout == b""
+                    and failure.encode() in result.stderr,
+                    f"expected typed failure without output: {argv!r}; see {prefix}.stderr")
         return result.stdout
 
     try:
@@ -245,13 +257,36 @@ def main() -> None:
                     f"candidate namespace-aware path read differs: {name}")
             metadata = json.loads(command(binary, "record", image, record, "--offline-image"))
             require(metadata["record"] == int(record), "candidate returned a different MFT identity")
+            if facade:
+                public = [facade, image]
+                require(command(*public, "stat", "/" + name)
+                        == f"ntfs\tRegularFile\t{len(expected)}\n".encode(),
+                        "public facade metadata differs from native")
+                require(command(*public, "read", "/" + name) == expected,
+                        "public facade unnamed DATA differs from native")
+                require(command(*public, "read", "/" + name, "--start", "507", "--bytes", "1031")
+                        == expected[507:1538], "public facade unnamed range differs")
+                command(*public, "refuse-write", "/" + name)
             report["streams_checked"].append({"record": int(record), "name": name, "size": len(expected)})
+        if facade:
+            raw_names = command(facade, image, "list", "/")
+            require(raw_names.endswith(b"\0"), "public facade listing lacks its final delimiter")
+            names = raw_names[:-1].split(b"\0")
+            require(len(names) == len(set(names))
+                    and {name.encode() for name in payloads} <= set(names),
+                    "public facade native directory names are missing or duplicated")
         record = str(records["tiny.txt"])
         require(command("ntfscat", "-i", record, "-n", "note", image) == named, "native named stream differs")
         require(command(binary, "cat", image, record, "--offline-image", "--stream", "note") == named,
                 "candidate named stream differs")
         require(command(binary, "read", image, "/tiny.txt", "--offline-image", "--stream", "note") == named,
                 "candidate path-selected named stream differs")
+        if facade:
+            for selector, value in [("--stream", "note"), ("--stream-utf16", "006e,006f,0074,0065")]:
+                require(command(facade, image, "read", "/tiny.txt", selector, value) == named,
+                        "public facade native named DATA differs")
+            for name in ("NOTE", "missing"):
+                command(facade, image, "read", "/tiny.txt", "--stream", name, failure="NotFound")
         for name, expected in extension_streams.items():
             require(command("ntfscat", "-i", record, "-n", name, image) == expected,
                     f"native extension-stream oracle differs: {name}")
@@ -260,6 +295,12 @@ def main() -> None:
             require(command(binary, "read", image, "/tiny.txt", "--offline-image", "--stream", name,
                             "--start", "507", "--bytes", "1031") == expected[507:1538],
                     f"candidate extension path/range differs: {name}")
+            if facade:
+                require(command(facade, image, "read", "/tiny.txt", "--stream", name) == expected,
+                        f"public facade extension stream differs: {name}")
+                require(command(facade, image, "read", "/tiny.txt", "--stream", name,
+                                "--start", "507", "--bytes", "1031") == expected[507:1538],
+                        f"public facade extension range differs: {name}")
             report["streams_checked"].append({"record": int(record), "stream": name, "size": len(expected)})
         require(digest(image) == before, "read operations changed the original image")
         disk = root / "partitioned.img"
@@ -274,6 +315,13 @@ def main() -> None:
         require(command(binary, "read", disk, "/tiny.txt", "--offline-image", "--stream", "extension-31",
                         "--offset", "1048576", "--length", str(image.stat().st_size)) == extension_streams["extension-31"],
                 "selected-partition extension stream differs")
+        if facade:
+            public = [facade, disk, "--offset", "1048576", "--length", str(image.stat().st_size)]
+            require(command(*public, "read", "/large.bin") == payloads["large.bin"],
+                    "bounded public facade unnamed DATA differs")
+            require(command(*public, "read", "/tiny.txt", "--stream", "extension-31")
+                    == extension_streams["extension-31"], "bounded public facade extension stream differs")
+            command(*public, "read", "/tiny.txt", "--stream", "missing", failure="NotFound")
         require(digest(disk) == disk_before, "candidate modified image or adjacent partition bytes")
         compression = compressed_cases(command, binary, root)
         report.update(status="passed", image_sha256=before, partitioned_sha256=disk_before,

@@ -97,6 +97,18 @@ pub struct ReadOnlyOpenOptions {
 pub struct ReadOnlyFs {
     pub format: FsFormatKind,
     pub filesystem: Box<dyn FsOps>,
+    ntfs: Option<Arc<ffs_ntfs::NtfsFs>>,
+}
+
+impl ReadOnlyFs {
+    /// Borrow the NTFS volume admitted by this open, for exact native DATA
+    /// stream selection and metadata inspection. Other formats return `None`.
+    /// The volume shares the original bounded, locked, OS-read-only descriptor;
+    /// no pathname is reopened and no mutable volume reference is exposed.
+    #[must_use]
+    pub fn ntfs_volume(&self) -> Option<&ffs_ntfs::NtfsVolume> {
+        self.ntfs.as_ref().map(|filesystem| filesystem.volume())
+    }
 }
 
 impl std::fmt::Debug for ReadOnlyFs {
@@ -239,6 +251,7 @@ pub fn open_read_only(
         length = device.len_bytes(),
         "opening bounded native read-only view"
     );
+    let mut ntfs = None;
     let filesystem: Box<dyn FsOps> = match detected {
         DetectedFilesystem::Ext4(_) | DetectedFilesystem::Btrfs(_) => {
             let mut core_options = OpenOptions {
@@ -281,7 +294,9 @@ pub fn open_read_only(
         DetectedFilesystem::Ntfs(_) => {
             let length = device.len_bytes();
             let volume = ffs_ntfs::NtfsVolume::from_device(cx, Box::new(device), 0, length)?;
-            Box::new(ffs_ntfs::NtfsFs::new(cx, volume, options.uid, options.gid)?)
+            let filesystem = Arc::new(ffs_ntfs::NtfsFs::new(cx, volume, options.uid, options.gid)?);
+            ntfs = Some(Arc::clone(&filesystem));
+            Box::new(filesystem)
         }
         DetectedFilesystem::Zfs(_) => {
             let defaults = ZfsReadOptions::default();
@@ -341,7 +356,11 @@ pub fn open_read_only(
         }
     };
     checkpoint(cx)?;
-    Ok(ReadOnlyFs { format, filesystem })
+    Ok(ReadOnlyFs {
+        format,
+        filesystem,
+        ntfs,
+    })
 }
 
 #[cfg(test)]

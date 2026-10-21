@@ -102,6 +102,7 @@ fn native_fat_both_dialects_open_through_bounded_facade_and_preserve_container()
         )
         .unwrap();
         assert_eq!(opened.format, expected);
+        assert!(opened.ntfs_volume().is_none());
         let mut scope = RequestScope::empty();
         let root = InodeNumber(1);
         let file = opened
@@ -348,6 +349,9 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
         .collect();
     let source = root.join("source.bin");
     fs::write(&source, &payload).unwrap();
+    let named_payload = b"independent native named DATA\0\xff";
+    let named_source = root.join("named.bin");
+    fs::write(&named_source, named_payload).unwrap();
     for (kind, expected) in [
         ("fat16", FsFormatKind::Fat16),
         ("fat32", FsFormatKind::Fat32),
@@ -389,6 +393,32 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                     source.as_os_str(),
                     OsStr::new("/Native payload.bin"),
                 ],
+            );
+            command(
+                &directory,
+                "populate-stream",
+                "ntfscp",
+                &[
+                    OsStr::new("-N"),
+                    OsStr::new("note"),
+                    image.as_os_str(),
+                    named_source.as_os_str(),
+                    OsStr::new("/Native payload.bin"),
+                ],
+            );
+            assert_eq!(
+                command(
+                    &directory,
+                    "reference-stream",
+                    "ntfscat",
+                    &[
+                        OsStr::new("-n"),
+                        OsStr::new("note"),
+                        image.as_os_str(),
+                        OsStr::new("/Native payload.bin"),
+                    ]
+                ),
+                named_payload
             );
             assert_eq!(
                 command(
@@ -462,6 +492,44 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
             )
             .unwrap();
             assert_eq!(opened.format, expected);
+            if kind == "ntfs" {
+                let volume = opened.ntfs_volume().unwrap();
+                let record = volume
+                    .resolve_no_follow(&cx, "/Native payload.bin")
+                    .unwrap();
+                let name: Vec<_> = "note".encode_utf16().collect();
+                let stream = volume.data_stream(&cx, &record, &name).unwrap();
+                assert_eq!(stream.size, named_payload.len() as u64);
+                assert_eq!(volume.read(&cx, &stream, 0, 4096).unwrap(), named_payload);
+                assert_eq!(
+                    volume.read(&cx, &stream, 5, 7).unwrap(),
+                    named_payload[5..12]
+                );
+                assert!(
+                    volume
+                        .read(&cx, &stream, stream.size, 9)
+                        .unwrap()
+                        .is_empty()
+                );
+                for absent in ["NOTE", "missing"] {
+                    assert!(matches!(
+                        volume.data_stream(
+                            &cx,
+                            &record,
+                            &absent.encode_utf16().collect::<Vec<_>>()
+                        ),
+                        Err(FfsError::NotFound(_))
+                    ));
+                }
+                let cancelled = Cx::for_testing();
+                cancelled.cancel_with(asupersync::types::CancelKind::User, None);
+                assert!(matches!(
+                    volume.read(&cancelled, &stream, 0, 1),
+                    Err(FfsError::Cancelled)
+                ));
+            } else {
+                assert!(opened.ntfs_volume().is_none());
+            }
             let mut scope = RequestScope::empty();
             let file = opened
                 .filesystem
