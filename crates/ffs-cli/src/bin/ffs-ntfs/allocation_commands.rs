@@ -2,7 +2,9 @@
 
 use super::{Cx, ImageArgs, Result, bail, json};
 use clap::Args;
-use ffs_ntfs::reader::allocation::{AllocationLimits, AllocationReport};
+use ffs_ntfs::reader::allocation::{
+    AllocationLimits, AllocationReport, RecordOwnershipLimits, RecordOwnershipReport,
+};
 use serde_json::{Value, json as value};
 
 #[derive(Debug, Args)]
@@ -18,6 +20,12 @@ pub(super) struct AllocationArgs {
     /// Maximum decoded mapping runs, including sparse holes.
     #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=1_048_576))]
     max_runs: u64,
+    /// Also validate allocated FILE extensions against their base ATTRIBUTE_LIST catalogs.
+    #[arg(long)]
+    verify_record_ownership: bool,
+    /// Independent metadata work cap for record ownership; defaults to one GiB.
+    #[arg(long, requires = "verify_record_ownership", value_parser = clap::value_parser!(u64).range(1..=1_099_511_627_776))]
+    max_metadata_bytes: Option<u64>,
 }
 
 impl AllocationArgs {
@@ -32,6 +40,22 @@ impl AllocationArgs {
         };
         limits.validate()?;
         Ok(limits)
+    }
+
+    fn ownership_limits(&self) -> Result<Option<RecordOwnershipLimits>> {
+        if !self.verify_record_ownership {
+            if self.max_metadata_bytes.is_some() {
+                bail!("--max-metadata-bytes requires --verify-record-ownership");
+            }
+            return Ok(None);
+        }
+        let limits = RecordOwnershipLimits {
+            records: self.max_records,
+            metadata_bytes: self.max_metadata_bytes
+                .unwrap_or(RecordOwnershipLimits::default().metadata_bytes),
+        };
+        limits.validate()?;
+        Ok(Some(limits))
     }
 }
 
@@ -99,14 +123,65 @@ fn outcome(report: &AllocationReport) -> Result<()> {
     Ok(())
 }
 
+fn combined_json(
+    report: &AllocationReport,
+    ownership: Option<&RecordOwnershipReport>,
+    offset: u64,
+) -> Value {
+    let mut output = report_json(report, offset);
+    output["requested_checks_consistent"] = (report.is_consistent()
+        && ownership.is_none_or(RecordOwnershipReport::is_consistent)).into();
+    let ownership_json = match ownership {
+        None => Value::Null,
+        Some(report) => {
+            output["not_checked"][3] = "complete logical stream assembly beyond catalog identity".into();
+            let issues: Vec<_> = report.issues.iter().map(|issue| value!({
+                "category": issue.category, "record": issue.record, "detail": issue.detail,
+            })).collect();
+            value!({
+                "scope": "allocated_mft_base_extension_catalogs",
+                "consistent": report.is_consistent(),
+                "complete": report.complete,
+                "limit_reached": report.limit_reached,
+                "logical_records": report.logical_records,
+                "initialized_records": report.initialized_records,
+                "record_slots_examined": report.record_slots_examined,
+                "base_records_examined": report.base_records_examined,
+                "extension_records_examined": report.extension_records_examined,
+                "referenced_extension_records": report.referenced_extension_records,
+                "metadata_bytes_attempted": report.metadata_bytes_attempted,
+                "extensions_without_owner": report.extensions_without_owner,
+                "errors": report.errors,
+                "unsupported": report.unsupported,
+                "issues": issues,
+                "omitted_issues": report.omitted_issues,
+                "reclaimable_records": null,
+            })
+        }
+    };
+    output["record_ownership"] = ownership_json;
+    output
+}
+
+fn ownership_outcome(report: Option<&RecordOwnershipReport>) -> Result<()> {
+    if report.is_some_and(|report| !report.is_consistent()) {
+        bail!("NTFS record ownership discrepancies or incomplete coverage; see the JSON report; no repair performed");
+    }
+    Ok(())
+}
+
 pub(super) fn run(cx: &Cx, args: &AllocationArgs) -> Result<()> {
     cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
     let limits = args.preflight()?;
+    let ownership_limits = args.ownership_limits()?;
     let volume = args.image.open(cx)?;
     let report = volume.check_allocations(cx, limits)?;
+    let ownership = ownership_limits
+        .map(|limits| volume.check_record_ownership(cx, limits)).transpose()?;
     cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
-    json(&report_json(&report, args.image.offset))?;
-    outcome(&report)
+    json(&combined_json(&report, ownership.as_ref(), args.image.offset))?;
+    outcome(&report)?;
+    ownership_outcome(ownership.as_ref())
 }
 
 #[cfg(test)]
@@ -115,6 +190,63 @@ mod tests {
     use crate::{Cli, Command};
     use clap::Parser;
     use ffs_ntfs::reader::allocation::AllocationIssue;
+
+    #[test]
+    fn record_ownership_cli_is_explicit_and_preserves_independent_limits() {
+        let base = ["ffs-ntfs", "check-allocation", "unopened.img", "--offline-image"];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Command::CheckAllocation { options } = cli.command else { panic!("allocation"); };
+        assert!(options.ownership_limits().unwrap().is_none());
+        let cli = Cli::try_parse_from(base.into_iter().chain([
+            "--verify-record-ownership", "--max-records", "4096", "--max-metadata-bytes", "8388608",
+        ])).unwrap();
+        let Command::CheckAllocation { options } = cli.command else { panic!("allocation"); };
+        let limits = options.ownership_limits().unwrap().unwrap();
+        assert_eq!((limits.records, limits.metadata_bytes), (4096, 8_388_608));
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--max-metadata-bytes", "1024"])).is_err());
+        for value in ["0", "1099511627777"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([
+                "--verify-record-ownership", "--max-metadata-bytes", value,
+            ])).is_err());
+        }
+    }
+
+    #[test]
+    fn record_ownership_cli_refuses_transformed_sources_before_io() {
+        for extra in [vec!["--recover-logfile"], vec!["--sidecar", "unopened.rq"]] {
+            let cli = Cli::try_parse_from([
+                "ffs-ntfs", "check-allocation", "unopened.img", "--offline-image",
+                "--verify-record-ownership",
+            ].into_iter().chain(extra)).unwrap();
+            let Command::CheckAllocation { options } = cli.command else { panic!("allocation"); };
+            assert!(run(&Cx::for_testing(), &options).unwrap_err().to_string()
+                .contains("without a sidecar or recovery overlay"));
+        }
+    }
+
+    #[test]
+    fn record_ownership_json_cannot_turn_unknown_ownership_into_success_or_reuse() {
+        let allocation = AllocationReport {
+            complete: true, allocated_without_reference: Some(0), ..AllocationReport::default()
+        };
+        assert!(combined_json(&allocation, None, 1024)["record_ownership"].is_null());
+        assert!(ownership_outcome(None).is_ok());
+        let mut ownership = RecordOwnershipReport::default();
+        let report = combined_json(&allocation, Some(&ownership), 1024);
+        assert_eq!(report["allocation_consistent"], true);
+        assert_eq!(report["requested_checks_consistent"], false);
+        assert!(report["record_ownership"]["extensions_without_owner"].is_null());
+        assert!(report["record_ownership"]["reclaimable_records"].is_null());
+        assert!(ownership_outcome(Some(&ownership)).is_err());
+        ownership.complete = true;
+        ownership.extensions_without_owner = Some(0);
+        assert!(ownership_outcome(Some(&ownership)).is_ok());
+        assert_eq!(combined_json(&allocation, Some(&ownership), 1024)["requested_checks_consistent"], true);
+        ownership.errors = 1;
+        ownership.extensions_without_owner = Some(1);
+        assert!(ownership_outcome(Some(&ownership)).is_err());
+        assert_eq!(combined_json(&allocation, Some(&ownership), 1024)["requested_checks_consistent"], false);
+    }
 
     #[test]
     fn allocation_cli_keeps_volume_bounds_and_exact_work_limits() {

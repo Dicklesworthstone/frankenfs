@@ -178,6 +178,13 @@ Ten library and four CLI/report controls are authored but not executed in this
 [NTFS allocation-check profile](docs/NTFS_ALLOCATION_CHECK.md) for exact scope,
 resource limits and qualification requirements.
 
+Add `--verify-record-ownership` to cross-check allocated MFT extensions against
+validated base ATTRIBUTE_LIST catalogs. The separate metadata budget is set with
+`--max-metadata-bytes`; free or stale catalog references fail, while incomplete
+coverage leaves owner-absence conclusions unknown. This does not grant repair
+or native write authority. Eight library and three CLI/report regressions are
+authored but unexecuted here. See the [record ownership profile](docs/NTFS_RECORD_OWNERSHIP.md).
+
 ## ZFS: extract from surviving mirror disks
 
 `--missing-mirror-member GUID` explicitly identifies every absent child of one

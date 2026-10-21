@@ -1,5 +1,7 @@
 //! Constructed native records and allocation models, not Windows qualification.
 
+mod ownership;
+
 use super::*;
 use crate::reader::{ByteDevice, ByteOffset, NtfsFileRecord, DATA, SPARSE, VOLUME_INFORMATION};
 use std::sync::{Arc, Mutex};

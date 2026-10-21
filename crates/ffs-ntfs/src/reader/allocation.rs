@@ -6,6 +6,9 @@
 //! unexplained allocation into authority to free it. It is not journal replay
 //! or a complete NTFS consistency checker.
 
+mod ownership;
+pub use ownership::{RecordOwnershipLimits, RecordOwnershipReport};
+
 use super::{
     Cx, FfsError, NtfsVolume, NtfsValue, Result, Storage, Stream, buffer, checkpoint,
     corrupt, decode_mapping_pairs, parse, unsupported,
