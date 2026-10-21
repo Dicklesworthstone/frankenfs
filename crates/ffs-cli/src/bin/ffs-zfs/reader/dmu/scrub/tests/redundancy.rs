@@ -225,3 +225,87 @@ fn recovered_data_is_not_evidence_that_actual_columns_or_parity_are_intact() {
         assert!(report.issues[0].detail.contains("unreconstructed RAIDZ data"));
     }
 }
+
+#[test]
+fn readable_missing_mirror_is_not_reported_as_intact_redundancy() {
+    use crate::reader::tests::mirror::{MIRROR_GUID, install_labels, native_config};
+
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let fixture = Fixture::new(order);
+        let mut view = fixture.view();
+        let config = native_config(1001, &[1001, 1002], 9, view.config.allocated_bytes, 42);
+        // This unit fixture constructs Objects directly, like its parent tests.
+        // The survivor constructor validates native labels, not an uberblock.
+        install_labels(
+            &mut fixture.storage.lock().unwrap().bytes,
+            0,
+            LENGTH as u64,
+            order,
+            &config,
+            &[0; 1024],
+        );
+        view.config.top_guid = MIRROR_GUID;
+        view.pool = Pool::from_mirror_survivors(&cx, vec![leaf(&fixture.storage)], vec![1002])
+            .unwrap();
+        let before = fixture.storage.lock().unwrap().bytes.clone();
+        assert!(scrub(&view).is_clean());
+        let report = view.scrub(&cx, limits()).unwrap();
+        assert_eq!(report.missing_native_members, 1);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.verified_blocks, 5);
+        assert_eq!(report.copies_examined, 5);
+        assert!(!report.is_clean());
+        assert_eq!(fixture.storage.lock().unwrap().bytes, before);
+    }
+}
+
+#[test]
+fn readable_missing_raidz_never_certifies_absent_columns_and_does_not_read_them() {
+    use crate::reader::tests::mirror::{
+        MIRROR_GUID, install_labels, native_config, repack,
+    };
+    use crate::reader::{NvList, Value};
+
+    let cx = Cx::for_testing();
+    for parity in 1..=3 {
+        for order in [Endian::Little, Endian::Big] {
+            let (fixture, mut view) = StripeFixture::view(parity, order);
+            let width = fixture.states.len();
+            let guids: Vec<_> = (0..width).map(|child| 1001 + child as u64).collect();
+            for (child, storage) in fixture.states.iter().enumerate() {
+                let raw = native_config(
+                    guids[child], &guids, 9, view.config.allocated_bytes, 42,
+                );
+                let mut config = NvList::parse(&raw).unwrap();
+                let Value::List(tree) = config.fields.get_mut("vdev_tree").unwrap() else {
+                    panic!("native fixture tree");
+                };
+                tree.fields.insert("type".into(), Value::String("raidz".into()));
+                tree.fields.insert("nparity".into(), Value::Unsigned(parity as u64));
+                install_labels(
+                    &mut storage.lock().unwrap().bytes,
+                    0, LENGTH as u64, order, &repack(&config), &[0; 1024],
+                );
+            }
+            let supplied: Vec<_> = (parity..width).rev().collect();
+            let leaves = supplied.iter().map(|&child| leaf(&fixture.states[child])).collect();
+            view.pool = Pool::from_raidz_survivors(&cx, leaves, guids[..parity].to_vec()).unwrap();
+            view.config.top_guid = MIRROR_GUID;
+            // The direct Objects fixture retains native child order; supplied
+            // image order is reversed and absent children have no image handle.
+            for (child, route) in view.config.raidz_members.as_mut().unwrap().members.iter_mut().enumerate() {
+                route.supplied_index = supplied.iter().position(|&index| index == child)
+                    .unwrap_or(usize::MAX);
+            }
+            assert!(scrub(&view).is_clean());
+            let report = view.scrub(&cx, limits()).unwrap();
+            assert_eq!(report.missing_native_members, parity);
+            assert_eq!(report.verified_blocks, 5);
+            assert!(!report.is_clean());
+            for absent in &fixture.states[..parity] {
+                assert!(absent.lock().unwrap().reads.is_empty());
+            }
+        }
+    }
+}

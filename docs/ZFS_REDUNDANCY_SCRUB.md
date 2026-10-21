@@ -84,11 +84,15 @@ refuses a ZIL replay overlay rather than auditing a different view silently.
 
 ## Evidence
 
-Nine authored Rust tests cover secondary mirror corruption in metadata/data/SA,
+Eleven authored Rust tests cover secondary mirror corruption in metadata/data/SA,
 a bad second DVA, fresh I/O despite warm caches, independent audit budget,
 cancellation in an otherwise unused replica, P/Q/R parity-only damage, recovered
 but corrupt actual data, unequal columns, high-bit GF arithmetic, CLI selection,
-and pre-I/O sidecar/replay refusal. Synthetic storage panics on writes/flushes.
+and pre-I/O sidecar/replay refusal. Missing-mirror and missing-RAIDZ controls
+also exercise native label admission with direct constructed Objects views:
+readability can succeed while the redundancy result remains non-clean, without
+any read from an absent member. These are not full uberblock-import tests.
+Synthetic storage panics on writes/flushes.
 Existing readability tests and their assertions are retained.
 
 These Rust tests have not been executed in this implementation environment.
