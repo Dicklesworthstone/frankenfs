@@ -7,6 +7,8 @@ use crate::reader::{BlockPointer, Endian, FfsError};
 use ffs_ondisk::zfs::{checksum, uberblock_bytes};
 use std::sync::Mutex;
 
+mod auto_import;
+
 type Reads = Arc<Mutex<Vec<(u64, usize)>>>;
 const BASE: usize = 1024;
 const LENGTH: usize = 8 * 1024 * 1024;
@@ -556,12 +558,18 @@ fn striped_mirror_gang_headers_and_cross_vdev_fragments_keep_every_replica() {
 }
 
 #[test]
-fn striped_mirror_automatic_selection_is_not_silently_enabled_by_explicit_admission() {
+fn striped_mirror_automatic_selection_preserves_explicit_config_and_replica_reads() {
     let fixture = Fixture::new([2, 2], [9, 12], Endian::Little);
-    let logs = fixture.logs.clone();
     let pool = fixture.pool(&[0, 1, 2, 3], &[Fault::None; 4]);
-    assert!(pool.import_active(&Cx::for_testing(), Some(123)).is_err());
-    Fixture::no_payload(&logs);
+    let cx = Cx::for_testing();
+    let explicit = pool.root(&cx, 0, 2, 123).unwrap();
+    let automatic = pool.import_active(&cx, Some(123)).unwrap().2;
+    assert_eq!(automatic.config, explicit.config);
+    assert_eq!(automatic.data, explicit.data);
+    assert_eq!(automatic.member_guid, explicit.member_guid);
+    let mut objects = pool.import_objects(&cx, Some(123)).unwrap();
+    drop(pool);
+    assert_eq!(objects.read(&cx, 1, 0, 512).unwrap(), vec![0xA5; 512]);
 }
 
 pub(in crate::reader) fn log_fixture(
