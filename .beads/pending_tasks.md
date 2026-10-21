@@ -940,7 +940,8 @@ Named-stream followthrough, 2026-10-21:
 - [x] Fix two strict Clippy EOF diagnostic findings without changing the checked
   conditions; all-target workspace Clippy passes at `919ad4caa`, receipt tree
   `db5f4fdb5ad358a599150bedef0034b00e042182`.
-- [ ] Finish the current workspace/all-target check at `c51d483b5`.
+- [x] Finish the current workspace/all-target check at `c51d483b5`: remote exit 0,
+  receipt tree `d040847cf0dcb5a572e39b9a413cc476baa2cae2`.
 - [ ] Retrieve and hash the new public consumer from its exact RCH build.
 - [ ] Receive the pending explicit approval for the staged CSD native NTFS run.
   The concrete command/profile/binary were presented; no answer is inferred.
@@ -1056,9 +1057,12 @@ Both were verified on CSD beneath the established private root. The exact
 command was presented in the pending approval question. It creates only three
 new exclusive 64 MiB regular files and retains all evidence. No response or
 permission has been inferred, and nothing has been formatted after rejection.
-The later named-stream public consumer build, full `c51d483b5` workspace check
-and same-source warm harness benchmark remain running in external transcripts
-`build-native-stream-consumers-c51.log`, `check-native-stream-c51.log` and
-`harness-bench-dcdc-warm.log`; collect their actual completion before any claim.
-Strict Clippy at `919ad4caa` completed exit 0. The canonical import refusal and
-zero staged graph cycles were rechecked; no canonical database mutation occurred.
+The later named-stream public consumer build and same-source warm harness
+benchmark remain running in external transcripts
+`build-native-stream-consumers-c51.log` and `harness-bench-dcdc-warm.log`;
+collect their actual completion before any claim. The full `c51d483b5`
+workspace/all-target check subsequently completed remote exit 0 at 17:27 UTC;
+transcript `check-native-stream-c51.log`, receipt tree
+`d040847cf0dcb5a572e39b9a413cc476baa2cae2`. Strict Clippy at `919ad4caa`
+completed exit 0. The canonical import refusal and zero staged graph cycles
+were rechecked; no canonical database mutation occurred.
