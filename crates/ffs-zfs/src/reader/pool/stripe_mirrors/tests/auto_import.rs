@@ -67,6 +67,8 @@ fn striped_mirror_auto_import_retains_mixed_geometry_and_independent_ring_locati
                 let mut fixture = Fixture::new(widths, shifts, order);
                 let count = fixture.images.len();
                 fixture.clear_rings();
+                // The only root candidate lives on a different top-level vdev
+                // from the root data. It remains valid next to a damaged label.
                 let candidate_member = fixture.groups[0][0];
                 let ub = fixture.ubs[candidate_member].clone();
                 fixture.candidate(candidate_member, 3, 1, &ub);
@@ -181,6 +183,8 @@ fn striped_mirror_auto_import_requires_every_valid_label_to_agree() {
                 1 => { cfg.fields.insert("txg".into(), Value::Unsigned(44)); }
                 _ => { cfg.fields.insert("pool_guid".into(), Value::Unsigned(456)); }
             }
+            // The conflicting fourth label is correctly checksummed. It must
+            // not be discarded like an unreadable or torn configuration copy.
             fixture.replace_label(1, 3, &cfg);
         }
         let logs = fixture.logs.clone();
@@ -198,14 +202,20 @@ fn striped_mirror_auto_import_filters_guid_sum_and_config_age_and_rejects_txg_fo
         let mut ub = fixture.ubs[0].clone();
         match case {
             0 => {
+                // Count each mirror parent and each physical child, not just
+                // top-level IDs or just the supplied disks.
                 word(&mut ub, 24, 123 + 500 + 501, fixture.order);
                 fixture.clear_rings();
             }
             1 => {
+                // This root is newer than group zero's label, but older than
+                // group one's configuration. It is not an admissible root.
                 word(&mut ub, 16, 40, fixture.order);
                 fixture.clear_rings();
             }
             _ => {
+                // Preserve a valid candidate at the same TXG but different
+                // root DVA. Fork rejection must happen before trying either.
                 word(&mut ub, 48, OTHER / 512, fixture.order);
             }
         }
@@ -291,6 +301,8 @@ fn striped_mirror_auto_import_never_uses_bytes_from_an_unrelated_top_level() {
             .any(|(position, _)| *position == at(ROOT) as u64));
     }
     for log in &logs[2..] {
+        // Equal ring copies are deduplicated; one failed root does not retry
+        // the same physical DVA on the same member once per ring copy.
         assert_eq!(log.lock().unwrap().iter()
             .filter(|(position, _)| *position == at(ROOT) as u64).count(), 1);
     }
