@@ -9,6 +9,7 @@
 //! checker have succeeded. Interrupted output is retained, never auto-deleted.
 
 mod relocation;
+mod root;
 
 use super::reader::{FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS, checkpoint};
 use anyhow::{Context, Result, bail};
@@ -43,6 +44,11 @@ pub struct ResizeArgs {
     /// Only the new output is changed; bad tail clusters are still refused.
     #[arg(long)]
     relocate: bool,
+    /// Expand the FAT16 fixed root to this many native directory slots.
+    /// Must be sector-aligned and no smaller than the source; FAT32 is refused.
+    /// At unchanged output size this consumes data capacity; --relocate may be needed.
+    #[arg(long, value_name = "SLOTS")]
+    root_entries: Option<u16>,
     /// Confirm the source stays offline and immutable for the complete operation.
     #[arg(long, required = true)]
     offline_image: bool,
@@ -736,6 +742,12 @@ pub fn run(cx: &Cx, args: &ResizeArgs) -> Result<serde_json::Value> {
         base: args.image.offset,
         length: selected,
     };
+    let (source, root_change) = if let Some(entries) = args.root_entries {
+        let (source, change) = root::prepare(cx, source, entries, args.image.oem_code_page)?;
+        (source, Some(change))
+    } else {
+        (source, None)
+    };
     let (source, relocated) = if args.relocate {
         relocation::prepare(cx, source, length, args.image.oem_code_page)?
     } else {
@@ -766,6 +778,14 @@ pub fn run(cx: &Cx, args: &ResizeArgs) -> Result<serde_json::Value> {
     report["relocation_requested"] = args.relocate.into();
     report["relocated_clusters"] = relocated.into();
     report["cluster_numbers_preserved"] = (relocated == 0).into();
+    if let Some(change) = root_change {
+        // The private expanded view is larger than the real source. Do not
+        // report its temporary geometry as the user's original image length.
+        report["source_volume_bytes"] = change.source_bytes.into();
+        report["source_root_entries"] = change.before.into();
+        report["output_root_entries"] = change.after.into();
+        report["root_directory_expanded"] = (change.after != change.before).into();
+    }
     if args.relocate {
         report["contract"] = "fresh standalone image with verified live-tail relocation; no in-place resize, dialect conversion, partition-table edit or sidecar transfer".into();
     }
