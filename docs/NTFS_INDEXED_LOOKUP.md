@@ -25,6 +25,34 @@ cache; `readdir` still enumerates and validates all targets before publishing on
 snapshot. Native inode generations, hard-link identity, relative symlinks,
 directory ancestry and lossless host-name projection remain required.
 
+The six-format facade exposes the same explicit selection:
+
+```rust,no_run
+# fn example(cx: &asupersync::Cx) -> ffs_error::Result<()> {
+let opened = ffs::open_read_only(cx, "volume.img", &ffs::ReadOnlyOpenOptions {
+    backend: ffs::ReadOnlyBackend::Ntfs { indexed_lookup: true },
+    ..ffs::ReadOnlyOpenOptions::default()
+})?;
+# Ok(()) }
+```
+
+`Auto` and `Ntfs { indexed_lookup: false }` retain strict construction and
+full-directory lookup. Explicit NTFS selection still refuses another detected
+format or ambiguous signatures. Both modes retain the same bounded, locked,
+OS-read-only image handle, ownership projection and native stream accessor.
+Indexed lookup does not populate a complete-directory cache; an indexed view's
+`readdir` can still fail on a damaged sibling which a selected lookup never read.
+
+The standalone public consumer accepts `--ntfs-indexed-lookup` before its
+subcommand. Its ordinary and exact named-stream paths use the selected mode;
+conflicting ZFS dataset/snapshot selectors are rejected during argument parsing.
+
+```sh
+native_reader volume.img --ntfs-indexed-lookup read /report.bin --start 507 --bytes 1031
+native_reader disk.img --offset 1048576 --length 67108864 --ntfs-indexed-lookup \
+  read /report.bin --stream note
+```
+
 ```sh
 ffs-ntfs read volume.img /large-directory/report.bin --offline-image --indexed-lookup
 ffs-ntfs read volume.img /large-directory/report.bin --offline-image \
@@ -73,6 +101,16 @@ or measured speedup is claimed. Cancellation and a failure anywhere in the
 selected search range fail the whole resolution.
 
 ## Evidence
+
+The public-facade selection increment is authored; its new Rust/native gates
+are pending. The existing native-producer regression retains all original
+checks and adds automatic, explicit strict and indexed NTFS views on plain and
+bounded images. It also plants selected and unrelated FILE-signature damage in
+new copies located through the native MFT mapping: strict admission must reject
+both, indexed lookup must read an unaffected file, selected corruption must
+fail, and complete indexed readdir must detect both damaged targets. Source
+presence is not execution evidence; the older receipts below predate this
+facade option. No indexed kernel-mount or performance claim follows.
 
 Seven new constructed-image Rust tests cover resident and external indexes,
 short aliases, Unicode, exact/insensitive/POSIX names, equal separators, selected

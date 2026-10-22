@@ -308,6 +308,7 @@ fn invalid_missing_member_requests_and_cancellation_fail_before_path_open() {
 #[test]
 #[ignore = "requires dosfstools, mtools and ntfs-3g; retains native images and command logs"]
 fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade() {
+    use std::io::Write;
     use std::process::Command;
 
     fn command(root: &Path, label: &str, tool: &str, arguments: &[&OsStr]) -> Vec<u8> {
@@ -337,6 +338,40 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
             "native oracle {label} failed; see {root:?}"
         );
         output.stdout
+    }
+
+    fn record_offset(cx: &Cx, volume: &ffs_ntfs::NtfsVolume, number: u32) -> usize {
+        use ffs_ondisk::ntfs::{DATA, NtfsValue, decode_mapping_pairs};
+
+        // Locate planted damage through the actual native MFT mapping, never
+        // assume the formatter placed all FILE records in one physical run.
+        let record = volume.record(cx, 0, None).unwrap();
+        let attribute = record
+            .attributes()
+            .unwrap()
+            .into_iter()
+            .find(|attribute| attribute.kind == DATA && attribute.name.is_empty())
+            .unwrap();
+        let NtfsValue::NonResident(value) = attribute.value else {
+            panic!("native MFT DATA must be nonresident");
+        };
+        let runs = decode_mapping_pairs(
+            value.mapping_pairs,
+            value.first_vcn,
+            value.last_vcn,
+            volume.geometry.cluster_count(),
+        )
+        .unwrap();
+        let cluster = u64::from(volume.geometry.cluster_bytes());
+        let logical = u64::from(number) * u64::from(volume.geometry.record_bytes());
+        let run = runs
+            .iter()
+            .find(|run| {
+                logical >= run.vcn * cluster
+                    && logical + 4 <= (run.vcn + run.clusters) * cluster
+            })
+            .unwrap();
+        usize::try_from(run.lcn.unwrap() * cluster + logical - run.vcn * cluster).unwrap()
     }
 
     let root = tempfile::Builder::new()
@@ -406,6 +441,16 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                     image.as_os_str(),
                     named_source.as_os_str(),
                     OsStr::new("/Native payload.bin"),
+                ],
+            );
+            command(
+                &directory,
+                "populate-unrelated",
+                "ntfscp",
+                &[
+                    image.as_os_str(),
+                    named_source.as_os_str(),
+                    OsStr::new("/Unrelated.bin"),
                 ],
             );
             assert_eq!(
@@ -606,6 +651,80 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                     .write(&cx, &mut scope, file.ino, 0, b"forbidden"),
                 Err(FfsError::ReadOnly)
             ));
+        }
+        if kind == "ntfs" {
+            let volume = ffs_ntfs::NtfsVolume::open(&cx, &image, 0, None).unwrap();
+            let selected = volume
+                .resolve_no_follow(&cx, "/Native payload.bin")
+                .unwrap();
+            let unrelated = volume.resolve_no_follow(&cx, "/Unrelated.bin").unwrap();
+            assert_ne!(selected.number, unrelated.number);
+            for (label, record) in [("unrelated", unrelated), ("selected", selected)] {
+                let at = record_offset(&cx, &volume, record.number);
+                assert_eq!(&native[at..at + 4], b"FILE");
+                assert_eq!(
+                    u32::from_le_bytes(native[at + 44..at + 48].try_into().unwrap()),
+                    record.number
+                );
+                for offset in [0, 4096] {
+                    let mut damaged = if offset == 0 {
+                        native.clone()
+                    } else {
+                        container.clone()
+                    };
+                    damaged[offset + at..offset + at + 4].copy_from_slice(b"FAIL");
+                    let path = directory.join(format!("{label}-{offset}.img"));
+                    fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(&damaged)
+                        .unwrap();
+                    let mut options = ReadOnlyOpenOptions {
+                        offset: offset as u64,
+                        length: Some(native.len() as u64),
+                        ..ReadOnlyOpenOptions::default()
+                    };
+                    // Default and explicitly strict views retain whole-root
+                    // admission and must see even an unrelated broken target.
+                    for backend in [
+                        ReadOnlyBackend::Auto,
+                        ReadOnlyBackend::Ntfs {
+                            indexed_lookup: false,
+                        },
+                    ] {
+                        options.backend = backend;
+                        assert!(matches!(
+                            open_read_only(&cx, &path, &options),
+                            Err(FfsError::Corruption { .. })
+                        ));
+                    }
+                    options.backend = ReadOnlyBackend::Ntfs {
+                        indexed_lookup: true,
+                    };
+                    let opened = open_read_only(&cx, &path, &options).unwrap();
+                    let mut scope = RequestScope::empty();
+                    let result = opened.filesystem.lookup(&cx, &mut scope, InodeNumber(1), name);
+                    if label == "selected" {
+                        assert!(matches!(result, Err(FfsError::Corruption { .. })));
+                    } else {
+                        let file = result.unwrap();
+                        assert_eq!(
+                            opened
+                                .filesystem
+                                .read(&cx, &mut scope, file.ino, 507, 1031)
+                                .unwrap(),
+                            payload[507..1538]
+                        );
+                    }
+                    assert!(matches!(
+                        opened.filesystem.readdir(&cx, &mut scope, InodeNumber(1), 0),
+                        Err(FfsError::Corruption { .. })
+                    ));
+                    assert_eq!(fs::read(&path).unwrap(), damaged);
+                }
+            }
         }
         assert!(
             open_read_only(
