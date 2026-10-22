@@ -324,7 +324,7 @@ fn external_journal_uses_bounded_locked_descriptor_for_overlay_replay() {
     let options = ReadOnlyOpenOptions {
         backend: ReadOnlyBackend::Ext4 {
             external_journal: Some(ImageSource {
-                path: directory.clone(),
+                path: directory,
                 offset: 0,
                 length: None,
             }),
