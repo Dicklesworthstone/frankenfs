@@ -3,11 +3,13 @@
 //! walks. Never choose a conflicting FAT or guess an owner for a cross-link.
 
 mod boot;
+mod fsinfo;
 mod long_names;
 mod mirrors;
 mod parents;
 mod salvage;
 
+pub use fsinfo::{RepairFsInfoArgs, repair_fsinfo};
 pub use parents::{RepairParentsArgs, repair_parents};
 
 use super::super::{
