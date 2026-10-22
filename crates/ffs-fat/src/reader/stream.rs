@@ -14,9 +14,10 @@ const ANCHOR_STRIDE: usize = 256;
 
 /// Owned validation evidence for the immutable adapter's mount-local cache.
 /// Only the owning volume may reuse it, and never across native mutation.
-/// The private type cannot be supplied by a public caller to bypass validation.
+/// The type is only re-exported within this crate; public callers cannot supply
+/// one to bypass validation.
 #[derive(Clone)]
-pub(crate) struct FileIndex {
+pub struct FileIndex {
     anchors: Arc<Vec<u32>>,
     allocated: usize,
     size: u32,
