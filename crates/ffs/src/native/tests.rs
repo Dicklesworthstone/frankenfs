@@ -229,6 +229,115 @@ fn image_admission_retains_exclusive_lock_refusal_and_rejects_nonregular_backing
 }
 
 #[test]
+fn external_journal_uses_bounded_locked_descriptor_for_overlay_replay() {
+    let cx = Cx::for_testing();
+    let directory = tempfile::tempdir().unwrap().keep();
+    let uuid = *b"facade-journal-1";
+    let mut image = ext4_image();
+    image[1024 + 0x5C..1024 + 0x60].copy_from_slice(&4_u32.to_le_bytes());
+    image[1024 + 0xE4..1024 + 0xE8].copy_from_slice(&1_u32.to_le_bytes());
+    image[1024 + 0xD0..1024 + 0xE0].copy_from_slice(&uuid);
+    let primary = directory.join("ext4.img");
+    fs::write(&primary, &image).unwrap();
+    let mut journal = vec![0_u8; 8 * 4096];
+    for (offset, value) in [
+        (0, 0xC03B_3998_u32),
+        (4, 4),
+        (8, 1),
+        (12, 4096),
+        (16, 8),
+        (20, 1),
+        (24, 1),
+        (28, 1),
+        (4096, 0xC03B_3998),
+        (4100, 1),
+        (4104, 1),
+        (4108, 15),
+        (4112, 8),
+        (12288, 0xC03B_3998),
+        (12292, 2),
+        (12296, 1),
+    ] {
+        journal[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    journal[48..64].copy_from_slice(&uuid);
+    journal[8192..8208].copy_from_slice(b"AUXILIARY-REPLAY");
+    for offset in [0, 8192] {
+        let mut container = vec![0xA7; offset];
+        container.extend_from_slice(&journal);
+        container.extend_from_slice(&[0xD3; 4096]);
+        let path = directory.join(format!("journal-{offset}.img"));
+        fs::write(&path, &container).unwrap();
+        let options = ReadOnlyOpenOptions {
+            backend: ReadOnlyBackend::Ext4 {
+                external_journal: Some(ImageSource {
+                    path: path.clone(),
+                    offset: offset as u64,
+                    length: Some(journal.len() as u64),
+                }),
+            },
+            ..ReadOnlyOpenOptions::default()
+        };
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        owner.try_lock().unwrap();
+        assert!(matches!(
+            open_read_only(&cx, &primary, &options),
+            Err(FfsError::Io(_))
+        ));
+        drop(owner);
+        let opened = open_read_only(&cx, &primary, &options).unwrap();
+        assert_eq!(opened.format, FsFormatKind::Ext4);
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            owner.try_lock().is_err(),
+            "journal shared lock must survive open"
+        );
+        let root = opened
+            .filesystem
+            .getattr(&cx, &mut RequestScope::empty(), InodeNumber(1))
+            .unwrap();
+        assert_eq!(root.kind, FileType::Directory);
+        assert_eq!(fs::read(&primary).unwrap(), image);
+        assert_eq!(fs::read(&path).unwrap(), container);
+        drop(opened);
+        owner.try_lock().unwrap();
+        drop(owner);
+        let mut truncated = options.clone();
+        if let ReadOnlyBackend::Ext4 {
+            external_journal: Some(source),
+        } = &mut truncated.backend
+        {
+            source.length = Some(4096);
+        }
+        assert!(open_read_only(&cx, &primary, &truncated).is_err());
+        assert_eq!(fs::read(&primary).unwrap(), image);
+        assert_eq!(fs::read(&path).unwrap(), container);
+    }
+    let options = ReadOnlyOpenOptions {
+        backend: ReadOnlyBackend::Ext4 {
+            external_journal: Some(ImageSource {
+                path: directory.clone(),
+                offset: 0,
+                length: None,
+            }),
+        },
+        ..ReadOnlyOpenOptions::default()
+    };
+    assert!(matches!(
+        open_read_only(&cx, &primary, &options),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+}
+
+#[test]
 fn invalid_missing_member_requests_and_cancellation_fail_before_path_open() {
     let cx = Cx::for_testing();
     let directory = tempfile::tempdir().unwrap();
@@ -367,8 +476,7 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
         let run = runs
             .iter()
             .find(|run| {
-                logical >= run.vcn * cluster
-                    && logical + 4 <= (run.vcn + run.clusters) * cluster
+                logical >= run.vcn * cluster && logical + 4 <= (run.vcn + run.clusters) * cluster
             })
             .unwrap();
         usize::try_from(run.lcn.unwrap() * cluster + logical - run.vcn * cluster).unwrap()
@@ -705,7 +813,9 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                     };
                     let opened = open_read_only(&cx, &path, &options).unwrap();
                     let mut scope = RequestScope::empty();
-                    let result = opened.filesystem.lookup(&cx, &mut scope, InodeNumber(1), name);
+                    let result = opened
+                        .filesystem
+                        .lookup(&cx, &mut scope, InodeNumber(1), name);
                     if label == "selected" {
                         assert!(matches!(result, Err(FfsError::Corruption { .. })));
                     } else {
@@ -719,7 +829,9 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                         );
                     }
                     assert!(matches!(
-                        opened.filesystem.readdir(&cx, &mut scope, InodeNumber(1), 0),
+                        opened
+                            .filesystem
+                            .readdir(&cx, &mut scope, InodeNumber(1), 0),
                         Err(FfsError::Corruption { .. })
                     ));
                     assert_eq!(fs::read(&path).unwrap(), damaged);

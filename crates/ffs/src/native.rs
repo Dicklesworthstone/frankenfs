@@ -30,11 +30,11 @@ pub enum ReadOnlyBackend {
     #[default]
     Auto,
     Ext4 {
-        external_journal: Option<PathBuf>,
+        external_journal: Option<ImageSource>,
     },
     Btrfs {
         root: BtrfsMountSelection,
-        additional_devices: Vec<PathBuf>,
+        additional_devices: Vec<ImageSource>,
     },
     Fat {
         oem_code_page: FatOemCodePage,
@@ -262,24 +262,42 @@ pub fn open_read_only(
                 ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
                 ..OpenOptions::default()
             };
+            let mut external_journal: Option<Arc<dyn ByteDevice>> = None;
+            let mut btrfs_additional: Vec<Arc<dyn ByteDevice>> = Vec::new();
             match &options.backend {
-                ReadOnlyBackend::Ext4 { external_journal } => {
-                    core_options
-                        .external_journal_path
-                        .clone_from(external_journal);
+                ReadOnlyBackend::Ext4 {
+                    external_journal: Some(source),
+                } => {
+                    external_journal = Some(Arc::new(open_image(
+                        cx,
+                        &source.path,
+                        source.offset,
+                        source.length,
+                    )?));
                 }
                 ReadOnlyBackend::Btrfs {
                     root,
                     additional_devices,
                 } => {
                     core_options.btrfs_mount_selection.clone_from(root);
-                    core_options
-                        .btrfs_device_paths
-                        .clone_from(additional_devices);
+                    for source in additional_devices {
+                        btrfs_additional.push(Arc::new(open_image(
+                            cx,
+                            &source.path,
+                            source.offset,
+                            source.length,
+                        )?));
+                    }
                 }
                 _ => {}
             }
-            Box::new(OpenFs::from_device(cx, Box::new(device), &core_options)?)
+            Box::new(OpenFs::from_devices(
+                cx,
+                Box::new(device),
+                &core_options,
+                external_journal,
+                btrfs_additional,
+            )?)
         }
         DetectedFilesystem::Fat16(_) | DetectedFilesystem::Fat32(_) => {
             let length = device.len_bytes();

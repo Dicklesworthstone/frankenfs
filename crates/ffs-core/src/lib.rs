@@ -1339,6 +1339,7 @@ impl BtrfsReadDevices {
         primary: &Arc<dyn ByteDevice>,
         sb: &BtrfsSuperblock,
         paths: &[std::path::PathBuf],
+        additional: Vec<Arc<dyn ByteDevice>>,
     ) -> Result<Self, FfsError> {
         let mut devices = Self {
             readers: ffs_btrfs::BtrfsDeviceSet::new(),
@@ -1347,6 +1348,9 @@ impl BtrfsReadDevices {
         devices.attach(cx, Arc::clone(primary), sb)?;
         for path in paths {
             devices.attach(cx, Arc::new(FileByteDevice::open_read_only(path)?), sb)?;
+        }
+        for device in additional {
+            devices.attach(cx, device, sb)?;
         }
         Ok(devices)
     }
@@ -2759,6 +2763,9 @@ pub struct OpenFs {
     pub mvcc_wal_recovery: Option<WalRecoveryReport>,
     /// External journal device pairing info, if an external journal was provided.
     pub external_journal_info: Option<ExternalJournalInfo>,
+    /// Retain the same admitted journal for pairing and replay, including any
+    /// caller-owned lock and byte-boundary authority.
+    external_journal_device: Option<Arc<dyn ByteDevice>>,
     /// Active mount mode (compat or native).
     pub mount_mode: MountMode,
     /// Active ext4 `data_err=` policy selected at open time.
@@ -7400,7 +7407,29 @@ impl OpenFs {
         dev: Box<dyn ByteDevice>,
         options: &OpenOptions,
     ) -> Result<Self, FfsError> {
-        Self::from_device_with_btrfs_devices(cx, dev, options, None)
+        Self::from_device_with_btrfs_devices(cx, dev, options, None, None, Vec::new())
+    }
+
+    /// Open using already-admitted auxiliary devices without reopening paths.
+    ///
+    /// The supplied devices retain their own access mode, bounds and locks.
+    /// All ordinary format, journal-pairing and btrfs inventory checks apply.
+    /// Path-based auxiliary options cannot be mixed with this constructor.
+    pub fn from_devices(
+        cx: &Cx,
+        dev: Box<dyn ByteDevice>,
+        options: &OpenOptions,
+        external_journal: Option<Arc<dyn ByteDevice>>,
+        btrfs_additional: Vec<Arc<dyn ByteDevice>>,
+    ) -> Result<Self, FfsError> {
+        if options.external_journal_path.is_some() || !options.btrfs_device_paths.is_empty() {
+            return Err(FfsError::Format(
+                "already-open devices cannot be combined with auxiliary paths".into(),
+            ));
+        }
+        Self::from_device_with_btrfs_devices(
+            cx, dev, options, None, external_journal, btrfs_additional,
+        )
     }
 
     /// Nested read-only subvolumes share the already validated backing handles.
@@ -7412,6 +7441,8 @@ impl OpenFs {
         dev: Box<dyn ByteDevice>,
         options: &OpenOptions,
         inherited_devices: Option<Arc<BtrfsReadDevices>>,
+        external_journal: Option<Arc<dyn ByteDevice>>,
+        btrfs_additional: Vec<Arc<dyn ByteDevice>>,
     ) -> Result<Self, FfsError> {
         if options.native_repair_max_working_bytes.is_some()
             && (options.skip_validation
@@ -7454,7 +7485,9 @@ impl OpenFs {
 
         let dev: Arc<dyn ByteDevice> = Arc::from(dev);
         if !matches!(flavor, FsFlavor::Btrfs(_))
-            && (inherited_devices.is_some() || !options.btrfs_device_paths.is_empty())
+            && (inherited_devices.is_some()
+                || !options.btrfs_device_paths.is_empty()
+                || !btrfs_additional.is_empty())
         {
             return Err(FfsError::Format("additional devices require btrfs".into()));
         }
@@ -7504,6 +7537,7 @@ impl OpenFs {
                     .map_err(|e| parse_to_ffs_error(&e))?;
                 let bootstrap_only = inherited_devices.is_none()
                     && options.btrfs_device_paths.is_empty()
+                    && btrfs_additional.is_empty()
                     && sb.num_devices <= 1
                     && sb.chunk_root == 0
                     && options.skip_validation
@@ -7537,6 +7571,7 @@ impl OpenFs {
                             &dev,
                             sb,
                             &options.btrfs_device_paths,
+                            btrfs_additional,
                         )?),
                     };
                     devices.validate_bootstrap_stripes(&bootstrap_chunks)?;
@@ -7787,6 +7822,24 @@ impl OpenFs {
             "mount_mode_selected"
         );
 
+        let external_journal_device = match &flavor {
+            FsFlavor::Ext4(sb) if sb.journal_dev != 0 && !options.skip_validation => {
+                match external_journal {
+                    Some(device) => Some(device),
+                    None => options.external_journal_path.as_ref().map(|path| {
+                        FileByteDevice::open_read_only(path)
+                            .map(|device| Arc::new(device) as Arc<dyn ByteDevice>)
+                    }).transpose()?,
+                }
+            }
+            _ if external_journal.is_some() => {
+                return Err(FfsError::Format(
+                    "supplied external journal requires a validated ext4 external-journal filesystem".into(),
+                ));
+            }
+            _ => None,
+        };
+
         let mut fs = Self {
             flavor,
             ext4_geometry,
@@ -7805,6 +7858,7 @@ impl OpenFs {
             crash_recovery: None,
             mvcc_wal_recovery,
             external_journal_info: None,
+            external_journal_device,
             mount_mode: options.mount_mode,
             ext4_data_err_policy: options.ext4_data_err_policy,
             numa_allocation_policy: options.numa_allocation_policy.clone(),
@@ -7932,10 +7986,11 @@ impl OpenFs {
         }
 
         if fs.is_ext4() && !options.skip_validation {
+            let external_journal = fs.external_journal_device.clone();
             fs.ext4_journal_replay = fs.maybe_replay_ext4_journal(
                 cx,
                 options.ext4_journal_replay_mode,
-                options.external_journal_path.as_deref(),
+                external_journal.as_deref(),
                 options.ext4_verify_journal_checksums,
             )?;
             fs.ext4_fast_commit_replay = fs.maybe_collect_ext4_fast_commit_evidence(cx)?;
@@ -7980,7 +8035,7 @@ impl OpenFs {
 
             // External journal device pairing, if provided.
             fs.external_journal_info =
-                fs.maybe_probe_external_journal(cx, options.external_journal_path.as_deref())?;
+                fs.maybe_probe_external_journal(cx, external_journal.as_deref())?;
 
             fs.crash_recovery = fs.detect_and_recover_crash();
             if options.ext4_journal_replay_mode != Ext4JournalReplayMode::Skip {
@@ -9224,7 +9279,7 @@ impl OpenFs {
     fn maybe_probe_external_journal(
         &self,
         cx: &Cx,
-        external_path: Option<&Path>,
+        external_device: Option<&dyn ByteDevice>,
     ) -> Result<Option<ExternalJournalInfo>, FfsError> {
         let Some(sb) = self.ext4_superblock() else {
             return Ok(None);
@@ -9235,7 +9290,7 @@ impl OpenFs {
             return Ok(None);
         }
 
-        let Some(path) = external_path else {
+        let Some(journal_dev) = external_device else {
             if ext4_superblock_requires_journal_recovery(sb) {
                 return Err(FfsError::UnsupportedFeature(format!(
                     "ext4 filesystem references external journal device {}, but no \
@@ -9251,10 +9306,9 @@ impl OpenFs {
             return Ok(None);
         };
 
-        // Open the journal device image and read its first block to parse
+        // Read the admitted journal device's first block to parse
         // the JBD2 superblock. We use the data FS block size as the read size;
         // the actual journal block size is only known after parsing.
-        let journal_dev = FileByteDevice::open_read_only(path)?;
         let read_size = sb.block_size;
 
         // Read the first block — JBD2 superblock is at the start of the journal.
@@ -9321,7 +9375,7 @@ impl OpenFs {
         &mut self,
         cx: &Cx,
         mode: Ext4JournalReplayMode,
-        external_path: Option<&Path>,
+        external_device: Option<&dyn ByteDevice>,
         verify_checksums: bool,
     ) -> Result<Option<ReplayOutcome>, FfsError> {
         let (block_size, journal_inum, journal_dev) = match self.ext4_superblock() {
@@ -9335,7 +9389,7 @@ impl OpenFs {
                 block_size,
                 journal_dev,
                 mode,
-                external_path,
+                external_device,
                 verify_checksums,
             );
         }
@@ -9433,13 +9487,13 @@ impl OpenFs {
         block_size: u32,
         journal_dev: u32,
         mode: Ext4JournalReplayMode,
-        external_path: Option<&Path>,
+        external_device: Option<&dyn ByteDevice>,
         verify_checksums: bool,
     ) -> Result<Option<ReplayOutcome>, FfsError> {
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("missing ext4 superblock".to_owned()))?;
-        let Some(path) = external_path else {
+        let Some(journal_file) = external_device else {
             if ext4_superblock_requires_journal_recovery(sb) && mode != Ext4JournalReplayMode::Skip
             {
                 return Err(FfsError::UnsupportedFeature(format!(
@@ -9463,7 +9517,6 @@ impl OpenFs {
             return Ok(Some(ReplayOutcome::default()));
         }
 
-        let journal_file = FileByteDevice::open_read_only(path)?;
         let block_len = usize::try_from(block_size)
             .map_err(|_| FfsError::Format("block size does not fit usize".to_owned()))?;
         let mut journal_sb_block = vec![0u8; block_len];
@@ -9492,7 +9545,7 @@ impl OpenFs {
         };
         let adapter = ExternalJournalReplayAdapter {
             data_dev: self.dev.as_ref(),
-            journal_dev: &journal_file,
+            journal_dev: journal_file,
             block_size,
             journal_blocks: journal_region.blocks,
         };
@@ -15210,6 +15263,8 @@ impl OpenFs {
             Box::new(SharedByteDevice(Arc::clone(&self.dev))),
             &options,
             self.btrfs_devices.clone(),
+            None,
+            Vec::new(),
         )?;
         nested.btrfs_nested_enabled = false;
         nested.btrfs_semantic_view_stale = Arc::clone(&self.btrfs_semantic_view_stale);
@@ -56773,6 +56828,55 @@ mod tests {
     }
 
     #[test]
+    fn open_devices_replays_bounded_external_journal_without_paths() {
+        use ffs_block::io_engine::{VolumeAccess, VolumeDevice};
+
+        let cx = Cx::for_testing();
+        let uuid = *b"journal-uuid-000";
+        let mut image = build_ext4_image_with_inode();
+        image[EXT4_SUPERBLOCK_OFFSET + 0xE4..EXT4_SUPERBLOCK_OFFSET + 0xE8]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        set_test_journal_uuid(&mut image, uuid);
+        let journal = build_external_journal_image(4096, uuid, 15, b"EXT-JBD2-REPLAY!");
+        let mut container = vec![0xA7; 8192];
+        container.extend_from_slice(&journal);
+        container.extend_from_slice(&[0xD3; 4096]);
+        for defect in ["healthy", "truncated", "uuid", "paths"] {
+            let mut bytes = container.clone();
+            if defect == "uuid" {
+                bytes[8192 + 48] ^= 1;
+            }
+            let backing = TestDevice::from_vec(bytes.clone());
+            let data = TestDevice::from_vec(image.clone());
+            let device = VolumeDevice::new(
+                Arc::new(backing.clone()), ByteOffset(8192),
+                if defect == "truncated" { 4096 } else { journal.len() as u64 },
+                VolumeAccess::ReadOnly,
+            ).unwrap();
+            let options = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+                external_journal_path: (defect == "paths").then(|| "must-not-open.img".into()),
+                ..OpenOptions::default()
+            };
+            let opened = OpenFs::from_devices(
+                &cx, Box::new(data.clone()), &options, Some(Arc::new(device)), Vec::new(),
+            );
+            if defect == "healthy" {
+                let fs = opened.unwrap();
+                let replay = fs.ext4_journal_replay().unwrap();
+                assert_eq!(replay.committed_sequences, vec![1]);
+                assert_eq!(replay.stats.replayed_blocks, 1);
+                assert!(fs.external_journal_info.as_ref().unwrap().uuid_match);
+                assert_eq!(&fs.read_block_vec(&cx, BlockNumber(15)).unwrap()[..16], b"EXT-JBD2-REPLAY!");
+            } else {
+                assert!(opened.is_err(), "{defect} must not be admitted");
+            }
+            assert_eq!(data.snapshot_bytes(), image);
+            assert_eq!(backing.snapshot_bytes(), bytes);
+        }
+    }
+
+    #[test]
     fn open_fs_rejects_external_journal_uuid_mismatch() {
         let data_uuid = *b"journal-uuid-000";
         let other_uuid = *b"journal-uuid-999";
@@ -97930,6 +98034,42 @@ mod tests {
     }
 
     #[test]
+    fn open_devices_routes_bounded_btrfs_seed_and_nested_view_without_paths() {
+        use ffs_block::io_engine::{VolumeAccess, VolumeDevice};
+
+        let cx = Cx::for_testing();
+        let (primary, seed) = build_btrfs_seed_sprout_images();
+        let mut bytes = vec![0xA7; 8192];
+        bytes.extend_from_slice(&seed);
+        bytes.extend_from_slice(&[0xD3; 4096]);
+        for truncated in [false, true] {
+            let data = TestDevice::from_vec(primary.clone());
+            let backing = TestDevice::from_vec(bytes.clone());
+            let bounded = VolumeDevice::new(
+                Arc::new(backing.clone()), ByteOffset(8192),
+                if truncated { 65536 } else { seed.len() as u64 },
+                VolumeAccess::ReadOnly,
+            ).unwrap();
+            let opened = OpenFs::from_devices(
+                &cx, Box::new(data.clone()), &OpenOptions::default(), None,
+                vec![Arc::new(bounded)],
+            );
+            if truncated {
+                assert!(opened.is_err(), "btrfs admission must respect member bounds");
+            } else {
+                let fs = opened.unwrap();
+                let file = fs.lookup(&cx, InodeNumber(1), OsStr::new("hello.txt")).unwrap();
+                assert_eq!(fs.read(&cx, file.ino, 0, 128).unwrap(), b"hello from btrfs fsops");
+                let (slot, _) = fs.btrfs_nested_slot_for(&cx, BTRFS_FS_TREE_OBJECTID, InodeNumber(1)).unwrap();
+                let nested = OpenFs::btrfs_nested_tag(slot, file.ino);
+                assert_eq!(fs.read(&cx, nested, 0, 128).unwrap(), b"hello from btrfs fsops");
+            }
+            assert_eq!(data.snapshot_bytes(), primary);
+            assert_eq!(backing.snapshot_bytes(), bytes);
+        }
+    }
+
+    #[test]
     fn btrfs_seed_sprout_admits_only_the_committed_frozen_seed() {
         let cx = Cx::for_testing();
         let sb = BTRFS_SUPER_INFO_OFFSET;
@@ -98057,7 +98197,7 @@ mod tests {
         let primary: Arc<dyn ByteDevice> = Arc::new(TestDevice::from_vec(primary));
         for defect in ["healthy", "generation", "flag", "identity"] {
             let device = TestDevice::from_vec(seed.clone());
-            let mut devices = BtrfsReadDevices::open(&cx, &primary, &sb, &[]).unwrap();
+            let mut devices = BtrfsReadDevices::open(&cx, &primary, &sb, &[], Vec::new()).unwrap();
             devices.attach(&cx, Arc::new(device.clone()), &sb).unwrap();
             let mut changed = seed.clone();
             match defect {
@@ -102765,7 +102905,8 @@ mod tests {
                 else {
                     panic!("fixture is btrfs");
                 };
-                let mut devices = BtrfsReadDevices::open(&cx, &primary, &superblock, &[]).unwrap();
+                let mut devices =
+                    BtrfsReadDevices::open(&cx, &primary, &superblock, &[], Vec::new()).unwrap();
                 if fault != "missing" {
                     devices
                         .attach(&cx, Arc::new(secondary.clone()), &superblock)
@@ -102780,6 +102921,8 @@ mod tests {
                         ..OpenOptions::default()
                     },
                     Some(Arc::clone(&devices)),
+                    None,
+                    Vec::new(),
                 );
                 if fault == "missing" {
                     assert!(opened.is_err(), "missing device must fail coverage");
