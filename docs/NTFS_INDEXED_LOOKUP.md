@@ -119,13 +119,21 @@ automatic, explicit strict and indexed NTFS views on plain and bounded images.
 It also plants selected and unrelated FILE-signature damage in new copies
 located through the native MFT mapping: strict admission must reject both,
 indexed lookup must read an unaffected file, selected corruption must fail,
-and complete indexed readdir must detect both damaged targets. Compilation and
-execution of that expanded producer regression remain pending. Workspace check
-passed the initial cut; final formatting passed, while strict Clippy found an
-unrelated FAT cache visibility declaration which has been corrected and is being
-rerun. Source presence and publication are not execution evidence. Exact cuts,
-failures and retained logs are in `.beads/pending_tasks.md`. No indexed
-kernel-mount or performance claim follows.
+and complete indexed readdir must detect both damaged targets. That expanded
+regression passed on a native Linux host using the RCH-delivered test executable
+`a358369f5949`: ten healthy option/view combinations and all four damaged-copy
+cases, with sixteen successful native producer/oracle commands and unchanged
+read-phase hashes. Its MFT mapping and four actual damaged copies were checked
+again after execution. Separately, the complete facade, example and NTFS library
+suites passed 402 tests with zero failures and zero filtered cases; the existing
+native opt-in case was ignored there and explicitly executed above.
+
+Workspace check passed the initial cut. Final workspace checks are being rerun
+after correcting an unrelated FAT cache visibility declaration and preserving
+eleven empty-value assertions in Clippy's required diagnostic form. Source
+presence and publication are not execution evidence. Exact cuts, failures and
+retained logs are in `.beads/pending_tasks.md`. No indexed kernel-mount or
+performance claim follows.
 
 Seven new constructed-image Rust tests cover resident and external indexes,
 short aliases, Unicode, exact/insensitive/POSIX names, equal separators, selected

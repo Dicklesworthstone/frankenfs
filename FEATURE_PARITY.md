@@ -310,10 +310,13 @@
 > cluster compression,32extension streams and the13-node/two-level native tree.
 > All51control hashes remain unchanged; the old consumer fails at the first
 > indexed request. This executes current code on retained native inputs with
-> fresh native oracles, not newly produced images. Initial workspace check and
-> final formatting passed; strict Clippy rerun and the expanded Rust producer/
-> damaged-FILE regressions remain pending. Indexed readdir still validates every
-> target. No indexed kernel-mount, whole-directory integrity or performance
+> fresh native oracles, not newly produced images. The expanded native producer
+> regression also passed: ten healthy option/view combinations, four damaged-FILE
+> copies and sixteen successful producer/oracle commands. Full facade, example
+> and NTFS library suites passed402 tests, zero failures and zero filtered cases;
+> the native opt-in case was explicitly executed separately. Final workspace
+> gates remain pending after FAT cache lint corrections. Indexed readdir still
+> validates every target. No indexed kernel-mount, whole-directory integrity or performance
 > claim follows. Exact receipts are in `.beads/pending_tasks.md` and
 > [the indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md).
 
