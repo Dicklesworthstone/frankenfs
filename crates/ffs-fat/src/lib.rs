@@ -22,7 +22,9 @@ use ffs_error::FfsError;
 use ffs_ondisk::fat::FatKind;
 pub use filesystem::FatFs;
 use reader::checkpoint;
-pub use reader::{CheckIssue, Directory, Entry, FatCheckReport, FatVolume, FileChain, ImageArgs};
+pub use reader::{
+    CheckIssue, Directory, Entry, FatCheckReport, FatVolume, FileChain, FileReader, ImageArgs,
+};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -220,10 +222,10 @@ pub fn stream_file(
     entry: &Entry,
     output: &mut impl Write,
 ) -> ffs_error::Result<()> {
-    let chain = volume.file_chain(cx, entry)?;
+    let mut reader = volume.open_file_reader(cx, entry)?;
     let mut offset = 0_u64;
-    while offset < u64::from(chain.size) {
-        let bytes = volume.read(cx, &chain, offset, 1024 * 1024)?;
+    while offset < reader.len_bytes() {
+        let bytes = reader.read(cx, offset, 1024 * 1024)?;
         output.write_all(&bytes)?;
         offset += bytes.len() as u64;
     }

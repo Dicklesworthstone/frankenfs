@@ -9,6 +9,8 @@ mod check;
 pub use check::{CheckIssue, FatCheckReport};
 pub mod recovery;
 pub mod replacement;
+mod stream;
+pub use stream::FileReader;
 
 use anyhow::Context as _;
 use asupersync::Cx;
@@ -553,8 +555,34 @@ impl FatVolume {
         report_offset: u64,
         limit: usize,
     ) -> Result<Vec<u32>> {
-        checkpoint(cx)?;
         let mut clusters = Vec::new();
+        let limit = limit.min(self.geometry.cluster_count() as usize);
+        self.walk_chain(cx, first, required, report_offset, limit, |_, cluster| {
+            if clusters.len() == clusters.capacity() {
+                clusters
+                    .try_reserve_exact(1024.min(limit - clusters.len()))
+                    .map_err(|error| {
+                        FfsError::Format(format!("FAT chain allocation failed: {error}"))
+                    })?;
+            }
+            clusters.push(cluster);
+            Ok(())
+        })?;
+        Ok(clusters)
+    }
+
+    /// Shared validation for materialized mutation maps and bounded read indexes.
+    /// The visitor's provisional state must not escape until the whole walk succeeds.
+    fn walk_chain(
+        &self,
+        cx: &Cx,
+        first: u32,
+        required: u64,
+        report_offset: u64,
+        limit: usize,
+        mut visit: impl FnMut(usize, u32) -> Result<()>,
+    ) -> Result<usize> {
+        checkpoint(cx)?;
         if required > u64::from(self.geometry.cluster_count()) {
             return Err(corrupt(
                 report_offset,
@@ -565,9 +593,10 @@ impl FatVolume {
             if required != 0 {
                 return Err(corrupt(report_offset, "nonempty FAT object has no chain"));
             }
-            return Ok(clusters);
+            return Ok(0);
         }
         let limit = limit.min(self.geometry.cluster_count() as usize);
+        let mut length = 0_usize;
         let mut table = FatTable::new(self);
         let mut cluster = first;
         let mut anchor = cluster;
@@ -576,19 +605,13 @@ impl FatVolume {
         loop {
             checkpoint(cx)?;
             self.cluster_offset(cluster)?;
-            if clusters.len() == limit {
+            if length == limit {
                 return Err(FfsError::UnsupportedFeature(
                     "FAT allocation chain exceeds the admitted map limit".into(),
                 ));
             }
-            if clusters.len() == clusters.capacity() {
-                clusters
-                    .try_reserve_exact(1024.min(limit - clusters.len()))
-                    .map_err(|error| {
-                        FfsError::Format(format!("FAT chain allocation failed: {error}"))
-                    })?;
-            }
-            clusters.push(cluster);
+            visit(length, cluster)?;
+            length += 1;
             let Some(next) = table.next(cx, cluster)? else {
                 break;
             };
@@ -603,11 +626,11 @@ impl FatVolume {
             }
             cluster = next;
         }
-        if (clusters.len() as u64) < required {
+        if (length as u64) < required {
             return Err(corrupt(report_offset, "FAT chain ends before logical EOF"));
         }
         checkpoint(cx)?;
-        Ok(clusters)
+        Ok(length)
     }
 
     /// Read exact logical bytes from a previously validated allocation chain.
@@ -681,8 +704,9 @@ impl FatVolume {
 }
 
 /// Two demand-sector caches that grow to bounded windows on sequential access.
-/// Cache lifetime remains one operation, never across native mutation. A short
-/// random chain pays only for its demanded sectors, not speculative whole FATs.
+/// Cache lifetime is one operation or one explicitly immutable FileReader,
+/// never across native mutation. A short random chain pays only for its demanded
+/// sectors, not speculative whole FATs.
 struct FatTable<'a> {
     volume: &'a FatVolume,
     sectors: [Option<(u64, Vec<u8>)>; 2],
