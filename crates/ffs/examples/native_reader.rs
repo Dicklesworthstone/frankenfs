@@ -17,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Debug, Parser)]
-#[command(about = "Read an offline native image through the public ffs facade")]
+#[command(about = "Read or mount an offline native image through the public ffs facade")]
 struct Args {
     image: PathBuf,
     #[arg(long, default_value_t = 0)]
@@ -60,10 +60,33 @@ enum Command {
     RefuseWrite {
         path: PathBuf,
     },
+    /// Mount read-only in the foreground until unmounted; keep the image offline.
+    Mount {
+        /// An existing empty directory.
+        mountpoint: PathBuf,
+    },
 }
 
 fn invalid(detail: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, detail)
+}
+
+fn read_only_mountpoint(image: &Path, mountpoint: &Path) -> Result<PathBuf> {
+    let mountpoint = mountpoint.canonicalize()?;
+    if !mountpoint.is_dir() {
+        return Err(invalid("mountpoint must be an existing empty directory").into());
+    }
+    if image.canonicalize()?.starts_with(&mountpoint) {
+        return Err(invalid("mountpoint would hide its backing image").into());
+    }
+    if std::fs::read_dir(&mountpoint)?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(invalid("mountpoint must be an existing empty directory").into());
+    }
+    Ok(mountpoint)
 }
 
 fn lookup(
@@ -281,6 +304,22 @@ fn main() -> Result<()> {
                 Ok(_) => return Err(io::Error::other("write unexpectedly succeeded").into()),
             }
         }
+        Command::Mount { mountpoint } => {
+            let mountpoint = read_only_mountpoint(&args.image, &mountpoint)?;
+            // Transfer the already admitted, bounded and locked FsOps handle.
+            // The transport has no option here to enable native mutation.
+            ffs_fuse::mount(
+                opened.filesystem,
+                mountpoint,
+                &ffs_fuse::MountOptions {
+                    read_only: true,
+                    allow_other: false,
+                    dev: false,
+                    suid: false,
+                    ..ffs_fuse::MountOptions::default()
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -339,5 +378,94 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
+    }
+
+    #[test]
+    fn read_only_mount_keeps_bounded_and_native_view_selection() {
+        for selection in [None, Some("--ntfs-indexed-lookup")] {
+            let mut arguments = vec![
+                "native_reader",
+                "disk.img",
+                "--offset",
+                "4096",
+                "--length",
+                "67108864",
+            ];
+            arguments.extend(selection);
+            arguments.extend(["mount", "/mnt/native"]);
+            let args = Args::try_parse_from(arguments).unwrap();
+            assert_eq!((args.offset, args.length), (4096, Some(67_108_864)));
+            assert_eq!(args.ntfs_indexed_lookup, selection.is_some());
+            let Command::Mount { mountpoint } = args.command else {
+                panic!("expected mount arguments");
+            };
+            assert_eq!(mountpoint, PathBuf::from("/mnt/native"));
+        }
+        let args = Args::try_parse_from([
+            "native_reader",
+            "pool.img",
+            "--zfs-dataset",
+            "archive",
+            "--zfs-snapshot",
+            "before",
+            "mount",
+            "/mnt/snapshot",
+        ])
+        .unwrap();
+        assert_eq!(args.zfs_dataset, [OsString::from("archive")]);
+        assert_eq!(args.zfs_snapshot, Some(OsString::from("before")));
+        assert!(matches!(args.command, Command::Mount { .. }));
+    }
+
+    #[test]
+    fn read_only_mount_has_no_write_or_privilege_switches() {
+        for option in [
+            "--rw",
+            "--read-write",
+            "--allow-other",
+            "--dev",
+            "--suid",
+            "--writeback-cache",
+        ] {
+            let error = Args::try_parse_from([
+                "native_reader",
+                "image.img",
+                "mount",
+                "/mnt/native",
+                option,
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn mountpoint_admits_empty_directory_and_refuses_hidden_backing_or_contents() {
+        let root = tempfile::Builder::new()
+            .prefix("ffs-public-mountpoint-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let image = root.join("backing.img");
+        std::fs::File::create_new(&image).unwrap();
+        let mountpoint = root.join("mount");
+        std::fs::create_dir(&mountpoint).unwrap();
+        assert_eq!(
+            read_only_mountpoint(&image, &mountpoint).unwrap(),
+            mountpoint.canonicalize().unwrap()
+        );
+        assert!(read_only_mountpoint(&image, &root.join("missing")).is_err());
+        assert!(read_only_mountpoint(&image, &image).is_err());
+        assert_eq!(
+            read_only_mountpoint(&image, &root).unwrap_err().to_string(),
+            "mountpoint would hide its backing image"
+        );
+        std::fs::File::create_new(mountpoint.join("visible.txt")).unwrap();
+        assert_eq!(
+            read_only_mountpoint(&image, &mountpoint)
+                .unwrap_err()
+                .to_string(),
+            "mountpoint must be an existing empty directory"
+        );
     }
 }

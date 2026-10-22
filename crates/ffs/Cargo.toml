@@ -21,6 +21,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
 clap = { workspace = true }
+ffs-fuse = { workspace = true }
 ffs-ondisk = { workspace = true }
 tempfile = { workspace = true }
 

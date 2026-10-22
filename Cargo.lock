@@ -890,6 +890,7 @@ dependencies = [
  "ffs-core",
  "ffs-error",
  "ffs-fat",
+ "ffs-fuse",
  "ffs-ntfs",
  "ffs-ondisk",
  "ffs-types",
