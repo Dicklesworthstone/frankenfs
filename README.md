@@ -66,13 +66,25 @@ ntfs-3g-produced images, including streams held in extension records.
 
 The standalone [`native_reader` example](crates/ffs/examples/native_reader.rs)
 uses that public API for `stat`, NUL-delimited `list`, bounded `read` and an
-explicit `refuse-write` scratch-image check. It owns its application runtime:
+explicit `refuse-write` scratch-image check. Its foreground `mount` subcommand
+passes the same admitted filesystem to the shared FUSE transport with kernel
+read-only enforcement. It owns its application runtime:
 
 ```bash
 cargo run -p ffs --example native_reader -- image.img stat /
 cargo run -p ffs --example native_reader -- image.img read /hello.txt --start 0 --bytes 4096
 cargo run -p ffs --example native_reader -- ntfs.img read /hello.txt --stream note
+cargo run -p ffs --example native_reader -- image.img mount /mnt/ffs
+cargo run -p ffs --example native_reader -- ntfs.img --ntfs-indexed-lookup mount /mnt/ffs
 ```
+
+Mounting requires working FUSE support and an existing empty directory which
+does not hide the backing image. Keep all backing files offline and unchanged
+until unmount; use `fusermount3 -u /mnt/ffs` on Linux to end the foreground
+session. Volume bounds and explicit NTFS/ZFS view selections apply to mounts
+as they do to offline reads. This consumer has no writable, `allow_other`,
+device-node or set-ID mount switches. Kernel-mount qualification for this new
+public-consumer path is pending; older companion mounts do not establish it.
 
 At merged revision `ff3dca7ec`, workspace/all-target checking and strict Clippy
 passed through RCH. Earlier executed engine suites passed FAT 452, NTFS 344,

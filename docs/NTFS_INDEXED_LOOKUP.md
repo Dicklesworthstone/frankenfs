@@ -46,11 +46,16 @@ Indexed lookup does not populate a complete-directory cache; an indexed view's
 The standalone public consumer accepts `--ntfs-indexed-lookup` before its
 subcommand. Its ordinary and exact named-stream paths use the selected mode;
 conflicting ZFS dataset/snapshot selectors are rejected during argument parsing.
+Its foreground `mount` subcommand passes the admitted strict or indexed FsOps
+directly to the shared read-only FUSE transport. Kernel-mount execution of this
+new public-consumer path remains pending; the older strict companion mounts
+below are separate evidence.
 
 ```sh
 native_reader volume.img --ntfs-indexed-lookup read /report.bin --start 507 --bytes 1031
 native_reader disk.img --offset 1048576 --length 67108864 --ntfs-indexed-lookup \
   read /report.bin --stream note
+native_reader volume.img --ntfs-indexed-lookup mount /mnt/ffs
 ```
 
 ```sh
