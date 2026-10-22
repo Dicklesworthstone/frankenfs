@@ -12,6 +12,7 @@ pub use directory::DirectoryReader;
 pub mod recovery;
 pub mod replacement;
 mod stream;
+pub(crate) use stream::FileIndex;
 pub use stream::FileReader;
 
 use anyhow::Context as _;

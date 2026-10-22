@@ -8,8 +8,46 @@ use super::{
     Cx, Entry, FatTable, FatVolume, FfsError, MAX_CHAIN_CLUSTERS, MAX_READ_BYTES,
     MAX_READ_RUN_BYTES, Result, allocate, checkpoint, corrupt,
 };
+use std::sync::Arc;
 
 const ANCHOR_STRIDE: usize = 256;
+
+/// Owned validation evidence for the immutable adapter's mount-local cache.
+/// Only the owning volume may reuse it, and never across native mutation.
+/// The private type cannot be supplied by a public caller to bypass validation.
+#[derive(Clone)]
+pub(crate) struct FileIndex {
+    anchors: Arc<Vec<u32>>,
+    allocated: usize,
+    size: u32,
+    report_offset: u64,
+    first_cluster: u32,
+}
+
+impl FileIndex {
+    #[must_use]
+    pub(crate) fn len_bytes(&self) -> u64 {
+        u64::from(self.size)
+    }
+
+    #[must_use]
+    pub(crate) fn allocated_clusters(&self) -> usize {
+        self.allocated
+    }
+
+    #[must_use]
+    pub(crate) fn storage_bytes(&self) -> usize {
+        self.anchors.capacity() * std::mem::size_of::<u32>()
+    }
+
+    #[must_use]
+    pub(crate) fn matches(&self, entry: &Entry) -> bool {
+        !entry.native.is_directory()
+            && entry.offset == self.report_offset
+            && entry.native.first_cluster == self.first_cluster
+            && entry.native.size == self.size
+    }
+}
 
 /// Read-only file access tied to one immutable volume and verified chain.
 ///
@@ -22,7 +60,7 @@ const ANCHOR_STRIDE: usize = 256;
 pub struct FileReader<'a> {
     volume: &'a FatVolume,
     table: FatTable<'a>,
-    anchors: Vec<u32>,
+    anchors: Arc<Vec<u32>>,
     allocated: usize,
     size: u32,
     report_offset: u64,
@@ -34,6 +72,13 @@ impl FatVolume {
     /// Uses the same native link validation and work limit as `file_chain`,
     /// without retaining a vector entry for every allocated cluster.
     pub fn open_file_reader(&self, cx: &Cx, entry: &Entry) -> Result<FileReader<'_>> {
+        let index = self.index_file(cx, entry)?;
+        Ok(self.reader_from_index(&index))
+    }
+
+    /// Build completely before insertion into the immutable mount cache. No
+    /// provisional anchors or failed validation are reusable evidence.
+    pub(crate) fn index_file(&self, cx: &Cx, entry: &Entry) -> Result<FileIndex> {
         checkpoint(cx)?;
         if entry.native.is_directory() {
             return Err(FfsError::IsDirectory);
@@ -63,17 +108,31 @@ impl FatVolume {
             },
         )?;
         checkpoint(cx)?;
-        Ok(FileReader {
+        Ok(FileIndex {
+            anchors: Arc::new(anchors),
+            allocated,
+            size: entry.native.size,
+            report_offset: entry.offset,
+            first_cluster: entry.native.first_cluster,
+        })
+    }
+
+    /// Caller pairs this internal index with its originating immutable volume.
+    /// Request-local FAT windows and cursor prevent concurrent reads sharing
+    /// mutable seek state or holding the mount cache lock during device I/O.
+    #[must_use]
+    pub(crate) fn reader_from_index(&self, index: &FileIndex) -> FileReader<'_> {
+        FileReader {
             volume: self,
             // Validation caches are deliberately not used to answer the first
             // demand read. Subsequent cache lifetime is this immutable reader.
             table: FatTable::new(self),
-            anchors,
-            allocated,
-            size: entry.native.size,
-            report_offset: entry.offset,
+            anchors: Arc::clone(&index.anchors),
+            allocated: index.allocated,
+            size: index.size,
+            report_offset: index.report_offset,
             cursor: None,
-        })
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 //! Real reader calls over native-layout synthetic images. This is not a kernel
 //! mount or an independent native-tool interoperability campaign.
 
+mod mounted;
+
 use super::*;
 use crate::{Directory, EntrySlots};
 use ffs_block::ByteDevice;

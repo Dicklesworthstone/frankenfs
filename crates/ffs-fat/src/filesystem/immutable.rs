@@ -1,0 +1,147 @@
+//! Bounded allocation evidence for read-only FsOps, separate from writable maps.
+//!
+//! Cache immutable sparse indexes, never borrowed readers or per-request cursors.
+//! The operation gate is acquired by FsOps before entering these helpers. No
+//! namespace/cache mutex is held while the native reader touches the device.
+//!
+//! Retained anchor Vec capacity is capped at 2 MiB and 1024 entries. Arc/map
+//! headers, allocator overhead and in-flight requests are separate; eviction
+//! does not revoke an index already held by a request. FAT windows and seek
+//! cursors are request-local. This is not a whole-process memory limit.
+//! Explicit FIEMAP may still materialize a temporary complete map and extent
+//! result; neither that map nor its FAT windows enter this immutable cache.
+
+use super::{Entry, FatFs, FfsError, InodeNumber, MAX_CACHED_CHAINS, Result, checkpoint};
+use crate::reader::FileIndex;
+use asupersync::Cx;
+use std::collections::BTreeMap;
+use std::sync::MutexGuard;
+
+const MAX_INDEX_BYTES: usize = 2 * 1024 * 1024;
+
+pub(super) struct IndexCache {
+    entries: BTreeMap<InodeNumber, FileIndex>,
+    retained_bytes: usize,
+    byte_limit: usize,
+    entry_limit: usize,
+}
+
+impl Default for IndexCache {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            retained_bytes: 0,
+            byte_limit: MAX_INDEX_BYTES,
+            entry_limit: MAX_CACHED_CHAINS,
+        }
+    }
+}
+
+impl IndexCache {
+    fn get(&self, ino: InodeNumber, entry: &Entry) -> Result<Option<FileIndex>> {
+        let Some(index) = self.entries.get(&ino) else {
+            return Ok(None);
+        };
+        if !index.matches(entry) {
+            return Err(FfsError::Corruption {
+                block: entry.offset / 512,
+                detail: "immutable FAT allocation identity changed".into(),
+            });
+        }
+        Ok(Some(index.clone()))
+    }
+
+    fn insert(&mut self, ino: InodeNumber, entry: &Entry, index: FileIndex) -> Result<FileIndex> {
+        // Concurrent cold readers may have validated the same file. Retain one
+        // allocation and charge it once; neither thread owns shared seek state.
+        if let Some(existing) = self.get(ino, entry)? {
+            return Ok(existing);
+        }
+        let bytes = index.storage_bytes();
+        if bytes > self.byte_limit || self.entry_limit == 0 {
+            return Ok(index);
+        }
+        while self.retained_bytes > self.byte_limit - bytes
+            || self.entries.len() >= self.entry_limit
+        {
+            let Some((_, previous)) = self.entries.pop_first() else {
+                return Err(FfsError::Io(std::io::Error::other(
+                    "FAT immutable index cache accounting is inconsistent",
+                )));
+            };
+            self.retained_bytes = self
+                .retained_bytes
+                .checked_sub(previous.storage_bytes())
+                .ok_or_else(|| {
+                    FfsError::Io(std::io::Error::other("FAT immutable cache accounting underflow"))
+                })?;
+        }
+        self.retained_bytes += bytes;
+        self.entries.insert(ino, index.clone());
+        Ok(index)
+    }
+}
+
+impl FatFs {
+    fn immutable_cache(&self) -> Result<MutexGuard<'_, IndexCache>> {
+        self.immutable_indexes.lock().map_err(|_| {
+            FfsError::Io(std::io::Error::other("FAT immutable index cache poisoned"))
+        })
+    }
+
+    pub(super) fn readonly_index(&self, cx: &Cx, ino: InodeNumber, entry: &Entry) -> Result<FileIndex> {
+        checkpoint(cx)?;
+        // Refuse accidental use by mutation paths, rather than adding a second
+        // invalidation protocol which could retain old allocation after reuse.
+        if self.writable {
+            return Err(FfsError::UnsupportedFeature(
+                "immutable FAT indexes are unavailable on writable mounts".into(),
+            ));
+        }
+        let cached = self.immutable_cache()?.get(ino, entry)?;
+        if let Some(index) = cached {
+            checkpoint(cx)?;
+            return Ok(index);
+        }
+        let index = self.volume.index_file(cx, entry)?;
+        checkpoint(cx)?;
+        let index = self.immutable_cache()?.insert(ino, entry, index)?;
+        checkpoint(cx)?;
+        Ok(index)
+    }
+
+    pub(super) fn file_allocation(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        entry: &Entry,
+    ) -> Result<(u64, usize)> {
+        if self.writable {
+            let chain = self.chain(cx, ino, entry)?;
+            Ok((u64::from(chain.size), chain.clusters.len()))
+        } else {
+            let index = self.readonly_index(cx, ino, entry)?;
+            Ok((index.len_bytes(), index.allocated_clusters()))
+        }
+    }
+}
+
+// Test-only observations exercise actual FsOps calls without exporting cache
+// state as public API or relaxing any production bound/admission rule.
+#[cfg(test)]
+impl FatFs {
+    pub(crate) fn immutable_cache_usage(&self) -> (usize, usize, usize) {
+        let (entries, bytes) = {
+            let cache = self.immutable_cache().unwrap();
+            (cache.entries.len(), cache.retained_bytes)
+        };
+        (entries, bytes, self.state().unwrap().chains.len())
+    }
+
+    pub(crate) fn limit_immutable_cache(&self, bytes: usize, entries: usize) {
+        let mut cache = self.immutable_cache().unwrap();
+        assert!(cache.entries.is_empty());
+        cache.byte_limit = bytes;
+        cache.entry_limit = entries;
+    }
+}

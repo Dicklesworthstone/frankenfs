@@ -5,6 +5,7 @@
 
 mod exchange;
 mod health;
+mod immutable;
 mod lifetime;
 
 use super::reader::replacement::{
@@ -91,6 +92,7 @@ pub struct FatFs {
     operations: RwLock<()>,
     health: MountHealth,
     state: Mutex<State>,
+    immutable_indexes: Mutex<immutable::IndexCache>,
     lifetime: Mutex<lifetime::Lifetime>,
     uid: u32,
     gid: u32,
@@ -182,6 +184,7 @@ impl FatFs {
             operations: RwLock::new(()),
             health: MountHealth::new(epoch),
             state: Mutex::new(state),
+            immutable_indexes: Mutex::new(immutable::IndexCache::default()),
             lifetime: Mutex::new(lifetime::Lifetime::default()),
             uid,
             gid,
@@ -530,6 +533,12 @@ impl FatFs {
 
     fn chain(&self, cx: &Cx, ino: InodeNumber, entry: &Entry) -> Result<Arc<FileChain>> {
         checkpoint(cx)?;
+        if !self.writable {
+            // Explicit extent enumeration still needs a complete temporary map.
+            // Never let it populate the mutable map cache on a read-only mount.
+            // Ordinary reads, attributes and opens use the bounded index instead.
+            return self.volume.file_chain(cx, entry).map(Arc::new);
+        }
         let cached = self.state()?.chains.get(&ino).cloned();
         if let Some(chain) = cached {
             checkpoint(cx)?;
@@ -583,10 +592,10 @@ impl FatFs {
                 .entry
                 .as_ref()
                 .ok_or_else(|| FfsError::NotFound(format!("FAT inode {}", ino.0)))?;
-            let chain = self.chain(cx, ino, entry)?;
+            let (size, allocated) = self.file_allocation(cx, ino, entry)?;
             let blocks =
-                chain.clusters.len() as u64 * u64::from(self.volume.geometry.cluster_bytes()) / 512;
-            (FileType::RegularFile, u64::from(chain.size), blocks, 1)
+                allocated as u64 * u64::from(self.volume.geometry.cluster_bytes()) / 512;
+            (FileType::RegularFile, size, blocks, 1)
         };
         let (atime, mtime, crtime) = if let Some(entry) = &node.entry {
             (
@@ -873,6 +882,13 @@ impl FsOps for FatFs {
         let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
+        if !self.writable {
+            let index = self.readonly_index(cx, ino, entry)?;
+            return self
+                .volume
+                .reader_from_index(&index)
+                .read(cx, offset, size as usize);
+        }
         let chain = self.chain(cx, ino, entry)?;
         self.volume.read(cx, &chain, offset, size as usize)
     }
@@ -909,7 +925,7 @@ impl FsOps for FatFs {
             node = self.refresh_node_from_path(cx, ino, &path)?;
         }
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
-        self.chain(cx, ino, entry)?;
+        self.file_allocation(cx, ino, entry)?;
         operation.complete((handle.accept(), 0))
     }
 
@@ -1425,14 +1441,14 @@ impl FsOps for FatFs {
         let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
-        let chain = self.chain(cx, ino, entry)?;
-        if offset >= u64::from(chain.size) {
+        let (size, _) = self.file_allocation(cx, ino, entry)?;
+        if offset >= size {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ENXIO)));
         }
         checkpoint(cx)?;
         match whence {
             SeekWhence::Data => Ok(offset),
-            SeekWhence::Hole => Ok(u64::from(chain.size)),
+            SeekWhence::Hole => Ok(size),
             _ => Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,
             ))),
