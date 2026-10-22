@@ -209,10 +209,15 @@ The native companion engines also have dedicated library members:
 
 `ffs::open_read_only` selects the existing `FsOps` implementation after probing
 all six signatures; explicit backend selection does not suppress ambiguity.
-The primary image and additional ZFS members use retained OS read-only regular
-file descriptors with shared locks and bounded `VolumeDevice` views. ext4
-recovery uses a volatile overlay, external journals are opened read-only, and
-the result exposes no format-specific `enable_writes`. NTFS keeps its clean-log
+The primary image, external ext4 journal, additional btrfs devices and ZFS
+members use retained OS read-only regular file descriptors with shared locks
+and independently bounded `VolumeDevice` views. `ImageSource` carries each
+auxiliary volume's path, offset and length. `OpenFs::from_devices` consumes
+already-admitted auxiliary handles and refuses mixed path/handle options;
+btrfs nested views inherit the same member handles, and ext4 journal replay
+and UUID pairing share one descriptor retained for the filesystem lifetime.
+ext4 recovery uses a volatile overlay, and the result exposes no
+format-specific `enable_writes`. NTFS keeps its clean-log
 mounted-view admission. ZFS retains explicit pool, candidate, dataset, snapshot,
 topology and optional volatile replay selections; historical snapshots open
 without requiring a valid live head. Native refusal rules still apply.
