@@ -272,6 +272,24 @@
 > `.beads/pending_tasks.md`; scanner disposition and original acceptance remain
 > open.
 
+> **Directory cursor Rust qualification, 2026-10-22:** the cursor introduced in
+> `7407fea61` now has executed Rust evidence. On `066563d74` plus `7fd8b10b`,
+> the unfiltered FAT/facade run passed558 tests with zero failures and one
+> existing native opt-in ignore:515 FAT,40 facade,2 external consumers and1
+> doctest. Final test-only assertion spelling fixes retain all67 predicates;
+> all10 directory tests passed again on `cc181764` (505 other FAT tests filtered,
+> no credit for empty filtered facade/integration selections). Final formatting,
+> workspace/all-target check and strict Clippy passed on that final cut.
+> Controls cover fragmented/fixed roots, late errors and collisions, cancellation,
+> complete-chain admission, native names and bounded cursor retention. FsOps
+> still materializes complete listings. The initial combined binary build
+> timed out137; current-binary delivery and native/mounted qualification remain
+> pending. The three-file directory UBS review remains red on two test panic
+> tripwires, which are preserved. This is Rust execution evidence, not a native,
+> performance, writable/crash or field result. Exact cuts and commands are in
+> `.beads/pending_tasks.md`; the API contract is in
+> [the FAT read profile](docs/FAT_READ_PROFILE.md).
+
 > **Native NTFS mounted slice, 2026-10-21:** the current RCH-delivered Linux CLI
 > candidate `3effe8ed21c9af9b5b0f537451e9f64fce869d58ce3d986ebbeb6eb0754d9d76`
 > passed 27 indexed positive calls, three semantic negatives and 25 byte

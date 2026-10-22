@@ -47,11 +47,10 @@ impl ByteDevice for Device {
 
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> Result<()> {
         checkpoint(cx)?;
-        let end = at
-            .0
-            .checked_add(bytes.len() as u64)
-            .filter(|end| *end <= self.length)
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        let end =
+            at.0.checked_add(bytes.len() as u64)
+                .filter(|end| *end <= self.length)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
         let mut state = self.state.lock().unwrap();
         state.reads.push((at.0, bytes.len()));
         if state
@@ -105,8 +104,8 @@ impl Fixture {
         } else {
             0
         };
-        let fat_sectors = ((u64::from(count) + 2) * u64::from(kind.entry_bytes()))
-            .div_ceil(u64::from(sector));
+        let fat_sectors =
+            ((u64::from(count) + 2) * u64::from(kind.entry_bytes())).div_ceil(u64::from(sector));
         let total = u64::from(reserved)
             + 2 * fat_sectors
             + u64::from(roots) * 32 / u64::from(sector)
@@ -185,10 +184,9 @@ impl Fixture {
             fixture
                 .device
                 .put(BASE + start, &(end & !7).to_le_bytes()[..width]);
-            fixture.device.put(
-                BASE + start + width as u64,
-                &end.to_le_bytes()[..width],
-            );
+            fixture
+                .device
+                .put(BASE + start + width as u64, &end.to_le_bytes()[..width]);
             for (index, &cluster) in chain.iter().enumerate() {
                 fixture.fat(copy, cluster, chain.get(index + 1).copied().unwrap_or(end));
             }
@@ -239,9 +237,9 @@ impl Fixture {
             .iter()
             .copied()
             .filter(|&(at, _)| {
-                self.offsets.iter().any(|&offset| {
-                    at >= BASE + offset && at < BASE + offset + self.unit as u64
-                })
+                self.offsets
+                    .iter()
+                    .any(|&offset| at >= BASE + offset && at < BASE + offset + self.unit as u64)
             })
             .collect()
     }
@@ -320,11 +318,14 @@ fn fixed_and_fragmented_directories_preserve_native_records_across_buffer_bounda
                 let mut cursor: crate::reader::DirectoryReader<'_> = volume
                     .open_directory_reader(&cx, fixture.directory)
                     .unwrap();
-                assert!(fixture.data_reads().is_empty());
+                assert_eq!(fixture.data_reads(), Vec::<(u64, usize)>::new());
                 let entries = drain(&mut cursor, &cx).unwrap();
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].offset, expected_offset);
-                assert_eq!(entries[0].native.long_name.as_deref(), Some(units.as_slice()));
+                assert_eq!(
+                    entries[0].native.long_name.as_deref(),
+                    Some(units.as_slice())
+                );
                 assert_eq!(entries[0].name().unwrap(), name);
                 assert_eq!(entries[0].short_alias().as_deref(), Some("BOUND~1.BIN"));
                 assert_eq!(entries[1].name().unwrap(), "SECOND.TXT");
@@ -498,7 +499,7 @@ fn complete_chain_admission_precedes_even_an_immediate_end_marker() {
                     .is_err(),
                 "{kind:?}: {fault}"
             );
-            assert!(fixture.data_reads().is_empty());
+            assert_eq!(fixture.data_reads(), Vec::<(u64, usize)>::new());
         }
         let fixture = Fixture::new(kind, 512, 1, &[9, 3]);
         fixture.slot(0, &[0; 32]);
@@ -509,7 +510,7 @@ fn complete_chain_admission_precedes_even_an_immediate_end_marker() {
                 .open_directory_reader(&Cx::for_testing(), fixture.directory)
                 .is_err()
         );
-        assert!(fixture.data_reads().is_empty());
+        assert_eq!(fixture.data_reads(), Vec::<(u64, usize)>::new());
     }
 }
 
@@ -562,7 +563,7 @@ fn full_roots_and_maximum_native_directory_storage_have_bounded_cursor_memory() 
         volume.open_directory_reader(&Cx::for_testing(), fixture.directory),
         Err(FfsError::UnsupportedFeature(_))
     ));
-    assert!(fixture.data_reads().is_empty());
+    assert_eq!(fixture.data_reads(), Vec::<(u64, usize)>::new());
 }
 
 #[test]
@@ -599,7 +600,9 @@ fn selected_active_fat_high_bits_and_volume_boundaries_are_preserved() {
 fn malformed_and_unrepresentable_long_names_keep_the_existing_native_decoder_policy() {
     let fixture = Fixture::new(FatKind::Fat32, 512, 1, &[9, 3]);
     let mut bad = long(
-        &"must not steal this alias".encode_utf16().collect::<Vec<_>>(),
+        &"must not steal this alias"
+            .encode_utf16()
+            .collect::<Vec<_>>(),
         b"SAFE    BIN",
     );
     bad[0][13] ^= 1;
@@ -658,7 +661,8 @@ fn public_catalog_and_nested_resolve_use_the_shared_native_scanner() {
         assert_eq!(report["entries"].as_array().unwrap().len(), 1);
         assert_eq!(report["entries"][0]["name"], "DIRECTOR");
         let selector =
-            crate::EntrySlots::parse(report["entries"][0]["entry_slots"].as_str().unwrap()).unwrap();
+            crate::EntrySlots::parse(report["entries"][0]["entry_slots"].as_str().unwrap())
+                .unwrap();
         let child_report = crate::native_catalog(&cx, &volume, &selector, BASE).unwrap();
         assert_eq!(child_report["entries"][0]["name"], "CHILD.BIN");
     }

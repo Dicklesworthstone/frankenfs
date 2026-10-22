@@ -3,8 +3,8 @@
 //! after the end marker. Decoding then retains one physical buffer, not all names.
 
 use super::{
-    Cx, Directory, Entry, FatDirectoryDecoder, FatVolume, FfsError, MAX_DIRECTORY_SLOTS,
-    Result, allocate, checkpoint, corrupt,
+    Cx, Directory, Entry, FatDirectoryDecoder, FatVolume, FfsError, MAX_DIRECTORY_SLOTS, Result,
+    allocate, checkpoint, corrupt,
 };
 
 enum Storage {

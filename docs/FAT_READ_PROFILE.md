@@ -424,9 +424,11 @@ Library callers can scan an immutable directory incrementally with
 fixed root or one cluster for a cluster-backed directory, plus a bounded map
 of that directory's allocation chain. Raw UTF-16 names, OEM aliases and native
 short-slot offsets remain available in each returned `Entry`. `FatVolume::list`
-consumes the cursor into a complete vector; `FatVolume::lookup` scans it fully while retaining only
-the matching candidate, so a later invalid entry or alias collision still
-defeats lookup.
+consumes the cursor into a complete vector. `FatVolume::lookup` scans it fully
+before returning a match or `NotFound`, retaining only the matching candidate.
+It propagates a later read or directory-record error and rejects a second match
+for the requested name or alias. Collision validation across all names remains the FsOps
+adapter's stronger namespace check.
 
 Opening validates the complete allocation chain before returning any entries.
 Only `Ok(None)` certifies completion of the record scan; a later error does not

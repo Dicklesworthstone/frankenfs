@@ -1,8 +1,8 @@
 //! Explicit index-directed FsOps lookup; no path reconstruction or new parser.
 
 use super::{
-    Cx, FfsError, FileType, InodeAttr, InodeNumber, NtfsFs, OsStr, ROOT, Result,
-    checkpoint, corrupt, unsupported,
+    Cx, FfsError, FileType, InodeAttr, InodeNumber, NtfsFs, OsStr, ROOT, Result, checkpoint,
+    corrupt, unsupported,
 };
 
 impl NtfsFs {
