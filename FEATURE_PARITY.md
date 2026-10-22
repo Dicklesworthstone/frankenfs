@@ -314,9 +314,11 @@
 > regression also passed: ten healthy option/view combinations, four damaged-FILE
 > copies and sixteen successful producer/oracle commands. Full facade, example
 > and NTFS library suites passed402 tests, zero failures and zero filtered cases;
-> the native opt-in case was explicitly executed separately. Final workspace
-> gates remain pending after FAT cache lint corrections. Indexed readdir still
-> validates every target. No indexed kernel-mount, whole-directory integrity or performance
+> the native opt-in case was explicitly executed separately. All525 FAT library
+> tests, workspace/all-target checking, strict Clippy and final formatting passed.
+> UBS remains red on a retained test tripwire; independent scanner disposition
+> and original acceptance remain open. Indexed readdir still validates every
+> target. No indexed kernel-mount, whole-directory integrity or performance
 > claim follows. Exact receipts are in `.beads/pending_tasks.md` and
 > [the indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md).
 

@@ -128,12 +128,14 @@ again after execution. Separately, the complete facade, example and NTFS library
 suites passed 402 tests with zero failures and zero filtered cases; the existing
 native opt-in case was ignored there and explicitly executed above.
 
-Workspace check passed the initial cut. Final workspace checks are being rerun
-after correcting an unrelated FAT cache visibility declaration and preserving
-eleven empty-value assertions in Clippy's required diagnostic form. Source
-presence and publication are not execution evidence. Exact cuts, failures and
-retained logs are in `.beads/pending_tasks.md`. No indexed kernel-mount or
-performance claim follows.
+Workspace/all-target checking and strict Clippy passed after correcting an
+unrelated FAT cache visibility declaration and preserving eleven empty-value
+assertions in Clippy's required diagnostic form. All 525 FAT library tests also
+passed without filtering. Final formatting passed after two whitespace-only
+corrections. UBS remains red on a retained test failure tripwire; independent
+scanner disposition and original Bead acceptance remain open. Exact source cuts,
+failures and retained logs are in `.beads/pending_tasks.md`. No indexed
+kernel-mount or performance claim follows.
 
 Seven new constructed-image Rust tests cover resident and external indexes,
 short aliases, Unicode, exact/insensitive/POSIX names, equal separators, selected
