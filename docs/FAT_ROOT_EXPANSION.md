@@ -57,6 +57,39 @@ copied boot program will boot successfully.
 Constructed-image Rust regressions cover 512/4096-byte sectors, full roots,
 long names, nested directories, exact region-crossing reads, preallocation,
 combined relocation, no-write refusals, source failures, cancellation and output
-publication faults. Authoring these tests is not execution evidence. Compile,
-execute the Rust tests and qualify native filesystem-tool interchange before
-using the feature on anything other than disposable test images.
+publication faults. All nine root-expansion Rust regressions passed on
+2026-10-22 (`tests-d452-fat-root-expansion-0207.log`). That constructed-image
+result is separate from native interchange qualification.
+
+The permanent `scripts/verify_fat_read.py` root-growth case also passed against
+a native-produced 64 MiB FAT16 image with 512-byte sectors: 532 captured commands,
+530 successful commands and two expected refusals. Native mcopy filled the
+512-slot root, then confirmed the full-root error. FrankenFS expanded it to
+1,024 slots; original records and three payloads survived, added slots were zero,
+and native mcopy and FrankenFS each created files that the other reader verified.
+Native `fsck.fat -n` passed. Plain and bounded expansion produced identical
+selected images; source hashes and surrounding sentinel bytes stayed unchanged.
+The old CLI failed the same case specifically because it lacked `--root-entries`.
+
+This native result uses base `8dae5e14b` plus explicit Rust overlays, fingerprint
+`d1224d035dd49a9089e6981720f81374c280fef275d98b6493ecc9926ee121be`, Linux CLI
+SHA-256 `12af1605e9a1e2f9fbd4f22971a9c87a1820401bbc3d1c72b03670c786641b8b`,
+and runner SHA-256
+`7cb88675ffe717009b22bc096b03d8862c30b2d02f3875bc25a63cd6b2d763af`.
+The retained log is `native-fat-root-workload-8dae-positive-0327.log` under
+`~/Library/Logs/frankenfs-verification/`; native evidence is retained on CSD in
+`/data/ssd/tmp/ffs-native-verification-7CWV8iQw/fat-root-8dae-native-a_dxn2cp`.
+Only this component of the runner was executed in that invocation. Native
+4096-byte-sector relocation, mounted operation, bootability, field use and later
+streaming changes remain outside this evidence.
+
+A separate operation-output probe reopened this exact expanded image through
+the previously qualified public `ffs` consumer (SHA-256 `e862954f...e4ef48`)
+and a strict read-only `FatFs` FUSE mount using the CLI above. It verified all
+514 root listing names including dot entries, all five original/new payloads
+and sizes, public write refusal, mounted full/range bytes and EROFS, then clean
+unmount and native fsck. The expanded image's SHA-256 stayed unchanged. Log:
+`native-fat-operation-output-consumers-0358.log`; retained CSD evidence:
+`/tmp/fat-operation-consumers-68fgd5vi/result.json`. The two executable source
+cuts remain distinct; this is read-only consumption of the actual growth output,
+not a facade-mounted, writable, boot or field qualification.

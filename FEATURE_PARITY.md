@@ -150,6 +150,101 @@
 > assertion was weakened. Independent scanner disposition and publication remain
 > open. No clean UBS, functional closure, native writer or field proof is claimed.
 
+> **Native FAT16 root growth, 2026-10-22:** all nine constructed-image root
+> regressions passed (`tests-d452-fat-root-expansion-0207.log`). The permanent
+> native runner then passed its root-growth component with 532 captured commands
+> (530 successful, two expected refusals) on a native-produced 64 MiB image with
+> 512-byte sectors. It filled 512 root slots, expanded to 1,024, preserved raw
+> records and three payloads, checked native/FrankenFS writer interchange and
+> native fsck, and verified identical plain/bounded output with unchanged sources
+> and sentinels. The old CLI failed this same component at its unsupported
+> `--root-entries` option. The positive CLI SHA-256 is
+> `12af1605e9a1e2f9fbd4f22971a9c87a1820401bbc3d1c72b03670c786641b8b`, built
+> from `8dae5e14b` plus overlays with fingerprint
+> `d1224d035dd49a9089e6981720f81374c280fef275d98b6493ecc9926ee121be`.
+> Log: `native-fat-root-workload-8dae-positive-0327.log` under the local
+> verification log root. [The feature contract](docs/FAT_ROOT_EXPANSION.md)
+> records retained native evidence. This does not qualify the full six-profile
+> runner, native 4096-byte-sector relocation, mounted operation, bootability,
+> FSInfo repair, later streaming changes or field use.
+
+> **FAT32 FSInfo recovery, 2026-10-22:** all 11 Rust regressions passed with
+> zero failures or ignores (RCH `30074357740995216`). The permanent native
+> FSInfo component passed 20 captured commands (17 zero, three exact expected
+> nonzero) on a private bounded 128 MiB native-produced image with 512-byte
+> sectors. Independent whole-file expectations allow only five words per hint
+> sector and four dirty markers during repair; separate ordinary recovery then
+> restores clean state. Native allocation, three file payloads, native fsck,
+> source hashes and neighboring sentinels passed. The first harness run's wrong
+> dirty-check exit expectation is retained; the corrected probe requires exit
+> one plus the unchanged complete-ownership/four-marker assertions. Source and
+> CLI are the same frozen `8dae5e14b`/`d1224d03`/`12af1605` cut above, runner
+> `320d1c13`. Log: `native-fat-fsinfo-8dae-fixed-0339.log`; retained native
+> evidence and complete hashes are in [the contract](docs/FAT_FSINFO_RECOVERY.md).
+> This proves this offline component, with no full-runner, native 4096-byte,
+> kernel-FUSE, crash, later-streaming or field qualification.
+
+> **Strict read-only FAT mounts, 2026-10-22:** the unchanged permanent mounted
+> case passed real FAT16 and FAT32 FUSE mounts using the same `8dae5e14b`/
+> `d1224d03`/`12af1605` CLI and retained native images. Both mounts completed
+> three full and three unaligned byte comparisons, three size checks, one
+> EROFS write-open refusal and statfs. Both daemons returned zero and unmounted;
+> native fsck passed before/after and all 12 source, payload, tool, CLI and
+> workload hashes stayed unchanged. Six captured commands plus two owned mount
+> daemons ran. Evidence: CSD `/tmp/fat-ro-mount-8dae-5nkor59r/result.json`, local
+> `native-fat-ro-mount-8dae-0345.log`. This qualifies the strict `FatFs` mount
+> slice, with no facade-mounted routing, writable, crash or field claim.
+
+> **Consumers of the actual operation outputs:** a separate probe passed 20
+> public API calls (eight payloads, eight stats, two listings and two write
+> refusals) and two more strict read-only FUSE mounts on the expanded FAT16 and
+> recovered FAT32 outputs. Mounted checks covered 16 full/range byte comparisons,
+> eight sizes, two EROFS refusals and two statfs calls; both daemons exited zero
+> and unmounted. Native fsck and all 15 immutable input/tool/executable hashes
+> passed. This ran 26 captured commands plus two mount daemons, retaining CSD
+> `/tmp/fat-operation-consumers-68fgd5vi/result.json` and local
+> `native-fat-operation-output-consumers-0358.log`. The public consumer remains
+> the previously qualified `e862954f...e4ef48` ELF; the mount uses `12af1605`.
+> Keep those source cuts distinct. This adds actual output consumption, without
+> a facade-mounted, writable, crash or field claim.
+
+> **Final root/FSInfo compiler gates:** `8dae5e14b` plus eight overlays,
+> fingerprint
+> `7262c1db4f99fdb1f5a8887af02a35b2fa3ea2f290900216853e3d81952f81c5`,
+> passed workspace/all-target check (`30074357740995264`), strict Clippy with
+> `-D warnings` (`30074357740995256`) and full formatting (`30074357740995259`).
+> All returned zero with terminal acknowledgment. The earlier FSInfo Clippy
+> failures are retained: two production spelling issues, then two test-lint
+> issues. The fixes preserve repair authority, values, assertions and faults.
+> Changed FSInfo production and test UBS scans return zero; wider public-hash
+> and existing test-panic reports still need independent disposition. No clean
+> whole-change scan, publication, closure or later-streaming coverage is claimed.
+> The eleven FSInfo tests also reran successfully on the final production source
+> (`a02d60b9`, RCH `30074357740995253`, zero failed/ignored, 484 filtered).
+> Runtime predates only the two test-only literal/fixture-guard edits, which the
+> final compiler/Clippy gates compile. Fresh eight-file Rust UBS returns one,
+> with two critical no-write/no-sync test panic guards, 491 warnings and 166 info
+> items; the Python runner remains one with public-hash comparison reports.
+
+> **Bounded FAT streaming native execution, 2026-10-22:** `ea0bc8afd` plus nine
+> overlays (`ed09c13e`), CLI `a45f6380`, and permanent workload `b0645eed` passed
+> 118 captured commands on native FAT16/FAT32 and the actual expanded/recovered
+> outputs. Four images/fourteen file instances produced 56 path/exact-selector
+> comparisons across plain and bounded selections, 14 native references, eight
+> filesystem checks and 16 catalogs. All 24 expected selector/cyclic-tail refusals
+> returned one with empty stdout; all 15 immutable hashes stayed unchanged.
+> RCH build 95285 returned zero/ACKtrue. Full FAT/facade runtime on `ed09c13e`
+> passed 548 tests, zero failed, one existing native-tool test ignored (95283).
+> After equivalent test-only lint corrections, all ten streaming regressions
+> passed again on final `7d13873c` (95310, zero failed/ignored, 495 filtered).
+> Final workspace/all-target check (95301), strict Clippy (95296) and formatting
+> (95295) returned zero/ACKtrue on that same cut. Native fragmentation,
+> 4096-byte sectors, 4 GiB files, mounted streaming, speedup and field use are
+> not claimed. Whole-change UBS remains one with 27 critical public-hash/test-
+> tripwire reports pending independent disposition; assertions and scanner rules
+> remain intact. Exact hashes, source-cut distinctions, evidence and memory/
+> lifetime limits are in [the contract](docs/FAT_BOUNDED_FILE_READS.md).
+
 > **Native NTFS mounted slice, 2026-10-21:** the current RCH-delivered Linux CLI
 > candidate `3effe8ed21c9af9b5b0f537451e9f64fce869d58ce3d986ebbeb6eb0754d9d76`
 > passed 27 indexed positive calls, three semantic negatives and 25 byte

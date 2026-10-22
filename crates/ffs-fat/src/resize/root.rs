@@ -34,11 +34,10 @@ impl ByteDevice for ExpandedRoot {
 
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
         checkpoint(cx)?;
-        let end = at
-            .0
-            .checked_add(bytes.len() as u64)
-            .filter(|end| *end <= self.length)
-            .ok_or_else(|| invalid("expanded root read exceeds the private volume"))?;
+        let end =
+            at.0.checked_add(bytes.len() as u64)
+                .filter(|end| *end <= self.length)
+                .ok_or_else(|| invalid("expanded root read exceeds the private volume"))?;
         let mut done = 0;
         while done < bytes.len() {
             checkpoint(cx)?;
@@ -99,7 +98,9 @@ pub(super) fn prepare(
     let (start, bytes) = old.fixed_root().context("FAT16 fixed root is absent")?;
     let requested = u64::from(entries) * 32;
     if entries == 0 || requested < bytes || !requested.is_multiple_of(sector) {
-        bail!("--root-entries must preserve or grow the FAT16 root and occupy whole logical sectors");
+        bail!(
+            "--root-entries must preserve or grow the FAT16 root and occupy whole logical sectors"
+        );
     }
     // Validate the ORIGINAL namespace first. Appended end markers must never
     // conceal malformed records or an incomplete ownership scan in the source.
@@ -123,14 +124,17 @@ pub(super) fn prepare(
         .context("expanded root length overflow")?;
     let sectors =
         u32::try_from(length / sector).context("expanded root exceeds native sector count")?;
-    let old_end = start.checked_add(bytes).context("old root boundary overflow")?;
-    let new_end = start.checked_add(requested).context("expanded root boundary overflow")?;
+    let old_end = start
+        .checked_add(bytes)
+        .context("old root boundary overflow")?;
+    let new_end = start
+        .checked_add(requested)
+        .context("expanded root boundary overflow")?;
     let mut boot = buffer(sector as usize)?;
     source.read_exact_at(cx, ByteOffset(0), &mut boot)?;
     // Retained geometry must still describe the same original file before we
     // replace fields. Unknown state is never normalized into an admitted view.
-    let original =
-        FatGeometry::parse(&boot, source.length).map_err(|e| invalid(e.to_string()))?;
+    let original = FatGeometry::parse(&boot, source.length).map_err(|e| invalid(e.to_string()))?;
     if original != *old || boot[37] != 0 {
         bail!("source geometry or native boot state changed during root expansion");
     }
@@ -148,7 +152,10 @@ pub(super) fn prepare(
         || geometry.cluster_count() != old.cluster_count()
         || geometry.fixed_root() != Some((start, requested))
         || old.cluster_offset(2).map_err(|e| invalid(e.to_string()))? != old_end
-        || geometry.cluster_offset(2).map_err(|e| invalid(e.to_string()))? != new_end
+        || geometry
+            .cluster_offset(2)
+            .map_err(|e| invalid(e.to_string()))?
+            != new_end
     {
         bail!("expanded root changed native cluster identity or geometry");
     }
@@ -163,8 +170,8 @@ pub(super) fn prepare(
         base: 0,
         length,
     };
-    let candidate = FatVolume::from_device(cx, Box::new(view.clone()), 0, length)?
-        .with_oem_code_page(page);
+    let candidate =
+        FatVolume::from_device(cx, Box::new(view.clone()), 0, length)?.with_oem_code_page(page);
     if candidate.geometry != geometry || checked(cx, &candidate)? != expected {
         bail!("expanded root changed native ownership or free-space accounting");
     }

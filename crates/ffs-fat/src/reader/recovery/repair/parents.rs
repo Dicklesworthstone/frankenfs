@@ -72,10 +72,7 @@ fn corrected_prefix(bytes: &[u8], kind: FatKind, first: u32, parent: u32) -> Res
         let record = &mut updated[index * 32..(index + 1) * 32];
         // Refuse missing, deleted, substituted or malformed dot records. A
         // parent_link finding alone is not permission to overwrite a live file.
-        if record[..11] != name
-            || record[11] & 0xD8 != 0x10
-            || record[28..32] != [0; 4]
-        {
+        if record[..11] != name || record[11] & 0xD8 != 0x10 || record[28..32] != [0; 4] {
             bail!("parent repair requires recognizable, zero-size native dot records");
         }
         pointer(record, kind, cluster);
@@ -88,8 +85,10 @@ fn permitted(report: &FatCheckReport, parent_links: bool) -> Result<()> {
         bail!("parent repair requires complete, untruncated ownership evidence");
     }
     for issue in &report.issues {
-        if !matches!(issue.kind, "native_boot_dirty" | "native_fat_dirty" | "lost_allocation")
-            && !(parent_links && issue.kind == "parent_link")
+        if !(matches!(
+            issue.kind,
+            "native_boot_dirty" | "native_fat_dirty" | "lost_allocation"
+        ) || (parent_links && issue.kind == "parent_link"))
         {
             bail!("parent repair refuses {}: {}", issue.kind, issue.detail);
         }
@@ -118,18 +117,23 @@ fn same_accounting(before: &FatCheckReport, after: &FatCheckReport) -> bool {
 fn verify_dirty(cx: &Cx, diagnostic: &DiagnosticVolume) -> Result<()> {
     let volume = &diagnostic.volume;
     let state = diagnostic.native_state(cx)?;
-    let expected = 1 + usize::from(volume.geometry.backup_boot_sector().is_some())
-        + volume.copies().count();
+    let expected =
+        1 + usize::from(volume.geometry.backup_boot_sector().is_some()) + volume.copies().count();
     if state.len() != expected
-        || state.iter().any(|issue|
-            !matches!(issue.kind, "native_boot_dirty" | "native_fat_dirty"))
+        || state
+            .iter()
+            .any(|issue| !matches!(issue.kind, "native_boot_dirty" | "native_fat_dirty"))
     {
         bail!("parent repair could not verify all native dirty markers");
     }
     // Check the actual boot records, not only the geometry retained on open.
     for number in std::iter::once(0_u16).chain(volume.geometry.backup_boot_sector()) {
         let mut bytes = [0; 512];
-        volume.read_exact(cx, u64::from(number) * u64::from(volume.geometry.sector_bytes()), &mut bytes)?;
+        volume.read_exact(
+            cx,
+            u64::from(number) * u64::from(volume.geometry.sector_bytes()),
+            &mut bytes,
+        )?;
         let geometry = ffs_ondisk::fat::FatGeometry::parse(&bytes, volume.geometry.volume_bytes())
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         if geometry != volume.geometry || bytes[21] != diagnostic.boot[21] {
@@ -152,7 +156,9 @@ fn allocation_digest(cx: &Cx, volume: &FatVolume) -> Result<[u8; 32]> {
         while cluster < end {
             checkpoint(cx)?;
             let entries = (end - cluster).min((TRANSFER / width) as u32);
-            let offset = volume.geometry.entry_offset(copy, cluster)
+            let offset = volume
+                .geometry
+                .entry_offset(copy, cluster)
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
             let length = entries as usize * width;
             volume.read_exact(cx, offset, &mut bytes[..length])?;
@@ -182,8 +188,11 @@ fn state_digest(cx: &Cx, volume: &FatVolume) -> Result<[u8; 32]> {
     }
     let width = volume.geometry.kind().entry_bytes() as usize;
     for copy in volume.copies() {
-        let offset = volume.geometry.entry_offset(copy, 2)
-            .map_err(|error| anyhow::anyhow!("{error}"))? - 2 * width as u64;
+        let offset = volume
+            .geometry
+            .entry_offset(copy, 2)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            - 2 * width as u64;
         volume.read_exact(cx, offset, &mut bytes[..2 * width])?;
         let mut word = [0; 4];
         word[..width].copy_from_slice(&bytes[width..2 * width]);
@@ -200,8 +209,13 @@ fn state_digest(cx: &Cx, volume: &FatVolume) -> Result<[u8; 32]> {
 /// Include physical mappings so a same-count chain swap cannot pass as intact.
 fn scan(cx: &Cx, volume: &FatVolume) -> Result<Evidence> {
     let mut evidence = Evidence {
-        patches: Vec::new(), namespace: [0; 32], allocation: [0; 32], native_state: [0; 32],
-        files: 0, directories: 0, storage_slots: 0,
+        patches: Vec::new(),
+        namespace: [0; 32],
+        allocation: [0; 32],
+        native_state: [0; 32],
+        files: 0,
+        directories: 0,
+        storage_slots: 0,
     };
     let mut digest = Sha256::new();
     let mut pending = VecDeque::from([(Directory::Root, 0_u32, 0_u16)]);
@@ -212,14 +226,21 @@ fn scan(cx: &Cx, volume: &FatVolume) -> Result<Evidence> {
     let mut objects = 1_u64;
     while let Some((directory, parent, depth)) = pending.pop_front() {
         checkpoint(cx)?;
-        if depth > 256 { bail!("parent repair exceeds the directory-depth budget"); }
+        if depth > 256 {
+            bail!("parent repair exceeds the directory-depth budget");
+        }
         evidence.directories += 1;
-        let fixed = if directory == Directory::Root { volume.geometry.fixed_root() } else { None };
+        let fixed = if directory == Directory::Root {
+            volume.geometry.fixed_root()
+        } else {
+            None
+        };
         let mut offsets = Vec::new();
         let size;
         if let Some((start, length)) = fixed {
             size = volume.geometry.sector_bytes() as usize;
-            offsets.try_reserve_exact((length / size as u64) as usize)
+            offsets
+                .try_reserve_exact((length / size as u64) as usize)
                 .context("reserving fixed-root evidence")?;
             offsets.extend((start..start + length).step_by(size));
         } else {
@@ -228,33 +249,55 @@ fn scan(cx: &Cx, volume: &FatVolume) -> Result<Evidence> {
                 Directory::Cluster(first) => first,
             };
             size = volume.geometry.cluster_bytes() as usize;
-            let chain = volume.allocation_chain(cx, first, 1, volume.cluster_offset(first)?,
-                (MAX_DIRECTORY_SLOTS * 32).div_ceil(size))?;
-            offsets.try_reserve_exact(chain.len()).context("reserving directory evidence")?;
+            let chain = volume.allocation_chain(
+                cx,
+                first,
+                1,
+                volume.cluster_offset(first)?,
+                (MAX_DIRECTORY_SLOTS * 32).div_ceil(size),
+            )?;
+            offsets
+                .try_reserve_exact(chain.len())
+                .context("reserving directory evidence")?;
             for cluster in chain {
                 checkpoint(cx)?;
                 offsets.push(volume.cluster_offset(cluster)?);
             }
         }
         let slots = offsets.len() as u64 * (size as u64 / 32);
-        if slots > MAX_DIRECTORY_SLOTS as u64 { bail!("parent repair directory is too large"); }
-        evidence.storage_slots = evidence.storage_slots.checked_add(slots)
-            .filter(|total| *total <= MAX_SLOTS).context("parent repair directory budget exceeded")?;
+        if slots > MAX_DIRECTORY_SLOTS as u64 {
+            bail!("parent repair directory is too large");
+        }
+        evidence.storage_slots = evidence
+            .storage_slots
+            .checked_add(slots)
+            .filter(|total| *total <= MAX_SLOTS)
+            .context("parent repair directory budget exceeded")?;
         digest.update(b"directory");
         digest.update((offsets.len() as u64).to_le_bytes());
         let mut bytes = allocate(size)?;
         for (index, offset) in offsets.into_iter().enumerate() {
             checkpoint(cx)?;
             volume.read_exact(cx, offset, &mut bytes)?;
-            if index == 0 && let Directory::Cluster(first) = directory {
-                let original: [u8; 64] = bytes[..64].try_into().expect("complete directory cluster");
+            if index == 0
+                && let Directory::Cluster(first) = directory
+            {
+                let original: [u8; 64] =
+                    bytes[..64].try_into().expect("complete directory cluster");
                 let updated = corrected_prefix(&bytes, volume.geometry.kind(), first, parent)?;
                 if original != updated {
                     if evidence.patches.len() as u64 >= MAX_OBJECTS {
                         bail!("parent repair patch budget exceeded");
                     }
-                    evidence.patches.try_reserve(1).context("reserving parent repair evidence")?;
-                    evidence.patches.push(Patch { offset, original, updated });
+                    evidence
+                        .patches
+                        .try_reserve(1)
+                        .context("reserving parent repair evidence")?;
+                    evidence.patches.push(Patch {
+                        offset,
+                        original,
+                        updated,
+                    });
                 }
                 bytes[..64].copy_from_slice(&updated);
             }
@@ -263,16 +306,23 @@ fn scan(cx: &Cx, volume: &FatVolume) -> Result<Evidence> {
         }
         // The ordinary list ignores . and .. instead of following them. A
         // second root-based traversal derives ancestry from live name bindings.
-        let expected_parent = match directory { Directory::Root => 0, Directory::Cluster(first) => first };
+        let expected_parent = match directory {
+            Directory::Root => 0,
+            Directory::Cluster(first) => first,
+        };
         for entry in volume.list(cx, directory)? {
             checkpoint(cx)?;
             objects += 1;
-            if objects > MAX_OBJECTS { bail!("parent repair object budget exceeded"); }
+            if objects > MAX_OBJECTS {
+                bail!("parent repair object budget exceeded");
+            }
             if entry.native.is_directory() {
                 if depth == 256 || !visited.insert(entry.native.first_cluster) {
                     bail!("parent repair encountered a cycle or repeated directory owner");
                 }
-                pending.try_reserve(1).context("reserving bounded parent traversal")?;
+                pending
+                    .try_reserve(1)
+                    .context("reserving bounded parent traversal")?;
                 pending.push_back((entry.directory()?, expected_parent, depth + 1));
             } else {
                 evidence.files += 1;
@@ -306,11 +356,18 @@ impl ParentPlan {
     }
 
     pub(super) fn report(&self, dry_run: bool) -> serde_json::Value {
-        let repairs: Vec<_> = self.evidence.patches.iter().map(|patch| serde_json::json!({
-            "volume_offset": patch.offset,
-            "before_dot_records": patch.original.as_slice(),
-            "after_dot_records": patch.updated.as_slice(),
-        })).collect();
+        let repairs: Vec<_> = self
+            .evidence
+            .patches
+            .iter()
+            .map(|patch| {
+                serde_json::json!({
+                    "volume_offset": patch.offset,
+                    "before_dot_records": patch.original.as_slice(),
+                    "after_dot_records": patch.updated.as_slice(),
+                })
+            })
+            .collect();
         serde_json::json!({
             "operation": "repair_native_parent_links", "dry_run": dry_run,
             "planned_directory_repairs": self.evidence.patches.len(),
@@ -324,7 +381,11 @@ impl ParentPlan {
         })
     }
 
-    pub(super) fn execute(&self, cx: &Cx, diagnostic: &DiagnosticVolume) -> Result<serde_json::Value> {
+    pub(super) fn execute(
+        &self,
+        cx: &Cx,
+        diagnostic: &DiagnosticVolume,
+    ) -> Result<serde_json::Value> {
         checkpoint(cx)?;
         let current = diagnostic.report(cx)?;
         if serde_json::to_value(&current)? != serde_json::to_value(&self.before)?
@@ -357,20 +418,25 @@ impl ParentPlan {
             for patch in &self.evidence.patches {
                 checkpoint(cx)?;
                 volume.read_exact(cx, patch.offset, &mut sector)?;
-                if sector[..64] != patch.original { bail!("dot records changed before repair"); }
+                if sector[..64] != patch.original {
+                    bail!("dot records changed before repair");
+                }
                 updated.copy_from_slice(&sector);
                 updated[..64].copy_from_slice(&patch.updated);
                 write_patch(cx, volume, patch.offset, &sector, &updated)?;
                 volume.device.sync(cx)?;
                 volume.read_exact(cx, patch.offset, &mut readback)?;
-                if readback != updated { bail!("parent repair sector failed durable readback"); }
+                if readback != updated {
+                    bail!("parent repair sector failed durable readback");
+                }
             }
             phase = "checking retained namespace and allocation";
             verify_dirty(cx, diagnostic)?;
             let after = diagnostic.report(cx)?;
             permitted(&after, false)?;
             let evidence = scan(cx, volume)?;
-            if !same_accounting(&self.before, &after) || !evidence.patches.is_empty()
+            if !same_accounting(&self.before, &after)
+                || !evidence.patches.is_empty()
                 || evidence.namespace != self.evidence.namespace
                 || evidence.allocation != self.evidence.allocation
                 || evidence.native_state != self.evidence.native_state
@@ -381,7 +447,8 @@ impl ParentPlan {
             report["changed"] = true.into();
             report["repaired_directories"] = self.evidence.patches.len().into();
             report["left_dirty"] = true.into();
-            report["durability"] = "parent_sectors_synced_and_verified_native_state_left_dirty".into();
+            report["durability"] =
+                "parent_sectors_synced_and_verified_native_state_left_dirty".into();
             report["verification"] = serde_json::to_value(after)?;
             Ok(())
         })();
@@ -394,26 +461,43 @@ impl ParentPlan {
 
 pub fn repair_parents(cx: &Cx, args: &RepairParentsArgs) -> Result<serde_json::Value> {
     checkpoint(cx)?;
-    if !args.offline_image { bail!("--offline-image is required for parent repair"); }
+    if !args.offline_image {
+        bail!("--offline-image is required for parent repair");
+    }
     reject_sidecar(&args.image)?;
     // Reuse the established regular-file, no-follow, identity and advisory-lock
     // policy without granting any other recovery mode. Dry-run opens read-only.
     let options = RecoverArgs {
         image: ImageArgs {
-            image: args.image.image.clone(), offset: args.image.offset, length: args.image.length,
-            oem_code_page: args.image.oem_code_page, sidecar: None,
+            image: args.image.image.clone(),
+            offset: args.image.offset,
+            length: args.image.length,
+            oem_code_page: args.image.oem_code_page,
+            sidecar: None,
         },
-        offline_image: true, reclaim_lost: false, discard_orphan_lfn: false,
-        repair_mirrors_from: None, repair_boot_from: None, salvage_to: None,
+        offline_image: true,
+        reclaim_lost: false,
+        discard_orphan_lfn: false,
+        repair_mirrors_from: None,
+        repair_boot_from: None,
+        salvage_to: None,
         dry_run: args.dry_run,
     };
     let (file, stamp) = open(&options)?;
-    let diagnostic = DiagnosticVolume::from_device(cx, Box::new(Image {
-        file: Arc::clone(&file), length: stamp.length, writable: !args.dry_run,
-    }), &args.image)?;
+    let diagnostic = DiagnosticVolume::from_device(
+        cx,
+        Box::new(Image {
+            file: Arc::clone(&file),
+            length: stamp.length,
+            writable: !args.dry_run,
+        }),
+        &args.image,
+    )?;
     let plan = ParentPlan::prepare(cx, &diagnostic)?;
     stable(&file, &args.image.image, stamp)?;
     checkpoint(cx)?;
-    if args.dry_run { return Ok(plan.report(true)); }
+    if args.dry_run {
+        return Ok(plan.report(true));
+    }
     plan.execute(cx, &diagnostic)
 }

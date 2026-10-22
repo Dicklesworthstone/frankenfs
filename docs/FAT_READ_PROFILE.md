@@ -557,6 +557,11 @@ rch exec -- cargo check -p ffs-cli --bin ffs-fat
 # Requires dosfstools and mtools; --mounted additionally requires usable FUSE.
 python3 scripts/verify_fat_read.py --binary target/debug/ffs-fat
 python3 scripts/verify_fat_read.py --binary target/debug/ffs-fat --mounted
+
+# Also exercise the reusable facade on both plain and bounded image views.
+rch exec -- cargo build -p ffs --example native_reader
+python3 scripts/verify_fat_read.py --binary target/debug/ffs-fat \
+  --facade-binary target/debug/examples/native_reader
 ```
 
 The external runner exercises images created by both `mkfs.fat` and
@@ -568,6 +573,16 @@ write-open, checks unchanged image hashes, and runs `fsck.fat -n`. Formatter
 scenarios also require exact refusal statuses and unchanged bytes when trying
 to format an existing path, and no destination for rejected partition options.
 All images and command logs are retained; missing prerequisites fail the run.
+With `--facade-binary`, each native-created, formatted and populated scenario
+also opens its image through the standalone public `ffs::open_read_only`
+consumer. `mcopy` defines payload bytes and `mdir` defines exact directory
+names independently. The checks cover metadata, complete and ranged reads,
+EOF and empty reads, write refusal, typed missing-path/directory errors, and
+fresh selected-volume wrappers with adjacent sentinels. They retain command
+stdout/stderr/status and require unchanged images and consumer executable.
+This optional path exercises the existing FsOps FAT adapter; its materialized
+chain cache is distinct from the immutable bounded-index FileReader used by
+the companion's streaming selectors. It does not qualify a facade FUSE mount.
 The added Rust unit tests cover independent byte layouts, error/cancellation
 propagation, malformed chains, partition bounds, LFN boundaries, FsOps and dates.
 Additional checker regressions retain raw malformed/orphaned LFN records,

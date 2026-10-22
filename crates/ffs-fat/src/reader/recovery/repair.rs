@@ -240,8 +240,7 @@ impl Plan {
         checkpoint(cx)?;
         // DiagnosticVolume retains its parsed geometry. A no-op must not report
         // a cached clean result after the actual BPB has changed either.
-        for number in std::iter::once(0_u16)
-            .chain(diagnostic.volume.geometry.backup_boot_sector())
+        for number in std::iter::once(0_u16).chain(diagnostic.volume.geometry.backup_boot_sector())
         {
             StateSector::boot(cx, diagnostic, number, true)?;
         }
@@ -511,12 +510,7 @@ struct StateSector {
 }
 
 impl StateSector {
-    fn boot(
-        cx: &Cx,
-        diagnostic: &DiagnosticVolume,
-        number: u16,
-        dirty: bool,
-    ) -> Result<Self> {
+    fn boot(cx: &Cx, diagnostic: &DiagnosticVolume, number: u16, dirty: bool) -> Result<Self> {
         let volume = &diagnostic.volume;
         let size = volume.geometry.sector_bytes() as usize;
         let offset = u64::from(number) * size as u64;
@@ -587,7 +581,10 @@ impl StateSector {
         checkpoint(cx)?;
         volume.read_exact(cx, self.offset, scratch)?;
         if scratch[..] != self.bytes[..] {
-            bail!("recovery state sector failed exact readback at {}", self.offset);
+            bail!(
+                "recovery state sector failed exact readback at {}",
+                self.offset
+            );
         }
         Ok(())
     }

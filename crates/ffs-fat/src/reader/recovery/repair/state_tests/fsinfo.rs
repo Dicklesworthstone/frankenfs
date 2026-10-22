@@ -156,7 +156,7 @@ fn same_count_namespace_or_allocation_changes_and_stale_hint_sector_refuse_befor
             match change {
                 "name" => state.put(BASE + geometry.cluster_offset(2).unwrap(), b"N"),
                 "orphan_successor" => for copy in 0..2_u8 {
-                    state.put(BASE + geometry.entry_offset(copy, 300).unwrap(), &(((10 + u32::from(copy)) << 28) | 300).to_le_bytes());
+                    state.put(BASE + geometry.entry_offset(copy, 300).unwrap(), &(((10 + u32::from(copy)) << 28) | 0x012C).to_le_bytes());
                 },
                 _ => state.put(BASE + 512 + 100, &[0x43]),
             }
@@ -309,7 +309,8 @@ fn public_cli_dry_run_and_repair_round_trip_to_separate_ordinary_recovery() {
     let path = directory.path().join("fsinfo.fat");
     let file = File::create(&path).unwrap();
     file.set_len(device.length).unwrap();
-    for (page, bytes) in device.state.lock().unwrap().image() {
+    let image = device.state.lock().unwrap().image();
+    for (page, bytes) in image {
         let at = page * PAGE as u64;
         let count = (device.length - at).min(PAGE as u64) as usize;
         file.write_all_at(&bytes[..count], at).unwrap();
