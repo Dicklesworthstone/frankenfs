@@ -2,6 +2,7 @@
 //! images. Pending bytes and sync-time loss are distinct; this is not hardware
 //! or native-tool interoperability qualification.
 
+mod fsinfo;
 mod reclamation;
 
 use super::*;

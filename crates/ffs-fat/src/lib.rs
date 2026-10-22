@@ -262,6 +262,13 @@ pub enum Command {
         #[command(flatten)]
         options: reader::recovery::RepairParentsArgs,
     },
+    /// Rebuild declared FAT32 FSInfo from verified allocation, not old hint values.
+    /// Leaves changed images dirty; never reclaims allocation or invents a sector.
+    #[command(name = "repair-fsinfo")]
+    RepairFsInfo {
+        #[command(flatten)]
+        options: reader::recovery::RepairFsInfoArgs,
+    },
     /// Replace an existing regular file using initialized, separately allocated clusters.
     /// Requires exclusive offline ownership; --dry-run performs only preflight reads.
     Replace {
