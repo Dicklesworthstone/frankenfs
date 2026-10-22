@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(about = "Read an offline native image through the public ffs facade")]
 struct Args {
     image: PathBuf,
@@ -24,6 +24,9 @@ struct Args {
     offset: u64,
     #[arg(long)]
     length: Option<u64>,
+    /// Opt into NTFS index-directed lookup; does not certify unvisited siblings.
+    #[arg(long, conflicts_with_all = ["zfs_dataset", "zfs_snapshot"])]
+    ntfs_indexed_lookup: bool,
     /// Repeat for each raw ZFS dataset-name component.
     #[arg(long)]
     zfs_dataset: Vec<OsString>,
@@ -33,7 +36,7 @@ struct Args {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     Stat {
         path: PathBuf,
@@ -157,6 +160,7 @@ fn read_stream(
     name: &ffs::ntfs::StreamName,
     start: u64,
     count: Option<u64>,
+    indexed_lookup: bool,
 ) -> Result<()> {
     let volume = opened
         .ntfs_volume()
@@ -164,7 +168,11 @@ fn read_stream(
     let path = path
         .to_str()
         .ok_or_else(|| invalid("NTFS path must be UTF-8"))?;
-    let record = volume.resolve_no_follow(cx, path)?;
+    let record = if indexed_lookup {
+        volume.resolve_indexed_no_follow(cx, path)?
+    } else {
+        volume.resolve_no_follow(cx, path)?
+    };
     let stream = volume.data_stream(cx, &record, name.as_units())?;
     let end = match count {
         Some(count) => start
@@ -195,7 +203,11 @@ fn main() -> Result<()> {
         .blocking_threads(0, 0)
         .build()?;
     let cx = runtime.request_cx_with_budget(Budget::INFINITE);
-    let backend = if args.zfs_dataset.is_empty() && args.zfs_snapshot.is_none() {
+    let backend = if args.ntfs_indexed_lookup {
+        ReadOnlyBackend::Ntfs {
+            indexed_lookup: true,
+        }
+    } else if args.zfs_dataset.is_empty() && args.zfs_snapshot.is_none() {
         ReadOnlyBackend::Auto
     } else {
         ReadOnlyBackend::Zfs(ZfsReadOptions {
@@ -245,7 +257,15 @@ fn main() -> Result<()> {
                 }
                 let name = ffs::ntfs::StreamName::select(stream.as_deref(), stream_utf16)
                     .map_err(|error| invalid(&error))?;
-                read_stream(&cx, &opened, &path, &name, start, bytes)?;
+                read_stream(
+                    &cx,
+                    &opened,
+                    &path,
+                    &name,
+                    start,
+                    bytes,
+                    args.ntfs_indexed_lookup,
+                )?;
             } else {
                 read(&cx, &opened, &mut scope, &attr, start, bytes)?;
             }
@@ -263,4 +283,61 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_ntfs_selection_keeps_bounded_raw_stream_arguments() {
+        let args = Args::try_parse_from([
+            "native_reader",
+            "image.img",
+            "--offset",
+            "4096",
+            "--length",
+            "67108864",
+            "--ntfs-indexed-lookup",
+            "read",
+            "/payload.bin",
+            "--stream-utf16",
+            "006e,006f,0074,0065",
+            "--start",
+            "507",
+            "--bytes",
+            "1031",
+        ])
+        .unwrap();
+        assert!(args.ntfs_indexed_lookup);
+        assert_eq!((args.offset, args.length), (4096, Some(67_108_864)));
+        let Command::Read {
+            stream_utf16,
+            start,
+            bytes,
+            ..
+        } = args.command
+        else {
+            panic!("expected read arguments");
+        };
+        assert_eq!((start, bytes), (507, Some(1031)));
+        assert_eq!(stream_utf16.unwrap().as_units(), [0x6e, 0x6f, 0x74, 0x65]);
+    }
+
+    #[test]
+    fn ntfs_and_zfs_selections_cannot_silently_override_each_other() {
+        for option in ["--zfs-dataset", "--zfs-snapshot"] {
+            let error = Args::try_parse_from([
+                "native_reader",
+                "image.img",
+                "--ntfs-indexed-lookup",
+                option,
+                "data",
+                "stat",
+                "/",
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
 }

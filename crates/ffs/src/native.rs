@@ -39,7 +39,11 @@ pub enum ReadOnlyBackend {
     Fat {
         oem_code_page: FatOemCodePage,
     },
-    Ntfs,
+    /// Strict enumeration is the default. Indexed lookup validates only the
+    /// selected native search range; directory enumeration remains complete.
+    Ntfs {
+        indexed_lookup: bool,
+    },
     Zfs(ZfsReadOptions),
 }
 
@@ -204,7 +208,7 @@ fn selection_matches(backend: &ReadOnlyBackend, format: FsFormatKind) -> bool {
         ReadOnlyBackend::Fat { .. } => {
             matches!(format, FsFormatKind::Fat16 | FsFormatKind::Fat32)
         }
-        ReadOnlyBackend::Ntfs => format == FsFormatKind::Ntfs,
+        ReadOnlyBackend::Ntfs { .. } => format == FsFormatKind::Ntfs,
         ReadOnlyBackend::Zfs(_) => format == FsFormatKind::Zfs,
     }
 }
@@ -294,7 +298,17 @@ pub fn open_read_only(
         DetectedFilesystem::Ntfs(_) => {
             let length = device.len_bytes();
             let volume = ffs_ntfs::NtfsVolume::from_device(cx, Box::new(device), 0, length)?;
-            let filesystem = Arc::new(ffs_ntfs::NtfsFs::new(cx, volume, options.uid, options.gid)?);
+            let filesystem = if matches!(
+                &options.backend,
+                ReadOnlyBackend::Ntfs {
+                    indexed_lookup: true
+                }
+            ) {
+                ffs_ntfs::NtfsFs::new_indexed(cx, volume, options.uid, options.gid)?
+            } else {
+                ffs_ntfs::NtfsFs::new(cx, volume, options.uid, options.gid)?
+            };
+            let filesystem = Arc::new(filesystem);
             ntfs = Some(Arc::clone(&filesystem));
             Box::new(filesystem)
         }

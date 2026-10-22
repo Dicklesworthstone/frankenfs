@@ -136,14 +136,16 @@ fn native_fat_both_dialects_open_through_bounded_facade_and_preserve_container()
         drop(opened);
         exclusive.try_lock().unwrap();
         drop(exclusive);
-        let mismatched = ReadOnlyOpenOptions {
-            backend: ReadOnlyBackend::Ntfs,
-            ..ReadOnlyOpenOptions::default()
-        };
-        assert!(matches!(
-            open_read_only(&cx, &image, &mismatched),
-            Err(FfsError::Format(_))
-        ));
+        for indexed_lookup in [false, true] {
+            let mismatched = ReadOnlyOpenOptions {
+                backend: ReadOnlyBackend::Ntfs { indexed_lookup },
+                ..ReadOnlyOpenOptions::default()
+            };
+            assert!(matches!(
+                open_read_only(&cx, &image, &mismatched),
+                Err(FfsError::Format(_))
+            ));
+        }
         let truncated = ReadOnlyOpenOptions {
             length: Some(512),
             ..ReadOnlyOpenOptions::default()
@@ -477,16 +479,34 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
         container.extend_from_slice(&[0xD3; 8192]);
         let bounded = directory.join("bounded.img");
         fs::write(&bounded, &container).unwrap();
-        for (path, offset, length) in [
-            (&image, 0, None),
-            (&bounded, 4096, Some(native.len() as u64)),
-        ] {
+        let mut views = vec![
+            (&image, 0, None, ReadOnlyBackend::Auto),
+            (
+                &bounded,
+                4096,
+                Some(native.len() as u64),
+                ReadOnlyBackend::Auto,
+            ),
+        ];
+        if kind == "ntfs" {
+            for indexed_lookup in [false, true] {
+                views.push((&image, 0, None, ReadOnlyBackend::Ntfs { indexed_lookup }));
+                views.push((
+                    &bounded,
+                    4096,
+                    Some(native.len() as u64),
+                    ReadOnlyBackend::Ntfs { indexed_lookup },
+                ));
+            }
+        }
+        for (path, offset, length, backend) in views {
             let opened = open_read_only(
                 &cx,
                 path,
                 &ReadOnlyOpenOptions {
                     offset,
                     length,
+                    backend,
                     ..ReadOnlyOpenOptions::default()
                 },
             )
@@ -611,7 +631,7 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
             assert_eq!(fs::read(&image).unwrap(), native);
         }
         println!(
-            "native {kind}: plain/bounded lookup/getattr/readdir/full/ranged/EOF reads, RO refusal and unchanged bytes passed"
+            "native {kind}: plain/bounded lookup/getattr/readdir/full/ranged/EOF reads, RO refusal and unchanged bytes passed; NTFS includes automatic, explicit strict and indexed modes"
         );
     }
 }
