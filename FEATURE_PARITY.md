@@ -25,8 +25,9 @@
 > same admitted volume. The unchanged native FAT and NTFS Cargo profile wrappers
 > also passed; NTFS executed 203 commands including 32 extension records and
 > compressed 512/4096-byte-cluster images. These are native offline-image results.
-> The full harness subsequently passed; acceptance remains open for the required
-> benchmark and current shared-source compiler/formatting gates described below.
+> The full harness and default benchmarks subsequently passed. The later frozen
+> maintenance cut also passed compiler, strict Clippy and formatting gates;
+> targeted UBS disposition and publication remain open as described below.
 > Acceptance across all mounted formats and extra parity credit are not claimed.
 > The bounded native NTFS mounted result below covers its strict read-only slice.
 > The older
@@ -88,8 +89,8 @@
 > `30074357740994971`, root
 > `7fa320e15e551fd22a4519099db37bbc9250fd8d3480192b519e7241cf071bb9`).
 > All 5,007 non-Beads root tracked files matched that frozen input before the
-> run. Later FAT parent-repair lint/formatting maintenance has separate pending
-> compiler gates; it is not silently included in that receipt. Production
+> run. Later FAT parent-repair lint/formatting maintenance has separate passing
+> compiler gates below; it is not silently included in that receipt. Production
 > admission and old assertions are unchanged.
 
 > **Current public-consumer refresh, 2026-10-21:** Linux ELF
@@ -112,8 +113,42 @@
 > `7fbdb0d7b3987fcefd3a0250594c7c5652ad845262b35f448f15cdc6ac8265cc`;
 > retained CSD evidence is `ext4-btrfs-public-native-2glw4nqx`, with the full
 > command in `.beads/pending_tasks.md`. Together these refreshes executed 280
-> public calls on five native formats. APFS native qualification, mounted
-> acceptance across formats and native write authority are separate.
+> public calls across ext4, btrfs, FAT16, FAT32, NTFS and ZFS: all six declared
+> formats. Mounted acceptance across formats and native write authority are
+> separate.
+
+> **Final maintenance verification, 2026-10-22:** complete baseline
+> `08226b8cb79755aee243068744eb2abeb743b01d` plus nine explicit overlays,
+> fingerprint
+> `23f0f687639a1cd61fd8f6de680967c4874ad93e10cde5efd21afec7aee68782`, passed
+> workspace/all-target `cargo check` (RCH `30074357740995112`), strict Clippy
+> with `-D warnings` (`30074357740995101`) and full `cargo fmt --check`.
+> All nine parent-repair regressions also passed (`30074357740995102`), with
+> zero failures or ignores and 466 deliberately filtered cases. Remote commands
+> and durable wrappers returned zero with terminal acknowledgment. The earlier
+> full FAT/facade run passed 515 tests, zero failures and one native opt-in ignore
+> on the same production source with the preceding test-iterator spelling
+> (overlay `c7dd1dceddd5c96a8074dac509033d585e61bee63b7f980e02308466243234ad`).
+> The corrected iterators visit the same sixteen 32-byte records; every old
+> assertion and write/sync tripwire remains. The earlier strict Clippy failure
+> on three constant `chunks_exact` calls is retained, rather than suppressed.
+> Logs are `check-082-array-chunks-vmi114-0113.log`,
+> `clippy-complete-082-array-chunks-0101.log`,
+> `fmt-082-array-chunks-ts1-0103.log` and
+> `tests-082-parent-array-chunks-0101.log` under the local verification log root.
+> The later `5c7d8d76b` FAT root-expansion implementation is outside this cut.
+>
+> Default `cargo bench -j1 -p ffs-harness` also completed with 60 timing intervals
+> across `metadata_parse` and `ondisk_parse` (RCH `30074357740994956`, base
+> `990539073` plus overlay
+> `a7eafb081c533557501747facea8c7567b1b154dcbea9fbff7afb59649f39eea`).
+> This is maintenance qualification, with no incumbent-relative speedup claim.
+> Fresh targeted UBS over all six changed Rust files still returns one:
+> three critical reports, 453 warnings and 157 information items. The three
+> critical sites are test-only CLI-variant and read-only write/sync panic
+> tripwires. They remain intact; no scanner rule, exclusion, baseline filter or
+> assertion was weakened. Independent scanner disposition and publication remain
+> open. No clean UBS, functional closure, native writer or field proof is claimed.
 
 > **Native NTFS mounted slice, 2026-10-21:** the current RCH-delivered Linux CLI
 > candidate `3effe8ed21c9af9b5b0f537451e9f64fce869d58ce3d986ebbeb6eb0754d9d76`

@@ -109,10 +109,18 @@ public consumer then passed another 52 calls on freshly natively produced ext4
 and btrfs images: plain/bounded windows, eight native payload readbacks, 28
 payload comparisons, Unicode and empty files, ranged reads and four typed
 missing-path failures. All source, image, tool and executable hashes remained
-unchanged during verification. This adds offline read evidence for those two
-formats; APFS native acceptance is separate. Benchmark and later shared-source compiler
-gates remain open under `bd-native-image-library-s4tde`. These bounded results
-do not constitute release acceptance.
+unchanged during verification. Together these refreshes executed 280 public
+calls across ext4, btrfs, FAT16, FAT32, NTFS and ZFS.
+
+The default harness benchmarks completed with 60 timing intervals. A later
+frozen `08226b8cb` plus recorded overlays passed workspace/all-target checking,
+strict Clippy and full formatting through RCH. Its full FAT/facade run passed
+515 tests; all nine parent-repair tests passed again after equivalent test
+iterator corrections. Exact source cuts and logs are in `FEATURE_PARITY.md`
+and `.beads/pending_tasks.md`. The later FAT root-expansion feature is outside
+those cuts. UBS still reports three test-only panic tripwires; their separate
+review and publication remain open under `bd-native-image-library-s4tde`.
+These bounded results do not constitute release acceptance.
 Explicit native checks require their real producer tools:
 
 ```bash
