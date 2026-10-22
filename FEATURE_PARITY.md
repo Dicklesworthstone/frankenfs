@@ -309,8 +309,9 @@
 > ZFS:56 files,236 byte comparisons,20 EROFS/20 ENOENT refusals and six typed
 > command negatives. Every daemon exited0 after unmount, all47 controls unchanged.
 > NTFS includes indexed compressed views; ZFS includes divergent ZPL4/5 head/
-> snapshots, hard links and sparse reads. All45 facade/example tests and remote
-> workspace check/strict Clippy/fmt passed. The first probe correctly refused a
+> snapshots, hard links and sparse reads.45 facade/example tests passed with one
+> existing native-producer ignore; remote workspace check/strict Clippy/fmt passed.
+> The first probe correctly refused a
 > mistaken64MiB FAT32 window; corrected native BPB128MiB bounds passed without
 > changing product code or dropping checks. These are retained native inputs and
 > payload captures, with kernel-clamped EOF, not fresh native producer, writable,

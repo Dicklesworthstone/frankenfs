@@ -89,8 +89,9 @@ public-consumer path passed on retained native fixtures across all six formats:
 write-open refusals and 20 missing-path refusals. Every mount unmounted and its
 daemon exited successfully; all 47 image/payload/tool/executable controls stayed
 unchanged. This includes strict/indexed and compressed NTFS views and divergent
-ZFS head/snapshot views. The current source also passed all 45 facade/example
-tests, workspace/all-target checking, strict Clippy and formatting. Exact source
+ZFS head/snapshot views. The current source also passed 45 facade/example tests
+(one existing native-producer test remained ignored), workspace/all-target
+checking, strict Clippy and formatting. Exact source
 cuts, failed attempts and readback receipts are in `.beads/pending_tasks.md`.
 These are kernel reads of retained native inputs and captured native payloads,
 with kernel-clamped EOF checks; no writable, crash, performance or field claim.
