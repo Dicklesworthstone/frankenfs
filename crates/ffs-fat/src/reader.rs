@@ -7,6 +7,8 @@
 
 mod check;
 pub use check::{CheckIssue, FatCheckReport};
+mod directory;
+pub use directory::DirectoryReader;
 pub mod recovery;
 pub mod replacement;
 mod stream;
@@ -352,92 +354,22 @@ impl FatVolume {
     }
 
     pub fn list(&self, cx: &Cx, directory: Directory) -> Result<Vec<Entry>> {
-        checkpoint(cx)?;
-        let mut decoder = FatDirectoryDecoder::default();
+        let mut reader = self.open_directory_reader(cx, directory)?;
         let mut entries = Vec::new();
-        let mut slots = 0_usize;
-        let fixed = match directory {
-            Directory::Root => self.geometry.fixed_root(),
-            Directory::Cluster(_) => None,
-        };
-        if let Some((start, length)) = fixed {
-            let mut bytes = allocate(self.geometry.sector_bytes() as usize)?;
-            for offset in (start..start + length).step_by(bytes.len()) {
-                self.read_exact(cx, offset, &mut bytes)?;
-                self.decode_directory(&mut decoder, &bytes, offset, &mut entries, &mut slots)?;
-                if decoder.ended() {
-                    break;
-                }
+        while let Some(entry) = reader.next_entry(cx)? {
+            if entries.len() == entries.capacity() {
+                let additional = entries
+                    .len()
+                    .max(16)
+                    .min(MAX_DIRECTORY_SLOTS - entries.len());
+                entries.try_reserve_exact(additional).map_err(|error| {
+                    FfsError::Format(format!("FAT directory allocation failed: {error}"))
+                })?;
             }
-        } else {
-            let first = match directory {
-                Directory::Root => self.geometry.root_cluster(),
-                Directory::Cluster(cluster) => cluster,
-            };
-            // The end-of-directory marker ends the namespace, not the native
-            // allocation chain. Validate every allocated link before returning
-            // a listing, including unused tail clusters after that marker.
-            let clusters = self.allocation_chain(
-                cx,
-                first,
-                1,
-                self.cluster_offset(first)?,
-                (MAX_DIRECTORY_SLOTS * 32).div_ceil(self.geometry.cluster_bytes() as usize),
-            )?;
-            let mut bytes = allocate(self.geometry.cluster_bytes() as usize)?;
-            for cluster in clusters {
-                checkpoint(cx)?;
-                let offset = self.cluster_offset(cluster)?;
-                self.read_exact(cx, offset, &mut bytes)?;
-                self.decode_directory(&mut decoder, &bytes, offset, &mut entries, &mut slots)?;
-                if decoder.ended() {
-                    break;
-                }
-            }
+            entries.push(entry);
         }
         checkpoint(cx)?;
         Ok(entries)
-    }
-
-    fn decode_directory(
-        &self,
-        decoder: &mut FatDirectoryDecoder,
-        bytes: &[u8],
-        offset: u64,
-        entries: &mut Vec<Entry>,
-        slots: &mut usize,
-    ) -> Result<()> {
-        for (index, slot) in bytes.as_chunks::<32>().0.iter().enumerate() {
-            if *slots >= MAX_DIRECTORY_SLOTS {
-                return Err(FfsError::UnsupportedFeature(
-                    "FAT directory exceeds 65536 slots".into(),
-                ));
-            }
-            *slots += 1;
-            let position = offset + (index as u64) * 32;
-            let native = decoder
-                .push(slot, self.geometry.kind())
-                .map_err(|error| corrupt(position, error.to_string()))?;
-            if let Some(native) = native {
-                if native.short_name == *b".          " || native.short_name == *b"..         " {
-                    continue;
-                }
-                if native.is_directory() || native.first_cluster != 0 {
-                    self.cluster_offset(native.first_cluster)?;
-                } else if native.size != 0 {
-                    return Err(corrupt(position, "nonempty FAT file has no first cluster"));
-                }
-                entries.push(Entry {
-                    offset: position,
-                    native,
-                    oem_code_page: self.oem_code_page,
-                });
-            }
-            if decoder.ended() {
-                break;
-            }
-        }
-        Ok(())
     }
 
     pub fn lookup(&self, cx: &Cx, directory: Directory, name: &str) -> Result<Entry> {
@@ -447,7 +379,11 @@ impl FatVolume {
         }
         let mut found = None;
         let key = self.oem_code_page.name_key(name);
-        for entry in self.list(cx, directory)? {
+        // Do not stop at the first match. A later alias collision, unreadable
+        // record or invalid entry must still defeat both positive and negative
+        // lookup; only the candidate, not every sibling, is retained.
+        let mut reader = self.open_directory_reader(cx, directory)?;
+        while let Some(entry) = reader.next_entry(cx)? {
             checkpoint(cx)?;
             let displayed = entry.name()?;
             let short = entry.short_alias();
