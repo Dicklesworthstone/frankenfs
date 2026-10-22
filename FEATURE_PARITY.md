@@ -282,11 +282,21 @@
 > workspace/all-target check and strict Clippy passed on that final cut.
 > Controls cover fragmented/fixed roots, late errors and collisions, cancellation,
 > complete-chain admission, native names and bounded cursor retention. FsOps
-> still materializes complete listings. The initial combined binary build
-> timed out137; current-binary delivery and native/mounted qualification remain
-> pending. The three-file directory UBS review remains red on two test panic
-> tripwires, which are preserved. This is Rust execution evidence, not a native,
-> performance, writable/crash or field result. Exact cuts and commands are in
+> still materializes complete listings. Final `cc181764` CLI/public binaries
+> (`dc4dc81527c4`/`838ee076b942`) subsequently passed the unchanged native runner:
+> six producer scenarios, eight public profiles/16 plain-bounded views and all
+> 2,832 exact command statuses. The public consumer executed 1,688 calls with
+> 1,368 byte comparisons,228 stats,44 listings,16 write refusals and32 expected
+> failures. Eight actual read-only FUSE mounts passed, including the expanded
+> FAT16 root and recovered FAT32 outputs:112 full/range/stat file cases, eight
+> EROFS write-open refusals and eight statfs checks. All mounts exited cleanly;
+> backing/sentinel and executor hashes remained unchanged. The first derived
+> mounted-file count incorrectly included two files added after unmount; the
+> retained correction establishes112, not114. The initial combined binary build
+> timed out137 before the successful standalone builds. Directory UBS remains
+> red on two preserved test panic tripwires; independent scanner disposition
+> and original acceptance remain open. This is bounded Rust/native read evidence,
+> with no performance, general writable/crash or field claim. Exact cuts and commands are in
 > `.beads/pending_tasks.md`; the API contract is in
 > [the FAT read profile](docs/FAT_READ_PROFILE.md).
 

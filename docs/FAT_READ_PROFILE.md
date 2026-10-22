@@ -440,6 +440,22 @@ This bounds cursor retention without claiming a measured speedup or bounded
 memory for callers that collect the entire directory themselves. The FsOps
 adapter still materializes listings for its complete namespace validation.
 
+The 2026-10-22 directory-cursor cut has executed Rust and native qualification.
+Final `cc181764` CLI/public binaries (`dc4dc81527c4`/`838ee076b942`) passed the
+unchanged six-scenario native runner with 16 plain/bounded public views and
+eight real read-only FUSE mounts, including the actual expanded-root and
+FSInfo-recovered outputs. Native tools supplied independent file/name/allocation
+references. The 1,688 public calls include 1,368 byte comparisons and32 expected
+failures; all 2,832 runner commands matched their exact expected statuses.
+Mounted checks covered112 file cases with full bytes, unaligned ranges and
+sizes, plus eight EROFS write-open refusals and statfs checks. The populated-image
+mounts precede a later native file addition, so those files are included in
+public reads but not mounted counts. Readback confirmed unchanged backing and
+sentinel hashes, unchanged executables and no remaining owned mounts. Exact
+source receipts and retained logs are in `.beads/pending_tasks.md`. Independent
+scanner review remains open; these results do not qualify performance or general
+writable/crash behavior.
+
 Path commands and mounts use lossless UTF-8 LFNs and short names decoded with
 the explicit `--oem-code-page ascii|437|850` option. The default `ascii` preserves
 the conservative refusal of non-ASCII OEM-only names. FAT stores no OEM code-page
