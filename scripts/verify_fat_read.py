@@ -86,17 +86,29 @@ class Run:
                 expected_returncode: int = 0) -> bytes:
         self.sequence += 1
         command = [str(arg) for arg in args]
-        result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
         prefix = self.root / f"command-{self.sequence:03d}"
-        prefix.with_suffix(".json").write_text(
-            json.dumps({"argv": command, "returncode": result.returncode,
-                        "expected_returncode": expected_returncode}, indent=2) + "\n"
-        )
-        prefix.with_suffix(".stderr").write_bytes(result.stderr)
-        prefix.with_suffix(".stdout").write_bytes(result.stdout)
+        record = {"argv": command, "returncode": None,
+                  "expected_returncode": expected_returncode,
+                  "timeout_seconds": timeout, "status": "running"}
+        with prefix.with_suffix(".json").open("x") as metadata:
+            metadata.write(json.dumps(record, indent=2) + "\n")
+        try:
+            # Direct file capture retains partial bytes even when run() raises.
+            # Exclusive creation also prevents a reused root from erasing logs.
+            with prefix.with_suffix(".stdout").open("xb") as stdout, \
+                    prefix.with_suffix(".stderr").open("xb") as stderr:
+                result = subprocess.run(command, stdout=stdout, stderr=stderr,
+                                        timeout=timeout, check=False)
+            record.update(status="completed", returncode=result.returncode)
+        except BaseException as error:
+            status = "timeout" if isinstance(error, subprocess.TimeoutExpired) else "failed"
+            record.update(status=status, error=f"{type(error).__name__}: {error}")
+            raise
+        finally:
+            prefix.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
         check(result.returncode == expected_returncode,
               f"unexpected command status: {command!r}; see {prefix}.stderr")
-        return result.stdout
+        return prefix.with_suffix(".stdout").read_bytes()
 
     def mounted(self, image: Path, payloads: dict[str, bytes]) -> None:
         mountpoint = self.root / f"{image.stem}-mount"
@@ -989,7 +1001,7 @@ def main() -> None:
     root = Path(tempfile.mkdtemp(prefix="ffs-fat-native-"))
     print(f"Retaining native images and command logs in {root}", flush=True)
     run = Run(binary, root, facade)
-    report = {"candidate_sha256": digest(binary), "native_tool_locale": native_locale,
+    report = {"status": "running", "candidate_sha256": digest(binary), "native_tool_locale": native_locale,
               "tool_paths": {tool: shutil.which(tool) for tool in tools},
               "scenarios": []}
     if facade:
@@ -1005,6 +1017,10 @@ def main() -> None:
             populated = run.populated(bits, args.mounted)
             report["scenarios"].append(populated)
             print(json.dumps(populated), flush=True)
+        report["status"] = "passed"
+    except BaseException as error:
+        report.update(status="failed", error=f"{type(error).__name__}: {error}")
+        raise
     finally:
         (root / "result.json").write_text(json.dumps(report, indent=2) + "\n")
 
