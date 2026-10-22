@@ -300,6 +300,24 @@
 > `.beads/pending_tasks.md`; the API contract is in
 > [the FAT read profile](docs/FAT_READ_PROFILE.md).
 
+> **Public read-only facade mounts, 2026-10-22:** the existing `native_reader`
+> consumer now mounts its already-admitted `Box<dyn FsOps>` through the shared
+> FUSE transport. Foreground mounts retain bounds and explicit NTFS/ZFS views,
+> refuse nonempty/invalid/hidden-backing mountpoints and expose no write or
+> privilege switches. Executable `763c430d3fc8` from `7b1f93a31` + `23f5c784`
+> passed twenty actual kernel mounts across ext4, btrfs, FAT16, FAT32, NTFS and
+> ZFS:56 files,236 byte comparisons,20 EROFS/20 ENOENT refusals and six typed
+> command negatives. Every daemon exited0 after unmount, all47 controls unchanged.
+> NTFS includes indexed compressed views; ZFS includes divergent ZPL4/5 head/
+> snapshots, hard links and sparse reads. All45 facade/example tests and remote
+> workspace check/strict Clippy/fmt passed. The first probe correctly refused a
+> mistaken64MiB FAT32 window; corrected native BPB128MiB bounds passed without
+> changing product code or dropping checks. These are retained native inputs and
+> payload captures, with kernel-clamped EOF, not fresh native producer, writable,
+> crash, performance, field or whole-format parity proof. Original scanner/status
+> acceptance and canonical WAL recovery remain open. Exact receipts are in
+> `.beads/pending_tasks.md`.
+
 > **Public NTFS indexed selection, 2026-10-22:** explicit
 > `ReadOnlyBackend::Ntfs { indexed_lookup: true }` now selects the existing
 > index-directed FsOps constructor; automatic and explicit strict views retain

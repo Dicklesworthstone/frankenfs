@@ -48,8 +48,15 @@ subcommand. Its ordinary and exact named-stream paths use the selected mode;
 conflicting ZFS dataset/snapshot selectors are rejected during argument parsing.
 Its foreground `mount` subcommand passes the admitted strict or indexed FsOps
 directly to the shared read-only FUSE transport. Kernel-mount execution of this
-new public-consumer path remains pending; the older strict companion mounts
-below are separate evidence.
+new public-consumer path passed six NTFS views: strict/indexed plain/bounded
+images and indexed actual LZNT1 data with 512-byte/4096-byte clusters. All sixteen
+files and 64 full/range/EOF comparisons passed, with six EROFS write-open and
+six ENOENT refusals, clean unmounts and unchanged hashes. These cases are part
+of the twenty-mount public-facade run across all six formats, using executable
+`763c430d3fc8` from `7b1f93a31` plus overlay `23f5c784`. Inputs and native payload
+captures were retained; EOF may be kernel-clamped. The older strict companion
+mounts below are separate evidence. No performance or general integrity claim
+follows from these mounted reads.
 
 ```sh
 native_reader volume.img --ntfs-indexed-lookup read /report.bin --start 507 --bytes 1031

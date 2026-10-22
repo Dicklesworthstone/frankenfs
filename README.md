@@ -84,7 +84,16 @@ until unmount; use `fusermount3 -u /mnt/ffs` on Linux to end the foreground
 session. Volume bounds and explicit NTFS/ZFS view selections apply to mounts
 as they do to offline reads. This consumer has no writable, `allow_other`,
 device-node or set-ID mount switches. Kernel-mount qualification for this new
-public-consumer path is pending; older companion mounts do not establish it.
+public-consumer path passed on retained native fixtures across all six formats:
+20 mounts, 56 files, 236 full/range/EOF/sparse byte comparisons, 20 read-only
+write-open refusals and 20 missing-path refusals. Every mount unmounted and its
+daemon exited successfully; all 47 image/payload/tool/executable controls stayed
+unchanged. This includes strict/indexed and compressed NTFS views and divergent
+ZFS head/snapshot views. The current source also passed all 45 facade/example
+tests, workspace/all-target checking, strict Clippy and formatting. Exact source
+cuts, failed attempts and readback receipts are in `.beads/pending_tasks.md`.
+These are kernel reads of retained native inputs and captured native payloads,
+with kernel-clamped EOF checks; no writable, crash, performance or field claim.
 
 At merged revision `ff3dca7ec`, workspace/all-target checking and strict Clippy
 passed through RCH. Earlier executed engine suites passed FAT 452, NTFS 344,
@@ -110,9 +119,10 @@ indexed-lookup repair and the indexed FsOps constructor below.
 A current RCH-built NTFS CLI subsequently passed four strict read-only kernel
 FUSE mounts on retained native plain, bounded and compressed images: 24 mounted
 byte comparisons and eight EROFS/ENOENT refusals, with successful unmounts and
-unchanged backing hashes. An independent rerun passed. This covers the strict
-NTFS adapter; indexed FsOps mounting and acceptance across all mounted formats
-remain open. The standalone public consumer built from `990539073` plus
+unchanged backing hashes. An independent rerun passed. Those companion mounts
+covered the strict NTFS adapter; the public-consumer qualification above adds
+the named indexed and six-format mounted slice. The standalone public consumer
+built from `990539073` plus
 explicit overlays also passed 228 calls on retained native FAT16/FAT32, NTFS
 and ZFS images, including nine expected semantic failures and unchanged backing
 hashes. The full harness subsequently passed 2,652 tests, zero failures and 11
