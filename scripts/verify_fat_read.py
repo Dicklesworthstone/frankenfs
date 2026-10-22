@@ -430,8 +430,126 @@ class Run:
         check(digest(image) == before, f"candidate changed FAT{bits} image bytes")
         self.command("fsck.fat", "-n", image)
         check(digest(image) == before, "read-only native checker changed the image")
+        root_growth = self.root_growth(image, payloads) if bits == 16 else None
         return {"format": f"FAT{bits}", "image_sha256": before,
-                "files_checked": len(payloads), "mounted": mounted, "result": "passed"}
+                "files_checked": len(payloads), "mounted": mounted,
+                "root_growth": root_growth, "result": "passed"}
+
+    def root_growth(self, original: Path, payloads: dict[str, bytes]) -> dict[str, object]:
+        """Fill a native FAT16 root, grow it, and interchange both writers."""
+        original_hash = digest(original)
+        source = self.root / "root-growth-source.img"
+        with original.open("rb") as old, source.open("xb") as new:
+            shutil.copyfileobj(old, new, 1024 * 1024)
+
+        def records(image: Path) -> tuple[int, bytes]:
+            with image.open("rb") as stream:
+                boot = stream.read(512)
+                sector = int.from_bytes(boot[11:13], "little")
+                slots = int.from_bytes(boot[17:19], "little")
+                start = (int.from_bytes(boot[14:16], "little")
+                         + boot[16] * int.from_bytes(boot[22:24], "little")) * sector
+                check(sector == 512 and slots in (512, 1024),
+                      "root-growth fixture has an unexpected native layout")
+                stream.seek(start)
+                data = stream.read(slots * 32)
+            check(len(data) == slots * 32, "native root records are truncated")
+            return slots, data
+
+        slots, data = records(source)
+        check(slots == 512, "native producer did not create the declared fixed root")
+        empty = self.root / "root-growth-empty.bin"
+        with empty.open("xb"):
+            pass
+        ended = False
+        free = 0
+        for at in range(0, len(data), 32):
+            ended |= data[at] == 0
+            free += ended or data[at] == 0xE5
+        check(0 < free <= slots, "native fixture has no root slots to fill")
+        for index in range(free):
+            self.command("mcopy", "-i", source, empty, f"::/F{index:07d}.BIN")
+        _, full = records(source)
+        check(all(full[at] not in (0, 0xE5) for at in range(0, len(full), 32)),
+              "native tools did not fill every root slot")
+        payload = self.root / "root-growth-payload.bin"
+        expected_payload = bytes(range(251)) * 19 + b"native root growth\n"
+        with payload.open("xb") as stream:
+            stream.write(expected_payload)
+        self.command("mcopy", "-i", source, payload, "::/MORE.BIN", expected_returncode=1)
+        refusal = self.root / f"command-{self.sequence:03d}.stderr"
+        check(b"no directory slots" in refusal.read_bytes().lower(),
+              "native create failed for a reason other than exhausted root capacity")
+        self.command("fsck.fat", "-n", source)
+        source_hash = digest(source)
+        checked = json.loads(self.command(self.binary, "check", source))
+        check(checked["clean"] is True and checked["complete"] is True and
+              checked["namespace_complete"] is True, "full native root failed admission")
+        output = self.root / "root-growth-expanded.img"
+        resize = [self.binary, "resize", source, "--output", output, "--size-mib", "64",
+                  "--root-entries", "1024", "--offline-image"]
+        preview = json.loads(self.command(*resize, "--dry-run"))
+        check(not output.exists() and digest(source) == source_hash,
+              "root-growth dry run created output or changed source")
+        check(preview["source_root_entries"] == 512 and preview["output_root_entries"] == 1024,
+              "root-growth plan reports the wrong native capacities")
+        grown = json.loads(self.command(*resize))
+        check(grown["source_modified"] is False and grown["root_directory_expanded"] is True
+              and grown["source_volume_bytes"] == source.stat().st_size
+              and grown["relocated_clusters"] == 0 and grown["cluster_numbers_preserved"] is True,
+              "root growth changed its source or native cluster identity")
+        check(output.stat().st_size == 64 * 1024 * 1024,
+              "root growth did not preserve the requested output length")
+        slots, expanded = records(output)
+        check(slots == 1024 and expanded[:len(full)] == full
+              and expanded[len(full):] == bytes(len(full)),
+              "root growth changed old native records or failed to add zeroed storage")
+        self.command("fsck.fat", "-n", output)
+        for name, expected in payloads.items():
+            check(self.command("mcopy", "-i", output, f"::/{name}", "-") == expected,
+                  f"native read after root growth differs: {name}")
+            check(self.command(self.binary, "cat", output, f"/{name}") == expected,
+                  f"FrankenFS read after root growth differs: {name}")
+        bounded = self.root / "root-growth-bounded.img"
+        with bounded.open("xb") as wrapped, source.open("rb") as plain:
+            wrapped.write(b"P" * 4096)
+            shutil.copyfileobj(plain, wrapped, 1024 * 1024)
+            wrapped.write(b"S" * 4096)
+        bounded_hash = digest(bounded)
+        bounded_output = self.root / "root-growth-bounded-expanded.img"
+        selected = json.loads(self.command(
+            self.binary, "resize", bounded, "--offset", "4096", "--length", str(source.stat().st_size),
+            "--output", bounded_output, "--size-mib", "64", "--root-entries", "1024", "--offline-image"))
+        check(selected["source_volume_offset"] == 4096 and selected["source_modified"] is False
+              and digest(bounded) == bounded_hash and digest(bounded_output) == digest(output),
+              "bounded root growth changed sentinels or included neighboring storage")
+        self.command("fsck.fat", "-n", bounded_output)
+        self.command("mcopy", "-i", output, payload, "::/MORE.BIN")
+        check(self.command(self.binary, "cat", output, "/MORE.BIN") == expected_payload,
+              "native creation did not use the expanded root correctly")
+        self.command("fsck.fat", "-n", output)
+        created = json.loads(self.command(self.binary, "replace", output, "/FFSNEW.BIN",
+                                         "--source", payload, "--create", "--offline-image"))
+        check(created["created_new_file"] is True, "FrankenFS did not create in the expanded root")
+        check(self.command("mcopy", "-i", output, "::/FFSNEW.BIN", "-") == expected_payload,
+              "native tools cannot read FrankenFS creation in the expanded root")
+        self.command("fsck.fat", "-n", output)
+        before_refusal = digest(output)
+        self.command(*resize, expected_returncode=1)
+        refusal = self.root / f"command-{self.sequence:03d}.stderr"
+        check(b"output already exists" in refusal.read_bytes().lower(),
+              "repeated root growth failed for a reason other than existing output")
+        check(digest(output) == before_refusal and digest(source) == source_hash
+              and digest(original) == original_hash, "root growth or refusal changed an existing source/output")
+        for name, expected in payloads.items():
+            check(self.command("mcopy", "-i", output, f"::/{name}", "-") == expected,
+                  f"new writes damaged a preserved file after root growth: {name}")
+        checked = json.loads(self.command(self.binary, "check", output))
+        check(checked["clean"] is True and checked["complete"] is True and
+              checked["namespace_complete"] is True, "expanded native root failed final verification")
+        return {"filled_native_slots": free, "source_root_entries": 512, "output_root_entries": 1024,
+                "source_sha256": source_hash, "bounded_sha256": bounded_hash,
+                "output_sha256": before_refusal, "preserved_files": len(payloads), "result": "passed"}
 
 
 def main() -> None:
