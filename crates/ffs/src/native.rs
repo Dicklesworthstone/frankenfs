@@ -13,7 +13,7 @@ use ffs_types::ByteOffset;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// An explicitly selected volume inside an additional backing image.
+/// An explicitly selected volume or journal inside an additional backing image.
 /// The file must remain offline and immutable for the lifetime of the reader.
 #[derive(Debug, Clone)]
 pub struct ImageSource {
@@ -30,10 +30,13 @@ pub enum ReadOnlyBackend {
     #[default]
     Auto,
     Ext4 {
+        /// The JBD2 volume, with the same regular-file, lock and bounds admission
+        /// as the data image. Recovery writes only to the volatile data overlay.
         external_journal: Option<ImageSource>,
     },
     Btrfs {
         root: BtrfsMountSelection,
+        /// Each member retains its admitted descriptor through nested views.
         additional_devices: Vec<ImageSource>,
     },
     Fat {

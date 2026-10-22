@@ -59,6 +59,13 @@ image handles, refuses ambiguous signatures and keeps native admission rules.
 Options preserve volume bounds, FAT OEM selection, btrfs roots/devices and ZFS
 pool/candidate/dataset/snapshot/device selection. ext4 recovery stays in memory.
 Callers supply their own context and keep backing images offline and immutable.
+Auxiliary ext4 journals, btrfs devices and ZFS members use `ImageSource` with
+their own offset and length. Each receives the same regular-file, OS-read-only
+and shared-lock admission as the primary image. The facade passes these handles
+into the engines; ext4 replay and journal pairing share one descriptor, and
+nested btrfs views retain the admitted member handles. Direct core consumers can
+use `OpenFs::from_devices` for already-open auxiliary devices; it refuses mixed
+path/handle auxiliary options.
 For NTFS, `ReadOnlyFs::ntfs_volume()` borrows the same admitted volume for exact
 UTF-16 named-stream selection, including streams stored in extension records.
 Native stream access has executed through the standalone public consumer on
@@ -89,7 +96,7 @@ public-consumer path passed on retained native fixtures across all six formats:
 write-open refusals and 20 missing-path refusals. Every mount unmounted and its
 daemon exited successfully; all 47 image/payload/tool/executable controls stayed
 unchanged. This includes strict/indexed and compressed NTFS views and divergent
-ZFS head/snapshot views. The current source also passed 45 facade/example tests
+ZFS head/snapshot views. The mount-qualified source passed 45 facade/example tests
 (one existing native-producer test remained ignored), workspace/all-target
 checking, strict Clippy and formatting. Exact source
 cuts, failed attempts and readback receipts are in `.beads/pending_tasks.md`.
