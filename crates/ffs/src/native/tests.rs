@@ -243,7 +243,7 @@ fn external_journal_uses_bounded_locked_descriptor_for_overlay_replay() {
     for (offset, value) in [
         (0, 0xC03B_3998_u32),
         (4, 4),
-        (8, 1),
+        (8, 0),
         (12, 4096),
         (16, 8),
         (20, 1),

@@ -7428,7 +7428,12 @@ impl OpenFs {
             ));
         }
         Self::from_device_with_btrfs_devices(
-            cx, dev, options, None, external_journal, btrfs_additional,
+            cx,
+            dev,
+            options,
+            None,
+            external_journal,
+            btrfs_additional,
         )
     }
 
@@ -7826,10 +7831,14 @@ impl OpenFs {
             FsFlavor::Ext4(sb) if sb.journal_dev != 0 && !options.skip_validation => {
                 match external_journal {
                     Some(device) => Some(device),
-                    None => options.external_journal_path.as_ref().map(|path| {
-                        FileByteDevice::open_read_only(path)
-                            .map(|device| Arc::new(device) as Arc<dyn ByteDevice>)
-                    }).transpose()?,
+                    None => options
+                        .external_journal_path
+                        .as_ref()
+                        .map(|path| {
+                            FileByteDevice::open_read_only(path)
+                                .map(|device| Arc::new(device) as Arc<dyn ByteDevice>)
+                        })
+                        .transpose()?,
                 }
             }
             _ if external_journal.is_some() => {
@@ -56834,6 +56843,7 @@ mod tests {
         let cx = Cx::for_testing();
         let uuid = *b"journal-uuid-000";
         let mut image = build_ext4_image_with_inode();
+        image[EXT4_SUPERBLOCK_OFFSET + 0x5C] |= 4; // HAS_JOURNAL
         image[EXT4_SUPERBLOCK_OFFSET + 0xE4..EXT4_SUPERBLOCK_OFFSET + 0xE8]
             .copy_from_slice(&1_u32.to_le_bytes());
         set_test_journal_uuid(&mut image, uuid);
@@ -56849,17 +56859,27 @@ mod tests {
             let backing = TestDevice::from_vec(bytes.clone());
             let data = TestDevice::from_vec(image.clone());
             let device = VolumeDevice::new(
-                Arc::new(backing.clone()), ByteOffset(8192),
-                if defect == "truncated" { 4096 } else { journal.len() as u64 },
+                Arc::new(backing.clone()),
+                ByteOffset(8192),
+                if defect == "truncated" {
+                    4096
+                } else {
+                    journal.len() as u64
+                },
                 VolumeAccess::ReadOnly,
-            ).unwrap();
+            )
+            .unwrap();
             let options = OpenOptions {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
                 external_journal_path: (defect == "paths").then(|| "must-not-open.img".into()),
                 ..OpenOptions::default()
             };
             let opened = OpenFs::from_devices(
-                &cx, Box::new(data.clone()), &options, Some(Arc::new(device)), Vec::new(),
+                &cx,
+                Box::new(data.clone()),
+                &options,
+                Some(Arc::new(device)),
+                Vec::new(),
             );
             if defect == "healthy" {
                 let fs = opened.unwrap();
@@ -56867,7 +56887,10 @@ mod tests {
                 assert_eq!(replay.committed_sequences, vec![1]);
                 assert_eq!(replay.stats.replayed_blocks, 1);
                 assert!(fs.external_journal_info.as_ref().unwrap().uuid_match);
-                assert_eq!(&fs.read_block_vec(&cx, BlockNumber(15)).unwrap()[..16], b"EXT-JBD2-REPLAY!");
+                assert_eq!(
+                    &fs.read_block_vec(&cx, BlockNumber(15)).unwrap()[..16],
+                    b"EXT-JBD2-REPLAY!"
+                );
             } else {
                 assert!(opened.is_err(), "{defect} must not be admitted");
             }
@@ -98046,23 +98069,41 @@ mod tests {
             let data = TestDevice::from_vec(primary.clone());
             let backing = TestDevice::from_vec(bytes.clone());
             let bounded = VolumeDevice::new(
-                Arc::new(backing.clone()), ByteOffset(8192),
+                Arc::new(backing.clone()),
+                ByteOffset(8192),
                 if truncated { 65536 } else { seed.len() as u64 },
                 VolumeAccess::ReadOnly,
-            ).unwrap();
+            )
+            .unwrap();
             let opened = OpenFs::from_devices(
-                &cx, Box::new(data.clone()), &OpenOptions::default(), None,
+                &cx,
+                Box::new(data.clone()),
+                &OpenOptions::default(),
+                None,
                 vec![Arc::new(bounded)],
             );
             if truncated {
-                assert!(opened.is_err(), "btrfs admission must respect member bounds");
+                assert!(
+                    opened.is_err(),
+                    "btrfs admission must respect member bounds"
+                );
             } else {
                 let fs = opened.unwrap();
-                let file = fs.lookup(&cx, InodeNumber(1), OsStr::new("hello.txt")).unwrap();
-                assert_eq!(fs.read(&cx, file.ino, 0, 128).unwrap(), b"hello from btrfs fsops");
-                let (slot, _) = fs.btrfs_nested_slot_for(&cx, BTRFS_FS_TREE_OBJECTID, InodeNumber(1)).unwrap();
+                let file = fs
+                    .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+                    .unwrap();
+                assert_eq!(
+                    fs.read(&cx, file.ino, 0, 128).unwrap(),
+                    b"hello from btrfs fsops"
+                );
+                let (slot, _) = fs
+                    .btrfs_nested_slot_for(&cx, BTRFS_FS_TREE_OBJECTID, InodeNumber(1))
+                    .unwrap();
                 let nested = OpenFs::btrfs_nested_tag(slot, file.ino);
-                assert_eq!(fs.read(&cx, nested, 0, 128).unwrap(), b"hello from btrfs fsops");
+                assert_eq!(
+                    fs.read(&cx, nested, 0, 128).unwrap(),
+                    b"hello from btrfs fsops"
+                );
             }
             assert_eq!(data.snapshot_bytes(), primary);
             assert_eq!(backing.snapshot_bytes(), bytes);
