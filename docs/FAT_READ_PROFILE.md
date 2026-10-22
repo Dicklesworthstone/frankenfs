@@ -583,6 +583,16 @@ stdout/stderr/status and require unchanged images and consumer executable.
 This optional path exercises the existing FsOps FAT adapter; its materialized
 chain cache is distinct from the immutable bounded-index FileReader used by
 the companion's streaming selectors. It does not qualify a facade FUSE mount.
+Direct execution of this permanent method passed266 captured commands on
+2026-10-22 using current RCH-built consumer `eed90a44` (`ea0bc8afd` plus
+`7d13873c` overlays), with runner `9f3751c4`. Four retained native/expanded/
+recovered FAT images and eight plain/bounded views passed168 byte comparisons,
+28 file stats,16 exact native-name listings,8 write refusals and16 expected
+typed failures. All16 source/payload/tool/executable hashes remained unchanged.
+The full native producer runner with the new argument was not rerun in this
+refresh. EOF/zero-length output may be clamped by the consumer before FsOps;
+these calls do not prove a low-level EOF read occurred. The separate planted
+negative correctly rejected an executable that returned success without data.
 The added Rust unit tests cover independent byte layouts, error/cancellation
 propagation, malformed chains, partition bounds, LFN boundaries, FsOps and dates.
 Additional checker regressions retain raw malformed/orphaned LFN records,

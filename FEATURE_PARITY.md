@@ -245,6 +245,33 @@
 > remain intact. Exact hashes, source-cut distinctions, evidence and memory/
 > lifetime limits are in [the contract](docs/FAT_BOUNDED_FILE_READS.md).
 
+> **Current public reader refresh, 2026-10-22:** RCH build30075807208570969
+> returned zero/ACKtrue on `ea0bc8afd` plus final nine-overlay `7d13873c`.
+> Public consumer ELF `eed90a44` passed four check groups, 644 captured commands
+> including 516 public calls and 29 expected semantic failures. The permanent
+> FAT runner's new `--facade-binary` / `Run.public_reads` path (`9f3751c4`)
+> passed266 commands on four retained native/expanded/recovered images and
+> eight plain/bounded views:168 byte comparisons,28 file stats,16 native-name
+> listings,8 write refusals and16 exact failures. All16 input/payload/tool/
+> executable hashes remained unchanged. NTFS passed162 commands/120public
+> calls,152 comparisons and3 expected failures, including32 extension streams
+> and actual compressed inputs. Retained FAT/ZFS passed164 commands/108public
+> calls,6 fresh mcopy reads and50 comparisons of fresh outputs, with6 expected
+> failures. Retained ext4/btrfs passed52 public calls with exact prior outputs
+> and4 expected failures. The latter two groups include capture equivalence;
+> no new native pools or ext4/btrfs producer/oracle execution is claimed.
+> EOF is consumer-clamped. These results refresh offline public-reader
+> execution across all six formats, not facade mounting, mutable/native writer,
+> bounded FsOps cache memory, performance, crash or field acceptance. All146
+> prior FAT runner predicates remain intact; an empty-success substitute also
+> fails the first public listing check (separate planted-negative proof).
+> The full producer runner with its new optional argument was not rerun here;
+> its permanent public method executed directly on the four retained images.
+> Final ten-file UBS returns one with30 critical public-hash/test-tripwire
+> reports; all guards remain intact. Exact receipts are in
+> `.beads/pending_tasks.md`; scanner disposition and original acceptance remain
+> open.
+
 > **Native NTFS mounted slice, 2026-10-21:** the current RCH-delivered Linux CLI
 > candidate `3effe8ed21c9af9b5b0f537451e9f64fce869d58ce3d986ebbeb6eb0754d9d76`
 > passed 27 indexed positive calls, three semantic negatives and 25 byte
