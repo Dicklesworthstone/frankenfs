@@ -418,6 +418,26 @@ individual file allocation maps at 8,388,608 clusters; individual reads at
 chain caches at 1,024 files and 32 MiB of cluster addresses. These are admission
 and resource limits, not assertions of full FAT parity.
 
+Library callers can scan an immutable directory incrementally with
+`FatVolume::open_directory_reader(cx, directory)` and
+`DirectoryReader::next_entry(cx)`. The cursor retains one sector for a FAT16
+fixed root or one cluster for a cluster-backed directory, plus a bounded map
+of that directory's allocation chain. Raw UTF-16 names, OEM aliases and native
+short-slot offsets remain available in each returned `Entry`. `FatVolume::list`
+consumes the cursor into a complete vector; `FatVolume::lookup` scans it fully while retaining only
+the matching candidate, so a later invalid entry or alias collision still
+defeats lookup.
+
+Opening validates the complete allocation chain before returning any entries.
+Only `Ok(None)` certifies completion of the record scan; a later error does not
+retract entries already delivered to an incremental caller. Any error, including
+cancellation, permanently stops that cursor and requires reopening. Keep the
+backing and metadata immutable throughout its lifetime; an advisory lock or shared
+Rust borrow is not a snapshot. Mounted callers retain their operation gate.
+This bounds cursor retention without claiming a measured speedup or bounded
+memory for callers that collect the entire directory themselves. The FsOps
+adapter still materializes listings for its complete namespace validation.
+
 Path commands and mounts use lossless UTF-8 LFNs and short names decoded with
 the explicit `--oem-code-page ascii|437|850` option. The default `ascii` preserves
 the conservative refusal of non-ASCII OEM-only names. FAT stores no OEM code-page
