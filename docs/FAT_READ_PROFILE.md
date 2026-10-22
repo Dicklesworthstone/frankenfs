@@ -573,6 +573,12 @@ write-open, checks unchanged image hashes, and runs `fsck.fat -n`. Formatter
 scenarios also require exact refusal statuses and unchanged bytes when trying
 to format an existing path, and no destination for rejected partition options.
 All images and command logs are retained; missing prerequisites fail the run.
+Each command creates its metadata before launch and streams stdout/stderr to
+exclusively created files. Timeouts and launch failures retain their error and
+partial output; reusing a command-log path refuses to erase prior evidence.
+The top-level `result.json` has an explicit `status` of `passed` or `failed` on
+normal completion or a caught failure, with failure details and completed
+scenarios preserved. A hard interruption may leave a command marked `running`.
 With `--facade-binary`, each native-created, formatted and populated scenario
 also opens its image through the standalone public `ffs::open_read_only`
 consumer. `mcopy` defines payload bytes and `mdir` defines exact directory
@@ -593,6 +599,13 @@ The full native producer runner with the new argument was not rerun in this
 refresh. EOF/zero-length output may be clamped by the consumer before FsOps;
 these calls do not prove a low-level EOF read occurred. The separate planted
 negative correctly rejected an executable that returned success without data.
+The subsequent fresh-eyes review fixed missing timeout/launch evidence and
+ambiguous top-level failure status. Runner `2a60abbe` then passed the complete
+six-scenario FAT16/FAT32 producer workflow with pinned CLI `a45f6380` and facade
+`eed90a44`, including all eight facade profiles. This full run supersedes the
+earlier direct-method-only execution limit for this runner revision; it does
+not qualify later Rust changes or mounted operation. Exact logs and source
+identities are in `.beads/pending_tasks.md`.
 The added Rust unit tests cover independent byte layouts, error/cancellation
 propagation, malformed chains, partition bounds, LFN boundaries, FsOps and dates.
 Additional checker regressions retain raw malformed/orphaned LFN records,
