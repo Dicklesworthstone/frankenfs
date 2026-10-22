@@ -8,13 +8,13 @@
   },
   "summary": {
     "modules": 90,
-    "total_loc": 171849,
+    "total_loc": 172665,
     "conformance_modules": 24,
     "conformance_loc": 43825,
-    "conformance_loc_basis_points": 2550,
+    "conformance_loc_basis_points": 2538,
     "meta_modules": 66,
-    "meta_loc": 128024,
-    "meta_loc_basis_points": 7450
+    "meta_loc": 128840,
+    "meta_loc_basis_points": 7462
   },
   "modules": [
     {
@@ -170,7 +170,7 @@
     {
       "path": "src/lib.rs",
       "classification": "meta",
-      "loc": 3093
+      "loc": 3541
     },
     {
       "path": "src/log_contract.rs",
@@ -190,7 +190,7 @@
     {
       "path": "src/main.rs",
       "classification": "meta",
-      "loc": 11318
+      "loc": 11384
     },
     {
       "path": "src/metamorphic_workload_seed_catalog.rs",
@@ -455,7 +455,7 @@
     {
       "path": "src/writeback_cache_audit.rs",
       "classification": "meta",
-      "loc": 2876
+      "loc": 3178
     },
     {
       "path": "src/writeback_crash_matrix_executor.rs",
