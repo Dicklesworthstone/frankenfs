@@ -102,15 +102,30 @@ selected search range fail the whole resolution.
 
 ## Evidence
 
-The public-facade selection increment is authored; its new Rust/native gates
-are pending. The existing native-producer regression retains all original
-checks and adds automatic, explicit strict and indexed NTFS views on plain and
-bounded images. It also plants selected and unrelated FILE-signature damage in
-new copies located through the native MFT mapping: strict admission must reject
-both, indexed lookup must read an unaffected file, selected corruption must
-fail, and complete indexed readdir must detect both damaged targets. Source
-presence is not execution evidence; the older receipts below predate this
-facade option. No indexed kernel-mount or performance claim follows.
+The public consumer built from `4cae156cc` plus production overlay `8343adea`
+(ELF SHA-256 `1cd83f3db33c3eacb7cefb6fad16c1088600383bf1beec109ae69ebb673aa5b8`)
+passed 371 exact command statuses:328 public calls and43 fresh native-tool
+reads,309 byte comparisons and32 expected failures. Strict and indexed modes
+both read retained native plain/bounded images, actual compressed data with
+512-byte/4096-byte clusters, all32 extension streams and a13-node/two-level
+native directory index. All51 image/payload/tool/consumer control hashes stayed
+unchanged. The old consumer passes the initial comparisons but fails at the
+first indexed request; its failed result and all29 command records are retained.
+This is current runtime plus fresh native readback on retained native inputs,
+not newly produced images. EOF/zero-length requests may be consumer-clamped.
+
+The existing native-producer regression retains all original checks and adds
+automatic, explicit strict and indexed NTFS views on plain and bounded images.
+It also plants selected and unrelated FILE-signature damage in new copies
+located through the native MFT mapping: strict admission must reject both,
+indexed lookup must read an unaffected file, selected corruption must fail,
+and complete indexed readdir must detect both damaged targets. Compilation and
+execution of that expanded producer regression remain pending. Workspace check
+passed the initial cut; final formatting passed, while strict Clippy found an
+unrelated FAT cache visibility declaration which has been corrected and is being
+rerun. Source presence and publication are not execution evidence. Exact cuts,
+failures and retained logs are in `.beads/pending_tasks.md`. No indexed
+kernel-mount or performance claim follows.
 
 Seven new constructed-image Rust tests cover resident and external indexes,
 short aliases, Unicode, exact/insensitive/POSIX names, equal separators, selected
