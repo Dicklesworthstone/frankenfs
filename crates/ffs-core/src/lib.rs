@@ -9132,7 +9132,7 @@ impl OpenFs {
     /// Like kernel ext4 (`ext4_tmpfile` + `d_tmpfile`), the inode starts with no
     /// links and sits on the orphan list: the last kernel reference reclaims it
     /// (or mount-time recovery after a crash), and a later `link` that names it
-    /// takes it back off ([`Self::ext4_unorphan_inode`]). `parent` only places
+    /// takes it back off ([`Self::ext4_stage_unorphan_inode`]). `parent` only places
     /// the inode near its directory.
     fn ext4_tmpfile(
         &self,
@@ -9186,40 +9186,62 @@ impl OpenFs {
         Ok(inode_to_attr(sb, ino, &inode))
     }
 
-    /// Take a zero-link inode back off the orphan list once `link` names it
-    /// again (`O_TMPFILE` + `linkat`; kernel `ext4_link` -> `ext4_orphan_del`).
-    /// `victim_next` is the inode's old `i_dtime` (its orphan-list next link);
-    /// the caller has already written the inode with `dtime` 0. The caller
-    /// holds the allocation lock.
-    fn ext4_unorphan_inode(
+    /// Stage removal of a newly named `O_TMPFILE` inode from the orphan list.
+    /// The caller holds the allocation lock and supplies its publication
+    /// transaction's device. A returned head must be installed, and the pending
+    /// orphan removed, only after that transaction commits successfully.
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_stage_unorphan_inode(
         &self,
         cx: &Cx,
+        dev: &dyn BlockDevice,
         ino: InodeNumber,
         victim_next: u32,
         geo: &FsGeometry,
         groups: &[GroupStats],
         csum_seed: u32,
-    ) -> ffs_error::Result<()> {
+    ) -> ffs_error::Result<Option<u32>> {
         let ino_u32 = u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
             block: 0,
             detail: format!("unorphan: inode {ino} exceeds the ext4 32-bit inode range"),
         })?;
-        let mut prev: Option<u32> = None;
+        let mut prev = None;
         let mut next = self.ext4_read_orphan_head();
-        let mut steps = 0_u64;
+        let mut visited = BTreeSet::new();
         while next != 0 && next != ino_u32 {
-            prev = Some(next);
-            next = self.read_inode_raw(cx, InodeNumber(u64::from(next)))?.dtime;
-            steps = steps.saturating_add(1);
-            if steps > u64::from(u32::MAX) {
-                break; // cycle guard, as in the finalize walk
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if next > geo.total_inodes || !visited.insert(next) {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("unorphan: invalid or cyclic predecessor {next}"),
+                });
+            }
+            let predecessor = InodeNumber(u64::from(next));
+            let inode = self.read_inode_raw(cx, predecessor)?;
+            next = inode.dtime;
+            prev = Some(predecessor);
+        }
+        if next != ino_u32
+            || victim_next > geo.total_inodes
+            || victim_next == ino_u32
+            || visited.contains(&victim_next)
+        {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!("unorphan: inode {ino} has no valid orphan-list splice"),
+            });
+        }
+        match prev {
+            None => Ok(Some(victim_next)),
+            Some(predecessor) => {
+                // Preserve any fields this same publication already changed,
+                // including another inode sharing the predecessor's table block.
+                let mut inode = ffs_inode::read_inode(cx, dev, geo, groups, predecessor)?;
+                inode.dtime = victim_next;
+                ffs_inode::write_inode(cx, dev, geo, groups, predecessor, &inode, csum_seed)?;
+                Ok(None)
             }
         }
-        if next == ino_u32 {
-            self.ext4_splice_orphan_list(cx, prev, victim_next, geo, groups, csum_seed)?;
-        }
-        self.ext4_pending_orphans.lock().remove(&ino.0);
-        Ok(())
     }
 
     /// Write the superblock with the orphan list cleared (`s_last_orphan = 0`,
@@ -32469,7 +32491,7 @@ impl OpenFs {
     }
 
     /// Create a hard link in `new_parent/new_name` to existing inode `ino`.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn ext4_link(
         &self,
         cx: &Cx,
@@ -32493,6 +32515,10 @@ impl OpenFs {
 
         let mut alloc = alloc_mutex.write();
         let block_dev = self.block_device_adapter();
+        // Capture the conflict boundary before reading any inode that will be
+        // rewritten. A concurrent data request may finish its scope commit
+        // after releasing the allocator, and must not be overwritten by link.
+        let mut txn = self.mvcc_store.begin();
 
         let src_inode = self.read_inode(cx, ino)?;
         if src_inode.is_dir() {
@@ -32517,10 +32543,9 @@ impl OpenFs {
         }
         // Skip the redundant positive lookup_name on a non-casefold htree dir:
         // the insert (ext4_add_dir_entry -> add_entry_reject_existing) dup-checks
-        // the hash-correct leaf, and on a collision the rollback below rewrites the
-        // ORIGINAL source inode (undoing the link-count bump), so EEXIST + link
-        // accounting are unchanged — same guard as ext4_create/ext4_mkdir
-        // (bd-cc-mkdir-dedup). Casefold/linear dirs keep the pre-check.
+        // the hash-correct leaf. On collision the entire private transaction is
+        // discarded, including its source nlink update. Casefold/linear dirs
+        // keep the pre-check.
         let htree_dedup_covers = new_parent_inode.has_htree_index()
             && new_parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
             && Self::htree_create_dedup_enabled();
@@ -32539,56 +32564,94 @@ impl OpenFs {
         }
         src_upd.links_count = Self::ext4_checked_links_count_delta(src_upd.links_count, ino, 1)?;
         ffs_inode::touch_ctime(&mut src_upd, tstamp_secs, tstamp_nanos);
-        ffs_inode::write_inode(
-            cx,
-            &block_dev,
-            &alloc.geo,
-            &alloc.groups,
-            ino,
-            &src_upd,
-            csum_seed,
-        )?;
 
-        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
-        // before the error branch re-borrows `alloc` — NLL ends it at the backend's
-        // last use, so the explicit `drop` this comment used to name was a no-op and
-        // is gone. The ORDER is still the requirement.
-        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-        let add_result = self.ext4_add_dir_entry(
-            cx,
-            &mut backend,
-            new_parent,
-            &new_parent_inode,
-            new_name,
-            ino,
-            inode_dir_entry_file_type(&src_upd),
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-        );
-        if let Err(err) = add_result {
-            let block_dev = self.block_device_adapter();
-            ffs_inode::write_inode(
+        // Like symlink, link owns one namespace publication transaction. Keep
+        // allocation, both inode updates, the directory entry and any orphan
+        // predecessor splice private until the complete operation can commit.
+        let groups_before = alloc.groups.clone();
+        let staged = (|| -> ffs_error::Result<Option<u32>> {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                ffs_inode::write_inode(
+                    cx,
+                    &tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &src_upd,
+                    csum_seed,
+                )?;
+            }
+            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+            self.ext4_stage_dir_entry(
                 cx,
-                &block_dev,
-                &alloc.geo,
-                &alloc.groups,
+                &mut txn,
+                &mut backend,
+                new_parent,
+                &new_parent_inode,
+                new_name,
                 ino,
-                &src_inode,
+                inode_dir_entry_file_type(&src_upd),
                 csum_seed,
+                tstamp_secs,
+                tstamp_nanos,
             )?;
-            return Err(err);
+            let new_head = if was_orphan {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                self.ext4_stage_unorphan_inode(
+                    cx,
+                    &tx_dev,
+                    ino,
+                    src_inode.dtime,
+                    &alloc.geo,
+                    &alloc.groups,
+                    csum_seed,
+                )?
+            } else {
+                None
+            };
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            Ok(new_head)
+        })();
+        let new_head = match staged {
+            Ok(head) => head,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        let txn_id = txn.id();
+        let write_blocks = if self.repair_flush_lifecycle.is_some() {
+            txn.write_set().keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
+        {
+            Ok(seq) => seq,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        // Keep orphan insertion and finalization excluded until their runtime
+        // bookkeeping reflects the committed splice.
+        if let Some(head) = new_head {
+            self.ext4_write_orphan_head(head);
         }
         if was_orphan {
-            self.ext4_unorphan_inode(
-                cx,
-                ino,
-                src_inode.dtime,
-                &alloc.geo,
-                &alloc.groups,
-                csum_seed,
-            )?;
+            self.ext4_pending_orphans.lock().remove(&ino.0);
         }
+        drop(alloc);
+        self.prune_mvcc_after_commit_if_due(commit_seq);
+        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
 
         debug!(
             target: "ffs::write",
@@ -72656,9 +72719,11 @@ mod tests {
 
         // linkat(fd, "", root, "named", AT_EMPTY_PATH). `kept` sits mid-list,
         // behind `dropped`, so the splice rewrites `dropped`'s next link.
+        let before_link = fs.current_snapshot();
         let named = fs
             .link(&cx, kept.ino, root, OsStr::new("named"))
             .expect("link the tmpfile");
+        assert_eq!(fs.current_snapshot().high.0, before_link.high.0 + 1);
         assert_eq!(named.nlink, 1);
         let on_disk = fs.read_inode(&cx, kept.ino).expect("read named");
         assert_eq!(on_disk.dtime, 0, "a named inode is off the orphan list");
@@ -72696,6 +72761,21 @@ mod tests {
             free_before - 1,
             "only the named tmpfile still holds an inode"
         );
+
+        // Removing the head uses runtime s_last_orphan instead of a predecessor
+        // inode. It must still share the link's one publication boundary.
+        let head = fs.ext4_tmpfile(&cx, root, 0o600, 0, 0).unwrap();
+        assert_eq!(u64::from(fs.ext4_read_orphan_head()), head.ino.0);
+        let before_head = fs.current_snapshot();
+        fs.link(&cx, head.ino, root, OsStr::new("named_head"))
+            .unwrap();
+        assert_eq!(fs.current_snapshot().high.0, before_head.high.0 + 1);
+        assert_eq!(fs.ext4_read_orphan_head(), 0);
+        assert_eq!(fs.read_inode(&cx, head.ino).unwrap().dtime, 0);
+        assert_eq!(fs.getattr(&cx, head.ino).unwrap().nlink, 1);
+        assert!(!fs.ext4_pending_orphans.lock().contains(&head.ino.0));
+        assert!(!fs.finalize_unlinked_inode_public(&cx, head.ino).unwrap());
+        assert_eq!(fs.statfs(&cx, root).unwrap().files_free, free_before - 2);
 
         fs.flush_mvcc_to_device(&cx).expect("flush mvcc to device");
         std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
@@ -82529,6 +82609,242 @@ mod tests {
 
         let readback = fs.read(&cx, dst_attr.ino, 0, 64).expect("read via link");
         assert_eq!(&readback, b"linked-bytes");
+    }
+
+    #[test]
+    fn ext4_link_single_commit_preserves_snapshots_through_growth_and_reopen() {
+        for small_blocks in [false, true] {
+            let opened = if small_blocks {
+                open_ext4_mke2fs(16, true)
+            } else {
+                open_writable_ext4_mkfs_with_device(16).map(|(fs, dev, tmp)| {
+                    let image = tmp.path().join("test.ext4");
+                    (fs, dev, tmp, image)
+                })
+            };
+            let (fs, dev, _tmp, image) =
+                opened.expect("hard-link publication regression requires e2fsprogs");
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let source = fs
+                .create(&cx, root, OsStr::new("source"), 0o600, 0, 0)
+                .unwrap();
+            fs.write(&cx, source.ino, 0, b"shared payload").unwrap();
+            let parent = fs
+                .mkdir(&cx, root, OsStr::new("links"), 0o700, 0, 0)
+                .unwrap();
+            let names: Vec<_> = (0..40)
+                .map(|index| format!("alias_{index:03}_{}", "n".repeat(180)))
+                .collect();
+            for (index, name) in names.iter().enumerate() {
+                // Match the FUSE lifecycle and pin the pre-operation version.
+                let mut scope = fs.begin_request_scope(&cx, RequestOp::Link).unwrap();
+                let before = fs.current_snapshot();
+                let linked = FsOps::link(
+                    &fs,
+                    &cx,
+                    &mut scope,
+                    source.ino,
+                    parent.ino,
+                    OsStr::new(name),
+                )
+                .expect("link publication");
+                let after = fs.current_snapshot();
+                assert_eq!(after.high.0, before.high.0 + 1, "one publication per link");
+                assert_eq!(linked.nlink, u32::try_from(index + 2).unwrap());
+                assert_eq!(
+                    fs.read_inode_with_scope(&cx, &scope, source.ino)
+                        .unwrap()
+                        .links_count,
+                    u16::try_from(index + 1).unwrap(),
+                    "an old snapshot must retain the old link count"
+                );
+                let old_parent = fs.read_inode_with_scope(&cx, &scope, parent.ino).unwrap();
+                assert!(
+                    fs.read_dir_with_scope(&cx, &scope, &old_parent)
+                        .unwrap()
+                        .iter()
+                        .all(|entry| entry.name != name.as_bytes()),
+                    "the same old snapshot must not contain the new name"
+                );
+                assert_eq!(
+                    fs.lookup(&cx, parent.ino, OsStr::new(name)).unwrap().ino,
+                    source.ino
+                );
+                fs.commit_request_scope(&cx, &mut scope).unwrap();
+                assert_eq!(fs.current_snapshot(), after, "outer scope stays empty");
+                fs.end_request_scope(&cx, RequestOp::Link, scope).unwrap();
+            }
+            let parent_inode = fs.read_inode(&cx, parent.ino).unwrap();
+            assert!(
+                parent_inode.has_htree_index(),
+                "exercise indexed directory growth"
+            );
+            assert!(parent_inode.size > u64::from(fs.block_size()));
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+            let (clean, output) = run_e2fsck(&image).expect("hard-link oracle requires e2fsck");
+            assert!(
+                clean,
+                "hard links and directory growth must be native-clean: {output}"
+            );
+            drop(fs);
+            let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+                .expect("reopen hard-link image");
+            for name in names {
+                let alias = reopened.lookup(&cx, parent.ino, OsStr::new(&name)).unwrap();
+                assert_eq!(alias.ino, source.ino);
+                assert_eq!(alias.nlink, 41);
+                assert_eq!(
+                    reopened.read(&cx, alias.ino, 0, 64).unwrap(),
+                    b"shared payload"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_link_htree_collision_publishes_no_source_or_allocation_changes() {
+        let (fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("hard-link collision regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let names: Vec<_> = (0..32)
+            .map(|index| format!("entry_{index:03}_{}", "a".repeat(180)))
+            .collect();
+        for name in &names {
+            fs.create(&cx, root, OsStr::new(name), 0o600, 0, 0).unwrap();
+        }
+        assert!(fs.read_inode(&cx, root).unwrap().has_htree_index());
+        let source = fs.lookup(&cx, root, OsStr::new(&names[0])).unwrap();
+        let occupied = fs.lookup(&cx, root, OsStr::new(&names[1])).unwrap();
+        let before = fs.current_snapshot();
+        let before_bytes = dev.snapshot_bytes();
+        let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        let before_blocks = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+        let before_inodes = fs.count_free_inodes_in_group(&cx, GroupNumber(0)).unwrap();
+        let error = fs
+            .link(&cx, source.ino, root, OsStr::new(&names[1]))
+            .expect_err("duplicate htree name");
+        assert!(matches!(error, FfsError::Exists));
+        assert_eq!(
+            fs.current_snapshot(),
+            before,
+            "failure must publish no block versions"
+        );
+        assert_eq!(dev.snapshot_bytes(), before_bytes);
+        assert_eq!(
+            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+            before_groups
+        );
+        assert_eq!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+            before_blocks
+        );
+        assert_eq!(
+            fs.count_free_inodes_in_group(&cx, GroupNumber(0)).unwrap(),
+            before_inodes
+        );
+        assert_eq!(fs.getattr(&cx, source.ino).unwrap().nlink, 1);
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new(&names[1])).unwrap().ino,
+            occupied.ino
+        );
+    }
+
+    #[test]
+    fn ext4_link_failed_orphan_splice_rolls_back_directory_growth_and_retries() {
+        let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("hard-link rollback regression requires mkfs.ext4");
+        let image = tmp.path().join("test.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let parent = fs
+            .mkdir(&cx, root, OsStr::new("full_parent"), 0o700, 0, 0)
+            .unwrap();
+        // Fifteen 252-byte names fill one 4 KiB directory block. The next
+        // long entry must allocate blocks to promote the directory to htree.
+        for index in 0..15 {
+            let name = format!("{index:03}_{}", "f".repeat(248));
+            fs.create(&cx, parent.ino, OsStr::new(&name), 0o600, 0, 0)
+                .unwrap();
+        }
+        assert_eq!(fs.read_inode(&cx, parent.ino).unwrap().size, 4096);
+        let source = fs.ext4_tmpfile(&cx, root, 0o600, 0, 0).unwrap();
+        fs.write(&cx, source.ino, 0, b"temporary payload").unwrap();
+        let head = fs.ext4_tmpfile(&cx, root, 0o600, 0, 0).unwrap();
+        let good_head = fs.read_inode(&cx, head.ino).unwrap();
+        assert_eq!(u64::from(good_head.dtime), source.ino.0);
+        let mut bad_head = good_head.clone();
+        bad_head.dtime = fs
+            .ext4_superblock()
+            .unwrap()
+            .inodes_count
+            .checked_add(1)
+            .unwrap();
+        fs.persist_ext4_inode_for_testing(&cx, head.ino, &bad_head)
+            .unwrap();
+        let name = format!("new_{}", "l".repeat(248));
+        let before = fs.current_snapshot();
+        let before_bytes = dev.snapshot_bytes();
+        let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        let before_blocks = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+        let error = fs
+            .link(&cx, source.ino, parent.ino, OsStr::new(&name))
+            .unwrap_err();
+        assert!(matches!(error, FfsError::Corruption { .. }));
+        assert_eq!(
+            fs.current_snapshot(),
+            before,
+            "invalid orphan splice cannot publish a link"
+        );
+        assert_eq!(dev.snapshot_bytes(), before_bytes);
+        assert_eq!(
+            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+            before_groups,
+            "failed directory growth must restore cached allocation state"
+        );
+        assert_eq!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+            before_blocks
+        );
+        assert_eq!(fs.read_inode(&cx, parent.ino).unwrap().size, 4096);
+        assert_eq!(fs.getattr(&cx, source.ino).unwrap().nlink, 0);
+        assert_eq!(u64::from(fs.ext4_read_orphan_head()), head.ino.0);
+        assert!(fs.ext4_pending_orphans.lock().contains(&source.ino.0));
+        assert!(matches!(
+            fs.lookup(&cx, parent.ino, OsStr::new(&name)),
+            Err(FfsError::NotFound(_))
+        ));
+
+        // Repair only the deliberately planted bad predecessor, then repeat
+        // the exact link to prove the failed allocation left no stale state.
+        fs.persist_ext4_inode_for_testing(&cx, head.ino, &good_head)
+            .unwrap();
+        let before_retry = fs.current_snapshot();
+        let named = fs
+            .link(&cx, source.ino, parent.ino, OsStr::new(&name))
+            .unwrap();
+        assert_eq!(fs.current_snapshot().high.0, before_retry.high.0 + 1);
+        assert_eq!(named.nlink, 1);
+        assert!(fs.read_inode(&cx, parent.ino).unwrap().size > 4096);
+        assert_eq!(fs.read_inode(&cx, source.ino).unwrap().dtime, 0);
+        assert_eq!(fs.read_inode(&cx, head.ino).unwrap().dtime, 0);
+        assert!(!fs.ext4_pending_orphans.lock().contains(&source.ino.0));
+        assert_eq!(
+            fs.read(&cx, source.ino, 0, 64).unwrap(),
+            b"temporary payload"
+        );
+        assert!(fs.finalize_unlinked_inode_public(&cx, head.ino).unwrap());
+        assert_eq!(fs.ext4_read_orphan_head(), 0);
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        let (clean, output) =
+            run_e2fsck(&image).expect("hard-link rollback oracle requires e2fsck");
+        assert!(
+            clean,
+            "failed and retried hard-link publication must be native-clean: {output}"
+        );
     }
 
     #[test]

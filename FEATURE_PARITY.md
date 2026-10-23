@@ -1,5 +1,18 @@
 # FEATURE_PARITY
 
+> **Atomic ext4 hard-link publication:** `ext4_link` now stages the source link
+> count, parent inode, directory entry, directory-growth allocation and any
+> `O_TMPFILE` orphan predecessor splice in one MVCC transaction. Failed staging
+> or commit restores cached allocation state; orphan runtime state changes only
+> after publication. Three new regressions cover old snapshots, indexed growth,
+> duplicate names, failed orphan splices, retry, reopen and native `e2fsck` checks
+> on generated images; the existing tmpfile test also checks head and interior
+> splices each publish once. These Rust tests are authored but unexecuted here:
+> local Cargo cannot resolve uncached dependencies and shared storage is
+> exhausted. Exact pinned formatting and whitespace checks pass. This advances
+> the hard-link slice of `bd-9rutw`; the remaining namespace operations and its
+> broader request-scope conversion stay open.
+
 > **Native ZFS atomic-exchange recovery:** `Zpl::replay_zil` now decodes native
 > `TX_RENAME_EXCHANGE` records separately from ordinary rename and stages both
 > names together. File/directory swaps preserve both objects and their contents;
