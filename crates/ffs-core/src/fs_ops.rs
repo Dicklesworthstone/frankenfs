@@ -4623,10 +4623,16 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
-        // A chmod of an inode with an access ACL rewrites that ACL too. ext4
-        // writes xattrs straight to the device, so the mode change goes the
-        // same way: through the request's transaction it would commit over a
-        // block the xattr write changed after its snapshot (EAGAIN).
+        // Ext4 reads the inode and ACL inside one registered transaction and
+        // publishes the complete request together. A cached ACL probe here
+        // could miss an ACL installed after that probe but before chmod.
+        if attrs.mode.is_some() && matches!(&self.flavor, FsFlavor::Ext4(_)) {
+            return self
+                .ext4_setattr_with_acl(cx, Self::ext4_canonical_inode(ino), attrs)
+                .map(Self::ext4_present_attr);
+        }
+        // Preserve the existing Btrfs ACL dispatch; its semantic mutation view
+        // serializes the attribute and ACL updates.
         if attrs.mode.is_some()
             && self
                 .getxattr(cx, ino, super::POSIX_ACL_ACCESS_XATTR)?

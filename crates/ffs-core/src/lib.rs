@@ -36025,6 +36025,284 @@ impl OpenFs {
         Ok(attr)
     }
 
+    /// A mode-bearing setattr must publish the complete request together with
+    /// its access ACL. In particular, a failed ACL COW must not leave an
+    /// already-truncated file or partially changed ownership/timestamps.
+    fn ext4_setattr_with_acl(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> ffs_error::Result<InodeAttr> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let inode = self
+            .ext4_inode_transaction(cx, ino, |dev, alloc, inode, now| {
+                self.ext4_stage_setattr_with_acl(cx, dev, alloc, ino, inode, attrs, now)?;
+                Ok(true)
+            })?
+            .ok_or_else(|| FfsError::Format("setattr did not produce an inode".into()))?;
+        Ok(inode_to_attr(sb, ino, &inode))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_stage_setattr_with_acl(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+        attrs: &SetAttrRequest,
+        now: (u64, u32),
+    ) -> ffs_error::Result<()> {
+        // Linux may_setattr rejects chmod on append-only as well as immutable
+        // inodes, whether or not an access ACL is present.
+        Self::ext4_reject_immutable_or_append(inode)?;
+        let old_size = inode.size;
+        if let Some(size) = attrs.size {
+            Self::ext4_stage_setattr_size(cx, dev, alloc, ino, inode, size)?;
+        }
+        if let Some(mode) = attrs.mode {
+            inode.mode = (inode.mode & 0xF000) | (mode & 0o7777);
+        }
+        if let Some(uid) = attrs.uid {
+            inode.uid = uid;
+        }
+        if let Some(gid) = attrs.gid {
+            inode.gid = gid;
+        }
+        if let Some(atime) = attrs.atime {
+            let (secs, nanos) = system_time_to_signed(atime);
+            ffs_inode::set_atime(inode, secs, nanos);
+        }
+        if let Some(mtime) = attrs.mtime {
+            let (secs, nanos) = system_time_to_signed(mtime);
+            ffs_inode::set_mtime(inode, secs, nanos);
+        } else if inode.size != old_size {
+            ffs_inode::touch_mtime_ctime(inode, now.0, now.1);
+        }
+        if attrs.mode.is_some() {
+            // Truncate first: its privately freed blocks can fund shared ACL
+            // COW even on a full filesystem. Any later error discards both.
+            self.ext4_stage_chmod_access_acl(cx, dev, alloc, ino, inode)?;
+        }
+        Ok(())
+    }
+
+    /// Stage a size change through the transaction's exact inode/data view.
+    /// The ordinary no-mode setattr path retains its existing dispatch; this
+    /// combined path refuses storage layouts it cannot update atomically.
+    #[allow(clippy::too_many_lines)]
+    fn ext4_stage_setattr_size(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+        new_size: u64,
+    ) -> ffs_error::Result<()> {
+        if inode.is_dir() {
+            return Err(FfsError::IsDirectory);
+        }
+        if inode.is_symlink() {
+            return Err(FfsError::Format("cannot truncate a symlink".into()));
+        }
+        Self::ext4_reject_verity(inode)?;
+        let block_size = alloc.geo.block_size;
+        Self::ext4_reject_oversized_file(new_size, u64::from(block_size))?;
+        if new_size == inode.size {
+            return Ok(());
+        }
+        if inode.mode & 0xF000 != 0x8000 {
+            return Err(FfsError::Format(
+                "cannot truncate a non-regular file".into(),
+            ));
+        }
+        Self::ext4_reject_encrypted(inode)?;
+        if Self::ext4_inode_uses_inline_data(inode)
+            || inode.flags & (ffs_types::EXT4_COMPR_FL | ffs_types::EXT4_COMPRBLK_FL) != 0
+        {
+            return Err(FfsError::UnsupportedFeature(
+                "atomic chmod with a size change on inline or compressed ext4 data".into(),
+            ));
+        }
+        let uses_extents = inode.flags & ffs_types::EXT4_EXTENTS_FL != 0;
+        if !uses_extents && !Self::ext4_inode_block_map_is_indirect(inode) {
+            return Err(FfsError::UnsupportedFeature(
+                "atomic setattr cannot interpret this ext4 block map".into(),
+            ));
+        }
+        if new_size > inode.size {
+            inode.size = new_size;
+            return Ok(());
+        }
+
+        let keep = u32::try_from(new_size.div_ceil(u64::from(block_size))).map_err(|_| {
+            FfsError::Format("truncation size exceeds ext4 32-bit logical block limit".into())
+        })?;
+        let mut root = Self::extent_root(inode);
+        let (freed_data, meta_before, meta_after) = if uses_extents {
+            let meta_before = Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root)?;
+            let freed = ffs_extent::truncate_extents(
+                cx,
+                dev,
+                &mut root,
+                &alloc.geo,
+                &mut alloc.groups,
+                keep,
+                &alloc.persist_ctx,
+                ffs_extent::ExtentOwner {
+                    ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                    generation: inode.generation,
+                },
+            )?;
+            let meta_after = Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root)?;
+            (freed, meta_before, meta_after)
+        } else {
+            let meta_before = Self::ext4_ind_meta_blocks(cx, dev, &root, block_size)?;
+            let freed = Self::ext4_ind_truncate(
+                cx,
+                dev,
+                &mut SingleLockDirAlloc { alloc },
+                &mut root,
+                keep,
+            )?;
+            let meta_after = Self::ext4_ind_meta_blocks(cx, dev, &root, block_size)?;
+            (freed, meta_before, meta_after)
+        };
+        let sectors_per_block = u64::from(block_size / EXT4_SECTOR_SIZE);
+        Self::ext4_apply_extent_meta_delta(inode, ino, meta_before, meta_after, sectors_per_block)?;
+        let freed_units = if inode.is_huge_file() {
+            freed_data
+        } else {
+            freed_data
+                .checked_mul(sectors_per_block)
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: format!("inode {} atomic truncation freed sectors overflow", ino.0),
+                })?
+        };
+        inode.blocks =
+            Self::ext4_checked_inode_blocks_delta(inode.blocks, ino, -i128::from(freed_units))?;
+        Self::set_extent_root(inode, &root);
+
+        let partial_offset = usize::try_from(new_size % u64::from(block_size))
+            .map_err(|_| FfsError::Format("truncation offset exceeds usize capacity".into()))?;
+        if partial_offset != 0 {
+            let logical = u32::try_from(new_size / u64::from(block_size)).map_err(|_| {
+                FfsError::Format("truncation size exceeds ext4 32-bit logical block limit".into())
+            })?;
+            let physical = if uses_extents {
+                ffs_extent::map_logical_to_physical(cx, dev, &root, logical, 1)?
+                    .first()
+                    .filter(|mapping| {
+                        mapping.physical_start > 0 && mapping.count > 0 && !mapping.unwritten
+                    })
+                    .map(|mapping| mapping.physical_start)
+            } else {
+                Self::ext4_ind_resolve_via_dev(cx, dev, &root, logical, block_size)?
+            };
+            if let Some(physical) = physical {
+                let block = BlockNumber(physical);
+                let mut bytes = dev.read_block(cx, block)?.into_inner();
+                bytes
+                    .get_mut(partial_offset..)
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: physical,
+                        detail: "truncation tail exceeds the data block".into(),
+                    })?
+                    .fill(0);
+                dev.write_block(cx, block, &bytes)?;
+            }
+        }
+        inode.size = new_size;
+        Ok(())
+    }
+
+    /// Resolve an indirect mapping without falling back to the current MVCC
+    /// view. The caller's device includes its staged pointer-tree changes.
+    fn ext4_ind_resolve_via_dev(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        root: &[u8; 60],
+        logical: u32,
+        block_size: u32,
+    ) -> ffs_error::Result<Option<u64>> {
+        let (slot, path) = Self::ext4_ind_path(logical, block_size).ok_or_else(|| {
+            FfsError::Format(format!(
+                "logical block {logical} is beyond the triple-indirect range"
+            ))
+        })?;
+        let mut block = Self::ext4_ind_root_slot(root, slot);
+        for index in path {
+            if block == 0 {
+                return Ok(None);
+            }
+            let block_num = BlockNumber(u64::from(block));
+            let data = dev.read_block(cx, block_num)?;
+            Self::indirect_pointer_slot(
+                data.as_slice(),
+                block_num,
+                index,
+                "indirect block too small for pointer",
+            )?;
+            block = Self::ext4_ind_block_slot(data.as_slice(), index);
+        }
+        Ok((block != 0).then_some(u64::from(block)))
+    }
+
+    fn ext4_stage_chmod_access_acl(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+    ) -> ffs_error::Result<()> {
+        // Do not consult the public cache: the transaction holds its write
+        // gate and must read the ACL from the same snapshot as this inode.
+        let is_access_acl = |(entry, _): &(Ext4Xattr, u32)| {
+            entry.name_index == ffs_types::EXT4_XATTR_INDEX_POSIX_ACL_ACCESS
+                && entry.name.is_empty()
+        };
+        let mut acl = ffs_ondisk::parse_ibody_xattrs_with_inum(inode)
+            .map_err(|error| parse_to_ffs_error(&error))?
+            .into_iter()
+            .find(is_access_acl);
+        if acl.is_none() && inode.file_acl != 0 {
+            let block = dev.read_block(cx, BlockNumber(inode.file_acl))?;
+            acl = ffs_ondisk::parse_xattr_block_with_inum(block.as_slice())
+                .map_err(|error| parse_to_ffs_error(&error))?
+                .into_iter()
+                .find(is_access_acl);
+        }
+        let Some((acl, value_inode)) = acl else {
+            return Ok(());
+        };
+        if value_inode != 0 {
+            return Err(FfsError::UnsupportedFeature(
+                "chmod of an ext4 access ACL stored in an EA inode".into(),
+            ));
+        }
+        let value = ext4_expand_posix_acl_xattr_value(&acl.value)?;
+        let mut entries = posix_acl_parse(&value)?;
+        posix_acl_chmod(&mut entries, inode.mode);
+        let value = ext4_compact_posix_acl_xattr_value(&posix_acl_encode(&entries))?;
+        self.ext4_stage_setxattr(
+            cx,
+            dev,
+            alloc,
+            ino,
+            inode,
+            POSIX_ACL_ACCESS_XATTR,
+            &value,
+            XattrSetMode::Replace,
+        )?;
+        Ok(())
+    }
+
     /// Record an access: set atime to `now` and nothing else (no ctime bump,
     /// unlike `setattr`). With `strict` false this is relatime, the kernel
     /// default: only when atime is not after mtime or ctime, or is at least a
@@ -36219,11 +36497,8 @@ impl OpenFs {
         self.ext4_inode_xattr_cache.remove(&ino.0);
     }
 
-    /// Publish an xattr operation, including allocation and inode metadata,
-    /// once. Live allocator counters and caches never describe an aborted
-    /// attempt. The existing block-allocation exclusion also covers mounts
-    /// using sharded inode allocation.
-    #[allow(clippy::significant_drop_tightening)]
+    /// Keep the xattr mutation policy and callback interface while sharing
+    /// the operation-owned inode transaction with chmod plus ACL updates.
     fn ext4_xattr_transaction(
         &self,
         cx: &Cx,
@@ -36234,6 +36509,30 @@ impl OpenFs {
             &mut Ext4Inode,
         ) -> ffs_error::Result<bool>,
     ) -> ffs_error::Result<bool> {
+        self.ext4_inode_transaction(cx, ino, |dev, alloc, inode, _now| {
+            Self::ext4_reject_immutable_or_append(inode)?;
+            mutate(dev, alloc, inode)
+        })
+        .map(|inode| inode.is_some())
+    }
+
+    /// Publish an inode operation, including allocation, data and xattrs,
+    /// once. Live allocator counters and caches never describe an aborted
+    /// attempt. The existing block-allocation exclusion also covers mounts
+    /// using sharded inode allocation. The callback owns operation-specific
+    /// permission checks and receives the timestamp used for the final ctime.
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    fn ext4_inode_transaction(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        mut mutate: impl FnMut(
+            &dyn BlockDevice,
+            &mut Ext4AllocState,
+            &mut Ext4Inode,
+            (u64, u32),
+        ) -> ffs_error::Result<bool>,
+    ) -> ffs_error::Result<Option<Ext4Inode>> {
         const MAX_ATTEMPTS: u32 = 16;
         let alloc_mutex = self.require_alloc_state()?;
         let csum_seed = self
@@ -36264,12 +36563,12 @@ impl OpenFs {
                     return Err(FfsError::NotFound(format!("inode {}", ino.0)));
                 }
                 inode.number = ino.0;
-                Self::ext4_reject_immutable_or_append(&inode)?;
-                if !mutate(&tx_dev, &mut working, &mut inode)? {
+                let old_inode = inode.clone();
+                let now = Self::now_timestamp();
+                if !mutate(&tx_dev, &mut working, &mut inode, now)? {
                     return Ok(None);
                 }
-                let (secs, nanos) = Self::now_timestamp();
-                ffs_inode::touch_ctime(&mut inode, secs, nanos);
+                ffs_inode::touch_ctime(&mut inode, now.0, now.1);
                 ffs_inode::write_inode(
                     cx,
                     &tx_dev,
@@ -36280,11 +36579,11 @@ impl OpenFs {
                     csum_seed,
                 )?;
                 cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-                Ok(Some(inode))
+                Ok(Some((old_inode, inode)))
             })();
-            let inode = match staged {
-                Ok(Some(inode)) => inode,
-                Ok(None) => return Ok(false),
+            let (old_inode, inode) = match staged {
+                Ok(Some(inodes)) => inodes,
+                Ok(None) => return Ok(None),
                 Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                 Err(error) => return Err(error),
             };
@@ -36301,6 +36600,17 @@ impl OpenFs {
                     Err(error) => return Err(error),
                 };
             alloc.groups = working.groups;
+            if inode.size < old_inode.size {
+                // A successful shrink can recycle either data or mapping
+                // metadata. Use the pre-mutation namespace, including its
+                // content-hash fallback, and leave caches intact on abort.
+                self.extent_cache.invalidate_range(
+                    extent_cache_namespace(&old_inode),
+                    0,
+                    1_u64 << 32,
+                );
+                self.invalidate_ext4_write_extent_snapshot(&old_inode);
+            }
             self.invalidate_ext4_xattr_block_cache(ino);
             self.invalidate_ext4_inode_xattr_cache(ino);
             // Keep publication serialized with the next xattr writer. A cache
@@ -36311,9 +36621,9 @@ impl OpenFs {
             drop(alloc);
             self.prune_mvcc_after_commit_if_due(commit_seq);
             self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
-            return Ok(true);
+            return Ok(Some(inode));
         }
-        unreachable!("the final xattr attempt returns its result")
+        unreachable!("the final inode transaction attempt returns its result")
     }
 
     /// Set or replace one ext4 xattr.
@@ -84793,6 +85103,766 @@ mod tests {
                 Vec::<String>::new()
             );
             assert_eq!(reopened.listxattr(&cx, peer).unwrap(), Vec::<String>::new());
+        }
+    }
+
+    fn ext4_setattr_test_acl(owner: u16, mask: u16, other: u16) -> Vec<u8> {
+        let entry = |tag, perm, id| PosixAclEntry { tag, perm, id };
+        let mut entries = vec![entry(POSIX_ACL_TAG_USER_OBJ, owner, POSIX_ACL_UNDEFINED_ID)];
+        entries.extend((1000..1024).map(|id| entry(POSIX_ACL_TAG_USER, 4, id)));
+        entries.extend([
+            entry(POSIX_ACL_TAG_GROUP_OBJ, 4, POSIX_ACL_UNDEFINED_ID),
+            entry(POSIX_ACL_TAG_MASK, mask, POSIX_ACL_UNDEFINED_ID),
+            entry(POSIX_ACL_TAG_OTHER, other, POSIX_ACL_UNDEFINED_ID),
+        ]);
+        posix_acl_encode(&entries)
+    }
+
+    fn ext4_setattr_test_payload(
+        fs: &OpenFs,
+        cx: &Cx,
+        ino: InodeNumber,
+        indirect: bool,
+    ) -> Vec<u8> {
+        let bs = fs.block_size() as usize;
+        if indirect {
+            let mut inode = fs.read_inode(cx, ino).unwrap();
+            inode.flags &= !ffs_types::EXT4_EXTENTS_FL;
+            inode.extent_bytes.fill(0);
+            fs.persist_ext4_inode_for_testing(cx, ino, &inode).unwrap();
+            let payload: Vec<_> = (0..14 * bs).map(|index| (1 + index % 251) as u8).collect();
+            fs.write(cx, ino, 0, &payload).unwrap();
+            payload
+        } else {
+            // Six separated extents overflow the inode's four-entry root and
+            // force mapping metadata, even if the allocator is contiguous.
+            let mut payload = vec![0; 11 * bs];
+            for index in 0..6 {
+                let start = index * 2 * bs;
+                payload[start..start + bs].fill(0x31 + index as u8);
+                fs.write(cx, ino, start as u64, &payload[start..start + bs])
+                    .unwrap();
+            }
+            payload
+        }
+    }
+
+    #[test]
+    fn ext4_setattr_with_acl_publishes_complete_extent_and_indirect_changes_once() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            for indirect in [false, true] {
+                let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                    .expect("combined setattr regression requires mkfs.ext4");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                fs.set_bhh0i_sharded_ops(sharded);
+                let cx = Cx::for_testing();
+                let ino = fs
+                    .create(&cx, InodeNumber(2), OsStr::new("owner"), 0o651, 0, 0)
+                    .unwrap()
+                    .ino;
+                let peer = fs
+                    .create(&cx, InodeNumber(2), OsStr::new("peer"), 0o651, 0, 0)
+                    .unwrap()
+                    .ino;
+                let payload = ext4_setattr_test_payload(&fs, &cx, ino, indirect);
+                let original_acl = ext4_setattr_test_acl(6, 5, 1);
+                fs.setxattr(
+                    &cx,
+                    ino,
+                    POSIX_ACL_ACCESS_XATTR,
+                    &original_acl,
+                    XattrSetMode::Set,
+                )
+                .unwrap();
+                share_ext4_test_xattr_block(&fs, &cx, ino, peer);
+                assert_eq!(
+                    fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    Some(original_acl.clone())
+                );
+                let before_inode = fs.read_inode(&cx, ino).unwrap();
+                let before_root = OpenFs::extent_root(&before_inode);
+                let block_dev = fs.block_device_adapter();
+                let bs = fs.block_size() as usize;
+                let sectors = u64::from(fs.block_size() / EXT4_SECTOR_SIZE);
+                let before_meta = if indirect {
+                    assert_ne!(
+                        u32::from_le_bytes(before_root[48..52].try_into().unwrap()),
+                        0
+                    );
+                    1
+                } else {
+                    let (header, tree) = parse_extent_tree(&before_root).unwrap();
+                    assert_eq!(header.depth, 1);
+                    let ExtentTree::Index(indexes) = tree else {
+                        panic!("external extent tree required")
+                    };
+                    indexes.len() as u64
+                };
+                let before_data = if indirect { 14 } else { 6 };
+                assert_eq!(
+                    before_inode.blocks,
+                    (before_data + before_meta + 1) * sectors
+                );
+                let before_free = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+                let before_statfs = fs.statfs(&cx, InodeNumber(2)).unwrap().blocks_free;
+
+                // Capture each referenced data and mapping block. The held
+                // snapshot must retain the original bytes even when truncation
+                // frees blocks that the ACL's COW immediately reuses.
+                let mut old_blocks = Vec::new();
+                for (logical, bytes) in payload.chunks_exact(bs).enumerate() {
+                    if bytes.iter().all(|byte| *byte == 0) {
+                        continue;
+                    }
+                    let physical = if indirect {
+                        OpenFs::ext4_ind_resolve_via_dev(
+                            &cx,
+                            &block_dev,
+                            &before_root,
+                            logical as u32,
+                            fs.block_size(),
+                        )
+                        .unwrap()
+                        .unwrap()
+                    } else {
+                        ext4_block_mapping(&fs, &cx, ino, logical as u32).physical_start
+                    };
+                    let block = BlockNumber(physical);
+                    old_blocks.push((block, fs.read_block_vec(&cx, block).unwrap()));
+                }
+                let first_data = old_blocks[0].0;
+                if indirect {
+                    let block = BlockNumber(u64::from(u32::from_le_bytes(
+                        before_root[48..52].try_into().unwrap(),
+                    )));
+                    old_blocks.push((block, fs.read_block_vec(&cx, block).unwrap()));
+                } else if let (_, ExtentTree::Index(indexes)) =
+                    parse_extent_tree(&before_root).unwrap()
+                {
+                    for index in indexes {
+                        let block = BlockNumber(index.leaf_block);
+                        old_blocks.push((block, fs.read_block_vec(&cx, block).unwrap()));
+                    }
+                }
+                let old_acl_block = BlockNumber(before_inode.file_acl);
+                old_blocks.push((
+                    old_acl_block,
+                    fs.read_block_vec(&cx, old_acl_block).unwrap(),
+                ));
+                let namespace = extent_cache_namespace(&before_inode);
+                fs.extent_cache.insert(
+                    namespace,
+                    ffs_extent::ExtentMapping {
+                        logical_start: u32::MAX,
+                        physical_start: first_data.0,
+                        count: 1,
+                        unwritten: false,
+                    },
+                );
+                assert!(fs.extent_cache.lookup(namespace, u32::MAX).is_some());
+                let cut = bs / 2 + 37;
+                let atime = UNIX_EPOCH - Duration::new(60, 123_456_789);
+                let mtime = UNIX_EPOCH + Duration::new(1_700_000_123, 987_654_321);
+                let attrs = SetAttrRequest {
+                    mode: Some(0o2750),
+                    uid: Some(2001),
+                    gid: Some(3002),
+                    size: Some(cut as u64),
+                    atime: Some(atime),
+                    mtime: Some(mtime),
+                };
+                let mut scope = fs.begin_request_scope(&cx, RequestOp::Setattr).unwrap();
+                let before = fs.current_snapshot();
+                let changed = FsOps::setattr(&fs, &cx, &mut scope, ino, &attrs).unwrap();
+                let after = fs.current_snapshot();
+                assert_eq!(
+                    after.high.0,
+                    before.high.0 + 1,
+                    "the complete request has one publication"
+                );
+                assert_eq!(
+                    (changed.perm, changed.uid, changed.gid, changed.size),
+                    (0o2750, 2001, 3002, cut as u64)
+                );
+                assert_eq!((changed.atime, changed.mtime), (atime, mtime));
+                assert!(
+                    fs.extent_cache.lookup(namespace, u32::MAX).is_none(),
+                    "invalidation includes the last logical block"
+                );
+                fs.prune_mvcc_versions();
+                assert_eq!(
+                    fs.read_inode_with_scope(&cx, &scope, ino).unwrap(),
+                    before_inode
+                );
+                for (block, bytes) in &old_blocks {
+                    assert_eq!(
+                        fs.read_block_with_scope(&cx, &scope, *block).unwrap(),
+                        *bytes,
+                        "old snapshot block {block:?}"
+                    );
+                }
+                fs.commit_request_scope(&cx, &mut scope).unwrap();
+                assert_eq!(
+                    fs.current_snapshot(),
+                    after,
+                    "the outer scope stages nothing else"
+                );
+                fs.end_request_scope(&cx, RequestOp::Setattr, scope)
+                    .unwrap();
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+
+                let shrunk = fs.read_inode(&cx, ino).unwrap();
+                let shrunk_root = OpenFs::extent_root(&shrunk);
+                let after_meta = if indirect {
+                    assert_eq!(&shrunk_root[48..60], &[0; 12]);
+                    0
+                } else {
+                    let (header, tree) = parse_extent_tree(&shrunk_root).unwrap();
+                    match tree {
+                        ExtentTree::Leaf(_) => {
+                            assert_eq!(header.depth, 0);
+                            0
+                        }
+                        ExtentTree::Index(indexes) => {
+                            assert_eq!(header.depth, 1);
+                            indexes.len() as u64
+                        }
+                    }
+                };
+                assert_eq!(
+                    shrunk.blocks,
+                    (1 + after_meta + 1) * sectors,
+                    "retained data, mapping metadata and ACL are all charged"
+                );
+                let freed = before_data - 1 + before_meta - after_meta;
+                assert_eq!(
+                    fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                    before_free + freed as u32 - 1,
+                    "one newly allocated ACL COW block consumes part of the truncate savings"
+                );
+                assert_eq!(
+                    fs.statfs(&cx, InodeNumber(2)).unwrap().blocks_free,
+                    before_statfs + freed - 1
+                );
+                assert_ne!(shrunk.file_acl, before_inode.file_acl);
+                for block in [old_acl_block, BlockNumber(shrunk.file_acl)] {
+                    let bytes = fs.read_block_vec(&cx, block).unwrap();
+                    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
+                }
+                assert_eq!(
+                    fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    Some(ext4_setattr_test_acl(7, 5, 0))
+                );
+                assert_eq!(
+                    fs.getxattr(&cx, peer, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    Some(original_acl.clone())
+                );
+                assert_eq!(fs.getattr(&cx, peer).unwrap().perm, 0o651);
+                let tail = fs.read_block_vec(&cx, first_data).unwrap();
+                assert_eq!(&tail[..cut], &payload[..cut]);
+                assert!(tail[cut..].iter().all(|byte| *byte == 0));
+
+                // A second chmod rewrites the now-private ACL in place while
+                // sparse reextension must never reveal the truncated bytes.
+                let free_after_shrink = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+                let before_extend = fs.current_snapshot();
+                let reextended = fs
+                    .setattr(
+                        &cx,
+                        ino,
+                        &SetAttrRequest {
+                            mode: Some(0o2640),
+                            size: Some(payload.len() as u64),
+                            ..SetAttrRequest::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(fs.current_snapshot().high.0, before_extend.high.0 + 1);
+                assert_eq!(
+                    reextended.mtime, reextended.ctime,
+                    "an implicit size-change mtime uses the commit's ctime"
+                );
+                let extended = fs.read_inode(&cx, ino).unwrap();
+                assert_eq!(
+                    extended.file_acl, shrunk.file_acl,
+                    "last-owner ACL update reuses its block"
+                );
+                assert_eq!(extended.blocks, shrunk.blocks);
+                assert_eq!(
+                    fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                    free_after_shrink
+                );
+                let mut expected = payload;
+                expected[cut..].fill(0);
+                assert_eq!(
+                    fs.read(&cx, ino, 0, expected.len() as u32).unwrap(),
+                    expected
+                );
+                let final_acl = ext4_setattr_test_acl(6, 4, 0);
+                assert_eq!(
+                    fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    Some(final_acl.clone())
+                );
+
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                assert_eq!(
+                    ext4_group_free_block_mismatches(&dev.snapshot_bytes()),
+                    Vec::<(u32, u32, u32)>::new()
+                );
+                let image = tmp.path().join("test.ext4");
+                std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+                let (clean, output) =
+                    run_e2fsck(&image).expect("combined setattr oracle requires e2fsck");
+                assert!(
+                    clean,
+                    "combined setattr must be native-clean, sharded={sharded}, indirect={indirect}: {output}"
+                );
+                drop(block_dev);
+                drop(fs);
+                let reopened =
+                    OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+                let attr = reopened.getattr(&cx, ino).unwrap();
+                assert_eq!(
+                    (attr.perm, attr.uid, attr.gid, attr.size),
+                    (0o2640, 2001, 3002, expected.len() as u64)
+                );
+                assert_eq!((attr.atime, attr.mtime), (atime, reextended.mtime));
+                assert_eq!(
+                    reopened.read(&cx, ino, 0, expected.len() as u32).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    reopened.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    Some(final_acl)
+                );
+                assert_eq!(
+                    reopened
+                        .getxattr(&cx, peer, POSIX_ACL_ACCESS_XATTR)
+                        .unwrap(),
+                    Some(original_acl)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_setattr_with_acl_late_abort_preserves_data_metadata_and_caches() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            for indirect in [false, true] {
+                let (fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+                    .expect("combined setattr abort regression requires mkfs.ext4");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                fs.set_bhh0i_sharded_ops(sharded);
+                let cx = Cx::for_testing();
+                let ino = fs
+                    .create(&cx, InodeNumber(2), OsStr::new("owner"), 0o651, 0, 0)
+                    .unwrap()
+                    .ino;
+                let peer = fs
+                    .create(&cx, InodeNumber(2), OsStr::new("peer"), 0o651, 0, 0)
+                    .unwrap()
+                    .ino;
+                let payload = ext4_setattr_test_payload(&fs, &cx, ino, indirect);
+                let acl = ext4_setattr_test_acl(6, 5, 1);
+                fs.setxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR, &acl, XattrSetMode::Set)
+                    .unwrap();
+                share_ext4_test_xattr_block(&fs, &cx, ino, peer);
+                assert_eq!(
+                    fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    Some(acl.clone())
+                );
+                assert_eq!(fs.read(&cx, ino, 0, payload.len() as u32).unwrap(), payload);
+                let cached = fs.ext4_inode_xattr_cache.get(&ino.0).unwrap();
+                let before_inode = fs.read_inode(&cx, ino).unwrap();
+                let namespace = extent_cache_namespace(&before_inode);
+                fs.extent_cache.insert(
+                    namespace,
+                    ffs_extent::ExtentMapping {
+                        logical_start: u32::MAX,
+                        physical_start: 0,
+                        count: 1,
+                        unwritten: false,
+                    },
+                );
+                let before_groups =
+                    format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+                let before_free = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+                let before_acl = fs
+                    .read_block_vec(&cx, BlockNumber(before_inode.file_acl))
+                    .unwrap();
+                let before_bytes = dev.snapshot_bytes();
+                let before = fs.current_snapshot();
+                let attrs = SetAttrRequest {
+                    mode: Some(0o750),
+                    uid: Some(2001),
+                    gid: Some(3002),
+                    size: Some(137),
+                    atime: Some(UNIX_EPOCH + Duration::from_secs(123)),
+                    mtime: Some(UNIX_EPOCH + Duration::from_secs(456)),
+                };
+                for cancel in [false, true] {
+                    let op_cx = Cx::for_testing();
+                    let mut attempts = 0;
+                    let result =
+                        fs.ext4_inode_transaction(&op_cx, ino, |block_dev, alloc, inode, now| {
+                            attempts += 1;
+                            fs.ext4_stage_setattr_with_acl(
+                                &op_cx, block_dev, alloc, ino, inode, &attrs, now,
+                            )?;
+                            assert_eq!(inode.size, 137);
+                            assert_ne!(
+                                inode.file_acl, before_inode.file_acl,
+                                "ACL COW must actually stage"
+                            );
+                            assert!(
+                                inode.blocks < before_inode.blocks,
+                                "data and mapping truncation must actually stage"
+                            );
+                            assert_ne!(
+                                format!("{:?}", alloc.groups),
+                                before_groups,
+                                "private allocation accounting must change"
+                            );
+                            assert_eq!(fs.current_snapshot(), before);
+                            if cancel {
+                                op_cx.set_cancel_requested(true);
+                                Ok(true)
+                            } else {
+                                Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO)))
+                            }
+                        });
+                    let error = result.unwrap_err();
+                    if cancel {
+                        assert!(matches!(error, FfsError::Cancelled));
+                    } else {
+                        assert_eq!(error.to_errno(), libc::EIO);
+                    }
+                    assert_eq!(attempts, 1);
+                    assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                    assert_eq!(fs.current_snapshot(), before);
+                    assert_eq!(dev.snapshot_bytes(), before_bytes);
+                    assert_eq!(
+                        format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                        before_groups
+                    );
+                    assert_eq!(
+                        fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                        before_free
+                    );
+                    assert_eq!(fs.read_inode(&cx, ino).unwrap(), before_inode);
+                    assert_eq!(
+                        fs.read_block_vec(&cx, BlockNumber(before_inode.file_acl))
+                            .unwrap(),
+                        before_acl
+                    );
+                    assert!(Arc::ptr_eq(
+                        &cached,
+                        &fs.ext4_inode_xattr_cache.get(&ino.0).unwrap()
+                    ));
+                    assert!(
+                        fs.extent_cache.lookup(namespace, u32::MAX).is_some(),
+                        "abort leaves mapping caches intact"
+                    );
+                    assert_eq!(
+                        fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                        Some(acl.clone())
+                    );
+                    assert_eq!(fs.read(&cx, ino, 0, payload.len() as u32).unwrap(), payload);
+                }
+                fs.setattr(&cx, ino, &attrs).unwrap();
+                assert_eq!(
+                    fs.current_snapshot().high.0,
+                    before.high.0 + 1,
+                    "aborts release all gates for a subsequent real operation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_setattr_with_shared_acl_enospc_rolls_back_a_staged_partial_tail() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            let (fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("combined setattr ENOSPC regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            let ino = fs
+                .create(&cx, InodeNumber(2), OsStr::new("owner"), 0o651, 0, 0)
+                .unwrap()
+                .ino;
+            let peer = fs
+                .create(&cx, InodeNumber(2), OsStr::new("peer"), 0o651, 0, 0)
+                .unwrap()
+                .ino;
+            let filler = fs
+                .create(&cx, InodeNumber(2), OsStr::new("filler"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let payload = vec![0xDB; fs.block_size() as usize];
+            fs.write(&cx, ino, 0, &payload).unwrap();
+            let acl = ext4_setattr_test_acl(6, 5, 1);
+            fs.setxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR, &acl, XattrSetMode::Set)
+                .unwrap();
+            share_ext4_test_xattr_block(&fs, &cx, ino, peer);
+            // Data fallocate leaves the metadata reserve untouched. Give every
+            // remaining metadata block a real xattr owner, prepared before data
+            // exhaustion so directory growth cannot interfere with the fixture.
+            let reserve = ffs_alloc::reserved_metadata_blocks(&FsGeometry::from_superblock(
+                fs.ext4_superblock().unwrap(),
+            ));
+            let holders: Vec<_> = (0..=reserve)
+                .map(|index| {
+                    fs.create(
+                        &cx,
+                        InodeNumber(2),
+                        OsStr::new(&format!("metadata-{index}")),
+                        0o600,
+                        0,
+                        0,
+                    )
+                    .unwrap()
+                    .ino
+                })
+                .collect();
+            let mut offset = 0;
+            for blocks in [256, 16, 1] {
+                let len = blocks * u64::from(fs.block_size());
+                loop {
+                    match fs.fallocate(&cx, filler, offset, len, 0) {
+                        Ok(()) => offset += len,
+                        Err(error) if error.to_errno() == libc::ENOSPC => break,
+                        Err(error) => panic!("filler fallocate: {error}"),
+                    }
+                    assert!(
+                        offset < 16 * 1024 * 1024,
+                        "filler must exhaust the finite image"
+                    );
+                }
+            }
+            let mut metadata_full = false;
+            for (index, holder) in holders.into_iter().enumerate() {
+                let mut value = vec![0xB0; 512];
+                value[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                match fs.setxattr(&cx, holder, "user.fill", &value, XattrSetMode::Set) {
+                    Ok(()) => {}
+                    Err(error) if error.to_errno() == libc::ENOSPC => {
+                        metadata_full = true;
+                        break;
+                    }
+                    Err(error) => panic!("metadata filler xattr: {error}"),
+                }
+            }
+            assert!(metadata_full, "metadata allocations must also reach ENOSPC");
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                0,
+                "one-block allocation must really exhaust free space"
+            );
+            assert_eq!(
+                fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                Some(acl.clone())
+            );
+            assert_eq!(fs.read(&cx, ino, 0, payload.len() as u32).unwrap(), payload);
+            let cached = fs.ext4_inode_xattr_cache.get(&ino.0).unwrap();
+            let before_inode = fs.read_inode(&cx, ino).unwrap();
+            let original_data = ext4_block_mapping(&fs, &cx, ino, 0).physical_start;
+            let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            let before_free = fs.statfs(&cx, InodeNumber(2)).unwrap().blocks_free;
+            let before_block = fs
+                .read_block_vec(&cx, BlockNumber(before_inode.file_acl))
+                .unwrap();
+            let before_bytes = dev.snapshot_bytes();
+            let before = fs.current_snapshot();
+            let error = fs
+                .setattr(
+                    &cx,
+                    ino,
+                    &SetAttrRequest {
+                        mode: Some(0o750),
+                        uid: Some(2001),
+                        gid: Some(3002),
+                        size: Some(137),
+                        atime: Some(UNIX_EPOCH + Duration::from_secs(123)),
+                        mtime: Some(UNIX_EPOCH + Duration::from_secs(456)),
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_errno(),
+                libc::ENOSPC,
+                "tail zeroing succeeds, then shared ACL COW cannot allocate"
+            );
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(dev.snapshot_bytes(), before_bytes);
+            assert_eq!(
+                format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                before_groups
+            );
+            assert_eq!(
+                fs.statfs(&cx, InodeNumber(2)).unwrap().blocks_free,
+                before_free
+            );
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                0
+            );
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), before_inode);
+            assert_eq!(
+                fs.read_block_vec(&cx, BlockNumber(before_inode.file_acl))
+                    .unwrap(),
+                before_block
+            );
+            assert!(Arc::ptr_eq(
+                &cached,
+                &fs.ext4_inode_xattr_cache.get(&ino.0).unwrap()
+            ));
+            assert_eq!(
+                fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                Some(acl.clone())
+            );
+            assert_eq!(
+                fs.getxattr(&cx, peer, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                Some(acl.clone())
+            );
+            assert_eq!(
+                fs.read(&cx, ino, 0, payload.len() as u32).unwrap(),
+                payload,
+                "failed shrink must retain every original tail byte"
+            );
+
+            // This time truncation frees one complete data block. The private
+            // bitmap update must fund ACL COW without any intermediate commit,
+            // even though the live allocator still has zero free blocks.
+            fs.setattr(
+                &cx,
+                ino,
+                &SetAttrRequest {
+                    mode: Some(0o750),
+                    size: Some(0),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+            let emptied = fs.read_inode(&cx, ino).unwrap();
+            assert_eq!(emptied.size, 0);
+            assert_eq!(emptied.mode & 0o7777, 0o750);
+            assert_eq!(
+                emptied.file_acl, original_data,
+                "the sole freed data block becomes the private ACL block"
+            );
+            assert_ne!(emptied.file_acl, before_inode.file_acl);
+            assert_eq!(
+                emptied.blocks,
+                u64::from(fs.block_size() / EXT4_SECTOR_SIZE)
+            );
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                0
+            );
+            assert_eq!(
+                fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                Some(ext4_setattr_test_acl(7, 5, 0))
+            );
+            assert_eq!(
+                fs.getxattr(&cx, peer, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                Some(acl)
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_mode_setattr_rejects_append_and_immutable_with_or_without_acl() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            let (fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("protected chmod regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            for with_acl in [false, true] {
+                let ino = fs
+                    .create(
+                        &cx,
+                        InodeNumber(2),
+                        OsStr::new(if with_acl { "acl" } else { "plain" }),
+                        0o651,
+                        0,
+                        0,
+                    )
+                    .unwrap()
+                    .ino;
+                if with_acl {
+                    fs.setxattr(
+                        &cx,
+                        ino,
+                        POSIX_ACL_ACCESS_XATTR,
+                        &ext4_setattr_test_acl(6, 5, 1),
+                        XattrSetMode::Set,
+                    )
+                    .unwrap();
+                }
+                let original_inode = fs.read_inode(&cx, ino).unwrap();
+                for flag in [ffs_types::EXT4_APPEND_FL, ffs_types::EXT4_IMMUTABLE_FL] {
+                    let mut protected = original_inode.clone();
+                    protected.flags |= flag;
+                    persist_ext4_test_inode(&fs, &cx, ino, &protected);
+                    fs.forget_ext4_inode_caches(ino);
+                    let before_acl = fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap();
+                    let cached = fs.ext4_inode_xattr_cache.get(&ino.0).unwrap();
+                    let before_inode = fs.read_inode(&cx, ino).unwrap();
+                    let before_groups =
+                        format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+                    let before_bytes = dev.snapshot_bytes();
+                    let before = fs.current_snapshot();
+                    let error = fs
+                        .setattr(
+                            &cx,
+                            ino,
+                            &SetAttrRequest {
+                                mode: Some(0o750),
+                                uid: Some(2001),
+                                gid: Some(3002),
+                                ..SetAttrRequest::default()
+                            },
+                        )
+                        .unwrap_err();
+                    assert_eq!(error.to_errno(), libc::EPERM);
+                    assert_eq!(fs.current_snapshot(), before);
+                    assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                    assert_eq!(dev.snapshot_bytes(), before_bytes);
+                    assert_eq!(
+                        format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                        before_groups
+                    );
+                    assert_eq!(fs.read_inode(&cx, ino).unwrap(), before_inode);
+                    assert!(Arc::ptr_eq(
+                        &cached,
+                        &fs.ext4_inode_xattr_cache.get(&ino.0).unwrap()
+                    ));
+                    assert_eq!(
+                        fs.getxattr(&cx, ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                        before_acl
+                    );
+                }
+            }
         }
     }
 

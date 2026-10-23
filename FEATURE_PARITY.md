@@ -1,5 +1,26 @@
 # FEATURE_PARITY
 
+> **Atomic ext4 chmod and combined inode attributes:** every mode-bearing
+> `setattr` now reads the inode and any access ACL inside one registered MVCC
+> transaction and publishes mode, ownership, timestamps, size and ACL changes
+> together. Ordinary extent and indirect-map truncation stages data and mapping
+> frees, block accounting and partial-tail zeroing before shared-ACL COW, so a
+> privately freed block can fund the ACL update even on a full filesystem.
+> Failed staging leaves allocation state, data and caches unchanged; successful
+> shrink invalidates the complete old mapping-cache namespace. Chmod rejects
+> append-only and immutable inodes with or without an ACL. Four new regression
+> groups cover both allocator modes, mapping formats, old snapshots, native
+> checker/reopen, late I/O failure/cancellation, real metadata ENOSPC and reuse
+> of a truncation free. All four groups executed and passed with
+> `bhh0i_sharded_alloc` enabled, including both allocator modes and the native
+> `e2fsck`/reopen scenarios. The broader 24-test `setattr` selection also passed.
+> Strict Clippy passes for the core library and test targets with that feature
+> enabled. Pinned formatting and whitespace checks pass. This advances `bd-9rutw`;
+> arbitrary outer-request composition and remaining namespace conversions stay
+> open. Actual size changes on inline, compressed or encrypted ext4 data and
+> chmod of an EA-inode-backed ACL are refused before publication. No-mode
+> `setattr` retains its existing path.
+
 > **EA-inode reference preservation during ext4 xattr writes:** mutations now
 > retain whether inline or external storage contains an EA-inode reference and
 > refuse unsupported reconstruction before changing either storage area. This
@@ -25,11 +46,14 @@
 > Four new regressions cover old-snapshot visibility, both allocator modes,
 > shared blocks, ACLs, late failure/cancellation, retry exhaustion, cache races
 > and native checker/reopen; the existing oversized-spill control now requires
-> zero publication on failure. Production core type-checking passed through the
-> ZFS dependency build. These core tests remain unexecuted locally because their
-> dependency compilation exceeded the available memory. Pinned formatting and
-> whitespace checks pass. This advances `bd-9rutw`; outer request
-> composition, atomic chmod-with-ACL and other namespace mutations remain open.
+> zero publication on failure. After memory pressure subsided, the seven-test
+> `ext4_xattr_` selection executed and passed with `bhh0i_sharded_alloc`,
+> including all four new regressions and native checker/reopen. The separate
+> oversized-external rollback test also passed. Strict core library/test-target
+> Clippy, pinned formatting and whitespace checks pass. This advances
+> `bd-9rutw`; outer request
+> composition and other namespace mutations remain open. The later combined
+> chmod/ACL conversion is recorded above.
 
 > **Native ZFS SA user-attribute recovery:** `Zpl::replay_zil` now admits native
 > `TX_SETSAXATTR` records and publishes recovered values through the existing
@@ -41,9 +65,10 @@
 > view is published, and a later failure preserves any previously published
 > view. Six new native-format regression functions cover both byte orders,
 > both ZIL checksums, claim boundaries, object lifetimes and resource limits.
-> Strict all-target Clippy now passes, including the new ZFS tests, and pinned
-> formatting and whitespace checks pass. ZFS test execution remains unverified
-> locally because dependency code generation exceeded the available memory.
+> The full ZFS library suite now passes all 339 tests, with zero failures or
+> ignores, including all six new regressions. Strict all-target Clippy, pinned
+> formatting and whitespace checks pass. Earlier memory-limited build attempts
+> are superseded by this executed run.
 > Native OpenZFS crash-image interchange and the broader `bd-ofjn7` acceptance
 > remain open. See `docs/ZFS_ZIL_TOPOLOGY_PROFILE.md` for the operation contract.
 

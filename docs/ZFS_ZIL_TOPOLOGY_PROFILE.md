@@ -198,9 +198,18 @@ both byte orders, both ZIL checksum variants, claimed/unclaimed boundaries,
 binary replacement, SA/directory precedence, hard links, object reuse, skipped
 unallocated owners and late failure. Pinned-nightly formatting, whitespace and
 strict all-target Clippy checks pass, including type-checking the new tests.
-The complete `ffs-ondisk` library suite passed all 955 tests. ZFS test execution
-remains unverified locally because dependency code generation exceeded the
-available memory. Native OpenZFS crash-image interchange remains unverified.
+The complete `ffs-ondisk` library suite passed all 955 tests. After the earlier
+memory-limited attempts, the complete ZFS library suite executed successfully:
+339 passed, zero failed or ignored, including all six new SA-xattr regressions.
+The executed command was:
+
+```bash
+cargo test --locked -p ffs-zfs --lib \
+  --features ffs-core/bhh0i_sharded_alloc -- --test-threads=2
+```
+
+These are constructed native-format fixtures. Native OpenZFS crash-image
+interchange remains unverified.
 
 ## Earlier validation notes
 
