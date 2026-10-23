@@ -14,7 +14,7 @@ fn repro_create() {
         ext4_journal_replay_mode: ffs_core::Ext4JournalReplayMode::SimulateOverlay,
         ..ffs_core::OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, &img_path, &opts).unwrap();
+    let mut fs = OpenFs::open_read_write(&cx, &img_path, &opts).unwrap();
     fs.enable_writes(&cx).unwrap();
 
     let attr = fs
@@ -44,7 +44,7 @@ fn repro_mkdir() {
         ext4_journal_replay_mode: ffs_core::Ext4JournalReplayMode::SimulateOverlay,
         ..ffs_core::OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, &img_path, &opts).unwrap();
+    let mut fs = OpenFs::open_read_write(&cx, &img_path, &opts).unwrap();
     fs.enable_writes(&cx).unwrap();
 
     let attr = fs
@@ -74,7 +74,7 @@ fn repro_symlink() {
         ext4_journal_replay_mode: ffs_core::Ext4JournalReplayMode::SimulateOverlay,
         ..ffs_core::OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, &img_path, &opts).unwrap();
+    let mut fs = OpenFs::open_read_write(&cx, &img_path, &opts).unwrap();
     fs.enable_writes(&cx).unwrap();
 
     let attr = fs

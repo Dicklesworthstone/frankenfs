@@ -34,7 +34,7 @@ pub use vfs::{
     RequestScope, SeekWhence, SetAttrRequest, XattrSetMode, xflags,
 };
 // Re-export repair lifecycle for convenient wiring.
-pub use ffs_block::RepairFlushLifecycle;
+pub use ffs_block::{RepairFlushLifecycle, io_engine::VolumeAccess};
 
 use asupersync::{Cx, RaptorQConfig};
 use ffs_alloc::{
@@ -1000,6 +1000,7 @@ pub struct OpenOptions {
     ///
     /// Controls whether mount-time JBD2 replay writes through to the underlying
     /// image, writes into an in-memory overlay, or is skipped entirely.
+    /// Path-based read-only opens interpret `Apply` as `SimulateOverlay`.
     pub ext4_journal_replay_mode: Ext4JournalReplayMode,
     /// Filesystem mount mode (compat or native).
     ///
@@ -2807,6 +2808,10 @@ pub struct OpenFs {
     ext4_orphan_head: std::sync::atomic::AtomicU64,
     /// Block device for I/O operations.
     dev: Arc<dyn ByteDevice>,
+    /// Authority retained at open time, independent of allocator activation.
+    /// Path-based readers cannot later become writers, even when their recovery
+    /// overlay accepts internal writes or the caller owns the backing image.
+    write_authority: bool,
     /// Explicitly attached btrfs devices; writable mounts use the single-device path.
     btrfs_devices: Option<Arc<BtrfsReadDevices>>,
     /// Bootstrap-only inspection does not establish device inventory authority.
@@ -4704,6 +4709,7 @@ impl std::fmt::Debug for OpenFs {
                 &self.ext4_forced_read_only.load(Ordering::SeqCst),
             )
             .field("dev_len", &self.dev.len_bytes())
+            .field("write_authority", &self.write_authority)
             .field("mvcc_version_count", &self.mvcc_store.version_count())
             .field(
                 "mvcc_active_snapshots",
@@ -7434,7 +7440,11 @@ pub struct OpenFsMvccTelemetry {
 }
 
 impl OpenFs {
-    /// Open a filesystem image at `path` with default options (validation enabled).
+    /// Open a filesystem image read-only with validation enabled.
+    ///
+    /// Native recovery is confined to an in-memory overlay. The backing image
+    /// is opened without write access and cannot be made writable through
+    /// [`Self::enable_writes`]. Use [`Self::open_read_write`] for mutation.
     pub fn open(cx: &Cx, path: impl AsRef<Path>) -> Result<Self, FfsError> {
         Self::open_with_options(cx, path, &OpenOptions::default())
     }
@@ -7465,14 +7475,54 @@ impl OpenFs {
         Ok(())
     }
 
-    /// Open a filesystem image with custom options.
+    /// Open a filesystem image read-only with custom options.
+    ///
+    /// `Apply` journal recovery is interpreted as `SimulateOverlay`, including
+    /// fast-commit and orphan recovery. Options requiring external mutation
+    /// authority are refused before the image or any WAL is opened.
     pub fn open_with_options(
         cx: &Cx,
         path: impl AsRef<Path>,
         options: &OpenOptions,
     ) -> Result<Self, FfsError> {
-        let path = path.as_ref();
-        let dev = FileByteDevice::open(path)?;
+        let read_options = Self::read_only_options(options)?;
+        let dev = FileByteDevice::open_read_only(path)?;
+        Self::from_device_with_btrfs_devices(
+            cx,
+            Box::new(dev),
+            &read_options,
+            None,
+            None,
+            Vec::new(),
+            false,
+        )
+    }
+
+    fn read_only_options(options: &OpenOptions) -> Result<OpenOptions, FfsError> {
+        if options.native_repair_max_working_bytes.is_some()
+            || options.metadata_log_enabled
+            || options.mvcc_wal_path.is_some()
+        {
+            return Err(FfsError::ReadOnly);
+        }
+        let mut read_options = options.clone();
+        if read_options.ext4_journal_replay_mode == Ext4JournalReplayMode::Apply {
+            read_options.ext4_journal_replay_mode = Ext4JournalReplayMode::SimulateOverlay;
+        }
+        Ok(read_options)
+    }
+
+    /// Open an image with explicit authority to mutate its native storage.
+    ///
+    /// This requires a read-write descriptor and never falls back to read-only.
+    /// Recovery follows `options`, so `Apply` may write before this returns.
+    /// Filesystem operations still require [`Self::enable_writes`].
+    pub fn open_read_write(
+        cx: &Cx,
+        path: impl AsRef<Path>,
+        options: &OpenOptions,
+    ) -> Result<Self, FfsError> {
+        let dev = FileByteDevice::open_read_write(path)?;
         let fs = Self::from_device(cx, Box::new(dev), options)?;
         if fs.metadata_log.is_some() {
             fs.start_metadata_compactor(cx)?;
@@ -7480,24 +7530,32 @@ impl OpenFs {
         Ok(fs)
     }
 
-    /// Open a filesystem from an already-opened device.
+    /// Open a filesystem from a caller-owned device.
+    ///
+    /// Supplying a device explicitly supplies its mutation authority: recovery
+    /// follows `options` and later writes use that device's own access checks.
+    /// Use the path-based read-only constructors when no mutation is intended.
     pub fn from_device(
         cx: &Cx,
         dev: Box<dyn ByteDevice>,
         options: &OpenOptions,
     ) -> Result<Self, FfsError> {
-        Self::from_device_with_btrfs_devices(cx, dev, options, None, None, Vec::new())
+        Self::from_device_with_btrfs_devices(cx, dev, options, None, None, Vec::new(), true)
     }
 
     /// Open using already-admitted auxiliary devices without reopening paths.
     ///
     /// The supplied devices retain their own access mode, bounds and locks.
+    /// `access` separately declares filesystem mutation authority. Read-only
+    /// selection confines recovery to memory and cannot later enable writes;
+    /// read-write selection never upgrades the supplied devices' own rights.
     /// All ordinary format, journal-pairing and btrfs inventory checks apply.
     /// Path-based auxiliary options cannot be mixed with this constructor.
     pub fn from_devices(
         cx: &Cx,
         dev: Box<dyn ByteDevice>,
         options: &OpenOptions,
+        access: VolumeAccess,
         external_journal: Option<Arc<dyn ByteDevice>>,
         btrfs_additional: Vec<Arc<dyn ByteDevice>>,
     ) -> Result<Self, FfsError> {
@@ -7506,13 +7564,19 @@ impl OpenFs {
                 "already-open devices cannot be combined with auxiliary paths".into(),
             ));
         }
+        let options = if access == VolumeAccess::ReadOnly {
+            Self::read_only_options(options)?
+        } else {
+            options.clone()
+        };
         Self::from_device_with_btrfs_devices(
             cx,
             dev,
-            options,
+            &options,
             None,
             external_journal,
             btrfs_additional,
+            access == VolumeAccess::ReadWrite,
         )
     }
 
@@ -7527,6 +7591,7 @@ impl OpenFs {
         inherited_devices: Option<Arc<BtrfsReadDevices>>,
         external_journal: Option<Arc<dyn ByteDevice>>,
         btrfs_additional: Vec<Arc<dyn ByteDevice>>,
+        write_authority: bool,
     ) -> Result<Self, FfsError> {
         if options.native_repair_max_working_bytes.is_some()
             && (options.skip_validation
@@ -7959,6 +8024,7 @@ impl OpenFs {
             btrfs_pending_orphans: Mutex::new(rustc_hash::FxHashSet::default()),
             ext4_orphan_head: std::sync::atomic::AtomicU64::new(u64::MAX),
             dev,
+            write_authority,
             btrfs_devices,
             btrfs_inventory_verified,
             mvcc_store,
@@ -8785,16 +8851,19 @@ impl OpenFs {
 
     /// Check that the current mount mode permits repair symbol writes.
     pub fn require_repair_write_access(&self) -> Result<(), FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("write_repair_symbols")
     }
 
     /// Check that the current mount mode permits version store writes.
     pub fn require_version_store_access(&self) -> Result<(), FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("write_version_store")
     }
 
     /// Check that the current mount mode permits BLAKE3 checksum writes.
     pub fn require_blake3_write_access(&self) -> Result<(), FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("write_blake3_checksum")
     }
 
@@ -9229,7 +9298,7 @@ impl OpenFs {
     /// Like kernel ext4 (`ext4_tmpfile` + `d_tmpfile`), the inode starts with no
     /// links and sits on the orphan list: the last kernel reference reclaims it
     /// (or mount-time recovery after a crash), and a later `link` that names it
-    /// takes it back off ([`Self::ext4_unorphan_inode`]). `parent` only places
+    /// takes it back off ([`Self::ext4_stage_unorphan_inode`]). `parent` only places
     /// the inode near its directory.
     fn ext4_tmpfile(
         &self,
@@ -9283,40 +9352,62 @@ impl OpenFs {
         Ok(inode_to_attr(sb, ino, &inode))
     }
 
-    /// Take a zero-link inode back off the orphan list once `link` names it
-    /// again (`O_TMPFILE` + `linkat`; kernel `ext4_link` -> `ext4_orphan_del`).
-    /// `victim_next` is the inode's old `i_dtime` (its orphan-list next link);
-    /// the caller has already written the inode with `dtime` 0. The caller
-    /// holds the allocation lock.
-    fn ext4_unorphan_inode(
+    /// Stage removal of a newly named `O_TMPFILE` inode from the orphan list.
+    /// The caller holds the allocation lock and supplies its publication
+    /// transaction's device. A returned head must be installed, and the pending
+    /// orphan removed, only after that transaction commits successfully.
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_stage_unorphan_inode(
         &self,
         cx: &Cx,
+        dev: &dyn BlockDevice,
         ino: InodeNumber,
         victim_next: u32,
         geo: &FsGeometry,
         groups: &[GroupStats],
         csum_seed: u32,
-    ) -> ffs_error::Result<()> {
+    ) -> ffs_error::Result<Option<u32>> {
         let ino_u32 = u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
             block: 0,
             detail: format!("unorphan: inode {ino} exceeds the ext4 32-bit inode range"),
         })?;
-        let mut prev: Option<u32> = None;
+        let mut prev = None;
         let mut next = self.ext4_read_orphan_head();
-        let mut steps = 0_u64;
+        let mut visited = BTreeSet::new();
         while next != 0 && next != ino_u32 {
-            prev = Some(next);
-            next = self.read_inode_raw(cx, InodeNumber(u64::from(next)))?.dtime;
-            steps = steps.saturating_add(1);
-            if steps > u64::from(u32::MAX) {
-                break; // cycle guard, as in the finalize walk
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if next > geo.total_inodes || !visited.insert(next) {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("unorphan: invalid or cyclic predecessor {next}"),
+                });
+            }
+            let predecessor = InodeNumber(u64::from(next));
+            let inode = self.read_inode_raw(cx, predecessor)?;
+            next = inode.dtime;
+            prev = Some(predecessor);
+        }
+        if next != ino_u32
+            || victim_next > geo.total_inodes
+            || victim_next == ino_u32
+            || visited.contains(&victim_next)
+        {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!("unorphan: inode {ino} has no valid orphan-list splice"),
+            });
+        }
+        match prev {
+            None => Ok(Some(victim_next)),
+            Some(predecessor) => {
+                // Preserve any fields this same publication already changed,
+                // including another inode sharing the predecessor's table block.
+                let mut inode = ffs_inode::read_inode(cx, dev, geo, groups, predecessor)?;
+                inode.dtime = victim_next;
+                ffs_inode::write_inode(cx, dev, geo, groups, predecessor, &inode, csum_seed)?;
+                Ok(None)
             }
         }
-        if next == ino_u32 {
-            self.ext4_splice_orphan_list(cx, prev, victim_next, geo, groups, csum_seed)?;
-        }
-        self.ext4_pending_orphans.lock().remove(&ino.0);
-        Ok(())
     }
 
     /// Write the superblock with the orphan list cleared (`s_last_orphan = 0`,
@@ -12458,6 +12549,7 @@ impl OpenFs {
     }
 
     pub fn attach_ext4_internal_jbd2_writer(&mut self, cx: &Cx) -> Result<bool, FfsError> {
+        self.require_write_authority()?;
         let Some(writer) = self.open_ext4_internal_jbd2_writer(cx)? else {
             return Ok(false);
         };
@@ -12700,8 +12792,10 @@ impl OpenFs {
     /// Whether write operations are enabled.
     #[must_use]
     pub fn is_writable(&self) -> bool {
-        (self.ext4_alloc_state.is_some() && !self.ext4_forced_read_only.load(Ordering::SeqCst))
-            || self.btrfs_alloc_state.is_some()
+        self.write_authority
+            && ((self.ext4_alloc_state.is_some()
+                && !self.ext4_forced_read_only.load(Ordering::SeqCst))
+                || self.btrfs_alloc_state.is_some())
     }
 
     /// Incrementally checkpoint MVCC versions to this filesystem's base device.
@@ -13020,7 +13114,16 @@ impl OpenFs {
         (self.is_btrfs() && pending_writes != 0).then(|| self.btrfs_semantic_view_stale.write())
     }
 
+    fn require_write_authority(&self) -> Result<(), FfsError> {
+        if self.write_authority {
+            Ok(())
+        } else {
+            Err(FfsError::ReadOnly)
+        }
+    }
+
     fn reject_btrfs_unsupported_mutation(&self) -> Result<(), FfsError> {
+        self.require_write_authority()?;
         let Some(sb) = self.btrfs_superblock() else {
             return Ok(());
         };
@@ -15308,6 +15411,7 @@ impl OpenFs {
             self.btrfs_devices.clone(),
             None,
             Vec::new(),
+            self.write_authority,
         )?;
         nested.btrfs_nested_enabled = false;
         nested.btrfs_semantic_view_stale = Arc::clone(&self.btrfs_semantic_view_stale);
@@ -32508,7 +32612,7 @@ impl OpenFs {
     }
 
     /// Create a hard link in `new_parent/new_name` to existing inode `ino`.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn ext4_link(
         &self,
         cx: &Cx,
@@ -32532,6 +32636,10 @@ impl OpenFs {
 
         let mut alloc = alloc_mutex.write();
         let block_dev = self.block_device_adapter();
+        // Capture the conflict boundary before reading any inode that will be
+        // rewritten. A concurrent data request may finish its scope commit
+        // after releasing the allocator, and must not be overwritten by link.
+        let mut txn = self.mvcc_store.begin();
 
         let src_inode = self.read_inode(cx, ino)?;
         if src_inode.is_dir() {
@@ -32556,10 +32664,9 @@ impl OpenFs {
         }
         // Skip the redundant positive lookup_name on a non-casefold htree dir:
         // the insert (ext4_add_dir_entry -> add_entry_reject_existing) dup-checks
-        // the hash-correct leaf, and on a collision the rollback below rewrites the
-        // ORIGINAL source inode (undoing the link-count bump), so EEXIST + link
-        // accounting are unchanged — same guard as ext4_create/ext4_mkdir
-        // (bd-cc-mkdir-dedup). Casefold/linear dirs keep the pre-check.
+        // the hash-correct leaf. On collision the entire private transaction is
+        // discarded, including its source nlink update. Casefold/linear dirs
+        // keep the pre-check.
         let htree_dedup_covers = new_parent_inode.has_htree_index()
             && new_parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
             && Self::htree_create_dedup_enabled();
@@ -32578,56 +32685,94 @@ impl OpenFs {
         }
         src_upd.links_count = Self::ext4_checked_links_count_delta(src_upd.links_count, ino, 1)?;
         ffs_inode::touch_ctime(&mut src_upd, tstamp_secs, tstamp_nanos);
-        ffs_inode::write_inode(
-            cx,
-            &block_dev,
-            &alloc.geo,
-            &alloc.groups,
-            ino,
-            &src_upd,
-            csum_seed,
-        )?;
 
-        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
-        // before the error branch re-borrows `alloc` — NLL ends it at the backend's
-        // last use, so the explicit `drop` this comment used to name was a no-op and
-        // is gone. The ORDER is still the requirement.
-        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-        let add_result = self.ext4_add_dir_entry(
-            cx,
-            &mut backend,
-            new_parent,
-            &new_parent_inode,
-            new_name,
-            ino,
-            inode_dir_entry_file_type(&src_upd),
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-        );
-        if let Err(err) = add_result {
-            let block_dev = self.block_device_adapter();
-            ffs_inode::write_inode(
+        // Like symlink, link owns one namespace publication transaction. Keep
+        // allocation, both inode updates, the directory entry and any orphan
+        // predecessor splice private until the complete operation can commit.
+        let groups_before = alloc.groups.clone();
+        let staged = (|| -> ffs_error::Result<Option<u32>> {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                ffs_inode::write_inode(
+                    cx,
+                    &tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &src_upd,
+                    csum_seed,
+                )?;
+            }
+            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+            self.ext4_stage_dir_entry(
                 cx,
-                &block_dev,
-                &alloc.geo,
-                &alloc.groups,
+                &mut txn,
+                &mut backend,
+                new_parent,
+                &new_parent_inode,
+                new_name,
                 ino,
-                &src_inode,
+                inode_dir_entry_file_type(&src_upd),
                 csum_seed,
+                tstamp_secs,
+                tstamp_nanos,
             )?;
-            return Err(err);
+            let new_head = if was_orphan {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                self.ext4_stage_unorphan_inode(
+                    cx,
+                    &tx_dev,
+                    ino,
+                    src_inode.dtime,
+                    &alloc.geo,
+                    &alloc.groups,
+                    csum_seed,
+                )?
+            } else {
+                None
+            };
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            Ok(new_head)
+        })();
+        let new_head = match staged {
+            Ok(head) => head,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        let txn_id = txn.id();
+        let write_blocks = if self.repair_flush_lifecycle.is_some() {
+            txn.write_set().keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
+        {
+            Ok(seq) => seq,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        // Keep orphan insertion and finalization excluded until their runtime
+        // bookkeeping reflects the committed splice.
+        if let Some(head) = new_head {
+            self.ext4_write_orphan_head(head);
         }
         if was_orphan {
-            self.ext4_unorphan_inode(
-                cx,
-                ino,
-                src_inode.dtime,
-                &alloc.geo,
-                &alloc.groups,
-                csum_seed,
-            )?;
+            self.ext4_pending_orphans.lock().remove(&ino.0);
         }
+        drop(alloc);
+        self.prune_mvcc_after_commit_if_due(commit_seq);
+        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
 
         debug!(
             target: "ffs::write",
@@ -37115,9 +37260,9 @@ impl OpenFs {
     /// head, REG middle with checksums, PREALLOC tail), each extra view one
     /// more reference under the same backref key. nbytes is unchanged.
     ///
-    /// Taken only when the extent is exclusively this inode's (every backref
-    /// is this root and inode) and nothing can share it implicitly: no
-    /// subvolume or snapshot exists, and the extent is newer than the root's
+    /// Taken only when the extent is exclusively this mapping's (every backref
+    /// has this root, inode and backref offset) and nothing can share it
+    /// implicitly: no subvolume or snapshot exists, and the extent is newer than the root's
     /// `last_snapshot` (the kernel's rule). A crash before the commit leaves
     /// the old PREALLOC item, which reads zeros whatever the blocks hold.
     fn btrfs_try_write_into_prealloc(
@@ -37168,9 +37313,16 @@ impl OpenFs {
             return Ok(false);
         }
         let root = alloc.fs_root_objectid;
+        let ref_offset = key.offset.wrapping_sub(extent_offset);
         if !alloc
             .extent_alloc
-            .data_extent_owned_only_by(disk_bytenr, disk_num_bytes, root, canonical)
+            .data_extent_owned_only_by_mapping(
+                disk_bytenr,
+                disk_num_bytes,
+                root,
+                canonical,
+                ref_offset,
+            )
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
             || Self::btrfs_may_be_shared_by_a_snapshot(alloc, root, generation)?
         {
@@ -37241,7 +37393,6 @@ impl OpenFs {
             inserted.push(piece_key);
         }
         // One reference per view; the original item held one.
-        let ref_offset = key.offset.wrapping_sub(extent_offset);
         for _ in 1..inserted.len() {
             alloc
                 .extent_alloc
@@ -37606,112 +37757,22 @@ impl OpenFs {
         Ok(length)
     }
 
-    /// Share every data extent of `src_canonical` into `dst_canonical` — the
-    /// core of a btrfs reflink (bd-vh8p9). For each of src's `EXTENT_DATA`
-    /// items, insert an identical `EXTENT_DATA` for dst at the same file offset
-    /// (pointing at the SAME `disk_bytenr` — a shared extent) and, for regular
-    /// extents, bump the extent's refcount + add a keyed `EXTENT_DATA_REF`
-    /// backref for dst via [`BtrfsExtentAllocator::add_data_extent_ref`]. Inline
-    /// extents carry their bytes in the item itself, so the copied `EXTENT_DATA`
-    /// is sufficient (no extent-tree reference). No new space is allocated, and
-    /// the shared extent's `EXTENT_CSUM` (keyed by `disk_bytenr`) already covers
-    /// dst. Finally dst's `size`/`nbytes` are set to match src.
-    ///
-    /// The `EXTENT_DATA_REF` offset is `key.offset - extent_offset` (the disk
-    /// extent's logical start in the file), matching btrfs. Reached from FUSE
-    /// FICLONE through `FsOps::clone_file`.
+    /// Reflink the source's logical content at destination offset zero.
+    /// Native FICLONE preserves any destination suffix and allocations beyond
+    /// EOF, and never transfers source reservations beyond its logical EOF.
+    /// Use the same bounded extent sharing as FICLONERANGE (bd-vh8p9).
     fn btrfs_clone_file_data(
         &self,
+        cx: &Cx,
         alloc: &mut BtrfsAllocState,
         src_canonical: u64,
         dst_canonical: u64,
     ) -> ffs_error::Result<()> {
-        let lo = BtrfsKey {
-            objectid: src_canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: 0,
-        };
-        let hi = BtrfsKey {
-            objectid: src_canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: u64::MAX,
-        };
-        let src_extents = alloc
-            .fs_tree
-            .range(&lo, &hi)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-
-        // FICLONE replaces dst's ENTIRE content with src's. Drop dst's existing
-        // extents refcount-aware (a shared extent loses only this inode's
-        // EXTENT_DATA_REF; a sole extent is freed with its EXTENT_CSUM items)
-        // before grafting src's. Without this, cloning onto a NON-EMPTY dst
-        // either collides on a same-offset EXTENT_DATA key (KeyAlreadyExists,
-        // aborting mid-loop with a half-cloned dst) or leaves stale extents past
-        // the cloned i_size — leaking refs and tripping `btrfs check`. Mirrors
-        // the range path (btrfs_clone_file_range_data), which drops the dest
-        // window first. A whole-file clone onto itself is a no-op (guarding it
-        // also prevents freeing src's own extents in the clear step below).
-        if src_canonical == dst_canonical {
+        let len = self.btrfs_read_inode_from_tree(alloc, src_canonical)?.size;
+        if len == 0 {
             return Ok(());
         }
-        let stale = Self::btrfs_extent_data_items(alloc, dst_canonical)?;
-        Self::btrfs_delete_extent_data_items(alloc, &stale)?;
-
-        for (key, data) in src_extents {
-            let dst_key = BtrfsKey {
-                objectid: dst_canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: key.offset,
-            };
-            // Same on-disk bytes: dst references the identical (possibly shared)
-            // extent. For inline extents this carries the data; for regular
-            // extents it points at src's disk_bytenr.
-            alloc
-                .fs_tree
-                .insert(dst_key, &data)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-
-            if let BtrfsExtentData::Regular {
-                disk_bytenr,
-                disk_num_bytes,
-                extent_offset,
-                ..
-            } = parse_extent_data(&data).map_err(|e| parse_to_ffs_error(&e))?
-                && disk_bytenr > 0
-            {
-                // btrfs data-backref offset = file_offset - extent_offset,
-                // computed with u64 wraparound (a reflinked sub-range views
-                // into the extent, so extent_offset can exceed file_offset —
-                // btrfs check validates the wrapped value).
-                let ref_offset = key.offset.wrapping_sub(extent_offset);
-                let root = alloc.fs_root_objectid;
-                alloc
-                    .extent_alloc
-                    .add_data_extent_ref(
-                        disk_bytenr,
-                        disk_num_bytes,
-                        root,
-                        dst_canonical,
-                        ref_offset,
-                    )
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            }
-        }
-
-        let src_inode = self.btrfs_read_inode_from_tree(alloc, src_canonical)?;
-        let mut dst_inode = self.btrfs_read_inode_from_tree(alloc, dst_canonical)?;
-        dst_inode.size = src_inode.size;
-        dst_inode.nbytes = src_inode.nbytes;
-        let dst_inode_key = BtrfsKey {
-            objectid: dst_canonical,
-            item_type: BTRFS_ITEM_INODE_ITEM,
-            offset: 0,
-        };
-        alloc
-            .fs_tree
-            .update(&dst_inode_key, &dst_inode.to_bytes())
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        Ok(())
+        self.btrfs_clone_file_range_data(cx, alloc, src_canonical, dst_canonical, 0, len, 0)
     }
 
     /// Reflink a byte sub-range of `src` into `dst` (FICLONERANGE, bd-jbtd2).
@@ -37722,8 +37783,8 @@ impl OpenFs {
     /// the extent refcount via `add_data_extent_ref`. Existing dst data in
     /// `[dest_offset, dest_offset+len)` is first dropped refcount-aware; dst
     /// `size`/`nbytes` are then recomputed from the resulting extent set.
-    /// Inline/compressed extents can't be carved by view, so a partial range
-    /// covering one is refused (FrankenFS writes neither for data extents).
+    /// Compressed extents are shared by view; inline bytes are copied into
+    /// fresh regular extents because inline data has no shareable disk extent.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::match_wildcard_for_single_variants)]
     #[allow(clippy::too_many_arguments)]
@@ -38278,13 +38339,10 @@ impl OpenFs {
             .range(&ext_start, &ext_end)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-        // Each overlapping extent is freed refcount-aware (bd-xkvcm): a SHARED
-        // extent (reflink/snapshot/CoW, EXTENT_ITEM.refs > 1) has only this
-        // inode's EXTENT_DATA_REF dropped — the left/right non-overlapping parts
-        // are re-inserted below as fresh materialized copies, so this inode no
-        // longer needs the shared extent and the other references stay live. A
-        // sole reference (refs == 1) is freed as before. FrankenFS's own extents
-        // are refs == 1, so the drop path only engages on kernel-shared extents.
+        // Account for each overlapping item's references (bd-xkvcm). Disk-backed
+        // regular and preallocated remnants keep the original extent as narrower
+        // views. Entirely removed items drop their reference, freeing space and
+        // checksums only when no references remain.
         let mut nbytes_delta = 0_i128;
         for (key, extent_bytes) in extents {
             let extent = parse_extent_data(&extent_bytes).map_err(|e| parse_to_ffs_error(&e))?;
@@ -38315,25 +38373,25 @@ impl OpenFs {
                 BtrfsExtentData::Regular { extent_type, .. }
                     if extent_type == BTRFS_FILE_EXTENT_PREALLOC
             );
-            // A REGULAR extent backed by real disk is split BY REFERENCE: both
+            // Disk-backed REGULAR and PREALLOC extents split by reference: both
             // halves keep the original's `disk_bytenr`/`disk_num_bytes` and just
             // narrow `extent_offset`/`num_bytes` to their own file range, exactly
-            // as the kernel splits a file extent item. Nothing is copied and
-            // nothing is allocated, which is what removes bd-72tn8's failure mode
-            // rather than recovering from it — the old path materialized each
-            // remnant into a fresh private extent, so a split could fail on a full
-            // or fragmented filesystem after the original was already gone.
+            // as the kernel splits a file extent item. No new data allocation or
+            // data copy is needed. Metadata updates can still fail, but the
+            // remnant's data-space ENOSPC failure site is removed (bd-72tn8).
             //
-            // Holes (`disk_bytenr == 0`), PREALLOC, and inline extents keep the
-            // old handling: a hole has nothing to reference, prealloc re-inserts
-            // reservations, and an inline extent's bytes live in the item itself.
+            // Keeping PREALLOC's extent type preserves its zero reads, unwritten
+            // FIEMAP state and existing reservation. Reallocating its remnants
+            // could fail with ENOSPC after deleting the original item, even
+            // though the surviving ranges already owned their backing space.
+            // Other extent forms keep the remnant handling below.
             let reference_split = matches!(
                 extent,
                 BtrfsExtentData::Regular {
-                    extent_type,
+                    extent_type: BTRFS_FILE_EXTENT_REG | BTRFS_FILE_EXTENT_PREALLOC,
                     disk_bytenr,
                     ..
-                } if extent_type == BTRFS_FILE_EXTENT_REG && disk_bytenr > 0
+                } if disk_bytenr > 0
             );
             let materialized = if is_prealloc || reference_split {
                 Vec::new()
@@ -38345,14 +38403,9 @@ impl OpenFs {
                 .delete(&key)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-            // The original's disk extent is NOT freed yet (bd-72tn8). Rebuilding
-            // the non-overlapping head/tail allocates, and allocation can fail on
-            // a full or fragmented filesystem — a total-free pre-flight cannot
-            // predict it, because each remnant needs a CONTIGUOUS run. Freeing
-            // first made that failure destructive: the caller got ENOSPC and the
-            // file kept a hole where a remnant was never rebuilt. Holding the
-            // original until both remnants are safely in place means a failure
-            // can be rolled back to exactly the prior state.
+            // Keep the original reference until surviving views or materialized
+            // remnants are installed. Reference splits retain that ownership;
+            // fallback paths drop it only after both remnants succeed (bd-72tn8).
             if reference_split {
                 let surviving = Self::btrfs_split_extent_by_reference(
                     alloc,
@@ -38485,7 +38538,8 @@ impl OpenFs {
     /// This is the kernel's file-extent split: `disk_bytenr`, `disk_num_bytes`,
     /// `ram_bytes` and `compression` are inherited untouched, and only
     /// `extent_offset`/`num_bytes` narrow to each half's file range. No data is
-    /// read and no space is allocated, so the split cannot fail for want of it.
+    /// read and no new data space is allocated. Metadata insertion and the
+    /// caller's reference-count updates can still fail.
     ///
     /// Both halves resolve to the same backref key — the left keeps the original
     /// file offset and `extent_offset`, and the right advances both by the same
@@ -55811,6 +55865,304 @@ mod tests {
     }
 
     #[test]
+    fn read_only_open_recovers_fast_commit_without_changing_backing_file() {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        assert!(
+            ffs_dir::remove_entry(&mut image[10 * 4096..11 * 4096], b"hello.txt", 0)
+                .expect("remove fixture directory entry")
+        );
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+
+        for mode in [
+            None,
+            Some(Ext4JournalReplayMode::Apply),
+            Some(Ext4JournalReplayMode::SimulateOverlay),
+            Some(Ext4JournalReplayMode::Skip),
+        ] {
+            let fs = if let Some(mode) = mode {
+                OpenFs::open_with_options(
+                    &cx,
+                    file.path(),
+                    &OpenOptions {
+                        ext4_journal_replay_mode: mode,
+                        ..OpenOptions::default()
+                    },
+                )
+            } else {
+                OpenFs::open(&cx, file.path())
+            }
+            .expect("open without write authority");
+            assert!(!fs.write_authority);
+            assert!(!fs.is_writable());
+            let root = fs.read_inode(&cx, InodeNumber(2)).expect("read root");
+            let entry = fs
+                .lookup_name(&cx, &root, b"hello.txt")
+                .expect("lookup committed name");
+            if mode == Some(Ext4JournalReplayMode::Skip) {
+                assert!(entry.is_none(), "Skip must retain the unrecovered view");
+            } else {
+                assert_eq!(entry.expect("overlay recovers committed name").inode, 11);
+            }
+            drop(fs);
+            assert_eq!(
+                std::fs::read(file.path()).expect("read backing image"),
+                image,
+                "read-only recovery mode {mode:?} changed its backing file"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_open_jbd2_recovery_changes_only_the_visible_overlay() {
+        let image = build_ext4_image_with_internal_journal();
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        let fs = OpenFs::open(&cx, file.path()).expect("recover JBD2 in overlay");
+        let replay = fs.ext4_journal_replay().expect("journal recovery report");
+        assert_eq!(replay.committed_sequences, vec![1]);
+        assert_eq!(replay.stats.replayed_blocks, 1);
+        assert_eq!(
+            &fs.read_block_vec(&cx, BlockNumber(15))
+                .expect("recovered block")[..16],
+            b"JBD2-REPLAY-TEST"
+        );
+        drop(fs);
+        assert_eq!(std::fs::read(file.path()).expect("backing image"), image);
+    }
+
+    #[test]
+    fn read_only_open_orphan_cleanup_changes_only_the_visible_overlay() {
+        let mut image = build_ext4_image_with_orphan_chain(&[11, 12]);
+        set_test_ext4_state(&mut image, EXT4_VALID_FS | EXT4_ORPHAN_FS);
+        set_test_inode_links_count(&mut image, 11, 0);
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        let fs = OpenFs::open(&cx, file.path()).expect("recover orphans in overlay");
+        assert!(fs.crash_recovery().expect("recovery report").had_orphans);
+        assert!(matches!(
+            fs.read_inode(&cx, InodeNumber(11)),
+            Err(FfsError::NotFound(_))
+        ));
+        assert!(
+            fs.read_ext4_orphan_list(&cx)
+                .expect("recovered orphan list")
+                .inodes
+                .is_empty()
+        );
+        drop(fs);
+        assert_eq!(std::fs::read(file.path()).expect("backing image"), image);
+    }
+
+    #[test]
+    fn read_only_open_recovery_failure_preserves_image_on_retry() {
+        let image = build_unreadable_htree_fast_commit_image();
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        for _ in 0..2 {
+            let error = OpenFs::open(&cx, file.path())
+                .expect_err("incomplete committed recovery must remain an error");
+            assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+            assert!(error.to_string().contains("CREATE recovery incomplete"));
+            assert_eq!(std::fs::read(file.path()).expect("backing image"), image);
+        }
+    }
+
+    #[test]
+    fn read_only_open_cannot_acquire_mutation_authority() {
+        let image = build_ext4_image_with_extents();
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        let options = OpenOptions {
+            mount_mode: MountMode::Native,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::open_with_options(&cx, file.path(), &options)
+            .expect("open clean image read-only");
+        assert!(matches!(fs.enable_writes(&cx), Err(FfsError::ReadOnly)));
+        assert!(matches!(
+            fs.attach_ext4_internal_jbd2_writer(&cx),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.require_repair_write_access(),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.require_version_store_access(),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.require_blake3_write_access(),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.activate_native_ext4_repair(&cx, 4096),
+            Err(FfsError::ReadOnly)
+        ));
+
+        let snapshot = fs.current_snapshot();
+        for ssi in [false, true] {
+            let mut txn = fs.begin_transaction();
+            txn.stage_write(BlockNumber(15), vec![0xAB; 4096]);
+            let error = if ssi {
+                fs.commit_transaction_ssi(&cx, txn)
+            } else {
+                fs.commit_transaction(&cx, txn)
+            }
+            .expect_err("read-only handles cannot publish raw writes");
+            assert!(matches!(error, CommitError::DurabilityFailure { .. }));
+            assert_eq!(fs.current_snapshot().high, snapshot.high);
+            assert!(
+                fs.mvcc_read_visible(BlockNumber(15), fs.current_snapshot())
+                    .is_none()
+            );
+        }
+        assert!(!fs.is_writable());
+        assert_eq!(fs.flush_mvcc_to_device(&cx).expect("empty flush"), 0);
+        drop(fs);
+        for operation in ["prepare", "validation", "parity"] {
+            let fs = OpenFs::open_with_options(&cx, file.path(), &options)
+                .expect("open native image for inspection");
+            let result = match operation {
+                "prepare" => fs.prepare_native_ext4_repair(&cx, 100).map(|_| ()),
+                "validation" => fs.initialize_native_ext4_validation(&cx).map(|_| ()),
+                _ => fs.initialize_native_ext4_repair(&cx, 4096).map(|_| ()),
+            };
+            assert!(matches!(result, Err(FfsError::ReadOnly)), "{operation}");
+        }
+        assert_eq!(std::fs::read(file.path()).expect("backing image"), image);
+    }
+
+    #[test]
+    fn declared_device_access_controls_recovery_and_later_mutation_authority() {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        assert!(
+            ffs_dir::remove_entry(&mut image[10 * 4096..11 * 4096], b"hello.txt", 0)
+                .expect("remove fixture directory entry")
+        );
+        let cx = Cx::for_testing();
+        for access in [VolumeAccess::ReadOnly, VolumeAccess::ReadWrite] {
+            let device = TestDevice::from_vec(image.clone());
+            let mut fs = OpenFs::from_devices(
+                &cx,
+                Box::new(device.clone()),
+                &OpenOptions::default(),
+                access,
+                None,
+                Vec::new(),
+            )
+            .expect("recover through caller-owned writable memory");
+            let root = fs.read_inode(&cx, InodeNumber(2)).expect("read root");
+            let entry = fs
+                .lookup_name(&cx, &root, b"hello.txt")
+                .expect("read recovered directory")
+                .expect("committed CREATE must be visible in both access modes");
+            assert_eq!(entry.inode, 11);
+            assert_eq!(fs.write_authority, access == VolumeAccess::ReadWrite);
+            if access == VolumeAccess::ReadOnly {
+                assert!(matches!(fs.enable_writes(&cx), Err(FfsError::ReadOnly)));
+                assert!(matches!(
+                    fs.attach_ext4_internal_jbd2_writer(&cx),
+                    Err(FfsError::ReadOnly)
+                ));
+                assert_eq!(device.snapshot_bytes(), image);
+            } else {
+                assert_ne!(device.snapshot_bytes(), image);
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_open_rejects_mutating_options_before_opening_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let image = directory.path().join("absent-image.ext4");
+        let existing_wal = directory.path().join("existing.wal");
+        let absent_wal = directory.path().join("absent.wal");
+        let sentinel = b"WAL bytes must survive rejected read-only opens";
+        std::fs::write(&existing_wal, sentinel).expect("write WAL sentinel");
+        let cx = Cx::for_testing();
+        for options in [
+            OpenOptions {
+                native_repair_max_working_bytes: Some(4096),
+                ..OpenOptions::default()
+            },
+            OpenOptions {
+                metadata_log_enabled: true,
+                ..OpenOptions::default()
+            },
+            OpenOptions {
+                mvcc_wal_path: Some(existing_wal.clone()),
+                ..OpenOptions::default()
+            },
+            OpenOptions {
+                mvcc_wal_path: Some(absent_wal.clone()),
+                ..OpenOptions::default()
+            },
+        ] {
+            assert!(matches!(
+                OpenFs::open_with_options(&cx, &image, &options),
+                Err(FfsError::ReadOnly)
+            ));
+            assert!(matches!(
+                OpenFs::from_devices(
+                    &cx,
+                    Box::new(TestDevice::from_vec(Vec::new())),
+                    &options,
+                    VolumeAccess::ReadOnly,
+                    None,
+                    Vec::new(),
+                ),
+                Err(FfsError::ReadOnly)
+            ));
+            assert_eq!(
+                std::fs::read(&existing_wal).expect("WAL sentinel"),
+                sentinel
+            );
+            assert!(!absent_wal.exists());
+            assert!(!image.exists());
+        }
+    }
+
+    #[test]
+    fn read_write_open_persists_fast_commit_recovery() {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        assert!(
+            ffs_dir::remove_entry(&mut image[10 * 4096..11 * 4096], b"hello.txt", 0)
+                .expect("remove fixture directory entry")
+        );
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        let fs = OpenFs::open_read_write(&cx, file.path(), &OpenOptions::default())
+            .expect("explicit writable recovery");
+        assert!(fs.write_authority);
+        drop(fs);
+        assert_ne!(std::fs::read(file.path()).expect("backing image"), image);
+
+        let reopened = OpenFs::open_with_options(
+            &cx,
+            file.path(),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("read persisted state without another recovery");
+        let root = reopened.read_inode(&cx, InodeNumber(2)).expect("read root");
+        let entry = reopened
+            .lookup_name(&cx, &root, b"hello.txt")
+            .expect("lookup persisted name")
+            .expect("explicit writable recovery persisted the committed name");
+        assert_eq!(entry.inode, 11);
+    }
+
+    #[test]
     fn fast_commit_create_apply_splices_dir_entry_bd_6nwjx() {
         // A create that was fast-committed but lost its directory entry on crash:
         // the inode (#11) survives but the parent (#2) no longer lists it. CREAT
@@ -56180,7 +56532,7 @@ mod tests {
         let requested = b"ffs-renamed";
 
         {
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts)
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts)
                 .expect("open ext4 image for setfslabel");
             fs.enable_writes(&cx).expect("enable writes");
             fs.set_fs_label(&cx, &mut RequestScope::empty(), requested)
@@ -56219,7 +56571,7 @@ mod tests {
         };
 
         let mut fs =
-            OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open ext4 image for write");
+            OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("open ext4 image for write");
         fs.enable_writes(&cx).expect("enable writes");
 
         let err = fs
@@ -56912,6 +57264,7 @@ mod tests {
                 &cx,
                 Box::new(data.clone()),
                 &options,
+                VolumeAccess::ReadOnly,
                 Some(Arc::new(device)),
                 Vec::new(),
             );
@@ -60284,7 +60637,7 @@ mod tests {
         let ino;
 
         {
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts)
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts)
                 .expect("open ext4 image for setversion");
             fs.enable_writes(&cx).expect("enable writes");
             let created = fs
@@ -72666,9 +73019,11 @@ mod tests {
 
         // linkat(fd, "", root, "named", AT_EMPTY_PATH). `kept` sits mid-list,
         // behind `dropped`, so the splice rewrites `dropped`'s next link.
+        let before_link = fs.current_snapshot();
         let named = fs
             .link(&cx, kept.ino, root, OsStr::new("named"))
             .expect("link the tmpfile");
+        assert_eq!(fs.current_snapshot().high.0, before_link.high.0 + 1);
         assert_eq!(named.nlink, 1);
         let on_disk = fs.read_inode(&cx, kept.ino).expect("read named");
         assert_eq!(on_disk.dtime, 0, "a named inode is off the orphan list");
@@ -72706,6 +73061,21 @@ mod tests {
             free_before - 1,
             "only the named tmpfile still holds an inode"
         );
+
+        // Removing the head uses runtime s_last_orphan instead of a predecessor
+        // inode. It must still share the link's one publication boundary.
+        let head = fs.ext4_tmpfile(&cx, root, 0o600, 0, 0).unwrap();
+        assert_eq!(u64::from(fs.ext4_read_orphan_head()), head.ino.0);
+        let before_head = fs.current_snapshot();
+        fs.link(&cx, head.ino, root, OsStr::new("named_head"))
+            .unwrap();
+        assert_eq!(fs.current_snapshot().high.0, before_head.high.0 + 1);
+        assert_eq!(fs.ext4_read_orphan_head(), 0);
+        assert_eq!(fs.read_inode(&cx, head.ino).unwrap().dtime, 0);
+        assert_eq!(fs.getattr(&cx, head.ino).unwrap().nlink, 1);
+        assert!(!fs.ext4_pending_orphans.lock().contains(&head.ino.0));
+        assert!(!fs.finalize_unlinked_inode_public(&cx, head.ino).unwrap());
+        assert_eq!(fs.statfs(&cx, root).unwrap().files_free, free_before - 2);
 
         fs.flush_mvcc_to_device(&cx).expect("flush mvcc to device");
         std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
@@ -82542,6 +82912,242 @@ mod tests {
     }
 
     #[test]
+    fn ext4_link_single_commit_preserves_snapshots_through_growth_and_reopen() {
+        for small_blocks in [false, true] {
+            let opened = if small_blocks {
+                open_ext4_mke2fs(16, true)
+            } else {
+                open_writable_ext4_mkfs_with_device(16).map(|(fs, dev, tmp)| {
+                    let image = tmp.path().join("test.ext4");
+                    (fs, dev, tmp, image)
+                })
+            };
+            let (fs, dev, _tmp, image) =
+                opened.expect("hard-link publication regression requires e2fsprogs");
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let source = fs
+                .create(&cx, root, OsStr::new("source"), 0o600, 0, 0)
+                .unwrap();
+            fs.write(&cx, source.ino, 0, b"shared payload").unwrap();
+            let parent = fs
+                .mkdir(&cx, root, OsStr::new("links"), 0o700, 0, 0)
+                .unwrap();
+            let names: Vec<_> = (0..40)
+                .map(|index| format!("alias_{index:03}_{}", "n".repeat(180)))
+                .collect();
+            for (index, name) in names.iter().enumerate() {
+                // Match the FUSE lifecycle and pin the pre-operation version.
+                let mut scope = fs.begin_request_scope(&cx, RequestOp::Link).unwrap();
+                let before = fs.current_snapshot();
+                let linked = FsOps::link(
+                    &fs,
+                    &cx,
+                    &mut scope,
+                    source.ino,
+                    parent.ino,
+                    OsStr::new(name),
+                )
+                .expect("link publication");
+                let after = fs.current_snapshot();
+                assert_eq!(after.high.0, before.high.0 + 1, "one publication per link");
+                assert_eq!(linked.nlink, u32::try_from(index + 2).unwrap());
+                assert_eq!(
+                    fs.read_inode_with_scope(&cx, &scope, source.ino)
+                        .unwrap()
+                        .links_count,
+                    u16::try_from(index + 1).unwrap(),
+                    "an old snapshot must retain the old link count"
+                );
+                let old_parent = fs.read_inode_with_scope(&cx, &scope, parent.ino).unwrap();
+                assert!(
+                    fs.read_dir_with_scope(&cx, &scope, &old_parent)
+                        .unwrap()
+                        .iter()
+                        .all(|entry| entry.name != name.as_bytes()),
+                    "the same old snapshot must not contain the new name"
+                );
+                assert_eq!(
+                    fs.lookup(&cx, parent.ino, OsStr::new(name)).unwrap().ino,
+                    source.ino
+                );
+                fs.commit_request_scope(&cx, &mut scope).unwrap();
+                assert_eq!(fs.current_snapshot(), after, "outer scope stays empty");
+                fs.end_request_scope(&cx, RequestOp::Link, scope).unwrap();
+            }
+            let parent_inode = fs.read_inode(&cx, parent.ino).unwrap();
+            assert!(
+                parent_inode.has_htree_index(),
+                "exercise indexed directory growth"
+            );
+            assert!(parent_inode.size > u64::from(fs.block_size()));
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+            let (clean, output) = run_e2fsck(&image).expect("hard-link oracle requires e2fsck");
+            assert!(
+                clean,
+                "hard links and directory growth must be native-clean: {output}"
+            );
+            drop(fs);
+            let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+                .expect("reopen hard-link image");
+            for name in names {
+                let alias = reopened.lookup(&cx, parent.ino, OsStr::new(&name)).unwrap();
+                assert_eq!(alias.ino, source.ino);
+                assert_eq!(alias.nlink, 41);
+                assert_eq!(
+                    reopened.read(&cx, alias.ino, 0, 64).unwrap(),
+                    b"shared payload"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_link_htree_collision_publishes_no_source_or_allocation_changes() {
+        let (fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("hard-link collision regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let names: Vec<_> = (0..32)
+            .map(|index| format!("entry_{index:03}_{}", "a".repeat(180)))
+            .collect();
+        for name in &names {
+            fs.create(&cx, root, OsStr::new(name), 0o600, 0, 0).unwrap();
+        }
+        assert!(fs.read_inode(&cx, root).unwrap().has_htree_index());
+        let source = fs.lookup(&cx, root, OsStr::new(&names[0])).unwrap();
+        let occupied = fs.lookup(&cx, root, OsStr::new(&names[1])).unwrap();
+        let before = fs.current_snapshot();
+        let before_bytes = dev.snapshot_bytes();
+        let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        let before_blocks = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+        let before_inodes = fs.count_free_inodes_in_group(&cx, GroupNumber(0)).unwrap();
+        let error = fs
+            .link(&cx, source.ino, root, OsStr::new(&names[1]))
+            .expect_err("duplicate htree name");
+        assert!(matches!(error, FfsError::Exists));
+        assert_eq!(
+            fs.current_snapshot(),
+            before,
+            "failure must publish no block versions"
+        );
+        assert_eq!(dev.snapshot_bytes(), before_bytes);
+        assert_eq!(
+            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+            before_groups
+        );
+        assert_eq!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+            before_blocks
+        );
+        assert_eq!(
+            fs.count_free_inodes_in_group(&cx, GroupNumber(0)).unwrap(),
+            before_inodes
+        );
+        assert_eq!(fs.getattr(&cx, source.ino).unwrap().nlink, 1);
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new(&names[1])).unwrap().ino,
+            occupied.ino
+        );
+    }
+
+    #[test]
+    fn ext4_link_failed_orphan_splice_rolls_back_directory_growth_and_retries() {
+        let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("hard-link rollback regression requires mkfs.ext4");
+        let image = tmp.path().join("test.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let parent = fs
+            .mkdir(&cx, root, OsStr::new("full_parent"), 0o700, 0, 0)
+            .unwrap();
+        // Fifteen 252-byte names fill one 4 KiB directory block. The next
+        // long entry must allocate blocks to promote the directory to htree.
+        for index in 0..15 {
+            let name = format!("{index:03}_{}", "f".repeat(248));
+            fs.create(&cx, parent.ino, OsStr::new(&name), 0o600, 0, 0)
+                .unwrap();
+        }
+        assert_eq!(fs.read_inode(&cx, parent.ino).unwrap().size, 4096);
+        let source = fs.ext4_tmpfile(&cx, root, 0o600, 0, 0).unwrap();
+        fs.write(&cx, source.ino, 0, b"temporary payload").unwrap();
+        let head = fs.ext4_tmpfile(&cx, root, 0o600, 0, 0).unwrap();
+        let good_head = fs.read_inode(&cx, head.ino).unwrap();
+        assert_eq!(u64::from(good_head.dtime), source.ino.0);
+        let mut bad_head = good_head.clone();
+        bad_head.dtime = fs
+            .ext4_superblock()
+            .unwrap()
+            .inodes_count
+            .checked_add(1)
+            .unwrap();
+        fs.persist_ext4_inode_for_testing(&cx, head.ino, &bad_head)
+            .unwrap();
+        let name = format!("new_{}", "l".repeat(248));
+        let before = fs.current_snapshot();
+        let before_bytes = dev.snapshot_bytes();
+        let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        let before_blocks = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+        let error = fs
+            .link(&cx, source.ino, parent.ino, OsStr::new(&name))
+            .unwrap_err();
+        assert!(matches!(error, FfsError::Corruption { .. }));
+        assert_eq!(
+            fs.current_snapshot(),
+            before,
+            "invalid orphan splice cannot publish a link"
+        );
+        assert_eq!(dev.snapshot_bytes(), before_bytes);
+        assert_eq!(
+            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+            before_groups,
+            "failed directory growth must restore cached allocation state"
+        );
+        assert_eq!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+            before_blocks
+        );
+        assert_eq!(fs.read_inode(&cx, parent.ino).unwrap().size, 4096);
+        assert_eq!(fs.getattr(&cx, source.ino).unwrap().nlink, 0);
+        assert_eq!(u64::from(fs.ext4_read_orphan_head()), head.ino.0);
+        assert!(fs.ext4_pending_orphans.lock().contains(&source.ino.0));
+        assert!(matches!(
+            fs.lookup(&cx, parent.ino, OsStr::new(&name)),
+            Err(FfsError::NotFound(_))
+        ));
+
+        // Repair only the deliberately planted bad predecessor, then repeat
+        // the exact link to prove the failed allocation left no stale state.
+        fs.persist_ext4_inode_for_testing(&cx, head.ino, &good_head)
+            .unwrap();
+        let before_retry = fs.current_snapshot();
+        let named = fs
+            .link(&cx, source.ino, parent.ino, OsStr::new(&name))
+            .unwrap();
+        assert_eq!(fs.current_snapshot().high.0, before_retry.high.0 + 1);
+        assert_eq!(named.nlink, 1);
+        assert!(fs.read_inode(&cx, parent.ino).unwrap().size > 4096);
+        assert_eq!(fs.read_inode(&cx, source.ino).unwrap().dtime, 0);
+        assert_eq!(fs.read_inode(&cx, head.ino).unwrap().dtime, 0);
+        assert!(!fs.ext4_pending_orphans.lock().contains(&source.ino.0));
+        assert_eq!(
+            fs.read(&cx, source.ino, 0, 64).unwrap(),
+            b"temporary payload"
+        );
+        assert!(fs.finalize_unlinked_inode_public(&cx, head.ino).unwrap());
+        assert_eq!(fs.ext4_read_orphan_head(), 0);
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        let (clean, output) =
+            run_e2fsck(&image).expect("hard-link rollback oracle requires e2fsck");
+        assert!(
+            clean,
+            "failed and retried hard-link publication must be native-clean: {output}"
+        );
+    }
+
+    #[test]
     fn write_unlink_one_of_two_links_keeps_inode_data_and_csum() {
         // Unlinking ONE of two hard links must decrement nlink and must NOT
         // reclaim the inode or its data blocks (links remain) — the surviving
@@ -85056,7 +85662,7 @@ mod tests {
             return None;
         }
         let cx = Cx::for_testing();
-        let dev = FileByteDevice::open(&image).expect("open image");
+        let dev = FileByteDevice::open_read_write(&image).expect("open image for mutation");
         let mut fs =
             OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open ext4");
         fs.enable_writes(&cx).expect("enable writes");
@@ -85346,7 +85952,7 @@ mod tests {
             return None;
         }
         let cx = Cx::for_testing();
-        let dev = FileByteDevice::open(&image).expect("open image");
+        let dev = FileByteDevice::open_read_write(&image).expect("open image for mutation");
         let mut fs =
             OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open btrfs");
         fs.enable_writes(&cx).expect("enable writes");
@@ -85683,12 +86289,7 @@ mod tests {
         );
         drop(fs);
 
-        let reopened = OpenFs::from_device(
-            &cx,
-            Box::new(FileByteDevice::open(&image).expect("reopen image")),
-            &OpenOptions::default(),
-        )
-        .expect("reopen btrfs");
+        let reopened = OpenFs::open(&cx, &image).expect("reopen btrfs read-only");
         let ino = reopened
             .lookup(&cx, root, OsStr::new("test"))
             .expect("test survives")
@@ -86192,12 +86793,7 @@ mod tests {
 
         // The image is still a filesystem: reopen it and read keep back.
         drop(fs);
-        let reopened = OpenFs::from_device(
-            &cx,
-            Box::new(FileByteDevice::open(&image).expect("reopen image")),
-            &OpenOptions::default(),
-        )
-        .expect("reopen btrfs");
+        let reopened = OpenFs::open(&cx, &image).expect("reopen btrfs read-only");
         let attr = reopened
             .lookup(&cx, root, OsStr::new("keep"))
             .expect("keep survives");
@@ -93365,7 +93961,7 @@ mod tests {
             metadata_log_enabled: true,
             ..OpenOptions::default()
         };
-        let mut fs = OpenFs::open_with_options(&cx, &image, &options).expect("open logged ext4");
+        let mut fs = OpenFs::open_read_write(&cx, &image, &options).expect("open logged ext4");
         fs.enable_writes(&cx).expect("enable writes");
         let created = fs
             .create(&cx, InodeNumber(2), OsStr::new("logged.txt"), 0o644, 0, 0)
@@ -93385,7 +93981,7 @@ mod tests {
         drop(fs);
 
         let mut recovered =
-            OpenFs::open_with_options(&cx, &image, &options).expect("replay metadata WAL");
+            OpenFs::open_read_write(&cx, &image, &options).expect("replay metadata WAL");
         let report = recovered
             .mvcc_wal_recovery()
             .expect("recovery report after WAL fsync");
@@ -96117,7 +96713,7 @@ mod tests {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
                 ..OpenOptions::default()
             };
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open for write");
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("open for write");
             fs.enable_writes(&cx).expect("enable writes");
 
             for d in 0..dir_count {
@@ -96214,7 +96810,7 @@ mod tests {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
                 ..OpenOptions::default()
             };
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open for write");
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("open for write");
             fs.enable_writes(&cx).expect("enable writes");
 
             let dir_attr = fs
@@ -96239,8 +96835,7 @@ mod tests {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
                 ..OpenOptions::default()
             };
-            let mut fs =
-                OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("reopen for modify");
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("reopen for modify");
             fs.enable_writes(&cx).expect("enable writes");
 
             let dir_attr = fs
@@ -98269,6 +98864,7 @@ mod tests {
                 &cx,
                 Box::new(data.clone()),
                 &OpenOptions::default(),
+                VolumeAccess::ReadOnly,
                 None,
                 vec![Arc::new(bounded)],
             );
@@ -98278,7 +98874,9 @@ mod tests {
                     "btrfs admission must respect member bounds"
                 );
             } else {
-                let fs = opened.unwrap();
+                let mut fs = opened.unwrap();
+                assert!(!fs.write_authority);
+                assert!(matches!(fs.enable_writes(&cx), Err(FfsError::ReadOnly)));
                 let file = fs
                     .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
                     .unwrap();
@@ -98289,6 +98887,12 @@ mod tests {
                 let (slot, _) = fs
                     .btrfs_nested_slot_for(&cx, BTRFS_FS_TREE_OBJECTID, InodeNumber(1))
                     .unwrap();
+                let nested_fs = Arc::clone(&fs.btrfs_nested.lock()[slot - 1].fs);
+                assert!(!nested_fs.write_authority);
+                assert!(matches!(
+                    nested_fs.require_repair_write_access(),
+                    Err(FfsError::ReadOnly)
+                ));
                 let nested = OpenFs::btrfs_nested_tag(slot, file.ino);
                 assert_eq!(
                     fs.read(&cx, nested, 0, 128).unwrap(),
@@ -103027,6 +103631,16 @@ mod tests {
             "read-only",
             InodeNumber((1 << BTRFS_NESTED_SLOT_SHIFT) | u64::from(BTRFS_FIRST_FREE_OBJECTID)),
         );
+        let nested = ro.btrfs_nested.lock();
+        assert!(
+            !nested.is_empty(),
+            "nested lookup must populate its child reader"
+        );
+        assert!(
+            nested
+                .iter()
+                .all(|slot| !slot.fs.write_authority && !slot.fs.is_writable())
+        );
     }
 
     #[test]
@@ -103154,6 +103768,7 @@ mod tests {
                     Some(Arc::clone(&devices)),
                     None,
                     Vec::new(),
+                    false,
                 );
                 if fault == "missing" {
                     assert!(opened.is_err(), "missing device must fail coverage");
@@ -103184,6 +103799,14 @@ mod tests {
                 assert_eq!(link.kind, FileType::Directory);
                 let (slot, nested, _) = fs.btrfs_nested_route(link.ino).unwrap().unwrap();
                 assert_ne!(slot, 0);
+                assert!(
+                    !nested.write_authority,
+                    "child must inherit read-only authority"
+                );
+                assert!(matches!(
+                    nested.require_write_authority(),
+                    Err(FfsError::ReadOnly)
+                ));
                 assert!(Arc::ptr_eq(
                     nested.btrfs_devices.as_ref().unwrap(),
                     &devices
@@ -105337,7 +105960,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -105449,7 +106072,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -105520,7 +106143,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -105592,7 +106215,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("alloc state");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -105645,7 +106268,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("alloc state");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -106449,7 +107072,7 @@ mod tests {
         // Clone src -> dst.
         {
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -106536,16 +107159,12 @@ mod tests {
         );
     }
 
-    /// Whole-file FICLONE onto a NON-EMPTY destination must REPLACE dst's
-    /// content: drop dst's pre-existing extents (refcount-aware) before grafting
-    /// src's. Regression for the bug where btrfs_clone_file_data only inserted
-    /// src's extents — so a same-offset dst extent tripped KeyAlreadyExists
-    /// (aborting mid-loop) and any dst extent past src's i_size was left stale
-    /// (leaked ref + extent beyond i_size -> `btrfs check` failure). The range
-    /// path (FICLONERANGE) already dropped its window; this pins parity for the
-    /// whole-file path.
+    /// A whole-source reflink replaces the overlapping destination window,
+    /// with correct shared-extent references, while preserving the suffix.
+    /// Linux FICLONE uses the same remap operation as FICLONERANGE; its inode
+    /// update only grows i_size. Expecting truncation here masked data loss.
     #[test]
-    fn btrfs_clone_file_data_over_nonempty_dst_replaces_content() {
+    fn btrfs_clone_file_data_over_nonempty_dst_preserves_suffix() {
         let (fs, cx) = open_writable_btrfs();
         let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
         let src = fs
@@ -106581,38 +107200,48 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone over non-empty dst");
         }
 
         let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
         let alloc = alloc_mutex.read();
-        // dst now shares src's single extent; size matches src; nothing stale.
+        // The cloned prefix shares src; the original suffix keeps its reference.
         let dst_inode = fs
             .btrfs_read_inode_from_tree(&alloc, dst_canon)
             .expect("dst inode");
         assert_eq!(
             dst_inode.size,
-            src_payload.len() as u64,
-            "dst size must be replaced by src's"
+            dst_payload.len() as u64,
+            "cloning must never shrink the destination"
         );
+        assert_eq!(dst_inode.nbytes, dst_payload.len() as u64);
         let dst_exts = OpenFs::btrfs_extent_data_items(&alloc, dst_canon).expect("dst extents");
-        assert_eq!(dst_exts.len(), 1, "dst must hold exactly src's one extent");
+        assert_eq!(dst_exts.len(), 2, "dst must retain both prefix and suffix");
         let src_size = u64::try_from(src_payload.len()).unwrap();
         for (key, ext) in &dst_exts {
-            assert!(
-                key.offset < src_size,
-                "no extent may sit past the cloned i_size"
-            );
             match ext {
-                BtrfsExtentData::Regular { disk_bytenr, .. } => {
-                    assert_eq!(*disk_bytenr, src_db, "dst must share src's disk extent");
+                BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    extent_offset,
+                    num_bytes,
+                    ..
+                } => {
+                    if key.offset == 0 {
+                        assert_eq!(*disk_bytenr, src_db, "prefix shares src's extent");
+                        assert_eq!(*extent_offset, 0);
+                    } else {
+                        assert_eq!(key.offset, src_size, "suffix begins after the clone");
+                        assert_eq!(*disk_bytenr, old_dst_db, "suffix keeps dst's extent");
+                        assert_eq!(*extent_offset, src_size);
+                    }
+                    assert_eq!(*num_bytes, 8192);
                 }
                 other => panic!("expected a regular extent, got {other:?}"),
             }
         }
-        // src's extent is now shared (refs 1 -> 2); dst's old sole extent was
-        // freed by the refcount-aware clear (refs 1 -> 0, no longer present).
+        // src's extent is shared (refs 1 -> 2); dst's old extent still backs
+        // its suffix and must retain its sole reference.
         assert_eq!(
             alloc
                 .extent_alloc
@@ -106626,12 +107255,12 @@ mod tests {
                 .extent_alloc
                 .extent_item_refs(old_dst_db, old_dst_dnb)
                 .expect("old dst refs"),
-            None,
-            "dst's replaced extent must be freed by the refcount-aware clear"
+            Some(1),
+            "dst's suffix extent must retain its reference"
         );
         drop(alloc);
 
-        // dst reads back exactly src's bytes (no leftover 0xBB tail).
+        // Read the full destination, including its original suffix.
         let read_back = fs_ops
             .read(
                 &cx,
@@ -106641,9 +107270,17 @@ mod tests {
                 u32::try_from(dst_payload.len()).unwrap(),
             )
             .expect("read dst");
+        let mut expected = src_payload.clone();
+        expected.extend_from_slice(&dst_payload[src_payload.len()..]);
         assert_eq!(
-            read_back, src_payload,
-            "dst must read back src's content, capped at src's i_size"
+            read_back, expected,
+            "clone must preserve destination suffix"
+        );
+        assert_eq!(
+            fs.read(&cx, src.ino, 0, src_payload.len() as u32)
+                .expect("read src"),
+            src_payload,
+            "cloning must preserve source content"
         );
     }
 
@@ -106719,9 +107356,9 @@ mod tests {
         assert_eq!(refs, Some(2), "reflink must bump the extent refcount to 2");
     }
 
-    /// bd-jbtd2: clone_file_range whole-file (src_length == 0 = to EOF) reduces
-    /// to a full reflink; a true sub-range performs boundary-split extent
-    /// sharing so dst reads exactly the requested src window.
+    /// bd-jbtd2: cloning the whole source (src_length == 0 = to EOF) into an
+    /// empty destination shares all its extents; a true sub-range performs
+    /// boundary-split sharing so dst reads exactly the requested src window.
     #[test]
     fn clone_file_range_whole_and_partial_bd_jbtd2() {
         let (fs, cx) = open_writable_btrfs();
@@ -106782,6 +107419,852 @@ mod tests {
             .getattr(&cx, &mut RequestScope::empty(), dst2.ino)
             .expect("getattr dst2");
         assert_eq!(attr.size, 8192, "dst2 size = cloned range length");
+    }
+
+    #[test]
+    fn btrfs_reflink_splits_preallocation_on_a_full_filesystem() {
+        let _guard = log_contract_guard();
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        const BS: usize = 4096;
+        let source = fs
+            .create(&cx, root, OsStr::new("prealloc-source"), 0o600, 0, 0)
+            .expect("source");
+        let destination = fs
+            .create(&cx, root, OsStr::new("prealloc-destination"), 0o600, 0, 0)
+            .expect("destination");
+        let peer = fs
+            .create(&cx, root, OsStr::new("prealloc-peer"), 0o600, 0, 0)
+            .expect("peer");
+        fs.write(&cx, source.ino, 0, &[0xC3; BS])
+            .expect("source data");
+        fs.fallocate(&cx, destination.ino, 0, (5 * BS) as u64, 0)
+            .expect("reserve destination");
+        let source_canonical = fs.btrfs_canonical_inode(source.ino).unwrap();
+        let destination_canonical = fs.btrfs_canonical_inode(destination.ino).unwrap();
+        let (source_disk, source_disk_len) = btrfs_first_regular_extent(&fs, source_canonical);
+        let (reserved_disk, reserved_disk_len) =
+            btrfs_first_regular_extent(&fs, destination_canonical);
+        fs.clone_file(&cx, &mut RequestScope::empty(), peer.ino, destination.ino)
+            .expect("share the unwritten reservation with another inode");
+
+        // Reach actual one-sector ENOSPC, not merely failure to find a large
+        // contiguous allocation. The clone must reuse existing reservations.
+        let filler = fs
+            .create(&cx, root, OsStr::new("prealloc-filler"), 0o600, 0, 0)
+            .expect("filler");
+        let mut offset = 0_u64;
+        for blocks in [16_usize, 4, 1] {
+            let bytes = vec![0xEE; blocks * BS];
+            loop {
+                match fs.write(&cx, filler.ino, offset, &bytes) {
+                    Ok(written) => {
+                        assert_eq!(written as usize, bytes.len());
+                        offset += u64::from(written);
+                    }
+                    Err(error) if error.to_errno() == libc::ENOSPC => break,
+                    Err(error) => panic!("filler write: {error}"),
+                }
+                assert!(offset < 64 * 1024 * 1024, "filler never reached ENOSPC");
+            }
+        }
+        let free_before = fs.statfs(&cx, root).expect("free space").blocks_free;
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            destination.ino,
+            source.ino,
+            0,
+            BS as u64,
+            (2 * BS) as u64,
+        )
+        .expect("reflink must split existing preallocation without allocating");
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+        {
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            let layout: Vec<_> = OpenFs::btrfs_extent_data_items(&alloc, destination_canonical)
+                .unwrap()
+                .into_iter()
+                .map(|(key, extent)| match extent {
+                    BtrfsExtentData::Regular {
+                        extent_type,
+                        disk_bytenr,
+                        extent_offset,
+                        num_bytes,
+                        ..
+                    } => (
+                        key.offset,
+                        extent_type,
+                        disk_bytenr,
+                        extent_offset,
+                        num_bytes,
+                    ),
+                    other => panic!("expected a disk-backed extent, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                layout,
+                vec![
+                    (
+                        0,
+                        BTRFS_FILE_EXTENT_PREALLOC,
+                        reserved_disk,
+                        0,
+                        (2 * BS) as u64
+                    ),
+                    (
+                        (2 * BS) as u64,
+                        BTRFS_FILE_EXTENT_REG,
+                        source_disk,
+                        0,
+                        BS as u64
+                    ),
+                    (
+                        (3 * BS) as u64,
+                        BTRFS_FILE_EXTENT_PREALLOC,
+                        reserved_disk,
+                        (3 * BS) as u64,
+                        (2 * BS) as u64,
+                    ),
+                ],
+                "both remnants must keep the original physical reservation and unwritten type"
+            );
+            assert_eq!(
+                alloc
+                    .extent_alloc
+                    .extent_item_refs(reserved_disk, reserved_disk_len)
+                    .unwrap(),
+                Some(3),
+                "two destination views plus the peer own the reservation"
+            );
+            assert_eq!(
+                alloc
+                    .extent_alloc
+                    .extent_item_refs(source_disk, source_disk_len)
+                    .unwrap(),
+                Some(2)
+            );
+            let inode = fs
+                .btrfs_read_inode_from_tree(&alloc, destination_canonical)
+                .unwrap();
+            assert_eq!(inode.size, (5 * BS) as u64);
+            assert_eq!(inode.nbytes, (5 * BS) as u64);
+        }
+        let mappings = fs
+            .fiemap(
+                &cx,
+                &mut RequestScope::empty(),
+                destination.ino,
+                0,
+                u64::MAX,
+            )
+            .expect("fiemap");
+        assert_eq!(mappings.len(), 3);
+        for index in [0, 2] {
+            assert_ne!(mappings[index].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
+        }
+        assert_eq!(mappings[1].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
+        let mut expected = vec![0; 5 * BS];
+        expected[2 * BS..3 * BS].fill(0xC3);
+
+        // Another inode still references the reservation: an overwrite must
+        // need COW space and fail without modifying either file.
+        let error = fs
+            .write(&cx, destination.ino, 0, &[0x31; 2 * BS])
+            .expect_err("shared preallocation must not be written in place");
+        assert_eq!(error.to_errno(), libc::ENOSPC);
+        assert_eq!(
+            fs.read(&cx, destination.ino, 0, (5 * BS) as u32).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs.read(&cx, peer.ino, 0, (5 * BS) as u32).unwrap(),
+            vec![0; 5 * BS]
+        );
+        fs.unlink(&cx, root, OsStr::new("prealloc-peer"))
+            .expect("drop peer");
+
+        // Now both disjoint remnants are exclusively this inode's. Its original
+        // fallocate promise must remain usable even with no free data sectors.
+        fs.write(&cx, destination.ino, 0, &[0x31; 2 * BS])
+            .expect("consume the reserved left remnant in place");
+        fs.write(&cx, destination.ino, (3 * BS) as u64, &[0x72; 2 * BS])
+            .expect("consume the reserved right remnant in place");
+        expected[..2 * BS].fill(0x31);
+        expected[3 * BS..].fill(0x72);
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+        let error = fs
+            .write(&cx, destination.ino, (2 * BS) as u64, &[0x99; BS])
+            .expect_err("the cloned middle still needs COW space");
+        assert_eq!(error.to_errno(), libc::ENOSPC);
+        assert_eq!(
+            fs.read(&cx, destination.ino, 0, (5 * BS) as u32).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs.read(&cx, source.ino, 0, BS as u32).unwrap(),
+            vec![0xC3; BS]
+        );
+
+        fs.unlink(&cx, root, OsStr::new("prealloc-destination"))
+            .expect("release all destination views");
+        let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+        assert_eq!(
+            alloc
+                .extent_alloc
+                .extent_item_refs(reserved_disk, reserved_disk_len)
+                .unwrap(),
+            None,
+            "the final reservation view must release the original extent"
+        );
+        assert_eq!(
+            alloc
+                .extent_alloc
+                .extent_item_refs(source_disk, source_disk_len)
+                .unwrap(),
+            Some(1),
+            "removing the clone must retain the source's reference"
+        );
+    }
+
+    #[test]
+    fn btrfs_reflink_preallocated_remnants_pass_native_check_and_reopen() {
+        let _guard = log_contract_guard();
+        let (fs, dev, _tmp, image) =
+            open_writable_btrfs_mkfs(256).expect("btrfs-progs fixture required");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let source = fs
+            .create(&cx, root, OsStr::new("split-source"), 0o600, 0, 0)
+            .unwrap();
+        let destination = fs
+            .create(&cx, root, OsStr::new("split-destination"), 0o600, 0, 0)
+            .unwrap();
+        fs.write(&cx, source.ino, 0, &[0xC3; 4096]).unwrap();
+        fs.fallocate(&cx, destination.ino, 0, 20_480, 0).unwrap();
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            destination.ino,
+            source.ino,
+            0,
+            4096,
+            8192,
+        )
+        .expect("clone into the middle of an unwritten reservation");
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        fs.btrfs_full_transaction_commit(&cx, "reflink-prealloc-remnants")
+            .unwrap();
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        drop(fs);
+        let (clean, output) = run_btrfs_check(&image).expect("native btrfs checker required");
+        assert!(
+            clean,
+            "btrfs check must accept shared preallocation views:\n{output}"
+        );
+        let reopened = OpenFs::open(&cx, &image).expect("reopen preallocation image");
+        let mut expected = vec![0; 20_480];
+        expected[8192..12_288].fill(0xC3);
+        assert_eq!(
+            reopened.read(&cx, destination.ino, 0, 20_480).unwrap(),
+            expected
+        );
+        assert_eq!(
+            reopened.read(&cx, source.ino, 0, 4096).unwrap(),
+            vec![0xC3; 4096]
+        );
+        let mappings = reopened
+            .fiemap(
+                &cx,
+                &mut RequestScope::empty(),
+                destination.ino,
+                0,
+                u64::MAX,
+            )
+            .unwrap();
+        assert_eq!(mappings.len(), 3);
+        for index in [0, 2] {
+            assert_ne!(mappings[index].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
+        }
+        assert_eq!(mappings[1].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
+    }
+
+    fn btrfs_prealloc_self_alias_sequence(
+        fs: &OpenFs,
+        cx: &Cx,
+        alias_first: bool,
+    ) -> (InodeNumber, Vec<u8>) {
+        const BS: usize = 4096;
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let name = format!("prealloc-self-alias-{alias_first}");
+        let file = fs
+            .create(cx, root, OsStr::new(&name), 0o600, 0, 0)
+            .expect("create preallocated file");
+        fs.fallocate(cx, file.ino, 0, (4 * BS) as u64, 0)
+            .expect("reserve four blocks");
+        fs.clone_file_range(
+            cx,
+            &mut RequestScope::empty(),
+            file.ino,
+            file.ino,
+            0,
+            BS as u64,
+            (4 * BS) as u64,
+        )
+        .expect("nonoverlapping self-reflink of an unwritten block");
+        let canonical = fs.btrfs_canonical_inode(file.ino).unwrap();
+        let mut expected = vec![0; 5 * BS];
+        let original = (0, 0xB2);
+        let alias = (4 * BS, 0xA1);
+        let writes = if alias_first {
+            [alias, original]
+        } else {
+            [original, alias]
+        };
+        for (offset, byte) in writes {
+            fs.write(cx, file.ino, offset as u64, &vec![byte; BS])
+                .expect("write must COW when another offset aliases its reservation");
+            expected[offset..offset + BS].fill(byte);
+            assert_eq!(
+                fs.read(cx, file.ino, 0, (5 * BS) as u32).unwrap(),
+                expected,
+                "alias_first={alias_first}, after writing offset {offset}"
+            );
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            let extents = OpenFs::btrfs_extent_data_items(&alloc, canonical).unwrap();
+            let physical_at = |offset| {
+                let (_, extent) = extents
+                    .iter()
+                    .find(|(key, _)| key.offset == offset)
+                    .expect("both file positions retain extent items");
+                match extent {
+                    BtrfsExtentData::Regular {
+                        disk_bytenr,
+                        extent_offset,
+                        ..
+                    } => disk_bytenr + extent_offset,
+                    other => panic!("expected disk-backed data, got {other:?}"),
+                }
+            };
+            assert_ne!(
+                physical_at(0),
+                physical_at((4 * BS) as u64),
+                "the first write must separate aliased physical sectors"
+            );
+        }
+        assert_eq!(fs.getattr(cx, file.ino).unwrap().size, (5 * BS) as u64);
+        (file.ino, expected)
+    }
+
+    #[test]
+    fn btrfs_prealloc_self_aliases_cow_in_both_write_orders() {
+        let _guard = log_contract_guard();
+        for alias_first in [false, true] {
+            let (fs, cx) = open_writable_btrfs();
+            btrfs_prealloc_self_alias_sequence(&fs, &cx, alias_first);
+        }
+    }
+
+    #[test]
+    fn btrfs_prealloc_alias_writes_fail_unchanged_when_full() {
+        let _guard = log_contract_guard();
+        const BS: usize = 4096;
+        for same_inode in [false, true] {
+            let (fs, cx) = open_writable_btrfs();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let source = fs
+                .create(&cx, root, OsStr::new("source"), 0o600, 0, 0)
+                .unwrap();
+            fs.fallocate(&cx, source.ino, 0, (4 * BS) as u64, 0)
+                .unwrap();
+            let (alias, alias_offset) = if same_inode {
+                (source.ino, (4 * BS) as u64)
+            } else {
+                (
+                    fs.create(&cx, root, OsStr::new("alias"), 0o600, 0, 0)
+                        .unwrap()
+                        .ino,
+                    0,
+                )
+            };
+            fs.clone_file_range(
+                &cx,
+                &mut RequestScope::empty(),
+                alias,
+                source.ino,
+                0,
+                BS as u64,
+                alias_offset,
+            )
+            .unwrap();
+            let canonical = fs.btrfs_canonical_inode(source.ino).unwrap();
+            let alias_canonical = fs.btrfs_canonical_inode(alias).unwrap();
+            let (disk, disk_len) = btrfs_first_regular_extent(&fs, canonical);
+            let snapshot = || {
+                let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                (
+                    OpenFs::btrfs_extent_data_items(&alloc, canonical).unwrap(),
+                    OpenFs::btrfs_extent_data_items(&alloc, alias_canonical).unwrap(),
+                    alloc.extent_alloc.extent_item_refs(disk, disk_len).unwrap(),
+                )
+            };
+            let before = snapshot();
+            assert_eq!(before.2, Some(2));
+
+            let filler = fs
+                .create(&cx, root, OsStr::new("filler"), 0o600, 0, 0)
+                .unwrap();
+            let mut offset = 0_u64;
+            for blocks in [16_usize, 4, 1] {
+                let bytes = vec![0xEE; blocks * BS];
+                loop {
+                    match fs.write(&cx, filler.ino, offset, &bytes) {
+                        Ok(written) => {
+                            assert_eq!(written as usize, bytes.len());
+                            offset += u64::from(written);
+                        }
+                        Err(error) if error.to_errno() == libc::ENOSPC => break,
+                        Err(error) => panic!("filler: {error}"),
+                    }
+                    assert!(offset < 64 * 1024 * 1024, "filler never reached ENOSPC");
+                }
+            }
+            let free_before = fs.statfs(&cx, root).unwrap().blocks_free;
+            let source_size = if same_inode { 5 * BS } else { 4 * BS };
+            for (ino, offset) in [(alias, alias_offset), (source.ino, 0)] {
+                let error = fs
+                    .write(&cx, ino, offset, &[0xA5; BS])
+                    .expect_err("both aliases require fresh data space");
+                assert_eq!(error.to_errno(), libc::ENOSPC);
+                assert_eq!(snapshot(), before, "failed COW must retain all mappings");
+                assert_eq!(
+                    fs.read(&cx, source.ino, 0, source_size as u32).unwrap(),
+                    vec![0; source_size]
+                );
+                assert_eq!(
+                    fs.read(&cx, alias, alias_offset, BS as u32).unwrap(),
+                    vec![0; BS]
+                );
+                assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+            }
+
+            // Removing the alias returns exclusive ownership without freeing
+            // the still-reserved data. NOCOW must then work on a full disk,
+            // including a second write after the first has split the mapping.
+            if same_inode {
+                fs.setattr(
+                    &cx,
+                    source.ino,
+                    &SetAttrRequest {
+                        size: Some((4 * BS) as u64),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .unwrap();
+            } else {
+                fs.unlink(&cx, root, OsStr::new("alias")).unwrap();
+            }
+            fs.write(&cx, source.ino, 0, &[0x31; BS])
+                .expect("exclusive reservation survives data-space exhaustion");
+            fs.write(&cx, source.ino, (3 * BS) as u64, &[0x72; BS])
+                .expect("multiple views under the same backref remain exclusive");
+            let mut expected = vec![0; 4 * BS];
+            expected[..BS].fill(0x31);
+            expected[3 * BS..].fill(0x72);
+            assert_eq!(
+                fs.read(&cx, source.ino, 0, (4 * BS) as u32).unwrap(),
+                expected
+            );
+            assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+        }
+    }
+
+    #[test]
+    fn btrfs_prealloc_self_aliases_pass_native_check_and_reopen() {
+        let _guard = log_contract_guard();
+        let (fs, dev, _tmp, image) =
+            open_writable_btrfs_mkfs(256).expect("btrfs-progs fixture required");
+        let cx = Cx::for_testing();
+        let expected = [false, true]
+            .map(|alias_first| btrfs_prealloc_self_alias_sequence(&fs, &cx, alias_first));
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        fs.btrfs_full_transaction_commit(&cx, "prealloc-self-alias-cow")
+            .unwrap();
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        drop(fs);
+        let (clean, output) = run_btrfs_check(&image).expect("native btrfs checker required");
+        assert!(clean, "btrfs check after self-alias COW:\n{output}");
+        let reopened = OpenFs::open(&cx, &image).expect("reopen self-alias image");
+        for (ino, bytes) in expected {
+            assert_eq!(
+                reopened.read(&cx, ino, 0, bytes.len() as u32).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    /// Replay the three-operation ARM proptest failure, then exercise COW and
+    /// repeated cloning. None selects FICLONE; Some(0) selects range-to-EOF.
+    fn btrfs_reflink_suffix_sequence(
+        fs: &OpenFs,
+        cx: &Cx,
+        name: &str,
+        src_length: Option<u64>,
+        fill: u8,
+    ) -> [(InodeNumber, Vec<u8>); 2] {
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let src = fs
+            .create(cx, root, OsStr::new(&format!("{name}-src")), 0o644, 0, 0)
+            .expect("create src");
+        let dst = fs
+            .create(cx, root, OsStr::new(&format!("{name}-dst")), 0o644, 0, 0)
+            .expect("create dst");
+        fs.write(cx, dst.ino, 64_037, &vec![fill; 26_075])
+            .expect("seed destination");
+        let mut dst_model = vec![0_u8; 90_112];
+        dst_model[64_037..].fill(fill);
+        fs.clone_file_range(
+            cx,
+            &mut RequestScope::empty(),
+            src.ino,
+            dst.ino,
+            61_440,
+            12_288,
+            73_728,
+        )
+        .expect("make shorter source by reflinking destination window");
+        let mut src_model = vec![0_u8; 86_016];
+        src_model[73_728..].copy_from_slice(&dst_model[61_440..73_728]);
+        assert_eq!(fs.getattr(cx, src.ino).expect("src size").size, 86_016);
+
+        for round in 0..2_u8 {
+            match src_length {
+                Some(length) => fs.clone_file_range(
+                    cx,
+                    &mut RequestScope::empty(),
+                    dst.ino,
+                    src.ino,
+                    0,
+                    length,
+                    0,
+                ),
+                None => fs.clone_file(cx, &mut RequestScope::empty(), dst.ino, src.ino),
+            }
+            .expect("clone whole source over larger destination");
+            dst_model[..src_model.len()].copy_from_slice(&src_model);
+            assert_eq!(
+                fs.getattr(cx, dst.ino).expect("dst size").size,
+                90_112,
+                "whole-source clone must preserve the larger destination size"
+            );
+            assert_eq!(
+                fs.read(cx, dst.ino, 0, 90_112).expect("read cloned dst"),
+                dst_model,
+                "cloned prefix and untouched suffix must both survive"
+            );
+
+            let patch = vec![0x80 + round; 1024];
+            fs.write(cx, dst.ino, 74_241, &patch)
+                .expect("COW write into cloned source extent");
+            dst_model[74_241..75_265].copy_from_slice(&patch);
+            assert_eq!(
+                fs.read(cx, dst.ino, 0, 90_112).expect("read COW dst"),
+                dst_model,
+                "COW must preserve the rest of the clone and its suffix"
+            );
+            assert_eq!(
+                fs.read(cx, src.ino, 0, 86_016).expect("read source"),
+                src_model,
+                "cloning and later COW writes must preserve source content"
+            );
+        }
+        [(src.ino, src_model), (dst.ino, dst_model)]
+    }
+
+    #[test]
+    fn btrfs_reflink_whole_source_preserves_larger_destination() {
+        // fill=0 is the exact minimized ARM failure's sparse content. The
+        // nonzero case additionally proves that the suffix bytes survive.
+        for fill in [0, 0xD7] {
+            for src_length in [None, Some(0), Some(86_016)] {
+                let (fs, cx) = open_writable_btrfs();
+                btrfs_reflink_suffix_sequence(&fs, &cx, "suffix", src_length, fill);
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_reflink_empty_source_validates_both_endpoints() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let empty = fs
+            .create(&cx, root, OsStr::new("empty"), 0o644, 0, 0)
+            .expect("empty");
+        let dst = fs
+            .create(&cx, root, OsStr::new("dst"), 0o644, 0, 0)
+            .expect("dst");
+        let bytes = vec![0xA7; 12_288];
+        fs.write(&cx, dst.ino, 0, &bytes).expect("seed dst");
+        let symlink = FsOps::symlink(
+            &fs,
+            &cx,
+            &mut RequestScope::empty(),
+            root,
+            OsStr::new("sym"),
+            Path::new("dst"),
+            0,
+            0,
+        )
+        .expect("symlink");
+        for whole_file in [false, true] {
+            let clone = |dest, src| {
+                if whole_file {
+                    fs.clone_file(&cx, &mut RequestScope::empty(), dest, src)
+                } else {
+                    fs.clone_file_range(&cx, &mut RequestScope::empty(), dest, src, 0, 0, 0)
+                }
+            };
+            clone(dst.ino, empty.ino).expect("empty source is a no-op");
+            clone(InodeNumber(999_999), empty.ino)
+                .expect_err("empty source must still validate the destination");
+            for (dest, src) in [(root, empty.ino), (dst.ino, root)] {
+                assert_eq!(
+                    clone(dest, src).expect_err("directory rejected").to_errno(),
+                    libc::EISDIR
+                );
+            }
+            for (dest, src) in [(symlink.ino, empty.ino), (dst.ino, symlink.ino)] {
+                assert_eq!(
+                    clone(dest, src).expect_err("symlink rejected").to_errno(),
+                    libc::EINVAL
+                );
+            }
+        }
+        fs.clone_file_range(&cx, &mut RequestScope::empty(), dst.ino, empty.ino, 0, 0, 1)
+            .expect("empty EOF range returns before alignment checks");
+        assert_eq!(
+            fs.getattr(&cx, dst.ino).expect("size").size,
+            bytes.len() as u64
+        );
+        assert_eq!(fs.read(&cx, dst.ino, 0, 12_288).expect("read dst"), bytes);
+        assert_eq!(
+            FsOps::readlink(&fs, &cx, &mut RequestScope::empty(), symlink.ino).expect("readlink"),
+            b"dst"
+        );
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new("dst"))
+                .expect("directory unchanged")
+                .ino,
+            dst.ino
+        );
+    }
+
+    #[test]
+    fn btrfs_reflink_range_rejects_destructive_requests_without_mutation() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let src = fs
+            .create(&cx, root, OsStr::new("partial"), 0o644, 0, 0)
+            .expect("src");
+        let dst = fs
+            .create(&cx, root, OsStr::new("larger"), 0o644, 0, 0)
+            .expect("dst");
+        let source = vec![0x3C; 5904];
+        let mut expected = vec![0xA7; 12_288];
+        fs.write(&cx, src.ino, 0, &source).expect("source");
+        fs.write(&cx, dst.ino, 0, &expected).expect("destination");
+        // Partial EOF sectors cannot overwrite a larger destination's middle;
+        // explicit ranges and zero-length-to-EOF offsets cannot exceed src EOF.
+        for (src_offset, length, dest_offset) in [
+            (0, 0, 0),
+            (0, 5904, 0),
+            (4096, 1808, 4096),
+            (0, 8192, 0),
+            (8192, 0, 0),
+        ] {
+            let error = fs
+                .clone_file_range(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    dst.ino,
+                    src.ino,
+                    src_offset,
+                    length,
+                    dest_offset,
+                )
+                .expect_err("invalid source or partial-tail range");
+            assert_eq!(error.to_errno(), libc::EINVAL);
+            assert_eq!(
+                fs.read(&cx, dst.ino, 0, 12_288).expect("unchanged dst"),
+                expected
+            );
+            assert_eq!(
+                fs.read(&cx, src.ino, 0, 5904).expect("unchanged src"),
+                source
+            );
+        }
+        assert_eq!(
+            fs.clone_file(&cx, &mut RequestScope::empty(), dst.ino, src.ino)
+                .expect_err("FICLONE also rejects an interior partial EOF sector")
+                .to_errno(),
+            libc::EINVAL,
+        );
+        assert_eq!(
+            fs.clone_file(&cx, &mut RequestScope::empty(), src.ino, src.ino)
+                .expect_err("overlapping same-inode clone rejected before removing source")
+                .to_errno(),
+            libc::EINVAL,
+        );
+        assert_eq!(
+            fs.read(&cx, src.ino, 0, 5904)
+                .expect("self-clone source intact"),
+            source
+        );
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            dst.ino,
+            src.ino,
+            0,
+            4096,
+            0,
+        )
+        .expect("aligned interior clone remains supported");
+        expected[..4096].copy_from_slice(&source[..4096]);
+        assert_eq!(
+            fs.read(&cx, dst.ino, 0, 12_288).expect("aligned clone"),
+            expected
+        );
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            src.ino,
+            src.ino,
+            0,
+            4096,
+            8192,
+        )
+        .expect("non-overlapping same-inode clone remains supported");
+        let mut self_clone = source.clone();
+        self_clone.resize(8192, 0);
+        self_clone.extend_from_slice(&source[..4096]);
+        assert_eq!(
+            fs.read(&cx, src.ino, 0, 12_288).expect("self-cloned data"),
+            self_clone
+        );
+    }
+
+    #[test]
+    fn btrfs_reflink_preserves_reservations_outside_logical_range() {
+        let _guard = log_contract_guard();
+        for src_length in [None, Some(0), Some(4096)] {
+            let (fs, cx) = open_writable_btrfs();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let src = fs
+                .create(&cx, root, OsStr::new("reserved-src"), 0o644, 0, 0)
+                .expect("src");
+            let dst = fs
+                .create(&cx, root, OsStr::new("reserved-dst"), 0o644, 0, 0)
+                .expect("dst");
+            fs.write(&cx, src.ino, 0, &[0xAA; 4096]).expect("source");
+            fs.write(&cx, dst.ino, 0, &[0xBB; 4096])
+                .expect("destination");
+            for (ino, offset) in [(src.ino, 16_384), (dst.ino, 8192)] {
+                FsOps::fallocate(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    ino,
+                    offset,
+                    4096,
+                    libc::FALLOC_FL_KEEP_SIZE,
+                )
+                .expect("reserve space past logical EOF");
+            }
+            let reservations = |ino| {
+                let canonical = fs.btrfs_canonical_inode(ino).expect("canonical");
+                let alloc = fs.btrfs_alloc_state.as_ref().expect("alloc").read();
+                OpenFs::btrfs_extent_data_items(&alloc, canonical)
+                    .expect("extents")
+                    .into_iter()
+                    .filter(|(key, _)| key.offset >= 4096)
+                    .map(|(key, extent)| (key, extent.to_bytes()))
+                    .collect::<Vec<_>>()
+            };
+            let src_before = reservations(src.ino);
+            let dst_before = reservations(dst.ino);
+            assert_eq!(src_before.len(), 1);
+            assert_eq!(dst_before.len(), 1);
+            match src_length {
+                Some(length) => fs.clone_file_range(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    dst.ino,
+                    src.ino,
+                    0,
+                    length,
+                    0,
+                ),
+                None => fs.clone_file(&cx, &mut RequestScope::empty(), dst.ino, src.ino),
+            }
+            .expect("clone content with reservations beyond EOF");
+            assert_eq!(fs.getattr(&cx, dst.ino).expect("size").size, 4096);
+            assert_eq!(
+                fs.read(&cx, dst.ino, 0, 4096).expect("cloned content"),
+                vec![0xAA; 4096]
+            );
+            assert_eq!(
+                reservations(dst.ino),
+                dst_before,
+                "destination reservations must survive byte-for-byte, without copying source reservations"
+            );
+            assert_eq!(
+                reservations(src.ino),
+                src_before,
+                "source reservations must remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_reflink_preserved_suffix_passes_native_check_and_reopen() {
+        let (fs, dev, _tmp, image) =
+            open_writable_btrfs_mkfs(256).expect("btrfs-progs fixture required");
+        let cx = Cx::for_testing();
+        let mut expected = Vec::new();
+        for (index, src_length) in [None, Some(0), Some(86_016)].into_iter().enumerate() {
+            expected.extend(btrfs_reflink_suffix_sequence(
+                &fs,
+                &cx,
+                &format!("native-{index}"),
+                src_length,
+                0xD7,
+            ));
+        }
+        fs.flush_mvcc_to_device(&cx).expect("flush");
+        fs.btrfs_full_transaction_commit(&cx, "reflink-suffix-preservation")
+            .expect("commit reflink and COW changes");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("persist image");
+        drop(fs);
+        let (clean, output) = run_btrfs_check(&image).expect("native btrfs checker required");
+        assert!(
+            clean,
+            "btrfs check must accept preserved suffixes:\n{output}"
+        );
+        let reopened = OpenFs::open(&cx, &image).expect("reopen committed image");
+        for (ino, bytes) in expected {
+            assert_eq!(
+                reopened.getattr(&cx, ino).expect("size").size,
+                bytes.len() as u64
+            );
+            assert_eq!(
+                reopened
+                    .read(&cx, ino, 0, u32::try_from(bytes.len()).expect("read size"))
+                    .expect("read reopened content"),
+                bytes,
+                "cloned prefix, suffix and source must survive reopen"
+            );
+        }
     }
 
     /// bd-vh8p9 on-disk validation: a reflink performed through the public
@@ -118613,7 +120096,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().unwrap();
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("reflink src into dst");
         }
 
@@ -118673,7 +120156,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().unwrap();
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("reflink src into dst");
         }
 

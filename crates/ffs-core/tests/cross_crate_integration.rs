@@ -93,7 +93,7 @@ fn open_writable_ext4_fixture() -> Option<OpenFs> {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, &img_path, &opts).ok()?;
+    let mut fs = OpenFs::open_read_write(&cx, &img_path, &opts).ok()?;
     fs.enable_writes(&cx).ok()?;
     Some(fs)
 }

@@ -781,6 +781,8 @@ fn read_first_byte_and_block(
 
 The canonical concrete `ByteDevice` is `FileByteDevice`, which `OpenFs::open` constructs from a path. Device I/O trait methods accept `&Cx` for cooperative cancellation and budget checks; constructors and standard-library I/O are not universally context-bound. A companion `VectoredBlockDevice` trait adds scatter/gather with a default scalar implementation.
 
+`OpenFs::open` and `OpenFs::open_with_options` hold a read-only file descriptor. Ext4 journal, fast-commit, and orphan recovery run in an in-memory overlay, so inspection can see recovered state without changing the image. `Ext4JournalReplayMode::Skip` retains the unrecovered view. These handles refuse `enable_writes`, raw transaction publication, and options that activate repair or a persistent WAL. Call `OpenFs::open_read_write(cx, path, &options)` when mutation is intended; its descriptor must be writable, and `Apply` recovery may persist changes during open. `enable_writes` then activates filesystem mutations. The lower-level `OpenFs::from_device` keeps the authority of the device the caller explicitly supplies.
+
 ### Aligned buffers
 
 `AlignedVec` provides heap-allocated byte vectors with configurable alignment (default 4096 bytes), enabling `O_DIRECT` and avoiding memcpy penalties. `BlockBuf` wraps an `AlignedVec` and tracks logical-to-physical mapping metadata.

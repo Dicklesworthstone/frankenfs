@@ -71,13 +71,13 @@ fn lock_native_prepare_image(
     let device = if check {
         FileByteDevice::open_read_only(path)?
     } else {
-        FileByteDevice::open(path)?
+        FileByteDevice::open_read_write(path)
+            .context("native preparation requires a writable regular image file")?
     };
     if !device.file().metadata()?.is_file() {
         bail!("native preparation requires a regular image file");
     }
-    // FileByteDevice::open can fall back to O_RDONLY. Refuse that fallback
-    // before entering any conversion code, including when running as root.
+    // Verify the retained descriptor before entering conversion code.
     let access = nix::fcntl::fcntl(device.file().as_raw_fd(), nix::fcntl::FcntlArg::F_GETFL)?;
     if !check && access & libc::O_ACCMODE != libc::O_RDWR {
         bail!("native preparation requires a writable image file");
@@ -1260,7 +1260,7 @@ pub fn repair_corrupt_btrfs_superblock_mirrors_from_primary(
     limitations: &mut Vec<String>,
 ) -> Result<BtrfsMirrorRepairOutcome> {
     let cx = cli_cx();
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_write(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let image_len = byte_dev.len_bytes();
     let primary_offset = BTRFS_SUPER_INFO_OFFSET as u64;
@@ -1415,7 +1415,7 @@ pub fn recover_primary_btrfs_superblock_from_backup(
     limitations: &mut Vec<String>,
 ) -> Result<Option<BtrfsSuperblockRecoverySource>> {
     let cx = cli_cx();
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_write(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let image_len = byte_dev.len_bytes();
     let primary_offset = BTRFS_SUPER_INFO_OFFSET as u64;
@@ -1704,9 +1704,7 @@ pub fn discover_btrfs_repair_group_specs(
     block_size: u32,
 ) -> Result<Vec<BtrfsRepairGroupSpec>> {
     let cx = cli_cx();
-    let byte_dev = FileByteDevice::open(path)
-        .with_context(|| format!("failed to open image: {}", path.display()))?;
-    let fs = OpenFs::from_device(&cx, Box::new(byte_dev), &OpenOptions::default())
+    let fs = OpenFs::open(&cx, path)
         .with_context(|| format!("failed to open btrfs image at {}", path.display()))?;
     if !fs.is_btrfs() {
         bail!("image is not btrfs");
@@ -1855,7 +1853,7 @@ pub fn probe_ext4_repair_staleness(
     specs: &[Ext4RepairGroupSpec],
 ) -> Result<Vec<(u32, Ext4RepairStaleness)>> {
     let cx = cli_cx();
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_only(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
@@ -1889,7 +1887,7 @@ pub fn probe_btrfs_repair_staleness(
     specs: &[BtrfsRepairGroupSpec],
 ) -> Result<Vec<(u32, Ext4RepairStaleness)>> {
     let cx = cli_cx();
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_only(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
@@ -2035,7 +2033,7 @@ pub fn scrub_ext4_groups_for_repair(
     // once per pass from the image as it is now (the post-repair verification
     // pass calls this again and so sees the repaired descriptors).
     let validator = {
-        let byte_dev = FileByteDevice::open(path)
+        let byte_dev = FileByteDevice::open_read_only(path)
             .with_context(|| format!("failed to open image: {}", path.display()))?;
         let block_dev = ByteBlockDevice::new(byte_dev, block_size)
             .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
@@ -2163,7 +2161,7 @@ pub fn recover_ext4_corrupt_blocks(
         |cx: &Cx, view: &dyn BlockDevice| -> ffs_error::Result<Box<dyn BlockValidator>> {
             Ok(Box::new(Ext4MetadataValidator::from_device(cx, view, sb)?))
         };
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_write(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
@@ -2255,7 +2253,7 @@ pub fn recover_btrfs_corrupt_blocks(
     limitations: &mut Vec<String>,
 ) -> Result<(u64, u64, Vec<u32>)> {
     let cx = cli_cx();
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_write(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
@@ -2653,7 +2651,7 @@ pub fn rebuild_btrfs_repair_symbols(
     })?;
     let admitted =
         preflight_btrfs_repair_groups(&cx, &tail_fs, specs, groups, block_size, "symbol_rebuild")?;
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_write(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
@@ -2730,7 +2728,7 @@ pub fn rebuild_ext4_repair_symbols(
         repair_tail_refusal("symbol_rebuild", "ext4", None, format!("{error:#}"))
     })?;
     let admitted = preflight_ext4_repair_groups(&cx, &tail_fs, specs, groups, "symbol_rebuild")?;
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_write(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
@@ -2801,7 +2799,7 @@ pub fn scrub_range_for_repair(
     max_threads: Option<u32>,
     limitations: &mut Vec<String>,
 ) -> Result<ScrubReport> {
-    let seed_dev = FileByteDevice::open(path)
+    let seed_dev = FileByteDevice::open_read_only(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let seed_block_dev = ByteBlockDevice::new(seed_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
@@ -2849,7 +2847,7 @@ pub fn scrub_range_for_repair(
             let path = path.clone();
             handles.push(scope.spawn(move || -> Result<ScrubReport> {
                 let cx = cli_cx();
-                let byte_dev = FileByteDevice::open(&path)
+                let byte_dev = FileByteDevice::open_read_only(&path)
                     .with_context(|| format!("failed to open image: {}", path.display()))?;
                 let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
                     format!("failed to create block device (block_size={block_size})")
@@ -2963,7 +2961,7 @@ pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Res
             FsFlavor::Btrfs(_) => None,
         }
     };
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_only(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let image_len = byte_dev.len_bytes();
 

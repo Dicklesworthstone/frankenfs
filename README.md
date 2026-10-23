@@ -64,8 +64,11 @@ their own offset and length. Each receives the same regular-file, OS-read-only
 and shared-lock admission as the primary image. The facade passes these handles
 into the engines; ext4 replay and journal pairing share one descriptor, and
 nested btrfs views retain the admitted member handles. Direct core consumers can
-use `OpenFs::from_devices` for already-open auxiliary devices; it refuses mixed
-path/handle auxiliary options.
+use `OpenFs::from_devices` for already-open auxiliary devices, with an explicit
+`VolumeAccess` selection; it refuses mixed path/handle auxiliary options.
+`ReadOnly` confines recovery to memory, rejects mutation-oriented WAL/repair
+options and permanently denies enabling writes, including nested btrfs views.
+`ReadWrite` keeps the caller-owned devices' own access checks authoritative.
 The auxiliary-handle change passed 46 facade/example tests (one existing native
 producer test remained ignored), nine selected btrfs seed/journal regressions,
 workspace checking, strict Clippy and formatting on a single source cut. Those

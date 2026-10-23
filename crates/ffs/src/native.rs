@@ -298,6 +298,7 @@ pub fn open_read_only(
                 cx,
                 Box::new(device),
                 &core_options,
+                VolumeAccess::ReadOnly,
                 external_journal,
                 btrfs_additional,
             )?)

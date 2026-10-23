@@ -213,8 +213,13 @@ The primary image, external ext4 journal, additional btrfs devices and ZFS
 members use retained OS read-only regular file descriptors with shared locks
 and independently bounded `VolumeDevice` views. `ImageSource` carries each
 auxiliary volume's path, offset and length. `OpenFs::from_devices` consumes
-already-admitted auxiliary handles and refuses mixed path/handle options;
-btrfs nested views inherit the same member handles, and ext4 journal replay
+already-admitted auxiliary handles with an explicit `VolumeAccess` selection
+and refuses mixed path/handle options. The facade selects `ReadOnly` even for
+caller-owned handles: shared option validation confines recovery to a volatile
+overlay, refuses mutation-oriented WAL/repair options and permanently denies
+later write enablement. `ReadWrite` never upgrades the devices' own access rights.
+btrfs nested views inherit both the same member handles and parent mutation
+authority, and ext4 journal replay
 and UUID pairing share one descriptor retained for the filesystem lifetime.
 ext4 recovery uses a volatile overlay, and the result exposes no
 format-specific `enable_writes`. NTFS keeps its clean-log
