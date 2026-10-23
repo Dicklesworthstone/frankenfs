@@ -6,7 +6,7 @@ use asupersync::{Budget, Cx};
 use clap::{Parser, Subcommand};
 use ffs::{
     FileType, ImageSource, InodeAttr, InodeNumber, ReadOnlyBackend, ReadOnlyFs,
-    ReadOnlyOpenOptions, RequestScope, ZfsReadOptions, open_read_only,
+    ReadOnlyOpenOptions, RequestScope, ZfsReadOptions, ZfsRootSelection, open_read_only,
 };
 use ffs_error::FfsError;
 use std::error::Error;
@@ -63,6 +63,31 @@ struct Args {
     zfs_dataset: Vec<OsString>,
     #[arg(long)]
     zfs_snapshot: Option<OsString>,
+    /// Repeat for each ZFS member: byte offset and positive length, or `rest`.
+    #[arg(
+        long,
+        num_args = 3,
+        value_names = ["PATH", "OFFSET", "LENGTH"],
+        conflicts_with_all = ["ext4_journal", "btrfs_device", "btrfs_subvolume", "btrfs_subvolume_id", "ntfs_indexed_lookup"]
+    )]
+    zfs_device: Vec<OsString>,
+    /// Bind automatic read-only root selection to this pool GUID.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with_all = ["ext4_journal", "btrfs_device", "btrfs_subvolume", "btrfs_subvolume_id", "ntfs_indexed_lookup"]
+    )]
+    zfs_pool_guid: Option<u64>,
+    /// Select an exact exported-pool candidate instead of automatic selection.
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["LABEL", "SLOT"],
+        requires = "zfs_pool_guid",
+        action = clap::ArgAction::Set,
+        conflicts_with_all = ["ext4_journal", "btrfs_device", "btrfs_subvolume", "btrfs_subvolume_id", "ntfs_indexed_lookup"]
+    )]
+    zfs_candidate: Vec<usize>,
     #[command(subcommand)]
     command: Command,
 }
@@ -154,12 +179,10 @@ impl Args {
             || self.btrfs_subvolume.is_some()
             || self.btrfs_subvolume_id.is_some()
         {
-            let root = if let Some(name) = &self.btrfs_subvolume {
-                ffs::BtrfsMountSelection::Subvolume(name.clone())
-            } else if let Some(id) = self.btrfs_subvolume_id {
-                ffs::BtrfsMountSelection::SubvolumeId(id)
-            } else {
-                ffs::BtrfsMountSelection::DefaultRoot
+            let root = match (&self.btrfs_subvolume, self.btrfs_subvolume_id) {
+                (Some(name), _) => ffs::BtrfsMountSelection::Subvolume(name.clone()),
+                (None, Some(id)) => ffs::BtrfsMountSelection::SubvolumeId(id),
+                (None, None) => ffs::BtrfsMountSelection::DefaultRoot,
             };
             Ok(ReadOnlyBackend::Btrfs {
                 root,
@@ -169,10 +192,27 @@ impl Args {
             Ok(ReadOnlyBackend::Ntfs {
                 indexed_lookup: true,
             })
-        } else if self.zfs_dataset.is_empty() && self.zfs_snapshot.is_none() {
+        } else if self.zfs_dataset.is_empty()
+            && self.zfs_snapshot.is_none()
+            && self.zfs_device.is_empty()
+            && self.zfs_pool_guid.is_none()
+            && self.zfs_candidate.is_empty()
+        {
             Ok(ReadOnlyBackend::Auto)
         } else {
+            let root = match (self.zfs_pool_guid, self.zfs_candidate.as_slice()) {
+                (None, []) => ZfsRootSelection::Auto,
+                (Some(guid), []) => ZfsRootSelection::Pool(guid),
+                (Some(pool_guid), [label, slot]) => ZfsRootSelection::Candidate {
+                    pool_guid,
+                    label: *label,
+                    slot: *slot,
+                },
+                _ => return Err(invalid("a ZFS candidate needs POOL GUID, LABEL and SLOT").into()),
+            };
             Ok(ReadOnlyBackend::Zfs(ZfsReadOptions {
+                additional_images: image_sources(&self.zfs_device)?,
+                root,
                 dataset: self
                     .zfs_dataset
                     .iter()
@@ -653,7 +693,7 @@ mod tests {
 
     #[test]
     fn auxiliary_sources_refuse_bad_geometry_and_incomplete_or_duplicate_journals() {
-        for option in ["--ext4-journal", "--btrfs-device"] {
+        for option in ["--ext4-journal", "--btrfs-device", "--zfs-device"] {
             for (offset, length) in [
                 ("nonsense", "rest"),
                 ("18446744073709551616", "1"),
@@ -791,6 +831,154 @@ mod tests {
     }
 
     #[test]
+    fn zfs_root_selection_keeps_independent_member_bounds_and_native_views() {
+        let selections: &[&[&str]] = &[
+            &[],
+            &["--zfs-pool-guid", "123"],
+            &["--zfs-pool-guid", "123", "--zfs-candidate", "2", "17"],
+        ];
+        for (index, selection) in selections.iter().enumerate() {
+            let mut arguments = vec![
+                "native_reader",
+                "first.img",
+                "--offset",
+                "4096",
+                "--length",
+                "67108864",
+                "--zfs-device",
+                "second member.img",
+                "8192",
+                "134217728",
+                "--zfs-device",
+                "third.img",
+                "16384",
+                "rest",
+                "--zfs-dataset",
+                "archive",
+                "--zfs-dataset",
+                "data",
+                "--zfs-snapshot",
+                "before",
+            ];
+            arguments.extend(*selection);
+            arguments.extend(["mount", "/mnt/native"]);
+            let args = Args::try_parse_from(arguments).unwrap();
+            assert_eq!((args.offset, args.length), (4096, Some(67_108_864)));
+            let ReadOnlyBackend::Zfs(options) = args.backend().unwrap() else {
+                panic!("expected explicit ZFS selection");
+            };
+            match index {
+                0 => assert!(matches!(options.root, ZfsRootSelection::Auto)),
+                1 => assert!(matches!(options.root, ZfsRootSelection::Pool(123))),
+                _ => assert!(matches!(
+                    options.root,
+                    ZfsRootSelection::Candidate {
+                        pool_guid: 123,
+                        label: 2,
+                        slot: 17,
+                    }
+                )),
+            }
+            assert_eq!(options.dataset, [b"archive".to_vec(), b"data".to_vec()]);
+            assert_eq!(options.snapshot, Some(b"before".to_vec()));
+            assert!(!options.replay_zil);
+            assert!(matches!(options.missing, ffs::ZfsMissingMembers::None));
+            assert_eq!(options.additional_images.len(), 2);
+            assert_eq!(
+                options.additional_images[0].path,
+                PathBuf::from("second member.img")
+            );
+            assert_eq!(
+                (
+                    options.additional_images[0].offset,
+                    options.additional_images[0].length
+                ),
+                (8192, Some(134_217_728))
+            );
+            assert_eq!(
+                options.additional_images[1].path,
+                PathBuf::from("third.img")
+            );
+            assert_eq!(
+                (
+                    options.additional_images[1].offset,
+                    options.additional_images[1].length
+                ),
+                (16384, None)
+            );
+        }
+        for selection in &selections[1..] {
+            let mut arguments = vec!["native_reader", "single.img"];
+            arguments.extend(*selection);
+            arguments.extend(["stat", "/"]);
+            let args = Args::try_parse_from(arguments).unwrap();
+            let ReadOnlyBackend::Zfs(options) = args.backend().unwrap() else {
+                panic!("pool selection alone must select the ZFS backend");
+            };
+            assert!(options.additional_images.is_empty());
+        }
+    }
+
+    #[test]
+    fn zfs_root_selectors_reject_incomplete_invalid_and_cross_format_arguments() {
+        let invalid: &[&[&str]] = &[
+            &["--zfs-pool-guid", "0"],
+            &["--zfs-pool-guid", "-1"],
+            &["--zfs-pool-guid", "18446744073709551616"],
+            &["--zfs-candidate", "0", "1"],
+            &["--zfs-pool-guid", "123", "--zfs-candidate", "0"],
+            &["--zfs-pool-guid", "123", "--zfs-candidate", "invalid", "1"],
+            &[
+                "--zfs-pool-guid",
+                "123",
+                "--zfs-candidate",
+                "0",
+                "18446744073709551616",
+            ],
+            &[
+                "--zfs-pool-guid",
+                "123",
+                "--zfs-candidate",
+                "0",
+                "1",
+                "--zfs-candidate",
+                "0",
+                "2",
+            ],
+        ];
+        for selection in invalid {
+            let mut arguments = vec!["native_reader", "image.img"];
+            arguments.extend(*selection);
+            arguments.extend(["stat", "/"]);
+            assert!(Args::try_parse_from(arguments).is_err(), "{selection:?}");
+        }
+        let selections: &[&[&str]] = &[
+            &["--zfs-device", "member.img", "0", "rest"],
+            &["--zfs-pool-guid", "123"],
+            &["--zfs-pool-guid", "123", "--zfs-candidate", "0", "1"],
+        ];
+        let other_formats: &[&[&str]] = &[
+            &["--ext4-journal", "journal.img", "0", "rest"],
+            &["--btrfs-device", "seed.img", "0", "rest"],
+            &["--btrfs-subvolume", "nested"],
+            &["--btrfs-subvolume-id", "256"],
+            &["--ntfs-indexed-lookup"],
+        ];
+        for selection in selections {
+            for other in other_formats {
+                for (left, right) in [(selection, other), (other, selection)] {
+                    let mut arguments = vec!["native_reader", "image.img"];
+                    arguments.extend(*left);
+                    arguments.extend(*right);
+                    arguments.extend(["stat", "/"]);
+                    let error = Args::try_parse_from(arguments).unwrap_err();
+                    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn auxiliary_format_selections_never_silently_override_another_format() {
         let selections: &[&[&str]] = &[
             &["--ext4-journal", "journal.img", "0", "rest"],
@@ -825,7 +1013,7 @@ mod tests {
         std::fs::create_dir(&mountpoint).unwrap();
         let auxiliary = mountpoint.join("member.img");
         std::fs::File::create_new(&auxiliary).unwrap();
-        for option in ["--ext4-journal", "--btrfs-device"] {
+        for option in ["--ext4-journal", "--btrfs-device", "--zfs-device"] {
             let args = Args::try_parse_from([
                 OsString::from("native_reader"),
                 image.as_os_str().to_owned(),
@@ -851,20 +1039,23 @@ mod tests {
     fn auxiliary_paths_preserve_native_bytes_and_geometry_requires_ascii_numbers() {
         use std::os::unix::ffi::OsStringExt;
         let path = OsString::from_vec(b"member-\xff.img".to_vec());
-        let mut arguments: Vec<OsString> = ["native_reader", "primary.img", "--btrfs-device"]
-            .into_iter()
-            .map(OsString::from)
-            .collect();
-        arguments.push(path.clone());
-        arguments.extend(["8192", "rest", "stat", "/"].map(OsString::from));
-        let args = Args::try_parse_from(arguments).unwrap();
-        let ReadOnlyBackend::Btrfs {
-            additional_devices, ..
-        } = args.backend().unwrap()
-        else {
-            panic!("expected btrfs member selection");
-        };
-        assert_eq!(additional_devices[0].path.as_os_str(), path);
+        for option in ["--btrfs-device", "--zfs-device"] {
+            let mut arguments: Vec<OsString> = ["native_reader", "primary.img", option]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            arguments.push(path.clone());
+            arguments.extend(["8192", "rest", "stat", "/"].map(OsString::from));
+            let args = Args::try_parse_from(arguments).unwrap();
+            let sources = match args.backend().unwrap() {
+                ReadOnlyBackend::Btrfs {
+                    additional_devices, ..
+                } => additional_devices,
+                ReadOnlyBackend::Zfs(options) => options.additional_images,
+                other => panic!("expected member selection, got {other:?}"),
+            };
+            assert_eq!(sources[0].path.as_os_str(), path);
+        }
         let invalid_number = OsString::from_vec(vec![0xff]);
         assert!(image_sources(&[path.clone(), invalid_number.clone(), "rest".into()]).is_err());
         assert!(image_sources(&[path, "0".into(), invalid_number]).is_err());
