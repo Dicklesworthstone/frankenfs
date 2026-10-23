@@ -69,6 +69,70 @@ pub struct FileReader<'a> {
 }
 
 impl FatVolume {
+    /// Walk complete physical runs without retaining the cluster map. The
+    /// visitor's output is provisional until this method succeeds: a corrupt
+    /// tail, short chain or cancellation must discard ALL accumulated extents.
+    /// No payload is read. Keep the volume immutable or hold its operation gate.
+    pub(crate) fn visit_file_runs(
+        &self,
+        cx: &Cx,
+        entry: &Entry,
+        mut visit: impl FnMut(u64, u64, u64, bool) -> Result<()>,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        if entry.native.is_directory() {
+            return Err(FfsError::IsDirectory);
+        }
+        let cluster_bytes = u64::from(self.geometry.cluster_bytes());
+        let required = u64::from(entry.native.size).div_ceil(cluster_bytes);
+        let mut emit = |index: usize, first: u32, count: usize, last: bool| {
+            checkpoint(cx)?;
+            let logical = (index as u64)
+                .checked_mul(cluster_bytes)
+                .ok_or_else(|| corrupt(entry.offset, "FAT run logical offset overflow"))?;
+            let physical = self.cluster_offset(first)?;
+            let length = (count as u64)
+                .checked_mul(cluster_bytes)
+                .ok_or_else(|| corrupt(entry.offset, "FAT run length overflow"))?;
+            if physical
+                .checked_add(length)
+                .is_none_or(|end| end > self.geometry.volume_bytes())
+            {
+                return Err(corrupt(entry.offset, "FAT run exceeds selected volume"));
+            }
+            visit(logical, physical, length, last)?;
+            checkpoint(cx)
+        };
+        let mut run: Option<(usize, u32, u32, usize)> = None;
+        self.walk_chain(
+            cx,
+            entry.native.first_cluster,
+            required,
+            entry.offset,
+            MAX_CHAIN_CLUSTERS,
+            |index, cluster| {
+                if let Some((_, _, previous, count)) = run.as_mut()
+                    && previous.checked_add(1) == Some(cluster)
+                {
+                    *previous = cluster;
+                    *count += 1;
+                    return Ok(());
+                }
+                if let Some((start, first, _, count)) = run.take() {
+                    emit(start, first, count, false)?;
+                }
+                run = Some((index, cluster, cluster, 1));
+                Ok(())
+            },
+        )?;
+        // LAST is only announced after complete native chain validation, even
+        // when logical EOF is zero or precedes reachable preallocation.
+        if let Some((start, first, _, count)) = run {
+            emit(start, first, count, true)?;
+        }
+        checkpoint(cx)
+    }
+
     /// Validate a regular file and prepare a bounded random/sequential reader.
     /// Uses the same native link validation and work limit as `file_chain`,
     /// without retaining a vector entry for every allocated cluster.

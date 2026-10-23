@@ -534,9 +534,9 @@ impl FatFs {
     fn chain(&self, cx: &Cx, ino: InodeNumber, entry: &Entry) -> Result<Arc<FileChain>> {
         checkpoint(cx)?;
         if !self.writable {
-            // Explicit extent enumeration still needs a complete temporary map.
-            // Never let it populate the mutable map cache on a read-only mount.
-            // Ordinary reads, attributes and opens use the bounded index instead.
+            // A caller explicitly requesting a full map cannot populate the
+            // writable cache. Read-only FsOps, including FIEMAP, use bounded
+            // traversal instead of requesting this materialized representation.
             return self.volume.file_chain(cx, entry).map(Arc::new);
         }
         let cached = self.state()?.chains.get(&ino).cloned();
@@ -1411,6 +1411,9 @@ impl FsOps for FatFs {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,
             )));
+        }
+        if !self.writable {
+            return self.readonly_fiemap(cx, entry, start, length);
         }
         let chain = self.chain(cx, ino, entry)?;
         let data_start = self
