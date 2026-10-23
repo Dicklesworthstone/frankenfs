@@ -6540,3 +6540,204 @@ Final bounded review and publication preparation, 2026-10-23 18:47 UTC:
   only leases6695/6696/6723. Record the actual commit/push/release outcome on the
   original staged Bead and Agent Mail after execution, rather than adding a
   self-referential bookkeeping commit or falsely pre-marking publication done.
+
+## Buffer-read semantic dispatch — 2026-10-23 19:13 UTC
+
+- [x] Prior publication snapshot is resolved by staged comment2267/Mail6499:
+  preserving merge819af1749 reached both refs, zero runtime delta over peer
+  ef600e507, tracked source clean and three prior leases released. Retain the
+  original broader acceptance obligations; this is not another Bead claim.
+- [x] Refresh queue/inbox/source. Canonical br refuses framed WAL before open;
+  source-aware queue identifies50claimable/local53/foreign0. Full hygiene still
+  fails on installed bv --no-cache and dependent fixture checks; no gate edit.
+  Raw warm-stat recommendation is stale: source/record already has the measured
+  suppression/client-floor result. The older metadata-pressure report also has
+  an existing default chunk-growth implementation and kernel regression; no new
+  metadata bug is established by reading that report.
+- [x] Find an actual API wiring defect: public read_into bypasses the nested
+  route used by FsOps::read, so tagged nested reads incorrectly hit ReadOnly.
+  Initial suspicion that it also bypassed raw-publication invalidation was
+  overstated: with_latest_scope already holds the recursive semantic guard.
+  Preserve that existing protection; no additional guard is needed. Continue
+  the sole staged native API claim; reserve
+  core/lib.rs and this TODO as6971/6972, announce in the existing Mail thread.
+- [x] Extend existing constructed two-device nested regression: same inner
+  inode in parent/child names different bytes, child data absent on primary;
+  check direct buffer reads, offsets, EOF, empty output, cancellation and tails.
+- [x] Extend raw-publication regression with warm direct buffer readers of the
+  parent and retained child; after publication/flush require ESTALE with output
+  unchanged. Reopen must produce the new bytes. Retain every old assertion.
+- [x] Execute focused red against unchanged production and record source hash,
+  actual assertions, terminal status/ACK and source-pair release.
+- [x] Fix only the missing nested instance route inside the existing guard;
+  keep the existing direct-to-buffer data path and read-only child authority.
+- [x] Reexecute focused tests, affected Btrfs/core/facade coverage, workspace
+  check/strict Clippy/fmt and complete scoped UBS without gate suppression.
+- [x] Fresh-review source/error paths and all original assertions; fill the
+  bounded real-work/honesty audit before claiming this slice verified.
+- [x] Update original staged Bead, cycles/flush and parity with exact executed
+  scope. Publication and lease-release execution are recorded after the commit.
+- [ ] Keep canonical owning-engine recovery, independent scanner/status,
+  native writer/crash/topology and older worker/performance obligations open.
+
+The TODO is explicitly operator-requested. Raw logs retain evidence across the
+observed RCH wrapper/output-loss failures and gate whether this exact correction
+may be reported verified. No new report framework is needed. Retire the working
+checklist after its outcomes are durably linked on the original Bead, subject to
+the repository's no-deletion rule; retained transcripts remain historical proof.
+
+Executed red19908 / rchw-03f2b1a9-da65-43f6-a84f-ae5cb0cc210f:
+base819af1749, test-only coree17122323498a6783b42771f77326835daf159feb27559367624f44918f51162,
+overlay791879ec1fec2ff027933956fde78f7cbd7daf13224414c0f11cd7ec7b6908bb.
+Two tests actually ran: nested attached-device buffer read fails with ReadOnly
+after the ordinary read returned the correct child bytes; raw-publication
+invalidation passes. Actual101/terminalACK/source+pairreleased,57.5s command.
+Log read-into-semantic-red-20261023T1917.log. This is a real routing red and
+guard-conservation green, not a stale-view counterexample. Five production lines
+route tagged inodes to their already-open child inside with_latest_scope; no
+new guard, runtime, allocation policy, dependency or fallback copy. Correct the
+existing read_into doc's obsolete fallback description. Frozen candidate core
+d987669f6a5364c3a467d9a9bce2495d8f9390942dadfe07ed1ec3927e1dca4d;
+fmt/diff-check0. Focused green adds the existing cached-cancellation regression;
+scoped UBS uses the unchanged installed scanner under command-local BASH_COMPAT=50.
+
+Focused green19915 / rchw-2f36edfd-2cfa-49b7-b088-be7501d95409 executes3tests,
+3passed/0failed/0ignored,0.02s tests/49.6s RCH,0/terminalACK/source+pairreleased.
+Candidate d987669f, overlayd278a9e3074858f7c49a274afccd009d4e3a93c821283d0cc6f62b494ec16f17.
+Exact source UBS completes0:0critical/14883warnings/3105info, unchanged scanner
+and rules. Broader independent findings remain open. Full required checks are
+not yet passes: check wrapperrchw-646cc4ca-bdd5-46dd-a33e-69d8328d399c queued at
+normal admission; subsequent serial Clippy/core/facade stages have not run.
+
+Shared maintainer commit14fff2f5a735abeddab47a05c9757959a309ee29 captured the
+exact candidate while gates waited. Its core SHA is still d987669f and its
+message explicitly says that sweep did not run tests. Preserve the commit and
+history; do not treat it as independent authorship or verification. The
+qualification commands retain explicit base819af1749 plus the frozen overlay.
+
+Bounded audit, this work block only (19:07 UTC onward; later gate results will
+be appended rather than backdated):
+- Real-work inventory: read current README purpose (Rust native filesystem
+  behavior through FUSE/offline-image tools), current queue and recent staged
+  closes, Git log/reflog and full owned diff. One USER unit is the runtime fix
+  with its stronger tests captured in14fff2f5a; one PROCESS unit is requested
+  TODO/Bead/evidence accounting. No separate ENABLER or UNKNOWN unit and no
+  closure. This classification is not a progress-credit quota.
+- Real-work questions:1) demo read versus read_into on a nested file whose
+  data lives only on the attached device; both now return the child's bytes.
+  2) Omitting process leaves the same code but loses the explicitly requested
+  source/failure handoff.3) Existing real engine regressions actually ran and
+  exposed ReadOnly before the fix; no speculative test framework.4) Oldest
+  source-aware ready user item is bd-kdmu4 (June22 multi-file read copy tax);
+  this correctness defect takes priority over an unprofiled throughput change.
+  5) Solo: no subagent, pane, close comparison or independent acceptance.
+  6) No plan/spec reduction or follow-up item carries unmet acceptance.
+  Verdict: bounded USER progress; initial triage rejected stale leads instead
+  of manufacturing fixes. Do not turn the admission wait into tooling work.
+- Creation worksheet: existing TODO/logs are PROCESS, not runtime inputs.
+  Consumer=user who explicitly requested granular TODO plus reviewer of this
+  exact API correction. Gate=do not report nested buffer-read qualification
+  without executed byte/error/source evidence. Observed defects=ReadOnly for a
+  valid child and prior RCH wrapper/output loss. Retirement=after publication
+  and durable outcomes on the original Bead, with no file deletion authorized.
+  Integrity exception: prior lost-wrapper/public-output failures are concrete;
+  raw per-command logs are required at this scale, are the smallest reliable
+  durable capture, and context-only output is not equivalent. Highest ready
+  capability under the sole claim is this API repair; prioritize it over extra
+  reports. Verdict=minimum requested TODO plus minimal integrity transcripts;
+  no new report framework, schema or dashboard.
+- Honesty inventory, all20prompts:
+  1 No (checked full core diff: every old assertion/test/ignore retained).
+  2 No (checked existing two-device and raw-MVCC fixtures; real reader/routing
+    executes, with distinct parent/child payloads, no new mock or success stub).
+  3 No (checked changed paths: no goldens/snapshots touched).
+  4 No (checked runtime/inline-test/doc diff; no validator/CI/config/pragmas,
+    tolerances, retries or gates relaxed; existing tests gain assertions).
+  5 No (checked production branch: no environment/fixture success path).
+  6 No (checked captured Rust output: red2tests, green3tests; broader queued
+    stages are explicitly unrun, not green).
+  7 No (checked command logs/ACK metadata; no unrun command claimed executed).
+  8 No (constructed-image unit scope explicit; no new native/crash/perf claim).
+  9 Yes: initial source-only stale-view diagnosis was overstated before
+    following with_latest_scope. It already held the semantic guard. Corrected
+    operator commentary, TODO, Bead2269 and Mail6513; passing raw-buffer test is
+    conservation evidence, not bug-fix credit. No added redundant guard.
+  10 No (checked subprocess commands; both streams retained in raw transcripts).
+  11 No (checked recent closes/current original status: no new close/split).
+  12 No (checked docs/spec paths; only obsolete read_into fallback description
+    corrected to actual implementation, requirements/parity unchanged).
+  13-17 N/A, each: no subagent dispatched, report accepted, close made, pane
+    farmed or agreement counted. Shared maintenance commit is not verification.
+  18 No (two exact red filters and three green filters declared before runs;
+    six nested read-window cases and all fault arms retained).
+  Older-session sweep N/A: this is the bounded current work audit, not a claim
+    that historical conduct or broader independent findings are cleared.
+  19 Explain the early stale-view overstatement and source capture by the
+    shared maintainer; both disclosed, source identity unchanged.
+  20 Strongest current proof: actual ReadOnly red19908 after valid ordinary
+    child read, followed by unchanged assertions green19915 on d987669f. A
+    skeptic can rerun the exact filters at the documented base/overlay.
+  Disposition: overstatement corrected in place, disclosed, and countermeasured
+  under RH-2/PL-2: distinguish a source suspicion from executed failure and keep
+  the already-working guard as an explicit countermetric. No self-review is
+  independent approval. Publication still waits on the remaining actual gates.
+
+20:00 UTC gate outcomes on unchanged d987669f / base819af1749+overlayd278a9e3:
+- [x] Workspace/all-target check19929 / rchw-646cc4ca-bdd5-46dd-a33e-69d8328d399c
+  completes0/ACK/source+pairreleased,371.1s RCH. Strict Clippy19938 /
+  rchw-acd121f0-0582-4b72-a385-06239a260d40 completes0/ACK/releases,761.3s.
+- [x] Full core library19946 / rchw-882622b3-7a00-492d-a031-09ed1326fccd:
+  1577declared tests,1553passed/0failed/24existing ignores/0filtered;
+  954.96s tests,993.7s RCH,0/ACK/source+pairreleased. All three focused tests
+  execute again inside it; do not add their repeated counts to the full total.
+- [x] Existing native btrfs-progs regression actually executes baseline checks
+  and20fsync/full-commit cycles at each of2000/5000/20000files. All three final
+  btrfs check verdicts are CLEAN. Native freshness fsops/journal-fsync test also
+  passes. CPU/thread readback explains their long runtime: both active test
+  threads were running, not lock-waiting; no debugger, test/resource/timeout
+  override or cancellation applied. These are bounded structural image checks,
+  not a new kernel-mounted readback/crash campaign or a performance win.
+- [x] Same local scanner mode still catches the retained literal panic control:
+  exit1,1critical/0warnings/4info, rust.ownership.panic-macro at line4. No scanner
+  asset, severity, category or assertion edited. Current source scan remains
+ 0critical/14883warnings/3105info; broader independent findings remain open.
+- [x] Complete facade/all-target reader examples at this same source cut; final
+  facade log read-into-final-facade-20261023T1921.log records42facade and14reader
+  passes,0failures,1existing facade ignore;348.4s RCH,0/ACK/source+pairreleased.
+- [ ] Complete parity/final audit delta, original staged evidence/cycles/flush
+  and exact-owned-path publication. Remote already contains the unchanged
+ 14fff2f5a runtime unit; fresh refs will be checked again before publishing docs.
+  Keep the shared staged old-core reversal untouched until the owned commit;
+  preserve its index bytes outside the repo before consuming qualified working
+  source. Release only6971/6972/7024 after the actual publication outcome.
+
+Final pre-publication delta, 2026-10-23 20:07 UTC:
+- [x] Facade19959 / rchw-2bb21224-c205-445e-aaa4-766b37bf99ec has actual test
+  summaries and terminal0/ACK/releases. Current jobs readback2007 preserves all
+  six owned red/green/check/Clippy/core/facade outcomes, including red101. Full
+  current unique core/facade/example runs report1609passes/0failures/25existing
+  ignores in aggregate; the focused3green tests are included, not extra credit.
+- [x] Source remains d987669f byte-identical to runtime commit14fff2f5a and
+  base819af1749+overlayd278a9e3. No Rust edit followed these qualifications.
+  Update parity narrative only; no percentage, golden, assertion, ignore,
+  validator, timing tolerance, dependency or runtime policy changed.
+- [x] Freshly inspect the dispatch: parent with_latest_scope already holds its
+  recursive semantic guard; route clones the owning child Arc without retaining
+  the slot mutex, and the child keeps its existing guard/device/verification
+  policy. Child routing is disabled inside that view, so this adds no recursion
+  cycle. Read-only mutation refusal remains unchanged. All original assertions
+  remain. No further defect found in this bounded changed-path review.
+- [x] Final honesty delta to6/7/20: all planned current-block gates now actually
+  execute and have captured summaries. The only diagnostic correction is still
+  the early stale-view overstatement, corrected openly in2269/Mail6513 and above.
+  Existing invalidation is conservation evidence, not a second repaired bug.
+  Solo author verification only. Retain the original broader independent/native
+  conditions. No current benchmark, kernel mount or crash campaign was run.
+- [x] Staged Bead2272 records final evidence; cycles0 and flush0. Raw canonical
+  DB/WAL/SHM/JSONL remain frozen and unpromoted. No task closed or acceptance split.
+- [ ] Finish only exact-owned-path docs/TODO publication and fresh remote ref
+  readback, then release leases6971/6972/7024. Preserve the current index before
+  consuming qualified working core bytes, rather than committing its shared
+  staged old-core reversal. Record actual publication/release on the original
+  Bead/Mail after execution; this committed checklist is the pre-publication
+  snapshot, not a false claim that a future push has already succeeded.

@@ -1,5 +1,20 @@
 # FEATURE_PARITY
 
+> **Nested Btrfs buffer reads (2026-10-23, source `14fff2f5a`):**
+> `OpenFs::read_into` now routes tagged subvolume inodes to the owning child
+> reader, preserving its attached-device mapping and direct caller-buffer path.
+> The existing semantic-view guard and read-only child authority remain intact.
+> A reproduced `ReadOnly` failure became a passing distinct-device regression;
+> offset/EOF, cancellation, missing-slot, directory and untouched-tail controls
+> also pass. This source passed workspace/all-target check, strict Clippy,
+> formatting, 1,553 core tests (24 existing ignores), 42 facade tests and 14
+> reader-example tests (one existing ignore). Scoped UBS reported zero critical
+> findings; broader independent findings remain open. The core run also executed
+> clean btrfs-progs checks at 2,000/5,000/20,000 files after twenty commit cycles
+> per size. These are bounded unit/structural-image results, with no new mounted,
+> crash, performance or independent-acceptance claim and no parity percentage
+> promotion. Exact hashes, failures and acknowledgements are in the existing TODO.
+
 > **Atomic ext4 chmod and combined inode attributes:** every mode-bearing
 > `setattr` now reads the inode and any access ACL inside one registered MVCC
 > transaction and publishes mode, ownership, timestamps, size and ACL changes
