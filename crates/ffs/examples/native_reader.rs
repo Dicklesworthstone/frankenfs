@@ -41,6 +41,20 @@ struct Args {
         conflicts_with_all = ["ntfs_indexed_lookup", "zfs_dataset", "zfs_snapshot"]
     )]
     btrfs_device: Vec<OsString>,
+    /// Select the named btrfs subvolume as the image root.
+    #[arg(
+        long,
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        conflicts_with_all = ["btrfs_subvolume_id", "ext4_journal", "ntfs_indexed_lookup", "zfs_dataset", "zfs_snapshot"]
+    )]
+    btrfs_subvolume: Option<String>,
+    /// Select a btrfs root-tree objectid, including a snapshot root.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with_all = ["ext4_journal", "ntfs_indexed_lookup", "zfs_dataset", "zfs_snapshot"]
+    )]
+    btrfs_subvolume_id: Option<u64>,
     /// Opt into NTFS index-directed lookup; does not certify unvisited siblings.
     #[arg(long, conflicts_with_all = ["zfs_dataset", "zfs_snapshot"])]
     ntfs_indexed_lookup: bool,
@@ -136,9 +150,19 @@ impl Args {
             Ok(ReadOnlyBackend::Ext4 {
                 external_journal: image_sources(&self.ext4_journal)?.pop(),
             })
-        } else if !self.btrfs_device.is_empty() {
+        } else if !self.btrfs_device.is_empty()
+            || self.btrfs_subvolume.is_some()
+            || self.btrfs_subvolume_id.is_some()
+        {
+            let root = if let Some(name) = &self.btrfs_subvolume {
+                ffs::BtrfsMountSelection::Subvolume(name.clone())
+            } else if let Some(id) = self.btrfs_subvolume_id {
+                ffs::BtrfsMountSelection::SubvolumeId(id)
+            } else {
+                ffs::BtrfsMountSelection::DefaultRoot
+            };
             Ok(ReadOnlyBackend::Btrfs {
-                root: ffs::BtrfsMountSelection::DefaultRoot,
+                root,
                 additional_devices: image_sources(&self.btrfs_device)?,
             })
         } else if self.ntfs_indexed_lookup {
@@ -673,6 +697,97 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn btrfs_root_selections_keep_primary_and_member_bounds() {
+        for (option, value, expected) in [
+            (
+                "--btrfs-subvolume",
+                "seed-nested",
+                ffs::BtrfsMountSelection::Subvolume("seed-nested".into()),
+            ),
+            (
+                "--btrfs-subvolume-id",
+                "256",
+                ffs::BtrfsMountSelection::SubvolumeId(256),
+            ),
+        ] {
+            for attached in [false, true] {
+                let mut arguments = vec![
+                    "native_reader",
+                    "sprout.img",
+                    "--offset",
+                    "4096",
+                    "--length",
+                    "268435456",
+                    option,
+                    value,
+                ];
+                if attached {
+                    arguments.extend(["--btrfs-device", "seed.img", "8192", "268435456"]);
+                }
+                arguments.extend(["mount", "/mnt/native"]);
+                let args = Args::try_parse_from(arguments).unwrap();
+                assert_eq!((args.offset, args.length), (4096, Some(268_435_456)));
+                let ReadOnlyBackend::Btrfs {
+                    root,
+                    additional_devices,
+                } = args.backend().unwrap()
+                else {
+                    panic!("expected explicit btrfs root selection");
+                };
+                assert_eq!(root, expected);
+                assert_eq!(additional_devices.len(), usize::from(attached));
+                if attached {
+                    assert_eq!(additional_devices[0].path, PathBuf::from("seed.img"));
+                    assert_eq!(
+                        (additional_devices[0].offset, additional_devices[0].length),
+                        (8192, Some(268_435_456))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_root_selectors_reject_invalid_and_cross_format_arguments() {
+        for (option, value) in [
+            ("--btrfs-subvolume", ""),
+            ("--btrfs-subvolume-id", "0"),
+            ("--btrfs-subvolume-id", "-1"),
+            ("--btrfs-subvolume-id", "18446744073709551616"),
+        ] {
+            assert!(
+                Args::try_parse_from(["native_reader", "image.img", option, value, "stat", "/"])
+                    .is_err()
+            );
+        }
+        let roots: &[&[&str]] = &[
+            &["--btrfs-subvolume", "seed-nested"],
+            &["--btrfs-subvolume-id", "256"],
+        ];
+        let other_formats: &[&[&str]] = &[
+            &["--ext4-journal", "journal.img", "0", "rest"],
+            &["--ntfs-indexed-lookup"],
+            &["--zfs-dataset", "data"],
+            &["--zfs-snapshot", "before"],
+        ];
+        for root in roots {
+            for other in other_formats
+                .iter()
+                .chain(roots.iter().filter(|other| *other != root))
+            {
+                for (left, right) in [(root, other), (other, root)] {
+                    let mut arguments = vec!["native_reader", "image.img"];
+                    arguments.extend(*left);
+                    arguments.extend(*right);
+                    arguments.extend(["stat", "/"]);
+                    let error = Args::try_parse_from(arguments).unwrap_err();
+                    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                }
+            }
+        }
     }
 
     #[test]

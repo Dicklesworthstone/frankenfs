@@ -89,6 +89,7 @@ cargo run -p ffs --example native_reader -- image.img mount /mnt/ffs
 cargo run -p ffs --example native_reader -- ntfs.img --ntfs-indexed-lookup mount /mnt/ffs
 cargo run -p ffs --example native_reader -- ext4.img --ext4-journal journal.img 8192 32768 stat /
 cargo run -p ffs --example native_reader -- sprout.img --btrfs-device seed.img 0 rest mount /mnt/ffs
+cargo run -p ffs --example native_reader -- sprout.img --btrfs-device seed.img 0 rest --btrfs-subvolume seed-nested read /payload
 ```
 
 `--ext4-journal PATH OFFSET LENGTH` selects one external journal;
@@ -100,6 +101,11 @@ as the library API, including independent regular-file, lock and bounds checks.
 An external journal can be a bare JBD2 region or a native `JOURNAL_DEV` image.
 For a native image, the selected bounds include its device header: keep the
 original device-relative ring addresses instead of slicing past that header.
+`--btrfs-subvolume NAME` or `--btrfs-subvolume-id ID` selects the root for all
+offline commands and foreground mounts, with or without additional members.
+The selectors are mutually exclusive and retain every primary/member bound
+and lock. Root IDs must be positive; native root existence and format admission
+are still checked by the library. Selecting a subvolume does not grant writes.
 
 Mounting requires working FUSE support and an existing empty directory which
 does not hide any primary or auxiliary backing image. Keep all backing files offline and unchanged
