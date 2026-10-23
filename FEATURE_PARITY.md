@@ -1,5 +1,16 @@
 # FEATURE_PARITY
 
+> **Btrfs preallocation survives range replacement at full capacity:** overwriting
+> part of a disk-backed PREALLOC extent now retains the surviving unwritten
+> ranges as references to their existing reservation. Splitting no longer needs
+> fresh data allocations that could fail after removing the original mapping.
+> Two new regressions cover actual one-sector ENOSPC, shared reservations,
+> reference accounting, unwritten FIEMAP flags, consuming exclusive remnants
+> in place, final-reference release, native `btrfs check` and reopen. These tests
+> are authored but unexecuted here because dependencies are uncached and shared
+> storage is exhausted. Pinned formatting and whitespace checks pass. This
+> addresses reservation splitting, not general metadata-allocation rollback.
+
 > **Btrfs reflink destination preservation:** public `FICLONE` and
 > `FICLONERANGE` now share the same bounded range-clone behavior. A whole-source
 > clone no longer truncates a larger destination, discards its trailing data or

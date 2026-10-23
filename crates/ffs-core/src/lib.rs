@@ -38212,13 +38212,10 @@ impl OpenFs {
             .range(&ext_start, &ext_end)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-        // Each overlapping extent is freed refcount-aware (bd-xkvcm): a SHARED
-        // extent (reflink/snapshot/CoW, EXTENT_ITEM.refs > 1) has only this
-        // inode's EXTENT_DATA_REF dropped — the left/right non-overlapping parts
-        // are re-inserted below as fresh materialized copies, so this inode no
-        // longer needs the shared extent and the other references stay live. A
-        // sole reference (refs == 1) is freed as before. FrankenFS's own extents
-        // are refs == 1, so the drop path only engages on kernel-shared extents.
+        // Account for each overlapping item's references (bd-xkvcm). Disk-backed
+        // regular and preallocated remnants keep the original extent as narrower
+        // views. Entirely removed items drop their reference, freeing space and
+        // checksums only when no references remain.
         let mut nbytes_delta = 0_i128;
         for (key, extent_bytes) in extents {
             let extent = parse_extent_data(&extent_bytes).map_err(|e| parse_to_ffs_error(&e))?;
@@ -38249,25 +38246,25 @@ impl OpenFs {
                 BtrfsExtentData::Regular { extent_type, .. }
                     if extent_type == BTRFS_FILE_EXTENT_PREALLOC
             );
-            // A REGULAR extent backed by real disk is split BY REFERENCE: both
+            // Disk-backed REGULAR and PREALLOC extents split by reference: both
             // halves keep the original's `disk_bytenr`/`disk_num_bytes` and just
             // narrow `extent_offset`/`num_bytes` to their own file range, exactly
-            // as the kernel splits a file extent item. Nothing is copied and
-            // nothing is allocated, which is what removes bd-72tn8's failure mode
-            // rather than recovering from it — the old path materialized each
-            // remnant into a fresh private extent, so a split could fail on a full
-            // or fragmented filesystem after the original was already gone.
+            // as the kernel splits a file extent item. No new data allocation or
+            // data copy is needed. Metadata updates can still fail, but the
+            // remnant's data-space ENOSPC failure site is removed (bd-72tn8).
             //
-            // Holes (`disk_bytenr == 0`), PREALLOC, and inline extents keep the
-            // old handling: a hole has nothing to reference, prealloc re-inserts
-            // reservations, and an inline extent's bytes live in the item itself.
+            // Keeping PREALLOC's extent type preserves its zero reads, unwritten
+            // FIEMAP state and existing reservation. Reallocating its remnants
+            // could fail with ENOSPC after deleting the original item, even
+            // though the surviving ranges already owned their backing space.
+            // Other extent forms keep the remnant handling below.
             let reference_split = matches!(
                 extent,
                 BtrfsExtentData::Regular {
-                    extent_type,
+                    extent_type: BTRFS_FILE_EXTENT_REG | BTRFS_FILE_EXTENT_PREALLOC,
                     disk_bytenr,
                     ..
-                } if extent_type == BTRFS_FILE_EXTENT_REG && disk_bytenr > 0
+                } if disk_bytenr > 0
             );
             let materialized = if is_prealloc || reference_split {
                 Vec::new()
@@ -38279,14 +38276,9 @@ impl OpenFs {
                 .delete(&key)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-            // The original's disk extent is NOT freed yet (bd-72tn8). Rebuilding
-            // the non-overlapping head/tail allocates, and allocation can fail on
-            // a full or fragmented filesystem — a total-free pre-flight cannot
-            // predict it, because each remnant needs a CONTIGUOUS run. Freeing
-            // first made that failure destructive: the caller got ENOSPC and the
-            // file kept a hole where a remnant was never rebuilt. Holding the
-            // original until both remnants are safely in place means a failure
-            // can be rolled back to exactly the prior state.
+            // Keep the original reference until surviving views or materialized
+            // remnants are installed. Reference splits retain that ownership;
+            // fallback paths drop it only after both remnants succeed (bd-72tn8).
             if reference_split {
                 let surviving = Self::btrfs_split_extent_by_reference(
                     alloc,
@@ -106963,6 +106955,274 @@ mod tests {
             .getattr(&cx, &mut RequestScope::empty(), dst2.ino)
             .expect("getattr dst2");
         assert_eq!(attr.size, 8192, "dst2 size = cloned range length");
+    }
+
+    #[test]
+    fn btrfs_reflink_splits_preallocation_on_a_full_filesystem() {
+        let _guard = log_contract_guard();
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        const BS: usize = 4096;
+        let source = fs
+            .create(&cx, root, OsStr::new("prealloc-source"), 0o600, 0, 0)
+            .expect("source");
+        let destination = fs
+            .create(&cx, root, OsStr::new("prealloc-destination"), 0o600, 0, 0)
+            .expect("destination");
+        let peer = fs
+            .create(&cx, root, OsStr::new("prealloc-peer"), 0o600, 0, 0)
+            .expect("peer");
+        fs.write(&cx, source.ino, 0, &[0xC3; BS])
+            .expect("source data");
+        fs.fallocate(&cx, destination.ino, 0, (5 * BS) as u64, 0)
+            .expect("reserve destination");
+        let source_canonical = fs.btrfs_canonical_inode(source.ino).unwrap();
+        let destination_canonical = fs.btrfs_canonical_inode(destination.ino).unwrap();
+        let (source_disk, source_disk_len) = btrfs_first_regular_extent(&fs, source_canonical);
+        let (reserved_disk, reserved_disk_len) =
+            btrfs_first_regular_extent(&fs, destination_canonical);
+        fs.clone_file(&cx, &mut RequestScope::empty(), peer.ino, destination.ino)
+            .expect("share the unwritten reservation with another inode");
+
+        // Reach actual one-sector ENOSPC, not merely failure to find a large
+        // contiguous allocation. The clone must reuse existing reservations.
+        let filler = fs
+            .create(&cx, root, OsStr::new("prealloc-filler"), 0o600, 0, 0)
+            .expect("filler");
+        let mut offset = 0_u64;
+        for blocks in [16_usize, 4, 1] {
+            let bytes = vec![0xEE; blocks * BS];
+            loop {
+                match fs.write(&cx, filler.ino, offset, &bytes) {
+                    Ok(written) => {
+                        assert_eq!(written as usize, bytes.len());
+                        offset += u64::from(written);
+                    }
+                    Err(error) if error.to_errno() == libc::ENOSPC => break,
+                    Err(error) => panic!("filler write: {error}"),
+                }
+                assert!(offset < 64 * 1024 * 1024, "filler never reached ENOSPC");
+            }
+        }
+        let free_before = fs.statfs(&cx, root).expect("free space").blocks_free;
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            destination.ino,
+            source.ino,
+            0,
+            BS as u64,
+            (2 * BS) as u64,
+        )
+        .expect("reflink must split existing preallocation without allocating");
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+        {
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            let layout: Vec<_> = OpenFs::btrfs_extent_data_items(&alloc, destination_canonical)
+                .unwrap()
+                .into_iter()
+                .map(|(key, extent)| match extent {
+                    BtrfsExtentData::Regular {
+                        extent_type,
+                        disk_bytenr,
+                        extent_offset,
+                        num_bytes,
+                        ..
+                    } => (
+                        key.offset,
+                        extent_type,
+                        disk_bytenr,
+                        extent_offset,
+                        num_bytes,
+                    ),
+                    other => panic!("expected a disk-backed extent, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                layout,
+                vec![
+                    (
+                        0,
+                        BTRFS_FILE_EXTENT_PREALLOC,
+                        reserved_disk,
+                        0,
+                        (2 * BS) as u64
+                    ),
+                    (
+                        (2 * BS) as u64,
+                        BTRFS_FILE_EXTENT_REG,
+                        source_disk,
+                        0,
+                        BS as u64
+                    ),
+                    (
+                        (3 * BS) as u64,
+                        BTRFS_FILE_EXTENT_PREALLOC,
+                        reserved_disk,
+                        (3 * BS) as u64,
+                        (2 * BS) as u64,
+                    ),
+                ],
+                "both remnants must keep the original physical reservation and unwritten type"
+            );
+            assert_eq!(
+                alloc
+                    .extent_alloc
+                    .extent_item_refs(reserved_disk, reserved_disk_len)
+                    .unwrap(),
+                Some(3),
+                "two destination views plus the peer own the reservation"
+            );
+            assert_eq!(
+                alloc
+                    .extent_alloc
+                    .extent_item_refs(source_disk, source_disk_len)
+                    .unwrap(),
+                Some(2)
+            );
+            let inode = fs
+                .btrfs_read_inode_from_tree(&alloc, destination_canonical)
+                .unwrap();
+            assert_eq!(inode.size, (5 * BS) as u64);
+            assert_eq!(inode.nbytes, (5 * BS) as u64);
+        }
+        let mappings = fs
+            .fiemap(
+                &cx,
+                &mut RequestScope::empty(),
+                destination.ino,
+                0,
+                u64::MAX,
+            )
+            .expect("fiemap");
+        assert_eq!(mappings.len(), 3);
+        for index in [0, 2] {
+            assert_ne!(mappings[index].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
+        }
+        assert_eq!(mappings[1].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
+        let mut expected = vec![0; 5 * BS];
+        expected[2 * BS..3 * BS].fill(0xC3);
+
+        // Another inode still references the reservation: an overwrite must
+        // need COW space and fail without modifying either file.
+        let error = fs
+            .write(&cx, destination.ino, 0, &[0x31; 2 * BS])
+            .expect_err("shared preallocation must not be written in place");
+        assert_eq!(error.to_errno(), libc::ENOSPC);
+        assert_eq!(
+            fs.read(&cx, destination.ino, 0, (5 * BS) as u32).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs.read(&cx, peer.ino, 0, (5 * BS) as u32).unwrap(),
+            vec![0; 5 * BS]
+        );
+        fs.unlink(&cx, root, OsStr::new("prealloc-peer"))
+            .expect("drop peer");
+
+        // Now both disjoint remnants are exclusively this inode's. Its original
+        // fallocate promise must remain usable even with no free data sectors.
+        fs.write(&cx, destination.ino, 0, &[0x31; 2 * BS])
+            .expect("consume the reserved left remnant in place");
+        fs.write(&cx, destination.ino, (3 * BS) as u64, &[0x72; 2 * BS])
+            .expect("consume the reserved right remnant in place");
+        expected[..2 * BS].fill(0x31);
+        expected[3 * BS..].fill(0x72);
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+        let error = fs
+            .write(&cx, destination.ino, (2 * BS) as u64, &[0x99; BS])
+            .expect_err("the cloned middle still needs COW space");
+        assert_eq!(error.to_errno(), libc::ENOSPC);
+        assert_eq!(
+            fs.read(&cx, destination.ino, 0, (5 * BS) as u32).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs.read(&cx, source.ino, 0, BS as u32).unwrap(),
+            vec![0xC3; BS]
+        );
+
+        fs.unlink(&cx, root, OsStr::new("prealloc-destination"))
+            .expect("release all destination views");
+        let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+        assert_eq!(
+            alloc
+                .extent_alloc
+                .extent_item_refs(reserved_disk, reserved_disk_len)
+                .unwrap(),
+            None,
+            "the final reservation view must release the original extent"
+        );
+        assert_eq!(
+            alloc
+                .extent_alloc
+                .extent_item_refs(source_disk, source_disk_len)
+                .unwrap(),
+            Some(1),
+            "removing the clone must retain the source's reference"
+        );
+    }
+
+    #[test]
+    fn btrfs_reflink_preallocated_remnants_pass_native_check_and_reopen() {
+        let _guard = log_contract_guard();
+        let (fs, dev, _tmp, image) =
+            open_writable_btrfs_mkfs(256).expect("btrfs-progs fixture required");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let source = fs
+            .create(&cx, root, OsStr::new("split-source"), 0o600, 0, 0)
+            .unwrap();
+        let destination = fs
+            .create(&cx, root, OsStr::new("split-destination"), 0o600, 0, 0)
+            .unwrap();
+        fs.write(&cx, source.ino, 0, &[0xC3; 4096]).unwrap();
+        fs.fallocate(&cx, destination.ino, 0, 20_480, 0).unwrap();
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            destination.ino,
+            source.ino,
+            0,
+            4096,
+            8192,
+        )
+        .expect("clone into the middle of an unwritten reservation");
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        fs.btrfs_full_transaction_commit(&cx, "reflink-prealloc-remnants")
+            .unwrap();
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        drop(fs);
+        let (clean, output) = run_btrfs_check(&image).expect("native btrfs checker required");
+        assert!(
+            clean,
+            "btrfs check must accept shared preallocation views:\n{output}"
+        );
+        let reopened = OpenFs::open(&cx, &image).expect("reopen preallocation image");
+        let mut expected = vec![0; 20_480];
+        expected[8192..12_288].fill(0xC3);
+        assert_eq!(
+            reopened.read(&cx, destination.ino, 0, 20_480).unwrap(),
+            expected
+        );
+        assert_eq!(
+            reopened.read(&cx, source.ino, 0, 4096).unwrap(),
+            vec![0xC3; 4096]
+        );
+        let mappings = reopened
+            .fiemap(
+                &cx,
+                &mut RequestScope::empty(),
+                destination.ino,
+                0,
+                u64::MAX,
+            )
+            .unwrap();
+        assert_eq!(mappings.len(), 3);
+        for index in [0, 2] {
+            assert_ne!(mappings[index].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
+        }
+        assert_eq!(mappings[1].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
     }
 
     /// Replay the three-operation ARM proptest failure, then exercise COW and
