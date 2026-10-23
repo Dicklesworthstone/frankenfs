@@ -48526,8 +48526,9 @@ impl OpenFs {
     /// `walk --read-data` vs the kernel-style fixed-buffer reuse (bd-2x68s).
     /// Pure-safe-Rust — no allocator tuning (the crate is `forbid(unsafe_code)`).
     ///
-    /// Result is byte-identical to `read(..)[..n]`. Less-common ext4 paths
-    /// (compressed / inline / indirect) and btrfs fall back to `read` + a copy
+    /// Result is byte-identical to `read(..)[..n]`. Btrfs also reads directly
+    /// into `dst`, routing nested-subvolume inodes to their owning reader.
+    /// Less-common ext4 paths (compressed / inline) fall back to `read` + a copy
     /// into `dst`, which still allocates but preserves exact semantics.
     pub fn read_into(
         &self,
@@ -48538,6 +48539,11 @@ impl OpenFs {
     ) -> ffs_error::Result<usize> {
         let size = u32::try_from(dst.len()).unwrap_or(u32::MAX);
         self.with_latest_scope(|scope| {
+            // The tagged inode belongs to the child's tree and device mapping,
+            // not this mount's tree. Preserve the direct-to-buffer path there.
+            if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+                return nested.read_into(cx, inner, offset, dst);
+            }
             if let FsFlavor::Ext4(_) = &self.flavor {
                 let canonical = Self::ext4_canonical_inode(ino);
                 // Lock-free hot-inode fast path: a single-file random-read
@@ -65795,6 +65801,12 @@ mod tests {
         let (_, nested, inner) = fs.btrfs_nested_route(tagged).unwrap().unwrap();
         assert_eq!(fs.read(&cx, tagged, 0, 6).unwrap(), b"before");
         assert_eq!(OpenFs::read(&nested, &cx, inner, 0, 6).unwrap(), b"before");
+        for (reader, ino) in [(&fs, InodeNumber(257)), (nested.as_ref(), inner)] {
+            let mut out = [0xA5; 16];
+            assert_eq!(reader.read_into(&cx, ino, 0, &mut out).unwrap(), 6);
+            assert_eq!(&out[..6], b"before");
+            assert_eq!(&out[6..], &[0xA5; 10]);
+        }
         let logical = BTRFS_TEST_FS_TREE_LOGICAL;
         let block_size = fs.block_size() as usize;
         write_btrfs_test_extent_payload(&mut image, &encode_btrfs_extent_inline(b"after!"));
@@ -65814,6 +65826,23 @@ mod tests {
                 .to_errno(),
             libc::ESTALE
         );
+        let assert_stale_buffers = || {
+            for (reader, ino) in [
+                (&fs, InodeNumber(257)),
+                (&fs, tagged),
+                (nested.as_ref(), inner),
+            ] {
+                for (offset, size) in [(0, 16), (6, 16), (0, 0)] {
+                    let mut out = [0xA5; 16];
+                    let error = reader
+                        .read_into(&cx, ino, offset, &mut out[..size])
+                        .expect_err("raw publication invalidates buffer reads too");
+                    assert_eq!(error.to_errno(), libc::ESTALE);
+                    assert_eq!(out, [0xA5; 16], "a stale read must not touch its output");
+                }
+            }
+        };
+        assert_stale_buffers();
         fs.flush_mvcc_to_device(&cx).unwrap();
         assert_eq!(
             OpenFs::read(&nested, &cx, inner, 0, 6)
@@ -65821,11 +65850,21 @@ mod tests {
                 .to_errno(),
             libc::ESTALE
         );
+        assert_stale_buffers();
         let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
         assert_eq!(
             reopened.read(&cx, InodeNumber(257), 0, 6).unwrap(),
             b"after!"
         );
+        let mut out = [0xA5; 16];
+        assert_eq!(
+            reopened
+                .read_into(&cx, InodeNumber(257), 0, &mut out)
+                .unwrap(),
+            6
+        );
+        assert_eq!(&out[..6], b"after!");
+        assert_eq!(&out[6..], &[0xA5; 10]);
     }
 
     #[test]
@@ -105766,6 +105805,42 @@ mod tests {
                     "different subvolume inode aliases"
                 );
                 assert_eq!(fs.read(&cx, file.ino, 0, 128).unwrap(), payload);
+                for (offset, size) in [
+                    (0, 128),
+                    (3, 7),
+                    ((payload.len() - 2) as u64, 128),
+                    (payload.len() as u64, 128),
+                    (u64::MAX, 128),
+                    (0, 0),
+                ] {
+                    let expected = fs.read(&cx, file.ino, offset, size as u32).unwrap();
+                    let mut out = [0xA5; 128];
+                    let n = fs
+                        .read_into(&cx, file.ino, offset, &mut out[..size])
+                        .expect("buffer read must route to the attached nested device");
+                    assert_eq!(n, expected.len());
+                    assert_eq!(&out[..n], expected);
+                    assert!(out[n..].iter().all(|&byte| byte == 0xA5));
+                }
+                let cancelled = Cx::for_testing();
+                cancelled.set_cancel_requested(true);
+                let mut out = [0xA5; 128];
+                assert!(matches!(
+                    fs.read_into(&cancelled, file.ino, 0, &mut out),
+                    Err(FfsError::Cancelled)
+                ));
+                assert_eq!(out, [0xA5; 128]);
+                assert!(matches!(
+                    fs.read_into(&cx, link.ino, 0, &mut out),
+                    Err(FfsError::IsDirectory)
+                ));
+                assert_eq!(out, [0xA5; 128]);
+                let invalid = OpenFs::btrfs_nested_tag(slot + 1, InodeNumber(257));
+                assert!(matches!(
+                    fs.read_into(&cx, invalid, 0, &mut out),
+                    Err(FfsError::NotFound(_))
+                ));
+                assert_eq!(out, [0xA5; 128]);
                 let mut encoded_args = [0_u8; 64];
                 encoded_args[32..40].copy_from_slice(&128_u64.to_le_bytes());
                 let encoded = fs
