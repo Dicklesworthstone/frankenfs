@@ -37139,9 +37139,9 @@ impl OpenFs {
     /// head, REG middle with checksums, PREALLOC tail), each extra view one
     /// more reference under the same backref key. nbytes is unchanged.
     ///
-    /// Taken only when the extent is exclusively this inode's (every backref
-    /// is this root and inode) and nothing can share it implicitly: no
-    /// subvolume or snapshot exists, and the extent is newer than the root's
+    /// Taken only when the extent is exclusively this mapping's (every backref
+    /// has this root, inode and backref offset) and nothing can share it
+    /// implicitly: no subvolume or snapshot exists, and the extent is newer than the root's
     /// `last_snapshot` (the kernel's rule). A crash before the commit leaves
     /// the old PREALLOC item, which reads zeros whatever the blocks hold.
     fn btrfs_try_write_into_prealloc(
@@ -37192,9 +37192,16 @@ impl OpenFs {
             return Ok(false);
         }
         let root = alloc.fs_root_objectid;
+        let ref_offset = key.offset.wrapping_sub(extent_offset);
         if !alloc
             .extent_alloc
-            .data_extent_owned_only_by(disk_bytenr, disk_num_bytes, root, canonical)
+            .data_extent_owned_only_by_mapping(
+                disk_bytenr,
+                disk_num_bytes,
+                root,
+                canonical,
+                ref_offset,
+            )
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
             || Self::btrfs_may_be_shared_by_a_snapshot(alloc, root, generation)?
         {
@@ -37265,7 +37272,6 @@ impl OpenFs {
             inserted.push(piece_key);
         }
         // One reference per view; the original item held one.
-        let ref_offset = key.offset.wrapping_sub(extent_offset);
         for _ in 1..inserted.len() {
             alloc
                 .extent_alloc
@@ -38411,7 +38417,8 @@ impl OpenFs {
     /// This is the kernel's file-extent split: `disk_bytenr`, `disk_num_bytes`,
     /// `ram_bytes` and `compression` are inherited untouched, and only
     /// `extent_offset`/`num_bytes` narrow to each half's file range. No data is
-    /// read and no space is allocated, so the split cannot fail for want of it.
+    /// read and no new data space is allocated. Metadata insertion and the
+    /// caller's reference-count updates can still fail.
     ///
     /// Both halves resolve to the same backref key — the left keeps the original
     /// file offset and `extent_offset`, and the right advances both by the same
@@ -107223,6 +107230,220 @@ mod tests {
             assert_ne!(mappings[index].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
         }
         assert_eq!(mappings[1].flags & FIEMAP_EXTENT_UNWRITTEN, 0);
+    }
+
+    fn btrfs_prealloc_self_alias_sequence(
+        fs: &OpenFs,
+        cx: &Cx,
+        alias_first: bool,
+    ) -> (InodeNumber, Vec<u8>) {
+        const BS: usize = 4096;
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let name = format!("prealloc-self-alias-{alias_first}");
+        let file = fs
+            .create(cx, root, OsStr::new(&name), 0o600, 0, 0)
+            .expect("create preallocated file");
+        fs.fallocate(cx, file.ino, 0, (4 * BS) as u64, 0)
+            .expect("reserve four blocks");
+        fs.clone_file_range(
+            cx,
+            &mut RequestScope::empty(),
+            file.ino,
+            file.ino,
+            0,
+            BS as u64,
+            (4 * BS) as u64,
+        )
+        .expect("nonoverlapping self-reflink of an unwritten block");
+        let canonical = fs.btrfs_canonical_inode(file.ino).unwrap();
+        let mut expected = vec![0; 5 * BS];
+        let original = (0, 0xB2);
+        let alias = (4 * BS, 0xA1);
+        let writes = if alias_first {
+            [alias, original]
+        } else {
+            [original, alias]
+        };
+        for (offset, byte) in writes {
+            fs.write(cx, file.ino, offset as u64, &vec![byte; BS])
+                .expect("write must COW when another offset aliases its reservation");
+            expected[offset..offset + BS].fill(byte);
+            assert_eq!(
+                fs.read(cx, file.ino, 0, (5 * BS) as u32).unwrap(),
+                expected,
+                "alias_first={alias_first}, after writing offset {offset}"
+            );
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            let extents = OpenFs::btrfs_extent_data_items(&alloc, canonical).unwrap();
+            let physical_at = |offset| {
+                let (_, extent) = extents
+                    .iter()
+                    .find(|(key, _)| key.offset == offset)
+                    .expect("both file positions retain extent items");
+                match extent {
+                    BtrfsExtentData::Regular {
+                        disk_bytenr,
+                        extent_offset,
+                        ..
+                    } => disk_bytenr + extent_offset,
+                    other => panic!("expected disk-backed data, got {other:?}"),
+                }
+            };
+            assert_ne!(
+                physical_at(0),
+                physical_at((4 * BS) as u64),
+                "the first write must separate aliased physical sectors"
+            );
+        }
+        assert_eq!(fs.getattr(cx, file.ino).unwrap().size, (5 * BS) as u64);
+        (file.ino, expected)
+    }
+
+    #[test]
+    fn btrfs_prealloc_self_aliases_cow_in_both_write_orders() {
+        let _guard = log_contract_guard();
+        for alias_first in [false, true] {
+            let (fs, cx) = open_writable_btrfs();
+            btrfs_prealloc_self_alias_sequence(&fs, &cx, alias_first);
+        }
+    }
+
+    #[test]
+    fn btrfs_prealloc_alias_writes_fail_unchanged_when_full() {
+        let _guard = log_contract_guard();
+        const BS: usize = 4096;
+        for same_inode in [false, true] {
+            let (fs, cx) = open_writable_btrfs();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let source = fs
+                .create(&cx, root, OsStr::new("source"), 0o600, 0, 0)
+                .unwrap();
+            fs.fallocate(&cx, source.ino, 0, (4 * BS) as u64, 0)
+                .unwrap();
+            let (alias, alias_offset) = if same_inode {
+                (source.ino, (4 * BS) as u64)
+            } else {
+                (
+                    fs.create(&cx, root, OsStr::new("alias"), 0o600, 0, 0)
+                        .unwrap()
+                        .ino,
+                    0,
+                )
+            };
+            fs.clone_file_range(
+                &cx,
+                &mut RequestScope::empty(),
+                alias,
+                source.ino,
+                0,
+                BS as u64,
+                alias_offset,
+            )
+            .unwrap();
+            let canonical = fs.btrfs_canonical_inode(source.ino).unwrap();
+            let alias_canonical = fs.btrfs_canonical_inode(alias).unwrap();
+            let (disk, disk_len) = btrfs_first_regular_extent(&fs, canonical);
+            let snapshot = || {
+                let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                (
+                    OpenFs::btrfs_extent_data_items(&alloc, canonical).unwrap(),
+                    OpenFs::btrfs_extent_data_items(&alloc, alias_canonical).unwrap(),
+                    alloc.extent_alloc.extent_item_refs(disk, disk_len).unwrap(),
+                )
+            };
+            let before = snapshot();
+            assert_eq!(before.2, Some(2));
+
+            let filler = fs
+                .create(&cx, root, OsStr::new("filler"), 0o600, 0, 0)
+                .unwrap();
+            let mut offset = 0_u64;
+            for blocks in [16_usize, 4, 1] {
+                let bytes = vec![0xEE; blocks * BS];
+                loop {
+                    match fs.write(&cx, filler.ino, offset, &bytes) {
+                        Ok(written) => {
+                            assert_eq!(written as usize, bytes.len());
+                            offset += u64::from(written);
+                        }
+                        Err(error) if error.to_errno() == libc::ENOSPC => break,
+                        Err(error) => panic!("filler: {error}"),
+                    }
+                    assert!(offset < 64 * 1024 * 1024, "filler never reached ENOSPC");
+                }
+            }
+            let free_before = fs.statfs(&cx, root).unwrap().blocks_free;
+            let source_size = if same_inode { 5 * BS } else { 4 * BS };
+            for (ino, offset) in [(alias, alias_offset), (source.ino, 0)] {
+                let error = fs
+                    .write(&cx, ino, offset, &[0xA5; BS])
+                    .expect_err("both aliases require fresh data space");
+                assert_eq!(error.to_errno(), libc::ENOSPC);
+                assert_eq!(snapshot(), before, "failed COW must retain all mappings");
+                assert_eq!(
+                    fs.read(&cx, source.ino, 0, source_size as u32).unwrap(),
+                    vec![0; source_size]
+                );
+                assert_eq!(
+                    fs.read(&cx, alias, alias_offset, BS as u32).unwrap(),
+                    vec![0; BS]
+                );
+                assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+            }
+
+            // Removing the alias returns exclusive ownership without freeing
+            // the still-reserved data. NOCOW must then work on a full disk,
+            // including a second write after the first has split the mapping.
+            if same_inode {
+                fs.setattr(
+                    &cx,
+                    source.ino,
+                    &SetAttrRequest {
+                        size: Some((4 * BS) as u64),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .unwrap();
+            } else {
+                fs.unlink(&cx, root, OsStr::new("alias")).unwrap();
+            }
+            fs.write(&cx, source.ino, 0, &[0x31; BS])
+                .expect("exclusive reservation survives data-space exhaustion");
+            fs.write(&cx, source.ino, (3 * BS) as u64, &[0x72; BS])
+                .expect("multiple views under the same backref remain exclusive");
+            let mut expected = vec![0; 4 * BS];
+            expected[..BS].fill(0x31);
+            expected[3 * BS..].fill(0x72);
+            assert_eq!(
+                fs.read(&cx, source.ino, 0, (4 * BS) as u32).unwrap(),
+                expected
+            );
+            assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+        }
+    }
+
+    #[test]
+    fn btrfs_prealloc_self_aliases_pass_native_check_and_reopen() {
+        let _guard = log_contract_guard();
+        let (fs, dev, _tmp, image) =
+            open_writable_btrfs_mkfs(256).expect("btrfs-progs fixture required");
+        let cx = Cx::for_testing();
+        let expected = [false, true]
+            .map(|alias_first| btrfs_prealloc_self_alias_sequence(&fs, &cx, alias_first));
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        fs.btrfs_full_transaction_commit(&cx, "prealloc-self-alias-cow")
+            .unwrap();
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        drop(fs);
+        let (clean, output) = run_btrfs_check(&image).expect("native btrfs checker required");
+        assert!(clean, "btrfs check after self-alias COW:\n{output}");
+        let reopened = OpenFs::open(&cx, &image).expect("reopen self-alias image");
+        for (ino, bytes) in expected {
+            assert_eq!(
+                reopened.read(&cx, ino, 0, bytes.len() as u32).unwrap(),
+                bytes
+            );
+        }
     }
 
     /// Replay the three-operation ARM proptest failure, then exercise COW and

@@ -1,5 +1,17 @@
 # FEATURE_PARITY
 
+> **Btrfs same-file preallocation clone isolation:** in-place PREALLOC writes
+> now require every extent back-reference to match the root, inode and mapping
+> offset. Cloning an unwritten range elsewhere in the same file therefore takes
+> the COW path instead of letting a later write overwrite its alias. Disjoint
+> split views of one mapping remain eligible to consume their reservation in
+> place. The existing public inode-ownership query is preserved alongside the
+> stricter mapping query. Regressions exercise inline and keyed back-references,
+> both write orders, full-disk failure preservation and native check/reopen.
+> These Rust tests are authored but unexecuted here because dependencies are
+> uncached and shared storage is exhausted; pinned formatting and whitespace
+> checks pass. Runtime and native-image acceptance remain pending execution.
+
 > **Btrfs preallocation survives range replacement at full capacity:** overwriting
 > part of a disk-backed PREALLOC extent now retains the surviving unwritten
 > ranges as references to their existing reservation. Splitting no longer needs
