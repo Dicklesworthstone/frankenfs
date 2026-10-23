@@ -479,9 +479,13 @@ are capped at 64 KiB and 256 components, names at 255 bytes, symlink output at
 64 KiB, directory result payloads at 32 MiB. SA registries/layouts are capped at
 4,096 registered entries, 1,022 stored layouts, 65,536 layout items, and 128 KiB
 per bonus/spill buffer. These are admission budgets, not format maxima or a
-whole-process memory limit. Reads describe the selected committed root only:
-there is no ZIL replay, recovery validation or claim that pending synchronous
-intent has been incorporated into that root.
+whole-process memory limit. Reads describe the selected committed root by
+default. Explicit `--replay-zil` on a head dataset stages admitted intent-log
+operations in a private in-memory ZPL view, including native hard links and
+shared data after unlink or rename. Named snapshot reads retain their selected
+committed root. See [ZIL recovery](ZFS_ZIL_TOPOLOGY_PROFILE.md#zpl-namespace-recovery-and-hard-links)
+for record admission, failure behavior and the distinction from single-file
+recovery. No recovery path here writes a pool or certifies native durable replay.
 
 ## Native user extended attributes
 

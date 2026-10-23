@@ -980,6 +980,37 @@ fn rename_record(
     raw
 }
 
+fn exchange_record(
+    seq: u64,
+    source: u64,
+    destination: u64,
+    from: &[u8],
+    to: &[u8],
+    order: Endian,
+) -> Vec<u8> {
+    // OpenZFS TX_RENAME_EXCHANGE uses lr_rename_t unchanged, with type 22.
+    let mut raw = rename_record(seq, source, destination, from, to, order);
+    put(&mut raw, 0, 22, order);
+    raw
+}
+
+fn link_record(seq: u64, parent: u64, object: u64, name: &[u8], order: Endian) -> Vec<u8> {
+    let mut raw = vec![0; (49 + name.len()).next_multiple_of(8)];
+    let length = raw.len() as u64;
+    for (at, value) in [
+        (0, 7),
+        (8, length),
+        (16, 43),
+        (24, seq),
+        (32, parent),
+        (40, object),
+    ] {
+        put(&mut raw, at, value, order);
+    }
+    raw[48..48 + name.len()].copy_from_slice(name);
+    raw
+}
+
 fn seven_operation_records(order: Endian) -> Vec<Vec<u8>> {
     let mut write = record(9, 43, 4, 0, b"hello-zil-world", order);
     put(&mut write, 32, 9, order);
@@ -1165,6 +1196,395 @@ fn native_namespace_transitions_preserve_hardlinks_tombstones_and_directory_pare
             view.resolve(&cx, b"/made"),
             Err(FfsError::NotFound(_))
         ));
+    }
+}
+
+#[test]
+fn native_hard_link_replay_shares_existing_and_created_files_across_directories() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for algorithm in [5, 9] {
+            for claimed in [false, true] {
+                let mut write = record(9, 43, 7, 0, b"shared", order);
+                put(&mut write, 32, 9, order);
+                let mut append = record(9, 43, 10, 6, b"!", order);
+                put(&mut append, 32, 9, order);
+                let records = [
+                    create_record(2, 1, 2, 8, b"links", order),
+                    link_record(2, 2, 7, b"third", order),
+                    link_record(3, 8, 7, b"base", order),
+                    remove_record(5, 4, 2, b"file", order),
+                    remove_record(5, 5, 2, b"alias", order),
+                    create_record(1, 6, 2, 9, b"fresh", order),
+                    write,
+                    link_record(8, 8, 9, b"fresh", order),
+                    remove_record(5, 9, 2, b"fresh", order),
+                    append,
+                    rename_record(11, 2, 8, b"third", b"moved", order),
+                ];
+                let (mut objects, _, _) =
+                    recovery_graph_log(order, algorithm, &records, claimed, None, &[]);
+                let mut view = objects.zpl(&cx, &[]).unwrap();
+                let stats = view.replay_zil(&cx).unwrap();
+                assert_eq!(stats.records_replayed, 11);
+                for _ in 0..2 {
+                    assert_eq!(names(&mut view, &cx, 2), [b"links".to_vec()]);
+                    assert_eq!(
+                        names(&mut view, &cx, 8),
+                        [b"base".to_vec(), b"fresh".to_vec(), b"moved".to_vec()]
+                    );
+                    for path in [b"/links/base".as_slice(), b"/links/moved"] {
+                        let object = view.resolve(&cx, path).unwrap();
+                        assert_eq!(object, 7);
+                        assert_eq!(view.read(&cx, object, 0, 64).unwrap(), b"abcdefghijklmnop");
+                    }
+                    assert_eq!(view.resolve(&cx, b"/links/fresh").unwrap(), 9);
+                    assert_eq!(view.read(&cx, 9, 0, 64).unwrap(), b"shared!");
+                    let root = view.stat(&cx, 2).unwrap().0;
+                    let directory = view.stat(&cx, 8).unwrap().0;
+                    let original = view.stat(&cx, 7).unwrap().0;
+                    let created = view.stat(&cx, 9).unwrap().0;
+                    assert_eq!((root.size, root.links), (3, 3));
+                    assert_eq!((directory.size, directory.links), (5, 2));
+                    assert_eq!(
+                        (original.links, original.parent, original.generation),
+                        (2, 8, 2)
+                    );
+                    assert_eq!(
+                        (created.links, created.parent, created.generation),
+                        (1, 8, 43)
+                    );
+                    assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+                }
+                // A new committed view and the backing storage are unchanged.
+                let mut committed = objects.zpl(&cx, &[]).unwrap();
+                assert_eq!(
+                    names(&mut committed, &cx, 2),
+                    [b"alias".to_vec(), b"file".to_vec()]
+                );
+                assert_eq!(committed.stat(&cx, 7).unwrap().0.links, 2);
+                assert_eq!(committed.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+            }
+        }
+    }
+}
+
+#[test]
+fn native_hard_link_replay_keeps_symlink_identity_and_survives_original_unlink() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let mut symlink = create_record(4, 1, 2, 8, b"symbolic\0file", order);
+        put(&mut symlink, 48, 0o120_777, order);
+        let records = [
+            symlink,
+            link_record(2, 2, 8, b"other", order),
+            remove_record(5, 3, 2, b"symbolic", order),
+        ];
+        let (mut objects, _, _) = recovery_graph_log(order, 9, &records, true, None, &[]);
+        let mut view = objects.zpl(&cx, &[]).unwrap();
+        view.replay_zil(&cx).unwrap();
+        assert_eq!(view.readlink(&cx, 8).unwrap(), b"file");
+        let metadata = view.stat(&cx, 8).unwrap().0;
+        assert_eq!(metadata.kind, ffs_ondisk::zfs_zpl::Kind::Symlink);
+        assert_eq!((metadata.links, metadata.size), (1, 4));
+        assert_eq!(
+            names(&mut view, &cx, 2),
+            [b"alias".to_vec(), b"file".to_vec(), b"other".to_vec()]
+        );
+    }
+}
+
+#[test]
+fn native_hard_link_rejections_never_publish_a_partial_recovered_namespace() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for (parent, target, name) in [
+            (2, 2, b"new".as_slice()),
+            (2, 8, b"new"),
+            (2, 9, b"new"),
+            (2, 20, b"new"),
+            (2, 0, b"new"),
+            (2, 1_u64 << 48, b"new"),
+            (7, 7, b"new"),
+            (2, 7, b"file"),
+            (2, 7, b"surviving"),
+            (2, 7, b".."),
+            (2, 7, b"bad/name"),
+        ] {
+            let records = [
+                create_record(2, 1, 2, 8, b"made", order),
+                link_record(2, 2, 7, b"surviving", order),
+                create_record(1, 3, 2, 9, b"gone", order),
+                remove_record(5, 4, 2, b"gone", order),
+                link_record(5, parent, target, name, order),
+            ];
+            let (mut objects, _, _) = recovery_graph_log(order, 9, &records, true, None, &[]);
+            let mut view = objects.zpl(&cx, &[]).unwrap();
+            assert!(
+                view.replay_zil(&cx).is_err(),
+                "parent={parent} target={target} name={name:?}"
+            );
+            assert!(view.zil_replay_stats().is_none());
+            assert_eq!(
+                names(&mut view, &cx, 2),
+                [b"alias".to_vec(), b"file".to_vec()]
+            );
+            assert_eq!(view.stat(&cx, 7).unwrap().0.links, 2);
+            assert_eq!(view.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+        }
+    }
+}
+
+#[test]
+fn native_exchange_replay_preserves_object_data_aliases_and_repeatability() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for algorithm in [5, 9] {
+            for claimed in [false, true] {
+                let mut write = record(9, 43, 2, 0, b"fresh", order);
+                put(&mut write, 32, 8, order);
+                let records = [
+                    create_record(1, 1, 2, 8, b"new", order),
+                    write,
+                    exchange_record(3, 2, 2, b"file", b"new", order),
+                    // Distinct names for one inode and one name onto itself
+                    // must both succeed without changing either link count.
+                    exchange_record(4, 2, 2, b"new", b"alias", order),
+                    exchange_record(5, 2, 2, b"file", b"file", order),
+                    record(9, 43, 6, 1, b"XYZ", order),
+                ];
+                let (mut objects, _, _) =
+                    recovery_graph_log(order, algorithm, &records, claimed, None, &[]);
+                let mut view = objects.zpl(&cx, &[]).unwrap();
+                let stats = view.replay_zil(&cx).unwrap();
+                assert_eq!(stats.records_replayed, 6);
+                assert_eq!((stats.last_txg, stats.last_seq), (43, 6));
+                assert_eq!(stats.unverified_tail, !claimed);
+                for _ in 0..2 {
+                    assert_eq!(
+                        names(&mut view, &cx, 2),
+                        [b"alias".to_vec(), b"file".to_vec(), b"new".to_vec()]
+                    );
+                    assert_eq!(view.resolve(&cx, b"/file").unwrap(), 8);
+                    assert_eq!(view.read(&cx, 8, 0, 64).unwrap(), b"fresh");
+                    for name in [b"/new".as_slice(), b"/alias"] {
+                        let object = view.resolve(&cx, name).unwrap();
+                        assert_eq!(object, 7);
+                        assert_eq!(view.read(&cx, object, 0, 64).unwrap(), b"aXYZefghijklmnop");
+                    }
+                    let original = view.stat(&cx, 7).unwrap().0;
+                    let created = view.stat(&cx, 8).unwrap().0;
+                    let root = view.stat(&cx, 2).unwrap().0;
+                    assert_eq!(
+                        (original.links, original.parent, original.generation),
+                        (2, 2, 2)
+                    );
+                    assert_eq!(
+                        (created.links, created.parent, created.generation),
+                        (1, 2, 43)
+                    );
+                    assert_eq!((root.size, root.links), (5, 2));
+                    // Replaying from the committed root must not exchange the
+                    // already recovered names a second time.
+                    assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+                }
+                let mut committed = objects.zpl(&cx, &[]).unwrap();
+                assert_eq!(committed.resolve(&cx, b"/file").unwrap(), 7);
+                assert_eq!(committed.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+                assert_eq!(committed.stat(&cx, 7).unwrap().0.links, 2);
+                assert!(matches!(
+                    committed.resolve(&cx, b"/new"),
+                    Err(FfsError::NotFound(_))
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn native_exchange_replay_moves_nonempty_directories_and_accounts_for_mixed_types() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for destination_is_directory in [false, true] {
+            for reverse in [false, true] {
+                let mut source_data = record(9, 43, 5, 0, b"source-child", order);
+                put(&mut source_data, 32, 11, order);
+                let mut records = vec![
+                    create_record(2, 1, 2, 8, b"left", order),
+                    create_record(2, 2, 2, 9, b"right", order),
+                    create_record(2, 3, 8, 10, b"item", order),
+                    create_record(1, 4, 10, 11, b"child", order),
+                    source_data,
+                    create_record(
+                        if destination_is_directory { 2 } else { 1 },
+                        6,
+                        9,
+                        12,
+                        b"item",
+                        order,
+                    ),
+                ];
+                if destination_is_directory {
+                    records.push(create_record(1, 7, 12, 13, b"other", order));
+                }
+                let mut destination_data = record(
+                    9,
+                    43,
+                    records.len() as u64 + 1,
+                    0,
+                    b"destination-data",
+                    order,
+                );
+                put(
+                    &mut destination_data,
+                    32,
+                    if destination_is_directory { 13 } else { 12 },
+                    order,
+                );
+                records.push(destination_data);
+                records.push(exchange_record(
+                    records.len() as u64 + 1,
+                    if reverse { 9 } else { 8 },
+                    if reverse { 8 } else { 9 },
+                    b"item",
+                    b"item",
+                    order,
+                ));
+                let (mut objects, _, _) = recovery_graph_log(order, 9, &records, true, None, &[]);
+                let mut view = objects.zpl(&cx, &[]).unwrap();
+                let stats = view.replay_zil(&cx).unwrap();
+                assert_eq!(stats.records_replayed, records.len());
+                for _ in 0..2 {
+                    assert_eq!(view.resolve(&cx, b"/right/item").unwrap(), 10);
+                    assert_eq!(view.resolve(&cx, b"/right/item/child").unwrap(), 11);
+                    assert_eq!(view.read(&cx, 11, 0, 64).unwrap(), b"source-child");
+                    assert_eq!(view.resolve(&cx, b"/left/item").unwrap(), 12);
+                    let destination = if destination_is_directory {
+                        assert_eq!(view.resolve(&cx, b"/left/item/other").unwrap(), 13);
+                        assert_eq!(view.stat(&cx, 13).unwrap().0.parent, 12);
+                        13
+                    } else {
+                        12
+                    };
+                    assert_eq!(
+                        view.read(&cx, destination, 0, 64).unwrap(),
+                        b"destination-data"
+                    );
+                    assert_eq!(names(&mut view, &cx, 8), [b"item".to_vec()]);
+                    assert_eq!(names(&mut view, &cx, 9), [b"item".to_vec()]);
+                    let root = view.stat(&cx, 2).unwrap().0;
+                    let left = view.stat(&cx, 8).unwrap().0;
+                    let right = view.stat(&cx, 9).unwrap().0;
+                    let moved_directory = view.stat(&cx, 10).unwrap().0;
+                    let moved_target = view.stat(&cx, 12).unwrap().0;
+                    assert_eq!((root.size, root.links), (6, 4));
+                    assert_eq!(
+                        (left.size, left.links),
+                        (3, if destination_is_directory { 3 } else { 2 })
+                    );
+                    assert_eq!((right.size, right.links), (3, 3));
+                    assert_eq!(
+                        (
+                            moved_directory.size,
+                            moved_directory.links,
+                            moved_directory.parent
+                        ),
+                        (3, 2, 9)
+                    );
+                    assert_eq!(
+                        (moved_target.parent, moved_target.links),
+                        (8, if destination_is_directory { 2 } else { 1 })
+                    );
+                    assert_eq!(view.stat(&cx, 11).unwrap().0.parent, 10);
+                    assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_exchange_replay_rejects_missing_targets_cycles_and_invalid_names_atomically() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for (source, destination, from, to) in [
+            (2, 9, b"outer".as_slice(), b"inner".as_slice()),
+            (9, 2, b"inner", b"outer"),
+            (2, 8, b"outer", b"child"),
+            (8, 2, b"child", b"outer"),
+            (2, 2, b"outside", b"missing"),
+            (2, 2, b"missing", b"outside"),
+            (7, 2, b"file", b"outside"),
+            (2, 7, b"outside", b"file"),
+            (2, 2, b".", b"outside"),
+            (2, 2, b"outside", b".."),
+            (2, 2, b"outer/child", b"outside"),
+            (0, 2, b"outside", b"file"),
+            (2, 1_u64 << 48, b"outside", b"file"),
+        ] {
+            let records = [
+                create_record(2, 1, 2, 8, b"outer", order),
+                create_record(2, 2, 8, 9, b"child", order),
+                create_record(1, 3, 9, 10, b"inner", order),
+                create_record(1, 4, 2, 11, b"outside", order),
+                exchange_record(5, source, destination, from, to, order),
+            ];
+            let (mut objects, _, _) = recovery_graph_log(order, 9, &records, true, None, &[]);
+            let mut view = objects.zpl(&cx, &[]).unwrap();
+            assert!(
+                view.replay_zil(&cx).is_err(),
+                "source={source}/{from:?} destination={destination}/{to:?}"
+            );
+            assert!(view.zil_replay_stats().is_none());
+            assert_eq!(
+                names(&mut view, &cx, 2),
+                [b"alias".to_vec(), b"file".to_vec()]
+            );
+            assert_eq!(view.stat(&cx, 7).unwrap().0.links, 2);
+            assert_eq!(view.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+        }
+    }
+}
+
+#[test]
+fn native_exchange_late_failure_preserves_the_previously_published_overlay() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for algorithm in [5, 9] {
+            let mut write = record(9, 43, 2, 0, b"fresh", order);
+            put(&mut write, 32, 8, order);
+            let records = [
+                create_record(1, 1, 2, 8, b"new", order),
+                write,
+                exchange_record(3, 2, 2, b"file", b"new", order),
+                link_record(4, 2, 7, b"third", order),
+            ];
+            let (mut objects, _, faults) =
+                recovery_graph_log(order, algorithm, &records, true, None, &[]);
+            let mut view = objects.zpl(&cx, &[]).unwrap();
+            let stats = view.replay_zil(&cx).unwrap();
+            let second = pointer(SECOND, 2, algorithm, 4096, order, order);
+            let tail = pointer(0x30000, 3, algorithm, 4096, order, order);
+            let bad = [
+                records[2].clone(),
+                exchange_record(4, 2, 2, b"new", b"absent", order),
+            ];
+            faults.lock().unwrap().insert(
+                BASE + DATA_OFFSET + SECOND,
+                Fault::Replacement(block(&second, order, &tail, &bad)),
+            );
+            assert!(view.replay_zil(&cx).is_err());
+            assert_eq!(view.zil_replay_stats(), Some(&stats));
+            assert_eq!(view.resolve(&cx, b"/file").unwrap(), 8);
+            assert_eq!(view.read(&cx, 8, 0, 64).unwrap(), b"fresh");
+            assert_eq!(view.stat(&cx, 7).unwrap().0.links, 3);
+            for name in [b"/new".as_slice(), b"/alias", b"/third"] {
+                assert_eq!(view.resolve(&cx, name).unwrap(), 7);
+            }
+            assert_eq!(view.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+            faults.lock().unwrap().clear();
+            assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+        }
     }
 }
 

@@ -462,6 +462,45 @@ impl Zpl {
         Ok(())
     }
 
+    fn link_entry(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        dir: u64,
+        target: u64,
+        name: &[u8],
+    ) -> Result<()> {
+        self.component(name)?;
+        let mut meta = self.ensure_overlay_metadata(cx, overlay, target)?;
+        if meta.kind == Kind::Directory || meta.links == 0 {
+            return Err(corrupt(
+                "ZIL hard link requires a live non-directory object",
+            ));
+        }
+        let links = meta
+            .links
+            .checked_add(1)
+            .ok_or_else(|| corrupt("ZIL hard-link count overflows"))?;
+        if self.staged_directory(cx, overlay, dir)?.contains_key(name) {
+            return Err(corrupt("ZIL hard-link name already exists"));
+        }
+        self.adjust_directory(cx, overlay, dir, 1, 0)?;
+        meta.links = links;
+        // Native zfs_link_create updates SA_ZPL_PARENT even for another
+        // non-directory alias. Object identity, data and generation stay shared.
+        meta.parent = dir;
+        overlay.objects.insert(target, meta);
+        overlay
+            .dir_entries
+            .entry(dir)
+            .or_default()
+            .insert(name.to_vec(), Some(target));
+        // Check the resulting namespace's bound before the private replay can
+        // publish; a new alias must not turn an admitted directory unreadable.
+        self.staged_directory(cx, overlay, dir)?;
+        Ok(())
+    }
+
     fn rename_entry(
         &mut self,
         cx: &Cx,
@@ -527,6 +566,96 @@ impl Zpl {
             .insert(to.to_vec(), Some(source));
         meta.parent = dst;
         overlay.objects.insert(source, meta);
+        Ok(())
+    }
+
+    /// Replay native TX_RENAME_EXCHANGE without retiring either object.
+    /// Both names survive, including when a nonempty directory trades places
+    /// with a regular file. The complete log remains private until replay ends.
+    fn exchange_entries(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        src: u64,
+        dst: u64,
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<()> {
+        self.component(from)?;
+        self.component(to)?;
+        let source = self
+            .staged_directory(cx, overlay, src)?
+            .get(from)
+            .copied()
+            .ok_or_else(|| FfsError::NotFound("ZIL exchange source".into()))?;
+        let destination = self
+            .staged_directory(cx, overlay, dst)?
+            .get(to)
+            .copied()
+            .ok_or_else(|| FfsError::NotFound("ZIL exchange destination".into()))?;
+        if source == destination {
+            // Native rename succeeds without changing either hard-link alias.
+            return Ok(());
+        }
+        if source == self.root || destination == self.root {
+            return Err(corrupt("ZIL cannot exchange the root directory"));
+        }
+        let mut source_meta = self.ensure_overlay_metadata(cx, overlay, source)?;
+        let mut destination_meta = self.ensure_overlay_metadata(cx, overlay, destination)?;
+        let source_directory = source_meta.kind == Kind::Directory;
+        let destination_directory = destination_meta.kind == Kind::Directory;
+        if src != dst {
+            // Check BOTH moves against the old ancestry before changing either
+            // parent. Checking only the first side would allow an ancestor to
+            // be exchanged into its descendant through the other operand.
+            for (object, mut parent, directory) in [
+                (source, dst, source_directory),
+                (destination, src, destination_directory),
+            ] {
+                if !directory {
+                    continue;
+                }
+                let mut visited = BTreeSet::new();
+                loop {
+                    checkpoint(cx)?;
+                    if parent == object || !visited.insert(parent) || visited.len() > MAX_COMPONENTS
+                    {
+                        return Err(corrupt("ZIL directory exchange forms a cycle"));
+                    }
+                    if parent == self.root {
+                        break;
+                    }
+                    let ancestor = self.ensure_overlay_metadata(cx, overlay, parent)?;
+                    if ancestor.kind != Kind::Directory {
+                        return Err(corrupt("ZIL directory ancestry contains a non-directory"));
+                    }
+                    parent = ancestor.parent;
+                }
+            }
+            // Entry counts are unchanged. Only a directory/non-directory swap
+            // transfers the extra link represented by the child's '..'.
+            let links = i64::from(destination_directory) - i64::from(source_directory);
+            self.adjust_directory(cx, overlay, src, 0, links)?;
+            self.adjust_directory(cx, overlay, dst, 0, -links)?;
+        }
+        source_meta.parent = dst;
+        destination_meta.parent = src;
+        overlay.objects.insert(source, source_meta);
+        overlay.objects.insert(destination, destination_meta);
+        overlay
+            .dir_entries
+            .entry(src)
+            .or_default()
+            .insert(from.to_vec(), Some(destination));
+        overlay
+            .dir_entries
+            .entry(dst)
+            .or_default()
+            .insert(to.to_vec(), Some(source));
+        self.staged_directory(cx, overlay, src)?;
+        if src != dst {
+            self.staged_directory(cx, overlay, dst)?;
+        }
         Ok(())
     }
 
@@ -631,6 +760,13 @@ impl Zpl {
             } => {
                 self.remove_entry(cx, overlay, *dir_obj, name, *is_dir)?;
             }
+            ZilRecordPayload::Link {
+                dir_obj,
+                file_obj,
+                name,
+            } => {
+                self.link_entry(cx, overlay, *dir_obj, *file_obj, name)?;
+            }
             ZilRecordPayload::Rename {
                 src_dir_obj,
                 dst_dir_obj,
@@ -638,6 +774,14 @@ impl Zpl {
                 dst_name,
             } => {
                 self.rename_entry(cx, overlay, *src_dir_obj, *dst_dir_obj, src_name, dst_name)?;
+            }
+            ZilRecordPayload::RenameExchange {
+                src_dir_obj,
+                dst_dir_obj,
+                src_name,
+                dst_name,
+            } => {
+                self.exchange_entries(cx, overlay, *src_dir_obj, *dst_dir_obj, src_name, dst_name)?;
             }
             ZilRecordPayload::Write { file_obj, .. } => {
                 let edit = write.ok_or_else(|| corrupt("ZIL write was not admitted"))?;

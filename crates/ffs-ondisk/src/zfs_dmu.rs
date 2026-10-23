@@ -290,7 +290,18 @@ pub enum ZilRecordPayload {
         name: Vec<u8>,
         is_dir: bool,
     },
+    Link {
+        dir_obj: u64,
+        file_obj: u64,
+        name: Vec<u8>,
+    },
     Rename {
+        src_dir_obj: u64,
+        dst_dir_obj: u64,
+        src_name: Vec<u8>,
+        dst_name: Vec<u8>,
+    },
+    RenameExchange {
         src_dir_obj: u64,
         dst_dir_obj: u64,
         src_name: Vec<u8>,
@@ -380,7 +391,7 @@ impl ZilBlock {
                 .filter(|&end| end <= records_limit)
                 .ok_or_else(|| invalid("ZIL record exceeds block used bytes"))?;
             let rec = &raw[pos..rec_end];
-            if !matches!(txtype & 0x1f, 1 | 2 | 4..=6 | 8..=11 | 14..=20) {
+            if !matches!(txtype & 0x1f, 1 | 2 | 4..=11 | 14..=20 | 22) {
                 pos = rec_end;
                 continue;
             }
@@ -451,7 +462,18 @@ impl ZilRecord {
                     is_dir: (txtype & 0x1f) == 6,
                 }
             }
-            8 => {
+            7 => {
+                if rec.len() < 48 {
+                    return Err(invalid("truncated ZIL lr_link_t"));
+                }
+                let (name, _) = cstr_pair(&rec[48..])?;
+                ZilRecordPayload::Link {
+                    dir_obj: order.u64(rec, 32)?,
+                    file_obj: order.u64(rec, 40)?,
+                    name,
+                }
+            }
+            8 | 22 => {
                 if rec.len() < 48 {
                     return Err(invalid("truncated ZIL lr_rename_t"));
                 }
@@ -460,11 +482,20 @@ impl ZilRecord {
                 let (src_name, dst_opt) = cstr_pair(&rec[48..])?;
                 let dst_name = dst_opt
                     .ok_or_else(|| invalid("missing destination name in ZIL lr_rename_t"))?;
-                ZilRecordPayload::Rename {
-                    src_dir_obj,
-                    dst_dir_obj,
-                    src_name,
-                    dst_name,
+                if txtype & 0x1f == 22 {
+                    ZilRecordPayload::RenameExchange {
+                        src_dir_obj,
+                        dst_dir_obj,
+                        src_name,
+                        dst_name,
+                    }
+                } else {
+                    ZilRecordPayload::Rename {
+                        src_dir_obj,
+                        dst_dir_obj,
+                        src_name,
+                        dst_name,
+                    }
                 }
             }
             9 | 20 => {
