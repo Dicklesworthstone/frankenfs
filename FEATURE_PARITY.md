@@ -1,5 +1,67 @@
 # FEATURE_PARITY
 
+> **Btrfs same-file preallocation clone isolation:** in-place PREALLOC writes
+> now require every extent back-reference to match the root, inode and mapping
+> offset. Cloning an unwritten range elsewhere in the same file therefore takes
+> the COW path instead of letting a later write overwrite its alias. Disjoint
+> split views of one mapping remain eligible to consume their reservation in
+> place. The existing public inode-ownership query is preserved alongside the
+> stricter mapping query. Regressions exercise inline and keyed back-references,
+> both write orders, full-disk failure preservation and native check/reopen.
+> These Rust tests are authored but unexecuted here because dependencies are
+> uncached and shared storage is exhausted; pinned formatting and whitespace
+> checks pass. Runtime and native-image acceptance remain pending execution.
+
+> **Btrfs preallocation survives range replacement at full capacity:** overwriting
+> part of a disk-backed PREALLOC extent now retains the surviving unwritten
+> ranges as references to their existing reservation. Splitting no longer needs
+> fresh data allocations that could fail after removing the original mapping.
+> Two new regressions cover actual one-sector ENOSPC, shared reservations,
+> reference accounting, unwritten FIEMAP flags, consuming exclusive remnants
+> in place, final-reference release, native `btrfs check` and reopen. These tests
+> are authored but unexecuted here because dependencies are uncached and shared
+> storage is exhausted. Pinned formatting and whitespace checks pass. This
+> addresses reservation splitting, not general metadata-allocation rollback.
+
+> **Btrfs reflink destination preservation:** public `FICLONE` and
+> `FICLONERANGE` now share the same bounded range-clone behavior. A whole-source
+> clone no longer truncates a larger destination, discards its trailing data or
+> transfers source preallocation beyond EOF. Destination reservations outside
+> the clone window survive. Empty-source clones leave the destination unchanged;
+> invalid inode kinds, out-of-bounds source ranges, overlapping self-clones and
+> partial EOF sectors landing inside a destination are refused before mutation.
+> Regression coverage captures the prior ARM CI size-mismatch sequence and adds
+> byte, reference-count, copy-on-write, preallocation and native-image checks.
+> The existing randomized reference model is unchanged. These Rust regressions
+> are authored but unexecuted here because local dependencies are uncached and
+> shared storage is exhausted; pinned formatting and whitespace checks pass.
+> This does not claim general rollback safety for every Btrfs mutation failure.
+
+> **Atomic ext4 hard-link publication:** `ext4_link` now stages the source link
+> count, parent inode, directory entry, directory-growth allocation and any
+> `O_TMPFILE` orphan predecessor splice in one MVCC transaction. Failed staging
+> or commit restores cached allocation state; orphan runtime state changes only
+> after publication. Three new regressions cover old snapshots, indexed growth,
+> duplicate names, failed orphan splices, retry, reopen and native `e2fsck` checks
+> on generated images; the existing tmpfile test also checks head and interior
+> splices each publish once. These Rust tests are authored but unexecuted here:
+> local Cargo cannot resolve uncached dependencies and shared storage is
+> exhausted. Exact pinned formatting and whitespace checks pass. This advances
+> the hard-link slice of `bd-9rutw`; the remaining namespace operations and its
+> broader request-scope conversion stay open.
+
+> **Native ZFS atomic-exchange recovery:** `Zpl::replay_zil` now decodes native
+> `TX_RENAME_EXCHANGE` records separately from ordinary rename and stages both
+> names together. File/directory swaps preserve both objects and their contents;
+> cross-parent directory link accounting and both ancestry checks are enforced.
+> Five new regression functions cover native framing, both byte orders, both log
+> checksum layouts, claim boundaries, aliases, nonempty directories, repeated
+> replay and whole-view refusal. Exact pinned rustfmt and `git diff --check`
+> passed. Rust execution and native OpenZFS interchange remain unverified here:
+> local Cargo cannot resolve the uncached dependencies and shared storage is
+> exhausted. This advances `bd-ofjn7`; its broader recovery acceptance stays open.
+> See `docs/ZFS_ZIL_TOPOLOGY_PROFILE.md` for the operation contract.
+
 > Quantitative feature coverage tracking for FrankenFS.
 
 ## 1. Coverage Summary (Current)

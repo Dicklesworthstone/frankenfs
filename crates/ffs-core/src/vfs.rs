@@ -2486,6 +2486,8 @@ pub trait FsOps: Send + Sync {
     /// Clone (reflink) an entire file for `FICLONE`.
     ///
     /// Creates a CoW copy where `dest_ino` shares the source's data extents.
+    /// The destination is not truncated: bytes and preallocation beyond the
+    /// cloned range remain intact. An empty source leaves it unchanged.
     /// FUSE dispatch resolves the caller's source fd to `src_ino` (same-device
     /// check) before invoking this. Returns `FfsError::ReadOnly` for read-only
     /// mounts.
@@ -2505,7 +2507,8 @@ pub trait FsOps: Send + Sync {
     ///
     /// Creates a CoW copy of a range where `dest_ino` shares the source's
     /// extents. FUSE dispatch resolves the caller's source fd to `src_ino`
-    /// first. `src_length == 0` means "to source EOF". Returns
+    /// first. `src_length == 0` means "to source EOF". The destination may grow,
+    /// but its size never shrinks and data outside the range is preserved. Returns
     /// `FfsError::ReadOnly` for read-only mounts.
     #[allow(clippy::too_many_arguments)]
     fn clone_file_range(

@@ -8745,9 +8745,9 @@ impl BtrfsExtentAllocator {
     /// Whether every reference to the data extent `(bytenr, num_bytes)` is an
     /// `EXTENT_DATA_REF` from `root` / `objectid`: no other file, subvolume or
     /// parent-keyed (`SHARED_DATA_REF`) reference, and the per-ref counts add
-    /// up to the item's `refs`. The explicit-reference half of kernel btrfs's
-    /// NOCOW test (`btrfs_cross_ref_exist`); a caller must still rule out
-    /// sharing through a snapshot of the whole tree (bd-a5lko).
+    /// up to the item's `refs`. This permits aliases at different offsets in
+    /// the same inode, so it does not establish that an in-place write is safe.
+    /// Use [`Self::data_extent_owned_only_by_mapping`] for that check.
     ///
     /// # Errors
     /// A truncated or unparseable extent item.
@@ -8757,6 +8757,40 @@ impl BtrfsExtentAllocator {
         num_bytes: u64,
         root: u64,
         objectid: u64,
+    ) -> Result<bool, BtrfsMutationError> {
+        self.data_extent_refs_match_owner(bytenr, num_bytes, root, objectid, None)
+    }
+
+    /// Whether every data reference belongs to the same `(root, objectid,
+    /// offset)` mapping. The backref `offset` is the file extent's key offset
+    /// minus its extent offset, using wrapping arithmetic. Disjoint views of
+    /// one mapping may have multiple references, but reflink aliases at other
+    /// offsets must copy on write even when they belong to the same inode.
+    ///
+    /// This is the explicit-reference half of kernel btrfs's NOCOW test
+    /// (`btrfs_cross_ref_exist`). The caller must still rule out sharing through
+    /// a snapshot of the whole tree (bd-a5lko).
+    ///
+    /// # Errors
+    /// A truncated or unparseable extent item.
+    pub fn data_extent_owned_only_by_mapping(
+        &self,
+        bytenr: u64,
+        num_bytes: u64,
+        root: u64,
+        objectid: u64,
+        offset: u64,
+    ) -> Result<bool, BtrfsMutationError> {
+        self.data_extent_refs_match_owner(bytenr, num_bytes, root, objectid, Some(offset))
+    }
+
+    fn data_extent_refs_match_owner(
+        &self,
+        bytenr: u64,
+        num_bytes: u64,
+        root: u64,
+        objectid: u64,
+        required_offset: Option<u64>,
     ) -> Result<bool, BtrfsMutationError> {
         const EXTENT_ITEM_HEADER: usize = 24; // refs(8) + generation(8) + flags(8)
         const DATA_REF_PAYLOAD: usize = 28;
@@ -8774,7 +8808,11 @@ impl BtrfsExtentAllocator {
         }
         let refs = u64::from_le_bytes(value[0..8].try_into().expect("8 bytes"));
         let mut counted = 0_u64;
-        let owned = |dr: &BtrfsExtentDataRef| dr.root == root && dr.objectid == objectid;
+        let owned = |dr: &BtrfsExtentDataRef| {
+            dr.root == root
+                && dr.objectid == objectid
+                && required_offset.is_none_or(|offset| dr.offset == offset)
+        };
 
         let mut cursor = EXTENT_ITEM_HEADER;
         while cursor < value.len() {
@@ -23098,6 +23136,62 @@ mod tests {
                 offset: 0,
                 count: 1,
             }
+        );
+    }
+
+    #[test]
+    fn data_extent_mapping_ownership_rejects_same_inode_aliases() {
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("alloc");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x10_0000));
+        let extent = alloc.alloc_data(16_384).expect("reserve");
+        let (disk, len) = (extent.bytenr, extent.num_bytes);
+        alloc
+            .insert_data_extent_item(disk, len, 5, 256, 0, 7)
+            .unwrap();
+        // Splitting one mapping creates multiple views under the same backref.
+        alloc.add_data_extent_ref(disk, len, 5, 256, 0).unwrap();
+        assert!(
+            alloc
+                .data_extent_owned_only_by_mapping(disk, len, 5, 256, 0)
+                .unwrap()
+        );
+
+        // A self-reflink has the same inode but a different mapping offset.
+        // Its keyed reference must disqualify the original inline reference;
+        // the original must also disqualify the alias when checked in reverse.
+        alloc
+            .add_data_extent_ref(disk, len, 5, 256, 16_384)
+            .unwrap();
+        assert!(
+            alloc.data_extent_owned_only_by(disk, len, 5, 256).unwrap(),
+            "the existing inode-ownership API retains its contract"
+        );
+        for offset in [0, 16_384] {
+            assert!(
+                !alloc
+                    .data_extent_owned_only_by_mapping(disk, len, 5, 256, offset)
+                    .unwrap(),
+                "alias offset {offset} must require COW"
+            );
+        }
+        alloc
+            .remove_data_extent_ref(disk, len, 5, 256, 16_384)
+            .unwrap();
+        assert_eq!(alloc.extent_item_refs(disk, len).unwrap(), Some(2));
+        assert!(
+            alloc
+                .data_extent_owned_only_by_mapping(disk, len, 5, 256, 0)
+                .unwrap(),
+            "disjoint views remain eligible after the alias is removed"
+        );
+
+        alloc.add_data_extent_ref(disk, len, 5, 257, 0).unwrap();
+        assert!(!alloc.data_extent_owned_only_by(disk, len, 5, 256).unwrap());
+        assert!(
+            !alloc
+                .data_extent_owned_only_by_mapping(disk, len, 5, 256, 0)
+                .unwrap(),
+            "another inode remains a cross-reference"
         );
     }
 

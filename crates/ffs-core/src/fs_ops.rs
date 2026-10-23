@@ -3924,31 +3924,23 @@ impl FsOps for OpenFs {
     fn clone_file(
         &self,
         cx: &Cx,
-        _scope: &mut RequestScope,
+        scope: &mut RequestScope,
         dest_ino: InodeNumber,
         src_ino: InodeNumber,
     ) -> ffs_error::Result<()> {
-        let _mutation = self.mutation_gate_guard_with_pressure(cx);
-        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "FICLONE is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                // Reflink: share every src EXTENT_DATA into dst (refs++,
-                // EXTENT_DATA_REF backref, dst i_size = src i_size). FUSE has
-                // already resolved src_ino on the same device. bd-vh8p9.
-                self.require_btrfs_rw_allowed("clone_file")?;
-                let src_canonical = self.btrfs_canonical_inode(src_ino)?;
-                let dst_canonical = self.btrfs_canonical_inode(dest_ino)?;
-                let alloc_mutex = self.require_btrfs_alloc_state()?;
-                let mut alloc = alloc_mutex.write();
-                self.btrfs_clone_file_data(&mut alloc, src_canonical, dst_canonical)
+                // Linux FICLONE is FICLONERANGE from src@0 to dst@0 with
+                // length 0 (to source EOF), preserving any destination suffix.
+                self.clone_file_range(cx, scope, dest_ino, src_ino, 0, 0, 0)
             }
         }
     }
 
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn clone_file_range(
         &self,
         cx: &Cx,
@@ -3971,36 +3963,68 @@ impl FsOps for OpenFs {
                 let dst_canonical = self.btrfs_canonical_inode(dest_ino)?;
                 let alloc_mutex = self.require_btrfs_alloc_state()?;
                 let mut alloc = alloc_mutex.write();
-                // src_length == 0 means "to source EOF" (FICLONERANGE semantics).
-                let src_size = self.btrfs_read_inode_from_tree(&alloc, src_canonical)?.size;
-                let len = if src_length == 0 {
-                    src_size.saturating_sub(src_offset)
-                } else {
-                    src_length
-                };
-                // FICLONERANGE alignment (kernel remap_check_alignment): the
-                // source and destination offsets must be sector-aligned, and the
-                // length must be sector-aligned UNLESS the range reaches the
-                // source EOF (the final partial block may be cloned). Otherwise
-                // EINVAL — which also keeps every cloned extent sector-aligned so
-                // the on-disk image stays btrfs-check-clean (bd-70gyh).
-                let ss = u64::from(alloc.sectorsize);
-                let reaches_src_eof = src_offset.saturating_add(len) >= src_size;
-                if !src_offset.is_multiple_of(ss)
-                    || !dest_offset.is_multiple_of(ss)
-                    || (!reaches_src_eof && !len.is_multiple_of(ss))
+                let src_inode = self.btrfs_read_inode_from_tree(&alloc, src_canonical)?;
+                let dst_inode = self.btrfs_read_inode_from_tree(&alloc, dst_canonical)?;
+                let file_types = [src_inode.mode, dst_inode.mode]
+                    .map(|mode| mode & u32::from(ffs_types::S_IFMT));
+                if file_types.contains(&u32::from(ffs_types::S_IFDIR)) {
+                    return Err(FfsError::IsDirectory);
+                }
+                if file_types
+                    .iter()
+                    .any(|&kind| kind != u32::from(ffs_types::S_IFREG))
                 {
                     return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                         libc::EINVAL,
                     )));
                 }
-                // A range covering the whole source from 0 into dst@0 reduces to
-                // a full reflink (verbatim extent copy). Any other window uses
-                // boundary-split sharing (bd-jbtd2).
-                if src_offset == 0 && dest_offset == 0 && len >= src_size {
-                    self.btrfs_clone_file_data(&mut alloc, src_canonical, dst_canonical)
-                } else if len == 0 {
-                    Ok(()) // empty range (e.g. src_offset past EOF): nothing to share
+                let src_size = src_inode.size;
+                // Zero input length means "to source EOF", not truncate dst.
+                let len = if src_length == 0 {
+                    src_size.checked_sub(src_offset).ok_or_else(|| {
+                        FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL))
+                    })?
+                } else {
+                    src_length
+                };
+                // Linux validates both inodes before this empty-EOF no-op.
+                if len == 0 {
+                    return Ok(());
+                }
+                let src_end = src_offset
+                    .checked_add(len)
+                    .filter(|&end| end <= src_size)
+                    .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)))?;
+                let dest_end = dest_offset
+                    .checked_add(len)
+                    .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)))?;
+                Self::btrfs_reject_oversized_file(dest_end)?;
+                let ss = u64::from(alloc.sectorsize);
+                // A partial EOF sector may only end at or beyond dst EOF;
+                // otherwise its padding would overwrite preserved suffix bytes.
+                if !src_offset.is_multiple_of(ss)
+                    || !dest_offset.is_multiple_of(ss)
+                    || (!len.is_multiple_of(ss)
+                        && (src_end != src_size || dest_end < dst_inode.size))
+                {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::EINVAL,
+                    )));
+                }
+                // Native remap rejects overlap in the same inode, including
+                // the padded EOF sector. Reject before removing any extents.
+                if src_canonical == dst_canonical
+                    && src_offset < Self::btrfs_align_up(dest_end, ss)?
+                    && dest_offset < Self::btrfs_align_up(src_end, ss)?
+                {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::EINVAL,
+                    )));
+                }
+                // Both helpers carve only the requested window, preserving
+                // suffix data and KEEP_SIZE reservations beyond either EOF.
+                if src_offset == 0 && dest_offset == 0 && len == src_size {
+                    self.btrfs_clone_file_data(cx, &mut alloc, src_canonical, dst_canonical)
                 } else {
                     self.btrfs_clone_file_range_data(
                         cx,
