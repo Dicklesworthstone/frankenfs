@@ -2,12 +2,14 @@
 //! OpenZFS zfs-2.3.0 zpl_xattr.c defines prefixed-name fallback and SA priority.
 
 use super::{
-    Cx, FfsError, Kind, Result, Zpl, checkpoint, corrupt, directory_reference, parse, unsupported,
+    Cx, FfsError, Kind, Object, Result, ZilOverlay, Zpl, checkpoint, corrupt, directory_reference,
+    parse, unsupported,
 };
 use ffs_ondisk::zfs_zpl::{XATTR_BYTES, XATTR_COUNT, XATTR_NAME_BYTES, XattrSources};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 const USER: &[u8] = b"user.";
+const REPLAY_XATTR_WORK_BYTES: usize = 64 * 1024 * 1024;
 
 fn reserved(name: &[u8]) -> bool {
     [
@@ -61,15 +63,118 @@ struct Catalog {
     names: Vec<String>,
 }
 
+fn packed_sa_size(values: &BTreeMap<String, Vec<u8>>) -> Result<usize> {
+    // Native NV_ENCODE_XDR: 12-byte nvlist header, two terminating words,
+    // and each nvpair's five words plus aligned name and byte-array payload.
+    let bytes = values.iter().try_fold(20_usize, |total, (name, value)| {
+        total.checked_add(20 + name.len().next_multiple_of(4) + value.len().next_multiple_of(4))
+    });
+    bytes
+        .filter(|bytes| *bytes <= usize::from(u16::MAX) && values.len() <= XATTR_COUNT)
+        .ok_or_else(|| unsupported("recovered SA xattr nvlist exceeds native attribute limits"))
+}
+
+fn charge_sa_work(work: &mut usize, before: usize, after: usize) -> Result<()> {
+    *work = work
+        .checked_add(before)
+        .and_then(|bytes| bytes.checked_add(after))
+        .filter(|bytes| *bytes <= REPLAY_XATTR_WORK_BYTES)
+        .ok_or_else(|| unsupported("ZIL SA xattr replay exceeds 64 MiB of map work"))?;
+    Ok(())
+}
+
 impl Zpl {
-    fn xattr_catalog(&mut self, cx: &Cx, owner: u64) -> Result<Catalog> {
-        let (object, _) = self.file(cx, owner)?;
-        let source = match object.node.bonus_type() {
+    fn native_xattr_sources(&mut self, cx: &Cx, object: &Object) -> Result<XattrSources> {
+        match object.node.bonus_type() {
             17 => XattrSources::legacy(object.node.bonus(), object.node.order()),
-            44 => self.sa_attributes(cx, &object)?.xattrs(),
+            44 => self.sa_attributes(cx, object)?.xattrs(),
             _ => return Err(corrupt("xattr owner has an unknown bonus representation")),
         }
-        .map_err(|error| parse(&error))?;
+        .map_err(|error| parse(&error))
+    }
+
+    pub(super) fn replay_sa_xattr(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        owner: u64,
+        name: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<()> {
+        // TX_SETSAXATTR is TX_OOO: native zil_replay_log_record skips an
+        // already-unallocated owner before dispatch. Only this lookup's
+        // ENOENT is ignorable; a missing SA key on a live owner is an error.
+        match self.ensure_overlay_metadata(cx, overlay, owner) {
+            Ok(_) => {}
+            Err(FfsError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        if user_name(name)?.is_none() {
+            return Err(unsupported(
+                "ZIL SA xattr replay admits only user attributes",
+            ));
+        }
+        let name =
+            std::str::from_utf8(name).map_err(|_| unsupported("ZIL SA xattr name is not UTF-8"))?;
+        if self.version < 5 || self.registry.is_none() {
+            return Err(unsupported(
+                "ZIL SA xattr replay requires a native SA dataset",
+            ));
+        }
+        if let Entry::Vacant(entry) = overlay.sa_xattrs.entry(owner) {
+            let values = if overlay.created.contains(&owner) {
+                BTreeMap::new()
+            } else {
+                // Replay always rebuilds from the committed root. The previous
+                // published overlay must not supply this record's starting SA.
+                let (object, _) = self.committed_file(cx, owner, false)?;
+                if object.node.bonus_type() != 44 {
+                    return Err(unsupported("ZIL SA xattr owner is not SA formatted"));
+                }
+                self.native_xattr_sources(cx, &object)?.inline
+            };
+            entry.insert(values);
+        }
+        let values = overlay
+            .sa_xattrs
+            .get_mut(&owner)
+            .ok_or_else(|| corrupt("ZIL SA xattr map was not staged"))?;
+        let before = packed_sa_size(values)?;
+        if let Some(value) = value {
+            values.insert(name.to_owned(), value.to_vec());
+        } else if values.remove(name).is_none() {
+            // Native zfs_replay_setsaxattr removes only the SA nvpair. It
+            // neither ignores a missing key nor deletes a directory fallback.
+            return Err(FfsError::NotFound("ZIL SA xattr removal target".into()));
+        }
+        let after = packed_sa_size(values)?;
+        charge_sa_work(&mut overlay.sa_xattr_work_bytes, before, after)?;
+        checkpoint(cx)
+    }
+
+    fn xattr_catalog(&mut self, cx: &Cx, owner: u64) -> Result<Catalog> {
+        let (object, _) = self.file(cx, owner)?;
+        let mut source = if self
+            .zil_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.created.contains(&owner))
+        {
+            // Created/reused objects have no committed SA or private xattr
+            // directory. file() returns a metadata-only placeholder for them.
+            XattrSources {
+                directory: 0,
+                inline: BTreeMap::new(),
+            }
+        } else {
+            self.native_xattr_sources(cx, &object)?
+        };
+        if let Some(values) = self
+            .zil_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.sa_xattrs.get(&owner))
+        {
+            source.inline.clone_from(values);
+        }
         let mut directory = BTreeMap::new();
         if source.directory != 0 {
             if source.directory == owner || source.directory == self.root {
@@ -197,5 +302,47 @@ impl Zpl {
         }
         checkpoint(cx)?;
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovered_sa_maps_obey_the_native_packed_attribute_boundary() {
+        // Each six-byte name consumes 28 XDR bytes before its value; the
+        // nvlist adds 20. Both values independently fit DXATTR_MAX_ENTRY_SIZE.
+        let mut values = BTreeMap::from([
+            ("user.a".to_owned(), vec![0xA5; 32_720]),
+            ("user.b".to_owned(), vec![0x5A; 32_720]),
+        ]);
+        assert_eq!(packed_sa_size(&values).unwrap(), 65_516);
+        values.get_mut("user.b").unwrap().resize(32_736, 0);
+        assert_eq!(packed_sa_size(&values).unwrap(), 65_532);
+        values.get_mut("user.b").unwrap().push(0);
+        assert!(
+            packed_sa_size(&values).is_err(),
+            "65,536 cannot fit a native u16 SA length"
+        );
+        values.remove("user.a");
+        assert_eq!(packed_sa_size(&values).unwrap(), 32_788);
+    }
+
+    #[test]
+    fn sa_replay_work_budget_has_an_exact_boundary_and_never_wraps() {
+        let mut work = 64 * 1024 * 1024 - 2 * 65_535;
+        charge_sa_work(&mut work, 65_535, 65_535).unwrap();
+        assert_eq!(work, 64 * 1024 * 1024);
+        assert!(charge_sa_work(&mut work, 0, 1).is_err());
+        assert_eq!(
+            work,
+            64 * 1024 * 1024,
+            "a refused charge must not change the budget"
+        );
+        for (before, after) in [(usize::MAX, 0), (0, usize::MAX)] {
+            assert!(charge_sa_work(&mut work, before, after).is_err());
+            assert_eq!(work, 64 * 1024 * 1024);
+        }
     }
 }

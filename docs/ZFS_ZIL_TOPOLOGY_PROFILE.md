@@ -145,6 +145,63 @@ blocked by an incomplete local Cargo cache and exhausted shared storage. Native
 OpenZFS crash-image interchange is also unverified; the broad `bd-ofjn7` remains
 open. Existing workspace CI runs on `main` and retains its compiler/test gates.
 
+## Native SA user-xattr recovery
+
+Selected-head namespace replay also admits native `TX_SETSAXATTR` (type 21)
+for the existing user-xattr read profile. OpenZFS zfs-2.3.0 defines the record
+in [`zil.h`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/zil.h)
+and emits it in
+[`zfs_log_setsaxattr`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zfs_log.c):
+a 48-byte fixed header contains the object number and value length, followed
+by one NUL-terminated native name, exactly that many value bytes, and ordinary
+eight-byte alignment padding. Unknown flags, incomplete values and unexplained
+suffixes remain errors. Binary values are retained unchanged.
+
+The native
+[`zfs_replay_setsaxattr`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zfs_replay.c)
+contract treats a zero value length as removal of an existing SA nvpair, not
+creation of an empty value. A missing SA key on a live owner fails recovery.
+The outer
+[`zil_replay_log_record`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zil.c)
+dispatcher classifies this operation as out of order: an owner already proven
+unallocated is skipped. Other owner lookup failures, corrupt metadata and
+private xattr objects remain errors. Large-dnode interior slots retain the
+existing reader refusal; arbitrary parse failures are never treated as absence.
+
+Committed owners must use the native SA representation in an SA-capable dataset.
+Recovered creations begin with empty xattr sources. Changes are keyed by object
+identity, so hard links share them; the final unlink retires them, and reuse of
+an object number cannot inherit its prior SA values or private xattr directory.
+Replay initializes each map from the committed root, never from an earlier
+published recovery view.
+
+Recovered SA maps enter the existing public `listxattr` and `getxattr` paths
+before name projection. Lookup order remains prefixed SA, prefixed directory,
+unprefixed SA, then unprefixed directory. Removing only the SA nvpair can reveal
+a directory fallback. Lists remain sorted and deduplicate compatibility aliases.
+Reserved security, system, trusted and foreign namespaces are refused by this
+replay increment; it does not add ACL or capability interpretation. Existing
+UTF-8 and 255-byte host-name bounds remain.
+
+The native value limit is 32 KiB; the packed XDR SA map must fit the native
+65,535-byte attribute ceiling. The sum of pre-edit and post-edit map sizes has
+a separate 64 MiB replay work limit. These bounds follow
+[`zfs_sa.h`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/zfs_sa.h),
+[`sa.h`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/sa.h), and the
+existing bounded reader design.
+
+Publication remains atomic across the complete pending log: a later framing,
+owner, namespace, size or removal failure leaves the previous view intact.
+Repeating replay rebuilds the same state without writing backing images,
+claim fields or replay sequences. Constructed native-format regressions cover
+both byte orders, both ZIL checksum variants, claimed/unclaimed boundaries,
+binary replacement, SA/directory precedence, hard links, object reuse, skipped
+unallocated owners and late failure. Pinned-nightly formatting and whitespace
+checks pass. The initial execution attempt was blocked by an incomplete Cargo
+cache and exhausted storage; the replacement workspace has restored the exact
+toolchain and dependencies, with Rust execution pending completion. Native
+OpenZFS crash-image interchange remains unverified.
+
 ## Earlier validation notes
 
 Twelve new Rust regression functions cover topology transport and CLI admission,

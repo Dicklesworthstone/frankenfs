@@ -1,5 +1,20 @@
 # FEATURE_PARITY
 
+> **Native ZFS SA user-attribute recovery:** `Zpl::replay_zil` now admits native
+> `TX_SETSAXATTR` records and publishes recovered values through the existing
+> public `listxattr`/`getxattr` paths. Binary replacements and SA-only deletions
+> preserve native prefixed-name and directory-fallback precedence. Hard links
+> share recovered attributes; final unlink and object-number reuse retire old
+> values. Proven absent owners follow native out-of-order replay handling.
+> Complete framing, namespace and resource bounds are enforced before the new
+> view is published, and a later failure preserves any previously published
+> view. Six new native-format regression functions cover both byte orders,
+> both ZIL checksums, claim boundaries, object lifetimes and resource limits.
+> The initial review passed pinned formatting and whitespace checks; Rust
+> execution was blocked by uncached dependencies and exhausted shared storage.
+> Native OpenZFS crash-image interchange and the broader `bd-ofjn7` acceptance
+> remain open. See `docs/ZFS_ZIL_TOPOLOGY_PROFILE.md` for the operation contract.
+
 > **2026-10-23 merged-source qualification (`bd-native-image-library-s4tde`):**
 > on base `05292f536` plus Rust overlay `421d75ff`, workspace/all-target check,
 > strict Clippy and formatting passed. The core/facade/example run reported
