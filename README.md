@@ -87,10 +87,19 @@ cargo run -p ffs --example native_reader -- image.img read /hello.txt --start 0 
 cargo run -p ffs --example native_reader -- ntfs.img read /hello.txt --stream note
 cargo run -p ffs --example native_reader -- image.img mount /mnt/ffs
 cargo run -p ffs --example native_reader -- ntfs.img --ntfs-indexed-lookup mount /mnt/ffs
+cargo run -p ffs --example native_reader -- ext4.img --ext4-journal journal.img 8192 32768 stat /
+cargo run -p ffs --example native_reader -- sprout.img --btrfs-device seed.img 0 rest mount /mnt/ffs
 ```
 
+`--ext4-journal PATH OFFSET LENGTH` selects one external journal;
+`--btrfs-device PATH OFFSET LENGTH` repeats for additional members. Each offset
+and length is in bytes; a positive length bounds that member, while `rest`
+selects the remainder of its file. These format selections conflict with each
+other and with NTFS/ZFS selectors. They use the same admitted read-only handles
+as the library API, including independent regular-file, lock and bounds checks.
+
 Mounting requires working FUSE support and an existing empty directory which
-does not hide the backing image. Keep all backing files offline and unchanged
+does not hide any primary or auxiliary backing image. Keep all backing files offline and unchanged
 until unmount; use `fusermount3 -u /mnt/ffs` on Linux to end the foreground
 session. Volume bounds and explicit NTFS/ZFS view selections apply to mounts
 as they do to offline reads. This consumer has no writable, `allow_other`,

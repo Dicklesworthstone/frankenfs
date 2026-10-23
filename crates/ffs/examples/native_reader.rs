@@ -5,8 +5,8 @@
 use asupersync::{Budget, Cx};
 use clap::{Parser, Subcommand};
 use ffs::{
-    FileType, InodeAttr, InodeNumber, ReadOnlyBackend, ReadOnlyFs, ReadOnlyOpenOptions,
-    RequestScope, ZfsReadOptions, open_read_only,
+    FileType, ImageSource, InodeAttr, InodeNumber, ReadOnlyBackend, ReadOnlyFs,
+    ReadOnlyOpenOptions, RequestScope, ZfsReadOptions, open_read_only,
 };
 use ffs_error::FfsError;
 use std::error::Error;
@@ -24,6 +24,23 @@ struct Args {
     offset: u64,
     #[arg(long)]
     length: Option<u64>,
+    /// External ext4 journal: byte offset and positive byte length, or `rest`.
+    #[arg(
+        long,
+        num_args = 3,
+        value_names = ["PATH", "OFFSET", "LENGTH"],
+        action = clap::ArgAction::Set,
+        conflicts_with_all = ["btrfs_device", "ntfs_indexed_lookup", "zfs_dataset", "zfs_snapshot"]
+    )]
+    ext4_journal: Vec<OsString>,
+    /// Repeat for each btrfs member: byte offset and positive length, or `rest`.
+    #[arg(
+        long,
+        num_args = 3,
+        value_names = ["PATH", "OFFSET", "LENGTH"],
+        conflicts_with_all = ["ntfs_indexed_lookup", "zfs_dataset", "zfs_snapshot"]
+    )]
+    btrfs_device: Vec<OsString>,
     /// Opt into NTFS index-directed lookup; does not certify unvisited siblings.
     #[arg(long, conflicts_with_all = ["zfs_dataset", "zfs_snapshot"])]
     ntfs_indexed_lookup: bool,
@@ -71,13 +88,102 @@ fn invalid(detail: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, detail)
 }
 
-fn read_only_mountpoint(image: &Path, mountpoint: &Path) -> Result<PathBuf> {
+fn image_sources(values: &[OsString]) -> Result<Vec<ImageSource>> {
+    let triples = values.chunks_exact(3);
+    if !triples.remainder().is_empty() {
+        return Err(invalid("each auxiliary image needs PATH OFFSET LENGTH").into());
+    }
+    triples
+        .map(|triple| {
+            let offset = triple[1]
+                .to_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| invalid("auxiliary image OFFSET must be an unsigned byte count"))?;
+            let length = match triple[2].to_str() {
+                Some("rest") => None,
+                Some(value) => {
+                    let length = value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|length| *length > 0)
+                        .ok_or_else(|| {
+                            invalid("auxiliary image LENGTH must be positive bytes or rest")
+                        })?;
+                    offset
+                        .checked_add(length)
+                        .ok_or_else(|| invalid("auxiliary image range overflows"))?;
+                    Some(length)
+                }
+                None => {
+                    return Err(
+                        invalid("auxiliary image LENGTH must be positive bytes or rest").into(),
+                    );
+                }
+            };
+            Ok(ImageSource {
+                path: PathBuf::from(&triple[0]),
+                offset,
+                length,
+            })
+        })
+        .collect()
+}
+
+impl Args {
+    fn backend(&self) -> Result<ReadOnlyBackend> {
+        if !self.ext4_journal.is_empty() {
+            Ok(ReadOnlyBackend::Ext4 {
+                external_journal: image_sources(&self.ext4_journal)?.pop(),
+            })
+        } else if !self.btrfs_device.is_empty() {
+            Ok(ReadOnlyBackend::Btrfs {
+                root: ffs::BtrfsMountSelection::DefaultRoot,
+                additional_devices: image_sources(&self.btrfs_device)?,
+            })
+        } else if self.ntfs_indexed_lookup {
+            Ok(ReadOnlyBackend::Ntfs {
+                indexed_lookup: true,
+            })
+        } else if self.zfs_dataset.is_empty() && self.zfs_snapshot.is_none() {
+            Ok(ReadOnlyBackend::Auto)
+        } else {
+            Ok(ReadOnlyBackend::Zfs(ZfsReadOptions {
+                dataset: self
+                    .zfs_dataset
+                    .iter()
+                    .map(|name| name.as_encoded_bytes().to_vec())
+                    .collect(),
+                snapshot: self
+                    .zfs_snapshot
+                    .as_ref()
+                    .map(|name| name.as_encoded_bytes().to_vec()),
+                ..ZfsReadOptions::default()
+            }))
+        }
+    }
+}
+
+fn read_only_mountpoint(
+    image: &Path,
+    backend: &ReadOnlyBackend,
+    mountpoint: &Path,
+) -> Result<PathBuf> {
     let mountpoint = mountpoint.canonicalize()?;
     if !mountpoint.is_dir() {
         return Err(invalid("mountpoint must be an existing empty directory").into());
     }
-    if image.canonicalize()?.starts_with(&mountpoint) {
-        return Err(invalid("mountpoint would hide its backing image").into());
+    let auxiliary: &[ImageSource] = match backend {
+        ReadOnlyBackend::Ext4 { external_journal } => external_journal.as_slice(),
+        ReadOnlyBackend::Btrfs {
+            additional_devices, ..
+        } => additional_devices,
+        ReadOnlyBackend::Zfs(options) => &options.additional_images,
+        _ => &[],
+    };
+    for path in std::iter::once(image).chain(auxiliary.iter().map(|source| source.path.as_path())) {
+        if path.canonicalize()?.starts_with(&mountpoint) {
+            return Err(invalid("mountpoint would hide its backing image").into());
+        }
     }
     if std::fs::read_dir(&mountpoint)?
         .next()
@@ -221,31 +327,18 @@ fn read_stream(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let backend = args.backend()?;
+    let mountpoint = match &args.command {
+        Command::Mount { mountpoint } => {
+            Some(read_only_mountpoint(&args.image, &backend, mountpoint)?)
+        }
+        _ => None,
+    };
     // The application owns the runtime and supplies its context to the library.
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .blocking_threads(0, 0)
         .build()?;
     let cx = runtime.request_cx_with_budget(Budget::INFINITE);
-    let backend = if args.ntfs_indexed_lookup {
-        ReadOnlyBackend::Ntfs {
-            indexed_lookup: true,
-        }
-    } else if args.zfs_dataset.is_empty() && args.zfs_snapshot.is_none() {
-        ReadOnlyBackend::Auto
-    } else {
-        ReadOnlyBackend::Zfs(ZfsReadOptions {
-            dataset: args
-                .zfs_dataset
-                .iter()
-                .map(|name| name.as_encoded_bytes().to_vec())
-                .collect(),
-            snapshot: args
-                .zfs_snapshot
-                .as_ref()
-                .map(|name| name.as_encoded_bytes().to_vec()),
-            ..ZfsReadOptions::default()
-        })
-    };
     let opened = open_read_only(
         &cx,
         &args.image,
@@ -304,8 +397,8 @@ fn main() -> Result<()> {
                 Ok(_) => return Err(io::Error::other("write unexpectedly succeeded").into()),
             }
         }
-        Command::Mount { mountpoint } => {
-            let mountpoint = read_only_mountpoint(&args.image, &mountpoint)?;
+        Command::Mount { .. } => {
+            let mountpoint = mountpoint.ok_or_else(|| invalid("mountpoint was not admitted"))?;
             // Transfer the already admitted, bounded and locked FsOps handle.
             // The transport has no option here to enable native mutation.
             ffs_fuse::mount(
@@ -450,22 +543,214 @@ mod tests {
         std::fs::File::create_new(&image).unwrap();
         let mountpoint = root.join("mount");
         std::fs::create_dir(&mountpoint).unwrap();
+        let backend = ReadOnlyBackend::Auto;
         assert_eq!(
-            read_only_mountpoint(&image, &mountpoint).unwrap(),
+            read_only_mountpoint(&image, &backend, &mountpoint).unwrap(),
             mountpoint.canonicalize().unwrap()
         );
-        assert!(read_only_mountpoint(&image, &root.join("missing")).is_err());
-        assert!(read_only_mountpoint(&image, &image).is_err());
+        assert!(read_only_mountpoint(&image, &backend, &root.join("missing")).is_err());
+        assert!(read_only_mountpoint(&image, &backend, &image).is_err());
         assert_eq!(
-            read_only_mountpoint(&image, &root).unwrap_err().to_string(),
+            read_only_mountpoint(&image, &backend, &root)
+                .unwrap_err()
+                .to_string(),
             "mountpoint would hide its backing image"
         );
         std::fs::File::create_new(mountpoint.join("visible.txt")).unwrap();
         assert_eq!(
-            read_only_mountpoint(&image, &mountpoint)
+            read_only_mountpoint(&image, &backend, &mountpoint)
                 .unwrap_err()
                 .to_string(),
             "mountpoint must be an existing empty directory"
         );
+    }
+
+    #[test]
+    fn auxiliary_sources_keep_independent_bounds_in_the_selected_backend() {
+        let args = Args::try_parse_from([
+            "native_reader",
+            "data.img",
+            "--offset",
+            "4096",
+            "--length",
+            "67108864",
+            "--ext4-journal",
+            "journal image.img",
+            "8192",
+            "32768",
+            "read",
+            "/hello.txt",
+        ])
+        .unwrap();
+        assert_eq!((args.offset, args.length), (4096, Some(67_108_864)));
+        let ReadOnlyBackend::Ext4 { external_journal } = args.backend().unwrap() else {
+            panic!("expected external journal selection");
+        };
+        let journal = external_journal.unwrap();
+        assert_eq!(journal.path, PathBuf::from("journal image.img"));
+        assert_eq!((journal.offset, journal.length), (8192, Some(32768)));
+
+        let args = Args::try_parse_from([
+            "native_reader",
+            "sprout.img",
+            "--btrfs-device",
+            "first seed.img",
+            "8192",
+            "1048576",
+            "--btrfs-device",
+            "second.img",
+            "16384",
+            "rest",
+            "mount",
+            "/mnt/native",
+        ])
+        .unwrap();
+        let ReadOnlyBackend::Btrfs {
+            root,
+            additional_devices,
+        } = args.backend().unwrap()
+        else {
+            panic!("expected btrfs member selection");
+        };
+        assert_eq!(root, ffs::BtrfsMountSelection::DefaultRoot);
+        assert_eq!(additional_devices.len(), 2);
+        assert_eq!(additional_devices[0].path, PathBuf::from("first seed.img"));
+        assert_eq!(
+            (additional_devices[0].offset, additional_devices[0].length),
+            (8192, Some(1048576))
+        );
+        assert_eq!(additional_devices[1].path, PathBuf::from("second.img"));
+        assert_eq!(
+            (additional_devices[1].offset, additional_devices[1].length),
+            (16384, None)
+        );
+    }
+
+    #[test]
+    fn auxiliary_sources_refuse_bad_geometry_and_incomplete_or_duplicate_journals() {
+        for option in ["--ext4-journal", "--btrfs-device"] {
+            for (offset, length) in [
+                ("nonsense", "rest"),
+                ("18446744073709551616", "1"),
+                ("0", "0"),
+                ("0", "all"),
+                ("0", "18446744073709551616"),
+                ("18446744073709551615", "1"),
+            ] {
+                let args = Args::try_parse_from([
+                    "native_reader",
+                    "image.img",
+                    option,
+                    "member.img",
+                    offset,
+                    length,
+                    "stat",
+                    "/",
+                ])
+                .unwrap();
+                assert!(args.backend().is_err(), "{option} {offset} {length}");
+            }
+            for values in [&["member.img"][..], &["member.img", "4096"][..]] {
+                let mut arguments = vec!["native_reader", "image.img", option];
+                arguments.extend(values);
+                assert!(Args::try_parse_from(arguments).is_err());
+            }
+        }
+        let error = Args::try_parse_from([
+            "native_reader",
+            "image.img",
+            "--ext4-journal",
+            "a.img",
+            "0",
+            "rest",
+            "--ext4-journal",
+            "b.img",
+            "0",
+            "rest",
+            "stat",
+            "/",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn auxiliary_format_selections_never_silently_override_another_format() {
+        let selections: &[&[&str]] = &[
+            &["--ext4-journal", "journal.img", "0", "rest"],
+            &["--btrfs-device", "seed.img", "4096", "32768"],
+            &["--ntfs-indexed-lookup"],
+            &["--zfs-dataset", "data"],
+            &["--zfs-snapshot", "before"],
+        ];
+        for first in 0..2 {
+            for second in 0..selections.len() {
+                if first == second {
+                    continue;
+                }
+                for (left, right) in [(first, second), (second, first)] {
+                    let mut arguments = vec!["native_reader", "image.img"];
+                    arguments.extend(selections[left]);
+                    arguments.extend(selections[right]);
+                    arguments.extend(["stat", "/"]);
+                    let error = Args::try_parse_from(arguments).unwrap_err();
+                    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mountpoint_refuses_an_auxiliary_backing_file_it_would_hide() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let image = root.join("primary.img");
+        std::fs::File::create_new(&image).unwrap();
+        let mountpoint = root.join("mount");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let auxiliary = mountpoint.join("member.img");
+        std::fs::File::create_new(&auxiliary).unwrap();
+        for option in ["--ext4-journal", "--btrfs-device"] {
+            let args = Args::try_parse_from([
+                OsString::from("native_reader"),
+                image.as_os_str().to_owned(),
+                OsString::from(option),
+                auxiliary.as_os_str().to_owned(),
+                OsString::from("0"),
+                OsString::from("rest"),
+                OsString::from("mount"),
+                mountpoint.as_os_str().to_owned(),
+            ])
+            .unwrap();
+            assert_eq!(
+                read_only_mountpoint(&image, &args.backend().unwrap(), &mountpoint)
+                    .unwrap_err()
+                    .to_string(),
+                "mountpoint would hide its backing image"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_paths_preserve_native_bytes_and_geometry_requires_ascii_numbers() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = OsString::from_vec(b"member-\xff.img".to_vec());
+        let mut arguments: Vec<OsString> = ["native_reader", "primary.img", "--btrfs-device"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        arguments.push(path.clone());
+        arguments.extend(["8192", "rest", "stat", "/"].map(OsString::from));
+        let args = Args::try_parse_from(arguments).unwrap();
+        let ReadOnlyBackend::Btrfs {
+            additional_devices, ..
+        } = args.backend().unwrap()
+        else {
+            panic!("expected btrfs member selection");
+        };
+        assert_eq!(additional_devices[0].path.as_os_str(), path);
+        let invalid_number = OsString::from_vec(vec![0xff]);
+        assert!(image_sources(&[path.clone(), invalid_number.clone(), "rest".into()]).is_err());
+        assert!(image_sources(&[path, "0".into(), invalid_number]).is_err());
     }
 }
