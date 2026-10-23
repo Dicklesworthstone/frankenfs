@@ -341,8 +341,10 @@
 > 36 malformed header/geometry cases and bounded facade inode replay. The final
 > base `0b3fa02a0` plus overlay `3f1e95127c63` passed workspace/all-target check,
 > strict Clippy, format and 52 facade/example tests (one existing native-producer
-> ignore). The earlier `80ba5c98` cut passed 7 core journal tests, including wrapped
-> replay at all three block sizes; its final-cut repeat is pending. The exact
+> ignore), 7 core journal tests including wrapped replay at all three block sizes,
+> and all 14 existing harness journal recovery tests: 73 distinct Rust tests,
+> zero failures. All these final-cut jobs have terminal ACK and released sources.
+> The exact
 > Linux ELF `9e39c59dddd2db65cd5c87b71306d09b880110855641846355c93317f68ccf72`
 > passed 73 retained-native/bare-journal commands and 16 constructed-device-layout
 > commands, plus an actual read-only FUSE mount: replayed root size 8192, EROFS,
@@ -354,6 +356,17 @@
 > JBD2 regions retain their bootstrap form. Constructed journal/FUSE evidence
 > does not establish native-produced journal crash recovery, performance or
 > field qualification; original scanner and canonical tracker gates stay open.
+>
+> The same ELF also passed the retained six-format FUSE regression: 20 mounts,
+> 56 files, 236 byte comparisons, 20 read-only write refusals and six CLI/preflight
+> negatives. A fresh readback verified all 47 controls unchanged, clean daemon
+> exits and zero remaining mounts. CSD result:
+> `/tmp/public-facade-mounts-lrp6t7d9/result.json`. The first repeat remains failed
+> at its final negative predicate: a nonempty mountpoint was refused before the
+> wrong format selector. Changing only that case's input to an empty mountpoint
+> exercises the unchanged expected format refusal; all counts and assertions
+> remain. These are current mounted reads of retained native inputs and captured
+> payloads, with no fresh native producer or native oracle execution.
 
 > **Public read-only facade mounts, 2026-10-22:** the existing `native_reader`
 > consumer now mounts its already-admitted `Box<dyn FsOps>` through the shared
