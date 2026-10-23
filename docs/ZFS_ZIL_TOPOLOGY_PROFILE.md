@@ -196,11 +196,11 @@ Repeating replay rebuilds the same state without writing backing images,
 claim fields or replay sequences. Constructed native-format regressions cover
 both byte orders, both ZIL checksum variants, claimed/unclaimed boundaries,
 binary replacement, SA/directory precedence, hard links, object reuse, skipped
-unallocated owners and late failure. Pinned-nightly formatting and whitespace
-checks pass. The initial execution attempt was blocked by an incomplete Cargo
-cache and exhausted storage; the replacement workspace has restored the exact
-toolchain and dependencies, with Rust execution pending completion. Native
-OpenZFS crash-image interchange remains unverified.
+unallocated owners and late failure. Pinned-nightly formatting, whitespace and
+strict all-target Clippy checks pass, including type-checking the new tests.
+The complete `ffs-ondisk` library suite passed all 955 tests. ZFS test execution
+remains unverified locally because dependency code generation exceeded the
+available memory. Native OpenZFS crash-image interchange remains unverified.
 
 ## Earlier validation notes
 

@@ -84788,8 +84788,11 @@ mod tests {
                     .unwrap(),
                 Some(acl)
             );
-            assert!(reopened.listxattr(&cx, right).unwrap().is_empty());
-            assert!(reopened.listxattr(&cx, peer).unwrap().is_empty());
+            assert_eq!(
+                reopened.listxattr(&cx, right).unwrap(),
+                Vec::<String>::new()
+            );
+            assert_eq!(reopened.listxattr(&cx, peer).unwrap(), Vec::<String>::new());
         }
     }
 
@@ -85214,7 +85217,7 @@ mod tests {
         let block_size = usize::try_from(fs.ext4_superblock().expect("ext4 superblock").block_size)
             .expect("block size fits usize");
         let oversized_value = vec![b'x'; block_size];
-        assert!(fs.listxattr(&cx, ino).unwrap().is_empty());
+        assert_eq!(fs.listxattr(&cx, ino).unwrap(), Vec::<String>::new());
         let cached_before = fs.ext4_inode_xattr_cache.get(&ino.0).unwrap();
         let snapshot_before = fs.current_snapshot();
         let groups_before = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);

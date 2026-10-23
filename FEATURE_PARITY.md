@@ -1,5 +1,18 @@
 # FEATURE_PARITY
 
+> **EA-inode reference preservation during ext4 xattr writes:** mutations now
+> retain whether inline or external storage contains an EA-inode reference and
+> refuse unsupported reconstruction before changing either storage area. This
+> prevents sibling edits, spills, replacements and removals from silently
+> discarding referenced values or their ownership. Inline edits still succeed
+> when an external EA-bearing block remains untouched, and missing-name removal
+> stays a no-op. Three regression functions check complete inode/block byte
+> preservation, zero-sized referenced values and safe inline edits. The full
+> `ffs-xattr` library suite passed all 128 tests and `ffs-ondisk` passed all 955
+> tests, with no failures or ignores. Strict Clippy passed for all targets of
+> `ffs-xattr`, `ffs-ondisk` and `ffs-zfs`. Public EA-inode reads remain supported;
+> EA-inode allocation, replacement and reference-count mutation remain open.
+
 > **Atomic ext4 xattr and access-ACL publication:** `setxattr` and
 > `removexattr` now stage inode changes, external values, shared-block COW and
 > reference counts, block allocation and freeing in one operation-owned MVCC
@@ -12,9 +25,10 @@
 > Four new regressions cover old-snapshot visibility, both allocator modes,
 > shared blocks, ACLs, late failure/cancellation, retry exhaustion, cache races
 > and native checker/reopen; the existing oversized-spill control now requires
-> zero publication on failure. These tests are authored; local execution remains
-> pending after dependency compilation exceeded the available memory. Pinned
-> formatting and whitespace checks pass. This advances `bd-9rutw`; outer request
+> zero publication on failure. Production core type-checking passed through the
+> ZFS dependency build. These core tests remain unexecuted locally because their
+> dependency compilation exceeded the available memory. Pinned formatting and
+> whitespace checks pass. This advances `bd-9rutw`; outer request
 > composition, atomic chmod-with-ACL and other namespace mutations remain open.
 
 > **Native ZFS SA user-attribute recovery:** `Zpl::replay_zil` now admits native
@@ -27,8 +41,9 @@
 > view is published, and a later failure preserves any previously published
 > view. Six new native-format regression functions cover both byte orders,
 > both ZIL checksums, claim boundaries, object lifetimes and resource limits.
-> The initial review passed pinned formatting and whitespace checks; Rust
-> execution was blocked by uncached dependencies and exhausted shared storage.
+> Strict all-target Clippy now passes, including the new ZFS tests, and pinned
+> formatting and whitespace checks pass. ZFS test execution remains unverified
+> locally because dependency code generation exceeded the available memory.
 > Native OpenZFS crash-image interchange and the broader `bd-ofjn7` acceptance
 > remain open. See `docs/ZFS_ZIL_TOPOLOGY_PROFILE.md` for the operation contract.
 

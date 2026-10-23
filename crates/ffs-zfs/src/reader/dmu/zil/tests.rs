@@ -1269,7 +1269,7 @@ fn native_sa_xattrs_follow_object_lifetimes_and_skip_removed_out_of_order_owners
                     assert_eq!(view.getxattr(&cx, owner, name).unwrap(), None);
                 }
             }
-            assert!(view.listxattr(&cx, 8).unwrap().is_empty());
+            assert_eq!(view.listxattr(&cx, 8).unwrap(), Vec::<String>::new());
             assert_eq!(view.getxattr(&cx, 8, "user.absent").unwrap(), None);
             assert!(matches!(
                 view.listxattr(&cx, 31),

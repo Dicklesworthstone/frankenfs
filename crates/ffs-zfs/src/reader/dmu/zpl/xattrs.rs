@@ -70,7 +70,7 @@ fn packed_sa_size(values: &BTreeMap<String, Vec<u8>>) -> Result<usize> {
         total.checked_add(20 + name.len().next_multiple_of(4) + value.len().next_multiple_of(4))
     });
     bytes
-        .filter(|bytes| *bytes <= usize::from(u16::MAX) && values.len() <= XATTR_COUNT)
+        .filter(|bytes| u16::try_from(*bytes).is_ok() && values.len() <= XATTR_COUNT)
         .ok_or_else(|| unsupported("recovered SA xattr nvlist exceeds native attribute limits"))
 }
 
