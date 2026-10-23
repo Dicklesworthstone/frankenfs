@@ -96,6 +96,7 @@ cargo run -p ffs --example native_reader -- ntfs.img --ntfs-indexed-lookup mount
 cargo run -p ffs --example native_reader -- ext4.img --ext4-journal journal.img 8192 32768 stat /
 cargo run -p ffs --example native_reader -- sprout.img --btrfs-device seed.img 0 rest mount /mnt/ffs
 cargo run -p ffs --example native_reader -- sprout.img --btrfs-device seed.img 0 rest --btrfs-subvolume seed-nested read /payload
+cargo run -p ffs --example native_reader -- first.img --zfs-device second.img 0 rest --zfs-dataset data read /payload
 ```
 
 `--ext4-journal PATH OFFSET LENGTH` selects one external journal;
@@ -112,6 +113,20 @@ offline commands and foreground mounts, with or without additional members.
 The selectors are mutually exclusive and retain every primary/member bound
 and lock. Root IDs must be positive; native root existence and format admission
 are still checked by the library. Selecting a subvolume does not grant writes.
+
+`--zfs-device PATH OFFSET LENGTH` repeats for additional ZFS images with their
+own bounds and retained locks. `--zfs-pool-guid GUID` binds automatic read-only
+selection to one positive pool GUID. Adding `--zfs-candidate LABEL SLOT` selects
+an exact committed candidate and requires that GUID; obtain these values from
+`ffs-zfs inspect`. Dataset and snapshot selectors apply to every mode, including
+foreground mounts. All supplied members still undergo native topology, identity
+and root admission. These flags do not enable missing-member extraction, ZIL
+replay or native pool ownership. Other-format selectors conflict with them.
+The final consumer passed 117 commands and 12 read-only FUSE mounts on a fresh
+OpenZFS two-file mirror, including divergent native head/snapshot bytes across
+automatic, pool-bound and exact-candidate views. All monitored hashes stayed
+unchanged. This measured profile and the remaining topology/crash limits are
+recorded in `FEATURE_PARITY.md`.
 
 Mounting requires working FUSE support and an existing empty directory which
 does not hide any primary or auxiliary backing image. Keep all backing files offline and unchanged

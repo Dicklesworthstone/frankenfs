@@ -402,6 +402,32 @@
 > findings; original broader scanner disposition and native external-journal
 > crash/broader topology qualification remain open. No fresh native image
 > production, kernel mount or crash-replay claim is made by these probes.
+>
+> **Public ZFS member and root selection, 2026-10-23:** `native_reader` now
+> connects bounded `--zfs-device` members, positive `--zfs-pool-guid` binding and
+> exact `--zfs-candidate LABEL SLOT` selection to the existing public ZFS backend.
+> Reader SHA `aa5e2c41421a` on base `0b3fa02a0`, overlay `5b4a7d09c62c`, passed
+> workspace/all-target check, strict Clippy, formatting and 56 facade/example
+> tests (one existing producer ignore). Final ELF SHA `a8f056975546` passed 117
+> CLI commands and 12 FUSE mounts on a freshly OpenZFS 2.4.1-produced, exported
+> two-file mirror, including divergent native head/snapshot payloads. Automatic,
+> pool-bound and exact-candidate views passed 50 offline and 48 mounted byte
+> comparisons, 12 offline write refusals, 24 mounted EROFS and 24 retained member
+> lock checks. All 31 negative commands refused as expected; all 16 monitored
+> controls stayed unchanged and every mount exited cleanly. CSD producer:
+> `/data/ssd/tmp/ffs-public-zfs-members-42o_tjmd/producer.json`; result:
+> `/tmp/public-zfs-members-kxgjn4hg/result.json`. A fresh author pass checked all
+> status/control records and executed six more byte-exact reads with reversed
+> members, separately from the 117-command denominator. The previous ELF refused
+> the new member flag. This qualifies this fresh exported two-member read profile;
+> RAIDZ/multiple-top-level/missing-member, ZIL, crash, write and field acceptance
+> remain separate. Focused reader UBS returned zero critical findings; broader
+> original scanner disposition and canonical tracker recovery remain open.
+> The first probe allowed namespace errors to satisfy some member-refusal
+> checks. The final probe requires `stat /` for admission failures, with a valid
+> default-root positive control, and checks the hidden-backing diagnostic.
+> It repeated all 117 cases with the same binary and unchanged denominators;
+> the earlier result is retained and is not additional coverage.
 
 > **Public read-only facade mounts, 2026-10-22:** the existing `native_reader`
 > consumer now mounts its already-admitted `Box<dyn FsOps>` through the shared
