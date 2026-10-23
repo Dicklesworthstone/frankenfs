@@ -107496,6 +107496,170 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_failed_cow_replacement_preserves_destination() {
+        struct ReplacementDevice {
+            inner: TestDevice,
+            fail: Arc<AtomicBool>,
+            writes: Arc<AtomicUsize>,
+        }
+        impl ByteDevice for ReplacementDevice {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.writes.fetch_add(1, AtomicOrdering::SeqCst);
+                if self.fail.swap(false, AtomicOrdering::SeqCst) {
+                    self.inner.write_all_at(cx, offset, &buf[..buf.len() / 2])?;
+                    return Err(FfsError::Io(std::io::Error::other(
+                        "injected partial replacement write",
+                    )));
+                }
+                self.inner.write_all_at(cx, offset, buf)
+            }
+
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        const BS: usize = 4096;
+        let csum_lo = BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        };
+        let csum_hi = BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        };
+        for clone_inline in [false, true] {
+            for failure in ["none", "write", "checksum"] {
+                let mut image = build_btrfs_fsops_image();
+                add_btrfs_test_empty_extent_tree(&mut image);
+                let fail = Arc::new(AtomicBool::new(false));
+                let writes = Arc::new(AtomicUsize::new(0));
+                let cx = Cx::for_testing();
+                let mut fs = OpenFs::from_device(
+                    &cx,
+                    Box::new(ReplacementDevice {
+                        inner: TestDevice::from_vec(image),
+                        fail: Arc::clone(&fail),
+                        writes: Arc::clone(&writes),
+                    }),
+                    &OpenOptions {
+                        btrfs_rw_ephemeral_ok: true,
+                        ..OpenOptions::default()
+                    },
+                )
+                .unwrap();
+                fs.enable_writes(&cx).unwrap();
+                let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+                let src = fs
+                    .create(&cx, root, OsStr::new("src"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                let dst = fs
+                    .create(&cx, root, OsStr::new("dst"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                let peer = fs
+                    .create(&cx, root, OsStr::new("peer"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                fs.write(&cx, src, 0, b"new").unwrap();
+                let original = vec![0x67; 3 * BS];
+                fs.write(&cx, dst, 0, &original).unwrap();
+                let ops: &dyn FsOps = &fs;
+                ops.clone_file_range(&cx, &mut RequestScope::empty(), peer, dst, 0, 0, 0)
+                    .unwrap();
+                let canonical = fs.btrfs_canonical_inode(dst).unwrap();
+                let before = {
+                    let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                    (
+                        OpenFs::btrfs_extent_data_items(&alloc, canonical).unwrap(),
+                        alloc.extent_alloc.space_info(),
+                        alloc.csum_tree.range(&csum_lo, &csum_hi).unwrap(),
+                        fs.btrfs_read_inode_from_tree(&alloc, canonical)
+                            .unwrap()
+                            .to_bytes(),
+                    )
+                };
+                if failure == "checksum" {
+                    fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = u16::MAX;
+                }
+                writes.store(0, AtomicOrdering::SeqCst);
+                fail.store(failure == "write", AtomicOrdering::SeqCst);
+                let result = if clone_inline {
+                    ops.clone_file_range(&cx, &mut RequestScope::empty(), dst, src, 0, 0, BS as u64)
+                        .map(|_| ())
+                } else {
+                    fs.write(&cx, dst, BS as u64, &[0x5A; BS]).map(|_| ())
+                };
+                assert_eq!(writes.load(AtomicOrdering::SeqCst), 1, "{failure}");
+                assert!(!fail.load(AtomicOrdering::SeqCst), "fault must execute");
+                if failure == "none" {
+                    result.unwrap();
+                } else {
+                    let error = result.expect_err("replacement fault must be reported");
+                    assert!(
+                        if failure == "write" {
+                            error
+                                .to_string()
+                                .contains("injected partial replacement write")
+                        } else {
+                            error.to_string().contains("unsupported btrfs csum_type")
+                        },
+                        "{failure}: {error}"
+                    );
+                    let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                    assert_eq!(
+                        OpenFs::btrfs_extent_data_items(&alloc, canonical).unwrap(),
+                        before.0,
+                        "failed replacement must preserve destination mappings (clone={clone_inline}, {failure})"
+                    );
+                    assert_eq!(alloc.extent_alloc.space_info(), before.1);
+                    assert_eq!(alloc.csum_tree.range(&csum_lo, &csum_hi).unwrap(), before.2);
+                    assert_eq!(
+                        fs.btrfs_read_inode_from_tree(&alloc, canonical)
+                            .unwrap()
+                            .to_bytes(),
+                        before.3
+                    );
+                }
+                fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = 0;
+                let mut expected = original.clone();
+                if failure == "none" {
+                    if clone_inline {
+                        expected[BS..2 * BS].fill(0);
+                        expected[BS..BS + 3].copy_from_slice(b"new");
+                    } else {
+                        expected[BS..2 * BS].fill(0x5A);
+                    }
+                }
+                assert_eq!(fs.read(&cx, dst, 0, (3 * BS) as u32).unwrap(), expected);
+                assert_eq!(fs.read(&cx, peer, 0, (3 * BS) as u32).unwrap(), original);
+                assert_eq!(fs.read(&cx, src, 0, 3).unwrap(), b"new");
+            }
+        }
+    }
+
+    #[test]
     fn btrfs_aligned_extent_checksum_failure_releases_reservation() {
         const BS: usize = 4096;
         for reject_checksum in [false, true] {
