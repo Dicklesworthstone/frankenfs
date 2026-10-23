@@ -29,6 +29,31 @@
 > core suite cover these corrections. General metadata, partial checksum-tree,
 > I/O and crash rollback are not established by this bounded cleanup.
 
+> **Btrfs replacement preparation (2026-10-23, source-bound qualification):**
+> COW overwrite and inline-copy reflink now finish fresh data writes and build
+> checksum values before removing destination mappings. Late cancellation and
+> checksum-construction refusal therefore leave the old destination available.
+> The change uses the existing reservation ownership and does not copy the full
+> allocator state per write. Executed regressions exposed lost mappings before
+> the correction; the production blob in `63ab7eb73` passed workspace checks,
+> strict Clippy and 547 Btrfs tests plus 10 range-clone tests (10 existing ignores).
+> Its first clone fault profile bypassed public partial-EOF admission. The corrected
+> EOF profile through public dispatch passed all six success/cancellation/checksum
+> cases in one Rust regression at frozen core SHA `76d965251dc5`. That source cut
+> passed workspace/all-target check, strict Clippy, formatting, 42 facade tests
+> plus 14 reader-example tests (one existing ignore), and the genuine-Git harness
+> with 2,652 reported passes, zero failures and 11 existing ignores. Harness
+> prerequisite soft-skips remain distinct from mounted execution. The scoped
+> scanner completed with zero critical findings; broader findings remain open.
+> The default benchmark completed 60 timing cases: retained historical baselines
+> flagged two regressions and 16 improvements, with no live-incumbent win or
+> causal performance attribution established. Exact source receipts, failed
+> attempts and remaining obligations are in `.beads/pending_tasks.md`. One facade
+> attempt failed in the managed worker build directory before tests ran. General
+> metadata, partial checksum-tree and crash rollback remain unqualified. These
+> results do not qualify later merged ext4/ZFS runtime changes, new native mounts
+> or independent acceptance, and do not change a parity percentage.
+
 > **Btrfs same-file preallocation clone isolation:** in-place PREALLOC writes
 > now require every extent back-reference to match the root, inode and mapping
 > offset. Cloning an unwritten range elsewhere in the same file therefore takes

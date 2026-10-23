@@ -6243,3 +6243,300 @@ Publication preparation and remaining original obligations, 2026-10-23:
   failed workers and obsolete-probe version mistake. Existing corrected probe
   retained every original assertion. Counters keep repeated/source-cut results
   separate. No independent reviewer, gate waiver, new close or performance win.
+
+## Post-reservation Btrfs replacement failures — 2026-10-23 15:55 UTC
+
+The preceding unit is published as ebb20b1bf; its historical pre-publication
+checkbox is resolved by original Bead comment2259 and Mail6274. Continue exactly
+the same staged in-progress Bead, without laundering remaining acceptance.
+
+- [x] Refresh clean tracked source, local source-aware queue, inbox and leases.
+  Canonical br still refuses framed WAL. Hygiene report identifies50claimable
+  local rows, but its full execution fails6/15 scenarios because installed bv
+  rejects --no-cache and dependent fixture checks fail. Preserve the failure;
+  artifacts/e2e/20261023_115101_ffs_tracker_source_hygiene_jWhTiq. No gate edit.
+- [x] Reserve core/lib.rs and this existing TODO; record staged comment2260.
+- [x] Review actual write/clone callers: allocation now precedes removal, but
+  later data/checksum failure can still follow destination removal. Author six
+  profiles with successful controls, cancellation at the actual data-write
+  checkpoint, and checksum-construction rejection. Compare mappings, allocator
+  space, checksum tree, inode bytes and destination/source/reflink-peer readbacks.
+  The first proposed backing-device fault was NOT exercised: successful data
+  writes stop in the MVCC overlay, so its asserted write count was0. Preserve
+  cow-replacement-red-20261023T1556.log as a fixture-setup failure, not a product
+  counterexample. Replace that unused double with cancellation after admission
+  in the real mutation helper; require actual MVCC publication counts as well.
+- [x] Execute the corrected regression against published product code. Red19658
+  (coreSHA2d7048e2, overlay9ab0bc6a) fails destination-mapping preservation for
+  cancelled overwrite, after its successful control. Red19661 (SHA d9c0063e)
+  then passes the three overwrite profiles and fails the same invariant for
+  cancelled inline-clone. Both exit101/terminalACK; logs cow-replacement-real-red-
+  auto-20261023T1609.log and cow-replacement-clone-red-20261023T1611.log.
+- [x] Correct confirmed failures by preparing data and checksum values before
+  destructive destination changes; preserve ENOSPC/refcount/read-only/cancellation
+  contracts. Rejected full allocator snapshots for the hot write path because
+  they clone the complete extent-refcount map, adding filesystem-size work to
+  every write. Existing checkpoint machinery remains appropriate to its callers.
+- [x] The unchanged six-profile regression now passes1Rust test/0fail/0ignore
+  at coreSHA355a81b17873e77208c80f8922c657b7e4199871fa50cf51440d6ead9e5fc09e,
+  overlay821005621088c16d74c65b315fb2d01128a3e56591c1a176fb89ae6169b34b7c
+  on baseebb20b1bf. Log cow-replacement-green-20261023T1614.log. This is executed
+  constructed-image/MVCC mutation proof, not native mounted/crash/field evidence
+  or a backing-device partial-write test. No old assertion/ignore/gate changed.
+- [x] Preserve unexpected shared commit a18ebbca8 (15:56:29 UTC), which captured
+  the first unused backing-device regression during its initial execution.
+  Fresh status shows that obsolete164-line test staged for removal, while the
+  corrected working core remains exactly355a81b1. I did not stage/reset/unstage
+  that index state. Notify existing collaborators to hold core/index publication
+  during current gates; preserve the commit/history and finish the corrected
+  code+test unit. RCH proof remains baseebb20b1bf plus explicit overlay, not
+  silently rebound to this new HEAD. No peer path is overwritten or unstaged.
+- [x] Execute focused red/green, affected full suites, workspace check/strict
+  Clippy/fmt and scoped UBS. Retain exact source hashes and terminal RCH ACKs.
+- [x] Current355a81b1 workspace/all-target check completed0 (416.5s), and
+  format/diff checks pass. One-file UBS completes0critical/14499warnings/3062info;
+  keep broader retained scanner disposition separate. Strict Clippy and affected
+  Btrfs/clone/facade suites are still running, not passes.
+- [x] Refine the clone fault profile before final qualification: its earlier
+  internal-helper test copied partial EOF into a larger destination, which public
+  FsOps refuses. Keep that red scoped to the helper. Use a destination ending at
+  the cloned EOF, preserve the shared peer, and exercise public clone dispatch.
+  The admitted overwrite counterexample and its correction remain unaffected.
+  Concrete fixture: source b"new", old regular destination BS+3bytes, shared
+  peer, source0..3 to destinationBS..BS+3 (exact destination EOF).
+- [x] At355a81b1, affected core Btrfs selection547passed/0failed/10existing
+  ignores (233.73s test time), range-clone10passed/0failed/0ignore. Preserve this
+  source scope pending final public-profile refinement. Native check/reopen and
+  2000-file btrfs-check cases actually execute within the selection.
+- [x] Preserve facade build failure before tests: cow-replacement-facade-
+  20261023T1616.log exits101 because managed Cargo build-directory fingerprint /
+  invoked.timestamp path is absent (OS error2). No facade pass or product-test
+  failure claimed. Retry through ordinary managed RCH after final source settles;
+  no target/cache/source bypass, deletion or local build.
+- [ ] Finish strict Clippy: automatic RCH retry after hz3 source-namespace
+  initialization was killed/status73 is retained; current hz4 execution remains
+  pending. Earlier default queue refusal103/timeout remains a refusal, not a run.
+- [x] Prior355a81b1 strict workspace/all-target Clippy completed19673/0/ACK on
+  hz4, after the retained hz3 initializer failure. Shared maintainer commit
+  63ab7eb7341e2a7ed2926c8c71a54561808a1baf contains exactly that355a81b1 Rust
+  blob and explicitly says its sweep ran no checks. Its publication is not a
+  new proof. Canonical index still holds80909707 (old baseline); preserve it.
+- [x] Refine only the test fixture/caller: old destination now BS+3bytes, so
+  source0..3 to destinationBS..BS+3 ends at EOF and is publicly admitted. Clone
+  calls FsOps dispatch; write still models late cancellation in its real helper.
+  No production delta from63ab7eb. New source09fddaec pendingfocused execution.
+- [ ] Apply the single call-layout formatter correction before final freeze.
+  The new test's fmt check reported one wrapping difference; no final-format
+  pass claimed. Keep the already launched09fddaec test frozen until terminal.
+- [x] Final-check attempt on09fddaec never reaches compilation: hz4 namespace
+  initialization killed/status73, wrapper exits103, initial ACK refusal retained.
+  Supported recovery ofrchw-2ccb1197/build19689 completes with failed exit1 and
+  terminalACKtrue. Log cow-replacement-check-recovery-20261023T1648.json. No local
+  fallback/cache/source/pressure bypass and no pass from recovery. Fresh final
+  check/Clippy remain required after formatting; dependent Clippy did not run.
+
+Bounded anti-ceremony review, this replacement-failure work block only:
+- Creation worksheet: TODO consumer is the user's explicit granular tracking
+  request; gate is preserving unfinished acceptance through this sustained work;
+  observed defects are the lost mappings and the unused initial fault wrapper.
+  Retire this active section on complete verified original-task acceptance,
+  retaining history under the no-delete rule. Runtime does not consume it.
+  Raw command logs are minimal integrity controls for observed lost wrappers /
+  source-cut changes: required at this scale, smallest direct transcript, no
+  cheaper reliable substitute. Highest-value current capability is preventing
+  ordinary failed COW replacement from destroying old bytes. Spend implementation
+  time there; tracking earns no capability credit.
+- Real-work worksheet: purpose (README) is native Rust filesystem behavior via
+  FUSE/offline-image tools. Actual window inventory: one bounded USER correction
+  plus same-unit regression; PROCESS is this requested TODO, tracker/Mail updates
+  and provenance logs. No closed work or delegated agents. Demo is old bytes
+  surviving a refused overwrite/clone; final public clone proof remains pending.
+  Without process the runtime is identical; it prevents evidence/status loss.
+  Existing write/clone callers execute the new prepared-extent value, so it is
+  real product plumbing, not speculative infrastructure. Older open native
+  writers/crash/topologies remain on the original roadmap; bounded data-loss
+  fixes take precedence over expanding mutation support on a flawed base.
+  No follow-up minted to close acceptance, no lowered spec. Verdict HEALTHY
+  implementation; compiler/recovery waits have delivered no extra capability.
+- Honesty inventory, answers to all20prompts:
+  1 No (checked full core/test diff: original assertions/ignores retained).
+  2 Yes, initial proposed backing-device fault could not exercise MVCC writes;
+    its positive counter failed before product assertions. Retained as fixture
+    failure, removed unused wrapper, required real MVCC sequence deltas. The
+    first clone-helper profile also bypassed public EOF admission; scoped that
+    red accurately, refined actual public EOF input before final qualification.
+  3 No (checked changed paths: no goldens/snapshots).
+  4 No (checked gate/config/assertion diffs: none weakened or suppressed).
+  5 No (checked production helpers: no environment/fixture success branches).
+  6 No (checked nonempty1/547/10test counts; facade never ran after build error).
+  7 No (checked transcripts; missing public-profile output not called passed).
+  8 No (constructed/MVCC scope explicit; no live/native/crash promotion).
+  9 No (fixture failure, invalid public profile, source churn, queue103, managed
+    Cargo directory failure and initializer/ACK/recovery failures disclosed).
+  10 No (stderr retained in transcript or tool output).
+  11 No (original Bead remainsin_progress; no acceptance moved/closed).
+  12 No (requirements/parity percentages unchanged; narrative states limits).
+  13-17 N/A: solo execution, no subagents dispatched/reports accepted, no
+    consensus counted; concurrent maintenance commits are not independent proof.
+  18 No (six profiles predeclared; separate547+10counts with ignores/failures).
+  19 Initial fault design and helper-only clone coverage required correction;
+    openly recorded rather than counting those failures as broader proof.
+  20 Strongest so far: reproducible red overwrite19658, corrected unchanged
+    test green19664 and native-checking affected suite. Final public EOF profile,
+    source-final workspace/facade/harness and independent verification pending.
+  Older-session sweep N/A: no historical conduct conclusion in this bounded
+  current-block audit. Disposition: RH-2/PL-2/PL-3 countermeasures are actual
+  publication counters, admitted public inputs and exact source/log scope.
+  Own faulty fixture/public-coverage statements corrected in place and disclosed;
+  do not count them as live I/O/public proof or inflate recovered exit0.
+
+Final public EOF profile, 2026-10-23:
+- [x] Shared commitfe16e6cf9 preserved the corrected09fddaec test before final
+  formatting; one wrapping correction produces final core76d965251dc51d6e1a5315144e1ed0b6afde5fe3e12ec003de3ef45912eda8d1.
+  Actual production code is identical to63ab7eb/355a81b1. fmt/diff-check0.
+- [x] Original09fddaec public job19691 lost its wrapper; supported recovery
+  reported remote/delivery0/ACK and pair release, versus daemon130. Transcript
+  contains no terminal Rust assertion summary, so do not count a test pass.
+  Preserve cow-replacement-public-recovery-20261023T1711.json and raw log.
+- [x] Reexecute final76d96525 public EOF profile with output captured: actual
+  one Rust test runs all six profiles,1passed/0failed/0ignore,0.07s test time,
+  RCH155.6s/exit0. Log cow-replacement-final-public-20261023T1713.log, baseebb20b1bf
+  overlay8a62c66bd0596e6b526186fd37a3e1a4be3bd372199a3ad0b4882542b328eaee.
+  Exact cancellation/checksum refusal, MVCC sequence, mappings/csums/inode/space,
+  byte-exact successful replacement and unchanged shared peer/source exercised.
+- [x] Finish final-source check/strict Clippy/facade serial managed runs; logs
+  cow-replacement-final-{check,clippy,facade}-20261023T1716.log. Earlier355a81b1
+  full workspace/547Btrfs/10clone proof remains its own source cut. No duplicate
+  counters, new native mounted/performance/crash or independent claim.
+- [x] Complete final scoped UBS and genuine-Git harness after final parity text;
+  record ACK/source/pair release before exact-path publication and lease release.
+- [x] Diagnose local UBS stall without changing scanner/project rules. Automatic
+  startup produced0bytes, terminated143. Explicit Rust module emits no contract
+  before its300s limit (reported2); its aggregator and read-only doctor then
+  stall too. Read-only process sample shows Bash5.3.9 blocked in heredoc_write /
+  write, matching maintainer Chet Ramey's documented dynamic-pipe fix:
+  https://www.mail-archive.com/bug-bash@gnu.org/msg36171.html.
+  Only the exact owned stalled processes were terminated143; raw logs/sample
+  retained. No host interpreter/tool update, cache deletion or rule suppression.
+- [x] Preflight Linux UBS5.5.3: doctor0, checksums verified. Compare installed
+  Rust module against local5.5.0: only shared-library pin and Cargo diagnostic
+  parsing differ; shared manifest Rust helper hashes unchanged. Non-Rust helper
+  pins differ, so do not call the tool distributions identical. Preserve both
+  version/module hashes and exact diff in remote-ubs diagnostic files.
+- [x] Attempt version-labelled remote static scan via ordinary RCH job mode,
+  exact final core SHA asserted before and after. Job mode does not provide a
+  whole-tree source-content receipt. Two invalid combinations (--job with
+  --clean-overlay, then --source-content-receipt) were refusedexit2 before
+  execution; corrected against documented EXEC_MODES, no source/gate bypass.
+  Log cow-replacement-final-remote-ubs-job-20261023T1732.log records normal4-slot
+  admission and source-owner refusal. The failed attempt and supported terminal
+  recovery below complete its disposition; the local exact-source scan supplies
+  the bounded scanner evidence. No remote scan pass or slot override claimed.
+- [x] Remote static job19788 never executed: after ordinary admission trj
+  source namespace refused75 (unfinished overlapping source owner), caller103.
+  Supported recoveryfc57d4d1 completes failed1/ACK. Keep all source locks; do
+  not bypass the refusal with direct SSH execution, new source aliases or slot
+  overrides. Remote doctor0/module comparison remains diagnostics only.
+- [x] Resolve the local interpreter issue without changing UBS assets/rules:
+  BASH_COMPAT=50 on the scanner command uses Bash's existing pre-5.1 here-document
+  transport. Local installedUBS5.5.0 completes exact final76d96525 scanexit0,
+  0critical/14496warnings/3062info. Logs cow-replacement-final-local-ubs-compat50-
+  20261023T1736.log. WrapperSHA7bafd261..., RustmoduleSHAa027aacf... unchanged.
+  No skip/severity/cache flag, interpreter installation or validator edit.
+- [x] One retained production-shaped panic control under the same interpreter
+  mode fails1 with1critical/0warnings/4info, exact rust.ownership.panic-macro at
+  line4. Existing Rust module/wrapper/common contain no RANDOM references;
+  Bash's compatibility RNG change does not change those rules. This bounded
+  control does not certify every scanner rule or resolve broader findings.
+  Fixture and raw log remain outside the repository; no file removed.
+- [x] DCG rejected optional dynamic shell-source heredoc reproducer under
+  heredoc.posix:inline-launcher-unverified before execution. Do not bypass it,
+  auto-apply token886316 or claim it ran. Skip the unnecessary probe; direct
+  installed-scanner execution and the literal Rust panic control above are
+  independently statically reviewable and completed within authorized scope.
+
+Final source-bound qualification completed while default benchmarks run:
+- [x] Final core76d96525 is still frozen. Workspace/all-target check19748/0,
+  strict Clippy19789/0 and facade/examples19808/0 have terminalACK and both
+  source/pair releases. Facade42passed/0failed/1existingignore; reader example
+  14passed/0failed/0ignore. Earlier absent managed-directory failure stays failed.
+- [x] Genuine-Git full harness19798 / rchw-8119b3fc-a9d8-4cae-ba43-312f80d3e297
+  completes0 in2675.9s with source-content postflight, terminalACK and releases.
+  29groups report2652passed/0failed/11existing ignores. Both actual compiler-
+  contract tests pass (497.19s group), plus real-suite / planted-red public parity
+  execution. FUSE permission/optional-oracle early returns stay soft-skips, not
+  mounted/native proof; expected caught negative-control panics are not failures.
+- [x] Source receipt binds core76d96525 and FEATURE_PARITY59db3f3a. Git index
+  remains30759c22a1b4b5575b121f316281ee1a722bea78403464fba2dc8e00ea43f662
+  before/after the genuine-Git run. Minimal current-readback-20261023T1823.json
+  preserves ACK/release state before rolling metadata expires. Public19739 now
+  falls outside current metadata, but its previously observed0/ACK/releases and
+  captured assertions remain in this session/raw log; do not fabricate metadata.
+- [x] Canonical DB/WAL/SHM/JSONL hashes still match the frozen family exactly;
+  no live SQLite open/checkpoint/rebuild or tracker authority change.
+- [x] Finish default cargo bench -p ffs-harness at exact core76d96525 plus
+  parity59db3f3a. Build19810 / rchw-f18f07a1-2f7b-48f9-9df7-1ffe56913253
+  was admitted normally, waited for the owned source workspace, now executing.
+  Log cow-replacement-final-bench-20261023T1749.log. Retain diagnostics and
+  require terminalACK/release; no live-incumbent win or repeated coverage credit.
+- [ ] After that gate, complete final bounded audit/readback, staged Bead
+  evidence/cycles/flush and exact-owned-path publication; release only these
+  three owned leases. Original broader obligations stay open on their record.
+- [x] Read-only remote check found origin/main and its compatibility branch at
+  ef600e5077ffc2ef057fc71b2772115d102eee36, ahead of localfe16e6cf9. Fetch with
+  --no-write-fetch-head preserves all local work. Four incoming commits add ext4
+  atomic attributes/EA-reference preservation and ZFS native SA xattr replay;
+  11modified paths, no deletion. Do not claim our frozen receipts cover that
+  later runtime source or overwrite those changes with the old checkout.
+- [x] Exact read-only source-slice comparison confirms incoming remote matches
+  all tested Btrfs preparation, publication/checksum, range-clone, write and new
+  regression sections byte for byte, including final call wrapping. The four
+  remote commits already contain our source fix and final formatter line.
+- [ ] After the running benchmark gate, commit exact owned qualification paths
+  on main, preflight the history-preserving merge and retain the incoming work.
+  Verify the final Rust/crate/manifests match the previously published remote
+  bytes exactly, with only our explicit documentation/TODO additions over it.
+  Keep all runtime test counts bound to the frozen76d96525/59db3f3a cut; a clean
+  Git merge or identical helper slices do not qualify the later whole runtime.
+- [ ] Freshly review implementation and fault coverage, update staged evidence,
+  cycles/flush and publish a coherent code+test unit if all required gates pass.
+- [ ] Retain canonical recovery, independent scanner/status, broad native
+  writer/crash/topology and old worker obligations on the original task.
+
+Final bounded review and publication preparation, 2026-10-23 18:47 UTC:
+- [x] Benchmark19810 finishes0/terminalACK/source+pairreleased in3471.1s,
+  baseebb20b1bf, overlay36659f8695c823704455e8eceb538f4d2da60b702e6b8ec67ca7ef816851522b.
+  All60timing cases execute:2historical regressions,16improvements,13within
+  noise,29no-change. Sequential Btrfs write13.893ms median (+28.359% historical),
+  PREALLOC append12.010ms (+28.014%). Preserve these losses. No matched live
+  incumbent/profile was run, so neither cause nor optimization win is established.
+  Any performance correction requires the existing baseline/profile/one-lever
+  loop; do not speculate or weaken the gate. Benchmark-filtered unit tests are
+  not additional executed coverage. Retained report:
+  /Users/jemanuel/Library/Logs/frankenfs-verification/cow-replacement-final-qualification-20261023T1847.json.
+- [x] Read preparation/publication/checksum/clone/write implementations and the
+  final fault regression again. No further defect found in this bounded review.
+  Actual success controls and MVCC publication deltas distinguish exercised
+  preparation from an unused fault double; public clone uses admitted EOF input.
+  Preparation errors preserve mappings/space/csums/inode/readback and shared
+  peers. Later metadata failure/partial checksum-tree/crash rollback remains open.
+- [x] Final audit delta to honesty answers6/7/20 above: source-final public
+  regression, check/Clippy, facade/examples, scoped scanner, full genuine-Git
+  harness and default benchmark have actual terminal evidence. The faulty test
+  design, helper-only red, managed-directory/init/source-owner failures, missing
+  public-job assertions, optional DCG refusal and benchmark losses remain in the
+  record. No gate/assertion/golden weakened, no independent reviewer claimed,
+  no new native mount run and no original acceptance closed or moved elsewhere.
+- [x] Canonical DB/WAL/SHM/JSONL remain byte-identical. Staged dep cycles0.
+  Before exact-path commit, preserve the shared pre-publication index verbatim
+  as cow-replacement-index-prepublication-20261023T1841.index outside the repo,
+  SHA30759c22a1b4b5575b121f316281ee1a722bea78403464fba2dc8e00ea43f662.
+  Its staged old-core snapshot is not the qualified working source.
+- [x] Final parity wording now records completed bounded verification and the
+  two historical benchmark losses. This documentation edit follows the frozen
+  parity59db3f3a benchmark/harness cut; do not relabel those source receipts.
+- [ ] Publish this pre-publication snapshot through the preserving merge above,
+  prove zero runtime delta over ef600e507, read back both remote refs and release
+  only leases6695/6696/6723. Record the actual commit/push/release outcome on the
+  original staged Bead and Agent Mail after execution, rather than adding a
+  self-referential bookkeeping commit or falsely pre-marking publication done.

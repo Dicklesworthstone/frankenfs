@@ -107637,15 +107637,7 @@ mod tests {
                 // range. Both observe cancellation at the MVCC write checkpoint.
                 cx.set_cancel_requested(failure == "cancel");
                 let result = if clone_inline {
-                    ops.clone_file_range(
-                        &cx,
-                        &mut RequestScope::empty(),
-                        dst,
-                        src,
-                        0,
-                        3,
-                        BS as u64,
-                    )
+                    ops.clone_file_range(&cx, &mut RequestScope::empty(), dst, src, 0, 3, BS as u64)
                 } else {
                     fs.btrfs_write(&cx, dst, BS as u64, &[0x5A; BS]).map(|_| ())
                 };
