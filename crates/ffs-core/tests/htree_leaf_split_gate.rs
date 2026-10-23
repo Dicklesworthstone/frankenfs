@@ -65,7 +65,7 @@ fn make_ext4_image(path: &Path, size_mib: u64) {
 fn open_writable(path: &Path) -> OpenFs {
     let cx = Cx::for_testing();
     let opts = OpenOptions::default();
-    let mut fs = OpenFs::open_with_options(&cx, path, &opts).expect("open ext4 image");
+    let mut fs = OpenFs::open_read_write(&cx, path, &opts).expect("open ext4 image");
     fs.enable_writes(&cx).expect("enable writes");
     fs
 }

@@ -121,13 +121,11 @@ fn immutable_fsops_maximum_file_keeps_sparse_index_through_stat_open_seek_and_re
     }
     fixture.device.reset();
     assert_eq!(
-        fs.read(&cx, &mut scope, attr.ino, attr.size, 8192)
-            .unwrap(),
+        fs.read(&cx, &mut scope, attr.ino, attr.size, 8192).unwrap(),
         Vec::<u8>::new()
     );
     assert_eq!(
-        fs.read(&cx, &mut scope, attr.ino, u64::MAX, 8192)
-            .unwrap(),
+        fs.read(&cx, &mut scope, attr.ino, u64::MAX, 8192).unwrap(),
         Vec::<u8>::new()
     );
     assert_eq!(

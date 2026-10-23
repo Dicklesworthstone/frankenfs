@@ -26848,7 +26848,7 @@ AllowOther"#;
 
         // Phase 1: Open writable, exercise POSIX ops, fsync, then crash without unmount.
         {
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open ext4 rw");
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("open ext4 rw");
             fs.enable_writes(&cx).expect("enable writes");
 
             let hello = fs
@@ -26964,7 +26964,7 @@ AllowOther"#;
         // Phase 2: Remount after crash without unmount, verify fsync'd bytes, run FrankenFuse, and clean unmount.
         {
             let mut fs =
-                OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("reopen after crash");
+                OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("reopen after crash");
             fs.enable_writes(&cx).expect("enable writes on remount");
 
             let sub = fs

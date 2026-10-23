@@ -2496,6 +2496,7 @@ impl OpenFs {
         cx: &Cx,
         max_working_bytes: u64,
     ) -> Result<NativeRepairReport, FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("activate_native_repair")?;
         if self.native_repair_active {
             return Err(freshness_error("device is already active"));
@@ -2584,6 +2585,7 @@ impl OpenFs {
         cx: &Cx,
         max_working_bytes: u64,
     ) -> Result<NativeRepairReport, FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("initialize_native_repair")?;
         let owned = self.native_ext4_repair_storage(cx)?;
         let sb = self
@@ -2763,6 +2765,7 @@ impl OpenFs {
         self,
         cx: &Cx,
     ) -> Result<NativeValidationReport, FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("initialize_native_validation")?;
         let storage = self.native_ext4_repair_storage(cx)?;
         let sb = self.ext4_superblock().expect("validated ext4 ownership");
@@ -2916,6 +2919,7 @@ impl OpenFs {
         cx: &Cx,
         basis_points: u32,
     ) -> Result<NativeRepairStorage, FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("prepare_native_repair_storage")?;
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         if self.is_writable() || self.mvcc_version_count() != 0 {

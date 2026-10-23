@@ -1000,6 +1000,7 @@ pub struct OpenOptions {
     ///
     /// Controls whether mount-time JBD2 replay writes through to the underlying
     /// image, writes into an in-memory overlay, or is skipped entirely.
+    /// Path-based read-only opens interpret `Apply` as `SimulateOverlay`.
     pub ext4_journal_replay_mode: Ext4JournalReplayMode,
     /// Filesystem mount mode (compat or native).
     ///
@@ -2800,6 +2801,10 @@ pub struct OpenFs {
     ext4_orphan_head: std::sync::atomic::AtomicU64,
     /// Block device for I/O operations.
     dev: Arc<dyn ByteDevice>,
+    /// Authority retained at open time, independent of allocator activation.
+    /// Path-based readers cannot later become writers, even when their recovery
+    /// overlay accepts internal writes or the caller owns the backing image.
+    write_authority: bool,
     /// Explicitly attached btrfs devices; writable mounts use the single-device path.
     btrfs_devices: Option<Arc<BtrfsReadDevices>>,
     /// Bootstrap-only inspection does not establish device inventory authority.
@@ -4697,6 +4702,7 @@ impl std::fmt::Debug for OpenFs {
                 &self.ext4_forced_read_only.load(Ordering::SeqCst),
             )
             .field("dev_len", &self.dev.len_bytes())
+            .field("write_authority", &self.write_authority)
             .field("mvcc_version_count", &self.mvcc_store.version_count())
             .field(
                 "mvcc_active_snapshots",
@@ -7348,7 +7354,11 @@ pub struct OpenFsMvccTelemetry {
 }
 
 impl OpenFs {
-    /// Open a filesystem image at `path` with default options (validation enabled).
+    /// Open a filesystem image read-only with validation enabled.
+    ///
+    /// Native recovery is confined to an in-memory overlay. The backing image
+    /// is opened without write access and cannot be made writable through
+    /// [`Self::enable_writes`]. Use [`Self::open_read_write`] for mutation.
     pub fn open(cx: &Cx, path: impl AsRef<Path>) -> Result<Self, FfsError> {
         Self::open_with_options(cx, path, &OpenOptions::default())
     }
@@ -7379,14 +7389,41 @@ impl OpenFs {
         Ok(())
     }
 
-    /// Open a filesystem image with custom options.
+    /// Open a filesystem image read-only with custom options.
+    ///
+    /// `Apply` journal recovery is interpreted as `SimulateOverlay`, including
+    /// fast-commit and orphan recovery. Options requiring external mutation
+    /// authority are refused before the image or any WAL is opened.
     pub fn open_with_options(
         cx: &Cx,
         path: impl AsRef<Path>,
         options: &OpenOptions,
     ) -> Result<Self, FfsError> {
-        let path = path.as_ref();
-        let dev = FileByteDevice::open(path)?;
+        if options.native_repair_max_working_bytes.is_some()
+            || options.metadata_log_enabled
+            || options.mvcc_wal_path.is_some()
+        {
+            return Err(FfsError::ReadOnly);
+        }
+        let mut read_options = options.clone();
+        if read_options.ext4_journal_replay_mode == Ext4JournalReplayMode::Apply {
+            read_options.ext4_journal_replay_mode = Ext4JournalReplayMode::SimulateOverlay;
+        }
+        let dev = FileByteDevice::open_read_only(path)?;
+        Self::from_device_with_btrfs_devices(cx, Box::new(dev), &read_options, None, false)
+    }
+
+    /// Open an image with explicit authority to mutate its native storage.
+    ///
+    /// This requires a read-write descriptor and never falls back to read-only.
+    /// Recovery follows `options`, so `Apply` may write before this returns.
+    /// Filesystem operations still require [`Self::enable_writes`].
+    pub fn open_read_write(
+        cx: &Cx,
+        path: impl AsRef<Path>,
+        options: &OpenOptions,
+    ) -> Result<Self, FfsError> {
+        let dev = FileByteDevice::open_read_write(path)?;
         let fs = Self::from_device(cx, Box::new(dev), options)?;
         if fs.metadata_log.is_some() {
             fs.start_metadata_compactor(cx)?;
@@ -7394,13 +7431,17 @@ impl OpenFs {
         Ok(fs)
     }
 
-    /// Open a filesystem from an already-opened device.
+    /// Open a filesystem from a caller-owned device.
+    ///
+    /// Supplying a device explicitly supplies its mutation authority: recovery
+    /// follows `options` and later writes use that device's own access checks.
+    /// Use the path-based read-only constructors when no mutation is intended.
     pub fn from_device(
         cx: &Cx,
         dev: Box<dyn ByteDevice>,
         options: &OpenOptions,
     ) -> Result<Self, FfsError> {
-        Self::from_device_with_btrfs_devices(cx, dev, options, None)
+        Self::from_device_with_btrfs_devices(cx, dev, options, None, true)
     }
 
     /// Nested read-only subvolumes share the already validated backing handles.
@@ -7412,6 +7453,7 @@ impl OpenFs {
         dev: Box<dyn ByteDevice>,
         options: &OpenOptions,
         inherited_devices: Option<Arc<BtrfsReadDevices>>,
+        write_authority: bool,
     ) -> Result<Self, FfsError> {
         if options.native_repair_max_working_bytes.is_some()
             && (options.skip_validation
@@ -7817,6 +7859,7 @@ impl OpenFs {
             btrfs_pending_orphans: Mutex::new(rustc_hash::FxHashSet::default()),
             ext4_orphan_head: std::sync::atomic::AtomicU64::new(u64::MAX),
             dev,
+            write_authority,
             btrfs_devices,
             btrfs_inventory_verified,
             mvcc_store,
@@ -8642,16 +8685,19 @@ impl OpenFs {
 
     /// Check that the current mount mode permits repair symbol writes.
     pub fn require_repair_write_access(&self) -> Result<(), FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("write_repair_symbols")
     }
 
     /// Check that the current mount mode permits version store writes.
     pub fn require_version_store_access(&self) -> Result<(), FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("write_version_store")
     }
 
     /// Check that the current mount mode permits BLAKE3 checksum writes.
     pub fn require_blake3_write_access(&self) -> Result<(), FfsError> {
+        self.require_write_authority()?;
         self.require_native_mode("write_blake3_checksum")
     }
 
@@ -12362,6 +12408,7 @@ impl OpenFs {
     }
 
     pub fn attach_ext4_internal_jbd2_writer(&mut self, cx: &Cx) -> Result<bool, FfsError> {
+        self.require_write_authority()?;
         let Some(writer) = self.open_ext4_internal_jbd2_writer(cx)? else {
             return Ok(false);
         };
@@ -12604,8 +12651,10 @@ impl OpenFs {
     /// Whether write operations are enabled.
     #[must_use]
     pub fn is_writable(&self) -> bool {
-        (self.ext4_alloc_state.is_some() && !self.ext4_forced_read_only.load(Ordering::SeqCst))
-            || self.btrfs_alloc_state.is_some()
+        self.write_authority
+            && ((self.ext4_alloc_state.is_some()
+                && !self.ext4_forced_read_only.load(Ordering::SeqCst))
+                || self.btrfs_alloc_state.is_some())
     }
 
     /// Incrementally checkpoint MVCC versions to this filesystem's base device.
@@ -12924,7 +12973,16 @@ impl OpenFs {
         (self.is_btrfs() && pending_writes != 0).then(|| self.btrfs_semantic_view_stale.write())
     }
 
+    fn require_write_authority(&self) -> Result<(), FfsError> {
+        if self.write_authority {
+            Ok(())
+        } else {
+            Err(FfsError::ReadOnly)
+        }
+    }
+
     fn reject_btrfs_unsupported_mutation(&self) -> Result<(), FfsError> {
+        self.require_write_authority()?;
         let Some(sb) = self.btrfs_superblock() else {
             return Ok(());
         };
@@ -15210,6 +15268,7 @@ impl OpenFs {
             Box::new(SharedByteDevice(Arc::clone(&self.dev))),
             &options,
             self.btrfs_devices.clone(),
+            self.write_authority,
         )?;
         nested.btrfs_nested_enabled = false;
         nested.btrfs_semantic_view_stale = Arc::clone(&self.btrfs_semantic_view_stale);
@@ -55713,6 +55772,254 @@ mod tests {
     }
 
     #[test]
+    fn read_only_open_recovers_fast_commit_without_changing_backing_file() {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        assert!(
+            ffs_dir::remove_entry(&mut image[10 * 4096..11 * 4096], b"hello.txt", 0)
+                .expect("remove fixture directory entry")
+        );
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+
+        for mode in [
+            None,
+            Some(Ext4JournalReplayMode::Apply),
+            Some(Ext4JournalReplayMode::SimulateOverlay),
+            Some(Ext4JournalReplayMode::Skip),
+        ] {
+            let fs = if let Some(mode) = mode {
+                OpenFs::open_with_options(
+                    &cx,
+                    file.path(),
+                    &OpenOptions {
+                        ext4_journal_replay_mode: mode,
+                        ..OpenOptions::default()
+                    },
+                )
+            } else {
+                OpenFs::open(&cx, file.path())
+            }
+            .expect("open without write authority");
+            assert!(!fs.write_authority);
+            assert!(!fs.is_writable());
+            let root = fs.read_inode(&cx, InodeNumber(2)).expect("read root");
+            let entry = fs
+                .lookup_name(&cx, &root, b"hello.txt")
+                .expect("lookup committed name");
+            if mode == Some(Ext4JournalReplayMode::Skip) {
+                assert!(entry.is_none(), "Skip must retain the unrecovered view");
+            } else {
+                assert_eq!(entry.expect("overlay recovers committed name").inode, 11);
+            }
+            drop(fs);
+            assert_eq!(
+                std::fs::read(file.path()).expect("read backing image"),
+                image,
+                "read-only recovery mode {mode:?} changed its backing file"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_open_jbd2_recovery_changes_only_the_visible_overlay() {
+        let image = build_ext4_image_with_internal_journal();
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        let fs = OpenFs::open(&cx, file.path()).expect("recover JBD2 in overlay");
+        let replay = fs.ext4_journal_replay().expect("journal recovery report");
+        assert_eq!(replay.committed_sequences, vec![1]);
+        assert_eq!(replay.stats.replayed_blocks, 1);
+        assert_eq!(
+            &fs.read_block_vec(&cx, BlockNumber(15))
+                .expect("recovered block")[..16],
+            b"JBD2-REPLAY-TEST"
+        );
+        drop(fs);
+        assert_eq!(std::fs::read(file.path()).expect("backing image"), image);
+    }
+
+    #[test]
+    fn read_only_open_orphan_cleanup_changes_only_the_visible_overlay() {
+        let mut image = build_ext4_image_with_orphan_chain(&[11, 12]);
+        set_test_ext4_state(&mut image, EXT4_VALID_FS | EXT4_ORPHAN_FS);
+        set_test_inode_links_count(&mut image, 11, 0);
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        let fs = OpenFs::open(&cx, file.path()).expect("recover orphans in overlay");
+        assert!(fs.crash_recovery().expect("recovery report").had_orphans);
+        assert!(matches!(
+            fs.read_inode(&cx, InodeNumber(11)),
+            Err(FfsError::NotFound(_))
+        ));
+        assert!(
+            fs.read_ext4_orphan_list(&cx)
+                .expect("recovered orphan list")
+                .inodes
+                .is_empty()
+        );
+        drop(fs);
+        assert_eq!(std::fs::read(file.path()).expect("backing image"), image);
+    }
+
+    #[test]
+    fn read_only_open_recovery_failure_preserves_image_on_retry() {
+        let image = build_unreadable_htree_fast_commit_image();
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        for _ in 0..2 {
+            let error = OpenFs::open(&cx, file.path())
+                .expect_err("incomplete committed recovery must remain an error");
+            assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+            assert!(error.to_string().contains("CREATE recovery incomplete"));
+            assert_eq!(std::fs::read(file.path()).expect("backing image"), image);
+        }
+    }
+
+    #[test]
+    fn read_only_open_cannot_acquire_mutation_authority() {
+        let image = build_ext4_image_with_extents();
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        let options = OpenOptions {
+            mount_mode: MountMode::Native,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::open_with_options(&cx, file.path(), &options)
+            .expect("open clean image read-only");
+        assert!(matches!(fs.enable_writes(&cx), Err(FfsError::ReadOnly)));
+        assert!(matches!(
+            fs.attach_ext4_internal_jbd2_writer(&cx),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.require_repair_write_access(),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.require_version_store_access(),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.require_blake3_write_access(),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.activate_native_ext4_repair(&cx, 4096),
+            Err(FfsError::ReadOnly)
+        ));
+
+        let snapshot = fs.current_snapshot();
+        for ssi in [false, true] {
+            let mut txn = fs.begin_transaction();
+            txn.stage_write(BlockNumber(15), vec![0xAB; 4096]);
+            let error = if ssi {
+                fs.commit_transaction_ssi(&cx, txn)
+            } else {
+                fs.commit_transaction(&cx, txn)
+            }
+            .expect_err("read-only handles cannot publish raw writes");
+            assert!(matches!(error, CommitError::DurabilityFailure { .. }));
+            assert_eq!(fs.current_snapshot().high, snapshot.high);
+            assert!(
+                fs.mvcc_read_visible(BlockNumber(15), fs.current_snapshot())
+                    .is_none()
+            );
+        }
+        assert!(!fs.is_writable());
+        assert_eq!(fs.flush_mvcc_to_device(&cx).expect("empty flush"), 0);
+        drop(fs);
+        for operation in ["prepare", "validation", "parity"] {
+            let fs = OpenFs::open_with_options(&cx, file.path(), &options)
+                .expect("open native image for inspection");
+            let result = match operation {
+                "prepare" => fs.prepare_native_ext4_repair(&cx, 100).map(|_| ()),
+                "validation" => fs.initialize_native_ext4_validation(&cx).map(|_| ()),
+                _ => fs.initialize_native_ext4_repair(&cx, 4096).map(|_| ()),
+            };
+            assert!(matches!(result, Err(FfsError::ReadOnly)), "{operation}");
+        }
+        assert_eq!(std::fs::read(file.path()).expect("backing image"), image);
+    }
+
+    #[test]
+    fn read_only_open_rejects_mutating_options_before_opening_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let image = directory.path().join("absent-image.ext4");
+        let existing_wal = directory.path().join("existing.wal");
+        let absent_wal = directory.path().join("absent.wal");
+        let sentinel = b"WAL bytes must survive rejected read-only opens";
+        std::fs::write(&existing_wal, sentinel).expect("write WAL sentinel");
+        let cx = Cx::for_testing();
+        for options in [
+            OpenOptions {
+                native_repair_max_working_bytes: Some(4096),
+                ..OpenOptions::default()
+            },
+            OpenOptions {
+                metadata_log_enabled: true,
+                ..OpenOptions::default()
+            },
+            OpenOptions {
+                mvcc_wal_path: Some(existing_wal.clone()),
+                ..OpenOptions::default()
+            },
+            OpenOptions {
+                mvcc_wal_path: Some(absent_wal.clone()),
+                ..OpenOptions::default()
+            },
+        ] {
+            assert!(matches!(
+                OpenFs::open_with_options(&cx, &image, &options),
+                Err(FfsError::ReadOnly)
+            ));
+            assert_eq!(
+                std::fs::read(&existing_wal).expect("WAL sentinel"),
+                sentinel
+            );
+            assert!(!absent_wal.exists());
+            assert!(!image.exists());
+        }
+    }
+
+    #[test]
+    fn read_write_open_persists_fast_commit_recovery() {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        assert!(
+            ffs_dir::remove_entry(&mut image[10 * 4096..11 * 4096], b"hello.txt", 0)
+                .expect("remove fixture directory entry")
+        );
+        let file = tempfile::NamedTempFile::new().expect("temporary image");
+        std::fs::write(file.path(), &image).expect("write fixture");
+        let cx = Cx::for_testing();
+        let fs = OpenFs::open_read_write(&cx, file.path(), &OpenOptions::default())
+            .expect("explicit writable recovery");
+        assert!(fs.write_authority);
+        drop(fs);
+        assert_ne!(std::fs::read(file.path()).expect("backing image"), image);
+
+        let reopened = OpenFs::open_with_options(
+            &cx,
+            file.path(),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("read persisted state without another recovery");
+        let root = reopened.read_inode(&cx, InodeNumber(2)).expect("read root");
+        let entry = reopened
+            .lookup_name(&cx, &root, b"hello.txt")
+            .expect("lookup persisted name")
+            .expect("explicit writable recovery persisted the committed name");
+        assert_eq!(entry.inode, 11);
+    }
+
+    #[test]
     fn fast_commit_create_apply_splices_dir_entry_bd_6nwjx() {
         // A create that was fast-committed but lost its directory entry on crash:
         // the inode (#11) survives but the parent (#2) no longer lists it. CREAT
@@ -56082,7 +56389,7 @@ mod tests {
         let requested = b"ffs-renamed";
 
         {
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts)
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts)
                 .expect("open ext4 image for setfslabel");
             fs.enable_writes(&cx).expect("enable writes");
             fs.set_fs_label(&cx, &mut RequestScope::empty(), requested)
@@ -56121,7 +56428,7 @@ mod tests {
         };
 
         let mut fs =
-            OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open ext4 image for write");
+            OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("open ext4 image for write");
         fs.enable_writes(&cx).expect("enable writes");
 
         let err = fs
@@ -59967,7 +60274,7 @@ mod tests {
         let ino;
 
         {
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts)
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts)
                 .expect("open ext4 image for setversion");
             fs.enable_writes(&cx).expect("enable writes");
             let created = fs
@@ -84739,7 +85046,7 @@ mod tests {
             return None;
         }
         let cx = Cx::for_testing();
-        let dev = FileByteDevice::open(&image).expect("open image");
+        let dev = FileByteDevice::open_read_write(&image).expect("open image for mutation");
         let mut fs =
             OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open ext4");
         fs.enable_writes(&cx).expect("enable writes");
@@ -85029,7 +85336,7 @@ mod tests {
             return None;
         }
         let cx = Cx::for_testing();
-        let dev = FileByteDevice::open(&image).expect("open image");
+        let dev = FileByteDevice::open_read_write(&image).expect("open image for mutation");
         let mut fs =
             OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open btrfs");
         fs.enable_writes(&cx).expect("enable writes");
@@ -85366,12 +85673,7 @@ mod tests {
         );
         drop(fs);
 
-        let reopened = OpenFs::from_device(
-            &cx,
-            Box::new(FileByteDevice::open(&image).expect("reopen image")),
-            &OpenOptions::default(),
-        )
-        .expect("reopen btrfs");
+        let reopened = OpenFs::open(&cx, &image).expect("reopen btrfs read-only");
         let ino = reopened
             .lookup(&cx, root, OsStr::new("test"))
             .expect("test survives")
@@ -85875,12 +86177,7 @@ mod tests {
 
         // The image is still a filesystem: reopen it and read keep back.
         drop(fs);
-        let reopened = OpenFs::from_device(
-            &cx,
-            Box::new(FileByteDevice::open(&image).expect("reopen image")),
-            &OpenOptions::default(),
-        )
-        .expect("reopen btrfs");
+        let reopened = OpenFs::open(&cx, &image).expect("reopen btrfs read-only");
         let attr = reopened
             .lookup(&cx, root, OsStr::new("keep"))
             .expect("keep survives");
@@ -93048,7 +93345,7 @@ mod tests {
             metadata_log_enabled: true,
             ..OpenOptions::default()
         };
-        let mut fs = OpenFs::open_with_options(&cx, &image, &options).expect("open logged ext4");
+        let mut fs = OpenFs::open_read_write(&cx, &image, &options).expect("open logged ext4");
         fs.enable_writes(&cx).expect("enable writes");
         let created = fs
             .create(&cx, InodeNumber(2), OsStr::new("logged.txt"), 0o644, 0, 0)
@@ -93068,7 +93365,7 @@ mod tests {
         drop(fs);
 
         let mut recovered =
-            OpenFs::open_with_options(&cx, &image, &options).expect("replay metadata WAL");
+            OpenFs::open_read_write(&cx, &image, &options).expect("replay metadata WAL");
         let report = recovered
             .mvcc_wal_recovery()
             .expect("recovery report after WAL fsync");
@@ -95800,7 +96097,7 @@ mod tests {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
                 ..OpenOptions::default()
             };
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open for write");
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("open for write");
             fs.enable_writes(&cx).expect("enable writes");
 
             for d in 0..dir_count {
@@ -95897,7 +96194,7 @@ mod tests {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
                 ..OpenOptions::default()
             };
-            let mut fs = OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("open for write");
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("open for write");
             fs.enable_writes(&cx).expect("enable writes");
 
             let dir_attr = fs
@@ -95922,8 +96219,7 @@ mod tests {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
                 ..OpenOptions::default()
             };
-            let mut fs =
-                OpenFs::open_with_options(&cx, &tmp_path, &opts).expect("reopen for modify");
+            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("reopen for modify");
             fs.enable_writes(&cx).expect("enable writes");
 
             let dir_attr = fs
@@ -102656,6 +102952,16 @@ mod tests {
             "read-only",
             InodeNumber((1 << BTRFS_NESTED_SLOT_SHIFT) | u64::from(BTRFS_FIRST_FREE_OBJECTID)),
         );
+        let nested = ro.btrfs_nested.lock();
+        assert!(
+            !nested.is_empty(),
+            "nested lookup must populate its child reader"
+        );
+        assert!(
+            nested
+                .iter()
+                .all(|slot| !slot.fs.write_authority && !slot.fs.is_writable())
+        );
     }
 
     #[test]
@@ -102780,6 +103086,7 @@ mod tests {
                         ..OpenOptions::default()
                     },
                     Some(Arc::clone(&devices)),
+                    false,
                 );
                 if fault == "missing" {
                     assert!(opened.is_err(), "missing device must fail coverage");
@@ -102810,6 +103117,14 @@ mod tests {
                 assert_eq!(link.kind, FileType::Directory);
                 let (slot, nested, _) = fs.btrfs_nested_route(link.ino).unwrap().unwrap();
                 assert_ne!(slot, 0);
+                assert!(
+                    !nested.write_authority,
+                    "child must inherit read-only authority"
+                );
+                assert!(matches!(
+                    nested.require_write_authority(),
+                    Err(FfsError::ReadOnly)
+                ));
                 assert!(Arc::ptr_eq(
                     nested.btrfs_devices.as_ref().unwrap(),
                     &devices

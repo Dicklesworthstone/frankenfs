@@ -1395,8 +1395,12 @@ fn ext4_inline_data_vfs_lookup_readdir_conforms() {
 
 #[test]
 fn ext4_inline_data_write_rejects_without_mutating_contents() {
-    let mut fs = open_ext4_inline_data_image("ext4_inode_inline_data.json");
+    let image = build_ext4_inline_data_image("ext4_inode_inline_data.json");
+    let tmp = tempfile::NamedTempFile::new().expect("create inline-data write test image");
+    fs::write(tmp.path(), &image).expect("write inline-data image");
     let cx = Cx::for_testing();
+    let mut fs = OpenFs::open_read_write(&cx, tmp.path(), &OpenOptions::default())
+        .expect("open inline-data image with write authority");
     fs.enable_writes(&cx)
         .expect("enable writes for inline-data rejection check");
 
@@ -1426,8 +1430,12 @@ fn ext4_inline_data_write_rejects_without_mutating_contents() {
 
 #[test]
 fn ext4_inline_data_fallocate_rejects_without_mutating_contents() {
-    let mut fs = open_ext4_inline_data_image("ext4_inode_inline_data.json");
+    let image = build_ext4_inline_data_image("ext4_inode_inline_data.json");
+    let tmp = tempfile::NamedTempFile::new().expect("create inline-data fallocate test image");
+    fs::write(tmp.path(), &image).expect("write inline-data image");
     let cx = Cx::for_testing();
+    let mut fs = OpenFs::open_read_write(&cx, tmp.path(), &OpenOptions::default())
+        .expect("open inline-data image with write authority");
     fs.enable_writes(&cx)
         .expect("enable writes for inline-data fallocate rejection check");
 
@@ -1809,8 +1817,7 @@ fn ext4_orphan_recovery_conforms() {
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let fs2 =
-        OpenFs::open_with_options(&cx, &image_path, &opts).expect("open with orphan recovery");
+    let fs2 = OpenFs::open_read_write(&cx, &image_path, &opts).expect("open with orphan recovery");
 
     let res = fs2.read_inode(&cx, ino);
     assert!(
@@ -1863,7 +1870,8 @@ fn ext4_path_resolution_conforms() {
 #[test]
 fn btrfs_tree_block_checksum_tamper_detection_conforms() {
     let cx = Cx::for_testing();
-    let (fs, _tmp, image_path) = open_btrfs_mkfs(128);
+    let (_tmp, image_path) = create_btrfs_mkfs(128);
+    let fs = open_btrfs_image(&image_path);
 
     let sb = fs.btrfs_superblock().expect("btrfs sb");
     let root_logical = sb.root;
@@ -2729,7 +2737,7 @@ fn open_btrfs_image(image: &Path) -> OpenFs {
     OpenFs::open_with_options(&cx, image, &opts).expect("open btrfs image")
 }
 
-fn open_btrfs_mkfs(size_mb: u64) -> (OpenFs, tempfile::TempDir, std::path::PathBuf) {
+fn create_btrfs_mkfs(size_mb: u64) -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::TempDir::new().expect("tmpdir for btrfs");
     let image = tmp.path().join("conformance.btrfs");
     let file = std::fs::File::create(&image).expect("create btrfs image");
@@ -2748,8 +2756,7 @@ fn open_btrfs_mkfs(size_mb: u64) -> (OpenFs, tempfile::TempDir, std::path::PathB
         String::from_utf8_lossy(&mkfs.stderr)
     );
 
-    let fs = open_btrfs_image(&image);
-    (fs, tmp, image)
+    (tmp, image)
 }
 
 /// Build a btrfs image whose root directory already contains `name` holding
@@ -2784,7 +2791,9 @@ fn open_btrfs_mkfs_rootdir(
         String::from_utf8_lossy(&mkfs.stderr)
     );
 
-    let fs = open_btrfs_image(&image);
+    let cx = Cx::for_testing();
+    let fs = OpenFs::open_read_write(&cx, &image, &OpenOptions::default())
+        .expect("open writable rootdir-populated btrfs image");
     (fs, tmp, image)
 }
 
@@ -2839,7 +2848,7 @@ fn open_writable_ext4_mkfs(size_mb: u64) -> (OpenFs, tempfile::TempDir, std::pat
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, &image, &opts).expect("open writable ext4 image");
+    let mut fs = OpenFs::open_read_write(&cx, &image, &opts).expect("open writable ext4 image");
     fs.enable_writes(&cx).expect("enable writes on ext4 image");
     assert!(fs.is_writable(), "test ext4 image should be writable");
     (fs, tmp, image)
@@ -2909,7 +2918,7 @@ fn reopen_writable_ext4(image_path: &Path) -> OpenFs {
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, image_path, &opts).expect("reopen writable ext4");
+    let mut fs = OpenFs::open_read_write(&cx, image_path, &opts).expect("reopen writable ext4");
     fs.enable_writes(&cx)
         .expect("re-enable writes on ext4 image");
     fs
@@ -3753,7 +3762,9 @@ fn ext4_generic_112_preallocation_contract_conforms() {
 #[test]
 fn btrfs_generic_112_preallocation_contract_conforms() {
     let cx = Cx::for_testing();
-    let (mut fs, _tmp, image_path) = open_btrfs_mkfs(128);
+    let (_tmp, image_path) = create_btrfs_mkfs(128);
+    let mut fs = OpenFs::open_read_write(&cx, &image_path, &OpenOptions::default())
+        .expect("open writable btrfs generic/112 image");
     fs.enable_writes(&cx)
         .expect("enable writes on btrfs generic/112 image");
     assert!(
@@ -3766,7 +3777,9 @@ fn btrfs_generic_112_preallocation_contract_conforms() {
 #[test]
 fn btrfs_fallocate_does_not_prealloc_over_live_data_conforms() {
     let cx = Cx::for_testing();
-    let (mut fs, _tmp, _image_path) = open_btrfs_mkfs(128);
+    let (_tmp, image_path) = create_btrfs_mkfs(128);
+    let mut fs = OpenFs::open_read_write(&cx, &image_path, &OpenOptions::default())
+        .expect("open writable btrfs live-data prealloc image");
     fs.enable_writes(&cx)
         .expect("enable writes on btrfs live-data prealloc image");
 
@@ -3992,7 +4005,7 @@ fn ext4_active_mmp_write_open_is_rejected() {
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let err = OpenFs::open_with_options(&cx, &image_path, &opts)
+    let err = OpenFs::open_read_write(&cx, &image_path, &opts)
         .expect_err("active ext4 MMP state must refuse write-participating open");
 
     assert!(

@@ -367,8 +367,7 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
         let run = runs
             .iter()
             .find(|run| {
-                logical >= run.vcn * cluster
-                    && logical + 4 <= (run.vcn + run.clusters) * cluster
+                logical >= run.vcn * cluster && logical + 4 <= (run.vcn + run.clusters) * cluster
             })
             .unwrap();
         usize::try_from(run.lcn.unwrap() * cluster + logical - run.vcn * cluster).unwrap()
@@ -705,7 +704,9 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                     };
                     let opened = open_read_only(&cx, &path, &options).unwrap();
                     let mut scope = RequestScope::empty();
-                    let result = opened.filesystem.lookup(&cx, &mut scope, InodeNumber(1), name);
+                    let result = opened
+                        .filesystem
+                        .lookup(&cx, &mut scope, InodeNumber(1), name);
                     if label == "selected" {
                         assert!(matches!(result, Err(FfsError::Corruption { .. })));
                     } else {
@@ -719,7 +720,9 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                         );
                     }
                     assert!(matches!(
-                        opened.filesystem.readdir(&cx, &mut scope, InodeNumber(1), 0),
+                        opened
+                            .filesystem
+                            .readdir(&cx, &mut scope, InodeNumber(1), 0),
                         Err(FfsError::Corruption { .. })
                     ));
                     assert_eq!(fs::read(&path).unwrap(), damaged);

@@ -1,6 +1,6 @@
 //! Actual FsOps calls on sparse native-layout devices, not kernel mount evidence.
-use super::*;
 use super::super::{FileChain, ROOT, fat_fiemap};
+use super::*;
 use crate::reader::FatVolume;
 use ffs_block::ByteDevice;
 use ffs_core::{FsOps, RequestScope};
@@ -54,11 +54,19 @@ impl Device {
             1 => end,
             2 if self.0.geometry.kind() == FatKind::Fat32 => end,
             n if n >= 3 && (n - 3) < self.0.linear as u32 => {
-                if (n - 2) == self.0.linear as u32 { end } else { n + 1 }
+                if (n - 2) == self.0.linear as u32 {
+                    end
+                } else {
+                    n + 1
+                }
             }
             n => self.0.successors.get(&n).copied().unwrap_or(0),
         };
-        if self.0.active { value | 0xa000_0000 } else { value }
+        if self.0.active {
+            value | 0xa000_0000
+        } else {
+            value
+        }
     }
 
     fn reset(&self) {
@@ -66,7 +74,12 @@ impl Device {
     }
 
     fn fault(&self, copy: u8, cluster: u32, value: u32) {
-        self.0.trace.lock().unwrap().overrides.insert((copy, cluster), value);
+        self.0
+            .trace
+            .lock()
+            .unwrap()
+            .overrides
+            .insert((copy, cluster), value);
     }
 }
 
@@ -82,12 +95,20 @@ impl ByteDevice for Device {
         let mut trace = self.0.trace.lock().unwrap();
         trace.calls += 1;
         trace.maximum = trace.maximum.max(bytes.len());
-        if trace.fail.as_ref().is_some_and(|bad| at.0 < bad.end && end > bad.start) {
+        if trace
+            .fail
+            .as_ref()
+            .is_some_and(|bad| at.0 < bad.end && end > bad.start)
+        {
             bytes.fill(0xee);
             return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
         }
         let sector = u64::from(self.0.geometry.sector_bytes());
-        let backup = self.0.geometry.backup_boot_sector().map(|n| BASE + u64::from(n) * sector);
+        let backup = self
+            .0
+            .geometry
+            .backup_boot_sector()
+            .map(|n| BASE + u64::from(n) * sector);
         let width = u64::from(self.0.geometry.kind().entry_bytes());
         for (index, byte) in bytes.iter_mut().enumerate() {
             let position = at.0 + index as u64;
@@ -100,7 +121,11 @@ impl ByteDevice for Device {
                 self.raw(copy as u8, (relative / width) as u32, &trace)
                     .to_le_bytes()[(relative % width) as usize]
             } else if (self.0.root..self.0.root + sector).contains(&position) {
-                self.0.record.get((position - self.0.root) as usize).copied().unwrap_or(0)
+                self.0
+                    .record
+                    .get((position - self.0.root) as usize)
+                    .copied()
+                    .unwrap_or(0)
             } else {
                 panic!("extent query read payload or unrelated storage at {position}");
             };
@@ -128,17 +153,30 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(kind: FatKind, sector: u16, chain: &[u32], linear: usize, size: u32,
-        active: bool, writable: bool) -> Self {
+    fn new(
+        kind: FatKind,
+        sector: u16,
+        chain: &[u32],
+        linear: usize,
+        size: u32,
+        active: bool,
+        writable: bool,
+    ) -> Self {
         let sector_bytes = u64::from(sector);
         let minimum: u32 = if kind == FatKind::Fat16 { 5000 } else { 70_000 };
         let clusters = minimum.max(chain.iter().copied().max().unwrap_or(3 + linear as u32) + 1);
         let reserved = if kind == FatKind::Fat16 { 1_u16 } else { 32 };
         let width = u64::from(kind.entry_bytes());
         let fat_sectors = ((u64::from(clusters) + 2) * width).div_ceil(sector_bytes);
-        let root_entries = if kind == FatKind::Fat16 { sector / 32 } else { 0 };
-        let total = u64::from(reserved) + 2 * fat_sectors
-            + u64::from(root_entries) * 32 / sector_bytes + u64::from(clusters);
+        let root_entries = if kind == FatKind::Fat16 {
+            sector / 32
+        } else {
+            0
+        };
+        let total = u64::from(reserved)
+            + 2 * fat_sectors
+            + u64::from(root_entries) * 32 / sector_bytes
+            + u64::from(clusters);
         let mut boot = [0_u8; 512];
         boot[..3].copy_from_slice(&[0xeb, 0x58, 0x90]);
         boot[3..11].copy_from_slice(b"MSWIN4.1");
@@ -158,11 +196,16 @@ impl Fixture {
             boot[44..48].copy_from_slice(&2_u32.to_le_bytes());
             boot[50..52].copy_from_slice(&6_u16.to_le_bytes());
             boot[66] = 0x29;
-            if active { boot[40..42].copy_from_slice(&0x81_u16.to_le_bytes()); }
+            if active {
+                boot[40..42].copy_from_slice(&0x81_u16.to_le_bytes());
+            }
         }
         let geometry = FatGeometry::parse(&boot, total * sector_bytes).unwrap();
         assert_eq!(geometry.kind(), kind);
-        let first = chain.first().copied().unwrap_or(if linear == 0 { 0 } else { 3 });
+        let first = chain
+            .first()
+            .copied()
+            .unwrap_or(if linear == 0 { 0 } else { 3 });
         let mut record = [0; 32];
         record[..11].copy_from_slice(b"DATA    BIN");
         record[11] = 0x20;
@@ -171,38 +214,86 @@ impl Fixture {
             record[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
         }
         record[28..32].copy_from_slice(&size.to_le_bytes());
-        let terminal = if kind == FatKind::Fat16 { 0xffff } else { 0x0fff_ffff };
-        let successors = chain.iter().enumerate().map(|(i, &cluster)| {
-            (cluster, chain.get(i + 1).copied().unwrap_or(terminal))
-        }).collect();
+        let terminal = if kind == FatKind::Fat16 {
+            0xffff
+        } else {
+            0x0fff_ffff
+        };
+        let successors = chain
+            .iter()
+            .enumerate()
+            .map(|(i, &cluster)| (cluster, chain.get(i + 1).copied().unwrap_or(terminal)))
+            .collect();
         let start = BASE + u64::from(reserved) * sector_bytes;
         let fat_bytes = fat_sectors * sector_bytes;
-        let root = BASE + geometry.fixed_root()
-            .map_or_else(|| geometry.cluster_offset(2).unwrap(), |(at, _)| at);
+        let root = BASE
+            + geometry
+                .fixed_root()
+                .map_or_else(|| geometry.cluster_offset(2).unwrap(), |(at, _)| at);
         let device = Device(Arc::new(Image {
-            boot, geometry, fats: [start..start + fat_bytes, start + fat_bytes..start + 2 * fat_bytes],
-            root, record, linear, successors, active, trace: Mutex::default(),
+            boot,
+            geometry,
+            fats: [
+                start..start + fat_bytes,
+                start + fat_bytes..start + 2 * fat_bytes,
+            ],
+            root,
+            record,
+            linear,
+            successors,
+            active,
+            trace: Mutex::default(),
         }));
         let cx = Cx::for_testing();
-        let volume = FatVolume::from_device(&cx, Box::new(device.clone()), BASE, total * sector_bytes).unwrap();
-        let entry = volume.lookup(&cx, crate::Directory::Root, "DATA.BIN").unwrap();
+        let volume =
+            FatVolume::from_device(&cx, Box::new(device.clone()), BASE, total * sector_bytes)
+                .unwrap();
+        let entry = volume
+            .lookup(&cx, crate::Directory::Root, "DATA.BIN")
+            .unwrap();
         let fs = FatFs::new_with_mode(&cx, volume, 1000, 1000, writable).unwrap();
-        let page = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, 0).unwrap();
-        let ino = page.iter().find(|entry| entry.name == b"DATA.BIN").unwrap().ino;
+        let page = fs
+            .readdir(&cx, &mut RequestScope::empty(), ROOT, 0)
+            .unwrap();
+        let ino = page
+            .iter()
+            .find(|entry| entry.name == b"DATA.BIN")
+            .unwrap()
+            .ino;
         device.reset();
-        Self { device, fs, entry, ino }
+        Self {
+            device,
+            fs,
+            entry,
+            ino,
+        }
     }
 
     fn query(&self, start: u64, length: u64) -> Result<Vec<FiemapExtent>> {
-        self.fs.fiemap(&Cx::for_testing(), &mut RequestScope::empty(), self.ino, start, length)
+        self.fs.fiemap(
+            &Cx::for_testing(),
+            &mut RequestScope::empty(),
+            self.ino,
+            start,
+            length,
+        )
     }
 
     fn reference(&self, chain: &[u32], start: u64, length: u64) -> Vec<FiemapExtent> {
         let geometry = &self.device.0.geometry;
-        fat_fiemap(&Cx::for_testing(), &FileChain {
-            clusters: chain.to_vec(), size: self.entry.native.size,
-        }, geometry.cluster_bytes(), geometry.cluster_offset(2).unwrap(), geometry.volume_bytes(),
-            start, length).unwrap()
+        fat_fiemap(
+            &Cx::for_testing(),
+            &FileChain {
+                clusters: chain.to_vec(),
+                size: self.entry.native.size,
+            },
+            geometry.cluster_bytes(),
+            geometry.cluster_offset(2).unwrap(),
+            geometry.volume_bytes(),
+            start,
+            length,
+        )
+        .unwrap()
     }
 }
 
@@ -214,10 +305,19 @@ fn streamed_fiemap_matches_materialized_extent_semantics() {
             for size in [0, 1, 4 * u32::from(sector) - 17, 6 * u32::from(sector)] {
                 let fixture = Fixture::new(kind, sector, &chain, 0, size, false, false);
                 let capacity = chain.len() as u64 * u64::from(sector);
-                for (start, length) in [(0, u64::MAX), (0, 0), (1, 1),
-                    (2 * u64::from(sector) + 1, 7), (capacity - 1, u64::MAX),
-                    (capacity, 1), (u64::MAX, u64::MAX)] {
-                    assert_eq!(fixture.query(start, length).unwrap(), fixture.reference(&chain, start, length));
+                for (start, length) in [
+                    (0, u64::MAX),
+                    (0, 0),
+                    (1, 1),
+                    (2 * u64::from(sector) + 1, 7),
+                    (capacity - 1, u64::MAX),
+                    (capacity, 1),
+                    (u64::MAX, u64::MAX),
+                ] {
+                    assert_eq!(
+                        fixture.query(start, length).unwrap(),
+                        fixture.reference(&chain, start, length)
+                    );
                 }
                 assert_eq!(fixture.fs.immutable_cache_usage(), (0, 0, 0));
                 assert!(fixture.device.0.trace.lock().unwrap().maximum <= 64 * 1024);
@@ -232,11 +332,23 @@ fn maximum_native_file_returns_two_extents_without_any_cluster_map_cache() {
     let fixture = Fixture::new(FatKind::Fat32, 4096, &[], count, u32::MAX, false, false);
     let physical = fixture.device.0.geometry.cluster_offset(3).unwrap();
     let all = fixture.query(0, u64::MAX).unwrap();
-    assert_eq!(all, [
-        FiemapExtent { logical: 0, physical, length: u64::from(u32::MAX), flags: FIEMAP_EXTENT_NOT_ALIGNED },
-        FiemapExtent { logical: u64::from(u32::MAX), physical: physical + u64::from(u32::MAX), length: 1,
-            flags: FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_NOT_ALIGNED },
-    ]);
+    assert_eq!(
+        all,
+        [
+            FiemapExtent {
+                logical: 0,
+                physical,
+                length: u64::from(u32::MAX),
+                flags: FIEMAP_EXTENT_NOT_ALIGNED
+            },
+            FiemapExtent {
+                logical: u64::from(u32::MAX),
+                physical: physical + u64::from(u32::MAX),
+                length: 1,
+                flags: FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_NOT_ALIGNED
+            },
+        ]
+    );
     assert_eq!(fixture.query(1234, 1).unwrap(), all[..1]);
     assert_eq!(fixture.fs.immutable_cache_usage(), (0, 0, 0));
     assert!(fixture.device.0.trace.lock().unwrap().maximum <= 64 * 1024);
@@ -291,15 +403,26 @@ fn read_and_cancellation_failures_drop_the_entire_extent_result_and_allow_retry(
     fixture.device.reset();
     let cx = Cx::for_testing();
     fixture.device.0.trace.lock().unwrap().cancel_after = Some(3);
-    assert!(matches!(fixture.fs.fiemap(&cx, &mut RequestScope::empty(), fixture.ino, 0, u64::MAX),
-        Err(FfsError::Cancelled)));
+    assert!(matches!(
+        fixture
+            .fs
+            .fiemap(&cx, &mut RequestScope::empty(), fixture.ino, 0, u64::MAX),
+        Err(FfsError::Cancelled)
+    ));
     fixture.device.reset();
-    assert_eq!(fixture.query(0, u64::MAX).unwrap(), fixture.reference(&chain, 0, u64::MAX));
+    assert_eq!(
+        fixture.query(0, u64::MAX).unwrap(),
+        fixture.reference(&chain, 0, u64::MAX)
+    );
     let cancelled = Cx::for_testing();
     cancelled.set_cancel_requested(true);
     fixture.device.reset();
-    assert!(matches!(fixture.fs.fiemap(&cancelled, &mut RequestScope::empty(), fixture.ino, 0, 0),
-        Err(FfsError::Cancelled)));
+    assert!(matches!(
+        fixture
+            .fs
+            .fiemap(&cancelled, &mut RequestScope::empty(), fixture.ino, 0, 0),
+        Err(FfsError::Cancelled)
+    ));
     assert_eq!(fixture.device.0.trace.lock().unwrap().calls, 0);
 }
 
@@ -308,14 +431,25 @@ fn selected_active_fat_ignores_inactive_damage_and_reserved_high_bits() {
     let chain = [3, 4, 70_000, 70_001, 9];
     let fixture = Fixture::new(FatKind::Fat32, 4096, &chain, 0, 8193, true, false);
     fixture.device.0.trace.lock().unwrap().fail = Some(fixture.device.0.fats[0].clone());
-    assert_eq!(fixture.query(0, u64::MAX).unwrap(), fixture.reference(&chain, 0, u64::MAX));
+    assert_eq!(
+        fixture.query(0, u64::MAX).unwrap(),
+        fixture.reference(&chain, 0, u64::MAX)
+    );
     assert_eq!(fixture.fs.immutable_cache_usage(), (0, 0, 0));
 }
 
 #[test]
 fn warm_sparse_cache_cannot_mask_extent_walk_failure() {
     let fixture = Fixture::new(FatKind::Fat32, 512, &[], 600, 1, false, false);
-    fixture.fs.lookup(&Cx::for_testing(), &mut RequestScope::empty(), ROOT, OsStr::new("DATA.BIN")).unwrap();
+    fixture
+        .fs
+        .lookup(
+            &Cx::for_testing(),
+            &mut RequestScope::empty(),
+            ROOT,
+            OsStr::new("DATA.BIN"),
+        )
+        .unwrap();
     let usage = fixture.fs.immutable_cache_usage();
     assert_eq!((usage.0, usage.2), (1, 0));
     let at = BASE + fixture.device.0.geometry.entry_offset(1, 602).unwrap();
@@ -328,11 +462,20 @@ fn warm_sparse_cache_cannot_mask_extent_walk_failure() {
 fn empty_short_and_directory_requests_keep_native_refusals() {
     for kind in [FatKind::Fat16, FatKind::Fat32] {
         let empty = Fixture::new(kind, 512, &[], 0, 0, false, false);
-        assert_eq!(empty.query(0, u64::MAX).unwrap(), Vec::<FiemapExtent>::new());
+        assert_eq!(
+            empty.query(0, u64::MAX).unwrap(),
+            Vec::<FiemapExtent>::new()
+        );
         let short = Fixture::new(kind, 512, &[3], 0, 513, false, false);
         assert!(short.query(0, 1).is_err());
-        assert_eq!(empty.fs.fiemap(&Cx::for_testing(), &mut RequestScope::empty(), ROOT, 0, 1)
-            .unwrap_err().to_errno(), libc::EINVAL);
+        assert_eq!(
+            empty
+                .fs
+                .fiemap(&Cx::for_testing(), &mut RequestScope::empty(), ROOT, 0, 1)
+                .unwrap_err()
+                .to_errno(),
+            libc::EINVAL
+        );
     }
 }
 
@@ -340,9 +483,17 @@ fn empty_short_and_directory_requests_keep_native_refusals() {
 fn writable_fiemap_keeps_existing_maps_and_refuses_immutable_helper() {
     let chain = [3, 4, 11, 12];
     let fixture = Fixture::new(FatKind::Fat16, 512, &chain, 0, 1025, false, true);
-    assert!(fixture.fs.readonly_fiemap(&Cx::for_testing(), &fixture.entry, 0, 1).is_err());
+    assert!(
+        fixture
+            .fs
+            .readonly_fiemap(&Cx::for_testing(), &fixture.entry, 0, 1)
+            .is_err()
+    );
     assert_eq!(fixture.device.0.trace.lock().unwrap().calls, 0);
-    assert_eq!(fixture.query(0, u64::MAX).unwrap(), fixture.reference(&chain, 0, u64::MAX));
+    assert_eq!(
+        fixture.query(0, u64::MAX).unwrap(),
+        fixture.reference(&chain, 0, u64::MAX)
+    );
     assert_eq!(fixture.fs.immutable_cache_usage(), (0, 0, 1));
 }
 
@@ -350,7 +501,9 @@ fn writable_fiemap_keeps_existing_maps_and_refuses_immutable_helper() {
 fn concurrent_extent_requests_have_independent_run_state_and_no_cache_publication() {
     let chain: Vec<_> = (0..257_u32).map(|n| 3 + (n * 37) % 257).collect();
     let fixture = Fixture::new(FatKind::Fat32, 512, &chain, 0, 100_001, false, false);
-    let expected: Vec<_> = (0..8).map(|n| fixture.reference(&chain, n * 7919, 4097)).collect();
+    let expected: Vec<_> = (0..8)
+        .map(|n| fixture.reference(&chain, n * 7919, 4097))
+        .collect();
     std::thread::scope(|threads| {
         for (n, expected) in expected.into_iter().enumerate() {
             let fixture = &fixture;

@@ -150,7 +150,7 @@ fn run_e2fsck(image: &PathBuf) -> Option<i32> {
 fn run_ffs() -> Option<FfsRun> {
     let image = create_ext4_image()?;
     let cx = Cx::for_testing();
-    let mut fs = OpenFs::open(&cx, &image).ok()?;
+    let mut fs = OpenFs::open_read_write(&cx, &image, &ffs_core::OpenOptions::default()).ok()?;
     fs.enable_writes(&cx).ok()?;
     let attr = fs
         .create(&cx, InodeNumber(2), OsStr::new("fsync.bin"), 0o644, 0, 0)

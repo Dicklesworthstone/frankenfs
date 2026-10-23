@@ -61,7 +61,7 @@ fn open_writable_ext4(image: &Path) -> OpenFs {
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, image, &opts).expect("open ext4");
+    let mut fs = OpenFs::open_read_write(&cx, image, &opts).expect("open ext4");
     fs.enable_writes(&cx).expect("enable writes");
     fs
 }

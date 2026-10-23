@@ -1420,7 +1420,7 @@ fn try_mount_ffs_rw_with_options(
         mvcc_wal_path: Some(image.with_extension("wal")),
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, image, &opts).expect("open ext4 image");
+    let mut fs = OpenFs::open_read_write(&cx, image, &opts).expect("open ext4 image");
     fs.enable_writes(&cx).expect("enable ext4 write support");
     match mount_background(Box::new(fs), mountpoint, mount_opts) {
         Ok(session) => {
@@ -2185,7 +2185,7 @@ fn run_shared_btrfs_rw_scenario(scenario: &SharedBtrfsScenario) {
             btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-ro".to_owned()),
             ..OpenOptions::default()
         };
-        let mut ro_snap = OpenFs::open_with_options(&cx, &image, &opts).expect("open snap-ro");
+        let mut ro_snap = OpenFs::open_read_write(&cx, &image, &opts).expect("open snap-ro");
         let refused = ro_snap
             .enable_writes(&cx)
             .expect_err("a read-only snapshot must refuse writes");
@@ -12585,7 +12585,7 @@ fn ext4_openfs_oversized_external_xattr_value_reports_enospc_without_drift() {
         mvcc_wal_path: Some(image.with_extension("wal")),
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, &image, &opts).expect("open ext4 image");
+    let mut fs = OpenFs::open_read_write(&cx, &image, &opts).expect("open ext4 image");
     fs.enable_writes(&cx).expect("enable ext4 write support");
     let free_before = fs
         .count_free_blocks_in_group(&cx, GroupNumber(0))
@@ -12785,7 +12785,7 @@ fn try_mount_btrfs_rw_selection(
         btrfs_mount_selection: selection,
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, image, &opts).expect("open btrfs image");
+    let mut fs = OpenFs::open_read_write(&cx, image, &opts).expect("open btrfs image");
     if let Err(e) = fs.enable_writes(&cx) {
         require_fuse_or_skip(&format!("btrfs enable_writes failed: {e}"));
         return None;
@@ -15282,7 +15282,7 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, &image, &opts).expect("open btrfs image");
+    let mut fs = OpenFs::open_read_write(&cx, &image, &opts).expect("open btrfs image");
 
     let info = fs
         .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
@@ -15961,7 +15961,7 @@ fn assert_btrfs_mirror_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8], pr
                 .collect(),
             ..OpenOptions::default()
         };
-        let opened = OpenFs::open_with_options(cx, &images[selected[0]], &options);
+        let opened = OpenFs::open_read_write(cx, &images[selected[0]], &options);
         if readable {
             let mut filesystem =
                 opened.unwrap_or_else(|error| panic!("{profile} subset {mask:04b}: {error}"));
@@ -18402,7 +18402,8 @@ fn assert_btrfs_attached_devices_read_seeded_files(
             for (primary, image) in images.iter().enumerate() {
                 // Only this path is supplied. The sibling image exists but is
                 // not authorized/attached and must not be discovered implicitly.
-                let mut degraded = OpenFs::open(&cx, image).expect("open surviving RAID1 mirror");
+                let mut degraded = OpenFs::open_read_write(&cx, image, &OpenOptions::default())
+                    .expect("open surviving RAID1 mirror");
                 for name in ["payload", "compressed", "nodatasum"] {
                     let attr = degraded
                         .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new(name))
@@ -18511,7 +18512,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(
                     .collect(),
                 ..OpenOptions::default()
             };
-            let mut filesystem = OpenFs::open_with_options(&cx, &images[primary], &options)
+            let mut filesystem = OpenFs::open_read_write(&cx, &images[primary], &options)
                 .unwrap_or_else(|error| panic!("open {profile} primary {primary}: {error}"));
             assert_eq!(
                 filesystem.btrfs_superblock().unwrap().csum_type,
@@ -18647,7 +18648,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(
                     btrfs_device_paths: attached[1..].to_vec(),
                     ..OpenOptions::default()
                 };
-                let mut degraded = OpenFs::open_with_options(&cx, &attached[0], &options)
+                let mut degraded = OpenFs::open_read_write(&cx, &attached[0], &options)
                     .unwrap_or_else(|error| {
                         panic!("{profile} degraded open (omitted {omitted:?}): {error}")
                     });
@@ -19436,8 +19437,7 @@ fn ext4_fuse_ioctl_setversion_roundtrips_via_mounted_path() {
         mvcc_wal_path: Some(image.with_extension("wal")),
         ..OpenOptions::default()
     };
-    let mut filesystem =
-        OpenFs::open_with_options(&cx, &image, &open_opts).expect("open ext4 image");
+    let mut filesystem = OpenFs::open_read_write(&cx, &image, &open_opts).expect("open ext4 image");
     filesystem.enable_writes(&cx).expect("enable ext4 writes");
     let config = ffs_fuse::MountConfig {
         options: mount_opts,
@@ -20193,7 +20193,7 @@ fn btrfs_openfs_mkfs_fixture_cross_parent_directory_rename_updates_parent_nlink_
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_with_options(&cx, &image, &open_options).expect("open btrfs image");
+    let mut fs = OpenFs::open_read_write(&cx, &image, &open_options).expect("open btrfs image");
     fs.enable_writes(&cx).expect("enable btrfs write support");
     let fs_ops: &dyn FsOps = &fs;
 
@@ -21807,7 +21807,7 @@ fn run_fc_kernel_scenario_with(
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let fs = OpenFs::open_with_options(&cx, &crash_image, &options).unwrap_or_else(|e| {
+    let fs = OpenFs::open_read_write(&cx, &crash_image, &options).unwrap_or_else(|e| {
         panic!("{scenario}: FrankenFS must recover the fast-commit crash image: {e}")
     });
     report_jbd2_replay(scenario, &fs);
@@ -21893,7 +21893,7 @@ fn run_fc_kernel_scenario_with(
 
     // Recovery is idempotent: opening the recovered image again shows the
     // same tree.
-    let again = OpenFs::open_with_options(&cx, &crash_image, &options)
+    let again = OpenFs::open_read_write(&cx, &crash_image, &options)
         .unwrap_or_else(|e| panic!("{scenario}: reopen after recovery: {e}"));
     assert_eq!(
         fc_view(&cx, &again),
@@ -21908,7 +21908,7 @@ fn run_fc_kernel_scenario_with(
     // does: Apply recovery, writes, the image's own JBD2 journal.
     let rw_mnt = tmp.path().join("ffs-rw");
     fs::create_dir_all(&rw_mnt).unwrap();
-    let mut rw_fs = OpenFs::open_with_options(&cx, &crash_image, &options)
+    let mut rw_fs = OpenFs::open_read_write(&cx, &crash_image, &options)
         .unwrap_or_else(|e| panic!("{scenario}: RW open after recovery: {e}"));
     rw_fs.enable_writes(&cx).expect("enable writes");
     rw_fs
@@ -21955,7 +21955,7 @@ fn run_fc_kernel_scenario_with(
         (b"written after recovery".to_vec(), 1),
     );
     session.unmount_and_join();
-    let remounted = OpenFs::open_with_options(&cx, &crash_image, &options)
+    let remounted = OpenFs::open_read_write(&cx, &crash_image, &options)
         .unwrap_or_else(|e| panic!("{scenario}: open after the RW session: {e}"));
     assert_eq!(
         fc_view(&cx, &remounted),
@@ -22008,7 +22008,7 @@ fn run_fc_kernel_scenario_with(
             "{scenario}: recovery with its write #{} failing reported success",
             budget + 1
         );
-        let rerun = OpenFs::open_with_options(&cx, &image, &options).unwrap_or_else(|e| {
+        let rerun = OpenFs::open_read_write(&cx, &image, &options).unwrap_or_else(|e| {
             panic!("{scenario}: recovery after an interruption at write {budget}/{total}: {e}")
         });
         assert_eq!(
@@ -22048,7 +22048,7 @@ impl WriteBudgetDevice {
     fn open(path: &Path, budget: usize) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let device = Self {
-            inner: ffs_block::FileByteDevice::open(path).expect("open image"),
+            inner: ffs_block::FileByteDevice::open_read_write(path).expect("open image"),
             budget,
             writes: std::sync::Arc::clone(&writes),
         };
@@ -22768,7 +22768,7 @@ fn jbd2_wrapped_log_crash_image_recovery_matches_kernel() {
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let fs = OpenFs::open_with_options(&cx, &crash_image, &options)
+    let fs = OpenFs::open_read_write(&cx, &crash_image, &options)
         .unwrap_or_else(|e| panic!("FrankenFS must recover the wrapped-log crash image: {e}"));
     report_jbd2_replay("jbd2 wrapped-log", &fs);
     let wdir = fs
@@ -22875,7 +22875,7 @@ fn gdt_eager_mounted_forensics_bd_d2hdc() {
                     mvcc_wal_path: Some(image.with_extension("wal")),
                     ..OpenOptions::default()
                 };
-                let mut fsys = match OpenFs::open_with_options(&cx, &image, &opts) {
+                let mut fsys = match OpenFs::open_read_write(&cx, &image, &opts) {
                     Ok(fs) => fs,
                     Err(e) => {
                         let _ = mount_tx.send(Err(format!("open ext4 image: {e}")));

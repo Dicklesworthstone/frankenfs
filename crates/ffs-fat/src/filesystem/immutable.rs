@@ -14,8 +14,8 @@
 
 use super::{Entry, FatFs, FfsError, InodeNumber, MAX_CACHED_CHAINS, Result, checkpoint};
 use super::{
-    FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_NOT_ALIGNED, FIEMAP_EXTENT_UNWRITTEN,
-    FiemapExtent, fiemap_corrupt,
+    FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_NOT_ALIGNED, FIEMAP_EXTENT_UNWRITTEN, FiemapExtent,
+    fiemap_corrupt,
 };
 use crate::reader::FileIndex;
 use asupersync::Cx;
@@ -78,7 +78,9 @@ impl IndexCache {
                 .retained_bytes
                 .checked_sub(previous.storage_bytes())
                 .ok_or_else(|| {
-                    FfsError::Io(std::io::Error::other("FAT immutable cache accounting underflow"))
+                    FfsError::Io(std::io::Error::other(
+                        "FAT immutable cache accounting underflow",
+                    ))
                 })?;
         }
         self.retained_bytes += bytes;
@@ -109,61 +111,68 @@ impl FatFs {
         let query_end = start.saturating_add(length);
         let size = u64::from(entry.native.size);
         let cluster_bytes = u64::from(self.volume.geometry.cluster_bytes());
-        self.volume.visit_file_runs(cx, entry, |logical, physical, run_length, last| {
-            let run_end = logical
-                .checked_add(run_length)
-                .ok_or_else(|| fiemap_corrupt(logical, "FAT extent end overflow"))?;
-            let initialized_end = size.clamp(logical, run_end);
-            // Match the existing materialized mapper exactly: retain complete
-            // intersecting extents, split at EOF, and describe real allocated
-            // slack/preallocation as UNWRITTEN rather than readable file bytes.
-            for (at, delta, count, mut flags) in [
-                (logical, 0, initialized_end - logical, 0),
-                (
-                    initialized_end,
-                    initialized_end - logical,
-                    run_end - initialized_end,
-                    FIEMAP_EXTENT_UNWRITTEN,
-                ),
-            ] {
-                checkpoint(cx)?;
-                let end = at + count; // Bounded by the checked run_end above.
-                if count == 0 || length == 0 || at >= query_end || end <= start {
-                    continue;
+        self.volume
+            .visit_file_runs(cx, entry, |logical, physical, run_length, last| {
+                let run_end = logical
+                    .checked_add(run_length)
+                    .ok_or_else(|| fiemap_corrupt(logical, "FAT extent end overflow"))?;
+                let initialized_end = size.clamp(logical, run_end);
+                // Match the existing materialized mapper exactly: retain complete
+                // intersecting extents, split at EOF, and describe real allocated
+                // slack/preallocation as UNWRITTEN rather than readable file bytes.
+                for (at, delta, count, mut flags) in [
+                    (logical, 0, initialized_end - logical, 0),
+                    (
+                        initialized_end,
+                        initialized_end - logical,
+                        run_end - initialized_end,
+                        FIEMAP_EXTENT_UNWRITTEN,
+                    ),
+                ] {
+                    checkpoint(cx)?;
+                    let end = at + count; // Bounded by the checked run_end above.
+                    if count == 0 || length == 0 || at >= query_end || end <= start {
+                        continue;
+                    }
+                    let position = physical + delta; // Checked by visit_file_runs.
+                    if last && end == run_end {
+                        flags |= FIEMAP_EXTENT_LAST;
+                    }
+                    if !at.is_multiple_of(cluster_bytes)
+                        || !position.is_multiple_of(cluster_bytes)
+                        || !count.is_multiple_of(cluster_bytes)
+                    {
+                        flags |= FIEMAP_EXTENT_NOT_ALIGNED;
+                    }
+                    result
+                        .try_reserve(1)
+                        .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+                    result.push(FiemapExtent {
+                        logical: at,
+                        physical: position,
+                        length: count,
+                        flags,
+                    });
                 }
-                let position = physical + delta; // Checked by visit_file_runs.
-                if last && end == run_end {
-                    flags |= FIEMAP_EXTENT_LAST;
-                }
-                if !at.is_multiple_of(cluster_bytes)
-                    || !position.is_multiple_of(cluster_bytes)
-                    || !count.is_multiple_of(cluster_bytes)
-                {
-                    flags |= FIEMAP_EXTENT_NOT_ALIGNED;
-                }
-                result.try_reserve(1)
-                    .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
-                result.push(FiemapExtent {
-                    logical: at,
-                    physical: position,
-                    length: count,
-                    flags,
-                });
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
         // Nothing escapes on a late FAT error, visitor failure or cancellation.
         checkpoint(cx)?;
         Ok(result)
     }
 
     fn immutable_cache(&self) -> Result<MutexGuard<'_, IndexCache>> {
-        self.immutable_indexes.lock().map_err(|_| {
-            FfsError::Io(std::io::Error::other("FAT immutable index cache poisoned"))
-        })
+        self.immutable_indexes
+            .lock()
+            .map_err(|_| FfsError::Io(std::io::Error::other("FAT immutable index cache poisoned")))
     }
 
-    pub(super) fn readonly_index(&self, cx: &Cx, ino: InodeNumber, entry: &Entry) -> Result<FileIndex> {
+    pub(super) fn readonly_index(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        entry: &Entry,
+    ) -> Result<FileIndex> {
         checkpoint(cx)?;
         // Refuse accidental use by mutation paths, rather than adding a second
         // invalidation protocol which could retain old allocation after reuse.

@@ -3030,7 +3030,7 @@ fn createbench_cmd(
     rounds: usize,
 ) -> Result<()> {
     let cx = cli_cx();
-    let mut open_fs = OpenFs::open(&cx, path)
+    let mut open_fs = OpenFs::open_read_write(&cx, path, &OpenOptions::default())
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     open_fs
         .enable_writes(&cx)
@@ -3425,7 +3425,7 @@ impl CreateBenchCutoverArm {
         publication_mode: PublicationMode,
     ) -> Result<Self> {
         let cx = cli_cx();
-        let mut open_fs = OpenFs::open(&cx, path)
+        let mut open_fs = OpenFs::open_read_write(&cx, path, &OpenOptions::default())
             .with_context(|| format!("failed to open {label} image: {}", path.display()))?;
         open_fs
             .set_empty_mvcc_publication_mode_for_bench(publication_mode)
@@ -4063,7 +4063,7 @@ fn truncated_rate(rate: f64) -> u64 {
 
 fn mkdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
     let cx = cli_cx();
-    let mut open_fs = OpenFs::open(&cx, path)
+    let mut open_fs = OpenFs::open_read_write(&cx, path, &OpenOptions::default())
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     open_fs
         .enable_writes(&cx)
@@ -4108,7 +4108,7 @@ fn mkdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
 
 fn rmdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
     let cx = cli_cx();
-    let mut open_fs = OpenFs::open(&cx, path)
+    let mut open_fs = OpenFs::open_read_write(&cx, path, &OpenOptions::default())
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     open_fs
         .enable_writes(&cx)
@@ -4161,7 +4161,7 @@ fn rmdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
 
 fn unlinkbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
     let cx = cli_cx();
-    let mut open_fs = OpenFs::open(&cx, path)
+    let mut open_fs = OpenFs::open_read_write(&cx, path, &OpenOptions::default())
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     open_fs
         .enable_writes(&cx)
@@ -4214,7 +4214,7 @@ fn unlinkbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
 
 fn renamebench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
     let cx = cli_cx();
-    let mut open_fs = OpenFs::open(&cx, path)
+    let mut open_fs = OpenFs::open_read_write(&cx, path, &OpenOptions::default())
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     open_fs
         .enable_writes(&cx)
@@ -4292,8 +4292,12 @@ fn readdirbench_cmd(
         bail!("--iters must be at least 1");
     }
     let cx = cli_cx();
-    let mut open_fs = OpenFs::open(&cx, path)
-        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let mut open_fs = if rw {
+        OpenFs::open_read_write(&cx, path, &OpenOptions::default())
+    } else {
+        OpenFs::open(&cx, path)
+    }
+    .with_context(|| format!("failed to open image: {}", path.display()))?;
     if rw {
         // Selects the COW-tree readdir path, which is what a read-write mount
         // executes. Untimed: only the enumerations below are measured.
@@ -4415,8 +4419,12 @@ fn statbench_prepare(
     rw: bool,
 ) -> Result<(OpenFs, Vec<InodeNumber>)> {
     let cx = cli_cx();
-    let mut open_fs = OpenFs::open(&cx, path)
-        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let mut open_fs = if rw {
+        OpenFs::open_read_write(&cx, path, &OpenOptions::default())
+    } else {
+        OpenFs::open(&cx, path)
+    }
+    .with_context(|| format!("failed to open image: {}", path.display()))?;
     if rw {
         open_fs
             .enable_writes(&cx)
@@ -4666,7 +4674,7 @@ fn writebench_cmd(
     create: bool,
 ) -> Result<()> {
     let cx = cli_cx();
-    let mut open_fs = OpenFs::open(&cx, path)
+    let mut open_fs = OpenFs::open_read_write(&cx, path, &OpenOptions::default())
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     open_fs
         .enable_writes(&cx)
@@ -8274,7 +8282,12 @@ fn run_mount_background_scrub_daemon(
     if repair_writes_enabled {
         ensure_mount_background_repair_write_access(image_path)?;
     }
-    let byte_dev = FileByteDevice::open(image_path).with_context(|| {
+    let byte_dev = if config.repair_writes_enabled {
+        FileByteDevice::open_read_write(image_path)
+    } else {
+        FileByteDevice::open_read_only(image_path)
+    }
+    .with_context(|| {
         format!(
             "failed to open image for background scrub: {}",
             image_path.display()
@@ -8959,9 +8972,13 @@ fn open_filesystem_for_mount(image_path: &Path, options: &MountCmdOptions) -> Re
         open_opts.mvcc_wal_path = Some(image_path.with_extension("ffs-metadata-wal"));
         open_opts.metadata_log_enabled = true;
     }
-    let open_fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
-        .map_err(anyhow::Error::new)
-        .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
+    let open_fs = if options.read_write {
+        OpenFs::open_read_write(&cx, image_path, &open_opts)
+    } else {
+        OpenFs::open_with_options(&cx, image_path, &open_opts)
+    }
+    .map_err(anyhow::Error::new)
+    .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
     if open_fs.metadata_log_enabled() {
         eprintln!(
             "mount: append-only ext4 metadata WAL ENABLED ({})",
@@ -9314,7 +9331,7 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
 
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_only(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let image_len = byte_dev.len_bytes();
 
@@ -9501,7 +9518,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
         },
     });
 
-    let byte_dev = FileByteDevice::open(path)
+    let byte_dev = FileByteDevice::open_read_only(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let image_len = byte_dev.len_bytes();
 
@@ -10020,7 +10037,7 @@ fn scrub_report_to_phase(report: &ScrubReport) -> FsckScrubOutput {
 
 pub fn run_ext4_mount_recovery(path: &PathBuf) -> Result<Ext4RecoveryOutput> {
     let cx = cli_cx();
-    let open = OpenFs::open_with_options(
+    let open = OpenFs::open_read_write(
         &cx,
         path,
         &OpenOptions {
@@ -10466,7 +10483,7 @@ fn build_live_tui_snapshot(
     }
 
     let scrub_report = if run_scrub {
-        let byte_dev = FileByteDevice::open(image_path)
+        let byte_dev = FileByteDevice::open_read_only(image_path)
             .with_context(|| format!("failed to open image for scrub: {}", image_path.display()))?;
         let image_len = byte_dev.len_bytes();
         let block_size = match &open_fs.flavor {
@@ -14088,6 +14105,53 @@ mod tests {
     }
 
     #[test]
+    fn mount_open_requires_explicit_write_authority_bd_read_means_read_xpx37() {
+        let image = repair_tail_test_image_bd_plamw();
+        with_temp_image_path(&image, |path| {
+            let cx = Cx::for_testing();
+            let block = BlockNumber(14);
+            let payload = vec![0xA5; 4096];
+            let mut reader = open_filesystem_for_mount(
+                &path,
+                &test_mount_cmd_options(false, MountWritebackCacheConfig::disabled()),
+            )
+            .expect("read-only mount opens a writable backing image");
+
+            assert!(matches!(
+                reader.enable_writes(&cx),
+                Err(ffs_error::FfsError::ReadOnly)
+            ));
+            assert!(!reader.is_writable());
+            let mut denied = reader.begin_transaction();
+            reader.stage_block_write(&mut denied, block, payload.clone());
+            reader
+                .commit_transaction(&cx, denied)
+                .expect_err("raw publication cannot bypass read-only mount authority");
+            assert_eq!(reader.mvcc_version_count(), 0);
+            assert_eq!(reader.flush_mvcc_to_device(&cx).unwrap(), 0);
+            drop(reader);
+            assert_eq!(std::fs::read(&path).unwrap(), image);
+
+            let mut writer = open_filesystem_for_mount(
+                &path,
+                &test_mount_cmd_options(true, MountWritebackCacheConfig::disabled()),
+            )
+            .expect("explicit read-write mount acquires write authority");
+            writer.enable_writes(&cx).expect("enable authorized writes");
+            assert!(writer.is_writable());
+            let mut accepted = writer.begin_transaction();
+            writer.stage_block_write(&mut accepted, block, payload.clone());
+            writer
+                .commit_transaction(&cx, accepted)
+                .expect("authorized publication");
+            assert!(writer.flush_mvcc_to_device(&cx).unwrap() > 0);
+            drop(writer);
+            let persisted = std::fs::read(&path).unwrap();
+            assert_eq!(&persisted[14 * 4096..15 * 4096], payload.as_slice());
+        });
+    }
+
+    #[test]
     fn mount_runtime_config_rejects_timeout_for_standard_mode() {
         let err = MountRuntimeConfig {
             mode: MountRuntimeMode::Standard,
@@ -14640,7 +14704,8 @@ mod tests {
         );
         let cx = Cx::for_testing();
         {
-            let mut ordinary = OpenFs::open(&cx, &image).expect("ordinary image opens");
+            let mut ordinary = OpenFs::open_read_write(&cx, &image, &OpenOptions::default())
+                .expect("ordinary image opens for writes");
             ordinary
                 .enable_writes(&cx)
                 .expect("ordinary image permits writes");
@@ -14689,7 +14754,7 @@ mod tests {
         )
         .expect("repair config");
         for ephemeral in [false, true] {
-            let mut fs = OpenFs::open_with_options(
+            let mut fs = OpenFs::open_read_write(
                 &cx,
                 &image,
                 &OpenOptions {
@@ -14803,7 +14868,7 @@ mod tests {
             backing.sync_all().unwrap();
             let before = super::file_sha256(&image).unwrap();
             let mut fs =
-                OpenFs::open_with_options(&cx, &image, &options).expect("committed inventory wins");
+                OpenFs::open_read_write(&cx, &image, &options).expect("committed inventory wins");
             assert_eq!(fs.btrfs_superblock().unwrap().num_devices, 1);
             assert!(fs.btrfs_device_inventory_verified());
             let info =
@@ -14832,7 +14897,7 @@ mod tests {
 
         // Publish the corrected count with a real filesystem mutation, then
         // independently inspect the durable superblock and btrfs-progs check.
-        let mut fs = OpenFs::open_with_options(&cx, &image, &options).unwrap();
+        let mut fs = OpenFs::open_read_write(&cx, &image, &options).unwrap();
         fs.enable_writes(&cx).unwrap();
         let file = fs
             .create(
@@ -15990,7 +16055,7 @@ mod tests {
         let image = build_test_ext4_image_with_internal_journal_feature();
         with_temp_image_path(&image, |path| {
             let cx = Cx::for_testing();
-            let mut fs = OpenFs::open_with_options(
+            let mut fs = OpenFs::open_read_write(
                 &cx,
                 path,
                 &OpenOptions {
@@ -19416,7 +19481,7 @@ mod tests {
             .status();
         assert!(formatted.is_ok_and(|s| s.success()), "mke2fs");
         {
-            let mut fs = super::OpenFs::open_with_options(
+            let mut fs = super::OpenFs::open_read_write(
                 &cx,
                 &ffs_image,
                 &super::OpenOptions {

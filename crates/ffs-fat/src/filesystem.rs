@@ -593,8 +593,7 @@ impl FatFs {
                 .as_ref()
                 .ok_or_else(|| FfsError::NotFound(format!("FAT inode {}", ino.0)))?;
             let (size, allocated) = self.file_allocation(cx, ino, entry)?;
-            let blocks =
-                allocated as u64 * u64::from(self.volume.geometry.cluster_bytes()) / 512;
+            let blocks = allocated as u64 * u64::from(self.volume.geometry.cluster_bytes()) / 512;
             (FileType::RegularFile, size, blocks, 1)
         };
         let (atime, mtime, crtime) = if let Some(entry) = &node.entry {
