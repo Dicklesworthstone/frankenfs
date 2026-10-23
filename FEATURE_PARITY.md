@@ -317,6 +317,22 @@
 > percentages are unchanged; exact cuts and failed attempts are in
 > `.beads/pending_tasks.md`.
 
+> **Public auxiliary-image selection, 2026-10-23:** `native_reader` now routes
+> `--ext4-journal PATH OFFSET LENGTH` and repeatable
+> `--btrfs-device PATH OFFSET LENGTH` through the admitted facade. Each member
+> has independent byte bounds (`rest` selects the remaining file bytes), and
+> conflicting format selectors are refused. Mountpoint admission checks every
+> backing path. The first run passed 41 facade and ten consumer tests, including
+> geometry/format conflicts, raw native paths and hidden-member refusal. The final
+> layout-only source passed formatting; focused consumer UBS found no critical
+> findings (70 warnings). Workspace check, strict Clippy, the final test repeat
+> and executable build were refused before execution by RCH admission pressure.
+> The older consumer failed the standalone replay probe at the unknown new flag,
+> after 48 retained native byte comparisons with all 17 controls unchanged; the
+> new candidate has not executed that probe. Remaining gates and native
+> auxiliary-image qualification stay open. This does not
+> establish native auxiliary-device, crash, performance or field qualification.
+
 > **Public read-only facade mounts, 2026-10-22:** the existing `native_reader`
 > consumer now mounts its already-admitted `Box<dyn FsOps>` through the shared
 > FUSE transport. Foreground mounts retain bounds and explicit NTFS/ZFS views,
