@@ -330,6 +330,12 @@ pub enum ZilRecordPayload {
         atime: [u64; 2],
         mtime: [u64; 2],
     },
+    SetSaXattr {
+        file_obj: u64,
+        name: Vec<u8>,
+        /// Native lr_size == 0 removes the SA nvpair; it is not an empty value.
+        value: Option<Vec<u8>>,
+    },
 }
 
 /// One validated ZIL log record (`lr_t`).
@@ -391,7 +397,7 @@ impl ZilBlock {
                 .filter(|&end| end <= records_limit)
                 .ok_or_else(|| invalid("ZIL record exceeds block used bytes"))?;
             let rec = &raw[pos..rec_end];
-            if !matches!(txtype & 0x1f, 1 | 2 | 4..=11 | 14..=20 | 22) {
+            if !matches!(txtype & 0x1f, 1 | 2 | 4..=11 | 14..=22) {
                 pos = rec_end;
                 continue;
             }
@@ -550,6 +556,30 @@ impl ZilRecord {
                     size: order.u64(rec, 72)?,
                     atime: [order.u64(rec, 80)?, order.u64(rec, 88)?],
                     mtime,
+                }
+            }
+            21 => {
+                if rec.len() < 49 {
+                    return Err(invalid("truncated ZIL lr_setsaxattr_t"));
+                }
+                let name_length = rec[48..]
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .filter(|length| *length != 0)
+                    .ok_or_else(|| invalid("missing ZIL SA xattr name"))?;
+                let start = 49 + name_length;
+                let size = usize::try_from(order.u64(rec, 40)?)
+                    .map_err(|_| invalid("ZIL SA xattr value length overflows"))?;
+                let end = start
+                    .checked_add(size)
+                    .ok_or_else(|| invalid("ZIL SA xattr value end overflows"))?;
+                let bytes = rec
+                    .get(start..end)
+                    .ok_or_else(|| invalid("truncated ZIL SA xattr value"))?;
+                ZilRecordPayload::SetSaXattr {
+                    file_obj: order.u64(rec, 32)?,
+                    name: rec[48..48 + name_length].to_vec(),
+                    value: (size != 0).then(|| bytes.to_vec()),
                 }
             }
             _ => return Err(invalid("unknown ZIL record payload")),

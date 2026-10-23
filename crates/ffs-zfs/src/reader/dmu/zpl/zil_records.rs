@@ -125,6 +125,18 @@ pub(super) fn verified(cx: &Cx, record: &[u8], order: Endian) -> Result<ZilRecor
             }
         }
         10 | 11 => return Err(corrupt("invalid fixed-size ZIL truncate/setattr record")),
+        21 => {
+            let object = word(record, 32, order)?;
+            if object == 0 || object >= 1_u64 << 48 {
+                return Err(corrupt("invalid ZIL SA xattr object identity"));
+            }
+            let start = names_end(record, 48, 1)?;
+            let size = word(record, 40, order)?;
+            if start - 49 > ffs_ondisk::zfs_zpl::XATTR_NAME_BYTES || size > 32_768 {
+                return Err(unsupported("ZIL SA xattr exceeds native name/value limits"));
+            }
+            padded_record(record, start + size as usize)?;
+        }
         _ => {
             return Err(unsupported(
                 "ZIL operation or type flags are not implemented for replay",
@@ -360,6 +372,79 @@ mod tests {
             suffix[8..16].copy_from_slice(&order.encode(length));
             assert!(verified(&cx, &suffix, order).is_err());
             assert!(verified(&cx, &record(22, &body[..21], order), order).is_err());
+        }
+    }
+
+    #[test]
+    fn sa_xattr_records_preserve_binary_values_removal_and_exact_native_framing() {
+        let cx = Cx::for_testing();
+        for order in [Endian::Little, Endian::Big] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&order.encode(7));
+            body.extend_from_slice(&order.encode(4));
+            body.extend_from_slice(b"user.binary\0\0\xffA\0");
+            let bytes = record(21, &body, order);
+            let decoded = verified(&cx, &bytes, order).unwrap();
+            assert_eq!(
+                decoded.payload,
+                ZilRecordPayload::SetSaXattr {
+                    file_obj: 7,
+                    name: b"user.binary".to_vec(),
+                    value: Some(vec![0, 255, b'A', 0]),
+                }
+            );
+            assert_eq!(
+                ffs_ondisk::zfs_dmu::ZilBlock::parse(
+                    &block(&bytes, bytes.len() as u64, order),
+                    order,
+                )
+                .unwrap()
+                .records,
+                [decoded]
+            );
+            let mut removal = body[..16].to_vec();
+            removal[8..16].copy_from_slice(&order.encode(0));
+            removal.extend_from_slice(b"user.binary\0");
+            assert!(matches!(
+                verified(&cx, &record(21, &removal, order), order)
+                    .unwrap()
+                    .payload,
+                ZilRecordPayload::SetSaXattr { value: None, .. }
+            ));
+            for at in [0, 32, 40] {
+                let values = match at {
+                    0 => vec![0x15 | (1_u64 << 63), 0x15 | 0x20],
+                    32 => vec![0, 1_u64 << 48, u64::MAX],
+                    _ => vec![32_769, u64::MAX, 12],
+                };
+                for value in values {
+                    let mut bad = bytes.clone();
+                    bad[at..at + 8].copy_from_slice(&order.encode(value));
+                    assert!(verified(&cx, &bad, order).is_err());
+                }
+            }
+            let mut empty = bytes.clone();
+            empty[48] = 0;
+            assert!(verified(&cx, &empty, order).is_err());
+            let mut unterminated = bytes.clone();
+            unterminated[48..].fill(b'x');
+            assert!(verified(&cx, &unterminated, order).is_err());
+            let mut suffix = bytes.clone();
+            suffix.extend_from_slice(&[0; 8]);
+            let length = suffix.len() as u64;
+            suffix[8..16].copy_from_slice(&order.encode(length));
+            assert!(verified(&cx, &suffix, order).is_err());
+            assert!(verified(&cx, &record(21, &body[..16], order), order).is_err());
+
+            let mut maximum = Vec::new();
+            maximum.extend_from_slice(&order.encode(7));
+            maximum.extend_from_slice(&order.encode(32_768));
+            maximum.extend_from_slice(&vec![b'x'; 255]);
+            maximum.push(0);
+            maximum.extend_from_slice(&vec![0xA5; 32_768]);
+            assert!(verified(&cx, &record(21, &maximum, order), order).is_ok());
+            maximum.insert(16, b'x');
+            assert!(verified(&cx, &record(21, &maximum, order), order).is_err());
         }
     }
 

@@ -141,7 +141,7 @@ fn sa_bytes(layout: u16, fields: &[(u16, Vec<u8>)], order: Endian) -> Vec<u8> {
 
 // A native fat-ZAP fixture is needed because layout IDs contain uint16 arrays,
 // not micro-ZAP uint64 scalars. Hash constants were generated independently.
-fn layouts(arrays: &[Vec<u16>], order: Endian) -> (Vec<u8>, Vec<u8>) {
+pub(in crate::reader::dmu) fn layouts(arrays: &[Vec<u16>], order: Endian) -> (Vec<u8>, Vec<u8>) {
     let mut header = vec![0; 512];
     for (at, value) in [
         (0, (1_u64 << 63) + 1),

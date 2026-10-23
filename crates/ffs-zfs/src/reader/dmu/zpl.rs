@@ -45,6 +45,8 @@ struct ZilOverlay {
     objects: BTreeMap<u64, Metadata>,
     dir_entries: BTreeMap<u64, BTreeMap<Vec<u8>, Option<u64>>>,
     file_edits: BTreeMap<u64, Arc<RecoveredFile>>,
+    sa_xattrs: BTreeMap<u64, BTreeMap<String, Vec<u8>>>,
+    sa_xattr_work_bytes: usize,
     created: BTreeSet<u64>,
     removed_objects: BTreeSet<u64>,
 }
@@ -456,6 +458,7 @@ impl Zpl {
             overlay.removed_objects.insert(target);
             overlay.objects.remove(&target);
             overlay.file_edits.remove(&target);
+            overlay.sa_xattrs.remove(&target);
         } else {
             overlay.objects.insert(target, meta);
         }
@@ -736,6 +739,7 @@ impl Zpl {
                 overlay.created.insert(*file_obj);
                 overlay.dir_entries.remove(file_obj);
                 overlay.file_edits.remove(file_obj);
+                overlay.sa_xattrs.remove(file_obj);
                 self.adjust_directory(cx, overlay, *dir_obj, 1, i64::from(*is_dir))?;
                 overlay.objects.insert(*file_obj, meta);
                 overlay
@@ -869,6 +873,11 @@ impl Zpl {
                     }
                 }
             }
+            ZilRecordPayload::SetSaXattr {
+                file_obj,
+                name,
+                value,
+            } => self.replay_sa_xattr(cx, overlay, *file_obj, name, value.as_deref())?,
         }
         Ok(())
     }
@@ -1309,5 +1318,5 @@ impl Zpl {
 
 companion_bin_tests! {
     #[cfg(test)]
-    mod tests;
+    pub(super) mod tests;
 }

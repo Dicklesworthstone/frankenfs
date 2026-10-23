@@ -633,6 +633,26 @@ fn recovery_graph_log(
     cancelled_at: Option<u64>,
     extra: &[(u64, Vec<u8>)],
 ) -> (Objects, Reads, Faults) {
+    recovery_graph_xattrs(
+        order,
+        algorithm,
+        records,
+        claimed,
+        cancelled_at,
+        extra,
+        false,
+    )
+}
+
+fn recovery_graph_xattrs(
+    order: Endian,
+    algorithm: u8,
+    records: &[Vec<u8>],
+    claimed: bool,
+    cancelled_at: Option<u64>,
+    extra: &[(u64, Vec<u8>)],
+    sa_xattrs: bool,
+) -> (Objects, Reads, Faults) {
     use ffs_ondisk::zfs_dmu::Dnode;
     let first = pointer(FIRST, 1, algorithm, 4096, order, order);
     let next = pointer(SECOND, 2, algorithm, 4096, order, order);
@@ -678,6 +698,12 @@ fn recovery_graph_log(
         &base_file_metadata,
         order,
     ));
+    let xattr_blocks = if sa_xattrs {
+        recovery_sa_xattrs(&mut table, &mut master, &file, order)
+    } else {
+        Vec::new()
+    };
+    table[512 + 64..512 + 192].copy_from_slice(&data_pointer(&master, 0x4c000, 21, 37, order));
     let mut os = vec![0; 1024];
     os[..512].copy_from_slice(&dnode(
         10,
@@ -759,6 +785,7 @@ fn recovery_graph_log(
         (0x4c200, directory),
         (0x4c400, file),
     ];
+    blocks.extend(xattr_blocks);
     blocks.extend_from_slice(extra);
     let (leaf, reads) = leaf_with_faults(&blocks, cancelled_at, Arc::clone(&faults));
     let objects = Objects {
@@ -771,6 +798,116 @@ fn recovery_graph_log(
         cached_bytes: 0,
     };
     (objects, reads, faults)
+}
+
+fn recovery_sa_xattrs(
+    table: &mut [u8],
+    master: &mut [u8],
+    file: &[u8],
+    order: Endian,
+) -> Vec<(u64, Vec<u8>)> {
+    // Native XDR byte-array nvpairs, independent of the SA/container byte order.
+    let mut packed = vec![1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    for (name, value) in [
+        ("user.base", b"old".as_slice()),
+        ("base", b"raw-sa".as_slice()),
+        ("user.keep", b"keep".as_slice()),
+    ] {
+        let mut pair = vec![0; 8];
+        pair.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        pair.extend_from_slice(name.as_bytes());
+        pair.resize(pair.len().next_multiple_of(4), 0);
+        pair.extend_from_slice(&10_u32.to_be_bytes());
+        pair.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        pair.extend_from_slice(value);
+        pair.resize(pair.len().next_multiple_of(4), 0);
+        let length = pair.len() as u32;
+        pair[..4].copy_from_slice(&length.to_be_bytes());
+        let decoded = (16 + name.len() + 1).next_multiple_of(8) + value.len().next_multiple_of(8);
+        pair[4..8].copy_from_slice(&(decoded as u32).to_be_bytes());
+        packed.extend(pair);
+    }
+    packed.extend_from_slice(&[0; 8]);
+    let mut bonus = vec![0; 8];
+    bonus[..4].copy_from_slice(&match order {
+        Endian::Little => 0x002f_505a_u32.to_le_bytes(),
+        Endian::Big => 0x002f_505a_u32.to_be_bytes(),
+    });
+    let word16 = |value: u16| match order {
+        Endian::Little => value.to_le_bytes(),
+        Endian::Big => value.to_be_bytes(),
+    };
+    bonus[4..6].copy_from_slice(&word16((1 << 10) | 2));
+    bonus[6..8].copy_from_slice(&word16(packed.len() as u16));
+    bonus.extend_from_slice(&[0; 64]); // atime, mtime, ctime, crtime
+    for value in [2, 0o100_644, 16, 2, 2, 15, 0, 1000, 1000] {
+        bonus.extend_from_slice(&order.encode(value));
+    }
+    bonus.extend(packed);
+    bonus.resize(bonus.len().next_multiple_of(8), 0);
+    table[7 * 512..8 * 512].copy_from_slice(&dnode(
+        19,
+        512,
+        &data_pointer(file, 0x4c400, 19, 37, order),
+        44,
+        &bonus,
+        order,
+    ));
+    put(master, 128, 5, order);
+    put(master, 192, 12, order);
+    master[206..214].copy_from_slice(b"SA_ATTRS");
+
+    let mut sa_master = micro(b"REGISTRY", 13, order);
+    put(&mut sa_master, 128, 14, order);
+    sa_master[142..149].copy_from_slice(b"LAYOUTS");
+    let registry = micro(b"ZPL_DXATTR", 0x3f | (3 << 16), order);
+    let ids = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 63];
+    let (layout_header, layout_leaf) = super::super::zpl::tests::layouts(&[ids], order);
+    let directory = micro(b"user.base", (8_u64 << 60) | 16, order);
+    let mut directory_meta = file_metadata(true, 3, order);
+    put(&mut directory_meta, 88, 7, order);
+    put(&mut directory_meta, 120, 1, order);
+    let mut value = vec![0; 512];
+    value[..9].copy_from_slice(b"directory");
+    let mut value_meta = file_metadata(false, 9, order);
+    put(&mut value_meta, 88, 15, order);
+    put(&mut value_meta, 120, 1, order);
+    let blocks = vec![
+        (0x50000, sa_master),
+        (0x50200, registry),
+        (0x50400, layout_header),
+        (0x50600, layout_leaf),
+        (0x50800, directory),
+        (0x50a00, value),
+    ];
+    for (number, kind, index, bonus_type, metadata) in [
+        (12, 45, 0, 0, &[][..]),
+        (13, 46, 1, 0, &[][..]),
+        (14, 47, 2, 0, &[][..]),
+        (15, 20, 4, 17, directory_meta.as_slice()),
+        (16, 19, 5, 17, value_meta.as_slice()),
+    ] {
+        let (at, data) = &blocks[index];
+        let node = dnode(
+            kind,
+            512,
+            &data_pointer(data, *at, kind, 37, order),
+            bonus_type,
+            metadata,
+            order,
+        );
+        table[number * 512..(number + 1) * 512].copy_from_slice(&node);
+    }
+    table[14 * 512 + 3] = 2;
+    put(table, 14 * 512 + 16, 1, order);
+    table[14 * 512 + 192..14 * 512 + 320].copy_from_slice(&data_pointer(
+        &blocks[3].1,
+        blocks[3].0,
+        47,
+        37,
+        order,
+    ));
+    blocks
 }
 
 #[test]
@@ -1009,6 +1146,222 @@ fn link_record(seq: u64, parent: u64, object: u64, name: &[u8], order: Endian) -
     }
     raw[48..48 + name.len()].copy_from_slice(name);
     raw
+}
+
+fn sa_xattr_record(seq: u64, object: u64, name: &[u8], value: &[u8], order: Endian) -> Vec<u8> {
+    let mut raw = vec![0xA5; (49 + name.len() + value.len()).next_multiple_of(8)];
+    let length = raw.len() as u64;
+    for (at, value) in [
+        (0, 21),
+        (8, length),
+        (16, 43),
+        (24, seq),
+        (32, object),
+        (40, value.len() as u64),
+    ] {
+        put(&mut raw, at, value, order);
+    }
+    raw[48..48 + name.len()].copy_from_slice(name);
+    raw[48 + name.len()] = 0;
+    raw[49 + name.len()..49 + name.len() + value.len()].copy_from_slice(value);
+    raw
+}
+
+#[test]
+fn native_sa_xattr_replay_preserves_precedence_binary_values_and_hardlinks() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for algorithm in [5, 9] {
+            for claimed in [false, true] {
+                let records = vec![
+                    sa_xattr_record(1, 7, b"user.base", b"replacement", order),
+                    sa_xattr_record(2, 7, b"added", b"compatibility", order),
+                    sa_xattr_record(3, 7, b"user.added", b"prefixed", order),
+                    sa_xattr_record(4, 7, b"user.binary", b"old", order),
+                    sa_xattr_record(5, 7, b"user.binary", b"\0\xffnew\0", order),
+                    sa_xattr_record(6, 7, b"user.base", b"", order),
+                    sa_xattr_record(7, 7, b"user.keep", b"", order),
+                    link_record(8, 2, 7, b"third", order),
+                    remove_record(5, 9, 2, b"file", order),
+                ];
+                let (mut objects, _, _) =
+                    recovery_graph_xattrs(order, algorithm, &records, claimed, None, &[], true);
+                let mut view = objects.zpl(&cx, &[]).unwrap();
+                assert_eq!(
+                    view.getxattr(&cx, 7, "user.base").unwrap(),
+                    Some(b"old".to_vec())
+                );
+                let stats = view.replay_zil(&cx).unwrap();
+                assert_eq!((stats.records_replayed, stats.last_seq), (9, 9));
+                for _ in 0..2 {
+                    for path in [b"/alias".as_slice(), b"/third"] {
+                        let owner = view.resolve(&cx, path).unwrap();
+                        assert_eq!(owner, 7);
+                        assert_eq!(
+                            view.listxattr(&cx, owner).unwrap(),
+                            ["user.added", "user.base", "user.binary"]
+                        );
+                        assert_eq!(
+                            view.getxattr(&cx, owner, "user.base").unwrap(),
+                            Some(b"directory".to_vec()),
+                            "SA-only removal reveals prefixed directory before raw SA fallback"
+                        );
+                        assert_eq!(
+                            view.getxattr(&cx, owner, "user.added").unwrap(),
+                            Some(b"prefixed".to_vec())
+                        );
+                        assert_eq!(
+                            view.getxattr(&cx, owner, "user.binary").unwrap(),
+                            Some(b"\0\xffnew\0".to_vec())
+                        );
+                        assert_eq!(view.getxattr(&cx, owner, "user.keep").unwrap(), None);
+                        assert_eq!(view.read(&cx, owner, 0, 16).unwrap(), b"abcdefghijklmnop");
+                    }
+                    assert_eq!(view.stat(&cx, 7).unwrap().0.links, 2);
+                    assert!(view.resolve(&cx, b"/file").is_err());
+                    assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+                }
+                let mut committed = objects.zpl(&cx, &[]).unwrap();
+                assert_eq!(
+                    committed.listxattr(&cx, 7).unwrap(),
+                    ["user.base", "user.keep"]
+                );
+                assert_eq!(
+                    committed.getxattr(&cx, 7, "user.base").unwrap(),
+                    Some(b"old".to_vec())
+                );
+                assert_eq!(committed.resolve(&cx, b"/file").unwrap(), 7);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_sa_xattrs_follow_object_lifetimes_and_skip_removed_out_of_order_owners() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let records = vec![
+            sa_xattr_record(1, 7, b"user.base", b"retired", order),
+            remove_record(5, 2, 2, b"file", order),
+            remove_record(5, 3, 2, b"alias", order),
+            sa_xattr_record(4, 7, b"user.retired", b"ignored", order),
+            sa_xattr_record(5, 31, b"user.absent", b"ignored", order),
+            create_record(1, 6, 2, 7, b"reborn", order),
+            link_record(7, 2, 7, b"reborn-alias", order),
+            sa_xattr_record(8, 7, b"user.fresh", b"new-generation", order),
+            create_record(1, 9, 2, 8, b"plain", order),
+        ];
+        let (mut objects, _, _) = recovery_graph_xattrs(order, 9, &records, true, None, &[], true);
+        let mut view = objects.zpl(&cx, &[]).unwrap();
+        let stats = view.replay_zil(&cx).unwrap();
+        assert_eq!(stats.records_replayed, 9);
+        for _ in 0..2 {
+            for path in [b"/reborn".as_slice(), b"/reborn-alias"] {
+                let owner = view.resolve(&cx, path).unwrap();
+                assert_eq!(owner, 7);
+                assert_eq!(view.stat(&cx, owner).unwrap().0.generation, 43);
+                assert_eq!(view.listxattr(&cx, owner).unwrap(), ["user.fresh"]);
+                assert_eq!(
+                    view.getxattr(&cx, owner, "user.fresh").unwrap(),
+                    Some(b"new-generation".to_vec())
+                );
+                for name in ["user.base", "user.keep", "user.retired"] {
+                    assert_eq!(view.getxattr(&cx, owner, name).unwrap(), None);
+                }
+            }
+            assert_eq!(view.listxattr(&cx, 8).unwrap(), Vec::<String>::new());
+            assert_eq!(view.getxattr(&cx, 8, "user.absent").unwrap(), None);
+            assert!(matches!(
+                view.listxattr(&cx, 31),
+                Err(FfsError::NotFound(_))
+            ));
+            assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+        }
+    }
+}
+
+#[test]
+fn native_sa_xattr_late_refusals_keep_the_previously_published_view() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let records = vec![
+            sa_xattr_record(1, 7, b"user.base", b"published", order),
+            sa_xattr_record(2, 7, b"user.binary", b"\0\xff", order),
+            sa_xattr_record(3, 7, b"user.keep", b"visible", order),
+            sa_xattr_record(4, 7, b"user.extra", b"overlay", order),
+        ];
+        let (mut objects, _, faults) =
+            recovery_graph_xattrs(order, 9, &records, true, None, &[], true);
+        let mut view = objects.zpl(&cx, &[]).unwrap();
+        let stats = view.replay_zil(&cx).unwrap();
+        let second = pointer(SECOND, 2, 9, 4096, order, order);
+        let tail = pointer(0x30000, 3, 9, 4096, order, order);
+        let mut cases = vec![
+            sa_xattr_record(4, 7, b"user.missing", b"", order),
+            sa_xattr_record(4, 2, b"user.legacy", b"value", order),
+            sa_xattr_record(4, 15, b"user.private", b"value", order),
+            sa_xattr_record(4, 7, b"security.capability", b"value", order),
+            sa_xattr_record(4, 7, b"user.user.hidden", b"value", order),
+            sa_xattr_record(4, 7, b"user.\xff", b"value", order),
+        ];
+        let mut malformed = sa_xattr_record(4, 7, b"user.late", b"value", order);
+        put(&mut malformed, 40, 32_769, order);
+        cases.push(malformed);
+        for bad in cases {
+            let replacement = block(
+                &second,
+                order,
+                &tail,
+                &[
+                    sa_xattr_record(3, 7, b"user.keep", b"unpublished", order),
+                    bad,
+                ],
+            );
+            faults
+                .lock()
+                .unwrap()
+                .insert(BASE + DATA_OFFSET + SECOND, Fault::Replacement(replacement));
+            assert!(view.replay_zil(&cx).is_err());
+            assert_eq!(view.zil_replay_stats(), Some(&stats));
+            assert_eq!(
+                view.getxattr(&cx, 7, "user.keep").unwrap(),
+                Some(b"visible".to_vec())
+            );
+            assert_eq!(
+                view.getxattr(&cx, 7, "user.base").unwrap(),
+                Some(b"published".to_vec())
+            );
+            assert_eq!(
+                view.getxattr(&cx, 7, "user.binary").unwrap(),
+                Some(vec![0, 255])
+            );
+            assert_eq!(
+                view.getxattr(&cx, 7, "user.extra").unwrap(),
+                Some(b"overlay".to_vec())
+            );
+        }
+        // Removal is an SA operation, not a deletion of the visible projected
+        // attribute. The second removal must not consume the directory fallback.
+        faults.lock().unwrap().insert(
+            BASE + DATA_OFFSET + SECOND,
+            Fault::Replacement(block(
+                &second,
+                order,
+                &tail,
+                &[
+                    sa_xattr_record(3, 7, b"user.base", b"", order),
+                    sa_xattr_record(4, 7, b"user.base", b"", order),
+                ],
+            )),
+        );
+        assert!(matches!(view.replay_zil(&cx), Err(FfsError::NotFound(_))));
+        assert_eq!(
+            view.getxattr(&cx, 7, "user.base").unwrap(),
+            Some(b"published".to_vec())
+        );
+        faults.lock().unwrap().clear();
+        assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+    }
 }
 
 fn seven_operation_records(order: Endian) -> Vec<Vec<u8>> {

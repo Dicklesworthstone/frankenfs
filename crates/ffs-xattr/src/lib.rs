@@ -61,6 +61,33 @@ fn parse_external_entries(block: &[u8], allow_zero_initialized: bool) -> Result<
     parse_xattr_block(block).map_err(|err| parse_to_ffs(&err))
 }
 
+fn mutation_entries(entries: Vec<(Ext4Xattr, u32)>) -> (Vec<Ext4Xattr>, bool) {
+    let has_ea_inode = entries.iter().any(|(_, value_inum)| *value_inum != 0);
+    (
+        entries.into_iter().map(|(entry, _)| entry).collect(),
+        has_ea_inode,
+    )
+}
+
+fn parse_external_mutation_entries(block: &[u8]) -> Result<(Vec<Ext4Xattr>, bool)> {
+    if block.len() >= EXTERNAL_HEADER_LEN && all_zero_bytes(block) {
+        return Ok((Vec::new(), false));
+    }
+    let entries =
+        ffs_ondisk::parse_xattr_block_with_inum(block).map_err(|err| parse_to_ffs(&err))?;
+    Ok(mutation_entries(entries))
+}
+
+fn ensure_storage_rewrite_supported(has_ea_inode: bool) -> Result<()> {
+    if has_ea_inode {
+        return Err(FfsError::UnsupportedFeature(
+            "rewriting xattr storage with EA-inode references requires EA-inode ownership support"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn entry_index(entries: &[Ext4Xattr], name_index: u8, name: &[u8]) -> Option<usize> {
     entries
         .iter()
@@ -407,6 +434,8 @@ pub fn parse_xattr_name(full_name: &str) -> Result<(u8, Vec<u8>)> {
 /// - Updates existing entries in-place in their current storage location.
 /// - For new entries, tries inline storage first, then external block.
 /// - If an inline update no longer fits, spills that entry to external storage.
+/// - Refuses to rebuild storage containing EA-inode references; an untouched
+///   external block containing such references does not prevent inline edits.
 pub fn set_xattr(
     inode: &mut Ext4Inode,
     mut external_block: Option<&mut [u8]>,
@@ -435,14 +464,21 @@ pub fn set_xattr(
         ));
     }
 
-    let mut inline_entries = parse_inline_entries(inode)?;
-    let mut external_entries = if let Some(block) = external_block.as_deref() {
-        parse_external_entries(block, true)?
-    } else {
-        Vec::new()
-    };
+    let (mut inline_entries, inline_has_ea_inode) = mutation_entries(
+        ffs_ondisk::parse_ibody_xattrs_with_inum(inode).map_err(|err| parse_to_ffs(&err))?,
+    );
+    let (mut external_entries, external_has_ea_inode) =
+        if let Some(block) = external_block.as_deref() {
+            parse_external_mutation_entries(block)?
+        } else {
+            (Vec::new(), false)
+        };
 
+    // Every set path rebuilds the ibody, even an external-only edit. The
+    // value-only builders cannot preserve e_value_inum or its ownership.
+    ensure_storage_rewrite_supported(inline_has_ea_inode)?;
     if let Some(pos) = entry_index(&external_entries, name_index, name) {
+        ensure_storage_rewrite_supported(external_has_ea_inode)?;
         external_entries[pos].value.clear();
         external_entries[pos].value.extend_from_slice(value);
         let Some(block) = external_block.as_mut() else {
@@ -465,6 +501,7 @@ pub fn set_xattr(
             return Ok(XattrStorage::Inline);
         }
 
+        ensure_storage_rewrite_supported(external_has_ea_inode)?;
         let mut inline_without_target = inline_entries;
         inline_without_target.remove(pos);
         let new_ibody = build_inline_ibody_for_inode_state(
@@ -505,6 +542,7 @@ pub fn set_xattr(
         .expect("inline candidate contains the appended xattr");
     let inline_entries = inline_candidate;
 
+    ensure_storage_rewrite_supported(external_has_ea_inode)?;
     let Some(block) = external_block.as_mut() else {
         return Err(FfsError::NoSpace);
     };
@@ -520,6 +558,8 @@ pub fn set_xattr(
 /// Remove one extended attribute by full name.
 ///
 /// Returns `true` when an entry was removed.
+/// Refuses to rebuild storage containing EA-inode references, including removal
+/// of the reference itself, because its inode ownership cannot be released here.
 pub fn remove_xattr(
     inode: &mut Ext4Inode,
     mut external_block: Option<&mut [u8]>,
@@ -529,8 +569,11 @@ pub fn remove_xattr(
     let (name_index, name) = parse_xattr_name_borrowed(full_name)?;
     check_write_permissions(name_index, access)?;
 
-    let mut inline_entries = parse_inline_entries(inode)?;
+    let (mut inline_entries, inline_has_ea_inode) = mutation_entries(
+        ffs_ondisk::parse_ibody_xattrs_with_inum(inode).map_err(|err| parse_to_ffs(&err))?,
+    );
     if let Some(pos) = entry_index(&inline_entries, name_index, name) {
+        ensure_storage_rewrite_supported(inline_has_ea_inode)?;
         inline_entries.remove(pos);
         inode.xattr_ibody = build_inline_ibody_for_inode_state(
             inode.xattr_ibody.len(),
@@ -550,10 +593,12 @@ pub fn remove_xattr(
     };
     let block = &mut **block;
 
-    let mut external_entries = parse_external_entries(block, true)?;
+    let (mut external_entries, external_has_ea_inode) = parse_external_mutation_entries(block)?;
     let Some(pos) = entry_index(&external_entries, name_index, name) else {
         return Ok(false);
     };
+    ensure_storage_rewrite_supported(inline_has_ea_inode)?;
+    ensure_storage_rewrite_supported(external_has_ea_inode)?;
     external_entries.remove(pos);
 
     // Capture emptiness before handing ownership of `external_entries` to the
@@ -860,6 +905,242 @@ mod tests {
             xattr_ibody: vec![0; ibody_len],
             number: 0,
         }
+    }
+
+    fn ea_inode_storage(header_len: usize, with_sibling: bool, value_size: u32) -> Vec<u8> {
+        assert!(matches!(
+            header_len,
+            INLINE_HEADER_LEN | EXTERNAL_HEADER_LEN
+        ));
+        let mut storage = vec![0_u8; 256];
+        storage[..4].copy_from_slice(&EXT4_XATTR_MAGIC.to_le_bytes());
+        if header_len == EXTERNAL_HEADER_LEN {
+            storage[4..8].copy_from_slice(&3_u32.to_le_bytes());
+            storage[8..12].copy_from_slice(&1_u32.to_le_bytes());
+            storage[16..20].copy_from_slice(&0xD00D_BEEF_u32.to_le_bytes());
+        }
+        // Native e_value_inum points at the value inode; e_value_offs is zero.
+        // The declared value may exceed this storage area and is not empty just
+        // because the value-only parser cannot read it from here.
+        let entry = header_len;
+        storage[entry] = 3;
+        storage[entry + 1] = EXT4_XATTR_INDEX_USER;
+        storage[entry + 4..entry + 8].copy_from_slice(&77_u32.to_le_bytes());
+        storage[entry + 8..entry + 12].copy_from_slice(&value_size.to_le_bytes());
+        storage[entry + 12..entry + 16].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        storage[entry + 16..entry + 19].copy_from_slice(b"big");
+        if with_sibling {
+            let sibling = entry + 20;
+            let value_offset = if header_len == INLINE_HEADER_LEN {
+                236_u16
+            } else {
+                240_u16
+            };
+            storage[sibling] = 5;
+            storage[sibling + 1] = EXT4_XATTR_INDEX_USER;
+            storage[sibling + 2..sibling + 4].copy_from_slice(&value_offset.to_le_bytes());
+            storage[sibling + 8..sibling + 12].copy_from_slice(&4_u32.to_le_bytes());
+            storage[sibling + 16..sibling + 21].copy_from_slice(b"small");
+            storage[240..244].copy_from_slice(b"old!");
+        }
+        storage
+    }
+
+    #[test]
+    fn inline_ea_inode_rewrites_refuse_without_changing_either_storage_area() {
+        let access = XattrWriteAccess {
+            is_owner: true,
+            ..Default::default()
+        };
+        let mut original_inode = make_inode(256);
+        original_inode.xattr_ibody = ea_inode_storage(INLINE_HEADER_LEN, true, 9000);
+        original_inode.file_acl = 123;
+        original_inode.blocks = 8;
+        let original_block = build_external_block(
+            1024,
+            &[Ext4Xattr {
+                name_index: EXT4_XATTR_INDEX_USER,
+                name: b"external".to_vec(),
+                value: b"outside".to_vec(),
+            }],
+        )
+        .unwrap();
+        let parsed = ffs_ondisk::parse_ibody_xattrs_with_inum(&original_inode).unwrap();
+        assert_eq!(parsed[0].1, 77);
+        assert_eq!(parsed[1].0.value, b"old!");
+        let large = vec![0xAB; 512];
+        for (name, value) in [
+            ("user.big", Some(b"replacement".as_slice())),
+            ("user.big", Some(b"".as_slice())),
+            ("user.small", Some(b"changed".as_slice())),
+            ("user.small", Some(large.as_slice())),
+            ("user.new", Some(b"new".as_slice())),
+            ("user.external", Some(b"changed".as_slice())),
+            ("user.big", None),
+            ("user.small", None),
+            ("user.external", None),
+        ] {
+            let mut inode = original_inode.clone();
+            let mut block = original_block.clone();
+            let result = if let Some(value) = value {
+                set_xattr(&mut inode, Some(&mut block), name, value, access).map(|_| ())
+            } else {
+                remove_xattr(&mut inode, Some(&mut block), name, access).map(|_| ())
+            };
+            assert!(
+                matches!(result, Err(FfsError::UnsupportedFeature(_))),
+                "{name}: {result:?}"
+            );
+            assert_eq!(
+                inode, original_inode,
+                "refusal must preserve the entire inode"
+            );
+            assert_eq!(
+                block, original_block,
+                "refusal must preserve external storage"
+            );
+        }
+        let mut missing_inode = original_inode.clone();
+        let mut missing_block = original_block.clone();
+        assert!(
+            !remove_xattr(
+                &mut missing_inode,
+                Some(&mut missing_block),
+                "user.missing",
+                access
+            )
+            .unwrap()
+        );
+        assert_eq!(missing_inode, original_inode);
+        assert_eq!(missing_block, original_block);
+        let mut inline_only = make_inode(256);
+        inline_only.xattr_ibody = ea_inode_storage(INLINE_HEADER_LEN, false, 0);
+        let before = inline_only.clone();
+        assert!(matches!(
+            remove_xattr(&mut inline_only, None, "user.big", access),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert_eq!(
+            inline_only, before,
+            "an empty referenced value still owns an EA inode"
+        );
+        assert!(!remove_xattr(&mut inline_only, None, "user.missing", access).unwrap());
+        assert_eq!(inline_only, before);
+    }
+
+    #[test]
+    fn external_ea_inode_rewrites_and_spills_refuse_without_losing_references() {
+        let access = XattrWriteAccess {
+            is_owner: true,
+            ..Default::default()
+        };
+        let mut original_inode = make_inode(128);
+        set_xattr(&mut original_inode, None, "user.local", b"local", access).unwrap();
+        original_inode.file_acl = 321;
+        original_inode.blocks = 8;
+        let large = vec![0xCD; 512];
+        for value_size in [0, 9000] {
+            let original_block = ea_inode_storage(EXTERNAL_HEADER_LEN, true, value_size);
+            let parsed = ffs_ondisk::parse_xattr_block_with_inum(&original_block).unwrap();
+            assert_eq!(parsed[0].1, 77);
+            assert_eq!(parsed[1].0.value, b"old!");
+            for (name, value) in [
+                ("user.big", Some(b"replacement".as_slice())),
+                ("user.big", Some(b"".as_slice())),
+                ("user.small", Some(b"changed".as_slice())),
+                ("user.local", Some(large.as_slice())),
+                ("user.new", Some(large.as_slice())),
+                ("user.big", None),
+                ("user.small", None),
+            ] {
+                let mut inode = original_inode.clone();
+                let mut block = original_block.clone();
+                let result = if let Some(value) = value {
+                    set_xattr(&mut inode, Some(&mut block), name, value, access).map(|_| ())
+                } else {
+                    remove_xattr(&mut inode, Some(&mut block), name, access).map(|_| ())
+                };
+                assert!(
+                    matches!(result, Err(FfsError::UnsupportedFeature(_))),
+                    "{name}: {result:?}"
+                );
+                assert_eq!(inode, original_inode);
+                assert_eq!(
+                    block, original_block,
+                    "including reference, size, hash and refcount"
+                );
+            }
+            let mut inode = original_inode.clone();
+            let mut last = ea_inode_storage(EXTERNAL_HEADER_LEN, false, value_size);
+            let before = last.clone();
+            assert!(matches!(
+                remove_xattr(&mut inode, Some(&mut last), "user.big", access),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+            assert_eq!(
+                inode, original_inode,
+                "cannot detach the last referenced value"
+            );
+            assert_eq!(last, before);
+        }
+    }
+
+    #[test]
+    fn inline_edits_preserve_untouched_external_ea_inode_bytes_and_read_behavior() {
+        let access = XattrWriteAccess {
+            is_owner: true,
+            ..Default::default()
+        };
+        let mut inode = make_inode(128);
+        set_xattr(&mut inode, None, "user.local", b"old", access).unwrap();
+        inode.file_acl = 321;
+        inode.blocks = 8;
+        let mut block = ea_inode_storage(EXTERNAL_HEADER_LEN, true, 9000);
+        let original = block.clone();
+        let reference_read = get_xattr(&inode, Some(&block), "user.big").unwrap();
+        for (name, value) in [
+            ("user.local", b"new".as_slice()),
+            ("user.empty", b"".as_slice()),
+            ("user.fresh", b"v".as_slice()),
+        ] {
+            assert_eq!(
+                set_xattr(&mut inode, Some(&mut block), name, value, access).unwrap(),
+                XattrStorage::Inline
+            );
+            assert_eq!(
+                get_xattr(&inode, Some(&block), name).unwrap(),
+                Some(value.to_vec())
+            );
+            assert_eq!(block, original);
+            assert_eq!(inode.file_acl, 321);
+            assert_eq!(inode.blocks, 8);
+        }
+        for name in ["user.local", "user.empty", "user.fresh"] {
+            assert!(remove_xattr(&mut inode, Some(&mut block), name, access).unwrap());
+            assert_eq!(block, original);
+            assert_eq!(inode.file_acl, 321);
+            assert_eq!(inode.blocks, 8);
+        }
+        let before = inode.clone();
+        assert!(!remove_xattr(&mut inode, Some(&mut block), "user.missing", access).unwrap());
+        assert_eq!(inode, before);
+        assert_eq!(block, original);
+        assert_eq!(
+            list_xattrs(&inode, Some(&block)).unwrap(),
+            vec!["user.big", "user.small"]
+        );
+        assert_eq!(
+            get_xattr(&inode, Some(&block), "user.small").unwrap(),
+            Some(b"old!".to_vec())
+        );
+        assert_eq!(
+            get_xattr(&inode, Some(&block), "user.big").unwrap(),
+            reference_read
+        );
+        assert_eq!(
+            ffs_ondisk::parse_xattr_block_with_inum(&block).unwrap()[0].1,
+            77
+        );
     }
 
     fn representative_external_block_entries() -> Vec<Ext4Xattr> {
