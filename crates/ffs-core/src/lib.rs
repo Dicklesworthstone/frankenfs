@@ -107609,7 +107609,9 @@ mod tests {
                     .unwrap()
                     .ino;
                 fs.write(&cx, src, 0, b"new").unwrap();
-                let original = vec![0x67; 3 * BS];
+                // A partial source-EOF clone may replace only destination EOF,
+                // otherwise public dispatch correctly refuses its padded tail.
+                let original = vec![0x67; if clone_inline { BS + 3 } else { 3 * BS }];
                 fs.write(&cx, dst, 0, &original).unwrap();
                 let ops: &dyn FsOps = &fs;
                 ops.clone_file_range(&cx, &mut RequestScope::empty(), peer, dst, 0, 0, 0)
@@ -107630,17 +107632,16 @@ mod tests {
                     fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = u16::MAX;
                 }
                 let sequence = fs.mvcc_store.current_snapshot().high.0;
-                // Model cancellation after request admission, at the data-write
-                // checkpoint inside the real mutation helper. The outer public
-                // request's initial checkpoint has already passed at this point.
+                // The write helper models cancellation after outer admission.
+                // Clone exercises the public dispatch with an admitted EOF
+                // range. Both observe cancellation at the MVCC write checkpoint.
                 cx.set_cancel_requested(failure == "cancel");
                 let result = if clone_inline {
-                    let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
-                    fs.btrfs_clone_file_range_data(
+                    ops.clone_file_range(
                         &cx,
-                        &mut alloc,
-                        fs.btrfs_canonical_inode(src).unwrap(),
-                        canonical,
+                        &mut RequestScope::empty(),
+                        dst,
+                        src,
                         0,
                         3,
                         BS as u64,
@@ -107685,7 +107686,6 @@ mod tests {
                 let mut expected = original.clone();
                 if failure == "none" {
                     if clone_inline {
-                        expected[BS..2 * BS].fill(0);
                         expected[BS..BS + 3].copy_from_slice(b"new");
                     } else {
                         expected[BS..2 * BS].fill(0x5A);
