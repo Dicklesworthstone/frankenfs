@@ -338,6 +338,78 @@ fn external_journal_uses_bounded_locked_descriptor_for_overlay_replay() {
 }
 
 #[test]
+fn native_external_journal_device_replays_inode_through_bounded_facade() {
+    let cx = Cx::for_testing();
+    let directory = tempfile::tempdir().unwrap().keep();
+    let uuid = *b"facade-journal-1";
+    let mut image = ext4_image();
+    image[1024 + 0x5C..1024 + 0x60].copy_from_slice(&4_u32.to_le_bytes());
+    image[1024 + 0xE4..1024 + 0xE8].copy_from_slice(&1_u32.to_le_bytes());
+    image[1024 + 0xD0..1024 + 0xE0].copy_from_slice(&uuid);
+    let primary = directory.join("data.img");
+    fs::write(&primary, &image).unwrap();
+    let mut journal = vec![0_u8; 8 * 4096];
+    for (offset, value) in [(4, 8_u32), (24, 2), (0x60, 8), (0x64, 0x400)] {
+        journal[1024 + offset..1024 + offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    journal[1024 + 56..1024 + 58].copy_from_slice(&0xEF53_u16.to_le_bytes());
+    journal[1024 + 0x68..1024 + 0x78].copy_from_slice(&uuid);
+    journal[1024 + 0x175] = 1;
+    let checksum = ffs_ondisk::ext4_chksum(!0, &journal[1024..2044]);
+    journal[2044..2048].copy_from_slice(&checksum.to_le_bytes());
+    for (offset, value) in [
+        (4096, 0xC03B_3998_u32),
+        (4100, 4),
+        (4104, 0),
+        (4108, 4096),
+        (4112, 8),
+        (4116, 2),
+        (4120, 1),
+        (4124, 2),
+        (4160, 1),
+        (8192, 0xC03B_3998),
+        (8196, 1),
+        (8200, 1),
+        (8204, 4),
+        (8208, 8),
+        (16384, 0xC03B_3998),
+        (16388, 2),
+        (16392, 1),
+    ] {
+        journal[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    journal[4096 + 48..4096 + 64].copy_from_slice(&uuid);
+    journal[12288..16384].copy_from_slice(&image[16384..20480]);
+    journal[12288 + 256 + 4..12288 + 256 + 8].copy_from_slice(&8192_u32.to_le_bytes());
+    let mut container = vec![0xA7; 8192];
+    container.extend_from_slice(&journal);
+    container.extend_from_slice(&[0xD3; 4096]);
+    let member = directory.join("journal-container.img");
+    fs::write(&member, &container).unwrap();
+    let options = ReadOnlyOpenOptions {
+        backend: ReadOnlyBackend::Ext4 {
+            external_journal: Some(ImageSource {
+                path: member.clone(),
+                offset: 8192,
+                length: Some(journal.len() as u64),
+            }),
+        },
+        ..ReadOnlyOpenOptions::default()
+    };
+    let opened = open_read_only(&cx, &primary, &options).unwrap();
+    let root = opened
+        .filesystem
+        .getattr(&cx, &mut RequestScope::empty(), InodeNumber(1))
+        .unwrap();
+    assert_eq!(
+        root.size, 8192,
+        "getattr must see replay at device block3, not shifted block4"
+    );
+    assert_eq!(fs::read(primary).unwrap(), image);
+    assert_eq!(fs::read(member).unwrap(), container);
+}
+
+#[test]
 fn invalid_missing_member_requests_and_cancellation_fail_before_path_open() {
     let cx = Cx::for_testing();
     let directory = tempfile::tempdir().unwrap();

@@ -333,6 +333,28 @@
 > auxiliary-image qualification stay open. This does not
 > establish native auxiliary-device, crash, performance or field qualification.
 
+> **External-journal device layout, bounded verification, 2026-10-23:** native
+> `JOURNAL_DEV` header discovery now validates type, block size, UUID, advertised
+> metadata checksum, single-user JBD2 admission and declared bounds. Only the
+> bootstrap superblock read is mapped to block 1/2; ring addresses remain relative
+> to the whole device. New constructed regressions cover 1/2/4 KiB wrapped replay,
+> 36 malformed header/geometry cases and bounded facade inode replay. The final
+> base `0b3fa02a0` plus overlay `3f1e95127c63` passed workspace/all-target check,
+> strict Clippy, format and 52 facade/example tests (one existing native-producer
+> ignore). The earlier `80ba5c98` cut passed 7 core journal tests, including wrapped
+> replay at all three block sizes; its final-cut repeat is pending. The exact
+> Linux ELF `9e39c59dddd2db65cd5c87b71306d09b880110855641846355c93317f68ccf72`
+> passed 73 retained-native/bare-journal commands and 16 constructed-device-layout
+> commands, plus an actual read-only FUSE mount: replayed root size 8192, EROFS,
+> retained auxiliary lock, clean unmount/daemon exit 0. Both runs preserved 17 monitored
+> input/tool hashes. Results: CSD `/tmp/auxiliary-consumer-rmcyx83m/result.json`
+> and `/tmp/native-journal-layout-u2avfnvy/result.json`. RCH compilation succeeded;
+> its macOS-target artifact delivery refused 102, recovered terminal ACK/source
+> release, and the ELF was transferred separately with SHA verification. Bare
+> JBD2 regions retain their bootstrap form. Constructed journal/FUSE evidence
+> does not establish native-produced journal crash recovery, performance or
+> field qualification; original scanner and canonical tracker gates stay open.
+
 > **Public read-only facade mounts, 2026-10-22:** the existing `native_reader`
 > consumer now mounts its already-admitted `Box<dyn FsOps>` through the shared
 > FUSE transport. Foreground mounts retain bounds and explicit NTFS/ZFS views,

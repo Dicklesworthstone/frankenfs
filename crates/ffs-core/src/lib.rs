@@ -5133,6 +5133,80 @@ struct ExternalJournalReplayAdapter<'a> {
     journal_dev: &'a dyn ByteDevice,
     block_size: u32,
     journal_blocks: u64,
+    journal_superblock: BlockNumber,
+}
+
+/// Locate a bare JBD2 region or an ext-family external journal device. Only
+/// the bootstrap superblock read moves; native log indices remain device-relative.
+fn read_external_journal_superblock(
+    cx: &Cx,
+    device: &dyn ByteDevice,
+    data: &Ext4Superblock,
+) -> Result<(Jbd2Superblock, BlockNumber), FfsError> {
+    let block_size = usize::try_from(data.block_size)
+        .map_err(|_| FfsError::Format("journal block size does not fit usize".into()))?;
+    let mut bytes = vec![0_u8; block_size];
+    device.read_exact_at(cx, ByteOffset(0), &mut bytes)?;
+    let (journal, location, native_blocks) = if let Some(journal) = Jbd2Superblock::parse(&bytes) {
+        (journal, BlockNumber(0), None)
+    } else {
+        let mut region = [0_u8; 1024];
+        device.read_exact_at(cx, ByteOffset(1024), &mut region)?;
+        let header = Ext4Superblock::parse_superblock_region(&region)
+            .map_err(|error| parse_to_ffs_error(&error))?;
+        header
+            .validate_checksum(&region)
+            .map_err(|error| parse_to_ffs_error(&error))?;
+        if !header.has_incompat(ffs_ondisk::Ext4IncompatFeatures::JOURNAL_DEV)
+            || header.block_size != data.block_size
+            || header.uuid != data.journal_uuid
+        {
+            return Err(FfsError::Format(
+                "external journal device header has incompatible type, block size or UUID".into(),
+            ));
+        }
+        let location = BlockNumber(1024 / u64::from(data.block_size) + 1);
+        device.read_exact_at(
+            cx,
+            ByteOffset(location.0 * u64::from(data.block_size)),
+            &mut bytes,
+        )?;
+        let journal = Jbd2Superblock::parse(&bytes).ok_or_else(|| {
+            FfsError::Format("external journal device has no valid JBD2 superblock".into())
+        })?;
+        let users = u32::from_be_bytes([bytes[64], bytes[65], bytes[66], bytes[67]]);
+        if users != 1 || u64::from(journal.first_log_block) <= location.0 {
+            return Err(FfsError::Format(
+                "external journal requires one user and a log after its device headers".into(),
+            ));
+        }
+        (journal, location, Some(header.blocks_count))
+    };
+    if journal.block_size != data.block_size {
+        return Err(FfsError::Format(format!(
+            "external journal block size {} does not match data filesystem block size {}",
+            journal.block_size, data.block_size
+        )));
+    }
+    if journal.uuid != data.journal_uuid {
+        return Err(FfsError::Format(
+            "external journal UUID does not match data filesystem journal_uuid".into(),
+        ));
+    }
+    let blocks = native_blocks.unwrap_or_else(|| u64::from(journal.max_len));
+    if u64::from(journal.max_len) > blocks
+        || journal.first_log_block >= journal.max_len
+        || (journal.start_block != 0
+            && !(journal.first_log_block..journal.max_len).contains(&journal.start_block))
+        || blocks
+            .checked_mul(u64::from(data.block_size))
+            .is_none_or(|length| length > device.len_bytes())
+    {
+        return Err(FfsError::Format(
+            "external journal geometry exceeds its admitted volume".into(),
+        ));
+    }
+    Ok((journal, location))
 }
 
 impl ExternalJournalReplayAdapter<'_> {
@@ -5816,7 +5890,12 @@ impl BlockDevice for ExternalJournalReplayAdapter<'_> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
         let expected = usize::try_from(self.block_size)
             .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
-        let offset = self.block_offset(block)?;
+        let read_block = if block.0 == 0 {
+            self.journal_superblock
+        } else {
+            block
+        };
+        let offset = self.block_offset(read_block)?;
         let end = offset
             .checked_add(u64::from(self.block_size))
             .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
@@ -9315,34 +9394,8 @@ impl OpenFs {
             return Ok(None);
         };
 
-        // Read the admitted journal device's first block to parse
-        // the JBD2 superblock. We use the data FS block size as the read size;
-        // the actual journal block size is only known after parsing.
-        let read_size = sb.block_size;
-
-        // Read the first block — JBD2 superblock is at the start of the journal.
-        let mut jbd2_buf = vec![0u8; read_size as usize];
-        journal_dev.read_exact_at(cx, ByteOffset(0), &mut jbd2_buf)?;
-
-        let journal_sb = Jbd2Superblock::parse(&jbd2_buf).ok_or_else(|| {
-            FfsError::Format(
-                "external journal device does not contain a valid JBD2 superblock".to_owned(),
-            )
-        })?;
-
-        if journal_sb.block_size != sb.block_size {
-            return Err(FfsError::Format(format!(
-                "external journal block size {} does not match data filesystem block size {}",
-                journal_sb.block_size, sb.block_size
-            )));
-        }
-
+        let (journal_sb, _) = read_external_journal_superblock(cx, journal_dev, sb)?;
         let uuid_match = sb.journal_uuid == journal_sb.uuid;
-        if !uuid_match {
-            return Err(FfsError::Format(
-                "external journal UUID does not match data filesystem journal_uuid".to_owned(),
-            ));
-        }
 
         info!(
             uuid = ?journal_sb.uuid,
@@ -9526,28 +9579,8 @@ impl OpenFs {
             return Ok(Some(ReplayOutcome::default()));
         }
 
-        let block_len = usize::try_from(block_size)
-            .map_err(|_| FfsError::Format("block size does not fit usize".to_owned()))?;
-        let mut journal_sb_block = vec![0u8; block_len];
-        journal_file.read_exact_at(cx, ByteOffset(0), &mut journal_sb_block)?;
-        let journal_sb = Jbd2Superblock::parse(&journal_sb_block).ok_or_else(|| {
-            FfsError::Format(
-                "external journal device does not contain a valid JBD2 superblock".to_owned(),
-            )
-        })?;
-
-        if journal_sb.block_size != block_size {
-            return Err(FfsError::Format(format!(
-                "external journal block size {} does not match data filesystem block size {}",
-                journal_sb.block_size, block_size
-            )));
-        }
-        if journal_sb.uuid != sb.journal_uuid {
-            return Err(FfsError::Format(
-                "external journal UUID does not match data filesystem journal_uuid".to_owned(),
-            ));
-        }
-
+        let (journal_sb, journal_superblock) =
+            read_external_journal_superblock(cx, journal_file, sb)?;
         let journal_region = ffs_journal::JournalRegion {
             start: BlockNumber(0),
             blocks: u64::from(journal_sb.max_len),
@@ -9557,6 +9590,7 @@ impl OpenFs {
             journal_dev: journal_file,
             block_size,
             journal_blocks: journal_region.blocks,
+            journal_superblock,
         };
         info!(
             journal_dev,
@@ -56900,6 +56934,133 @@ mod tests {
     }
 
     #[test]
+    fn external_journal_native_layout_replays_wrapped_device_relative_blocks() {
+        use ffs_block::io_engine::{VolumeAccess, VolumeDevice};
+
+        let cx = Cx::for_testing();
+        let uuid = *b"journal-uuid-000";
+        for block_size in [1024_usize, 2048, 4096] {
+            let image = build_native_external_journal_image(block_size, uuid);
+            let mut bytes = vec![0xA7; 8192];
+            bytes.extend_from_slice(&image);
+            bytes.extend_from_slice(&[0xD3; 4096]);
+            let backing = TestDevice::from_vec(bytes.clone());
+            let device = VolumeDevice::new(
+                Arc::new(backing.clone()),
+                ByteOffset(8192),
+                image.len() as u64,
+                VolumeAccess::ReadOnly,
+            )
+            .unwrap();
+            let mut data_sb =
+                Ext4Superblock::parse_from_image(&build_ext4_image_with_inode()).unwrap();
+            data_sb.block_size = u32::try_from(block_size).unwrap();
+            data_sb.journal_uuid = uuid;
+            let (journal, location) =
+                read_external_journal_superblock(&cx, &device, &data_sb).unwrap();
+            assert_eq!(location.0, 1024 / block_size as u64 + 1);
+            let data = TestDevice::from_vec(vec![0x5A; 32 * block_size]);
+            let overlay = OverlayByteDevice::new(Box::new(data.clone()));
+            let adapter = ExternalJournalReplayAdapter {
+                data_dev: &overlay,
+                journal_dev: &device,
+                block_size: data_sb.block_size,
+                journal_blocks: u64::from(journal.max_len),
+                journal_superblock: location,
+            };
+            let replay = replay_jbd2_with_options(
+                &cx,
+                &adapter,
+                ffs_journal::JournalRegion {
+                    start: BlockNumber(0),
+                    blocks: 8,
+                },
+                ffs_journal::ReplayOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(replay.committed_sequences, [1]);
+            assert_eq!(replay.stats.replayed_blocks, 1);
+            let mut marker = [0_u8; 16];
+            overlay
+                .read_exact_at(&cx, ByteOffset(15 * block_size as u64), &mut marker)
+                .unwrap();
+            assert_eq!(&marker, b"EXT-JBD2-REPLAY!");
+            assert_eq!(data.snapshot_bytes(), vec![0x5A; 32 * block_size]);
+            assert_eq!(backing.snapshot_bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn external_journal_native_layout_rejects_invalid_headers_and_geometry() {
+        use ffs_block::io_engine::{VolumeAccess, VolumeDevice};
+
+        let cx = Cx::for_testing();
+        let uuid = *b"journal-uuid-000";
+        let mut data_sb = Ext4Superblock::parse_from_image(&build_ext4_image_with_inode()).unwrap();
+        data_sb.journal_uuid = uuid;
+        for block_size in [1024_usize, 2048, 4096] {
+            data_sb.block_size = u32::try_from(block_size).unwrap();
+            let jbd = (1024 / block_size + 1) * block_size;
+            for defect in [
+                "type",
+                "header_uuid",
+                "block_size",
+                "checksum",
+                "capacity",
+                "no_users",
+                "two_users",
+                "header_ring",
+                "jbd_uuid",
+                "short",
+                "max_len",
+                "start",
+            ] {
+                let mut bytes = build_native_external_journal_image(block_size, uuid);
+                match defect {
+                    "type" => bytes[1024 + 0x60..1024 + 0x64].fill(0),
+                    "header_uuid" => bytes[1024 + 0x68] ^= 1,
+                    "block_size" => bytes[1024 + 0x18..1024 + 0x1C].copy_from_slice(
+                        &((u32::try_from(block_size).unwrap().trailing_zeros() - 10 + 1) % 3)
+                            .to_le_bytes(),
+                    ),
+                    "capacity" => bytes[1024 + 4..1024 + 8].copy_from_slice(&9_u32.to_le_bytes()),
+                    "no_users" => bytes[jbd + 64..jbd + 68].fill(0),
+                    "two_users" => bytes[jbd + 64..jbd + 68].copy_from_slice(&2_u32.to_be_bytes()),
+                    "header_ring" => {
+                        bytes[jbd + 20..jbd + 24].copy_from_slice(&1_u32.to_be_bytes())
+                    }
+                    "jbd_uuid" => bytes[jbd + 48] ^= 1,
+                    "max_len" => bytes[jbd + 16..jbd + 20].copy_from_slice(&9_u32.to_be_bytes()),
+                    "start" => bytes[jbd + 28..jbd + 32].copy_from_slice(&8_u32.to_be_bytes()),
+                    _ => {}
+                }
+                let checksum = ffs_ondisk::ext4_chksum(!0, &bytes[1024..2044]);
+                bytes[2044..2048].copy_from_slice(&checksum.to_le_bytes());
+                if defect == "checksum" {
+                    bytes[1024 + 0x78] ^= 1;
+                }
+                let backing = TestDevice::from_vec(bytes.clone());
+                let device = VolumeDevice::new(
+                    Arc::new(backing.clone()),
+                    ByteOffset(0),
+                    if defect == "short" {
+                        (4 * block_size) as u64
+                    } else {
+                        bytes.len() as u64
+                    },
+                    VolumeAccess::ReadOnly,
+                )
+                .unwrap();
+                assert!(
+                    read_external_journal_superblock(&cx, &device, &data_sb).is_err(),
+                    "{block_size}/{defect}"
+                );
+                assert_eq!(backing.snapshot_bytes(), bytes);
+            }
+        }
+    }
+
+    #[test]
     fn open_fs_rejects_external_journal_uuid_mismatch() {
         let data_uuid = *b"journal-uuid-000";
         let other_uuid = *b"journal-uuid-999";
@@ -58123,6 +58284,35 @@ mod tests {
         let commit = 3 * block_size;
         write_jbd2_header(&mut image[commit..commit + block_size], 2, 1);
 
+        image
+    }
+
+    fn build_native_external_journal_image(block_size: usize, uuid: [u8; 16]) -> Vec<u8> {
+        let raw = build_external_journal_image(block_size, uuid, 15, b"EXT-JBD2-REPLAY!");
+        let mut image = vec![0_u8; raw.len()];
+        let superblock = 1024 / block_size + 1;
+        let first = superblock + 1;
+        image[superblock * block_size..(superblock + 1) * block_size]
+            .copy_from_slice(&raw[..block_size]);
+        let jbd = superblock * block_size;
+        image[jbd + 20..jbd + 24].copy_from_slice(&u32::try_from(first).unwrap().to_be_bytes());
+        image[jbd + 28..jbd + 32].copy_from_slice(&7_u32.to_be_bytes());
+        image[jbd + 64..jbd + 68].copy_from_slice(&1_u32.to_be_bytes());
+        for (source, target) in [(1, 7), (2, first), (3, first + 1)] {
+            image[target * block_size..(target + 1) * block_size]
+                .copy_from_slice(&raw[source * block_size..(source + 1) * block_size]);
+        }
+        image[1024 + 4..1024 + 8].copy_from_slice(&8_u32.to_le_bytes());
+        image[1024 + 24..1024 + 28].copy_from_slice(
+            &(u32::try_from(block_size).unwrap().trailing_zeros() - 10).to_le_bytes(),
+        );
+        image[1024 + 56..1024 + 58].copy_from_slice(&0xEF53_u16.to_le_bytes());
+        image[1024 + 0x60..1024 + 0x64].copy_from_slice(&8_u32.to_le_bytes());
+        image[1024 + 0x64..1024 + 0x68].copy_from_slice(&0x400_u32.to_le_bytes());
+        image[1024 + 0x68..1024 + 0x78].copy_from_slice(&uuid);
+        image[1024 + 0x175] = 1;
+        let checksum = ffs_ondisk::ext4_chksum(!0, &image[1024..2044]);
+        image[2044..2048].copy_from_slice(&checksum.to_le_bytes());
         image
     }
 

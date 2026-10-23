@@ -97,6 +97,9 @@ and length is in bytes; a positive length bounds that member, while `rest`
 selects the remainder of its file. These format selections conflict with each
 other and with NTFS/ZFS selectors. They use the same admitted read-only handles
 as the library API, including independent regular-file, lock and bounds checks.
+An external journal can be a bare JBD2 region or a native `JOURNAL_DEV` image.
+For a native image, the selected bounds include its device header: keep the
+original device-relative ring addresses instead of slicing past that header.
 
 Mounting requires working FUSE support and an existing empty directory which
 does not hide any primary or auxiliary backing image. Keep all backing files offline and unchanged

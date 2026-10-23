@@ -1344,8 +1344,24 @@ extents. Replay semantics are defined by journal logical block order, not by
 physical contiguity, so recovery must iterate across extent boundaries in
 logical sequence. The journal contains:
 
+An external journal device has a different bootstrap layout: its ext-family
+superblock is at byte 1024 and must identify `JOURNAL_DEV`, match the data
+filesystem's journal UUID, and pass its advertised metadata checksum. Its JBD2
+superblock is at device block `1024 / block_size + 1` (block 2 for 1 KiB,
+block 1 for 2/4 KiB). Ring addresses (`s_first`, `s_start`, `s_maxlen`) remain
+relative to the whole journal device; slicing away the header shifts recovery
+to the wrong blocks. The JBD2 superblock must match block size/UUID and name
+exactly one user, and all declared journal bytes must fit the admitted volume.
+Bare JBD2 journal regions start at block zero. Both forms retain the same
+admitted descriptor and volume bounds throughout pairing and replay.
+Sources: Linux v6.19 `fs/ext4/super.c` (`ext4_get_journal_blkdev`,
+`ext4_open_dev_journal`), `fs/jbd2/journal.c` (`journal_load_superblock`,
+`jbd2_journal_bmap`), and
+e2fsprogs `lib/ext2fs/mkjournal.c` (`ext2fs_create_journal_superblock2`).
+
 1. **Journal superblock**: Describes journal size, block size, sequence
-   numbers, and feature flags. Located at the first block of the journal.
+   numbers, and feature flags. Located at logical block zero for an inode/bare
+   region, or after the native external-device header as described above.
 
 2. **Descriptor blocks**: List the filesystem blocks that are included in
    the following data blocks. Each descriptor block has a header with magic
