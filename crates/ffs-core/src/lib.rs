@@ -2210,6 +2210,14 @@ impl BtrfsPressureRetry {
     }
 }
 
+/// Replacement data already written to fresh MVCC blocks, with checksum values
+/// built but no file mapping, back-reference or checksum item published yet.
+struct BtrfsPreparedDataExtent {
+    bytenr: u64,
+    num_bytes: u64,
+    checksum_items: Vec<(BtrfsKey, Vec<u8>)>,
+}
+
 /// Everything a btrfs commit changes in memory before its superblock write,
 /// restored if it fails there (bd-x4h1q). Trees are COW checkpoints (no
 /// copy); the rest is small and cloned. The FS tree is only read by a commit.
@@ -37465,16 +37473,55 @@ impl OpenFs {
         is_datasum: bool,
         disk_bytenr: u64,
     ) -> ffs_error::Result<u64> {
+        let prepared =
+            self.btrfs_prepare_aligned_extent_at(cx, alloc, data, is_datasum, disk_bytenr)?;
+        Self::btrfs_publish_aligned_extent(alloc, canonical, aligned_offset, prepared)
+    }
+
+    /// Finish fallible data I/O and checksum construction while the old file
+    /// mappings are intact. On failure only the unpublished reservation is freed.
+    fn btrfs_prepare_aligned_extent_at(
+        &self,
+        cx: &Cx,
+        alloc: &mut BtrfsAllocState,
+        data: &[u8],
+        is_datasum: bool,
+        disk_bytenr: u64,
+    ) -> ffs_error::Result<BtrfsPreparedDataExtent> {
         let alloc_size = u64::try_from(data.len())
             .map_err(|_| FfsError::InvalidGeometry("aligned extent length overflow".into()))?;
-
-        if let Err(e) = self.btrfs_write_logical(cx, disk_bytenr, data) {
+        let result = (|| {
+            self.btrfs_write_logical(cx, disk_bytenr, data)?;
+            let checksum_items = if is_datasum {
+                Self::btrfs_build_data_extent_csums(alloc, disk_bytenr, data)?
+            } else {
+                Vec::new()
+            };
+            Ok(BtrfsPreparedDataExtent {
+                bytenr: disk_bytenr,
+                num_bytes: alloc_size,
+                checksum_items,
+            })
+        })();
+        if result.is_err() {
             let _ = alloc
                 .extent_alloc
                 .free_extent(disk_bytenr, alloc_size, false);
-            return Err(e);
         }
+        result
+    }
 
+    /// Publish a prepared extent without repeating its data write. Metadata
+    /// failures release this extent; callers still own their operation's other
+    /// mappings and reservations.
+    fn btrfs_publish_aligned_extent(
+        alloc: &mut BtrfsAllocState,
+        canonical: u64,
+        aligned_offset: u64,
+        prepared: BtrfsPreparedDataExtent,
+    ) -> ffs_error::Result<u64> {
+        let disk_bytenr = prepared.bytenr;
+        let alloc_size = prepared.num_bytes;
         let extent = BtrfsExtentData::Regular {
             generation: alloc.generation,
             ram_bytes: alloc_size,
@@ -37511,17 +37558,14 @@ impl OpenFs {
             return Err(e);
         }
 
-        if is_datasum {
-            // `data` is the exact sector-aligned content just written to
-            // `disk_bytenr`, so csum it directly — no device read-back.
-            if let Err(error) =
-                self.btrfs_capture_data_extent_csums(cx, alloc, disk_bytenr, alloc_size, Some(data))
-            {
+        for (key, value) in prepared.checksum_items {
+            if let Err(error) = alloc.csum_tree.upsert(key, &value) {
                 let _ = alloc.fs_tree.delete(&extent_key);
+                let _ = Self::btrfs_remove_extent_csums(alloc, disk_bytenr, alloc_size);
                 let _ = alloc
                     .extent_alloc
                     .free_extent(disk_bytenr, alloc_size, false);
-                return Err(error);
+                return Err(btrfs_mutation_to_ffs(&error));
             }
         }
         Ok(alloc_size)
@@ -37547,8 +37591,6 @@ impl OpenFs {
     ) -> ffs_error::Result<()> {
         let alloc_size_usize = usize::try_from(alloc_size)
             .map_err(|_| FfsError::Format("btrfs alloc size overflow".into()))?;
-        let sectorsize_usize = usize::try_from(u64::from(alloc.sectorsize))
-            .map_err(|_| FfsError::Format("btrfs sectorsize overflow".into()))?;
         // When the caller already holds the exact sector-aligned bytes it just
         // wrote (the emit-aligned path), csum them in place instead of reading
         // the extent back from the device (bd-6dm4o): regular data round-trips,
@@ -37566,15 +37608,7 @@ impl OpenFs {
                 &read_buf
             }
         };
-        let max_per_item = ffs_btrfs::max_data_csums_per_item(alloc.nodesize, alloc.csum_type);
-        let csum_items = ffs_btrfs::build_extent_csum_items(
-            disk_bytenr,
-            on_disk,
-            sectorsize_usize,
-            max_per_item,
-            alloc.csum_type,
-        )
-        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let csum_items = Self::btrfs_build_data_extent_csums(alloc, disk_bytenr, on_disk)?;
         for (key, value) in csum_items {
             alloc
                 .csum_tree
@@ -37582,6 +37616,24 @@ impl OpenFs {
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         }
         Ok(())
+    }
+
+    fn btrfs_build_data_extent_csums(
+        alloc: &BtrfsAllocState,
+        disk_bytenr: u64,
+        data: &[u8],
+    ) -> ffs_error::Result<Vec<(BtrfsKey, Vec<u8>)>> {
+        let sectorsize = usize::try_from(u64::from(alloc.sectorsize))
+            .map_err(|_| FfsError::Format("btrfs sectorsize overflow".into()))?;
+        let max_per_item = ffs_btrfs::max_data_csums_per_item(alloc.nodesize, alloc.csum_type);
+        ffs_btrfs::build_extent_csum_items(
+            disk_bytenr,
+            data,
+            sectorsize,
+            max_per_item,
+            alloc.csum_type,
+        )
+        .map_err(|e| btrfs_mutation_to_ffs(&e))
     }
 
     fn btrfs_insert_regular_extent_segment(
@@ -37990,6 +38042,9 @@ impl OpenFs {
                 .map_err(|_| FfsError::InvalidGeometry("inline copy size overflow".into()))?;
             inline_segments.push((file_offset, chunk, size));
         }
+        let is_datasum = !inline_segments.is_empty()
+            && self.btrfs_read_inode_from_tree(alloc, dst_canonical)?.flags & BTRFS_INODE_NODATASUM
+                == 0;
         let release = |alloc: &mut BtrfsAllocState,
                        reservations: &[ffs_btrfs::ExtentAllocation]| {
             for reservation in reservations {
@@ -38006,6 +38061,32 @@ impl OpenFs {
                 Ok(allocation) => reservations.push(allocation),
                 Err(error) => {
                     release(alloc, &reservations);
+                    return Err(error);
+                }
+            }
+        }
+
+        // Complete every copy's data write and checksum construction before
+        // removing any destination mapping. A cancelled write must not turn
+        // the old destination range into a hole.
+        let mut prepared = Vec::with_capacity(inline_segments.len());
+        for ((file_offset, chunk, _), allocation) in inline_segments.into_iter().zip(&reservations)
+        {
+            match self.btrfs_prepare_aligned_extent_at(
+                cx,
+                alloc,
+                &chunk,
+                is_datasum,
+                allocation.bytenr,
+            ) {
+                Ok(extent) => prepared.push((file_offset, extent)),
+                Err(error) => {
+                    // The failing preparation freed its own reservation.
+                    for other in &reservations {
+                        if other.bytenr != allocation.bytenr {
+                            release(alloc, std::slice::from_ref(other));
+                        }
+                    }
                     return Err(error);
                 }
             }
@@ -38045,23 +38126,13 @@ impl OpenFs {
                 return Err(btrfs_mutation_to_ffs(&error));
             }
         }
-        // Copy through the already reserved extents. Padding beyond i_size is
-        // allocation slack; all-zero chunks remain sparse as before.
-        let is_datasum = !inline_segments.is_empty()
-            && self
-                .btrfs_read_inode_from_tree(alloc, dst_canonical)
-                .is_ok_and(|inode| inode.flags & BTRFS_INODE_NODATASUM == 0);
-        let mut prepared = inline_segments.into_iter().zip(reservations);
-        while let Some(((file_offset, chunk, _), allocation)) = prepared.next() {
-            if let Err(error) = self.btrfs_emit_aligned_extent_at(
-                cx,
-                alloc,
-                dst_canonical,
-                file_offset,
-                &chunk,
-                is_datasum,
-                allocation.bytenr,
-            ) {
+        // Publish prepared extents without another fallible data write.
+        // Padding beyond i_size is allocation slack; zero chunks stay sparse.
+        let mut prepared = prepared.into_iter().zip(reservations);
+        while let Some(((file_offset, extent), _)) = prepared.next() {
+            if let Err(error) =
+                Self::btrfs_publish_aligned_extent(alloc, dst_canonical, file_offset, extent)
+            {
                 for (_, unused) in prepared {
                     release(alloc, std::slice::from_ref(&unused));
                 }
@@ -42900,12 +42971,19 @@ impl OpenFs {
                 let merged_len = u64::try_from(merged.len()).map_err(|_| {
                     FfsError::InvalidGeometry("merged write length overflow".into())
                 })?;
+                let pure_append = aligned_start >= inode.size
+                    && Self::btrfs_last_extent_end(&alloc, canonical)? <= aligned_start;
                 let reserved_bytenr = self
                     .btrfs_alloc_data_with_growth(&mut alloc, merged_len)?
                     .bytenr;
-                let removed_nbytes_delta = if aligned_start >= inode.size
-                    && Self::btrfs_last_extent_end(&alloc, canonical)? <= aligned_start
-                {
+                let prepared = self.btrfs_prepare_aligned_extent_at(
+                    cx,
+                    &mut alloc,
+                    &merged,
+                    is_datasum,
+                    reserved_bytenr,
+                )?;
+                let removed_nbytes_delta = if pure_append {
                     // Pure append: no EXTENT_DATA item reaches the aligned write
                     // range, so the removal query would only prove an empty
                     // intersection. Decided from the inode's last extent, not
@@ -42934,18 +43012,24 @@ impl OpenFs {
                     }
                 };
                 let nbytes_after_remove =
-                    Self::btrfs_apply_nbytes_delta(inode.nbytes, removed_nbytes_delta)?;
+                    match Self::btrfs_apply_nbytes_delta(inode.nbytes, removed_nbytes_delta) {
+                        Ok(nbytes) => nbytes,
+                        Err(error) => {
+                            let _ =
+                                alloc
+                                    .extent_alloc
+                                    .free_extent(reserved_bytenr, merged_len, false);
+                            return Err(error);
+                        }
+                    };
 
-                // Emit into the extent reserved above (write + backref + per-sector
-                // csums) covering [aligned_start, aligned_end).
-                let emitted_nbytes = self.btrfs_emit_aligned_extent_at(
-                    cx,
+                // Data and checksum construction succeeded before removal.
+                // Publish their mapping/backref/csum items without another write.
+                let emitted_nbytes = Self::btrfs_publish_aligned_extent(
                     &mut alloc,
                     canonical,
                     aligned_start,
-                    &merged,
-                    is_datasum,
-                    reserved_bytenr,
+                    prepared,
                 )?;
                 nbytes_after_remove
                     .checked_add(emitted_nbytes)
@@ -107497,46 +107581,6 @@ mod tests {
 
     #[test]
     fn btrfs_failed_cow_replacement_preserves_destination() {
-        struct ReplacementDevice {
-            inner: TestDevice,
-            fail: Arc<AtomicBool>,
-            writes: Arc<AtomicUsize>,
-        }
-        impl ByteDevice for ReplacementDevice {
-            fn len_bytes(&self) -> u64 {
-                self.inner.len_bytes()
-            }
-
-            fn read_exact_at(
-                &self,
-                cx: &Cx,
-                offset: ByteOffset,
-                buf: &mut [u8],
-            ) -> ffs_error::Result<()> {
-                self.inner.read_exact_at(cx, offset, buf)
-            }
-
-            fn write_all_at(
-                &self,
-                cx: &Cx,
-                offset: ByteOffset,
-                buf: &[u8],
-            ) -> ffs_error::Result<()> {
-                self.writes.fetch_add(1, AtomicOrdering::SeqCst);
-                if self.fail.swap(false, AtomicOrdering::SeqCst) {
-                    self.inner.write_all_at(cx, offset, &buf[..buf.len() / 2])?;
-                    return Err(FfsError::Io(std::io::Error::other(
-                        "injected partial replacement write",
-                    )));
-                }
-                self.inner.write_all_at(cx, offset, buf)
-            }
-
-            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
-                self.inner.sync(cx)
-            }
-        }
-
         const BS: usize = 4096;
         let csum_lo = BtrfsKey {
             objectid: 0,
@@ -107549,26 +107593,8 @@ mod tests {
             offset: u64::MAX,
         };
         for clone_inline in [false, true] {
-            for failure in ["none", "write", "checksum"] {
-                let mut image = build_btrfs_fsops_image();
-                add_btrfs_test_empty_extent_tree(&mut image);
-                let fail = Arc::new(AtomicBool::new(false));
-                let writes = Arc::new(AtomicUsize::new(0));
-                let cx = Cx::for_testing();
-                let mut fs = OpenFs::from_device(
-                    &cx,
-                    Box::new(ReplacementDevice {
-                        inner: TestDevice::from_vec(image),
-                        fail: Arc::clone(&fail),
-                        writes: Arc::clone(&writes),
-                    }),
-                    &OpenOptions {
-                        btrfs_rw_ephemeral_ok: true,
-                        ..OpenOptions::default()
-                    },
-                )
-                .unwrap();
-                fs.enable_writes(&cx).unwrap();
+            for failure in ["none", "cancel", "checksum"] {
+                let (fs, cx) = open_writable_btrfs();
                 let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
                 let src = fs
                     .create(&cx, root, OsStr::new("src"), 0o600, 0, 0)
@@ -107603,25 +107629,38 @@ mod tests {
                 if failure == "checksum" {
                     fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = u16::MAX;
                 }
-                writes.store(0, AtomicOrdering::SeqCst);
-                fail.store(failure == "write", AtomicOrdering::SeqCst);
+                let sequence = fs.mvcc_store.current_snapshot().high.0;
+                // Model cancellation after request admission, at the data-write
+                // checkpoint inside the real mutation helper. The outer public
+                // request's initial checkpoint has already passed at this point.
+                cx.set_cancel_requested(failure == "cancel");
                 let result = if clone_inline {
-                    ops.clone_file_range(&cx, &mut RequestScope::empty(), dst, src, 0, 0, BS as u64)
-                        .map(|_| ())
+                    let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
+                    fs.btrfs_clone_file_range_data(
+                        &cx,
+                        &mut alloc,
+                        fs.btrfs_canonical_inode(src).unwrap(),
+                        canonical,
+                        0,
+                        3,
+                        BS as u64,
+                    )
                 } else {
-                    fs.write(&cx, dst, BS as u64, &[0x5A; BS]).map(|_| ())
+                    fs.btrfs_write(&cx, dst, BS as u64, &[0x5A; BS]).map(|_| ())
                 };
-                assert_eq!(writes.load(AtomicOrdering::SeqCst), 1, "{failure}");
-                assert!(!fail.load(AtomicOrdering::SeqCst), "fault must execute");
+                cx.set_cancel_requested(false);
+                assert_eq!(
+                    fs.mvcc_store.current_snapshot().high.0 - sequence,
+                    u64::from(failure != "cancel"),
+                    "only a completed replacement block reaches MVCC ({failure})"
+                );
                 if failure == "none" {
                     result.unwrap();
                 } else {
                     let error = result.expect_err("replacement fault must be reported");
                     assert!(
-                        if failure == "write" {
-                            error
-                                .to_string()
-                                .contains("injected partial replacement write")
+                        if failure == "cancel" {
+                            matches!(error, FfsError::Cancelled)
                         } else {
                             error.to_string().contains("unsupported btrfs csum_type")
                         },
@@ -107676,8 +107715,8 @@ mod tests {
                 .btrfs_alloc_data_with_growth(&mut alloc, BS as u64)
                 .unwrap();
             if reject_checksum {
-                // Reject checksum construction after the actual data write,
-                // file extent insertion and back-reference registration.
+                // Reject checksum construction after the actual data write;
+                // no file mapping or back-reference may survive the refusal.
                 alloc.csum_type = u16::MAX;
             }
             let result = fs.btrfs_emit_aligned_extent_at(
