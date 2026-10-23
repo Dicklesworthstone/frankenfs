@@ -300,6 +300,23 @@
 > `.beads/pending_tasks.md`; the API contract is in
 > [the FAT read profile](docs/FAT_READ_PROFILE.md).
 
+> **Auxiliary image admission, 2026-10-22:** external ext4 journals and additional
+> btrfs devices now use independently bounded `ImageSource` handles admitted as
+> OS-read-only regular files under shared locks. `OpenFs::from_devices` accepts
+> these handles without path reopening; journal replay/pairing retain one
+> descriptor and nested btrfs views inherit the admitted members. Source
+> `0b3fa02a0` + `8f956f23` passed 46 facade/example tests (one existing native
+> producer ignore), nine selected btrfs seed/external-journal regressions,
+> workspace/all-target checking, strict Clippy and formatting. Controls exercise real file locks,
+> overlay replay, member bounds, nested reads and unchanged input/sentinel bytes.
+> These are constructed-image regressions; native auxiliary-device production,
+> FUSE, crash, performance and field qualification are not claimed. The broader
+> legacy journal regression slice also passed, including path-based replay,
+> UUID mismatch and missing-journal refusal. UBS still reports the retained
+> test panic, and canonical tracker WAL recovery remains open. Overall parity
+> percentages are unchanged; exact cuts and failed attempts are in
+> `.beads/pending_tasks.md`.
+
 > **Public read-only facade mounts, 2026-10-22:** the existing `native_reader`
 > consumer now mounts its already-admitted `Box<dyn FsOps>` through the shared
 > FUSE transport. Foreground mounts retain bounds and explicit NTFS/ZFS views,
