@@ -89,11 +89,12 @@ fn invalid(detail: &str) -> io::Error {
 }
 
 fn image_sources(values: &[OsString]) -> Result<Vec<ImageSource>> {
-    let triples = values.chunks_exact(3);
-    if !triples.remainder().is_empty() {
+    let (triples, remainder) = values.as_chunks::<3>();
+    if !remainder.is_empty() {
         return Err(invalid("each auxiliary image needs PATH OFFSET LENGTH").into());
     }
     triples
+        .iter()
         .map(|triple| {
             let offset = triple[1]
                 .to_str()
