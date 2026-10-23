@@ -66,6 +66,10 @@ into the engines; ext4 replay and journal pairing share one descriptor, and
 nested btrfs views retain the admitted member handles. Direct core consumers can
 use `OpenFs::from_devices` for already-open auxiliary devices; it refuses mixed
 path/handle auxiliary options.
+The auxiliary-handle change passed 46 facade/example tests (one existing native
+producer test remained ignored), nine selected btrfs seed/journal regressions,
+workspace checking, strict Clippy and formatting on a single source cut. These regressions
+use constructed images; native auxiliary-device qualification remains open.
 For NTFS, `ReadOnlyFs::ntfs_volume()` borrows the same admitted volume for exact
 UTF-16 named-stream selection, including streams stored in extension records.
 Native stream access has executed through the standalone public consumer on
