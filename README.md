@@ -72,6 +72,8 @@ workspace checking, strict Clippy and formatting on a single source cut. Those
 regressions use constructed images. A later public-consumer run on retained
 kernel-produced btrfs seed/sprout images passed six mounts, 192 byte comparisons,
 native inventory checks and bounded-member/lock refusals with unchanged inputs.
+Named/root-ID selection then passed ten mounts and 82 byte comparisons, including
+root isolation and bounded-member views, on the final standalone consumer.
 Broader topology and native external-journal crash qualification remain open;
 exact source cuts and results are recorded in `FEATURE_PARITY.md`.
 For NTFS, `ReadOnlyFs::ntfs_volume()` borrows the same admitted volume for exact

@@ -380,9 +380,28 @@
 > a fresh author readback verified all 155 statuses and control hashes. Fixture
 > production and kernel readbacks are historical; current execution performed
 > public API/FUSE reads on copied inputs, with no new production or crash oracle.
-> Native `btrfs-progs` also reread the root tree and confirmed the retained named
-> roots 256/257. Standalone consumer root-name/ID flags are now implemented;
-> their final executable and mounted-root qualification are pending.
+> Final candidate ELF `cf51328e3ee0` repeated this unchanged auxiliary probe
+> successfully: CSD `/tmp/native-btrfs-aux-m5ezntnt/result.json`.
+>
+> **Public btrfs root selection, 2026-10-23:** `native_reader` now connects
+> `--btrfs-subvolume NAME` and `--btrfs-subvolume-id ID` to the existing public
+> backend selection. The same final ELF passed 91 commands over ten selected
+> views, including standalone seed and plain/bounded primary/member combinations:
+> 42 offline and 40 mounted byte comparisons, 27 negative commands, 20 selected
+> root-ID and 40 native-inventory ioctl checks, 20 EROFS and 18 retained-lock
+> refusals. All ten mounts exited normally; all 19 monitored controls remained
+> unchanged. Native `btrfs-progs` independently read root IDs 256/257, and fresh
+> native userspace restores recovered both payloads byte-for-byte from the
+> retained images. Result: CSD `/tmp/btrfs-root-selection-oasjwvc7/result.json`.
+> Reader source `9083dcdd8664` on base `0b3fa02a0`, clean-overlay fingerprint
+> `ecb9b5038dea`, passed workspace/all-target check, strict Clippy, formatting and
+> 54 facade/example tests (one existing native-producer ignore). Build/test RCH
+> jobs 72226/72227 terminated with exit 0, ACK and released sources. A fresh
+> author readback checked all command/daemon statuses and current control hashes;
+> this is not independent approval. Focused reader UBS passed with zero critical
+> findings; original broader scanner disposition and native external-journal
+> crash/broader topology qualification remain open. No fresh native image
+> production, kernel mount or crash-replay claim is made by these probes.
 
 > **Public read-only facade mounts, 2026-10-22:** the existing `native_reader`
 > consumer now mounts its already-admitted `Box<dyn FsOps>` through the shared
