@@ -462,6 +462,45 @@ impl Zpl {
         Ok(())
     }
 
+    fn link_entry(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        dir: u64,
+        target: u64,
+        name: &[u8],
+    ) -> Result<()> {
+        self.component(name)?;
+        let mut meta = self.ensure_overlay_metadata(cx, overlay, target)?;
+        if meta.kind == Kind::Directory || meta.links == 0 {
+            return Err(corrupt(
+                "ZIL hard link requires a live non-directory object",
+            ));
+        }
+        let links = meta
+            .links
+            .checked_add(1)
+            .ok_or_else(|| corrupt("ZIL hard-link count overflows"))?;
+        if self.staged_directory(cx, overlay, dir)?.contains_key(name) {
+            return Err(corrupt("ZIL hard-link name already exists"));
+        }
+        self.adjust_directory(cx, overlay, dir, 1, 0)?;
+        meta.links = links;
+        // Native zfs_link_create updates SA_ZPL_PARENT even for another
+        // non-directory alias. Object identity, data and generation stay shared.
+        meta.parent = dir;
+        overlay.objects.insert(target, meta);
+        overlay
+            .dir_entries
+            .entry(dir)
+            .or_default()
+            .insert(name.to_vec(), Some(target));
+        // Check the resulting namespace's bound before the private replay can
+        // publish; a new alias must not turn an admitted directory unreadable.
+        self.staged_directory(cx, overlay, dir)?;
+        Ok(())
+    }
+
     fn rename_entry(
         &mut self,
         cx: &Cx,
@@ -630,6 +669,13 @@ impl Zpl {
                 is_dir,
             } => {
                 self.remove_entry(cx, overlay, *dir_obj, name, *is_dir)?;
+            }
+            ZilRecordPayload::Link {
+                dir_obj,
+                file_obj,
+                name,
+            } => {
+                self.link_entry(cx, overlay, *dir_obj, *file_obj, name)?;
             }
             ZilRecordPayload::Rename {
                 src_dir_obj,

@@ -78,7 +78,42 @@ describe the log chain only, not these separately budgeted file-data reads.
 A payload checksum/I/O failure is an error, not an unwritten tail or permission
 to substitute committed bytes. Prefix-recovery consent remains mandatory.
 
-## Validation
+## ZPL namespace recovery and hard links
+
+The selected-head `Zpl::replay_zil` path, exposed by `ffs-zfs --replay-zil`,
+also stages namespace operations in a private in-memory view. This is a
+separate interface from the narrower, single-file `zil-read` recovery above.
+Native `TX_LINK` records now join the existing plain create, mkdir, symlink,
+unlink, rmdir, rename, write, truncate and setattr operations. The native
+layout is a 48-byte header followed by one NUL-terminated name and alignment
+padding, as defined by OpenZFS's
+[`lr_link_t`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/zil.h).
+
+A recovered hard link retains the target's object number, generation and data.
+Aliases share later writes, survive removal of the original name, and update
+the native link count and destination directory accounting. The parent field
+follows OpenZFS's
+[`zfs_link_create`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/os/linux/zfs/zfs_dir.c)
+semantics. Existing committed targets and objects created earlier in the same
+log are admitted, including symlinks. Directories, deleted or missing targets,
+invalid object identities, occupied names, invalid path components and link
+count overflow are refused.
+
+Every pending record must pass native framing and semantic checks before the
+new view is published. A later failure discards earlier staged links and
+preserves the previously visible view. Repeating replay rebuilds from the
+committed root rather than incrementing link counts again. Backing images,
+log claims and replay sequence fields are never written. Unknown flags,
+including `TX_CI`, remain unsupported; this does not admit writable pools or
+native durable replay.
+
+Five added Rust regression functions cover both byte orders, legacy and slim
+log checksums, claimed and unclaimed boundaries, cross-directory aliases,
+newly created targets, symlinks, original-name removal, repeat replay, malformed
+records and atomic refusal. Their native-layout fixtures are constructed;
+they do not establish OpenZFS crash-image interoperability.
+
+## Earlier validation notes
 
 Twelve new Rust regression functions cover topology transport and CLI admission,
 including mixed checksum variants/byte orders, 512-byte through 64-KiB native

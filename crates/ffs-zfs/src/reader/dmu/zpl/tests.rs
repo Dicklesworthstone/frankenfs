@@ -711,6 +711,24 @@ fn dataset_views_do_not_reuse_mos_or_other_dataset_block_caches() {
 }
 
 #[test]
+fn hard_link_replay_rejects_dead_and_overflowing_link_counts_before_namespace_changes() {
+    let cx = Cx::for_testing();
+    let (leaf, meta) = graph(Endian::Little, 0, 0, Arc::default(), None);
+    let mut view = mos(&leaf, meta).zpl(&cx, &[]).unwrap();
+    let original = view.stat(&cx, 3).unwrap().0;
+    for links in [0, u64::MAX] {
+        let mut metadata = original.clone();
+        metadata.links = links;
+        let mut overlay = ZilOverlay::default();
+        overlay.objects.insert(3, metadata);
+        assert!(view.link_entry(&cx, &mut overlay, 2, 3, b"new").is_err());
+        assert!(overlay.dir_entries.is_empty());
+        assert_eq!(overlay.objects[&3].links, links);
+        assert_eq!(view.stat(&cx, 3).unwrap().0.links, original.links);
+    }
+}
+
+#[test]
 fn legacy_synthetic_zil_is_refused_without_publishing_a_replay_prefix() {
     let cx = Cx::for_testing();
     let order = Endian::Little;

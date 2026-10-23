@@ -980,6 +980,23 @@ fn rename_record(
     raw
 }
 
+fn link_record(seq: u64, parent: u64, object: u64, name: &[u8], order: Endian) -> Vec<u8> {
+    let mut raw = vec![0; (49 + name.len()).next_multiple_of(8)];
+    let length = raw.len() as u64;
+    for (at, value) in [
+        (0, 7),
+        (8, length),
+        (16, 43),
+        (24, seq),
+        (32, parent),
+        (40, object),
+    ] {
+        put(&mut raw, at, value, order);
+    }
+    raw[48..48 + name.len()].copy_from_slice(name);
+    raw
+}
+
 fn seven_operation_records(order: Endian) -> Vec<Vec<u8>> {
     let mut write = record(9, 43, 4, 0, b"hello-zil-world", order);
     put(&mut write, 32, 9, order);
@@ -1165,6 +1182,142 @@ fn native_namespace_transitions_preserve_hardlinks_tombstones_and_directory_pare
             view.resolve(&cx, b"/made"),
             Err(FfsError::NotFound(_))
         ));
+    }
+}
+
+#[test]
+fn native_hard_link_replay_shares_existing_and_created_files_across_directories() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for algorithm in [5, 9] {
+            for claimed in [false, true] {
+                let mut write = record(9, 43, 7, 0, b"shared", order);
+                put(&mut write, 32, 9, order);
+                let mut append = record(9, 43, 10, 6, b"!", order);
+                put(&mut append, 32, 9, order);
+                let records = [
+                    create_record(2, 1, 2, 8, b"links", order),
+                    link_record(2, 2, 7, b"third", order),
+                    link_record(3, 8, 7, b"base", order),
+                    remove_record(5, 4, 2, b"file", order),
+                    remove_record(5, 5, 2, b"alias", order),
+                    create_record(1, 6, 2, 9, b"fresh", order),
+                    write,
+                    link_record(8, 8, 9, b"fresh", order),
+                    remove_record(5, 9, 2, b"fresh", order),
+                    append,
+                    rename_record(11, 2, 8, b"third", b"moved", order),
+                ];
+                let (mut objects, _, _) =
+                    recovery_graph_log(order, algorithm, &records, claimed, None, &[]);
+                let mut view = objects.zpl(&cx, &[]).unwrap();
+                let stats = view.replay_zil(&cx).unwrap();
+                assert_eq!(stats.records_replayed, 11);
+                for _ in 0..2 {
+                    assert_eq!(names(&mut view, &cx, 2), [b"links".to_vec()]);
+                    assert_eq!(
+                        names(&mut view, &cx, 8),
+                        [b"base".to_vec(), b"fresh".to_vec(), b"moved".to_vec()]
+                    );
+                    for path in [b"/links/base".as_slice(), b"/links/moved"] {
+                        let object = view.resolve(&cx, path).unwrap();
+                        assert_eq!(object, 7);
+                        assert_eq!(view.read(&cx, object, 0, 64).unwrap(), b"abcdefghijklmnop");
+                    }
+                    assert_eq!(view.resolve(&cx, b"/links/fresh").unwrap(), 9);
+                    assert_eq!(view.read(&cx, 9, 0, 64).unwrap(), b"shared!");
+                    let root = view.stat(&cx, 2).unwrap().0;
+                    let directory = view.stat(&cx, 8).unwrap().0;
+                    let original = view.stat(&cx, 7).unwrap().0;
+                    let created = view.stat(&cx, 9).unwrap().0;
+                    assert_eq!((root.size, root.links), (3, 3));
+                    assert_eq!((directory.size, directory.links), (5, 2));
+                    assert_eq!(
+                        (original.links, original.parent, original.generation),
+                        (2, 8, 2)
+                    );
+                    assert_eq!(
+                        (created.links, created.parent, created.generation),
+                        (1, 8, 43)
+                    );
+                    assert_eq!(view.replay_zil(&cx).unwrap(), stats);
+                }
+                // A new committed view and the backing storage are unchanged.
+                let mut committed = objects.zpl(&cx, &[]).unwrap();
+                assert_eq!(
+                    names(&mut committed, &cx, 2),
+                    [b"alias".to_vec(), b"file".to_vec()]
+                );
+                assert_eq!(committed.stat(&cx, 7).unwrap().0.links, 2);
+                assert_eq!(committed.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+            }
+        }
+    }
+}
+
+#[test]
+fn native_hard_link_replay_keeps_symlink_identity_and_survives_original_unlink() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let mut symlink = create_record(4, 1, 2, 8, b"symbolic\0file", order);
+        put(&mut symlink, 48, 0o120_777, order);
+        let records = [
+            symlink,
+            link_record(2, 2, 8, b"other", order),
+            remove_record(5, 3, 2, b"symbolic", order),
+        ];
+        let (mut objects, _, _) = recovery_graph_log(order, 9, &records, true, None, &[]);
+        let mut view = objects.zpl(&cx, &[]).unwrap();
+        view.replay_zil(&cx).unwrap();
+        assert_eq!(view.readlink(&cx, 8).unwrap(), b"file");
+        let metadata = view.stat(&cx, 8).unwrap().0;
+        assert_eq!(metadata.kind, ffs_ondisk::zfs_zpl::Kind::Symlink);
+        assert_eq!((metadata.links, metadata.size), (1, 4));
+        assert_eq!(
+            names(&mut view, &cx, 2),
+            [b"alias".to_vec(), b"file".to_vec(), b"other".to_vec()]
+        );
+    }
+}
+
+#[test]
+fn native_hard_link_rejections_never_publish_a_partial_recovered_namespace() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for (parent, target, name) in [
+            (2, 2, b"new".as_slice()),
+            (2, 8, b"new"),
+            (2, 9, b"new"),
+            (2, 20, b"new"),
+            (2, 0, b"new"),
+            (2, 1_u64 << 48, b"new"),
+            (7, 7, b"new"),
+            (2, 7, b"file"),
+            (2, 7, b"surviving"),
+            (2, 7, b".."),
+            (2, 7, b"bad/name"),
+        ] {
+            let records = [
+                create_record(2, 1, 2, 8, b"made", order),
+                link_record(2, 2, 7, b"surviving", order),
+                create_record(1, 3, 2, 9, b"gone", order),
+                remove_record(5, 4, 2, b"gone", order),
+                link_record(5, parent, target, name, order),
+            ];
+            let (mut objects, _, _) = recovery_graph_log(order, 9, &records, true, None, &[]);
+            let mut view = objects.zpl(&cx, &[]).unwrap();
+            assert!(
+                view.replay_zil(&cx).is_err(),
+                "parent={parent} target={target} name={name:?}"
+            );
+            assert!(view.zil_replay_stats().is_none());
+            assert_eq!(
+                names(&mut view, &cx, 2),
+                [b"alias".to_vec(), b"file".to_vec()]
+            );
+            assert_eq!(view.stat(&cx, 7).unwrap().0.links, 2);
+            assert_eq!(view.read(&cx, 7, 0, 64).unwrap(), b"abcdefghijklmnop");
+        }
     }
 }
 

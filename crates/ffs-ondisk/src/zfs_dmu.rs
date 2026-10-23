@@ -290,6 +290,11 @@ pub enum ZilRecordPayload {
         name: Vec<u8>,
         is_dir: bool,
     },
+    Link {
+        dir_obj: u64,
+        file_obj: u64,
+        name: Vec<u8>,
+    },
     Rename {
         src_dir_obj: u64,
         dst_dir_obj: u64,
@@ -380,7 +385,7 @@ impl ZilBlock {
                 .filter(|&end| end <= records_limit)
                 .ok_or_else(|| invalid("ZIL record exceeds block used bytes"))?;
             let rec = &raw[pos..rec_end];
-            if !matches!(txtype & 0x1f, 1 | 2 | 4..=6 | 8..=11 | 14..=20) {
+            if !matches!(txtype & 0x1f, 1 | 2 | 4..=11 | 14..=20) {
                 pos = rec_end;
                 continue;
             }
@@ -449,6 +454,17 @@ impl ZilRecord {
                     dir_obj,
                     name,
                     is_dir: (txtype & 0x1f) == 6,
+                }
+            }
+            7 => {
+                if rec.len() < 48 {
+                    return Err(invalid("truncated ZIL lr_link_t"));
+                }
+                let (name, _) = cstr_pair(&rec[48..])?;
+                ZilRecordPayload::Link {
+                    dir_obj: order.u64(rec, 32)?,
+                    file_obj: order.u64(rec, 40)?,
+                    name,
                 }
             }
             8 => {
