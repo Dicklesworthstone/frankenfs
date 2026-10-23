@@ -73,7 +73,9 @@ impl IndexCache {
                 .retained_bytes
                 .checked_sub(previous.storage_bytes())
                 .ok_or_else(|| {
-                    FfsError::Io(std::io::Error::other("FAT immutable cache accounting underflow"))
+                    FfsError::Io(std::io::Error::other(
+                        "FAT immutable cache accounting underflow",
+                    ))
                 })?;
         }
         self.retained_bytes += bytes;
@@ -84,12 +86,17 @@ impl IndexCache {
 
 impl FatFs {
     fn immutable_cache(&self) -> Result<MutexGuard<'_, IndexCache>> {
-        self.immutable_indexes.lock().map_err(|_| {
-            FfsError::Io(std::io::Error::other("FAT immutable index cache poisoned"))
-        })
+        self.immutable_indexes
+            .lock()
+            .map_err(|_| FfsError::Io(std::io::Error::other("FAT immutable index cache poisoned")))
     }
 
-    pub(super) fn readonly_index(&self, cx: &Cx, ino: InodeNumber, entry: &Entry) -> Result<FileIndex> {
+    pub(super) fn readonly_index(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        entry: &Entry,
+    ) -> Result<FileIndex> {
         checkpoint(cx)?;
         // Refuse accidental use by mutation paths, rather than adding a second
         // invalidation protocol which could retain old allocation after reuse.

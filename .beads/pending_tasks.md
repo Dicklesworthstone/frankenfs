@@ -2,6 +2,46 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current checkpoint — 2026-10-22
+
+`bd-native-image-library-s4tde` remains the single claimed item, staged as
+`in_progress`. Canonical import still refuses its committed-WAL guard; that
+database and its WAL have not been modified. Historical entries below retain
+their original scope; the latest source-bound receipts are at the end.
+
+Completed in the preceding continuation: permanent native FAT16 root growth
+(532 commands), FAT32 FSInfo repair plus separate ordinary recovery (20
+commands), and two strict read-only FAT FUSE mounts. Source and payload hashes,
+native filesystem checks and exact byte-preservation controls passed. Nine root
+regressions and the initial eleven FSInfo regressions passed. Two equivalent
+FSInfo production corrections plus two test-lint corrections are now under
+overlay `7262c1db`; full formatting and changed production/test UBS pass. Strict
+Clippy, workspace/all-target check and formatting all pass on that final cut.
+The eleven-test rerun passed on `a02d60b9`, the same final production before
+the two test-only literal/fixture-guard edits; final compiler/Clippy checks cover
+those edits. The later streaming commit is outside those executed source cuts.
+Current work qualifies ea0bc8afd plus nine overlays. Its CLI passes 118 native
+commands across four images, with 56 payload comparisons and unchanged hashes.
+Full FAT/facade runtime passes 548 tests with one existing ignore on ed09c13e.
+After equivalent test-only lint fixes, all ten streaming tests pass again and
+workspace check, strict Clippy and formatting all pass on final7d13873c.
+Production source is identical between those two cuts. Older review bundles
+remain historical snapshots; the final review snapshot is recorded below.
+The later public-consumer refresh builds the same final Rust cut and passes
+644captured commands/516public calls across all six formats. The permanent FAT
+runner now supports --facade-binary, including root-expanded and recovered
+outputs. Exact proof classes, logs, hashes and the16:26 no-delete violation are
+recorded in the final continuation below. An external session committed9800c04f6
+during this work; root preserved its index and made no commit or push.
+
+Publication and closure still require independent disposition of the unchanged
+UBS public-hash/test-panic reports and review of the new dirty-check status
+correction. No source rule, assertion or scanner has been weakened. Later
+`ea0bc8afd` streaming is outside the frozen `8dae5e14b` qualification package.
+The dependent native-engine fuzz task remains open; do not bypass the original
+dependency, claim another owner's read-authority item, or infer field/writer
+acceptance from these read-only and offline results.
+
 ## DEADLOCK AUDIT: ffs-core - FIXED
 
 **Status:** FIXED in commit 3b8db67
@@ -569,7 +609,8 @@ maintenance to minutes and spend the work block on executable integration.
 - [x] Diagnose remote harness Git-source-identity failures without weakening its gates.
 - [x] Complete original native public-facade FAT16/32, NTFS and ZFS acceptance.
 - [x] Review UBS findings and resolve actual production defects; retain test traps.
-- [ ] Re-execute acceptance in a fresh verification pass; keep unproved items open.
+- [x] Re-execute the library/native acceptance in fresh source-bound verification;
+  retain the targeted UBS/publication condition and broader unproved items below.
 - [ ] Record exact results in staged Beads, sync, commit and publish coherent work.
 
 Shared-main update: the source increment landed in `93b8ca751`, then merged
@@ -1611,8 +1652,9 @@ Current merged source and execution routing, 21:11 UTC:
   now running complete-source Clippy; log `fmt-complete-indexed-borrow-2135.log`.
   This is a single-process metadata job, no compilation or reduced compiler
   reservation. Static local checks remain distinct from remote Cargo fmt.
-- [ ] Collect updated tests, planted red, complete-source Clippy, original
-  workspace check, full formatter and frozen real-Git harness results.
+- [x] Collect updated tests, planted red, complete-source Clippy, original
+  workspace check, full formatter and frozen real-Git harness results. Later
+  completed source-bound runs and the retained red/failure outcomes are below.
 
 21:58 UTC executed failures, red control, and next concrete repairs:
 
@@ -1668,7 +1710,7 @@ Current merged source and execution routing, 21:11 UTC:
   probe and preserve exact 27 positives/3 negatives/25 indexed byte comparisons,
   4 strict mounts/24 mounted byte comparisons/8 refusals. Successful denominator
   is 47 captured commands plus 4 owned mount daemons. Probe is still unexecuted.
-- [ ] Execute post-lint complete NTFS/CLI tests; qualify fresh native ELF and
+- [x] Execute post-lint complete NTFS/CLI tests; qualify fresh native ELF and
   probe, current workspace check/Clippy/fmt, full real-Git harness, and actual
   mandatory benchmark measurements. Keep original staged Bead in progress.
 
@@ -1718,7 +1760,7 @@ not those printed remote directories. No canonical Beads import/close occurred.
   remote SHA matches 7da93ffcffc4e18bfa59edf2bc5a65e8f16db0c048ddd7154083f56a8cf1d316.
   One incorrect destination copy failed before writing and was corrected to the
   observed directory. Native CLI build still runs; no probe execution claimed.
-- [ ] Complete current full fmt/check, fixture-delta strict Clippy, actual full
+- [x] Complete current full fmt/check, fixture-delta strict Clippy, actual full
   harness, current NTFS/CLI/ZFS tests, native indexed/strict-mounted probe and
   required benchmark measurements. Independent native multi-branch qualification
   is being scoped; existing retained images prove only one external index leaf.
@@ -1773,7 +1815,7 @@ not those printed remote directories. No canonical Beads import/close occurred.
   tests with two ignored, including all five formerly failing cases and the
   new positive/checksum-byte/covered-payload control. Later targets and final
   source receipt are pending. Log `harness-full-valid-inventory-real-git-2217.log`.
-- [ ] Collect complete workspace check, current NTFS/CLI/ZFS/facade tests,
+- [x] Collect complete workspace check, current NTFS/CLI/ZFS/facade tests,
   remaining full harness targets and final source receipt; run fixture-delta
   strict workspace Clippy and mandatory benchmarks. Independently verify native
   mounted evidence. Original staged Bead stays in progress; no canonical close.
@@ -1939,7 +1981,7 @@ not those printed remote directories. No canonical Beads import/close occurred.
   full-Git snapshot. All deadlines/profiles/admission/ownership guards remain.
   Any timing is current maintenance qualification, not an incumbent-relative win.
 
-### Bounded work audit and honesty inventory, 20:10–23:07 UTC
+### Bounded work audit and honesty inventory, 20:10 UTC Oct 21–01:48 UTC Oct 22
 
 Creation gate: this existing TODO and staged comments serve the user's explicit
 request for granular tracking of bd-native-image-library-s4tde. Native probe
@@ -1953,8 +1995,9 @@ The higher-value ready capability remains this claimed integration; finish its
 positive runtime gates before expanding scope. No integrity exception is invoked.
 
 Real-work audit: README purpose is native filesystem behavior in Rust through
-FUSE and offline-image tools. Actual git-stat inventory is retained in
-audit-window-2010-2307-git-stat.txt. The window contains user-visible indexed FsOps,
+FUSE and offline-image tools. The initial20:10–23:07 git-stat inventory is retained
+in audit-window-2010-2307-git-stat.txt; subsequent source cuts and executed gate
+receipts are recorded below. The window contains user-visible indexed FsOps,
 the same-reference identity fix, ZFS auto-import and peer FAT parent recovery,
 with their regression, lint and fixture enablers. Public docs describe real bounded
 results. Root did not author all peer work or make these commits. Tiny external
@@ -1988,18 +2031,23 @@ certificate for every peer change):
 5. No (checked source/config/recipes: no bench hardcoding, fake Git, local Cargo,
    guard bypass or release-profile change. Foreign ELF delivery was explicit;
    command-scoped Git no-refresh avoids metadata writes without hiding content).
-6. No (checked actual Libtest selections and native counters:747 passed/1ignored
-   are explicit packages, not doctests; ignored native selections earn no proof).
-7. Current-source wording needs an exact cut: native/public and747-test results
-   bind base990 plus stated overlays, not later shared-main FAT parent recovery.
-   A read-only comparison exposed seven changed FAT source files; fresh shared-
-   head workspace checking and FAT/facade tests are now requested explicitly.
+6. No (checked actual selections/counters:747passed/1ignored are explicit packages,
+   not doctests; full harness2652/0/11 includes one actual compiled doctest.
+   Full FAT/facade515/0/1 and final affected9/0/0 are separate source-bound
+   executions;466filtered cases in the final focused run earn no new credit).
+7. Source cuts are explicit: native/public and747-test results bind base990 plus
+   stated overlays. Complete082+c7dd passed515FAT/facade tests; final082+23f0
+   passed check/strict Clippy/fmt and all9affected tests. Later5c7d8d76b root
+   expansion is outside those cuts. Public refresh280covers all SIX declared
+   formats, naming FAT16 and FAT32 separately; the earlier five-format/APFS
+   wording was inaccurate and has been corrected without changing project goals.
 8. No (checked reports: retained-image replay, fresh native producer, constructed
    unit, strict FUSE and source-only classes remain distinct; no field/write or
    indexed FsOps mount claim; shared origins count once).
 9. No (checked retained transcripts/TODO/comments: harness failures, missing
    raw scratch paths, benchmark deadlines/SSH failure, mount failure and replay
-   preflight failure remain visible; original item stays open).
+   preflight failure, three-lint Clippy failure and nonzero UBS results remain
+   visible; original item stays open).
 10. No (checked own cited commands: stdout/stderr retained, including failures
     and timeout partials. Existing benchmark helper output suppression is not
     presented as separate native-tool proof).
@@ -2018,25 +2066,30 @@ certificate for every peer change):
 17. No (checked independent mounted rerun: separate runtime execution with the
     same ELF/input lineage, not an independent build or two native corpora).
 18. No (checked predeclared native27/3/25, mounted4/24/8, public162/120/152/3
-    and replay164/108/6/50/6 counters: no failing case dropped from totals).
+    and replay164/108/6/50/6 counters, plus extra native61/public52/expected4
+    statuses: no failing case dropped from totals).
 19. Yes: repeated namespace/queue/SSH failures, unsupported example JSON mode,
     wrong-cwd no-op copies and oversized receipt output cost avoidable time.
-    They earn no progress. A wrapped README phrase would fail an exact existing
-    assertion; root is corrected, the active frozen run is intentionally not
-    mutated. Retain its resulting failure and rerun only after ownership retires.
+    They earn no progress. The wrapped README phrase's actual failure was retained
+    and corrected; the later full harness passed. Selected source bytes stayed
+    fixed through each active verification run. The final focused cold build
+    took1800.8seconds; actual9-test runtime was33.58seconds, not a speedup claim.
 20. Strongest evidence: exact delivered ELF SHA with native byte comparisons,
     unchanged whole-image hashes, 32 extension streams, a new native13-node
     index, four actual RO mounts and an independently executed mounted rerun.
-    The skeptic can rerun named scripts against retained CSD images and source
-    cuts. Full harness and benchmark success are still required, not inferred.
+    The current public refresh executes280calls across all six named formats.
+    Full harness2652passes,60actual benchmark intervals and final source-bound
+    compiler/lint/format/test receipts are retained. A skeptic can rerun the named
+    scripts on retained CSD inputs. UBS remains nonzero; no clean scan is inferred.
 
 Disposition: correct source-scope and operational mistakes in place and disclose
 them here and to the operator. RH-1/RH-2/RH-3 are controlled by unchanged production
 admission, conserved assertions, explicit proof classes and exact inventory data;
 RH-4 forbids treating tiny external commits as capability wins; RH-7/RH-9 keep the
 original open. Earlier bounded Cass review is retained above; no claim of a new
-or comprehensive older-session audit follows. Update this disposition for later
-gate results before final reporting or closure.
+or comprehensive older-session audit follows. Final gate results are incorporated
+here; required UBS disposition and publication authority remain open. No scanner
+exception has been self-granted and no functional Bead is closed.
 
 ### 23:22 UTC full harness green, shared FAT maintenance and guarded extra probe
 
@@ -2063,7 +2116,7 @@ gate results before final reporting or closure.
   source plus that one equivalent predicate, with every test/assertion intact.
   An initial diagnostic-only Python expression had a precedence syntax error;
   it changed no file and was corrected before the actual normalization pass.
-- [ ] Collect corrected shared-head strict Clippy and full formatting, then
+- [x] Collect corrected shared-head strict Clippy and full formatting, then
   execute corrected FAT/facade tests and compiler check as needed. The first
   FAT/facade request timed out in admission, no execution; retry2312 is compiling.
   Formatter --job plus --clean-overlay was rejected before execution. Correct
@@ -2193,7 +2246,7 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=yes csd 'printf "%s  %s\n" 7fbdb0d
   owned overlays, including current README/FEATURE updates; log
   check-complete-082-shared-source-2347.log. Do not mutate selected source bytes
   during admission/sync; TODO is excluded from this selected source.
-- [ ] Collect that complete-cut check; run strict workspace/all-target Clippy
+- [x] Collect that complete-cut check; run strict workspace/all-target Clippy
   and the actual FAT/facade tests on the SAME complete cut. Old0133 tests still
   qualify only their old source. Preserve all fresh failures and repair causes.
 - [ ] Refresh final bounded honesty disposition, publish exact owned paths and
@@ -2228,7 +2281,8 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=yes csd 'printf "%s  %s\n" 7fbdb0d
 - [x] Collect old0133 full FAT/facade suite:501passed/0failed/1ignored.
 - [x] Execute and collect complete082 full FAT/facade suite:515passed/0failed/
   1ignored, including all14 new state/reclamation tests; no filtered cases.
-- [ ] Collect complete-source strict workspace/all-target Clippy, still active.
+- [x] Collect complete-source strict workspace/all-target Clippy: c7dd failed
+  three test-iterator lints; the corrected23f0 source subsequently passed.
 - [x] Run required targeted UBS on all six changed Rust files, no Cargo locally,
   no category exclusions, baseline filtering or suppressions. Initial default
   Bash5.3.9 execution hung before any report. Read-only sample85545 shows
@@ -2292,9 +2346,9 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=yes csd 'printf "%s  %s\n" 7fbdb0d
   FAT runtime824.54s. Verify EXACTLY the samec7dd source and2b266 tree receipt
   as workspace checking. These storage-fault tests are constructed-image unit
   evidence, not native writer, crash hardware or field qualification.
-- [ ] Collect the strict complete-cut Clippy result on vmi1149989, same082+c7dd
-  source. It has reached workspace harness/native allocator compilation after
-  dependencies. No failure or green result is inferred from slow execution.
+- [x] Collect the strict complete-cut Clippy result on vmi1149989, same082+c7dd
+  source:101, three test-iterator lints. Corrected082+23f0 subsequently passed
+  strict workspace/all-target Clippy without suppressions, as recorded below.
 - [ ] Resolve required UBS disposition separately; retain its nonzero results,
   test tripwires, actual source scope and independent-review requirement.
   No assertions/thresholds have been weakened; no functional Bead is closed.
@@ -2342,9 +2396,9 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=yes csd 'printf "%s  %s\n" 7fbdb0d
   The first diagnostic was refused before execution because its subprocess argv
   used dynamic unpacking. A fixed, explicit read-only argv was accepted; no
   one-use approval, command hiding or source transformation was involved.
-- [ ] Collect final strict Clippy, affected parent regressions and UBS outcomes;
-  update precise public/source status and original staged Bead, synchronize the
-  staged JSONL and resolve publication authority without changing gate policy.
+- [x] Collect final strict Clippy, affected parent regressions and UBS outcomes;
+  outcomes and public/source status are recorded below. Publication authority
+  remains explicitly pending; collecting outcomes does not waive the scanner.
 - [x] Fresh full remote cargo fmt --check passed on exact082+23f0f687639a1cd61fd8f6de680967c4874ad93e10cde5efd21afec7aee68782
   overlay selection, receipt tree2b266328814625b917489f063791b93f2331cb0f,
   remote0/wrapper0. Log fmt-082-array-chunks-ts1-0103.log. The preceding hz3
@@ -2354,8 +2408,3103 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=yes csd 'printf "%s  %s\n" 7fbdb0d
 - [x] Request final exact-source workspace/all-target check after the iterator
   corrections: check-082-array-chunks-0104.log. This uses ordinary -j1 on hz3,
   preserving the compiler's existing cache/source locks and all admission gates.
-- [ ] Correct public evidence accounting at final documentation refresh: the
+- [x] Correct public evidence accounting at final documentation refresh: the
   280public calls cover ext4, btrfs, FAT16, FAT32, NTFS and ZFS, all SIX declared
   formats. Prior wording grouped FAT16/FAT32 as one family while saying five
   formats; that wording and the unrelated APFS qualification sentence were
   inaccurate. FsFormatKind and the public facade declare these six, not APFS.
+- [x] Corrected082+23f0 full workspace/all-target strict Clippy passed remote0/
+  wrapper0: build30074357740995101, wrapperrchw-0bd80ead-b364-4d4c-a415-9648cf83fd85,
+  log clippy-complete-082-array-chunks-0101.log,657.0seconds total. Receipt
+  fingerprint23f0f687639a1cd61fd8f6de680967c4874ad93e10cde5efd21afec7aee68782,
+  tree2b266328814625b917489f063791b93f2331cb0f, exactly as full formatting.
+- [x] First final-check request failed before admission at the unchanged queue
+  deadline, wrapper103; journalrchw-1f3e2c6e-9575-4276-8665-3a2763ddb910
+  acknowledged the failure. Fresh hz3 telemetry then showed one available slot,
+  I/O0.50% and memory50.98%, supporting one same-command retry. That retry stayed
+  queued. When Clippy freed the warm vmi1149989 worker, supported exact cancel
+  rchw-a9a7a160-4cca-4857-9fb9-84c6bdeb239a returned cancelled_before_start130;
+  collect original wrapper130 and terminal acknowledgment true before requesting
+  the same check on vmi1149989. No remote build or duplicate check existed.
+  Log check-082-array-chunks-vmi114-0113.log; all guards/deadlines unchanged.
+- [x] Collect final affected tests and final check; exact selected source bytes
+  remained fixed until every source guard and receipt completed.
+
+### 01:48 UTC final executed verification and concrete publication boundary
+
+- [x] Final check passed on082+23f0: build30074357740995112, wrapper
+  rchw-a644c6e2-2158-45a6-9467-59cd34e8ba47, remote0/returned0/journal0,
+  terminal acknowledged. Command cargo check -j1 --workspace --all-targets;
+  log check-082-array-chunks-vmi114-0113.log,1625.6seconds total, command ended
+  01:39:43Z. Automatic rsync executable-resolution warnings were retained; the
+  supported transfer still completed and emitted the exact source receipt.
+- [x] Final parent regressions passed9/0/0,466filtered,33.58seconds runtime:
+  build30074357740995102, wrapperrchw-a1b12192-d0ab-461c-9799-5c14e49f4b75,
+  remote0/returned0/journal0, terminal acknowledged. Command cargo test -j1
+  -p ffs-fat --lib reader::recovery::repair::tests::parents -- --nocapture
+  --test-threads=4. Log tests-082-parent-array-chunks-0101.log,1800.8seconds
+  total, command ended01:30:43Z. Read-only worker process inspection confirmed
+  active asupersync compilation during the quiet log; no idle-job pass inferred.
+- [x] Verify final check, strict Clippy95101, affected tests95102 and full
+  formatting95103 all return0 with terminal acknowledgment and the SAME source
+  fingerprint23f0f687639a1cd61fd8f6de680967c4874ad93e10cde5efd21afec7aee68782,
+  baseline08226b8cb79755aee243068744eb2abeb743b01d and receipt tree
+  2b266328814625b917489f063791b93f2331cb0f. Formatter wrapper is
+  rchw-d7526a9d-ce79-4ea8-bf8d-fc2164e1bd55. Original PTY IDs were no longer
+  available on continuation at01:44; actual logs AND durable acknowledged
+  journal results supplied the completion evidence, not the missing PTYs.
+- [x] Refresh README/FEATURE in place with these source cuts, benchmark60intervals,
+  full515and affected9test counts, six-format280call accounting, nonzero UBS and
+  the unqualified later root-expansion boundary. No original goal, production
+  admission, assertion, benchmark profile or scanner policy was weakened.
+- [x] Canonical br sync --import-only again refused before opening, exit6, due
+  to possibly committed uncheckpointed WAL frames. Do not checkpoint, delete,
+  replace, rebuild or bypass it. Continue the original staged record only.
+- [x] Review the next dependent fuzz task without claiming or editing it:
+  bd-uz4m0 is open and depends on this integration and in-progress bd-vuzzq.
+  Current63-target fuzz Cargo.toml has no FAT/NTFS/ZFS library dependencies or
+  named engine traversal targets; existing detector target exercises only
+  ext4/btrfs. Reuse the existing harness when both dependencies are satisfied;
+  actual bounded engine campaigns, not signature-only fuzzing, are required.
+- [x] Add final executed-command/source/counts comment to original staged Bead,
+  retaining in_progress. Staged br --no-db sync --flush-only returned0 with
+  nothing dirty to export, and br --no-db dep cycles returned an empty graph.
+- [x] Fresh read-only normalization of all six Rust paths confirms three exact
+  formatting-only changes, one equivalent production De Morgan condition,
+  three equivalent32-byte test iterators and equivalent empty backend-read-log
+  equality. Retain file hashes and the complete non-format diff in
+  native-library-semantic-review-20261022.txt,3139bytes,
+  SHA43d7969e47d829455d8f051d914edac67cf0081b7360348417f3e75d3ed9a8ea.
+  No source was modified by this review. The final publication patch is generated
+  after these notes; its exact hash is recorded in the staged Bead and Mail.
+- [ ] Obtain independent scanner disposition or explicit operator ruling before
+  publication/closure. Preserve the review artifact and all failed executions.
+  UBS on the six changed Rust files remains1 with3critical/453warning/157info;
+  all three critical sites are retained cfg(test) failure tripwires. Wider
+ 142-file scan52critical remains unadjudicated independently and gets no clean
+  claim. No actor replied to the separate-owner review request as of this check.
+
+### 02:05 UTC continuation — execute the newly landed root feature
+
+- [x] Refresh main and preserve concurrent publication: d452889fa committed the
+  parent iterator correction and README/FEATURE receipt. The remaining five Rust
+  maintenance files and this requested TODO are still dirty; no peer work was
+  reverted, restaged or claimed as a new implementation.
+- [x] Read all 178 production and 474 test lines of the landed FAT root expansion,
+  its resize integration and operational contract. The nine authored regressions
+  cover real slot creation, original record/payload/preallocation preservation,
+  explicit tail relocation, 512/4096-byte sectors, total-sector field transition,
+  cancellation/read-only boundaries and output publication faults. These remain
+  constructed-image tests until executed, separate from native interchange.
+- [x] Refresh local source-aware tracker triage without canonical DB mutation:
+  artifacts/e2e/20261021_220439_ffs_tracker_source_hygiene_JSkdiD/
+  tracker_source_hygiene_report.json reports ready,50claimable/53open/3blocked,
+  zero foreign or permission-gated rows. The enclosing wrapper again fails bv
+  unsupported --no-cache and fixture self-checks; no global tracker-green claim.
+  Continue the single staged integration claim; do not claim blocked fuzz work.
+- [x] Announce current-source qualification in original Mail thread, message5529,
+  and reserve only this TODO initially (4968). No fresh scanner disposition has
+  arrived; retain the existing publication boundary without another question.
+- [x] Start exact current-source RCH root regressions on warm vmi1227854:
+  base d452889fa016e8a6815fe74d1ee937a8570c96bb plus five explicit Rust overlays,
+  fingerprint307e79efaecfd6c5c99709d7d8e66b00e24e641257aa03f705c0feaec67098ea.
+  Command cargo test -j1 -p ffs-fat --lib resize::root::tests -- --nocapture
+  --test-threads=4; log tests-d452-fat-root-expansion-0207.log. Strict remote-only
+  execution and all source/cache/slot/deadline guards stay enabled.
+- [x] Collect terminal test result: all9passed/0failed/0ignored/475filtered,
+  13.58seconds runtime,138.4seconds total. Build30074357740995160,
+  wrapperrchw-491a0b9b-1778-4ceb-a262-5e27f842beaa finished acknowledged true,
+  and actual wrapper returned0. No compile/runtime defect was exposed.
+- [x] Fix the newly observed root.rs formatting drift manually under lease4972;
+  read-only rustfmt --check passes. Unchanged body tokens and assertions retain
+  the nine passing tests' semantics. Fresh UBS on the changed production file
+  returned0 (0critical/10warning/16info), log
+  ubs-d452-fat-root-production-0211.log. The ten direct-index warnings are bounded
+  by the checked read end, transfer minimum and validated logical boot sector;
+  no indexing or scanner rule was removed. This one-file pass does not erase the
+  earlier six-file nonzero scan.
+- [x] Collect the frozen root package's compiler, strict Clippy and formatting
+  results through RCH: d452 strict Clippy passed, then 8dae workspace check and
+  corrected formatting passed; complete receipts are recorded at 03:22 below.
+  The original four-slot ts1 formatter requests did not execute. Later metadata
+  formatting uses the existing one-slot formatter-only profile; compiler/test
+  profiles and all guards/deadlines remain unchanged.
+- [x] Build the frozen FAT CLI and verify source-preserving root growth against
+  native FAT tools using a private copy of an existing native-produced image.
+  Prepared probe verify-native-fat-root-growth-20261022.py, SHA256
+  5611ea97ff2a7d869da0e2e152ad311a65dabd49b66f0109e1790fc709b9eea4,
+  retained under the local verification log root and copied to CSD with the
+  hash-suffixed name. It fills the native root with mcopy, requires a semantic
+  no-directory-slots refusal, expands512to1024, compares original records and
+  three payloads, checks plain/bounded output equality and immutable sentinels,
+  creates with both native/FrankenFS tools and checks fsck.fat -n throughout.
+  It never formats, deletes or modifies retained source images. Preparation is
+  not execution evidence. This prototype was superseded by the permanent runner;
+  the executed 532-command positive and exact 511-command old-CLI counterexample
+  are recorded below. The prototype itself remains unexecuted and retained.
+- [x] Record exact source/results in the existing Bead and parity notes. Keep
+  original integration acceptance open until its remaining conditions pass.
+
+### 02:20 UTC native workload wiring and executed counterexample
+
+- [x] Extend the EXISTING scripts/verify_fat_read.py runner in place under
+  lease4976. The FAT16 native dialect scenario now invokes root_growth; FAT32
+  keeps its old path. Every previous method body except the additive dialect
+  call/report is AST-identical. All old assertions remain. No extra repository
+  test wrapper, skip path, replacement golden or format gate was introduced.
+- [x] The permanent native workload fills all available fixed-root records with
+  mcopy-created empty files, requires its exact no-directory-slots error, verifies
+  old records/payloads after512to1024slot growth, compares plain/bounded output,
+  creates files with native and FrankenFS writers, then checks both with native
+  fsck and the engine. Immutable source and neighboring sentinels are hash-bound;
+  refused overwrite must preserve the already-created output too.
+- [x] Parse the modified Python AST, inspect the diff and retain script SHA256
+  38f43f61ddecfd4889a2bd0fd2543020cc986c6dc356614f3dbd3521a066828a.
+  The earlier external5611ea97 probe is an unexecuted prototype only; actual
+  evidence now executes Run.root_growth from this real repository workload.
+- [x] Execute the new workload against the old97289769 CLI. Retained root
+  fat-root-old-red-sufvbhzf, log native-fat-root-workload-old-red-0220.log:
+  511captured commands, first510successful/expected; the old CLI failed the
+  positive resize dry run with actual2/expected0 and the exact unsupported
+  --root-entries error. No output was created and retained native input SHA
+  stayed f6a7d3aaff437419ac799a0e60db610ca72007a0c02213c41c1d4d10d62d2add.
+  Outer counterexample verifier returned0 only after asserting this precise red;
+  it is not a successful current-feature or complete native-profile run.
+- [x] Production root.rs UBS returned0; Python runner UBS returned1 with
+  11critical/18warning/19info, log ubs-fat-native-root-workload-0219.log.
+  Critical rule python.ctcompare.secret_eq flags public image SHA comparisons,
+  including old unchanged lines203/243/245/338/360. Retain those comparisons and
+  reports. No scanner rule, test exclusion or equality check was weakened.
+- [x] First current cargo fmt request failed before admission at the unchanged
+  queue deadline: wrapperrchw-54cb58bc-7731-4d11-88b9-3165c9bb55f0,
+  acknowledged true, actual wrapper103. Fresh ts1 telemetry changed from three
+  busy slots to one, supporting one same-four-slot retry; no build-slot config
+  reduction or local fallback. Retry log fmt-d452-root-retry-0219.log.
+- [x] Read-only build health inspection using the existing pinned host-key file
+  found the exact owned cargo build and its asupersync rustc active (~51% CPU),
+  not stalled. An earlier strict SSH probe had incorrectly inherited /dev/null
+  known-hosts lookup and failed255; no keys, host trust or SSH config were changed.
+- [x] Collect the frozen CLI build and run the SAME permanent native workload
+  against its hash-verified Linux binary. Preserve any failure, fix its actual
+  cause and rerun. The executed 532-command positive is recorded below, with
+  unchanged input hashes and both expected refusals; no later-streaming credit.
+
+### 03:22 UTC followthrough — frozen root/FSInfo qualification
+
+- [x] Peer01507310c committed the actual native root-growth workload; its final
+  SHA remains7cb88675ffe717009b22bc096b03d8862c30b2d02f3875bc25a63cd6b2d763af.
+  Final exact-script old-CLI control also returned expected_red,511commands,
+  retained fat-root-final-old-red-i6bvtv22 and local
+  native-fat-root-workload-final-old-red-0228.log. The three extra final controls
+  check exact output length, semantic existing-output refusal and all old payloads
+  again after both writers add files. Older38f43 control remains historical.
+- [x] Full strict Clippy passed d452889fa+six Rust overlays, fingerprint
+  c7e4ab4180fa2eac38aadfbe83e2a7e454fc4d5e12c552c21fe1fcae1f7d267a:
+  build30074357740995175, wrapperrchw-620b08ca-a6c6-4ee2-95eb-69cbea8547f2,
+  actual0/remote0/terminalACKtrue;3017883ms execution/3041.5seconds total.
+  cargo clippy -j1 --workspace --all-targets -- -D warnings. Retain Cargo's
+  dependency future-incompatibility notice for nix0.29.0/0.31.2; no project lint
+  was suppressed. This cut does not cover the subsequent FSInfo/stream features.
+- [x] Retire the overloaded native CLI attempt before a successor: build95171
+  on vmi122 reached reported100%memory pressure. Exact supported cancel RPC
+  timed out RCH-E504; original wrapper ended143, and supported recovery of
+  rchw-9eda77c8-8e68-47af-a938-521c3a806ca0 confirmed completed143/ACKtrue.
+  The log calls SIGTERM attribution unconfirmed; do not claim an OOM diagnosis
+  or a successful build. No daemon restart, lock cleanup, local fallback or
+  duplicate active CLI build was used.
+- [x] Read the complete342-line landed FSInfo production module,351-line test
+  module,71-line contract and integration changes from91f468ef0/8dae5e14b.
+  Eleven authored tests are not execution evidence. Preserve explicit FAT32-only
+  authority, raw allocation/directory/state evidence, five-word hint repair,
+  recognized-backup policy, dirty-state publication and no reclamation/rollback.
+  Reader admission already limits clusters to65536bytes, so its64KiB scratch
+  also covers every admitted directory-cluster size; no hidden large-cluster
+  exclusion was inferred from the scratch bound.
+- [x] Pin this qualification package to8dae5e14b8a0bc6996785e835d48fbb39d79124a
+  plus five original Rust overlays, fingerprint
+  d1224d035dd49a9089e6981720f81374c280fef275d98b6493ecc9926ee121be.
+  Later ea0bc8afd bounded streaming is outside these receipts and has not been
+  fully reviewed or executed here. Do not chase newer main or claim latest-tree
+  coverage from these fixed inputs.
+- [x] Request cache-informed CLI build on hz3 after old143 retirement; ordinary
+  admission queued it until capacity was available, then real compilation began.
+  Log build-8dae-fat-root-fsinfo-hz3-0306.log. All guardrails/deadlines unchanged.
+- [x] The first FSInfo test request on vmi122 refused critical-pressure admission,
+  actual103/no execution, log tests-8dae-fsinfo-0310.log. Request the exact11-test
+  probe on healthy vmi114: tests-8dae-fsinfo-vmi114-0311.log. Start workspace
+  cargo check on idle vmi115: check-8dae-fsinfo-0311.log. Both compile the same
+  pinned8dae+d1224 source. Cache-informed placement did not imply a cached pass;
+  the logs show dependency compilation.
+- [x] Resolve formatter invocation without bypassing destination safety. A
+  --job/--source-content-receipt pair was rejected2 before execution. Plain
+  metadata-job source sync then refused a live checkout destination; wrapper
+  rchw-18717ca0-ceaa-4981-9ae0-48e75cdf2f70 recovered completed1/ACKtrue.
+  Preserve fmt-d452-native-metadata-job-0243.log and fmt-d452-metadata-0242.log.
+  Neither request changed the live checkout. The5015-file preflight manifest
+  fmt-metadata-current-input-0242.json is a retained local snapshot, not a remote
+  execution proof or a receipt covering newer main.
+- [x] Use normal RCH execution with explicit baseline/overlays and the existing
+  one-slot formatter-only profile; no --job flag. This supports isolated source
+  binding and leaves compiler/test profiles, all admission/source/cache checks
+  and deadlines intact. The actual formatter ran and returned1 on exactly two
+  source files: FSInfo and its parent repair module. Retain
+  fmt-8dae-metadata-isolated-0314.log; its failure is not a capacity-only failure.
+- [x] Manually correct the actual two-file formatting diff under leases5034/5035.
+  An initial combined patch context mismatch made no changes; corrected manual
+  edits now pass direct read-only rustfmt. FSInfo bytes equal rustfmt of the exact
+  8dae source, proving no behavior-token change. The parent's three changes are
+  wrapping only. No repair authority, assertions, checks or flags were changed.
+  Corrected full RCH formatter and changed-file UBS are running in
+  fmt-8dae-fsinfo-fixed-0320.log and ubs-8dae-fsinfo-production-0320.log.
+- [x] Collect corrected formatter/UBS and pinned workspace check/FSInfo tests.
+  Workspace check build30074357740995218/wrapper
+  rchw-d9e409bd-a7fe-4e38-aece-31d707963e76 returned0/remote0/ACKtrue,
+  actualPTY23700returned0;1545248ms execution/1577.0seconds total. Full fmt
+  build30074357740995245/wrapperrchw-7335bec7-5ee5-4e5d-bddc-5765eea3de24
+  returned0/ACKtrue. Check/tests use8dae+d1224; fmt uses8dae+e082 with only
+  formatting changes in the two extra files. No latest-main coverage inferred.
+- [x] Hash/deliver the new Linux CLI and execute the permanent native root case.
+  Build30074357740995217/wrapperrchw-bf867189-372b-4566-af98-6c8c43c70b16
+  returned0/remote0/terminalACKtrue;781965ms execution/805.1seconds total.
+  Linux ELF542589256bytes, SHA256
+  12af1605e9a1e2f9fbd4f22971a9c87a1820401bbc3d1c72b03670c786641b8b,
+  delivered exclusively to CSD ffs-fat-8dae-12af1605 and rehashed unchanged.
+  Permanent Run.root_growth passed532commands:530successful/two expected1s.
+  Log native-fat-root-workload-8dae-positive-0327.log, actualPTY86014returned0;
+  retained fat-root-8dae-native-a_dxn2cp/result.json. Native mcopy filled507
+  empty files into the512-slot root, required no-directory-slots refusal;
+  expanded1024-slot image preserves old raw records, zeroes new slots and
+  retains three payloads before/after native and FrankenFS creation. Native
+  fsck passed; plain/bounded output equal; dry-run and overwrite refusal
+  preserve input/output hashes. Eight immutable inputs/tools/binary/script
+  stayed unchanged. Only this native component ran, not the full6profile suite,
+  native4096relocation, FSInfo, newer streaming, mounted, boot or field proof.
+- [x] Collect corrected full formatter: fmt-8dae-fsinfo-vmi115-0328.log,
+  actualPTY61826returned0,33.5seconds total, corrected7overlay fingerprint
+  e08208528b6817996e0af810ac47aeab5e0a3b8cbd2bde5ed1862b0ba8dade3f.
+  Newly corrected production files also passed UBS0:0critical/46warning/61info,
+  log ubs-8dae-fsinfo-production-0320.log, actualPTY82270returned0. Wider test
+  panic/public-hash scanner reports remain unresolved and were not weakened.
+- [x] Collect all11FSInfo Rust tests: build30074357740995216,
+  wrapperrchw-ab424599-14b6-444c-9b46-cf6a580587f8, actualPTY65105returned0,
+  remote0/terminalACKtrue.11pass/0fail/0ignore/484filtered;17.67seconds test
+  execution,1190487ms remote/1227.1seconds total, source8dae+d1224. Log
+  tests-8dae-fsinfo-vmi114-0311.log. Includes no-write refusals, every write/sync
+  fault, cancellation, changing evidence, unknown reserved backup, exact five
+  words and separate ordinary recovery. Native FSInfo is still pending below.
+- [x] After the FSInfo Rust probe, qualify its explicit dirty-state repair and
+  separate ordinary-recovery path on a private native-produced FAT32 copy;
+  preserve old payloads, surrounding bytes and all failed evidence.
+  Actual permanent Run.fsinfo_recovery added in place; all old Run methods
+  except additive dialect dispatch remain AST-identical, including root_growth.
+  Independent native_allocation now also computes first free cluster. First
+  runnerc7b163a3 wrongly expected0 from intentionally dirty check. Six-command
+  failure retained fat-fsinfo-8dae-native-8o2xnok3 and native-fat-fsinfo-8dae-0342.log;
+  all immutable hashes unchanged. Actual CLI main.rs132-142 emits JSON then1
+  whenever not clean. Correct new probe to exact1 plus semantic stderr;
+  retain exact4native dirty markers, complete namespace/allocation and wholefile
+  expectations. Independent review requested Mail5554; no production gate changed.
+  Corrected runner320d1c1318b6470462698e5e51f19c11f38203cd75185848781335d5a38f5d55
+  passed20commands:17zero/three exactnonzero, actualPTY57445returned0.
+  Log native-fat-fsinfo-8dae-fixed-0339.log, retained
+  fat-fsinfo-8dae-native-_qg201_z/result.json. Private128MiB native FAT32 copy,
+  512Bsectors/4096Bprefix+suffix; damagedprimarysignatures/bothhints,
+  ordinaryrecoverrefusal, authorityrefusal/dryrun, repaironly5wordsperhintsector
+  +4dirtymarkers; independently counted253962free/next4118. Repeatedrepair
+  wholehashunchanged; ordinaryrecoverdryrununchanged, actualrecoverclean,
+  reclaimed0/retiredLFN0. Native mcopy3payloadsbefore+after, ffscat3after,
+  nativefsck0. Original/3payloads/tools/binary/script all8hashesunchanged.
+  DamagedwrapperSHA9d1f3a545f07776b77061dadf29a4efcce9ad7cb44017f679b5f5a99e4e6a552;
+  dirtySHAad2ae68136016108a931cfed0cb530290a8bc717e406439092cc4e656f8bc9f2;
+  recoveredSHAaf48993cfcb7ff3a6b0f6083f4461b7bc353c8bc67d424b7a39c473d2cfc8c52.
+  Retainednativeoriginal76a7d98589f62d18c068eb2f92aa7675e172f96d1cbbca339d4a4f4af71e1e6b.
+  No fullrunner/native4096/kernel/crash/newstream/field inference.
+- [x] Refresh measured parity/Bead comments with executed results; retain original
+  in_progress and unresolved publication/scanner boundary until acceptance holds.
+- [x] Collect full workspace strict Clippy on corrected8dae+e082. Request
+  clippy-8dae-fsinfo-0341.log on now-idle/warm vmi115, normal compiler profile,
+  unchanged guards/deadlines/slots and explicit frozenbase+sevenoverlays.
+  It returned 101 on exactly two FSInfo production lints: nonminimal_bool and
+  chunks_exact_to_as_chunks. Build 30074357740995248, wrapper
+  rchw-377d5096-7e34-49a2-8616-95b28f786090, actual PTY94304 exit101/ACKtrue;
+  278205ms execution. This failure remains a failure, not a passing gate.
+- [x] Manually correct both actual production lint sites under lease5034:
+  !(state || hints && hint) is DeMorgan-equivalent for all eight boolean inputs;
+  as_chunks::<4>().0.iter() visits identical ascending FAT32 allocation words.
+  prepare rejects other dialects before Evidence; width=4, length=entries*4,
+  so both old/new iterators have no remainder and retain the same evidence hash.
+  No assertion, repair authority, refusal or scanner rule changed. New source
+  overlay a02d60b9d4cdb54f405c230a906dc519636887e4513676a71f9ecde467adb974.
+- [x] Full RCH formatting passes again on that final overlay, 35.7seconds;
+  log fmt-8dae-fsinfo-clippy-fixed-0347.log, actual PTY16576 exit0.
+  Changed production FSInfo UBS also returns0/0critical/14warning/23info,
+  log ubs-8dae-fsinfo-clippy-fixed-0347.log, actual PTY2493 exit0.
+- [x] Collect strict workspace Clippy and the eleven FSInfo regressions on
+  final8dae+a02d60b9; then repeat required workspace/all-target check on this
+  final source. Logs clippy-8dae-fsinfo-fixed-0346.log and
+  tests-8dae-fsinfo-fixed-0347.log. Native12af remains the pre-spelling-change
+  executable; retain its original source binding rather than claiming a new ELF.
+  The a02d60b9 Clippy failure and the subsequent final7262c1db pass are recorded
+  below. Eleven tests reran on final production; all final compiler/style gates
+  pass, with each test-only delta and source distinction disclosed.
+- [ ] Obtain independent disposition of wider UBS/publichash/testpanic reports
+  and the new-probe status correction before any gated publication/closure.
+  Current Python UBS remains1:20critical/24warning/41info, all20critical under
+  python.ctcompare.secret_eq on public SHA comparisons. Preservechecksandreport
+  ubs-fat-native-fsinfo-0345.log; do not replace equality just to appease scanner.
+- [x] Execute the existing unchanged Run.mounted read-only FAT16/FAT32 cases
+  with the already-qualified8dae CLI and retained native images. Fresh /tmp
+  mountpoints obey the previously observed fusermount profile; preserve all
+  source/tool/binary hashes and require owned clean unmounts, actual mounted
+  payload/range/stat reads and EROFS write-open refusal. This is strict FatFs
+  mounted evidence only, not facade-mounted routing or writable/crash proof.
+  ActualPTY10247returned0; log native-fat-ro-mount-8dae-0345.log,
+  CSD /tmp/fat-ro-mount-8dae-5nkor59r/result.json statuspassed. Two actualFUSE
+  mounts,12full/rangecomparisons,6sizechecks,2EROFSwriteopenrefusals,2statfschecks,
+  eachdaemonexit0/unmounted. Four nativefsckchecks+twofusermount commands all0;
+  12source/payload/tool/CLI/script hashes unchanged and noownedmountpointleft.
+
+### 04:00 UTC continuation — actual output consumers and remaining gate fixes
+
+- [x] Reopen the actual expanded FAT16 and recovered FAT32 outputs through the
+  public facade consumer and strict read-only FUSE. The permanent mounted method
+  remains unchanged. Native evidence `/tmp/fat-operation-consumers-68fgd5vi`;
+  local `native-fat-operation-output-consumers-0358.log`, actual PTY4765 exit0.
+  Twenty public calls: eight payload reads, eight stats, two exact listings and
+  two write refusals. The expanded root lists 514 names including dot entries;
+  five root-growth payloads and three recovered payloads match. Two mounts pass
+  sixteen full/range comparisons, eight sizes, two EROFS refusals and two statfs
+  checks. Both daemons exit0/unmount; four native fsck plus two unmount commands
+  pass. Total26 captured commands plus two daemons; all15 immutable hashes match.
+  Public consumer remains prior e862954f96cf7bfff76fd63d47465cd4b55dd0f1f3e3acb9c08e883b34e4ef48;
+  mount CLI remains12af1605 on8dae+d1224. These are distinct executable cuts,
+  not latest-main, facade-mounted, writable, crash or field proof.
+- [x] Correct an uncommitted documentation transcription of this evidence path
+  against the actual log header before publication. All three documents now cite
+  the real68fgd5vi directory; no nonexistent evidence path is relied on.
+- [x] Collect the second full strict Clippy failure: build30074357740995252,
+  wrapperrchw-b29b8a26-6414-43de-803c-d6953fc77268, actual PTY38809 exit101,
+  remote101/ACKtrue,527969ms. Production lints are fixed; it now reaches tests
+  and reports decimal_bitwise_operands at FSInfo test159 and
+  significant_drop_in_scrutinee at312. Log clippy-8dae-fsinfo-fixed-0346.log.
+- [x] Reserve the test file (lease5065) and manually correct only those two sites:
+  300 becomes identical0x012C in the bitwise expression; clone Storage::image()
+  into a local before the loop, releasing its mutex before host-file writes.
+  image() returns an owned clone of durable+pending pages; the same pages/bytes
+  are written. Every old assertion, expected value, fault and panic stays intact.
+- [x] Final eight-overlay source fingerprint:
+  7262c1db4f99fdb1f5a8887af02a35b2fa3ea2f290900216853e3d81952f81c5.
+  Full formatter0/ACKtrue,32.6seconds, build30074357740995259/wrapper
+  rchw-f9c627fa-ec9c-4a41-b840-6af8f238d0ac, actual PTY94237 exit0;
+  log fmt-8dae-fsinfo-test-fixed-0358.log. Test-file UBS0/0critical/180warning/
+  19info, actual PTY21784 exit0; log ubs-8dae-fsinfo-test-fixed-0358.log.
+- [x] Collect final full strict Clippy95256/wrapper
+  rchw-c46d3dce-ebf7-4527-b4a9-e7f5f6eaacbb, log
+  clippy-8dae-fsinfo-test-fixed-0357.log: actual PTY38501 exit0, remote0/ACKtrue,
+  212049ms execution/231.3seconds total. No lint suppression or assertion change.
+- [x] Required final workspace/all-target check also passed on8dae+7262c1db:
+  build30074357740995264/wrapperrchw-3a1f5b14-0db0-448a-aa68-841991922cbd,
+  actual PTY82607 exit0, remote0/ACKtrue,31680ms execution/51.9seconds total.
+  Log check-8dae-fsinfo-test-fixed-0402.log. All three required compiler/style
+  gates are green for this frozen package, not for the later streaming commit.
+- [x] Collect the eleven-test production-correction rerun95253 on8dae+a02d60b9.
+  Actual PTY8825 returned0; remote0/ACKtrue, wrapper
+  rchw-861cf9b2-5350-4253-95f2-68d6b5667336. Eleven passed, zero failed/ignored,
+  484 filtered,20.64seconds test runtime;1406517ms remote/1442.9seconds total.
+  Log tests-8dae-fsinfo-fixed-0347.log. Its production source is final; the
+  subsequent test-only literal/fixture-guard edits were compiled by final
+  workspace/Clippy gates. No exact-final-test runtime is silently substituted.
+- [x] Read the later streaming production module, reader/lib integration diff
+  and contract as preparation only. Its ten new Rust tests remain unreviewed and
+  unexecuted here. CLI/public stream_file are wired; mutable mount caches retain
+  the materialized representation by the declared lifetime contract. Do not
+  substitute immutable-reader indexes into mutable mounts or claim new parity.
+
+### 04:12 UTC bounded completion and publication boundary
+
+- [x] Fresh eight-file Rust UBS scan completed with actual exit1:
+  two critical reports,491 warnings,166 information items. Log
+  ubs-final-fat-followthrough-eight-rust-0407.log, actual PTY81594. The remaining
+  critical sites are indexed/tests.rs57/61, the explicit no-write/no-sync panic
+  tripwires. Both remain intact. The scanner classifies six other test-only
+  panic sites as warnings; the older three-critical scan is retained, not erased
+  or presented as a code improvement. Python scan remains1/20critical on public
+  SHA comparisons, exact runner320d1c13; no scanner rule or assertion changed.
+- [x] Retry ordinary canonical br sync --import-only once: actual6, recovery
+  refused BEFORE OPENING because WAL may contain committed/uncheckpointed
+  changes. No canonical engine/WAL cleanup, checkpoint, rebuild or deletion.
+  Continue staged-only comments; do not pretend canonical import succeeded.
+- [x] Preserve all failed probes, old source cuts, partial outputs, eight
+  pre-existing DS_Store files and unrelated peer work. Native mount daemons
+  exited/unmounted; all owned RCH requests now have observed terminal outcomes.
+  No root commit, push, functional Bead closure, new ownership claim or field
+  claim occurred. The exact new-probe dirty-status correction still awaits the
+  independent review requested in Mail5554; empty inboxes are not acceptance.
+- [x] Bounded honesty refresh: this continuation adds actual native/output/kernel
+  consumers and one permanent FSInfo runner component, rather than a new process
+  framework. Four executed Clippy diagnostics were fixed without suppressions;
+  all assertions/faults remain. The dirty-check expected-status correction and
+  an uncommitted evidence-path transcription error are disclosed and corrected,
+  with failed evidence preserved. Native binaries, unit source and final gates
+  retain distinct fingerprints. No speedup, complete six-format mount, crash,
+  latest-streaming, release or tracker-closure credit is inferred.
+- [ ] Independent scanner-lane/status-correction review, authorized publication
+  and original acceptance closure remain outstanding. Preserve existing graph
+  dependencies and canonical engine ownership; do not self-grant an exception.
+  Concrete review bundle:
+  /Users/jemanuel/Library/Logs/frankenfs-verification/native-library-fat-review-20261022-3698wcyx/changes.patch
+  and its source/file/log-bound manifest.json. This supersedes the older c4956
+  publication patch for reviewing the current owned diff; retain that old artifact.
+  The first export command was rejected before execution because DCG could not
+  statically verify an expanded subprocess argument list. Use an explicit literal
+  read-only Git argv and exclusive-create artifact files; no allow-once token,
+  guard override or existing-file overwrite is authorized or used.
+
+### 04:19 UTC next capability slice — bounded FAT streaming
+
+- [x] Confirm HEAD remains ea0bc8afd and preserve all thirteen owned dirty paths
+  plus eight pre-existing DS_Store files. Keep the original staged Bead
+  in_progress; no new claim, graph mutation or independent-review assumption.
+- [x] Read the complete177-line streaming implementation, shared-walker and
+  public stream_file integration diff,57-line contract and all445test lines.
+  Ten actual tests cover both dialects/sector sizes, fragmented/reverse reads,
+  max native file length, bounded physical reads, corruption before output,
+  active FATs, partial I/O, cancellation, visitor/work bounds and sink failure.
+  No functional defect found in the initial source review; source review is not
+  Rust execution or native qualification. Mutable mounts retain full maps by
+  their declared lifetime contract; do not substitute immutable caches there.
+- [x] Reserve stream.rs/tests.rs and TODO under leases5074-5076. Start strict
+  full workspace Clippy and full formatting on frozen ea0bc8afd plus the eight
+  retained Rust overlays using normal RCH admission and existing profiles.
+  Logs clippy-ea-stream-0419.log and fmt-ea-stream-0419.log. No local Cargo,
+  source/slot/cache guard changes, deadline extensions or daemon maintenance.
+- [x] Full remote formatting returned1 on new streaming source/test formatting;
+  retain its real failure. Strict Clippy is still compiling, not a pass.
+- [x] Manually format only stream/tests.rs under the parent lease; independent
+  root comparison equals read-only rustfmt output byte-for-byte. All ten tests,
+  55 assertions and protective panic guards are preserved. SHA3941e4ae.
+  Full remote formatting now returns0, build30074357740995281, wrapper
+  rchw-0bc7fe86-1104-4743-b4fc-af3ec52e80eb, terminal ACKtrue. Final nine-overlay
+  fingerprint ed09c13eb2eeab4f156d97c26adb92f6f0845e91c4c0a1505ec55d506a77c8f6.
+  Initial Clippy95276 still compiles; full FAT/facade runtime started separately
+  on the corrected nine-overlay cut, tests-ea-stream-0434.log.
+- [x] Add Run.streaming_reads to the existing native runner and invoke it from
+  dialect. Require both cat/exact extraction, native mcopy references, declared
+  volume origins, full native slot ancestry, zero-output wrong-parent/unknown
+  selector refusals, native fsck and unchanged plain/bounded input hashes.
+  Predeclared native scope: two dialects, three files, two selectors and two
+  volume profiles =24 payload comparisons; eight expected selector refusals,
+  six native reference reads and four native filesystem checks. Expected50
+  captured commands includes eight catalogs. Authored checks are not execution.
+- [x] Add a private cyclic-tail control for each native format, changing only
+  the final allocation word in each mirror and preserving reserved high bits.
+  Cat and exact extraction must both refuse before stdout. Before execution,
+  baseline scope is now54 commands:24 payload comparisons,12 exact expected
+  refusals,6 native reference reads,4 fsck checks and8 catalogs. UBS found two
+  scope warnings in new BPB closures; bind them to an immutable boot-sector
+  copy before releasing the private image buffer. Corrected runner b0645eed
+  rescans without those warnings; public-hash and test-panic reports remain.
+- [x] Also consume the previously verified expanded FAT16 and recovered FAT32
+  outputs with this new reader, including both post-expansion writes. Planned
+  four-image total before execution:118 commands,56 payload comparisons,
+  24 expected refusals,14 native references,8 fsck checks and16 catalogs.
+  Preserve all input/output hashes and bind execution to the new CLI/source.
+- [x] Execute the complete four-image scope with final runner b0645eed and new
+  Linux CLI a45f6380. Actual PTY8819 returned0;118 commands matched exact status,
+  94 zero/24 one. All56 payload comparisons,14 native reference reads,eight
+  native filesystem checks and16 catalogs passed. Eight cyclic-tail refusals
+  and16 unknown/wrong-parent refusals emitted no stdout. All15 immutable hashes
+  remained unchanged. Retained CSD fat-stream-ea-native-n3rmvqrt/result.json and
+  local native-fat-stream-ea-a45f-0445.log. No complete-runner/mounted/native4GiB,
+  fragmentation,4096-byte-sector, speedup or field claim follows.
+- [x] New RCH CLI build95285, wrapper rchw-251c3113-3138-49b8-9c5e-05689ccaff2e,
+  actual0/remote0/ACKtrue on final nine-overlay ed09c13e. ELF verified x86_64,
+  542684816 bytes, SHA a45f6380c4ce1faefa66082c9586ccf0de9a8eb6c21afc9a02d70e92f7aa1e9a.
+  Delivery used exclusive creation and checked the same SHA before execution.
+  Initial Clippy95276 remains running on the pre-format test cut; corrected
+  full FAT/facade runtime95283 continues. Full corrected workspace check now
+  runs through RCH on hz3, check-ea-stream-0444.log. No pending run is a pass.
+- [x] New streaming production UBS returns0, zero critical/one warning/15 info.
+  The warning is result-buffer slicing, bounded by allocated request length
+  and each physical-run count. New test panic guards remain intact; their
+  scan returns1/two critical. Corrected Python b064 scan returns1/23 critical
+  public-hash comparisons; old scope warnings disappeared without suppression.
+  All findings and old failed-source scans remain retained for review.
+- [x] Correct the README's obsolete fixed-root limitation to the already
+  native-qualified new-image resize capability, linking its existing contract.
+- [x] Manually correct observed diagnostics without suppressions, weakened
+  assertions, test exclusions or golden updates. Assertion forms change only
+  as explicitly recorded below; their predicates and count remain intact.
+- [x] Execute ten streaming regressions and complete affected FAT/facade tests
+  with nonempty selections on final corrected source. Require final workspace/
+  all-target check, strict Clippy and full formatting.
+- [x] Build the final Linux ffs-fat CLI, hash/deliver it exclusively and execute
+  existing native read/exact-selector consumers and preservation controls on
+  native FAT16/FAT32 inputs. New native evidence must bind to the new ELF;
+  old12af receipts do not qualify streaming or establish a measured speedup.
+- [x] Update parity, contracts and original staged Bead with actual results.
+  Keep publication/closure gated on unresolved whole-change UBS and independent
+  status-correction review, and preserve canonical WAL ownership.
+
+### 05:04 UTC executed Rust results and final test-only corrections
+
+- [x] Full FAT/facade run95283 returned0/ACKtrue on ed09c13e. Actual548 passes,
+  zero failures, one existing ignored native-tool interchange test:40 facade
+  units,505 FAT units,two downstream admission/context integrations and one
+  facade compile doctest. All ten streaming tests passed; empty ffs-fat doctests
+  earn no test credit. FAT runtime616.91seconds; facade1.72seconds/integrations
+  5.39seconds;2020878ms remote/2062.8seconds total. Log tests-ea-stream-0434.log.
+- [x] Corrected full workspace check95291 returned0/ACKtrue, wrapper
+  rchw-64dced15-1e2d-41a4-832c-a4326c8ac539. Runtime588296ms/598.5seconds total.
+  This is the pre-test-lint ed09c13e cut, not a final7d13873c check.
+- [x] Initial strict Clippy95276 returned101/ACKtrue with15 new test diagnostics:
+  three numeric-literal spellings, eleven empty-value assertions and one
+  identical match arm. Manually use131_072, equivalent typed empty Vec equality
+  assertions with better failure output, and let the existing zero-valued
+  wildcard handle both free/mirror fault cases. All six fault labels,ten tests,
+  55 assertions, no-write/no-sync panics and production bytes remain unchanged.
+  Current test SHA61aae46ea781e2cc940a87234ca1fb91f2de7e829a09811d752bf0270c00657d.
+- [x] Superseded ed09c13e Clippy95293 was explicitly cancelled through RCH;
+  actual143/ACKtrue, not a pass or unexplained OOM. The helper's generic SIGTERM
+  message is explained by that owned cancellation. Waited for terminal ACK
+  before replacing it. First corrected retry on hz3 refused103 for disk/I/O
+  critical pressure; no local fallback, cache/slot/pressure bypass or cleanup.
+  Corrected strict Clippy now runs on admissible vmi1153651.
+- [x] Full corrected formatting returns0 on7d13873c, log
+  fmt-ea-stream-lint-fixed-0500.log, actual PTY29659. Full fingerprint
+  7d13873c18805f020d68515fbba8121b96a1213d06c2ac4e756dddd2c17a6ad1.
+- [x] Collect corrected strict Clippy and rerun full workspace check on7d13873c.
+- [x] Collect exact-final ten-test streaming rerun on7d13873c through RCH after
+  full95283 completed. Final log tests-ea-stream-lint-fixed-warm-0524.log.
+  Earlier548-runtime/nativeCLI receipts remain bound to ed09c13e; the only later
+  source change is the equivalent streaming-test lint correction above.
+- [x] Full changed-code UBS returns1:27 critical,662 warnings,248 information
+  items across nine Rust files plus Python. Critical classes remain23 public
+  hash comparisons and four test-only backing-write/sync panic tripwires.
+  No scanner suppression or assertion removal. The final test edits rescanned
+  with the same27/662/248 counts; older scans remain retained.
+
+### 05:16 UTC bounded audit and review-snapshot creation gate
+
+Window:04:17 onward, current uncommitted streaming followthrough. README purpose:
+native filesystem behavior in Rust, through FUSE and offline-image tools, with
+explicit durability boundaries. Git log/reflog show no new commit or rewrite in
+this window; newest staged closure is October20, not this window. The first
+closed-item query used reverse and returned oldest rows; inspecting dates caught
+that and the corrected newest-first query is retained. No new closure occurred.
+
+Real-work classification: USER2 (README capability correction and reader profile),
+ENABLER2 (streaming-test gate fixes and permanent native positive/negative runner),
+PROCESS2 (requested TODO/Bead accounting and parity/evidence accounting), UNKNOWN0.
+This is an enabler-heavy qualification block, not a newly authored algorithm.
+Audit questions:1) demo cat/exact extraction on a bounded native image plus its
+zero-output cyclic-tail refusal;2) without process entries the bytes would be
+the same, but the explicitly requested source/remaining-work record would be
+missing;3) the new permanent runner actually executed118 commands, not speculative
+infrastructure;4) native fuzz/writer/durability goals remain open, and another
+owner retains the read-authority P0 without handoff; this block completes the
+already claimed native-library integration slice;5) no close-farming pane—one
+helper only formatted tests and no pane closed anything;6) no plan/spec edits
+stand in for code, no follow-up closes an unmet original. Verdict:bounded
+HEALTHY enabler work; process earns zero capability credit. Finish existing
+gates and return to executable work; do not create another framework.
+
+Honesty inventory, all20 prompts, checked against actual diffs/logs:
+1. No (checked:ten tests/55 assertions retained; empty-value predicates remain
+   exact equality to empty, all six fault labels and panic tripwires remain).
+2. No (checked:no production mock/stub; native tools run on retained native
+   images, synthetic ByteDevice tests are labeled as such).
+3. No (checked:changed paths contain no golden/snapshot regeneration).
+4. Yes—existing native verification code was extended additively; prior methods
+   except additive dialect dispatch remain AST-identical. No relaxation here.
+   The earlier dirty-check status correction remains separately review-gated.
+5. No (checked:all four predeclared native cases ran; no success hardcoding,
+   source/admission override, selected-result filtering or timeout increase).
+6. No (checked:548 nonempty test passes are counted; empty FAT doctests earn
+   zero, one existing native-tool test stays explicitly ignored; final ten-test
+   rerun is still pending and earns zero additional runtime credit).
+7. No (checked:actual PTY statuses and RCH terminal ACKs distinguish each
+   passed, failed, cancelled, refused and queued/preparing invocation).
+8. No (checked:unit/synthetic, retained-native CLI, older mounts and field
+   evidence stay distinct; native script names the retained input images).
+9. No (checked:fmt1,Clippy101,cancel143,admission103,UBS1 and pending runs are
+   recorded. The original format failure was in tests only; production stream.rs
+   already matched rustfmt. Test-lint changes do not acquire old runtime credit).
+10. No (checked:stdout/stderr are retained locally or in every native command
+    record; redirected output is inspected, not discarded).
+11. No (checked:original Bead remains in_progress; no new closure/dependency
+    laundering or substitute item was created).
+12. No (checked:README increases accuracy about implemented root growth; no
+    target, requirement, compatibility promise or acceptance criterion lowered).
+13. No (checked:format helper had no tracker mutation and closed no item).
+14. No (checked:helper acceptance required exact formatting with all tests,
+    assertions and refusal checks retained, with no native/independent claim).
+15. No (checked:root compared helper output byte-for-byte to read-only rustfmt,
+    read the diff and counted tests/assertions before relying on it).
+16. No (checked:one positive capability slice,56 native byte comparisons plus
+    refusals, zero closure credits; no refusal-only task farming).
+17. No (checked:helper agreement is not independent verification; root execution
+    and external native-tool oracles retain their precise proof classes).
+18. No (checked:native denominators50,54,then118 were extended before execution;
+    the actual four-image scope matches118/56/24/14/8/16, with15 immutable hashes).
+19. Yes—source cuts need explicit explanation:548 tests and native CLI use
+    ed09c13e; later7d13873c changes only equivalent test forms/literals. Old
+    lint failure and replacement runs remain visible. Correction/countermeasure:
+    bind each receipt to its cut (RH-2), retain failures and never weaken the
+    gate (RH-1); no entire-final-cut or field claim is substituted.
+20. Strongest executed evidence:the real permanent runner with candidate ELF
+    a45f6380 on four named native/operation-output images, all118 exact command
+    statuses and15 input hashes, plus full548 Rust passes. Logs and input/tool/
+    executable hashes make those bounded observations reproducible.
+
+Historical audit limitation:all six scoped cass searches (five inventory phrases
+plus stream/tests.rs) timed out124 despite healthy initial status. Its owned
+index process stayed in preparation; TERM/INT did not stop it, and only that
+verified owned PID47243 was stopped137. No purge/rebuild or manual corpus-file
+edit followed. This is not a clean historical-audit result. Current-source
+review uses direct diffs and receipts; no historical conclusion is inferred.
+Disposition:assertions and source gates preserved, gate extension/source-cut
+distinctions disclosed and review remains required. This is solo re-execution
+with native-tool oracles, not independent human/agent certification or closure.
+
+Creation worksheet for one final two-file review snapshot:
+- Boundary:NO; patch/manifest are process, not runtime state.
+- Consumer:the operator and ChartreuseMouse/DustyWolf reviewing the pending
+  scanner/status-correction request in the original Bead thread.
+- Gate:publication/closure of bd-native-image-library-s4tde cannot use the old
+  13-file snapshot for this now16-file patch and two distinct source cuts.
+- Observed defect:the previous04:15 snapshot became historical as test fixes,
+  the runner and TODO evolved; stale proof/source binding is already observed.
+- Retirement:retire its decision authority after review or any source change;
+  retain historical bytes until the user authorizes deletion. No deletion here.
+- Integrity questions:prevents approving stale bytes; required at16 dirty paths
+  and several executed cuts; two files are the minimum diff plus source/log
+  binding; a live diff alone cannot freeze reviewer inputs. No cheaper stable
+  equivalent is available within the existing review workflow.
+- Opportunity cost:the claimed reader qualification is highest admissible work
+  here; finish its two pending commands. Cap snapshot work at one simple export,
+  with no dashboard, schema, speculative check or capability credit.
+- Verdict:LEGITIMATE GATE; create only that snapshot after final results.
+
+### 05:29 UTC final source-bound qualification
+
+- [x] Final strict workspace/all-target Clippy95296 returns0/ACKtrue on7d13873c,
+  wrapper rchw-9a6cd269-7c96-4f95-b706-7e9314471aea.333218ms remote/353.8seconds
+  total; clippy-ea-stream-lint-fixed-vmi-0501.log. All15 observed test lints are
+  fixed without changing a predicate, fault case, production byte or lint rule.
+- [x] Final full workspace/all-target check95301 returns0/ACKtrue on the same
+  cut, wrapper rchw-e47186a2-6971-4b85-9b09-535ab3e0711a.792889ms remote/
+  812.6seconds total; check-ea-stream-lint-fixed-0508.log. Formatting95295 also
+  returns0/ACKtrue, wrapper rchw-df59dbc7-85e1-4dc2-94cb-3e3f819b2e24.
+- [x] Final exact ten-test rerun95310 returns0/ACKtrue on7d13873c, wrapper
+  rchw-4d4cb75d-c279-4d73-b8fd-a28a664163d7, actual PTY46018. Ten passed,zero
+  failed/ignored,495 FAT cases filtered. Runtime39.20seconds,26.09seconds build,
+  68293ms remote/108.0seconds total. The41 facade units/two integrations filtered
+  by this targeted command earn no additional passes. Full548 remains the
+  separate ed09c13e run. The original FAT/facade package selection is retained
+  to preserve its dependency features; no cache/source/admission guard changed.
+- [x] Retain failed admission of the first targeted attempt (103,before remote
+  execution; rchw-394dd0f2-d37d-4b40-ac32-37cd29555222,ACKtrue). Its worker was
+  full with another project. The admitted cold attempt95302 was explicitly
+  superseded/cancelled143/ACKtrue when the warm worker became available. No
+  waiting, cancellation or empty selection is counted as a test pass.
+- [x] Audit extension/Q9+Q19 correction:commentary briefly inferred continued
+  queueing from the quiet second warm-run log and proposed automatic selection.
+  Registry95310 instead confirmed admitted/sync_up. Corrected that statement
+  publicly before any further cancellation/reroute; the admitted warm run was
+  kept and passed. Future status claims use the registry before inferring from
+  a quiet log. No source/gate/capacity change resulted (RH-2 countermeasure).
+- [x] Preserve both source cuts:the native a45f6380 ELF and full548 use ed09c13e;
+  the final ten-test runtime/compiler gates use7d13873c with equivalent test-only
+  lint edits. No full-runtime relabel, mounted-reader, native4GiB/4096-byte-sector,
+  fragmentation, speedup, independent human review, crash or field claim.
+- [x] Updated reader contract and measured parity with these executed outcomes.
+  The README's obsolete fixed-root limitation now links actual new-image root
+  expansion. No target or requirement was lowered to match missing behavior.
+- [x] Finalize staged Bead comment and empty-cycle/flush checks. Publication
+  and original acceptance closure remain open under
+  AGENTS.md797 (UBS exit>0 requires fix/rerun) and the pending independent
+  scanner/status-correction review. Canonical WAL ownership stays untouched.
+- [x] Fresh canonical import attempt0531 again returns6 BEFORE OPENING, naming
+  possible committed/uncheckpointed WAL frames. No engine/WAL replacement,
+  checkpoint, rebuild or deletion. Staged cycles return0/empty and flush returns0
+  (already-written JSONL had nothing dirty to export). No new ownership claim,
+  graph edit, root commit, push or functional Bead closure occurred.
+- [x] Reservation check covers all16 changed paths with zero conflicts. Retain
+  all failed probes, earlier source cuts, eight pre-existing DS_Store files,
+  unrelated jobs and prior review snapshots. All owned RCH invocations now have
+  terminal outcomes; the unrelated old rchw-ee4eea67 record was not touched.
+
+Final review freeze target:
+/Users/jemanuel/Library/Logs/frankenfs-verification/native-library-fat-stream-review-20261022-m2404c_1/
+containing only changes.patch and manifest.json. Its export verification/hashes
+are recorded in the original Bead after export, so this source note can remain
+frozen as part of that exact patch. The creation worksheet above applies; no
+additional report/framework is authorized or credited. Earlier13-file bundles
+remain historical and do not cover this16-file review surface.
+
+## Current public FAT consumer continuation — 2026-10-22 16:13 UTC
+
+**No-delete violation disclosed16:26 UTC:** root invoked tracker hygiene without
+FFS_E2E_DISABLE_TEMP_CLEANUP=1. scripts/e2e/lib.sh's EXIT cleanup removed its own
+scratch tree /var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/ffs_e2e_XXXXXX.01uvUjGZyu
+and child scratch fixtures. There was no user authorization for deletion. The
+directory is now absent; do not fabricate recovery or recreate it as evidence.
+The artifacts/e2e/20261022_121230_ffs_tracker_source_hygiene_aa9ROZ run logs and
+JSON reports remain. Git has no deleted project paths. This was avoidable:
+inspect cleanup behavior and explicitly set the no-cleanup environment on all
+future E2E calls. Honesty Q9/Q19=Yes for this window; disclose in final report,
+do not count the failed tracker run as passing or silently bury this incident.
+
+Continue `bd-native-image-library-s4tde` only. It is in_progress in the staged
+bridge; canonical JSONL still shows open/unassigned, and `br sync --import-only`
+again refuses6 BEFORE OPENING for potentially committed WAL. No claim or status
+is represented as canonical. The fresh local hygiene report now finds53local
+open/50claimable/zero foreign-open rows, including this original ID. The E2E
+itself fails6/15 scenarios because installed bv rejects --no-cache, so that
+report does not establish a passing tracker gate. No tracker gate or WAL edits.
+
+- [x] Refresh main/dirty paths, all AGENTS/README content, current inbox and
+  source-aware tracker state. No review reply, source movement or peer lease
+  conflict; preserve05:38 review bundle as historical frozen bytes.
+- [x] Select concrete integration gap: permanent FAT native runner cannot
+  invoke the public facade consumer, unlike the NTFS/ZFS runners. Existing
+  manual public ELF is older than current streaming/repair code.
+- [x] Reserve existing runner/TODO/parity/FAT profile and announce original-ID
+  scope through Agent Mail5604. No new graph claim or speculative framework.
+- [x] Add optional --facade-binary and reusable Run.public_reads to the existing
+  native runner, wired into all three existing producer scenarios. Native
+  mcopy payloads/mdir names independently define expected bytes/listings;
+  check exact format/type/length, whole/range/EOF/empty reads, EROFS contract,
+  typed missing-path/directory-read errors, plain/bounded sentinel preservation
+  and unchanged source/executable hashes. All previous checks stay intact.
+- [x] Syntax/CLI help pass without pycache. Read-only AST comparison against
+  retained b0645eed runner confirms all146 previous check predicates and
+  command/mounted/streaming_reads bodies preserved. All five producer/output
+  methods differ only by additive facade calls and report fields.
+- [x] Finish strict RCH current native_reader build on ea0bc8afd+7d13873c;
+  build-ea-public-fat-1614.log, worker vmi1149989. No local fallback or pending
+  build counted as a pass. Await actual exit/terminal ACK and artifact hash.
+- [x] Execute the actual permanent public_reads method against four retained
+  native/operation-output images and fresh bounded wrappers. Predeclare both
+  counts and expected failure countermetric before execution; no new mkfs,
+  native mount, or mutation of retained originals is required.
+  Fixed denominator:14 file instances, eight plain/bounded views,168 byte
+  comparisons,28 file stats,16 exact listings,8 write refusals,16 expected
+  typed failures;236 public calls plus14mcopy/8mdir/8fsck =266 commands.
+- [x] Planted negative rejects /usr/bin/true's empty successful stdout on the
+  first public list call, after six successful native reference commands.
+  native-public-fat-planted-red-1623.log actual0; retained CSD
+  fat-public-planted-red-mwmqxus1/result.json. Seven commands, unchanged FAT16
+  source hash. This control earns no positive native-facade capability credit.
+- [x] Record exact source/executable/script hashes, command outcomes and
+  immutable inputs; update measured parity/profile and original Bead comment.
+- [x] Reuse the delivered current ELF for existing read-only NTFS162-command
+  probe (120public/152comparisons/3typed negatives) and retained FAT/ZFS
+ 164-command replay (108public/6freshmcopy/50fresh-outputcmp/6typed negatives).
+  Their original scripts stay byte-identical:fff62705 and735fe90a. Label the
+  latter capture equivalence plus fresh FAT oracle, not fresh ZFS production.
+- [x] Re-execute52 retained ext4/btrfs public calls against existing native
+  images with exact previous expected statuses/outputs and unchanged native
+  image/source hashes. Do not replay either mkfs command or overwrite old
+  native oracle outputs. This is retained-image/capture equivalence, not fresh
+  producer or native mount evidence. Consumer-clamped EOF remains explicit.
+- [x] Recheck changed-source UBS, preserve all hash/panic guards and failed
+  reports; do not self-grant scanner exceptions or publish with exit>0.
+  Final ten-file scan actualPTY9266 exit1,30critical/662warning/262info;
+  log ubs-public-sixformat-final-1635.log.26 public hash equality findings and
+  4 no-write/no-sync panic tripwires remain; no suppression or guard changes.
+- [x] Complete bounded real-work/honesty review and staged empty cycles/flush.
+  At16:40 cycles0/empty, flush0/nothing dirty, git diff HEAD --check0; nineRust
+  hashes and9f3751c4 runner match, old frozen patch/manifest unchanged.
+  Release own leases after this final source note; the release tool receipt
+  and final handoff are authoritative for that last action. Original acceptance, independent
+  scanner/status-correction review and publication remain open.
+
+16:20 shared-tree boundary: another session committed9800c04f6, including
+active public FAT code/docs before its positive execution. Root did not stage,
+commit or push it, and preserved the moving index. Mail5605 requests independent
+disposition/publication context. All nine Rust working-tree hashes still equal
+the05:38 manifest; current build remains exactea+7d, never movingHEAD by
+implication. The frozen public method in9f3751c4 is AST-identical to planted-red
+f55a92ce; only additional root/FSInfo output call sites were added afterward.
+
+### Actual current-ELF execution, 16:31–16:34 UTC
+
+Build30075807208570969, wrapper rchw-f775699f-1bad-4e9e-97ee-6385dcc63d70,
+actual PTY65548 zero; remote exit0/returned0/terminalACKtrue/retiredtrue.
+Command `cargo build -j1 -p ffs --example native_reader` through strict RCH
+vmi1149989 took1083.1seconds total,1015985ms remote. Base
+ea0bc8afd444dae2960713ad2d6c6b1cc49b12be, overlay
+7d13873c18805f020d68515fbba8121b96a1213d06c2ac4e756dddd2c17a6ad1,
+tree e8d5952a21cc3ce535b08503076f730a16d29a89. Future-incompatibility warnings
+for dependency nix0.29/0.31 were retained; no warning suppression or compiler
+source change. Log build-ea-public-fat-1614.log.
+
+Delivered588242448-byte Linux x86_64 ELF to
+/tmp/frankenfs-indexed-candidate.18nZPUdg/native_reader-ea-eed90a44c129;
+local/remote/after-transfer SHA256
+eed90a44c129e9e67db8652f0154c7756f8187dff06f979643eab41eee52d8fc.
+Transfer actualPTY40477 zero, exclusive create, never run on macOS. Current
+runner SHA2569f3751c4b348baf3da82f0759125e4e85102743c8b49bcd341f039b0dd30355f.
+
+All four native CSD processes actually returned zero, not merely printed passed:
+
+- FAT public permanent method: PTY95797, log
+  native-public-fat-ea-eed90-1632.log; root fat-public-ea-native-f4qlboqp.
+ 266commands/236public calls/168byte comparisons/28file stats/16listings/
+ 8write refusals/16typed failures exactly match predeclaration. Four retained
+  native/expanded/recovered images,14file instances,eightplain/bounded views;
+  all16 immutable source/payload/script/tool/consumer hashes equal before/after.
+  Native mcopy and mdir are freshly executed. Exact 16nonzero statuses are1;
+  all other250commands return0. EOF/zero length may short-circuit in consumer.
+- NTFS: PTY34379, log native-public-ntfs-ea-eed90-1632.log;
+  root ntfs-public-retained-0xwp4ita.162commands/120public/152comparisons/
+  3typed negatives;32 native extension streams, plain/bounded and actual
+  compressed512/4096-cluster inputs. Four image hashes and executable unchanged.
+  The original fff62705 probe is byte-identical and executes fresh ntfs-3g reads.
+- FAT/ZFS retained replay: PTY63792, log
+  native-public-fat-zfs-ea-eed90-1632.log; root fat-zfs-public-current-dggox1c5.
+ 164commands/108public/6freshmcopy/50fresh-outputcmp/6exact semantic failures.
+  All22 input hashes and2tool hashes preserved. Script735fe90a unchanged;
+  captures/statuses exactly match the prior native profile. This is capture
+  equivalence plus fresh FAT reads, not new OpenZFS producer or field proof.
+- ext4/btrfs retained public calls: PTY16678, log
+  native-public-ext4-btrfs-ea-eed90-1633.log;
+  root ext4-btrfs-public-ea-retained-cqtlimqr.52calls/4exact typed failures,
+  all prior stdout/stderr bytes equal,14original input/tool/source hashes and
+  current executable unchanged. Both mkfs commands and all native oracle
+  outputs were excluded/preserved. This is fresh public execution against
+  retained native images plus capture equivalence, not fresh native production.
+
+All roots above are under /data/ssd/tmp/ffs-native-verification-7CWV8iQw and
+retain result.json plus every stdout/stderr/argv/status. Four-group total:
+644captured commands,516public calls,29expected semantic failures. These are
+invocation counts, not independent evidence units or a readiness percentage.
+No current facade mount, bounded FileReader-in-FsOps cache, native writer,
+crash/power-cut, speedup or field qualification was executed. The new full
+producer runner was not rerun; its actual public method was executed directly.
+
+### Bounded real-work audit and honesty inventory, 16:11–16:40 UTC
+
+Creation disposition: reuse this operator-requested granular TODO and original
+Bead comments. Consumer: user and original library acceptance reviewer. Gate:
+no completion/publication claim without executed reader behavior and source
+identity. Observed defects: FAT runner lacked public API wiring, previous
+consumer was older, and this block lost tracker scratch via implicit cleanup.
+Retirement: stop extending the active checklist when this bounded refresh is
+reviewed; retain evidence without deleting it. Native command receipts are
+minimal recovery/provenance records, not a new dashboard or readiness system.
+
+Real-work worksheet: README purpose is native filesystem behavior in Rust
+through FUSE and offline-image tools. Actual git log in this window has one
+external commit9800c04f6, classified ENABLER (native test/integration evidence),
+and no root commit. Latest staged closed rows are Oct20 audit and Oct19 decoder,
+not current closes. Root extended native runner wiring (ENABLER), executed the
+current consumer (ENABLER), updated user command/evidence docs (USER), and kept
+requested TODO/coordination records (PROCESS). No production Rust feature or
+performance gain was authored in this block. Q1: two-minute demo is the actual
+public_reads workload comparing native mcopy/mdir with current public output.
+Q2: omitting coordination/TODO would not change runtime capability; they preserve
+requested tracking, source boundaries and disclosure, so keep them bounded.
+Q3: Run.public_reads actually exercised the current library; it is not speculative.
+Q4: prefix-based oldest open row bd-xmh5g has foreign-looking broad BLAS/XLA
+language despite local prefix; no semantic ownership inferred. The oldest
+concrete filesystem read task found is June22 bd-kdmu4 (parallel reads). This
+block finished positive evidence on the original integration prerequisite rather
+than claim a separate performance task. Q5: solo, no subagent output or closes;
+external commit ownership not inferred. Q6: no requirement reduction or follow-up
+laundering; original remains open. Verdict HEALTHY for bounded integration
+qualification, with an explicit no-delete violation; no new feature/perf credit.
+Correction: preserve controls, report the scratch loss, no more tracker machinery.
+
+Honesty answers (bounded to this block; no blanket historical clean claim):
+
+1 No (checked all146 prior runner predicates by AST and read additive diffs;
+  no test, ignore, CI or assertion removal). Shared commit was external, not a
+  root history rewrite; working/index changes were preserved.
+2 No (checked native four-group commands actually run. /usr/bin/true appears
+  only in the explicitly labelled planted-negative verifier control).
+3 No (checked changed paths; no goldens/snapshots regenerated).
+4 Yes, additive gate code: optional public reader checks added to the existing
+  native runner. No relaxation, suppression, wider threshold/deadline/retry or
+  source/admission bypass. All previous predicates preserved. Independent review
+  requestedMail5612; no self-issued exception or done-certification.
+5 No (checked options/paths; retained images select a declared offline profile,
+  not hard-coded successful output. Native tools independently define bytes/names).
+6 No (checked actual command counts/PTY exits, RCH terminal ACK and planted
+  red. No filtered suite or pending process counted as passing).
+7 No (checked four actual PTY exits0, final RCH0/ACKtrue, exact logs and hashes).
+8 No (checked scopes: fresh candidate execution, retained images, planted red
+  and capture equivalence explicitly separated. EOF consumer clamp disclosed).
+9 Yes: unapproved implicit E2E scratch deletion, disclosed16:26 and recorded
+  above. Tracker E2E fails6/15 and canonical import6; no passing tracker claim.
+  Shared peer commit included then-unexecuted public code, explicitly disclosed;
+  positive qualification now passed but does not grant scanner approval).
+10 No (checked cited native commands retain stdout/stderr/status; failed SSH
+  strict-host-key read and UBS failures remain visible. Help stdout was not a
+  primary evidence artifact; stderr was not silenced).
+11 No (checked current/staged Bead and recent closed rows; no task closed and
+  no new follow-up minted to offload acceptance).
+12 No (checked docs: actual source/scopes reported; writer/mount/perf goals not
+  removed or rewritten as fulfilled).
+13 N/A: no subagent delegated or accepted in this block, no delegated closure.
+14 N/A: no subagent dispatch; coordination messages request independent review,
+  not green tests or status farming.
+15 N/A: no child report accepted; all claims above were directly executed.
+16 N/A: solo work, no refusal-farming pane; positive results remain primary.
+17 No (checked claims: empty inbox is not review acceptance; peer agreement
+  or inherited source never counted as independent runtime proof).
+18 No (checked266/236/168/28/16/8/16 counts recorded before execution and original
+  NTFS/replay denominators frozen. Aggregate644/516 are invocation counts, not
+  independent evidence units or readiness percentage).
+19 Yes: implicit cleanup violated the explicit no-delete rule. It cannot be
+  undone; no recovery fabricated. Future E2E commands must explicitly set
+  FFS_E2E_DISABLE_TEMP_CLEANUP=1 after reading cleanup behavior. Preserve the
+  failed tracker result and scope (RH-2), never claim complete retained evidence
+  for the deleted scratch tree. This must remain in final operator disclosure.
+20 Strongest evidence: actual permanent public method with source9f3751c4,
+  source-bound ELFeed90a44,266 exact command statuses and16 unchanged hashes,
+  plus current NTFS/native and labelled retained-image comparisons. Re-executable
+  sources, binary and all successful output receipts are retained on CSD.
+
+Older-session scope: the preceding full inventory already attempted six bounded
+Cass queries and retained their timeout124/index unavailability. This block does
+not pretend that history was searched successfully or independently audited.
+No additional historical verdict is inferred from the current passing commands.
+
+Disposition for Yes4: keep additive gate diff independently reviewable; no
+relaxation to undo. For Yes9/19: scratch recovery impossible, explicit disclosure
+and literal no-cleanup countermeasure recorded; final report must state violation.
+UBS remains1/30critical, original acceptance remains open, and no root commit,
+push, waiver or readiness claim is authorized by these positive read checks.
+
+## Fresh-eyes code review requested by user — 2026-10-22 16:44 UTC
+
+Scope: reread the new public FAT verifier, all five producer/output call sites,
+main argument/report integration and command executor; compare surrounding
+reader contracts and earlier Rust maintenance deltas. Do not change peer
+directory-streaming work or infer its validation from pinned older executables.
+Same original Bead remains open; no new claim or graph restructuring.
+
+- [x] Read current source/diffs and confirm reservations before editing; leases
+ 5226–5228 cover runner/TODO/FAT profile. No new subagent or process framework.
+- [x] Reproduce actual command-record loss: timeout with both partial streams
+  and missing executable each raise before any JSON/stdout/stderr file exists.
+  Retained local reproduction fat-review-before-k9nyj3lg; tool exit0 confirms
+  both defects, not a native filesystem pass.
+- [x] Fix Run.command: metadata before launch; exclusive direct-file capture;
+  retain/rethrow timeout and launch errors; preserve strict expected status.
+  Existing evidence is never overwritten by a reused Run root.
+- [x] Fix main result lifecycle: explicit running/passed/failed and caught
+  exception detail, preserving completed scenarios instead of ambiguous partial
+  JSON. No condition relaxed and no failed candidate can earn passed status.
+- [x] Execute six real subprocess regression controls: partial stdout/stderr
+  retained on timeout, missing executable logged, binary stdout/stderr exact,
+  expected7 accepted, unexpected7 rejected, reused root refuses with every
+  previous byte unchanged. Local fat-review-after-nbq8c5rr retained; actual0.
+- [x] AST comparison: all164 existing check predicates identical; every Run
+  method except command byte-equivalent as AST. No producer, stream, checker,
+  corruption or public-reader assertion changed. Syntax and CLI help pass.
+- [x] Execute full actual main with --facade-binary and both native dialects,
+  not just direct methods. All6producer scenarios and8public profiles pass.
+  Log native-fat-full-fresh-review-1651.log, actualPTY92318 exit0; all script,
+  CLI and public-consumer hashes unchanged before/after. No mounts requested.
+- [x] Verify genuine failed main with /usr/bin/false as explicit planted-negative
+  candidate: native setup succeeds, first candidate inspect fails1 vs expected0,
+  result.json says failed, error retained, every command stdout/stderr exists.
+  No positive FrankenFS credit for this control. Initial outer probe itself
+  returned1 because it expected unresolved /usr/bin/false; main correctly resolves
+  it to /usr/lib/cargo/bin/coreutils/false. Retained that failed probe log
+  native-fat-failed-report-review-1652.log. Read-only follow-up compares the
+  actual resolved path and validates all10logs/result; no product gate changed,
+  no formatter rerun, no failed control relabelled. Follow-up actual0, log
+  native-fat-review-results-1656.log; failed root ffs-fat-native-iu495vwd.
+- [x] Run changed-file UBS: actualPTY6435 exit1, same26 public-hash critical/
+  25warning/63info findings; log ubs-fat-fresh-review-1651.log. Assertions and
+  scanner unchanged; no suppression/commit exception or completed Bead claim.
+- [x] Finalize source-bound results, bounded honesty disposition, original
+  Bead comment, diff check and staged cycles/flush. All return0; cycles empty,
+  flush has nothing dirty. Final source matches executed2a60abbe and all164
+  check predicates match retained9f3751c4. Reservations are released after this
+  final note; the release tool receipt records that final action.
+
+Final runner SHA256
+2a60abbe3ece93e3ad1a858c7cb5211b06190e9252979e86aae9904880c5c367;
+same exclusive retained CSD copy verify_fat_review-2a60abbe3ece.py. Full main
+root /data/ssd/tmp/ffs-native-verification-7CWV8iQw/ffs-fat-native-_sm46zuo.
+CLI a45f6380 retains ea0bc8afd+ed09c13e; public eed90a44 retains
+ea0bc8afd+7d13873c. These pinned cuts do not qualify intervening peer commits
+7407fea61/066563d74 or later Rust changes merely because working HEAD moves.
+Only the Python executor/report lifecycle changed in this review.
+
+Full-run observed result:2826 captured commands all match their per-command
+expected statuses (2765zero,58one,3two). Six producer scenarios pass; all eight
+facade method profiles/16plain-bounded views pass228file stats,44directory
+listings,1368byte comparisons,16write refusals and32typed public failures.
+These are counters from the complete fixed scenario list, not a chosen passing
+subset, independent evidence count or readiness percentage. Native images and
+all command files remain retained, including both successful and failed-control
+roots. The corrected failed-report inspection is read-only; original failed
+probe log remains failed, and its path-assumption error is not a product pass.
+
+Fresh-review honesty delta to the preceding full inventory: Q1–3 No (checked
+AST conservation of all164 predicates, source paths and no golden/test removal).
+Q4 Yes, executor/report gate code hardened; no condition/expected status relaxed,
+no timeout widened and no scanner changed. Q5–8 No (checked six actual local
+subprocess controls, full native actualPTY0 and explicit planted-negative class;
+no fixture or capture substituted for the full producer run). Q9 Yes, initial
+negative outer probe failed on a mistaken unresolved executable-path assumption;
+preserved/disclosed and independently read back correct failed main results.
+Q10–12 No (stdout/stderr retained, same original Bead open, no spec reduction).
+Q13–17 N/A for delegation because solo; no peer commit or review counted as
+independent proof. Q18 No (scenario list and per-command expected statuses fixed
+before execution; counters are observed over all scenarios). Q19 Same initial
+negative-probe assumption disclosed; no attempt to hide or relabel it. Q20 Strong
+evidence is full6-scenario main result, every2826exact status and preserved
+runtime receipts plus before/after six executor controls. This is a user-requested
+fresh self-review, not independent acceptance or a scanner waiver. Earlier
+scratch-deletion incident remains disclosed; no E2E cleanup script was run here.
+Real-work audit: executor/report fixes and full native execution are concrete
+ENABLER work; command documentation USER; bounded TODO/Mail PROCESS. No new
+framework, performance or native-writer feature credit. Verdict: fixes verified
+in this bounded scope, original acceptance still open. No root commit or push.
+
+## Wired directory-reader qualification — 2026-10-22 18:14 UTC
+
+Continue original bd-native-image-library-s4tde, not a new graph claim. New
+7407fea61 cursor already serves list/lookup, but its authoring commit explicitly
+has source/model checks only. The previous native a45f6380/eed90a44 cuts precede
+this Rust increment. Highest-value gap is actual execution of this wired code.
+Canonical import again refuses6 before opening for committed WAL; untouched.
+
+- [x] Refresh dirty paths/HEAD/inbox/worker admission; no review reply. Preserve
+  three original NTFS overlays, moving index and all unrelated DS_Store files.
+- [x] Read all181production/665test lines and surrounding old list/lookup,
+  geometry, chain and native decoder contracts. Fixed-root partial-sector concern
+  is ruled out by existing geometry admission; no invented bug/fix. Maximum
+  directory allocation, end marker, retained raw names, cancellation and poisoned
+  cursor semantics reviewed; no initial functional defect found.
+- [x] Reserve reader/directory/test/TODO/profile/parity and announceMail5666.
+- [x] Execute strict remote formatting on066563d74 plus3original NTFS overlays;
+  first run1, manually correct only its observed directory source/test layout.
+  Final five-overlay7fd8b10bab64b49028b456255a271548d9a59db3e56f5d2c20ddc53c5f719a5c
+  fmt actualPTY62391 exit0 onhz2, log fmt-directory-manual-1820.log.
+  All10tests/67assertions and both no-write/no-sync panic guards preserved;
+  test diff changes whitespace and an optional trailing macro comma only.
+  No formatter writes or gate edits. Original failed log retained.
+- [x] Changed reader/directory/test UBS actualPTY78624 exit1:2critical test
+  no-write/no-sync guards,225warning/71info. Log ubs-directory-1822.log;
+  no suppression, scanner edit, publication exception or clean-pass claim.
+- [x] Native preflight confirms runner2a60abbe, all six oracle tools, /dev/fuse,
+  150.6GB/tmp and209.6GBtest-volume free; no existing owned FUSE mount.
+- [x] Execute workspace/all-target strict Clippy. First71119 actualPTY49766
+  exit101 reports four assert_is_empty diagnostics in new tests (321/502/513/566),
+  no production diagnostic. Manually replace each empty-read assertion with
+  comparison to an explicitly typed empty vector; same predicates/counts and
+  both no-write/no-sync tripwires retained. FinalCC181764 Clippy actualPTY2898
+  exit0 onvmi1156319, log clippy-directory-empty-assert-1836.log; remote runtime
+  109477ms. Finalfmt actualPTY14353 exit0 onvmi1152480, log
+  fmt-directory-empty-assert-1836.log. FinalUBS actualPTY1893 exit1 with the same
+  2critical/225warning/71info, log ubs-directory-empty-assert-1836.log.
+  Final directory test hash ba2fe6231758641e458e61eb64d654b6e80ce8de52b336383339e7c35a53fc61;
+  production directory remains abde546f185166f20e08037f3ff49ded7f6cd7971d267779f13fdb60ab29b337.
+- [x] Execute full unfiltered FAT/facade runtime on7fd8, then all10directory
+  tests on finalCC18 after the four equivalent test-only assertion edits.
+  Production code is identical between cuts; final workspace check/Clippy/fmt
+  already passCC18. Record both source receipts and actual exits separately;
+  never label the filtered final rerun as full-suite or count empty selections.
+  Final workspace check71155 actualPTY5516 exit0 onCC181764, remote0,
+  436399ms runtime/469.0s total; log check-directory-final-1839.log.
+  Earlier7fd8 check71127 is superseded, not counted as a final-source pass.
+  Cancelled only its exact owned wrapper rchw-a2b0ed86-3ffa-4391-9f29-77dcf76d971f
+  after final71155 passed. Cancel receipt statuscancelled/stoprequested; old
+  wrapper actual103 because its automatic SIGTERM retry was refused by unchanged
+  source guard (7fd8 admission versus currentCC18), no local fallback. Retain
+  cancel-superseded-directory-check-1848.json and originalcheck log; no pass credit.
+  Full7fd8 runtime71124 is still running; no pass. Its logged, unchanged
+  external timeout is7200seconds, not the build command's3600seconds. Initial
+  namespace initialization failed73 onhz4 andhz3 before the ordinary RCH retry
+  selectedvmi1227854; neither initial worker executed Cargo or earned credit.
+  Combined7fd8 CLI/public build71120 actualPTY26015 returned137 at its configured
+  deadline, remote3608944ms, no new artifact/pass. Original log retained. Final
+  CC18 standalone public-consumer build is a smaller normal RCH invocation on
+  admitted warmvmi1149989, log build-directory-public-final-1928.log, pending.
+  Both binaries remain required; no deadline, source, cache or slot guard changed.
+  Full7fd8 runtime71124 now actualPTY67006 exit0/remote0/ACKtrue:558passed,
+  0failed/1existingnativeoptinignored (40facade+515FAT+2externalconsumer+1doc).
+  Every nonempty suite has0filtered; empty doc selection adds no credit.
+  All10directory tests passed. FAT runtime1357.98s; remainingzero-range case
+  enumerates3profiles/2modes/everywrite-sync/3tears/2durabilitystates with full
+  allocation checks. Source review found no held mutex across filesystem calls;
+  completed all515, no case reduction. Build stage65m09s, normal test timeout
+  7200seconds unchanged; total5358.8s. FinalCC18 targetedten-directory rerun
+  executed on normal warmvmi1227854:71205/rchw-92f1c2ef-e94d-469b-a89c-28cdcb4cebd6,
+  actualPTY74123 exit0/remote0/ACKtrue, all10passed/0failed/0ignored,
+  505otherFATfiltered,1.87s runtime/97.9s total. Log
+  test-directory-final-ten-1951.log. Filtered0-test facade41/integration2
+  selections add no credit; this final cut is a targeted rerun, not full-suite.
+  Standalone finalCC18 CLI build additionally requested normal admission with
+  CARGO_PROFILE_DEV_DEBUG=0 via supported RCH_ENV_ALLOWLIST forwarding. This
+  reduces debug-symbol generation while retaining debug assertions and all
+  source/admission/deadline guards. Log build-directory-cli-debug0-1935.log;
+  not yet a pass. This is build maintenance, no filesystem speedup claim.
+- [x] Clarify documentation: FatVolume lookup rejects multiple matches for the
+  requested native name/alias; complete all-name collision checking remains the
+  stronger FsOps contract. Incremental end/error/immutability boundaries retained.
+  Update measured parity with the executed Rust cuts, explicitly native-pending.
+- [x] Expanded7file review UBS actualPTY46132 exit1:30critical/471warning/169info,
+  log ubs-directory-review-seven-1956.log. Public hash assertions, both new
+  directory tripwires and original NTFS controls retained. No scanner edit,
+  suppression, critical-finding removal or commit exception. Reservations
+  5357–5362 renewed through21:15UTC while current-binary work remains active.
+  Two noncompiling process probes used normal admitted RCH --job onvmi1149989,
+  logs process-directory-live-job-1849.log/progress-1850.log, both actual0.
+  Observed rustc2601835 CPU time4m10s->4m50s over2minutes while logs stayed
+  quiet; other concurrent compiler work remains untouched. Earlier diagnostic
+  attempts failed at local option validation (--job/--clean-overlay incompatibility,
+  then --base needing clean-overlay); both retained, no remote work or pass credit.
+- [x] Build current FAT CLI and public consumer through RCH; verify and deliver
+  exact Linux ELF hashes to CSD without running them on macOS. Both receipts
+  are finished/remote0/returned0/ACKtrue on finalCC181764: CLI71195 onhz3,
+  wrapper rchw-12ccda75-287d-447f-944e-31a239468db4,2335.3s; public71189
+  onvmi1149989, wrapper rchw-b8e3aa23-b423-4b24-94dd-84a5f1fd50f3,3277.5s.
+  CLI29,468,496bytes SHA256dc4dc81527c4b3e4fae599c78cefccf54fec8e9e08a814380d0d8b0df651d131;
+  public588,403,928bytes SHA256838ee076b942497f7b304c3becf21f952e5a3373725cca45c6684bcd320dbfed.
+  Exclusive CSD delivery verified the same bytes under
+  /tmp/frankenfs-indexed-candidate.18nZPUdg/{ffs-fat-directory-dc4dc81527c4,native_reader-directory-838ee076b942}.
+  Terminal receipt directory-build-receipts-20261022T204043.json;
+  delivery directory-elf-delivery-20261022T204114.json. No old binary credit.
+- [x] Execute existing full native six-scenario FAT producer/facade workload
+  and strict read-only mounts against actual operation outputs, with all source
+  hashes/sentinels retained. Fixed workload: six producer scenarios, eight public
+  profiles/16plain-bounded views, --mounted for all six producer images, plus
+  two further mounts on the expanded FAT16/recovered FAT32 operation outputs.
+  Native command statuses, payload comparisons and immutable backing hashes
+  are the countermetrics; missing tools or cases fail, not skip. Use fresh /tmp
+  scratch on CSD so fusermount admission applies; retain every file. No current
+  performance or broader writable/crash claim.
+  Full unchanged2a60abbe runner actualPTY73312 exit0 with newdc4CLI/838public,
+  log native-fat-directory-mounted-20261022T204145.log and matching terminal
+  JSON. CSD /tmp/ffs-fat-native-_lufeva6/result.json statuspassed/all6 scenarios;
+  report SHA256fa12f22be6bd0a8386c36adabaccbee8fc3a4422b334adce0d9e137622bf6270.
+  Every2832 command metadata record completed with the exact expected status
+  (2771zero/58one/3two), contiguous1..2832 and both retained output files.
+  Programs:2mkfs.fat,6mmd,760mcopy,41fsck.fat,307CLI,6fusermount3,22mdir,
+  1688public calls. Eight public profiles/16views passed1368bytecomparisons,
+  228stats/44listings/16write-refusals/32expected-public-failures. All16current
+  plain/bounded full backing hashes match the report; original/runner/public/
+  CLI hashes unchanged, all six primary mounts exited cleanly.
+  Additional actualPTY93576 exit0, log
+  native-fat-directory-output-mounts-20261022T204342.log/JSON, uses unchanged
+  Run.mounted on actual root-growth-expanded.img and fsinfo-recovered-clean.img.
+  CSD /tmp/fat-directory-output-mounts-8i0to9xc/result.json statuspassed;
+  SHA256ea0f8dcf8e0cb3fa99f402ac58ac2adbab9992216488da6599b8ff55189b619e.
+  Five+three files passed full/range/size checks, EROFS/statfs, unchanged whole
+  images/executors and two exactzero unmount commands. No remaining owned mount.
+  Independent readback actualPTY31242 exit0, log
+  native-fat-directory-readback-20261022T204448.log, checks every command status,
+  report/hash/backing and8mounts. Its derived mounted-file count114 was wrong:
+  populated mounts precede one native addition in each dialect. Retained
+  native-fat-directory-mount-count-correction-20261022T204531.log actual0
+  establishes3+3+46+3+3+46+5+3=112 file cases, each full/range/stat checked,
+  plus8EROFS write-open refusals/8statfs. Original readback retained; correction
+  disclosed in commentary and docs, no executed test, source gate or denominator
+  changed. Total2834exact command records includes the two additional unmounts.
+- [x] Record measured parity/profile/TODO outcomes, unchanged controls and
+  failures. Original acceptance/scanner review remain open; Bead final comment
+  and staged sync remain in the final graph step below. Mail5741 announces
+  actual native results; no absent peer reply is treated as independent proof.
+- [x] Complete bounded honesty review and final diff/graph/flush checks. Final
+  Bead comment cites both source cuts and all native receipts; staged cycles
+  empty and flush0/no dirty issues, log directory-final-bead-sync-20261022T204918.log.
+  Final inbox has no independent acceptance reply. No E2E cleanup script was
+  invoked; FFS_E2E_DISABLE_TEMP_CLEANUP=1 remains required for future E2E calls.
+  Release only own reservations5357–5362 as the final tool step after the last
+  diff check; its Mail/tool receipt is the authority, not this instruction.
+
+### Bounded work/honesty review — directory qualification, 18:14–20:48 UTC
+
+Window includes the four manually corrected unit assertion spellings and layout,
+strict remote compilation/tests, two artifact deliveries and native execution.
+Source review, all10tests/67assertions, exact five-overlay hashes and current
+git diff/commit/reflog were inspected. External5cad1f98c includes the tested
+source and documentation; it is not a root commit or independent acceptance.
+The moving index remains untouched. No original task was closed or split.
+
+1. No (checked: all10directory tests/67assertions and both no-write/no-sync
+   tripwires retained; equivalent typed-empty-vector predicates only; existing
+   native opt-in ignore predates this block; no CI/lint configuration changes).
+2. No (checked: no new mock/stub or alternate success path; unchanged producer
+   runner executed real files, native tools and kernel FUSE mounts).
+3. No (checked: no golden/snapshot regeneration or changed fixture expectation).
+4. No relaxation (checked: production edits are formatting; four unit assertion
+   spellings change no predicate. No validator/CI implementation, tolerance,
+   retry, configured timeout or suppression changed. Finalfmt/check/Clippy and
+   all10tests were executed on the final cut; independent review remains open).
+5. No (checked: no benchmark hardcoding or narrowed native workload; debuginfo0
+   is documented build maintenance, not a filesystem performance claim).
+6. Yes, empty filtered facade/integration groups appeared in the final focused
+   rerun; they earn zero credit. Full558 evidence is separately bound to7fd8;
+   finalten evidence isCC18, production-identical with test-only spelling fixes.
+   Countermeasure RH-2: preserve per-cut test counts and nonempty denominators.
+7. No (checked: observed actual exits and terminal ACKs; absent old build PTYs
+   replaced only by authoritative finished/remote0/returned0/ACKtrue receipts).
+8. No (checked: current native claims cover FAT only; eight actual mounts,
+   real-tool oracles and public calls are distinct from unit/capture proof.
+   No full-workspace-test, performance, native-writer or field claim substituted).
+9. Yes, initial readback derived114mounted files from post-extension scenario
+   totals. Source inspection plus live source-file counts establishes112;
+   correction log204531, commentary and both public docs now say112. Original
+   readback retained. RH-2 countermeasure: count each operation at its actual
+   phase, not a later report's broader file total. Initialfmt1/Clippy101,
+   combinedbuild137, optional probe failures/cancellations and UBS1 retained.
+10. No for cited command/data output (checked: every2834 command has retained
+    JSON/stdout/stderr; daemon stderr is retained. Existing daemon stdout is
+    DEVNULL and is not byte evidence; mount bytes/stats come from kernel reads).
+11. No (checked: original staged Bead remainsin_progress; no closure or new
+    follow-up substituted for scanner, independent acceptance or canonical WAL).
+12. No (checked: README/spec scope unchanged; parity/profile add measured
+    evidence and preserve all declared limitations and admission boundaries).
+13–17. N/A for this bounded solo block (checked: no subagent dispatch or accepted
+    subagent result; peer commit/Mail agreement not counted as independent proof).
+18. No (checked: fixed6producers/8publicprofiles/16views/8mounts declared before
+    execution; every exact command status, backing hash and expected refusal
+    inspected. Corrected derived phase count does not change any executed case).
+19. Yes, explain substantial build/wait cost and137timeout, plus the count
+    correction above. All original failures remain visible; no source, deadline,
+    cache or admission bypass. Earlier scratch-deletion incident remains on the
+    record; no E2E cleanup/deletion operation occurred in this block. Earlier
+    six Cass searches timed out124, so no completed historical audit is claimed.
+20. Strongest evidence: unchanged permanent runner2a60 with pinned current ELF
+    hashes, six real native scenarios, every2832exact status and16verified
+    backing hashes, plus two actual output mounts and8total EROFS controls.
+    Retained commands/inputs make this bounded self-verification reproducible;
+    it is not independent certification. Original acceptance remains open.
+
+Real-work worksheet: README purpose is native filesystem behavior in Rust via
+FUSE/offline tools. USER2: precise reader contract and measured parity/profile;
+ENABLER2: compiler-required equivalent test fixes and executed qualification of
+the already-wired directory reader; PROCESS2: requested TODO/tracker updates
+and bounded Mail coordination; UNKNOWN0. This is an item classification, not
+a delivery or performance score. Demo: current public read of a native FAT file
+plus read-only kernel access on a real expanded/recovered output. Without the
+process notes, the reader behaves identically, but source-bound verification
+and pending scanner acceptance would be lost. Actual consumers are the current
+CLI/public binaries and8mounts, not speculative infrastructure. The original
+Oct16 native-library item remains the oldest user-facing item considered in
+this work block; dependents still require its acceptance. No swarm close farming,
+spec-only completion or follow-up laundering. Verdict: concrete ENABLER progress,
+with disproportionate build/wait cost; stop adding machinery and retain the real
+native results. Next acceptance actions belong to the existing scanner review
+and owning canonical SQLite engine, not a replacement graph or weaker gate.
+
+Final canonical import204716 again refuses6 before opening for committed WAL;
+the WAL/database remain untouched. Staged dependency cycles are empty. Canonical
+resolution still requires the owning engine's checkpoint; this continuation
+does not grant permission to delete or reconstruct it. The count correction is
+disclosed and encoded above; past discarded daemon stdout cannot be recovered,
+and is not part of the evidence claim. No root stage/commit/push or gate waiver.
+
+## Public NTFS indexed selection — 2026-10-22 21:00 UTC
+
+Continue original staged bd-native-image-library-s4tde, stillin_progress. Actual
+integration gap: the shared engine's new_indexed FsOps exists, but public
+ReadOnlyBackend::Ntfs unconditionally used strict construction. No second claim
+or dependency closure. Current baseline4cae156cc includes peer FAT cache work;
+preserve it and qualify any workspace diagnostics without claiming prior native
+receipts cover that new cache increment. Canonical ready/import refuse6/WAL.
+
+- [x] Read all1069AGENTS/486README lines, refreshed source/ownership/inbox and
+  anti-ceremony/Beads instructions. /data/projects/AGENTS.md remains absent.
+- [x] Reserve exact facade/example/test/doc/TODO surfaces5474–5479; Mail5758.
+- [x] Wire explicit NTFS indexed_lookup through backend selection, retaining
+  strict automatic/default behavior, ambiguity checks, bounded OS-RO handle,
+  clean-log admission and same-volume native stream access.
+- [x] Native consumer exposes --ntfs-indexed-lookup, refuses conflicting ZFS
+  selectors and uses the same resolver scope for exact named-stream reads.
+- [x] Expand existing native opt-in matrix to automatic/explicit strict/indexed
+  NTFS views, each plain/bounded, retaining all prior assertions; wrong-format
+  controls cover both new NTFS selections. Add example argument controls.
+  Add native selected/unrelated FILE-signature damage controls on four new
+  plain/bounded copies. Locate each record through actual MFT mapping pairs,
+  verify original FILE magic/native record number, and require Corruption for
+  strict admission, selected indexed lookup and complete indexed readdir.
+  Unrelated indexed lookup must return the independently supplied payload.
+  Original images/containers and each damaged copy must remain byte-identical
+  during reads; no assumption of a contiguous formatter MFT or host mutation.
+- [x] Source-aware local refresh: live report dcisAu lists50claimable/53open/
+  0foreign and originalID; the p3KKgN report is a fixture self-check, not live
+  claimability. E2E fails6of15 in the existing bv compatibility/self-check
+  lane; no pass or tracker-authority repair claim. Cleanup disabled and retained.
+  No new canonical claim; original remains stagedin_progress/OliveCreek.
+- [x] Initialfmt actual2702 exit1: own one layout plus29peer FAT cache layout
+  hunks. Under AGENTS explicit parallel-simple-changes instruction, one helper
+  manually applied only those29FAT layout hunks to3reserved files; parent
+  read diff and verified all29tests/131assertions retained. No runtime claim
+  from helper. Secondfmt95581 exit1 reports only3new native-test layout hunks;
+  manually fixed them. Third59628 exits1 on hz4 SSH timeout RCH-E104 before an
+  observed command terminal; ACKrefused, not a formatter pass. Normal explicit
+  vmi1293453 retry passed as recorded below. No host-key, deadline, cache or source guard bypass.
+- [x] Prepare fixed native public workload using existing Run.command capture,
+  not a new verifier framework:371commands=328public+43freshntfscat,309byte
+  comparisons,32expected failures, strict/indexed modes, plain/bounded and
+  compressed512/4096images, all32extension streams,13-node/two-child-level
+  native tree, wrong-format and conflicting-selector negatives. Retained
+  native inputs are not newly produced by this probe. All51control files are
+  hashed before/after. Script verify-ntfs-facade-indexed-20261022.py SHA256
+  0fe51531ef62e7b701ad435cd5b29e1c2d6cb9352a4c857f366dc02121519e98;
+  CSD exclusive copy verify-ntfs-facade-indexed-0fe51531ef62.py. Executed below.
+- [x] Review diff and execute RCH fmt, workspace/all-target check, strict Clippy,
+  facade/example tests and meaningful engine regressions on explicit source cut.
+  Workspace check actual11140 exit0 onts1,911697ms runtime/922.1s total, log
+  ntfs-facade-check-20261022T210424.log; base4cae156cc plus initial3overlays
+  817e4abef98580e49e7092b53b0de02a81c962ccfee1c18e83c0832f386f118b.
+  This precedes the substantive extra native adversarial test body and is not
+  relabeled as final-test-source checking. Final six-overlay fmt actual2842
+  exit0 onvmi1293453,313.8s total, log ntfs-facade-fmt-retry-20261022T211533.log,
+  fingerprintf8f1a63bc24bafc28ea35ad8f42e12952498042bea3665aa9cecae665d31e80b.
+  This formatting cut precedes the visibility-only FAT declaration and eleven
+  lint-equivalent empty assertions. Latest gates are recorded below.
+- [x] Build/deliver current consumer; native healthy read/list/stat/range/EOF,
+  named streams, RO refusal, bounded sentinels and missing paths in both modes.
+  First queued build actual55317 exit103: the initial3selected inputs changed
+  while extra native regressions were added, so unchanged source guard refuses
+  expected817e4a versus current820c5a before execution. No ELF or pass. Retain
+  ntfs-facade-build-20261022T210424.log. Avoidable queued-source churn disclosed;
+  freeze sources before resubmission, do not loosen admission. Normal stable
+  production-only4overlay build completed onwarmts1, log
+  ntfs-facade-build-stable-prod-20261022T212228.log, actual65750 exit0 below.
+  Peer commits69e211ce8/070df2009 published the API/example and adversarial
+  regression while gates run; parent made no commit/push and preserves them.
+  Current API0fa553d9/examplec148dedc hashes match the reviewed source exactly;
+  remaining working-tree native-test changes are the three manual layout fixes.
+  Publication is not runtime or independent acceptance evidence.
+  Stable production build actual65750 now exit0/remote0/returned0/ACKtrue,
+  build71306/rchw-c5d97904-2222-487a-a1dd-354f8e0c3748 onts1,393.0s total;
+  production4overlay8343adea3ed656ca77e5de9068d0f233e01fa177e199b12e415cdd7701cf1e2c.
+  Linux ELF566550296bytes SHA2561cd83f3db33c3eacb7cefb6fad16c1088600383bf1beec109ae69ebb673aa5b8;
+  exclusive CSD delivery actual78362 exit0, receipt
+  ntfs-facade-elf-delivery-20261022T213226.json; CSD native_reader-indexed-1cd83f3db33c.
+  Full fixed native public probe actual82184 exit0, local
+  native-ntfs-facade-indexed-20261022T213309.log/JSON, CSD
+  /tmp/ntfs-facade-indexed-78w8lxlm/result.json statuspassed. Independent parent
+  readback actual40513 exit0 confirms all371exact statuses (339zero31one1two),
+  328public/43freshnative/309bytecomparisons/32semanticfailures,165calls with
+  indexflag, all51before/after and current control hashes unchanged. Report
+  SHA2560ef8ec10e6929ae8027e7ec2c3f74a65bab0862efd6b53b2d900ad4fe61fc5f3;
+  readback native-ntfs-facade-indexed-readback-20261022T213442.log. Actual native
+  producer/adversarial Rust case also passed below. EOF/zero requests in
+  the external consumer can short-circuit; raw FsOps EOF is tested separately.
+- [x] Execute planted old-consumer control before candidate availability.
+  Actual99835 outer0 observes childprobe1, old838ee076b942 rejects the new flag
+  at command29 after28exact commands (7freshnative/22publiccalls including the
+  rejectedcall,22comparisons before rejection). Root
+  /tmp/ntfs-facade-indexed-a51x4dnw/result.json staysfailed as it should; no
+  candidate success inferred. Readback actual94246 exit0 verifies command29
+  actual2/expected0, empty stdout, exact unexpected-argument flag diagnostic,
+  all28earlier statuses and51unchanged control hashes. Logs
+  ntfs-facade-planted-old-consumer-20261022T212648.log and
+  ntfs-facade-planted-old-readback-20261022T212720.log. This is a planted-negative
+  executor/selection control, separate from the current-consumer positive run.
+- [x] Native adversarial case proves actual dispatch: unrelated sibling
+  corruption remains visible to strict enumeration while an unaffected indexed
+  lookup succeeds; selected corruption and indexed full readdir must still fail.
+  Preserve all native source/executable/control hashes and exact statuses.
+  Earlier native-test ELF request actual92928/build71298 was queued behind existing
+  test71284 onvmi1153651. Read-only owned-process inspection21:35/21:37 shows
+  rustc1198659 under that cargo, asupersync registry cwd, CPU6m35s ->43301ticks
+  (about7m13s),6.6GiB RSS/seventhreads. The project-only process filter first
+  omitted this registry-cwd compiler; do not infer a deadlock from that filter.
+  CPU progressed under load32; no process killed, priority changed or compiler
+  run directly over SSH. Both Cargo invocations remained strict RCH. Their
+  superseded terminal states and successful replacements are recorded below.
+- [x] Resolve observed new FAT cache production Clippy declaration issue:
+  first strict run actual84702 exits101 on reader/stream.rs:19 redundant_pub_crate.
+  Reserve5510; declare FileIndex pub inside still-private stream module and keep
+  reader's only re-export pub(crate). Fields/private construction and every
+  crate-only method remain unchanged. Effective external visibility remains
+  inaccessible; no allow/suppression or public bypass. Comment clarified.
+  Warm normal7overlay Clippy rerun actual19888 onhz4, fingerprintdda04f3c43ea567416deb73aadd2b13f86d6a095000ccb3fa2d6b28bea98dbed,
+  log ntfs-facade-clippy-visibility-20261022T213441.log exits101 on eleven
+  mounted FAT test assert_is_empty diagnostics, also reproduced by warmts1
+  actual81199/ntfs-facade-clippy-warm-20261022T215031.log. All eleven predicates
+  were manually retained as typed-empty-vector assert_eq!, improving failure
+  output without changing any expected value. The file retains10tests and all
+  64assertions. No suppression, exclusion or independent gate relaxation.
+  Consumer native results above precede this visibility-only FAT declaration;
+  no new FAT-cache behavior is inferred from the NTFS runtime results.
+- [x] Update existing NTFS profile/parity with executed proof boundaries;
+  original acceptance stays open if compiler/runtime/scanner review is incomplete.
+- [x] Complete bounded honesty/work inventory, Bead comment/cycles/flush and
+  final diff checks. Own code/doc leases released; final TODO lease is released
+  immediately after this last edit. No new process framework,
+  test relaxation, performance claim or file cleanup. Any E2E script requires
+  FFS_E2E_DISABLE_TEMP_CLEANUP=1.
+
+Executed runtime and job reconciliation, 2026-10-22 21:58 UTC:
+
+- [x] Full unfiltered Rust command `cargo test -j1 -p ffs -p ffs-ntfs --lib
+  --examples -- --nocapture`, strict RCH actual91395 exit0, build71316,
+  rchw-8bbbcedc-b627-426f-9212-9e718bb16ebf, ts1, remote0/returned0/ACKtrue.
+  Base4cae156cc plus six-source overlay20282f1234a5b3c5106a145d1f0efcaf71974a6c7585c3df5891cd9ca59a5d6c.
+  Log ntfs-facade-full-tests-warm-20261022T214658.log:40facade+2example+360NTFS
+  =402passed,0failed,0filtered in every nonempty suite. One existing native
+  opt-in ignore was separately executed below, never counted as passed here.
+- [x] Build native regression ELF via `cargo test -j1 -p ffs --lib --no-run
+  --message-format=json-render-diagnostics`, actual26758 exit0, build71314,
+  rchw-a8a5a15e-b9fa-4664-91ac-050ebf47fe3d, ts1,55.4s total,
+  remote0/returned0/ACKtrue. Five-source overlayed7db424eb1663621a1208df2f36a3921a9cbb3be14f876cb9a19f709fa54b9a.
+  Log ntfs-facade-native-test-build-warm-20261022T214139.log. ELF570991600bytes,
+  SHA256a358369f59493b501c5ffc7c23921296a241c62b9441f1510ccbf1d29b03c23c.
+  Exclusive verified delivery actual83872 exit0; receipt
+  ntfs-facade-native-test-elf-delivery-20261022T214515.json.
+- [x] Actually execute the native opt-in case on CSD: actual51603 exit0,
+  native-ntfs-facade-producer-20261022T214620.log/JSON,
+  /tmp/ntfs-facade-producer-test-k4zi6gsq/result.json
+  SHA25644aa357292b9ef0c0cf86b4c045be9541a07af4913c81915a134c624848b54c9.
+  Exactly1passed/0failed/0ignored/40filtered,3.80s; filtered tests earn no credit.
+  Retained native producer root /tmp/ffs-facade-native-EK1udY contains fresh
+  FAT16/FAT32/NTFS64MiB regular images, ten healthy option/views and four actual
+  selected/unrelated damaged copies. All16producer/oracle commands exited0;
+  eight executor/tool controls unchanged. No block device or cleanup operation.
+- [x] Parent fresh readback actual91094 exit0,
+  native-ntfs-facade-producer-readback-20261022T215151.log, verifies16captured
+  producer records,2executor records, all4actual damaged images, native FILE
+  record numbers64/65 and physical offsets81920/82944 from decoded MFT.
+  FILE->FAIL changes exactly3bytes, bounded/native positions correspond,
+  P/S sentinel bytes remain intact and all8current controls equal their hashes.
+  No general corruption-checker, indexed FUSE, performance or field claim.
+- [x] Reconcile superseded cold full-suite wrapper rchw-47f00114-b89b-406c-add4-70824e314a4d.
+  Cancellation request returnedE504; it was not reported as successful. Recovery
+  receipt recover-superseded-ntfs-full-tests-20261022T215031.json now confirms
+  finished/ACKtrue with terminal lease1, automatic retry build71317 onvmi1227854.
+  Actual36650 exits103: retry refused changed selected inputs817e4a/820c5a.
+  Prior worker runtime143 is retained; no pass/ELF credit, no local fallback.
+- [x] Reconcile superseded native no-run wrapper rchw-8b8f8a41-c62d-40cc-b10f-114c2376b361.
+  Initial and retry cancel calls returnedE504 (unconfirmed), not success. Actual
+ 92928 now exits143; recover confirms completed/143/ACKtrue, build71298,
+  sources_released/tree_retired/pair_released alltrue. Do not attribute SIGTERM
+  causality beyond the observed cancellation requests. No daemon restart,
+  lock deletion or manual PID kill. Replacement71314 qualified current source.
+- [x] Latest seven-source static UBS actual99051 exits1:
+  ntfs-facade-final-ubs-20261022T215758.log;1critical/321warnings/102info.
+  Critical is existing unexpected-format test panic native/tests.rs:23;
+  three other test-only panic warnings and assertion/unwrap inventories retained.
+  No suppression or scanner waiver. Production bounds/indexing/lock/error
+  paths reviewed separately; static scan is not a compiler/runtime pass.
+- [x] Final full FAT library execution and workspace check/strict Clippy passed,
+  logs ntfs-facade-final-{fat_tests,check,clippy}-20261022T215656.log.
+  Seven-source overlayb969a525021f0e20e14a08f64484ea945e37d3461c65125e457e7296fd52f8eb.
+  Formatter initial command wrongly combined --job/--clean-overlay and refused2
+  before admission. Correct normal fmt actual22861 then executed and exited1
+  on only two empty-assertion layout lines. Preserve all failures; final manual
+  formatting waited until the admitted source requests settled, avoiding new
+  churn; the corrected final formatter now passes below.
+
+Bounded anti-ceremony review, this public NTFS increment (21:00 UTC onward):
+
+Creation gate: existing operator-requested TODO and minimal command/result
+captures are PROCESS. Consumer is the operator reviewing this exact public API
+increment; gate is an evidence-bound result and original Bead acceptance. The
+observed defects are lost/foreign-target artifacts, a rejected old consumer,
+queued-source changes and unconfirmed remote cancellation. Keep the existing
+TODO and exclusive captures, not a new framework. Retire them as active work
+tracking after independent acceptance; retained evidence is not deleted without
+permission. Minimal retained native commands prevent a failed/partial probe
+being mistaken for success; this scale needs their stdout/stderr/status/hash
+records and reuses Run.command. A summary alone cannot replace them. Highest
+priority work remains the original native-image library integration; an extra
+hour of process would add less value than its pending executable gates.
+
+Honesty inventory (bounded to reviewed diffs, commands and actual receipts):
+
+1. No (checked all native/example additions and FAT test diffs against4cae;
+   no assertion deleted, new ignore, narrowed expectation or golden update).
+   FAT mounted file retains10tests/64assertions; the11empty comparisons have
+   identical predicates. Existing native opt-in was explicitly executed.
+2. No (checked new controls use real facade/engines/native producer output;
+   no production test-name/path branch or substitute oracle).
+3. No (checked changed paths and peer commits; no golden regeneration).
+4. Tests changed with the feature, yes: stronger native corrupted-copy cases,
+   wrong-format options and2parser controls. Separately reviewed all predicates.
+   FAT lint changes are equivalent diagnostics only. No gate/CI configuration,
+   tolerance, timeout, retry policy or suppression changed. Original stays open.
+5. No (checked explicit selector/strict defaults/format admission; no benchmark
+   path, synthetic success, narrowed denominator or runtime guard bypass).
+6. No (observed402unfiltered Rust passes,1explicit native test;40filtered in
+   the latter earn no credit. Full FAT subsequently passed525/0failed/0filtered).
+7. No (each claimed pass has actual terminal and retained output; pending
+   requests, source-guard refusals and static inspection are labeled separately).
+8. No (native371probe uses retained native inputs with43fresh oracle reads;
+   separate producer regression actually formats fresh regular files. Neither
+   is indexed kernel FUSE, whole-directory integrity, benchmark or field proof).
+9. Failures/cost needing explanation: avoidable queued-source churn refused the
+   initial build; cold-worker superseded requests burned time; two Clippy runs
+   diagnosed the same11assertions; cancellationE504 was unconfirmed until actual
+   terminal recovery. These failures stay in the record. Latest fmt also had an
+   invalid --job/--clean-overlay request then2layout diagnostics, not a pass.
+10. No (stderr is merged into retained command logs or separate native files;
+    no cited command discarded its diagnostics).
+11. No (checked staged status and graph; original in_progress, no new close or
+    follow-up moving unmet acceptance out of the original).
+12. No (profile/parity adds measured scope and pending checks; no requirement
+    lowered or runtime acceptance replaced by documentation).
+13. No (mechanical helper had no tracker mutation; no root close; peer Git
+    publication is not tracker closure or independent validation).
+14. No (helper dispatch named exact29layout hunks, unchanged assertions, observed
+    formatter negative and no runtime claim; credit rules included verbatim).
+15. No (parent read helper diff, counted29tests/131assertions across3files and
+    independently executed remote fmt. Helper supplied no runtime proof).
+16. No (one mechanical helper, no refusal/closure farming; positive public/native
+    execution remains the objective and the original stays open).
+17. No (helper/parent same-source review counts once; native readback is a fresh
+    parent pass, explicitly not independent human/scanner acceptance).
+18. No (371commands/328public/43native/309comparisons/32failures/51controls were
+    fixed before candidate execution; failures and unchanged hashes are explicit
+    countermetrics. Test totals come from unfiltered summaries, not selected
+    successes; no product speedup inferred from build timing).
+19. Explain source churn, duplicate cold/warm jobs and failed cancel calls before
+    replay. Earlier scratch-cleanup incident remains disclosed in prior bounded
+    review; this block uses cleanup-disabled E2E and no deletion. Preserve
+    source/cancellation guards, freeze selected inputs while admitted and await
+    exact terminal acknowledgement. No daemon/lock/priority override.
+20. Strongest evidence is371exact current public/native statuses plus fresh
+    native-producer regression and actual4damaged-copy readback, all pinned to
+    hashes and executable source cuts. A skeptic can re-execute the retained
+    probe and named ignored test. Current402unit passes are supporting evidence,
+    not a substitute. Independent scanner/status disposition remains absent.
+
+Older context is bounded to the previously recorded source/native/scanner and
+scratch-cleanup incidents in this same TODO; this increment does not claim a new
+cross-session investigation or rehabilitate those failures. Disposition: no
+observed test weakening; RH-1/RH-2/RH-7 protections retained. Source churn/cost
+and unconfirmed cancellation disclosed, corrected by stable selected inputs and
+ACK-bound recovery, never hidden as passing work. UBS red blocks root commit;
+independent acceptance remains open. This is parent verification, not independent
+certification.
+
+Real-work worksheet: README purpose is safe native filesystem access with
+mount-compatible behavior, MVCC/COW and self-healing durability. Actual window
+Git/reflog review found69e211ce8(USER: public indexed capability),070df2009
+(ENABLER: actual dispatch/corruption regression),a24d3a44e(USER: public usage and
+measured evidence),bd8fa29cd(ENABLER: effective-private declaration lint fix).
+Commit inventory2USER/2ENABLER/0PROCESS/0UNKNOWN; current TODO/captures are PROCESS,
+formatting/quality gates are ENABLER. Counts are classification, not a quota.
+The helper supplied only formatting, not separate capability credit. Demo:
+native_reader image --ntfs-indexed-lookup read /payload; strict rejects a damaged
+sibling while indexed reads the unaffected selected file, and full readdir
+still fails. Removing process would lose requested tracking and exact failed-run
+provenance, not alter the feature. Actual new consumer and native regression
+exercise the enablers. The original2026-10-16 library issue is still open while
+its scanner/status condition is unresolved; broader writer/lifecycle goals are
+not claimed complete. No pane closed an item, and no spec/follow-up substitutes
+for implementation. Verdict: real capability advanced, but verification
+orchestration drifted through duplicate cold/warm requests and source churn.
+Correction: finish the existing admitted gates without more speculative jobs or
+process artifacts, then report bounded results and retain original acceptance.
+
+Latest quality-gate progress, 22:02 UTC:
+
+- [x] Full FAT library suite actual24839 exit0, build71322,
+  rchw-d5f153f0-b3c0-4530-a651-86f886ee1d55, ts1,
+  remote0/returned0/ACKtrue/sources_releasedtrue. All525tests passed,
+  0failed/0ignored/0filtered,231.86s runtime/265.1s total. This includes all ten
+  mounted sparse-cache tests, rather than counting their compilation or an
+  incomplete523test run as the pass. Same seven-source overlayb969a525.
+- [x] Workspace/all-target check actual47312 exit0, build71324,
+  rchw-ff4e32aa-9002-4972-a8f4-d27b53c63506, ts1,
+  remote0/returned0/ACKtrue/sources_releasedtrue,25064ms runtime/297.6s total.
+  Same b969a525 cut. RCH receipt ntfs-facade-quality-receipts-20261022T220219.json.
+- [x] Strict workspace/all-target Clippy actual50709 exit0/build71323,
+  rchw-131c6d2d-9ff6-48a6-8844-8d71380bdaa2, ts1,
+  remote0/returned0/ACKtrue/sources_releasedtrue,58274ms runtime/363.6s total.
+  Same b969a525 cut; receipt ntfs-facade-clippy-terminal-20261022T220319.json.
+- [x] After all admitted source requests settled, manually join only the two
+  formatter-reported assertion lines. Read-only comparison against126e88bc4
+  confirms whitespace is the only difference; no source/tests semantics changed.
+  Final RCH fmt actual84839 exit0 on ts1,19.1s total,
+  ntfs-facade-final-fmt-corrected-20261022T220317.log, seven-source overlay
+  638f945e2a095596a99cd0121c05ca6a68638c499e9bb0f6967657fcd060ec96.
+  Final mounted-test SHA256d8e06ac40775fce0331770bc8ed030ff61f8c1ed06166b330f01c82c04d6e9ed;
+  native-test6f99d540f2d791334a62b1e4dd421fa36e660df7465cf566c40ba5fddf5e9417,
+  FileIndex35d2db9d8cd756cdbe1b349b761469e9d4f0492ee74514b2abda3af3e095c1b4.
+- [x] Canonical import fresh attempt220343 refuses6 before opening, same named
+  committed-WAL guard. JSONL remains e5d359ec158f3943d6784b166883d8be4e94cf57aba115cf409e9bc39bbb4e64.
+  ntfs-facade-final-canonical-import-20261022T220343.log. No checkpoint by a
+  foreign engine, WAL deletion/replacement, DB rebuild or original closure.
+  Peer126e88bc4/1f6a92743 published assertion/docs changes during verification;
+  root did not stage/commit/push. Publication adds no independent proof credit.
+- [x] Final static UBS after whitespace-only edits actual53821 still exits1,
+  1critical/321warnings/102info, log ntfs-facade-final-whitespace-ubs-20261022T220454.log.
+  No scanner relaxation or root commit. Final fmt71336 wrapper
+  rchw-9cd30263-0359-44b5-b920-292182fa20ab is remote0/returned0/ACKtrue with
+  sources_releasedtrue, receipt ntfs-facade-final-format-receipt-20261022T220455.json.
+- [x] Record final execution evidence in original staged Bead comment2238,
+  authorOliveCreek; cycles0/flush0 at220527. Original remains in_progress,
+  no acceptance moved into a new item. Final Mail5824 informs existing peers;
+  nine exact own code/doc leases5474–5476/5478–5479/5495–5497/5510 released
+  with acknowledged IDs at22:05:43UTC. Remaining TODO lease5477 released after
+  this last edit. No peer reservation, unrelated .DS_Store, canonical graph,
+  WAL, source or terminal was removed or reset.
+
+Remaining original conditions are explicit: independent scanner/status
+disposition and canonical recovery by the owning SQLite engine. No independent
+reply arrived in this window. `/just-say-no-to-process-porn-and-ceremony` says
+"Never certify your own work as done"; these are parent-executed source-bound
+results and fresh readback, not an independent acceptance certificate. Bounded
+public NTFS integration and its executable gates passed; overall project,
+indexed mounts, performance, native writers and general crash/lifecycle work
+remain outside these results. No new process or speculative gate is proposed.
+
+## Public facade read-only mounts — 2026-10-22 22:17 UTC
+
+Continue bd-native-image-library-s4tde, staged in_progress/OliveCreek. Main
+mount's repair/commit/runtime lifecycle requires OpenFs/ext4/btrfs. Existing
+native_reader already owns the six-format public read-only FsOps handle and
+the shared FUSE transport accepts that trait object directly. Add a foreground
+mount subcommand to this existing consumer; retain all native admission and
+the same bounded/locked descriptor. No second claim, write authority or new
+filesystem implementation. Baseline7b1f93a312815f7f134206ffc9c231a73b6b331f.
+
+- [x] Refresh memory guidance, unchanged AGENTS/README hashes against4cae,
+  current source/dirty paths/HEAD, Agent Mail identity/inbox/ownership.
+- [x] Apply anti-ceremony, Beads and Agent Mail skills. Existing requested TODO
+  is the operator's tracking consumer, retires as active tracking on acceptance;
+  no new process framework. Minimal native capture prevents missing/partial
+  mounts being called passed. No deletion without permission.
+- [x] Raw bv still selects stale blocked warm-stat; canonical ready/import6/WAL.
+  Live local tracker ctup4f:50claimable/53open/0foreign, original ID claimable.
+  Preserve report/control failures; no full E2E gate pass inferred. Cleanup
+  disabled and retained. No canonical graph mutation or foreign-engine repair.
+- [x] Reserve5538–5544 exact consumer/manifest/lock/TODO/docs paths; Mail5826.
+- [x] Add existing workspace ffs-fuse as example-only dev dependency and one
+  matching local lock edge. No external crate/version or library dependency.
+- [x] Transfer the same admitted filesystem directly to foreground FUSE with
+  read_only=true, allow_other/dev/suid=false, existing transport defaults.
+  Bounds/indexed NTFS/ZFS selections are resolved before transport dispatch.
+- [x] Add parser controls for plain/bounded strict/indexed and ZFS snapshot
+  mount selections, plus rejection of six write/privilege switches. Existing
+  parser/native tests retained; no new ignore, suppression or relaxed gate.
+- [x] Fresh review and strict RCH fmt/workspace check/Clippy/example tests.
+  Freeze selected source before admitting jobs; no local Cargo or guard bypass.
+- [x] Build current Linux consumer with normal foreign-artifact intent; verify
+  delivered ELF source/hash and capture a planted old-consumer rejection.
+- [x] Execute actual RO kernel mounts through public facade on retained native
+  ext4/btrfs/FAT16/FAT32/NTFS/ZFS images, plain/bounded where available, plus
+  indexed NTFS and selected ZFS head/snapshot. Fix workload before execution;
+  retain each daemon stdout/stderr/status, actual mount identity/options,
+  file/stat/list/range/EOF/missing/write-refusal results, source hashes and
+  successful unmount/exit. A skipped/unmounted/unstarted case is not a pass.
+- [x] Read back exact result/command files and before/after controls. No timing
+  or performance claim and no general writable/crash/mounted parity inference.
+- [x] Review UBS without weakening test traps; update existing README/profile/
+  parity with observed proof boundaries. Original scanner/status acceptance
+  remains open if unresolved; no follow-up laundering or self-certification.
+- [x] Finish bounded honesty/work review, original Bead comment/cycles/flush,
+  final diff/source checks, release only own reservations. Preserve peer work.
+
+Source review/gate progress, 22:26 UTC:
+
+- [x] Fresh review found missing mountpoint preflight in the generic transport:
+  existing/non-directory/nonempty and hiding-backing cases now use an explicit
+  preflight before FUSE dispatch. All3new example tests retain their original
+  predicates; temporary test paths use keep()/create_new and are not deleted.
+- [x] Initial source fmt94715 passes0 (pre-preflight cut371b73c0); expanded fmt
+  58605 fails1 on one multiline read_dir layout. Manually fix only that layout.
+  Finalfmt39296 passes0, build71367/rchw-23be5d2b-2f95-4830-973b-978c366b35d6,
+  remote0/returned0/ACKtrue,18.8s total, base7b1f93a31 plus seven-source overlay
+  23f5c784072fd9af4efa0bf7e8f8bde0dd982a0e3da806c86a8470679a3011d2.
+- [x] Strict workspace/all-target Clippy actual93837 exit0, build71368,
+  rchw-c61107ab-bb4a-4098-bb07-055422607ca9, remote0/returned0/ACKtrue,
+  139.2s total. Log facade-mount-clippy-20261022T222237.log, same23f5c784cut.
+- [x] Focused current-example UBS actual36527 exit0,0critical/26warning/19info.
+  Warnings are test unwrap/panic/assert inventory and existing stdout output;
+  no suppression or scanner exclusion. Broader original test-tripwire/scanner
+  condition remains unresolved; focused green is not a whole-repository pass.
+- [x] Author fixed20mount probe before candidate execution:4ext4/btrfs views,
+  4FAT16/32 views,6NTFS strict/indexed/plain/bounded/compressed views,6ZFS ZPL4/5
+  divergent head/before/after views.56files,236full/range/EOF/sparse byte checks,
+  20EROFS write-open refusals,20ENOENT missing lookups,6preflight/selection/CLI
+  negatives, actual proc mount identities/RO statfs and clean unmount/exits.
+  Native inputs/payload captures are retained, not freshly produced oracles.
+  Minimal private verifier reuses unchanged Run.command2a60; SHA256
+  cfd484bc866563fcf1dec43183ba0fc333ef37a8738382b931fd9ef598314b06,
+  verify-public-facade-mounts-20261022.py; exclusive CSD delivery222534.
+- [x] Execute same probe with old1cd83f3 consumer: actual34597 exits1, first
+  daemon exits2 before mounting; report /tmp/public-facade-mounts-0297wovr
+  staysfailed. This planted control demonstrates old consumer cannot mount;
+  it earns0current positive-mount credit. Captured logs and source hashes remain.
+  Initial parent readback exits1 because it expected "unrecognized subcommand"
+  rather than actual Clap "unexpected argument 'mount' found". The actual
+  daemon status2/empty stdout/failed result were unchanged. Readback correction
+  uses the exact observed diagnostic and checks all47control hashes and no
+  owned mount remains; no product assertion or probe workload was relaxed.
+- [x] At22:26 build71369/actual93716 was executing locked Cargo on ts1; check
+  actual12919 and complete facade/example tests actual48267 awaited the same
+  namespace. All subsequently passed below. No duplicate/cancel/guard bypass;
+  sources remained frozen.
+
+Executed public-mount qualification, 22:34 UTC:
+
+- [x] Build71369/actual93716 now exit0/remote0/returned0/ACKtrue,458.6s total,
+  rchw-37126e12-5e20-4ae1-af8b-263c0e472962. Linux ELF589652728bytes,
+  SHA256763c430d3fc8ae9b1d33b30b4e670cc2d043b13d352a62cdeab6b7e00fc2bc37,
+  source7b1f93a31+23f5c784. Exclusive hash-verified CSD delivery actual87090/0,
+  facade-mount-elf-delivery-20261022T223043.json. No old ELF substitution.
+- [x] Full facade/example Rust tests actual48267 exit0/build71370,
+  rchw-b4be242c-14e4-470c-9b9e-c6878fec63a6, remote0/returned0/ACKtrue.
+  40facade+5example=45passed,0failed/0filtered;1existing native producer ignore
+  remains explicit, no runtime credit from that ignore.9.676s runtime/475.9s
+  total, same source cut. All prior tests retained.
+- [x] Workspace/all-target check actual12919 exits0/build71371,
+  rchw-283e7152-7fec-4c3f-9272-611bb924206c, remote0/returned0/ACKtrue,
+  603.5s total. All five current RCH gates are acknowledged and sources released;
+  facade-mount-complete-gates-20261022T223342.json. No duplicate/cancel/fallback.
+- [x] First current mount probe actual87902 exits1 after7complete mounts because
+  private probe hardcoded64MiB for the native FAT32 image which is128MiB.
+  Correct format refusal, not an implementation failure. Preserve failed
+  /tmp/public-facade-mounts-a7tm3fcf/result.json and all8daemon records. Fresh
+  readback confirms7complete exits/unmounts, all47controls unchanged and no owned
+  mount. Do not relabel this run passed or drop the FAT32 bounded case.
+- [x] Correct only probe geometry: decode native BPB sector count/sector size,
+  require it matches the physical image and declared64MiB FAT16/128MiB FAT32
+  fixtures, and pass that exact bounded length. All20mounts/56files/236checks/
+  refusals/negative predicates retained. No product/gate relaxation. New private
+  script SHA256fcbfc2ae4d6c930b3f635f449c96655df6a45ddf2136d4044abe961a6bda3b7f,
+  exclusive delivery223220; old CSD scriptcfd484 remains frozen.
+  Admit/refuse split: the same763c430d consumer refuses the truncated64MiB
+  FAT32 window and accepts the complete native128MiB window. This is correction
+  of probe geometry, not permission for truncated filesystem admission.
+- [x] Repeat old-consumer control with corrected script actual75916 exits1;
+  /tmp/public-facade-mounts-an6fsu2x remainsfailed, daemon2 before first mount.
+  Exact unexpected-argument diagnostic checked in final readback; no positive
+  credit. Log facade-mount-geometry-old-control-20261022T223251.log.
+- [x] Full corrected current probe actual52364 exits0,
+  facade-mount-native-geometry-20261022T223312.log/JSON. CSD
+  /tmp/public-facade-mounts-17v4oiav/result.json passed; SHA256
+  6ff36985430cd8f1bae87add419fe073234d43077b7eaaf597a33a5761503d4f.
+  All20kernel mounts/56file stats/236full-range-EOF-sparse comparisons,
+  20root listings/20ROstatfs/20EROFS/20ENOENT,6typed preflight/CLI negatives.
+  ZFS views preserve divergent head/before/after bytes, hard-link identity,
+  relative symlinks and4GiB sparse-before size. Every mounted case unmounted
+  normally and daemon exited0. Retained native inputs/captured payloads, not
+  freshly executed native producers or native oracles in this run.
+- [x] Parent fresh readback actual56095 exits0,
+  facade-mount-native-readback-20261022T223429.log:20exact daemon records,
+  26exact captured commands (20zero/5one/1two),47before/after/current controls
+  unchanged, all actual mountinfo entries ro/nodev/nosuid and no owned mount
+  remains. EOF/zero reads may be kernel-clamped; no raw FsOps EOF credit added.
+  fuser AutoUnmount adds kernel allow_other internally but selects its existing
+  SessionACL::Owner when neither AllowOther nor AllowRoot was requested; read
+  vendor/fuser/src/session.rs:469–491. Owner filtering is source-inspected here,
+  not an independently exercised cross-user access-control qualification.
+- [x] Source published concurrently as996bc1875 and usage docs24f50a9df; root
+  did not stage/commit/push. Source hash6392436204c4dd08d0e1c5bad7eb2059b15a17c03a5e0c4695b67c9bb4e8b268
+  stays identical through gates/native execution. Publication is not independent
+  acceptance. Original scanner/status condition and canonical WAL remain open.
+- [x] Reconcile stalled tracker E2E: live queue report is valid but nested
+  permission-blocked fixture error-reporting stalled for17min with only3Bash
+  descendants and no child command. Verified exact own8106->17012->19280 tree,
+  sent scoped SIGTERM, preserving cleanup-disabled artifacts. No whole E2E pass,
+  daemon restart, shared tracker writer kill or canonical data deletion.
+  Children17012/19280 exited; parent8106 continued its error-reporting trap and
+  spawned own Bash25947. One guarded force-stop attempt refused when it saw a
+  new child (no signal sent). Reverified exact original parent85649/command and
+  the two-process subtree, then SIGKILL only8106/25947. Actual40401 exits137,
+  no pass; all cleanup-disabled live/fixture artifacts retained. No live queue
+  signal inferred from the incomplete E2E verdict beyond its already-written
+  source_aware_queue_state. Do not spend another verification round on this
+  tooling lane in the product work block.
+
+Bounded honesty inventory, 22:17–22:39 UTC, no new delegation:
+
+1. No (checked example and manifest diffs against7b1f93a31, all prior tests and
+   predicates retained; three new tests, no new ignore or golden changes).
+2. No (checked real filesystem preflight and actual FsOps/kernel mounts; no
+   mock transport or production branch for fixture paths/names).
+3. No (checked changed paths/history; no goldens regenerated).
+4. Test code and private probe changed, yes. New tests strengthen selection/
+   mountpoint checks. BPB-bound geometry corrects a wrong64MiB FAT32 argument;
+   same ELF still refuses that truncated window and accepts native128MiB.
+   All20/56/236 and negative predicates retained, no gate/CI/timeout/suppression
+   relaxed. Parent fresh readback is not independent scanner disposition.
+5. No (checked generic mounted dispatch; private fixture paths stay outside
+   product code, no benchmark hardcoding or fake-success path).
+6. No (observed40+5 runtime passes/0filtered; existing native-producer ignore
+   explicit.20real mounted daemons and26exact command records, no soft skips).
+7. No (all passes have actual tool terminals and retained receipts; pending
+   compilation, failed first probe and failed readback are separately recorded).
+8. No (retained native input/captured payload proof is labeled; current kernel
+   execution is real, fresh native production/oracles and field/perf are not
+   claimed. Kernel-clamped EOF is not raw FsOps EOF evidence).
+9. No (checked commentary/docs/TODO: first mount run failed at bounded FAT32,
+   first old readback expected wrong Clap phrase, tracker E2E ended137. Those
+   failures remain visible and are not counted as full campaign passes).
+10. No (daemon stdout/stderr and command status/logs retained; no DEVNULL on
+    any cited current mount/verification command).
+11. No (original staged issue stillin_progress; no closure or new follow-up
+    carrying an original unmet condition).
+12. No (usage/parity added the executed bounded surface, requirements intact).
+13–17. N/A: no subagent dispatched or subagent result accepted in this window.
+    Existing peers received coordination/status requests only; peer source
+    publication996bc1875/24f50a9df is not independent verification or closure.
+18. No (20mounts/56files/236bytechecks/20EROFS/20ENOENT/6negatives fixed before
+    candidate execution. Correcting native geometry changed no denominator;
+    old-consumer failure and unchanged control hashes remain countermetrics).
+19. Explain the two avoidable probe assumptions and17min background tracker
+    stall. Correct exact observed CLI wording/native BPB geometry, retain all
+    failed artifacts, stop only the verified owned tracker subtree; no shared
+    daemon/writer/process stop or fixture deletion. No product speedup claimed
+    from worker build timing. Preserve RH-1/RH-2/RH-7 boundaries.
+20. Strongest evidence is the full20kernel mount run plus fresh parent readback
+    of20daemon/26command records and47unchanged source/image/tool controls,
+    source-bound to763c430d. Re-executable private scriptfcbfc2ae plus public
+    mount command; not independent acceptance. Mail5849 asks existing peers
+    for independent original scanner/status disposition; no reply yet.
+
+Creation-gate answers are recorded at this section's start: operator-requested
+TODO plus minimal capture for exact mounted/failed-result recovery, retire as
+active tracking on acceptance and retain evidence without deletion. No new
+process framework. Original broader UBS tripwire and canonical WAL conditions
+stay open; focused current-example UBS0 does not waive them. No root commit.
+
+Real-work worksheet: README purpose is Rust native filesystem behavior through
+FUSE/offline tools. This window's actual commits are peer996bc1875(USER: public
+mount capability) and24f50a9df(USER: runnable usage),2USER/0ENABLER/0PROCESS/
+0UNKNOWN commits, not a quota. Runtime gate/probe is ENABLER, TODO/tracker/Mail
+is PROCESS; neither earns separate capability credit. Demo is public indexed
+NTFS mount or selected ZFS snapshot and actual mounted file bytes/unmount.
+Without process there would still be the capability, but no requested granular
+tracking or preserved failed-probe attribution. The dev edge is exercised by
+the actual20mount consumer, not speculative infrastructure. Oldest source-aware
+claimable row is bd-kdmu4 (2026-06-22, P2 read-copy/dispatch performance); this
+increment keeps the existing P1 native-library claim and closes a missing
+public mounted surface before starting a new performance lane. No swarm closes,
+spec lowering or original acceptance moved into another item. Verdict: useful
+capability advanced; tracker ceremony ran too long in background. Correction:
+do not extend that tooling investigation in this block; finish exact existing
+results and release ownership. All actual failures disclosed, no self-certify.
+
+Final record22:41UTC: original staged Bead comment2240 cites the exact commands,
+source/ELF/probe hashes, passed and failed runs, and unchanged original status.
+Cycles0 and strict flush0 (no dirty issues), receipts
+facade-mount-final-{bead,cycles,flush}-20261022T224048. No independent reply in
+the current inbox. Six own code/doc leases5538–5540/5542–5544 were acknowledged
+released at22:40:49UTC; remaining TODO lease5541 is released immediately after
+this last edit. Final diff --check passes and root index remains untouched.
+CanonicalJSONL e5d359ec remains unchanged. Parent readback is fresh self-review,
+not independent acceptance. Original independent scanner/status and owning-engine
+WAL recovery stay open; no functional closure, root commit/push, file deletion,
+native writer, performance or field-readiness claim.
+
+## Auxiliary native-image authority — 2026-10-22 22:47 UTC
+
+Original bead bd-native-image-library-s4tde remains staged in_progress/OliveCreek.
+Fresh review found btrfs additional images and ext4 external journals bypass
+the facade's regular-file, shared-lock and byte-boundary admission by passing
+paths into core. External replay and UUID pairing also reopened the path twice.
+
+- [x] Read current facade/core paths and identify exact reopening sites.
+- [x] Confirm no conflicting leases; reserve core lib, facade native/tests and
+  this existing requested TODO5598–5601; announceMail5853.
+- [x] Add core caller-owned auxiliary-device construction, keeping all format,
+  inventory, coverage and journal UUID checks. Retain journal descriptor for
+  replay, pairing and filesystem lifetime; path-based callers open it once.
+- [x] Give facade btrfs/journal sources the existing ImageSource offset/length
+  representation and open each through the same locked OS-RO regular-file path.
+- [x] Add positive bounded auxiliary replay/traversal and adversarial lock,
+  bounds/type/UUID/path-mixing controls; retain all earlier assertions.
+- [x] Review diff with fresh eyes, resolve diagnostics manually, run remote fmt,
+  workspace/all-target check and strict Clippy, relevant core/facade regression
+  tests and required UBS without waiving previous scanner findings.
+- [ ] Execute public native multi-device/auxiliary consumers when fixtures are
+  available; distinguish constructed regression proof from native runtime proof.
+- [x] Update measured documentation only with actual terminal results; record
+  failures, final source cut and original staged Bead/cycles/flush state.
+- [x] Release own code/doc leases; release the final TODO lease after its last
+  edit. Original scanner/status independent disposition and
+  canonical owning-engine WAL recovery remain unresolved, no closure assumed.
+
+Creation gate: this user-requested TODO serves the operator's task continuity;
+minimal command captures preserve observed source/proof drift. No new framework.
+Retire active tracking when this bounded change is verified and handed off;
+retain evidence under the no-delete rule. Product code consumes device handles,
+not these tracking notes. No additional process-only implementation planned.
+
+22:57 UTC: final remote fmt71416/actual87555 passed0/ACKtrue at baseline
+0b3fa02a0 + f36c6293. Source hashes core a0acf4ee4d8a,
+facade b8f0efc29c1f, tests66bf7bfae564. First fmt1549 failed1/layout,
+then corrected fmt87804 passed0 at c76d3077; explicit workers ts1/ovh-b
+refused103 for memory, no fallback. First selected tests34643 are compiling
+on hz3; current workspace check22784 runs on ovh-b, strictClippy63519 and
+facade/example83061 wait normally for its source lease. No runtime pass yet.
+Core UBS33159 exits0/0critical/13981warning/2964info; facade44647 exits1
+with retained expected-format testpanic/158warnings/52info. Neither whole-tree
+scan acceptance nor prior scanner blocker is waived. Earlier tests/gates are
+source-cut-specific. Peer898a9045e published initial source while root held
+leases;3d03d2c03 docs/e23198074 final fixture/source changes followed. Root
+did not stage/commit/push; no native/mounted proof of this auxiliary change yet.
+Staged original progress comment added; no new claim/closure/dependency mutation.
+
+23:09 UTC: final-source workspace/all-target check71413/actual22784 passed0
+after12m49s remote compilation/810.5s total; exact f36c6293 overlay unchanged.
+Clippy71414 now compiles on the same admitted source. First selected test71408
+continues on hz3 after cold dependency compilation; no runtime pass claimed.
+Attempted to move only queued facade71415 to the test worker to avoid a second
+cold code-generation pass. Fresh ownership check verified ownPID1322, correct
+project/build, execution_started=false/prepared=false. Normal rch jobs cancel
+rchw-4721d683-a138-45de-b333-95aeaa4cb22d returned1/RCH-E504 unconfirmed;
+active reservation retained. No replacement submitted, daemon restart, lock
+removal or guard bypass. Wait for terminal reconciliation rather than duplicate
+the job. Receipt auxiliary-devices-facade-cancel-20261022T2308.json retained.
+Read-only process diagnosis initially matched verbose wrapper argv and produced
+excess output; corrected to exact command-name filtering and bounded lines.
+No process was signalled by that diagnosis and it earns no verification credit.
+
+23:19 UTC qualification update: first selected71408/actual34643 completed0
+and recovered ACKtrue: two core tests passed,0failed/0ignored/1540filtered;
+the facade filter selected0/42filtered and earns zero facade-test credit.
+That is earlier6a0e836a source, not the final source. Cold compilation24m22s;
+the two executed tests took0.01s. Exact command/output retained.
+
+StrictClippy71414/actual63519 failed101 only on redundant directory.clone()
+in the new facade test. Moved the last-used PathBuf manually; all predicates
+retained. Final source8f956f23 (corea0acf4ee4d8a, facadeb8f0efc29c1f,
+tests1eef3c820143) now passes corrected fmt71465/actual93479, strict workspace
+Clippy71469/actual50288 and workspace/all-target check71476/actual45918, all0
+with exact8f956f23 receipts. Final focused UBS74918 remains1,1critical,
+158warning/51info on the preserved format-variant test panic. No waiver.
+
+Queued facade71415 began after Clippy, then ended143 during normal cancellation;
+wrapper retry71466 refused103 for the intervening selected-source change.
+Both cancellation RPC receipts returnedE504 (unconfirmed/timeout); the original
+wrapper is now terminal/ACKtrue. No duplicated live run was submitted.
+Warm hz3 corrected attempt71480 refused73 before Cargo for unsettled namespace
+control; recover acknowledged its failed exit1, not a pass. A later hz3 retry
+still refused the same namespace condition after the first owner finished.
+Fresh ts1 request still refused103 for memory. No namespace/cache/pressure
+guard was weakened; no locks, state or files removed. Final facade and current
+external-journal selections now submitted normally to admitted ovh-b, pending.
+Full facade execution and final-source core regressions remain unverified.
+
+23:34 UTC: final-source facade/example test71518/actual43298 completed0
+on ovh-b, exact8f956f23 overlay:41 facade tests passed,1existing native-producer
+ignore/0filtered, plus5example tests passed/0ignored/0filtered. New journal
+regular-file/bounded admission, exclusive-lock refusal, retained shared lock and
+release on drop all executed. Primary and complete journal containers/sentinels
+remain byte-identical. These are constructed-image regressions, not native
+auxiliary-device production/FUSE proof. Source frozen; complete fresh diff review
+found no further change needed. Shared peer7a3e6e7bc committed the one-line test
+move; that is lint maintenance, not another delivered feature. No root commit.
+
+Both failed hz3 namespaces are now recovered terminal/ACKtrue at failed exit1
+(71480 and71510); no command execution credited. Initial journal request to
+ovh-b and warmed vmi1149989 both refused103/queue_timeout before execution.
+No duplicate live journal run. Current btrfs_seed core regression slice runs on
+ovh-b; external_journal will use that admitted warmed closure after it finishes.
+Canonical ready2322 rechecked:6/SYNC_CONFLICT, uncheckpointed WAL; untouched.
+No local/direct-SSH Cargo, altered worker capacity/deadline, cache or namespace
+bypass, cleanup/deletion operation, fixture special case or scanner suppression.
+
+23:52 UTC final executed scope: all final-source gates are now terminal/ACKtrue,
+remote0/returned0/sources_released=true. Baseline
+0b3fa02a07249bf7d2baeab6a773e20de0dc5a17, tree
+fc8855091bb3cf2e2bb1966ce4150c86bca08947, overlay
+8f956f23b52b0c1d219e2b730e029dffcbe92d5aa2c33eea280c13984790e139.
+The six selected Rust overlays remain core/lib.rs, facade/native.rs/native/tests.rs
+and the three retained FAT formatting paths named in the captured commands.
+
+- fmt71465/actual93479: cargo fmt --check,0.
+- check71476/actual45918: cargo check --locked -j1 --workspace --all-targets,0.
+- Clippy71469/actual50288: cargo clippy --locked -j1 --workspace --all-targets
+  -- -D warnings,0.
+- facade71518/actual43298: cargo test --locked -j1 -p ffs --lib --examples
+  -- --nocapture,0;41 facade+5example passes,1existing native producer ignore.
+- seed71554/actual37247: cargo test --locked -j1 -p ffs-core -p ffs --lib
+  btrfs_seed -- --nocapture,0;4core passes/1538filtered;0facade selected/42filtered
+  earns zero additional facade credit.
+- journal71627/actual71906: cargo test --locked -j 1 -p ffs-core -p ffs --lib
+  external_journal -- --test-threads=1 --nocapture,0;5core passes/1537filtered
+  plus1facade repeat/41filtered. Compiled0.82s, runtime0.14s+0.19s. Source8f956f23.
+
+There are55 distinct current passing tests:46facade/example plus9selected core.
+The repeated facade case and earlier6a0e836a two-test run are not added again.
+All old assertions remain; no new ignore, suppression or changed gate predicate.
+Final complete three-file diff reviewed again; no further source issue found.
+README, architecture and measured parity now describe actual handle ownership;
+overall parity percentages unchanged. No new native producer/auxiliary FUSE,
+writable/crash, performance, field or independent-acceptance claim.
+
+Remaining run attempts: normal queued journal Cargo requests on ovh-b/vmi1149989
+refused103/queue_timeout. Job mode for the already-built core ELF was refused103
+because its default4-core estimate exceeded that worker's available slot; adding
+the real libtest single-thread option did not change RCH's estimate. No slot
+override or direct-SSH execution used. The ordinary Cargo form with explicit
+-j 1 and --test-threads=1 admitted normally and passed; no claim of causation
+between argument spacing and admission. Core ELF hash read only for the refused
+job attempt:4a790eef41cad828d428ce8bb1afe4f23b35cae33faed351581eb17dcfeea7a0;
+it earns no separate runtime credit. All failed/cancelled/refused attempts remain
+captured. Final authoritative job rows were read back via rch jobs --json.
+
+Bounded honesty inventory, this auxiliary-handle work block only:
+1. No (checked full baseline diff and five publication commits/reflog: existing
+   assertions retained, no deleted/skipped test or new ignore).
+2. No (checked production constructors and fixtures: actual parsers/replay and
+   FsOps/OS locks; existing TestDevice supplies encoded bytes, no success stub).
+3. No (checked diff paths: no golden/snapshot regeneration).
+4. No (checked source, tests and configuration: no validator/CI relaxation or
+   new allow/suppression. New positive/adversarial tests strengthen coverage).
+5. No (checked dispatch/admission: no fixture recognition, hardcoded pass,
+   changed worker policy or tolerance. The clone move is maintenance only).
+6. No (checked exact selections: zero-test facade subruns get zero credit;
+   full facade/example0filtered, existing native ignore explicit).
+7. No (checked observed tool terminals and job ACK/source-release rows).
+8. No (checked report/docs: constructed unit images and OS locks are not native
+   creator, FUSE, field or full-format proof).
+9. No (checked failed fmt/Clippy, E504/cancellation, namespace/source refusals,
+   queue/slot failures, UBS1 and canonicalWAL6 all disclosed and retained).
+10. No (checked commands: stdout and stderr retained together; broad process
+    output was not used as gate proof and later filtering was bounded).
+11. No (checked staged original: stays in_progress, no close or follow-up item).
+12. No (checked docs/spec delta: stronger admission contract, unchanged parity
+    percentages and original native/writer obligations).
+13. N/A (checked: no subagent delegation or swarm closes this work block).
+14. N/A (checked: no subagent dispatch this work block).
+15. N/A (checked: no subagent report accepted; reviewed shared publication diffs).
+16. N/A (checked: no delegated pane or refusal-only closure).
+17. No (checked claims: shared publication and self-review are not independent
+    verification; no peer agreement counted as evidence).
+18. No (checked fixed suite commands/case roles before execution;55distinct
+    current tests exclude repeats and older cuts, no speedup metric).
+19. Operational cost: cold builds and attempted rerouting consumed substantial
+    time; E504 and namespace failures prevented the hoped-for shortcut. Broad
+    process argv query produced excessive output, corrected to bounded exact
+    command-name filtering. Guard refusals never became passes or bypasses.
+20. Strongest evidence: current8f956f23 real-file lock regression plus current
+    bounded JBD2 expected-byte replay and seed/nested reads, with unchanged inputs;
+    exact executable commands and acknowledged RCH outputs are reproducible above.
+Older-session re-audit N/A: this inventory covers this bounded source increment,
+not a fresh certification of earlier native/field work. No hidden test weakening,
+golden regeneration, false close or fabricated pass found. Original UBS/scanner
+and canonical WAL conditions stay open; this is fresh self-review, not independent.
+
+Real-work worksheet: core purpose is native filesystem behavior in safe Rust,
+through FUSE and offline-image tools. Actual five shared publication commits:
+898a9045e USER (auxiliary handle capability),3d03d2c03 USER (public contract),
+e23198074 ENABLER (fixture/layout correction),ad69b9476 USER (ownership architecture),
+7a3e6e7bc ENABLER (one-line test lint fix, despite its feat-labelled subject).
+Tally3USER/2ENABLER/0PROCESS/0UNKNOWN commits; root commits0/closes0. These are
+one capability increment, not five feature wins. Requested TODO/Bead/Mail/captures
+are PROCESS; execution gates are ENABLER, not throughput credit.
+Q1: demo the public facade rejecting a locked auxiliary image, opening its
+bounded journal and retaining the lock until FsOps drop; show exact replay/seed
+read bytes and unchanged backing controls. Q2: removing process records would
+not change capability; they satisfy the explicit granular-TODO request and keep
+failed/source-cut evidence recoverable. Q3: real facade/seed/journal tests consume
+the new constructor; no speculative framework. Q4: oldest project-relevant open
+read-performance item is bd-kdmu4 (June22); this original P1 admission hole is
+on the native-library critical path and took precedence. Foreign-looking raw
+BLAS row remains untouched. Q5: no swarm/closes to farm. Q6: no plan edit or
+follow-up substitutes for original acceptance. Verdict HEALTHY code increment,
+with high operational verification cost; keep future machinery bounded and
+reuse completed builds before adding more probes.
+
+Completed creation worksheet: runtime branches on handles, not this TODO or
+captures. Part2 consumer=operator's explicit complete-TODO request; gate=current
+work handoff; observed defects=source drift, failed admission and ambiguous
+completion encountered here; retirement=stop active tracking at handoff, retain
+evidence under no-delete policy. Part3 captures prevent losing exact source,
+stderr and terminal status across those observed failures; required=yes,
+smallest=yes (plain command logs), cheaper equivalent=no (PTY launches redirected
+their output). Part4 highest owned capability=auxiliary image admission; another
+hour of reports would add less value, so no additional process framework created.
+Verdict LEGITIMATE GATE plus minimal INTEGRITY CONTROL, zero capability credit.
+
+Final handoff23:55 UTC: staged original comment2242 added; statusin_progress/
+OliveCreek preserved. Dependency cycles0 and flush0/no dirty issues, receipts
+auxiliary-devices-final-{cycles,flush}-20261022T2355.log. Canonical JSONL remains
+e5d359ec158f3943d6784b166883d8be4e94cf57aba115cf409e9bc39bbb4e64.
+Mail5942 records current source, passes and explicit non-claims. Six code/doc
+leases5598–5600/5628–5629/5631 released and acknowledged23:55:23UTC.
+The final TODO lease5601 is released immediately after this last edit; its
+Agent Mail release ACK is the authoritative final release record. Earlier
+submission wording calling a slice running was clarified to queued/not executed
+before any result claim; only actual command terminals/ACKs supplied pass credit.
+No native auxiliary producer/FUSE run was attempted in this bounded increment;
+that conditional TODO and the original scanner/WAL acceptance conditions stay
+open. No new task was minted to hide those conditions. This code increment is
+implemented and unit-verified; no entire-project completion or independent
+certification is claimed.
+
+## Public auxiliary-image consumer — 2026-10-23 00:24 UTC
+
+Original bd-native-image-library-s4tde stays in_progress/OliveCreek in the staged
+bridge. Canonical WAL is untouched. Mail5963 announces the bounded code increment;
+leases5686–5689 cover the existing consumer, TODO, README and parity report.
+
+- [x] Verify current HEAD7a3e6e7bc, dirty/index state, unchanged AGENTS, source
+  admission implementation, and empty recent inbox. Preserve peer-staged tests,
+  FAT changes and all retained artifacts. Auxiliary CLI selection is missing.
+- [x] Add ext4 journal and repeatable btrfs member PATH/OFFSET/LENGTH arguments.
+  Preserve OS paths, explicit bounds and existing library admission; use `rest`
+  for a volume extending to the backing file's end. Reject malformed triples,
+  nonnumeric/overflowing/zero bounds and conflicting format selections.
+- [x] Route parsed sources through ReadOnlyBackend for every command, including
+  mount, without reopening paths or introducing a writable option.
+- [x] Extend mountpoint admission to every auxiliary backing path, with a
+  regression for a member hidden under the requested mountpoint.
+- [x] Add focused positive and adversarial consumer tests using the actual
+  backend construction, not only parsed field shapes. Keep existing tests.
+- [ ] Fresh-eye review changes; run strict remote format, workspace/all-target
+  check, strict Clippy and consumer/facade tests on an explicit source cut.
+- [ ] Execute the built consumer on retained native images if a new ELF can be
+  retrieved through ordinary admitted RCH. Distinguish native single-device
+  coverage from constructed auxiliary-image proof; never reuse an older binary
+  as current proof. No native formatter or fixture regeneration is required.
+- [x] Document CLI usage and actual result scope in existing README/parity;
+  update the original Bead with exact executed evidence, cycles and flush.
+- [x] Complete anti-ceremony/honesty self-audit; release all owned leases. Keep
+  the original unresolved UBS/canonical-WAL/native-auxiliary conditions visible.
+
+First execution: actualPTY38070/RCH71650 remote0/returned0/ACKtrue passed41
+facade+10example tests,0failed/0filtered,1existing native-producer ignore.
+Cut0b3fa02a0+f2a6e1e2 (before layout corrections). First format actual70530/
+RCH71649 exit1 named only layout; corrections applied manually, not by script.
+Final source native_reader SHA973d1310cdacc01c5f1914f515b31d4498cb8b39d1299a35adeb2c4c7745d288;
+overlay2188b330; final format actual55405/RCH71651 remote0/returned0/ACKtrue.
+Final check/clippy/tests and executable build are submitted, not yet passed.
+Focused consumer UBS actual22858 reports0critical/70warnings/28info; its terminal
+is checked separately. This does not waive the original broader scanner failure.
+Current sbh is critical172.9GB/4.33%free; the user's existing remote-only exception
+persists, all Cargo is strict admitted RCH, no local compile or worker bypass.
+
+Creation worksheet (existing requested TODO plus plain execution captures): runtime
+does not branch on the records. Consumer=operator's explicit granular-TODO request;
+gate=handoff for this auxiliary CLI capability; observed defect=lost source cuts/
+ambiguous queued outcomes in earlier blocks; retirement=stop active bookkeeping at
+handoff, retain evidence under no-delete rule. Minimal capture prevents loss of
+exact command stdout/stderr and acknowledgement across actual queue failures;
+required=yes, smallest=yes, cheaper equivalent=no while output is redirected.
+Highest owned capability is the auxiliary consumer; another hour of reports would
+deliver less than the code/probe. Verdict LEGITIMATE GATE/INTEGRITY CONTROL, no
+capability credit. New private probe is an executed-code enabler, not a tracker:
+it plans48native byte comparisons,7constructed replay/stat checks and10typed
+negatives. Constructed inode-size replay is explicitly not native auxiliary proof.
+
+Queue/adversarial evidence: final check67983,Clippy69300,tests45977 and binary
+build32879 all returned103/RCH-I001 queue_timeout before execution. No local
+fallback, limits/deadlines/source changes or target-root workaround. The new
+check retry65067 is queued, not a pass. Warm ovh-b is occupied by an unrelated
+fgdb all-target Clippy command; bounded read-only process checks show CPU/crate
+progress, so no process/daemon/lock changes were attempted. Final fmt2188 remains
+the only final gate completed at this point; first source f2a6 had51passingtests.
+
+Private probe7cc05d599f870ce04e7475333f74d5b7b3b3d4a759fcc7d8424018ba216b97ae
+is retained locally as verify-auxiliary-consumer-20261023.py and on CSD under
+/tmp/frankenfs-aux-consumer.UbbpXXVH/. It creates only new regular fixture/log
+files, uses no formatter, never writes retained native images, and preserves
+all artifacts. Old-consumer control actual64425 returned1 as expected:
+/tmp/auxiliary-consumer-092owr7q/result.json is failed, at command58 with unknown
+--ext4-journal, after48native byte comparisons and baseline root stat4096.
+Old ELF763c430d3fc8 does not implement the flag. All input hashes unchanged;
+this is a useful rejecting baseline, zero current-candidate qualification credit.
+
+Fresh-eye review: read the entire consumer change, the retained core/facade
+admission diff and journal UUID/replay ordering. UUID validation precedes replay;
+independent VolumeDevice bounds and shared locks survive in the same descriptors;
+nested btrfs retains the member set. No additional source defect found. Existing
+mountpoint assertions retain their exact predicates with the new backend argument.
+Geometry parsing and backend construction were exercised, including both orders
+of cross-format conflicts and duplicate-journal rejection. Private probe syntax
+checks0; old-result parent readback verified58 actual statuses,48 byte comparisons,
+baseline stat4096, exit2 on unknown flag, and all17 unchanged controls. No new ELF
+or native auxiliary producer/FUSE qualification has executed yet.
+
+Honesty inventory for this CLI work block (00:24 onward; fresh self-review,
+not independent review or retrospective certification of older sessions):
+1. No (checked full consumer/test diff and commits97a03ec0e/7b1fa2fe9/eff95b330;
+   no assertion weakening, removed test, new ignore or history rewrite by root).
+2. No (production uses the admitted facade; journal probe is explicitly
+   constructed, with expected4096->8192 replay and negative controls, not a mock).
+3. No (checked changed paths; no golden/snapshot regeneration).
+4. No (Cargo/CI/validators unchanged; no suppression, resource, priority, timeout
+   or source-guard relaxation; only new/updated inline consumer tests).
+5. No (no benchmark/speedup claim or demo-path code in the application; private
+   probe fixture paths are explicit retained test inputs, not runtime hardcoding).
+6. No (51 initial tests actually executed with0filtered; one existing native
+   ignore stays explicit. Queued/refused gates and fmt checks earn no test credit).
+7. No (executed results are source-cut-specific: f2a6 tests,2188 format. Final
+   check/Clippy/test repeat/build are pending/refused, not implicitly green).
+8. No (constructed journal replay, retained native captures, actual old-binary
+   execution and current source tests remain separate proof classes).
+9. No (initial fmt1, queue refusals103,70 UBS warnings and original broader UBS/
+   WAL blockers are visible; no whole-project or fully-verified-current claim).
+10. No (both stdout/stderr retained in named command logs; no discarded failures).
+11. No (original remains in_progress, no closes/new follow-up Beads).
+12. No (canonical specifications unchanged; measured parity percentages unchanged;
+    public CLI usage documents actual implemented options and pending gates).
+13–17. Solo block: no spawned agent, pane close, gaming delegation, accepted
+    peer test report or agreement counted as confirmation. Shared publication
+    commits were inspected; they are not independent test evidence.
+18. No (48 native bytes/7 replay stats/10 typed negatives declared before probe;
+    old run stopped at command58 and receives no candidate pass credit).
+19. Explain the queue cost: after the capability and51 tests, repeated resource
+    admission waits added no filesystem capability. Two bounded read-only worker
+    checks confirmed unrelated active compilation, not a hung process; no process
+    was stopped. Stop expanding verification machinery if the remaining ordinary
+    admission attempts also refuse; preserve a precise pending handoff.
+20. Strongest executed new-capability evidence is strict RCH41facade+10consumer
+    tests with real parsed backend fields, bounds/conflicts and filesystem
+    mountpoint controls, plus final fmt. The standalone replay probe remains
+    unrun for the new candidate and cannot be cited as a pass.
+
+Real-work worksheet: purpose is safe native filesystem behavior exposed through
+offline tools and FUSE. Actual new-window commits97a03ec0e(USER docs, previous
+auxiliary cut),7b1fa2fe9(USER measured parity, previous cut),eff95b330(USER CLI
+capability plus tests/usage):3USER/0ENABLER/0PROCESS/0UNKNOWN commits, all shared
+publication, root commits0/closes0. This is one new capability, not three wins.
+Two-minute demo: bounded external-journal invocation and repeated member triples;
+parsed conflicts/mountpoint refusal are currently executable-tested, standalone
+replay demo still awaits new ELF. Without TODO/Mail/captures, code behavior is the
+same but the operator-requested granular tracking/source-cut recovery disappears.
+The consumer actually exercises the new backend construction (10 tests), not
+speculative infrastructure. Oldest identified P2bd-kdmu4 (June22 multi-file read
+copy/dispatch) remains open, verified this block; this existing P1 library lane
+takes priority. No swarm farming, spec lowering or follow-up laundering. Verdict:
+useful source capability delivered; verification waits are now the dominant cost.
+Correction: retain finite attempts and exact pending status; do not add another
+reporting framework or broaden scope to manufacture activity during fleet pressure.
+
+Final ordinary admission outcomes,00:46UTC: actual77636 (two warm workers) and
+85088 (five healthy Linux candidates) both returned103/queue_timeout, no Cargo
+execution. In total seven check/Clippy/test-repeat/build attempts refused103;
+none counts as a failing compiler/test result or a pass. Actual65067's final
+reason was RCH-I003/no_free_slots after queuing, not queue_timeout. The initial
+four and the other two refused RCH-I001/queue_timeout. All owned command sessions
+are terminal; no queued retry, build, probe or background source mutation is left.
+Durable RCH records confirm71650 tests0/ACKtrue,71651 finalfmt0/ACKtrue and71649
+initialfmt1/ACKtrue. Records in auxiliary-consumer-final-jobs-20261023T0046.json.
+The four reviewed core/facade/example hashes still match the frozen source;
+root made no further Rust edits after final format2188b330. Canonical
+.beads/issues.jsonl is still e5d359ec158f3943d6784b166883d8be4e94cf57aba115cf409e9bc39bbb4e64.
+
+Concrete remaining work on this original Bead (not relocated or waived):
+- [ ] Once ordinary RCH capacity admits this exact source, run cargo check
+  --locked -j 1 --workspace --all-targets; cargo clippy --locked -j 1 --workspace
+  --all-targets -- -D warnings; cargo test --locked -j 1 -p ffs --lib --examples
+  -- --test-threads=1 --nocapture. Frozen base0b3fa02a0, seven explicit Rust
+  overlays: the six from the preceding auxiliary admission section plus
+  native_reader.rs (seven total),
+  final overlay2188b330, standard rch-git-bound.H8FGxz config. Preserve all guards.
+- [ ] Run cargo build --locked -j 1 -p ffs --example native_reader on the same
+  admitted source; deliver a uniquely named SHA-bound ELF without overwriting
+  older binaries. Run retained private probe7cc05d59 with that exact SHA; require
+  all48native byte comparisons/7replay stats/10negatives/unchanged17controls.
+  The old-binary failure is retained separately at /tmp/auxiliary-consumer-092owr7q.
+- [ ] Native auxiliary-device production/read/FUSE qualification remains distinct
+  from constructed journals and prior single-device native mount evidence.
+- [ ] Obtain original independent scanner/status disposition and owning-engine
+  canonical WAL recovery; no focused UBS0 or new CLI source can waive them.
+
+No new code defect was found in the fresh-eye review; the initial fmt failure
+was corrected manually. Honest disposition: implemented,51 tests on the first
+source cut, final format and focused UBS passed, mandatory final compiler/lint/
+repeat-test gates and current-ELF runtime probe uncompleted due to admission.
+The original Bead remains in_progress and root made no commit/push or file deletion.
+
+Final handoff00:49UTC: staged original readback confirmsin_progress/OliveCreek,
+updated2026-10-23T00:47:57.292294Z; final comment log auxiliary-consumer-final-bead-
+20261023T0048.log records actual successful and refused commands. Cycles0 and
+flush0/no dirty issues. Fresh canonical ready actualexit6 again refuses before
+opening with the same uncheckpointed-WAL guard; log auxiliary-consumer-canonical-
+ready-20261023T0049.log. Canonical JSONL e5d359ec unchanged. No DB/WAL recovery or
+foreign-row mutation attempted. Mail5975 provides exact pending handoff. Three
+code/doc leases5686/5688/5689 released with ACK2026-10-23T00:49:32.759465Z.
+TODO lease5687 is released immediately after this last edit; the Mail release ACK
+is authoritative. All three admitted RCH invocations have terminal ACKtrue and
+recovery.sources_released=true. Remaining final gates and current-ELF/native-
+auxiliary qualification checkboxes intentionally stay open. This closes the
+bounded work block, not the original Bead or the project. No independent scanner
+reply was received; prior blocker dispositions remain unchanged.
+
+## Resume auxiliary acceptance — 2026-10-23 01:46 UTC
+
+Continue original bd-native-image-library-s4tde/in_progress/OliveCreek; no new
+claim/closure. Current HEADc79b3da61; AGENTS/README unchanged since eff95b330.
+All seven Rust source hashes match prior cut2188b330, including the three dirty
+peer FAT paths. Mail5999 announces resume; leases5752–5754 cover existing TODO,
+parity and README. Private probe7cc05d59, old failed baseline and native fixtures
+remain retained. No production edit planned before acceptance evidence.
+
+- [x] Check current source/index, recent inbox and ordinary worker availability.
+- [x] Submit missing strict remote workspace/all-target check on unchanged
+  base0b3fa02a0/seven overlays. Actual69174 is admitted onovh-b and compiling;
+  dependencies are rebuilding, so this is not assumed to be a cached check.
+- [x] Observe terminal compiler result and durable RCH ACK/source release.
+- [x] Run strict workspace/all-target Clippy; fix any actual diagnostics with
+  a new explicit source cut and rerun affected gates, without suppression.
+- [x] Repeat all facade/example tests on final source, preserve existing ignore.
+- [x] Build current native_reader ELF; exclusively deliver/verify its exact SHA.
+- [x] Run unchanged7cc05d59 probe against current ELF; require48native byte checks,
+  7constructed replay/stat checks,10typed negatives and17unchanged controls.
+  Correct real source bugs if any; distinguish fixture/probe mistakes and retain
+  failed results. Do not weaken expected bytes, validation or negative cases.
+- [ ] Advance native auxiliary-device qualification if safely available, while
+  keeping constructed journals/retained single-device native proof distinct.
+- [x] Update existing measured docs/Bead/TODO with exact results; cycles and
+  flush, focused honesty/real-work audit and release all owned reservations.
+
+Creation gate reuses the existing operator-requested granular TODO and minimal
+command captures; no new report framework. Active tracking retires at handoff,
+retained evidence is preserved. Current capability priority is the unexecuted
+auxiliary consumer runtime path; repeated paperwork does not substitute for it.
+
+01:52 direction update (Mail6003): primary Linux6.19/e2fsprogs source review
+found a real native external-journal layout gap: the engine assumed JBD2 byte0;
+native JOURNAL_DEV has an ext header at1024 and JBD2 at block1/2, while log ring
+indices stay device-relative. Fix this before the new ELF to avoid two large
+builds. The active2188 check is earlier-cut evidence only, not this correction.
+Leases5756–5758 cover core, facade tests and extracted behavior spec.
+
+- [x] Extract native header/checksum/UUID/single-user/ring semantics from Linux
+  v6.19 ext4_get_journal_blkdev/ext4_open_dev_journal/journal_load_superblock and
+  e2fsprogs ext2fs_create_journal_superblock2; update existing behavior spec first.
+- [x] Centralize raw/native journal discovery and validation in core; alias only
+  bootstrap block0 to native JBD2 location, leave all ring and data-write indices
+  unchanged, retain existing descriptor/bounds and pre-replay UUID validation.
+- [x] Add constructed1/2/4KiB wrap replay tests with expected marker bytes and
+  unchanged backing/overlay data,36 malformed native header/geometry cases, and
+  real-file bounded facade replay changing observed root size4096->8192.
+- [x] Complete formatting manually from remote --check output; compile/test/
+  strict-lint this new source cut, preserve bare-JBD2 legacy positive controls.
+- [x] Build final ELF and execute bare probe7cc05d59 plus native-layout standalone
+  replay. Keep all constructed-layout results distinct from native production.
+
+Two optional read-only tool-inventory Python filters were rejected by DCG's
+system.disk:mkfs keyword rule (623966 remote,446099 local); neither executed.
+dcg explain confirmed the literal-string match. A plain read of the retained
+JSON report completed the inventory without Python remote execution or a guard
+override. No formatting/native production command was run, no allow-once token
+used. This was an avoidable repeated filter false positive, not a product error.
+The first context-only TODO patch failed to match and changed no file; the
+correct append follows here. No validation predicate was removed or relaxed.
+
+Validation progress02:12UTC:
+- Earlier2188 workspace check actual69174 finished0 onovh-b after931.3s; this
+  qualifies the prior auxiliary CLI cut only. The source was already frozen
+  remotely when the native-layout correction was implemented locally.
+- Native-layout first format actual95370/trj failed1 on layout only; applied
+  exact layout changes manually. Native-layout format actual69915/trj passed0
+  at overlay80ba5c98. Current initial core/native-test SHA6de9afaa/cc396c28.
+- First strict Clippy actual54732/trj failed101: one or_fun_call on the new
+  native_blocks.unwrap_or. Changed to lazy unwrap_or_else without suppression or
+  assertion changes; core now40cce6ece8e0eb3b4edb99dc2ab79d50e856a981c71246efc728ef3c58f4a128.
+  Native tests remaincc396c28. Final Clippy93224, format14495 and check52979 are
+  submitted ontrj, not yet final results. External-journal tests71494 onovh-b
+  compile the preceding80ba source; retain that source distinction if they pass.
+- UBS actual33782 returned1:1critical/14218warnings/3027info across changed core
+  and facade tests. The critical remains native/tests.rs:23 panic expected format
+  options; no new critical production finding shown. Do not waive original UBS.
+- New private native-layout replay/FUSE probe bfb155600a97d129b7daa8293d5c8468320cf9e155206403ad3286f8b5f569fd
+  syntax checked and exclusively delivered to CSD at
+  /tmp/frankenfs-aux-consumer.UbbpXXVH/verify-native-journal-layout-bfb155600a97.py.
+  It consumes a passing current7cc05d59 run, not old failed fixtures; creates
+  only new files, uses independently checked CRC32C, demands6replay stats,
+  10malformed refusals,1kernel mount/root-size8192/EROFS/retained-lock refusal,
+  clean unmount/daemon0 and all control hashes unchanged. No formatter or native
+  kernel ext4 mount, no delete. Cleanup errors are preserved in its result even
+  on a failed probe. This is constructed-layout and actual FUSE evidence if run,
+  not native producer/field qualification. Current ELF remains to be built.
+
+Final native-journal implementation and acceptance, 2026-10-23:
+
+- [x] Resolve the second strict-Clippy diagnostic without suppressions: replace
+  the auxiliary CLI parser's chunks_exact(3) with typed as_chunks::<3>(), retaining
+  incomplete-triple, geometry, selector and mountpoint rejection predicates.
+  Final Rust source hashes: core40cce6ece8e0eb3b4edb99dc2ab79d50e856a981c71246efc728ef3c58f4a128;
+  facade testscc396c28e0d28c89087b8556d4d30f974a07d4cd2bbe379de4134d033d395087;
+  readere45377b3095226fab675c143e20b105cc1e447454c81e6f96b831b6288507c19.
+  Seven Rust overlays still include the three unchanged peer FAT format deltas.
+  Frozen base0b3fa02a07249bf7d2baeab6a773e20de0dc5a17, final overlay
+  3f1e95127c6318cdb3cf1f52b165802b4dd25d5d996ef326b0ac50a8b20d23b2.
+- [x] Final format71975/actual79720, strict workspace/all-target Clippy71976/
+  actual21622, final workspace/all-target check71992/actual90481: remote0,
+  returned0, terminal ACKtrue and sources released. Check30.0s, Clippy415.7s.
+  Check71963 was the preceding parser source; do not substitute it for71992.
+- [x] Final facade/example71965/actual95637 passed42+10 tests,0failures/filtered;
+  one existing native-producer ignore remains. Final core journal71993/
+  actual88064 passed7,0failures/ignored,1537filtered. Harness journal71995/
+  actual35869 passed14,0failures/ignored/filtered. Total73 distinct Rust passes;
+  earlier80ba9 and overlapping facade journal repeats are not extra passes.
+  All three jobs have terminal ACKtrue, returned0 and sources released. Logs
+  native-journal-facade-final-20261023T0215.log, native-journal-core-recovered-
+  final-20261023T0232.log and native-journal-harness-recovery-20261023T0236.log.
+- [x] Build71970/actual52895 compiled remotely0 in5.55s, but artifact typing
+  refused Linux output for macOS with delivery102. Preserve that failure. One
+  exact-owner recover (actual60923) terminated with ACKtrue/sources released,
+  still delivery102: retained policy did not change under the intentional-foreign
+  environment option. No recipe edit, target/cache/source-lock bypass or rebuild.
+  The held source pair had refused the first final core repeat71969 before
+  Cargo; that refusal earns no test credit. Recovered repeat71993 above passes.
+- [x] Preserve old local ELF763c430d exclusively under pre-native-journal-
+  recovery-20261023T022947Z. Transfer the already-built Linux ELF directly from
+  the same worker to a new CSD path, exclusive create and SHA verification;
+  neither old local nor old CSD artifact overwritten. Current614719696-byte ELF
+  SHA9e39c59dddd2db65cd5c87b71306d09b880110855641846355c93317f68ccf72,
+  /tmp/frankenfs-aux-consumer.UbbpXXVH/native-reader-9e39c59dddd2-20261023T0233.
+  Delivery actual96831 exit0, source/destination SSH0, no local execution.
+- [x] Unchanged7cc05d59 probe actual5427 exit0:73commands,48retained-native
+  ext4/btrfs full/range/EOF comparisons,7bare-journal replay/baseline stats,
+  10typed negatives;17input/tool hashes unchanged. CSD
+  /tmp/auxiliary-consumer-rmcyx83m/result.json; local native-journal-aux-result-
+  20261023T0235.json. Exact statuses63zero/7one/3two; expected negatives count10.
+- [x] Native-layout probebfb15560 actual25136 exit0:16commands,6plain/bounded/
+  rest replay stats showing8192 and10malformed/truncated refusals. Actual FUSE
+  mount shows replayed root8192, EROFS creation refusal and auxiliary exclusive
+  flock refusal while mounted; clean unmount/daemon0 then exclusive flock works.
+  All17input/tool hashes unchanged. CSD /tmp/native-journal-layout-u2avfnvy/
+  result.json; local native-journal-device-fuse-result-20261023T0236.json.
+  This is constructed journal layout and actual FUSE, not native production.
+- [x] Current six-format probe initially failed1 at its last diagnostic predicate
+  after20complete mounts/236byte comparisons. It combined a wrong NTFS selector
+  with a nonempty mountpoint; earlier preflight now correctly returns the
+  mountpoint error before format admission. Preserve failed result
+  /tmp/public-facade-mounts-cpvla653/result.json. Fresh failed-run readback18905/0
+  confirms20daemon0/unmounts,26expected command statuses,47unchanged controls,
+  retained nonempty sentinel and0owned mounts. No failed-result relabeling.
+- [x] Direct isolated negative on its now-empty mount-00 returns1 and the exact
+  expected Format diagnostic. Preserve local scriptfcbfc2ae and frozen remote
+  source. Change only the final case's mountpoint input to existing empty
+  mount-00, keeping its Format/exit1/empty-output predicates and all six negative
+  cases. Manual one-line edit, no product/gate/assertion relaxation. New private
+  script SHAa59098ce7c381905ccb5b87b5ab77699e57dc3718c32ff495af3ee77be48ac04,
+  exclusive SHA-verified CSD delivery; this is a probe-setup correction.
+- [x] Corrected full probe28621 exit0 with the same ELF:20mounts/56files/
+  236full/range/EOF/sparse comparisons,20EROFS/20ENOENT/20ROstatfs/root listings,
+  6typed negatives. ZFS4/5 head/before/after, compressed/indexed NTFS and plain/
+  bounded FAT16/32/ext4/btrfs all retain expected bytes and native view metadata.
+  Result /tmp/public-facade-mounts-lrp6t7d9/result.json SHA
+  56ef55a23220f60ad2d459353c56282dc24b5a3f97a4183fc42ef7264ad5a0ca.
+  Fresh readback2502 independently re-executes checks as the same author, not
+  independent verification:20exact daemon records,26command records20zero/
+  5one/1two,47before/after/current controls,ro/nodev/nosuid,0owned mounts.
+  EOF may be kernel-clamped; retained native inputs/captured payloads are not
+  fresh producer/oracle executions. No write/crash/performance/field claim.
+- [x] Review all modified source/tests and published diffs with fresh eyes;
+  no additional production defect found. Checksum, ring-wrap, one-user, UUID,
+  geometry, sentinel, expected replayed bytes and existing assertion paths stay
+  enforced. No CI/lint/test configuration changed; no golden regenerated.
+  Current focused reader scan completed0critical/70warnings/28info; its original
+  exec session expired before terminal polling, so no returned-exit claim.
+  Core/tests UBS33782 remains exit1/1critical/14218warnings/3027info, known test
+  tripwire at native/tests.rs:23 retained. Original broad scanner not waived.
+- [x] Peer publication857074119/4dae6650e preserves the tested Rust hashes;
+  root did not stage/commit/push or treat publication as independent approval.
+  Current source remains the explicit frozen-base overlay, not a full-HEAD run.
+- [ ] Native-produced auxiliary journal/btrfs member images and native crash
+  qualification still need actual producer/oracle execution. Constructed data
+  and real FUSE do not satisfy this original acceptance condition.
+- [ ] Obtain original independent scanner/status disposition; no reply in fresh
+  inbox. Focused scan counts and author review do not waive it.
+- [ ] Canonical tracker owning-engine WAL recovery: fresh ready actualexit6,
+  SYNC_CONFLICT before opening, uncheckpointed-frame guard. JSONL e5d359ec158f3943d6784b166883d8be4e94cf57aba115cf409e9bc39bbb4e64
+  conserved, no DB/WAL manipulation, import or foreign-row mutation. Original
+  remains staged in_progress/OliveCreek; no closure/follow-up laundering.
+
+End-of-block anti-ceremony worksheets (this implementation/verification block):
+
+Creation gate: existing operator-requested granular TODO, measured parity note
+and minimal command captures are PROCESS. Consumer is jemanuel reviewing this
+native-library acceptance and the next agent continuing it; gate is a truthful
+claim about the tested native-journal/current-consumer capability. Observed
+defects are the byte0 journal assumption, previously unexecuted current ELF,
+and a probe that mixed two negative preconditions. Active tracking retires at
+handoff; evidence is retained under the no-delete rule. Integrity controls
+preserve exact failed/source-cut results against lost completion and accidental
+overwrite; minimal plain logs suffice, no new reporting framework. Highest
+priority owned capability is this P1 native-image task. Another hour building
+process would add less value than native auxiliary producer/oracle work; stop
+new machinery and leave the concrete external qualification gap explicit.
+
+Honesty inventory, all20 prompts, author review only:
+1 No (checked complete new-test and peer-published source diffs: original
+  assertions/ignores retained; no test/config weakening or history rewriting).
+2 No (checked production discovery/replay: no fixture paths, mocks or expected
+  marker special cases; constructed tests execute real parser/replay code).
+3 No (checked diff/status/log: no golden or snapshot regenerated).
+4 Yes, private probe setup changed after an executed failure: final negative
+  now uses an empty mountpoint to reach its original format predicate. No
+  expected diagnostic, exit, count, timeout, assertion or product gate relaxed.
+  Failed run retained; direct isolated refusal and full rerun/readback executed.
+  This was author review, not independent gate approval or scanner waiver.
+5 No (checked adapter/CLI diff: native device indices, real geometry and exact
+  source-bound ELF used; no demo hardcoding or post-result denominator change).
+6 No (checked executed output:42facade+10example+7core+14harness, counts/filters
+  explicit; one native-producer ignore earns no runtime credit).
+7 No (checked command logs/terminal ACKs/results: rejected admission/delivery
+  and lost reader-UBS exec receipt are distinguished from observed passes).
+8 No (checked parity/TODO/Mail: constructed journal, current FUSE, retained
+  native input and absent fresh producer/oracle/field proof explicitly separate).
+9 No (checked updates: firstfmt1, bothClippy101, queue/source refusals, build
+  delivery102, probe1 and UBS1 remain visible; original task remains incomplete).
+10 No (checked command captures: stderr preserved; no evidence command silenced).
+11 No (checked staged original:in_progress/OliveCreek; no functional close or
+  new follow-up carrying essential original acceptance).
+12 No (checked spec/README/parity: native header contract added from primary
+  behavior; original goals/native qualification not reduced to synthetic proof).
+13 No (checked current-block tracker/log: root closed nothing; peer source
+  publication is not a tracker closure or independent acceptance).
+14 No (checked dispatch: no subagents spawned or tasked in this work block).
+15 No (checked source hashes and direct reruns; peer publication is identical
+  tested source, not an accepted unexecuted peer verification claim).
+16 No (checked task/status: no refusal-farming agents or guard/error closures).
+17 No (checked counts/claims: shared source and author rechecks count once;
+  no agreement presented as independent confirmation).
+18 No (checked frozen probe predeclarations:20mounts/56files/236checks/six
+  negatives retained; corrected negative input changes no denominator).
+19 Yes, avoidable cost: two literal-keyword DCG inventory false positives,
+  remote layout/lint iterations and the combined-precondition probe failed;
+  artifact recovery also could not alter the retained delivery policy. All are
+  retained/disclosed. Recover one exact owner, isolate intended negative input,
+  and freeze final source before future runs (RH-1/RH-2/RH-7 countermeasures).
+20 Strongest evidence: exact ELF9e39c59d replays expected inode metadata through
+  bounded API and actual FUSE, plus full six-format regression and fresh hash/
+  mount/command readback. Scripts and sources retained for skeptic re-execution;
+  no independently verified native-produced auxiliary crash claim.
+Older-session check: CASS healthy lexical status; capped incremental refresh
+timed out45s/124, no rebuild/recovery bypass. Six bounded project queries all
+returned0; followed three hits with cass view, whose physical lines did not
+correspond to the searched semantic messages. Those results cannot establish a
+historical clean inventory. No older-session or independent certification claim.
+Disposition for4/19: corrected input/setup in place, exact failure chain here
+and operator progress updates, retained original failures; RH-1 forbids weakening
+predicates and RH-2/RH-7 forbid proof inflation/closure without qualification.
+
+Real-work worksheet: project purpose is mount-compatible filesystem behavior,
+MVCC/COW and self-healing durability, with native offline-image consumers.
+Actual bounded inventory: native journal discovery/ring fix+user docs (USER1),
+typed auxiliary parser lint correction and executed tests (ENABLER1), requested
+TODO/tracker/log/audit maintenance (PROCESS1), UNKNOWN0. These are work groups,
+not performance or productivity credits; root made0commits/0closes, peers made
+two source commits. A two-minute demo is replayed root8192 through native_reader
+and mounted FUSE while backing hashes stay fixed. Without PROCESS the runtime
+result is identical; its only value is preserving exact acceptance limits.
+Named consumers exercised: public facade, native_reader, shared FUSE and existing
+core/harness recovery suites. Oldest relevant observed open user issue remains
+bd-kdmu4 (June22,P2 multi-file read performance); this owned P1 native-library
+dependency took priority. Raw bounded queue includes foreign-looking bd-xmh5g
+despite its source_repo label; it was not claimed or mutated. No swarm/close
+competition; no spec edits or follow-ups substituted for implementation.
+Verdict: real capability advanced, verification/recovery overhead was large;
+further audit/receipt work now risks DRIFTING. End machinery here. Next work must
+execute native auxiliary producer/oracle qualification or resolve the original
+external scanner/tracker gate, not generate another status framework.
+
+Final handoff03:22UTC: staged comment2247 is read back on the original
+in_progress/OliveCreek task, updated2026-10-23T03:20:45.905090Z. Cycles0 and
+flush0/no dirty issues. Final core/facade-test/consumer hashes still match the
+frozen tested cut; canonical JSONL e5d359ec unchanged. Mail6068 carries exact
+results, failed-probe correction and remaining acceptance. Source/doc leases
+released with ACK03:21:16/03:21:59UTC; TODO lease5846 and its earlier own lease
+5752 are released immediately after this last edit, with tool ACK authoritative.
+No owned remote job or probe remains running, no pending source edit, native
+producer operation, delete, root commit/push or tracker closure. Remaining
+external acceptance checkboxes are intentionally open on the original task.
+
+## Native auxiliary interoperability continuation — 2026-10-23 03:54 UTC
+
+Continue original bd-native-image-library-s4tde/in_progress/OliveCreek, no new
+claim or close. HEAD4dae6650e and peer FAT deltas unchanged. Canonicalready6/WAL
+still refuses before opening; raw bv recommends an unrelated warm-stat task,
+so it is graph context, not a claim signal. Mail6088 announces this work.
+
+- [x] Refresh source state, ancestor/repo rules, README and recent inbox; no
+  new independent scanner/status reply. Preserve existing source/failed evidence.
+- [x] Locate retained kernel-produced btrfs seed/sprout or multi-device images,
+  their payloads, production receipts and expected native inventory. Bound this
+  search; do not format devices or remount original images to manufacture proof.
+- [x] Freeze fixture/tool/ELF hashes; ensure offline/unmounted inputs and preserve
+  all original source bytes. Prepare one minimal public-consumer probe against
+  native members, with expected file bytes, explicit primary/member offsets and
+  lengths, wrong/missing/duplicate/truncated/exclusive-lock negative cases.
+- [x] Execute plain/bounded public reads and actual read-only FUSE with retained
+  member-lock lifetime, EROFS, clean unmount and before/after whole-file hashes.
+  Keep fresh execution of retained native images distinct from fresh production.
+- [x] Fix any actual product defect with manual existing-file edits, inline
+  positive/adversarial regressions, exact-source RCH gates and rerun the probe.
+  The existing auxiliary path passed unchanged; the finished root selector was
+  disconnected from the standalone consumer and is now wired and qualified.
+- [x] Update original Bead/TODO/measured parity with executed results and failed
+  attempts; cycles/flush and bounded end-of-block audit complete. Source/doc
+  leases released; final TODO lease releases immediately after this last write.
+- [ ] Original native-produced external-journal crash, independent scanner and
+  canonical owning-engine recovery acceptance remain essential and open.
+
+Creation gate: operator-requested existing TODO and minimal probe/command captures
+serve this original native-library acceptance. Observed missing native auxiliary
+consumer execution justifies the probe; active machinery retires at handoff,
+retained results stay under no-delete. Do not add another reporting framework.
+
+Native fixture/probe preparation: existing bd-hk5w3 comment2030 identifies worker
+3651 /mnt/ffs-chartreusestone-resume10.2wmG2a/independent/.tmpsE0xSD from the
+independent 2026-10-11 kernel/CLI run. Seed/sprout/unrelated-seed256MiB images,
+two source payloads and both original evidence JSONLs remain present. This is
+historical production/oracle provenance, not a new native execution. Original
+losetup -j on all three returned0/empty: no attached loop devices. SSH alias
+initially refused because it configured UserKnownHostsFile=/dev/null; selecting
+the existing known_hosts file with StrictHostKeyChecking=yes used its already
+pinned host key. No key acceptance or trust bypass. Local Mail archive lacks the
+old /data project; the staged original issue provided the artifact path. cm's
+old --no-history option was unsupported; corrected retrieval succeeded but was
+unrelated/degraded, so no such guidance is applied.
+
+SHA256 seedf5e2f07f7c8948c1fbbd43152e2f06c2f7c21a3482aa68f56dc8ef4004e60400,
+sprout8dd60afc2be41b5bdfc9589c34c372cf722f7a686f61ad1a81fe1e3e5781d6e6,
+unrelatedbb251ff00792213dd59c6542d8421042f7b9c59b2cca77d4302b38ad4214d70c;
+source payloads1873887d/94101f86. Compressed read-only stream copies exactly seven
+allowlisted regular files into exclusively created CSD
+/tmp/frankenfs-native-btrfs-Tw3sTb6J, source/destination0, SHA verified; old files
+not overwritten. Original source SHA256 list rechecked identical after copy.
+Original kernel record contains four payload readbacks, two physical-owner
+readbacks and FS_INFO/DEV_INFO inventory. New probe independently rereads both
+recorded physical payload regions and compares every byte to retained sources.
+Old BLAKE3 whole-image receipts were not recomputed: b3sum/Python module absent;
+new before/after controls use SHA256. No old-hash or fresh-producer certification.
+
+Private probe4976d3d621143e0e5645de31ec47e37f0f5fa1234d62a870f23859a16586aba7
+is syntax checked and exclusively delivered. Predeclared six plain/bounded/rest
+profiles,96offline+96mounted byte comparisons over four files including both
+nested subvolumes,30native-inventory ioctl comparisons,30mounted EROFS cases,
+12mounted primary/auxiliary lock refusals,11CLI negatives, clean unmounts and
+whole-file hashes. No formatter, original-image mount, new dependency or build.
+Initial exact current consumer stat of ordinary and nested seed files both0/
+size1048613. Full probe now running; pending is not a pass.
+
+Executed retained-native auxiliary proof: probe78795 exit0, CSD
+/tmp/native-btrfs-aux-mad_boq5/result.json. Exactly155CLI commands144zero/11one,
+96offline+96mounted comparisons,6mounts/30inventoryioctls/30EROFS/12lockrefusals,
+6offline FsOps write refusals. All13whole-input/tool controls unchanged, all
+six daemons exited0 and unmounted normally. Fresh author readback97991/0 verifies
+all155status records,6daemon records and exactly13controls,
+native captured inventory,RO/nodev/nosuid and0ownedmounts. This is current
+execution on retained kernel images, not a new native producer or crash oracle.
+No failed native-auxiliary positive/negative case or assertion change.
+
+Additional high-value wiring found: native_reader previously forced DefaultRoot
+despite ReadOnlyBackend::Btrfs already accepting Subvolume/SubvolumeId. Expose
+--btrfs-subvolume NAME and --btrfs-subvolume-id positiveID across stat/list/read/
+refuse-write/mount, with or without auxiliary members; retain conflicts with all
+other formats. Two inline parser tests cover bounds, both root selectors, empty/
+zero/negative/overflow input and conflicts in both argument orders. No engine
+code or existing assertion changed. Native btrfs-progs6.17.1 dump-tree read the
+copied ROOT_TREE successfully and independently identifies seed-nested256 and
+sprout-nested257; no native mount/scan/format was run. Read-only oracle output
+native-aux-native-root-tree-20261023T0415.log.
+
+- [x] Wire existing root selection into existing standalone consumer and README.
+- [x] Correct initial remote fmt1 layout manually; no predicate/suppression change.
+  Final reader SHA686c5f8ca7380fe6dda45238f812d49786b1e00947f7c335a31135adf50b8096,
+  base0b3fa02a0/seven overlays fingerprint821d731ed28b6c35110173d82a790c3fe01d9da2ddc9fcbc28f9d453c6f40e58.
+  Final remote fmt85934 passes0 with exact clean-overlay receipt. UBS39715 exits0,
+  0critical/80warnings/31info on preceding layout-only source; original broad
+  scanner remains open. No local build: new SBH exit1/3.74%free, existing user-
+  approved strict-remote-only exception retained without resource bypass.
+- [x] Complete exact-source workspace/all-target check, strict Clippy and full
+  facade/example tests; handle actual failures and preserve source boundaries.
+- [x] Build new SHA-bound Linux ELF with intentional-foreign artifact staging;
+  preserve old local/CSD binaries and all old receipts. Run the unchanged native
+  auxiliary probe plus native root-name/ID scoping, bounds, wrong-root/format
+  negatives and mounted lock/write/inventory checks on the final new ELF.
+- [x] Finish measured docs/Bead/TODO/cycles/flush/audit; source/doc reservations
+  released and final TODO lease releases after the last write. Original task
+  remains open until its remaining acceptance is met.
+
+Root-selection final-source progress:
+- Final tuplematch removes Clippy's option_if_let_else diagnostic without a
+  suppression or predicate change. Final reader9083dcdd8664e6dfbf49fd0eb7211854103f08fd90e4716cd13417ab07a6948d,
+  overlayecb9b5038dea71b3e95b15467f0ad16709991f108fd6ed3bd6b04ed793268c65.
+  Remote fmt72216/47383, strictClippy72217/80049 and check72220/41196 all0,
+  terminalACKtrue/sourcesreleased. The preceding821d check0 and test72187 are
+  earlier-source evidence. Final facade/example72227 waits behind finalbuild
+  72226 ontrj; both are exact ecb9-source jobs, not assumed green from quiet logs.
+- First candidate build72194 was stillpre-execution when tuplefix superseded
+  its source. Exact named cooperative cancel returnsE504/unconfirmed: retain its
+  reservations, do not restart daemon/remove locks or mark it cancelled. It
+  subsequently resolved at the source guard before Cargo execution: wrapper103,
+  leaseexit1/ACKtrue/sourcesreleased, because821d had changed toecb9. No artifact
+  or successful-cancellation claim. Earlier821d tests72187 finished0/ACKtrue/
+  released:42facade+12examplepassed, one existing ignored producer,0fail/filtered.
+  This is earlier-source evidence; final72227 repeat still pending. No direct
+  Cargo, source/target/cache/slot/deadline bypass. Final build uses supported
+  intentional Linux artifact staging from invocation start.
+- Old9e39c59d control returns2/empty stdout/unknown --btrfs-subvolume before a
+  mount: no positive root-selector credit. New private root probe
+  a0d92019674349e82960dcc01173cecce4a685b9f00f5baff4523c0f759ccba8
+  is syntax checked and exclusively delivered but not yet executed. Its fixed
+  denominator is10selected native views (name/ID,plain/bounded,two native roots,
+  standalone seed),91CLIcalls/42offline+40mounted bytes comparisons,27negatives,
+  20root-ID ioctls,40inventoryioctls,20EROFS/18retainedlock refusals and10clean
+  mounts. Current final ELF is required; original native-aux155probe is unchanged.
+- Fresh native oracle: official btrfs restore documentation confirms input
+  images are not modified; selected-root extraction writes only new output
+  files. First two invocations returned1 because the output directories were
+  absent, not because image data was rejected. Preserved both logs, verified
+  parent empty, created the two new empty directories and repeated without
+  overwrite/ignore-errors options. Corrected seed256 and sprout257 each return0;
+  their full payload bytes match retained sources, and all13original controls
+  remain unchanged. CSD /tmp/frankenfs-native-btrfs-oracle-F7JGl6ko/result.json,
+  local btrfs-root-fresh-native-oracle-20261023T0439.json. This adds a fresh
+  native userspace byte oracle on retained images; it is not fresh image
+  production, kernel mounting, crash replay or full filesystem checking.
+- Peer commit3b8226fa4 published the821d source/docs; root has not committed or
+  pushed. The tuple lint correction remains the tested ecb9 overlay. Publication
+  is not independent acceptance. Root holds only its named leases.
+
+Final executable/runtime outcome, 04:43 UTC:
+- [x] Final build72226 and tests72227 both exit0/terminalACKtrue/sourcesreleased;
+  no active work left in either wrapper. Tests42facade+12examplepassed,
+  one pre-existing producerignore,0failed/filtered. Final focusedUBS0 with
+  0critical/80warnings/31info; broad original scanner is not cleared by this.
+- [x] ELF SHA256cf51328e3ee0d99654cd15be2c3da8928ce0bba4935faa51a4cee848040ce61e
+  matches worker, retrieved local target and exclusively created CSD
+  /tmp/frankenfs-native-btrfs-Tw3sTb6J/native-reader-cf51328e3ee0-20261023T0442.
+  GNU/Linuxx86_64 ELF,589937248bytes; source/destination transfer0, oldELFs kept.
+- [x] Unchanged4976 auxiliary probe36147/0 on finalELF:
+  /tmp/native-btrfs-aux-m5ezntnt/result.json,155CLI144zero/11expectedone,
+  96offline+96mounted bytes,6mounts/30inventory/30EROFS/12locks,
+  13controlsunchanged,0ownedmounts. Earlier9e execution is not extra coverage.
+- [x] Fixeda0d9 root probe31750/0 on finalELF:
+  /tmp/btrfs-root-selection-oasjwvc7/result.json,91CLI64zero/24expectedone/
+  3expectedtwo,10selectedviews/mounts,42offline+40mounted bytes,27negatives,
+  20root-ID/40inventoryioctls,20EROFS/18locks,19controlsunchanged,0ownedmounts.
+  Both namedroots256/257 withname/ID,plain/bounded andstandalone seed execute;
+  global files stay absent in selected roots. No native positive/negative failure
+  or change to the predeclared denominators/assertions.
+- [x] Fresh author readback94855/0 checks all246recorded CLIstatuses/argv,
+  all16daemonstatusfiles/RO,nodev,nosuid/unmounted,13+19currentcontrolhashes,
+  andfinalELFhash. Not independent review. Local full JSONLs/receipts:
+  btrfs-root-final-readback-20261023T0446.jsonl and
+  btrfs-root-jobs-terminal-20261023T0446.json under the verification log directory.
+- [x] Final fresh-eyes pass read the full119-line reader feature diff and tuple
+  correction, surrounding argument/backend/read/mount paths and both frozen
+  probe implementations. No further product defect found; diffcheck0 and
+  canonical JSONL/source hashes unchanged. Peerf190b0c06 recorded earlier native
+  auxiliary docs; final runtime/parity updates and tuple remain dirty here.
+- [x] Original staged Bead has final source/gates/ELF/probe/failure evidence;
+  staysin_progress/OliveCreek. No new task or close. Remaining essentials:
+  native-produced external-journal crash/broader-topology qualification,
+  original independent scanner/status disposition, canonical owning-engine
+  WAL recovery. Do not weaken criteria or move essential conditions elsewhere.
+- [x] Staged cycles0/count0, flush0/nodirty and readback0 confirm original
+  in_progress/OliveCreek/latestcomment2250. Canonical JSONL hash unchanged.
+  Mail released source/doc leases5877/5891/5892; final TODO5876 releases directly
+  after this last write. No commit/push, deletion, cleanup or peer overwrite.
+
+Bounded real-work audit, 03:54–04:43 UTC (current block, not old-session audit):
+README purpose: memory-safe native filesystem access with mount compatibility,
+MVCC/COW and self-healing durability. Actual git log has3b8226fa4 root-selection
+feature(USER),f190b0c06 native auxiliary docs(USER),54127fbd1 previous-cut measured
+parity docs(USER);0closed items. Commit tallyUSER3/ENABLER0/PROCESS0/UNKNOWN0,
+not a productivity score. Outside commits, executable native probes/gates are
+ENABLER validation for this exact reader; TODO/Bead updates are PROCESS.
+Most visible demo: select seed-nested by name orID and read /payload with bounded
+members, or mount that root. Without status work, bytes/features would match;
+the operator would lose unresolved criteria and exact-source provenance.
+Validation exercised the actual finalELF, not speculative scaffolding. Oldest
+relevant open user concern remains original native-library interoperability;
+this block qualified real auxiliary/root views on that same task. No swarm was
+launched, no close farming; no lowered plan or follow-up minted. VerdictHEALTHY
+for delivered capability with costly24-minute compile and bounded required
+status work. Correction: no further machinery/feature expansion in this block;
+finish its tracker/lease housekeeping and retain the native-crash/scanner gaps.
+
+Honesty inventory, same bounded window; all answers in writing:
+1.No(checked: full3b8226fa4 reader diff, final tuple diff and source; only two new
+  tests, no existing test removed/weakened/ignored; existing producerignore stays).
+2.No(checked: actual native-image producer receipts and byte oracles; no new
+  mock/stub in product or tests). 3.No(checked: touched paths and commit diffs;
+  no golden/snapshot changed). 4.No(checked: reader/docs/TODO diffs; no validator,
+  CI, suppression, tolerance, retry, timeout or gate relaxation. Supported
+  intentional-foreign delivery flag stages LinuxELF; all RCH source/resource
+  guards remain). 5.No(checked: ten predeclared selected native profiles,
+  standalone/multimember bounds, root isolation andwrong-root/format controls;
+  no demo-path branch in product). 6.No(checked: final test log42+12passed,
+  0filtered; one existingignore explicitly reported;246recorded nativeCLIcalls).
+7.No(checked: terminal ACKjobs and actual command/result/status files;
+  no quiet/pending job reported passed). 8.No(checked: parity/TODO/Bead text;
+  historical production/kernel captures separated from new public API/FUSE and
+  fresh native userspace extraction). 9.No(checked: firstfmt1/Clippy101,
+  obsolete cancellationE504 thenpre-execution103, native restore setup1 then0
+  retained and reported; all remaining acceptance left open). 10.No(checked:
+  RCH combined logs, transfer stderr, native command stderr/status captures and
+  fresh readback stderr; none suppressed for a cited pass). 11.No(checked:
+  staged original remainsin_progress; no close or follow-up). 12.No(checked:
+  specs unchanged; parity adds scoped measured facts and explicit remaining gaps).
+13–16.Not applicable: no subagent dispatched/accepted/closed/farmed in this block;
+  peer commits were read as shared-tree changes, not delegated acceptance.
+17.No(checked: author readback explicitly labeled non-independent; peer commit
+  is not approval). 18.No(checked: probe4976/a0d9 frozen before execution;
+  counters met unchanged; earlier/repeat runs not added to final denominators).
+19.Explanation owed: one old Bead query emitted an unnecessarily huge result;
+  subsequent reads were bounded to named comments. RCH dependency compilation
+  took24minutes; it remained active, no resource/deadline/cache bypass was used.
+  First strictSSH/obsoletecmflag/setup failures were corrected and preserved.
+  These are costs/failures, not positive capability credit. 20.Strongest evidence:
+  exact-source finalELF plus re-executable frozen91/155-command native probes,
+  actual16mounts/274bytecomparisons,38expectednegativeCLIcases, unchanged control
+  hashes and fresh native restore bytes. A skeptic can rerun on copied inputs.
+Historical CASS searches in the preceding block did not establish full semantic
+line correspondence; this inventory does not certify older sessions. Disposition:
+no gate weakening/false completion found in this bounded pass. Corrected first
+fmt/Clippy/source supersession/setup failures in place with visible receipts;
+countermeasuresRH-1/RH-2/RH-7/RH-9 keep assertions, proof classes and original
+remaining criteria intact. Self-review is not independent acceptance.
+
+## Public ZFS member and root selection continuation — 2026-10-23 05:02 UTC
+
+Continue original bd-native-image-library-s4tde/in_progress/OliveCreek. Canonical
+ready still exits6/SYNC_CONFLICT with committed-WAL guard; no canonical mutation
+or new claim. Raw bv warm-stat recommendation is graph context only. Git launcher
+now asks for Xcode license acceptance; the already-installed Git2.54 executable
+at /Applications/Xcode.app/Contents/Developer/usr/bin/git works directly. No
+license accepted, state changed or tool installed. SBH1/3.57%free: existing
+user-approved strict remote-only exception continues, no local Cargo or cleanup.
+
+The public ZFS facade already admits bounded additional_images and Auto/Pool/
+Candidate roots; standalone native_reader only exposes dataset/snapshot. This
+disconnect prevents a normal standalone consumer from exercising finished
+multi-member and explicit-root paths. Connect it within this same task.
+
+- [x] Read current rules/README, refresh actual source/tracker/inbox and preserve
+  peer FAT/source/doc deltas and all earlier failed/executed receipts.
+- [x] Reserve exact reader/README/parity/TODO paths, no conflicting leases.
+- [x] Wire --zfs-device PATH OFFSET LENGTH, positive --zfs-pool-guid and exact
+  --zfs-candidate LABEL SLOT; retain bounds, raw paths/dataset/snapshot names,
+  cross-format conflicts and read-only engine admission. No new replay/import/
+  write authority or separate parser/engine.
+- [x] Add inline regressions for Auto/Pool/Candidate selection, multiple bounds,
+  argument failures/conflicts in both orders, hidden auxiliary mountpoint and
+  native path bytes; preserve every existing assertion and negative control.
+- [x] Run exact-source remote fmt/check/strictClippy/facade-example tests/build
+  and focused UBS; fix actual failures manually without source/cache/slot bypass.
+- [x] Freeze and deliver final Linux ELF without replacing old evidence. Locate
+  retained native ZFS member images or produce only new private regular-file
+  mirror images with recorded native payload/head/snapshot oracles and export.
+- [x] Execute plain/bounded Auto/Pool/Candidate public reads and read-only FUSE,
+  candidate/format/member/lock/bounds negatives and retained member locks. Check
+  exact bytes, selected views, EROFS, clean unmount and unchanged control hashes.
+- [ ] Fresh-review code/results and record measured scope, failures, original
+  remaining conditions, staged Bead/cycles/flush and release all owned leases.
+
+Creation gate: existing operator-requested TODO and minimal native probe serve
+this exact consumer/feature acceptance; observed disconnected root/member flags
+justify it. Retire active machinery at handoff; no-delete retains evidence.
+No new reporting framework or original-task closure based on a partial profile.
+
+Executed source and native evidence:
+- Reader SHA256 aa5e2c41421acc3dc7f81a807838e9c3fe9507dcda9e89bae9c42d7bfbca4bed;
+  base0b3fa02a07249bf7d2baeab6a773e20de0dc5a17 and seven explicit overlays,
+  fingerprint5b4a7d09c62c79facd41c0174ed31ac9d57c5d5ba286cf9f38d96ec986997a43.
+  Final RCH fmt72317,Clippy72320,check72323,tests72324,build72325 all0/terminalACK/
+  sourcesreleased. Test log42facade+14examplepassed,1existing producerignore,
+  0failed/filtered. Initial fmt72312/1 requested layout only; manually corrected
+  without changing predicates. First raw fmt failure had no frozen-source pass
+  receipt; final invocations pass explicit argv and emit clean-overlay receipts.
+  No local Cargo, source/cache/slot/deadline override or validator relaxation.
+- Final focusedUBS49629/0 reports0critical/104warnings/33info on exact reader;
+  broad original scanner disposition remains open. Old cf51328e ELF is preserved
+  locally in native-reader-cf51328e3ee0-retained-20261023T0507.gz and at its earlier
+  CSD path. Archive decompression rehash matched cf51328e before new delivery.
+- FinalELF a8f0569755461160d1409dbe9fd4deba5cb47724074272c88789fdfef0809ef7,
+  GNU/Linuxx86_64/590112256bytes, worker/local/exclusive CSD delivery SHA matches.
+  Path /data/ssd/tmp/ffs-public-zfs-members-42o_tjmd/native-reader-a8f056975546-20261023T0511.
+- Fresh native producer b87ec63b70a1cd8a47e371ab505bbfdeab42a7f2a3e188b5477c58c04728b486
+  created only two exclusively created256MiB regular files in its new private
+  /data/ssd/tmp/ffs-public-zfs-members-42o_tjmd. OpenZFS2.4.1 created a new random
+  mirror with all optional features disabled/cachefile=none; native mounted ZPL5
+  readbacks verified divergent head/snapshot payloads, then ordinary export0.
+  No force/import/destroy, physical-device formatting, removal or existing-pool
+  command. Existing buildpool stayed present; owned pool absent before consumer
+  opens. Producer40707/0; native pool GUID8284848727802191574, selectedlabel0/
+  slot20/txg20; datasetGUID17174837708617112480. Four label configurations validated
+  in existing companion inspection after export. Native SHA payloads:
+  head1a2aabbfddb11c1d4dea10a314620add97801a5df675304842ba9c63ae9a2c70,
+  snapshotf4bf9b8dec6e3e28b2ec33266145d244fe97a6bce1ec054ace053bab67d2ef9a.
+  Image SHAs4caa0613e87cdc3c5f429eca2c8966978e144d44bcd2460c91a3b9c975e2feea/
+  2a8afd65c39a9f3cb8d05caf95c34f08ed0e14463310f4049aa846e5b7c6dfbd.
+- Frozen native probe aa71889c25863a89efdbece7e08a3e5ede46fa323b96bac870bcc7ca0515b8f3
+  syntax checked and exclusively delivered. Probe82420/0:
+  /tmp/public-zfs-members-w__qqfys/result.json. Predeclared117CLI86zero/27one/4two,
+  12views/mounts,50offline+48mounted bytecomparisons,31negativecommands,
+  12offlinewriterefusals/24mountedEROFS/24retainedlocks,16controlsunchanged,
+  all12daemons0/unmounted and0ownedmounts. Plain/member-rest and independent
+  bounded primary4096/member8192 exact windows pass in all3rootmodes and both
+  native views; reversed member candidate reads also pass. Negative cases cover
+  wrongGUID/candidate/label/slot/snapshot/format, missing/duplicate/directory/
+  truncated/shifted/short/locked members, hidden backing mountpoints, malformed
+  selectors and cross-format conflicts. No failed native predicate or changed
+  denominator. Oldcf51328e explicit flagcontrol24903/0 records actualCLIexit2/
+  unknown --zfs-device/empty stdout, not positive capability credit.
+- Fresh author review88658/0 rechecks all117statuses/argv,12daemonstatusfiles,
+  RO/nodev/nosuid,all16currentcontrolhashes and all native-producer command statuses.
+  Six newly executed reversed-primary reads cover3rootmodes×head/snapshot with
+  exact nativebytes; not added to the original117 denominator. Owned nativepool
+  remains exported and0ownedFUSEmounts. Full producer/result/readback and stderr
+  retained locally under verification logs: zfs-consumer-fresh-readback-20261023T0514.json.
+  This is fresh native production plus live public API/FUSE proof for this
+  two-member exported read profile; no broader topology/ZIL/crash/write claim.
+- Fresh-eyes read of the full215add/24delete reader diff and surrounding
+  image-source/backend/mount paths found no additional product defect. Existing
+  native-byte/geometry/hidden-backing assertions are retained and expanded toZFS.
+  No other code file changed by root in this block. Peer FAT deltas conserved.
+
+Fresh-review correction before final qualification: the first private probe
+used /payload in several bad-member checks without selecting datasetdata.
+Thus a namespace miss could satisfy its generic error predicate even if member
+admission were broken. This was disclosed in commentary; original result/logs
+remain retained. Strengthened probe SHA256
+70f6b1b06afa429854a416ffdbad98f3f5c830a96efd915ebd840b59ebcd2bad
+uses stat/ for all17externalnegative arguments plus the held-lock case, and
+requires the exact hidden-backing diagnostic. Frozen/redeployed under a new
+filename; no predicate weakened or old artifact replaced. Probe13620/0 at
+/tmp/public-zfs-members-kxgjn4hg/result.json meets the same117CLI/31negative/
+12mount/98byte/24EROFS/24lock/16control denominators,86zero/27one/4two,
+0remainingmounts. Earlier execution is not extra coverage or the final refusal
+qualification. Product source/ELF unchanged; no rebuild needed.
+
+Fresh final readback7718/0 verifies all117status/argv files, confirms commands
+99–116 actually use stat/, checks the last hidden-backing stderr and12clean
+daemons/16currenthashes. A separately executed valid default-root stat passes0/
+Directory2. Paired native control also shows identical valid members with
+stat/payload return1/NotFound, while stat/ returns0; this is the concrete defect
+class the strengthened predicate excludes. Local
+zfs-consumer-root-controls-readback-20261023T0519.json and
+zfs-consumer-negative-admission-control-20261023T0520.json retain stdout/stderr/
+status. No native product failure, assertion relaxation or independent-review
+claim. Fresh native production and scope boundaries above still apply.
+
+Bounded real-work audit, 04:55–05:20 UTC, current original-task continuation:
+README purpose: memory-safe userspace native filesystem access with explicit
+compatibility, concurrency and durability boundaries. Root authored no commits
+or closes in this window; actual source diff is one reader plus existing user
+documentation and TODO. Unit inventory: USER1(the connected native ZFS reader),
+ENABLER1(its exact-source gates and native producer/probe), PROCESS1(existing
+TODO/Bead/evidence updates), UNKNOWN0. This is grouping, not a progress quota.
+Most visible demo: the same public consumer reads divergent head/snapshot
+payloads from a fresh exported native mirror using three root-selection modes
+and then mounts bounded members. Without process updates capability would be
+identical, but remaining criteria/source provenance would be lost. The enabler
+actually ran the finalELF in12mounts; no speculative framework. Original native
+library interoperability is still the relevant open user concern; this block
+directly closes its disconnected ZFS consumer surface. No swarm, close farming,
+lowered specs or follow-up minted to dispose of original criteria. Verdict:
+HEALTHY capability increment; initial probe negative controls needed correction,
+not a completion claim. No second apparatus round; record the defect/correction
+and finish existing tracker/reservations. Native crash/topology/scanner recovery
+work remains open under its original conditions.
+
+Honesty inventory (all20 prompts, bounded current block; no older-session audit):
+1.No(checked: full215add/24delete reader diff, old/new tests and source gates;
+  existing assertions retained, auxiliary cases expanded, no addedignore).
+2.No(checked: actual OpenZFS-created mirrored regular images/native mounted
+  payload reads; no product stub/mock). 3.No(checked: touched paths/diffs; no
+  golden/snapshot regeneration). 4.Yes: authored a private native probe for this
+  feature and strengthened its negative operations after a real false-positive
+  risk was found. No existing gate/CI code, suppression/tolerance/retry/timeout
+  or resource/source guard relaxed; both exact probe hashes/results retained.
+  Existing conformance gates untouched; no self-review labeled independent.
+5.No(checked: six mode/view combinations×plain/bounded members, reversed-image
+  reads, valid-root baseline and paired namespace-error counterexample; product
+  has no fixture/path/success branch). 6.No(checked:42+14unitspassed/0filtered,
+  one existingignore disclosed; final117CLIstatuses86/27/4,12actualmounts).
+7.No(checked: all five terminalACK/source-release receipts, producer/probe
+  statusfiles and exact binary SHA at worker/local/destination; no quiet credit).
+8.No(checked: final parity/README/TODO; fresh native production is labeled,
+  restricted to a two-file exported mirror, not RAIDZ/ZIL/crash/field proof).
+9.Yes: the initial numeric-green native summary could imply stronger admission
+  negatives than its predicate established. Disclosed the namespace loophole,
+  retained old result, strengthened and reran all117 with unchanged product;
+  final reference now points to the stronger run. No extra repeat-run credit.
+10.No(checked: native producer/consumer argv/stdout/stderr/status files,
+  transfers, RCH logs and fresh readbacks; the native pool-list command now
+  persists captured stderr too). 11.No(checked: original staged task remains
+  in_progress/OliveCreek, no newclose/followup). 12.No(checked: specs unchanged;
+  user docs expose working flags and narrowly measured evidence only).
+13–16.Not applicable: solo block, no subagent dispatched/report accepted/item
+  closed/refusal farm; peer files were preserved, not delegated authority.
+17.No(checked: fresh author readbacks explicitly non-independent; native kernel
+  byte oracle is actual OpenZFS execution, not peer agreement). 18.No(checked:
+  each frozen probe declares117/31/12/98 before execution; strengthening keeps
+  counts and extra fresh controls/repeats remain outside that denominator).
+19.Explanation owed: first native negative predicate admitted a namespace-error
+  alternative; paired control0/1 demonstrates it, corrected and disclosed above.
+  Initialfmt1/layout fixed manually; git launcher license error resolved by the
+  existing Git executable without accepting terms or altering host state.
+20.Strongest evidence: exact finalELF plus fresh native mirror producer and
+  strengthened root-admission probe, re-executable on exported copied images,
+  actual12mounts/98bytecomparisons and16unchangedcontrols. Independent scanner
+  disposition remains separate. Disposition: test weakness corrected openly,
+  exact old/new artifacts retained and operator informed; RH-5 countermeasure:
+  admission negatives use an existing root with a matched valid positive,
+  avoiding unrelated namespace failures. RH-2/RH-7/RH-9 preserve proof class,
+  task status and original remaining conditions. No gate weakening found.
+
+## Main integration: auxiliary handles and permanent read authority — 05:28 UTC
+
+New ZFS feature source was committed concurrently by the shared-tree maintainer
+as fc534d532; its reader blob still matches tested aa5e2c41421a. Root's exact-path
+commit attempt returned1/nothing to commit, without changing files or history;
+no success credit. Peer docs commits3aa79f86e/5c1119def preserve scoped evidence.
+Fresh fetch succeeded; local main is20commits ahead/8behind origin/main370aa96b3.
+Read-only merge-tree c1b099a1738b95ffe6bf7637f90cfa5574b9ae47 finds only corelib
+conflicted (four constructor/call hunks). Its proposed file actions have no
+deletions:28modified/1new source/test file plus independently committed docs.
+
+This is a high-value correctness integration: incoming path-based read authority
+and explicit open_read_write coexist with local already-admitted auxiliary
+handles. Keeping only either constructor branch would lose one safety property.
+Existing dirty FAT edits are formatting only, fully read and hashes unchanged;
+their dedicated UBS81588 exits0/0critical/183warnings/43info, and the exact same
+bytes already passed workspace fmt/check/Clippy in5b4a7d09c62c. Preserve them by
+an exact-path checkpoint, not stash/reset/overwrite. No branch/history deletion.
+
+Invariants: path and declared read-only constructors retain false write authority;
+recovery stays volatile and mutation-oriented WAL/repair options are rejected.
+Caller-declared read-write devices retain their own access checks. Nested btrfs
+views inherit parent authority and the exact admitted member handles; no path
+reopen or authority escalation. Public read-only facade must choose read-only
+authority explicitly, even when the underlying device object can write.
+
+- [x] Refresh actual source/remote refs and inspect virtual conflicts before any
+  working-tree merge. Canonical JSONL remains byte-identical and is not changed
+  by either branch's merge proposal. No pull/import/DB repair performed.
+- [x] Check and reserve the full incoming merge surface plus facade/architecture
+  paths; no foreign lease conflicts. Existing four consumer/doc/TODO leases held.
+- [ ] Checkpoint only validated FAT formatting and existing granular task notes,
+  preserving every other path/index entry. Keep its maintenance credit separate
+  from capability work; reader/docs already have exact-source evidence.
+- [ ] Merge origin/main without force/reset/stash/deletion. Resolve core's
+  auxiliary handle parameters together with incoming write_authority. Add an
+  explicit VolumeAccess argument to from_devices; use ReadOnly in public facade
+  and its read tests. Share read-only option validation with the path constructor.
+  Preserve explicit writable from_device/open_read_write and inherited authority.
+- [ ] Add focused non-tautological authority controls using a writable memory
+  device: read-only handle admission cannot later enable writes, cannot create
+  metadata WALs or repair state, and selected recovery does not touch backing.
+  Preserve all incoming/native positive and negative tests; no gate relaxation.
+- [ ] Update actual public constructor contract in README/architecture in place.
+- [ ] Freeze integrated source; run strict-remote workspace fmt/check/Clippy,
+  relevant core/facade/FAT/ZFS tests and full harness/conformance gates. Inspect
+  every failure; no source/cache/resource/slot/deadline bypass or quiet credit.
+- [ ] Build/deliver a new exact ELF, preserve older consumers/results, and rerun
+  native ext4/btrfs auxiliary/read-only and fresh ZFS mirror mounted probes on
+  integrated code. Keep previous-source proof separate and all hashes stable.
+- [ ] Finish exact-source review, named broad scanner disposition/publication
+  gates, current Bead evidence/cycles/flush and guarded main publication where
+  accepted. Retain all histories and peer work; no force, deletion or false close.
+
+- [ ] Complete final original-Bead evidence comment, staged cycles/flush/readback,
+  bounded honesty disposition and release four named reservations. Original
+  scanner/status, native external-journal crash/broader topology and canonical
+  owning-engine WAL recovery criteria remain explicit and open.
