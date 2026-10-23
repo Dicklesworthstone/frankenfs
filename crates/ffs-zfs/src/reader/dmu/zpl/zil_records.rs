@@ -95,7 +95,15 @@ pub(super) fn verified(cx: &Cx, record: &[u8], order: Endian) -> Result<ZilRecor
             }
             padded_record(record, names_end(record, 48, 1)?)?;
         }
-        8 => padded_record(record, names_end(record, 48, 2)?)?,
+        8 | 22 => {
+            for at in [32, 40] {
+                let object = word(record, at, order)?;
+                if object == 0 || object >= 1_u64 << 48 {
+                    return Err(corrupt("invalid ZIL rename directory identity"));
+                }
+            }
+            padded_record(record, names_end(record, 48, 2)?)?;
+        }
         9 => {
             if record.len() < 192 {
                 return Err(corrupt("truncated ZIL write record"));
@@ -292,6 +300,66 @@ mod tests {
             suffix[8..16].copy_from_slice(&order.encode(length));
             assert!(verified(&cx, &suffix, order).is_err());
             assert!(verified(&cx, &record(7, &body[..16], order), order).is_err());
+        }
+    }
+
+    #[test]
+    fn rename_exchange_records_keep_both_names_and_reject_bad_framing() {
+        let cx = Cx::for_testing();
+        for order in [Endian::Little, Endian::Big] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&order.encode(2));
+            body.extend_from_slice(&order.encode((1_u64 << 48) - 1));
+            body.extend_from_slice(b"left\0right\0");
+            let bytes = record(22, &body, order);
+            let parsed = parse(&cx, &block(&bytes, bytes.len() as u64, order), order).unwrap();
+            assert_eq!(
+                parsed.records[0].payload,
+                ZilRecordPayload::RenameExchange {
+                    src_dir_obj: 2,
+                    dst_dir_obj: (1_u64 << 48) - 1,
+                    src_name: b"left".to_vec(),
+                    dst_name: b"right".to_vec(),
+                }
+            );
+            assert_eq!(
+                ffs_ondisk::zfs_dmu::ZilBlock::parse(
+                    &block(&bytes, bytes.len() as u64, order),
+                    order,
+                )
+                .unwrap()
+                .records,
+                parsed.records
+            );
+            for at in [32, 40] {
+                for id in [0, 1_u64 << 48, u64::MAX] {
+                    let mut bad = bytes.clone();
+                    bad[at..at + 8].copy_from_slice(&order.encode(id));
+                    assert!(verified(&cx, &bad, order).is_err());
+                }
+            }
+            for kind in [22 | (1_u64 << 63), 22 | 32] {
+                let mut bad = bytes.clone();
+                bad[..8].copy_from_slice(&order.encode(kind));
+                assert!(matches!(
+                    verified(&cx, &bad, order),
+                    Err(super::super::FfsError::UnsupportedFeature(_))
+                ));
+            }
+            for at in [48, 53] {
+                let mut empty = bytes.clone();
+                empty[at] = 0;
+                assert!(verified(&cx, &empty, order).is_err());
+            }
+            let mut unterminated = bytes.clone();
+            unterminated[53..].fill(b'x');
+            assert!(verified(&cx, &unterminated, order).is_err());
+            let mut suffix = bytes.clone();
+            suffix.extend_from_slice(&[0; 8]);
+            let length = suffix.len() as u64;
+            suffix[8..16].copy_from_slice(&order.encode(length));
+            assert!(verified(&cx, &suffix, order).is_err());
+            assert!(verified(&cx, &record(22, &body[..21], order), order).is_err());
         }
     }
 

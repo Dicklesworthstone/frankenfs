@@ -1,5 +1,17 @@
 # FEATURE_PARITY
 
+> **Native ZFS atomic-exchange recovery:** `Zpl::replay_zil` now decodes native
+> `TX_RENAME_EXCHANGE` records separately from ordinary rename and stages both
+> names together. File/directory swaps preserve both objects and their contents;
+> cross-parent directory link accounting and both ancestry checks are enforced.
+> Five new regression functions cover native framing, both byte orders, both log
+> checksum layouts, claim boundaries, aliases, nonempty directories, repeated
+> replay and whole-view refusal. Exact pinned rustfmt and `git diff --check`
+> passed. Rust execution and native OpenZFS interchange remain unverified here:
+> local Cargo cannot resolve the uncached dependencies and shared storage is
+> exhausted. This advances `bd-ofjn7`; its broader recovery acceptance stays open.
+> See `docs/ZFS_ZIL_TOPOLOGY_PROFILE.md` for the operation contract.
+
 > Quantitative feature coverage tracking for FrankenFS.
 
 ## 1. Coverage Summary (Current)

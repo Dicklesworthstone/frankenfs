@@ -301,6 +301,12 @@ pub enum ZilRecordPayload {
         src_name: Vec<u8>,
         dst_name: Vec<u8>,
     },
+    RenameExchange {
+        src_dir_obj: u64,
+        dst_dir_obj: u64,
+        src_name: Vec<u8>,
+        dst_name: Vec<u8>,
+    },
     Write {
         file_obj: u64,
         offset: u64,
@@ -385,7 +391,7 @@ impl ZilBlock {
                 .filter(|&end| end <= records_limit)
                 .ok_or_else(|| invalid("ZIL record exceeds block used bytes"))?;
             let rec = &raw[pos..rec_end];
-            if !matches!(txtype & 0x1f, 1 | 2 | 4..=11 | 14..=20) {
+            if !matches!(txtype & 0x1f, 1 | 2 | 4..=11 | 14..=20 | 22) {
                 pos = rec_end;
                 continue;
             }
@@ -467,7 +473,7 @@ impl ZilRecord {
                     name,
                 }
             }
-            8 => {
+            8 | 22 => {
                 if rec.len() < 48 {
                     return Err(invalid("truncated ZIL lr_rename_t"));
                 }
@@ -476,11 +482,20 @@ impl ZilRecord {
                 let (src_name, dst_opt) = cstr_pair(&rec[48..])?;
                 let dst_name = dst_opt
                     .ok_or_else(|| invalid("missing destination name in ZIL lr_rename_t"))?;
-                ZilRecordPayload::Rename {
-                    src_dir_obj,
-                    dst_dir_obj,
-                    src_name,
-                    dst_name,
+                if txtype & 0x1f == 22 {
+                    ZilRecordPayload::RenameExchange {
+                        src_dir_obj,
+                        dst_dir_obj,
+                        src_name,
+                        dst_name,
+                    }
+                } else {
+                    ZilRecordPayload::Rename {
+                        src_dir_obj,
+                        dst_dir_obj,
+                        src_name,
+                        dst_name,
+                    }
                 }
             }
             9 | 20 => {

@@ -113,6 +113,38 @@ newly created targets, symlinks, original-name removal, repeat replay, malformed
 records and atomic refusal. Their native-layout fixtures are constructed;
 they do not establish OpenZFS crash-image interoperability.
 
+## Native atomic rename exchanges
+
+The same selected-head namespace replay now admits exact native type 22,
+`TX_RENAME_EXCHANGE`. OpenZFS zfs-2.3.0 stores the two directory object numbers
+and two NUL-terminated names in `lr_rename_t`, then dispatches replay with
+`RENAME_EXCHANGE`. Inspection retains a distinct exchange payload; it is never
+decoded or applied as an ordinary rename that replaces and removes a target.
+
+Both entries must exist. Exchanges preserve each object's identity, generation,
+link count and contents, including symlinks and nonempty directories. A mixed
+file/directory exchange transfers the child's parent-link contribution between
+parents while preserving both directory entry counts. Both moved directories
+are checked against their prospective ancestors before either parent changes.
+Identical names or different hard-link aliases of one object are successful
+no-ops. Missing targets, invalid directory identities, cycles, malformed names,
+unknown type flags and unexplained record suffixes fail the complete replay.
+
+The operation uses the existing private-overlay publication boundary. A later
+failure leaves the previously visible view intact; replay starts from committed
+state each time, so it does not swap an already recovered namespace twice.
+Backing images, claim fields and replay-sequence fields remain unchanged.
+
+Five authored regression functions cover both byte orders, ZILOG/ZILOG2 checksums,
+claimed/unclaimed logs, shared hard-link writes, same-object no-ops, mixed and
+nonempty directory exchanges, both cycle directions, repeated replay, exact
+record framing and a later failure after a previously published recovery view.
+Pinned-nightly formatting and whitespace checks passed. These constructed-image
+Rust tests have not executed in this environment: dependency resolution is
+blocked by an incomplete local Cargo cache and exhausted shared storage. Native
+OpenZFS crash-image interchange is also unverified; the broad `bd-ofjn7` remains
+open. Existing workspace CI runs on `main` and retains its compiler/test gates.
+
 ## Earlier validation notes
 
 Twelve new Rust regression functions cover topology transport and CLI admission,
