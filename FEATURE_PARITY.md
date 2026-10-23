@@ -1,5 +1,19 @@
 # FEATURE_PARITY
 
+> **Btrfs reflink destination preservation:** public `FICLONE` and
+> `FICLONERANGE` now share the same bounded range-clone behavior. A whole-source
+> clone no longer truncates a larger destination, discards its trailing data or
+> transfers source preallocation beyond EOF. Destination reservations outside
+> the clone window survive. Empty-source clones leave the destination unchanged;
+> invalid inode kinds, out-of-bounds source ranges, overlapping self-clones and
+> partial EOF sectors landing inside a destination are refused before mutation.
+> Regression coverage captures the prior ARM CI size-mismatch sequence and adds
+> byte, reference-count, copy-on-write, preallocation and native-image checks.
+> The existing randomized reference model is unchanged. These Rust regressions
+> are authored but unexecuted here because local dependencies are uncached and
+> shared storage is exhausted; pinned formatting and whitespace checks pass.
+> This does not claim general rollback safety for every Btrfs mutation failure.
+
 > **Atomic ext4 hard-link publication:** `ext4_link` now stages the source link
 > count, parent inode, directory entry, directory-growth allocation and any
 > `O_TMPFILE` orphan predecessor splice in one MVCC transaction. Failed staging

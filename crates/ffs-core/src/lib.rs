@@ -37630,112 +37630,22 @@ impl OpenFs {
         Ok(length)
     }
 
-    /// Share every data extent of `src_canonical` into `dst_canonical` — the
-    /// core of a btrfs reflink (bd-vh8p9). For each of src's `EXTENT_DATA`
-    /// items, insert an identical `EXTENT_DATA` for dst at the same file offset
-    /// (pointing at the SAME `disk_bytenr` — a shared extent) and, for regular
-    /// extents, bump the extent's refcount + add a keyed `EXTENT_DATA_REF`
-    /// backref for dst via [`BtrfsExtentAllocator::add_data_extent_ref`]. Inline
-    /// extents carry their bytes in the item itself, so the copied `EXTENT_DATA`
-    /// is sufficient (no extent-tree reference). No new space is allocated, and
-    /// the shared extent's `EXTENT_CSUM` (keyed by `disk_bytenr`) already covers
-    /// dst. Finally dst's `size`/`nbytes` are set to match src.
-    ///
-    /// The `EXTENT_DATA_REF` offset is `key.offset - extent_offset` (the disk
-    /// extent's logical start in the file), matching btrfs. Reached from FUSE
-    /// FICLONE through `FsOps::clone_file`.
+    /// Reflink the source's logical content at destination offset zero.
+    /// Native FICLONE preserves any destination suffix and allocations beyond
+    /// EOF, and never transfers source reservations beyond its logical EOF.
+    /// Use the same bounded extent sharing as FICLONERANGE (bd-vh8p9).
     fn btrfs_clone_file_data(
         &self,
+        cx: &Cx,
         alloc: &mut BtrfsAllocState,
         src_canonical: u64,
         dst_canonical: u64,
     ) -> ffs_error::Result<()> {
-        let lo = BtrfsKey {
-            objectid: src_canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: 0,
-        };
-        let hi = BtrfsKey {
-            objectid: src_canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: u64::MAX,
-        };
-        let src_extents = alloc
-            .fs_tree
-            .range(&lo, &hi)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-
-        // FICLONE replaces dst's ENTIRE content with src's. Drop dst's existing
-        // extents refcount-aware (a shared extent loses only this inode's
-        // EXTENT_DATA_REF; a sole extent is freed with its EXTENT_CSUM items)
-        // before grafting src's. Without this, cloning onto a NON-EMPTY dst
-        // either collides on a same-offset EXTENT_DATA key (KeyAlreadyExists,
-        // aborting mid-loop with a half-cloned dst) or leaves stale extents past
-        // the cloned i_size — leaking refs and tripping `btrfs check`. Mirrors
-        // the range path (btrfs_clone_file_range_data), which drops the dest
-        // window first. A whole-file clone onto itself is a no-op (guarding it
-        // also prevents freeing src's own extents in the clear step below).
-        if src_canonical == dst_canonical {
+        let len = self.btrfs_read_inode_from_tree(alloc, src_canonical)?.size;
+        if len == 0 {
             return Ok(());
         }
-        let stale = Self::btrfs_extent_data_items(alloc, dst_canonical)?;
-        Self::btrfs_delete_extent_data_items(alloc, &stale)?;
-
-        for (key, data) in src_extents {
-            let dst_key = BtrfsKey {
-                objectid: dst_canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: key.offset,
-            };
-            // Same on-disk bytes: dst references the identical (possibly shared)
-            // extent. For inline extents this carries the data; for regular
-            // extents it points at src's disk_bytenr.
-            alloc
-                .fs_tree
-                .insert(dst_key, &data)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-
-            if let BtrfsExtentData::Regular {
-                disk_bytenr,
-                disk_num_bytes,
-                extent_offset,
-                ..
-            } = parse_extent_data(&data).map_err(|e| parse_to_ffs_error(&e))?
-                && disk_bytenr > 0
-            {
-                // btrfs data-backref offset = file_offset - extent_offset,
-                // computed with u64 wraparound (a reflinked sub-range views
-                // into the extent, so extent_offset can exceed file_offset —
-                // btrfs check validates the wrapped value).
-                let ref_offset = key.offset.wrapping_sub(extent_offset);
-                let root = alloc.fs_root_objectid;
-                alloc
-                    .extent_alloc
-                    .add_data_extent_ref(
-                        disk_bytenr,
-                        disk_num_bytes,
-                        root,
-                        dst_canonical,
-                        ref_offset,
-                    )
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            }
-        }
-
-        let src_inode = self.btrfs_read_inode_from_tree(alloc, src_canonical)?;
-        let mut dst_inode = self.btrfs_read_inode_from_tree(alloc, dst_canonical)?;
-        dst_inode.size = src_inode.size;
-        dst_inode.nbytes = src_inode.nbytes;
-        let dst_inode_key = BtrfsKey {
-            objectid: dst_canonical,
-            item_type: BTRFS_ITEM_INODE_ITEM,
-            offset: 0,
-        };
-        alloc
-            .fs_tree
-            .update(&dst_inode_key, &dst_inode.to_bytes())
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        Ok(())
+        self.btrfs_clone_file_range_data(cx, alloc, src_canonical, dst_canonical, 0, len, 0)
     }
 
     /// Reflink a byte sub-range of `src` into `dst` (FICLONERANGE, bd-jbtd2).
@@ -37746,8 +37656,8 @@ impl OpenFs {
     /// the extent refcount via `add_data_extent_ref`. Existing dst data in
     /// `[dest_offset, dest_offset+len)` is first dropped refcount-aware; dst
     /// `size`/`nbytes` are then recomputed from the resulting extent set.
-    /// Inline/compressed extents can't be carved by view, so a partial range
-    /// covering one is refused (FrankenFS writes neither for data extents).
+    /// Compressed extents are shared by view; inline bytes are copied into
+    /// fresh regular extents because inline data has no shareable disk extent.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::match_wildcard_for_single_variants)]
     #[allow(clippy::too_many_arguments)]
@@ -105594,7 +105504,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -105706,7 +105616,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -105777,7 +105687,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -105849,7 +105759,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("alloc state");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -105902,7 +105812,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("alloc state");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -106706,7 +106616,7 @@ mod tests {
         // Clone src -> dst.
         {
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone src into dst");
         }
 
@@ -106793,16 +106703,12 @@ mod tests {
         );
     }
 
-    /// Whole-file FICLONE onto a NON-EMPTY destination must REPLACE dst's
-    /// content: drop dst's pre-existing extents (refcount-aware) before grafting
-    /// src's. Regression for the bug where btrfs_clone_file_data only inserted
-    /// src's extents — so a same-offset dst extent tripped KeyAlreadyExists
-    /// (aborting mid-loop) and any dst extent past src's i_size was left stale
-    /// (leaked ref + extent beyond i_size -> `btrfs check` failure). The range
-    /// path (FICLONERANGE) already dropped its window; this pins parity for the
-    /// whole-file path.
+    /// A whole-source reflink replaces the overlapping destination window,
+    /// with correct shared-extent references, while preserving the suffix.
+    /// Linux FICLONE uses the same remap operation as FICLONERANGE; its inode
+    /// update only grows i_size. Expecting truncation here masked data loss.
     #[test]
-    fn btrfs_clone_file_data_over_nonempty_dst_replaces_content() {
+    fn btrfs_clone_file_data_over_nonempty_dst_preserves_suffix() {
         let (fs, cx) = open_writable_btrfs();
         let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
         let src = fs
@@ -106838,38 +106744,48 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("clone over non-empty dst");
         }
 
         let alloc_mutex = fs.btrfs_alloc_state.as_ref().expect("writable btrfs");
         let alloc = alloc_mutex.read();
-        // dst now shares src's single extent; size matches src; nothing stale.
+        // The cloned prefix shares src; the original suffix keeps its reference.
         let dst_inode = fs
             .btrfs_read_inode_from_tree(&alloc, dst_canon)
             .expect("dst inode");
         assert_eq!(
             dst_inode.size,
-            src_payload.len() as u64,
-            "dst size must be replaced by src's"
+            dst_payload.len() as u64,
+            "cloning must never shrink the destination"
         );
+        assert_eq!(dst_inode.nbytes, dst_payload.len() as u64);
         let dst_exts = OpenFs::btrfs_extent_data_items(&alloc, dst_canon).expect("dst extents");
-        assert_eq!(dst_exts.len(), 1, "dst must hold exactly src's one extent");
+        assert_eq!(dst_exts.len(), 2, "dst must retain both prefix and suffix");
         let src_size = u64::try_from(src_payload.len()).unwrap();
         for (key, ext) in &dst_exts {
-            assert!(
-                key.offset < src_size,
-                "no extent may sit past the cloned i_size"
-            );
             match ext {
-                BtrfsExtentData::Regular { disk_bytenr, .. } => {
-                    assert_eq!(*disk_bytenr, src_db, "dst must share src's disk extent");
+                BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    extent_offset,
+                    num_bytes,
+                    ..
+                } => {
+                    if key.offset == 0 {
+                        assert_eq!(*disk_bytenr, src_db, "prefix shares src's extent");
+                        assert_eq!(*extent_offset, 0);
+                    } else {
+                        assert_eq!(key.offset, src_size, "suffix begins after the clone");
+                        assert_eq!(*disk_bytenr, old_dst_db, "suffix keeps dst's extent");
+                        assert_eq!(*extent_offset, src_size);
+                    }
+                    assert_eq!(*num_bytes, 8192);
                 }
                 other => panic!("expected a regular extent, got {other:?}"),
             }
         }
-        // src's extent is now shared (refs 1 -> 2); dst's old sole extent was
-        // freed by the refcount-aware clear (refs 1 -> 0, no longer present).
+        // src's extent is shared (refs 1 -> 2); dst's old extent still backs
+        // its suffix and must retain its sole reference.
         assert_eq!(
             alloc
                 .extent_alloc
@@ -106883,12 +106799,12 @@ mod tests {
                 .extent_alloc
                 .extent_item_refs(old_dst_db, old_dst_dnb)
                 .expect("old dst refs"),
-            None,
-            "dst's replaced extent must be freed by the refcount-aware clear"
+            Some(1),
+            "dst's suffix extent must retain its reference"
         );
         drop(alloc);
 
-        // dst reads back exactly src's bytes (no leftover 0xBB tail).
+        // Read the full destination, including its original suffix.
         let read_back = fs_ops
             .read(
                 &cx,
@@ -106898,9 +106814,17 @@ mod tests {
                 u32::try_from(dst_payload.len()).unwrap(),
             )
             .expect("read dst");
+        let mut expected = src_payload.clone();
+        expected.extend_from_slice(&dst_payload[src_payload.len()..]);
         assert_eq!(
-            read_back, src_payload,
-            "dst must read back src's content, capped at src's i_size"
+            read_back, expected,
+            "clone must preserve destination suffix"
+        );
+        assert_eq!(
+            fs.read(&cx, src.ino, 0, src_payload.len() as u32)
+                .expect("read src"),
+            src_payload,
+            "cloning must preserve source content"
         );
     }
 
@@ -106976,9 +106900,9 @@ mod tests {
         assert_eq!(refs, Some(2), "reflink must bump the extent refcount to 2");
     }
 
-    /// bd-jbtd2: clone_file_range whole-file (src_length == 0 = to EOF) reduces
-    /// to a full reflink; a true sub-range performs boundary-split extent
-    /// sharing so dst reads exactly the requested src window.
+    /// bd-jbtd2: cloning the whole source (src_length == 0 = to EOF) into an
+    /// empty destination shares all its extents; a true sub-range performs
+    /// boundary-split sharing so dst reads exactly the requested src window.
     #[test]
     fn clone_file_range_whole_and_partial_bd_jbtd2() {
         let (fs, cx) = open_writable_btrfs();
@@ -107039,6 +106963,370 @@ mod tests {
             .getattr(&cx, &mut RequestScope::empty(), dst2.ino)
             .expect("getattr dst2");
         assert_eq!(attr.size, 8192, "dst2 size = cloned range length");
+    }
+
+    /// Replay the three-operation ARM proptest failure, then exercise COW and
+    /// repeated cloning. None selects FICLONE; Some(0) selects range-to-EOF.
+    fn btrfs_reflink_suffix_sequence(
+        fs: &OpenFs,
+        cx: &Cx,
+        name: &str,
+        src_length: Option<u64>,
+        fill: u8,
+    ) -> [(InodeNumber, Vec<u8>); 2] {
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let src = fs
+            .create(cx, root, OsStr::new(&format!("{name}-src")), 0o644, 0, 0)
+            .expect("create src");
+        let dst = fs
+            .create(cx, root, OsStr::new(&format!("{name}-dst")), 0o644, 0, 0)
+            .expect("create dst");
+        fs.write(cx, dst.ino, 64_037, &vec![fill; 26_075])
+            .expect("seed destination");
+        let mut dst_model = vec![0_u8; 90_112];
+        dst_model[64_037..].fill(fill);
+        fs.clone_file_range(
+            cx,
+            &mut RequestScope::empty(),
+            src.ino,
+            dst.ino,
+            61_440,
+            12_288,
+            73_728,
+        )
+        .expect("make shorter source by reflinking destination window");
+        let mut src_model = vec![0_u8; 86_016];
+        src_model[73_728..].copy_from_slice(&dst_model[61_440..73_728]);
+        assert_eq!(fs.getattr(cx, src.ino).expect("src size").size, 86_016);
+
+        for round in 0..2_u8 {
+            match src_length {
+                Some(length) => fs.clone_file_range(
+                    cx,
+                    &mut RequestScope::empty(),
+                    dst.ino,
+                    src.ino,
+                    0,
+                    length,
+                    0,
+                ),
+                None => fs.clone_file(cx, &mut RequestScope::empty(), dst.ino, src.ino),
+            }
+            .expect("clone whole source over larger destination");
+            dst_model[..src_model.len()].copy_from_slice(&src_model);
+            assert_eq!(
+                fs.getattr(cx, dst.ino).expect("dst size").size,
+                90_112,
+                "whole-source clone must preserve the larger destination size"
+            );
+            assert_eq!(
+                fs.read(cx, dst.ino, 0, 90_112).expect("read cloned dst"),
+                dst_model,
+                "cloned prefix and untouched suffix must both survive"
+            );
+
+            let patch = vec![0x80 + round; 1024];
+            fs.write(cx, dst.ino, 74_241, &patch)
+                .expect("COW write into cloned source extent");
+            dst_model[74_241..75_265].copy_from_slice(&patch);
+            assert_eq!(
+                fs.read(cx, dst.ino, 0, 90_112).expect("read COW dst"),
+                dst_model,
+                "COW must preserve the rest of the clone and its suffix"
+            );
+            assert_eq!(
+                fs.read(cx, src.ino, 0, 86_016).expect("read source"),
+                src_model,
+                "cloning and later COW writes must preserve source content"
+            );
+        }
+        [(src.ino, src_model), (dst.ino, dst_model)]
+    }
+
+    #[test]
+    fn btrfs_reflink_whole_source_preserves_larger_destination() {
+        // fill=0 is the exact minimized ARM failure's sparse content. The
+        // nonzero case additionally proves that the suffix bytes survive.
+        for fill in [0, 0xD7] {
+            for src_length in [None, Some(0), Some(86_016)] {
+                let (fs, cx) = open_writable_btrfs();
+                btrfs_reflink_suffix_sequence(&fs, &cx, "suffix", src_length, fill);
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_reflink_empty_source_validates_both_endpoints() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let empty = fs
+            .create(&cx, root, OsStr::new("empty"), 0o644, 0, 0)
+            .expect("empty");
+        let dst = fs
+            .create(&cx, root, OsStr::new("dst"), 0o644, 0, 0)
+            .expect("dst");
+        let bytes = vec![0xA7; 12_288];
+        fs.write(&cx, dst.ino, 0, &bytes).expect("seed dst");
+        let symlink = FsOps::symlink(
+            &fs,
+            &cx,
+            &mut RequestScope::empty(),
+            root,
+            OsStr::new("sym"),
+            Path::new("dst"),
+            0,
+            0,
+        )
+        .expect("symlink");
+        for whole_file in [false, true] {
+            let clone = |dest, src| {
+                if whole_file {
+                    fs.clone_file(&cx, &mut RequestScope::empty(), dest, src)
+                } else {
+                    fs.clone_file_range(&cx, &mut RequestScope::empty(), dest, src, 0, 0, 0)
+                }
+            };
+            clone(dst.ino, empty.ino).expect("empty source is a no-op");
+            clone(InodeNumber(999_999), empty.ino)
+                .expect_err("empty source must still validate the destination");
+            for (dest, src) in [(root, empty.ino), (dst.ino, root)] {
+                assert_eq!(
+                    clone(dest, src).expect_err("directory rejected").to_errno(),
+                    libc::EISDIR
+                );
+            }
+            for (dest, src) in [(symlink.ino, empty.ino), (dst.ino, symlink.ino)] {
+                assert_eq!(
+                    clone(dest, src).expect_err("symlink rejected").to_errno(),
+                    libc::EINVAL
+                );
+            }
+        }
+        fs.clone_file_range(&cx, &mut RequestScope::empty(), dst.ino, empty.ino, 0, 0, 1)
+            .expect("empty EOF range returns before alignment checks");
+        assert_eq!(
+            fs.getattr(&cx, dst.ino).expect("size").size,
+            bytes.len() as u64
+        );
+        assert_eq!(fs.read(&cx, dst.ino, 0, 12_288).expect("read dst"), bytes);
+        assert_eq!(
+            FsOps::readlink(&fs, &cx, &mut RequestScope::empty(), symlink.ino).expect("readlink"),
+            b"dst"
+        );
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new("dst"))
+                .expect("directory unchanged")
+                .ino,
+            dst.ino
+        );
+    }
+
+    #[test]
+    fn btrfs_reflink_range_rejects_destructive_requests_without_mutation() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let src = fs
+            .create(&cx, root, OsStr::new("partial"), 0o644, 0, 0)
+            .expect("src");
+        let dst = fs
+            .create(&cx, root, OsStr::new("larger"), 0o644, 0, 0)
+            .expect("dst");
+        let source = vec![0x3C; 5904];
+        let mut expected = vec![0xA7; 12_288];
+        fs.write(&cx, src.ino, 0, &source).expect("source");
+        fs.write(&cx, dst.ino, 0, &expected).expect("destination");
+        // Partial EOF sectors cannot overwrite a larger destination's middle;
+        // explicit ranges and zero-length-to-EOF offsets cannot exceed src EOF.
+        for (src_offset, length, dest_offset) in [
+            (0, 0, 0),
+            (0, 5904, 0),
+            (4096, 1808, 4096),
+            (0, 8192, 0),
+            (8192, 0, 0),
+        ] {
+            let error = fs
+                .clone_file_range(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    dst.ino,
+                    src.ino,
+                    src_offset,
+                    length,
+                    dest_offset,
+                )
+                .expect_err("invalid source or partial-tail range");
+            assert_eq!(error.to_errno(), libc::EINVAL);
+            assert_eq!(
+                fs.read(&cx, dst.ino, 0, 12_288).expect("unchanged dst"),
+                expected
+            );
+            assert_eq!(
+                fs.read(&cx, src.ino, 0, 5904).expect("unchanged src"),
+                source
+            );
+        }
+        assert_eq!(
+            fs.clone_file(&cx, &mut RequestScope::empty(), dst.ino, src.ino)
+                .expect_err("FICLONE also rejects an interior partial EOF sector")
+                .to_errno(),
+            libc::EINVAL,
+        );
+        assert_eq!(
+            fs.clone_file(&cx, &mut RequestScope::empty(), src.ino, src.ino)
+                .expect_err("overlapping same-inode clone rejected before removing source")
+                .to_errno(),
+            libc::EINVAL,
+        );
+        assert_eq!(
+            fs.read(&cx, src.ino, 0, 5904)
+                .expect("self-clone source intact"),
+            source
+        );
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            dst.ino,
+            src.ino,
+            0,
+            4096,
+            0,
+        )
+        .expect("aligned interior clone remains supported");
+        expected[..4096].copy_from_slice(&source[..4096]);
+        assert_eq!(
+            fs.read(&cx, dst.ino, 0, 12_288).expect("aligned clone"),
+            expected
+        );
+        fs.clone_file_range(
+            &cx,
+            &mut RequestScope::empty(),
+            src.ino,
+            src.ino,
+            0,
+            4096,
+            8192,
+        )
+        .expect("non-overlapping same-inode clone remains supported");
+        let mut self_clone = source.clone();
+        self_clone.resize(8192, 0);
+        self_clone.extend_from_slice(&source[..4096]);
+        assert_eq!(
+            fs.read(&cx, src.ino, 0, 12_288).expect("self-cloned data"),
+            self_clone
+        );
+    }
+
+    #[test]
+    fn btrfs_reflink_preserves_reservations_outside_logical_range() {
+        let _guard = log_contract_guard();
+        for src_length in [None, Some(0), Some(4096)] {
+            let (fs, cx) = open_writable_btrfs();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let src = fs
+                .create(&cx, root, OsStr::new("reserved-src"), 0o644, 0, 0)
+                .expect("src");
+            let dst = fs
+                .create(&cx, root, OsStr::new("reserved-dst"), 0o644, 0, 0)
+                .expect("dst");
+            fs.write(&cx, src.ino, 0, &[0xAA; 4096]).expect("source");
+            fs.write(&cx, dst.ino, 0, &[0xBB; 4096])
+                .expect("destination");
+            for (ino, offset) in [(src.ino, 16_384), (dst.ino, 8192)] {
+                FsOps::fallocate(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    ino,
+                    offset,
+                    4096,
+                    libc::FALLOC_FL_KEEP_SIZE,
+                )
+                .expect("reserve space past logical EOF");
+            }
+            let reservations = |ino| {
+                let canonical = fs.btrfs_canonical_inode(ino).expect("canonical");
+                let alloc = fs.btrfs_alloc_state.as_ref().expect("alloc").read();
+                OpenFs::btrfs_extent_data_items(&alloc, canonical)
+                    .expect("extents")
+                    .into_iter()
+                    .filter(|(key, _)| key.offset >= 4096)
+                    .map(|(key, extent)| (key, extent.to_bytes()))
+                    .collect::<Vec<_>>()
+            };
+            let src_before = reservations(src.ino);
+            let dst_before = reservations(dst.ino);
+            assert_eq!(src_before.len(), 1);
+            assert_eq!(dst_before.len(), 1);
+            match src_length {
+                Some(length) => fs.clone_file_range(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    dst.ino,
+                    src.ino,
+                    0,
+                    length,
+                    0,
+                ),
+                None => fs.clone_file(&cx, &mut RequestScope::empty(), dst.ino, src.ino),
+            }
+            .expect("clone content with reservations beyond EOF");
+            assert_eq!(fs.getattr(&cx, dst.ino).expect("size").size, 4096);
+            assert_eq!(
+                fs.read(&cx, dst.ino, 0, 4096).expect("cloned content"),
+                vec![0xAA; 4096]
+            );
+            assert_eq!(
+                reservations(dst.ino),
+                dst_before,
+                "destination reservations must survive byte-for-byte, without copying source reservations"
+            );
+            assert_eq!(
+                reservations(src.ino),
+                src_before,
+                "source reservations must remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_reflink_preserved_suffix_passes_native_check_and_reopen() {
+        let (fs, dev, _tmp, image) =
+            open_writable_btrfs_mkfs(256).expect("btrfs-progs fixture required");
+        let cx = Cx::for_testing();
+        let mut expected = Vec::new();
+        for (index, src_length) in [None, Some(0), Some(86_016)].into_iter().enumerate() {
+            expected.extend(btrfs_reflink_suffix_sequence(
+                &fs,
+                &cx,
+                &format!("native-{index}"),
+                src_length,
+                0xD7,
+            ));
+        }
+        fs.flush_mvcc_to_device(&cx).expect("flush");
+        fs.btrfs_full_transaction_commit(&cx, "reflink-suffix-preservation")
+            .expect("commit reflink and COW changes");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("persist image");
+        drop(fs);
+        let (clean, output) = run_btrfs_check(&image).expect("native btrfs checker required");
+        assert!(
+            clean,
+            "btrfs check must accept preserved suffixes:\n{output}"
+        );
+        let reopened = OpenFs::open(&cx, &image).expect("reopen committed image");
+        for (ino, bytes) in expected {
+            assert_eq!(
+                reopened.getattr(&cx, ino).expect("size").size,
+                bytes.len() as u64
+            );
+            assert_eq!(
+                reopened
+                    .read(&cx, ino, 0, u32::try_from(bytes.len()).expect("read size"))
+                    .expect("read reopened content"),
+                bytes,
+                "cloned prefix, suffix and source must survive reopen"
+            );
+        }
     }
 
     /// bd-vh8p9 on-disk validation: a reflink performed through the public
@@ -118870,7 +119158,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().unwrap();
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("reflink src into dst");
         }
 
@@ -118930,7 +119218,7 @@ mod tests {
         {
             let alloc_mutex = fs.btrfs_alloc_state.as_ref().unwrap();
             let mut alloc = alloc_mutex.write();
-            fs.btrfs_clone_file_data(&mut alloc, src_canon, dst_canon)
+            fs.btrfs_clone_file_data(&cx, &mut alloc, src_canon, dst_canon)
                 .expect("reflink src into dst");
         }
 
