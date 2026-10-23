@@ -5481,19 +5481,19 @@ authority explicitly, even when the underlying device object can write.
   by either branch's merge proposal. No pull/import/DB repair performed.
 - [x] Check and reserve the full incoming merge surface plus facade/architecture
   paths; no foreign lease conflicts. Existing four consumer/doc/TODO leases held.
-- [ ] Checkpoint only validated FAT formatting and existing granular task notes,
+- [x] Checkpoint only validated FAT formatting and existing granular task notes,
   preserving every other path/index entry. Keep its maintenance credit separate
   from capability work; reader/docs already have exact-source evidence.
-- [ ] Merge origin/main without force/reset/stash/deletion. Resolve core's
+- [x] Merge origin/main without force/reset/stash/deletion. Resolve core's
   auxiliary handle parameters together with incoming write_authority. Add an
   explicit VolumeAccess argument to from_devices; use ReadOnly in public facade
   and its read tests. Share read-only option validation with the path constructor.
   Preserve explicit writable from_device/open_read_write and inherited authority.
-- [ ] Add focused non-tautological authority controls using a writable memory
+- [x] Add focused non-tautological authority controls using a writable memory
   device: read-only handle admission cannot later enable writes, cannot create
   metadata WALs or repair state, and selected recovery does not touch backing.
   Preserve all incoming/native positive and negative tests; no gate relaxation.
-- [ ] Update actual public constructor contract in README/architecture in place.
+- [x] Update actual public constructor contract in README/architecture in place.
 - [ ] Freeze integrated source; run strict-remote workspace fmt/check/Clippy,
   relevant core/facade/FAT/ZFS tests and full harness/conformance gates. Inspect
   every failure; no source/cache/resource/slot/deadline bypass or quiet credit.
@@ -5504,7 +5504,742 @@ authority explicitly, even when the underlying device object can write.
   gates, current Bead evidence/cycles/flush and guarded main publication where
   accepted. Retain all histories and peer work; no force, deletion or false close.
 
+Integration source outcome and running-gate boundary:
+- Checkpoint3e79e4a1f849be97be71fa403d2a889f7c277fac records only the three
+  validated formatting files and accumulated task notes. Actual merge found one
+  extra FAT formatting/cache conflict beyond the virtual pre-checkpoint merge:
+  retain incoming readonly_fiemap and the identical formatted immutable_cache,
+  removing only conflict markers/duplicated identical method text. No file lost.
+- Core now accepts explicit VolumeAccess in from_devices, re-exported through
+  core/facade; shared read_only_options guards both path and handle admission.
+  All constructor sites updated, including facadeReadOnly and two auxiliary
+  tests. Explicit single-device from_device/open_read_write keep true authority;
+  nested views inherit parent authority and admitted handles. Added one writable-
+  memory recovery test with separate byte-exact overlay/persistent controls,
+  expanded four mutation-option refusals and nested repair/write-enable refusals.
+  Snapshot helper reused rather than dereferencing the stdMutex Result directly;
+  caught in fresh source review before compiler execution, not suppressed.
+- Shared maintainer committed integrated source as1e1da7ce0,71c5d90af,e7edd87ba,
+  05292f5366c8cc26075ebc558e24b252e1478d52. Main now has origin370aa96b3 asancestor;
+  tracked Rust is clean. Commit/source publication is not compiler/runtime proof.
+  Current coreSHA66a18f3462853d3c7f61a0d76694da91cb0fd023731d0dc68f743726a4cee8b2,
+  facadeNativeSHA5e72b56e94ac4964aa08cfc24467dbd417d7990bca3ed36c53916ca2e7d3f290.
+- Source3e79+25explicitoverlays fingerprint970a61d0948b0cdcc1530abed7ca660c348beb4bd702832f2a2e5099b73c2fff
+  first check72367 ontrj returnedSSH255/unconfirmed. Exact recovery reconciled
+  original wrapper3112aa1e-5979-4ffa-8830-782eaaaf74c4 to255/ACKtrue/sourcesreleased;
+  no pass/replay/cancel credit, no daemon restart/lock clearing. Subsequent normal
+  autoscheduled check is executing onts1. trjfmt103/missing_runtime andovh-bfmt
+  103/estimated4cores>3slots were admission refusals; auto fmt then103queue_timeout.
+  No local fallback or resource/capacity/RCH_BUILD_SLOTS override. A new exact-
+  commit formatter declares CARGO_BUILD_JOBS=1 for its actual serial formatting
+  operation; all Cargo/source/host admission remains enabled, no style skip.
+- Focused core/nativeUBS0/0critical/14413warnings/3051info; Cargo phases explicitly
+  not evaluated in targeted shadow scan. Current committed-source Clippy and
+  selected core/facade/FAT/ZFS tests are active, not passes. Initial no-overlay
+  selection omitted mandatory --no-overlay and was refusedE504 before admission;
+  corrected explicit --base05292 --clean-overlay --no-overlay. Source gates and
+  actual integrated ELF/native probes are still required before qualification.
+
 - [ ] Complete final original-Bead evidence comment, staged cycles/flush/readback,
   bounded honesty disposition and release four named reservations. Original
   scanner/status, native external-journal crash/broader topology and canonical
   owning-engine WAL recovery criteria remain explicit and open.
+
+Integration verification continuation (2026-10-23, exact source boundaries):
+- [x] Read back terminal acknowledgements for integrated snapshot check72387
+  (base3e79 +25 overlays, exit0) and committed05292 fmt72406 (exit0), both
+  acknowledged with source/pair release. Do not promote the earlier snapshot
+  check to an exact-commit receipt without a matching source manifest.
+- [x] Inspect strict Clippy72399 exit101: two decimal bitwise literals in the
+  incoming rename-exchange adversarial test. Manually use0x16/0x20 instead of
+  decimal22/32; values and all positive/negative assertions remain identical.
+  No lint allowance, expectation change, ignored test or golden regeneration.
+- [x] Preserve the old A8 Linux reader in an exclusively-created local gzip;
+  decompressed SHA equals a8f0569755461160d1409dbe9fd4deba5cb47724074272c88789fdfef0809ef7.
+  Native fixture copy and all old receipts also remain retained.
+- [x] Diagnose widened UBS exit2 as partial AST output above16MiB; retain raw
+  failure. Disjoint unchanged-rule scans complete: core2files0critical,
+  btree4files1critical, CLI2files7critical, transport8files93critical,
+  FAT4files3critical, ZFS5files4critical. These are108 findings, not a clean
+  scanner gate. Detailed text scans retain all rules and their exit1 results.
+- [x] Finish bounded author scanner disposition: preserve external test-module
+  write/sync/payload tripwires, inspect33 constant Python scripts and their argv,
+  fixed-command/current-executable callers, and production benchmark error paths.
+  The btrfs prefetch-pool initialization panic is a real resource-failure path,
+  distinct from test assertions. Do not suppress or call every finding noise.
+  All33 matches and launchers reviewed below; independent broader disposition
+  remains an original open obligation.
+- [ ] Await the optional independent-review-agent authorization already asked;
+  continue solo implementation and verification meanwhile. Elapsed time is not
+  permission and agreement would not substitute for runtime execution.
+- [ ] Finish check/strict Clippy/build on base05292 plus only the ZFS literal
+  fix (overlay fingerprint d0e3e0d8e641ebf4df456702d8bedf69c4ffcf77f101347a26aec036a76ebf02),
+  finish original core/facade/FAT/ZFS tests72398, then qualify affected remaining
+  CLI/harness/btrfs/ondisk/FUSE execution. The first fixed Clippy attempt onhz2
+  was refused103 for measured critical memory pressure; no pressure bypass.
+- [x] Reconcile fixed Clippy72426 ontrj after RCH_SCOPED_COMPLETION_UNCONFIRMED
+  before replay; pending check still awaits that source authority. Do not kill
+  peers, remove locks, restart daemons, count quiet output or replay active work.
+  Supported recovery reached255/ACK/source release as recorded below; not a pass.
+- [x] Deliver and execute the new integrated ELF/native probes only after
+  successful build and SHA readback. Earlier A8 native passes remain scoped to
+  their earlier source. Publication and original-Bead closure remain pending.
+  Final4e170b64 ELF and all seven probe scopes/readbacks completed below.
+
+Fresh-review production correction:
+- [x] Fix the btrfs prefetch initialization panic rather than suppressing the
+  scanner rule: retain an optional pool and use ordered serial child reads if
+  thread creation fails. Existing successful pool, fan-out threshold, key order,
+  duplicate/cycle checks, provider failures and tree finalization stay intact.
+  The failed initialization is cached for this process to avoid retry churn;
+  throughput under resource pressure may be lower, with no speedup claim.
+- [x] Add an inline deterministic failed-spawn test exercising ordered child
+  fetch with an error between two successful nodes, retained node identity and
+  zero provider calls for empty input. This is unit fault-injection evidence,
+  not live OS resource-exhaustion proof; the 487-test suite below executed it.
+- [x] Scan both newly edited files with unchanged UBS rules: exit0,0critical,
+  3379warnings,389info. Preserve every test panic, assertion and gate. This
+  focused result does not dispose of the remaining broad-source findings.
+- [ ] Finish new source-bound fmt/check/strict Clippy/runtime/native receipts
+  for base05292 plus both btrfs/lib.rs and ZFS zil_records.rs. Do not attribute
+  either the earlier single-overlay build or original05292 tests to this source.
+- [x] Recover fixed Clippy72426 terminal result255/ACKtrue through its own RCH
+  wrapper after unconfirmed SSH completion. No pass, no lock removal/restart.
+  Existing check wrapper performs its managed remote retry; do not duplicate it.
+
+Source and scope corrections after the fresh pass:
+- [x] Test the actual optional-pool initialization function with a failing Rayon
+  spawn handler and verify a cached failure never invokes a second builder.
+  Source9ce1f6cf767b4d7c8b17697486b6efa23f09dc54dc060da809529037ac12808a
+  includes that stronger test. Later manual formatting only wraps its iterator
+  assertion; current btrfsSHA0e9f186d1417f3c034843e694b2d12acd5e535190f30ad43da6129ada5f11992.
+  ZFS literal-fix SHAe7139e66faaa7a6903516954864edc2dd36c95564798493fb96935c748ab961f.
+  Local read-only rustfmt first reported that layout then passed after the
+  manual edit. This is static formatting evidence, not a remote Cargo receipt.
+- [x] Final two-file scanner at9ce exits0/0critical/3380warnings/389info. The
+  added warning is the retained test-only no-retry tripwire, not a suppression.
+- [x] Re-read original staged Bead description: its positive goal is reusable
+  engine crates, unified ambiguity-checked read-only FsOps, explicit native write
+  authority. No formal acceptance_criteria field exists. Original remains open
+  while its gates finish; distinguish separately accumulated project-wide native
+  writer/crash/topology and canonical tracker recovery obligations without
+  dropping any of them or calling the project complete.
+- [x] Re-read anti-ceremony skill's explicit solo exception: with no independent
+  verifier available, re-execute in a fresh pass against original criteria and
+  disclose the absence of independent verification. Optional review-agent
+  authorization is not a prerequisite to continue. Prior full-review request
+  remains recorded; no self-review will be called independent verification.
+- [x] Verify the historical protected-mount Deref panic is already removed in
+  current93b8ca751 source: explicit as_ops and periodic-commit variant dispatch
+  remain. Do not carry a historical defect forward as a current finding.
+- [x] Preserve successful pre-fallback integrated ELF65a3fb96d6a942b3725df860c55d30229f308486331926d2cca053d9f681fe44
+  in an exclusively-created gzip and verify its decompressed hash. Build72428
+  exits0/ACKtrue/source+pairreleased; it is not the latest fallback-source ELF.
+- [ ] Finish final exact-source btrfs tests72447, Clippy and native-reader build
+  on warmedts1, full harness and required benchmark onovh-b under normal gates.
+  Current two-file source manifest, each actual RCH overlay fingerprint and
+  command output decide scope; the initial check/Clippy driver's manifest was
+  captured before the stronger initialization test and cannot bind later steps.
+- [ ] Finish workspace Cargo fmt when admitted. trjfmt72441 recovered255/ACKtrue;
+  ovh-b refused103 because fmt estimates4cores versus3total, and ts1 request
+  timed out103. CARGO_BUILD_JOBS=1 did not reduce that estimate; no slot/pressure
+  override or local Cargo. Read-only `rch admit` classifies fmt non-compilation;
+  that is a diagnostic result, not formatting execution or a pass.
+- [x] Reconcile obsolete single-overlay check72431. Its own cooperative cancel
+  returned1/E504/unconfirmed, retaining reservations; recover returned only
+  recover_requested. Later jobs readback0733 records build72431 exit0 with
+  terminal ACK and source/pair released. This qualifies its old source only.
+  Preserve peer jobs and all source locks; do not restart or clear anything.
+
+Full-suite findings and targeted product corrections (2026-10-23):
+- [x] Inspect the entire live baseline transcript for failures, not only its
+  latest output. Facade42passed/1existingignore and reader14passed completed;
+  new declared-device-access recovery/authority test passed. Core has two real
+  failures: btrfs_prealloc_alias_writes_fail_unchanged_when_full (exclusive write
+  after removing alias returnsNoSpace) and btrfs_reflink_splits_preallocation_on_a_full_filesystem
+  (reference-only clone returnsNoSpace). Baseline05292 is RED; no broad pass.
+- [x] Trace the product's coarse ENOSPC latch. It classified every write and
+  reflink as space-consuming before inspecting whether it could reuse storage.
+  Move refusal to the existing data-reservation helper; keep create/fallocate/
+  xattr/etc early refusals, shared-preallocation COW, and hard commit/read-only
+  refusal intact. Inline clones preflight the latch before removing mappings.
+- [x] Add a planted-latch unit regression with actual FsOps calls: fresh regular
+  writes and inline clones fail without changing a KEEP_SIZE reservation or
+  existing payload; exclusive PREALLOC write and reference-only clone succeed
+  with unchanged free space; hard commit refusal still rejects reuse asReadOnly.
+  Original two failing tests and all their assertions are unchanged.
+- [x] Execute this correction and the original failing cases before claiming
+  it fixed. Frozen current coreSHAcc7b42c6838d0626247937eaab27930b71c48c9c920de0e0dca4021262c36bd6,
+  btrfs0e9f186d1417f3c034843e694b2d12acd5e535190f30ad43da6129ada5f11992,
+  ZFSe7139e66faaa7a6903516954864edc2dd36c95564798493fb96935c748ab961f.
+  Sequential ts1 driver37122 runs core-prealloc/core-latched/core-reflink/
+  core-pressure on base05292 plus exactly those three overlays; compilation is
+  completed14 tests, all passed. Frozen final source below adds the separately
+  reproduced inline-write/inline-clone corrections; do not reuse old receipts.
+- [x] Current full-workspace formatting command through the ordinary Cargo
+  shim, RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=summary cargo fmt --all --check,
+  exits0. It follows the shim's non-compilation path, with no remote-execution
+  claim or local compilation. Parent rules require heavy builds remote; earlier
+  all-Cargo-remote phrasing was broader than that rule. No shim/admission bypass.
+- [x] Current core-only UBS exits0/0critical/14435warnings/3051info, and the two
+  support files exit0/0critical/3380warnings/389info. Dynamic Python argv assembly
+  was blocked before scanner execution by DCG's unverified-argv rule; dcg explain
+  reportsALLOW, then fixed literal scanner argv with shell noclobber runs through
+  the normal guard. No allow-once, suppression, partial profile or guard override.
+- [x] Actual optional-pool initialization source9ce btrfs unit suite passes
+  487active/0fail/1existingignore, including failed initialization/no-retry/error
+  ordering. RCH72447 exits0/ACKtrue/source+pairreleased; overlay80f11fceca6ca34645d4169677583492d9a1193532a790250832861a0817ef84.
+  Later assertion formatting changes only whitespace; do not label this current
+  three-file core-fix runtime proof. Initial pool-only check72443 passes a prior
+  source; delayed Clippy72449 refuses changed input, and build72453 refuses an
+  unfinished paired owner. Both refused103 and are acknowledged/released, with
+  no source/cache/target reuse override. Source churn during queued validation
+  was avoidable and is disclosed, not a successful gate.
+- [x] Full harness old-core run72458 executes2077selected:2072passed/4failed/
+  1existingignore, exit101. Four provenance gates fail; explicit errors include
+  cannot bind execution to a Git revision. Clean-overlay archive execution lacks
+  the real Git context required by SourceIdentity. No gate code/assertion edits.
+  Benchmark driver stops after the failed harness; no benchmark execution credit.
+- [ ] After final source fixes, rerun the unchanged full harness from the actual
+  Git checkout using RCH --source-content-receipt and existing git-bound config
+  (which preserves real.git metadata). Keep the snapshot/dirty digest frozen
+  and inspect any byte-barrier failure; never manufacture Git identity or relax
+  source binding. Complete required benchmark separately on the final source.
+- [x] Reconcile supported cancellation of the known-red original core run72398
+  (wrappercd033589-6427-4674-8abb-a535c4cd240c). Retain its two failures and mark
+  unfinished cases unrun; cancellation is not success. Isolated baseline probes
+  initially refused103/no_free_slots; no pressure/capacity bypass or test edits.
+  Wrapper retried the terminated obsolete run on trj and hz3 before exhausting
+  its third attempt. Final143/terminalACK/source+pairreleased confirmed0733.
+- [x] Fresh source review also identifies an unexecuted risk in the existing
+  unlatched INLINE clone path: destination mappings are removed before fresh
+  inline-copy data is reserved. Add a focused true allocator-ENOSPC preservation
+  regression and reserve before carving if it reproduces. Do not hide this by
+  the new latch preflight or claim IO/crash atomicity from the latch regression.
+  Also preserve old latch refusal for inline writes explicitly when narrowing
+  regular-write admission; verify this before publishing the product correction.
+
+Final ENOSPC/fallback candidate qualification (2026-10-23, 07:38 UTC):
+- [x] Execute planted inline-write red: build72504 exits101 because a latched
+  fresh inline write returned Ok(3). Restore the product's allocation refusal
+  before changing inline extent metadata. Red log:
+  main-integration-inline-red-btrfs_latched_enospc_allows_reuse_but_preserves_allocation_refusals-20261023T0651.log.
+- [x] Execute true allocator-exhaustion inline-clone red: build72505 exits101,
+  destination extent list becomes[] instead of its retained regular extent
+  after ENOSPC. Positive free-space profile passes before the failing profile.
+  Red log: main-integration-inline-data-red-vmi-20261023T0655.log.
+- [x] Fix allocation order: prepare padding/conversions and reserve inline-copy
+  storage before carving destination mappings; release unpublished reservations
+  on error. Preserve reference-only clones, sparse zeros, shared PREALLOC COW,
+  hard commit refusal, and prior create/fallocate/xattr refusals. Scope is data
+  allocator ENOSPC preservation, not general I/O or crash atomicity.
+- [x] Freeze base05292f5366c8cc26075ebc558e24b252e1478d52 plus exactly three
+  overlays: core2574024ae2547fde29e66927568ccf37cdcd392d5fecf0ebd8d5e87ae3f94231,
+  btrfs0e9f186d1417f3c034843e694b2d12acd5e535190f30ad43da6129ada5f11992,
+  ZFSe7139e66faaa7a6903516954864edc2dd36c95564798493fb96935c748ab961f.
+  RCH fingerprint768ecdc71939af9bdd7f4c61b7b50846d98b1d5d2cd2d67a0a49ad58a8973a58.
+- [x] Current workspace/all-target check72509, strict Clippy72512 and Linux
+  reader build72514 all exit0; jobs0733 records terminalACK/source+pairreleased
+  for all three. Logs: main-integration-complete-auto-{check,clippy,build}-20261023T0708.log.
+- [x] Current core btrfs_ run:545passed/0failed/10existing ignores;
+  clone_file_:10passed; declared-device authority:1passed; read-only option
+  refusal:1passed. Both new ENOSPC tests pass. Logs:
+  main-integration-complete-core-ts1-*-20261023T0723.log. Their jobs readback
+  records terminalACK/source+pairreleased. Count filters separately, not as
+  disjoint additional coverage.
+- [x] Current focused UBS core:0critical/14454warnings/3056info; support two
+  files:0critical/3380warnings/389info, both exit0. Keep broad-source unresolved
+  findings explicit; these focused scans do not establish workspace cleanliness.
+- [x] Current normal-shim cargo fmt --all --check exits0 (non-compilation path).
+- [x] Deliver final ELF4e170b64e22d226426304298b10e4be6c72a1b0dda0ef4ea67f930dd71cff775
+  (590376552bytes) to a new exclusively-created CSD file. Local and destination
+  hashes match; no previous binary replaced. Delivery log:
+  main-integration-complete-delivery-20261023T0733.log.
+- [x] Finish full relevant library/example suite on frozen final overlays:
+  ffs-core, ffs, ffs-fat, ffs-zfs, ffs-btrfs; current RCH driver96833/log
+  main-integration-complete-libraries-20261023T0734.log. Read complete results,
+  ignores/native soft-skips and terminal ACK/source release before claiming pass.
+  Completed42facade/14example/487btrfs/1543core/535FAT/333ZFS reportedpasses,
+  0failures/26existing ignores, with2optional Btrfs fixture soft-skips separately
+  retained. Build72528 exits0/ACKtrue/source+pairreleased. This535-test FAT run
+  is current integrated-source execution, not the earlier452/515-test source cuts.
+- [ ] Finish real-Git full harness on vmi1156319 and required benchmark. Earlier
+  ts1 live-checkout guard refused the same normal-transfer approach; preserve
+  refusal and route to a pure build worker without modifying guard/markers.
+  Current source-content pair has real Git and is executing unchanged gates.
+- [x] Finish current-ELF ZFS117, Btrfs aux155 then root91, and six-format20-mount
+  probes; verify full denominators, statuses, bytes, controls, daemon exits and
+  zero owned mounts. Retained native inputs are not fresh format production.
+- [x] Complete solo fresh-pass audit against the original acceptance scope;
+  preserve project-wide tracker/native-writer/crash/topology obligations and
+  unresolved broader scanner findings. No independent verification claimed.
+  Bounded honesty/real-work disposition and actual re-execution follow below.
+- [ ] Recheck exact source closure/HEAD, stage only owned paths, commit qualified
+  product fixes and tests together, publish main and synchronize legacy branch
+  without force. Record exact revision and limitations, update Bead evidence,
+  flush staged tracker, verify cycles remain empty, and release owned leases.
+
+Final ELF native readback, 2026-10-23:
+- [x] ZFS result /tmp/public-zfs-members-0bu41iyl/result.json:117CLI,
+  86zero/27expectedone/4expectedtwo,12mounts/12daemon0,50offline+48mounted
+  comparisons,31negative commands,16controls unchanged and rehashed,0mounts.
+  Same freshly produced native mirror retained earlier this turn, no new pool
+  production in this rerun; no write/import/RAIDZ/crash qualification.
+- [x] Btrfs auxiliary result /tmp/native-btrfs-aux-r4d_et13/result.json:
+  155CLI,144zero/11expectedone,6mounts/6daemon0,192byte comparisons,
+  30inventory ioctls/30EROFS/12retained locks,13controls rehashed,0mounts.
+- [x] Btrfs roots result /tmp/btrfs-root-selection-4cwzv7ma/result.json:
+  91CLI,64zero/24expectedone/3expectedtwo,10mounts/10daemon0,82byte
+  comparisons,27negative commands,20root/40inventory ioctls,20EROFS/
+  18retained locks,19controls rehashed,0mounts. Native root oracle0.
+- [x] Six-format mount result /tmp/public-facade-mounts-ug5ee1zu/result.json:
+  20mounts/20daemon0,56files/236byte comparisons,20EROFS/20ENOENT,
+  6negative commands,47controls rehashed,0mounts. Fresh readback checks
+  each Run command JSON's actual/expected returncode, not nonexistent status
+  files; daemon status files and per-case unmount fields checked separately.
+- [x] Ext4 auxiliary /tmp/auxiliary-consumer-6vi6zbl9/result.json:
+  73CLI,63zero/7expectedone/3expectedtwo,48retained-native byte comparisons,
+  7constructed replay stats/10negatives,17controls rehashed. Native device-header
+  layout /tmp/native-journal-layout-xvlderll/result.json:16CLI (6zero/10one),
+  1mount/replayed stat/EROFS/lock refusal/daemon0,17controls unchanged. Journal
+  fixtures are constructed; neither run establishes native crash replay.
+- [x] NTFS /data/ssd/tmp/ntfs-facade-indexed-mp7dwtl6/result.json:
+  328public+43fresh native-tool calls,309byte comparisons/32expected failures,
+  strict/indexed/plain/bounded/compressed views and32extension named streams,
+  51controls rehashed. All371 Run command JSON records checked for completed
+  status and exact expected returncode. No fresh image producer in this rerun.
+- [x] Retain fresh author native readbacks in main-integration-complete-native-
+  readback-20261023T0744.json and native-command-readback-20261023T0748.json.
+  Their stderr files are empty; results are author execution, not independent
+  approval. Common scenarios across these probes count once, not as added
+  independent evidence or whole-format parity percentages.
+- [x] Investigate full-harness vmi1156319 SSH255. Supported own-job recovery
+  confirms execution ended without completion receipt, then fails to persist
+  source cancellation with printf I/O error. Worker reports0.89GiB free/critical.
+  No success/ACK/source-release claim; keep wrapperac974128 ownership and failure
+  visible. No cleanup, marker edits, daemon restart, deadline or disk override.
+- [ ] Finish a fresh same-source full harness on healthy trj, whose absence of
+  /etc/rch/live-checkouts was verified read-only using its configured SSH key.
+  Ordinary --source-content-receipt transfer retains genuine Git metadata and
+  normal admission. Driver97842/log main-integration-real-git-trj-harness-
+  20261023T0747.log; benchmark runs only after actual harness success.
+- [x] Complete current NTFS library and engine/facade doctests as well as the
+  active broader library suite. The first extra NTFS submission shares the
+  active TS1 source pair; preserve any ownership refusal and serialize a later
+  admitted attempt rather than bypassing its source guard.
+  Completed360 NTFS tests and two compiled doctests; final ACK readback below.
+- [x] Re-read final product diffs: allocation/refusal lock order remains alloc
+  then retry, as in pressure commit; serial prefetch retains ordered results and
+  error slots; sector geometry comes from validated native geometry. Existing
+  partial I/O/metadata failure paths do not become crash-atomic through this
+  bounded allocator-ENOSPC correction. No unrelated feature expansion.
+- [x] Staged tracker cycles remain0 and flush-only reports nothing to export.
+  Canonical tracker WAL/schema recovery remains separate and untouched.
+- [x] Current broad library run completed facade42passed/1existingignore,
+  reader14passed and btrfs487reportedpassed/1existingignore. Btrfs output includes
+  two pre-existing optional-native-fixture soft-skips (missing /data/tmp/probe_xfs/
+  btrfs.img and /data/tmp/ffs-pgo-train.img); those paths are not native proof.
+  The new failed-pool test actually executed and passed. Core/FAT/ZFS remainder
+  and final job ACK still pending; no whole-driver pass yet.
+- [x] Finish bounded author source triage of all33 interpreter matches using
+  the installed, unchanged UBS AST patterns:15 direct .arg(-c).arg(script) and
+  18two-element .args([-c,script]) sites. Of these13 use literal/constant Python
+  source and20 use formatted quoted-string/numeric substitutions. Read every
+  matched launcher and source-building expression; data in the literal scripts
+  travels through argv/current_dir. Test fixture strings are controlled, not
+  arbitrary production request code. The generic timeout wrapper and longer
+  argv forms were inspected separately, not counted as extra scanner matches.
+  AST locations retained in main-integration-python-{direct,array}-20261023T0805.json.
+  No scanner/gate/test changes, clean broad-scan or independent approval claim.
+- [x] Recheck CLI nonce/current-exe contexts: nonce names a new create_new file,
+  not an authentication secret; child paths originate in current_exe and the
+  child in-process hash is compared with its parent. The two CLI create-benchmark
+  panics deliberately fail a scoped worker/measurement on create errors; do not
+  silently relax those benchmark failure paths. Transport panics are in external
+  test helpers; FAT/ZFS tripwires reject unwanted fixture I/O. No production
+  imports of those external integration sources found. Retain broad scanner
+  nonzero output and its original separate disposition obligation.
+- [x] Full final-overlay core suite now completes1543passed/0failed/24existing
+  ignores in2213.80s, including native ext4 repair/freshness and all Btrfs fixes.
+  Facade42/1ignore, example14 and Btrfs487/1ignore already passed in that driver;
+  FAT535 and ZFS remain active/pending before its final ACK.
+- [x] Real-Git trj harness72531 finishes every test/doctest with0 failures,
+  including2compile-contract tests and both real/planted-red public parity runs.
+  Its overall source-content invocation FAILS after execution: postflight rsync
+  detects exactly1delta, .git/index. Original transcript retained. Supported
+  jobs recover returns delivery0/ACKtrue/source+pairreleased, but does not erase
+  the failed integrity barrier or qualify a clean source-content receipt.
+  No benchmark ran from that failed sequential driver. Source/test success and
+  source-byte/delivery success remain separate obligations (RH-2/RH-7).
+- [x] Investigate index refresh using installed harness/RCH source and official
+  Git documentation: status/diff inspection can refresh optional index caches;
+  Git documents GIT_OPTIONAL_LOCKS=0 to suppress optional writes without disabling
+  mandatory Git operations. No fake revision, index removal/exclusion, chmod,
+  barrier edit, allowlist, resource override or source suppression.
+- [x] Execute initial read-only-Git source probe and preserve its failure
+  through normal trj --source-content-receipt. Parent process uses
+  GIT_OPTIONAL_LOCKS=0; ordinary Cargo env.GIT_OPTIONAL_LOCKS value0/force=true
+  passes the same read-only inspection policy to unmodified tests/children.
+  Driver68516, logs main-integration-readonly-git-{source-probe,harness,bench}-
+  20261023T0837.log. Local index hashes are captured before/after each invocation.
+  Keep local source/docs/index frozen and use --no-optional-locks for any Git
+  inspection. A recovered delivery0 is not a substitute for a clean final gate.
+  Probe failed on index refresh, so its sequential harness/benchmark did not run.
+  Corrected policy and full harness qualification are recorded below.
+- [x] Harness FUSE288reportedpasses include many existing soft-skip returns:
+  worker lacks mounted CLI proof inputs or permission to mount. Two conformance
+  cases also lack the optional ext4 golden image. Preserve all skips/ignores;
+  these reported counts are not mounted proof. Current CSD probes independently
+  executed48mount sessions on retained native inputs plus1constructed journal
+  view; all49daemon/unmount paths passed. Do not turn the worker's soft skips
+  into additional mounted coverage or claim native writable/crash acceptance.
+- [x] First read-only-Git probe (GIT_OPTIONAL_LOCKS alone) actually runs1test0
+  but still fails the unchanged postflight .git/index check. Local index hash
+  staysd369686e5b5e3193723e3a43fa2857eff1151e0cdc3a714ae23ec53bb9b9f137;
+  retained remote index differs in cache/stat bytes and mode, while local/remote
+  tracked entry rows have identical SHA25637ce53981941b18721acd98819a91dbb0cdeda2fecf277b23c7918c3c29567ed.
+  Recover8a658827 yields delivery0/ACK/released, not a qualified integrity gate.
+- [x] Reproduce remaining producer write in a newly created isolated Git fixture
+  /data/tmp/ffs-git-read-control-lq73p481 on trj: GIT_OPTIONAL_LOCKS=0 alone lets
+  Git diff refresh a cold index; diff.autoRefreshIndex=false leaves it untouched,
+  and a planted changed source still produces its exact nonempty diff. All6Git
+  commands0, no existing repo/config/index changed. This is a constructed Git
+  environment control, not native filesystem or independent product proof.
+- [x] Final no-refresh source probe runs1source-binding test0 and completes the
+  full RCH source-content invocation0 with unchanged local index. New driver27044
+  uses process/Cargo env for GIT_OPTIONAL_LOCKS=0 plus GIT_CONFIG_COUNT=1,
+  GIT_CONFIG_KEY_0=diff.autoRefreshIndex, GIT_CONFIG_VALUE_0=false; parent and worker
+  had no existing count to overwrite. No global config change or gate relaxation.
+  Log main-integration-no-refresh-source-probe-20261023T0844.log.
+- [x] Finish benchmark attempt under driver27044 (full same-policy harness
+  already passed below):
+  main-integration-no-refresh-{harness,bench}-20261023T0844.log. Keep source/docs/
+  index frozen; after-source byte checks and actual ACKs still decide qualification.
+  Remote timing execution0 but final FETCH_HEAD barrier failed; not a pass.
+  Pinned final benchmark19410 remains separately pending below.
+- [x] Final full harness19376 (wrappera815d66c) completes0 with source-content
+  postflight0, terminalACK and source+pairreleased. All29Rust groups report
+  2652passed/0failed/11existing ignores, including the compiled doctest. Keep
+  prerequisite soft-skips distinct as above. Local index remainsd369686e5b5e3193723e3a43fa2857eff1151e0cdc3a714ae23ec53bb9b9f137
+  before/after. Logs main-integration-no-refresh-harness-20261023T0844.log and
+  main-integration-jobs-20261023T0852.json. No repeated-run coverage/speedup credit.
+  Benchmark is now compiling normally; no benchmark result claimed yet.
+
+Bounded fresh-eyes honesty/real-work disposition for the three final fixes:
+- Scope: uncommitted differences from05292 in core/lib.rs, btrfs/lib.rs and
+  ZFS zil_records.rs, plus their actual test/native/RCH transcripts. Earlier
+  extraction/integration blocks retain their own inventories; no historical
+  audit is inferred from this bounded source review.
+- Creation gate for this TODO/evidence: no product branch reads it; consumer is
+  the user explicitly requesting a complete granular TODO. It gates this work
+  handoff and prevents the observed source-cut/unfinished-gate confusion. Retire
+  active entries when their actual checks finish; archive with their commit,
+  never delete evidence without permission. No separate process framework.
+- Inventory1 No (checked complete three-file diff: only new regressions and
+  value-equivalent ZFS literals; no existing assertion/ignore deleted or weakened).
+- Inventory2 No (checked real FsOps positive/exhausted profiles and real Rayon
+  builder failure; fault injection is explicitly unit/planted, not native proof).
+- Inventory3 No (checked changed path list: no golden/snapshot updates).
+- Inventory4 No (checked diff/config/source receipts: no validator/CI changes,
+  new lint allowance, cache/slot/source/disk/deadline override or local compiler).
+- Inventory5 No (checked production routing and allocator boundary; no fixture
+  identifier, demo success branch or changed success denominator).
+- Inventory6 No (checked actual nonzero selected counts in completed runs;
+  existing diagnostic ignores and unrun full suites stay explicit).
+- Inventory7 No (checked named raw command logs and delivery/ACK readbacks;
+  pending, refused,255,143 and101 attempts do not become passes).
+- Inventory8 No (checked each native report scope: current execution on retained
+  inputs vs earlier fresh producer, constructed journals vs actual native pools,
+  and author execution vs independent review remain distinguished).
+- Inventory9 Yes, avoidable execution churn warrants disclosure: a prior source
+  edit during queued validation caused legitimate byte-barrier refusal. Re-runs
+  then hit missing Git metadata, dual-role live-checkout refusal and disk/SSH
+  failure. Corrections: freeze candidate, carry actual Git on an ordinary admitted
+  worker, retain every failed attempt. This costs time and earns no capability
+  credit. No broad green/runtime/release declaration has been made.
+- Inventory10 No (checked stdout/stderr capture files, including empty readback
+  stderr; no suppressed diagnostic output used for success claims).
+- Inventory11 No (checked original Bead remainsin_progress; no follow-up task
+  closes it or carries away essential unmet acceptance).
+- Inventory12 No (checked canonical spec/gate diffs: no downward scope changes).
+- Inventory13-17 N/A for new delegation: this final fix block is solo; no new
+  agent, close, agent agreement or independent-verification credit. Earlier peer
+  source is covered by current executed engine/core/facade checks and native reads,
+  with remaining full-suite results pending rather than assumed.
+- Inventory18 No (checked frozen native probe assertions/denominators and named
+  Rust filters; overlaps/repeated runs are not added as independent coverage).
+- Inventory19 Explain before replay: source-churn and harness-worker selection
+  wasted time; preserve those failures, use the healthy worker normally and
+  freeze code. Source/metadata persistence on the full worker remains unresolved;
+  do not remove locks/restart services or call its harness passed.
+- Inventory20 Strongest bounded evidence: executed reds72504/72505 show the
+  inline refusal/data-loss defects, unchanged assertions now pass in the current
+  545-test btrfs core selection; current ELF passes actual native payload/FUSE/
+  lock/EROFS controls with rehashed input files. Commands/logs above are replayable.
+- Countermeasure RH-2/RH-5: native/constructed/unit classes and valid-root
+  admission controls stay explicit; RH-7: actual completion/ACK required before
+  closure; RH-11: no new governance machinery or redundant meta-tests. No new
+  reward-hacking defect found in the product/test diff; no independent review.
+- Real-work inventory: final source unit contains USER ENOSPC/data-preservation
+  and prefetch availability fixes; ENABLER equivalent ZFS notation enables strict
+  Clippy; PROCESS is this user-requested TODO/comment evidence. No new closes or
+  commits yet. Demonstration: failed clone preserves old destination/peer bytes,
+  exclusive reserved-space write/reference-only clone succeeds, current reader
+  mounts admitted native inputs read-only. Process omission would not change
+  runtime behavior. Actual consumers have executed the code; nothing speculative
+  was added. Oldest active user-facing item is this library/facade integration,
+  which is receiving the work rather than unrelated easy leaves. No close-heavy
+  pane, spec-only implementation substitute or acceptance-laundering follow-up.
+- Verdict: substantive product progress; keep remaining work limited to actual
+  qualification/publication and the original open obligations. Waiting and this
+  bookkeeping earn no additional capability credit.
+
+Final qualification continuation, 2026-10-23 09:30 UTC:
+- [x] Complete final-overlay facade/core/Btrfs/FAT/ZFS library and reader example
+  driver: 2954 reported passes, zero failures, 26 existing ignores. Wrapper
+  rchw-178eb6ed-1168-47e2-8e2a-dfe36c8f5aab has terminal ACK and source/pair
+  release. The two optional-fixture Btrfs soft-skips remain separate from native
+  proof. FAT535 and ZFS333 actually completed, not merely started.
+- [x] Complete NTFS360/0fail/0ignore and the facade/engine doctest driver with
+  two passing compiled doctests. Logs main-integration-complete-{ntfs,docs}-
+  20261023T0750.log; builds30075807208572532 and30077256843919405 both have
+  terminal ACK, exit0, and source/pair release. Together with the preceding
+  library driver this is3314 reported library/example passes, not independent
+  coverage or a replacement for the separate full harness.
+- [x] Full actual-Git harness19376 remains qualified:2652 reported passes,
+  zero failures,11existing ignores, final source-content check0 and terminal ACK.
+  The subsequent benchmark19385 ran all60 timing intervals with remote exit0,
+  but its source-content postflight FAILED because shared .git/FETCH_HEAD changed
+  at09:00:40UTC. Original log main-integration-no-refresh-bench-20261023T0844.log
+  is retained as failed qualification. Supported recovery returned delivery0,
+  ACK and release; it does not retroactively pass that source barrier.
+- [x] Recheck SBH20G: critical at3.208percent free. Do not make a local verification
+  clone or override storage admission. Both default benchmark targets,
+  metadata_parse and ondisk_parse, have no runtime Git provenance dependency;
+  the full harness does and already
+  passed using real Git. Use the ordinary pinned clean-overlay benchmark route.
+- [x] Finish benchmark19410, wrapperrchw-b20bc138-77cb-46f7-9f61-58ce46433ab2,
+  base05292f5366c8cc26075ebc558e24b252e1478d52 plus exactly the three frozen
+  qualified Rust overlays, fingerprint768ecdc71939af9bdd7f4c61b7b50846d98b1d5d2cd2d67a0a49ad58a8973a58.
+  Log main-integration-pinned-bench-20261023T0926.log. It is currently compiling
+  remotely on trj. Require actual completion, receipt, ACK and release; no
+  performance-win claim without a live incumbent in the same invocation.
+  Completed60timing intervals/remote0/clean-overlay receipt0/ACK/source+pairrelease
+  at09:56UTC,1843.4s total. This remains the pre-checksum-cleanup source cut.
+- [x] Re-read the complete final three-file diff plus allocation/emit/clone and
+  pressure-commit callers. Unpublished inline reservations release on pre-emission
+  failure; the existing aligned-emission helper owns its current extent. Existing
+  partial metadata/checksum/I/O failure behavior is not promoted to transactional
+  rollback. Lock order stays allocator then retry; no gate or assertion relaxed.
+- [ ] Finish fresh disjoint final UBS scans, then update the existing parity
+  execution notes, inspect exact source/HEAD/whitespace and preserve peer paths.
+- [ ] Commit this coherent code+regression unit with its evidence; publish through
+  the ordinary main/compatibility-branch path after remote ancestry inspection.
+  Keep the original Bead in_progress while original unmet obligations remain.
+- [ ] Final staged tracker comment/cycle/flush/readback and release only the owned
+  Mail reservations. Canonical tracker WAL/schema recovery, broader scanner
+  disposition and native writer/crash/topology obligations remain explicitly open.
+
+Canonical tracker recovery diagnosis during benchmark wait, 2026-10-23:
+- [x] Recheck canonical br ready: exit6/SYNC_CONFLICT, framed WAL refusal. Apply
+  the fixing-beads-problems skill only within the stronger owning-engine guard;
+  its generic rebuild/promote route does not apply to this framed WAL incident.
+- [x] Reserve beads.db*, .write.lock and issues.jsonl without conflicts. With the
+  existing workspace write lock held, preserve all seven present family/config/
+  JSONL files to exclusive frozen/trial directories outside the repository:
+  /Users/jemanuel/Library/Logs/frankenfs-verification/frankenfs-tracker-rehearsal-20261023-36xt7meg.
+  Verify matching before/after bytes, inode and mtime. Frozen copies mode0400;
+  no canonical DB/WAL/SHM/config/JSONL mutation or rebuild.
+- [x] Private fsqlite0.4.9 .dump exits1 before producing SQL: sqlite_master is
+  missing implicit autoindex slot1 for table issues. Stop the sequential private
+  rehearsal before checkpoint/quick-check/post-dump; none of those commands ran.
+  No live fsqlite opening/checkpoint is justified by this failed rehearsal.
+- [x] A separate fresh copy opened by /usr/bin/sqlite3 -readonly can enumerate
+  schema user_version4,635issues/368comments/824dependencies/0dirty_issues, but
+  PRAGMA quick_check reports many never-used pages rather than ok. Process exit0
+  is NOT a clean integrity result. This narrows the incident beyond only stale
+  WAL-index metadata; it does not certify the DB healthy or authorize repair.
+- [x] Preserve private diagnostic outputs/result JSON and all canonical hashes:
+  main1e327d51d43acd2967a1e71a29db9059cf823406abcbf039a87faf81b0ba59f1,
+  WAL6d4009e6ef95d77519482712d17b619c25b26c01ea06df9ad96e066e100d6c08,
+  SHMfd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb,
+  canonical JSONLe5d359ec158f3943d6784b166883d8be4e94cf57aba115cf409e9bc39bbb4e64.
+- [ ] Owning-engine/schema recovery remains open: obtain a successful private
+  logical-content/integrity rehearsal before any live transition. Do not delete,
+  replace, truncate, promote a JSONL rebuild, or copy a trial DB over live state.
+  Keep staged Beads authoritative for this work block and release the three
+  diagnostic-only reservations now; no tracker-fix or capability credit.
+
+Additional fresh-eyes cleanup mismatch (source review, not yet reproduced):
+- [x] Compare the old inline-copy segment writer with the newly reused aligned
+  extent emitter. The segment writer removes its mapping and frees its data
+  allocation if checksum registration fails. btrfs_emit_aligned_extent_at uses
+  a bare question-mark at that step despite promising failure cleanup, leaving
+  the newly inserted extent/back-reference allocated on that error path.
+- [x] Keep all source frozen through active benchmark19410 completion. Preserve
+  that run's exact source scope; it is not evidence for a later cleanup change.
+- [x] Add a focused actual-emitter regression with successful checksum control
+  and explicit injected checksum rejection; verify error, absent mapping/backref
+  and restored allocation accounting. Execute expected red before product fix.
+  Test btrfs_aligned_extent_checksum_failure_releases_reservation runs both
+  profiles. Red build30077256843919438 actually exits101: failed checksum
+  registration must not publish a file extent; positive profile completed first.
+  Log main-integration-checksum-red-20261023T0957.log; wrapper6f930bb5 has ACK,
+  source and pair released. Injected unsupported checksum is unit fault evidence,
+  not native corruption/crash proof. No assertion or prior gate weakened.
+- [x] Match the existing segment writer's checksum-error cleanup in the aligned
+  emitter, retaining the successful path and not claiming general I/O/crash
+  atomicity. Keep any partial-checksum-tree behavior outside this bounded fix.
+  Green selection passed in main-integration-checksum-green-20261023T1003.log;
+  the final full source gates below also completed successfully.
+- [x] Re-run substantive-code gates on the final new source, full core suite and
+  harness, benchmark, exact reader build and relevant native profiles. Unchanged
+  engine suites remain bound to their unchanged blobs, not relabeled new runs.
+- [ ] Publish only after that final correction is reviewable and qualified;
+  update the original staged Bead/TODO with all failures, actual counts and ACKs.
+
+Checksum cleanup final-source qualification, 2026-10-23 10:08 UTC:
+- [x] Green emitter regression actually passes1test/0fail,42.9s driver, build
+  30077256843919457/wrapper1d0c5acd, terminalACK/source+pairreleased. Successful
+  checksum control reads the written sector; explicit checksum rejection checks
+  absent file mapping, inline/keyed backrefs and restored block-group accounting.
+  No claim that arbitrary partial checksum-tree mutations or crash failures roll
+  back. Red19438 remains retained; original assertions are unchanged.
+- [x] Freeze final coreSHA80909707f88986728a5a0234af53aaa8c4a5d1584734a8dd60c1226ead4f6e5a
+  plus unchanged btrfs0e9f186d1417f3c034843e694b2d12acd5e535190f30ad43da6129ada5f11992
+  and ZFSe7139e66faaa7a6903516954864edc2dd36c95564798493fb96935c748ab961f,
+  on base05292; overlay421d75ff6ac394c5263949c512440db031e665fbfe32fbea000137b549144453.
+- [x] Workspace/all-target strict Clippy19461 exits0,211.8s, clean-overlay
+  receipt; formatting exits0 through the normal non-compilation shim. Final
+  focused UBS core0critical/14468warnings/3057info and two support files
+  0critical/3380warnings/389info, both complete/exit0. Broader findings stay open.
+- [x] Finish full core/facade library+reader examples on ts1, driver94726;
+  main-integration-checksum-final-core-facade-20261023T1008.log. Do not assume
+  a pass or a count until every selected case and terminal ACK completes.
+  Completed1600reportedpasses/0fail/25existing ignores: core1544/facade42/
+  example14. Driver1671.3s; terminalACK/source+pairreleased confirmed in
+  main-integration-checksum-final-readback-20261023T1039.json.
+- [x] Finish sequential trj workspace/all-target check, exact Linux reader
+  build,60case default benchmark, then real-Git full harness, driver35714;
+  main-integration-checksum-final-{check,build,bench,harness}-20261023T1008.log.
+  Run actual-Git harness after the build/benchmark submissions to limit our own
+  Git metadata churn. All parents retain temporary read-only Git policy; the
+  unmodified harness receives it via Cargo env configuration. No gate override.
+  All four stages exit0/ACK/source+pairreleased. Actual-Git harness19520 has
+  29Rust result groups:2652reportedpasses/0fail/11existing ignores,358.1s driver,
+  no source-barrier error. Existing prerequisite soft-skips remain as above.
+- [x] Deliver/hash new ELF to an exclusive CSD path, then execute six-format
+  read-only mount consumer using retained native inputs and existing bounded
+  images. CSD /tmp root is98percent full; avoid producing extra window images.
+  /data/ssd/tmp has199458560KiB available. No cleanup or storage bypass.
+- [x] Scope repeated tests to affected core/facade/helper and public reader.
+  Unchanged FAT535/NTFS360/ZFS333/Btrfs487 engine suites retain their earlier
+  source-cut proof, not relabeled final-source executions. Prior seven native
+  profile results remain tied to4e170b64 and the pre-cleanup source; the new
+  mounted reader result will name its own exact binary. No repeated coverage
+  or speedup credit. The full core suite includes required native-check/reopen
+  Btrfs tests with nonoptional btrfs-progs fixture/checker assertions.
+
+Final-reader native mount execution, 2026-10-23 10:18 UTC:
+- [x] Linux reader build19486 exits0/ACK/source+pairreleased; artifact590376760bytes,
+  SHA3d7a8e3825034f89908506f739180d6ec85258f088adcc612a1c0313711ae50c.
+  Exclusive CSD delivery /data/ssd/tmp/ffs-public-zfs-members-42o_tjmd/native-reader-3d7a8e382503-20261023T1013
+  has matching SHA/size and mode0500. Older4e170b64 consumer remains retained.
+- [x] Workspace/all-target check19478 exits0,128.8s, ACK/source+pairreleased.
+  Source is still frozen at core80909707/overlay421d75ff. Full core/facade and
+  benchmark19490 remain active; actual-Git harness waits for benchmark completion.
+- [x] Preserve failed native result /tmp/public-facade-mounts-qh1hleua/result.json
+  and log main-integration-checksum-native-facade-20261023T1014.log. I mistakenly
+  selected retained obsolete probefcbfc2ae, whose last negative uses a nonempty
+  mountpoint and masks its expected Format error. This exact setup issue and
+  already-corrected probea590 were documented earlier; avoidable version-selection
+  churn is disclosed. All20daemon/unmount records0 and retained sentinel verified;
+  negative6 fails its diagnostic assertion. Do NOT relabel it a passing gate.
+- [x] Use existing corrected SHAa59098ce7c381905ccb5b87b5ab77699e57dc3718c32ff495af3ee77be48ac04,
+  with an exclusive hash-verified CSD delivery. Exact diff changes only that last
+  case's setup input to an existing empty mountpoint; all diagnostics, exits,
+  counts and assertions are unchanged. No new gate edits or product changes.
+- [x] Corrected full current-ELF consumer exits0: /tmp/public-facade-mounts-k0vlc0am/result.json,
+  resultSHA8f6843bc2ee26f15e7629be5fd7feb55bb7d443a65eda03894aadd8c07fa46dc.
+  Actual20mounts/56files/236byte comparisons,20EROFS/20ENOENT/20ROstatfs,
+  six negative controls and47before/after input hashes. Log
+  main-integration-checksum-native-facade-correct-version-20261023T1017.log.
+  Retained native images/captured payloads, no fresh producer/writer/crash/field
+  claim and no repeated-run coverage credit. Failed obsolete run remains separate.
+- [x] Fresh author readback of all command/daemon records and current control
+  hashes; verify0owned mounts. This is author verification, not independent review.
+  main-integration-checksum-native-readback-20261023T1019.json confirms both
+  retained statuses separately:26completed commands (20zero/5one/1two),20daemon0,
+  47current hashes unchanged and0owned mounts for each. Correct probe has6typed
+  negatives; obsolete one has5and the masked final diagnostic. Readback stderr
+  is empty. No repeat-run mounted/byte-comparison coverage added.
+- [x] Fresh health probe of prior unacknowledged own RCH wrapperac974128 refuses
+  SSH255 before execution because178.18.254.243 has no verified host key. The
+  configured alias disables checking and uses /dev/null; retain strict checking
+  rather than use that alias. No worker command, trust/config/lock change or
+  completion claim. Previous disk failure remains historical; current storage
+  cannot be inferred. Leave supported recovery obligation visible for handoff.
+
+Final benchmark/legacy reachable-row evidence:
+- [x] Current benchmark19490 completes60timing intervals/remote0/clean-overlay
+  receipt/terminalACK/source+pairrelease,1206.1s total. It reports7historical
+  regressions,6historical improvements,29no-change and18within-noise comparisons.
+  Retain all60diagnostics; these historical self-comparisons are not a qualified
+  same-invocation incumbent win. No performance claim or baseline/gate change.
+- [x] Finish actual-Git full harness19520, wrapperbb398c03-89de-4870-ad42-880af3c784f9.
+  Final source-content postflight, terminalACK and source/pair release completed
+  with0. Core/facade19477 also completed0/ACK/released. Local index stayed
+  d369686e5b5e3193723e3a43fa2857eff1151e0cdc3a714ae23ec53bb9b9f137;
+  Rust hashes and canonical JSONL remain unchanged. No gate/test edits.
+- [x] Preserve reachable legacy tracker rows from the separate read-only private
+  SQLite copy. reachable-rows.sql exits0/empty stderr/endsCOMMIT, SHA
+  e3006432dcc623dfc05a82fc9f1888e149f745b15ec89047e6a465a54ff4f05a;
+  reachable-rows.json SHA26b5407f249b4099a375e2c53e56d69b01b0f85fad478eea55740335e4e884ee.
+  Both are under frankenfs-tracker-rehearsal-20261023-36xt7meg alongside the
+  frozen raw family.635reachable issues/368comments/824dependencies preserved.
+- [x] Compare reachable issue IDs with4323frozen canonical JSONL IDs:0reachable
+  DB-only IDs;35shared IDs have exact title/status differences. Do not choose a
+  winner, overwrite statuses or infer that every comment/hidden page is present
+  in JSONL. The existing non-ok quick_check and possible unreachable-page data
+  remain unresolved. This harvest is not a logical-integrity witness or live
+  promotion authority; canonical family remains untouched.
+
+Publication preparation and remaining original obligations, 2026-10-23:
+- [x] Finish bounded fresh-eyes review of every final Rust delta and its callers,
+  including reservation ordering, checksum-error ownership, hard commit refusal,
+  serial child order/error slots and cancellation/read-only boundaries. Four
+  substantive Btrfs corrections plus value-equivalent ZFS lint notation; no
+  compatibility layer, new dependency, golden regeneration or removed assertion.
+- [x] Correct stale unexecuted notes in FEATURE_PARITY.md for actual core/ZFS
+  runs; retain exact source cuts, existing ignores/soft-skips, historical benchmark
+  flags and author-only proof. No capability table/percentage/spec promise changed.
+- [x] Finish one final real-Git harness after that document update, because the
+  harness embeds FEATURE_PARITY.md. Log main-integration-checksum-parity-harness-
+  20261023T1042.log, driver4316. Rust source stays80909707/0e9/e713 unchanged.
+  No additional native/core/engine coverage credit from this document rerun.
+  Completed19523/wrapper6bfb911a:273.9s,2652reportedpasses/0fail/11existing
+  ignores, source-content postflight0, terminalACK/source+pairreleased.
+  FEATURE_PARITY SHA7734f2b5120e22a03f2633129e15c016865035659b7e5f8e368928d2f6b3819e;
+  Rust hashes unchanged. Receipt main-integration-checksum-parity-readback-
+  20261023T1049.json. This supersedes pending validation of the document asset.
+- [ ] Commit/publish exact owned Rust+test+parity+TODO paths after final receipt,
+  with no force, cleanup, history replacement or peer-path staging. This TODO is
+  frozen immediately before that Git action; its actual commit/push receipt and
+  reservation release are recorded afterward in the original Bead/Mail thread,
+  avoiding a self-referential bookkeeping commit.
+- [ ] Canonical owning-engine recovery: private fsqlite open fails, stock-SQLite
+  quick_check is non-ok, and reachable export has35shared title/status differences.
+  Preserve frozen raw family and reachable rows. Successful private integrity /
+  logical-content verification is required before any live transition.
+- [ ] Independent broader scanner/status disposition remains original open work.
+  Current three Rust files have complete0critical scans; that does not erase
+  retained wider scanner findings or supply independent acceptance.
+- [ ] Keep broader native writer/crash/topology qualification and the old own
+  unacknowledged worker recovery open. New source publication is reviewable code,
+  not whole-project release acceptance or a false close of this original Bead.
+- [x] Final audit delta: new cleanup has executed red/green and current full-core
+  proof; all seven completed Rust-source jobs have0/ACK/release. The final
+  document rerun also completed0/ACK/release as recorded above. Preserve failed source barriers,
+  failed workers and obsolete-probe version mistake. Existing corrected probe
+  retained every original assertion. Counters keep repeated/source-cut results
+  separate. No independent reviewer, gate waiver, new close or performance win.

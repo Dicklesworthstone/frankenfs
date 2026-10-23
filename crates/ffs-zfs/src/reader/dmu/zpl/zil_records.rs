@@ -338,7 +338,7 @@ mod tests {
                     assert!(verified(&cx, &bad, order).is_err());
                 }
             }
-            for kind in [22 | (1_u64 << 63), 22 | 32] {
+            for kind in [0x16 | (1_u64 << 63), 0x16 | 0x20] {
                 let mut bad = bytes.clone();
                 bad[..8].copy_from_slice(&order.encode(kind));
                 assert!(matches!(

@@ -31,16 +31,20 @@ const BTRFS_RANGE_PREFETCH_THREADS: usize = 16;
 /// before this gate). The deep-/wide-range walk that `bd-h6p3w` parallelized
 /// surfaces many children per node and stays on the parallel path.
 const BTRFS_PREFETCH_MIN_CHILDREN: usize = 2;
-static BTRFS_RANGE_PREFETCH_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static BTRFS_RANGE_PREFETCH_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
-fn btrfs_range_prefetch_pool() -> &'static rayon::ThreadPool {
-    BTRFS_RANGE_PREFETCH_POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(BTRFS_RANGE_PREFETCH_THREADS)
-            .thread_name(|idx| format!("ffs-btrfs-prefetch-{idx}"))
-            .build()
-            .unwrap_or_else(|err| panic!("failed to build btrfs range prefetch pool: {err}"))
+fn btrfs_range_prefetch_pool(
+    slot: &OnceLock<Option<rayon::ThreadPool>>,
+    build: impl FnOnce() -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
+) -> Option<&rayon::ThreadPool> {
+    slot.get_or_init(|| {
+        build()
+            .inspect_err(|error| {
+                warn!(%error, "btrfs prefetch pool unavailable; using serial reads");
+            })
+            .ok()
     })
+    .as_ref()
 }
 
 /// A single leaf item yielded by tree traversal: key + raw payload bytes.
@@ -2958,6 +2962,26 @@ struct BtrfsParallelTreeWalker<'a> {
     range: Option<(BtrfsKey, BtrfsKey)>,
 }
 
+fn fetch_btrfs_children(
+    node_provider: &(dyn Fn(u64) -> Result<Arc<BtrfsParsedNode>, ParseError> + Sync),
+    children: Vec<u64>,
+    pool: Option<&rayon::ThreadPool>,
+) -> Vec<(u64, Result<Arc<BtrfsParsedNode>, ParseError>)> {
+    if let Some(pool) = pool {
+        pool.install(|| {
+            children
+                .into_par_iter()
+                .map(|logical| (logical, node_provider(logical)))
+                .collect()
+        })
+    } else {
+        children
+            .into_iter()
+            .map(|logical| (logical, node_provider(logical)))
+            .collect()
+    }
+}
+
 impl BtrfsParallelTreeWalker<'_> {
     fn enter_node(&mut self, logical: u64) -> Result<u64, ParseError> {
         let nodesize_u64 = u64::from(self.nodesize);
@@ -3046,20 +3070,17 @@ impl BtrfsParallelTreeWalker<'_> {
                 // cost; otherwise fetch serially so narrow/point walks don't thrash
                 // the pool. Byte-identical: `into_par_iter` on a `Vec` + `collect`
                 // preserves index order, matching the serial `into_iter().map`.
-                let fetched: Vec<(u64, Result<Arc<BtrfsParsedNode>, ParseError>)> =
-                    if children.len() >= BTRFS_PREFETCH_MIN_CHILDREN {
-                        btrfs_range_prefetch_pool().install(|| {
-                            children
-                                .into_par_iter()
-                                .map(|logical| (logical, node_provider(logical)))
-                                .collect::<Vec<_>>()
-                        })
-                    } else {
-                        children
-                            .into_iter()
-                            .map(|logical| (logical, node_provider(logical)))
-                            .collect::<Vec<_>>()
-                    };
+                let pool = if children.len() >= BTRFS_PREFETCH_MIN_CHILDREN {
+                    btrfs_range_prefetch_pool(&BTRFS_RANGE_PREFETCH_POOL, || {
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(BTRFS_RANGE_PREFETCH_THREADS)
+                            .thread_name(|idx| format!("ffs-btrfs-prefetch-{idx}"))
+                            .build()
+                    })
+                } else {
+                    None
+                };
+                let fetched = fetch_btrfs_children(node_provider, children, pool);
                 for (logical, node) in fetched {
                     self.walk_loaded_node(logical, node)?;
                 }
@@ -14959,6 +14980,55 @@ mod tests {
                 assert_eq!(from_bytes, from_cache, "range [{lo:?},{hi:?})");
             }
         }
+    }
+
+    #[test]
+    fn unavailable_prefetch_pool_preserves_child_order_and_errors() {
+        let failed_pool = OnceLock::new();
+        let pool = btrfs_range_prefetch_pool(&failed_pool, || {
+            rayon::ThreadPoolBuilder::new()
+                .spawn_handler(|_| Err(std::io::Error::other("injected thread creation failure")))
+                .build()
+        });
+        assert!(pool.is_none());
+        assert!(
+            btrfs_range_prefetch_pool(&failed_pool, || panic!("retried failed initialization"))
+                .is_none()
+        );
+        let calls = std::sync::Mutex::new(Vec::new());
+        let node = Arc::new(BtrfsParsedNode::Internal { ptrs: Vec::new() });
+        let provider = |logical| {
+            calls.lock().unwrap().push(logical);
+            if logical == 20 {
+                Err(ParseError::InvalidField {
+                    field: "test child",
+                    reason: "injected read failure",
+                })
+            } else {
+                Ok(Arc::clone(&node))
+            }
+        };
+        let fetched = fetch_btrfs_children(&provider, vec![30, 20, 10], pool);
+        assert_eq!(*calls.lock().unwrap(), [30, 20, 10]);
+        assert_eq!(
+            fetched
+                .iter()
+                .map(|(logical, _)| *logical)
+                .collect::<Vec<_>>(),
+            [30, 20, 10]
+        );
+        assert!(Arc::ptr_eq(fetched[0].1.as_ref().unwrap(), &node));
+        assert!(matches!(
+            fetched[1].1,
+            Err(ParseError::InvalidField {
+                field: "test child",
+                reason: "injected read failure"
+            })
+        ));
+        assert!(Arc::ptr_eq(fetched[2].1.as_ref().unwrap(), &node));
+        calls.lock().unwrap().clear();
+        assert!(fetch_btrfs_children(&provider, Vec::new(), pool).is_empty());
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]

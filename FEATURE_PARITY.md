@@ -1,5 +1,34 @@
 # FEATURE_PARITY
 
+> **2026-10-23 merged-source qualification (`bd-native-image-library-s4tde`):**
+> on base `05292f536` plus Rust overlay `421d75ff`, workspace/all-target check,
+> strict Clippy and formatting passed. The core/facade/example run reported
+> 1,600 passes, zero failures and 25 existing ignores; the full genuine-Git
+> harness reported 2,652 passes, zero failures and 11 existing ignores with a
+> clean final source-content check. Harness prerequisite soft-skips remain
+> distinct from execution: its FUSE count does not establish mounted coverage.
+> The exact Linux reader `3d7a8e382503` separately passed 20 actual read-only
+> mounts over retained native ext4/btrfs/FAT16/FAT32/NTFS/ZFS inputs, including
+> 56 files, 236 byte comparisons, six negative controls and 47 unchanged hashed
+> controls. All 20 daemons exited zero and no owned mount remained. The default
+> benchmark executed 60 timing cases; historical comparisons flagged seven
+> regressions and six improvements, with no live-incumbent performance win
+> established. Full hashes, commands, failures, source cuts and acknowledgements
+> are recorded in `.beads/pending_tasks.md`. These are author-executed results;
+> independent scanner disposition, canonical tracker recovery and broader
+> native writer/crash/topology qualification remain open. No parity percentage
+> is promoted by these counts.
+
+> **Btrfs resource-failure corrections:** a failed prefetch-pool startup now
+> selects ordered serial reads. A latched commit ENOSPC permits exclusive
+> PREALLOC reuse and reference-only reflinks while fresh allocations still
+> refuse. Inline reflinks reserve copy storage before removing destination
+> mappings, preserving existing bytes on allocator ENOSPC. Checksum-registration
+> failure in the aligned emitter now removes its unpublished mapping and frees
+> its allocation/back-references. Executed red/green controls and the complete
+> core suite cover these corrections. General metadata, partial checksum-tree,
+> I/O and crash rollback are not established by this bounded cleanup.
+
 > **Btrfs same-file preallocation clone isolation:** in-place PREALLOC writes
 > now require every extent back-reference to match the root, inode and mapping
 > offset. Cloning an unwritten range elsewhere in the same file therefore takes
@@ -8,9 +37,9 @@
 > place. The existing public inode-ownership query is preserved alongside the
 > stricter mapping query. Regressions exercise inline and keyed back-references,
 > both write orders, full-disk failure preservation and native check/reopen.
-> These Rust tests are authored but unexecuted here because dependencies are
-> uncached and shared storage is exhausted; pinned formatting and whitespace
-> checks pass. Runtime and native-image acceptance remain pending execution.
+> These Rust tests passed in the 1,544-test core library run above, including
+> the nonoptional native `btrfs check` and reopen regression. This qualifies
+> those bounded image scenarios; broader native acceptance remains open.
 
 > **Btrfs preallocation survives range replacement at full capacity:** overwriting
 > part of a disk-backed PREALLOC extent now retains the surviving unwritten
@@ -19,9 +48,9 @@
 > Two new regressions cover actual one-sector ENOSPC, shared reservations,
 > reference accounting, unwritten FIEMAP flags, consuming exclusive remnants
 > in place, final-reference release, native `btrfs check` and reopen. These tests
-> are authored but unexecuted here because dependencies are uncached and shared
-> storage is exhausted. Pinned formatting and whitespace checks pass. This
-> addresses reservation splitting, not general metadata-allocation rollback.
+> passed in the current core library run, including the nonoptional native
+> checker/reopen regression. This addresses reservation splitting, not general
+> metadata-allocation rollback.
 
 > **Btrfs reflink destination preservation:** public `FICLONE` and
 > `FICLONERANGE` now share the same bounded range-clone behavior. A whole-source
@@ -33,8 +62,7 @@
 > Regression coverage captures the prior ARM CI size-mismatch sequence and adds
 > byte, reference-count, copy-on-write, preallocation and native-image checks.
 > The existing randomized reference model is unchanged. These Rust regressions
-> are authored but unexecuted here because local dependencies are uncached and
-> shared storage is exhausted; pinned formatting and whitespace checks pass.
+> passed in the current core library run, including native checker/reopen.
 > This does not claim general rollback safety for every Btrfs mutation failure.
 
 > **Atomic ext4 hard-link publication:** `ext4_link` now stages the source link
@@ -44,10 +72,9 @@
 > after publication. Three new regressions cover old snapshots, indexed growth,
 > duplicate names, failed orphan splices, retry, reopen and native `e2fsck` checks
 > on generated images; the existing tmpfile test also checks head and interior
-> splices each publish once. These Rust tests are authored but unexecuted here:
-> local Cargo cannot resolve uncached dependencies and shared storage is
-> exhausted. Exact pinned formatting and whitespace checks pass. This advances
-> the hard-link slice of `bd-9rutw`; the remaining namespace operations and its
+> splices each publish once. These Rust tests passed in the current core library
+> run. This advances the hard-link slice of `bd-9rutw`; the remaining namespace
+> operations and its
 > broader request-scope conversion stay open.
 
 > **Native ZFS atomic-exchange recovery:** `Zpl::replay_zil` now decodes native
@@ -56,10 +83,10 @@
 > cross-parent directory link accounting and both ancestry checks are enforced.
 > Five new regression functions cover native framing, both byte orders, both log
 > checksum layouts, claim boundaries, aliases, nonempty directories, repeated
-> replay and whole-view refusal. Exact pinned rustfmt and `git diff --check`
-> passed. Rust execution and native OpenZFS interchange remain unverified here:
-> local Cargo cannot resolve the uncached dependencies and shared storage is
-> exhausted. This advances `bd-ofjn7`; its broader recovery acceptance stays open.
+> replay and whole-view refusal. The 333-test ZFS library suite passed on the
+> preceding merged source cut; its ZFS source is unchanged in the final cut
+> above. Native OpenZFS interchange for atomic-exchange recovery remains
+> unverified. This advances `bd-ofjn7`; its broader recovery acceptance stays open.
 > See `docs/ZFS_ZIL_TOPOLOGY_PROFILE.md` for the operation contract.
 
 > Quantitative feature coverage tracking for FrankenFS.
