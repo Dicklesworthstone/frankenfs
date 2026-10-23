@@ -367,6 +367,22 @@
 > exercises the unchanged expected format refusal; all counts and assertions
 > remain. These are current mounted reads of retained native inputs and captured
 > payloads, with no fresh native producer or native oracle execution.
+>
+> **Public native btrfs auxiliary reads, 2026-10-23:** the same ELF `9e39c59d`
+> passed 155 commands and six actual FUSE mounts over retained kernel-produced
+> seed/sprout images from the original `bd-hk5w3` execution. Coverage includes
+> independent primary/member bounds, remainder windows, both nested subvolumes,
+> 96 offline and 96 mounted byte comparisons, 30 kernel-captured inventory ioctl
+> matches, 30 mounted EROFS refusals and 12 retained primary/member lock checks.
+> Eleven wrong/missing/duplicate/truncated/locked or hidden-member cases refused;
+> all 13 monitored inputs/tools stayed unchanged and every daemon unmounted and
+> exited normally. Result: CSD `/tmp/native-btrfs-aux-mad_boq5/result.json`;
+> a fresh author readback verified all 155 statuses and control hashes. Fixture
+> production and kernel readbacks are historical; current execution performed
+> public API/FUSE reads on copied inputs, with no new production or crash oracle.
+> Native `btrfs-progs` also reread the root tree and confirmed the retained named
+> roots 256/257. Standalone consumer root-name/ID flags are now implemented;
+> their final executable and mounted-root qualification are pending.
 
 > **Public read-only facade mounts, 2026-10-22:** the existing `native_reader`
 > consumer now mounts its already-admitted `Box<dyn FsOps>` through the shared
