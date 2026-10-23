@@ -164,6 +164,9 @@ impl OpenFs {
         value: &[u8],
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
+        if matches!(&self.flavor, FsFlavor::Ext4(_)) {
+            return self.ext4_set_access_acl(cx, Self::ext4_canonical_inode(ino), value, mode);
+        }
         let entries = super::posix_acl_parse(value)?;
         let (bits, equivalent) = super::posix_acl_equiv_mode(&entries);
         let attr = <Self as FsOps>::getattr(self, cx, scope, ino)?;

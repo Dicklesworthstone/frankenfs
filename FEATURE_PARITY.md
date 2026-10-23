@@ -1,5 +1,22 @@
 # FEATURE_PARITY
 
+> **Atomic ext4 xattr and access-ACL publication:** `setxattr` and
+> `removexattr` now stage inode changes, external values, shared-block COW and
+> reference counts, block allocation and freeing in one operation-owned MVCC
+> transaction. Access-ACL assignment publishes its permission bits in that same
+> transaction. Registered exact-snapshot reads and bounded fresh-snapshot retries
+> preserve concurrent inode updates; failed attempts discard private allocation
+> state without compensating commits. Striped cache gates prevent old readers
+> from reinstalling stale values after publication or inode-number reuse.
+> Inline-only edits retain shared external reservations without unnecessary COW.
+> Four new regressions cover old-snapshot visibility, both allocator modes,
+> shared blocks, ACLs, late failure/cancellation, retry exhaustion, cache races
+> and native checker/reopen; the existing oversized-spill control now requires
+> zero publication on failure. These tests are authored; local execution remains
+> pending after dependency compilation exceeded the available memory. Pinned
+> formatting and whitespace checks pass. This advances `bd-9rutw`; outer request
+> composition, atomic chmod-with-ACL and other namespace mutations remain open.
+
 > **Native ZFS SA user-attribute recovery:** `Zpl::replay_zil` now admits native
 > `TX_SETSAXATTR` records and publishes recovered values through the existing
 > public `listxattr`/`getxattr` paths. Binary replacements and SA-only deletions
