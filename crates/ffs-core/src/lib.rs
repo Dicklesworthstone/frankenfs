@@ -22854,11 +22854,12 @@ impl OpenFs {
 
     // ── High-level file read ──────────────────────────────────────────
 
-    /// Read file data by inode number via the device.
+    /// Read logical ext4 file data by on-disk inode number.
     ///
-    /// Reads the inode, validates it is a regular file, then reads up to
-    /// `size` bytes starting at `offset` using extent mapping. Returns
-    /// `FfsError::IsDirectory` if the inode is a directory.
+    /// Reads up to `size` bytes starting at `offset` from extent, indirect,
+    /// inline or e2compr storage, using the caller's request scope throughout.
+    /// Directories, symlinks and unsupported encrypted content are rejected
+    /// before reading file data, including for empty or EOF requests.
     pub fn read_file(
         &self,
         cx: &Cx,
@@ -22871,6 +22872,24 @@ impl OpenFs {
         if inode.is_dir() {
             return Err(FfsError::IsDirectory);
         }
+        if inode.is_symlink() {
+            return Err(FfsError::Format("cannot read a symlink".into()));
+        }
+        // No fscrypt support: never return raw ciphertext as plaintext.
+        Self::ext4_reject_encrypted(&inode)?;
+
+        // e2compr can mix compressed and uncompressed clusters. Its method
+        // flags overlap inline-data flags, so retain this dispatch precedence.
+        if inode.flags & EXT4_COMPRBLK_FL != 0 {
+            return self.read_ext4_compressed(cx, scope, &inode, offset, size);
+        }
+        if Self::ext4_inode_uses_inline_data(&inode) {
+            return Self::read_ext4_inline_data(&inode, offset, size);
+        }
+        if inode.flags & ffs_types::EXT4_EXTENTS_FL == 0 {
+            return self.read_ext4_indirect(cx, scope, &inode, offset, size);
+        }
+
         let mut buf = vec![0_u8; ext4_read_buffer_len(inode.size, offset, size)?];
         let n = self.read_file_data(cx, scope, &inode, offset, &mut buf)?;
         buf.truncate(n);
@@ -22925,7 +22944,8 @@ impl OpenFs {
     ///
     /// Fast symlinks (target <= 60 bytes) are stored inline in the inode's
     /// block area. Slow symlinks read their target from data blocks via
-    /// extent mapping.
+    /// extent mapping. Encrypted targets are refused because fscrypt is
+    /// not supported.
     pub fn read_symlink(
         &self,
         cx: &Cx,
@@ -22935,6 +22955,7 @@ impl OpenFs {
         if !inode.is_symlink() {
             return Err(FfsError::Format("not a symlink".into()));
         }
+        Self::ext4_reject_encrypted(inode)?;
         // Fast symlink: target stored inline in extent_bytes
         if let Some(target) = inode.fast_symlink_target() {
             let mut buf = target.to_vec();
@@ -62512,6 +62533,222 @@ mod tests {
     }
 
     #[test]
+    fn read_file_routes_inline_data_and_checks_capacity() {
+        const INODE: usize = 4 * 4096 + 10 * 256;
+        let payload = b"inline file content";
+        let cx = Cx::for_testing();
+        for malformed in [false, true] {
+            let mut image = build_ext4_image_with_extents();
+            let size = if malformed { 61 } else { 19_u32 };
+            image[INODE + 4..INODE + 8].copy_from_slice(&size.to_le_bytes());
+            image[INODE + 0x20..INODE + 0x24]
+                .copy_from_slice(&ffs_types::EXT4_INLINE_DATA_FL.to_le_bytes());
+            image[INODE + 0x28..INODE + 0x64].fill(0);
+            image[INODE + 0x28..INODE + 0x28 + payload.len()].copy_from_slice(payload);
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            if malformed {
+                assert!(matches!(
+                    fs.read_file(&cx, &RequestScope::empty(), InodeNumber(11), 0, 8),
+                    Err(FfsError::Corruption { .. })
+                ));
+                continue;
+            }
+            for (offset, size, expected) in [
+                (0, u32::MAX, payload.as_slice()),
+                (7, 4, &payload[7..11]),
+                (18, u32::MAX, &payload[18..]),
+                (19, u32::MAX, &[]),
+                (u64::MAX, u32::MAX, &[]),
+                (0, 0, &[]),
+            ] {
+                assert_eq!(
+                    FsOps::read(
+                        &fs,
+                        &cx,
+                        &mut RequestScope::empty(),
+                        InodeNumber(11),
+                        offset,
+                        size
+                    )
+                    .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    fs.read_file(&cx, &RequestScope::empty(), InodeNumber(11), offset, size)
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_file_routes_indirect_data_in_the_callers_transaction() {
+        const BS: usize = 4096;
+        const INODE: usize = 10 * 256;
+        let image = build_ext4_image_with_extents();
+        let mut table = image[4 * BS..5 * BS].to_vec();
+        table[INODE + 4..INODE + 8].copy_from_slice(&8192_u32.to_le_bytes());
+        table[INODE + 0x20..INODE + 0x24].fill(0);
+        table[INODE + 0x28..INODE + 0x64].fill(0);
+        table[INODE + 0x28..INODE + 0x2C].copy_from_slice(&30_u32.to_le_bytes());
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        // Warm the base caches first: a scoped inode and data block must still
+        // override them without publishing either block to unrelated readers.
+        assert_eq!(
+            fs.read_file(&cx, &RequestScope::empty(), InodeNumber(11), 0, 100)
+                .unwrap(),
+            b"Hello, extent!"
+        );
+        let mut tx = fs.begin_transaction();
+        tx.stage_write(BlockNumber(4), table);
+        tx.stage_write(BlockNumber(30), vec![0xA7; BS]);
+        let mut scope = RequestScope::with_transaction(tx);
+        for (offset, size, expected) in [
+            (4093, 6, vec![0xA7, 0xA7, 0xA7, 0, 0, 0]),
+            (8191, u32::MAX, vec![0]),
+            (8192, u32::MAX, vec![]),
+            (u64::MAX, u32::MAX, vec![]),
+        ] {
+            assert_eq!(
+                FsOps::read(&fs, &cx, &mut scope, InodeNumber(11), offset, size).unwrap(),
+                expected
+            );
+            assert_eq!(
+                fs.read_file(&cx, &scope, InodeNumber(11), offset, size)
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            scope.pending_write_count(),
+            2,
+            "reads must not consume the transaction"
+        );
+        assert_eq!(
+            fs.read_file(&cx, &RequestScope::empty(), InodeNumber(11), 0, 100)
+                .unwrap(),
+            b"Hello, extent!",
+            "uncommitted pointer and data blocks must stay private"
+        );
+    }
+
+    #[test]
+    fn read_file_routes_compressed_clusters_and_rejects_corrupt_payload() {
+        const INODE: usize = 4 * 4096 + 10 * 256;
+        const DATA: usize = 30 * 4096;
+        let payload = b"compressed public file content";
+        let (cluster, _) = build_e2compr_gzip_cluster_bytes(payload);
+        let cx = Cx::for_testing();
+        for corrupt in [false, true] {
+            let mut image = build_ext4_image_with_extents();
+            image[EXT4_SUPERBLOCK_OFFSET + 0x60..EXT4_SUPERBLOCK_OFFSET + 0x64]
+                .copy_from_slice(&0x0043_u32.to_le_bytes()); // COMPRESSION|FILETYPE|EXTENTS
+            image[INODE + 4..INODE + 8].copy_from_slice(&30_u32.to_le_bytes());
+            let flags = ffs_types::EXT4_COMPR_FL | EXT4_COMPRBLK_FL | (2 << 23) | (20 << 26);
+            image[INODE + 0x20..INODE + 0x24].copy_from_slice(&flags.to_le_bytes());
+            image[INODE + 0x28..INODE + 0x64].fill(0);
+            image[INODE + 0x28..INODE + 0x2C].copy_from_slice(&30_u32.to_le_bytes());
+            image[INODE + 0x34..INODE + 0x38].copy_from_slice(&u32::MAX.to_le_bytes());
+            image[DATA..DATA + cluster.len()].copy_from_slice(&cluster);
+            if corrupt {
+                image[DATA + 4] ^= 1; // Stored checksum, not the expected plaintext.
+            }
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            if corrupt {
+                assert!(matches!(
+                    fs.read_file(&cx, &RequestScope::empty(), InodeNumber(11), 0, 100),
+                    Err(FfsError::Corruption { .. })
+                ));
+                continue;
+            }
+            for (offset, size, expected) in [
+                (0, u32::MAX, payload.as_slice()),
+                (11, 6, &payload[11..17]),
+                (29, u32::MAX, &payload[29..]),
+                (30, u32::MAX, &[]),
+                (u64::MAX, u32::MAX, &[]),
+            ] {
+                assert_eq!(
+                    FsOps::read(
+                        &fs,
+                        &cx,
+                        &mut RequestScope::empty(),
+                        InodeNumber(11),
+                        offset,
+                        size
+                    )
+                    .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    fs.read_file(&cx, &RequestScope::empty(), InodeNumber(11), offset, size)
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_file_refuses_encrypted_content_and_symlinks() {
+        const INODE: usize = 4 * 4096 + 10 * 256;
+        let cx = Cx::for_testing();
+        for encrypted in [true, false] {
+            let mut image = build_ext4_image_with_extents();
+            if encrypted {
+                image[INODE + 0x20..INODE + 0x24]
+                    .copy_from_slice(&(ffs_types::EXT4_EXTENTS_FL | 0x800).to_le_bytes());
+            } else {
+                image[INODE..INODE + 2].copy_from_slice(&0o120_777_u16.to_le_bytes());
+            }
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            // Refusal also applies to empty/EOF reads; they must not bypass policy.
+            for (offset, size) in [(0, 100), (0, 0), (u64::MAX, u32::MAX)] {
+                let reference = FsOps::read(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    InodeNumber(11),
+                    offset,
+                    size,
+                )
+                .unwrap_err();
+                let err = fs
+                    .read_file(&cx, &RequestScope::empty(), InodeNumber(11), offset, size)
+                    .unwrap_err();
+                assert_eq!(err.to_errno(), reference.to_errno());
+                if encrypted {
+                    assert!(matches!(err, FfsError::UnsupportedFeature(_)));
+                } else {
+                    assert!(matches!(err, FfsError::Format(_)));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn read_file_scalar_data_block_cache_hits_in_read_only_mode() {
         let image = build_ext4_image_with_extents();
         let dev = CountingDevice::new(TestDevice::from_vec(image), ByteOffset(13 * 4096));
@@ -93533,8 +93770,17 @@ mod tests {
             )
             .expect("create slow symlink");
 
-        for (label, ino) in [("fast", fast.ino), ("slow", slow.ino)] {
+        for (label, ino, expected) in [
+            ("fast", fast.ino, "hello.txt"),
+            ("slow", slow.ino, slow_target),
+        ] {
             let mut inode = fs.read_inode(&cx, ino).expect("read test symlink inode");
+            assert_eq!(
+                fs.read_symlink(&cx, &RequestScope::empty(), &inode)
+                    .expect("plain public symlink target"),
+                expected.as_bytes(),
+                "public {label} symlink target must remain readable"
+            );
             inode.flags |= 0x0000_0800;
             persist_ext4_test_inode(&fs, &cx, ino, &inode);
 
@@ -93546,6 +93792,15 @@ mod tests {
                 "expected UnsupportedFeature for {label} symlink, got {err:?}"
             );
             assert_eq!(err.to_errno(), libc::EOPNOTSUPP);
+
+            let public_err = fs
+                .read_symlink(&cx, &RequestScope::empty(), &inode)
+                .expect_err("public encrypted symlink must require fscrypt support");
+            assert!(
+                matches!(public_err, FfsError::UnsupportedFeature(_)),
+                "expected public refusal for {label} symlink, got {public_err:?}"
+            );
+            assert_eq!(public_err.to_errno(), libc::EOPNOTSUPP);
         }
     }
 

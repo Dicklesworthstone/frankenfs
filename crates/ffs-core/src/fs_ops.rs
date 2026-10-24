@@ -11,9 +11,9 @@ use super::{
     BTRFS_TREE_SEARCH_KEY_SIZE, BTRFS_TREE_SEARCH_V2_HEADER_SIZE, BTRFS_USER_SETTABLE_FSFLAGS,
     BTRFS_USER_SETTABLE_XFLAGS, BlockDevice, BlockNumber, BtrfsBTree, BtrfsExtentData, BtrfsKey,
     BtrfsParsedNode, BtrfsQgroupLimitRequest, BtrfsRootItem, BtrfsTreeSearchKey, ByteOffset,
-    CommitSeq, Cx, DirEntry, DirNameIndex, EXT4_COMPRBLK_FL, EXT4_ENCRYPTION_XATTR_NAME,
-    EXT4_SB_CHECKSUM_OFFSET, Ext4FileType, Ext4Inode, Ext4MoveExtRequest, Ext4Superblock,
-    Ext4Xattr, FSCRYPT_CONTEXT_V1_SIZE, FSCRYPT_CONTEXT_V2_SIZE, FSCRYPT_POLICY_V1_SIZE,
+    CommitSeq, Cx, DirEntry, DirNameIndex, EXT4_ENCRYPTION_XATTR_NAME, EXT4_SB_CHECKSUM_OFFSET,
+    Ext4FileType, Ext4Inode, Ext4MoveExtRequest, Ext4Superblock, Ext4Xattr,
+    FSCRYPT_CONTEXT_V1_SIZE, FSCRYPT_CONTEXT_V2_SIZE, FSCRYPT_POLICY_V1_SIZE,
     FSCRYPT_POLICY_V1_VERSION, FSCRYPT_POLICY_V2_SIZE, FSCRYPT_POLICY_V2_VERSION, FfsError,
     FiemapExtent, FileType, FsFlavor, FsGeometry, FsOps, FsStat, FsxattrInfo, InodeAttr,
     InodeNumber, LINUX_PATH_MAX, LINUX_SYMLINK_TARGET_MAX, Mutex, OpenFs, OsStr, Path, QuotaInfo,
@@ -24,7 +24,7 @@ use super::{
     encode_btrfs_dev_info_args, encode_btrfs_fs_info_args, encode_btrfs_ino_paths_container,
     encode_btrfs_supported_feature_flags, encode_btrfs_tree_search_results,
     encode_btrfs_tree_search_results_with_limit, ext4_flags_to_xflags, ext4_present_xattr_value,
-    ext4_read_buffer_len, first_nul, fsflags_to_btrfs_inode_flags, generate_send_stream, info,
+    first_nul, fsflags_to_btrfs_inode_flags, generate_send_stream, info,
     parse_btrfs_tree_search_key_bytes, parse_extent_data, parse_root_item, parse_to_ffs_error,
     read_btrfs_superblock_region, read_ext4_superblock_region, readdir_snapshot_serve,
     readdir_snapshot_serve_unvalidated, readdir_snapshot_store, slice_readdir_snapshot,
@@ -888,39 +888,7 @@ impl FsOps for OpenFs {
         }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let inode =
-                    self.read_inode_with_scope(cx, scope, Self::ext4_canonical_inode(ino))?;
-                if inode.is_dir() {
-                    return Err(FfsError::IsDirectory);
-                }
-                if inode.is_symlink() {
-                    return Err(FfsError::Format("cannot read a symlink".into()));
-                }
-                // No fscrypt support: never return raw ciphertext as plaintext.
-                Self::ext4_reject_encrypted(&inode)?;
-
-                // e2compr compressed inode: if COMPRBLK_FL is set, the file
-                // contains at least one compressed cluster. Route to the
-                // compressed read path which handles mixed compressed/
-                // uncompressed clusters transparently.
-                if inode.flags & EXT4_COMPRBLK_FL != 0 {
-                    return self.read_ext4_compressed(cx, scope, &inode, offset, size);
-                }
-
-                // Inline data: file content stored directly in inode's i_block area.
-                if Self::ext4_inode_uses_inline_data(&inode) {
-                    return Self::read_ext4_inline_data(&inode, offset, size);
-                }
-
-                // Indirect block addressing (legacy pre-extent inodes).
-                if inode.flags & ffs_types::EXT4_EXTENTS_FL == 0 {
-                    return self.read_ext4_indirect(cx, scope, &inode, offset, size);
-                }
-
-                let mut buf = vec![0_u8; ext4_read_buffer_len(inode.size, offset, size)?];
-                let n = self.read_file_data(cx, scope, &inode, offset, &mut buf)?;
-                buf.truncate(n);
-                Ok(buf)
+                self.read_file(cx, scope, Self::ext4_canonical_inode(ino), offset, size)
             }
             FsFlavor::Btrfs(_) => {
                 let attr = self.btrfs_read_inode_attr(cx, ino)?;
