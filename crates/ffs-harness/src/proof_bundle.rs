@@ -2044,6 +2044,211 @@ fn validate_executable_lane_pass_requires_evidence(
     }
 }
 
+fn allowlisted_lane_command_prefixes(lane_id: &str) -> &'static [&'static [&'static str]] {
+    match lane_id {
+        "conformance" => &[
+            &["test", "-p", "ffs-harness", "--test", "conformance"],
+            &[
+                "test",
+                "-p",
+                "ffs-harness",
+                "--lib",
+                "tests::ext4_fixture_parses",
+            ],
+            &["test", "-p", "ffs-harness", "--lib", "parity::"],
+            &["run", "-p", "ffs-harness", "--", "check-fixtures"],
+            &[
+                "run",
+                "--quiet",
+                "-p",
+                "ffs-harness",
+                "--",
+                "check-fixtures",
+            ],
+        ],
+        "fuse" => &[
+            &["test", "-p", "ffs-harness", "--test", "fuse_e2e"],
+            &["test", "-p", "ffs-fuse", "--lib"],
+            &[
+                "test",
+                "-p",
+                "ffs-harness",
+                "--lib",
+                "mounted_write_matrix::tests::",
+            ],
+            &[
+                "run",
+                "-p",
+                "ffs-harness",
+                "--",
+                "validate-mounted-write-matrix",
+            ],
+            &[
+                "run",
+                "--quiet",
+                "-p",
+                "ffs-harness",
+                "--",
+                "validate-mounted-write-matrix",
+            ],
+        ],
+        "repair_lab" => &[
+            &["test", "-p", "ffs-repair"],
+            &[
+                "test",
+                "-p",
+                "ffs-harness",
+                "--lib",
+                "chaos_replay_lab::tests::",
+            ],
+            &[
+                "run",
+                "-p",
+                "ffs-harness",
+                "--",
+                "validate-chaos-replay-lab",
+            ],
+            &[
+                "run",
+                "--quiet",
+                "-p",
+                "ffs-harness",
+                "--",
+                "validate-chaos-replay-lab",
+            ],
+        ],
+        "crash_replay" => &[
+            &["test", "-p", "ffs-harness", "--lib", "e2e::tests::"],
+            &[
+                "test",
+                "-p",
+                "ffs-harness",
+                "--lib",
+                "writeback_cache_audit::tests::crash_replay_oracle_accepts_complete_matrix",
+            ],
+            &["run", "-p", "ffs-harness", "--", "crash-replay-suite"],
+            &[
+                "run",
+                "--quiet",
+                "-p",
+                "ffs-harness",
+                "--",
+                "crash-replay-suite",
+            ],
+        ],
+        _ => &[],
+    }
+}
+
+/// Returns the default allowlisted `(command, args)` for an executable proof-bundle lane.
+#[must_use]
+pub fn default_allowlisted_lane_command(lane_id: &str) -> Option<(&'static str, Vec<String>)> {
+    let args: &[&str] = match lane_id {
+        "conformance" => &[
+            "test",
+            "-p",
+            "ffs-harness",
+            "--lib",
+            "tests::ext4_fixture_parses",
+            "--",
+            "--exact",
+        ],
+        "fuse" => &[
+            "test",
+            "-p",
+            "ffs-harness",
+            "--lib",
+            "mounted_write_matrix::tests::default_matrix_validates_required_write_workload_contract",
+            "--",
+            "--exact",
+        ],
+        "repair_lab" => &[
+            "test",
+            "-p",
+            "ffs-harness",
+            "--lib",
+            "chaos_replay_lab::tests::default_lab_validates_required_taxonomy_coverage",
+            "--",
+            "--exact",
+        ],
+        "crash_replay" => &[
+            "test",
+            "-p",
+            "ffs-harness",
+            "--lib",
+            "writeback_cache_audit::tests::crash_replay_oracle_accepts_complete_matrix",
+            "--",
+            "--exact",
+        ],
+        _ => return None,
+    };
+    Some(("cargo", args.iter().map(|arg| (*arg).to_owned()).collect()))
+}
+
+fn is_safe_test_filter_token(token: &str) -> bool {
+    !token.is_empty()
+        && !token.starts_with('-')
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':')
+}
+
+fn is_allowlisted_trailing_arg(token: &str) -> bool {
+    matches!(
+        token,
+        "--" | "--exact" | "--nocapture" | "--quiet" | "--lib"
+    ) || is_safe_test_filter_token(token)
+}
+
+fn matches_allowlisted_prefix(args: &[String], prefix: &[&str]) -> bool {
+    if prefix.is_empty() || args.len() < prefix.len() {
+        return false;
+    }
+    let last_idx = prefix.len() - 1;
+    if args[..last_idx]
+        .iter()
+        .zip(&prefix[..last_idx])
+        .any(|(actual, expected)| actual != expected)
+    {
+        return false;
+    }
+    let last_expected = prefix[last_idx];
+    let last_actual = args[last_idx].as_str();
+    let last_matches = if last_expected.ends_with("::") {
+        last_actual.starts_with(last_expected) && is_safe_test_filter_token(last_actual)
+    } else {
+        last_actual == last_expected
+    };
+    if !last_matches {
+        return false;
+    }
+    args[prefix.len()..]
+        .iter()
+        .all(|arg| is_allowlisted_trailing_arg(arg))
+}
+
+fn validate_allowlisted_lane_command(
+    lane_id: &str,
+    command: &str,
+    args: &[String],
+) -> std::result::Result<(), String> {
+    if command != "cargo" {
+        return Err(format!(
+            "lane {lane_id} metadata.{EXECUTED_EVIDENCE_COMMAND_KEY}={command:?} is not in the pinned command allowlist for lane {lane_id} (expected \"cargo\")"
+        ));
+    }
+    let prefixes = allowlisted_lane_command_prefixes(lane_id);
+    if !prefixes
+        .iter()
+        .any(|prefix| matches_allowlisted_prefix(args, prefix))
+    {
+        return Err(format!(
+            "lane {lane_id} metadata.{EXECUTED_EVIDENCE_ARGS_JSON_KEY}={args:?} does not match any pinned command allowlist entry for lane {lane_id}"
+        ));
+    }
+    Ok(())
+}
+
 fn lane_executed_evidence_command(
     lane: &ProofBundleLane,
 ) -> std::result::Result<(String, Vec<String>), String> {
@@ -2077,6 +2282,7 @@ fn lane_executed_evidence_command(
         None => Vec::new(),
     };
 
+    validate_allowlisted_lane_command(&lane.lane_id, &command, &args)?;
     Ok((command, args))
 }
 
@@ -2816,14 +3022,12 @@ mod tests {
 
     fn configure_executable_lane_commands(manifest: &mut ProofBundleManifest) -> Result<()> {
         for lane in &mut manifest.lanes {
-            if is_executable_proof_bundle_lane(&lane.lane_id) {
-                lane.metadata.insert(
-                    EXECUTED_EVIDENCE_COMMAND_KEY.to_owned(),
-                    "printf".to_owned(),
-                );
+            if let Some((command, args)) = default_allowlisted_lane_command(&lane.lane_id) {
+                lane.metadata
+                    .insert(EXECUTED_EVIDENCE_COMMAND_KEY.to_owned(), command.to_owned());
                 lane.metadata.insert(
                     EXECUTED_EVIDENCE_ARGS_JSON_KEY.to_owned(),
-                    serde_json::to_string(&[format!("{} executed\n", lane.lane_id)])?,
+                    serde_json::to_string(&args)?,
                 );
             }
         }
@@ -3039,14 +3243,15 @@ mod tests {
         );
         for lane_id in EXECUTABLE_PROOF_BUNDLE_LANES {
             let evidence = executed_evidence_by_lane(&report, lane_id)?;
-            assert_eq!(evidence.command, "printf");
+            let (expected_command, expected_args) =
+                default_allowlisted_lane_command(lane_id).context("allowlisted lane command")?;
+            assert_eq!(evidence.command, expected_command);
             assert_eq!(evidence.exit_code, Some(0));
             assert_eq!(evidence.outcome, "success");
             assert_eq!(evidence.stdout_sha256.len(), 64);
             assert_eq!(evidence.stderr_sha256.len(), 64);
             assert_eq!(
-                evidence.args,
-                vec![format!("{lane_id} executed\n")],
+                evidence.args, expected_args,
                 "lane {lane_id} did not preserve configured args"
             );
         }
@@ -3064,6 +3269,70 @@ mod tests {
         assert!(summary.contains("## Executed Evidence"));
         assert!(summary.contains("conformance"));
         assert!(summary.contains("Stdout SHA-256"));
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_naming_printf_for_executable_lane_is_rejected_bd_jtk24() -> Result<()> {
+        let mut sample = sample_bundle()?;
+        configure_executable_lane_commands(&mut sample.manifest)?;
+        let conformance = sample
+            .manifest
+            .lanes
+            .iter_mut()
+            .find(|lane| lane.lane_id == "conformance")
+            .context("conformance lane")?;
+        conformance.metadata.insert(
+            EXECUTED_EVIDENCE_COMMAND_KEY.to_owned(),
+            "printf".to_owned(),
+        );
+        conformance.metadata.insert(
+            EXECUTED_EVIDENCE_ARGS_JSON_KEY.to_owned(),
+            serde_json::to_string(&["conformance executed\n"])?,
+        );
+
+        let report = validate_sample_with_execution(&sample);
+
+        assert!(!report.valid);
+        assert!(
+            report.errors.iter().any(|error| {
+                error.contains("lane conformance")
+                    && error.contains("printf")
+                    && error.contains("pinned command allowlist")
+            }),
+            "expected printf rejection in errors: {:?}",
+            report.errors
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_naming_cross_lane_command_is_rejected_bd_jtk24() -> Result<()> {
+        let mut sample = sample_bundle()?;
+        configure_executable_lane_commands(&mut sample.manifest)?;
+        let (_, conformance_args) =
+            default_allowlisted_lane_command("conformance").context("conformance command")?;
+        let fuse = sample
+            .manifest
+            .lanes
+            .iter_mut()
+            .find(|lane| lane.lane_id == "fuse")
+            .context("fuse lane")?;
+        fuse.metadata.insert(
+            EXECUTED_EVIDENCE_ARGS_JSON_KEY.to_owned(),
+            serde_json::to_string(&conformance_args)?,
+        );
+
+        let report = validate_sample_with_execution(&sample);
+
+        assert!(!report.valid);
+        assert!(
+            report.errors.iter().any(|error| {
+                error.contains("lane fuse") && error.contains("pinned command allowlist")
+            }),
+            "expected cross-lane command rejection in errors: {:?}",
+            report.errors
+        );
         Ok(())
     }
 

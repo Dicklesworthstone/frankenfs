@@ -677,9 +677,15 @@ for index, lane in enumerate(lanes):
             }
         )
     metadata["source_command"] = f"cargo run -p ffs-harness -- validate-{lane}"
-    if lane in {"conformance", "fuse", "repair_lab", "crash_replay"}:
-        metadata["executed_evidence_command"] = "printf"
-        metadata["executed_evidence_args_json"] = json.dumps([f"{lane} executed\n"])
+    allowlisted_lane_args = {
+        "conformance": ["run", "--quiet", "-p", "ffs-harness", "--", "check-fixtures"],
+        "fuse": ["run", "--quiet", "-p", "ffs-harness", "--", "validate-mounted-write-matrix"],
+        "repair_lab": ["run", "--quiet", "-p", "ffs-harness", "--", "validate-chaos-replay-lab"],
+        "crash_replay": ["run", "--quiet", "-p", "ffs-harness", "--", "crash-replay-suite"],
+    }
+    if lane in allowlisted_lane_args:
+        metadata["executed_evidence_command"] = "cargo"
+        metadata["executed_evidence_args_json"] = json.dumps(allowlisted_lane_args[lane])
     records.append(
         {
             "lane_id": lane,
@@ -849,7 +855,7 @@ executed_by_lane = {row["lane_id"]: row for row in executed_rows}
 if set(executed_by_lane) != expected_executed_lanes:
     raise SystemExit(f"unexpected executed evidence lanes: {sorted(executed_by_lane)}")
 for lane, evidence in executed_by_lane.items():
-    if evidence.get("command") != "printf":
+    if evidence.get("command") != "cargo":
         raise SystemExit(f"{lane} executed evidence command was not recorded")
     if evidence.get("exit_code") != 0 or evidence.get("outcome") != "success":
         raise SystemExit(f"{lane} executed evidence did not record a successful run")

@@ -127,6 +127,8 @@ pub struct WritebackCacheAuditGate {
     pub schema_version: u32,
     pub gate_version: String,
     pub bead_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
     pub mount_options: WritebackMountOptions,
     pub repair_serialization_state: String,
     pub fuse_capability: FuseCapabilityState,
@@ -172,6 +174,10 @@ pub struct WritebackRuntimeGuard {
     pub feature_state: String,
     pub config_source: String,
     pub gate_artifact_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_host_capability_fingerprint: Option<String>,
     pub gate_fresh: bool,
     pub gate_age_secs: u64,
     pub gate_max_age_secs: u64,
@@ -774,20 +780,203 @@ pub fn evaluate_writeback_cache_audit(
     WritebackCacheAuditDecision::Accept
 }
 
+#[must_use]
+pub fn evaluate_writeback_cache_audit_for_host(
+    gate: &WritebackCacheAuditGate,
+    live_host_fingerprint: &str,
+) -> WritebackCacheAuditDecision {
+    let decision = evaluate_writeback_cache_audit(gate);
+    if !matches!(decision, WritebackCacheAuditDecision::Accept) {
+        return decision;
+    }
+    if gate.runtime_guard.host_capability_fingerprint.trim() != live_host_fingerprint.trim() {
+        return reject(
+            "host_capability_mismatch",
+            ["I5"],
+            "rerun the authoritative lane manifest on this host before enabling writeback_cache",
+        );
+    }
+    WritebackCacheAuditDecision::Accept
+}
+
+/// Probe the live host capability fingerprint from `uname` and FUSE capability state (`bd-jtk24`).
+#[must_use]
+pub fn probe_live_host_capability_fingerprint() -> String {
+    let uname = std::process::Command::new("uname")
+        .args(["-s", "-r", "-m"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map_or_else(
+            || "unknown-uname".to_owned(),
+            |raw| {
+                raw.split_whitespace()
+                    .map(str::to_ascii_lowercase)
+                    .collect::<Vec<_>>()
+                    .join("-")
+            },
+        );
+    let dev_fuse = Path::new("/dev/fuse").exists();
+    let fusermount3 = std::process::Command::new("fusermount3")
+        .arg("-V")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    format!("{uname}-devfuse:{dev_fuse}-fusermount3:{fusermount3}")
+}
+
+/// Format the current wall-clock time as UTC RFC3339 seconds (`YYYY-MM-DDTHH:MM:SSZ`).
+#[must_use]
+pub fn current_utc_rfc3339_seconds() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_utc_timestamp_seconds(secs)
+}
+
+fn format_utc_timestamp_seconds(unix_secs: u64) -> String {
+    let days = i64::try_from(unix_secs / 86_400).unwrap_or(0);
+    let rem = unix_secs % 86_400;
+    let hour = rem / 3_600;
+    let minute = (rem % 3_600) / 60;
+    let second = rem % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+const fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d)
+}
+
+fn parse_utc_timestamp_seconds(raw: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    let without_z = trimmed
+        .strip_suffix('Z')
+        .context("timestamp must end with Z")?;
+    let (date, time) = without_z
+        .split_once('T')
+        .context("timestamp must contain T separator")?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts
+        .next()
+        .context("year missing")?
+        .parse()
+        .context("invalid year")?;
+    let month: i64 = date_parts
+        .next()
+        .context("month missing")?
+        .parse()
+        .context("invalid month")?;
+    let day: i64 = date_parts
+        .next()
+        .context("day missing")?
+        .parse()
+        .context("invalid day")?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        bail!("invalid date components");
+    }
+    let time_no_fraction = time.split_once('.').map_or(time, |(seconds, _)| seconds);
+    let mut time_parts = time_no_fraction.split(':');
+    let hour: i64 = time_parts
+        .next()
+        .context("hour missing")?
+        .parse()
+        .context("invalid hour")?;
+    let minute: i64 = time_parts
+        .next()
+        .context("minute missing")?
+        .parse()
+        .context("invalid minute")?;
+    let second: i64 = time_parts
+        .next()
+        .context("second missing")?
+        .parse()
+        .context("invalid second")?;
+    if time_parts.next().is_some()
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        bail!("invalid time components");
+    }
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let total_secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    u64::try_from(total_secs).context("timestamp before unix epoch")
+}
+
+fn is_timestamp_fresh_against_wall_clock(raw_ts: &str, max_age_secs: u64) -> bool {
+    let Ok(generated_secs) = parse_utc_timestamp_seconds(raw_ts) else {
+        return false;
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    generated_secs <= now_secs && now_secs - generated_secs <= max_age_secs
+}
+
+fn verify_lane_manifest_file_against_guard(guard: &WritebackRuntimeGuard) -> bool {
+    let manifest_path = Path::new(guard.lane_manifest_path.trim());
+    if !manifest_path.is_file() {
+        return true;
+    }
+    let Ok(bytes) = fs::read(manifest_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    if let Some(manifest_fp) = json
+        .get("host_capability_fingerprint")
+        .or_else(|| json.get("host_fingerprint"))
+        .and_then(serde_json::Value::as_str)
+        && manifest_fp.trim() != guard.host_capability_fingerprint.trim()
+    {
+        return false;
+    }
+    if let Some(manifest_ts) = json.get("generated_at").and_then(serde_json::Value::as_str)
+        && !is_timestamp_fresh_against_wall_clock(manifest_ts, guard.gate_max_age_secs)
+    {
+        return false;
+    }
+    true
+}
+
 fn check_raw_options_never_carry_writeback_cache(
     gate: &WritebackCacheAuditGate,
 ) -> Option<WritebackCacheAuditDecision> {
-    if !gate.explicit_opt_in
-        && gate
-            .mount_options
-            .raw_options
-            .iter()
-            .any(|option| option.to_ascii_lowercase().contains("writeback_cache"))
+    if gate.mount_options.raw_options.iter().any(|opt| {
+        opt == "writeback_cache"
+            || opt == "writeback"
+            || opt.starts_with("writeback_cache=")
+            || opt.starts_with("writeback=")
+    }) && (!gate.explicit_opt_in || gate.mount_options.mode != "rw")
     {
         return Some(reject(
             "default_or_read_only_mount",
-            ["I3"],
-            "writeback_cache must never appear in raw mount options unless explicit_opt_in is true",
+            ["I5"],
+            "remove writeback_cache from default/raw mount options; require explicit RW opt-in",
         ));
     }
     None
@@ -796,18 +985,11 @@ fn check_raw_options_never_carry_writeback_cache(
 fn check_mount_mode_and_opt_in(
     gate: &WritebackCacheAuditGate,
 ) -> Option<WritebackCacheAuditDecision> {
-    if gate.mount_options.mode != "rw" {
+    if !gate.explicit_opt_in || gate.mount_options.mode != "rw" {
         return Some(reject(
             "default_or_read_only_mount",
-            ["I3"],
-            "writeback_cache requires an rw mount; default, ro, and unsupported modes must keep it disabled",
-        ));
-    }
-    if !gate.explicit_opt_in {
-        return Some(reject(
-            "default_or_read_only_mount",
-            ["I3"],
-            "operator must pass an explicit opt-in flag before writeback_cache is considered",
+            ["I5"],
+            "enable writeback_cache only on explicit RW mounts",
         ));
     }
     None
@@ -843,9 +1025,27 @@ fn check_runtime_guard(gate: &WritebackCacheAuditGate) -> Option<WritebackCacheA
             "regenerate the writeback-cache gate artifact; stale evidence cannot enable the kernel cache",
         ));
     }
+    if let Some(generated_at) = gate
+        .generated_at
+        .as_deref()
+        .or(guard.generated_at.as_deref())
+        && !is_timestamp_fresh_against_wall_clock(generated_at, guard.gate_max_age_secs)
+    {
+        return Some(reject(
+            "stale_gate_artifact",
+            ["I1", "I6"],
+            "regenerate the writeback-cache gate artifact; stale evidence cannot enable the kernel cache",
+        ));
+    }
+    let expected_host_mismatch = guard
+        .expected_host_capability_fingerprint
+        .as_deref()
+        .is_some_and(|expected| expected.trim() != guard.host_capability_fingerprint.trim());
     if !guard.lane_manifest_fresh
         || !guard.lane_manifest_matches_host
         || guard.host_capability_fingerprint.trim().is_empty()
+        || expected_host_mismatch
+        || !verify_lane_manifest_file_against_guard(guard)
     {
         return Some(reject(
             "host_capability_mismatch",
@@ -1601,10 +1801,12 @@ pub fn generate_writeback_cache_oracle_bundle(
     WritebackOrderingOracle,
     WritebackCrashReplayOracle,
 )> {
+    let now_ts = current_utc_rfc3339_seconds();
     let gate = WritebackCacheAuditGate {
         schema_version: WRITEBACK_CACHE_AUDIT_SCHEMA_VERSION,
         gate_version: "v1".to_owned(),
         bead_id: "bd-rchk0.2.1.1".to_owned(),
+        generated_at: Some(now_ts.clone()),
         mount_options: WritebackMountOptions {
             raw_options: vec!["rw".to_owned(), "default_permissions".to_owned()],
             fs_name: "frankenfs".to_owned(),
@@ -1652,7 +1854,9 @@ pub fn generate_writeback_cache_oracle_bundle(
             gate_fresh: true,
             gate_age_secs: 30,
             gate_max_age_secs: 86_400,
+            generated_at: Some(now_ts),
             host_capability_fingerprint: "linux-fuse-writeback-cache-v1".to_owned(),
+            expected_host_capability_fingerprint: None,
             lane_manifest_id: "authoritative-env-frankenfs-fuse-v1".to_owned(),
             lane_manifest_path: "artifacts/qa/authoritative_environment_manifest.json".to_owned(),
             lane_manifest_fresh: true,
@@ -1895,7 +2099,9 @@ mod tests {
             gate_fresh: true,
             gate_age_secs: 30,
             gate_max_age_secs: 86_400,
+            generated_at: None,
             host_capability_fingerprint: "linux-fuse-writeback-cache-v1".to_owned(),
+            expected_host_capability_fingerprint: None,
             lane_manifest_id: "authoritative-env-frankenfs-fuse-v1".to_owned(),
             lane_manifest_path: "artifacts/qa/authoritative_environment_manifest.json".to_owned(),
             lane_manifest_fresh: true,
@@ -1909,6 +2115,7 @@ mod tests {
             schema_version: WRITEBACK_CACHE_AUDIT_SCHEMA_VERSION,
             gate_version: "v1".to_owned(),
             bead_id: "bd-rchk0.2.1.1".to_owned(),
+            generated_at: None,
             mount_options: WritebackMountOptions {
                 raw_options: vec!["rw".to_owned(), "default_permissions".to_owned()],
                 fs_name: "frankenfs".to_owned(),
@@ -3173,6 +3380,46 @@ mod tests {
             evaluate_writeback_crash_replay_oracle(&crash_replay),
             WritebackCrashReplayDecision::Accept
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_generated_at_30_days_old_with_gate_fresh_true_is_rejected_bd_jtk24() {
+        let mut gate = happy_gate();
+        gate.runtime_guard.gate_fresh = true;
+        gate.runtime_guard.gate_age_secs = 0;
+        gate.generated_at = Some("2020-01-01T00:00:00Z".to_owned());
+        let decision = evaluate_writeback_cache_audit(&gate);
+        assert_eq!(rejection_reason(&decision), Some("stale_gate_artifact"));
+    }
+
+    #[test]
+    fn host_mismatched_manifest_with_matches_host_true_is_rejected_bd_jtk24() -> Result<()> {
+        let mut gate = happy_gate();
+        gate.runtime_guard.lane_manifest_matches_host = true;
+        gate.runtime_guard.host_capability_fingerprint = "host-a-fingerprint".to_owned();
+        let decision = evaluate_writeback_cache_audit_for_host(&gate, "host-b-fingerprint");
+        assert_eq!(
+            rejection_reason(&decision),
+            Some("host_capability_mismatch")
+        );
+
+        let temp_dir = tempfile::tempdir()?;
+        let manifest_path = temp_dir.path().join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "host_capability_fingerprint": "host-b-fingerprint",
+                "generated_at": current_utc_rfc3339_seconds(),
+            })
+            .to_string(),
+        )?;
+        gate.runtime_guard.lane_manifest_path = manifest_path.display().to_string();
+        let file_decision = evaluate_writeback_cache_audit(&gate);
+        assert_eq!(
+            rejection_reason(&file_decision),
+            Some("host_capability_mismatch")
+        );
         Ok(())
     }
 }
