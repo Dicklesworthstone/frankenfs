@@ -7721,6 +7721,7 @@ impl OpenFs {
         let mut btrfs_inventory_verified = false;
 
         let mut btrfs_tree_log_items = Vec::new();
+        let mut btrfs_tree_log_deleted_keys = Vec::new();
         let mut btrfs_tree_log_dir_ranges = Vec::new();
         let mut btrfs_foreign_tree_log = false;
         let (ext4_geometry, btrfs_context) = match &mut flavor {
@@ -7977,10 +7978,13 @@ impl OpenFs {
                         Ok(result) if result.replayed => {
                             info!(
                                 items = result.items_count,
-                                "btrfs tree-log detected ({} items, applying read overlay)",
-                                result.items_count
+                                deleted_keys = result.deleted_keys.len(),
+                                "btrfs tree-log detected ({} items, {} deleted keys, applying read overlay)",
+                                result.items_count,
+                                result.deleted_keys.len(),
                             );
                             btrfs_tree_log_items = result.items;
+                            btrfs_tree_log_deleted_keys = result.deleted_keys;
                             btrfs_tree_log_dir_ranges = result.dir_log_ranges;
                         }
                         Ok(result) if result.foreign_format => {
@@ -8075,7 +8079,9 @@ impl OpenFs {
             ext4_geometry,
             btrfs_context,
             btrfs_tree_log_overlay_active: AtomicBool::new(
-                !btrfs_tree_log_items.is_empty() || !btrfs_tree_log_dir_ranges.is_empty(),
+                !btrfs_tree_log_items.is_empty()
+                    || !btrfs_tree_log_deleted_keys.is_empty()
+                    || !btrfs_tree_log_dir_ranges.is_empty(),
             ),
             btrfs_commit_out_of_space: AtomicBool::new(false),
             btrfs_unpin_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -8213,8 +8219,9 @@ impl OpenFs {
             fs.activate_native_ext4_repair(cx, max_working_bytes)?;
         }
 
-        if !fs.btrfs_tree_log_items.is_empty() {
-            fs.btrfs_tree_log_hidden = fs.resolve_btrfs_tree_log_removals(cx)?;
+        if fs.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+            fs.btrfs_tree_log_hidden =
+                fs.resolve_btrfs_tree_log_removals(cx, &btrfs_tree_log_deleted_keys)?;
         }
 
         if fs.is_ext4() && !options.skip_validation {
@@ -15725,14 +15732,104 @@ impl OpenFs {
 
     /// Resolve what a kernel tree log removed (the kernel's
     /// `replay_dir_deletes`): every FS-tree DIR_INDEX entry inside a logged
-    /// directory range that the log does not carry. A name the log re-adds
+    /// directory range that the log does not carry, plus any explicit
+    /// `TreeLogReplayResult::deleted_keys` records. A name the log re-adds
     /// under another index (a rename within the directory) stays visible.
-    fn resolve_btrfs_tree_log_removals(&self, cx: &Cx) -> Result<BtrfsTreeLogHidden, FfsError> {
+    fn resolve_btrfs_tree_log_removals(
+        &self,
+        cx: &Cx,
+        deleted_keys: &[BtrfsKey],
+    ) -> Result<BtrfsTreeLogHidden, FfsError> {
         let subvol = self
             .btrfs_context()
             .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid);
         let root = self.btrfs_fs_tree_root_bytenr(cx, subvol)?;
         let mut hidden = BtrfsTreeLogHidden::default();
+        for &del_key in deleted_keys {
+            if self
+                .btrfs_tree_log_items
+                .iter()
+                .any(|logged| logged.key == del_key)
+            {
+                continue;
+            }
+            if !hidden.keys.contains(&del_key) {
+                hidden.keys.push(del_key);
+            }
+            let hi = del_key.offset.checked_add(1).map_or_else(
+                || BtrfsKey {
+                    objectid: del_key.objectid,
+                    item_type: del_key.item_type.saturating_add(1),
+                    offset: 0,
+                },
+                |next| BtrfsKey {
+                    objectid: del_key.objectid,
+                    item_type: del_key.item_type,
+                    offset: next,
+                },
+            );
+            if del_key.item_type == BTRFS_ITEM_DIR_INDEX || del_key.item_type == BTRFS_ITEM_DIR_ITEM
+            {
+                let logged_names: Vec<Vec<u8>> = self
+                    .btrfs_tree_log_items
+                    .iter()
+                    .filter(|item| {
+                        item.key.objectid == del_key.objectid
+                            && (item.key.item_type == BTRFS_ITEM_DIR_INDEX
+                                || item.key.item_type == BTRFS_ITEM_DIR_ITEM)
+                    })
+                    .filter_map(|item| parse_dir_items(&item.data).ok())
+                    .flatten()
+                    .map(|entry| entry.name)
+                    .collect();
+                for item in self.walk_btrfs_tree_range(cx, root, del_key, hi)? {
+                    if item.key != del_key {
+                        continue;
+                    }
+                    for entry in parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))? {
+                        if !logged_names.contains(&entry.name)
+                            && !hidden
+                                .names
+                                .iter()
+                                .any(|(d, n)| *d == del_key.objectid && *n == entry.name)
+                        {
+                            hidden.names.push((del_key.objectid, entry.name));
+                        }
+                    }
+                }
+            } else if del_key.item_type == BTRFS_ITEM_INODE_REF {
+                let parent = del_key.offset;
+                for committed in self.walk_btrfs_tree_range(cx, root, del_key, hi)? {
+                    if committed.key != del_key {
+                        continue;
+                    }
+                    let refs = ffs_btrfs::parse_inode_refs(&committed.data)
+                        .map_err(|e| parse_to_ffs_error(&e))?;
+                    for r in refs {
+                        let index_key = BtrfsKey {
+                            objectid: parent,
+                            item_type: BTRFS_ITEM_DIR_INDEX,
+                            offset: r.index,
+                        };
+                        if !self
+                            .btrfs_tree_log_items
+                            .iter()
+                            .any(|item| item.key == index_key)
+                            && !hidden.keys.contains(&index_key)
+                        {
+                            hidden.keys.push(index_key);
+                        }
+                        if !hidden
+                            .names
+                            .iter()
+                            .any(|(d, n)| *d == parent && *n == r.name)
+                        {
+                            hidden.names.push((parent, r.name));
+                        }
+                    }
+                }
+            }
+        }
         for range in &self.btrfs_tree_log_dir_ranges {
             let key_at = |item_type, offset| BtrfsKey {
                 objectid: range.dir,
@@ -15852,7 +15949,8 @@ impl OpenFs {
         }
         items.retain(|item| !hidden.keys.contains(&item.key));
         for item in items.iter_mut() {
-            if item.key.item_type != BTRFS_ITEM_DIR_ITEM
+            if (item.key.item_type != BTRFS_ITEM_DIR_ITEM
+                && item.key.item_type != BTRFS_ITEM_DIR_INDEX)
                 || !hidden
                     .names
                     .iter()
@@ -15874,7 +15972,11 @@ impl OpenFs {
                 .flat_map(BtrfsDirItem::to_bytes)
                 .collect();
         }
-        items.retain(|item| item.key.item_type != BTRFS_ITEM_DIR_ITEM || !item.data.is_empty());
+        items.retain(|item| {
+            (item.key.item_type != BTRFS_ITEM_DIR_ITEM
+                && item.key.item_type != BTRFS_ITEM_DIR_INDEX)
+                || !item.data.is_empty()
+        });
     }
 
     /// Range-restricted counterpart to
@@ -29314,75 +29416,88 @@ impl OpenFs {
         self.ext4_create_duplicate_precheck(cx, &parent_inode, name)?;
 
         let mut alloc = alloc_mutex.write();
-        let Ext4AllocState {
-            geo,
-            groups,
-            persist_ctx,
-        } = &mut *alloc;
-
-        // Allocate a new inode.
         let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
+            u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
                 .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
         );
-        let (ino, new_inode) = ffs_inode::create_inode(
-            cx,
-            &block_dev,
-            geo,
-            groups,
-            mode | 0o100_000, // S_IFREG
-            uid,
-            gid,
-            parent_group,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-            persist_ctx,
-        )?;
-        self.forget_ext4_inode_caches(ino);
 
-        let attr = inode_to_attr(sb, ino, &new_inode);
-
-        // Add directory entry to parent.
-        // bd-bhh0i: single-lock caller wraps the alloc guard in a byte-identical
-        // SingleLock backend. There used to be an explicit `drop(backend)` here to
-        // end the borrow before the error branch re-borrows `alloc`; NLL already
-        // ends it at the last use, and the compiler confirms removing it changes
-        // nothing. The comment is kept because the ORDER still matters — the
-        // re-borrow below is only legal after the backend's last use.
-        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-        let add_result = self.ext4_add_dir_entry(
-            cx,
-            &mut backend,
-            parent,
-            &parent_inode,
-            name,
-            ino,
-            ffs_ondisk::Ext4FileType::RegFile,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-        );
-        if let Err(err) = add_result {
-            let mut rollback_inode = new_inode;
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
-            ffs_inode::delete_inode(
+        // bd-9rutw: Stage inode allocation, inode table write, and parent
+        // directory insertion in one operation-owned MVCC transaction so a
+        // concurrent reader or durability boundary never observes an allocated
+        // child inode before its directory entry (or a compensating delete on
+        // duplicate-name / ENOSPC failure).
+        let groups_before = alloc.groups.clone();
+        let mut txn = self.mvcc_store.begin();
+        let staged = (|| -> ffs_error::Result<(InodeNumber, Ext4Inode)> {
+            let (ino, new_inode) = {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                let Ext4AllocState {
+                    geo,
+                    groups,
+                    persist_ctx,
+                } = &mut *alloc;
+                let (ino, new_inode) = ffs_inode::create_inode(
+                    cx,
+                    &tx_dev,
+                    geo,
+                    groups,
+                    mode | 0o100_000, // S_IFREG
+                    uid,
+                    gid,
+                    parent_group,
+                    csum_seed,
+                    tstamp_secs,
+                    tstamp_nanos,
+                    persist_ctx,
+                )?;
+                self.forget_ext4_inode_caches(ino);
+                (ino, new_inode)
+            };
+            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+            self.ext4_stage_dir_entry(
                 cx,
-                &block_dev,
-                geo,
-                groups,
+                &mut txn,
+                &mut backend,
+                parent,
+                &parent_inode,
+                name,
                 ino,
-                &mut rollback_inode,
+                ffs_ondisk::Ext4FileType::RegFile,
                 csum_seed,
                 tstamp_secs,
-                persist_ctx,
+                tstamp_nanos,
             )?;
-            return Err(err);
-        }
+            Ok((ino, new_inode))
+        })();
+        let (ino, new_inode) = match staged {
+            Ok(created) => created,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        let txn_id = txn.id();
+        let write_blocks = if self.repair_flush_lifecycle.is_some() {
+            txn.write_set().keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
+        {
+            Ok(seq) => seq,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        drop(alloc);
+        self.prune_mvcc_after_commit_if_due(commit_seq);
+        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
+
+        let attr = inode_to_attr(sb, ino, &new_inode);
 
         trace!(
             target: "ffs::write",
@@ -29604,116 +29719,111 @@ impl OpenFs {
         }
 
         let mut alloc = alloc_mutex.write();
-        let Ext4AllocState {
-            geo,
-            groups,
-            persist_ctx,
-        } = &mut *alloc;
-
         let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
+            u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
                 .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
         );
-        // prepare_inode (no body persist): mknod strips EXT4_EXTENTS_FL / stores
-        // rdev below and write_inode's the final inode once (bd-mkinode-defer).
-        let (ino, mut new_inode) = ffs_inode::prepare_inode(
-            cx,
-            &block_dev,
-            geo,
-            groups,
-            mode, // full mode including S_IF* bits — no S_IFREG OR
-            uid,
-            gid,
-            parent_group,
-            tstamp_secs,
-            tstamp_nanos,
-            persist_ctx,
-        )?;
-        self.forget_ext4_inode_caches(ino);
 
-        // Devices + FIFOs + sockets do not own data extents. Strip the
-        // EXT4_EXTENTS_FL flag the create_inode helper unconditionally
-        // sets and stash rdev in the i_block area for char/block.
-        // Old encoding (i_block[0]): 16-bit rdev with 8-bit major in
-        // bits[15:8] + 8-bit minor in bits[7:0]. Use it when rdev fits
-        // in 16 bits (matches Linux's ext4_encode_dev preference).
-        // Otherwise fall back to the new encoding in i_block[1] which
-        // packs 12-bit major + 20-bit minor.
-        new_inode.flags &= !ffs_types::EXT4_EXTENTS_FL;
-        let mut iblock = [0_u8; 60];
-        if accepts_rdev {
-            if u16::try_from(rdev).is_ok() {
-                iblock[0..4].copy_from_slice(&rdev.to_le_bytes());
-            } else {
-                // i_block[1] holds the new-format rdev; i_block[0] stays 0.
-                iblock[4..8].copy_from_slice(&rdev.to_le_bytes());
-            }
-        }
-        new_inode.extent_bytes = iblock.to_vec().into();
-        // FIFOs/sockets/devices have no allocated data blocks.
-        new_inode.blocks = 0;
-        new_inode.size = 0;
+        // bd-9rutw: Stage special-inode creation and directory insertion in a
+        // single MVCC transaction; restore `alloc.groups` on pre-commit error.
+        let groups_before = alloc.groups.clone();
+        let mut txn = self.mvcc_store.begin();
+        let staged = (|| -> ffs_error::Result<(InodeNumber, Ext4Inode)> {
+            let (ino, new_inode) = {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                let Ext4AllocState {
+                    geo,
+                    groups,
+                    persist_ctx,
+                } = &mut *alloc;
+                // prepare_inode (no body persist): mknod strips EXT4_EXTENTS_FL / stores
+                // rdev below and write_inode's the final inode once (bd-mkinode-defer).
+                let (ino, mut new_inode) = ffs_inode::prepare_inode(
+                    cx,
+                    &tx_dev,
+                    geo,
+                    groups,
+                    mode, // full mode including S_IF* bits — no S_IFREG OR
+                    uid,
+                    gid,
+                    parent_group,
+                    tstamp_secs,
+                    tstamp_nanos,
+                    persist_ctx,
+                )?;
+                self.forget_ext4_inode_caches(ino);
 
-        if let Err(err) =
-            ffs_inode::write_inode(cx, &block_dev, geo, groups, ino, &new_inode, csum_seed)
-        {
-            // Roll back the inode allocation on write failure.
-            let mut rollback = new_inode.clone();
-            let _ = ffs_inode::delete_inode(
+                // Devices + FIFOs + sockets do not own data extents. Strip the
+                // EXT4_EXTENTS_FL flag the create_inode helper unconditionally
+                // sets and stash rdev in the i_block area for char/block.
+                // Old encoding (i_block[0]): 16-bit rdev with 8-bit major in
+                // bits[15:8] + 8-bit minor in bits[7:0]. Use it when rdev fits
+                // in 16 bits (matches Linux's ext4_encode_dev preference).
+                // Otherwise fall back to the new encoding in i_block[1] which
+                // packs 12-bit major + 20-bit minor.
+                new_inode.flags &= !ffs_types::EXT4_EXTENTS_FL;
+                let mut iblock = [0_u8; 60];
+                if accepts_rdev {
+                    if u16::try_from(rdev).is_ok() {
+                        iblock[0..4].copy_from_slice(&rdev.to_le_bytes());
+                    } else {
+                        // i_block[1] holds the new-format rdev; i_block[0] stays 0.
+                        iblock[4..8].copy_from_slice(&rdev.to_le_bytes());
+                    }
+                }
+                new_inode.extent_bytes = iblock.to_vec().into();
+                // FIFOs/sockets/devices have no allocated data blocks.
+                new_inode.blocks = 0;
+                new_inode.size = 0;
+
+                ffs_inode::write_inode(cx, &tx_dev, geo, groups, ino, &new_inode, csum_seed)?;
+                (ino, new_inode)
+            };
+            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+            self.ext4_stage_dir_entry(
                 cx,
-                &block_dev,
-                geo,
-                groups,
+                &mut txn,
+                &mut backend,
+                parent,
+                &parent_inode,
+                name,
                 ino,
-                &mut rollback,
+                entry_type,
                 csum_seed,
                 tstamp_secs,
-                persist_ctx,
-            );
-            return Err(err);
-        }
-
-        let attr = inode_to_attr(sb, ino, &new_inode);
-
-        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
-        // before the error branch re-borrows `alloc` — NLL ends it at the backend's
-        // last use, so the explicit `drop` this comment used to name was a no-op and
-        // is gone. The ORDER is still the requirement.
-        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-        let add_result = self.ext4_add_dir_entry(
-            cx,
-            &mut backend,
-            parent,
-            &parent_inode,
-            name,
-            ino,
-            entry_type,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-        );
-        if let Err(err) = add_result {
-            let mut rollback_inode = new_inode;
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
-            ffs_inode::delete_inode(
-                cx,
-                &block_dev,
-                geo,
-                groups,
-                ino,
-                &mut rollback_inode,
-                csum_seed,
-                tstamp_secs,
-                persist_ctx,
+                tstamp_nanos,
             )?;
-            return Err(err);
-        }
+            Ok((ino, new_inode))
+        })();
+        let (ino, new_inode) = match staged {
+            Ok(created) => created,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        let txn_id = txn.id();
+        let write_blocks = if self.repair_flush_lifecycle.is_some() {
+            txn.write_set().keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
+        {
+            Ok(seq) => seq,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        drop(alloc);
+        self.prune_mvcc_after_commit_if_due(commit_seq);
+        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
 
-        Ok(attr)
+        Ok(inode_to_attr(sb, ino, &new_inode))
     }
 
     /// Create a directory inside an ext4 parent directory.
@@ -29802,177 +29912,195 @@ impl OpenFs {
             u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
                 .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
         );
-        let (ino, mut new_inode) = {
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
-            // prepare_inode (no body persist): mkdir sets size/blocks/links_count/
-            // extent root below and write_inode's the final inode once, so the
-            // create_inode body write would be redundant (bd-mkinode-defer).
-            ffs_inode::prepare_inode(
-                cx,
-                &block_dev,
-                geo,
-                groups,
-                mode | 0o040_000, // S_IFDIR
-                uid,
-                gid,
-                parent_group,
-                tstamp_secs,
-                tstamp_nanos,
-                persist_ctx,
-            )?
-        };
 
-        self.forget_ext4_inode_caches(ino);
+        // bd-9rutw: Stage directory inode allocation, `.`/`..` data block
+        // initialization, child inode write, and parent directory entry
+        // insertion in a single MVCC transaction; restore `alloc.groups` on
+        // pre-commit error.
+        let groups_before = alloc.groups.clone();
+        let mut txn = self.mvcc_store.begin();
+        let staged = (|| -> ffs_error::Result<(InodeNumber, Ext4Inode)> {
+            let (ino, new_inode) = {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                let (ino, mut new_inode) = {
+                    let Ext4AllocState {
+                        geo,
+                        groups,
+                        persist_ctx,
+                    } = &mut *alloc;
+                    // prepare_inode (no body persist): mkdir sets size/blocks/links_count/
+                    // extent root below and write_inode's the final inode once, so the
+                    // create_inode body write would be redundant (bd-mkinode-defer).
+                    ffs_inode::prepare_inode(
+                        cx,
+                        &tx_dev,
+                        geo,
+                        groups,
+                        mode | 0o040_000, // S_IFDIR
+                        uid,
+                        gid,
+                        parent_group,
+                        tstamp_secs,
+                        tstamp_nanos,
+                        persist_ctx,
+                    )?
+                };
 
-        // Re-acquire the block device adapter so subsequent metadata reads and writes observe
-        // the newly committed inode-table state from create_inode().
-        let mut block_dev = self.block_device_adapter();
+                self.forget_ext4_inode_caches(ino);
 
-        // Allocate a data block for the directory and initialize with . and ..
-        let dir_alloc = {
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
-            let hint = self.numa_allocation_hint(
-                geo,
-                AllocHint {
-                    goal_group: Some(parent_group),
-                    ..AllocHint::default()
-                },
-                "ext4_mkdir_data_block",
-                Some(ino),
-            );
-            ffs_alloc::alloc_blocks_persist(cx, &block_dev, geo, groups, 1, &hint, persist_ctx)?
-        };
+                // Allocate a data block for the directory and initialize with . and ..
+                let dir_alloc = {
+                    let Ext4AllocState {
+                        geo,
+                        groups,
+                        persist_ctx,
+                    } = &mut *alloc;
+                    let hint = self.numa_allocation_hint(
+                        geo,
+                        AllocHint {
+                            goal_group: Some(parent_group),
+                            ..AllocHint::default()
+                        },
+                        "ext4_mkdir_data_block",
+                        Some(ino),
+                    );
+                    ffs_alloc::alloc_blocks_persist(
+                        cx,
+                        &tx_dev,
+                        geo,
+                        groups,
+                        1,
+                        &hint,
+                        persist_ctx,
+                    )?
+                };
 
-        let block_size_usize = usize::try_from(alloc.geo.block_size)
-            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
-        let mut dir_block = vec![0u8; block_size_usize];
-        let ino_u32 = u32::try_from(ino.0)
-            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
-        let parent_u32 = u32::try_from(parent.0)
-            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
-        let reserved_tail = self.ext4_dir_reserved_tail();
-        ffs_dir::init_dir_block(&mut dir_block, ino_u32, parent_u32, reserved_tail)?;
-        // On a metadata_csum filesystem the freshly initialized dir block carries
-        // a checksum tail that is still zero; stamp it (keyed on the new dir's own
-        // inode number + generation) before the write. The add_entry paths restamp
-        // a block whenever an entry is added, which is why a subdir that later
-        // receives a file appeared clean — but an *empty* directory is never
-        // restamped, so its block reached disk with a zero checksum and e2fsck
-        // reported "directory passes checks but fails checksum" (bd-bribi).
-        self.stamp_ext4_dir_block(&mut dir_block, ino_u32, new_inode.generation);
-        block_dev.write_block(cx, dir_alloc.start, &dir_block)?;
+                let block_size_usize = usize::try_from(alloc.geo.block_size)
+                    .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
+                let mut dir_block = vec![0u8; block_size_usize];
+                let ino_u32 = u32::try_from(ino.0).map_err(|_| {
+                    FfsError::Format("inode number exceeds ext4 32-bit limit".into())
+                })?;
+                let parent_u32 = u32::try_from(parent.0).map_err(|_| {
+                    FfsError::Format("inode number exceeds ext4 32-bit limit".into())
+                })?;
+                let reserved_tail = self.ext4_dir_reserved_tail();
+                ffs_dir::init_dir_block(&mut dir_block, ino_u32, parent_u32, reserved_tail)?;
+                // On a metadata_csum filesystem the freshly initialized dir block carries
+                // a checksum tail that is still zero; stamp it (keyed on the new dir's own
+                // inode number + generation) before the write (bd-bribi).
+                self.stamp_ext4_dir_block(&mut dir_block, ino_u32, new_inode.generation);
+                tx_dev.write_block(cx, dir_alloc.start, &dir_block)?;
 
-        // Set up the extent tree to point to this block.
-        let extent = Ext4Extent {
-            logical_block: 0,
-            raw_len: 1,
-            physical_start: dir_alloc.start.0,
-        };
-        let mut root_bytes = Self::extent_root(&new_inode);
-        block_dev = self.block_device_adapter();
-        if Self::ext4_inode_block_map_is_indirect(&new_inode) {
-            // No EXTENTS feature: the first block is direct pointer i_block[0].
-            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-            Self::ext4_dir_map_extent(
-                cx,
-                &block_dev,
-                &mut backend,
-                true,
-                &mut root_bytes,
-                extent,
-                u32::try_from(ino.0).unwrap_or(u32::MAX),
-                new_inode.generation,
-                AllocHint::default(),
-            )?;
-        } else {
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
-            let mut tree_alloc = ffs_extent::GroupBlockAllocator {
-                cx,
-                dev: &block_dev,
-                geo,
-                groups,
-                hint: self.numa_allocation_hint(
-                    geo,
-                    AllocHint {
-                        goal_group: Some(parent_group),
-                        ..AllocHint::default()
-                    },
-                    "ext4_mkdir_extent_tree",
-                    Some(ino),
-                ),
-                pctx: persist_ctx,
-                ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                generation: new_inode.generation,
+                // Set up the extent tree to point to this block.
+                let extent = Ext4Extent {
+                    logical_block: 0,
+                    raw_len: 1,
+                    physical_start: dir_alloc.start.0,
+                };
+                let mut root_bytes = Self::extent_root(&new_inode);
+                if Self::ext4_inode_block_map_is_indirect(&new_inode) {
+                    // No EXTENTS feature: the first block is direct pointer i_block[0].
+                    let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+                    Self::ext4_dir_map_extent(
+                        cx,
+                        &tx_dev,
+                        &mut backend,
+                        true,
+                        &mut root_bytes,
+                        extent,
+                        u32::try_from(ino.0).unwrap_or(u32::MAX),
+                        new_inode.generation,
+                        AllocHint::default(),
+                    )?;
+                } else {
+                    let Ext4AllocState {
+                        geo,
+                        groups,
+                        persist_ctx,
+                    } = &mut *alloc;
+                    let mut tree_alloc = ffs_extent::GroupBlockAllocator {
+                        cx,
+                        dev: &tx_dev,
+                        geo,
+                        groups,
+                        hint: self.numa_allocation_hint(
+                            geo,
+                            AllocHint {
+                                goal_group: Some(parent_group),
+                                ..AllocHint::default()
+                            },
+                            "ext4_mkdir_extent_tree",
+                            Some(ino),
+                        ),
+                        pctx: persist_ctx,
+                        ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                        generation: new_inode.generation,
+                    };
+                    ffs_btree::insert(cx, &tx_dev, &mut root_bytes, extent, &mut tree_alloc)?;
+                }
+                self.invalidate_ext4_write_extent_snapshot(&new_inode);
+                Self::set_extent_root(&mut new_inode, &root_bytes);
+
+                // Update inode metadata.
+                let bs = alloc.geo.block_size;
+                new_inode.size = u64::from(bs);
+                if new_inode.is_huge_file() {
+                    new_inode.blocks = 1;
+                } else {
+                    new_inode.blocks = u64::from(bs / EXT4_SECTOR_SIZE);
+                }
+                new_inode.links_count = 2; // . and parent
+                {
+                    let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                    ffs_inode::write_inode(cx, &tx_dev, geo, groups, ino, &new_inode, csum_seed)?;
+                }
+                (ino, new_inode)
             };
-            ffs_btree::insert(cx, &block_dev, &mut root_bytes, extent, &mut tree_alloc)?;
-        }
-        self.invalidate_ext4_write_extent_snapshot(&new_inode);
-        Self::set_extent_root(&mut new_inode, &root_bytes);
 
-        // Update inode metadata.
-        let bs = alloc.geo.block_size;
-        new_inode.size = u64::from(bs);
-        if new_inode.is_huge_file() {
-            new_inode.blocks = 1;
-        } else {
-            new_inode.blocks = u64::from(bs / EXT4_SECTOR_SIZE);
-        }
-        new_inode.links_count = 2; // . and parent
-        {
-            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
-            ffs_inode::write_inode(cx, &block_dev, geo, groups, ino, &new_inode, csum_seed)?;
-        }
-
-        // Add directory entry to parent.
-        // This will also update parent timestamps and size if needed.
-        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
-        // before the error branch re-borrows `alloc` — NLL ends it at the backend's
-        // last use, so the explicit `drop` this comment used to name was a no-op and
-        // is gone. The ORDER is still the requirement.
-        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-        let add_result = self.ext4_add_dir_entry(
-            cx,
-            &mut backend,
-            parent,
-            &parent_inode,
-            name,
-            ino,
-            ffs_ondisk::Ext4FileType::Dir,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-        );
-        if let Err(err) = add_result {
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
-            ffs_inode::delete_inode(
+            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+            self.ext4_stage_dir_entry(
                 cx,
-                &block_dev,
-                geo,
-                groups,
+                &mut txn,
+                &mut backend,
+                parent,
+                &parent_inode,
+                name,
                 ino,
-                &mut new_inode,
+                ffs_ondisk::Ext4FileType::Dir,
                 csum_seed,
                 tstamp_secs,
-                persist_ctx,
+                tstamp_nanos,
             )?;
-            return Err(err);
-        }
+            Ok((ino, new_inode))
+        })();
+        let (ino, new_inode) = match staged {
+            Ok(created) => created,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        let txn_id = txn.id();
+        let write_blocks = if self.repair_flush_lifecycle.is_some() {
+            txn.write_set().keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
+        {
+            Ok(seq) => seq,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        drop(alloc);
+        self.prune_mvcc_after_commit_if_due(commit_seq);
+        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
 
         let attr = inode_to_attr(sb, ino, &new_inode);
 
@@ -126589,6 +126717,182 @@ mod tests {
             detect_all_filesystems_with_hint_on_device(&cx, &hybrid_dev, Some(FsFormatKind::Ext4))
                 .expect("explicit hint should select ext4");
         assert_eq!(forced_ext4.kind(), FsFormatKind::Ext4);
+    }
+
+    #[test]
+    fn ext4_create_mknod_and_mkdir_publish_in_single_mvcc_commit_and_roll_back_cleanly_bd_9rutw() {
+        let cx = Cx::for_testing();
+        let Some((fs, _dev, _tmp)) = open_writable_ext4_mkfs_with_device(32) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        let root = InodeNumber(2);
+
+        let c0 = fs.current_snapshot().high.0;
+        fs.create(&cx, root, OsStr::new("single_create.txt"), 0o644, 0, 0)
+            .expect("create must succeed");
+        let c1 = fs.current_snapshot().high.0;
+        assert_eq!(
+            c1,
+            c0 + 1,
+            "ext4_create must publish child inode and parent dir entry in 1 MVCC commit"
+        );
+
+        fs.mknod(
+            &cx,
+            root,
+            OsStr::new("single_fifo"),
+            ffs_types::S_IFIFO | 0o600,
+            0,
+            0,
+            0,
+        )
+        .expect("mknod must succeed");
+        let c2 = fs.current_snapshot().high.0;
+        assert_eq!(
+            c2,
+            c1 + 1,
+            "ext4_mknod must publish special inode and parent dir entry in 1 MVCC commit"
+        );
+
+        fs.mkdir(&cx, root, OsStr::new("single_dir"), 0o755, 0, 0)
+            .expect("mkdir must succeed");
+        let c3 = fs.current_snapshot().high.0;
+        assert_eq!(
+            c3,
+            c2 + 1,
+            "ext4_mkdir must publish child dir inode, dot/dotdot block, and parent dir entry in 1 MVCC commit"
+        );
+
+        // Force a post-inode-allocation failure inside ext4_mkdir by zeroing
+        // free_blocks across all groups while leaving free_inodes > 0.
+        // `prepare_inode` succeeds, then `alloc_blocks_persist` for the `.`/`..`
+        // block fails with NoSpace. Because staging is private to one transaction,
+        // the failure must produce 0 MVCC commits and restore free_inodes
+        // and used_dirs.
+        {
+            let alloc_mutex = fs.require_alloc_state().expect("alloc state");
+            let mut alloc = alloc_mutex.write();
+            for group in &mut alloc.groups {
+                group.free_blocks = 0;
+            }
+        }
+        let before_fail_groups: Vec<(u32, u32)> = fs
+            .require_alloc_state()
+            .expect("alloc state")
+            .read()
+            .groups
+            .iter()
+            .map(|g| (g.free_inodes, g.used_dirs))
+            .collect();
+
+        let err = fs
+            .mkdir(&cx, root, OsStr::new("enospc_dir"), 0o755, 0, 0)
+            .expect_err("mkdir without free data blocks must fail with NoSpace");
+        assert!(
+            matches!(err, FfsError::NoSpace),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            fs.current_snapshot().high.0,
+            c3,
+            "failed mkdir must not publish an intermediate inode allocation or compensating delete commit"
+        );
+        let after_fail_groups: Vec<(u32, u32)> = fs
+            .require_alloc_state()
+            .expect("alloc state")
+            .read()
+            .groups
+            .iter()
+            .map(|g| (g.free_inodes, g.used_dirs))
+            .collect();
+        assert_eq!(
+            after_fail_groups, before_fail_groups,
+            "failed mkdir must restore allocator group counters"
+        );
+    }
+
+    #[test]
+    fn btrfs_tree_log_delete_records_hide_removed_entry_and_materialize_bd_uxh7t() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(128) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+
+        let keep = fs
+            .create(&cx, root, OsStr::new("keep.txt"), 0o644, 0, 0)
+            .expect("create keep.txt");
+        let victim = fs
+            .create(&cx, root, OsStr::new("victim.txt"), 0o644, 0, 0)
+            .expect("create victim.txt");
+        fs.write(&cx, keep.ino, 0, b"stay-alive")
+            .expect("write keep.txt");
+        fs.write(&cx, victim.ino, 0, b"to-be-deleted")
+            .expect("write victim.txt");
+        fs.btrfs_full_transaction_commit(&cx, "seed-uxh7t")
+            .expect("commit seed");
+
+        let victim_oid = fs
+            .btrfs_canonical_inode(victim.ino)
+            .expect("canonical victim inode");
+        let del_inode_ref = BtrfsKey {
+            objectid: victim_oid,
+            item_type: BTRFS_ITEM_INODE_REF,
+            offset: u64::from(BTRFS_FIRST_FREE_OBJECTID),
+        };
+
+        let mut reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &OpenOptions::default(),
+        )
+        .expect("reopen committed image");
+        reopened
+            .btrfs_tree_log_overlay_active
+            .store(true, Ordering::Release);
+        reopened.btrfs_tree_log_hidden = reopened
+            .resolve_btrfs_tree_log_removals(&cx, &[del_inode_ref])
+            .expect("resolve deleted_keys from tree log");
+
+        assert!(
+            reopened
+                .btrfs_tree_log_hidden
+                .names
+                .contains(&(u64::from(BTRFS_FIRST_FREE_OBJECTID), b"victim.txt".to_vec())),
+            "deleted INODE_REF key must resolve victim.txt into hidden.names"
+        );
+        assert!(
+            matches!(
+                reopened.lookup(&cx, root, OsStr::new("victim.txt")),
+                Err(FfsError::NotFound(_))
+            ),
+            "read overlay must hide victim.txt after deleted_keys resolution"
+        );
+        assert_eq!(
+            reopened
+                .lookup(&cx, root, OsStr::new("keep.txt"))
+                .expect("keep.txt remains visible")
+                .ino,
+            keep.ino
+        );
+
+        reopened
+            .enable_writes(&cx)
+            .expect("enable_writes must materialize deleted_keys into writable tree");
+        assert!(
+            matches!(
+                reopened.getattr(&cx, victim.ino),
+                Err(FfsError::NotFound(_))
+            ),
+            "materializing deleted_keys must purge the unlinked victim inode"
+        );
+        assert_eq!(
+            reopened
+                .read(&cx, keep.ino, 0, 10)
+                .expect("read keep.txt after materialization"),
+            b"stay-alive"
+        );
     }
 }
 

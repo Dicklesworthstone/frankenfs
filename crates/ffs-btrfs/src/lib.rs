@@ -22934,6 +22934,27 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tree-log-deletion-replay")]
+    #[test]
+    fn tree_log_delete_records_replay_when_core_overlay_enabled_bd_uxh7t() {
+        let deleted = BtrfsKey {
+            objectid: 256,
+            item_type: BTRFS_ITEM_DIR_ITEM,
+            offset: 1,
+        };
+        let result = tree_log_replay_result(vec![tree_log_delete_record(0, deleted)])
+            .expect("deletion replay must succeed when enabled");
+        assert!(
+            !result.foreign_format,
+            "enabled deletion replay must not mark deletion records foreign"
+        );
+        assert!(
+            result.replayed,
+            "deletion-only log must mark replay active so core applies deleted_keys"
+        );
+        assert_eq!(result.deleted_keys, vec![deleted]);
+    }
+
     fn make_data_bg(_start: u64, size: u64) -> BtrfsBlockGroupItem {
         BtrfsBlockGroupItem {
             total_bytes: size,
