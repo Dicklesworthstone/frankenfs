@@ -6741,3 +6741,204 @@ Final pre-publication delta, 2026-10-23 20:07 UTC:
   staged old-core reversal. Record actual publication/release on the original
   Bead/Mail after execution; this committed checklist is the pre-publication
   snapshot, not a false claim that a future push has already succeeded.
+
+## Ext4 public logical reads — 2026-10-23 21:15 UTC
+
+Original bead: bd-native-image-library-s4tde, still in progress. Prior nested
+Btrfs read_into publication/release completed in Bead2273/Mail6541; the older
+unchecked publication boxes above are retained pre-publication snapshots.
+
+- [x] Refresh main227512f06, clean tracked worktree, ownership and local queue.
+  Current hygiene run171037 reports9/15, with six existing bv/interface fixture
+  failures; source-aware local53/claimable50/foreign0. Canonical DB remains guarded.
+- [x] Reserve core lib.rs/fs_ops.rs and this existing TODO; announce Mail6582.
+- [x] Identify public read_file's low-level mapping route versus the finished Ext4
+  branch in FsOps::read. Preserve actual inode numbering and the caller scope.
+- [ ] Plant known-byte inline, indirect/hole, gzip cluster and policy regressions
+  through public read_file, with FsOps controls and malformed-input cases.
+- [ ] Verify uncommitted inode/data overlays remain private and visible through
+  both entry points; retain existing extent/EOF/cache/directory assertions.
+- [ ] Execute pre-fix remote snapshots; capture source hashes, actual failures
+  and RCH terminal ACK/releases before making any verification claim.
+- [ ] Restore and qualify read_file as the shared Ext4 logical reader with
+  FsOps delegation after the corrected original-code red. The earlier authored
+  implementation is temporarily absent for that controlled comparison.
+- [ ] Extend the existing native fast/slow encrypted-symlink regression to
+  exercise public read_symlink too. Reproduce its missing refusal, add the
+  shared encryption guard before either storage path, and retain plain targets.
+  Keep the helpers' existing NUL handling separate; no readlink semantic rewrite.
+- [ ] Execute focused green, workspace/all-target check, strict Clippy, fmt,
+  full core library and facade/examples through normal remote admission.
+- [ ] Inspect changed-path scanner findings without weakening rules; retain
+  negative control, full output, ignored-test counts and exact source closure.
+- [ ] Fresh-eyes diff review, bounded real-work/honesty inventory, evidence on
+  original bead, cycles/flush; preserve all broader unmet acceptance conditions.
+- [ ] Publish only owned qualified paths with both remote refs verified; release
+  only this unit's leases and report actual remaining limits.
+
+Creation gate: use existing code/TODO and raw external logs, no new repo framework.
+Consumer is the public inode reader and FsOps; observable defect is bypassed
+storage/policy routing. Retire this work window after qualification/publication.
+
+Source-binding correction, 21:37 UTC: the first file-read red reached remote
+execution at base227512f06+overlay1055e1c3 (test-only core15b27a2e) before local
+source edits. The companion symlink run was only queued when production edits
+began. RCH correctly refused it with E413/source-changed, exit103; no tests ran,
+so submission was not immutable-execution proof. The operator update claiming
+both snapshots were captured was premature and has been corrected. No gate
+or admission flag was changed. Re-run the symlink test with the read_file
+consolidation present but public read_symlink guard still absent: held core
+ceed84cf, fs_ops a03a9bfc, both selected overlays. Do not edit either selected
+Rust file until this attempt has its actual terminal result. The guard will
+then be restored manually and all final gates use the same frozen green cut.
+
+Bounded audit, main227512f06 through the current unqualified working diff:
+- Purpose from README: native Rust filesystem behavior through userspace FUSE
+  and offline-image tools, with explicit evidence and durability boundaries.
+- Inventory: no new published commit or closure yet. One coupled USER candidate
+  is logical public ext4 reads/policy; its inline regression additions are the
+  ENABLER. TODO, coordination and receipts are PROCESS, not another capability.
+- Two-minute demo after qualification: read known inline/indirect/gzip bytes via
+  the public inode API, then show private staged bytes and encrypted refusal.
+- Without process records the routing fix is the same; the records prevent
+  the queued-source mistake from becoming a false verified claim. Tests exercise
+  the actual production readers; they are not speculative infrastructure.
+- Native writer/crash/topology and original independent acceptance remain open.
+  This read-profile gap advances that existing item rather than displacing its
+  obligations. No swarm or close-count comparison applies. Current disposition:
+  implemented file routing, deliberately held symlink red, execution pending.
+
+Honesty inventory (all20, provisional before execution outcomes):
+1. No (checked: full working test diff retains original assertions and ignores).
+2. No (checked: existing byte-device/cluster fixtures, fixed plaintext oracles,
+   actual parsing/decoding and transaction staging; no fixture branch in runtime).
+3. No (checked: no golden or snapshot output changed).
+4. No (checked: no validator, CI, suppression, timeout or tolerance changed;
+   inline test additions strengthen behavior checks and E413 was respected).
+5. No (checked: production diff selects inode storage, with no demo-path input).
+6. No green claimed (checked: red executions are pending, not zero-run passes).
+7. Yes: the statement that both submitted snapshots were captured preceded the
+   queued companion's source binding. Corrected in operator commentary, this
+   TODO, the original Bead and Mail6601. E413/103 is a refusal, not test evidence.
+8. No (checked: synthetic image cases and planted encryption flags are labelled
+   bounded controls, not kernel-created encrypted images or mounted fscrypt proof).
+9. No (checked: tracker9/15 and source-drift103 remain visible; nothing closed).
+10. No (checked: actual test logs combine stdout and stderr. One overbroad rg
+    glob hit a huge JSON projection and was truncated; it is not complete review
+    evidence. Subsequent inspection used bounded paths and specific source ranges).
+11. No (checked: original staged item is still in progress, no follow-up laundering).
+12. No (checked: no spec promises or parity percentage changed).
+13. No (checked: solo work window, no agent closed a task).
+14. No (checked: no subagent dispatch in this window).
+15. No (checked: no delegated result accepted as verification).
+16. No (checked: no panes farming refusal-only work; positive reads are in scope).
+17. No (checked: no peer agreement is presented as independent confirmation).
+18. No (checked: first selection is5 named tests; companion extends1 existing
+    test. Final full-suite counts and conditional native execution await output).
+19. Yes: two heavyweight optional review workflows were inspected before being
+    judged inapplicable and redirected to implementation; no audit directory,
+    swarm or cron was created. The source-binding error in7 is the material
+    mistake to explain. Older-session review is not newly claimed by this window.
+20. Current strongest evidence is source inspection only. Actual red failures,
+    final green counts and terminal ACK/releases must replace this provisional
+    answer before any verified or publication claim. Solo review is not independent.
+
+Resolver-trace correction: resolve_extent already routes ordinary non-extent
+inodes through resolve_indirect_block. The earlier extent-only description was
+too broad: indirect reads were already supported. Their staged-data/hole test
+is conservation evidence for consolidation and scope forwarding, not a new
+capability. Expected pre-fix selection is therefore2passes (extent and indirect)
+and3failures (inline, compressed, policy), subject to actual executed output.
+No assertion was altered after this discovery and no performance win is claimed.
+
+First executed red, 22:00 UTC: RCH20055 / ecc5ecdb exits101 after42m16s build;
+5tests execute,2pass/3fail/0ignore/1576filtered. Extent and private indirect/hole
+controls pass. Inline fails on interpreting its bytes as a physical block;
+encrypted regular content incorrectly returns the plaintext fixture bytes.
+The compressed test instead panics during fixture construction: the existing
+EXT2_COMPRESSED_BLKADDR constant is u64, but its on-disk pointer field is4bytes.
+That third failure is an authored test bug, not reproduced runtime evidence.
+- [ ] After the held symlink red finishes, encode its sentinel as u32::MAX and
+  re-run compressed routing against the original read_file/FsOps implementation.
+  Restore the owned methods manually for that frozen red, then restore the
+  shared final implementation and symlink guard; keep all assertions intact.
+Honesty delta to6/7/9/18/20: only inline/encrypted-content failures and two
+conservation passes are proved by this first selection. The compression fixture
+error is disclosed, and the predicted three-defect failure count is withdrawn.
+
+22:07 UTC: symlink red20088 / f2568577 exits101/ACK/source+pairreleased;
+1test actually executes and fails on public encrypted fast target bytes
+"hello.txt". Plain fast target and the existing FsOps refusal pass first. Slow
+target controls are not reached in this red and await green. This uses native
+plain-image creation with a planted encryption flag, not a native fscrypt mount.
+- [x] Correct the compressed pointer encoding to exactly u32::MAX, four bytes.
+  Formatting initially caught the now-shorter line wrap; manually corrected and
+  fmt subsequently exits0. No oracle or assertion weakened.
+- [x] Manually restore the original production read_file and FsOps implementations
+  for a clean test-only red. fs_ops returns exactly to851e8400; git diff shows
+  only test hunks in core, SHA c6dea482. Main remains227512f06, no publication.
+- [ ] Await corrected five-case red on that source through terminal ACK/releases,
+  then restore the final shared reader and public symlink guard, qualify once.
+
+22:12 UTC corrected comparison completes:20126 / d7acac73, overlay7c56d8e3,
+5run/2pass/3fail/0ignore/1576filtered,0.04s tests,3m11s build,205.8s RCH,
+exit101/ACK/source+pairreleased. All three failures now reach runtime: inline
+bytes become an invalid block number, compressed bytes are returned encoded
+(actual header begins199,142), and encrypted regular data is returned. No
+fixture-construction failure remains. This supersedes the compression proof
+gap in the initial red without hiding that faulty attempt.
+- [x] Complete corrected red and manually restore final shared logical reader,
+  FsOps delegation and public read_symlink encryption guard. Add its policy doc.
+- [x] Freeze core fc8e7fc5e5f58dd0fed28bf389443f31b74967f5437ba6fc2ff4c50201b58a77,
+  fs_ops a03a9bfc927ec5b2f08914543ffaf73dbc34fd7a75f74f1d1fc44cc13f409244,
+  base227512f06+overlay2478e598be3db47a679750877d78c05f549f4f08f84ba0954f827f0aab73e037.
+  Do not edit selected Rust inputs while qualification attempts are pending.
+- [x] Final fmt exits0 and whitespace check0. Start12-case green, including all
+  file-read controls and both native symlink regression functions. Outcome pending.
+- [x] UBS5.5.0, unchanged BASH_COMPAT=50 mode/rules: final core exits0 with
+  0critical/14927warnings/3108info; dispatch file exits0 with0/86/61. Retained
+  literal-panic control exits1 with1critical/0warnings/4info. Raw stdout+stderr
+  retained externally in ext4-logical-read-*-ubs-20261023T2213 logs.
+  This is not zero-warning or independent acceptance. Default text output samples
+  findings rather than enumerating all14927 warnings; no full-warning disposition
+  is claimed. The displayed adjacent chunk-slice unwraps are unchanged, bounded
+  eight-byte conversions. New runtime lines are policy/dispatch only; test
+  assertions and negative tripwires remain intact, with no scanner suppressions.
+
+22:17 UTC: green20141 / b9137b58, base227512+overlay2478e598/treebb9bc05f,
+12passed/0failed/0ignored/1569filtered,1.38s tests,193.4s RCH; exit0/ACK and
+source+pairreleased. Actual selected output includes both native symlink tests
+without an unavailable-tool/skip message. Malformed inline capacity, corrupt
+compressed checksum, all refusal/EOF windows and private staged-data controls
+now execute successfully. Indirect reads remain conservation, not new support.
+- [x] Complete12-case green, including retained old controls and both native
+  fast/slow helper paths. The same cases repeat inside the upcoming full core
+  denominator and will not be added as extra full-suite credit.
+- [ ] Await frozen-code workspace check/all-targets, strict Clippy, complete
+  core library and facade/all-target example suites. Capture each real terminal
+  result and ACK/releases before qualification/publication.
+  Four generic dynamic Python launchers were refused by DCG before execution
+  (inline-launcher-unverified); no checks ran under those wrappers. Replaced
+  them with explicit normal RCH commands and direct no-clobber stdout+stderr
+  capture. No allowlist, token, category, fallback or executable obfuscation used.
+  Accepted direct sessions: check27679,Clippy72980,core92785,facade8872; logs are
+  ext4-logical-read-final-<label>-direct-20261023T2218.log outside the repo.
+Honesty delta6/7/9/18/20: actual12-case green now exists at the exact frozen
+cut, with reproduced original-runtime failures20126 and native planted-flag
+failure20088 as independently expected negatives. The initial fixture bug and
+queued-source error remain retained above. Full qualification is still pending.
+
+22:24 UTC scheduler adjustment: trj facade20148/4726e98f holds the shared source
+tree while compiling another dependency feature set; core20150/c183b14c and
+check20149/0717671b wait in sync. No quiet/queued job is counted as a pass.
+- [x] Use RCH's exact-wrapper cooperative cancel for the owned waiting Clippy
+  9bf6b1dd: settled130/ACK, zero slots released because it was not admitted.
+- [ ] Follow the original check20149: its cooperative cancel returned E504,
+  explicitly unconfirmed with reservations retained. No restart, forced ACK,
+  lock removal, duplicate check execution or peer cancellation was attempted.
+- [ ] Re-admit the same strict Clippy through configured vmi1152480, using the
+  same config/source/flags and normal capacity/toolchain/disk gates. Session41181,
+  ext4-logical-read-final-clippy-vmi1152480-20261023T2224.log. Classifier preflight
+  says offload-eligible only; actual resource admission/execution remains to verify.
+  Worker inventory had77GiB/9.97%free, without editing slots or worker settings.
+  Native core/facade jobs remain on trj. Keep the selected Rust source frozen.
