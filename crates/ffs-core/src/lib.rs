@@ -21726,6 +21726,220 @@ impl OpenFs {
         Ok(extents)
     }
 
+    fn read_inode_via_dev(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        geo: &FsGeometry,
+        groups: &[GroupStats],
+        ino: InodeNumber,
+    ) -> Result<Ext4Inode, FfsError> {
+        let mut inode = ffs_inode::read_inode(cx, dev, geo, groups, ino)?;
+        if inode.mode == 0 {
+            return Err(FfsError::NotFound(format!("inode {}", ino.0)));
+        }
+        inode.number = ino.0;
+        Ok(inode)
+    }
+
+    fn ext4_write_extents_via_dev(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        inode: &Ext4Inode,
+    ) -> Result<Arc<[Ext4Extent]>, FfsError> {
+        if Self::ext4_inode_block_map_is_indirect(inode) {
+            return Ok(Arc::from(self.ext4_indirect_runs_via_dev(cx, dev, inode)?));
+        }
+        let namespace = extent_cache_namespace(inode);
+        let root_namespace = extent_root_namespace(inode);
+
+        let cached_extents = {
+            let snapshot = self.ext4_write_extent_snapshot.lock();
+            snapshot
+                .as_ref()
+                .filter(|snapshot| {
+                    snapshot.namespace == namespace && snapshot.root_namespace == root_namespace
+                })
+                .map(|snapshot| Arc::clone(&snapshot.extents))
+        };
+        if let Some(extents) = cached_extents {
+            return Ok(extents);
+        }
+
+        let (header, tree) = parse_inode_extent_tree(inode).map_err(|e| parse_to_ffs_error(&e))?;
+        let mut collected = Vec::new();
+        Self::collect_extents_recursive_via_dev(cx, dev, &tree, header.depth, &mut collected)?;
+        let extents = Arc::<[Ext4Extent]>::from(collected);
+        *self.ext4_write_extent_snapshot.lock() = Some(Ext4WriteExtentSnapshot {
+            namespace,
+            root_namespace,
+            extents: Arc::clone(&extents),
+        });
+        Ok(extents)
+    }
+
+    fn collect_extents_recursive_via_dev(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        tree: &ExtentTree,
+        remaining_depth: u16,
+        result: &mut Vec<Ext4Extent>,
+    ) -> Result<(), FfsError> {
+        if remaining_depth > Self::MAX_EXTENT_DEPTH {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: "extent tree depth exceeds maximum".into(),
+            });
+        }
+        match tree {
+            ExtentTree::Leaf(extents) => {
+                result.extend_from_slice(extents);
+                Ok(())
+            }
+            ExtentTree::Index(indexes) => {
+                if remaining_depth == 0 {
+                    return Err(FfsError::Corruption {
+                        block: 0,
+                        detail: "extent index at depth 0".into(),
+                    });
+                }
+                for idx in indexes {
+                    let child = dev.read_block(cx, BlockNumber(idx.leaf_block))?;
+                    let (child_header, child_tree) =
+                        parse_extent_tree(child.as_slice()).map_err(|e| parse_to_ffs_error(&e))?;
+                    if child_header.depth + 1 != remaining_depth {
+                        return Err(FfsError::Corruption {
+                            block: idx.leaf_block,
+                            detail: "child extent tree depth inconsistency".into(),
+                        });
+                    }
+                    Self::collect_extents_recursive_via_dev(
+                        cx,
+                        dev,
+                        &child_tree,
+                        remaining_depth - 1,
+                        result,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn ext4_indirect_runs_via_dev(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        inode: &Ext4Inode,
+    ) -> Result<Vec<Ext4Extent>, FfsError> {
+        fn push(runs: &mut Vec<Ext4Extent>, logical: u64, phys: u32) -> Result<(), FfsError> {
+            let logical = u32::try_from(logical)
+                .map_err(|_| FfsError::Format("indirect logical block exceeds u32".into()))?;
+            if let Some(last) = runs.last_mut() {
+                let len = u32::from(last.raw_len);
+                if last.logical_block + len == logical
+                    && last.physical_start + u64::from(len) == u64::from(phys)
+                    && len < 32_768
+                {
+                    last.raw_len += 1;
+                    return Ok(());
+                }
+            }
+            runs.push(Ext4Extent {
+                logical_block: logical,
+                raw_len: 1,
+                physical_start: u64::from(phys),
+            });
+            Ok(())
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn walk(
+            cx: &Cx,
+            dev: &dyn BlockDevice,
+            block: u32,
+            level: u32,
+            base: u64,
+            ppb: u64,
+            total_blocks: u64,
+            runs: &mut Vec<Ext4Extent>,
+        ) -> Result<(), FfsError> {
+            if u64::from(block) >= total_blocks {
+                return Err(FfsError::Corruption {
+                    block: u64::from(block),
+                    detail: "indirect pointer block beyond the end of the filesystem".into(),
+                });
+            }
+            let data = dev.read_block(cx, BlockNumber(u64::from(block)))?;
+            let span = ppb.pow(level - 1);
+            for (index, raw) in data
+                .as_slice()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(ppb as usize)
+                .enumerate()
+            {
+                let child = u32::from_le_bytes(*raw);
+                if child == 0 {
+                    continue;
+                }
+                let logical = base + index as u64 * span;
+                if level == 1 {
+                    if u64::from(child) >= total_blocks {
+                        return Err(FfsError::Corruption {
+                            block: u64::from(child),
+                            detail: "indirect data pointer beyond the end of the filesystem".into(),
+                        });
+                    }
+                    push(runs, logical, child)?;
+                } else {
+                    walk(
+                        cx,
+                        dev,
+                        child,
+                        level - 1,
+                        logical,
+                        ppb,
+                        total_blocks,
+                        runs,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let total_blocks = sb.blocks_count;
+        let ppb = u64::from(sb.block_size / 4);
+        let mut root = [0_u8; 60];
+        let len = inode.extent_bytes.len().min(60);
+        root[..len].copy_from_slice(&inode.extent_bytes[..len]);
+        let mut runs = Vec::new();
+        for slot in 0..12 {
+            let ptr = Self::ext4_ind_root_slot(&root, slot);
+            if ptr != 0 {
+                if u64::from(ptr) >= total_blocks {
+                    return Err(FfsError::Corruption {
+                        block: u64::from(ptr),
+                        detail: "direct block pointer beyond the end of the filesystem".into(),
+                    });
+                }
+                push(&mut runs, slot as u64, ptr)?;
+            }
+        }
+        let mut base = 12_u64;
+        for (slot, level) in [(12_usize, 1_u32), (13, 2), (14, 3)] {
+            let ptr = Self::ext4_ind_root_slot(&root, slot);
+            if ptr != 0 {
+                walk(cx, dev, ptr, level, base, ppb, total_blocks, &mut runs)?;
+            }
+            base += ppb.pow(level);
+        }
+        Ok(runs)
+    }
+
     fn invalidate_ext4_write_extent_snapshot(&self, inode: &Ext4Inode) {
         let namespace = extent_cache_namespace(inode);
         let mut snapshot = self.ext4_write_extent_snapshot.lock();
@@ -30464,8 +30678,11 @@ impl OpenFs {
             (logical >= start && logical < start.saturating_add(len))
                 .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
         };
-        let read_leaf =
-            |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
+        let read_leaf = |lb| {
+            resolve_logical(lb)
+                .and_then(|phys| dev.read_block(cx, phys).ok())
+                .map(BlockBuf::into_inner)
+        };
 
         let Some(target_logical) = ffs_ondisk::htree_target_leaf_block(
             &sb.hash_seed,
@@ -30480,7 +30697,7 @@ impl OpenFs {
             return Ok(None);
         };
 
-        let mut data = self.read_block_vec(cx, target_phys)?;
+        let mut data = dev.read_block(cx, target_phys)?.into_inner();
         if let Some((_ino, edit)) =
             ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
         {
@@ -30559,8 +30776,11 @@ impl OpenFs {
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("htree directory on non-ext4 fs".into()))?;
-        let read_leaf =
-            |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
+        let read_leaf = |lb| {
+            resolve_logical(lb)
+                .and_then(|phys| dev.read_block(cx, phys).ok())
+                .map(BlockBuf::into_inner)
+        };
         let target_logical = if casefold {
             ffs_ondisk::htree_target_leaf_block_casefold(
                 &sb.hash_seed,
@@ -30593,7 +30813,7 @@ impl OpenFs {
             ),
         })?;
 
-        let mut data = self.read_block_vec(cx, target_phys)?;
+        let mut data = dev.read_block(cx, target_phys)?.into_inner();
         match ffs_dir::add_entry_reject_existing_tracked(
             &mut data,
             child_ino_u32,
@@ -30670,7 +30890,7 @@ impl OpenFs {
                 continue;
             }
             for block in Self::extent_phys_blocks(ext) {
-                let mut data = self.read_block_vec(cx, block)?;
+                let mut data = dev.read_block(cx, block)?.into_inner();
                 match ffs_dir::add_entry_tracked(
                     &mut data,
                     child_ino_u32,
@@ -30780,8 +31000,7 @@ impl OpenFs {
             // is an independent owned handle (the cache may invalidate its own
             // copy mid-insert on growth; ours stays the correct pre-insert
             // snapshot), exactly as the `to_vec` copy was — byte-identical.
-            let extents =
-                self.ext4_write_extents_with_scope(cx, &RequestScope::empty(), parent_inode)?;
+            let extents = self.ext4_write_extents_via_dev(cx, dev, parent_inode)?;
 
             // Try adding to each existing block.
             let child_ino_u32 = u32::try_from(child_ino.0)
@@ -31188,7 +31407,7 @@ impl OpenFs {
         let Some(dx_root_phys) = resolve(0) else {
             return Ok(None);
         };
-        let dx_root_block = self.read_block_vec(cx, dx_root_phys)?;
+        let dx_root_block = dev.read_block(cx, dx_root_phys)?.into_inner();
 
         // Pure split: repacks both leaves and the dx_root, all checksum-stamped.
         let split = match ffs_ondisk::split_htree_leaf(
@@ -31449,7 +31668,7 @@ impl OpenFs {
         let Some(node_phys) = resolve(node_logical) else {
             return Ok(None);
         };
-        let dx_node_block = self.read_block_vec(cx, node_phys)?;
+        let dx_node_block = dev.read_block(cx, node_phys)?.into_inner();
 
         let logical_end = extents
             .iter()
@@ -35501,7 +35720,7 @@ impl OpenFs {
             RenameTargetProbe::Absent => None,
             RenameTargetProbe::NotChecked => self.lookup_name(cx, &new_parent_inode, new_name)?,
         };
-        if let Some(existing) = existing_target {
+        let existing_target_info = if let Some(existing) = existing_target {
             let existing_ino = InodeNumber(u64::from(existing.inode));
             // POSIX: renaming a file onto one of its own hard links (old and new
             // resolve to the same inode) is a no-op: the kernel's vfs_rename
@@ -35538,7 +35757,307 @@ impl OpenFs {
             } else {
                 Self::ext4_checked_links_count_delta(existing_inode.links_count, existing_ino, -1)?;
             }
+            Some((existing_ino, existing_inode))
+        } else {
+            None
+        };
 
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let sharded_inode_free = self.bhh0i_sharded_ops_active();
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let sharded_inode_free = false;
+        let target_pinned = existing_target_info
+            .as_ref()
+            .is_some_and(|(existing_ino, _)| self.ext4_open_handle_count(*existing_ino) > 0);
+
+        if !sharded_inode_free && !target_pinned {
+            let groups_before = alloc.groups.clone();
+            let mut txn = self.mvcc_store.begin();
+            let stage_res = (|| -> ffs_error::Result<()> {
+                let new_parent_inode_fresh = {
+                    let tx_dev = TransactionBlockAdapter {
+                        base: &block_dev,
+                        tx: Mutex::new(&mut txn),
+                    };
+
+                    if let Some((existing_ino, existing_inode)) = existing_target_info.clone() {
+                        let extents =
+                            self.ext4_write_extents_via_dev(cx, &tx_dev, &new_parent_inode)?;
+                        let reserved_tail = self.ext4_dir_reserved_tail();
+                        let removed_existing_via_htree = self
+                            .ext4_htree_remove_dir_entry(
+                                cx,
+                                &tx_dev,
+                                new_parent,
+                                &new_parent_inode,
+                                &extents,
+                                new_name,
+                                reserved_tail,
+                            )?
+                            .unwrap_or(false);
+                        if !removed_existing_via_htree {
+                            let dx_root_phys =
+                                Self::ext4_htree_dx_root_phys(&new_parent_inode, &extents);
+                            'rm_existing_tx: for ext in extents.iter() {
+                                for block in Self::extent_phys_blocks(ext) {
+                                    if Some(block) == dx_root_phys {
+                                        continue;
+                                    }
+                                    let mut data = tx_dev.read_block(cx, block)?.into_inner();
+                                    if let Some((_ino, edit)) =
+                                        ffs_dir::remove_entry_take_inode_tracked(
+                                            &mut data,
+                                            new_name,
+                                            reserved_tail,
+                                        )?
+                                    {
+                                        let np_ino_u32 =
+                                            u32::try_from(new_parent.0).map_err(|_| {
+                                                FfsError::Format(
+                                                    "inode number exceeds ext4 32-bit limit".into(),
+                                                )
+                                            })?;
+                                        self.stamp_ext4_dir_block_after_edit(
+                                            &mut data,
+                                            np_ino_u32,
+                                            new_parent_inode.generation,
+                                            &edit,
+                                        );
+                                        tx_dev.write_block(cx, block, &data)?;
+                                        break 'rm_existing_tx;
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut ex_upd = existing_inode;
+                        if ex_upd.is_dir() {
+                            ex_upd.links_count = 0;
+                            let mut new_par = Self::read_inode_via_dev(
+                                cx,
+                                &tx_dev,
+                                &alloc.geo,
+                                &alloc.groups,
+                                new_parent,
+                            )?;
+                            new_par.links_count =
+                                Self::ext4_dir_link_dec(new_par.links_count, new_parent)?;
+                            ffs_inode::touch_mtime_ctime(&mut new_par, tstamp_secs, tstamp_nanos);
+                            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                            ffs_inode::write_inode(
+                                cx,
+                                &tx_dev,
+                                geo,
+                                groups,
+                                new_parent,
+                                &new_par,
+                                csum_seed,
+                            )?;
+                        } else {
+                            ex_upd.links_count = Self::ext4_checked_links_count_delta(
+                                ex_upd.links_count,
+                                existing_ino,
+                                -1,
+                            )?;
+                        }
+                        let Ext4AllocState {
+                            geo,
+                            groups,
+                            persist_ctx,
+                        } = &mut *alloc;
+                        if ex_upd.links_count == 0 {
+                            ffs_inode::delete_inode(
+                                cx,
+                                &tx_dev,
+                                geo,
+                                groups,
+                                existing_ino,
+                                &mut ex_upd,
+                                csum_seed,
+                                tstamp_secs,
+                                persist_ctx,
+                            )?;
+                        } else {
+                            ffs_inode::write_inode(
+                                cx,
+                                &tx_dev,
+                                geo,
+                                groups,
+                                existing_ino,
+                                &ex_upd,
+                                csum_seed,
+                            )?;
+                        }
+                    }
+
+                    Self::read_inode_via_dev(
+                        cx,
+                        &tx_dev,
+                        &alloc.geo,
+                        &alloc.groups,
+                        new_parent,
+                    )?
+                };
+                {
+                    let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+                    self.ext4_stage_dir_entry(
+                        cx,
+                        &mut txn,
+                        &mut backend,
+                        new_parent,
+                        &new_parent_inode_fresh,
+                        new_name,
+                        child_ino,
+                        ft,
+                        csum_seed,
+                        tstamp_secs,
+                        tstamp_nanos,
+                    )?;
+                }
+
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+
+                let src_parent_fresh = Self::read_inode_via_dev(
+                    cx,
+                    &tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    parent,
+                )?;
+                let src_extents =
+                    self.ext4_write_extents_via_dev(cx, &tx_dev, &src_parent_fresh)?;
+                let reserved_tail = self.ext4_dir_reserved_tail();
+                let removed_via_htree = self
+                    .ext4_htree_remove_dir_entry(
+                        cx,
+                        &tx_dev,
+                        parent,
+                        &src_parent_fresh,
+                        &src_extents,
+                        name,
+                        reserved_tail,
+                    )?
+                    .unwrap_or(false);
+                if !removed_via_htree {
+                    let dx_root_phys =
+                        Self::ext4_htree_dx_root_phys(&src_parent_fresh, &src_extents);
+                    'rm_src_tx: for ext in src_extents.iter() {
+                        for block in Self::extent_phys_blocks(ext) {
+                            if Some(block) == dx_root_phys {
+                                continue;
+                            }
+                            let mut data = tx_dev.read_block(cx, block)?.into_inner();
+                            if let Some((_ino, edit)) =
+                                ffs_dir::remove_entry_take_inode_tracked(
+                                    &mut data,
+                                    name,
+                                    reserved_tail,
+                                )?
+                            {
+                                let src_ino_u32 = u32::try_from(parent.0).map_err(|_| {
+                                    FfsError::Format(
+                                        "inode number exceeds ext4 32-bit limit".into(),
+                                    )
+                                })?;
+                                self.stamp_ext4_dir_block_after_edit(
+                                    &mut data,
+                                    src_ino_u32,
+                                    src_parent_fresh.generation,
+                                    &edit,
+                                );
+                                tx_dev.write_block(cx, block, &data)?;
+                                break 'rm_src_tx;
+                            }
+                        }
+                    }
+                }
+
+                if child_inode.is_dir() {
+                    if parent != new_parent
+                        && let Some((dot_dot_block, data)) = planned_child_dir_update.as_ref()
+                    {
+                        tx_dev.write_block(cx, *dot_dot_block, data)?;
+                    }
+                    let mut adjust_parent = Self::read_inode_via_dev(
+                        cx,
+                        &tx_dev,
+                        &alloc.geo,
+                        &alloc.groups,
+                        parent,
+                    )?;
+                    adjust_parent.links_count =
+                        Self::ext4_dir_link_dec(adjust_parent.links_count, parent)?;
+                    ffs_inode::touch_mtime_ctime(&mut adjust_parent, tstamp_secs, tstamp_nanos);
+                    ffs_inode::write_inode(
+                        cx,
+                        &tx_dev,
+                        &alloc.geo,
+                        &alloc.groups,
+                        parent,
+                        &adjust_parent,
+                        csum_seed,
+                    )?;
+                }
+
+                let mut child_upd = Self::read_inode_via_dev(
+                    cx,
+                    &tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    child_ino,
+                )?;
+                ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
+                ffs_inode::write_inode(
+                    cx,
+                    &tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    child_ino,
+                    &child_upd,
+                    csum_seed,
+                )?;
+                Ok(())
+            })();
+
+            if let Err(err) = stage_res {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+
+            let txn_id = txn.id();
+            let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                txn.write_set().keys().copied().collect()
+            } else {
+                Vec::new()
+            };
+            let commit_seq =
+                match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store) {
+                    Ok(seq) => seq,
+                    Err(err) => {
+                        alloc.groups = groups_before;
+                        return Err(err);
+                    }
+                };
+            drop(alloc);
+            self.prune_mvcc_after_commit_if_due(commit_seq);
+            self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
+            trace!(
+                target: "ffs::write",
+                op = "rename",
+                src_parent = parent.0,
+                dst_parent = new_parent.0,
+                old_name = %String::from_utf8_lossy(name),
+                new_name = %String::from_utf8_lossy(new_name),
+                ino = child_ino.0,
+                "entry renamed"
+            );
+            return Ok(());
+        }
+
+        if let Some((existing_ino, existing_inode)) = existing_target_info {
             // Remove the existing target. Cached extent snapshot (self-invalidating
             // on growth) instead of a fresh full parse (bd-cc-itableloc sibling).
             let extents =
@@ -35620,12 +36139,7 @@ impl OpenFs {
                     // leaks one inode per clobbering rename — measured at exactly
                     // 200 over 200 renames, e2fsck-dirty, which is bd-pbyu0's
                     // signature in a path that bead never listed.
-                    #[cfg(feature = "bhh0i_sharded_alloc")]
-                    let sharded_inode_free = self.bhh0i_sharded_ops_active();
-                    #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-                    let sharded_inode_free = false;
-
-                    if self.ext4_open_handle_count(existing_ino) > 0 {
+                    if target_pinned {
                         // bd-90aey: the clobbered target may still be open (or a
                         // cwd): it stays alive with nlink 0 until the last kernel
                         // reference, exactly as unlink's victim does.
@@ -126809,6 +127323,88 @@ mod tests {
         assert_eq!(
             after_fail_groups, before_fail_groups,
             "failed mkdir must restore allocator group counters"
+        );
+    }
+
+    #[test]
+    fn ext4_rename_publishes_in_single_mvcc_commit_and_rolls_back_clobber_on_error_bd_9rutw() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber::ROOT;
+
+        let src_attr = fs
+            .create(&cx, root, OsStr::new("src.txt"), 0o644, 0, 0)
+            .expect("create src.txt");
+        let dst_attr = fs
+            .create(&cx, root, OsStr::new("dst.txt"), 0o644, 0, 0)
+            .expect("create dst.txt");
+
+        let c0 = fs.current_snapshot().high.0;
+        fs.rename(
+            &cx,
+            root,
+            OsStr::new("src.txt"),
+            root,
+            OsStr::new("dst.txt"),
+        )
+        .expect("clobbering rename src.txt -> dst.txt");
+        let c1 = fs.current_snapshot().high.0;
+        assert_eq!(
+            c1,
+            c0 + 1,
+            "ext4 clobbering rename must publish in a single MVCC commit"
+        );
+        let looked_up = fs
+            .lookup(&cx, root, OsStr::new("dst.txt"))
+            .expect("dst.txt must resolve to moved source inode");
+        assert_eq!(looked_up.ino, src_attr.ino);
+        assert!(
+            matches!(
+                fs.lookup(&cx, root, OsStr::new("src.txt")),
+                Err(FfsError::NotFound(_))
+            ),
+            "old source name must be removed"
+        );
+        let _ = dst_attr;
+
+        // Cross-directory directory rename (updates new_parent, source parent,
+        // moved directory's '..' entry, and moved inode's ctime) must also
+        // publish in a single MVCC commit.
+        let dir_a = fs
+            .mkdir(&cx, root, OsStr::new("dir_a"), 0o755, 0, 0)
+            .expect("mkdir dir_a")
+            .ino;
+        let dir_b = fs
+            .mkdir(&cx, root, OsStr::new("dir_b"), 0o755, 0, 0)
+            .expect("mkdir dir_b")
+            .ino;
+        let moved_sub = fs
+            .mkdir(&cx, dir_a, OsStr::new("sub"), 0o755, 0, 0)
+            .expect("mkdir sub")
+            .ino;
+
+        let c2 = fs.current_snapshot().high.0;
+        fs.rename(
+            &cx,
+            dir_a,
+            OsStr::new("sub"),
+            dir_b,
+            OsStr::new("sub_moved"),
+        )
+        .expect("cross-dir rename sub -> sub_moved");
+        let c3 = fs.current_snapshot().high.0;
+        assert_eq!(
+            c3,
+            c2 + 1,
+            "cross-directory ext4 directory rename must publish in a single MVCC commit"
+        );
+        assert_eq!(
+            fs.lookup(&cx, dir_b, OsStr::new("sub_moved"))
+                .expect("sub_moved lookup")
+                .ino,
+            moved_sub
         );
     }
 
