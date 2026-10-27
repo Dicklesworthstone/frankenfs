@@ -1,5 +1,19 @@
 # FEATURE_PARITY
 
+> **Shared ext4 xattr checksums during inode retirement (2026-10-27):**
+> releasing one owner of an external xattr block now restamps its metadata
+> checksum after decrementing the reference count. Remaining owners retain a
+> valid shared block instead of inheriting a checksum mismatch. A regression
+> checks reference counts of two and three, preserved value bytes, unchanged
+> free-block accounting and the retiring inode's cleared xattr pointer.
+> The existing synthetic Btrfs write fixture also stamps and verifies its
+> superblock checksum, correcting the baseline CI admission failure so later
+> suites can execute. Pinned formatting and whitespace checks pass. Local
+> check and Clippy were killed in `asupersync` under shared memory pressure;
+> inode tests stopped in `hashbrown` on disk exhaustion, before any test ran.
+> Runtime qualification remains pending. No broader native writer, crash or
+> parity-percentage claim is made.
+
 > **Nested Btrfs buffer reads (2026-10-23, source `14fff2f5a`):**
 > `OpenFs::read_into` now routes tagged subvolume inodes to the owning child
 > reader, preserving its attached-device mapping and direct caller-buffer path.

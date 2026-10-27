@@ -1108,6 +1108,15 @@ fn release_inode_storage_inner(
                 if refcount > 1 {
                     let new_refcount = refcount - 1;
                     data[4..8].copy_from_slice(&new_refcount.to_le_bytes());
+                    // The checksum covers the header, including h_refcount.
+                    // Keep the block valid for every inode that still shares it.
+                    if pctx.has_metadata_csum {
+                        ffs_ondisk::stamp_xattr_block_checksum(
+                            &mut data,
+                            pctx.csum_seed,
+                            acl_block.0,
+                        );
+                    }
                     dev.write_block(cx, acl_block, &data)?;
                 } else {
                     ffs_alloc::free_blocks_persist(cx, dev, geo, groups, acl_block, 1, pctx)?;
@@ -3401,6 +3410,72 @@ mod tests {
         ]);
         assert_eq!(refcount, 2, "refcount should be decremented from 3 to 2");
         assert_eq!(inode.file_acl, 0, "file_acl should be cleared");
+    }
+
+    #[test]
+    fn release_shared_xattr_refcount_preserves_checksum_bd_9rutw() {
+        for refcount in [2_u32, 3] {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let (ino, mut inode) = create_inode(
+                &cx,
+                &dev,
+                &geo,
+                &mut groups,
+                0o100_644,
+                0,
+                0,
+                GroupNumber(0),
+                0,
+                1_700_000_000,
+                0,
+                &mock_pctx(),
+            )
+            .unwrap();
+            let mut pctx = mock_pctx();
+            pctx.has_metadata_csum = true;
+            pctx.csum_seed = 0x89AB_CDEF;
+            let xattr_block = BlockNumber(500);
+            let mut xattr_data = vec![0_u8; 4096];
+            xattr_data[0..4].copy_from_slice(&0xEA02_0000_u32.to_le_bytes());
+            xattr_data[4..8].copy_from_slice(&refcount.to_le_bytes());
+            xattr_data[8..12].copy_from_slice(&1_u32.to_le_bytes());
+            xattr_data[128..150].copy_from_slice(b"shared attribute value");
+            ffs_ondisk::stamp_xattr_block_checksum(&mut xattr_data, pctx.csum_seed, xattr_block.0);
+            assert!(ffs_ondisk::verify_xattr_block_checksum(
+                &xattr_data,
+                pctx.csum_seed,
+                xattr_block.0,
+            ));
+            dev.write_block(&cx, xattr_block, &xattr_data).unwrap();
+            inode.file_acl = xattr_block.0;
+            let free_before = groups[0].free_blocks;
+
+            release_inode_storage_deferring_writeback(
+                &cx,
+                &dev,
+                &geo,
+                &mut groups,
+                ino,
+                &mut inode,
+                1_700_000_001,
+                &pctx,
+            )
+            .unwrap();
+
+            let actual = dev.read_block(&cx, xattr_block).unwrap();
+            let actual = actual.as_slice();
+            assert_eq!(&actual[4..8], &(refcount - 1).to_le_bytes());
+            assert_eq!(&actual[128..150], b"shared attribute value");
+            assert!(
+                ffs_ondisk::verify_xattr_block_checksum(actual, pctx.csum_seed, xattr_block.0),
+                "shared xattr checksum must cover the decremented refcount {refcount}"
+            );
+            assert_eq!(groups[0].free_blocks, free_before);
+            assert_eq!(inode.file_acl, 0);
+        }
     }
 
     #[test]
