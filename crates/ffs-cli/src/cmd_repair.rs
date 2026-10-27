@@ -2153,10 +2153,9 @@ pub fn recover_ext4_corrupt_blocks(
     let cx = cli_cx();
     // bd-jufod: every decoded block must pass the image's own metadata
     // checksums before it is written. The validator is built over the image
-    // as it would be after the writeback, so a repaired descriptor block and
-    // the bitmaps it describes are judged together. Inode-owned blocks
-    // (extent/dir/xattr) are not covered here: identifying them needs an
-    // inode walk of that same view.
+    // as it would be after the writeback, so a repaired descriptor/inode-table
+    // block and the bitmaps or inode-owned blocks (extent/dir/xattr/JBD2) it
+    // describes are judged together.
     let validator_over_view =
         |cx: &Cx, view: &dyn BlockDevice| -> ffs_error::Result<Box<dyn BlockValidator>> {
             Ok(Box::new(Ext4MetadataValidator::from_device(cx, view, sb)?))

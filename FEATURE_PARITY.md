@@ -1,5 +1,43 @@
 # FEATURE_PARITY
 
+> **Atomic ext4 namespace retirement and classic rename (2026-10-27):**
+> unlink, rmdir, final orphan reclamation and classic rename now stage their
+> directory entries, inode slots, storage frees, link counts and orphan-list
+> edits through one registered-snapshot MVCC transaction per operation.
+> Allocation counters and runtime orphan/cache effects stay private until
+> publication, including the sharded allocator's retained inode-group guard.
+> Conflicts retry from a fresh snapshot up to sixteen times; failed staging
+> leaves the original namespace and storage available. Directory lookup,
+> emptiness, ancestry, insertion and removal read the supplied transaction
+> device, including htree growth, indirect mappings and indexed `..` entries.
+> Read-only FORGET remains a no-op when no reclamation is pending.
+> Ten new regression functions cover both allocator modes, retained snapshots,
+> hard links, pinned victims, directory moves, one-publication behavior, late
+> storage failure, cancellation, conflict recovery/exhaustion and native
+> checker/reopen scenarios on 1 KiB and 4 KiB images. These tests are authored;
+> local compilation stopped in unchanged dependencies under memory and disk
+> exhaustion. The first ARM CI build found an `Arc<OpenFs>` method-dispatch
+> error in the new conflict test; its calls now select the public wrappers
+> explicitly. Runtime execution remains pending. Pinned formatting and
+> whitespace checks pass. This advances `bd-9rutw` without closing it: sharded
+> create/mkdir, ACL inheritance and arbitrary outer-request composition still need their
+> remaining transaction work. No mounted, crash, performance or parity-rate
+> qualification is added.
+
+> **Shared ext4 xattr checksums during inode retirement (2026-10-27):**
+> releasing one owner of an external xattr block now restamps its metadata
+> checksum after decrementing the reference count. Remaining owners retain a
+> valid shared block instead of inheriting a checksum mismatch. A regression
+> checks reference counts of two and three, preserved value bytes, unchanged
+> free-block accounting and the retiring inode's cleared xattr pointer.
+> The existing synthetic Btrfs write fixture also stamps and verifies its
+> superblock checksum, correcting the baseline CI admission failure so later
+> suites can execute. Pinned formatting and whitespace checks pass. Local
+> check and Clippy were killed in `asupersync` under shared memory pressure;
+> inode tests stopped in `hashbrown` on disk exhaustion, before any test ran.
+> Runtime qualification remains pending. No broader native writer, crash or
+> parity-percentage claim is made.
+
 > **Nested Btrfs buffer reads (2026-10-23, source `14fff2f5a`):**
 > `OpenFs::read_into` now routes tagged subvolume inodes to the owning child
 > reader, preserving its attached-device mapping and direct caller-buffer path.

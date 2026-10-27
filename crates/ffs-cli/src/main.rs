@@ -19788,6 +19788,119 @@ mod tests {
         );
     }
 
+    /// bd-jufod: `validator_over_view` builds `Ext4MetadataValidator::from_device`
+    /// over the post-decode `DecodedOverlay` view, which must discover inode-owned
+    /// blocks (`DirLeaf`, `DxRoot`, `ExtentNode`, `Xattr`) directly from the view.
+    /// If an unallocated source block in the group changed after symbols were built,
+    /// decoding a damaged root directory block yields bytes that fail the directory
+    /// tail checksum; repair must refuse writeback instead of skipping inode-owned
+    /// validation on the overlay view.
+    #[test]
+    fn repair_refuses_corrupt_decoded_directory_block_via_view_validator_bd_jufod() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let Some(ProtectedExt4 {
+            image,
+            block_size: bs,
+            ..
+        }) = protected_ext4_image_bd_jufod(&dir, 0)
+        else {
+            return;
+        };
+
+        let root_dir_block = {
+            let cx = crate::cli_cx();
+            let fs = ffs_core::OpenFs::open(&cx, &image).expect("open ext4 image");
+            let root_inode = fs
+                .read_inode(&cx, ffs_types::InodeNumber(2))
+                .expect("read root inode");
+            let extents = fs
+                .collect_extents(&cx, &root_inode)
+                .expect("collect root dir extents");
+            extents[0].physical_start
+        };
+        let root_dir_off = usize::try_from(root_dir_block).expect("fits") * bs;
+
+        let clean = std::fs::read(&image).expect("read clean image");
+
+        // 1. Corrupting only the root directory block is detected and restored cleanly.
+        flip_byte(&image, root_dir_off + 24);
+        let restored_out = run_repair_with(&image, 0, false);
+        let restored_json = serde_json::to_string(&restored_out).unwrap_or_default();
+        let after_restore = std::fs::read(&image).expect("read restored image");
+        assert_eq!(
+            after_restore[root_dir_off..root_dir_off + bs],
+            clean[root_dir_off..root_dir_off + bs],
+            "root directory block {root_dir_block} must be restored cleanly: {restored_json}"
+        );
+        assert_eq!(restored_out.exit_code, 0, "{restored_json}");
+
+        // 2. Build a second protected image on group 2 (whose group descriptor and
+        // root inode table live in group 0). Point root inode 2's `file_acl` (in
+        // group 0's inode table, with a valid inode checksum) at `free_block` in
+        // group 2 after group 2's symbols were built, and corrupt `free_block`.
+        // Group 2's RaptorQ decode succeeds (only `free_block` changed in group 2)
+        // and reconstructs the old zero block, which `validator_over_view`
+        // (`Ext4MetadataValidator::from_device`) must refuse because it fails
+        // `Ext4OwnedBlock::Xattr` validation.
+        let dir2 = tempfile::TempDir::new().expect("tmpdir2");
+        let Some(ProtectedExt4 {
+            image: image2,
+            block_size: bs2,
+            free_block: free_block2,
+            ..
+        }) = protected_ext4_image_bd_jufod(&dir2, 2)
+        else {
+            return;
+        };
+        {
+            let mut bytes = std::fs::read(&image2).expect("read image2");
+            let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&bytes).expect("parse sb");
+            let gdt_off = if sb.block_size == 1024 {
+                2048
+            } else {
+                sb.block_size as usize
+            };
+            let gd0 = ffs_ondisk::Ext4GroupDesc::parse_from_bytes(
+                &bytes[gdt_off..],
+                sb.desc_size.max(32),
+            )
+            .expect("parse gd0");
+            let inode_size = usize::from(sb.inode_size);
+            let root_ino_off =
+                usize::try_from(gd0.inode_table).expect("fits") * (sb.block_size as usize)
+                    + inode_size;
+            let raw_inode = &mut bytes[root_ino_off..root_ino_off + inode_size];
+            let acl_lo = u32::try_from(free_block2).expect("free_block2 fits u32");
+            raw_inode[0x68..0x6C].copy_from_slice(&acl_lo.to_le_bytes());
+            ffs_ondisk::ext4::stamp_inode_checksum(raw_inode, sb.csum_seed(), 2, sb.inode_size)
+                .expect("stamp root inode checksum");
+            std::fs::write(&image2, &bytes).expect("write updated root inode");
+        }
+        let free_block2_off = usize::try_from(free_block2).expect("fits") * bs2;
+        flip_byte(&image2, free_block2_off + 16);
+        let corrupt = std::fs::read(&image2).expect("read corrupt image2");
+
+        let refused_out = run_repair_with(&image2, 2, false);
+        let refused_json = serde_json::to_string(&refused_out).unwrap_or_default();
+        let after_refused = std::fs::read(&image2).expect("read image2 after refused repair");
+        assert_eq!(
+            after_refused[free_block2_off..free_block2_off + bs2],
+            corrupt[free_block2_off..free_block2_off + bs2],
+            "stale decoded inode-owned block {free_block2} must not be written back: {refused_json}"
+        );
+        assert!(
+            refused_out
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("fails validation")),
+            "the decoded inode-owned block validation refusal must be reported: {refused_json}"
+        );
+        assert_ne!(
+            refused_out.exit_code, 0,
+            "an unrepaired inode-owned corruption is not success: {refused_json}"
+        );
+    }
+
     #[test]
     fn repair_verify_only_ignores_rebuild_symbols_write_path() {
         const EXT4_VALID_FS: u16 = 0x0001;

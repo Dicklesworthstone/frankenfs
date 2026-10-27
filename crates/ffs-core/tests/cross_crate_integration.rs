@@ -325,6 +325,16 @@ fn build_btrfs_fsops_image() -> Vec<u8> {
     let csum_fs = ffs_types::crc32c(&image[fs_leaf + 0x20..fs_leaf + nodesize]);
     image[fs_leaf..fs_leaf + 4].copy_from_slice(&csum_fs.to_le_bytes());
 
+    let sb_end = sb_off + ffs_types::BTRFS_SUPER_INFO_SIZE;
+    let csum = ffs_ondisk::btrfs_csum(
+        ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+        &image[sb_off + ffs_ondisk::BTRFS_CSUM_FIELD_SIZE..sb_end],
+    )
+    .expect("CRC32C is supported");
+    image[sb_off..sb_off + csum.len()].copy_from_slice(&csum);
+    ffs_ondisk::verify_btrfs_superblock_checksum(&image[sb_off..sb_end])
+        .expect("fixture superblock checksum must be valid");
+
     image
 }
 

@@ -7,7 +7,7 @@ use std::process::Command;
 #[test]
 fn readme_quantitative_claims_match_code() -> Result<(), String> {
     let root = workspace_root()?;
-    let readme = read_to_string(&root, "README.md")?;
+    let readme = read_quantitative_readme(&root)?;
 
     let mismatches = collect_mismatches(&root, &readme)?;
     if mismatches.is_empty() {
@@ -23,7 +23,7 @@ fn readme_quantitative_claims_match_code() -> Result<(), String> {
 #[test]
 fn injected_readme_count_drift_is_detected() -> Result<(), String> {
     let root = workspace_root()?;
-    let readme = read_to_string(&root, "README.md")?;
+    let readme = read_quantitative_readme(&root)?;
     let fuzz_targets = git_ls_files_count(&root, "fuzz/fuzz_targets/*.rs")?;
     let mutated = readme.replace(&format!("{fuzz_targets} fuzz targets"), "999 fuzz targets");
 
@@ -43,7 +43,7 @@ fn injected_readme_count_drift_is_detected() -> Result<(), String> {
 #[test]
 fn injected_readme_benchmark_file_count_drift_is_detected() -> Result<(), String> {
     let root = workspace_root()?;
-    let readme = read_to_string(&root, "README.md")?;
+    let readme = read_quantitative_readme(&root)?;
     let benchmark_files = git_ls_files_count(&root, "crates/*/benches/*.rs")?;
     let original = format!("{benchmark_files} Rust benchmark files");
     if !readme.contains(&original) {
@@ -69,7 +69,7 @@ fn injected_readme_benchmark_file_count_drift_is_detected() -> Result<(), String
 #[test]
 fn injected_readme_merge_mechanism_count_drift_is_detected() -> Result<(), String> {
     let root = workspace_root()?;
-    let readme = read_to_string(&root, "README.md")?;
+    let readme = read_quantitative_readme(&root)?;
     let source = read_to_string(&root, "crates/ffs-mvcc/src/lib.rs")?;
     let outcomes = count_enum_variants(&source, "MergeProofMechanism")?;
     let mechanisms = outcomes
@@ -267,6 +267,16 @@ fn read_to_string(root: &Path, relative: &str) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))
 }
 
+fn read_quantitative_readme(root: &Path) -> Result<String, String> {
+    let readme = read_to_string(root, "README.md")?;
+    if readme.contains("README_EXT4_BTRFS.md") && root.join("README_EXT4_BTRFS.md").is_file() {
+        let detailed = read_to_string(root, "README_EXT4_BTRFS.md")?;
+        Ok(format!("{readme}\n{detailed}"))
+    } else {
+        Ok(readme)
+    }
+}
+
 fn git_ls_files_count(root: &Path, pathspec: &str) -> Result<usize, String> {
     let output = Command::new("git")
         .args(["ls-files", pathspec])
@@ -274,6 +284,9 @@ fn git_ls_files_count(root: &Path, pathspec: &str) -> Result<usize, String> {
         .output()
         .map_err(|err| format!("run git ls-files {pathspec}: {err}"))?;
     if !output.status.success() {
+        if option_env!("RCH_BUILD_SOURCE").is_some() && !root.join(".git").exists() {
+            return paired_checkout_files_count(root, pathspec);
+        }
         return Err(format!(
             "git ls-files {pathspec} failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -283,6 +296,77 @@ fn git_ls_files_count(root: &Path, pathspec: &str) -> Result<usize, String> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count())
+}
+
+fn paired_checkout_files_count(root: &Path, pathspec: &str) -> Result<usize, String> {
+    if pathspec == "*.snap" {
+        return count_extension_recursive(root, root, "snap");
+    }
+    let segments: Vec<&str> = pathspec.split('/').collect();
+    count_matching_segments(root, &segments)
+}
+
+fn count_matching_segments(current: &Path, segments: &[&str]) -> Result<usize, String> {
+    let Some((&first, rest)) = segments.split_first() else {
+        return Ok(usize::from(current.is_file()));
+    };
+    if rest.is_empty() {
+        if let Some(ext) = first.strip_prefix("*.") {
+            let mut count = 0usize;
+            for entry in std::fs::read_dir(current).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some(ext) {
+                    count += 1;
+                }
+            }
+            return Ok(count);
+        }
+        return Ok(usize::from(current.join(first).is_file()));
+    }
+    if first == "*" {
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(current).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_matching_segments(&path, rest)?;
+            }
+        }
+        return Ok(count);
+    }
+    let next = current.join(first);
+    if !next.is_dir() {
+        return Ok(0);
+    }
+    count_matching_segments(&next, rest)
+}
+
+fn count_extension_recursive(root: &Path, current: &Path, ext: &str) -> Result<usize, String> {
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(current).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if current == root
+            && (name_str == ".git"
+                || name_str == ".beads"
+                || name_str == "target"
+                || name_str.starts_with(".rch-"))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            count += count_extension_recursive(root, &path, ext)?;
+        } else if meta.is_file() && path.extension().and_then(|s| s.to_str()) == Some(ext) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn count_btrfs_item_type_constants(source: &str) -> usize {

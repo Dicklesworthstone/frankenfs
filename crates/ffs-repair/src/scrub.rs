@@ -593,6 +593,8 @@ pub enum Ext4OwnedBlock {
     DxRoot { ino: u32, generation: u32 },
     /// An external extended-attribute block (checksum seeded by block number).
     Xattr,
+    /// Logical block 0 of the internal JBD2 journal inode (`s_journal_inum`).
+    Jbd2Superblock,
 }
 
 /// What a fixed-location ext4 metadata block holds (bd-jufod).
@@ -708,11 +710,20 @@ impl Ext4MetadataValidator {
             return Ok(validator);
         }
         // Inode tables: snapshot each initialized group's inode bitmap so the
-        // per-block check knows which slots are live.
+        // per-block check knows which slots are live, and discover inode-owned
+        // metadata blocks (`ExtentNode`, `DirLeaf`, `DxRoot`, `Xattr`, and
+        // `Jbd2Superblock`) directly from `device` so both scrub and post-decode
+        // `DecodedBlockView` verification validate them without needing an
+        // external `OpenFs` handle (bd-jufod).
         let inode_size = u64::from(sb.inode_size);
+        let inode_size_usize = usize::from(sb.inode_size);
         let table_bytes = u64::from(sb.inodes_per_group).saturating_mul(inode_size);
         let table_blocks = table_bytes.div_ceil(block_size);
         let slots_per_block = block_size / inode_size;
+        let seed = sb.csum_seed();
+        let has_journal = sb.has_compat(ffs_ondisk::ext4::Ext4CompatFeatures::HAS_JOURNAL)
+            && sb.journal_inum != 0;
+        let mut owned = Vec::new();
         for (index, gd) in groups.iter().enumerate() {
             let (Ok(group), Some(gd)) = (u32::try_from(index), gd) else {
                 continue;
@@ -731,17 +742,186 @@ impl Ext4MetadataValidator {
                 let Ok(first_index) = u32::try_from(n.saturating_mul(slots_per_block)) else {
                     break;
                 };
+                let table_block = gd.inode_table.saturating_add(n);
                 validator.blocks.insert(
-                    gd.inode_table.saturating_add(n),
+                    table_block,
                     Ext4MetaBlock::InodeTable {
                         group,
                         first_index,
                         inode_bitmap: std::sync::Arc::clone(&bitmap),
                     },
                 );
+                let end_index = first_index
+                    .saturating_add(u32::try_from(slots_per_block).unwrap_or(u32::MAX))
+                    .min(sb.inodes_per_group);
+                let has_relevant_inode = (first_index..end_index).any(|slot_index| {
+                    let Ok(bit) = usize::try_from(slot_index) else {
+                        return false;
+                    };
+                    if bitmap
+                        .get(bit / 8)
+                        .is_none_or(|byte| byte & (1 << (bit % 8)) == 0)
+                    {
+                        return false;
+                    }
+                    let ino = group
+                        .saturating_mul(sb.inodes_per_group)
+                        .saturating_add(slot_index)
+                        .saturating_add(1);
+                    ino == 2 || ino >= sb.first_ino || (has_journal && ino == sb.journal_inum)
+                });
+                if !has_relevant_inode {
+                    continue;
+                }
+                let Ok(table_buf) = device.read_block(cx, BlockNumber(table_block)) else {
+                    continue;
+                };
+                for (slot, raw) in table_buf
+                    .as_slice()
+                    .chunks_exact(inode_size_usize.max(1))
+                    .enumerate()
+                {
+                    let Some(slot_index) = u32::try_from(slot)
+                        .ok()
+                        .and_then(|s| first_index.checked_add(s))
+                    else {
+                        break;
+                    };
+                    if slot_index >= sb.inodes_per_group {
+                        break;
+                    }
+                    let Ok(bit) = usize::try_from(slot_index) else {
+                        break;
+                    };
+                    if bitmap
+                        .get(bit / 8)
+                        .is_none_or(|byte| byte & (1 << (bit % 8)) == 0)
+                    {
+                        continue;
+                    }
+                    let ino = group
+                        .saturating_mul(sb.inodes_per_group)
+                        .saturating_add(slot_index)
+                        .saturating_add(1);
+                    if ino < sb.first_ino && ino != 2 && !(has_journal && ino == sb.journal_inum) {
+                        continue;
+                    }
+                    let Ok(inode) = ffs_ondisk::Ext4Inode::parse_from_bytes(raw) else {
+                        continue;
+                    };
+                    if inode.mode == 0 {
+                        continue;
+                    }
+                    let inode_csum_ok =
+                        ffs_ondisk::ext4::verify_inode_checksum(raw, seed, ino, sb.inode_size)
+                            .is_ok();
+                    if inode_csum_ok && inode.file_acl != 0 && inode.file_acl < sb.blocks_count {
+                        owned.push((inode.file_acl, Ext4OwnedBlock::Xattr));
+                    }
+                    if inode.flags & ffs_types::EXT4_EXTENTS_FL != 0 {
+                        let is_dir = inode.is_dir();
+                        let indexed = inode.has_htree_index();
+                        let is_journal = has_journal && ino == sb.journal_inum;
+                        Self::collect_ext4_inode_owned_from_tree(
+                            cx,
+                            device,
+                            sb,
+                            ino,
+                            inode.generation,
+                            is_dir,
+                            indexed,
+                            is_journal,
+                            &inode.extent_bytes,
+                            0,
+                            &mut owned,
+                        );
+                    }
+                }
             }
         }
+        validator.add_owned_blocks(owned);
         Ok(validator)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn collect_ext4_inode_owned_from_tree(
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        sb: &Ext4Superblock,
+        ino: u32,
+        generation: u32,
+        is_dir: bool,
+        indexed: bool,
+        is_journal: bool,
+        node: &[u8],
+        level: u32,
+        out: &mut Vec<(u64, Ext4OwnedBlock)>,
+    ) {
+        if level > 5 {
+            return;
+        }
+        let Ok((header, tree)) = ffs_ondisk::ext4::parse_extent_tree(node) else {
+            return;
+        };
+        match tree {
+            ffs_ondisk::ext4::ExtentTree::Leaf(extents) => {
+                if !is_dir && !is_journal {
+                    return;
+                }
+                for extent in extents {
+                    if extent.is_unwritten() {
+                        continue;
+                    }
+                    let len = u64::from(extent.actual_len());
+                    if len == 0
+                        || extent.physical_start == 0
+                        || extent.physical_start.saturating_add(len) > sb.blocks_count
+                    {
+                        continue;
+                    }
+                    if is_journal {
+                        if extent.logical_block == 0 {
+                            out.push((extent.physical_start, Ext4OwnedBlock::Jbd2Superblock));
+                        }
+                        continue;
+                    }
+                    for n in 0..len {
+                        let logical = u64::from(extent.logical_block).saturating_add(n);
+                        let kind = if indexed && logical == 0 {
+                            Ext4OwnedBlock::DxRoot { ino, generation }
+                        } else {
+                            Ext4OwnedBlock::DirLeaf { ino, generation }
+                        };
+                        out.push((extent.physical_start.saturating_add(n), kind));
+                    }
+                }
+            }
+            ffs_ondisk::ext4::ExtentTree::Index(indices) => {
+                let need_child_read = header.depth > 1 || is_dir || is_journal;
+                for idx in indices {
+                    let child = idx.leaf_block;
+                    if child == 0 || child >= sb.blocks_count {
+                        continue;
+                    }
+                    out.push((child, Ext4OwnedBlock::ExtentNode { ino, generation }));
+                    if need_child_read && let Ok(buf) = device.read_block(cx, BlockNumber(child)) {
+                        Self::collect_ext4_inode_owned_from_tree(
+                            cx,
+                            device,
+                            sb,
+                            ino,
+                            generation,
+                            is_dir,
+                            indexed,
+                            is_journal,
+                            buf.as_slice(),
+                            level + 1,
+                            out,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Add inode-owned metadata blocks (from an inode walk of a static image).
@@ -945,6 +1125,66 @@ impl BlockValidator for Ext4MetadataValidator {
                     Self::checksum_issue(format!(
                         "ext4 xattr block checksum mismatch in block {block}"
                     ))
+                }
+            }
+            Ext4MetaBlock::Owned(Ext4OwnedBlock::Jbd2Superblock) => {
+                const JBD2_MAGIC: u32 = 0xC03B_3998;
+                const JBD2_BLOCKTYPE_SUPERBLOCK_V1: u32 = 3;
+                const JBD2_BLOCKTYPE_SUPERBLOCK_V2: u32 = 4;
+                const JBD2_FEATURE_INCOMPAT_CSUM_V2: u32 = 0x0000_0008;
+                const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
+                const JBD2_SB_STRUCT_SIZE: usize = 1024;
+                const JBD2_SB_CHECKSUM_OFFSET: usize = 0xFC;
+                const JBD2_CRC32C_CHKSUM: u8 = 4;
+
+                if bytes.len() < JBD2_SB_STRUCT_SIZE {
+                    Self::checksum_issue(format!(
+                        "ext4 jbd2 superblock in block {block} shorter than {JBD2_SB_STRUCT_SIZE} bytes"
+                    ))
+                } else {
+                    let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    let block_type = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                    let jbd2_block_size =
+                        u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+                    let max_len = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+                    let feature_incompat =
+                        u32::from_be_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+                    if magic != JBD2_MAGIC
+                        || (block_type != JBD2_BLOCKTYPE_SUPERBLOCK_V1
+                            && block_type != JBD2_BLOCKTYPE_SUPERBLOCK_V2)
+                        || jbd2_block_size != self.sb.block_size
+                        || max_len == 0
+                    {
+                        BlockVerdict::Corrupt(vec![(
+                            CorruptionKind::BadMagic,
+                            Severity::Error,
+                            format!("ext4 jbd2 superblock header invalid in block {block}"),
+                        )])
+                    } else if block_type == JBD2_BLOCKTYPE_SUPERBLOCK_V2
+                        && (feature_incompat
+                            & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3))
+                            != 0
+                    {
+                        let stored = u32::from_be_bytes([
+                            bytes[JBD2_SB_CHECKSUM_OFFSET],
+                            bytes[JBD2_SB_CHECKSUM_OFFSET + 1],
+                            bytes[JBD2_SB_CHECKSUM_OFFSET + 2],
+                            bytes[JBD2_SB_CHECKSUM_OFFSET + 3],
+                        ]);
+                        let mut csum_buf = [0u8; JBD2_SB_STRUCT_SIZE];
+                        csum_buf.copy_from_slice(&bytes[..JBD2_SB_STRUCT_SIZE]);
+                        csum_buf[JBD2_SB_CHECKSUM_OFFSET..JBD2_SB_CHECKSUM_OFFSET + 4].fill(0);
+                        let computed = ffs_ondisk::ext4::ext4_chksum(!0, &csum_buf);
+                        if bytes[0x50] != JBD2_CRC32C_CHKSUM || stored != computed {
+                            Self::checksum_issue(format!(
+                                "ext4 jbd2 superblock checksum mismatch in block {block}"
+                            ))
+                        } else {
+                            BlockVerdict::Clean
+                        }
+                    } else {
+                        BlockVerdict::Clean
+                    }
                 }
             }
             Ext4MetaBlock::InodeBitmap(gd) => {
@@ -2756,5 +2996,209 @@ mod tests {
         assert_eq!(report.blocks_scanned, 8);
         assert_eq!(report.blocks_corrupt, 8);
         assert_eq!(report.findings.len(), 8);
+    }
+
+    #[test]
+    fn ext4_metadata_validator_from_device_discovers_inode_owned_and_jbd2_blocks_bd_jufod() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096, 16);
+
+        let mut sb_region = make_valid_ext4_superblock_region();
+        // 16 inodes in group 0 (1 inode-table block at block 4) so blocks 5..=8
+        // sit past the inode table.
+        sb_region[0x00..0x04].copy_from_slice(&16_u32.to_le_bytes()); // s_inodes_count = 16
+        sb_region[0x28..0x2C].copy_from_slice(&16_u32.to_le_bytes()); // s_inodes_per_group = 16
+        // Enable HAS_JOURNAL and set journal_inum = 8, first_ino = 11.
+        sb_region[0x5C..0x60].copy_from_slice(
+            &ffs_ondisk::ext4::Ext4CompatFeatures::HAS_JOURNAL
+                .0
+                .to_le_bytes(),
+        );
+        sb_region[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes()); // s_first_ino = 11
+        sb_region[0xE0..0xE4].copy_from_slice(&8_u32.to_le_bytes()); // s_journal_inum = 8
+        let sb_csum = ffs_ondisk::ext4_chksum(!0_u32, &sb_region[..EXT4_SB_CHECKSUM_OFFSET]);
+        sb_region[EXT4_SB_CHECKSUM_OFFSET..EXT4_SB_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&sb_csum.to_le_bytes());
+        let mut block0 = vec![0_u8; 4096];
+        block0[1024..2048].copy_from_slice(&sb_region);
+        dev.write(BlockNumber(0), block0);
+
+        let sb = Ext4Superblock::parse_superblock_region(&sb_region).expect("parse sb");
+        let seed = sb.csum_seed();
+        let desc_size = sb.group_desc_size();
+
+        // Block 2: block bitmap; Block 3: inode bitmap (bits for ino 2, 8, 11 -> indices 1, 7, 10).
+        let block_bitmap = vec![0xFF_u8; 4096];
+        let mut inode_bitmap = vec![0_u8; 4096];
+        inode_bitmap[0] = (1 << 1) | (1 << 7); // ino 2 (bit 1), ino 8 (bit 7)
+        inode_bitmap[1] = 1 << (10 - 8); // ino 11 (bit 10)
+        dev.write(BlockNumber(2), block_bitmap.clone());
+        dev.write(BlockNumber(3), inode_bitmap.clone());
+
+        // Block 1: Group 0 descriptor pointing to block_bitmap=2, inode_bitmap=3, inode_table=4.
+        let mut raw_gd = vec![0_u8; usize::from(desc_size)];
+        raw_gd[0x00..0x04].copy_from_slice(&2_u32.to_le_bytes()); // bg_block_bitmap_lo
+        raw_gd[0x04..0x08].copy_from_slice(&3_u32.to_le_bytes()); // bg_inode_bitmap_lo
+        raw_gd[0x08..0x0C].copy_from_slice(&4_u32.to_le_bytes()); // bg_inode_table_lo
+        let mut gd =
+            ffs_ondisk::Ext4GroupDesc::parse_from_bytes(&raw_gd, desc_size).expect("parse gd");
+        ffs_ondisk::ext4::stamp_block_bitmap_checksum(
+            &block_bitmap,
+            seed,
+            sb.clusters_per_group,
+            &mut gd,
+            desc_size,
+        );
+        ffs_ondisk::ext4::stamp_inode_bitmap_checksum(
+            &inode_bitmap,
+            seed,
+            sb.inodes_per_group,
+            &mut gd,
+            desc_size,
+        );
+        gd.write_to_bytes(&mut raw_gd, desc_size).expect("write gd");
+        ffs_ondisk::ext4::stamp_group_desc_checksum(
+            &mut raw_gd,
+            &sb.uuid,
+            seed,
+            0,
+            desc_size,
+            sb.group_desc_checksum_kind(),
+        );
+        let mut gdt_block = vec![0_u8; 4096];
+        gdt_block[..usize::from(desc_size)].copy_from_slice(&raw_gd);
+        dev.write(BlockNumber(1), gdt_block);
+
+        // Block 4: first inode-table block (slots 0..16, inodes 1..16).
+        let mut itab = vec![0_u8; 4096];
+        let write_extent_root_leaf = |slot: &mut [u8], phys_block: u64| {
+            let iblock = &mut slot[0x28..0x64];
+            iblock[0..2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // magic
+            iblock[2..4].copy_from_slice(&1_u16.to_le_bytes()); // entries = 1
+            iblock[4..6].copy_from_slice(&4_u16.to_le_bytes()); // max = 4
+            iblock[6..8].copy_from_slice(&0_u16.to_le_bytes()); // depth = 0
+            iblock[12..16].copy_from_slice(&0_u32.to_le_bytes()); // logical = 0
+            iblock[16..18].copy_from_slice(&1_u16.to_le_bytes()); // len = 1
+            iblock[18..20].copy_from_slice(&((phys_block >> 32) as u16).to_le_bytes());
+            iblock[20..24].copy_from_slice(&(phys_block as u32).to_le_bytes());
+        };
+
+        // Slot 1 (ino 2): root directory -> DirLeaf at block 5, Xattr at block 6.
+        {
+            let slot = &mut itab[256..512];
+            slot[0x00..0x02].copy_from_slice(&(0x4000_u16 | 0o755).to_le_bytes());
+            slot[0x04..0x08].copy_from_slice(&4096_u32.to_le_bytes());
+            slot[0x1A..0x1C].copy_from_slice(&2_u16.to_le_bytes());
+            slot[0x20..0x24].copy_from_slice(&ffs_types::EXT4_EXTENTS_FL.to_le_bytes());
+            slot[0x64..0x68].copy_from_slice(&7_u32.to_le_bytes()); // generation = 7
+            slot[0x68..0x6C].copy_from_slice(&6_u32.to_le_bytes()); // file_acl_lo = 6
+            slot[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes()); // extra_isize
+            write_extent_root_leaf(slot, 5);
+            ffs_ondisk::ext4::stamp_inode_checksum(slot, seed, 2, 256).expect("stamp ino 2");
+        }
+        // Slot 7 (ino 8): journal inode -> Jbd2Superblock at block 7.
+        {
+            let slot = &mut itab[7 * 256..8 * 256];
+            slot[0x00..0x02].copy_from_slice(&(0x8000_u16 | 0o600).to_le_bytes());
+            slot[0x04..0x08].copy_from_slice(&4096_u32.to_le_bytes());
+            slot[0x1A..0x1C].copy_from_slice(&1_u16.to_le_bytes());
+            slot[0x20..0x24].copy_from_slice(&ffs_types::EXT4_EXTENTS_FL.to_le_bytes());
+            slot[0x64..0x68].copy_from_slice(&1_u32.to_le_bytes());
+            slot[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+            write_extent_root_leaf(slot, 7);
+            ffs_ondisk::ext4::stamp_inode_checksum(slot, seed, 8, 256).expect("stamp ino 8");
+        }
+        // Slot 10 (ino 11): regular file with depth=1 extent root -> ExtentNode at block 8.
+        {
+            let slot = &mut itab[10 * 256..11 * 256];
+            slot[0x00..0x02].copy_from_slice(&(0x8000_u16 | 0o644).to_le_bytes());
+            slot[0x04..0x08].copy_from_slice(&4096_u32.to_le_bytes());
+            slot[0x1A..0x1C].copy_from_slice(&1_u16.to_le_bytes());
+            slot[0x20..0x24].copy_from_slice(&ffs_types::EXT4_EXTENTS_FL.to_le_bytes());
+            slot[0x64..0x68].copy_from_slice(&9_u32.to_le_bytes()); // generation = 9
+            slot[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+            let iblock = &mut slot[0x28..0x64];
+            iblock[0..2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // magic
+            iblock[2..4].copy_from_slice(&1_u16.to_le_bytes()); // entries = 1
+            iblock[4..6].copy_from_slice(&4_u16.to_le_bytes()); // max = 4
+            iblock[6..8].copy_from_slice(&1_u16.to_le_bytes()); // depth = 1 (index)
+            iblock[12..16].copy_from_slice(&0_u32.to_le_bytes()); // ei_block = 0
+            iblock[16..20].copy_from_slice(&8_u32.to_le_bytes()); // ei_leaf_lo = 8
+            iblock[20..22].copy_from_slice(&0_u16.to_le_bytes()); // ei_leaf_hi = 0
+            ffs_ondisk::ext4::stamp_inode_checksum(slot, seed, 11, 256).expect("stamp ino 11");
+        }
+        dev.write(BlockNumber(4), itab);
+
+        // Block 5: valid directory leaf block for ino 2 (gen 7).
+        let mut dir_block = vec![0_u8; 4096];
+        dir_block[0..4].copy_from_slice(&2_u32.to_le_bytes());
+        dir_block[4..6].copy_from_slice(&(4096_u16 - 12).to_le_bytes());
+        dir_block[6] = 1;
+        dir_block[7] = 2;
+        dir_block[8] = b'.';
+        let tail_off = 4096 - 12;
+        dir_block[tail_off + 4..tail_off + 6].copy_from_slice(&12_u16.to_le_bytes());
+        dir_block[tail_off + 7] = 0xDE;
+        ffs_ondisk::ext4::stamp_dir_block_checksum(&mut dir_block, seed, 2, 7);
+        dev.write(BlockNumber(5), dir_block.clone());
+
+        // Block 6: valid external xattr block.
+        let mut xattr_block = vec![0_u8; 4096];
+        xattr_block[0..4].copy_from_slice(&0xEA02_0000_u32.to_le_bytes());
+        xattr_block[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        ffs_ondisk::ext4::stamp_xattr_block_checksum(&mut xattr_block, seed, 6);
+        dev.write(BlockNumber(6), xattr_block.clone());
+
+        // Block 7: valid JBD2 v2 superblock with CSUM_V3.
+        let mut jbd2_sb = vec![0_u8; 4096];
+        jbd2_sb[0..4].copy_from_slice(&0xC03B_3998_u32.to_be_bytes());
+        jbd2_sb[4..8].copy_from_slice(&4_u32.to_be_bytes()); // SUPERBLOCK_V2
+        jbd2_sb[12..16].copy_from_slice(&4096_u32.to_be_bytes()); // block_size
+        jbd2_sb[16..20].copy_from_slice(&64_u32.to_be_bytes()); // max_len
+        jbd2_sb[20..24].copy_from_slice(&1_u32.to_be_bytes()); // first_log_block
+        jbd2_sb[40..44].copy_from_slice(&0x0000_0010_u32.to_be_bytes()); // CSUM_V3
+        jbd2_sb[0x50] = 4; // JBD2_CRC32C_CHKSUM
+        let jbd2_csum = ffs_ondisk::ext4::ext4_chksum(!0, &jbd2_sb[..1024]);
+        jbd2_sb[0xFC..0x100].copy_from_slice(&jbd2_csum.to_be_bytes());
+        dev.write(BlockNumber(7), jbd2_sb.clone());
+
+        // Block 8: valid extent leaf node block for ino 11 (gen 9).
+        let mut extent_block = vec![0_u8; 4096];
+        extent_block[0..2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+        extent_block[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        extent_block[4..6].copy_from_slice(&340_u16.to_le_bytes()); // eh_max = 340
+        extent_block[6..8].copy_from_slice(&0_u16.to_le_bytes()); // depth = 0
+        extent_block[12..16].copy_from_slice(&0_u32.to_le_bytes());
+        extent_block[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        extent_block[20..24].copy_from_slice(&9_u32.to_le_bytes());
+        ffs_ondisk::ext4::stamp_extent_block_checksum(&mut extent_block, seed, 11, 9);
+        dev.write(BlockNumber(8), extent_block.clone());
+
+        // Build validator purely from `device` (no `add_owned_blocks` call!).
+        let validator = Ext4MetadataValidator::from_device(&cx, &dev, &sb)
+            .expect("from_device must build validator");
+        let clean_report = Scrubber::new(&dev, &validator)
+            .scrub_all(&cx)
+            .expect("clean scrub");
+        assert!(
+            clean_report.is_clean(),
+            "all valid blocks must scrub clean: {:?}",
+            clean_report.findings
+        );
+
+        // Flip 1 byte in each discovered inode-owned / JBD2 block and verify rejection.
+        for (blk_no, mut raw, flip_off, label) in [
+            (5_u64, dir_block, 24_usize, "DirLeaf"),
+            (6_u64, xattr_block, 64_usize, "Xattr"),
+            (7_u64, jbd2_sb, 28_usize, "Jbd2Superblock"),
+            (8_u64, extent_block, 16_usize, "ExtentNode"),
+        ] {
+            raw[flip_off] ^= 0x01;
+            let verdict = validator.validate(BlockNumber(blk_no), &BlockBuf::new(raw));
+            assert!(
+                matches!(verdict, BlockVerdict::Corrupt(_)),
+                "from_device validator must reject corrupted {label} at block {blk_no}, got {verdict:?}"
+            );
+        }
     }
 }

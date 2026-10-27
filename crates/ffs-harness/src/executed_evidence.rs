@@ -187,12 +187,20 @@ impl ExecutedEvidence {
         );
 
         let start = Instant::now();
-        let mut process = Command::new(command);
-        if command == "rch" {
-            process.env("RCH_REQUIRE_REMOTE", "1");
-        }
+        let mut process =
+            if let Some((exe, direct_args)) = Self::direct_in_crate_process(command, args) {
+                let mut cmd = Command::new(exe);
+                cmd.args(direct_args);
+                cmd
+            } else {
+                let mut cmd = Command::new(command);
+                if command == "rch" {
+                    cmd.env("RCH_REQUIRE_REMOTE", "1");
+                }
+                cmd.args(args);
+                cmd
+            };
         let result = process
-            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output();
@@ -241,6 +249,39 @@ impl ExecutedEvidence {
                 )
             }
         }
+    }
+
+    fn direct_in_crate_process<'a>(
+        command: &str,
+        args: &'a [&'a str],
+    ) -> Option<(std::path::PathBuf, Vec<&'a str>)> {
+        if command != "cargo" {
+            return None;
+        }
+        let exe = std::env::current_exe().ok()?;
+        #[cfg(test)]
+        if let ["test", "-p", "ffs-harness", "--lib", rest @ ..] = args
+            && !rest.is_empty()
+        {
+            let direct_args = rest
+                .iter()
+                .copied()
+                .filter(|arg| *arg != "--")
+                .collect::<Vec<_>>();
+            return Some((exe, direct_args));
+        }
+        #[cfg(not(test))]
+        {
+            let file_name = exe.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if file_name.starts_with("ffs-harness")
+                && let ["run", "-p", "ffs-harness", "--", rest @ ..]
+                | ["run", "--quiet", "-p", "ffs-harness", "--", rest @ ..] = args
+                && !rest.is_empty()
+            {
+                return Some((exe, rest.to_vec()));
+            }
+        }
+        None
     }
 
     /// Execute with a capability prerequisite check.
@@ -386,6 +427,20 @@ impl ExecutedEvidence {
         hex::encode(hasher.finalize())
     }
 
+    fn rch_compiled_git_sha() -> Option<String> {
+        let raw = option_env!("RCH_BUILD_SOURCE")?.trim();
+        let sha = raw.strip_suffix("-dirty").unwrap_or(raw);
+        if sha.len() == 40
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            Some(sha.to_owned())
+        } else {
+            None
+        }
+    }
+
     fn current_git_sha() -> String {
         Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -400,6 +455,7 @@ impl ExecutedEvidence {
                     None
                 }
             })
+            .or_else(Self::rch_compiled_git_sha)
             .unwrap_or_else(|| "unknown".to_string())
     }
 
@@ -459,7 +515,7 @@ impl SourceIdentity {
             .output()
             .map_err(|e| e.to_string())?;
         if !revision.status.success() {
-            return Err("cannot bind execution to a Git revision".to_owned());
+            return Self::capture_rch_paired_checkout_at(directory);
         }
         let git_sha = String::from_utf8(revision.stdout).map_err(|e| e.to_string())?;
         let git_sha = git_sha.trim().to_owned();
@@ -526,6 +582,83 @@ impl SourceIdentity {
             git_sha,
             dirty_source_sha256: hex::encode(hash.finalize()),
         })
+    }
+
+    fn capture_rch_paired_checkout_at(directory: &std::path::Path) -> Result<Self, String> {
+        let Some(git_sha) = ExecutedEvidence::rch_compiled_git_sha() else {
+            return Err("cannot bind execution to a Git revision".to_owned());
+        };
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| "cannot locate source root".to_owned())?;
+        let canonical_root = workspace_root
+            .canonicalize()
+            .map_err(|_| "cannot bind execution to a Git revision".to_owned())?;
+        let canonical_dir = directory
+            .canonicalize()
+            .map_err(|_| "cannot bind execution to a Git revision".to_owned())?;
+        if !canonical_dir.starts_with(&canonical_root) || canonical_root.join(".git").exists() {
+            return Err("cannot bind execution to a Git revision".to_owned());
+        }
+        let mut hash = Sha256::new();
+        Self::hash_paired_checkout_tree(&canonical_root, &canonical_root, &mut hash)?;
+        Ok(Self {
+            git_sha,
+            dirty_source_sha256: hex::encode(hash.finalize()),
+        })
+    }
+
+    fn hash_paired_checkout_tree(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        hash: &mut Sha256,
+    ) -> Result<(), String> {
+        let mut entries = std::fs::read_dir(current)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if current == root
+                && (name == ".git"
+                    || name == ".beads"
+                    || name == "target"
+                    || name == "artifacts"
+                    || name == "legacy_ext4_and_btrfs_code"
+                    || name.starts_with(".rch-"))
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            if metadata.is_dir() {
+                Self::hash_paired_checkout_tree(root, &path, hash)?;
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy();
+            hash.update(rel.as_bytes());
+            hash.update([0]);
+            let bytes = if metadata.is_symlink() {
+                std::fs::read_link(&path)
+                    .map_err(|e| e.to_string())?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            } else {
+                std::fs::read(&path).map_err(|e| e.to_string())?
+            };
+            hash.update(bytes.len().to_le_bytes());
+            hash.update(bytes);
+        }
+        Ok(())
     }
 }
 
