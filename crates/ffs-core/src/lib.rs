@@ -6051,6 +6051,39 @@ impl BlockDevice for RegisteredSnapshotBlockAdapter<'_> {
     }
 }
 
+/// Runtime effects of an inode retirement, kept private until its namespace
+/// transaction commits. Dropping this value aborts the sharded counter update.
+struct Ext4StagedInodeRetirement<'a> {
+    fs: &'a OpenFs,
+    ino: InodeNumber,
+    orphan_head: Option<u32>,
+    reclaimed_inode: Option<Ext4Inode>,
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    sharded: Option<(parking_lot::MutexGuard<'a, GroupStats>, GroupStats)>,
+}
+
+impl Ext4StagedInodeRetirement<'_> {
+    /// The caller still holds the allocation lock after successful MVCC
+    /// publication, excluding orphan-list changes and durability boundaries.
+    fn publish(self) {
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        if let Some((mut live, working)) = self.sharded {
+            *live = working;
+        }
+        if let Some(head) = self.orphan_head {
+            self.fs.ext4_write_orphan_head(head);
+            self.fs.ext4_pending_orphans.lock().insert(self.ino.0);
+        }
+        if let Some(inode) = self.reclaimed_inode {
+            self.fs
+                .extent_cache
+                .invalidate_range(extent_cache_namespace(&inode), 0, 1_u64 << 32);
+            self.fs.invalidate_ext4_write_extent_snapshot(&inode);
+            self.fs.forget_ext4_inode_caches(self.ino);
+        }
+    }
+}
+
 /// Adapter that stages all writes into an active MVCC transaction.
 ///
 /// This allows using high-level metadata helpers (like `ffs_inode::write_inode`)
@@ -9378,6 +9411,124 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Stage a decreased link count, orphan insertion or final inode reclamation
+    /// through the caller's transaction device. `alloc` is a private copy under
+    /// the allocation write lock. The returned guard retains any sharded inode
+    /// reservation; neither counter family nor orphan bookkeeping changes before
+    /// the caller commits and invokes `publish`.
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_stage_inode_retirement<'a>(
+        &'a self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+        now_secs: u64,
+        retain_open: bool,
+    ) -> ffs_error::Result<Ext4StagedInodeRetirement<'a>> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let csum_seed = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?
+            .csum_seed();
+        let mut retirement = Ext4StagedInodeRetirement {
+            fs: self,
+            ino,
+            orphan_head: None,
+            reclaimed_inode: None,
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            sharded: None,
+        };
+        if inode.links_count == 0 {
+            if retain_open && self.ext4_open_handle_count(ino) > 0 {
+                retirement.orphan_head =
+                    Some(u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
+                        block: 0,
+                        detail: format!("orphan push: inode {ino} exceeds ext4 range"),
+                    })?);
+                inode.dtime = self.ext4_read_orphan_head();
+            } else {
+                retirement.reclaimed_inode = Some(inode.clone());
+                let is_dir = ffs_inode::release_inode_storage_deferring_writeback(
+                    cx,
+                    dev,
+                    &alloc.geo,
+                    &mut alloc.groups,
+                    ino,
+                    inode,
+                    now_secs,
+                    &alloc.persist_ctx,
+                )?;
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                let sharded = self
+                    .ext4_sharded_alloc
+                    .as_ref()
+                    .filter(|_| self.bhh0i_sharded_ops_active());
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                if let Some(sharded) = sharded {
+                    let group = ffs_types::inode_to_group(ino, alloc.geo.inodes_per_group);
+                    let index = group.0 as usize;
+                    if index >= sharded.group_count() {
+                        return Err(FfsError::Corruption {
+                            block: 0,
+                            detail: format!("inode retirement: inode {ino} group out of range"),
+                        });
+                    }
+                    let live = sharded.lock_group(index);
+                    let mut working = live.clone();
+                    ffs_alloc::free_inode_in_group(
+                        cx,
+                        dev,
+                        &alloc.geo,
+                        &mut working,
+                        group,
+                        ino,
+                        is_dir,
+                        &alloc.persist_ctx,
+                    )?;
+                    retirement.sharded = Some((live, working));
+                } else {
+                    ffs_alloc::free_inode_persist(
+                        cx,
+                        dev,
+                        &alloc.geo,
+                        &mut alloc.groups,
+                        ino,
+                        is_dir,
+                        &alloc.persist_ctx,
+                    )?;
+                }
+                #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+                ffs_alloc::free_inode_persist(
+                    cx,
+                    dev,
+                    &alloc.geo,
+                    &mut alloc.groups,
+                    ino,
+                    is_dir,
+                    &alloc.persist_ctx,
+                )?;
+            }
+        }
+        let loc = ffs_inode::locate_inode(ino, &alloc.geo, &alloc.groups).ok_or_else(|| {
+            FfsError::Corruption {
+                block: 0,
+                detail: format!("inode retirement: inode {ino} out of range"),
+            }
+        })?;
+        ffs_inode::write_inode_at_slot_scoped(
+            cx,
+            dev,
+            loc,
+            usize::from(alloc.geo.inode_size),
+            ino,
+            inode,
+            csum_seed,
+        )?;
+        Ok(retirement)
+    }
+
     /// `O_TMPFILE`: allocate a regular-file inode that no directory names.
     ///
     /// Like kernel ext4 (`ext4_tmpfile` + `d_tmpfile`), the inode starts with no
@@ -9437,7 +9588,7 @@ impl OpenFs {
         Ok(inode_to_attr(sb, ino, &inode))
     }
 
-    /// Stage removal of a newly named `O_TMPFILE` inode from the orphan list.
+    /// Stage removal of a named or reclaimed inode from the orphan list.
     /// The caller holds the allocation lock and supplies its publication
     /// transaction's device. A returned head must be installed, and the pending
     /// orphan removed, only after that transaction commits successfully.
@@ -9468,7 +9619,7 @@ impl OpenFs {
                 });
             }
             let predecessor = InodeNumber(u64::from(next));
-            let inode = self.read_inode_raw(cx, predecessor)?;
+            let inode = ffs_inode::read_inode(cx, dev, geo, groups, predecessor)?;
             next = inode.dtime;
             prev = Some(predecessor);
         }
@@ -22614,47 +22765,42 @@ impl OpenFs {
         Ok(all_entries)
     }
 
-    /// Return whether an ext4 directory holds any entry other than `.` and
-    /// `..` — the rmdir / rename-clobber emptiness test.
-    ///
-    /// Equivalent to `!read_dir_with_scope(..)?.iter().any(|e| e.name != b"."
-    /// && e.name != b"..")`, but early-exits on the FIRST real entry instead of
-    /// materializing every entry (and its `name` allocation) into a vector. It
-    /// walks the same present, non-unwritten blocks via `resolve_extent_seq`,
-    /// reads each through the same cache, and parses each with the SAME
-    /// `parse_dir_block` used by `read_dir_with_scope`, so the boolean result is
-    /// identical by construction: the directory is empty here iff `read_dir`
-    /// would yield only `.` and `..`. Inline-data-dir rejection, resolve errors,
-    /// and parse errors surface identically and in the same lowest-block order.
-    /// The reject path for a non-empty directory is therefore O(1) in blocks
-    /// (it stops at the block holding the first real entry) rather than reading
-    /// and parsing the whole directory only to discard it.
-    fn ext4_directory_is_empty(
+    /// Check emptiness against an operation's registered snapshot and staged
+    /// writes, without consulting the live mapping or file-data caches.
+    fn ext4_directory_is_empty_from_device(
         &self,
         cx: &Cx,
-        scope: &RequestScope,
+        dev: &dyn BlockDevice,
         inode: &Ext4Inode,
     ) -> Result<bool, FfsError> {
         Self::ext4_reject_inline_data_dir(inode)?;
-        let bs = u64::from(self.block_size());
         let block_size = self.block_size();
-        let num_blocks = dir_logical_block_count(inode.size, bs)?;
-        let mut ehint = 0_usize; // sequential mapping hint (bd-vpypn)
-        for lb in 0..num_blocks {
-            let Some((phys, unwritten)) =
-                self.resolve_extent_seq(cx, scope, inode, lb, &mut ehint)?
-            else {
-                continue; // hole: contributes no entries (as in read_dir)
-            };
-            if unwritten {
+        let num_blocks = dir_logical_block_count(inode.size, u64::from(block_size))?;
+        for extent in self.ext4_dir_extents_from_device(cx, dev, inode)? {
+            if extent.is_unwritten() {
                 continue;
             }
-            let block_data =
-                self.read_ext4_file_data_block_with_scope(cx, scope, BlockNumber(phys))?;
-            let (entries, _tail) =
-                parse_dir_block(&block_data, block_size).map_err(|e| parse_to_ffs_error(&e))?;
-            if entries.iter().any(|e| e.name != b"." && e.name != b"..") {
-                return Ok(false);
+            let count = num_blocks
+                .saturating_sub(extent.logical_block)
+                .min(u32::from(extent.actual_len()));
+            for delta in 0..count {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                let physical = extent
+                    .physical_start
+                    .checked_add(u64::from(delta))
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: extent.physical_start,
+                        detail: "directory block address overflow".into(),
+                    })?;
+                let bytes = dev.read_block(cx, BlockNumber(physical))?;
+                let (entries, _tail) = parse_dir_block(bytes.as_slice(), block_size)
+                    .map_err(|error| parse_to_ffs_error(&error))?;
+                if entries
+                    .iter()
+                    .any(|entry| entry.name != b"." && entry.name != b"..")
+                {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -25284,6 +25430,14 @@ impl OpenFs {
         scope: &RequestScope,
         inode: &Ext4Inode,
     ) -> Result<Vec<Ext4Extent>, FfsError> {
+        self.ext4_indirect_runs_using(inode, &|block| self.read_block_with_scope(cx, scope, block))
+    }
+
+    fn ext4_indirect_runs_using(
+        &self,
+        inode: &Ext4Inode,
+        read_block: &impl Fn(BlockNumber) -> Result<Vec<u8>, FfsError>,
+    ) -> Result<Vec<Ext4Extent>, FfsError> {
         fn push(runs: &mut Vec<Ext4Extent>, logical: u64, phys: u32) -> Result<(), FfsError> {
             let logical = u32::try_from(logical)
                 .map_err(|_| FfsError::Format("indirect logical block exceeds u32".into()))?;
@@ -25306,9 +25460,7 @@ impl OpenFs {
         }
         #[allow(clippy::too_many_arguments)]
         fn walk(
-            fs: &OpenFs,
-            cx: &Cx,
-            scope: &RequestScope,
+            read_block: &impl Fn(BlockNumber) -> Result<Vec<u8>, FfsError>,
             block: u32,
             level: u32,
             base: u64,
@@ -25322,7 +25474,7 @@ impl OpenFs {
                     detail: "indirect pointer block beyond the end of the filesystem".into(),
                 });
             }
-            let data = fs.read_block_with_scope(cx, scope, BlockNumber(u64::from(block)))?;
+            let data = read_block(BlockNumber(u64::from(block)))?;
             let span = ppb.pow(level - 1);
             for (index, raw) in data
                 .as_chunks::<4>()
@@ -25346,9 +25498,7 @@ impl OpenFs {
                     push(runs, logical, child)?;
                 } else {
                     walk(
-                        fs,
-                        cx,
-                        scope,
+                        read_block,
                         child,
                         level - 1,
                         logical,
@@ -25386,17 +25536,7 @@ impl OpenFs {
         for (slot, level) in [(12_usize, 1_u32), (13, 2), (14, 3)] {
             let ptr = Self::ext4_ind_root_slot(&root, slot);
             if ptr != 0 {
-                walk(
-                    self,
-                    cx,
-                    scope,
-                    ptr,
-                    level,
-                    base,
-                    ppb,
-                    total_blocks,
-                    &mut runs,
-                )?;
+                walk(read_block, ptr, level, base, ppb, total_blocks, &mut runs)?;
             }
             base += ppb.pow(level);
         }
@@ -30464,8 +30604,11 @@ impl OpenFs {
             (logical >= start && logical < start.saturating_add(len))
                 .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
         };
-        let read_leaf =
-            |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
+        let read_leaf = |lb| {
+            resolve_logical(lb)
+                .and_then(|phys| dev.read_block(cx, phys).ok())
+                .map(BlockBuf::into_inner)
+        };
 
         let Some(target_logical) = ffs_ondisk::htree_target_leaf_block(
             &sb.hash_seed,
@@ -30480,7 +30623,7 @@ impl OpenFs {
             return Ok(None);
         };
 
-        let mut data = self.read_block_vec(cx, target_phys)?;
+        let mut data = dev.read_block(cx, target_phys)?.into_inner();
         if let Some((_ino, edit)) =
             ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
         {
@@ -30559,8 +30702,11 @@ impl OpenFs {
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("htree directory on non-ext4 fs".into()))?;
-        let read_leaf =
-            |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
+        let read_leaf = |lb| {
+            resolve_logical(lb)
+                .and_then(|phys| dev.read_block(cx, phys).ok())
+                .map(BlockBuf::into_inner)
+        };
         let target_logical = if casefold {
             ffs_ondisk::htree_target_leaf_block_casefold(
                 &sb.hash_seed,
@@ -30593,7 +30739,7 @@ impl OpenFs {
             ),
         })?;
 
-        let mut data = self.read_block_vec(cx, target_phys)?;
+        let mut data = dev.read_block(cx, target_phys)?.into_inner();
         match ffs_dir::add_entry_reject_existing_tracked(
             &mut data,
             child_ino_u32,
@@ -30670,7 +30816,7 @@ impl OpenFs {
                 continue;
             }
             for block in Self::extent_phys_blocks(ext) {
-                let mut data = self.read_block_vec(cx, block)?;
+                let mut data = dev.read_block(cx, block)?.into_inner();
                 match ffs_dir::add_entry_tracked(
                     &mut data,
                     child_ino_u32,
@@ -30736,7 +30882,6 @@ impl OpenFs {
 
     /// Stage directory publication into the transaction that owns its child.
     #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
-    #[expect(clippy::too_many_lines)]
     fn ext4_stage_dir_entry(
         &self,
         cx: &Cx,
@@ -30752,152 +30897,133 @@ impl OpenFs {
         tstamp_nanos: u32,
     ) -> ffs_error::Result<()> {
         let block_dev = self.block_device_adapter();
-        (|| -> ffs_error::Result<()> {
-            let tx_dev = TransactionBlockAdapter {
-                base: &block_dev,
-                tx: Mutex::new(txn),
-            };
-            let dev = &tx_dev;
+        let snapshot_dev =
+            RegisteredSnapshotBlockAdapter::new(&block_dev, &self.mvcc_store, txn.snapshot());
+        let tx_dev = TransactionBlockAdapter {
+            base: &snapshot_dev,
+            tx: Mutex::new(txn),
+        };
+        self.ext4_insert_dir_entry_from_device(
+            cx,
+            &tx_dev,
+            backend,
+            parent,
+            parent_inode,
+            name,
+            child_ino,
+            file_type,
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+        )
+    }
 
-            // Collect existing directory extents. Route through the cached
-            // write-extent snapshot (keyed by parent inode identity + extent-root
-            // content) instead of re-parsing the parent's whole extent tree on
-            // EVERY insert: a create-heavy directory grows only ~1 block per ~200
-            // entries, so the layout is stable across the intervening inserts, yet
-            // `collect_extents` re-read + re-parsed every external extent leaf per
-            // create (`parse_extent_leaf` ~4% of a create, perf). The existing
-            // growth path already `invalidate_ext4_write_extent_snapshot`s the
-            // parent when it allocates a new dir block, so the cache never serves a
-            // stale mapping; a cache miss simply re-collects (always correct), and
-            // the single-entry cache degrades to neutral (not wrong) under a mixed
-            // create+file-write workload (bd-cc-dirextcache).
-            Self::ext4_reject_inline_data_dir(parent_inode)?;
-            // Hold the shared `Arc<[Ext4Extent]>` snapshot directly instead of
-            // copying it into an owned `Vec` on every insert: the downstream
-            // helpers only borrow it (`&extents` deref-coerces to
-            // `&[Ext4Extent]`) and the growth path only reads `.last()`, so the
-            // per-create allocation + extent-list copy was pure waste. The Arc
-            // is an independent owned handle (the cache may invalidate its own
-            // copy mid-insert on growth; ours stays the correct pre-insert
-            // snapshot), exactly as the `to_vec` copy was — byte-identical.
-            let extents =
-                self.ext4_write_extents_with_scope(cx, &RequestScope::empty(), parent_inode)?;
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn ext4_insert_dir_entry_from_device(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        backend: &mut dyn DirAllocBackend,
+        parent: InodeNumber,
+        parent_inode: &Ext4Inode,
+        name: &[u8],
+        child_ino: InodeNumber,
+        file_type: Ext4FileType,
+        csum_seed: u32,
+        tstamp_secs: u64,
+        tstamp_nanos: u32,
+    ) -> ffs_error::Result<()> {
+        // Namespace composition can change mapping blocks and directory
+        // leaves before insertion. Use the transaction's exact view for
+        // both, rather than a current-view mapping or directory cache.
+        let extents = self.ext4_dir_extents_from_device(cx, dev, parent_inode)?;
 
-            // Try adding to each existing block.
-            let child_ino_u32 = u32::try_from(child_ino.0)
-                .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
-            let parent_ino_u32 = u32::try_from(parent.0)
-                .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
-            let parent_generation = parent_inode.generation;
-            let reserved_tail = self.ext4_dir_reserved_tail();
+        // Try adding to each existing block.
+        let child_ino_u32 = u32::try_from(child_ino.0)
+            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+        let parent_ino_u32 = u32::try_from(parent.0)
+            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+        let parent_generation = parent_inode.generation;
+        let reserved_tail = self.ext4_dir_reserved_tail();
 
-            // bd-bhh0i: the injected `backend` param serves ALL of d's allocation —
-            // the in-place-insert parent write, the a/c growth calls, and the
-            // linear-grow append. Single-lock callers pass a byte-identical
-            // SingleLockDirAlloc; the sharded create path passes a ShardedDirAlloc.
+        // bd-bhh0i: the injected `backend` param serves ALL of d's allocation —
+        // the in-place-insert parent write, the a/c growth calls, and the
+        // linear-grow append. Single-lock callers pass a byte-identical
+        // SingleLockDirAlloc; the sharded create path passes a ShardedDirAlloc.
 
-            // htree (dx-indexed) directories: logical block 0 is the dx_root,
-            // whose '..' rec_len slack hides the index. A linear add_entry would
-            // split that slack and overwrite the dx index (bd-wb4cd). Instead,
-            // route the entry to the hash-correct leaf — the same leaf
-            // htree_find_entry navigates to — so the index stays consistent and
-            // the dx_root is never linear-written.
-            match self.ext4_try_insert_existing(
-                cx,
-                dev,
-                parent,
-                parent_inode,
-                &extents,
-                name,
-                child_ino_u32,
-                parent_ino_u32,
-                parent_generation,
-                file_type,
-                reserved_tail,
-            )? {
-                DirInsertOutcome::Inserted => {
-                    // Parent-inode update hoisted out of try_insert_existing:
-                    // write it here (single-lock path) immediately after the
-                    // entry block was persisted — byte-identical to before.
-                    let mut parent_upd = parent_inode.clone();
-                    ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
-                    if file_type == Ext4FileType::Dir {
-                        parent_upd.links_count = Self::ext4_dir_link_inc(
-                            parent_upd.links_count,
-                            parent,
-                            parent_upd.flags & ffs_types::EXT4_INDEX_FL != 0,
-                        )?;
-                    }
-                    backend.dir_write_inode(cx, dev, parent, &parent_upd, csum_seed)?;
-                    return Ok(());
+        // htree (dx-indexed) directories: logical block 0 is the dx_root,
+        // whose '..' rec_len slack hides the index. A linear add_entry would
+        // split that slack and overwrite the dx index (bd-wb4cd). Instead,
+        // route the entry to the hash-correct leaf — the same leaf
+        // htree_find_entry navigates to — so the index stays consistent and
+        // the dx_root is never linear-written.
+        match self.ext4_try_insert_existing(
+            cx,
+            dev,
+            parent,
+            parent_inode,
+            &extents,
+            name,
+            child_ino_u32,
+            parent_ino_u32,
+            parent_generation,
+            file_type,
+            reserved_tail,
+        )? {
+            DirInsertOutcome::Inserted => {
+                // Parent-inode update hoisted out of try_insert_existing:
+                // write it here (single-lock path) immediately after the
+                // entry block was persisted — byte-identical to before.
+                let mut parent_upd = parent_inode.clone();
+                ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
+                if file_type == Ext4FileType::Dir {
+                    parent_upd.links_count = Self::ext4_dir_link_inc(
+                        parent_upd.links_count,
+                        parent,
+                        parent_upd.flags & ffs_types::EXT4_INDEX_FL != 0,
+                    )?;
                 }
-                DirInsertOutcome::NeedsGrowthHtree {
-                    target_logical,
-                    target_phys,
-                    leaf,
-                } => {
-                    // The hash-correct leaf is full: a leaf split is needed. The
-                    // O(log N) fast path (bd-gauub) splits just this one leaf and
-                    // inserts ONE dx_entry into the dx_root, instead of the O(dir)
-                    // full rebuild — which makes rename (insert+remove at capacity)
-                    // O(log N)/op instead of O(N^2). Only the single-level,
-                    // dx-root-has-room, non-casefold case is handled incrementally;
-                    // everything else falls back to the proven full rebuild, which
-                    // stays correct by construction (e2fsck validates htree
-                    // validity, not shape). casefold falls back because the split
-                    // helper hashes the verbatim name (the rebuild re-hashes by the
-                    // fold), so a fold-indexed dir must keep using the rebuild.
-                    let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-                    if !casefold
-                        && self.ext4_split_htree_leaf_and_add(
-                            cx,
-                            dev,
-                            &mut *backend,
-                            parent,
-                            parent_inode,
-                            &extents,
-                            target_logical,
-                            target_phys,
-                            &leaf,
-                            name,
-                            child_ino_u32,
-                            file_type,
-                            csum_seed,
-                            tstamp_secs,
-                            tstamp_nanos,
-                        )? == Some(())
-                    {
-                        return Ok(());
-                    }
-                    return self.ext4_rebuild_htree_dir(
+                backend.dir_write_inode(cx, dev, parent, &parent_upd, csum_seed)?;
+                return Ok(());
+            }
+            DirInsertOutcome::NeedsGrowthHtree {
+                target_logical,
+                target_phys,
+                leaf,
+            } => {
+                // The hash-correct leaf is full: a leaf split is needed. The
+                // O(log N) fast path (bd-gauub) splits just this one leaf and
+                // inserts ONE dx_entry into the dx_root, instead of the O(dir)
+                // full rebuild — which makes rename (insert+remove at capacity)
+                // O(log N)/op instead of O(N^2). Only the single-level,
+                // dx-root-has-room, non-casefold case is handled incrementally;
+                // everything else falls back to the proven full rebuild, which
+                // stays correct by construction (e2fsck validates htree
+                // validity, not shape). casefold falls back because the split
+                // helper hashes the verbatim name (the rebuild re-hashes by the
+                // fold), so a fold-indexed dir must keep using the rebuild.
+                let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+                if !casefold
+                    && self.ext4_split_htree_leaf_and_add(
                         cx,
                         dev,
                         &mut *backend,
                         parent,
                         parent_inode,
                         &extents,
+                        target_logical,
+                        target_phys,
+                        &leaf,
                         name,
                         child_ino_u32,
                         file_type,
                         csum_seed,
                         tstamp_secs,
                         tstamp_nanos,
-                    );
+                    )? == Some(())
+                {
+                    return Ok(());
                 }
-                DirInsertOutcome::NeedsGrowthLinear => {}
-            }
-
-            // All linear blocks are full. If the filesystem supports hash indexing
-            // (dir_index), convert this directory to an htree now — like the kernel,
-            // which builds a dx index once the directory outgrows linear blocks.
-            // This bounds linear create/lookup to a single block; further growth
-            // uses the O(log N) htree path with loose-pack doubling rebuilds
-            // (bd-xmh5g.111), so mass-create into a fresh directory is O(N) rather
-            // than O(N^2), and lookups become O(log N) instead of O(blocks).
-            let has_dir_index = self
-                .ext4_superblock()
-                .is_some_and(|sb| sb.has_compat(ffs_ondisk::ext4::Ext4CompatFeatures::DIR_INDEX));
-            if has_dir_index {
                 return self.ext4_rebuild_htree_dir(
                     cx,
                     dev,
@@ -30913,10 +31039,21 @@ impl OpenFs {
                     tstamp_nanos,
                 );
             }
+            DirInsertOutcome::NeedsGrowthLinear => {}
+        }
 
-            // No dir_index feature: keep the directory linear (kernel behaviour
-            // without dir_index).
-            self.ext4_append_linear_dir_block(
+        // All linear blocks are full. If the filesystem supports hash indexing
+        // (dir_index), convert this directory to an htree now — like the kernel,
+        // which builds a dx index once the directory outgrows linear blocks.
+        // This bounds linear create/lookup to a single block; further growth
+        // uses the O(log N) htree path with loose-pack doubling rebuilds
+        // (bd-xmh5g.111), so mass-create into a fresh directory is O(N) rather
+        // than O(N^2), and lookups become O(log N) instead of O(blocks).
+        let has_dir_index = self
+            .ext4_superblock()
+            .is_some_and(|sb| sb.has_compat(ffs_ondisk::ext4::Ext4CompatFeatures::DIR_INDEX));
+        if has_dir_index {
+            return self.ext4_rebuild_htree_dir(
                 cx,
                 dev,
                 &mut *backend,
@@ -30929,8 +31066,25 @@ impl OpenFs {
                 csum_seed,
                 tstamp_secs,
                 tstamp_nanos,
-            )
-        })()
+            );
+        }
+
+        // No dir_index feature: keep the directory linear (kernel behaviour
+        // without dir_index).
+        self.ext4_append_linear_dir_block(
+            cx,
+            dev,
+            &mut *backend,
+            parent,
+            parent_inode,
+            &extents,
+            name,
+            child_ino_u32,
+            file_type,
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+        )
     }
 
     /// Grow a full linear directory by one block holding the new entry: the
@@ -31188,7 +31342,7 @@ impl OpenFs {
         let Some(dx_root_phys) = resolve(0) else {
             return Ok(None);
         };
-        let dx_root_block = self.read_block_vec(cx, dx_root_phys)?;
+        let dx_root_block = dev.read_block(cx, dx_root_phys)?.into_inner();
 
         // Pure split: repacks both leaves and the dx_root, all checksum-stamped.
         let split = match ffs_ondisk::split_htree_leaf(
@@ -31449,7 +31603,7 @@ impl OpenFs {
         let Some(node_phys) = resolve(node_logical) else {
             return Ok(None);
         };
-        let dx_node_block = self.read_block_vec(cx, node_phys)?;
+        let dx_node_block = dev.read_block(cx, node_phys)?.into_inner();
 
         let logical_end = extents
             .iter()
@@ -31894,9 +32048,11 @@ impl OpenFs {
     /// add_entry ONLY on the hash-target leaf and fills `probe` from that leaf
     /// when byte-exact matching applies. `Ok(None)` = not an htree dir (caller
     /// runs the linear scan); `Ok(Some(checked))` = fast path ran.
+    #[allow(clippy::too_many_arguments)]
     fn ext4_preflight_htree_fast_path(
         &self,
         cx: &Cx,
+        dev: &dyn BlockDevice,
         parent_inode: &Ext4Inode,
         extents: &[Ext4Extent],
         name: &[u8],
@@ -31920,8 +32076,11 @@ impl OpenFs {
             (logical >= start && logical < start.saturating_add(len))
                 .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
         };
-        let read_leaf =
-            |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
+        let read_leaf = |lb| {
+            resolve_logical(lb)
+                .and_then(|phys| dev.read_block(cx, phys).ok())
+                .map(BlockBuf::into_inner)
+        };
         // Casefold htree dirs route by the folded name; the top-of-fn gate
         // already rejected non-ASCII casefold names, so the ASCII fold is
         // byte-exact here. Mirror the delete path's casefold descent
@@ -31949,7 +32108,7 @@ impl OpenFs {
             // name-fits dry-run (the real insert will rebuild).
             return Ok(Some(true));
         };
-        let mut data = self.read_block_vec(cx, target_phys)?;
+        let mut data = dev.read_block(cx, target_phys)?.into_inner();
         // Probe existence from this exact leaf BEFORE the dry-run add_entry
         // mutates `data`. For a non-casefold htree dir an existing
         // `new_name` MUST live in this hash-target leaf (same invariant the
@@ -31973,6 +32132,7 @@ impl OpenFs {
     fn ext4_preflight_dir_entry_insert(
         &self,
         cx: &Cx,
+        dev: &dyn BlockDevice,
         parent_inode: &Ext4Inode,
         name: &[u8],
         file_type: Ext4FileType,
@@ -32000,13 +32160,7 @@ impl OpenFs {
             ));
         }
 
-        // Cached extent snapshot: this preflight runs just before the add on the
-        // rename path, so caching it here lets the add + remove reuse the same
-        // parse (the snapshot self-invalidates on a growing add via its
-        // extent-root key) — one parse per rename instead of one per sub-step
-        // (bd-cc-itableloc sibling).
-        let extents =
-            self.ext4_write_extents_with_scope(cx, &RequestScope::empty(), parent_inode)?;
+        let extents = self.ext4_dir_extents_from_device(cx, dev, parent_inode)?;
         let reserved_tail = self.ext4_dir_reserved_tail();
 
         // The real insert (ext4_add_dir_entry) routes an htree entry to the SINGLE
@@ -32025,6 +32179,7 @@ impl OpenFs {
         let target_checked = self
             .ext4_preflight_htree_fast_path(
                 cx,
+                dev,
                 parent_inode,
                 &extents,
                 name,
@@ -32045,7 +32200,7 @@ impl OpenFs {
                     if Some(block) == dx_root_phys {
                         continue;
                     }
-                    let mut data = self.read_block_vec(cx, block)?;
+                    let mut data = dev.read_block(cx, block)?.into_inner();
                     match ffs_dir::add_entry(&mut data, 1, name, file_type, reserved_tail) {
                         Ok(_) | Err(FfsError::NoSpace) => {}
                         Err(err) => return Err(err),
@@ -32205,139 +32360,124 @@ impl OpenFs {
         name: &[u8],
         expect_dir: bool,
     ) -> ffs_error::Result<()> {
+        const MAX_ATTEMPTS: u32 = 16;
         Self::validate_single_path_component(name)?;
+        let alloc_mutex = self.require_alloc_state()?;
+        let mut alloc = alloc_mutex.write();
         let block_dev = self.block_device_adapter();
-        // Eager per-block commits (like `ext4_create`), NOT a batched
-        // `TransactionBlockAdapter` txn: measured ~2.7x faster on delbench (the
-        // batched-commit path caps unlink/rmdir throughput at ~half of create).
-        // Correctness is preserved by DEFERRING every destructive persist until
-        // AFTER the is-dir / rmdir-empty / immutable-append validations pass — the
-        // removed parent dir block is mutated in memory and stashed in
-        // `pending_dir_write`, and the child/parent inode writes come after, so a
-        // rejected unlink/rmdir persists NOTHING (same observable rollback as the
-        // old drop-the-uncommitted-txn path, and keeping the bd-cc-unlink-1pass
-        // single hash-leaf descent). The dir-entry removal is persisted BEFORE the
-        // inode is freed, so an interrupted op leaves at worst an orphan inode
-        // (e2fsck-reclaimable), never a dir entry pointing at a freed inode.
-        let tx_dev: &dyn ffs_block::BlockDevice = &block_dev;
-        (|| -> ffs_error::Result<()> {
-            let alloc_mutex = self.require_alloc_state()?;
-            let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
-
-            let sb = self
-                .ext4_superblock()
-                .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-            let csum_seed = sb.csum_seed();
-
-            let parent_inode = self.read_inode(cx, parent)?;
-            if !parent_inode.is_dir() {
-                return Err(FfsError::NotDirectory);
-            }
-            // Inline-data directories are unsupported for entry mutation: the
-            // old path got this rejection from `lookup_name`, which the one-pass
-            // removal below no longer calls — so assert it loudly here (bd-4y9ca).
-            Self::ext4_reject_inline_data_dir(&parent_inode)?;
-
-            let mut alloc = alloc_mutex.write();
-
-            // Remove the child's directory entry from the parent's blocks AND
-            // learn its inode number in ONE pass: `remove_entry_take_inode`
-            // returns the removed dirent's inode, so unlink no longer does a
-            // separate positive `lookup_name` (a second htree descent + leaf
-            // read + scan) just to find the child — the descent below already
-            // visits the hash-correct leaf. Validation (immutable/append, the
-            // is-dir / rmdir-empty checks) runs AFTER the in-memory removal but
-            // BEFORE it is persisted (the write is deferred to `pending_dir_write`
-            // and flushed only once validation passes); any rejection returns Err
-            // before that flush, so the removal never persists — observably
-            // identical to checking before removing (bd-cc-unlink-1pass).
-            // Cached extent snapshot: unlink removes a dirent but never grows or
-            // shrinks the parent's extent tree, so the mapping is stable across a
-            // stream of unlinks in the same directory — reuse the parse instead of
-            // re-parsing the parent's whole extent tree per op (bd-cc-itableloc
-            // sibling; ~6% of a rename came from this pattern, delbench analog).
-            let extents =
-                self.ext4_write_extents_with_scope(cx, &RequestScope::empty(), &parent_inode)?;
-            let mut removed_ino: Option<u32> = None;
-            // The removed parent dir block, persisted only after validation passes.
-            let mut pending_dir_write: Option<(BlockNumber, Vec<u8>)> = None;
-            let reserved_tail = self.ext4_dir_reserved_tail();
-            let parent_ino_u32 = u32::try_from(parent.0)
-                .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
-            // For an htree directory, logical block 0 is the dx_root: it holds no
-            // file entries (only '.'/'..' over the hidden index), and its '..'
-            // rec_len spans past the reserved tail, so a linear remove_entry scan
-            // rejects it as corrupt. Skip it — the entry is always in a leaf.
-            let dx_root_phys = Self::ext4_htree_dx_root_phys(&parent_inode, &extents);
-
-            // htree fast path: descend the dx index to the single hash-correct
-            // leaf and remove the entry there — O(log N) — instead of the linear
-            // scan of every directory block below, which is O(N) per unlink =
-            // O(N^2) for a delete-heavy directory (mirrors the add path's
-            // hash-correct-leaf routing). The linear scan stays as the
-            // correctness fallback when the htree path can't locate the entry
-            // (stale/odd index, non-ASCII casefold).
-            if parent_inode.has_htree_index()
-                && let Some(sb) = self.ext4_superblock()
-            {
-                let resolve_logical = |logical: u32| -> Option<BlockNumber> {
-                    let pos = extents.partition_point(|e| e.logical_block <= logical);
-                    let ext = extents.get(pos.checked_sub(1)?)?;
-                    if ext.is_unwritten() {
-                        return None;
-                    }
-                    let start = ext.logical_block;
-                    let len = u32::from(ext.actual_len());
-                    (logical >= start && logical < start.saturating_add(len))
-                        .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
+        for attempt in 1..=MAX_ATTEMPTS {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let mut working = Ext4AllocState {
+                geo: alloc.geo.clone(),
+                groups: alloc.groups.clone(),
+                persist_ctx: alloc.persist_ctx.clone(),
+            };
+            let mut txn = self.mvcc_store.begin();
+            let snapshot_dev =
+                RegisteredSnapshotBlockAdapter::new(&block_dev, &self.mvcc_store, txn.snapshot());
+            let staged = (|| {
+                let adapter = TransactionBlockAdapter {
+                    base: &snapshot_dev,
+                    tx: Mutex::new(&mut txn),
                 };
-                let read_leaf =
-                    |lb| resolve_logical(lb).and_then(|phys| self.read_block_vec(cx, phys).ok());
-                let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-                let target_logical = if casefold {
-                    ffs_ondisk::htree_target_leaf_block_casefold(
-                        &sb.hash_seed,
-                        sb.has_large_dir(),
-                        name,
-                        |v| sb.effective_dirhash_version(v),
-                        read_leaf,
-                    )
-                } else {
-                    ffs_ondisk::htree_target_leaf_block(
-                        &sb.hash_seed,
-                        sb.has_large_dir(),
-                        name,
-                        |v| sb.effective_dirhash_version(v),
-                        read_leaf,
-                    )
-                };
-                if let Some(target_phys) = target_logical.and_then(resolve_logical)
-                    && Some(target_phys) != dx_root_phys
-                {
-                    let mut data = self.read_block_vec(cx, target_phys)?;
-                    if let Some((ino, edit)) =
-                        ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
-                    {
-                        self.stamp_ext4_dir_block_after_edit(
-                            &mut data,
-                            parent_ino_u32,
-                            parent_inode.generation,
-                            &edit,
-                        );
-                        // Defer the persist until the validations below pass.
-                        pending_dir_write = Some((target_phys, data));
-                        removed_ino = Some(ino);
-                    }
+                let tx_dev: &dyn BlockDevice = &adapter;
+                let alloc = &mut working;
+                let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+                let sb = self
+                    .ext4_superblock()
+                    .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+                let csum_seed = sb.csum_seed();
+
+                let mut parent_inode =
+                    ffs_inode::read_inode(cx, tx_dev, &alloc.geo, &alloc.groups, parent)?;
+                parent_inode.number = parent.0;
+                if !parent_inode.is_dir() {
+                    return Err(FfsError::NotDirectory);
                 }
-            }
+                // Inline-data directories are unsupported for entry mutation: the
+                // old path got this rejection from `lookup_name`, which the one-pass
+                // removal below no longer calls — so assert it loudly here (bd-4y9ca).
+                Self::ext4_reject_inline_data_dir(&parent_inode)?;
 
-            if removed_ino.is_none() {
-                'outer: for ext in extents.iter() {
-                    for block in Self::extent_phys_blocks(ext) {
-                        if Some(block) == dx_root_phys {
-                            continue;
+                // Remove the child's directory entry from the parent's blocks AND
+                // learn its inode number in ONE pass: `remove_entry_take_inode`
+                // returns the removed dirent's inode, so unlink no longer does a
+                // separate positive `lookup_name` (a second htree descent + leaf
+                // read + scan) just to find the child — the descent below already
+                // visits the hash-correct leaf. Validation (immutable/append, the
+                // is-dir / rmdir-empty checks) runs AFTER the in-memory removal but
+                // BEFORE it is persisted (the write is deferred to `pending_dir_write`
+                // and flushed only once validation passes); any rejection returns Err
+                // before that flush, so the removal never persists — observably
+                // identical to checking before removing (bd-cc-unlink-1pass).
+                // Mapping and directory bytes come from the same registered
+                // snapshot as the inode, including any reads needed for reclaim.
+                let extents = self.ext4_dir_extents_from_device(cx, tx_dev, &parent_inode)?;
+                let mut removed_ino: Option<u32> = None;
+                // The removed parent dir block, persisted only after validation passes.
+                let mut pending_dir_write: Option<(BlockNumber, Vec<u8>)> = None;
+                let reserved_tail = self.ext4_dir_reserved_tail();
+                let parent_ino_u32 = u32::try_from(parent.0).map_err(|_| {
+                    FfsError::Format("inode number exceeds ext4 32-bit limit".into())
+                })?;
+                // For an htree directory, logical block 0 is the dx_root: it holds no
+                // file entries (only '.'/'..' over the hidden index), and its '..'
+                // rec_len spans past the reserved tail, so a linear remove_entry scan
+                // rejects it as corrupt. Skip it — the entry is always in a leaf.
+                let dx_root_phys = Self::ext4_htree_dx_root_phys(&parent_inode, &extents);
+
+                // htree fast path: descend the dx index to the single hash-correct
+                // leaf and remove the entry there — O(log N) — instead of the linear
+                // scan of every directory block below, which is O(N) per unlink =
+                // O(N^2) for a delete-heavy directory (mirrors the add path's
+                // hash-correct-leaf routing). The linear scan stays as the
+                // correctness fallback when the htree path can't locate the entry
+                // (stale/odd index, non-ASCII casefold).
+                if parent_inode.has_htree_index()
+                    && let Some(sb) = self.ext4_superblock()
+                {
+                    let resolve_logical = |logical: u32| -> Option<BlockNumber> {
+                        let pos = extents.partition_point(|e| e.logical_block <= logical);
+                        let ext = extents.get(pos.checked_sub(1)?)?;
+                        if ext.is_unwritten() {
+                            return None;
                         }
-                        let mut data = self.read_block_vec(cx, block)?;
+                        let start = ext.logical_block;
+                        let len = u32::from(ext.actual_len());
+                        (logical >= start && logical < start.saturating_add(len))
+                            .then(|| BlockNumber(ext.physical_start + u64::from(logical - start)))
+                    };
+                    let read_leaf = |lb| {
+                        resolve_logical(lb).and_then(|phys| {
+                            tx_dev
+                                .read_block(cx, phys)
+                                .ok()
+                                .map(|buf| buf.as_slice().to_vec())
+                        })
+                    };
+                    let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+                    let target_logical = if casefold {
+                        ffs_ondisk::htree_target_leaf_block_casefold(
+                            &sb.hash_seed,
+                            sb.has_large_dir(),
+                            name,
+                            |v| sb.effective_dirhash_version(v),
+                            read_leaf,
+                        )
+                    } else {
+                        ffs_ondisk::htree_target_leaf_block(
+                            &sb.hash_seed,
+                            sb.has_large_dir(),
+                            name,
+                            |v| sb.effective_dirhash_version(v),
+                            read_leaf,
+                        )
+                    };
+                    if let Some(target_phys) = target_logical.and_then(resolve_logical)
+                        && Some(target_phys) != dx_root_phys
+                    {
+                        let mut data = tx_dev.read_block(cx, target_phys)?.as_slice().to_vec();
                         if let Some((ino, edit)) = ffs_dir::remove_entry_take_inode_tracked(
                             &mut data,
                             name,
@@ -32350,259 +32490,167 @@ impl OpenFs {
                                 &edit,
                             );
                             // Defer the persist until the validations below pass.
-                            pending_dir_write = Some((block, data));
+                            pending_dir_write = Some((target_phys, data));
                             removed_ino = Some(ino);
-                            break 'outer;
                         }
                     }
                 }
-            }
-            let Some(child_ino_u32) = removed_ino else {
-                return Err(FfsError::NotFound(
-                    String::from_utf8_lossy(name).into_owned(),
-                ));
+
+                if removed_ino.is_none() {
+                    'outer: for ext in extents.iter() {
+                        for block in Self::extent_phys_blocks(ext) {
+                            if Some(block) == dx_root_phys {
+                                continue;
+                            }
+                            let mut data = tx_dev.read_block(cx, block)?.as_slice().to_vec();
+                            if let Some((ino, edit)) = ffs_dir::remove_entry_take_inode_tracked(
+                                &mut data,
+                                name,
+                                reserved_tail,
+                            )? {
+                                self.stamp_ext4_dir_block_after_edit(
+                                    &mut data,
+                                    parent_ino_u32,
+                                    parent_inode.generation,
+                                    &edit,
+                                );
+                                // Defer the persist until the validations below pass.
+                                pending_dir_write = Some((block, data));
+                                removed_ino = Some(ino);
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                let Some(child_ino_u32) = removed_ino else {
+                    return Err(FfsError::NotFound(
+                        String::from_utf8_lossy(name).into_owned(),
+                    ));
+                };
+
+                // The entry removal is staged in memory only (`pending_dir_write`),
+                // NOT yet persisted. Read the child and run the kernel-equivalent
+                // rejections; any Err here returns before the deferred write below, so
+                // the removal is discarded and nothing persists.
+                let child_ino = InodeNumber(u64::from(child_ino_u32));
+                let mut child_inode =
+                    ffs_inode::read_inode(cx, tx_dev, &alloc.geo, &alloc.groups, child_ino)?;
+                child_inode.number = child_ino.0;
+                // Immutable and append-only files cannot be deleted (kernel: EPERM).
+                Self::ext4_reject_immutable_or_append(&child_inode)?;
+
+                if expect_dir {
+                    if !child_inode.is_dir() {
+                        return Err(FfsError::NotDirectory);
+                    }
+                    // Check directory is empty (only . and ..). Early-exits on the
+                    // first real entry via the same parse_dir_block read_dir uses,
+                    // instead of materializing the whole directory to reject it.
+                    if !self.ext4_directory_is_empty_from_device(cx, tx_dev, &child_inode)? {
+                        return Err(FfsError::NotEmpty);
+                    }
+                } else if child_inode.is_dir() {
+                    return Err(FfsError::IsDirectory);
+                }
+
+                // Decrement child link count.
+                let mut child_upd = child_inode;
+                if expect_dir {
+                    child_upd.links_count = 0; // Removing a directory drops both the parent link and the `.` link
+                } else {
+                    child_upd.links_count =
+                        Self::ext4_checked_links_count_delta(child_upd.links_count, child_ino, -1)?;
+                }
+                ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
+
+                // Stage the namespace edit. A later allocation, xattr or inode-table
+                // read failure must discard this edit together with all reclamation.
+                if let Some((blk, data)) = pending_dir_write.take() {
+                    tx_dev.write_block(cx, blk, &data)?;
+                }
+
+                let links_remaining = child_upd.links_count;
+                let retirement = self.ext4_stage_inode_retirement(
+                    cx,
+                    tx_dev,
+                    alloc,
+                    child_ino,
+                    &mut child_upd,
+                    tstamp_secs,
+                    true,
+                )?;
+
+                // Update parent timestamps.
+                let mut parent_upd = parent_inode;
+                if expect_dir {
+                    // ext4_dec_count: the parent loses the removed subdir's `..`
+                    // backlink, but a directory's link count never drops below 2
+                    // (an htree parent pinned at the dir_nlink sentinel 1 stays) —
+                    // bd-j12g7.
+                    parent_upd.links_count =
+                        Self::ext4_dir_link_dec(parent_upd.links_count, parent)?;
+                }
+                ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
+                let loc = ffs_inode::locate_inode(parent, &alloc.geo, &alloc.groups).ok_or_else(
+                    || FfsError::Corruption {
+                        block: 0,
+                        detail: format!("unlink: parent inode {parent} out of range"),
+                    },
+                )?;
+                ffs_inode::write_inode_at_slot_scoped(
+                    cx,
+                    tx_dev,
+                    loc,
+                    usize::from(alloc.geo.inode_size),
+                    parent,
+                    &parent_upd,
+                    csum_seed,
+                )?;
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                Ok((retirement, child_ino, links_remaining))
+            })();
+            let (retirement, child_ino, links_remaining) = match staged {
+                Ok(staged) => staged,
+                Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                Err(error) => return Err(error),
             };
-
-            // The entry removal is staged in memory only (`pending_dir_write`),
-            // NOT yet persisted. Read the child and run the kernel-equivalent
-            // rejections; any Err here returns before the deferred write below, so
-            // the removal is discarded and nothing persists.
-            let child_ino = InodeNumber(u64::from(child_ino_u32));
-            let child_inode = self.read_inode(cx, child_ino)?;
-            // Immutable and append-only files cannot be deleted (kernel: EPERM).
-            Self::ext4_reject_immutable_or_append(&child_inode)?;
-
-            if expect_dir {
-                if !child_inode.is_dir() {
-                    return Err(FfsError::NotDirectory);
-                }
-                // Check directory is empty (only . and ..). Early-exits on the
-                // first real entry via the same parse_dir_block read_dir uses,
-                // instead of materializing the whole directory to reject it.
-                if !self.ext4_directory_is_empty(cx, &RequestScope::empty(), &child_inode)? {
-                    return Err(FfsError::NotEmpty);
-                }
-            } else if child_inode.is_dir() {
-                return Err(FfsError::IsDirectory);
-            }
-
-            // Decrement child link count.
-            let mut child_upd = child_inode;
-            if expect_dir {
-                child_upd.links_count = 0; // Removing a directory drops both the parent link and the `.` link
+            let txn_id = txn.id();
+            let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                txn.write_set().keys().copied().collect()
             } else {
-                child_upd.links_count =
-                    Self::ext4_checked_links_count_delta(child_upd.links_count, child_ino, -1)?;
-            }
-            ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
-
-            // Every fallible check (is-dir / rmdir-empty / immutable-append AND the
-            // link-count-underflow corruption check above) has now passed — persist
-            // the deferred parent dir-block removal BEFORE freeing the inode (so an
-            // interrupted op leaves an orphan inode, never a dir entry pointing at a
-            // freed inode). Any earlier rejection returned before this flush, so the
-            // removal never persists on a rejected op.
-            if let Some((blk, data)) = pending_dir_write.take() {
-                tx_dev.write_block(cx, blk, &data)?;
-            }
-
-            {
-                // bd-y2t0r / bd-pbyu0: when the sharded per-group allocator is
-                // active, inode ALLOCATION debits the sharded records and the
-                // descriptor flush reads `sharded.snapshot_group_stats()`. A free
-                // that credits the single-lock `groups` array is therefore written
-                // to a structure nothing reads, leaking exactly one inode per
-                // delete until the group descriptors read zero free and allocation
-                // returns ENOSPC on an empty filesystem.
-                //
-                // So split the delete: release the inode's storage against the
-                // single-lock array (block frees are measured safe there — data
-                // blocks are allocated and freed through the same structure and
-                // never diverge), then free the inode NUMBER through whichever
-                // structure allocated it.
-                #[cfg(feature = "bhh0i_sharded_alloc")]
-                let sharded_inode_free = self.bhh0i_sharded_ops_active();
-                #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-                let sharded_inode_free = false;
-
-                let Ext4AllocState {
-                    geo,
-                    groups,
-                    persist_ctx,
-                } = &mut *alloc;
-                if child_upd.links_count == 0 {
-                    // bd-90aey orphan-on-unlink: POSIX (and kernel ext4) keeps an
-                    // unlinked inode fully alive while anything still holds it —
-                    // an open fd, a cwd, an mmap: `fstat`/`read`/`write` must keep
-                    // working with `nlink` 0 and only the last reference reclaims
-                    // storage. When the transport oracle reports kernel
-                    // references pinning `child_ino` (file or directory), orphan
-                    // instead of freeing; the last FORGET finalizes. The removal
-                    // above already persisted first, so a crash never leaves a
-                    // dangling dirent.
-                    if self.ext4_open_handle_count(child_ino) > 0 {
-                        self.ext4_orphan_pinned_inode(
-                            cx,
-                            tx_dev,
-                            geo,
-                            groups,
-                            child_ino,
-                            &mut child_upd,
-                            csum_seed,
-                            sharded_inode_free,
-                        )?;
-                    } else if sharded_inode_free {
-                        // Release storage WITHOUT the inode write-back, then stage
-                        // the zeroed slot under a slot-scoped merge proof. The
-                        // write-back is split out because `write_inode` rewrites
-                        // the whole inode-table block, staging an opaque
-                        // whole-block write: two workers deleting inodes that
-                        // share a table block then first-committer-wins against
-                        // each other even though their slots are disjoint. That is
-                        // measured — the concurrent gate below failed on blocks 37
-                        // and 2085, the inode TABLES of groups 0 and 1, while the
-                        // inode bitmaps (35/36) never appeared in a conflict at
-                        // all. The sharded CREATE path already stages this exact
-                        // proof via `ext4_sharded_stage_inode_slot`; this is the
-                        // delete-side counterpart it never had.
-                        let is_dir = ffs_inode::release_inode_storage_deferring_writeback(
-                            cx,
-                            tx_dev,
-                            geo,
-                            groups,
-                            child_ino,
-                            &mut child_upd,
-                            tstamp_secs,
-                            persist_ctx,
-                        )?;
-                        let loc =
-                            ffs_inode::locate_inode(child_ino, geo, groups).ok_or_else(|| {
-                                FfsError::Corruption {
-                                    block: 0,
-                                    detail: format!(
-                                        "sharded unlink: inode {child_ino} out of range"
-                                    ),
-                                }
-                            })?;
-                        ffs_inode::write_inode_at_slot_scoped(
-                            cx,
-                            tx_dev,
-                            loc,
-                            usize::from(geo.inode_size),
-                            child_ino,
-                            &child_upd,
-                            csum_seed,
-                        )?;
-                        #[cfg(feature = "bhh0i_sharded_alloc")]
-                        self.ext4_sharded_free_inode(cx, tx_dev, child_ino, is_dir)?;
-                        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-                        let _ = is_dir;
-                    } else {
-                        ffs_inode::delete_inode(
-                            cx,
-                            tx_dev,
-                            geo,
-                            groups,
-                            child_ino,
-                            &mut child_upd,
-                            csum_seed,
-                            tstamp_secs,
-                            persist_ctx,
-                        )?;
-                    }
-                } else {
-                    ffs_inode::write_inode(
-                        cx, tx_dev, geo, groups, child_ino, &child_upd, csum_seed,
-                    )?;
-                }
-            }
-
-            // Update parent timestamps.
-            let mut parent_upd = parent_inode;
-            if expect_dir {
-                // ext4_dec_count: the parent loses the removed subdir's `..`
-                // backlink, but a directory's link count never drops below 2
-                // (an htree parent pinned at the dir_nlink sentinel 1 stays) —
-                // bd-j12g7.
-                parent_upd.links_count = Self::ext4_dir_link_dec(parent_upd.links_count, parent)?;
-            }
-            ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
-            {
-                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
-                // The parent-inode update is the OTHER whole-block write on this
-                // path, and measurement says it is the one that actually blocked
-                // the sharded cutover's concurrency gate. `write_inode` rewrites
-                // the parent's entire inode-table block, so two workers whose
-                // PARENT directories share a table block first-committer-wins
-                // against each other on every unlink — even though the two
-                // directories are unrelated and their 256-byte slots are disjoint.
-                //
-                // Measured, not inferred (the gate's layout dump):
-                //     w0..w3 = inodes 13-16 -> table block 37
-                //     w4..w7 = inodes 17-20 -> table block 38
-                // and every conflict the gate reported was on 37 or 38, each
-                // worker failing on its OWN parent's block. 16 inodes share a
-                // 4 KiB block at 256 bytes each, so this collides for any workload
-                // whose directories were created together — which is precisely the
-                // parallel-metadata shape the sharded allocator exists to serve.
-                //
-                // Staging the parent's slot through `rmw_block` declares the exact
-                // bytes touched, so disjoint-slot writers merge. It stays INSIDE
-                // the transaction (unlike `ext4_sharded_write_inode`, which
-                // auto-commits to the store), preserving unlink's atomicity.
-                #[cfg(feature = "bhh0i_sharded_alloc")]
-                let sharded_parent_write = self.bhh0i_sharded_ops_active();
-                #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-                let sharded_parent_write = false;
-
-                if sharded_parent_write {
-                    let loc = ffs_inode::locate_inode(parent, geo, groups).ok_or_else(|| {
-                        FfsError::Corruption {
-                            block: 0,
-                            detail: format!("sharded unlink: parent inode {parent} out of range"),
-                        }
-                    })?;
-                    ffs_inode::write_inode_at_slot_scoped(
-                        cx,
-                        tx_dev,
-                        loc,
-                        usize::from(geo.inode_size),
-                        parent,
-                        &parent_upd,
-                        csum_seed,
-                    )?;
-                } else {
-                    ffs_inode::write_inode(
-                        cx,
-                        tx_dev,
-                        geo,
-                        groups,
-                        parent,
-                        &parent_upd,
-                        csum_seed,
-                    )?;
-                }
-            }
-
+                Vec::new()
+            };
+            let commit_seq =
+                match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store) {
+                    Ok(seq) => seq,
+                    Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                    Err(error) => return Err(error),
+                };
+            alloc.groups = working.groups;
+            retirement.publish();
+            drop(snapshot_dev);
+            drop(alloc);
+            self.prune_mvcc_after_commit_if_due(commit_seq);
+            self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
             trace!(
                 target: "ffs::write",
                 op = if expect_dir { "rmdir" } else { "unlink" },
                 parent = parent.0,
                 child = child_ino.0,
                 name = %String::from_utf8_lossy(name),
-                links_remaining = child_upd.links_count,
-                "entry removed"
+                links_remaining,
+                "entry removed atomically"
             );
-
-            Ok(())
-        })()
+            return Ok(());
+        }
+        unreachable!("the final unlink transaction attempt returns its result")
     }
 
     /// Reclaim storage for an orphaned inode whose last open handle just
     /// closed (bd-90aey orphan-on-unlink).
     ///
-    /// Splices `ino` off the on-disk orphan list, then runs the same
-    /// device-level free the unlink fast path uses for un-pinned inodes.
+    /// Reclaims `ino` and splices it off the orphan list in one transaction,
+    /// using the same staged retirement as unlink of an un-pinned inode.
     /// Returns `Ok(true)` when storage was reclaimed now; `Ok(false)` when
     /// `ino` is not on the orphan list (still linked, never orphaned, or
     /// already final). The allocation lock serializes the walk/splice against
@@ -32613,149 +32661,117 @@ impl OpenFs {
         cx: &Cx,
         ino: InodeNumber,
     ) -> ffs_error::Result<bool> {
+        const MAX_ATTEMPTS: u32 = 16;
+
         if self.ext4_superblock().is_none() {
             return Ok(false);
         }
-        // Called on every last kernel reference: only an inode this mount
-        // orphaned has work to do (cheap check, no gate, for every other FORGET).
-        if !self.ext4_pending_orphans.lock().contains(&ino.0) {
+        // A read-only mount cannot have published a runtime orphan. FORGET
+        // still arrives for its ordinary lookup references and is a no-op.
+        let Some(alloc_mutex) = self.ext4_alloc_state.as_ref() else {
             return Ok(false);
-        }
+        };
         // A finalize arrives from FORGET, outside any request scope, yet it
         // frees storage and re-links the orphan list: a durability boundary
         // must see all of it or none (a captured head naming an inode whose
         // blocks the same capture freed is a double free at next mount).
         let _gate = self.mutation_gate_guard();
-        // Claim the inode only INSIDE the gate. Claimed before it, a finalize
-        // blocked behind the unmount flush still owned the inode, so the destroy
-        // drain could not reclaim it and its frees landed after the final flush
-        // (a later flush then wrote freed bitmap bits under a stale descriptor
-        // checksum). A failure below leaves it on the on-disk list for
-        // mount-time recovery.
-        if !self.ext4_pending_orphans.lock().remove(&ino.0) {
-            return Ok(false);
-        }
-        let ino_u32 = u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
-            block: 0,
-            detail: format!("finalize: inode {ino} exceeds the ext4 32-bit inode range"),
-        })?;
-        let alloc_mutex = self.require_alloc_state()?;
         let csum_seed = self
             .ext4_superblock()
             .map(ffs_ondisk::Ext4Superblock::csum_seed)
             .unwrap_or_default();
-        let (tstamp_secs, _tstamp_nanos) = Self::now_timestamp();
         let mut alloc = alloc_mutex.write();
-
-        // Walk the orphan list to find the victim and its predecessor. The
-        // dtime field of an orphan doubles as the next-pointer, mirroring the
-        // legacy layout `collect_ext4_orphan_list_lenient` walks at mount.
-        let mut prev: Option<u32> = None;
-        let mut next = self.ext4_read_orphan_head();
-        let mut found = false;
-        let mut steps = 0_u64;
-        while next != 0 {
-            if next == ino_u32 {
-                found = true;
-                break;
-            }
-            prev = Some(next);
-            let link_inode = self.read_inode_raw(cx, InodeNumber(u64::from(next)))?;
-            next = link_inode.dtime;
-            steps = steps.saturating_add(1);
-            if steps > u64::from(u32::MAX) {
-                // Cycle guard in the spirit of the mount-time lenient walker.
-                break;
-            }
-        }
-        if !found {
+        // Last-reference notification may race a staged unlink. Wait for its
+        // allocation guard BEFORE checking the pending set, or the notification
+        // could miss an orphan that is about to be published. Keep that pending
+        // entry until reclamation commits so failures remain retryable.
+        if !self.ext4_pending_orphans.lock().contains(&ino.0) {
             return Ok(false);
         }
-
-        let mut child_upd = self.read_inode(cx, ino)?;
-        let next_after = child_upd.dtime;
-        // Defensive: a zero-link orphan can never regain links through the
-        // namespace (its name is gone), so this is unreachable today. If it
-        // ever fires, splice the list but keep storage — recovery must not
-        // free a live inode.
-        let already_live = child_upd.links_count != 0;
-
-        let block_dev = self.block_device_adapter();
-        let tx_dev: &dyn ffs_block::BlockDevice = &block_dev;
-        #[cfg(feature = "bhh0i_sharded_alloc")]
-        let sharded_inode_free = self.bhh0i_sharded_ops_active();
-        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-        let sharded_inode_free = false;
-
-        child_upd.dtime = 0;
-        let splice_result;
-        {
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
-            if !already_live {
-                if sharded_inode_free {
-                    let is_dir = ffs_inode::release_inode_storage_deferring_writeback(
-                        cx,
-                        tx_dev,
-                        geo,
-                        groups,
-                        ino,
-                        &mut child_upd,
-                        tstamp_secs,
-                        persist_ctx,
-                    )?;
-                    let loc = ffs_inode::locate_inode(ino, geo, groups).ok_or_else(|| {
-                        FfsError::Corruption {
-                            block: 0,
-                            detail: format!("finalize: inode {ino} out of range"),
-                        }
-                    })?;
-                    ffs_inode::write_inode_at_slot_scoped(
-                        cx,
-                        tx_dev,
-                        loc,
-                        usize::from(geo.inode_size),
-                        ino,
-                        &child_upd,
-                        csum_seed,
-                    )?;
-                    #[cfg(feature = "bhh0i_sharded_alloc")]
-                    self.ext4_sharded_free_inode(cx, tx_dev, ino, is_dir)?;
-                    #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-                    let _ = is_dir;
-                } else {
-                    ffs_inode::delete_inode(
-                        cx,
-                        tx_dev,
-                        geo,
-                        groups,
-                        ino,
-                        &mut child_upd,
-                        csum_seed,
-                        tstamp_secs,
-                        persist_ctx,
-                    )?;
-                }
+        // A forced read-only transition must still prevent actual reclamation,
+        // without turning unrelated FORGET notifications into write errors.
+        self.require_alloc_state()?;
+        for attempt in 1..=MAX_ATTEMPTS {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let mut working = Ext4AllocState {
+                geo: alloc.geo.clone(),
+                groups: alloc.groups.clone(),
+                persist_ctx: alloc.persist_ctx.clone(),
+            };
+            let mut txn = self.mvcc_store.begin();
+            let block_dev = self.block_device_adapter();
+            let snapshot_dev =
+                RegisteredSnapshotBlockAdapter::new(&block_dev, &self.mvcc_store, txn.snapshot());
+            let staged = (|| {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &snapshot_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                let mut inode =
+                    ffs_inode::read_inode(cx, &tx_dev, &working.geo, &working.groups, ino)?;
+                inode.number = ino.0;
+                let next_after = inode.dtime;
+                inode.dtime = 0;
+                // Final close and destroy both own reclamation now. A stale
+                // transport pin must not re-orphan the inode during destroy.
+                // A live inode is only spliced out; its storage remains intact.
+                let retirement = self.ext4_stage_inode_retirement(
+                    cx,
+                    &tx_dev,
+                    &mut working,
+                    ino,
+                    &mut inode,
+                    Self::now_timestamp().0,
+                    false,
+                )?;
+                let head = self.ext4_stage_unorphan_inode(
+                    cx,
+                    &tx_dev,
+                    ino,
+                    next_after,
+                    &working.geo,
+                    &working.groups,
+                    csum_seed,
+                )?;
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                Ok((retirement, head))
+            })();
+            let (retirement, new_head) = match staged {
+                Ok(staged) => staged,
+                Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                Err(error) => return Err(error),
+            };
+            let txn_id = txn.id();
+            let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                txn.write_set().keys().copied().collect()
+            } else {
+                Vec::new()
+            };
+            let commit_seq =
+                match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store) {
+                    Ok(seq) => seq,
+                    Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                    Err(error) => return Err(error),
+                };
+            alloc.groups = working.groups;
+            retirement.publish();
+            if let Some(head) = new_head {
+                self.ext4_write_orphan_head(head);
             }
-            // Splice the list while still holding the alloc guard so the whole
-            // finalize is serialized against unlink's push. After the free: a
-            // crash mid-finalize leaves an already-freed inode on the list,
-            // which mount recovery skips the same way it skips any freed slot.
-            splice_result =
-                self.ext4_splice_orphan_list(cx, prev, next_after, geo, groups, csum_seed);
+            self.ext4_pending_orphans.lock().remove(&ino.0);
+            drop(snapshot_dev);
+            drop(alloc);
+            self.prune_mvcc_after_commit_if_due(commit_seq);
+            self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
+            trace!(
+                target: "ffs::write",
+                op = "finalize_unlinked",
+                child = ino.0,
+                "deferred inode reclaimed after last open handle"
+            );
+            return Ok(true);
         }
-        splice_result?;
-
-        trace!(
-            target: "ffs::write",
-            op = "finalize_unlinked",
-            child = ino.0,
-            "deferred inode reclaimed after last open handle"
-        );
-        Ok(true)
+        unreachable!("the final orphan transaction attempt returns its result")
     }
 
     /// Reclaim every orphan still on the on-disk list at unmount (bd-iah1f).
@@ -32796,44 +32812,6 @@ impl OpenFs {
                 });
             }
             reclaimed += 1;
-        }
-    }
-
-    /// Relink the orphan list around a removed entry (bd-90aey).
-    ///
-    /// `prev == None` means the victim was the head; otherwise the predecessor
-    /// orphan's `dtime` next-pointer is rewritten. Callers hold the allocation
-    /// lock and pass the guard-derived alloc state down — re-acquiring the
-    /// lock here would self-deadlock.
-    fn ext4_splice_orphan_list(
-        &self,
-        cx: &Cx,
-        prev: Option<u32>,
-        victim_next: u32,
-        geo: &FsGeometry,
-        groups: &[GroupStats],
-        csum_seed: u32,
-    ) -> ffs_error::Result<()> {
-        match prev {
-            None => {
-                self.ext4_write_orphan_head(victim_next);
-                Ok(())
-            }
-            Some(prev_ino) => {
-                let mut prev_inode = self.read_inode_raw(cx, InodeNumber(u64::from(prev_ino)))?;
-                prev_inode.dtime = victim_next;
-                let block_dev = self.block_device_adapter();
-                ffs_inode::write_inode(
-                    cx,
-                    &block_dev,
-                    geo,
-                    groups,
-                    InodeNumber(u64::from(prev_ino)),
-                    &prev_inode,
-                    csum_seed,
-                )?;
-                Ok(())
-            }
         }
     }
 
@@ -35363,6 +35341,220 @@ impl OpenFs {
         write_result
     }
 
+    /// Read a directory's mapping from the supplied operation view, including
+    /// extent-tree or indirect blocks staged earlier in the same transaction.
+    fn ext4_dir_extents_from_device(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        inode: &Ext4Inode,
+    ) -> ffs_error::Result<Vec<Ext4Extent>> {
+        Self::ext4_reject_inline_data_dir(inode)?;
+        if Self::ext4_inode_block_map_is_indirect(inode) {
+            return self.ext4_indirect_runs_using(inode, &|block| {
+                dev.read_block(cx, block).map(BlockBuf::into_inner)
+            });
+        }
+        let mut extents = Vec::new();
+        ffs_btree::walk(cx, dev, &Self::extent_root(inode), &mut |extent| {
+            extents.push(*extent);
+            Ok(())
+        })?;
+        Ok(extents)
+    }
+
+    /// Namespace decisions must use the same registered snapshot as their
+    /// writes. In particular, neither a current-view cache nor an unversioned
+    /// read may decide that an overwrite target is absent.
+    fn ext4_lookup_name_from_device(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        inode: &Ext4Inode,
+        name: &[u8],
+    ) -> ffs_error::Result<Option<Ext4DirEntry>> {
+        let extents = self.ext4_dir_extents_from_device(cx, dev, inode)?;
+        let casefold = inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        // Indexed directories keep these two entries in the dx root, outside
+        // the hashed leaves. An ancestry walk must never hash `..` as a name.
+        if name == b"." || name == b".." {
+            let first = extents
+                .iter()
+                .find(|extent| extent.logical_block == 0 && !extent.is_unwritten())
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: "directory is missing its dot-entry block".into(),
+                })?;
+            let data = dev.read_block(cx, BlockNumber(first.physical_start))?;
+            return lookup_in_dir_block(data.as_slice(), sb.block_size, name)
+                .map_err(|error| parse_to_ffs_error(&error));
+        }
+        if inode.has_htree_index() {
+            let read_logical = |logical| {
+                extents
+                    .iter()
+                    .find(|ext| {
+                        !ext.is_unwritten()
+                            && logical >= ext.logical_block
+                            && u64::from(logical)
+                                < u64::from(ext.logical_block) + u64::from(ext.actual_len())
+                    })
+                    .and_then(|ext| {
+                        dev.read_block(
+                            cx,
+                            BlockNumber(
+                                ext.physical_start + u64::from(logical - ext.logical_block),
+                            ),
+                        )
+                        .ok()
+                    })
+                    .map(BlockBuf::into_inner)
+            };
+            let found = if casefold {
+                htree_find_entry_casefold(
+                    sb.block_size,
+                    &sb.hash_seed,
+                    sb.has_large_dir(),
+                    name,
+                    |v| sb.effective_dirhash_version(v),
+                    read_logical,
+                )
+            } else {
+                htree_find_entry(
+                    sb.block_size,
+                    &sb.hash_seed,
+                    sb.has_large_dir(),
+                    name,
+                    |v| sb.effective_dirhash_version(v),
+                    read_logical,
+                )
+            };
+            match found {
+                HtreeFindResult::Found(entry) => return Ok(Some(entry)),
+                HtreeFindResult::NotFoundInIndex if !casefold => return Ok(None),
+                HtreeFindResult::NotFoundInIndex | HtreeFindResult::IndexInvalid => {}
+            }
+        }
+        for extent in &extents {
+            if extent.is_unwritten() {
+                continue;
+            }
+            for block in Self::extent_phys_blocks(extent) {
+                let data = dev.read_block(cx, block)?;
+                let found = if casefold {
+                    lookup_in_dir_block_casefold(data.as_slice(), sb.block_size, name)
+                } else {
+                    lookup_in_dir_block(data.as_slice(), sb.block_size, name)
+                }
+                .map_err(|error| parse_to_ffs_error(&error))?;
+                if found.is_some() {
+                    return Ok(found);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn ext4_directory_is_descendant_from_device(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        alloc: &Ext4AllocState,
+        candidate: InodeNumber,
+        ancestor: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        let mut current = Self::ext4_canonical_inode(candidate);
+        let mut visited = BTreeSet::new();
+        for _ in 0..4096 {
+            if current == ancestor {
+                return Ok(true);
+            }
+            if current == InodeNumber(2) {
+                return Ok(false);
+            }
+            if !visited.insert(current) {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("cycle in ext4 '..' chain at inode {}", current.0),
+                });
+            }
+            let inode = ffs_inode::read_inode(cx, dev, &alloc.geo, &alloc.groups, current)?;
+            if !inode.is_dir() {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("inode {} in '..' chain is not a directory", current.0),
+                });
+            }
+            let parent = self
+                .ext4_lookup_name_from_device(cx, dev, &inode, b"..")?
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: format!("directory {} is missing '..'", current.0),
+                })?;
+            current = InodeNumber(u64::from(parent.inode));
+        }
+        Err(FfsError::Corruption {
+            block: 0,
+            detail: "ext4 '..' chain exceeded maximum depth".into(),
+        })
+    }
+
+    /// Remove a previously resolved name through the transaction's view. A
+    /// missing entry after a successful lookup is corruption, never a partial
+    /// successful rename.
+    fn ext4_remove_dir_entry_from_device(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        dir: InodeNumber,
+        inode: &Ext4Inode,
+        name: &[u8],
+    ) -> ffs_error::Result<()> {
+        let extents = self.ext4_dir_extents_from_device(cx, dev, inode)?;
+        let reserved_tail = self.ext4_dir_reserved_tail();
+        if self
+            .ext4_htree_remove_dir_entry(cx, dev, dir, inode, &extents, name, reserved_tail)?
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let dx_root = Self::ext4_htree_dx_root_phys(inode, &extents);
+        for extent in &extents {
+            if extent.is_unwritten() {
+                continue;
+            }
+            for block in Self::extent_phys_blocks(extent) {
+                if Some(block) == dx_root {
+                    continue;
+                }
+                let mut data = dev.read_block(cx, block)?.into_inner();
+                if let Some((_, edit)) =
+                    ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
+                {
+                    self.stamp_ext4_dir_block_after_edit(
+                        &mut data,
+                        u32::try_from(dir.0).map_err(|_| {
+                            FfsError::Format("directory inode exceeds ext4 range".into())
+                        })?,
+                        inode.generation,
+                        &edit,
+                    );
+                    return dev.write_block(cx, block, &data);
+                }
+            }
+        }
+        Err(FfsError::Corruption {
+            block: 0,
+            detail: format!(
+                "resolved entry missing from directory {} during rename",
+                dir.0
+            ),
+        })
+    }
+
     /// Rename an entry from one directory to another.
     #[allow(
         clippy::too_many_lines,
@@ -35386,7 +35578,90 @@ impl OpenFs {
         Self::validate_single_path_component(name)?;
         Self::validate_single_path_component(new_name)?;
         let alloc_mutex = self.require_alloc_state()?;
-        let mut block_dev = self.block_device_adapter();
+        let mut alloc = alloc_mutex.write();
+        const MAX_ATTEMPTS: u32 = 16;
+        for attempt in 1..=MAX_ATTEMPTS {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let mut working = Ext4AllocState {
+                geo: alloc.geo.clone(),
+                groups: alloc.groups.clone(),
+                persist_ctx: alloc.persist_ctx.clone(),
+            };
+            let mut txn = self.mvcc_store.begin();
+            let block_dev = self.block_device_adapter();
+            let snapshot_dev =
+                RegisteredSnapshotBlockAdapter::new(&block_dev, &self.mvcc_store, txn.snapshot());
+            let staged = {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &snapshot_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                self.ext4_rename_staged(
+                    cx,
+                    &tx_dev,
+                    &mut working,
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                )
+            };
+            let (retirement, target_parent_inode) = match staged {
+                Ok(staged) => staged,
+                Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                Err(error) => return Err(error),
+            };
+            if txn.write_set().is_empty() {
+                return Ok(());
+            }
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let txn_id = txn.id();
+            let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                txn.write_set().keys().copied().collect()
+            } else {
+                Vec::new()
+            };
+            let commit_seq =
+                match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store) {
+                    Ok(seq) => seq,
+                    Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                    Err(error) => return Err(error),
+                };
+            alloc.groups = working.groups;
+            if let Some(retirement) = retirement {
+                retirement.publish();
+            }
+            // Growth helpers invalidate while staging. Clear the committed
+            // parent's stable namespace again so a concurrent reader cannot
+            // leave a mapping filled between staging and publication behind.
+            self.extent_cache.invalidate_range(
+                extent_cache_namespace(&target_parent_inode),
+                0,
+                1_u64 << 32,
+            );
+            self.invalidate_ext4_write_extent_snapshot(&target_parent_inode);
+            drop(snapshot_dev);
+            drop(alloc);
+            self.prune_mvcc_after_commit_if_due(commit_seq);
+            self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
+            return Ok(());
+        }
+        unreachable!("the final rename transaction attempt returns its result")
+    }
+
+    /// Stage both names, their parent metadata, the moved inode and any victim
+    /// retirement before publishing any part of a classic rename.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn ext4_rename_staged<'a>(
+        &'a self,
+        cx: &Cx,
+        block_dev: &dyn BlockDevice,
+        alloc: &mut Ext4AllocState,
+        parent: InodeNumber,
+        name: &[u8],
+        new_parent: InodeNumber,
+        new_name: &[u8],
+    ) -> ffs_error::Result<(Option<Ext4StagedInodeRetirement<'a>>, Ext4Inode)> {
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
 
         let sb = self
@@ -35394,35 +35669,46 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
         let csum_seed = sb.csum_seed();
 
-        let parent_inode = self.read_inode(cx, parent)?;
+        let mut parent_inode =
+            ffs_inode::read_inode(cx, block_dev, &alloc.geo, &alloc.groups, parent)?;
+        parent_inode.number = parent.0;
         if !parent_inode.is_dir() {
             return Err(FfsError::NotDirectory);
         }
 
-        let mut alloc = alloc_mutex.write();
-
         // Look up the source entry.
         let entry = self
-            .lookup_name(cx, &parent_inode, name)?
+            .ext4_lookup_name_from_device(cx, block_dev, &parent_inode, name)?
             .ok_or_else(|| FfsError::NotFound(String::from_utf8_lossy(name).into_owned()))?;
         let child_ino = InodeNumber(u64::from(entry.inode));
-        let child_inode = self.read_inode(cx, child_ino)?;
+        let mut child_inode =
+            ffs_inode::read_inode(cx, block_dev, &alloc.geo, &alloc.groups, child_ino)?;
+        child_inode.number = child_ino.0;
+        if child_inode.mode == 0 {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!("rename source references free inode {}", child_ino.0),
+            });
+        }
         // Immutable and append-only files cannot be renamed (kernel: EPERM).
         Self::ext4_reject_immutable_or_append(&child_inode)?;
         let ft = inode_dir_entry_file_type(&child_inode);
 
         // Check if target already exists — if so, remove it first.
-        let new_parent_inode = if new_parent == parent {
+        let mut new_parent_inode = if new_parent == parent {
             parent_inode.clone()
         } else {
-            self.read_inode(cx, new_parent)?
+            ffs_inode::read_inode(cx, block_dev, &alloc.geo, &alloc.groups, new_parent)?
         };
+        new_parent_inode.number = new_parent.0;
         if !new_parent_inode.is_dir() {
             return Err(FfsError::NotDirectory);
         }
         if child_inode.is_dir()
             && parent != new_parent
-            && self.ext4_directory_is_descendant_of(cx, new_parent, child_ino)?
+            && self.ext4_directory_is_descendant_from_device(
+                cx, block_dev, alloc, new_parent, child_ino,
+            )?
         {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,
@@ -35437,41 +35723,23 @@ impl OpenFs {
         // only the moved dir's own block), and the whole rename holds one
         // `alloc.write()`, so there is no TOCTOU (bd-cc-rename-probe).
         let target_probe =
-            self.ext4_preflight_dir_entry_insert(cx, &new_parent_inode, new_name, ft)?;
+            self.ext4_preflight_dir_entry_insert(cx, block_dev, &new_parent_inode, new_name, ft)?;
 
         let planned_child_dir_update = if child_inode.is_dir() && parent != new_parent {
             // Preflight the old parent's `..`-backref decrement (applied below):
             // ext4_dec_count never drops a directory below 2 — an htree parent
             // pinned at the dir_nlink sentinel (1) stays put (bd-j12g7).
             Self::ext4_dir_link_dec(parent_inode.links_count, parent)?;
-            // `..` lives in the moved directory's logical block 0. Resolve only
-            // that block via the extent-cache/hot-slot fast path (descending to
-            // block 0's leaf, O(depth)) instead of materializing the WHOLE extent
-            // list with `collect_extents` (O(extents), a device read per leaf) just
-            // to take `.first()`. Byte-identical for an extent-mapped dir: block 0
-            // is always the first extent, so `.first().physical_start` ==
-            // `resolve_extent(0)`'s physical (no offset). Indirect-mapped dirs keep
-            // the exact legacy path: `resolve_extent` would route them to the
-            // indirect resolver (succeeds), but `collect_extents` errors on their
-            // non-extent i_block — preserving that error keeps this a pure perf
-            // change, not a behaviour change.
-            let dot_dot_block = if child_inode.flags & EXT4_EXTENTS_FL != 0 {
-                let (phys, _unwritten) = self
-                    .resolve_extent(cx, &RequestScope::empty(), &child_inode, 0)?
-                    .ok_or_else(|| FfsError::Corruption {
-                        block: 0,
-                        detail: "directory inode missing data block for '..' update".to_owned(),
-                    })?;
-                BlockNumber(phys)
-            } else {
-                let child_extents = self.collect_extents(cx, &child_inode)?;
-                let first_ext = child_extents.first().ok_or_else(|| FfsError::Corruption {
+            let child_extents = self.ext4_dir_extents_from_device(cx, block_dev, &child_inode)?;
+            let first_ext = child_extents
+                .iter()
+                .find(|extent| extent.logical_block == 0 && !extent.is_unwritten())
+                .ok_or_else(|| FfsError::Corruption {
                     block: 0,
                     detail: "directory inode missing data block for '..' update".to_owned(),
                 })?;
-                BlockNumber(first_ext.physical_start)
-            };
-            let mut data = self.read_block_vec(cx, dot_dot_block)?;
+            let dot_dot_block = BlockNumber(first_ext.physical_start);
+            let mut data = block_dev.read_block(cx, dot_dot_block)?.into_inner();
             let parent_ino_u32 = u32::try_from(new_parent.0)
                 .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
             // Repoint '..' in place (fixed offset 12). Using remove/add here would
@@ -35499,8 +35767,11 @@ impl OpenFs {
         let existing_target = match target_probe {
             RenameTargetProbe::Present(entry) => Some(entry),
             RenameTargetProbe::Absent => None,
-            RenameTargetProbe::NotChecked => self.lookup_name(cx, &new_parent_inode, new_name)?,
+            RenameTargetProbe::NotChecked => {
+                self.ext4_lookup_name_from_device(cx, block_dev, &new_parent_inode, new_name)?
+            }
         };
+        let mut retired_target = None;
         if let Some(existing) = existing_target {
             let existing_ino = InodeNumber(u64::from(existing.inode));
             // POSIX: renaming a file onto one of its own hard links (old and new
@@ -35511,9 +35782,17 @@ impl OpenFs {
             // would unlink the target name and decrement the shared inode's
             // link count, silently dropping a hard link (bd-f7q6k).
             if existing_ino == child_ino {
-                return Ok(());
+                return Ok((None, new_parent_inode));
             }
-            let existing_inode = self.read_inode(cx, existing_ino)?;
+            let mut existing_inode =
+                ffs_inode::read_inode(cx, block_dev, &alloc.geo, &alloc.groups, existing_ino)?;
+            existing_inode.number = existing_ino.0;
+            if existing_inode.mode == 0 {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("rename target references free inode {}", existing_ino.0),
+                });
+            }
             // vfs_rename's may_delete(victim) forbids clobbering an immutable or
             // append-only target with EPERM, before any mutation (bd-85rav).
             Self::ext4_reject_immutable_or_append(&existing_inode)?;
@@ -35524,7 +35803,7 @@ impl OpenFs {
                 }
                 // Early-exit emptiness check (same parser as read_dir) instead
                 // of materializing the whole victim directory to reject it.
-                if !self.ext4_directory_is_empty(cx, &RequestScope::empty(), &existing_inode)? {
+                if !self.ext4_directory_is_empty_from_device(cx, block_dev, &existing_inode)? {
                     return Err(FfsError::NotEmpty);
                 }
             } else if child_inode.is_dir() {
@@ -35539,51 +35818,16 @@ impl OpenFs {
                 Self::ext4_checked_links_count_delta(existing_inode.links_count, existing_ino, -1)?;
             }
 
-            // Remove the existing target. Cached extent snapshot (self-invalidating
-            // on growth) instead of a fresh full parse (bd-cc-itableloc sibling).
-            let extents =
-                self.ext4_write_extents_with_scope(cx, &RequestScope::empty(), &new_parent_inode)?;
-            let reserved_tail = self.ext4_dir_reserved_tail();
-            // htree fast path first (O(log N)); linear scan fallback (bd-gauub).
-            let removed_existing_via_htree = self
-                .ext4_htree_remove_dir_entry(
-                    cx,
-                    &block_dev,
-                    new_parent,
-                    &new_parent_inode,
-                    &extents,
-                    new_name,
-                    reserved_tail,
-                )?
-                .unwrap_or(false);
-            if !removed_existing_via_htree {
-                let dx_root_phys = Self::ext4_htree_dx_root_phys(&new_parent_inode, &extents);
-                'rm_existing: for ext in extents.iter() {
-                    for block in Self::extent_phys_blocks(ext) {
-                        if Some(block) == dx_root_phys {
-                            continue;
-                        }
-                        let mut data = self.read_block_vec(cx, block)?;
-                        if let Some((_ino, edit)) = ffs_dir::remove_entry_take_inode_tracked(
-                            &mut data,
-                            new_name,
-                            reserved_tail,
-                        )? {
-                            let np_ino_u32 = u32::try_from(new_parent.0).map_err(|_| {
-                                FfsError::Format("inode number exceeds ext4 32-bit limit".into())
-                            })?;
-                            self.stamp_ext4_dir_block_after_edit(
-                                &mut data,
-                                np_ino_u32,
-                                new_parent_inode.generation,
-                                &edit,
-                            );
-                            block_dev.write_block(cx, block, &data)?;
-                            break 'rm_existing;
-                        }
-                    }
-                }
-            }
+            // Only the private transaction loses this entry. Failed insertion,
+            // storage reclamation or publication leaves both original names and
+            // both inodes intact, without a compensating commit.
+            self.ext4_remove_dir_entry_from_device(
+                cx,
+                block_dev,
+                new_parent,
+                &new_parent_inode,
+                &existing.name,
+            )?;
             // Decrement link count / delete.
             let mut ex_upd = existing_inode;
             if ex_upd.is_dir() {
@@ -35591,129 +35835,34 @@ impl OpenFs {
 
                 // Decrement the new parent's link count for the ".." backref from
                 // the deleted directory (ext4_dec_count: never below 2, bd-j12g7).
-                let mut new_par = self.read_inode(cx, new_parent)?;
+                let mut new_par =
+                    ffs_inode::read_inode(cx, block_dev, &alloc.geo, &alloc.groups, new_parent)?;
                 new_par.links_count = Self::ext4_dir_link_dec(new_par.links_count, new_parent)?;
                 ffs_inode::touch_mtime_ctime(&mut new_par, tstamp_secs, tstamp_nanos);
                 {
                     let Ext4AllocState { geo, groups, .. } = &mut *alloc;
                     ffs_inode::write_inode(
-                        cx, &block_dev, geo, groups, new_parent, &new_par, csum_seed,
+                        cx, block_dev, geo, groups, new_parent, &new_par, csum_seed,
                     )?;
                 }
-                block_dev = self.block_device_adapter();
             } else {
                 ex_upd.links_count =
                     Self::ext4_checked_links_count_delta(ex_upd.links_count, existing_ino, -1)?;
             }
-            {
-                let Ext4AllocState {
-                    geo,
-                    groups,
-                    persist_ctx,
-                } = &mut *alloc;
-                if ex_upd.links_count == 0 {
-                    // bd-y2t0r: rename-over-existing IS a delete path. When the
-                    // clobbered target's last link goes, its inode must be freed
-                    // through whichever structure ALLOCATED it, exactly as unlink
-                    // does. Freeing it into the single-lock `groups` while the
-                    // descriptor flush reads `sharded.snapshot_group_stats()`
-                    // leaks one inode per clobbering rename — measured at exactly
-                    // 200 over 200 renames, e2fsck-dirty, which is bd-pbyu0's
-                    // signature in a path that bead never listed.
-                    #[cfg(feature = "bhh0i_sharded_alloc")]
-                    let sharded_inode_free = self.bhh0i_sharded_ops_active();
-                    #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-                    let sharded_inode_free = false;
-
-                    if self.ext4_open_handle_count(existing_ino) > 0 {
-                        // bd-90aey: the clobbered target may still be open (or a
-                        // cwd): it stays alive with nlink 0 until the last kernel
-                        // reference, exactly as unlink's victim does.
-                        self.ext4_orphan_pinned_inode(
-                            cx,
-                            &block_dev,
-                            geo,
-                            groups,
-                            existing_ino,
-                            &mut ex_upd,
-                            csum_seed,
-                            sharded_inode_free,
-                        )?;
-                    } else if sharded_inode_free {
-                        let is_dir = ffs_inode::release_inode_storage_deferring_writeback(
-                            cx,
-                            &block_dev,
-                            geo,
-                            groups,
-                            existing_ino,
-                            &mut ex_upd,
-                            tstamp_secs,
-                            persist_ctx,
-                        )?;
-                        let loc = ffs_inode::locate_inode(existing_ino, geo, groups).ok_or_else(
-                            || FfsError::Corruption {
-                                block: 0,
-                                detail: format!(
-                                    "sharded rename: inode {existing_ino} out of range"
-                                ),
-                            },
-                        )?;
-                        ffs_inode::write_inode_at_slot_scoped(
-                            cx,
-                            &block_dev,
-                            loc,
-                            usize::from(geo.inode_size),
-                            existing_ino,
-                            &ex_upd,
-                            csum_seed,
-                        )?;
-                        #[cfg(feature = "bhh0i_sharded_alloc")]
-                        self.ext4_sharded_free_inode(cx, &block_dev, existing_ino, is_dir)?;
-                        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-                        let _ = is_dir;
-                    } else {
-                        ffs_inode::delete_inode(
-                            cx,
-                            &block_dev,
-                            geo,
-                            groups,
-                            existing_ino,
-                            &mut ex_upd,
-                            csum_seed,
-                            tstamp_secs,
-                            persist_ctx,
-                        )?;
-                    }
-                } else {
-                    ffs_inode::write_inode(
-                        cx,
-                        &block_dev,
-                        geo,
-                        groups,
-                        existing_ino,
-                        &ex_upd,
-                        csum_seed,
-                    )?;
-                }
-            }
-            // (block_dev is re-acquired below, after the add-dir-entry insert.)
+            ffs_inode::touch_ctime(&mut ex_upd, tstamp_secs, tstamp_nanos);
+            retired_target = Some((existing_ino, ex_upd));
         }
 
-        // Add the new entry to the target parent FIRST, before removing the source
-        // entry. ext4_add_dir_entry is the only fallible step remaining — it can
-        // reject the insert (non-ASCII casefold name; or an htree leaf that is full
-        // and would need an unsupported multi-level rebuild — bd-v1zli / bd-ikkdu).
-        // Performing it before the irreversible source removal makes rename atomic:
-        // a refused insert leaves the source entry intact instead of unlinking it
-        // and then failing, which would orphan the renamed inode (silent data
-        // loss). On success the result is identical to remove-then-add.
-        let new_parent_inode_fresh = self.read_inode(cx, new_parent)?;
-        // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must end
-        // before the subsequent source-entry removal re-borrows `alloc`; NLL ends it
-        // at the last use, so the explicit `drop` is gone. Order still matters.
-        let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-        let add_result = self.ext4_add_dir_entry(
+        // Insert through the same transaction device, preserving a staged victim
+        // removal even when both names share one directory leaf. Its allocator
+        // counters are private until the final publication succeeds.
+        let mut new_parent_inode_fresh =
+            ffs_inode::read_inode(cx, block_dev, &alloc.geo, &alloc.groups, new_parent)?;
+        new_parent_inode_fresh.number = new_parent.0;
+        let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
+        self.ext4_insert_dir_entry_from_device(
             cx,
+            block_dev,
             &mut backend,
             new_parent,
             &new_parent_inode_fresh,
@@ -35723,67 +35872,22 @@ impl OpenFs {
             csum_seed,
             tstamp_secs,
             tstamp_nanos,
-        );
-        add_result?;
-
-        // Re-acquire the block device adapter so subsequent reads/writes observe
-        // the metadata committed while inserting the directory entry.
-        block_dev = self.block_device_adapter();
+        )?;
 
         // Remove the old entry from the source parent. Re-read the source inode
         // fresh: for a same-parent rename the insert above may have grown/rebuilt
         // the directory's htree, so the pre-mutation `parent_inode` snapshot's
         // extents would be stale.
-        let src_parent_fresh = self.read_inode(cx, parent)?;
-        // Route through the cached write-extent snapshot (bd-cc-itableloc sibling):
-        // the add above already populated it for this parent, so a non-growing
-        // rename reuses the parse; a growing add invalidated the snapshot, so this
-        // still re-collects the fresh post-growth extents the comment above needs
-        // (the snapshot is keyed by extent-root content). Saves the per-rename
-        // `parse_extent_leaf` re-parse of the parent's extent tree.
-        let src_extents =
-            self.ext4_write_extents_with_scope(cx, &RequestScope::empty(), &src_parent_fresh)?;
-        let reserved_tail = self.ext4_dir_reserved_tail();
-        // htree fast path: descend the dx index to the hash-target leaf and remove
-        // there (O(log N)), keeping rename O(log N) per op for a large directory.
-        // Falls back to the linear block scan when it does not apply (bd-gauub).
-        let removed_via_htree = self
-            .ext4_htree_remove_dir_entry(
-                cx,
-                &block_dev,
-                parent,
-                &src_parent_fresh,
-                &src_extents,
-                name,
-                reserved_tail,
-            )?
-            .unwrap_or(false);
-        if !removed_via_htree {
-            let dx_root_phys = Self::ext4_htree_dx_root_phys(&src_parent_fresh, &src_extents);
-            'rm_src: for ext in src_extents.iter() {
-                for block in Self::extent_phys_blocks(ext) {
-                    if Some(block) == dx_root_phys {
-                        continue;
-                    }
-                    let mut data = self.read_block_vec(cx, block)?;
-                    if let Some((_ino, edit)) =
-                        ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
-                    {
-                        let src_ino_u32 = u32::try_from(parent.0).map_err(|_| {
-                            FfsError::Format("inode number exceeds ext4 32-bit limit".into())
-                        })?;
-                        self.stamp_ext4_dir_block_after_edit(
-                            &mut data,
-                            src_ino_u32,
-                            src_parent_fresh.generation,
-                            &edit,
-                        );
-                        block_dev.write_block(cx, block, &data)?;
-                        break 'rm_src;
-                    }
-                }
-            }
-        }
+        let mut src_parent_fresh =
+            ffs_inode::read_inode(cx, block_dev, &alloc.geo, &alloc.groups, parent)?;
+        src_parent_fresh.number = parent.0;
+        self.ext4_remove_dir_entry_from_device(
+            cx,
+            block_dev,
+            parent,
+            &src_parent_fresh,
+            &entry.name,
+        )?;
 
         // Directory rename link-count fixup. `ext4_add_dir_entry` already
         // incremented `new_parent`'s link count for the inserted directory entry
@@ -35801,29 +35905,28 @@ impl OpenFs {
             {
                 block_dev.write_block(cx, *dot_dot_block, data)?;
             }
-            let mut adjust_parent = self.read_inode(cx, parent)?;
             // ext4_dec_count for the old parent losing the moved subdir's `..`
             // backref: never drop a directory below 2 (bd-j12g7).
-            adjust_parent.links_count = Self::ext4_dir_link_dec(adjust_parent.links_count, parent)?;
-            ffs_inode::touch_mtime_ctime(&mut adjust_parent, tstamp_secs, tstamp_nanos);
-            ffs_inode::write_inode(
-                cx,
-                &block_dev,
-                &alloc.geo,
-                &alloc.groups,
-                parent,
-                &adjust_parent,
-                csum_seed,
-            )?;
-            block_dev = self.block_device_adapter();
+            src_parent_fresh.links_count =
+                Self::ext4_dir_link_dec(src_parent_fresh.links_count, parent)?;
         }
+        ffs_inode::touch_mtime_ctime(&mut src_parent_fresh, tstamp_secs, tstamp_nanos);
+        ffs_inode::write_inode(
+            cx,
+            block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            parent,
+            &src_parent_fresh,
+            csum_seed,
+        )?;
 
         // Touch ctime on the moved inode.
-        let mut child_upd = self.read_inode(cx, child_ino)?;
+        let mut child_upd = child_inode;
         ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
         ffs_inode::write_inode(
             cx,
-            &block_dev,
+            block_dev,
             &alloc.geo,
             &alloc.groups,
             child_ino,
@@ -35839,10 +35942,23 @@ impl OpenFs {
             old_name = %String::from_utf8_lossy(name),
             new_name = %String::from_utf8_lossy(new_name),
             ino = child_ino.0,
-            "entry renamed"
+            "entry rename staged"
         );
 
-        Ok(())
+        let retirement = retired_target
+            .map(|(ino, mut inode)| {
+                self.ext4_stage_inode_retirement(
+                    cx,
+                    block_dev,
+                    alloc,
+                    ino,
+                    &mut inode,
+                    tstamp_secs,
+                    true,
+                )
+            })
+            .transpose()?;
+        Ok((retirement, new_parent_inode))
     }
 
     /// Set attributes on an ext4 inode.
@@ -73876,6 +73992,239 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ext4_orphan_finalize_read_only_forget_is_noop_and_preserves_write_guard() {
+        let (fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("read-only orphan regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let read_only =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        assert!(read_only.ext4_alloc_state.is_none());
+        let before = read_only.current_snapshot();
+        assert!(!read_only.finalize_unlinked_inode_public(&cx, root).unwrap());
+        assert_eq!(read_only.current_snapshot(), before);
+        assert_eq!(read_only.mvcc_active_snapshot_count(), 0);
+
+        let victim = fs
+            .create(&cx, root, OsStr::new("forced_readonly_orphan"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        fs.install_open_handle_oracle(Arc::new(move |ino| u64::from(ino == victim)));
+        fs.unlink(&cx, root, OsStr::new("forced_readonly_orphan"))
+            .unwrap();
+        fs.ext4_forced_read_only
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let before = fs.current_snapshot();
+        assert!(!fs.finalize_unlinked_inode_public(&cx, root).unwrap());
+        assert!(matches!(
+            fs.finalize_unlinked_inode_public(&cx, victim),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(fs.ext4_pending_orphans.lock().contains(&victim.0));
+        assert_eq!(u64::from(fs.ext4_read_orphan_head()), victim.0);
+        assert_ne!(fs.read_inode(&cx, victim).unwrap().mode, 0);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_orphan_finalize_is_one_snapshot_publication_bd_9rutw() {
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let allocator_modes = [false, true];
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let allocator_modes = [false];
+
+        for sharded in allocator_modes {
+            let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("orphan finalization regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let victim = fs
+                .create(&cx, root, OsStr::new("pinned_victim"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let head = fs
+                .create(&cx, root, OsStr::new("pinned_head"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let payload = vec![0x5A; 3 * fs.block_size() as usize];
+            fs.write(&cx, victim, 0, &payload).unwrap();
+            fs.install_open_handle_oracle(std::sync::Arc::new(move |ino| {
+                u64::from(ino == victim || ino == head)
+            }));
+            fs.unlink(&cx, root, OsStr::new("pinned_victim")).unwrap();
+            fs.unlink(&cx, root, OsStr::new("pinned_head")).unwrap();
+            assert_eq!(u64::from(fs.ext4_read_orphan_head()), head.0);
+            assert_eq!(u64::from(fs.read_inode(&cx, head).unwrap().dtime), victim.0);
+            let (geo, groups) = {
+                let alloc = fs.require_alloc_state().unwrap().read();
+                (alloc.geo.clone(), alloc.groups.clone())
+            };
+            let group = ffs_types::inode_to_group(victim, geo.inodes_per_group);
+            let free_inodes = fs.count_free_inodes_in_group(&cx, group).unwrap();
+            let free_blocks = fs.count_free_blocks_in_group(&cx, group).unwrap();
+            let before = fs.current_snapshot();
+            let base = fs.block_device_adapter();
+            let old_view = RegisteredSnapshotBlockAdapter::new(&base, &fs.mvcc_store, before);
+
+            assert!(fs.finalize_unlinked_inode_public(&cx, victim).unwrap());
+            assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+            assert_eq!(fs.read_inode_raw(&cx, victim).unwrap().mode, 0);
+            assert_eq!(fs.read_inode(&cx, head).unwrap().dtime, 0);
+            assert!(!fs.ext4_pending_orphans.lock().contains(&victim.0));
+            assert!(fs.ext4_pending_orphans.lock().contains(&head.0));
+            assert_eq!(u64::from(fs.ext4_read_orphan_head()), head.0);
+            assert_eq!(
+                fs.count_free_inodes_in_group(&cx, group).unwrap(),
+                free_inodes + 1
+            );
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, group).unwrap(),
+                free_blocks + 3
+            );
+
+            // A reader pinned before final close must still see the allocated
+            // victim and the predecessor pointing at it, never half a splice.
+            let old_victim = ffs_inode::read_inode(&cx, &old_view, &geo, &groups, victim).unwrap();
+            let old_head = ffs_inode::read_inode(&cx, &old_view, &geo, &groups, head).unwrap();
+            assert_ne!(old_victim.mode, 0);
+            assert_eq!(old_victim.size, payload.len() as u64);
+            assert_eq!(u64::from(old_head.dtime), victim.0);
+            let after = fs.current_snapshot();
+            assert!(!fs.finalize_unlinked_inode_public(&cx, victim).unwrap());
+            assert_eq!(fs.current_snapshot(), after, "reclamation is idempotent");
+            drop(old_view);
+            assert!(fs.finalize_unlinked_inode_public(&cx, head).unwrap());
+            assert_eq!(fs.current_snapshot().high.0, after.high.0 + 1);
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+            assert!(fs.ext4_pending_orphans.lock().is_empty());
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+            let (clean, output) =
+                run_e2fsck(&image).expect("orphan finalization oracle requires e2fsck");
+            assert!(clean, "orphan reclaim (sharded={sharded}): {output}");
+        }
+    }
+
+    #[test]
+    fn ext4_orphan_finalize_failed_splice_preserves_storage_and_retry_bd_9rutw() {
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let allocator_modes = [false, true];
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let allocator_modes = [false];
+
+        for sharded in allocator_modes {
+            let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("orphan rollback regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let victim = fs
+                .create(&cx, root, OsStr::new("retry_victim"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let head = fs
+                .create(&cx, root, OsStr::new("retry_head"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let payload = vec![0xC7; 3 * fs.block_size() as usize];
+            fs.write(&cx, victim, 0, &payload).unwrap();
+            fs.install_open_handle_oracle(std::sync::Arc::new(move |ino| {
+                u64::from(ino == victim || ino == head)
+            }));
+            fs.unlink(&cx, root, OsStr::new("retry_victim")).unwrap();
+            fs.unlink(&cx, root, OsStr::new("retry_head")).unwrap();
+            let good_head = fs.read_inode(&cx, head).unwrap();
+            assert_eq!(u64::from(good_head.dtime), victim.0);
+            let mut bad_head = good_head.clone();
+            bad_head.dtime = fs
+                .ext4_superblock()
+                .unwrap()
+                .inodes_count
+                .checked_add(1)
+                .unwrap();
+            fs.persist_ext4_inode_for_testing(&cx, head, &bad_head)
+                .unwrap();
+            let geo = fs.require_alloc_state().unwrap().read().geo.clone();
+            let group = ffs_types::inode_to_group(victim, geo.inodes_per_group);
+            let before = fs.current_snapshot();
+            let before_bytes = dev.snapshot_bytes();
+            let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let before_sharded = fs
+                .ext4_sharded_alloc
+                .as_ref()
+                .map(|alloc| format!("{:?}", alloc.lock_group(group.0 as usize)));
+            let before_blocks = fs.count_free_blocks_in_group(&cx, group).unwrap();
+            let before_inodes = fs.count_free_inodes_in_group(&cx, group).unwrap();
+
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            assert!(matches!(
+                fs.finalize_unlinked_inode_public(&cancelled, victim),
+                Err(FfsError::Cancelled)
+            ));
+            assert!(fs.ext4_pending_orphans.lock().contains(&victim.0));
+            // The splice is checked after the victim's blocks, inode bitmap
+            // and inode slot have all been staged. None may escape this error.
+            assert!(matches!(
+                fs.finalize_unlinked_inode_public(&cx, victim),
+                Err(FfsError::Corruption { .. })
+            ));
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(dev.snapshot_bytes(), before_bytes);
+            assert_eq!(
+                format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                before_groups
+            );
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            assert_eq!(
+                fs.ext4_sharded_alloc
+                    .as_ref()
+                    .map(|alloc| format!("{:?}", alloc.lock_group(group.0 as usize))),
+                before_sharded,
+                "aborted reclamation must not credit the sharded allocator"
+            );
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, group).unwrap(),
+                before_blocks
+            );
+            assert_eq!(
+                fs.count_free_inodes_in_group(&cx, group).unwrap(),
+                before_inodes
+            );
+            assert_eq!(u64::from(fs.ext4_read_orphan_head()), head.0);
+            assert!(fs.ext4_pending_orphans.lock().contains(&victim.0));
+            assert_ne!(fs.read_inode(&cx, victim).unwrap().mode, 0);
+            assert_eq!(
+                fs.read(&cx, victim, 0, payload.len() as u32).unwrap(),
+                payload
+            );
+
+            // Repair only the planted corruption and retry the same final close.
+            fs.persist_ext4_inode_for_testing(&cx, head, &good_head)
+                .unwrap();
+            let before_retry = fs.current_snapshot();
+            assert!(fs.finalize_unlinked_inode_public(&cx, victim).unwrap());
+            assert_eq!(fs.current_snapshot().high.0, before_retry.high.0 + 1);
+            assert!(!fs.ext4_pending_orphans.lock().contains(&victim.0));
+            assert_eq!(fs.read_inode(&cx, head).unwrap().dtime, 0);
+            assert!(fs.finalize_unlinked_inode_public(&cx, head).unwrap());
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+            let (clean, output) =
+                run_e2fsck(&image).expect("orphan rollback oracle requires e2fsck");
+            assert!(clean, "orphan retry (sharded={sharded}): {output}");
+        }
+    }
+
     /// bd-90aey (xfstests generic/035): the victim of a rename-overwrite, and a
     /// directory removed by rmdir, may still be open (or a cwd). While the
     /// oracle reports them pinned they must survive with nlink 0 — the client
@@ -83352,6 +83701,365 @@ mod tests {
     }
 
     #[test]
+    fn ext4_unlink_and_rmdir_publish_once_preserve_old_snapshots_and_reopen() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("atomic unlink regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let file = fs
+                .create(&cx, root, OsStr::new("victim"), 0o600, 0, 0)
+                .unwrap();
+            let payload = vec![0xCA; 7000];
+            fs.write(&cx, file.ino, 0, &payload).unwrap();
+            fs.link(&cx, file.ino, root, OsStr::new("alias")).unwrap();
+            let directory = fs
+                .mkdir(&cx, root, OsStr::new("empty"), 0o700, 0, 0)
+                .unwrap();
+            for (name, ino, links, is_dir) in [
+                ("victim", file.ino, 2, false),
+                ("alias", file.ino, 1, false),
+                ("empty", directory.ino, 2, true),
+            ] {
+                let op = if is_dir {
+                    RequestOp::Rmdir
+                } else {
+                    RequestOp::Unlink
+                };
+                let mut scope = fs.begin_request_scope(&cx, op).unwrap();
+                let before = fs.current_snapshot();
+                if is_dir {
+                    FsOps::rmdir(&fs, &cx, &mut scope, root, OsStr::new(name)).unwrap();
+                } else {
+                    FsOps::unlink(&fs, &cx, &mut scope, root, OsStr::new(name)).unwrap();
+                }
+                let after = fs.current_snapshot();
+                assert_eq!(
+                    after.high.0,
+                    before.high.0 + 1,
+                    "one publication for {name}, sharded={sharded}"
+                );
+                let old_parent = fs.read_inode_with_scope(&cx, &scope, root).unwrap();
+                assert!(
+                    fs.read_dir_with_scope(&cx, &scope, &old_parent)
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.name == name.as_bytes())
+                );
+                assert_eq!(
+                    fs.read_inode_with_scope(&cx, &scope, ino)
+                        .unwrap()
+                        .links_count,
+                    links
+                );
+                assert_eq!(
+                    fs.lookup(&cx, root, OsStr::new(name))
+                        .unwrap_err()
+                        .to_errno(),
+                    libc::ENOENT
+                );
+                if links == 2 && !is_dir {
+                    assert_eq!(fs.getattr(&cx, ino).unwrap().nlink, 1);
+                    assert_eq!(fs.read(&cx, ino, 0, payload.len() as u32).unwrap(), payload);
+                }
+                fs.commit_request_scope(&cx, &mut scope).unwrap();
+                assert_eq!(
+                    fs.current_snapshot(),
+                    after,
+                    "outer request publishes nothing else"
+                );
+                fs.end_request_scope(&cx, op, scope).unwrap();
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            }
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+            let (clean, output) = run_e2fsck(&image).expect("atomic unlink requires e2fsck");
+            assert!(
+                clean,
+                "unlink/rmdir must remain native-clean, sharded={sharded}: {output}"
+            );
+            drop(fs);
+            let reopened =
+                OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            for name in ["victim", "alias", "empty"] {
+                assert_eq!(
+                    reopened
+                        .lookup(&cx, root, OsStr::new(name))
+                        .unwrap_err()
+                        .to_errno(),
+                    libc::ENOENT
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_unlink_late_storage_failure_keeps_namespace_payload_and_allocators() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            let (fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("unlink rollback regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let ino = fs
+                .create(&cx, root, OsStr::new("victim"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let payload = vec![0xAC; 7000];
+            fs.write(&cx, ino, 0, &payload).unwrap();
+            let original = fs.read_inode(&cx, ino).unwrap();
+            let mut damaged = original.clone();
+            damaged.file_acl = fs.ext4_superblock().unwrap().blocks_count + 1;
+            persist_ext4_test_inode(&fs, &cx, ino, &damaged);
+            let before = fs.current_snapshot();
+            let before_bytes = dev.snapshot_bytes();
+            let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let before_sharded = format!(
+                "{:?}",
+                fs.ext4_sharded_alloc
+                    .as_ref()
+                    .unwrap()
+                    .snapshot_group_stats()
+            );
+            let before_free = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+            let before_inode = fs.read_inode(&cx, ino).unwrap();
+            let error = fs.unlink(&cx, root, OsStr::new("victim")).unwrap_err();
+            assert!(matches!(
+                error,
+                FfsError::Io(_) | FfsError::Corruption { .. } | FfsError::Format(_)
+            ));
+            assert_eq!(
+                fs.current_snapshot(),
+                before,
+                "a failed xattr read follows staged data frees"
+            );
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(dev.snapshot_bytes(), before_bytes);
+            assert_eq!(
+                format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                before_groups
+            );
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    fs.ext4_sharded_alloc
+                        .as_ref()
+                        .unwrap()
+                        .snapshot_group_stats()
+                ),
+                before_sharded
+            );
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                before_free
+            );
+            assert_eq!(fs.lookup(&cx, root, OsStr::new("victim")).unwrap().ino, ino);
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), before_inode);
+            assert_eq!(fs.read(&cx, ino, 0, payload.len() as u32).unwrap(), payload);
+            persist_ext4_test_inode(&fs, &cx, ino, &original);
+            let before_retry = fs.current_snapshot();
+            fs.unlink(&cx, root, OsStr::new("victim")).unwrap();
+            assert_eq!(fs.current_snapshot().high.0, before_retry.high.0 + 1);
+        }
+    }
+
+    #[test]
+    fn ext4_unlink_cancellation_after_directory_staging_publishes_nothing() {
+        let (fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("unlink cancellation regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let ino = fs
+            .create(&cx, root, OsStr::new("victim"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        fs.write(&cx, ino, 0, b"retained payload").unwrap();
+        let op_cx = Cx::for_testing();
+        let cancel_cx = op_cx.clone();
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&reached);
+        fs.install_open_handle_oracle(Arc::new(move |candidate| {
+            if candidate == ino {
+                observed.store(true, std::sync::atomic::Ordering::Relaxed);
+                cancel_cx.set_cancel_requested(true);
+            }
+            0
+        }));
+        let before = fs.current_snapshot();
+        let before_bytes = dev.snapshot_bytes();
+        let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        let error = fs.unlink(&op_cx, root, OsStr::new("victim")).unwrap_err();
+        assert!(reached.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(matches!(error, FfsError::Cancelled));
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        assert_eq!(dev.snapshot_bytes(), before_bytes);
+        assert_eq!(
+            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+            before_groups
+        );
+        assert_eq!(fs.lookup(&cx, root, OsStr::new("victim")).unwrap().ino, ino);
+        assert_eq!(fs.read(&cx, ino, 0, 64).unwrap(), b"retained payload");
+        assert!(!fs.ext4_pending_orphans.lock().contains(&ino.0));
+    }
+
+    #[test]
+    fn ext4_unlink_conflicts_retry_fresh_snapshots_without_freeing_live_storage() {
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let allocator_modes = [false, true];
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let allocator_modes = [false];
+
+        for sharded in allocator_modes {
+            for conflicts in [1_u32, 16] {
+                let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                    .expect("unlink conflict regression requires mkfs.ext4");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                fs.set_bhh0i_sharded_ops(sharded);
+                let fs = Arc::new(fs);
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                let name = OsStr::new("conflicted_orphan");
+                let victim = fs.create(&cx, root, name, 0o600, 0, 0).unwrap().ino;
+                let payload = vec![0xA9; 3 * fs.block_size() as usize];
+                fs.write(&cx, victim, 0, &payload).unwrap();
+                let before_inode = fs.read_inode(&cx, victim).unwrap();
+                let (geo, groups, csum_seed) = {
+                    let alloc = fs.require_alloc_state().unwrap().read();
+                    (
+                        alloc.geo.clone(),
+                        alloc.groups.clone(),
+                        alloc.persist_ctx.csum_seed,
+                    )
+                };
+                let group = ffs_types::inode_to_group(victim, geo.inodes_per_group);
+                let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let oracle_calls = Arc::clone(&calls);
+                let weak_fs = Arc::downgrade(&fs);
+                fs.install_open_handle_oracle(Arc::new(move |ino| {
+                    if ino != victim {
+                        return 0;
+                    }
+                    let attempt = oracle_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt < conflicts {
+                        // The pin oracle runs after unlink stages its directory
+                        // edit but before retirement. Publish an independent inode
+                        // update now, without re-entering the allocation lock.
+                        let fs = weak_fs.upgrade().unwrap();
+                        let cx = Cx::for_testing();
+                        let dev = fs.block_device_adapter();
+                        let mut inode =
+                            ffs_inode::read_inode(&cx, &dev, &geo, &groups, ino).unwrap();
+                        inode.uid = 1000 + attempt;
+                        ffs_inode::write_inode(&cx, &dev, &geo, &groups, ino, &inode, csum_seed)
+                            .unwrap();
+                    }
+                    1
+                }));
+                let before = fs.current_snapshot();
+                let before_bytes = dev.snapshot_bytes();
+                let before_groups =
+                    format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+                let before_free_blocks = fs.count_free_blocks_in_group(&cx, group).unwrap();
+                let before_free_inodes = fs.count_free_inodes_in_group(&cx, group).unwrap();
+                let exhausted = conflicts == 16;
+
+                let result = fs.unlink(&cx, root, name);
+                if exhausted {
+                    assert!(matches!(result, Err(FfsError::MvccConflict { .. })));
+                    assert_eq!(fs.lookup(&cx, root, name).unwrap().ino, victim);
+                } else {
+                    result.unwrap();
+                    assert!(matches!(
+                        fs.lookup(&cx, root, name),
+                        Err(FfsError::NotFound(_))
+                    ));
+                }
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    conflicts + u32::from(!exhausted),
+                    "bounded retries must begin a new attempt after a conflicting commit"
+                );
+                assert_eq!(
+                    fs.current_snapshot().high.0,
+                    before.high.0 + u64::from(conflicts) + u64::from(!exhausted),
+                    "only injected writes and one successful unlink may publish"
+                );
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                assert_eq!(dev.snapshot_bytes(), before_bytes);
+                assert_eq!(
+                    format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                    before_groups
+                );
+                assert_eq!(
+                    fs.count_free_blocks_in_group(&cx, group).unwrap(),
+                    before_free_blocks
+                );
+                assert_eq!(
+                    fs.count_free_inodes_in_group(&cx, group).unwrap(),
+                    before_free_inodes
+                );
+                let current = fs.read_inode(&cx, victim).unwrap();
+                assert_eq!(
+                    current.uid,
+                    1000 + conflicts - 1,
+                    "retry preserves the winner's inode"
+                );
+                assert_eq!(current.links_count, u16::from(exhausted));
+                assert_eq!(current.size, before_inode.size);
+                assert_eq!(current.blocks, before_inode.blocks);
+                assert_eq!(current.extent_bytes, before_inode.extent_bytes);
+                assert_eq!(
+                    fs.read(&cx, victim, 0, payload.len() as u32).unwrap(),
+                    payload
+                );
+                assert_eq!(
+                    fs.ext4_pending_orphans.lock().contains(&victim.0),
+                    !exhausted
+                );
+                assert_eq!(
+                    u64::from(fs.ext4_read_orphan_head()),
+                    if exhausted { 0 } else { victim.0 }
+                );
+
+                // Exhaustion must leave a retryable named file; no injection
+                // remains, so the identical unlink now succeeds in one commit.
+                if exhausted {
+                    let before_retry = fs.current_snapshot();
+                    fs.unlink(&cx, root, name).unwrap();
+                    assert_eq!(fs.current_snapshot().high.0, before_retry.high.0 + 1);
+                }
+                assert!(fs.finalize_unlinked_inode_public(&cx, victim).unwrap());
+                assert!(fs.ext4_pending_orphans.lock().is_empty());
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                let image = tmp.path().join("test.ext4");
+                std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+                let (clean, output) =
+                    run_e2fsck(&image).expect("unlink conflict oracle requires e2fsck");
+                assert!(
+                    clean,
+                    "unlink conflict recovery (sharded={sharded}, conflicts={conflicts}): {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn write_unlink_last_link_reclaims_inode_and_blocks_keeps_csum_valid() {
         // Unlinking a file's last link frees its inode and data blocks via
         // delete_inode — the same MVCC-txn-op free path as rename-over-existing.
@@ -89809,6 +90517,484 @@ mod tests {
     // tracked separately.
 
     #[test]
+    fn ext4_rename_atomic_growth_overwrite_preserves_snapshots_and_reopens() {
+        for small_blocks in [false, true] {
+            for sharded in [false, true] {
+                #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+                if sharded {
+                    continue;
+                }
+                let opened = if small_blocks {
+                    open_ext4_mke2fs(16, true)
+                } else {
+                    open_writable_ext4_mkfs_with_device(16).map(|(fs, dev, tmp)| {
+                        let image = tmp.path().join("test.ext4");
+                        (fs, dev, tmp, image)
+                    })
+                };
+                let (fs, dev, _tmp, image) =
+                    opened.expect("atomic rename regression requires e2fsprogs");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                fs.set_bhh0i_sharded_ops(sharded);
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                let old_parent = fs
+                    .mkdir(&cx, root, OsStr::new("old"), 0o700, 0, 0)
+                    .unwrap()
+                    .ino;
+                let new_parent = fs
+                    .mkdir(&cx, root, OsStr::new("new"), 0o700, 0, 0)
+                    .unwrap()
+                    .ino;
+                let names: Vec<_> = (0..40)
+                    .map(|index| format!("destination_{index:03}_{}", "n".repeat(180)))
+                    .collect();
+                let mut sources = Vec::new();
+                let mut victims = Vec::new();
+                for (index, name) in names.iter().enumerate() {
+                    let source_name = format!("source_{index:03}");
+                    let source = fs
+                        .create(&cx, old_parent, OsStr::new(&source_name), 0o600, 0, 0)
+                        .unwrap()
+                        .ino;
+                    fs.write(&cx, source, 0, source_name.as_bytes()).unwrap();
+                    sources.push(source);
+                    let victim = if index % 5 == 0 {
+                        let ino = fs
+                            .create(&cx, new_parent, OsStr::new(name), 0o600, 0, 0)
+                            .unwrap()
+                            .ino;
+                        fs.write(&cx, ino, 0, &vec![0xAD; 7000]).unwrap();
+                        if index % 10 == 0 {
+                            fs.link(&cx, ino, root, OsStr::new(&format!("kept_{index:03}")))
+                                .unwrap();
+                        }
+                        Some(ino)
+                    } else {
+                        None
+                    };
+                    victims.push(victim);
+                }
+                for (index, name) in names.iter().enumerate() {
+                    let source_name = format!("source_{index:03}");
+                    let mut scope = fs.begin_request_scope(&cx, RequestOp::Rename).unwrap();
+                    let before = fs.current_snapshot();
+                    FsOps::rename(
+                        &fs,
+                        &cx,
+                        &mut scope,
+                        old_parent,
+                        OsStr::new(&source_name),
+                        new_parent,
+                        OsStr::new(name),
+                    )
+                    .unwrap();
+                    let after = fs.current_snapshot();
+                    assert_eq!(
+                        after.high.0,
+                        before.high.0 + 1,
+                        "one publication per rename, small_blocks={small_blocks}, sharded={sharded}"
+                    );
+                    let old_source_parent =
+                        fs.read_inode_with_scope(&cx, &scope, old_parent).unwrap();
+                    let old_target_parent =
+                        fs.read_inode_with_scope(&cx, &scope, new_parent).unwrap();
+                    assert!(
+                        fs.read_dir_with_scope(&cx, &scope, &old_source_parent)
+                            .unwrap()
+                            .iter()
+                            .any(|entry| entry.name == source_name.as_bytes()
+                                && u64::from(entry.inode) == sources[index].0)
+                    );
+                    let old_target = fs
+                        .read_dir_with_scope(&cx, &scope, &old_target_parent)
+                        .unwrap()
+                        .into_iter()
+                        .find(|entry| entry.name == name.as_bytes());
+                    assert_eq!(
+                        old_target.map(|entry| InodeNumber(u64::from(entry.inode))),
+                        victims[index]
+                    );
+                    if let Some(victim) = victims[index] {
+                        assert_eq!(
+                            fs.read_inode_with_scope(&cx, &scope, victim)
+                                .unwrap()
+                                .links_count,
+                            if index % 10 == 0 { 2 } else { 1 }
+                        );
+                    }
+                    assert_eq!(
+                        fs.lookup(&cx, old_parent, OsStr::new(&source_name))
+                            .unwrap_err()
+                            .to_errno(),
+                        libc::ENOENT
+                    );
+                    assert_eq!(
+                        fs.lookup(&cx, new_parent, OsStr::new(name)).unwrap().ino,
+                        sources[index]
+                    );
+                    assert_eq!(
+                        fs.read(&cx, sources[index], 0, 64).unwrap(),
+                        source_name.as_bytes()
+                    );
+                    fs.commit_request_scope(&cx, &mut scope).unwrap();
+                    assert_eq!(
+                        fs.current_snapshot(),
+                        after,
+                        "outer request publishes nothing else"
+                    );
+                    fs.end_request_scope(&cx, RequestOp::Rename, scope).unwrap();
+                    assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                }
+                let parent_inode = fs.read_inode(&cx, new_parent).unwrap();
+                assert!(
+                    parent_inode.has_htree_index(),
+                    "rename must exercise indexed directory growth"
+                );
+                assert!(parent_inode.size > u64::from(fs.block_size()));
+                // Same-parent replacement shares both directory and inode-table
+                // blocks with its source, so every read must see staged edits.
+                let before = fs.current_snapshot();
+                fs.rename(
+                    &cx,
+                    new_parent,
+                    OsStr::new(&names[0]),
+                    new_parent,
+                    OsStr::new(&names[1]),
+                )
+                .unwrap();
+                assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+                assert_eq!(
+                    fs.lookup(&cx, new_parent, OsStr::new(&names[0]))
+                        .unwrap_err()
+                        .to_errno(),
+                    libc::ENOENT
+                );
+                assert_eq!(
+                    fs.lookup(&cx, new_parent, OsStr::new(&names[1]))
+                        .unwrap()
+                        .ino,
+                    sources[0]
+                );
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+                let (clean, output) = run_e2fsck(&image).expect("atomic rename requires e2fsck");
+                assert!(
+                    clean,
+                    "rename growth/overwrite must be native-clean, small_blocks={small_blocks}, sharded={sharded}: {output}"
+                );
+                drop(fs);
+                let reopened =
+                    OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+                for (index, name) in names.iter().enumerate().skip(1) {
+                    let source_index = if index == 1 { 0 } else { index };
+                    let inode = reopened.lookup(&cx, new_parent, OsStr::new(name)).unwrap();
+                    assert_eq!(inode.ino, sources[source_index]);
+                    assert_eq!(
+                        reopened.read(&cx, inode.ino, 0, 64).unwrap(),
+                        format!("source_{source_index:03}").as_bytes()
+                    );
+                }
+                for index in (0..40).step_by(10) {
+                    let retained = reopened
+                        .lookup(&cx, root, OsStr::new(&format!("kept_{index:03}")))
+                        .unwrap();
+                    assert_eq!(retained.ino, victims[index].unwrap());
+                    assert_eq!(retained.nlink, 1);
+                    assert_eq!(
+                        reopened.read(&cx, retained.ino, 0, 7000).unwrap(),
+                        vec![0xAD; 7000]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_rename_atomic_directory_replacement_updates_both_parents_and_dotdot() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("atomic directory rename regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let old_parent = fs
+                .mkdir(&cx, root, OsStr::new("old"), 0o700, 0, 0)
+                .unwrap()
+                .ino;
+            let new_parent = fs
+                .mkdir(&cx, root, OsStr::new("new"), 0o700, 0, 0)
+                .unwrap()
+                .ino;
+            for index in 0..32 {
+                let name = format!("filler_{index:03}_{}", "d".repeat(180));
+                fs.create(&cx, new_parent, OsStr::new(&name), 0o600, 0, 0)
+                    .unwrap();
+            }
+            assert!(
+                fs.read_inode(&cx, new_parent).unwrap().has_htree_index(),
+                "ancestry must find '..' in an indexed destination's dx root"
+            );
+            let source = fs
+                .mkdir(&cx, old_parent, OsStr::new("source"), 0o700, 0, 0)
+                .unwrap()
+                .ino;
+            let child = fs
+                .create(&cx, source, OsStr::new("child"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            fs.write(&cx, child, 0, b"moved directory payload").unwrap();
+            let victim = fs
+                .mkdir(&cx, new_parent, OsStr::new("target"), 0o700, 0, 0)
+                .unwrap()
+                .ino;
+            let old_links = fs.getattr(&cx, old_parent).unwrap().nlink;
+            let new_links = fs.getattr(&cx, new_parent).unwrap().nlink;
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Rename).unwrap();
+            let before = fs.current_snapshot();
+            FsOps::rename(
+                &fs,
+                &cx,
+                &mut scope,
+                old_parent,
+                OsStr::new("source"),
+                new_parent,
+                OsStr::new("target"),
+            )
+            .unwrap();
+            assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+            assert_eq!(
+                fs.read_inode_with_scope(&cx, &scope, victim)
+                    .unwrap()
+                    .links_count,
+                2
+            );
+            let old_source = fs.read_inode_with_scope(&cx, &scope, source).unwrap();
+            let old_dotdot = fs
+                .lookup_name_with_scope(&cx, &scope, &old_source, b"..")
+                .unwrap()
+                .unwrap();
+            assert_eq!(u64::from(old_dotdot.inode), old_parent.0);
+            assert_eq!(fs.getattr(&cx, old_parent).unwrap().nlink, old_links - 1);
+            assert_eq!(fs.getattr(&cx, new_parent).unwrap().nlink, new_links);
+            assert_eq!(
+                fs.lookup(&cx, new_parent, OsStr::new("target"))
+                    .unwrap()
+                    .ino,
+                source
+            );
+            assert_eq!(
+                fs.lookup(&cx, source, OsStr::new("..")).unwrap().ino,
+                new_parent
+            );
+            fs.end_request_scope(&cx, RequestOp::Rename, scope).unwrap();
+            let before = fs.current_snapshot();
+            fs.rename(
+                &cx,
+                new_parent,
+                OsStr::new("target"),
+                new_parent,
+                OsStr::new("renamed"),
+            )
+            .unwrap();
+            assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+            assert_eq!(fs.getattr(&cx, new_parent).unwrap().nlink, new_links);
+            assert_eq!(
+                fs.lookup(&cx, source, OsStr::new("..")).unwrap().ino,
+                new_parent
+            );
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+            let (clean, output) =
+                run_e2fsck(&image).expect("atomic directory rename requires e2fsck");
+            assert!(
+                clean,
+                "directory rename must be native-clean, sharded={sharded}: {output}"
+            );
+            drop(fs);
+            let reopened =
+                OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            assert_eq!(
+                reopened
+                    .lookup(&cx, new_parent, OsStr::new("renamed"))
+                    .unwrap()
+                    .ino,
+                source
+            );
+            assert_eq!(
+                reopened.lookup(&cx, source, OsStr::new("..")).unwrap().ino,
+                new_parent
+            );
+            assert_eq!(
+                reopened.read(&cx, child, 0, 64).unwrap(),
+                b"moved directory payload"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_rename_atomic_late_failure_cancellation_and_pinned_victim() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("atomic rename rollback regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let source = fs
+                .create(&cx, root, OsStr::new("source"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let victim = fs
+                .create(&cx, root, OsStr::new("target"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            fs.write(&cx, source, 0, b"source payload").unwrap();
+            let payload = vec![0xCF; 7000];
+            fs.write(&cx, victim, 0, &payload).unwrap();
+            let good_victim = fs.read_inode(&cx, victim).unwrap();
+            let mut damaged_victim = good_victim.clone();
+            damaged_victim.file_acl = fs.ext4_superblock().unwrap().blocks_count + 1;
+            persist_ext4_test_inode(&fs, &cx, victim, &damaged_victim);
+            let before = fs.current_snapshot();
+            let before_bytes = dev.snapshot_bytes();
+            let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let before_sharded = format!(
+                "{:?}",
+                fs.ext4_sharded_alloc
+                    .as_ref()
+                    .unwrap()
+                    .snapshot_group_stats()
+            );
+            let before_free = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+            let error = fs
+                .rename(&cx, root, OsStr::new("source"), root, OsStr::new("target"))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                FfsError::Io(_) | FfsError::Corruption { .. } | FfsError::Format(_)
+            ));
+            assert_eq!(
+                fs.current_snapshot(),
+                before,
+                "victim xattr read fails after staged namespace and data frees"
+            );
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(dev.snapshot_bytes(), before_bytes);
+            assert_eq!(
+                format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                before_groups
+            );
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    fs.ext4_sharded_alloc
+                        .as_ref()
+                        .unwrap()
+                        .snapshot_group_stats()
+                ),
+                before_sharded
+            );
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                before_free
+            );
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("source")).unwrap().ino,
+                source
+            );
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("target")).unwrap().ino,
+                victim
+            );
+            assert_eq!(fs.read(&cx, source, 0, 64).unwrap(), b"source payload");
+            assert_eq!(fs.read(&cx, victim, 0, 7000).unwrap(), payload);
+            assert!(!fs.ext4_pending_orphans.lock().contains(&victim.0));
+            persist_ext4_test_inode(&fs, &cx, victim, &good_victim);
+
+            // The oracle runs only after both directory entries and inode
+            // updates are staged. Cancellation there must discard all of them,
+            // including the tentative orphan-list insertion for a pinned file.
+            let op_cx = Cx::for_testing();
+            let cancel_cx = op_cx.clone();
+            let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = Arc::clone(&reached);
+            let pinned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let oracle_pinned = Arc::clone(&pinned);
+            fs.install_open_handle_oracle(Arc::new(move |candidate| {
+                if candidate == victim {
+                    if !observed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        cancel_cx.set_cancel_requested(true);
+                    }
+                    u64::from(oracle_pinned.load(std::sync::atomic::Ordering::Relaxed))
+                } else {
+                    0
+                }
+            }));
+            let before_cancel = fs.current_snapshot();
+            let error = fs
+                .rename(
+                    &op_cx,
+                    root,
+                    OsStr::new("source"),
+                    root,
+                    OsStr::new("target"),
+                )
+                .unwrap_err();
+            assert!(reached.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(matches!(error, FfsError::Cancelled));
+            assert_eq!(fs.current_snapshot(), before_cancel);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("source")).unwrap().ino,
+                source
+            );
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("target")).unwrap().ino,
+                victim
+            );
+            assert!(!fs.ext4_pending_orphans.lock().contains(&victim.0));
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+
+            let before_retry = fs.current_snapshot();
+            fs.rename(&cx, root, OsStr::new("source"), root, OsStr::new("target"))
+                .unwrap();
+            assert_eq!(fs.current_snapshot().high.0, before_retry.high.0 + 1);
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("target")).unwrap().ino,
+                source
+            );
+            assert_eq!(fs.read_inode(&cx, victim).unwrap().links_count, 0);
+            assert_eq!(fs.read(&cx, victim, 0, 7000).unwrap(), payload);
+            assert!(fs.ext4_pending_orphans.lock().contains(&victim.0));
+            pinned.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(fs.ext4_finalize_unlinked_inode_impl(&cx, victim).unwrap());
+            assert!(!fs.ext4_pending_orphans.lock().contains(&victim.0));
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+            let (clean, output) =
+                run_e2fsck(&image).expect("atomic rename rollback requires e2fsck");
+            assert!(
+                clean,
+                "retried rename and final victim release must be native-clean, sharded={sharded}: {output}"
+            );
+        }
+    }
+
+    #[test]
     fn ext4_rename2_classic_flag_zero_overwrites_target() {
         let Some(fs) = open_writable_ext4() else {
             return;
@@ -91325,8 +92511,9 @@ mod tests {
                 .expect("read_dir")
                 .iter()
                 .any(|e| e.name != b"." && e.name != b"..");
+            let dev = fs.block_device_adapter();
             let candidate_empty = fs
-                .ext4_directory_is_empty(&cx, &RequestScope::empty(), &inode)
+                .ext4_directory_is_empty_from_device(&cx, &dev, &inode)
                 .expect("is_empty");
             assert_eq!(
                 candidate_empty, oracle_empty,
