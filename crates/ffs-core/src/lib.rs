@@ -83934,9 +83934,13 @@ mod tests {
                 let cx = Cx::for_testing();
                 let root = InodeNumber(2);
                 let name = OsStr::new("conflicted_orphan");
-                let victim = fs.create(&cx, root, name, 0o600, 0, 0).unwrap().ino;
+                let victim = fs
+                    .as_ref()
+                    .create(&cx, root, name, 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
                 let payload = vec![0xA9; 3 * fs.block_size() as usize];
-                fs.write(&cx, victim, 0, &payload).unwrap();
+                fs.as_ref().write(&cx, victim, 0, &payload).unwrap();
                 let before_inode = fs.read_inode(&cx, victim).unwrap();
                 let (geo, groups, csum_seed) = {
                     let alloc = fs.require_alloc_state().unwrap().read();
@@ -83978,14 +83982,14 @@ mod tests {
                 let before_free_inodes = fs.count_free_inodes_in_group(&cx, group).unwrap();
                 let exhausted = conflicts == 16;
 
-                let result = fs.unlink(&cx, root, name);
+                let result = fs.as_ref().unlink(&cx, root, name);
                 if exhausted {
                     assert!(matches!(result, Err(FfsError::MvccConflict { .. })));
-                    assert_eq!(fs.lookup(&cx, root, name).unwrap().ino, victim);
+                    assert_eq!(fs.as_ref().lookup(&cx, root, name).unwrap().ino, victim);
                 } else {
                     result.unwrap();
                     assert!(matches!(
-                        fs.lookup(&cx, root, name),
+                        fs.as_ref().lookup(&cx, root, name),
                         Err(FfsError::NotFound(_))
                     ));
                 }
@@ -84024,7 +84028,9 @@ mod tests {
                 assert_eq!(current.blocks, before_inode.blocks);
                 assert_eq!(current.extent_bytes, before_inode.extent_bytes);
                 assert_eq!(
-                    fs.read(&cx, victim, 0, payload.len() as u32).unwrap(),
+                    fs.as_ref()
+                        .read(&cx, victim, 0, payload.len() as u32)
+                        .unwrap(),
                     payload
                 );
                 assert_eq!(
@@ -84040,7 +84046,7 @@ mod tests {
                 // remains, so the identical unlink now succeeds in one commit.
                 if exhausted {
                     let before_retry = fs.current_snapshot();
-                    fs.unlink(&cx, root, name).unwrap();
+                    fs.as_ref().unlink(&cx, root, name).unwrap();
                     assert_eq!(fs.current_snapshot().high.0, before_retry.high.0 + 1);
                 }
                 assert!(fs.finalize_unlinked_inode_public(&cx, victim).unwrap());

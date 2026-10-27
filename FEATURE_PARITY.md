@@ -16,9 +16,11 @@
 > storage failure, cancellation, conflict recovery/exhaustion and native
 > checker/reopen scenarios on 1 KiB and 4 KiB images. These tests are authored;
 > local compilation stopped in unchanged dependencies under memory and disk
-> exhaustion, so execution remains pending. Pinned formatting and whitespace
-> checks pass. This advances `bd-9rutw` without closing it: sharded create/mkdir,
-> ACL inheritance and arbitrary outer-request composition still need their
+> exhaustion. The first ARM CI build found an `Arc<OpenFs>` method-dispatch
+> error in the new conflict test; its calls now select the public wrappers
+> explicitly. Runtime execution remains pending. Pinned formatting and
+> whitespace checks pass. This advances `bd-9rutw` without closing it: sharded
+> create/mkdir, ACL inheritance and arbitrary outer-request composition still need their
 > remaining transaction work. No mounted, crash, performance or parity-rate
 > qualification is added.
 
