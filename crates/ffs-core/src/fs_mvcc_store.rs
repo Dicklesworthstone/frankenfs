@@ -209,6 +209,18 @@ impl FsMvccStore {
         }
     }
 
+    pub(super) fn register_current_snapshot(&self) -> Snapshot {
+        match self {
+            Self::Single(lock) => {
+                let mut store = lock.write();
+                let snapshot = store.current_snapshot();
+                store.register_snapshot(snapshot);
+                snapshot
+            }
+            Self::Sharded { store } => store.register_current_snapshot(),
+        }
+    }
+
     pub(super) fn release_snapshot(&self, snapshot: Snapshot) -> bool {
         match self {
             Self::Single(lock) => lock.write().release_snapshot(snapshot),
@@ -235,7 +247,7 @@ impl FsMvccStore {
     /// block: an unregistered transaction can outlive that version's pruning.
     /// Refuse with the same retryable error as an optimistic commit conflict,
     /// rather than inventing a before-image from potentially stale disk bytes.
-    fn read_unversioned_base_at_snapshot<T>(
+    pub(super) fn read_unversioned_base_at_snapshot<T>(
         &self,
         block: BlockNumber,
         snapshot: Snapshot,

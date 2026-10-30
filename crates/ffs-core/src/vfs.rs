@@ -507,6 +507,11 @@ pub enum RequestCommitMode {
 pub struct RequestScope {
     pub snapshot: Option<Snapshot>,
     pub tx: Option<ffs_mvcc::Transaction>,
+    /// A managed read request on a writable filesystem pins and reads its
+    /// snapshot until `end_request_scope`. Unscoped mutation helpers still
+    /// need the current view for read-your-writes.
+    #[serde(default)]
+    pub(crate) read_snapshot_pinned: bool,
     #[serde(default)]
     pub commit_mode: RequestCommitMode,
     /// Set by callers (e.g. `readdirplus`) that immediately `getattr` every
@@ -530,6 +535,7 @@ impl RequestScope {
         Self {
             snapshot: None,
             tx: None,
+            read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
             ext4_freed_blocks: BTreeMap::new(),
@@ -542,6 +548,7 @@ impl RequestScope {
         Self {
             snapshot: Some(snapshot),
             tx: None,
+            read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
             ext4_freed_blocks: BTreeMap::new(),
@@ -554,6 +561,7 @@ impl RequestScope {
         Self {
             snapshot: Some(tx.snapshot()),
             tx: Some(tx),
+            read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
             ext4_freed_blocks: BTreeMap::new(),

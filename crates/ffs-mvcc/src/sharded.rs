@@ -2332,6 +2332,20 @@ impl ShardedMvccStore {
 
     // ── Snapshot tracking (inline, for compatibility) ────────────────────
 
+    /// Capture and pin the published head under the same lock used by GC.
+    /// Capturing before acquiring this lock could let pruning discard the
+    /// selected version before registration.
+    #[must_use]
+    pub fn register_current_snapshot(&self) -> Snapshot {
+        let mut active = self.active_snapshots.write();
+        let snapshot = self.current_snapshot();
+        active
+            .entry(snapshot.high)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        snapshot
+    }
+
     /// Register a snapshot as active (inline tracking).
     pub fn register_snapshot(&self, snapshot: Snapshot) {
         let mut active = self.active_snapshots.write();

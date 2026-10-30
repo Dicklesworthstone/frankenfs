@@ -4762,6 +4762,7 @@ impl FsOps for OpenFs {
         if Self::request_op_is_gated_mutation(op) {
             self.enter_mutation_gate();
         }
+        let read_snapshot_pinned = !op.is_write() && self.is_writable();
         let (snapshot, tx) = if op.is_write() {
             // Write operations must use a transaction for isolation and atomicity.
             let txn = self.mvcc_store.begin();
@@ -4775,20 +4776,15 @@ impl FsOps for OpenFs {
             );
             (Some(snapshot), Some(txn))
         } else {
-            // Read operations carry a snapshot VALUE but do NOT register it in the
-            // global `active_snapshots` map. Registration exists only to hold the GC
-            // watermark down so prune cannot remove a version the request still needs
-            // — but a read op never reads a pinned overlay version: every use of
-            // `scope.snapshot` to read an MVCC version is gated on `scope.tx.is_some()`
-            // (writes; see 12019/12135 overlay_snapshot and 11856/11910/11947), and
-            // `can_cache_ext4_read_only_block` bails on writable mounts before touching
-            // it; block reads go through the read-your-writes / base-direct adapter that
-            // is itself already unregistered (bd-bhh0i, block_device_adapter). So the
-            // per-read register+release was two acquisitions of the GLOBAL
-            // `active_snapshots` WRITE lock per read op with zero effect on read RESULTS
-            // — a serialization point on the parallel read path, now removed.
-            // `scope.snapshot` stays `Some` for the cacheability existence checks.
-            let snapshot = self.current_snapshot();
+            // Writable readers must retain one view across all block accesses.
+            // Capture and registration share GC's lock, so pruning cannot pass
+            // the selected head between those two steps. Immutable read-only
+            // mounts need no GC registration or transaction allocation.
+            let snapshot = if read_snapshot_pinned {
+                self.mvcc_store.register_current_snapshot()
+            } else {
+                self.current_snapshot()
+            };
             trace!(
                 target: "ffs::mvcc",
                 op = ?op,
@@ -4801,6 +4797,7 @@ impl FsOps for OpenFs {
         Ok(RequestScope {
             snapshot,
             tx,
+            read_snapshot_pinned,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
             ext4_freed_blocks: std::collections::BTreeMap::new(),
@@ -4814,12 +4811,9 @@ impl FsOps for OpenFs {
         scope: RequestScope,
     ) -> ffs_error::Result<()> {
         let deferred = scope.is_deferred_until_flush();
-        // Only WRITE scopes register a snapshot (see begin_request_scope); read
-        // scopes carry a snapshot value but never pin it in `active_snapshots`, so
-        // there is nothing to release. Keyed on `op.is_write()` (symmetric with the
-        // register condition) rather than `scope.tx`, because a committed write has
-        // already consumed its `tx` yet its snapshot is still registered.
-        if op.is_write()
+        // A committed write has already consumed its transaction; a managed
+        // writable read never allocated one. Both still own a snapshot pin.
+        if (op.is_write() || scope.read_snapshot_pinned)
             && let Some(snapshot) = scope.snapshot
         {
             let released = self.mvcc_store.release_snapshot(snapshot);

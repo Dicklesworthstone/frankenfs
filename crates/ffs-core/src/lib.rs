@@ -20924,6 +20924,12 @@ impl OpenFs {
             return Ok(staged.to_vec());
         }
 
+        if scope.read_snapshot_pinned {
+            return self
+                .read_pinned_scope_block(cx, scope, block)
+                .map(BlockBuf::into_inner);
+        }
+
         // 2. Transaction-backed scopes read at their fixed snapshot for
         //    isolation. A no-tx scope's in-scope writes go to the MVCC store
         //    via `block_device_adapter` (committed at the *current* snapshot,
@@ -20943,6 +20949,27 @@ impl OpenFs {
 
         // 3. Fall back to the current-snapshot device view.
         self.read_current_block_vec_from_device(cx, block)
+    }
+
+    /// Resolve a managed reader's fixed view. A missing old version cannot
+    /// fall through to a newer overlay or checkpointed device block.
+    fn read_pinned_scope_block(
+        &self,
+        cx: &Cx,
+        scope: &RequestScope,
+        block: BlockNumber,
+    ) -> Result<BlockBuf, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let snapshot = scope
+            .snapshot
+            .ok_or_else(|| FfsError::Format("pinned read scope has no snapshot".to_owned()))?;
+        if let Some(visible) = self.mvcc_store.read_visible_block_buf(block, snapshot) {
+            return Ok(visible);
+        }
+        self.mvcc_store
+            .read_unversioned_base_at_snapshot(block, snapshot, || {
+                self.direct_block_device_adapter().read_block(cx, block)
+            })
     }
 
     /// Resolve a block at the same current-snapshot fallback used by
@@ -20998,6 +21025,11 @@ impl OpenFs {
             return Ok(Arc::<[u8]>::from(staged));
         }
 
+        if scope.read_snapshot_pinned {
+            let buf = self.read_pinned_scope_block(cx, scope, block)?;
+            return Ok(Arc::from(buf.as_slice()));
+        }
+
         // 2. Snapshot-visible MVCC version (transaction-backed scopes only —
         //    no-tx scopes must read at the current snapshot for read-your-writes;
         //    see read_block_with_scope and bd-bw90c).
@@ -21037,6 +21069,10 @@ impl OpenFs {
             && let Some(staged) = tx.staged_write(block)
         {
             return Ok(f(staged));
+        }
+        if scope.read_snapshot_pinned {
+            let buf = self.read_pinned_scope_block(cx, scope, block)?;
+            return Ok(f(buf.as_slice()));
         }
         if scope.tx.is_some()
             && let Some(snapshot) = scope.snapshot
@@ -21097,6 +21133,12 @@ impl OpenFs {
             .0
             .checked_add(count_u64)
             .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
+
+        if scope.read_snapshot_pinned {
+            return (start.0..end)
+                .map(|block| self.read_block_with_scope(cx, scope, BlockNumber(block)))
+                .collect();
+        }
 
         // Single pass resolving transaction/snapshot overlay blocks (matching
         // read_block_with_scope's precedence exactly: tx staged write first,
@@ -21208,7 +21250,15 @@ impl OpenFs {
             .checked_add(count_u64)
             .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
 
-        // No-tx scopes (every read request: with_latest_scope sets tx=None) have
+        if scope.read_snapshot_pinned {
+            for (block, chunk) in (start.0..end).zip(dst.chunks_exact_mut(bs)) {
+                let buf = self.read_pinned_scope_block(cx, scope, BlockNumber(block))?;
+                chunk.copy_from_slice(buf.as_slice());
+            }
+            return Ok(());
+        }
+
+        // Unpinned no-tx scopes (with_latest_scope sets tx=None) have
         // no transaction overlay AND skip the snapshot store below (it is only
         // consulted when tx.is_some()), so the per-block resolution loop would
         // push `None` for all `count` blocks and fall through to the one ranged
@@ -22847,7 +22897,9 @@ impl OpenFs {
         let ns_gen = self
             .namespace_gen
             .load(std::sync::atomic::Ordering::Acquire);
-        let index_keyable = dir_inode.number != 0;
+        // This index describes the current namespace, not a retained reader's
+        // older directory blocks (timestamps can also collide).
+        let index_keyable = dir_inode.number != 0 && !scope.read_snapshot_pinned;
         if index_keyable {
             let guard = self.dir_name_index_shard(dir_inode.number).lock();
             if let Some(idx) = guard.as_ref()
@@ -49180,6 +49232,7 @@ impl OpenFs {
         let mut local_scope = RequestScope {
             snapshot: Some(snapshot),
             tx: Some(txn),
+            read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
             ext4_freed_blocks: BTreeMap::new(),
@@ -55260,6 +55313,7 @@ mod tests {
         let scope = RequestScope {
             snapshot: None,
             tx: Some(txn),
+            read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
             ext4_freed_blocks: BTreeMap::new(),
@@ -55349,6 +55403,7 @@ mod tests {
         let scope = RequestScope {
             snapshot: None,
             tx: Some(txn),
+            read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
             ext4_freed_blocks: BTreeMap::new(),
@@ -91107,6 +91162,13 @@ mod tests {
             let old_entries = fs
                 .read_dir_with_scope(&cx, &old_scope, &old_parent)
                 .unwrap();
+            for (name, expected) in [(b"cancel_source", source), (b"cancel_target", victim)] {
+                let old_entry = fs
+                    .lookup_name_with_scope(&cx, &old_scope, &old_parent, name)
+                    .unwrap()
+                    .expect("pinned lookup must preserve the old namespace");
+                assert_eq!(u64::from(old_entry.inode), expected.0);
+            }
             assert!(old_entries.iter().any(|entry| {
                 entry.name == b"cancel_source" && u64::from(entry.inode) == source.0
             }));
@@ -91119,7 +91181,9 @@ mod tests {
                     .links_count,
                 1
             );
-            drop(old_scope);
+            fs.end_request_scope(&cx, RequestOp::Read, old_scope)
+                .unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
             pinned.store(false, std::sync::atomic::Ordering::SeqCst);
             assert!(fs.ext4_finalize_unlinked_inode_impl(&cx, victim).unwrap());
             assert!(!fs.ext4_pending_orphans.lock().contains(&victim.0));
@@ -99180,6 +99244,7 @@ mod tests {
             RequestScope {
                 snapshot: Some(snapshot),
                 tx: None,
+                read_snapshot_pinned: false,
                 commit_mode: RequestCommitMode::PerRequest,
                 skip_readdir_prefetch: false,
                 ext4_freed_blocks: BTreeMap::new(),
@@ -99187,6 +99252,85 @@ mod tests {
         )
         .expect("end request scope");
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn writable_read_request_scope_preserves_all_block_views_through_gc() {
+        for single_store in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(build_ext4_image_with_state(EXT4_VALID_FS));
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            let bs = usize::try_from(fs.block_size()).unwrap();
+            let old = vec![0x31; bs];
+            let new = vec![0x72; bs];
+            let block = BlockNumber(8);
+            let base_gap = fs.read_block_vec(&cx, BlockNumber(9)).unwrap();
+            fs.block_device_adapter()
+                .write_block(&cx, block, &old)
+                .unwrap();
+
+            let scope = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            assert!(
+                scope.tx.is_none(),
+                "a reader must not allocate a write transaction"
+            );
+            assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+            fs.block_device_adapter()
+                .write_block(&cx, block, &new)
+                .unwrap();
+            fs.mvcc_store.prune_safe();
+            assert_eq!(fs.read_block_with_scope(&cx, &scope, block).unwrap(), old);
+            assert_eq!(
+                fs.read_block_arc_with_scope(&cx, &scope, block)
+                    .unwrap()
+                    .as_ref(),
+                old.as_slice()
+            );
+            assert_eq!(
+                fs.with_block_bytes(&cx, &scope, block, |bytes| bytes[0])
+                    .unwrap(),
+                0x31
+            );
+            assert_eq!(
+                fs.read_contiguous_blocks_with_scope(&cx, &scope, block, 2)
+                    .unwrap(),
+                vec![old.clone(), base_gap.clone()]
+            );
+            let mut into = vec![0; bs * 2];
+            fs.read_contiguous_into_with_scope(&cx, &scope, block, &mut into)
+                .unwrap();
+            assert_eq!(&into[..bs], old.as_slice());
+            assert_eq!(&into[bs..], base_gap.as_slice());
+
+            // A block first versioned after the snapshot has no retained old
+            // overlay. Its fallback must refuse ambiguous ancestry rather than
+            // return the new overlay or potentially newer checkpointed bytes.
+            fs.block_device_adapter()
+                .write_block(&cx, BlockNumber(10), &new)
+                .unwrap();
+            assert!(matches!(
+                fs.read_block_with_scope(&cx, &scope, BlockNumber(10)),
+                Err(FfsError::MvccConflict { block: 10, .. })
+            ));
+            let head = fs.current_snapshot();
+            fs.end_request_scope(&cx, RequestOp::Read, scope).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(
+                fs.current_snapshot(),
+                head,
+                "ending a read publishes nothing"
+            );
+            let fresh = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            assert_eq!(fs.read_block_with_scope(&cx, &fresh, block).unwrap(), new);
+            fs.end_request_scope(&cx, RequestOp::Read, fresh).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
     }
 
     #[test]
