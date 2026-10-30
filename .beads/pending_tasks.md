@@ -33,14 +33,135 @@ injection. The core-only build warning is addressed by compiling
 - [x] Repair both create-benchmark worker error paths and add the three unit
   regressions in the same existing source file; no new concurrency sites.
 - [x] Align the sharded-only helper's compilation condition with its callers.
-- [ ] Complete fresh workspace/all-target check and strict Clippy for this cut.
-- [ ] Execute the three new worker-result tests (expected3, no ignores).
-- [ ] Execute all16 retained-image rename2/own-hardlink/immutable-victim tests
+- [x] Complete the pre-snapshot workspace/all-target check and strict Clippy:
+  `cargo check -j2 --workspace --all-targets` exits0 (2m16s Cargo), and
+  `cargo clippy -j2 --workspace --all-targets -- -D warnings` exits0 (15.92s
+  Cargo), both on hz3. Logs: `check-final.log`, `clippy-final.log` in the
+  current capture directory. Fresh `cargo fmt --check`/`git diff --check` pass.
+- [x] Execute the three new worker-result tests (3passed/0failed/0ignored).
+- [x] Exercise the actual parallel benchmark command on private retained-image
+  copies: eight creates survive reopening, and real inode exhaustion returns
+  typed `NoSpace` without a worker panic. All5 combined CLI tests pass,
+  0failed/0ignored/408filtered,0.72s runtime, command exit0 on hz3.
+  Log: `/tmp/frankenfs-verification.sw1akO/cli-command-tests-fresh.log`.
+- [x] Execute all16 retained-image rename2/own-hardlink/immutable-victim tests
   on the final cut; keep native recovery and allocator-mode gaps explicit.
-- [ ] Verify final source/fixture hashes and review UBS findings without a
-  scanner change, suppression, exclusion or fabricated green result.
+- [x] Add a focused filesystem regression for cancellation after private
+  namespace staging, successful retry with exactly one publication, visibility
+  through an older snapshot, pinned-victim payload retention, and final release.
+  It uses the existing image-to-memory helper. Under the sharded feature it
+  explicitly executes both allocator modes. Native-oracle tests stay unchanged.
+- [x] Execute the17-test combined rename selection with the sharded feature:
+  the16 existing controls plus the new two-mode cancellation/open-victim test.
+  **Executed red:**16passed/1failed/0ignored, exit101, with the new old-snapshot
+  namespace assertion failing. The original assertion remains intact. A real
+  cause was identified: writable read requests did not register or read their
+  captured snapshot. This violates the existing documented per-callback view.
+- [x] Implement managed writable-read snapshot ownership, atomic capture/pin
+  against GC, scalar/Arc/borrowed/ranged snapshot reads and current-name-index
+  bypass. Preserve unscoped mutation read-your-writes and the immutable RO path.
+  Missing old ancestry returns typed `MvccConflict`, never newer bytes.
+- [x] Execute the expanded22-test core selection:17 rename tests, new all-block
+  views/GC test across single/sharded stores, unchanged RO registration and
+  empty-scope controls, plus two unchanged mixed ranged-read controls. Both
+  allocator modes are enabled for the rename regression. The first compile
+  exposed a new-test API typo (`read_block` instead of `read_block_vec`), now
+  corrected; that compile failure is retained without pass credit.
+  Final execution:22passed/0failed/0ignored/1645filtered,0.13s runtime, command
+  exit0 on hz3 (`core-snapshot-fixed2.log`). Both sharded=false/true markers
+  occur. The failing namespace assertion was preserved and now passes.
+- [x] Rerun final workspace compiler/strict Clippy checks and all5 CLI controls
+  after the snapshot correction. Earlier green gates predate this source cut.
+  Corrected-source check exits0 (44.25s Cargo, `check-snapshot.log`); strict
+  Clippy exits0 (1m04s Cargo, `clippy-snapshot.log`); standalone formatting
+  exits0 (`fmt-snapshot-verified.log`) and diff whitespace check exits0.
+  The final CLI rerun passes5/0/0,408filtered,18.46s runtime, command exit0
+  (`cli-snapshot-final.log`). Combined final targeted count is27 unique tests;
+  earlier overlapping runs are not added to this denominator.
+- [x] Rescan all six changed Rust files with the unchanged UBS rules. A combined
+  scan hit the16MiB AST-diagnostic output cap and exits2, retained as incomplete.
+  Two complete batches cover the same six files without exclusions or changed
+  limits: core-only exits0 (0critical/15388warnings/3169info); other five files
+  exit1 (5critical/2809warnings/1158info). The five critical sites remain the
+  previously traced CLI paths. No scanner pass or commit-gate waiver is claimed.
+- [x] Preserve the final source diff and16 raw execution/recovery captures under
+  `artifacts/implementation/20261030_O221Lk/`; copied bytes were compared to the
+  healthy `/tmp` captures. No build artifacts or fixture files were deleted.
+- [ ] Native checker qualification remains unexecuted. A read-only `e2fsck -fn`
+  RCH job for the persisted eight-create image was refused during source
+  initialization (status73, wrapper103), before the checker ran. Recovered exact
+  wrapper `rchw-1046e65a-6064-42b3-9b4d-726400a922d9`: acknowledged terminal1,
+  no replay. See `native-createbench-image-a.log` and
+  `native-refusal-recovery.json`. No native pass credit; no admission bypass.
+- [x] Verify final source/fixture hashes and review UBS findings without a
+  scanner change, suppression, exclusion or fabricated green result. Final
+  `ubs-final.log` exits1:5critical/17577warnings/4164info. The five critical
+  sites are unchanged exclusive fixture creation, three `current_exe` child
+  launches, and fixed-production `mkfs.ext4` selection. This review is not a
+  green scanner result or a waiver of the repository's commit gate.
 - [ ] Reverify acceptance, record incomplete original requirements, sync Beads
   and land the verified correction within authorized publication scope.
+
+Resource recovery: hz4 admitted the14-test run and a subsequent full workspace
+check, then its root filesystem fell to12GiB free and RCH refused further work
+under critical I/O/disk pressure. No admission threshold was changed. On hz3,
+available RAM was193GiB, but the per-user runtime tmpfs was only about25GiB and
+fell just below the required20GiB free. Increased only that existing tmpfs's
+volatile size ceiling to32GiB using a remount; no file was deleted, no contents
+were replaced, and `nosuid,nodev,mode=700,uid=1000,gid=1000` stayed unchanged.
+Fresh SBH preflight then passed with28,513,206,272bytes free. The existing warm
+task pool there is reused. Final lint surfaced two method-call closure lints
+in the new worker joins; both were corrected with the actual join method.
+For the explicit-feature core build, available RAM was179GiB; increased the
+same volatile tmpfs ceiling to40GiB, preserving all mount protections and
+contents. Fresh SBH then passed with30,404,882,432bytes free. This supplies real
+capacity rather than changing the20GiB admission requirement.
+
+Integrity incident and recovery: unrelated local disk growth exhausted the
+root filesystem during a manual patch, and the patch tool truncated the CLI
+source to zero bytes. This was disclosed immediately. Recovered the committed
+source into `/tmp/frankenfs-main-recovery-20261030T2217.rs`, restored only the
+confirmed empty regular file, and verified byte equality before reapplying the
+two uncommitted join-method fixes. The two command regressions were then edited
+manually on a preserved recovery candidate on healthy `/tmp`, formatted, copied
+back under an exact prior-source-hash guard and compared byte-for-byte. No file
+was deleted, and both tracker JSONLs still parse with4342rows. Backups remain.
+Local disk subsequently recovered externally to46GiB free. Captures now use
+`/tmp/frankenfs-verification.sw1akO`; this is raw execution evidence, not a new
+readiness artifact.
+
+An initial combined CLI run returned exit0 but executed only the three older
+tests despite matching source hashes. It does not verify the new tests. A
+source-mtime refresh forced actual recompilation through the same admitted RCH
+path; the verbose log above confirms all five named tests executed. Current
+CLI SHA256 is `613931a080ba33ac07aac59bb6df40c5128bd35add89a18f8e4bf25e8c6de40b`.
+The pre-snapshot core cut was
+`86cea02a983e87ebbc83b32b5258592502a8baa17d97fd51853cf9dbb390fb72`;
+the corrected final core is
+`8116bfd1c5ba882c17fc11677f393d88a22bb555ca53c8fdb7f01b7e9822d32f`.
+All six final Rust file hashes, Cargo.lock and retained fixture bytes matched
+the remote files. Final strict workspace Clippy/compiler/format checks and27
+targeted tests pass. This is solo unit/integration evidence; native, mounted,
+crash, full-workspace and performance qualification remain unestablished.
+Writable reads now pay for snapshot registration and fixed-view block reads;
+that correctness cost has not been benchmarked. Required full tests and the
+unchanged UBS commit gate remain incomplete, so the original baseline stays
+in_progress. The latest corrections remain uncommitted and unpushed. No
+original acceptance condition was moved into a new item.
+
+- [ ] Complete the original full workspace/harness/native requirements when
+  fixture creation/cleanup and remote admission permit them. The earlier narrow
+  Rule1 fixture-cleanup question remains unanswered; elapsed time is not consent.
+- [ ] Obtain the required separate disposition of the existing UBS findings
+  under AGENTS.md's zero-exit commit rule; no local scanner waiver was invented.
+- [ ] Land the coherent source/test correction after the original gates permit
+  it; keep source and tests together and preserve the current recovery patch.
+- [ ] Continue `bd-9rutw` request ownership/concurrent-reader qualification,
+  `bd-in31y` lifecycle and `bd-11a8t` repair within their existing ownership and
+  acceptance, then the dependency-ordered `bd-3nf06` native roadmap. The continuous
+  telemetry item `bd-dzbsp` still depends on this original baseline.
+
+### Earlier implementation history (superseded by the checklist above)
 
 - [x] Read the suite/project instructions and README; apply the requested
   anti-ceremony skill and inspect the existing dependency graph.
