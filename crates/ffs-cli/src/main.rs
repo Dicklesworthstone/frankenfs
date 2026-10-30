@@ -19866,9 +19866,9 @@ mod tests {
             )
             .expect("parse gd0");
             let inode_size = usize::from(sb.inode_size);
-            let root_ino_off =
-                usize::try_from(gd0.inode_table).expect("fits") * (sb.block_size as usize)
-                    + inode_size;
+            let root_ino_off = usize::try_from(gd0.inode_table).expect("fits")
+                * (sb.block_size as usize)
+                + inode_size;
             let raw_inode = &mut bytes[root_ino_off..root_ino_off + inode_size];
             let acl_lo = u32::try_from(free_block2).expect("free_block2 fits u32");
             raw_inode[0x68..0x6C].copy_from_slice(&acl_lo.to_le_bytes());

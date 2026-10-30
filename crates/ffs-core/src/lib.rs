@@ -21877,220 +21877,6 @@ impl OpenFs {
         Ok(extents)
     }
 
-    fn read_inode_via_dev(
-        cx: &Cx,
-        dev: &dyn BlockDevice,
-        geo: &FsGeometry,
-        groups: &[GroupStats],
-        ino: InodeNumber,
-    ) -> Result<Ext4Inode, FfsError> {
-        let mut inode = ffs_inode::read_inode(cx, dev, geo, groups, ino)?;
-        if inode.mode == 0 {
-            return Err(FfsError::NotFound(format!("inode {}", ino.0)));
-        }
-        inode.number = ino.0;
-        Ok(inode)
-    }
-
-    fn ext4_write_extents_via_dev(
-        &self,
-        cx: &Cx,
-        dev: &dyn BlockDevice,
-        inode: &Ext4Inode,
-    ) -> Result<Arc<[Ext4Extent]>, FfsError> {
-        if Self::ext4_inode_block_map_is_indirect(inode) {
-            return Ok(Arc::from(self.ext4_indirect_runs_via_dev(cx, dev, inode)?));
-        }
-        let namespace = extent_cache_namespace(inode);
-        let root_namespace = extent_root_namespace(inode);
-
-        let cached_extents = {
-            let snapshot = self.ext4_write_extent_snapshot.lock();
-            snapshot
-                .as_ref()
-                .filter(|snapshot| {
-                    snapshot.namespace == namespace && snapshot.root_namespace == root_namespace
-                })
-                .map(|snapshot| Arc::clone(&snapshot.extents))
-        };
-        if let Some(extents) = cached_extents {
-            return Ok(extents);
-        }
-
-        let (header, tree) = parse_inode_extent_tree(inode).map_err(|e| parse_to_ffs_error(&e))?;
-        let mut collected = Vec::new();
-        Self::collect_extents_recursive_via_dev(cx, dev, &tree, header.depth, &mut collected)?;
-        let extents = Arc::<[Ext4Extent]>::from(collected);
-        *self.ext4_write_extent_snapshot.lock() = Some(Ext4WriteExtentSnapshot {
-            namespace,
-            root_namespace,
-            extents: Arc::clone(&extents),
-        });
-        Ok(extents)
-    }
-
-    fn collect_extents_recursive_via_dev(
-        cx: &Cx,
-        dev: &dyn BlockDevice,
-        tree: &ExtentTree,
-        remaining_depth: u16,
-        result: &mut Vec<Ext4Extent>,
-    ) -> Result<(), FfsError> {
-        if remaining_depth > Self::MAX_EXTENT_DEPTH {
-            return Err(FfsError::Corruption {
-                block: 0,
-                detail: "extent tree depth exceeds maximum".into(),
-            });
-        }
-        match tree {
-            ExtentTree::Leaf(extents) => {
-                result.extend_from_slice(extents);
-                Ok(())
-            }
-            ExtentTree::Index(indexes) => {
-                if remaining_depth == 0 {
-                    return Err(FfsError::Corruption {
-                        block: 0,
-                        detail: "extent index at depth 0".into(),
-                    });
-                }
-                for idx in indexes {
-                    let child = dev.read_block(cx, BlockNumber(idx.leaf_block))?;
-                    let (child_header, child_tree) =
-                        parse_extent_tree(child.as_slice()).map_err(|e| parse_to_ffs_error(&e))?;
-                    if child_header.depth + 1 != remaining_depth {
-                        return Err(FfsError::Corruption {
-                            block: idx.leaf_block,
-                            detail: "child extent tree depth inconsistency".into(),
-                        });
-                    }
-                    Self::collect_extents_recursive_via_dev(
-                        cx,
-                        dev,
-                        &child_tree,
-                        remaining_depth - 1,
-                        result,
-                    )?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn ext4_indirect_runs_via_dev(
-        &self,
-        cx: &Cx,
-        dev: &dyn BlockDevice,
-        inode: &Ext4Inode,
-    ) -> Result<Vec<Ext4Extent>, FfsError> {
-        fn push(runs: &mut Vec<Ext4Extent>, logical: u64, phys: u32) -> Result<(), FfsError> {
-            let logical = u32::try_from(logical)
-                .map_err(|_| FfsError::Format("indirect logical block exceeds u32".into()))?;
-            if let Some(last) = runs.last_mut() {
-                let len = u32::from(last.raw_len);
-                if last.logical_block + len == logical
-                    && last.physical_start + u64::from(len) == u64::from(phys)
-                    && len < 32_768
-                {
-                    last.raw_len += 1;
-                    return Ok(());
-                }
-            }
-            runs.push(Ext4Extent {
-                logical_block: logical,
-                raw_len: 1,
-                physical_start: u64::from(phys),
-            });
-            Ok(())
-        }
-        #[allow(clippy::too_many_arguments)]
-        fn walk(
-            cx: &Cx,
-            dev: &dyn BlockDevice,
-            block: u32,
-            level: u32,
-            base: u64,
-            ppb: u64,
-            total_blocks: u64,
-            runs: &mut Vec<Ext4Extent>,
-        ) -> Result<(), FfsError> {
-            if u64::from(block) >= total_blocks {
-                return Err(FfsError::Corruption {
-                    block: u64::from(block),
-                    detail: "indirect pointer block beyond the end of the filesystem".into(),
-                });
-            }
-            let data = dev.read_block(cx, BlockNumber(u64::from(block)))?;
-            let span = ppb.pow(level - 1);
-            for (index, raw) in data
-                .as_slice()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .take(ppb as usize)
-                .enumerate()
-            {
-                let child = u32::from_le_bytes(*raw);
-                if child == 0 {
-                    continue;
-                }
-                let logical = base + index as u64 * span;
-                if level == 1 {
-                    if u64::from(child) >= total_blocks {
-                        return Err(FfsError::Corruption {
-                            block: u64::from(child),
-                            detail: "indirect data pointer beyond the end of the filesystem".into(),
-                        });
-                    }
-                    push(runs, logical, child)?;
-                } else {
-                    walk(
-                        cx,
-                        dev,
-                        child,
-                        level - 1,
-                        logical,
-                        ppb,
-                        total_blocks,
-                        runs,
-                    )?;
-                }
-            }
-            Ok(())
-        }
-
-        let sb = self
-            .ext4_superblock()
-            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-        let total_blocks = sb.blocks_count;
-        let ppb = u64::from(sb.block_size / 4);
-        let mut root = [0_u8; 60];
-        let len = inode.extent_bytes.len().min(60);
-        root[..len].copy_from_slice(&inode.extent_bytes[..len]);
-        let mut runs = Vec::new();
-        for slot in 0..12 {
-            let ptr = Self::ext4_ind_root_slot(&root, slot);
-            if ptr != 0 {
-                if u64::from(ptr) >= total_blocks {
-                    return Err(FfsError::Corruption {
-                        block: u64::from(ptr),
-                        detail: "direct block pointer beyond the end of the filesystem".into(),
-                    });
-                }
-                push(&mut runs, slot as u64, ptr)?;
-            }
-        }
-        let mut base = 12_u64;
-        for (slot, level) in [(12_usize, 1_u32), (13, 2), (14, 3)] {
-            let ptr = Self::ext4_ind_root_slot(&root, slot);
-            if ptr != 0 {
-                walk(cx, dev, ptr, level, base, ppb, total_blocks, &mut runs)?;
-            }
-            base += ppb.pow(level);
-        }
-        Ok(runs)
-    }
-
     fn invalidate_ext4_write_extent_snapshot(&self, inode: &Ext4Inode) {
         let namespace = extent_cache_namespace(inode);
         let mut snapshot = self.ext4_write_extent_snapshot.lock();
@@ -32406,7 +32192,7 @@ impl OpenFs {
             // block. For an htree dir, logical block 0 is the dx_root whose
             // index-spanning '..' a linear add_entry would reject as corrupt — skip it.
             let dx_root_phys = Self::ext4_htree_dx_root_phys(parent_inode, &extents);
-            for ext in extents.iter() {
+            for ext in &extents {
                 if ext.is_unwritten() {
                     continue;
                 }
@@ -32692,11 +32478,12 @@ impl OpenFs {
                         && Some(target_phys) != dx_root_phys
                     {
                         let mut data = tx_dev.read_block(cx, target_phys)?.as_slice().to_vec();
-                        if let Some((ino, edit)) = ffs_dir::remove_entry_take_inode_tracked(
+                        let removal = ffs_dir::remove_entry_take_inode_tracked(
                             &mut data,
                             name,
                             reserved_tail,
-                        )? {
+                        )?;
+                        if let Some((ino, edit)) = removal {
                             self.stamp_ext4_dir_block_after_edit(
                                 &mut data,
                                 parent_ino_u32,
@@ -32711,17 +32498,18 @@ impl OpenFs {
                 }
 
                 if removed_ino.is_none() {
-                    'outer: for ext in extents.iter() {
+                    'outer: for ext in &extents {
                         for block in Self::extent_phys_blocks(ext) {
                             if Some(block) == dx_root_phys {
                                 continue;
                             }
                             let mut data = tx_dev.read_block(cx, block)?.as_slice().to_vec();
-                            if let Some((ino, edit)) = ffs_dir::remove_entry_take_inode_tracked(
+                            let removal = ffs_dir::remove_entry_take_inode_tracked(
                                 &mut data,
                                 name,
                                 reserved_tail,
-                            )? {
+                            )?;
+                            if let Some((ino, edit)) = removal {
                                 self.stamp_ext4_dir_block_after_edit(
                                     &mut data,
                                     parent_ino_u32,
@@ -35985,8 +35773,7 @@ impl OpenFs {
                 self.ext4_lookup_name_from_device(cx, block_dev, &new_parent_inode, new_name)?
             }
         };
-        let mut retired_target = None;
-        if let Some(existing) = existing_target {
+        let retired_target = if let Some(existing) = existing_target {
             let existing_ino = InodeNumber(u64::from(existing.inode));
             // POSIX: renaming a file onto one of its own hard links (old and new
             // resolve to the same inode) is a no-op: the kernel's vfs_rename
@@ -36031,11 +35818,6 @@ impl OpenFs {
             } else {
                 Self::ext4_checked_links_count_delta(existing_inode.links_count, existing_ino, -1)?;
             }
-            Some((existing_ino, existing_inode))
-        } else {
-            None
-        };
-
             // Only the private transaction loses this entry. Failed insertion,
             // storage reclamation or publication leaves both original names and
             // both inodes intact, without a compensating commit.
@@ -36068,8 +35850,10 @@ impl OpenFs {
                     Self::ext4_checked_links_count_delta(ex_upd.links_count, existing_ino, -1)?;
             }
             ffs_inode::touch_ctime(&mut ex_upd, tstamp_secs, tstamp_nanos);
-            retired_target = Some((existing_ino, ex_upd));
-        }
+            Some((existing_ino, ex_upd))
+        } else {
+            None
+        };
 
         // Insert through the same transaction device, preserving a staged victim
         // removal even when both names share one directory leaf. Its allocator
