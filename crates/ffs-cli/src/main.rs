@@ -3090,7 +3090,7 @@ fn createbench_cmd(
                     Ok(())
                 }));
             }
-            finish_createbench_workers(workers.into_iter().map(|worker| worker.join()))
+            finish_createbench_workers(workers.into_iter().map(std::thread::ScopedJoinHandle::join))
         })?;
         open_fs
             .sync_all_to_device(&cx)
@@ -3375,7 +3375,7 @@ fn createbench_one_round(
                     Ok(())
                 }));
             }
-            finish_createbench_workers(workers.into_iter().map(|worker| worker.join()))
+            finish_createbench_workers(workers.into_iter().map(std::thread::ScopedJoinHandle::join))
         })?;
         started.elapsed()
     } else {
@@ -10678,6 +10678,72 @@ mod tests {
             "returned while the writer still held the image"
         );
         release.join().expect("join");
+    }
+
+    fn preserved_createbench_test_image() -> PathBuf {
+        let directory = tempfile::tempdir().expect("benchmark tmpdir").keep();
+        let image = directory.join("createbench.ext4");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/images/ext4_small.img");
+        if fixture.is_file() {
+            std::fs::copy(&fixture, &image).expect("copy ext4 fixture without mutating its source");
+        } else {
+            super::mkfs_cmd(&image, 16, 4096, "bench-test", false)
+                .expect("create benchmark regression requires e2fsprogs");
+        }
+        eprintln!("preserved create-benchmark image: {}", image.display());
+        image
+    }
+
+    #[test]
+    fn createbench_command_parallel_creates_survive_reopen() {
+        let image = preserved_createbench_test_image();
+        super::createbench_cmd(&image, "/", 8, 2, 1)
+            .expect("parallel create command must complete and flush");
+
+        let cx = Cx::for_testing();
+        let reopened = OpenFs::open(&cx, &image).expect("reopen persisted benchmark output");
+        let mut inodes = std::collections::BTreeSet::new();
+        for worker in 0..2 {
+            let directory = reopened
+                .lookup(
+                    &cx,
+                    ffs_types::InodeNumber(2),
+                    std::ffi::OsStr::new(&format!("t{worker}")),
+                )
+                .expect("worker directory must persist");
+            for index in 0..4 {
+                let file = reopened
+                    .lookup(
+                        &cx,
+                        directory.ino,
+                        std::ffi::OsStr::new(&format!("cb_{worker}_{index:08}")),
+                    )
+                    .expect("every requested create must persist");
+                assert_eq!(file.size, 0);
+                assert!(inodes.insert(file.ino));
+            }
+        }
+        assert_eq!(inodes.len(), 8);
+    }
+
+    #[test]
+    fn createbench_command_parallel_reports_real_inode_exhaustion() {
+        let image = preserved_createbench_test_image();
+        let cx = Cx::for_testing();
+        let initial = OpenFs::open(&cx, &image).expect("read fixture inode capacity");
+        let inodes = initial
+            .ext4_superblock()
+            .expect("ext4 fixture")
+            .inodes_count;
+        drop(initial);
+        let count = usize::try_from(inodes).expect("bounded fixture inode count") * 2 + 4;
+        let error = super::createbench_cmd(&image, "/", count, 2, 1)
+            .expect_err("real inode exhaustion must return an error instead of panicking");
+        assert!(matches!(
+            error.downcast_ref::<ffs_error::FfsError>(),
+            Some(ffs_error::FfsError::NoSpace)
+        ));
     }
 
     #[test]
