@@ -11,6 +11,37 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+Continuation: the shared checkout now contains the prior source repair in
+`86877f568` and its tracker checkpoint in `10e980b02`; both were committed by
+another actor during this session and are preserved. The resumed hz4 run has
+executed all14 retained-image rename2 tests successfully (0failed/0ignored,
+1580filtered,0.07s runtime; command exit0). This is unit evidence on real
+in-memory filesystem operations, not fresh-native or mounted qualification.
+Its source and fixture bytes are the previously recorded rename-repair cut.
+
+The next coherent baseline correction is ordinary create-benchmark worker
+errors: both existing parallel paths now return contextual errors, consume all
+worker joins, preserve the first failure, and return before successful timing
+output. Three new unit tests cover success/empty work, first typed I/O error
+with all outcomes consumed, and a planted panic payload with later outcomes
+consumed. They do not claim panic=abort recovery or real filesystem failure
+injection. The core-only build warning is addressed by compiling
+`ext4_add_dir_entry` under the same feature as its only two callers.
+
+- [x] Resume the existing P0 and reserve the source/TODO surfaces.
+- [x] Execute the14 existing rename2 unit tests on hz4 without changing them.
+- [x] Repair both create-benchmark worker error paths and add the three unit
+  regressions in the same existing source file; no new concurrency sites.
+- [x] Align the sharded-only helper's compilation condition with its callers.
+- [ ] Complete fresh workspace/all-target check and strict Clippy for this cut.
+- [ ] Execute the three new worker-result tests (expected3, no ignores).
+- [ ] Execute all16 retained-image rename2/own-hardlink/immutable-victim tests
+  on the final cut; keep native recovery and allocator-mode gaps explicit.
+- [ ] Verify final source/fixture hashes and review UBS findings without a
+  scanner change, suppression, exclusion or fabricated green result.
+- [ ] Reverify acceptance, record incomplete original requirements, sync Beads
+  and land the verified correction within authorized publication scope.
+
 - [x] Read the suite/project instructions and README; apply the requested
   anti-ceremony skill and inspect the existing dependency graph.
 - [x] Preserve all peer/untracked files; reserve the core, CLI and this handoff.
