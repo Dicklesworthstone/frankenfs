@@ -2,6 +2,105 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Implementation checkpoint — 2026-10-30 (`bd-vuzzq`)
+
+The operator requested implementation after the reality check, including a
+granular working TODO. NavyElm resumed the existing P0 baseline item after
+checking ownership and reservations. Its original full-workspace acceptance is
+unchanged; a syntax repair alone does not close it. This checklist serves that
+explicit continuity request and retires as active work when the listed work is
+completed or handed off. Historical evidence remains in place.
+
+- [x] Read the suite/project instructions and README; apply the requested
+  anti-ceremony skill and inspect the existing dependency graph.
+- [x] Preserve all peer/untracked files; reserve the core, CLI and this handoff.
+- [x] Repair the malformed victim scope in `ext4_rename_staged`, keeping victim
+  removal, link-count updates and retirement inside the private transaction.
+- [x] Correct the CLI rustfmt difference and remove the unused duplicate
+  device-view helper block exposed by the compiler. Existing namespace readers
+  remain in use; no lint allowance was added.
+- [x] Execute `cargo fmt --check` and `git diff --check`: both pass.
+- [x] Execute the initial all-target workspace check on hz3: exit0 in8m51s,
+  with the unused-helper warning. This predates the final cleanup/lint fixes.
+- [x] Execute strict workspace Clippy and repair its five source diagnostics:
+  two explicit iteration forms, two significant temporary lifetimes in unlink,
+  and the rename retirement result assignment. Original assertions are intact.
+- [ ] Complete the all-target workspace compiler check on pinned nightly.
+- [ ] Resolve actual compiler diagnostics without suppressions or gate changes.
+- [x] Complete strict all-target workspace Clippy on the final source:
+  `cargo clippy -j 2 --workspace --all-targets -- -D warnings`, hz3,
+  exit0 in6m26s. Log: `clippy-final4-hz3.log` under the capture directory below.
+  Final core/CLI/lock hashes matched the remote files after execution.
+- [ ] Execute the existing atomic rename overwrite/growth, directory replacement,
+  late-failure/cancellation/pinned-victim and single-publication regressions.
+- [x] Prepare a non-destructive unit-test alternative while native fixture
+  permission is pending: copy the retained16MiB ext4 image, without clobbering
+  anything, into the existing helper's ignored `ext4_small.img` fixture path.
+  Source and copy SHA256 both equal
+  `b87221221f9c4f489617329a5f9b68dc0c44f32bf6a560758353137a0a39e486`.
+- [ ] Run the14 unchanged `ext4_rename2_` tests on in-memory copies of that
+  retained image; verify the remote fixture hash and nonzero execution count.
+  This is unit proof, not native formatter, mounted, crash or field evidence.
+  **Attempted, not verified:** source/fixture transfer completed and the remote
+  fixture hash matched, but SSH execution lost its connection before any Cargo
+  or test output. Recovering owned wrapper
+  `rchw-f3751c06-3346-4921-9bc6-eb53e7af5519` confirmed terminal exit255 and released
+  custody; no automatic replay or test pass was claimed. See
+  `rename2-retained-unit-hz3.log` and `rename2-recovery.json`.
+- [ ] Run the two unchanged own-hardlink/immutable-victim rename controls using
+  the same retained-image helper, if disk admission remains available.
+- [ ] Exercise both allocator modes with `bhh0i_sharded_alloc` enabled; retain
+  real native-oracle requirements and report executed/nonzero test counts.
+- [ ] Execute the original required workspace/harness tests and classify every
+  failure. Keep original tasks open where their acceptance remains unmet.
+- [x] Execute changed-file UBS and inspect findings against the actual diff:
+  seven unchanged CLI critical findings remain; exit1 is preserved, not green.
+- [ ] Resolve or obtain the required separate disposition of the existing UBS
+  findings without changing the scanner, suppressing rules or weakening gates.
+- [ ] Reverify in a separate pass, record the evidence class and source binding,
+  then commit/push the implementation without representing partial gates as green.
+  Publication through the existing CI also runs native fixture creation and
+  cleanup; retain the pending Rule1 choice rather than using CI to bypass it.
+  **Current disposition:** keep the source patch uncommitted and unpushed while
+  required verification and UBS disposition remain incomplete. No gate bypass,
+  history rewrite or speculative task closure is authorized by partial results.
+- [ ] Once the baseline permits it, select the highest-value ready capability
+  from the existing graph: namespace request ownership (`bd-9rutw`), mounted
+  lifecycle (`bd-in31y`) and default repair (`bd-11a8t`) precede qualification
+  claims that depend on them. Preserve other owners' active lanes.
+- [ ] Continue the native roadmap `bd-3nf06` in dependency order: FAT writer
+  qualification/maintenance, NTFS transactions before operations/advanced
+  semantics/maintenance, ZFS TXGs before datasets/topology/encryption/replication/
+  zvols, then cross-format protection/fuzzing/workflow qualification. Continuous
+  TUI `bd-dzbsp` is a separate positive integration opportunity once claimable.
+- [ ] Close only items whose original acceptance has executed evidence; update
+  this TODO, source-aware queue status and handoff with unfinished work intact.
+
+Validation is in progress, not a green baseline. Local disk preflight fails,
+so no local compilation is allowed. Several RCH attempts refused source
+namespace initialization before compiling; source-content receipt mode also
+refused an existing untracked xfstests symlink, which was preserved. One standard
+check began on hz4's root target despite the transfer scratch setting; that
+specific job was stopped and recovered (exit137, not success). Per-run config
+now uses the supported `remediation.pooled_target.store_base` on a separately
+preflighted worker tmpfs. Global worker configuration and gates are untouched.
+The final core SHA256 is
+`e2ff431136e42b3dc6c3bdd4a3594ee049ffd54d0fbbafb074325dba1e98f716`.
+Two later hz4 attempts refused source initialization before compiling. hz3's
+original `/tmp` target filesystem subsequently failed the20GiB headroom check,
+so it was not reused for further builds. A separately preflighted task-specific
+pool under `/run/user/1000` on hz3 admitted the final strict lint rerun. No
+preflight, source-authority check or global configuration was relaxed.
+The final UBS scan still exits1 on seven unchanged CLI findings, which were
+inspected rather than suppressed; this is not a scanner pass. The latest
+`sbh check --need 20G /run/user/1000` reports21,169,074,176bytes free against
+21,474,836,480required, exit1, so no further build was launched. The original
+`/tmp` pool is also below headroom and hz4 source initialization is refusing.
+No cache or source file was deleted to make room. Native fixtures are awaiting
+the operator's cleanup choice under Rule1. The baseline and roadmap stay open;
+no mounted, crash, fresh-native or field qualification was established. Logs
+are retained under `artifacts/implementation/20261030_O221Lk/`.
+
 ## Current checkpoint — 2026-10-30 reality check
 
 Audit `bd-umbgi` reviewed source `bc3de2c09`. Normal canonical `br` reads and
