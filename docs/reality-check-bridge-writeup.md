@@ -1,5 +1,316 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Reality check — 2026-10-30 (`bc3de2c09`)
+
+**Verdict: FrankenFS contains substantial, experimentally useful filesystem
+engines, but the current main branch does not parse, and the complete native
+six-format, concurrent, self-healing delivery contract is unfinished.** The
+historical 97-row parity figure and thousands of closed issues do not measure
+that contract. The highest-priority action is restoring the executable baseline;
+the largest implementation gaps remain native NTFS transactions and ZFS writes.
+
+This section supersedes dated findings below where current source disagrees.
+It preserves the target specifications and all historical results. Audit owner:
+`bd-umbgi` (NavyElm). This audit changes planning and tracker coverage, not
+filesystem implementation, validators, assertions, fixtures or goldens.
+
+### Measuring stick and proof boundary
+
+The full 471-line suite instructions, 1,069-line project `AGENTS.md` and 562-line
+`README.md` were read. The review also read the complete multi-format plan and
+traced its obligations through the original specification's identity, durability
+and canonical gates, port-plan scope/exclusions/success criteria, architecture,
+legacy behavior mapping, implementation workpackages, current feature ledger,
+native profiles, security workplan and kernel-comparison scorecards. This is a
+claim-driven review of production paths and representative tests, not a claim to
+have proved every line of the repository or rerun every historical receipt.
+
+Source identity is `bc3de2c0954f2feeedfa373b25a576401df031bd`, on `main`.
+Production files were unchanged during inspection. The committed and working
+`ffs-core/src/lib.rs` both hash to
+`0c06fdd7ad5303ff0b180e71d5b01c07589f2a1748e0b2e09b82e85c4573fe6c`.
+Fresh logs and the original tracker snapshot are retained under
+`artifacts/reality-check/20261030_lHwVOA/`; generated logs remain local artifacts.
+The concrete failure, source anchors and commands are also recorded here and in
+the canonical Beads comments so another machine does not depend on that directory.
+
+| Fresh probe | Result | What it actually establishes |
+|---|---|---|
+| `cargo fmt --check` | **FAIL**, exit 1 | `fmt.log`: CLI test formatting differs at `crates/ffs-cli/src/main.rs:19866`; core parsing fails with unexpected closing delimiter at `lib.rs:49253`, pointing into `ext4_rename_staged` at lines 35878–36072. |
+| Source inspection and `git blame -L 36015,36035 -- crates/ffs-core/src/lib.rs` | **Committed defect confirmed** | A newly inserted `Some(...) / else / None` fragment ends the victim scope before later uses of `existing`, `existing_inode` and `existing_ino`. The final implementation must preserve the intended transactional retirement semantics; removing a brace alone is not demonstrated sufficient. |
+| `gh run view 40554264889 --json jobs,conclusion,url` | **CI failure at the same HEAD** | `Lint & Test` fails at Format check; Golden Verification and FUSE E2E are skipped. This is not evidence those suites failed their filesystem assertions. [CI run](https://github.com/Dicklesworthstone/frankenfs/actions/runs/40554264889). |
+| `sbh check --need 20G` | **REFUSED**, exit 1 | About 27.94 GB available but only 4.33% free, below the configured 14% pressure threshold. No heavy local compilation was started. |
+| `rch check`; fleet and admission inspection | **Not ready / conflicting aggregate views** | `rch check` names critical worker pressure; fleet lists 10/11 ready and admission recommends offload. The worker inventory still reports critical `hz1` and warning pressure elsewhere. A healthy-looking fleet count alone is not build-disk admission. No source check/test pass is inferred. |
+| Workspace check, strict Clippy, Rust tests, harness benchmarks | **NOT RUN** | Disk admission fails and the checkout already has a parser error. Historical successful source cuts remain historical. |
+| `FFS_E2E_DISABLE_TEMP_CLEANUP=1 TRACKER_SOURCE_HYGIENE_DEFAULT_FIXTURE_SELF_CHECK=0 ./scripts/e2e/ffs_tracker_source_hygiene_e2e.sh` | **PASS**, 15/15 scenarios, exit 0 | `artifacts/e2e/20261030_153228_ffs_tracker_source_hygiene_QYgqHs/result.json`: live projection, permission negatives and source conservation pass; the default golden self-check was explicitly disabled for live triage. No foreign open rows. |
+| Full default `FFS_E2E_DISABLE_TEMP_CLEANUP=1 ./scripts/e2e/ffs_tracker_source_hygiene_e2e.sh` | **FAIL**, 16/17 scenarios, exit 1 | `artifacts/e2e/20261030_155605_ffs_tracker_source_hygiene_FYUjaU/result.json`: default fixture/golden comparison fails. Strict duplicate-key-rejecting parsing confirms identical JSON values but different array whitespace. The live projection and permission negatives pass; this is still a failing wrapper. Separate gate-owner bug `bd-ln2wr`; no golden regeneration or gate edit. |
+| `br dep cycles --json` | **PASS**, zero active cycles before edits | Canonical graph is currently readable. Unlike October 20, normal `br create` also succeeds; no database/WAL replacement or recovery was attempted. |
+| `sha256sum -c checksums.sha256` in `conformance/fixtures` and `conformance/golden` | **PASS** | Retained fixture/golden bytes match their manifests. This is artifact integrity, not executed filesystem conformance. |
+| AST `todo!` scan over facade and three native engines | **No matches**, exit 1 | Missing writer behavior is an integration/implementation gap, not evidence of hidden `todo!` bodies. |
+| Archived executable smoke on a private copy of a retained ext4 image | **3 successes, 1 refusal** | `inspect`, `info`, `fsck` return zero with unchanged original/copy hashes. That October 13 binary rejects `tui` arguments with exit 2. ELF SHA `d61fe0a113f2c901dd30f27782e20b06771cb49a39707e185eef3805bc78c99e`; `archived-smoke.json`. This is archived-binary execution, never current-HEAD qualification. |
+| `ubs docs/reality-check-bridge-writeup.md .beads/pending_tasks.md .beads/issues.jsonl` | **NO SCAN**, exit 3 | Markdown/JSONL have no supported language scanner. Nothing was checked; this is not a clean UBS result. No no-scan override was used. Source hashes and `git diff --check` pass separately. |
+| `gh release list --limit 5 --json tagName,name,isDraft,publishedAt` | **One public release** | `v0.2.0`, 2026-07-11. The current six-format source is not established as shipped by that older artifact. [Release](https://github.com/Dicklesworthstone/frankenfs/releases/tag/v0.2.0). |
+
+A proposed native-producer smoke command was rejected by automatic approval
+review because `mkfs` is classified as destructive, even for new disposable
+regular files. It was not run or bypassed. The retained-image copy probe above
+is the safer executed substitute and carries a narrower proof claim. No new
+mounted, power-loss, Windows or OpenZFS qualification was performed in this audit.
+
+### Vision checklist: source reality versus the promised end state
+
+`IMPLEMENTED` below means an inspected production path, with the named historical
+evidence where available. It does not mean current-HEAD tests passed. `PARTIAL`
+and `UNPROVEN` name distinct missing implementation and execution obligations.
+The final graph mapping below makes each missing goal actionable.
+
+| # | Testable goal and measuring stick | Current reality | Remaining gap / existing lane |
+|---|---|---|---|
+| V1 | Strict read-only authority, including recovery and auxiliary members (multi-format §4/6) | **IMPLEMENTED, current execution unproven.** `OpenFs::open_with_options` opens OS-read-only and converts Apply to an overlay; facade `open_image` retains bounded, locked descriptors, including auxiliaries. | The old unsafe-default finding is superseded. Preserve zero-write/failed-open/cancellation/nested-view controls under current-build qualification. |
+| V2 | Native ext4 reads and observable metadata (original spec §1/11/12) | **IMPLEMENTED experimental reader.** Checked inode/extent/directory/xattr paths and recorded native-image results exist. | Current main cannot build; refresh native and mounted acceptance via `bd-vuzzq`, `bd-z5bav`, `bd-53dub`. |
+| V3 | ext4 writes, JBD2 recovery and acknowledged durability (spec §10/13/22) | **PARTIAL qualification.** Real journal writer/checkpoint, orphan recovery, periodic commits and pressure boundaries exist. | New retirement/rename tests are authored but explicitly unexecuted; parser regression blocks them. `bd-vuzzq`, `bd-9rutw`, `bd-dj725`. |
+| V4 | Declared btrfs read/write/topology profile (port-plan exclusions) | **IMPLEMENTED restricted reader/writer.** COW full commits, checksums, selected roots, device mapping, optional tree-log writes and replay are real. | Multi-device RW remains explicitly refused. Preserve native checker and failure-rollback limits; refresh current proof. Full commit remains the ordinary fsync default; do not describe the optional tree-log implementation as absent. |
+| V5 | One operation observes/publishes a coherent MVCC request (spec §2/5) | **PARTIAL.** Sharded stores, FCW/SSI and real merge proofs exist; link/xattr/chmod and newer namespace paths stage operation-owned transactions. | Sharded create/mkdir, ACL inheritance and arbitrary outer-request composition remain in `bd-9rutw`; latest retirement changes need execution. Mounted concurrency benefit is unproven here. |
+| V6 | Default automatic, fresh, restart-safe RaptorQ protection (spec §0.4/3.7) | **PARTIAL.** Native ext4 reservation/validation/parity/freshness and explicit sidecar protection are substantial. | Ordinary RW `--background-repair` is still refused at `main.rs:8389`; native activation is explicit. Default activation, automatic read repair, interrupted-epoch reconciliation and btrfs ownership remain `bd-11a8t`, `bd-j7a4e`, `bd-jufod`. |
+| V7 | Context propagation, owned workers, interruption and joined teardown (spec §4) | **PARTIAL, substantially improved.** Auto dispatch resolves to at most eight workers; interrupt registry is wired; `mount_worker.rs` uses child regions, blocking tasks and reserved completion. | Core `MetadataCompactor::start` still builds its own runtime/root context at `lib.rs:4983`; FUSE has process-global runtime/infinite root contexts at `ffs-fuse/src/lib.rs:53/64`. Budget copying does not prove inherited parent cancellation. Keep caller-owned runtime and mount-scoped cancellation/drain acceptance in `bd-in31y`. Older claims that all workers are unscoped or default dispatch is universally serial are stale. |
+| V8 | Native FAT16/32 ordinary mutation (multi-format §9.3/9.4) | **IMPLEMENTED experimental surface / UNPROVEN full qualification.** Native create/mkdir/rename/unlink/rmdir, ranged writes, truncate, identities and writable mounts exist. | Complete native/mounted/fault qualification is absent from the active canonical graph. Ordered FAT writes do not create a general crash-atomic transaction. |
+| V9 | FAT checking, recovery, formatting and resizing (§9.5) | **PARTIAL completion/qualification.** Root expansion, live-tail relocation, range operations, source-preserving resize and recovery increments have landed. | Qualify existing implementations and fill measured holes; do not build a duplicate relocator. Native naming, 4 KiB sectors and remaining maintenance/fault profiles need explicit evidence. |
+| V10 | Native NTFS namespace/streams/transforms/metadata (§10.1–3) | **IMPLEMENTED restricted read profile.** Reusable `ffs-ntfs`, exact UTF-16 streams, indexed lookup, compression, WOF and security inspection exist. | Historical native ntfs-3g and public-consumer receipts are bounded; source changes need renewed acceptance. Inspection is not ACL enforcement or encrypted-write support. |
+| V11 | NTFS native recovery, including dirty mounted views (§10.4) | **PARTIAL.** Volatile LogFile analysis/redo/undo and recovery application exist; `bd-ofjn7` is closed with selected executed tests. | Restricted overlay acceptance does not supply a general native journal writer or full Windows crash interchange. Keep the complete recovery vocabulary in writer acceptance without falsifying the closed overlay scope. |
+| V12 | NTFS native journal-aware allocation and mutations (§10.5) | **NOT IMPLEMENTED.** Native reader/storage denies writes; no general MFT/bitmap/I30 mutation engine or writable FsOps is exposed. | No active implementation task before this audit. This remains real engineering, not merely running another test. |
+| V13 | NTFS advanced writable semantics and lifecycle (§10.6/7) | **PARTIAL readers / missing native mutation and utilities.** Allocation/record-ownership checks are useful restricted accounting. | Compression/security/EFS/secondary-index writes, complete structural checking, formatting, resize and Windows interoperability need active coverage. |
+| V14 | Coherent ZFS committed dataset/snapshot/zvol reads (§11.1–4) | **IMPLEMENTED restricted reads.** MOS/DSL/DMU/ZPL, explicit/automatic candidates, transforms and bounded mirror/RAIDZ profiles exist. | Missing-member extraction remains committed-view-only; selected native topology qualification is not all-layout or writable-import authority. |
+| V15 | ZFS synchronous-intent recovery (§11.5) | **PARTIAL.** Native ZIL records replay into a volatile view, including newer namespace/xattr cases. | No native TXG publication or complete independently generated crash interchange follows from overlay tests. Preserve log authority before enabling writes. |
+| V16 | ZFS native TXGs, allocation and shared-reference lifecycle (§11.5/6) | **NOT IMPLEMENTED as a writer.** Space-map inspection and snapshot reading do not allocate, publish or reclaim native state. | No active allocator/TXG/dataset-writer tasks before this audit. Requires native transactions, reference accounting and crash/native proof. |
+| V17 | Complete pinned ZFS advanced/pool/replication/zvol profile (§11.7–9) | **PARTIAL readers / largely missing writable end state.** | Advanced layouts, authenticated encryption, pool lifecycle/resilver, send and receive, and a block-volume frontend remain distinct coherent work. |
+| V18 | Reusable six-format public library (README; multi-format §5) | **IMPLEMENTED.** `ffs::open_read_only`, three extracted engines and standalone `native_reader` exist. `OpenFs` intentionally remains ext4/btrfs. | The October 20 missing-library finding is superseded. Recorded October 23 qualification includes twenty actual RO mounts across six formats; it does not qualify current HEAD or native writes. |
+| V19 | Native durable tokens agree with MVCC/protection over the entire storage set (§8/12) | **PARTIAL.** Existing sidecar freshness machinery is substantive; protected NTFS/ZFS remain read-only. | Complete native writer tokens and every required pool/log/special member must participate. No active cross-format whole-set completion task before this audit. |
+| V20 | Canonical gates prove their named user boundary (spec §22) | **PARTIAL / proof mismatch.** CI now requires ext4/btrfs oracles and a separate FUSE lane. | Gate 5 at `ffs-fuse/src/lib.rs:26828` uses a handcrafted image and direct OpenFs/recorded dispatch; Gate 7 at `cli_e2e.rs:3529` runs one-shot tools. Neither witnesses its complete named mounted/load contract. `bd-wh1xk`, `bd-53dub`, `bd-ys3wb`. Full default tracker hygiene additionally fails a byte-versus-JSON-value golden comparison, tracked separately in `bd-ln2wr`. |
+| V21 | Continuous live telemetry at ≥1 Hz, bounded idle cost (spec §22.1 Gate 7) | **PARTIAL.** Real metrics/dashboard and mounted console exist. | `tui_cmd` at `main.rs:10530` builds/render one snapshot then returns; `refresh_ms` is only logged. Standalone continuous mode lacks an active canonical implementation task. |
+| V22 | Current performance under equivalent native semantics (port-plan §9.5; multi-format §16) | **UNPROVEN at HEAD.** Extensive old kernel scorecards and carefully qualified losses exist. | Refresh equivalent checksum/durability/topology/transport conditions, live incumbent in the same invocation, both nulls and cross-window replication. Keep existing perf lanes; no current win claimed. |
+| V23 | Hostile media stays bounded, isolated and accurately authorized (§15) | **PARTIAL.** Checked parsers and sandbox launcher exist; no forbidden async packages were found in the inspected lockfile scan. | `bd-sandbox-native-readers-qx2om` remains active; native engine/traversal/replay fuzz targets are absent from the checked 63-target inventory. No active native fuzz completion task. |
+| V24 | A current verified artifact delivers its admitted profile (§19) | **UNPROVEN.** July release differs from current experimental source. | `bd-z5bav` retains its original scope. Full six-format end-state completion needs a separate aggregate, actual artifact consumers, required native/mounted/crash evidence and zero unresolved local P0s. |
+
+### Answers to the five reality-check questions
+
+1. **What works?** Real native readers, experimental ext4/btrfs and FAT writers,
+   reusable six-format read-only APIs, FUSE integration, journal/replay logic,
+   repair codecs, explicit protection and native accounting. Historical
+   source-bound native and mounted runs substantiate useful restricted profiles.
+2. **What is unfinished?** A buildable current checkout; complete request-wide
+   mutation semantics; default self-healing/freshness; full native FAT
+   qualification; NTFS native transactions and mutations; ZFS TXGs and writable
+   lifecycle; advanced native profiles; continuous standalone telemetry; current
+   complete native/crash/performance/release proof.
+3. **What blocks delivery?** A concrete committed parser regression, inadequate
+   admitted build capacity, unexecuted recent changes, missing native engines,
+   incomplete boundary evidence and unoperationalized planning. Infrastructure
+   trouble does not explain away absent NTFS/ZFS writers.
+4. **Would all pre-audit active issues finish the vision? No.** The source had
+   4,323 records: 4,258 closed, 52 open, five in progress, seven blocked and one
+   wont-fix. All 64 nonterminal rows were considered, not just `br ready`.
+   No active canonical FAT/NTFS/ZFS completion or native fuzz/TUI tasks were
+   found; the October 20 staged packet exists only in the tracked handoff text
+   on this machine. Its artifact workspace is absent. Closed reader/overlay
+   issues cannot substitute for those native writer obligations.
+5. **Which goals lacked actionable coverage?** V8/V9, V12/V13, V16/V17,
+   whole-set V19, continuous V21, native fuzzing in V23, and the complete
+   six-format V24 aggregate. V1/V18 have advanced materially and must not be
+   recreated as missing features. Existing repair, MVCC, baseline, gate,
+   sandbox and performance owners retain their work.
+
+### Bridge plan and acceptance order
+
+The work graph is being reconciled through `br`; canonical IDs and the executed
+graph validation are recorded in the final mapping below. Every implementation
+package includes its unit, negative, failure and public integration tests in the
+same unit of work. Native-system campaigns are additional qualification, not a
+way to close untested implementations. No estimated percentage or delivery date
+is inferred from package count.
+
+1. **Restore the baseline first.** Keep `bd-vuzzq` with GoldKite, make the
+   parser/format failure an explicit current blocker, repair the transaction
+   scope correctly, then obtain pinned fmt/check/strict-Clippy/workspace tests.
+   Run the new namespace tests in both allocation modes and with native reopen.
+   Do not silently remove the intended transaction code or alter test gates.
+2. **Finish the original differentiators.** Preserve `bd-9rutw`, `bd-in31y`,
+   `bd-11a8t`, `bd-j7a4e`, `bd-jufod`, `bd-dj725`. Retain working regions,
+   completion reservations, periodic commits and native reservation machinery;
+   prove the remaining request/repair/restart contracts through actual mounts.
+3. **Qualify FAT's existing writer and maintenance.** Exercise both dialects,
+   native names/aliases, open-unlink/rename, full roots, 4 KiB geometry,
+   preallocation, fragmentation, native consumers and every ordered-write cut.
+   Source-preserving resize and recovery remain separate from partition edits.
+4. **Build native NTFS transactions, then operations.** Implement journal
+   publication/resource reservation before writable FsOps; preserve initialized
+   length, MFT/I30/secondary indexes, and explicit committed/uncertain outcomes.
+   Complete advanced writes and maintenance with Windows evidence where claimed.
+5. **Build native ZFS TXGs, then writable datasets/references.** A correct
+   full-TXG synchronous writer is a valid first step. Clean-only development must
+   refuse pending ZIL before writes; full roadmap acceptance retains native dirty
+   recovery. Follow with independent pool/topology, encryption, replication and
+   zvol packages; one shared pool owner, no synthetic native-commit shortcuts.
+6. **Bind protection to actual native durable state and whole device identity.**
+   Reuse sidecar/live; invalidate durably before source writes and seal only a
+   stable matching native generation. Distinguish native-durable and
+   protected-durable acknowledgment; never roll a legitimate write back from old
+   parity. Required members include log and special storage, not only data files.
+7. **Complete operational usability and adversarial coverage.** Add the real
+   standalone refresh loop, independent I/O/decode/memory/work budgets and native
+   engine fuzzing. Keep truthful gate ownership separate from implementation;
+   use sustained samples, real mounts, independent native consumers and exact
+   failure evidence. Missing tools or zero selected tests are not a pass.
+8. **Publish only the qualified scope.** Run actual source-bound native/mounted/
+   crash/workflow-cost campaigns and release-artifact consumers. A restricted
+   ext4/btrfs or six-format RO release need not wait for every future ZFS feature;
+   it must name its profile and preserve the complete roadmap separately.
+
+### Ambition and refinement ledger
+
+The frozen Phase 3a and Phase 5 prompts are recorded verbatim in `bd-umbgi`.
+
+The stronger plan keeps six explicit invariants: read-only opens have no backing
+write authority; newly visible data is initialized; allocation/reference ownership
+is conserved; acknowledged durability maps to native recoverable publication;
+repair authority binds the intended current generation; and cancellation never
+releases device ownership while worker I/O is still running. Persistence testing
+records the partial order of writes, barriers, publication and acknowledgments,
+then compares fresh-engine recovery with an independently recorded acknowledged
+prefix. Schedule reduction is valid only after proving the events independent.
+This improves test design; it is not a formal-proof or hardware power-cut claim.
+
+For repair policy, the losses are asymmetric:
+
+| Decision | Candidate is the intended current data | Candidate is wrong or stale |
+|---|---|---|
+| Publish repair | Repair cost | Wrong-data publication cost, including loss of a legitimate newer write |
+| Refuse / report EIO | Availability/manual-recovery cost | Avoids corrupting storage |
+
+If a policy uses a calibrated confidence `q`, the expected-loss comparison is
+`(1-q) * L_wrong + C_repair < L_refusal`. All hard ownership, generation,
+checksum/authentication and publication checks remain mandatory first. Neither
+the audit nor an uncalibrated probability grants repair authority. Costs and
+calibration must be explicit evidence; missing evidence selects refusal. The
+new whole-set protection task must preserve that boundary rather than introduce
+an arbitrary permissive confidence threshold.
+
+| Pass | Material result |
+|---|---|
+| Ambition 1 | Replaced stale all-thread claims with the actual remaining caller-runtime/cancellation authority gap; enriched `bd-in31y` and V7. |
+| Ambition 2 | Added native persistence partial orders, independent acknowledged prefixes, fresh-engine restart and committed/uncertain retry outcomes to five durability/campaign records. |
+| Ambition 3 | Added explicit preservation invariants and the repair loss matrix, retaining hard authority checks and native evidence. |
+| Refinement 1 | Preserved NTFS 3.0-after-3.1 and pinned/historical ZFS profiles, original exclusions and the implemented facade/read-authority gains. |
+| Refinement 2 | Added native encryption as a true prerequisite for complete raw send/receive; checked cross-format parallelism and separate restricted-release scope. |
+| Refinement 3 | Added exact owning Cargo commands and existing native runner anchors to every implementation/qualification task; retained substantive negative and fault cases. |
+| Refinement 4 | Updated existing gate/oracle/dispatch lanes with current source facts; strengthened independent I/O/decode/memory/work/retry budgets and strict RO/late-output controls. |
+| Refinement 5 | Investigated a failed initial conservation comparison: timestamp spelling, a historical receipt export and one comment-ID collision, with all original payloads conserved. The first failure is retained. |
+| Refinement 6 | Reviewed the initial seventeen work records and sixty-five new blocker edges; the subsequent full default probe exposed another operational gap. |
+| Refinement 7 | Diagnosed the default fixture's byte-versus-value mismatch and added separate gate-owner bug `bd-ln2wr`, with exact failure and required admitted/rejected controls. No gate/golden changed. |
+| Refinement 8 | Reviewed eighteen work records and sixty-seven new blocker edges after that finding; no further feature/test/dependency revision identified. The default gate remains red. |
+
+### Canonical bridge graph and handoff
+
+The canonical graph now contains **sixteen coherent implementation/qualification
+tasks, one separate gate-owner bug, one full-roadmap epic and this audit**. New work remains open. The table
+maps historical staged proposal IDs to the real records created through `br`;
+do not import those old proposals again. Each record contains its context,
+implementation boundaries, native and adversarial acceptance, exact owner test
+commands, execution/proof rules and relevant refinements.
+
+| Historical staged proposal | Canonical ID | Work package | Main prerequisites |
+|---|---|---|---|
+| `bd-8vjaj` | `bd-3nf06` | Complete declared six-format roadmap | All new work; existing baseline, MVCC, repair, lifecycle, evidence, release and local P0 lanes |
+| `bd-uzt72` | `bd-lby8f` | Native FAT writable-mount/interruption qualification | Current baseline; existing strict read authority |
+| `bd-50neb` | `bd-ave6y` | FAT maintenance/root growth/relocation qualification | Qualified ordinary FAT writer |
+| `bd-5osex` | `bd-8accd` | Native NTFS journal/allocator/MFT transactions | Baseline; existing library and read-overlay recovery |
+| `bd-wmzge` | `bd-kx0m7` | NTFS native namespace/streams/writable FsOps | Native NTFS transaction engine |
+| `bd-udh2o` | `bd-h8n46` | NTFS writable transforms/security/secondary metadata | Ordinary NTFS writer |
+| `bd-8bacs` | `bd-h7cme` | NTFS structural check/format/offline resize | Ordinary NTFS writer for complete utility acceptance |
+| `bd-f71fc` | `bd-uetvl` | ZFS native allocator/TXG/durable tokens | Baseline; existing library |
+| `bd-w4sht` | `bd-jdned` | Writable ZFS datasets/ZPL/shared references | Native TXGs |
+| `bd-l6gty` | `bd-i6em8` | Advanced ZFS topology/pool lifecycle | TXGs and writable/reference engine |
+| `bd-oscdu` | `bd-ady1j` | Native authenticated encryption/key lifecycle | TXGs and writable/reference engine |
+| `bd-lc4bg` | `bd-jbo9q` | Native full/incremental/raw/resumable send/receive | Writable datasets; native encryption for full raw acceptance |
+| `bd-k5jk6` | `bd-vw3b5` | Real zvol block frontend/lifecycle | TXGs and writable/reference engine |
+| `bd-wlfpt` | `bd-tqrnc` | Native-token/whole-storage-set protection | Existing default repair/freshness; all ordinary native writers |
+| `bd-qjqc4` | `bd-dzbsp` | Continuous standalone live TUI | Baseline; existing read authority |
+| `bd-uz4m0` | `bd-2tzok` | Bounded native engine/traversal/replay fuzzing | Baseline; extracted libraries |
+| `bd-us87k` | `bd-mizd2` | Current-source native/mounted/crash/workflow-cost campaign | Ordinary native writers, protection, evidence and sandbox qualification |
+| Fresh default-gate finding | `bd-ln2wr` | Repair tracker-hygiene golden comparison in a separate gate-owner lane | Exact failed default probe; preserve claimability/permission checks and publish admitted/rejected controls |
+| `bd-16kxp` | `bd-umbgi` | This audit and canonical handoff | Executed review, conservation, graph and report checks |
+
+The old tracker-recovery proposal `bd-enpwq` was not recreated as a new
+implementation task: ordinary `br` mutations and current source-aware projection
+now work. That observation is not a forensic recovery claim about every
+historical WAL. The extra advanced-ZFS aggregate `bd-c18h5` is represented by
+the four concrete advanced packages and the full-roadmap epic, preserving every
+feature without a redundant aggregate closure.
+
+```mermaid
+flowchart TD
+  B[bd-vuzzq: restore current baseline] --> F[bd-lby8f: qualify native FAT writes]
+  B --> N[bd-8accd: native NTFS transactions]
+  B --> Z[bd-uetvl: native ZFS TXGs]
+  N --> NO[bd-kx0m7: writable NTFS operations]
+  NO --> NA[NTFS advanced semantics and maintenance]
+  Z --> ZO[bd-jdned: writable ZFS datasets and references]
+  ZO --> ZA[ZFS topology, encryption, replication and zvol]
+  F --> FM[bd-ave6y: FAT maintenance]
+  F --> P[bd-tqrnc: whole-set native-token protection]
+  NO --> P
+  ZO --> P
+  R[Existing default repair and freshness lanes] --> P
+  P --> C[bd-mizd2: native and mounted campaign]
+  E[Existing exact-evidence and sandbox lanes] --> C
+  B --> O[Continuous TUI and native fuzzing]
+  C --> D[bd-3nf06: complete declared roadmap]
+  NA --> D
+  ZA --> D
+  FM --> D
+  O --> D
+  L[Existing MVCC, lifecycle and local P0 lanes] --> D
+```
+
+This diagram is a readable subset; `.beads/issues.jsonl` contains the exact
+sixty-seven new blocker edges. `br dep cycles --json` reports zero active cycles.
+`bv --no-cache --robot-triage` finally loads 4,342/4,342 records with complete authority and zero
+errors/skips/read errors; its current source is the exported canonical database.
+The independent conservation/reachability comparison reads JSONL directly.
+Source-aware hygiene remains the claimability authority, including explicit
+permission gates; graph rank does not authorize xfstests or other device work.
+The full default wrapper's golden failure is retained and blocks a clean
+tracker-hygiene claim despite the successful live projection.
+
+The first conservation comparison (`graph-round5.json`) failed its overly narrow
+assumption that only five existing rows would change. Investigation found
+eighteen equivalent zero-fraction timestamp fields on nine rows, one exported
+October 9 ChartreuseStone receipt on `bd-s5w1z`, and a colliding comment ID on
+`bd-uxh7t` renumbered from 2205 to 2206 with identical content. The separate
+`graph-conservation.json` check verifies every original issue ID, status,
+owner/assignee, description, dependency and original comment payload remains;
+the existing baseline priority changes from P1 to P0 and its notes are appended.
+There are no unexplained differences, missing dependency targets or unreachable
+new work. The original failed comparison has not been relabeled a pass.
+The final `graph-final-before-close.json` check includes the newly found gate
+bug: exactly nineteen new IDs, sixty-seven added blocker edges, no lost original
+rows, missing targets, unexplained preservation changes or unreachable new work.
+The tracked `beads.base.jsonl` is also exported by `br`, retains every original
+base ID and contains the same nineteen added issues; it was not hand-edited.
+
+After audit closeout there are 4,259 closed, 70 open, five in progress,
+seven blocked and one wont-fix record. Only this completed audit changed to
+closed; all eighteen new roadmap/work records remain open. Full
+default tracker hygiene remains **16/17, FAIL**, while conservation, cycle,
+source-hash and whitespace checks pass. UBS scans no supported language in this
+documentation/tracker-only change and returns exit 3, not a pass. Heavy Rust
+gates were not run; the existing parser regression and disk-admission failure
+remain explicit blockers. This review supplies no filesystem-readiness credit.
+
+Current release-blocking P0s are `bd-vuzzq`, `bd-8c9u0` and `bd-w2u82`.
+Their closure still needs their named executed acceptance. No filesystem
+implementation task was closed, no parity percentage changed, and no current
+mounted/native/crash/performance/release success is claimed by this audit.
+
 ## Reality check — 2026-10-20 (initial `944903e78`, refreshed at `4b0b22161`)
 
 **Source refresh:** shared `main` advanced during the audit. Existing remote

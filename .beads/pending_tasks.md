@@ -2,6 +2,46 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current checkpoint — 2026-10-30 reality check
+
+Audit `bd-umbgi` reviewed source `bc3de2c09`. Normal canonical `br` reads and
+mutations now work; the old guarded staging instructions below are historical.
+The October 20 artifact workspace is absent on this machine. Its relevant
+missing implementation/qualification proposals have been reconciled with current
+source and recreated through `br`, with fresh canonical IDs, rather than copying
+an old database or JSONL over the tracker. Do not blindly import that old packet.
+
+The full roadmap is `bd-3nf06`; sixteen coherent implementation/qualification
+tasks cover FAT native writes/maintenance, NTFS native transactions/operations/
+advanced semantics/maintenance, ZFS TXGs/datasets/topology/encryption/replication/
+zvols, whole-set protection, continuous TUI, native fuzzing and native workflow
+qualification. The old-to-canonical ID map, dependency graph, 24-goal checklist
+and evidence are in `docs/reality-check-bridge-writeup.md` at the October 30
+section. Existing repair, MVCC, lifecycle, gate, sandbox and performance owners
+and acceptance remain in place; no product implementation was closed by audit.
+
+**Current baseline is red.** `cargo fmt --check` fails to parse
+`ffs-core/src/lib.rs` (unexpected closing delimiter at line 49253, with malformed
+victim scope in `ext4_rename_staged` around 36034), and reports a CLI test format
+difference. The current-HEAD CI run `40554264889` fails Format check and skips
+dependent golden/FUSE jobs. Existing `bd-vuzzq` was raised to P0 with exact
+evidence; GoldKite ownership, in-progress status and full acceptance were kept.
+No source/gate/assertion/golden was edited by this audit. Heavy Rust checks,
+tests and benchmarks were not started after failed disk/fleet admission.
+
+The initial live-only source-aware tracker E2E passes 15/15 scenarios. The full
+default run subsequently fails 16/17: its fixture golden has identical parsed
+JSON values but different formatting, and the gate compares bytes. Separate
+gate-owner bug `bd-ln2wr` retains that failure and the required review/negative
+controls; no gate or golden was changed. It adds a seventeenth task to the
+sixteen product/qualification packages. Fixture and golden checksum manifests
+pass; these are artifact integrity, not filesystem readiness. Archived CLI
+inspect/info/fsck smoke runs on a retained-image copy
+pass with unchanged hashes; its TUI invocation refuses arguments, and none of
+that archived execution qualifies current HEAD. Fresh native formatting was
+rejected by automatic approval review and was not bypassed. Retained audit
+artifacts are under `artifacts/reality-check/20261030_lHwVOA/`.
+
 ## Current checkpoint — 2026-10-22
 
 `bd-native-image-library-s4tde` remains the single claimed item, staged as
