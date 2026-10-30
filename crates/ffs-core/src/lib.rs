@@ -91013,6 +91013,7 @@ mod tests {
             let fs = open_writable_ext4().expect("rename regression requires an ext4 image");
             #[cfg(feature = "bhh0i_sharded_alloc")]
             fs.set_bhh0i_sharded_ops(sharded);
+            eprintln!("rename cancellation/open-victim regression: sharded={sharded}");
             let cx = Cx::for_testing();
             let root = InodeNumber(2);
             let source = fs
@@ -91062,11 +91063,15 @@ mod tests {
                 before_groups
             );
             assert_eq!(
-                fs.lookup(&cx, root, OsStr::new("cancel_source")).unwrap().ino,
+                fs.lookup(&cx, root, OsStr::new("cancel_source"))
+                    .unwrap()
+                    .ino,
                 source
             );
             assert_eq!(
-                fs.lookup(&cx, root, OsStr::new("cancel_target")).unwrap().ino,
+                fs.lookup(&cx, root, OsStr::new("cancel_target"))
+                    .unwrap()
+                    .ino,
                 victim
             );
             assert_eq!(fs.read(&cx, source, 0, 64).unwrap(), b"source payload");
@@ -91089,7 +91094,9 @@ mod tests {
                 Err(FfsError::NotFound(_))
             ));
             assert_eq!(
-                fs.lookup(&cx, root, OsStr::new("cancel_target")).unwrap().ino,
+                fs.lookup(&cx, root, OsStr::new("cancel_target"))
+                    .unwrap()
+                    .ino,
                 source
             );
             assert_eq!(fs.read_inode(&cx, victim).unwrap().links_count, 0);
@@ -91097,7 +91104,9 @@ mod tests {
             assert!(fs.ext4_pending_orphans.lock().contains(&victim.0));
 
             let old_parent = fs.read_inode_with_scope(&cx, &old_scope, root).unwrap();
-            let old_entries = fs.read_dir_with_scope(&cx, &old_scope, &old_parent).unwrap();
+            let old_entries = fs
+                .read_dir_with_scope(&cx, &old_scope, &old_parent)
+                .unwrap();
             assert!(old_entries.iter().any(|entry| {
                 entry.name == b"cancel_source" && u64::from(entry.inode) == source.0
             }));
