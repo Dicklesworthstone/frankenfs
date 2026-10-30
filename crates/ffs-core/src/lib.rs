@@ -30846,6 +30846,7 @@ impl OpenFs {
     }
 
     /// Add a directory entry by scanning existing dir blocks, or allocating a new one.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
     #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
     fn ext4_add_dir_entry(
         &self,
@@ -90999,6 +91000,122 @@ mod tests {
                 clean,
                 "retried rename and final victim release must be native-clean, sharded={sharded}: {output}"
             );
+        }
+    }
+
+    #[test]
+    fn ext4_rename_cancellation_preserves_names_and_open_victim() {
+        for sharded in [false, true] {
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            if sharded {
+                continue;
+            }
+            let fs = open_writable_ext4().expect("rename regression requires an ext4 image");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(sharded);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let source = fs
+                .create(&cx, root, OsStr::new("cancel_source"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let victim = fs
+                .create(&cx, root, OsStr::new("cancel_target"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            fs.write(&cx, source, 0, b"source payload").unwrap();
+            let victim_payload = vec![0xCF; 7000];
+            fs.write(&cx, victim, 0, &victim_payload).unwrap();
+
+            let op_cx = Cx::for_testing();
+            let cancel_cx = op_cx.clone();
+            let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = Arc::clone(&reached);
+            let pinned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let oracle_pinned = Arc::clone(&pinned);
+            fs.install_open_handle_oracle(Arc::new(move |candidate| {
+                if candidate != victim {
+                    return 0;
+                }
+                if !observed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    cancel_cx.set_cancel_requested(true);
+                }
+                u64::from(oracle_pinned.load(std::sync::atomic::Ordering::SeqCst))
+            }));
+            let before_cancel = fs.current_snapshot();
+            let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            let error = fs
+                .rename(
+                    &op_cx,
+                    root,
+                    OsStr::new("cancel_source"),
+                    root,
+                    OsStr::new("cancel_target"),
+                )
+                .unwrap_err();
+            assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(matches!(error, FfsError::Cancelled));
+            assert_eq!(fs.current_snapshot(), before_cancel);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(
+                format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                before_groups
+            );
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("cancel_source")).unwrap().ino,
+                source
+            );
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("cancel_target")).unwrap().ino,
+                victim
+            );
+            assert_eq!(fs.read(&cx, source, 0, 64).unwrap(), b"source payload");
+            assert_eq!(fs.read(&cx, victim, 0, 7000).unwrap(), victim_payload);
+            assert!(!fs.ext4_pending_orphans.lock().contains(&victim.0));
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+
+            let old_scope = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            fs.rename(
+                &cx,
+                root,
+                OsStr::new("cancel_source"),
+                root,
+                OsStr::new("cancel_target"),
+            )
+            .unwrap();
+            assert_eq!(fs.current_snapshot().high.0, before_cancel.high.0 + 1);
+            assert!(matches!(
+                fs.lookup(&cx, root, OsStr::new("cancel_source")),
+                Err(FfsError::NotFound(_))
+            ));
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("cancel_target")).unwrap().ino,
+                source
+            );
+            assert_eq!(fs.read_inode(&cx, victim).unwrap().links_count, 0);
+            assert_eq!(fs.read(&cx, victim, 0, 7000).unwrap(), victim_payload);
+            assert!(fs.ext4_pending_orphans.lock().contains(&victim.0));
+
+            let old_parent = fs.read_inode_with_scope(&cx, &old_scope, root).unwrap();
+            let old_entries = fs.read_dir_with_scope(&cx, &old_scope, &old_parent).unwrap();
+            assert!(old_entries.iter().any(|entry| {
+                entry.name == b"cancel_source" && u64::from(entry.inode) == source.0
+            }));
+            assert!(old_entries.iter().any(|entry| {
+                entry.name == b"cancel_target" && u64::from(entry.inode) == victim.0
+            }));
+            assert_eq!(
+                fs.read_inode_with_scope(&cx, &old_scope, victim)
+                    .unwrap()
+                    .links_count,
+                1
+            );
+            drop(old_scope);
+            pinned.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(fs.ext4_finalize_unlinked_inode_impl(&cx, victim).unwrap());
+            assert!(!fs.ext4_pending_orphans.lock().contains(&victim.0));
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+            assert_eq!(fs.read(&cx, source, 0, 64).unwrap(), b"source payload");
         }
     }
 

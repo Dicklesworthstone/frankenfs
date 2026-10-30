@@ -3077,18 +3077,21 @@ fn createbench_cmd(
         let per = count / threads;
         let started = Instant::now();
         std::thread::scope(|s| {
+            let mut workers = Vec::with_capacity(tdirs.len());
             for (t, &tdir) in tdirs.iter().enumerate() {
                 let fs = &open_fs;
                 let cxr = &cx;
-                s.spawn(move || {
+                workers.push(s.spawn(move || -> Result<()> {
                     for i in 0..per {
                         let name = format!("cb_{t}_{i:08}");
                         fs.create(cxr, tdir, std::ffi::OsStr::new(&name), 0o644, 0, 0)
-                            .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
+                            .with_context(|| format!("failed to create {name}"))?;
                     }
-                });
+                    Ok(())
+                }));
             }
-        });
+            finish_createbench_workers(workers.into_iter().map(|worker| worker.join()))
+        })?;
         open_fs
             .sync_all_to_device(&cx)
             .with_context(|| "failed to flush creates".to_string())?;
@@ -3315,6 +3318,25 @@ fn bench_evidence_cmd() -> Result<()> {
     Ok(())
 }
 
+/// Consume every worker join before returning the first failure. An ordinary
+/// filesystem error must not panic or produce a successful timing row, and a
+/// failed worker must not leave later handles for the scope to join implicitly.
+fn finish_createbench_workers(
+    outcomes: impl IntoIterator<Item = std::thread::Result<Result<()>>>,
+) -> Result<()> {
+    let mut first_error = None;
+    for outcome in outcomes {
+        let result =
+            outcome.unwrap_or_else(|_| Err(anyhow::anyhow!("create benchmark worker panicked")));
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 fn createbench_one_round(
     cx: &Cx,
     open_fs: &OpenFs,
@@ -3341,17 +3363,20 @@ fn createbench_one_round(
         }
         let started = Instant::now();
         std::thread::scope(|s| {
+            let mut workers = Vec::with_capacity(tdirs.len());
             for (t, &tdir) in tdirs.iter().enumerate() {
                 let fs = &*open_fs;
-                s.spawn(move || {
+                workers.push(s.spawn(move || -> Result<()> {
                     for i in 0..per {
                         let name = format!("cb_{t}_{i:08}");
                         fs.create(cx, tdir, std::ffi::OsStr::new(&name), 0o644, 0, 0)
-                            .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
+                            .with_context(|| format!("failed to create {name}"))?;
                     }
-                });
+                    Ok(())
+                }));
             }
-        });
+            finish_createbench_workers(workers.into_iter().map(|worker| worker.join()))
+        })?;
         started.elapsed()
     } else {
         let started = Instant::now();
@@ -10653,6 +10678,60 @@ mod tests {
             "returned while the writer still held the image"
         );
         release.join().expect("join");
+    }
+
+    #[test]
+    fn createbench_workers_accept_success_and_empty_work() {
+        super::finish_createbench_workers(std::iter::empty::<
+            std::thread::Result<anyhow::Result<()>>,
+        >())
+        .expect("no workers is successful");
+        let visited = std::cell::Cell::new(0);
+        let outcomes = [Ok(Ok(())), Ok(Ok(()))];
+        super::finish_createbench_workers(outcomes.into_iter().inspect(|_| {
+            visited.set(visited.get() + 1);
+        }))
+        .expect("successful workers must remain successful");
+        assert_eq!(visited.get(), 2);
+    }
+
+    #[test]
+    fn createbench_workers_drain_joins_and_preserve_first_filesystem_error() {
+        let visited = std::cell::Cell::new(0);
+        let outcomes = [
+            Ok(Err(anyhow::Error::new(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )))),
+            Ok(Ok(())),
+            Ok(Err(anyhow::anyhow!("later worker failed"))),
+        ];
+        let error = super::finish_createbench_workers(outcomes.into_iter().inspect(|_| {
+            visited.set(visited.get() + 1);
+        }))
+        .expect_err("worker filesystem error must fail the benchmark");
+        assert_eq!(visited.get(), 3, "later workers must still be joined");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("original typed filesystem error must survive")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn createbench_workers_drain_joins_after_a_panic_payload() {
+        // Planted join failure: this checks handling of a returned payload,
+        // not recovery from a process built with panic=abort.
+        let panic_payload: Box<dyn std::any::Any + Send> = Box::new("worker panic");
+        let visited = std::cell::Cell::new(0);
+        let outcomes = [Err(panic_payload), Ok(Ok(()))];
+        let error = super::finish_createbench_workers(outcomes.into_iter().inspect(|_| {
+            visited.set(visited.get() + 1);
+        }))
+        .expect_err("panicked worker must fail the benchmark");
+        assert_eq!(visited.get(), 2, "later workers must still be joined");
+        assert_eq!(error.to_string(), "create benchmark worker panicked");
     }
 
     #[test]
