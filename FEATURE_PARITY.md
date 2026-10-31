@@ -1,5 +1,23 @@
 # FEATURE_PARITY
 
+> **POSIX ACL input and clearing (2026-10-31):** zero-length and header-only
+> ACL sets now clear access/default ACL storage while preserving the inode mode.
+> Nonempty ACLs validate owner/group/other ordering, masks for named entries,
+> permission bits and named IDs before mutation. Unsupported versions report
+> EOPNOTSUPP before entry-length validation. Ordinary empty xattrs remain values.
+> Four new regressions plus three existing representation controls pass in both
+> allocator builds (7/0/0 each), including valid default inheritance, clear and
+> readback, unrelated xattrs, and unchanged state on malformed input. Ext4 uses
+> the retained native image in memory; Btrfs uses the existing constructed image.
+> A live Linux 7.0.0-30-generic syscall oracle on tmpfs passes 15 planned cases
+> plus one error-precedence control. That oracle checks the common Linux ACL API,
+> not FrankenFS image interchange. Full FUSE library results are 715 passed,
+> one existing ignore; the native lifecycle case returns early on mount denial.
+> Workspace check, strict Clippy and formatting pass at the tested source cut.
+> Atomic ACL inheritance with inode/directory creation, broader namespace
+> composition and full native/crash qualification remain open under `bd-9rutw`
+> and `bd-vuzzq`; no parity percentage or performance claim is added.
+
 > **Atomic ext4 namespace retirement and classic rename (2026-10-27):**
 > unlink, rmdir, final orphan reclamation and classic rename now stage their
 > directory entries, inode slots, storage frees, link counts and orphan-list

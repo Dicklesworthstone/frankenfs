@@ -50918,13 +50918,16 @@ struct PosixAclEntry {
 /// entries is the ACL-removal representation.
 fn posix_acl_parse(value: &[u8]) -> ffs_error::Result<Vec<PosixAclEntry>> {
     let einval = || FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL));
-    if value.len() < 4 || !(value.len() - 4).is_multiple_of(8) {
+    if value.len() < 4 {
         return Err(einval());
     }
     if u32::from_le_bytes([value[0], value[1], value[2], value[3]]) != POSIX_ACL_XATTR_VERSION {
         return Err(FfsError::Io(std::io::Error::from_raw_os_error(
             libc::EOPNOTSUPP,
         )));
+    }
+    if !(value.len() - 4).is_multiple_of(8) {
+        return Err(einval());
     }
     let (raw_entries, _) = value[4..].as_chunks::<8>();
     let entries: Vec<PosixAclEntry> = raw_entries
@@ -109694,6 +109697,13 @@ mod tests {
         let mut truncated = posix_acl_encode(&[u, g, o]);
         truncated.push(0);
         cases.push(("truncated entry", truncated, libc::EINVAL));
+        let mut unsupported_truncated = 9_u32.to_le_bytes().to_vec();
+        unsupported_truncated.push(0);
+        cases.push((
+            "unsupported version before entry length",
+            unsupported_truncated,
+            libc::EOPNOTSUPP,
+        ));
         cases
     }
 
@@ -109745,13 +109755,38 @@ mod tests {
             .ino;
         let named = ext4_setattr_test_acl(6, 4, 0);
         let ops: &dyn FsOps = &fs;
-        for clear in [&POSIX_ACL_XATTR_VERSION.to_le_bytes()[..], &[][..]] {
+        fs.setxattr(&cx, file, "user.empty", &[], XattrSetMode::Set)
+            .unwrap();
+        assert_eq!(
+            fs.getxattr(&cx, file, "user.empty").unwrap(),
+            Some(Vec::new())
+        );
+        for (index, clear) in [&POSIX_ACL_XATTR_VERSION.to_le_bytes()[..], &[][..]]
+            .into_iter()
+            .enumerate()
+        {
             fs.setxattr(&cx, file, "user.keep", b"retained", XattrSetMode::Set)
                 .unwrap();
             fs.setxattr(&cx, file, POSIX_ACL_ACCESS_XATTR, &named, XattrSetMode::Set)
                 .unwrap();
             fs.setxattr(&cx, dir, POSIX_ACL_DEFAULT_XATTR, &named, XattrSetMode::Set)
                 .unwrap();
+            let inherited = fs
+                .create(
+                    &cx,
+                    dir,
+                    OsStr::new(&format!("restricted_{index}")),
+                    0o666,
+                    0,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(inherited.perm & 0o777, 0o640);
+            assert_eq!(
+                fs.getxattr(&cx, inherited.ino, POSIX_ACL_ACCESS_XATTR)
+                    .unwrap(),
+                Some(named.clone())
+            );
             for (ino, name, perm) in [
                 (file, POSIX_ACL_ACCESS_XATTR, 0o640),
                 (dir, POSIX_ACL_DEFAULT_XATTR, 0o750),

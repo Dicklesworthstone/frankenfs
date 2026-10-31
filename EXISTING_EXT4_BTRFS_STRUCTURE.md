@@ -1679,9 +1679,10 @@ Maximum xattr value size: `EXT4_XATTR_SIZE_MAX = 1 << 24 = 16 MB`
 
 ### 9.8 POSIX ACL Input Semantics
 
-The common Linux ACL interface (`fs/posix_acl.c`, `do_set_acl`,
-`posix_acl_from_xattr`, `posix_acl_valid` and `set_posix_acl`) supplies these
-contracts to both ext4 and btrfs:
+Supplemental common-Linux contract, verified 2026-10-31 against upstream
+`fs/posix_acl.c` and native Linux 7.0.0-30-generic syscalls. The helpers
+`do_set_acl`, `posix_acl_from_xattr`, `posix_acl_valid` and `set_posix_acl`
+supply these contracts to both ext4 and btrfs:
 
 - A zero-length set payload or a version-2 header with no entries clears the
   selected ACL. Clearing an access ACL preserves the inode's existing mode;
@@ -1694,8 +1695,9 @@ contracts to both ext4 and btrfs:
   sorted; unnamed entries' IDs are not interpreted.
 - Malformed lengths, tags, entry order, permissions or named IDs return EINVAL
   before changing stored attributes or permissions. Unsupported generic ACL
-  versions return EOPNOTSUPP. A nonempty default ACL on a nondirectory returns
-  EACCES; clearing a nonexistent default ACL on it succeeds.
+  versions return EOPNOTSUPP before entry-length validation. A nonempty default
+  ACL on a nondirectory returns EACCES; clearing a nonexistent default ACL on it
+  succeeds.
 
 These are input and removal contracts, separate from atomic publication of
 inherited ACLs with a newly created inode. The latter remains required.
