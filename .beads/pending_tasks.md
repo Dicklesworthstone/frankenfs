@@ -33,12 +33,35 @@ completed or handed off. Historical evidence remains in place.
   credited as behavioral proof. Worker source hashes and retained fixture match.
 - [x] Correct shared ACL validation and route ACL clearing through removal,
   preserving valid set/chmod/inheritance behavior and unrelated xattrs.
-- [ ] Execute the same regressions and existing ACL representation controls,
+- [x] Execute the same regressions and existing ACL representation controls,
   the full FUSE library, workspace check/strict Clippy/fmt and unchanged UBS.
   A fourth regression exercises real Btrfs operations on the existing constructed
   image helper. The next denominator is7:four new cases plus3 existing ACL
   representation controls; no fresh/native Btrfs qualification follows.
-- [ ] Bind source hashes, archive raw evidence, sync tracker and checkpoint.
+  Final7-case default run passes7/0/0,1596filtered,0.03s,command0, including
+  valid inherited ACLs and ordinary empty user xattrs. Same7 cases pass with
+  `bhh0i_sharded_alloc` enabled; output retained separately, not summed.
+  A host Linux7.0.0-30-generic syscall oracle on tmpfs independently passes
+  all15 predetermined scenarios (6clear/9invalid); scratch files remain at
+  `/tmp/ffs-acl-native-dhy3qv1m`. This proves common Linux ACL syscall behavior,
+  not FrankenFS image interchange or mounted/native crash qualification.
+  A final native error-precedence probe confirms unsupported-version errno95
+  wins over malformed entry length; it is a separate one-case control. The
+  corresponding case is now in the16-case rejection table. Final-source7-case
+  runs pass in both builds (default1596filtered, feature1667filtered),0.03s each.
+  Full FUSE final-source result715pass/0fail/1existing ignore/0filtered,0.30s,
+  command0; the actual-mount lifecycle case still returns early on permission
+  denial. Workspace/all-target check passes0 (16.92s Cargo), strict Clippy0
+  (27.73s Cargo), formatting and whitespace checks0. Final core UBS is0critical/
+  15516warnings/3173info; fs_ops is0critical/86warnings/61info, both exit0.
+- [x] Bind source hashes and archive raw evidence; final Bead audit records the
+  executed commands, source/lock bindings, all failures and proof-class limits.
+  All38 copied captures match the originals under the existing implementation
+  artifact directory. Source matches the worker after check/Clippy. Shared
+  commits `493abaa74`/`1bc17d1cc` appeared during work and are preserved; their
+  presence was not counted as verification.
+- [x] Sync tracker and checkpoint the verified source/test/doc unit locally;
+  original full-baseline acceptance and the unchecked work below remain open.
 - [ ] Complete original full-suite/native acceptance and remaining atomic
   inheritance/sharded namespace work; no narrow test run closes those items.
 
