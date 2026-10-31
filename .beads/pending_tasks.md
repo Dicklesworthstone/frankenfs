@@ -11,6 +11,51 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### Atomic tmpfile continuation — 2026-10-31 05:00 UTC
+
+- [x] Recheck main, existing P0 ownership, dependency cycles and build-volume
+  admission; reserve the existing implementation/test/doc files.
+- [x] Trace tmpfile allocation, ACL inheritance, transaction adapters and orphan
+  publication. Both allocator modes currently use the single-lock tmpfile path.
+- [x] Add retained-image regressions for one-publication creation with named,
+  mode-only and absent ACLs, link/reclaim lifecycle, malformed inherited ACLs
+  and external-ACL allocation failure. Execute them before production changes.
+  Actual pre-correction result0pass/3fail,1603filtered,exit101 on hz3: three
+  publications instead of one, and publication after each inheritance error.
+  First hz4 init73/admission103 failures occurred before tests, and its own
+  lease was reconciled before retry. No fixture failure is counted as a red.
+- [x] Stage the inode bitmap, inode body, inherited ACL and orphan link in one
+  registered-snapshot transaction; keep allocator and orphan runtime effects
+  private until commit. Retry the complete operation on typed MVCC conflicts.
+  Initial corrected3-case default run passes3/0/0,1603filtered,0.06s,command0.
+  Added EA-inode parent-value/oversize and retained-image native checker/reopen
+  controls. Expanded denominator is15 (5new tmpfile cases,7ACL controls and
+  3writer snapshot controls), separately in default and active sharded mode.
+- [x] Exercise these tests in both allocator configurations; recheck affected
+  ACL/snapshot controls, FUSE, workspace check/Clippy/fmt and unchanged UBS.
+  Default15/0/0,1593filtered,12.05s on hz3; active-sharded15/0/0,1664filtered,
+  0.15s on hz4. Both native e2fsck1.47.2 runs execute all5phases,exit0,
+  16/4096files,1329/4096blocks, followed by successful reopen/readback.
+  Both16MiB images are preserved byte-for-byte in the existing artifact dir.
+  FUSE715pass/0fail/1existing ignore/0filtered,10.02s,command0; actual mount
+  lifecycle still soft-skips on fusermount3 Permission denied. No mount credit.
+  Literal workspace/all-target check passes0 (21.09s Cargo), strict Clippy0
+  (1m02s Cargo), formatting/whitespace0. UBS exits0 on both changed Rust files:
+  core0critical/15743warnings/3189info; fs_ops0critical/86warnings/61info.
+  Source and lockfile hashes agree across local/hz3/hz4; core SHA256 is
+  `eef5d2e87986525ff3c54f630bc11da350bf911b66c1587c6b6ee5ad29b008da`.
+- [x] Bind raw output to tested source, preserve red/green evidence and update
+  measured parity and Bead comments. All49 `resume5-*` captures match their
+  originals byte-for-byte under `artifacts/implementation/20261030_O221Lk/`.
+  The existing Bead comment records commands, source bindings, proof limits and
+  the fresh bounded process/real-work/honesty worksheets. Verification is solo;
+  no independent reviewer or full-workspace acceptance is claimed.
+- [x] Sync the tracker and checkpoint this verified source/test/doc unit locally.
+  Dependency cycles remain empty. No task or graph dependency is created or
+  closed; the original P0 remains in progress with its original acceptance.
+- [ ] Keep original full-workspace/native acceptance and the broader named
+  creation/sharded namespace work open; do not count this unit as their closure.
+
 ### ACL input continuation — 2026-10-31 04:35 UTC
 
 - [x] Recheck main, the live source-aware queue and ownership; preserve all peer

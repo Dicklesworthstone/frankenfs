@@ -1702,6 +1702,33 @@ supply these contracts to both ext4 and btrfs:
 These are input and removal contracts, separate from atomic publication of
 inherited ACLs with a newly created inode. The latter remains required.
 
+### 9.9 Unnamed regular-file creation
+
+Supplemental source checked 2026-10-31: upstream Linux
+[`fs/ext4/namei.c`](https://github.com/torvalds/linux/blob/HEAD/fs/ext4/namei.c)
+(`ext4_tmpfile`) and
+[`fs/ext4/acl.c`](https://github.com/torvalds/linux/blob/HEAD/fs/ext4/acl.c)
+(`ext4_init_acl`). This is current upstream reference evidence, not a verified
+v6.19 source capture.
+
+- An `O_TMPFILE` inode has no directory entry and starts with zero links.
+  Orphan tracking retains its storage until a later link names it or the final
+  reference reclaims it. New orphans preserve the prior orphan chain.
+- The parent's default ACL restricts the requested mode. A regular child gets
+  an access ACL only when needed to represent permissions beyond mode bits;
+  it does not get a default ACL. Inline, external-block and EA-inode parent
+  values must retain their interpretation.
+- FrankenFS's publication invariant is one MVCC commit for allocation, final
+  mode/access ACL, inode body and orphan next link. Runtime allocator counters,
+  orphan head/membership and inode-cache invalidation follow successful commit
+  while allocation exclusion is held. Staging failure or cancellation before
+  commit leaves them unchanged. Typed conflicts retry the complete operation
+  from a fresh protected snapshot, with a bound of sixteen attempts.
+- The orphan head reaches disk at the existing quiesced durability boundary;
+  this transaction change does not establish mounted crash qualification or
+  arbitrary outer-request composition. Postcommit repair-notification failures
+  retain the existing explicit already-committed error contract.
+
 ## 10. Checksums
 
 **Source:** `ext4.h` lines 2545-2548

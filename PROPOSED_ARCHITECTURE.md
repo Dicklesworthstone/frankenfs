@@ -765,6 +765,18 @@ MVCC conflicts are retried. The group lock is released before pruning or cache
 invalidation. Directory insertion remains a later namespace step with its
 existing rollback path.
 
+Ext4 `O_TMPFILE` uses an operation-owned transaction under allocation exclusion
+in both allocator modes. Snapshot capture and registration are atomic with
+respect to MVCC pruning. A private allocator stages the inode bitmap, inherited
+access ACL (including external-block allocation), final mode and orphan next
+link. Parent ACL reads use that protected view, including EA-inode values.
+After one successful MVCC commit, the operation installs allocator statistics,
+runtime orphan head/membership and inode-cache invalidation before releasing
+exclusion. Staging failures discard all private state; typed conflicts retry
+the complete operation up to sixteen times. Existing link/reclaim and durability
+boundaries consume the published orphan state. Named create/mkdir inheritance
+and arbitrary outer-request composition remain separate unfinished work.
+
 ### 6.3 Corruption Recovery Path
 
 ```

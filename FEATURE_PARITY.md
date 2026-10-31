@@ -1,5 +1,25 @@
 # FEATURE_PARITY
 
+> **Atomic ext4 unnamed creation (2026-10-31):** `O_TMPFILE` now stages inode
+> allocation, inherited access ACL/mode, external ACL storage and the inode's
+> orphan link in one protected-snapshot MVCC transaction. Allocator counters,
+> runtime orphan head/membership and inode-cache invalidation follow commit
+> under allocation exclusion. Typed conflicts retry the complete operation up
+> to sixteen times. Five new tests cover absent/mode-only/named ACLs, link and
+> reclaim, malformed defaults, late ACL ENOSPC, EA-inode defaults/oversize and
+> persisted-image checker/reopen. The 15-case selection, including seven ACL
+> and three writer-snapshot controls, passes in default and active sharded
+> allocator builds (15/0/0 each). Native `e2fsck -fn` executes all five phases
+> with exit 0 in both runs, and reopen preserves payload, ACL, mode and links;
+> checker images are retained. EA-inode references in their separate unit
+> control are planted, not native EA ownership proof. These results qualify
+> bounded image interchange; mounted/crash behavior, named create/mkdir ACL
+> composition, arbitrary outer requests and performance remain unqualified.
+> Workspace/all-target check, strict Clippy and formatting pass. The FUSE
+> library reports 715 passes and one existing ignore; its live-mount lifecycle
+> case still returns early on permission denial and earns no mount credit.
+> The broader `bd-9rutw` and original baseline `bd-vuzzq` stay open.
+
 > **POSIX ACL input and clearing (2026-10-31):** zero-length and header-only
 > ACL sets now clear access/default ACL storage while preserving the inode mode.
 > Nonempty ACLs validate owner/group/other ordering, masks for named entries,
@@ -14,7 +34,7 @@
 > not FrankenFS image interchange. Full FUSE library results are 715 passed,
 > one existing ignore; the native lifecycle case returns early on mount denial.
 > Workspace check, strict Clippy and formatting pass at the tested source cut.
-> Atomic ACL inheritance with inode/directory creation, broader namespace
+> Atomic ACL inheritance with named inode/directory creation, broader namespace
 > composition and full native/crash qualification remain open under `bd-9rutw`
 > and `bd-vuzzq`; no parity percentage or performance claim is added.
 

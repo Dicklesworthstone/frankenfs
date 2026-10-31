@@ -1295,15 +1295,16 @@ impl FsOps for OpenFs {
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
-        let attr = match &self.flavor {
+        match &self.flavor {
+            // Ext4 stages inheritance with the nameless inode and orphan link.
             FsFlavor::Ext4(_) => self
                 .ext4_tmpfile(cx, Self::ext4_canonical_inode(parent), mode, uid, gid)
                 .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => self.btrfs_tmpfile(parent, mode, uid, gid),
-        }?;
-        // An O_TMPFILE inherits the directory's default ACL like any create
-        // (xfstests generic/389).
-        self.inherit_default_acl(cx, scope, parent, attr)
+            FsFlavor::Btrfs(_) => {
+                let attr = self.btrfs_tmpfile(parent, mode, uid, gid)?;
+                self.inherit_default_acl(cx, scope, parent, attr)
+            }
+        }
     }
 
     fn mknod(

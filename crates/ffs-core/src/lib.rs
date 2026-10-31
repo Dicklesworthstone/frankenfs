@@ -5998,6 +5998,20 @@ struct RegisteredSnapshotBlockAdapter<'a> {
 }
 
 impl<'a> RegisteredSnapshotBlockAdapter<'a> {
+    /// Capture and pin an operation's snapshot under the store's GC lock.
+    fn begin(base: &'a dyn BlockDevice, store: &'a FsMvccStore) -> (Transaction, Self) {
+        let txn = store.begin_registered();
+        let snapshot = txn.snapshot();
+        (
+            txn,
+            Self {
+                base,
+                store,
+                snapshot,
+            },
+        )
+    }
+
     fn new(base: &'a dyn BlockDevice, store: &'a FsMvccStore, snapshot: Snapshot) -> Self {
         store.register_snapshot(snapshot);
         Self {
@@ -9362,53 +9376,28 @@ impl OpenFs {
             .store(u64::from(new_head), std::sync::atomic::Ordering::Release);
     }
 
-    /// Orphan a zero-link inode the kernel still references instead of
-    /// freeing it (bd-90aey): write it with `nlink` 0 and push it onto the
-    /// on-disk orphan list (`s_last_orphan` + `i_dtime` next links, the legacy
-    /// layout `maybe_recover_ext4_orphans` walks), and remember it so the last
-    /// kernel reference finalizes it. `fstat`/`read`/`write` through an open
-    /// fd, a cwd or an mmap keep working until then; a crash leaves it to
-    /// mount-time recovery. The caller holds the allocation lock, which
-    /// serializes orphan-list mutations.
-    #[allow(clippy::too_many_arguments)]
-    fn ext4_orphan_pinned_inode(
+    /// Stage a new orphan's inode body and next link. The allocation lock
+    /// serializes orphan-list changes; the returned head and pending-orphan
+    /// membership belong to the caller only after successful publication.
+    fn ext4_stage_orphan_inode(
         &self,
         cx: &Cx,
         tx_dev: &dyn BlockDevice,
-        geo: &FsGeometry,
-        groups: &[GroupStats],
+        alloc: &Ext4AllocState,
         ino: InodeNumber,
         inode: &mut Ext4Inode,
-        csum_seed: u32,
-        slot_scoped: bool,
-    ) -> ffs_error::Result<()> {
+    ) -> ffs_error::Result<u32> {
+        let csum_seed = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?
+            .csum_seed();
         let ino_u32 = u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
             block: 0,
             detail: format!("orphan push: inode {ino} exceeds ext4 range"),
         })?;
-        // The on-disk head, not the flavor copy (a mount-time snapshot).
         inode.dtime = self.ext4_read_orphan_head();
-        if slot_scoped {
-            let loc =
-                ffs_inode::locate_inode(ino, geo, groups).ok_or_else(|| FfsError::Corruption {
-                    block: 0,
-                    detail: format!("orphan push: inode {ino} out of range"),
-                })?;
-            ffs_inode::write_inode_at_slot_scoped(
-                cx,
-                tx_dev,
-                loc,
-                usize::from(geo.inode_size),
-                ino,
-                inode,
-                csum_seed,
-            )?;
-        } else {
-            ffs_inode::write_inode(cx, tx_dev, geo, groups, ino, inode, csum_seed)?;
-        }
-        self.ext4_write_orphan_head(ino_u32);
-        self.ext4_pending_orphans.lock().insert(ino.0);
-        Ok(())
+        ffs_inode::write_inode(cx, tx_dev, &alloc.geo, &alloc.groups, ino, inode, csum_seed)?;
+        Ok(ino_u32)
     }
 
     /// Stage a decreased link count, orphan insertion or final inode reclamation
@@ -9529,6 +9518,66 @@ impl OpenFs {
         Ok(retirement)
     }
 
+    /// Stage a regular file's access ACL from its parent's default ACL using
+    /// the same transaction view as allocation. No cache, mode or external
+    /// xattr block is published separately from the new inode.
+    fn ext4_stage_inherited_access_acl(
+        &self,
+        cx: &Cx,
+        dev: &TransactionBlockAdapter<'_, '_>,
+        alloc: &mut Ext4AllocState,
+        parent: &Ext4Inode,
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+    ) -> ffs_error::Result<()> {
+        let inline = ffs_ondisk::find_ibody_xattr_by_name(parent, POSIX_ACL_DEFAULT_XATTR)
+            .map_err(|error| parse_to_ffs_error(&error))?;
+        let found = if inline.is_some() || parent.file_acl == 0 {
+            inline
+        } else {
+            let external = dev.read_block(cx, BlockNumber(parent.file_acl))?;
+            ffs_ondisk::find_xattr_block_value_by_name(external.as_slice(), POSIX_ACL_DEFAULT_XATTR)
+                .map_err(|error| parse_to_ffs_error(&error))?
+        };
+        let Some((_, mut default, value_inum)) = found else {
+            return Ok(());
+        };
+        if value_inum != 0 {
+            // Borrow the operation adapter's pin for this value read. This is
+            // not a managed request scope, so it must not release that pin.
+            let mut scope = RequestScope::with_snapshot(dev.tx.lock().snapshot());
+            scope.read_snapshot_pinned = true;
+            let ea_ino = InodeNumber(u64::from(value_inum));
+            let ea_inode = self.read_inode_with_scope(cx, &scope, ea_ino)?;
+            if ea_inode.size > 65_536 {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("EA inode {value_inum} ACL exceeds XATTR_SIZE_MAX"),
+                });
+            }
+            default = self.read_file(cx, &scope, ea_ino, 0, 65_536)?;
+        }
+        let mut entries = posix_acl_parse(&ext4_expand_posix_acl_xattr_value(&default)?)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let bits = posix_acl_create_masq(&mut entries, inode.mode);
+        if !posix_acl_equiv_mode(&entries).1 {
+            self.ext4_stage_setxattr(
+                cx,
+                dev,
+                alloc,
+                ino,
+                inode,
+                POSIX_ACL_ACCESS_XATTR,
+                &ext4_compact_posix_acl_xattr_value(&posix_acl_encode(&entries))?,
+                XattrSetMode::Set,
+            )?;
+        }
+        inode.mode = (inode.mode & !0o777) | bits;
+        Ok(())
+    }
+
     /// `O_TMPFILE`: allocate a regular-file inode that no directory names.
     ///
     /// Like kernel ext4 (`ext4_tmpfile` + `d_tmpfile`), the inode starts with no
@@ -9546,46 +9595,88 @@ impl OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         let alloc_mutex = self.require_alloc_state()?;
         let block_dev = self.block_device_adapter();
-        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-        let csum_seed = sb.csum_seed();
-        if !self.read_inode(cx, parent)?.is_dir() {
-            return Err(FfsError::NotDirectory);
-        }
-
-        // Single-lock path in both allocator modes, like `ext4_mknod`.
+        const MAX_ATTEMPTS: u32 = 16;
+        // Both allocator modes use this exclusion. Inode and ACL allocation
+        // change only the private counters until the complete operation commits.
         let mut alloc = alloc_mutex.write();
-        let Ext4AllocState {
-            geo,
-            groups,
-            persist_ctx,
-        } = &mut *alloc;
-        let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
-                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-        );
-        let (ino, mut inode) = ffs_inode::create_inode(
-            cx,
-            &block_dev,
-            geo,
-            groups,
-            mode | 0o100_000, // S_IFREG
-            uid,
-            gid,
-            parent_group,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-            persist_ctx,
-        )?;
-        self.forget_ext4_inode_caches(ino);
-        inode.links_count = 0;
-        self.ext4_orphan_pinned_inode(
-            cx, &block_dev, geo, groups, ino, &mut inode, csum_seed, false,
-        )?;
-        Ok(inode_to_attr(sb, ino, &inode))
+        for attempt in 1..=MAX_ATTEMPTS {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let mut working = Ext4AllocState {
+                geo: alloc.geo.clone(),
+                groups: alloc.groups.clone(),
+                persist_ctx: alloc.persist_ctx.clone(),
+            };
+            let (mut txn, snapshot_dev) =
+                RegisteredSnapshotBlockAdapter::begin(&block_dev, &self.mvcc_store);
+            let staged = (|| {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &snapshot_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                let parent_inode =
+                    ffs_inode::read_inode(cx, &tx_dev, &working.geo, &working.groups, parent)?;
+                if !parent_inode.is_dir() {
+                    return Err(FfsError::NotDirectory);
+                }
+                let parent_group = ffs_types::inode_to_group(parent, working.geo.inodes_per_group);
+                let (secs, nanos) = Self::now_timestamp();
+                let (ino, mut inode) = ffs_inode::prepare_inode(
+                    cx,
+                    &tx_dev,
+                    &working.geo,
+                    &mut working.groups,
+                    mode | 0o100_000,
+                    uid,
+                    gid,
+                    parent_group,
+                    secs,
+                    nanos,
+                    &working.persist_ctx,
+                )?;
+                self.ext4_stage_inherited_access_acl(
+                    cx,
+                    &tx_dev,
+                    &mut working,
+                    &parent_inode,
+                    ino,
+                    &mut inode,
+                )?;
+                inode.links_count = 0;
+                let head = self.ext4_stage_orphan_inode(cx, &tx_dev, &working, ino, &mut inode)?;
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                Ok((ino, inode, head))
+            })();
+            let (ino, inode, head) = match staged {
+                Ok(created) => created,
+                Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                Err(error) => return Err(error),
+            };
+            let txn_id = txn.id();
+            let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                txn.write_set().keys().copied().collect()
+            } else {
+                Vec::new()
+            };
+            let commit_seq =
+                match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store) {
+                    Ok(seq) => seq,
+                    Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                    Err(error) => return Err(error),
+                };
+            alloc.groups = working.groups;
+            self.ext4_write_orphan_head(head);
+            self.ext4_pending_orphans.lock().insert(ino.0);
+            self.forget_ext4_inode_caches(ino);
+            drop(snapshot_dev);
+            drop(alloc);
+            self.prune_mvcc_after_commit_if_due(commit_seq);
+            self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
+            return Ok(inode_to_attr(sb, ino, &inode));
+        }
+        unreachable!("the final tmpfile transaction attempt returns its result")
     }
 
     /// Stage removal of a named or reclaimed inode from the orphan list.
@@ -74435,6 +74526,386 @@ mod tests {
             return; // e2fsck unavailable
         };
         assert!(clean, "e2fsck after tmpfile + link + reclaim:\n{output}");
+    }
+
+    #[test]
+    fn ext4_tmpfile_atomic_acl_and_orphan_lifecycle() {
+        let mode_only = posix_acl_encode(&[
+            PosixAclEntry {
+                tag: POSIX_ACL_TAG_USER_OBJ,
+                perm: 6,
+                id: POSIX_ACL_UNDEFINED_ID,
+            },
+            PosixAclEntry {
+                tag: POSIX_ACL_TAG_GROUP_OBJ,
+                perm: 4,
+                id: POSIX_ACL_UNDEFINED_ID,
+            },
+            PosixAclEntry {
+                tag: POSIX_ACL_TAG_OTHER,
+                perm: 0,
+                id: POSIX_ACL_UNDEFINED_ID,
+            },
+        ]);
+        for default in [None, Some(mode_only), Some(ext4_setattr_test_acl(6, 4, 0))] {
+            let fs = open_writable_ext4().expect("retained ext4 fixture");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(true);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            if let Some(acl) = &default {
+                fs.setxattr(&cx, root, POSIX_ACL_DEFAULT_XATTR, acl, XattrSetMode::Set)
+                    .unwrap();
+            }
+            let names = fs.readdir(&cx, root, 0).unwrap();
+            let free = fs.statfs(&cx, root).unwrap().files_free;
+            let mut created = Vec::new();
+            for _ in 0..2 {
+                let before = fs.current_snapshot();
+                let attr = fs
+                    .with_latest_scope(|scope| {
+                        <OpenFs as FsOps>::tmpfile(&fs, &cx, scope, root, 0o666, 123, 456)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    fs.current_snapshot().high.0,
+                    before.high.0 + 1,
+                    "allocation, ACL and orphan link must publish once"
+                );
+                assert_eq!(attr.nlink, 0);
+                assert_eq!(attr.uid, 123);
+                assert_eq!(attr.gid, 456);
+                assert_eq!(
+                    attr.perm & 0o777,
+                    if default.is_some() { 0o640 } else { 0o666 }
+                );
+                let inode = fs.read_inode(&cx, attr.ino).unwrap();
+                assert_eq!(
+                    u64::from(inode.dtime),
+                    created.last().map_or(0, |ino: &InodeNumber| ino.0)
+                );
+                assert_eq!(u64::from(fs.ext4_read_orphan_head()), attr.ino.0);
+                assert!(fs.ext4_pending_orphans.lock().contains(&attr.ino.0));
+                let named = default.as_ref().filter(|acl| acl.len() > 100).cloned();
+                assert_eq!(
+                    fs.getxattr(&cx, attr.ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    named
+                );
+                assert_eq!(
+                    inode.file_acl != 0,
+                    named.is_some(),
+                    "large ACL uses an external block"
+                );
+                assert_eq!(
+                    fs.getxattr(&cx, attr.ino, POSIX_ACL_DEFAULT_XATTR).unwrap(),
+                    None
+                );
+                created.push(attr.ino);
+            }
+            assert_eq!(
+                fs.readdir(&cx, root, 0).unwrap(),
+                names,
+                "tmpfiles have no names"
+            );
+            let [kept, dropped] = created[..] else {
+                unreachable!()
+            };
+            fs.write(&cx, kept, 0, b"retained tmpfile payload").unwrap();
+            fs.link(&cx, kept, root, OsStr::new("named_tmpfile"))
+                .unwrap();
+            assert_eq!(fs.read_inode(&cx, dropped).unwrap().dtime, 0);
+            assert!(!fs.ext4_pending_orphans.lock().contains(&kept.0));
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("named_tmpfile"))
+                    .unwrap()
+                    .ino,
+                kept
+            );
+            assert_eq!(
+                fs.read(&cx, kept, 0, 64).unwrap(),
+                b"retained tmpfile payload"
+            );
+            assert!(fs.finalize_unlinked_inode_public(&cx, dropped).unwrap());
+            assert!(!fs.finalize_unlinked_inode_public(&cx, dropped).unwrap());
+            assert!(!fs.finalize_unlinked_inode_public(&cx, kept).unwrap());
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+            assert!(fs.ext4_pending_orphans.lock().is_empty());
+            assert_eq!(fs.statfs(&cx, root).unwrap().files_free, free - 1);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
+    }
+
+    #[test]
+    fn ext4_tmpfile_atomic_malformed_parent_acl_rolls_back() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        // Plant a corrupt on-disk default ACL without using the validating API.
+        let mut parent = fs.read_inode(&cx, root).unwrap();
+        ffs_xattr::set_xattr(
+            &mut parent,
+            None,
+            POSIX_ACL_DEFAULT_XATTR,
+            &posix_acl_encode(&[PosixAclEntry {
+                tag: POSIX_ACL_TAG_GROUP_OBJ,
+                perm: 4,
+                id: POSIX_ACL_UNDEFINED_ID,
+            }]),
+            XattrWriteAccess {
+                is_owner: true,
+                has_cap_fowner: true,
+                has_cap_sys_admin: true,
+            },
+        )
+        .unwrap();
+        persist_ext4_test_inode(&fs, &cx, root, &parent);
+        fs.forget_ext4_inode_caches(root);
+        let before = fs.current_snapshot();
+        let free = fs.statfs(&cx, root).unwrap().files_free;
+        let head = fs.ext4_read_orphan_head();
+        let pending = fs.ext4_pending_orphans.lock().clone();
+        let err = fs
+            .with_latest_scope(|scope| {
+                <OpenFs as FsOps>::tmpfile(&fs, &cx, scope, root, 0o666, 0, 0)
+            })
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EINVAL);
+        assert_eq!(
+            fs.current_snapshot(),
+            before,
+            "failed inheritance publishes no inode"
+        );
+        assert_eq!(fs.statfs(&cx, root).unwrap().files_free, free);
+        assert_eq!(fs.ext4_read_orphan_head(), head);
+        assert_eq!(*fs.ext4_pending_orphans.lock(), pending);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_tmpfile_atomic_external_acl_enospc_rolls_back() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let default = ext4_setattr_test_acl(6, 4, 0);
+        fs.setxattr(
+            &cx,
+            root,
+            POSIX_ACL_DEFAULT_XATTR,
+            &default,
+            XattrSetMode::Set,
+        )
+        .unwrap();
+        // Inode slots remain available; fail the later external-ACL allocation.
+        for group in &mut fs.require_alloc_state().unwrap().write().groups {
+            group.free_blocks = 0;
+        }
+        let before = fs.current_snapshot();
+        let free = fs.statfs(&cx, root).unwrap().files_free;
+        let head = fs.ext4_read_orphan_head();
+        let pending = fs.ext4_pending_orphans.lock().clone();
+        let err = fs
+            .with_latest_scope(|scope| {
+                <OpenFs as FsOps>::tmpfile(&fs, &cx, scope, root, 0o666, 0, 0)
+            })
+            .unwrap_err();
+        assert!(matches!(err, FfsError::NoSpace), "{err:?}");
+        assert_eq!(
+            fs.current_snapshot(),
+            before,
+            "ACL allocation failure publishes nothing"
+        );
+        assert_eq!(fs.statfs(&cx, root).unwrap().files_free, free);
+        assert_eq!(fs.ext4_read_orphan_head(), head);
+        assert_eq!(*fs.ext4_pending_orphans.lock(), pending);
+        assert_eq!(
+            fs.getxattr(&cx, root, POSIX_ACL_DEFAULT_XATTR).unwrap(),
+            Some(default)
+        );
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_tmpfile_atomic_ea_inode_default_acl() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let acl = ext4_setattr_test_acl(6, 4, 0);
+        let stored = ext4_compact_posix_acl_xattr_value(&acl).unwrap();
+        let ea = fs
+            .create(&cx, root, OsStr::new("acl_value"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        fs.write(&cx, ea, 0, &stored).unwrap();
+        let mut parent = fs.read_inode(&cx, root).unwrap();
+        assert!(
+            ffs_ondisk::parse_ibody_xattrs_with_inum(&parent)
+                .unwrap()
+                .is_empty()
+        );
+        ffs_xattr::set_xattr(
+            &mut parent,
+            None,
+            POSIX_ACL_DEFAULT_XATTR,
+            &[],
+            XattrWriteAccess {
+                is_owner: true,
+                has_cap_fowner: true,
+                has_cap_sys_admin: true,
+            },
+        )
+        .unwrap();
+        // Plant an EA-inode reference, retaining the ordinary extent-mapped
+        // value file as the existing reader tests do. This is a unit fixture,
+        // not a claim about native EA-inode ownership/refcount qualification.
+        parent.xattr_ibody[8..12].copy_from_slice(&u32::try_from(ea.0).unwrap().to_le_bytes());
+        parent.xattr_ibody[12..16]
+            .copy_from_slice(&u32::try_from(stored.len()).unwrap().to_le_bytes());
+        persist_ext4_test_inode(&fs, &cx, root, &parent);
+        fs.forget_ext4_inode_caches(root);
+        assert_eq!(
+            fs.getxattr(&cx, root, POSIX_ACL_DEFAULT_XATTR).unwrap(),
+            Some(acl.clone())
+        );
+        let before = fs.current_snapshot();
+        let child = fs
+            .with_latest_scope(|scope| {
+                <OpenFs as FsOps>::tmpfile(&fs, &cx, scope, root, 0o666, 0, 0)
+            })
+            .unwrap();
+        assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+        assert_eq!(child.perm & 0o777, 0o640);
+        assert_eq!(
+            fs.getxattr(&cx, child.ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+            Some(acl)
+        );
+
+        let mut oversized = fs.read_inode(&cx, ea).unwrap();
+        oversized.size = 65_537;
+        persist_ext4_test_inode(&fs, &cx, ea, &oversized);
+        let before = fs.current_snapshot();
+        let free = fs.statfs(&cx, root).unwrap().files_free;
+        let pending = fs.ext4_pending_orphans.lock().clone();
+        let err = fs
+            .with_latest_scope(|scope| {
+                <OpenFs as FsOps>::tmpfile(&fs, &cx, scope, root, 0o666, 0, 0)
+            })
+            .unwrap_err();
+        assert!(matches!(err, FfsError::Corruption { .. }), "{err:?}");
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap().files_free, free);
+        assert_eq!(u64::from(fs.ext4_read_orphan_head()), child.ino.0);
+        assert_eq!(*fs.ext4_pending_orphans.lock(), pending);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_tmpfile_atomic_retained_image_passes_native_checker() {
+        use std::io::Write as _;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/images/ext4_small.img");
+        let dev = TestDevice::from_vec(std::fs::read(fixture).expect("retained ext4 fixture"));
+        let cx = Cx::for_testing();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        fs.enable_writes(&cx).unwrap();
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let root = InodeNumber(2);
+        let acl = ext4_setattr_test_acl(6, 4, 0);
+        fs.setxattr(&cx, root, POSIX_ACL_DEFAULT_XATTR, &acl, XattrSetMode::Set)
+            .unwrap();
+        let kept = fs
+            .with_latest_scope(|scope| {
+                <OpenFs as FsOps>::tmpfile(&fs, &cx, scope, root, 0o666, 0, 0)
+            })
+            .unwrap();
+        let dropped = fs.ext4_tmpfile(&cx, root, 0o600, 0, 0).unwrap();
+        fs.write(&cx, kept.ino, 0, b"native checker tmpfile payload")
+            .unwrap();
+        fs.link(&cx, kept.ino, root, OsStr::new("native_tmpfile"))
+            .unwrap();
+        assert!(fs.finalize_unlinked_inode_public(&cx, dropped.ino).unwrap());
+        fs.flush_mvcc_to_device(&cx).unwrap();
+
+        // Retain this exclusively created artifact: no TempDir/NamedTempFile
+        // destructor or cleanup command removes it after the checker runs.
+        let image = std::env::temp_dir().join(format!(
+            "ffs-tmpfile-{}-{}.ext4",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&image)
+            .unwrap();
+        file.write_all(&dev.snapshot_bytes()).unwrap();
+        file.sync_all().unwrap();
+        let bytes = std::fs::read(&image).unwrap();
+        let digest = blake3::hash(&bytes);
+        let checked = std::process::Command::new("e2fsck")
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .expect("e2fsck must execute for this native checker test");
+        println!(
+            "retained tmpfile image: {}\n{}\n{}",
+            image.display(),
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        assert!(
+            checked.status.success(),
+            "native checker status: {:?}",
+            checked.status
+        );
+        assert_eq!(
+            blake3::hash(&std::fs::read(&image).unwrap()),
+            digest,
+            "checker is read-only"
+        );
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let named = reopened
+            .lookup(&cx, root, OsStr::new("native_tmpfile"))
+            .unwrap();
+        assert_eq!(named.perm & 0o777, 0o640);
+        assert_eq!(named.nlink, 1);
+        assert_eq!(
+            reopened.read(&cx, named.ino, 0, 64).unwrap(),
+            b"native checker tmpfile payload"
+        );
+        assert_eq!(
+            reopened
+                .getxattr(&cx, named.ino, POSIX_ACL_ACCESS_XATTR)
+                .unwrap(),
+            Some(acl)
+        );
+        assert_eq!(reopened.ext4_read_orphan_head(), 0);
     }
 
     /// Access-time maintenance (xfstests generic/003): relatime updates atime
