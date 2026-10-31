@@ -11,6 +11,33 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### Writer snapshot continuation — 2026-10-31 00:35 UTC
+
+- [x] Preserve local commit `92f2ada2c` and other actors' commits; keep the
+  original P0 `bd-vuzzq` in progress with its full acceptance unchanged.
+- [x] Recheck source-aware tracker diagnosis:16/16 scenarios pass, ready verdict,
+  50claimable/0foreign/0permission-gated; no graph closures or dependency edits.
+- [x] Identify writer fall-forward reads, current namespace-index reuse and the
+  separate writer snapshot capture/registration window; reserve existing files.
+- [x] Add three regressions using existing in-memory and retained image helpers:
+  all five block read forms, staged writes, both stores, pin lifetime and a
+  planted legal ext4 timestamp collision. Existing tests/gates stay unchanged.
+- [ ] Execute all three before the correction; retain the failing output.
+- [ ] Use protected fixed-view reads and bypass current namespace indexes for
+  active transactions; preserve staged-write precedence and postcommit reads.
+- [ ] Capture/register each managed writer transaction under the same lock used
+  by snapshot pruning, for both Single and Sharded stores.
+- [ ] Reexecute the regressions and existing snapshot/rename/range controls.
+- [ ] Run workspace check, strict Clippy, formatting and unchanged UBS; inspect
+  source/worker hashes, preserve all failures and successes, and update Beads.
+- [ ] Reassess the original full-workspace/native acceptance. Retained-image and
+  unit tests do not qualify native FUSE, crash recovery or throughput. The
+  separate temporary-cleanup permission remains pending; no P0 closure follows.
+
+hz4's former build volume fell below20GiB free. Its separate volatile user tmpfs
+now has40GiB capacity and42,949,644,288bytes free; SBH20GiB passes. The per-run
+RCH target location moved there; no global config, guard or fallback changed.
+
 ### FUSE read-consistency continuation — 23:30 UTC
 
 The previous correction/test/checkpoint is now present in shared commits
