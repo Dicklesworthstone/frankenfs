@@ -99307,9 +99307,9 @@ mod tests {
             } else {
                 FsMvccStore::sharded()
             });
-            let block = BlockNumber(40);
+            let block = BlockNumber(20);
             let bs = usize::try_from(fs.block_size()).unwrap();
-            let gap = fs.read_block_vec(&cx, BlockNumber(41)).unwrap();
+            let gap = fs.read_block_vec(&cx, BlockNumber(21)).unwrap();
             let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
             fs.block_device_adapter()
                 .write_block(&cx, block, &vec![0x72; bs])
@@ -99317,16 +99317,16 @@ mod tests {
             let before_abort = fs.current_snapshot();
             assert!(matches!(
                 fs.read_block_with_scope(&cx, &scope, block),
-                Err(FfsError::MvccConflict { block: 40, .. })
+                Err(FfsError::MvccConflict { block: 20, .. })
             ));
             assert!(matches!(
                 fs.read_block_arc_with_scope(&cx, &scope, block),
-                Err(FfsError::MvccConflict { block: 40, .. })
+                Err(FfsError::MvccConflict { block: 20, .. })
             ));
             let borrowed = std::cell::Cell::new(false);
             assert!(matches!(
                 fs.with_block_bytes(&cx, &scope, block, |_| borrowed.set(true)),
-                Err(FfsError::MvccConflict { block: 40, .. })
+                Err(FfsError::MvccConflict { block: 20, .. })
             ));
             assert!(
                 !borrowed.get(),
@@ -99334,12 +99334,12 @@ mod tests {
             );
             assert!(matches!(
                 fs.read_contiguous_blocks_with_scope(&cx, &scope, block, 2),
-                Err(FfsError::MvccConflict { block: 40, .. })
+                Err(FfsError::MvccConflict { block: 20, .. })
             ));
             let mut into = vec![0xAA; bs * 2];
             assert!(matches!(
                 fs.read_contiguous_into_with_scope(&cx, &scope, block, &mut into),
-                Err(FfsError::MvccConflict { block: 40, .. })
+                Err(FfsError::MvccConflict { block: 20, .. })
             ));
             assert_eq!(into, vec![0xAA; bs * 2]);
 
@@ -99385,7 +99385,7 @@ mod tests {
             } else {
                 FsMvccStore::sharded()
             });
-            let block = BlockNumber(40);
+            let block = BlockNumber(20);
             let bs = usize::try_from(fs.block_size()).unwrap();
             let old = vec![0x31; bs];
             fs.block_device_adapter()
@@ -99441,8 +99441,35 @@ mod tests {
             Err(FfsError::NotFound(_))
         ));
         let current_parent = fs.read_inode(&cx, root).unwrap();
+        // Seed a valid current cache from actual directory bytes. An htree
+        // miss can bypass cache rebuilding and leave an unusable old slot.
+        let names = fs
+            .read_dir_with_scope(&cx, &RequestScope::empty(), &current_parent)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        *fs.dir_name_index_shard(root.0).lock() = Some(DirNameIndex {
+            inode: root.0,
+            validation: ReaddirValidation {
+                ctime: (u64::from(current_parent.ctime) << 32)
+                    | u64::from(current_parent.ctime_extra),
+                mtime: u64::from(current_parent.mtime),
+                size: current_parent.size,
+            },
+            ns_gen: fs.namespace_gen_now(),
+            names,
+            present: None,
+        });
+        {
+            let index = fs.dir_name_index_shard(root.0).lock();
+            let index = index.as_ref().expect("prime the current namespace index");
+            assert!(!index.names.contains(b"scope_source".as_slice()));
+            assert!(index.names.contains(b"scope_target".as_slice()));
+        }
         let mut old_parent = fs.read_inode_with_scope(&cx, &scope, root).unwrap();
         assert_eq!(old_parent.size, current_parent.size);
+        assert_eq!(old_parent.number, root.0);
         // Equal ext4 timestamps are legal. Plant that collision so the current
         // name index cannot accidentally look valid for an older transaction.
         old_parent.ctime = current_parent.ctime;

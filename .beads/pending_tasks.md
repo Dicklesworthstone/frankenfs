@@ -22,17 +22,53 @@ completed or handed off. Historical evidence remains in place.
 - [x] Add three regressions using existing in-memory and retained image helpers:
   all five block read forms, staged writes, both stores, pin lifetime and a
   planted legal ext4 timestamp collision. Existing tests/gates stay unchanged.
-- [ ] Execute all three before the correction; retain the failing output.
-- [ ] Use protected fixed-view reads and bypass current namespace indexes for
+- [x] Execute all three before the correction; retain the failing output.
+  First run is not behavioral evidence:two new tests used out-of-range blocks
+  on the32-block constructed image; the third did not assert its cache setup.
+  Corrected the new setups to20/21 and explicit cache population checks. The
+  candidate is preserved while a second run uses original production bytes.
+  Another actor committed the initial candidate/notes as `a282a1561` and
+  `b8797e362` during verification; no verified-completion claim attaches to them.
+  Second run:1pass/2fail, exit101; writer fails its actual block20 snapshot
+  assertion, lifecycle passes, namespace instead fails its cache precondition.
+  htree misses do not guarantee cache rebuild. The final new namespace setup
+  seeds a valid current index from real directory bytes and plants only the
+  legal timestamp collision. Third run holds the old namespace guard alone:
+  2pass/1fail, exit101, with the old source incorrectly absent. The other two
+  writer tests pass under the corrected read path. Both real reds are retained;
+  setup failures are not credited as regression proof.
+- [x] Use protected fixed-view reads and bypass current namespace indexes for
   active transactions; preserve staged-write precedence and postcommit reads.
-- [ ] Capture/register each managed writer transaction under the same lock used
+- [x] Capture/register each managed writer transaction under the same lock used
   by snapshot pruning, for both Single and Sharded stores.
-- [ ] Reexecute the regressions and existing snapshot/rename/range controls.
-- [ ] Run workspace check, strict Clippy, formatting and unchanged UBS; inspect
+- [x] Reexecute the regressions and existing snapshot/rename/range controls.
+  Predeclared25 cases under both default and `bhh0i_sharded_alloc` builds;
+  then the full716-case FUSE library (existing ignore/conditional mount limits
+  unchanged). New block tests exercise Single and Sharded stores inside each run.
+  Default run passes25/0/0,1574filtered,0.09s; sharded-feature run passes
+  25/0/0,1645filtered,0.11s. Both commands0, and the feature run logs both
+  allocator modes in the cancellation/open-victim control. Overlaps are not
+  summed into a larger unique-test count. Full FUSE result:715passed/0failed/
+  1existing ignored/0filtered,0.32s,command0. Its native lifecycle case returns
+  early on fusermount3 Permission denied, and existing Gate5 remains ignored.
+  Those framework outcomes do not qualify native mount/unmount behavior.
+- [x] Run workspace check, strict Clippy, formatting and unchanged UBS; inspect
   source/worker hashes, preserve all failures and successes, and update Beads.
-- [ ] Reassess the original full-workspace/native acceptance. Retained-image and
+  Literal workspace/all-target check passes0 on hz4 (2m34s Cargo). Formatting
+  passes0; final core UBS passes0 with0critical/15455warnings/3170info, and
+  the other four changed Rust files pass0 with0critical/589warnings/163info.
+  All five source files and the unchanged lockfile match the tested worker;
+  core SHA256 `16defa1627aaa5c5a05fe53ec4a3a3db4e02d8a17d8a859bf6abacf235d4867f`.
+  Strict workspace/all-target Clippy passes0 (1m26s Cargo). Post-gate worker
+  hashes still match. Raw `resume3-*.log` and all three source/control patches
+  are preserved under `artifacts/implementation/20261030_O221Lk/`; copied bytes
+  match the originals. Failed fixture setups are retained alongside real reds.
+- [ ] Complete the original full-workspace/native acceptance. Retained-image and
   unit tests do not qualify native FUSE, crash recovery or throughput. The
   separate temporary-cleanup permission remains pending; no P0 closure follows.
+  Writable fixed-snapshot range-read throughput is unbenchmarked; no speedup or
+  native/crash qualification is claimed. This source/test unit is self-verified,
+  without an independent reviewer. No task or dependency was created or closed.
 
 hz4's former build volume fell below20GiB free. Its separate volatile user tmpfs
 now has40GiB capacity and42,949,644,288bytes free; SBH20GiB passes. The per-run
