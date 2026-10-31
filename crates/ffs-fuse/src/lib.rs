@@ -20145,6 +20145,203 @@ mod tests {
         }
     }
 
+    fn preserved_scope_ext4() -> Arc<ffs_core::OpenFs> {
+        static NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
+        let created = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ffs-read-scope-{}-{created}-{}.ext4",
+            std::process::id(),
+            NEXT_IMAGE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut image = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create private constructed ext4 image");
+        image
+            .write_all(&build_gate5_ext4_image())
+            .expect("write existing constructed fixture");
+        drop(image);
+        eprintln!("preserved read-scope image: {}", path.display());
+        let cx = Cx::for_testing();
+        let options = ffs_core::OpenOptions {
+            skip_validation: true,
+            ext4_journal_replay_mode: ffs_core::Ext4JournalReplayMode::Skip,
+            ..ffs_core::OpenOptions::default()
+        };
+        let mut fs = ffs_core::OpenFs::open_read_write(&cx, &path, &options).expect("open fixture");
+        fs.enable_writes(&cx).expect("enable fixture writes");
+        Arc::new(fs)
+    }
+
+    #[test]
+    fn snapshot_read_scope_retries_real_conflict_with_new_view() {
+        let fs = preserved_scope_ext4();
+        let fuse = FrankenFuse::with_options(
+            Box::new(Arc::clone(&fs)),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        );
+        let cx = Cx::for_testing();
+        let calls = std::cell::Cell::new(0);
+        let data = fuse
+            .with_request_scope(&cx, RequestOp::Read, |cx, scope| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    // A real writer publishes between this reader's scope
+                    // capture and its first inode/data access. The old view
+                    // has no retained before-image, so it must be retried.
+                    fs.as_ref().write(cx, InodeNumber(11), 0, b"newest")?;
+                }
+                fuse.inner.ops.read(cx, scope, InodeNumber(11), 0, 6)
+            })
+            .expect("retry must capture a usable new view");
+        assert_eq!(data, b"newest");
+        assert_eq!(calls.get(), 2);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        let metrics = fuse.metrics().snapshot();
+        assert_eq!(metrics.requests_total, 1);
+        assert_eq!(metrics.requests_ok, 1);
+        assert_eq!(metrics.requests_err, 0);
+    }
+
+    #[test]
+    fn writable_read_ignores_unversioned_readahead() {
+        let fs = preserved_scope_ext4();
+        let fuse = FrankenFuse::with_options(
+            Box::new(Arc::clone(&fs)),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        );
+        let cx = Cx::for_testing();
+        fs.as_ref()
+            .write(&cx, InodeNumber(11), 0, b"newest")
+            .unwrap();
+        // Model a prefetch completing after the writer's invalidation. These
+        // bytes have no snapshot stamp and must never answer a writable read.
+        fuse.inner
+            .readahead
+            .insert(InodeNumber(11), 0, b"hello\n".to_vec());
+        assert_eq!(fuse.read_for_fuzzing(11, 0, 6).unwrap(), b"newest");
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_read_scope_exhausts_retries_and_counts_one_request() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fuse = FrankenFuse::new(Box::new(HookFs::new(Arc::clone(&events), false, false)));
+        let cx = Cx::for_testing();
+        let calls = std::cell::Cell::new(0_u64);
+        let error = fuse
+            .with_request_scope(&cx, RequestOp::Lookup, |_, _| {
+                calls.set(calls.get() + 1);
+                Err::<(), _>(FfsError::MvccConflict {
+                    tx: calls.get(),
+                    block: 7,
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(error, FfsError::MvccConflict { tx: 4, block: 7 }));
+        assert_eq!(calls.get(), 4);
+        assert_eq!(events.lock().unwrap().len(), 8, "every attempt must end");
+        let metrics = fuse.metrics().snapshot();
+        assert_eq!(metrics.requests_total, 1);
+        assert_eq!(metrics.requests_ok, 0);
+        assert_eq!(metrics.requests_err, 1);
+    }
+
+    #[test]
+    fn snapshot_read_scope_never_replays_mutations_handles_or_ioctls() {
+        for op in [
+            RequestOp::Write,
+            RequestOp::Create,
+            RequestOp::Open,
+            RequestOp::Release,
+            RequestOp::Opendir,
+            RequestOp::IoctlRead,
+            RequestOp::IoctlWrite,
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let fuse = FrankenFuse::new(Box::new(HookFs::new(Arc::clone(&events), false, false)));
+            let calls = std::cell::Cell::new(0);
+            let error = fuse
+                .with_request_scope(&Cx::for_testing(), op, |_, _| {
+                    calls.set(calls.get() + 1);
+                    Err::<(), _>(FfsError::MvccConflict { tx: 1, block: 7 })
+                })
+                .unwrap_err();
+            assert!(matches!(error, FfsError::MvccConflict { .. }));
+            assert_eq!(calls.get(), 1, "{op:?} must never replay");
+            assert_eq!(events.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn snapshot_read_scope_does_not_retry_terminal_read_errors() {
+        for io_error in [false, true] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let fuse = FrankenFuse::new(Box::new(HookFs::new(Arc::clone(&events), false, false)));
+            let calls = std::cell::Cell::new(0);
+            let error = fuse
+                .with_request_scope(&Cx::for_testing(), RequestOp::Read, |_, _| {
+                    calls.set(calls.get() + 1);
+                    Err::<(), _>(if io_error {
+                        FfsError::Io(std::io::Error::from_raw_os_error(libc::EAGAIN))
+                    } else {
+                        FfsError::NotFound("absent".to_owned())
+                    })
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.to_errno(),
+                if io_error { libc::EAGAIN } else { libc::ENOENT }
+            );
+            assert_eq!(calls.get(), 1);
+            assert_eq!(events.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn snapshot_read_scope_cleanup_failure_prevents_retry() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fuse = FrankenFuse::new(Box::new(HookFs::new(Arc::clone(&events), false, true)));
+        let calls = std::cell::Cell::new(0);
+        let error = fuse
+            .with_request_scope(&Cx::for_testing(), RequestOp::Read, |_, _| {
+                calls.set(calls.get() + 1);
+                Err::<(), _>(FfsError::MvccConflict { tx: 1, block: 7 })
+            })
+            .unwrap_err();
+        assert!(matches!(error, FfsError::MvccConflict { tx: 1, block: 7 }));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(events.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_read_scope_cancellation_stops_between_attempts() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fuse = FrankenFuse::new(Box::new(HookFs::new(Arc::clone(&events), false, false)));
+        let cx = Cx::for_testing();
+        let calls = std::cell::Cell::new(0);
+        let error = fuse
+            .with_request_scope(&cx, RequestOp::Read, |cx, _| {
+                calls.set(calls.get() + 1);
+                cx.set_cancel_requested(true);
+                Err::<(), _>(FfsError::MvccConflict { tx: 1, block: 7 })
+            })
+            .unwrap_err();
+        assert!(matches!(error, FfsError::Cancelled));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(events.lock().unwrap().len(), 2);
+    }
+
     #[test]
     fn request_scope_calls_begin_and_end_for_successful_operation() {
         let events = Arc::new(Mutex::new(Vec::new()));

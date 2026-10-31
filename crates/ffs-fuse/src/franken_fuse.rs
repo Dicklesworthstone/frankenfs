@@ -3203,10 +3203,11 @@ impl FrankenFuse {
         Ok(())
     }
 
-    fn with_request_scope<T, F>(&self, cx: &Cx, op: RequestOp, f: F) -> ffs_error::Result<T>
+    fn with_request_scope<T, F>(&self, cx: &Cx, op: RequestOp, mut f: F) -> ffs_error::Result<T>
     where
-        F: FnOnce(&Cx, &mut RequestScope) -> ffs_error::Result<T>,
+        F: FnMut(&Cx, &mut RequestScope) -> ffs_error::Result<T>,
     {
+        const MAX_READ_ATTEMPTS: u8 = 4;
         // Per-opcode census (see crate::OP_COUNTS). This is the one choke point every
         // request passes through -- the getxattr memo used to return BEFORE it, which is
         // why requests_total once read 22 for 6,001 stats, fixed in bdd0fd1b.
@@ -3227,48 +3228,71 @@ impl FrankenFuse {
         }
         // Only read the clock when something will read the counter (bd-xfe7z).
         let started = crate::dispatch_timing_enabled().then(Instant::now);
-        let result = match self.inner.ops.begin_request_scope(cx, op) {
-            Ok(mut scope) => {
-                // bd-q3960: the scope MUST end even if the handler panics. A
-                // gated mutation that unwound past end_request_scope left the
-                // mutation gate's in-flight count raised, and every later
-                // fsync waited in close_mutation_gate forever (xfstests
-                // generic/308 before f8fb93ef). Release builds abort on panic
-                // and never get here; unwinding builds now answer EIO, keep
-                // the worker, and stay mountable.
-                let op_result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(cx, &mut scope)))
-                        .unwrap_or_else(|_| {
-                            error!(?op, "FUSE handler panicked; request answered EIO");
-                            Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO)))
-                        });
-                let end_result = self.inner.ops.end_request_scope(cx, op, scope);
+        // Only idempotent observations may restart at a newer snapshot.
+        // Handles, mutations and ioctls can have side effects before an error.
+        let retry_read = matches!(
+            op,
+            RequestOp::Lookup
+                | RequestOp::Getattr
+                | RequestOp::Read
+                | RequestOp::Readdir
+                | RequestOp::Readlink
+                | RequestOp::Getxattr
+                | RequestOp::Listxattr
+                | RequestOp::Statfs
+                | RequestOp::Lseek
+        );
+        let mut attempt = 0_u8;
+        let result = loop {
+            attempt += 1;
+            match self.inner.ops.begin_request_scope(cx, op) {
+                Ok(mut scope) => {
+                    // bd-q3960: the scope MUST end even if the handler panics. A
+                    // gated mutation that unwound past end_request_scope left the
+                    // mutation gate's in-flight count raised, and every later
+                    // fsync waited in close_mutation_gate forever (xfstests
+                    // generic/308 before f8fb93ef). Release builds abort on panic
+                    // and never get here; unwinding builds now answer EIO, keep
+                    // the worker, and stay mountable.
+                    let op_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        f(cx, &mut scope)
+                    }))
+                    .unwrap_or_else(|_| {
+                        error!(?op, "FUSE handler panicked; request answered EIO");
+                        Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO)))
+                    });
+                    let end_result = self.inner.ops.end_request_scope(cx, op, scope);
 
-                match (op_result, end_result) {
-                    (Ok(value), Ok(())) => {
-                        self.inner.metrics.record_ok();
-                        Ok(value)
+                    if retry_read
+                        && attempt < MAX_READ_ATTEMPTS
+                        && end_result.is_ok()
+                        && matches!(&op_result, Err(FfsError::MvccConflict { .. }))
+                    {
+                        if cx.checkpoint().is_err() {
+                            break Err(FfsError::Cancelled);
+                        }
+                        trace!(?op, attempt, "retrying read with a fresh snapshot");
+                        continue;
                     }
-                    (Ok(_), Err(end_err)) => {
-                        self.inner.metrics.record_err();
-                        Err(end_err)
-                    }
-                    (Err(op_err), Ok(())) => {
-                        self.inner.metrics.record_err();
-                        Err(op_err)
-                    }
-                    (Err(op_err), Err(end_err)) => {
-                        self.inner.metrics.record_err();
-                        warn!(?op, error = %end_err, "request scope cleanup failed after operation error");
-                        Err(op_err)
-                    }
+
+                    break match (op_result, end_result) {
+                        (Ok(value), Ok(())) => Ok(value),
+                        (Ok(_), Err(end_err)) => Err(end_err),
+                        (Err(op_err), Ok(())) => Err(op_err),
+                        (Err(op_err), Err(end_err)) => {
+                            warn!(?op, error = %end_err, "request scope cleanup failed after operation error");
+                            Err(op_err)
+                        }
+                    };
                 }
-            }
-            Err(e) => {
-                self.inner.metrics.record_err();
-                Err(e)
+                Err(error) => break Err(error),
             }
         };
+        if result.is_ok() {
+            self.inner.metrics.record_ok();
+        } else {
+            self.inner.metrics.record_err();
+        }
         self.inner
             .metrics
             .record_dispatch_duration(op, started.map(|started| started.elapsed()));
@@ -3812,30 +3836,39 @@ impl FrankenFuse {
     ) -> ffs_error::Result<Vec<u8>> {
         let requested_len = usize::try_from(size).unwrap_or(usize::MAX);
         self.with_request_scope(cx, RequestOp::Read, |cx, scope| {
-            let mut served = self
-                .inner
-                .readahead
-                .take(ino, byte_offset, requested_len)
-                .map_or_else(Vec::new, |prefetched| {
-                    trace!(
-                        target: "ffs::fuse::io",
-                        event = "readahead_hit",
-                        ino = ino.0,
-                        offset = byte_offset,
-                        bytes = prefetched.len()
-                    );
-                    prefetched
-                });
+            // Readahead entries have no MVCC snapshot stamp. On writable
+            // mounts an older in-flight prefetch can finish after invalidation,
+            // so only immutable read-only mounts may consume or queue them.
+            let mut served = if self.inner.read_only {
+                self.inner
+                    .readahead
+                    .take(ino, byte_offset, requested_len)
+                    .map_or_else(Vec::new, |prefetched| {
+                        trace!(
+                            target: "ffs::fuse::io",
+                            event = "readahead_hit",
+                            ino = ino.0,
+                            offset = byte_offset,
+                            bytes = prefetched.len()
+                        );
+                        prefetched
+                    })
+            } else {
+                Vec::new()
+            };
 
             if served.len() < requested_len {
                 let remaining_req =
                     size.saturating_sub(u32::try_from(served.len()).unwrap_or(u32::MAX));
                 let next_offset =
                     byte_offset.saturating_add(u64::try_from(served.len()).unwrap_or(u64::MAX));
-                let fetch_size =
+                let fetch_size = if self.inner.read_only {
                     self.inner
                         .access_predictor
-                        .fetch_size(ino, next_offset, remaining_req);
+                        .fetch_size(ino, next_offset, remaining_req)
+                } else {
+                    remaining_req
+                };
 
                 let mut fetched = self
                     .inner
@@ -3846,7 +3879,7 @@ impl FrankenFuse {
 
                 served.append(&mut fetched);
 
-                if !tail.is_empty() {
+                if self.inner.read_only && !tail.is_empty() {
                     let consumed = u64::try_from(fetched_served_len).unwrap_or(u64::MAX);
                     let prefetch_offset = next_offset.saturating_add(consumed);
                     let prefetch_bytes = tail.len();

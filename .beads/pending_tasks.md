@@ -11,6 +11,90 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### FUSE read-consistency continuation — 23:30 UTC
+
+The previous correction/test/checkpoint is now present in shared commits
+`068159046`, `2f0b31b74`, `f675bc5ef`; those commits were made by another actor.
+The same original P0 remains claimed by NavyElm; no product task was closed.
+
+- [x] Recheck the local source-aware queue:16/16 diagnostic scenarios, verdict ready,
+  50claimable/0foreign/0permission-gated open rows; preserve all graph ownership.
+  The fixture-golden self-check is disabled only for this documented live queue
+  diagnosis; this is not a pass of the separate full tracker/golden gate.
+- [x] Execute read-only native `e2fsck -fn` on the preserved persisted8-create
+  image through admitted RCH:all5phases,exit0,25/4096files,1328/4096blocks.
+  Image SHA256 before/after remains
+  `0e2dfa802cc84ff6b298848d4c91bca4bd379f83e5951a8ea9a4f94a144c9711`;
+  `debugfs` confirms the four expected files in `/t0`. This is retained-image
+  mutation/oracle evidence only; no fresh-native/mounted/crash claim.
+- [x] Identify two concrete FUSE gaps: writable readahead can answer with bytes
+  from another snapshot, and retryable observation conflicts escape immediately.
+- [x] Add7 regressions alongside existing tests. Real OpenFs tests reuse the
+  existing constructed ext4 fixture and preserve their private image files;
+  policy tests reuse HookFs. No original assertion/golden/ignore was changed.
+- [x] Execute the seven tests before the production change:3passed/4failed,
+  0ignored/709filtered,exit101. Actual stale-byte failure was `hello\n` instead
+  of `newest`; the real interleaving failed with `MvccConflict` at block4.
+  Retry bound and cancellation controls also failed as intended.
+  Worker pre-change include SHA256:
+  `d72bb21e04c62d89aa2ee6d8598309aebe2c1a43a611204bdb94abd145b0b8bb`;
+  tests SHA256 `56f2efb8285ed041644cce24cfc9a3a46a90ab5d59be3a4fd7fc9de285c04623`.
+- [x] Implement four-attempt typed snapshot-conflict retry for idempotent
+  observations, closing each old scope before acquiring the next. Never replay
+  mutations, handles, ioctls, terminal errors or failed cleanup. Check the Cx
+  between attempts, preserve terminal error priority and count metrics once.
+- [x] Restrict unversioned readahead consumption/queueing to immutable read-only
+  mounts; writable reads fetch only the requested range through their scope.
+- [x] Execute the same seven assertions against the correction; fix source
+  diagnostics or behavior rather than weakening any assertion.
+- [x] Execute existing scope lifecycle/panic/metrics and read-only sequential
+  coalescing controls with predeclared nonzero counts.
+  Combined18-test run on hz4 passes18/0/0,698filtered,command0. The seven
+  regressions are included; overlapping runs are not added to the denominator.
+  `resume2-fuse-hz4-final.log` contains the expected caught-panic diagnostic.
+- [x] Execute the full FUSE library suite:716 declared cases, including the
+  unchanged ignored kernel-mount Gate5 test. All other test bodies were checked
+  for fixture deletion before starting; no skip, ignore or assertion was added.
+  Result:715passed/0failed/1existing ignored/0filtered,0.33s runtime,command0.
+  `managed_unmount_joins_actual_destroy_and_retirement_bd_in31y` returned early
+  after fusermount3 Permission denied; its framework pass is not native lifecycle
+  proof. This existing conditional skip and Gate5 ignore are unchanged.
+- [x] Run final workspace check, strict Clippy, cargo fmt and standalone rustfmt
+  for `franken_fuse.rs` (it is included source, outside cargo fmt traversal).
+  Strict all-target workspace Clippy passes on hz4 (2m48s Cargo,command0);
+  cargo fmt and standalone include-file formatting pass. Literal all-target
+  workspace check passes0 (47.71s Cargo); `resume2-check-final.log`.
+- [x] Run unchanged UBS on both edited Rust files, inspect the actual diff,
+  bind all verification to hashes and retain failed as well as passing logs.
+  Final-source UBS passes0,0critical/2601warnings/419info. Include/test/lock
+  hashes match worker:a46d1336666011b9ab9f32fa89a2223dc36c9aea029e9bdc0f8b3316d606414f,
+  56f2efb8285ed041644cce24cfc9a3a46a90ab5d59be3a4fd7fc9de285c04623,
+  e03fc312dd127a579f05748d334a2bb36f7b069c607109222ec9771e4d07d278.
+- [x] Preserve all `resume2-*.log` files, both exact failed-job recovery records
+  and the source diff under `artifacts/implementation/20261030_O221Lk/`.
+  Source/test verification is complete for this local commit; no baseline close
+  or full-project/native qualification follows from the narrower results.
+- [ ] Reverify original acceptance, update/sync the existing Bead and this TODO,
+  and land only when the original gates permit it. Full workspace/native fixture
+  cleanup permission remains pending; no narrow proof closes the full baseline.
+  Writable readahead throughput is unbenchmarked; the unversioned cache is now
+  deliberately confined to immutable read-only mounts. Original performance
+  tasks/requirements remain open. The changed FUSE files satisfy UBS's zero-exit
+  commit rule; existing unrelated CLI findings have not been waived or changed.
+
+Both initial corrected-source attempts on hz3 are terminal/reconciled with no
+pass credit:SSH255 for `rchw-e4b3c9d1-24fb-4297-a725-c58d0de35715`, and source-init
+refusal73/wrapper103/acknowledged1 for
+`rchw-8ffba9f8-e3bb-4d23-adb5-8888e02fbda0`. No replay occurred before recovery.
+hz4's existing warm target pool on its separate64GiB `/tmp` tmpfs passed SBH
+with27,889,651,712bytes free; same per-run config now uses that measured pool.
+No global config, admission threshold or fallback changed. The first hz4 compile
+found a nonexistent `RequestOp::Access` whitelist name, removed because access
+checks use existing getattr. The corrected source passed the18-test run and
+workspace Clippy. Latest preflight still passes with23,760,318,464bytes free.
+
+### Earlier source checkpoint (retained history)
+
 Continuation: the shared checkout now contains the prior source repair in
 `86877f568` and its tracker checkpoint in `10e980b02`; both were committed by
 another actor during this session and are preserved. The resumed hz4 run has
