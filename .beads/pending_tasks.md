@@ -11,6 +11,37 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### ACL input continuation — 2026-10-31 04:35 UTC
+
+- [x] Recheck main, the live source-aware queue and ownership; preserve all peer
+  work and continue the original P0 `bd-vuzzq`, without a second active claim.
+- [x] Inspect ready items before implementation: auto dispatch/per-core routing
+  are already wired, with performance qualification still open. Do not redo them.
+- [x] Trace ACL creation and update paths. Inheritance publication still spans
+  allocator/namespace boundaries (`bd-9rutw` remains open); it is not solved by
+  the narrower ACL input correction below.
+- [x] Verify upstream ACL input contracts: nonempty ACL grammar, named-ID and
+  permission validity; empty payload/header-only ACL removal preserves mode.
+- [x] Add three regressions in existing core tests: valid and malformed inputs,
+  actual clear/readback/create after default removal, and failure atomicity.
+- [x] Run the three against current production; distinguish fixture failures
+  from actual incorrect behavior and retain all output.
+  hz4 refused admission twice (critical I/O/disk pressure), before tests. hz3
+  passes the20GiB build-volume guard. Its red run is0pass/3fail/0ignored,
+  1599filtered,exit101:actual clear changed0640 to0000, and both parser and
+  public setter accepted an ACL missing its owner. No fixture failure is
+  credited as behavioral proof. Worker source hashes and retained fixture match.
+- [x] Correct shared ACL validation and route ACL clearing through removal,
+  preserving valid set/chmod/inheritance behavior and unrelated xattrs.
+- [ ] Execute the same regressions and existing ACL representation controls,
+  the full FUSE library, workspace check/strict Clippy/fmt and unchanged UBS.
+  A fourth regression exercises real Btrfs operations on the existing constructed
+  image helper. The next denominator is7:four new cases plus3 existing ACL
+  representation controls; no fresh/native Btrfs qualification follows.
+- [ ] Bind source hashes, archive raw evidence, sync tracker and checkpoint.
+- [ ] Complete original full-suite/native acceptance and remaining atomic
+  inheritance/sharded namespace work; no narrow test run closes those items.
+
 ### Writer snapshot continuation — 2026-10-31 00:35 UTC
 
 - [x] Preserve local commit `92f2ada2c` and other actors' commits; keep the
