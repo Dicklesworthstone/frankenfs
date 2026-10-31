@@ -4765,9 +4765,8 @@ impl FsOps for OpenFs {
         let read_snapshot_pinned = !op.is_write() && self.is_writable();
         let (snapshot, tx) = if op.is_write() {
             // Write operations must use a transaction for isolation and atomicity.
-            let txn = self.mvcc_store.begin();
+            let txn = self.mvcc_store.begin_registered();
             let snapshot = txn.snapshot;
-            self.mvcc_store.register_snapshot(snapshot);
             trace!(
                 target: "ffs::mvcc",
                 op = ?op,

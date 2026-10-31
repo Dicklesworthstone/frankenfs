@@ -153,6 +153,19 @@ impl FsMvccStore {
         }
     }
 
+    /// Begin and pin a writer's snapshot without leaving a GC registration gap.
+    pub(super) fn begin_registered(&self) -> Transaction {
+        match self {
+            Self::Single(lock) => {
+                let mut store = lock.write();
+                let txn = store.begin();
+                store.register_snapshot(txn.snapshot());
+                txn
+            }
+            Self::Sharded { store } => store.begin_registered(),
+        }
+    }
+
     pub(super) fn commit(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         match self {
             Self::Single(lock) => lock.write().commit(txn),

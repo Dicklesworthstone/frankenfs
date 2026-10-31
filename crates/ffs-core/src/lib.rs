@@ -20924,36 +20924,23 @@ impl OpenFs {
             return Ok(staged.to_vec());
         }
 
-        if scope.read_snapshot_pinned {
+        if scope.uses_fixed_snapshot() {
             return self
-                .read_pinned_scope_block(cx, scope, block)
+                .read_fixed_scope_block(cx, scope, block)
                 .map(BlockBuf::into_inner);
         }
 
-        // 2. Transaction-backed scopes read at their fixed snapshot for
-        //    isolation. A no-tx scope's in-scope writes go to the MVCC store
-        //    via `block_device_adapter` (committed at the *current* snapshot,
-        //    i.e. seqs newer than the scope's begin snapshot); reading at the
-        //    fixed begin snapshot would shadow them, breaking read-your-writes
-        //    for a block that already existed at scope begin — e.g. an indirect
-        //    block reused across sequential e2compr writes, which dropped
-        //    pointer slots and corrupted clusters on readback (bd-bw90c). No-tx
-        //    scopes therefore fall through to the current-snapshot device
-        //    adapter below.
-        if scope.tx.is_some()
-            && let Some(snapshot) = scope.snapshot
-            && let Some(visible) = self.mvcc_store.read_visible(block, snapshot)
-        {
-            return Ok(visible);
-        }
-
-        // 3. Fall back to the current-snapshot device view.
+        // A current-view scope's writes go to the MVCC store via
+        // `block_device_adapter`, at sequences newer than its begin snapshot.
+        // Reading at that fixed snapshot would shadow its own writes, e.g. the
+        // pointer slots of an indirect block reused across sequential e2compr
+        // writes (bd-bw90c). Use the current-snapshot device view here.
         self.read_current_block_vec_from_device(cx, block)
     }
 
-    /// Resolve a managed reader's fixed view. A missing old version cannot
+    /// Resolve a reader or writer's fixed view. A missing old version cannot
     /// fall through to a newer overlay or checkpointed device block.
-    fn read_pinned_scope_block(
+    fn read_fixed_scope_block(
         &self,
         cx: &Cx,
         scope: &RequestScope,
@@ -20962,7 +20949,7 @@ impl OpenFs {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let snapshot = scope
             .snapshot
-            .ok_or_else(|| FfsError::Format("pinned read scope has no snapshot".to_owned()))?;
+            .ok_or_else(|| FfsError::Format("fixed scope has no snapshot".to_owned()))?;
         if let Some(visible) = self.mvcc_store.read_visible_block_buf(block, snapshot) {
             return Ok(visible);
         }
@@ -21025,26 +21012,12 @@ impl OpenFs {
             return Ok(Arc::<[u8]>::from(staged));
         }
 
-        if scope.read_snapshot_pinned {
-            let buf = self.read_pinned_scope_block(cx, scope, block)?;
+        if scope.uses_fixed_snapshot() {
+            let buf = self.read_fixed_scope_block(cx, scope, block)?;
             return Ok(Arc::from(buf.as_slice()));
         }
 
-        // 2. Snapshot-visible MVCC version (transaction-backed scopes only —
-        //    no-tx scopes must read at the current snapshot for read-your-writes;
-        //    see read_block_with_scope and bd-bw90c).
-        if scope.tx.is_some()
-            && let Some(snapshot) = scope.snapshot
-        {
-            // Share the visible version (no clone), then one copy into the
-            // Arc — vs `read_visible`'s owned Vec clone THEN Arc copy (two
-            // full-block copies) for the same `Arc<[u8]>` bytes (bd-cc-shardread).
-            if let Some(visible) = self.mvcc_store.read_visible_block_buf(block, snapshot) {
-                return Ok(Arc::<[u8]>::from(visible.as_slice()));
-            }
-        }
-
-        // 3. Device default adapter.
+        // Device default adapter for current-view scopes (bd-bw90c).
         let dev = self.block_device_adapter();
         Ok(Arc::<[u8]>::from(dev.read_block(cx, block)?.as_slice()))
     }
@@ -21070,20 +21043,9 @@ impl OpenFs {
         {
             return Ok(f(staged));
         }
-        if scope.read_snapshot_pinned {
-            let buf = self.read_pinned_scope_block(cx, scope, block)?;
+        if scope.uses_fixed_snapshot() {
+            let buf = self.read_fixed_scope_block(cx, scope, block)?;
             return Ok(f(buf.as_slice()));
-        }
-        if scope.tx.is_some()
-            && let Some(snapshot) = scope.snapshot
-        {
-            // `f` only borrows the bytes read-only, so SHARE the visible
-            // version (Arc BlockBuf, no copy) rather than cloning the whole
-            // block via `read_visible` just to borrow it — this completes the
-            // fn's own no-copy contract on the MVCC-hit branch (bd-cc-shardread).
-            if let Some(visible) = self.mvcc_store.read_visible_block_buf(block, snapshot) {
-                return Ok(f(visible.as_slice()));
-            }
         }
         let dev = self.block_device_adapter();
         let buf = dev.read_block(cx, block)?;
@@ -21134,7 +21096,7 @@ impl OpenFs {
             .checked_add(count_u64)
             .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
 
-        if scope.read_snapshot_pinned {
+        if scope.uses_fixed_snapshot() {
             return (start.0..end)
                 .map(|block| self.read_block_with_scope(cx, scope, BlockNumber(block)))
                 .collect();
@@ -21250,10 +21212,10 @@ impl OpenFs {
             .checked_add(count_u64)
             .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
 
-        if scope.read_snapshot_pinned {
+        if scope.uses_fixed_snapshot() {
             for (block, chunk) in (start.0..end).zip(dst.chunks_exact_mut(bs)) {
-                let buf = self.read_pinned_scope_block(cx, scope, BlockNumber(block))?;
-                chunk.copy_from_slice(buf.as_slice());
+                let buf = self.read_block_with_scope(cx, scope, BlockNumber(block))?;
+                chunk.copy_from_slice(&buf);
             }
             return Ok(());
         }
@@ -22897,9 +22859,9 @@ impl OpenFs {
         let ns_gen = self
             .namespace_gen
             .load(std::sync::atomic::Ordering::Acquire);
-        // This index describes the current namespace, not a retained reader's
+        // This index describes the current namespace, not a fixed snapshot's
         // older directory blocks (timestamps can also collide).
-        let index_keyable = dir_inode.number != 0 && !scope.read_snapshot_pinned;
+        let index_keyable = dir_inode.number != 0 && !scope.uses_fixed_snapshot();
         if index_keyable {
             let guard = self.dir_name_index_shard(dir_inode.number).lock();
             if let Some(idx) = guard.as_ref()
@@ -99331,6 +99293,173 @@ mod tests {
             fs.end_request_scope(&cx, RequestOp::Read, fresh).unwrap();
             assert_eq!(fs.mvcc_active_snapshot_count(), 0);
         }
+    }
+
+    #[test]
+    fn writer_snapshot_reads_reject_newer_ancestors_and_preserve_staged_bytes() {
+        for single_store in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(build_ext4_image_with_state(EXT4_VALID_FS));
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            let block = BlockNumber(40);
+            let bs = usize::try_from(fs.block_size()).unwrap();
+            let gap = fs.read_block_vec(&cx, BlockNumber(41)).unwrap();
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+            fs.block_device_adapter()
+                .write_block(&cx, block, &vec![0x72; bs])
+                .unwrap();
+            let before_abort = fs.current_snapshot();
+            assert!(matches!(
+                fs.read_block_with_scope(&cx, &scope, block),
+                Err(FfsError::MvccConflict { block: 40, .. })
+            ));
+            assert!(matches!(
+                fs.read_block_arc_with_scope(&cx, &scope, block),
+                Err(FfsError::MvccConflict { block: 40, .. })
+            ));
+            let borrowed = std::cell::Cell::new(false);
+            assert!(matches!(
+                fs.with_block_bytes(&cx, &scope, block, |_| borrowed.set(true)),
+                Err(FfsError::MvccConflict { block: 40, .. })
+            ));
+            assert!(
+                !borrowed.get(),
+                "newer pointer bytes must not reach the parser"
+            );
+            assert!(matches!(
+                fs.read_contiguous_blocks_with_scope(&cx, &scope, block, 2),
+                Err(FfsError::MvccConflict { block: 40, .. })
+            ));
+            let mut into = vec![0xAA; bs * 2];
+            assert!(matches!(
+                fs.read_contiguous_into_with_scope(&cx, &scope, block, &mut into),
+                Err(FfsError::MvccConflict { block: 40, .. })
+            ));
+            assert_eq!(into, vec![0xAA; bs * 2]);
+
+            let own = vec![0x31; bs];
+            scope.tx.as_mut().unwrap().stage_write(block, own.clone());
+            assert_eq!(fs.read_block_with_scope(&cx, &scope, block).unwrap(), own);
+            assert_eq!(
+                fs.read_block_arc_with_scope(&cx, &scope, block)
+                    .unwrap()
+                    .as_ref(),
+                own
+            );
+            assert_eq!(
+                fs.with_block_bytes(&cx, &scope, block, |bytes| bytes[0])
+                    .unwrap(),
+                0x31
+            );
+            assert_eq!(
+                fs.read_contiguous_blocks_with_scope(&cx, &scope, block, 2)
+                    .unwrap(),
+                vec![own.clone(), gap.clone()]
+            );
+            fs.read_contiguous_into_with_scope(&cx, &scope, block, &mut into)
+                .unwrap();
+            assert_eq!(&into[..bs], own.as_slice());
+            assert_eq!(&into[bs..], gap.as_slice());
+            fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(fs.current_snapshot(), before_abort);
+            assert_eq!(fs.read_block_vec(&cx, block).unwrap(), vec![0x72; bs]);
+        }
+    }
+
+    #[test]
+    fn writer_snapshot_pin_survives_gc_and_transaction_consumption() {
+        for single_store in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(build_ext4_image_with_state(EXT4_VALID_FS));
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            let block = BlockNumber(40);
+            let bs = usize::try_from(fs.block_size()).unwrap();
+            let old = vec![0x31; bs];
+            fs.block_device_adapter()
+                .write_block(&cx, block, &old)
+                .unwrap();
+            let scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+            let snapshot = scope.snapshot.unwrap();
+            assert_eq!(scope.tx.as_ref().unwrap().snapshot(), snapshot);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+            fs.block_device_adapter()
+                .write_block(&cx, block, &vec![0x72; bs])
+                .unwrap();
+            assert_eq!(fs.mvcc_store.prune_safe(), snapshot.high);
+            assert_eq!(fs.read_block_with_scope(&cx, &scope, block).unwrap(), old);
+            fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+
+            let mut next = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+            next.tx.as_mut().unwrap().stage_write(block, vec![0x53; bs]);
+            fs.commit_request_scope(&cx, &mut next).unwrap();
+            assert!(next.tx.is_none());
+            assert_eq!(
+                fs.mvcc_active_snapshot_count(),
+                1,
+                "commit does not end the request"
+            );
+            fs.end_request_scope(&cx, RequestOp::Write, next).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(fs.read_block_vec(&cx, block).unwrap(), vec![0x53; bs]);
+        }
+    }
+
+    #[test]
+    fn writer_snapshot_lookup_ignores_current_name_index_on_timestamp_collision() {
+        let fs = open_writable_ext4().expect("retained ext4 image");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let source = fs
+            .create(&cx, root, OsStr::new("scope_source"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let scope = fs.begin_request_scope(&cx, RequestOp::Rename).unwrap();
+        fs.rename(
+            &cx,
+            root,
+            OsStr::new("scope_source"),
+            root,
+            OsStr::new("scope_target"),
+        )
+        .unwrap();
+        assert!(matches!(
+            fs.lookup(&cx, root, OsStr::new("scope_source")),
+            Err(FfsError::NotFound(_))
+        ));
+        let current_parent = fs.read_inode(&cx, root).unwrap();
+        let mut old_parent = fs.read_inode_with_scope(&cx, &scope, root).unwrap();
+        assert_eq!(old_parent.size, current_parent.size);
+        // Equal ext4 timestamps are legal. Plant that collision so the current
+        // name index cannot accidentally look valid for an older transaction.
+        old_parent.ctime = current_parent.ctime;
+        old_parent.ctime_extra = current_parent.ctime_extra;
+        old_parent.mtime = current_parent.mtime;
+        let old_source = fs
+            .lookup_name_with_scope(&cx, &scope, &old_parent, b"scope_source")
+            .unwrap()
+            .expect("old source must remain visible to the writer snapshot");
+        assert_eq!(u64::from(old_source.inode), source.0);
+        assert!(
+            fs.lookup_name_with_scope(&cx, &scope, &old_parent, b"scope_target")
+                .unwrap()
+                .is_none()
+        );
+        fs.end_request_scope(&cx, RequestOp::Rename, scope).unwrap();
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
     }
 
     #[test]

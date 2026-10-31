@@ -529,6 +529,12 @@ pub struct RequestScope {
 }
 
 impl RequestScope {
+    /// Whether reads must use the retained snapshot rather than the current view.
+    /// A committed writer has consumed its transaction and resumes current reads.
+    pub(crate) fn uses_fixed_snapshot(&self) -> bool {
+        self.read_snapshot_pinned || (self.tx.is_some() && self.snapshot.is_some())
+    }
+
     /// Create a scope with no snapshot or transaction attached.
     #[must_use]
     pub fn empty() -> Self {

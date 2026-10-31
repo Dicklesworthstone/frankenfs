@@ -639,6 +639,7 @@ struct CommitInstallContext {
 /// | `commit_ssi`       | R (alone)       | -                | W (sorted) | R (alone, Adaptive); W (briefly) |
 /// | `prune_safe`       | -               | W                | W (per)    | -                   |
 /// | `register_snapshot`| -               | W                | -          | -                   |
+/// | `begin_registered` | -               | W                | -          | -                   |
 /// | `release_snapshot` | -               | W                | -          | -                   |
 /// | `set_conflict_policy` / `effective_policy`: leaf only       |
 ///
@@ -1718,6 +1719,20 @@ impl ShardedMvccStore {
     pub fn begin(&self) -> Transaction {
         self.try_begin()
             .unwrap_or_else(|_| Transaction::new(TxnId(u64::MAX), self.current_snapshot()))
+    }
+
+    /// Begin a transaction and pin its snapshot under the lock used by GC.
+    /// The caller must release the snapshot after the request ends, including
+    /// after commit or abort. Transaction ID exhaustion follows [`Self::begin`].
+    #[must_use]
+    pub fn begin_registered(&self) -> Transaction {
+        let mut active = self.active_snapshots.write();
+        let txn = self.begin();
+        active
+            .entry(txn.snapshot().high)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        txn
     }
 
     /// The latest commit sequence for a block (per-shard query).
