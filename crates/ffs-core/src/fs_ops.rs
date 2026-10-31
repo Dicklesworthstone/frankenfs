@@ -1176,6 +1176,15 @@ impl FsOps for OpenFs {
         if value.len() > XATTR_SIZE_MAX {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::E2BIG)));
         }
+        if matches!(
+            name,
+            super::POSIX_ACL_ACCESS_XATTR | super::POSIX_ACL_DEFAULT_XATTR
+        ) && (value.is_empty() || super::posix_acl_parse(value)?.is_empty())
+        {
+            // A null ACL clears storage without deriving new permission bits.
+            // This also succeeds for an absent default ACL on a regular file.
+            return <Self as FsOps>::removexattr(self, cx, scope, ino, name).map(|_| ());
+        }
         if name == super::POSIX_ACL_ACCESS_XATTR {
             return self.set_access_acl(cx, scope, ino, value, mode);
         }

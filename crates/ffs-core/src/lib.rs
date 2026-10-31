@@ -50913,15 +50913,18 @@ struct PosixAclEntry {
 }
 
 /// Parse a `system.posix_acl_*` value in the form userspace and the kernel's
-/// FUSE layer exchange (version 2 header, 8-byte entries). A malformed value
-/// is EINVAL, as the kernel's `posix_acl_from_xattr` reports it.
+/// FUSE layer exchange (version 2 header, 8-byte entries). An unsupported
+/// version is EOPNOTSUPP; malformed nonempty ACLs are EINVAL. A header without
+/// entries is the ACL-removal representation.
 fn posix_acl_parse(value: &[u8]) -> ffs_error::Result<Vec<PosixAclEntry>> {
     let einval = || FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL));
     if value.len() < 4 || !(value.len() - 4).is_multiple_of(8) {
         return Err(einval());
     }
     if u32::from_le_bytes([value[0], value[1], value[2], value[3]]) != POSIX_ACL_XATTR_VERSION {
-        return Err(einval());
+        return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+            libc::EOPNOTSUPP,
+        )));
     }
     let (raw_entries, _) = value[4..].as_chunks::<8>();
     let entries: Vec<PosixAclEntry> = raw_entries
@@ -50932,21 +50935,41 @@ fn posix_acl_parse(value: &[u8]) -> ffs_error::Result<Vec<PosixAclEntry>> {
             id: u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
         })
         .collect();
-    let known = |tag: u16| {
-        matches!(
-            tag,
-            POSIX_ACL_TAG_USER_OBJ
-                | POSIX_ACL_TAG_USER
-                | POSIX_ACL_TAG_GROUP_OBJ
-                | POSIX_ACL_TAG_GROUP
-                | POSIX_ACL_TAG_MASK
-                | POSIX_ACL_TAG_OTHER
-        )
-    };
-    if entries
+    if entries.is_empty() {
+        return Ok(entries);
+    }
+    if entries.iter().any(|entry| {
+        entry.perm & !0o7 != 0
+            || (matches!(entry.tag, POSIX_ACL_TAG_USER | POSIX_ACL_TAG_GROUP)
+                && entry.id == POSIX_ACL_UNDEFINED_ID)
+    }) {
+        return Err(einval());
+    }
+    // Validate the grammar directly: owner, named users, owning group, named
+    // groups, optional mask, other. Named entries require the mask. Unnamed
+    // IDs are ignored, and named IDs need not be sorted by Linux's contract.
+    let (owner, rest) = entries.split_first().ok_or_else(einval)?;
+    if owner.tag != POSIX_ACL_TAG_USER_OBJ {
+        return Err(einval());
+    }
+    let users = rest
         .iter()
-        .any(|entry| !known(entry.tag) || entry.perm & !0o7 != 0)
-    {
+        .take_while(|e| e.tag == POSIX_ACL_TAG_USER)
+        .count();
+    let (group, rest) = rest[users..].split_first().ok_or_else(einval)?;
+    if group.tag != POSIX_ACL_TAG_GROUP_OBJ {
+        return Err(einval());
+    }
+    let groups = rest
+        .iter()
+        .take_while(|e| e.tag == POSIX_ACL_TAG_GROUP)
+        .count();
+    let valid_tail = match &rest[groups..] {
+        [other] => users == 0 && groups == 0 && other.tag == POSIX_ACL_TAG_OTHER,
+        [mask, other] => mask.tag == POSIX_ACL_TAG_MASK && other.tag == POSIX_ACL_TAG_OTHER,
+        _ => false,
+    };
+    if !valid_tail {
         return Err(einval());
     }
     Ok(entries)
@@ -109601,6 +109624,246 @@ mod tests {
             return; // btrfs check tool unavailable
         };
         assert!(ok, "btrfs check must accept split preallocation:\n{output}");
+    }
+
+    fn acl_input_rejection_cases() -> Vec<(&'static str, Vec<u8>, i32)> {
+        let e = |tag, perm, id| PosixAclEntry { tag, perm, id };
+        let x = POSIX_ACL_UNDEFINED_ID;
+        let u = e(POSIX_ACL_TAG_USER_OBJ, 6, x);
+        let g = e(POSIX_ACL_TAG_GROUP_OBJ, 4, x);
+        let o = e(POSIX_ACL_TAG_OTHER, 0, x);
+        let m = e(POSIX_ACL_TAG_MASK, 4, x);
+        let n = e(POSIX_ACL_TAG_USER, 4, 1000);
+        let ng = e(POSIX_ACL_TAG_GROUP, 4, 1000);
+        let mut cases = vec![
+            ("missing owner", posix_acl_encode(&[g, o]), libc::EINVAL),
+            ("missing group", posix_acl_encode(&[u, o]), libc::EINVAL),
+            ("missing other", posix_acl_encode(&[u, g]), libc::EINVAL),
+            (
+                "duplicate owner",
+                posix_acl_encode(&[u, u, g, o]),
+                libc::EINVAL,
+            ),
+            (
+                "entries after other",
+                posix_acl_encode(&[u, g, o, m]),
+                libc::EINVAL,
+            ),
+            (
+                "named user without mask",
+                posix_acl_encode(&[u, n, g, o]),
+                libc::EINVAL,
+            ),
+            (
+                "named group without mask",
+                posix_acl_encode(&[u, g, ng, o]),
+                libc::EINVAL,
+            ),
+            (
+                "named user after group",
+                posix_acl_encode(&[u, g, n, m, o]),
+                libc::EINVAL,
+            ),
+            (
+                "undefined user",
+                posix_acl_encode(&[u, e(POSIX_ACL_TAG_USER, 4, x), g, m, o]),
+                libc::EINVAL,
+            ),
+            (
+                "undefined group",
+                posix_acl_encode(&[u, g, e(POSIX_ACL_TAG_GROUP, 4, x), m, o]),
+                libc::EINVAL,
+            ),
+            (
+                "invalid permission",
+                posix_acl_encode(&[e(POSIX_ACL_TAG_USER_OBJ, 8, x), g, o]),
+                libc::EINVAL,
+            ),
+            (
+                "unknown tag",
+                posix_acl_encode(&[u, e(0x40, 4, x), g, o]),
+                libc::EINVAL,
+            ),
+            ("short header", vec![2, 0, 0], libc::EINVAL),
+            (
+                "unknown version",
+                9_u32.to_le_bytes().to_vec(),
+                libc::EOPNOTSUPP,
+            ),
+        ];
+        let mut truncated = posix_acl_encode(&[u, g, o]);
+        truncated.push(0);
+        cases.push(("truncated entry", truncated, libc::EINVAL));
+        cases
+    }
+
+    #[test]
+    fn acl_input_nonempty_layout_matches_the_posix_contract() {
+        let e = |tag, perm, id| PosixAclEntry { tag, perm, id };
+        let x = POSIX_ACL_UNDEFINED_ID;
+        let u = e(POSIX_ACL_TAG_USER_OBJ, 6, x);
+        let g = e(POSIX_ACL_TAG_GROUP_OBJ, 4, x);
+        let o = e(POSIX_ACL_TAG_OTHER, 0, x);
+        let m = e(POSIX_ACL_TAG_MASK, 4, x);
+        // Named IDs need not be sorted by the Linux validity contract.
+        for entries in [
+            vec![],
+            vec![u, g, o],
+            vec![u, g, m, o],
+            vec![
+                u,
+                e(POSIX_ACL_TAG_USER, 4, 2000),
+                e(POSIX_ACL_TAG_USER, 2, 1000),
+                g,
+                e(POSIX_ACL_TAG_GROUP, 4, 2000),
+                m,
+                o,
+            ],
+        ] {
+            let encoded = posix_acl_encode(&entries);
+            let parsed = posix_acl_parse(&encoded).expect("valid ACL");
+            assert_eq!(posix_acl_encode(&parsed), encoded);
+        }
+        for (label, value, errno) in acl_input_rejection_cases() {
+            let err = posix_acl_parse(&value).expect_err(label);
+            assert_eq!(err.to_errno(), errno, "{label}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn acl_input_clear_preserves_mode_and_stops_default_inheritance() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let file = fs
+            .create(&cx, root, OsStr::new("acl_clear_file"), 0o640, 0, 0)
+            .unwrap()
+            .ino;
+        let dir = fs
+            .mkdir(&cx, root, OsStr::new("acl_clear_dir"), 0o750, 0, 0)
+            .unwrap()
+            .ino;
+        let named = ext4_setattr_test_acl(6, 4, 0);
+        let ops: &dyn FsOps = &fs;
+        for clear in [&POSIX_ACL_XATTR_VERSION.to_le_bytes()[..], &[][..]] {
+            fs.setxattr(&cx, file, "user.keep", b"retained", XattrSetMode::Set)
+                .unwrap();
+            fs.setxattr(&cx, file, POSIX_ACL_ACCESS_XATTR, &named, XattrSetMode::Set)
+                .unwrap();
+            fs.setxattr(&cx, dir, POSIX_ACL_DEFAULT_XATTR, &named, XattrSetMode::Set)
+                .unwrap();
+            for (ino, name, perm) in [
+                (file, POSIX_ACL_ACCESS_XATTR, 0o640),
+                (dir, POSIX_ACL_DEFAULT_XATTR, 0o750),
+            ] {
+                let mut scope = fs.begin_request_scope(&cx, RequestOp::Setxattr).unwrap();
+                ops.setxattr(&cx, &mut scope, ino, name, clear, XattrSetMode::Set)
+                    .unwrap();
+                fs.commit_request_scope(&cx, &mut scope).unwrap();
+                fs.end_request_scope(&cx, RequestOp::Setxattr, scope)
+                    .unwrap();
+                assert_eq!(fs.getxattr(&cx, ino, name).unwrap(), None);
+                assert_eq!(fs.getattr(&cx, ino).unwrap().perm & 0o777, perm);
+                let head = fs.current_snapshot();
+                fs.setxattr(&cx, ino, name, clear, XattrSetMode::Set)
+                    .unwrap();
+                assert_eq!(
+                    fs.current_snapshot(),
+                    head,
+                    "an absent ACL clear publishes nothing"
+                );
+            }
+            fs.setxattr(&cx, file, POSIX_ACL_DEFAULT_XATTR, clear, XattrSetMode::Set)
+                .unwrap();
+            assert_eq!(
+                fs.getxattr(&cx, file, "user.keep").unwrap(),
+                Some(b"retained".to_vec())
+            );
+        }
+        let child = fs
+            .create(&cx, dir, OsStr::new("unrestricted_child"), 0o664, 0, 0)
+            .unwrap();
+        assert_eq!(child.perm & 0o777, 0o664);
+        assert_eq!(
+            fs.getxattr(&cx, child.ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+            None
+        );
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn acl_input_btrfs_clear_and_invalid_updates_preserve_mode() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(1);
+        let file = fs
+            .create(&cx, root, OsStr::new("acl_clear_btrfs"), 0o640, 0, 0)
+            .unwrap()
+            .ino;
+        let named = ext4_setattr_test_acl(6, 4, 0);
+        for clear in [&POSIX_ACL_XATTR_VERSION.to_le_bytes()[..], &[][..]] {
+            fs.setxattr(&cx, file, POSIX_ACL_ACCESS_XATTR, &named, XattrSetMode::Set)
+                .unwrap();
+            for (label, value, errno) in acl_input_rejection_cases() {
+                let before = fs.getattr(&cx, file).unwrap();
+                let dirty = fs.btrfs_pending_dirty_bytes();
+                let err = fs
+                    .setxattr(&cx, file, POSIX_ACL_ACCESS_XATTR, &value, XattrSetMode::Set)
+                    .expect_err(label);
+                assert_eq!(err.to_errno(), errno, "{label}: {err:?}");
+                assert_eq!(fs.getattr(&cx, file).unwrap(), before);
+                assert_eq!(fs.btrfs_pending_dirty_bytes(), dirty);
+                assert_eq!(
+                    fs.getxattr(&cx, file, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    Some(named.clone())
+                );
+            }
+            fs.setxattr(&cx, file, POSIX_ACL_ACCESS_XATTR, clear, XattrSetMode::Set)
+                .unwrap();
+            assert_eq!(fs.getattr(&cx, file).unwrap().perm & 0o777, 0o640);
+            assert_eq!(
+                fs.getxattr(&cx, file, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                None
+            );
+            fs.setxattr(&cx, file, POSIX_ACL_DEFAULT_XATTR, clear, XattrSetMode::Set)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn acl_input_invalid_updates_preserve_existing_permissions_and_attributes() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let named = ext4_setattr_test_acl(6, 4, 0);
+        fs.setxattr(&cx, root, POSIX_ACL_ACCESS_XATTR, &named, XattrSetMode::Set)
+            .unwrap();
+        fs.setxattr(
+            &cx,
+            root,
+            POSIX_ACL_DEFAULT_XATTR,
+            &named,
+            XattrSetMode::Set,
+        )
+        .unwrap();
+        for name in [POSIX_ACL_ACCESS_XATTR, POSIX_ACL_DEFAULT_XATTR] {
+            for (label, value, errno) in acl_input_rejection_cases() {
+                let head = fs.current_snapshot();
+                let inode = fs.read_inode(&cx, root).unwrap();
+                let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+                let err = fs
+                    .setxattr(&cx, root, name, &value, XattrSetMode::Set)
+                    .expect_err(label);
+                assert_eq!(err.to_errno(), errno, "{name} {label}: {err:?}");
+                assert_eq!(fs.current_snapshot(), head, "{name} {label}");
+                assert_eq!(fs.read_inode(&cx, root).unwrap(), inode, "{name} {label}");
+                assert_eq!(fs.getxattr(&cx, root, name).unwrap(), Some(named.clone()));
+                assert_eq!(
+                    format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                    groups
+                );
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            }
+        }
     }
 
     /// bd-rnwd7 (xfstests generic/099): POSIX ACLs behave as on ext4. An access
