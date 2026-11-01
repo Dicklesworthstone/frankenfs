@@ -1,25 +1,36 @@
 # FEATURE_PARITY
 
-> **Staged named ext4 inheritance (2026-11-01):** transaction-backed create,
-> mkdir and mknod now share private allocation statistics, a protected snapshot,
-> complete-operation conflict retries and postcommit cache invalidation.
-> Inherited ACLs, final mode/group, inode body, directory initialization and
-> parent entry/link changes publish together. Child directories retain their
-> unmasked default ACL for subsequent descendants. ACL-bearing parents use this
-> boundary with the sharded toggle enabled; ordinary sharded creation retains
-> its prior route and remains part of the broader atomicity gap.
-> Four new regression functions plus existing ACL/tmpfile/snapshot, device and
-> directory controls pass in both configurations (37/0/0 each). The persisted
-> test mixes ordinary creation with later ACL-backed creation: native
-> `e2fsck -fn` executes all five phases with exit 0 and reopen preserves modes,
-> ACLs, identities and payloads. The existing tmpfile checker/reopen also passes
-> in both runs; all four final 16 MiB images are retained with matching hashes.
-> Workspace/all-target check, strict Clippy and formatting pass. FUSE reports
-> 715 passes and one existing ignore; actual mount lifecycle still returns
-> early on permission denial. These are self-verified bounded unit/image
-> results. Concurrent parent-ACL changes, ordinary sharded namespace atomicity,
+> **Atomic named ext4 births (2026-11-01):** ordinary sharded create/mkdir now
+> retain one group lock and shared allocation exclusion through a protected
+> snapshot transaction. Inode allocation/body, directory initialization/growth,
+> final owner/group and parent entry/link changes publish together. The original
+> file/directory regressions observed three/six publications; both now require
+> exactly one. Default-ACL absence is checked inside the same view. Inherited
+> ACLs, cross-group space/free needs and lazy bitmap initialization discard the
+> private attempt before the full birth transaction starts. That fallback uses
+> exact reconciled counters and precomputed bounded redistribution, preserving
+> `single + sharded - seed` without false unsigned-counter ENOSPC. Inherited
+> access/default ACLs, mode, inode body and namespace publish together; child
+> directories retain their unmasked default ACL for descendants.
+> The final expanded selection passes 45/0/0 in active sharded mode;
+> default controls pass 37/0/0. Coverage includes old-snapshot isolation, setgid,
+> real htree growth, late duplicate rollback, counter funding/boundaries and a
+> deliberately filled allocation group with successful cross-group fallback.
+> Full births arm the allocator-mode guard when sharded counts move; retirement
+> credits arm it after commit. A real FIFO create/unlink regression exposed the
+> missing retirement update (0/1 red) before its correction and final rerun.
+> Three sharded-run and two default-run native `e2fsck -fn` executions pass all
+> five phases and cold reopen/readback. These use retained 16/32 MiB images;
+> they qualify bounded offline image interchange. All five final images are
+> retained with matching worker/local hashes, alongside source/lock/toolchain
+> bindings and raw failure/green captures.
+> Workspace/all-target check, strict default/feature Clippy and formatting pass
+> at the final source cut. FUSE reports 715 passes and one existing ignore;
+> actual mount lifecycle still returns early on
+> permission denial. Concurrent birth/parent-ACL/cancellation stress, arbitrary
 > outer-request composition, full-workspace tests and mounted/crash/performance
-> qualification remain open under the existing Beads. No parity rate is added.
+> qualification remain open under `bd-vuzzq` and `bd-9rutw`. No parity rate or
+> speedup claim is added. Verification is solo.
 
 > **Atomic ext4 unnamed creation (2026-10-31):** `O_TMPFILE` now stages inode
 > allocation, inherited access ACL/mode, external ACL storage and the inode's

@@ -34,7 +34,7 @@ completed or handed off. Historical evidence remains in place.
   allocator; prepare bounded counter redistribution before commit and publish
   it under exclusive allocation exclusion. Preserve `single + sharded - seed`
   exactly, including a debit funded by frees credited to the other family.
-- [x] Preserve one-group lock ordering and conflict/cancellation rollback;
+- [x] Preserve one-group lock ordering and precommit conflict/cancellation rollback;
   retry complete unpublished operations, not individual metadata writes.
   These are implementation steps; final compiler/runtime qualification follows.
   Initial build caught a misplaced reconciliation setup in the neighboring
@@ -44,9 +44,20 @@ completed or handed off. Historical evidence remains in place.
   fails before checker execution. Setup now follows real extent allocation;
   its first rebuild also caught a reversed fallocate argument order. Neither
   failure is counted as native interchange proof or omitted from the captures.
-- [ ] Add failed late insertion, directory growth, actual multi-group fallback
+- [x] Add failed late insertion, directory growth, actual multi-group fallback
   and native checker/reopen coverage with deliberately retained images.
-- [ ] Run focused default/active-sharded tests, FUSE, workspace compiler/lint/fmt
+- [x] Preserve the original FIFO/non-ACL routing assertion: full births arm the
+  mode guard only if their publication moves sharded counters. The first expanded
+  run catches the overbroad marker43pass/1fail; corrected44-case rerun passes.
+  A further real FIFO create/unlink regression exposes an unmarked sharded
+  retirement credit0pass/1fail at matching source hashes. Wire the guard after
+  retirement commit. Final45-case selection passes45/0/0,1646filtered,10.88s;
+  its three native checker cases execute all5phases,exit0 and cold reopen.
+  The retained32MiB fallback image reports15/8192files,8332/32768blocks; named
+  and tmpfile controls report21/4096files1336/4096blocks and16/4096files
+  1329/4096blocks. Exact16/16/32MiB images are copied into the existing artifact
+  directory and match worker SHA256 digests. No mounted/crash/scaling claim.
+- [x] Run focused default/active-sharded tests, FUSE, workspace compiler/lint/fmt
   and unchanged UBS. Bind evidence, update specs/parity and Beads, checkpoint.
   Workspace check and strict default/feature Clippy pass; final formatting0.
   Installed UBS5.5.26 refuses its mismatched shared assets on local/hz3. A
@@ -63,6 +74,26 @@ completed or handed off. Historical evidence remains in place.
   current capacity; selectors and test-thread settings stay unchanged.
   Shared checkpoint0cac77490 appeared during verification; preserve it and
   bind results to source hashes rather than treating its existence as proof.
+  Shared8b4d3b8a8 then checkpointed part of the marker correction; preserve it
+  too. Final-source45/0/0 active-sharded (1646filtered,10.88s) and37/0/0 default
+  (1575filtered,0.25s) pass. The final five16/16/32/16/16MiB images total96MiB,
+  match worker SHA256 digests, execute all5checker phases with exit0 and cold
+  reopen successfully. Six source/lock/toolchain bindings match worker/local;
+  core8c24daa7c9d1db4b0e2daa34565efa3178ab97de586f1760b358f8411fc89f74,
+  sharded8abd5d1911bfc838d45f02c31cbebbdbbbbde132a83e2bd66ab4c9ac875fdfca.
+  Final FUSE715/0/1existing ignore,0filtered,0.34s; actual mount still returns
+  early on fusermount3 Permission denied. Final workspace/all-target check0
+  (55.74s Cargo), strict default Clippy0 (2m38s Cargo), strict feature Clippy0
+  (11m25s cold Cargo), fmt/whitespace0. Final UBS0critical on each changed file:
+  core15936warnings/3205info; sharded121/36; store137/46; ops86/61. Every scan
+  exits0 with the same pinned5.5.26 runner/assets; no ignores or cap changes.
+- [x] Finish source-bound Bead audit, sync the tracker and checkpoint the
+  remaining source/test/doc changes; release this unit's file reservations.
+  The final Bead comment records exact commands, source/image bindings, the
+  genuine reds and all intervening compiler/setup/admission failures. Its
+  fresh process/real-work/honesty worksheets disclose the avoidable --job
+  classifier detour, cancellation143/ACK and return to normal guarded Cargo.
+  OriginalP0 and bd-9rutw remain open; no claim of independent verification.
 - [ ] Complete original full-workspace/native acceptance, concurrent/field
   qualification and arbitrary outer-request composition; keep those Beads open.
 

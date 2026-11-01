@@ -55,6 +55,13 @@ pub struct PerGroupAlloc {
 pub struct ReconciledPublication {
     single: Vec<GroupStats>,
     sharded: Vec<GroupStats>,
+    sharded_moved: bool,
+}
+
+impl ReconciledPublication {
+    pub(crate) fn moves_sharded_counts(&self) -> bool {
+        self.sharded_moved
+    }
 }
 
 impl PerGroupAlloc {
@@ -248,6 +255,7 @@ impl PerGroupAlloc {
             return Err(counter_corruption());
         }
         let mut next_single = actual;
+        let mut sharded_moved = false;
         for (((next, shard), live), seed) in next_single
             .iter_mut()
             .zip(&mut sharded)
@@ -260,6 +268,9 @@ impl PerGroupAlloc {
             let blocks = split_count(next.free_blocks, shard.free_blocks, seed.free_blocks);
             let inodes = split_count(next.free_inodes, shard.free_inodes, seed.free_inodes);
             let dirs = split_count(next.used_dirs, shard.used_dirs, seed.used_dirs);
+            sharded_moved |= blocks.1 != shard.free_blocks
+                || inodes.1 != shard.free_inodes
+                || dirs.1 != shard.used_dirs;
             *shard = next.clone();
             (next.free_blocks, shard.free_blocks) = blocks;
             (next.free_inodes, shard.free_inodes) = inodes;
@@ -268,6 +279,7 @@ impl PerGroupAlloc {
         Ok(ReconciledPublication {
             single: next_single,
             sharded,
+            sharded_moved,
         })
     }
 
@@ -905,6 +917,7 @@ mod tests {
         let plan = sharded
             .prepare_birth_publication(&single, actual)
             .expect("funded debit");
+        assert!(plan.moves_sharded_counts());
         let published = sharded.publish_birth(plan);
         let final_counts = sharded
             .birth_group_stats(&published)
@@ -920,6 +933,20 @@ mod tests {
         assert_eq!((published[0].free_blocks, published[0].free_inodes), (0, 0));
         let shard = sharded.lock_group(0);
         assert_eq!((shard.free_blocks, shard.free_inodes), (5, 3));
+        drop(shard);
+
+        let single = vec![sample_group(0, 4, 3)];
+        let sharded = PerGroupAlloc::from_group_stats(single.clone());
+        let mut actual = single.clone();
+        actual[0].free_inodes -= 1;
+        let plan = sharded.prepare_birth_publication(&single, actual).unwrap();
+        assert!(
+            !plan.moves_sharded_counts(),
+            "the single ledger can fund this birth"
+        );
+        let published = sharded.publish_birth(plan);
+        assert_eq!(published[0].free_inodes, 2);
+        assert_eq!(sharded.lock_group(0).free_inodes, 3);
     }
 
     #[test]

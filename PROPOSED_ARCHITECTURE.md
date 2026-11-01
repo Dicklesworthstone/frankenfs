@@ -804,6 +804,9 @@ when one ledger must fund the other's debit. For wanted count `W`, origin `O`
 and previous sharded count `S`, it chooses `B' = min(max(W + O - S, 0), u32::MAX)`
 and `S' = W + O - B'`. All arithmetic checks and plan allocation precede commit;
 installing both ledgers then occurs under exclusive allocation exclusion.
+The runtime allocator-mode guard is armed only when a full birth moves sharded
+counts, and after a sharded retirement credits them. A birth funded entirely by
+the single ledger preserves its existing routing marker.
 Bitmaps remain allocation authority; ledger values describe movement from their
 shared origin. Concurrent scaling, parent-ACL race qualification, crash/mounted
 behavior and arbitrary outer-request composition remain unfinished work.

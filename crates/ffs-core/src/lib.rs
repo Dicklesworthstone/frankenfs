@@ -6192,6 +6192,7 @@ impl Ext4StagedInodeRetirement<'_> {
         #[cfg(feature = "bhh0i_sharded_alloc")]
         if let Some((mut live, working)) = self.sharded {
             *live = working;
+            self.fs.note_sharded_alloc_happened();
         }
         if let Some(head) = self.orphan_head {
             self.fs.ext4_write_orphan_head(head);
@@ -74593,6 +74594,24 @@ mod tests {
     #[test]
     fn ext4_sharded_birth_directory_is_one_publication() {
         check_sharded_birth_publication(FileType::Directory);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn ext4_sharded_birth_retirement_tracks_counter_family_movement() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let before = fs.statfs(&cx, root).unwrap().files_free;
+        ext4_named_birth_for_test(&fs, &cx, root, "fifo_credit", FileType::Fifo).unwrap();
+        assert!(!fs.bhh0i_sharded_alloc_happened.load(Ordering::Relaxed));
+        fs.unlink(&cx, root, OsStr::new("fifo_credit")).unwrap();
+        assert_eq!(fs.statfs(&cx, root).unwrap().files_free, before);
+        assert!(
+            fs.bhh0i_sharded_alloc_happened.load(Ordering::Relaxed),
+            "a sharded retirement credit must prevent later allocator-mode changes"
+        );
     }
 
     #[cfg(feature = "bhh0i_sharded_alloc")]
