@@ -48,6 +48,21 @@ completed or handed off. Historical evidence remains in place.
   and native checker/reopen coverage with deliberately retained images.
 - [ ] Run focused default/active-sharded tests, FUSE, workspace compiler/lint/fmt
   and unchanged UBS. Bind evidence, update specs/parity and Beads, checkpoint.
+  Workspace check and strict default/feature Clippy pass; final formatting0.
+  Installed UBS5.5.26 refuses its mismatched shared assets on local/hz3. A
+  separate cache downloads the same version's pinned assets, preserving every
+  checksum/rule: four one-file scans exit0,0critical (core15929warnings/3205info,
+  sharded115/31, store137/46, ops86/61). No global scanner assets are changed.
+  Remaining runtime execution has hit admitted-capacity/pressure refusals.
+  A longer-wait RCH --job attempt unexpectedly used the worker root target;
+  the actual-volume SBH20G probe refused it. Cancelled exactly that own job143,
+  acknowledged its journal, and cancelled its queued companion130. No tests
+  ran there, no outputs are deleted, and no guard is relaxed. Normal Cargo
+  routing retains the checked tmpfs pool. The idle third worker fails its own
+  unchanged SBH percentage guard and is not used. RCH recommends Cargo -j1 for
+  current capacity; selectors and test-thread settings stay unchanged.
+  Shared checkpoint0cac77490 appeared during verification; preserve it and
+  bind results to source hashes rather than treating its existence as proof.
 - [ ] Complete original full-workspace/native acceptance, concurrent/field
   qualification and arbitrary outer-request composition; keep those Beads open.
 

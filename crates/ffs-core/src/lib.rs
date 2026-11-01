@@ -29830,8 +29830,11 @@ impl OpenFs {
                 };
             #[cfg(feature = "bhh0i_sharded_alloc")]
             if let Some((sharded, plan)) = sharded.zip(publication) {
+                let sharded_moved = plan.moves_sharded_counts();
                 working.groups = sharded.publish_birth(plan);
-                self.note_sharded_alloc_happened();
+                if sharded_moved {
+                    self.note_sharded_alloc_happened();
+                }
             }
             alloc.groups = working.groups;
             self.forget_ext4_inode_caches(ino);
@@ -74810,7 +74813,8 @@ mod tests {
         );
         // Real writes allocate from the file's extent goal, which can visit
         // earlier groups before reaching this thread's inode spread target.
-        let mut offset = 0;
+        fs.write(cx, filler.ino, 0, &[0x5a; 1024]).unwrap();
+        let mut offset = 1024;
         loop {
             let free = fs.count_free_blocks_in_group(cx, group).unwrap();
             if free == 0 {
