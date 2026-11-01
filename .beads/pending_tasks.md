@@ -13,6 +13,20 @@ completed or handed off. Historical evidence remains in place.
 
 ### Deferred mapping publication continuation — 2026-11-01
 
+- [x] Operator directed SSH remediation using system-performance-remediation;
+  read that skill and its reclaim/RCH references before changing workers.
+- [ ] Diagnose hz3, hz4 and vmi1149989 sequentially: actual volumes, PSI,
+  writers, deleted-open files and pure/idle/unprotected build-output inventory.
+  hz3 has low pressure and appropriate VM settings. Its journal is207MB;
+  diagnostic sudo logging explains the writer sample, not a disk-space leak.
+  Two64h-idle pure accounting targets total4464MiB; no source/evidence or
+  protected directory qualifies for removal merely by being large or idle.
+- [ ] Restore disk headroom using the smallest authorized action; retain all
+  source, tracker, CASS, evidence, protected paths and current peer work.
+  Recheck purity, all protection markers and live use immediately before any
+  reclaim; exact deletion authorization required by AGENTS remains binding.
+- [ ] Verify restored worker admission and actual-volume SBH20GiB; resume
+  normal RCH checks without changing floors, slots, quotas or mount permissions.
 - [x] Read instructions/README; inspect the owned P0, local queue, cycles and
   current reservations. Preserve original full-workspace acceptance.
 - [x] Execute a deep-tree regression with a public reader between staging and
