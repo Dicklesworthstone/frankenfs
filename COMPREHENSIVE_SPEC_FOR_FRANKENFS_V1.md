@@ -2991,6 +2991,12 @@ Mappings derived from a private transaction or a retained reader snapshot MUST
 NOT enter or reuse a shared current-view extent cache. An unchanged inode index
 root does not imply that its leaf versions agree. Aborting a batch must not let
 a later real write follow its discarded mapping without bitmap allocation.
+Shared current-view mappings and cached write lists MUST also match the
+committed MVCC sequence captured before their tree walk. Staging invalidation
+alone is insufficient: readers can refill the old tree before publication or
+finish an older cache fill afterward. A different sequence is a miss, never an
+authority to return a stale hole or allocated mapping. After its transaction
+is consumed, a writer reads the current view rather than its old snapshot field.
 An error during staging requires aborting the request scope.
 
 Dependency rationale: depends on `ffs-btree` for extent tree operations;

@@ -3583,6 +3583,7 @@ type BtrfsDirItems = Arc<[(BtrfsKey, Vec<u8>)]>;
 struct Ext4WriteExtentSnapshot {
     namespace: u64,
     root_namespace: u64,
+    commit_seq: CommitSeq,
     extents: Arc<[Ext4Extent]>,
 }
 
@@ -21818,7 +21819,8 @@ impl OpenFs {
         logical_block: u32,
         hint: &mut usize,
     ) -> Result<Option<(u64, bool)>, FfsError> {
-        if inode.flags & EXT4_EXTENTS_FL != 0 && !scope.uses_fixed_snapshot() {
+        if inode.flags & EXT4_EXTENTS_FL != 0 && !self.is_writable() && !scope.uses_fixed_snapshot()
+        {
             let ns = extent_cache_namespace(inode);
             let hot = self.ext4_hot_extents.load();
             if let Some(slot) = hot.as_ref()
@@ -21869,12 +21871,14 @@ impl OpenFs {
             }));
         }
 
-        // Derive a cache namespace from the inode's extent root bytes.
-        // Different inodes have different extent trees, so the first 8 bytes
-        // of i_block (the extent header + first entry start) provide a
-        // practically unique per-inode key to prevent cross-inode cache
-        // pollution.
+        // Inode identity separates objects; the view sequence separates leaf
+        // versions even when a deferred edit keeps the same index root. Tag
+        // fills with the current sequence captured before walking. Non-fixed
+        // scopes read the current view, including after consuming their tx.
+        // A walk completing after a commit cannot make its old mappings
+        // reusable by the new view.
         let ns = extent_cache_namespace(inode);
+        let commit_seq = self.latest_snapshot().high;
 
         // Lock-free hot-extent fast path: a hot single-file read stream resolves
         // the same inode every read; once its full extent list is published (see
@@ -21882,7 +21886,8 @@ impl OpenFs {
         // and no `BTreeMap` query — skipping the `ExtentCache` shard `RwLock`
         // that otherwise serializes every reader on one hot file's namespace.
         let hot = self.ext4_hot_extents.load();
-        if let Some(slot) = hot.as_ref()
+        if !self.is_writable()
+            && let Some(slot) = hot.as_ref()
             && slot.0 == ns
         {
             return Ok(Self::ext4_resolve_block_from_mappings(
@@ -21893,7 +21898,10 @@ impl OpenFs {
         drop(hot);
 
         // Fast path: check extent cache.
-        if let Some(hit) = self.extent_cache.lookup(ns, logical_block) {
+        if let Some(hit) = self
+            .extent_cache
+            .lookup_versioned(ns, logical_block, commit_seq.0)
+        {
             return if hit.physical_start == 0 {
                 Ok(None)
             } else {
@@ -21915,7 +21923,8 @@ impl OpenFs {
 
         // No covering leaf (logical before every index entry): hole.
         let Some(mappings) = leaf else {
-            self.extent_cache.insert(ns, hole_sentinel());
+            self.extent_cache
+                .insert_versioned(ns, hole_sentinel(), commit_seq.0);
             return Ok(None);
         };
 
@@ -21926,20 +21935,23 @@ impl OpenFs {
         // physical mapping it would from a fresh walk (bd-tmyoc, extending the
         // per-extent cache of bd-r7enr).
         for mapping in &mappings {
-            self.extent_cache.insert(ns, *mapping);
+            self.extent_cache
+                .insert_versioned(ns, *mapping, commit_seq.0);
         }
 
         // Translate the requested block exactly as ExtentCache::lookup would:
         // the covering extent is the last whose start is <= logical_block.
         let pp = mappings.partition_point(|m| m.logical_start <= logical_block);
         if pp == 0 {
-            self.extent_cache.insert(ns, hole_sentinel());
+            self.extent_cache
+                .insert_versioned(ns, hole_sentinel(), commit_seq.0);
             return Ok(None);
         }
         let mapping = mappings[pp - 1];
         if logical_block >= mapping.logical_start.saturating_add(mapping.count) {
             // logical_block lies in a hole past this extent: cache the sentinel.
-            self.extent_cache.insert(ns, hole_sentinel());
+            self.extent_cache
+                .insert_versioned(ns, hole_sentinel(), commit_seq.0);
             return Ok(None);
         }
         if mapping.physical_start == 0 {
@@ -22146,13 +22158,16 @@ impl OpenFs {
         }
         let namespace = extent_cache_namespace(inode);
         let root_namespace = extent_root_namespace(inode);
+        let commit_seq = self.latest_snapshot().high;
 
         let cached_extents = {
             let snapshot = self.ext4_write_extent_snapshot.lock();
             snapshot
                 .as_ref()
                 .filter(|snapshot| {
-                    snapshot.namespace == namespace && snapshot.root_namespace == root_namespace
+                    snapshot.namespace == namespace
+                        && snapshot.root_namespace == root_namespace
+                        && snapshot.commit_seq == commit_seq
                 })
                 .map(|snapshot| Arc::clone(&snapshot.extents))
         };
@@ -22164,6 +22179,7 @@ impl OpenFs {
         *self.ext4_write_extent_snapshot.lock() = Some(Ext4WriteExtentSnapshot {
             namespace,
             root_namespace,
+            commit_seq,
             extents: Arc::clone(&extents),
         });
         Ok(extents)
@@ -75947,7 +75963,8 @@ mod tests {
             .unwrap()
             .ino;
         let bs = fs.block_size();
-        let payload = vec![0x19; usize::try_from(bs).unwrap()];
+        let block_len = usize::try_from(bs).unwrap();
+        let payload = vec![0x19; block_len];
         for index in 0..10 {
             fs.write(&cx, ino, u64::from(2 * index * bs), &payload)
                 .unwrap();
@@ -75956,7 +75973,7 @@ mod tests {
         assert!(u16::from_le_bytes([inode.extent_bytes[6], inode.extent_bytes[7]]) > 0);
         let free = fs.statfs(&cx, root).unwrap().blocks_free;
         let before = fs.current_snapshot();
-        let replacement = vec![0x62; usize::try_from(bs).unwrap()];
+        let replacement = vec![0x62; block_len];
         let mut reader = FsOps::begin_request_scope(&fs, &cx, RequestOp::Read).unwrap();
         let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
         FsOps::write(&fs, &cx, &mut scope, ino, u64::from(bs), &replacement).unwrap();
@@ -75969,26 +75986,82 @@ mod tests {
         );
         assert_eq!(
             fs.read(&cx, ino, u64::from(bs), bs).unwrap(),
-            vec![0; bs as usize]
+            vec![0; block_len]
         );
+        let old_extents = fs
+            .ext4_write_extents_with_scope(&cx, &RequestScope::empty(), &inode)
+            .unwrap();
+        assert!(old_extents.iter().all(|extent| extent.logical_block != 1));
         fs.commit_writeback_batch_scope(&cx, scope).unwrap();
         assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
         assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - 1);
         assert_eq!(fs.read(&cx, ino, u64::from(bs), bs).unwrap(), replacement);
-        let mut buffer = vec![0; bs as usize];
+        let new_extents = fs
+            .ext4_write_extents_with_scope(&cx, &RequestScope::empty(), &inode)
+            .unwrap();
+        assert!(new_extents.iter().any(|extent| {
+            extent.logical_block <= 1 && extent.logical_block + u32::from(extent.actual_len()) > 1
+        }));
+        // Model a reader that captured the old view and finished its cache
+        // fill late. The next actual public read must re-walk the new view.
+        fs.extent_cache.insert_versioned(
+            extent_cache_namespace(&inode),
+            ffs_extent::ExtentMapping {
+                logical_start: 1,
+                physical_start: 0,
+                count: 1,
+                unwritten: false,
+            },
+            before.high.0,
+        );
+        let mut buffer = vec![0; block_len];
         assert_eq!(
             fs.read_into(&cx, ino, u64::from(bs), &mut buffer).unwrap(),
-            bs as usize
+            block_len
         );
         assert_eq!(buffer, replacement);
         assert_eq!(
             FsOps::read(&fs, &cx, &mut reader, ino, u64::from(bs), bs).unwrap(),
-            vec![0; bs as usize]
+            vec![0; block_len]
         );
         FsOps::end_request_scope(&fs, &cx, RequestOp::Read, reader).unwrap();
         fs.write(&cx, ino, u64::from(bs), &payload).unwrap();
         assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - 1);
         assert_eq!(fs.read(&cx, ino, u64::from(bs), bs).unwrap(), payload);
+        let mut reader = FsOps::begin_request_scope(&fs, &cx, RequestOp::Read).unwrap();
+        let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+        FsOps::fallocate(
+            &fs,
+            &cx,
+            &mut scope,
+            ino,
+            u64::from(bs),
+            u64::from(bs),
+            0x03,
+        )
+        .unwrap();
+        assert_eq!(fs.read(&cx, ino, u64::from(bs), bs).unwrap(), payload);
+        FsOps::commit_request_scope(&fs, &cx, &mut scope).unwrap();
+        assert!(scope.tx.is_none());
+        assert_eq!(
+            FsOps::read(&fs, &cx, &mut scope, ino, u64::from(bs), bs).unwrap(),
+            vec![0; block_len],
+            "a consumed writer resumes the current view despite its older snapshot field"
+        );
+        FsOps::end_request_scope(&fs, &cx, RequestOp::Write, scope).unwrap();
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+        assert_eq!(
+            fs.read(&cx, ino, u64::from(bs), bs).unwrap(),
+            vec![0; block_len]
+        );
+        assert_eq!(
+            FsOps::read(&fs, &cx, &mut reader, ino, u64::from(bs), bs).unwrap(),
+            payload
+        );
+        FsOps::end_request_scope(&fs, &cx, RequestOp::Read, reader).unwrap();
+        fs.write(&cx, ino, u64::from(bs), &replacement).unwrap();
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - 1);
+        assert_eq!(fs.read(&cx, ino, u64::from(bs), bs).unwrap(), replacement);
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
     }
 

@@ -1782,6 +1782,18 @@ Supplemental source checked 2026-11-01: current upstream
   persisted storage mapping. Legacy targets use direct block pointers; a hole
   is an error rather than pointer bytes presented as a target.
 
+### 9.12 Mapping visibility across publication
+
+Native file reads must resolve mappings belonging to the selected filesystem
+view, including holes created or filled by mutations. This observable contract
+also applies to FrankenFS's deferred MVCC publication; it is not a claim that
+the kernel uses FrankenFS's cache architecture. An unchanged index root can
+refer to different committed leaf contents. Current-view cache entries retain
+their source commit sequence; a lookup in another view misses. A reader's old
+fill arriving after publication cannot authorize reuse in the new view.
+Fixed readers and private transactions bypass those shared mappings, while a
+writer whose transaction has been consumed resumes current-view resolution.
+
 ## 10. Checksums
 
 **Source:** `ext4.h` lines 2545-2548

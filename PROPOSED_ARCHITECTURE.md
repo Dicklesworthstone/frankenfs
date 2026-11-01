@@ -761,6 +761,14 @@ Fixed-snapshot requests neither consume nor populate shared current-view extent
 caches. A private or older leaf can differ while its top-level index root stays
 byte-identical; root identity alone cannot authorize reuse. Each write still
 retains its own per-operation extent list.
+Current-view `ExtentCache` entries carry an opaque view version, using the exact
+MVCC commit sequence in `OpenFs`; unversioned cache consumers use version zero.
+Lookup requires equality, so late fills from a different view cause misses.
+The single cached write list also compares its source sequence. Neither identity
+nor root bytes alone authorize reuse across deferred publication. Hot complete
+mapping lists remain restricted to immutable read-only filesystems. A consumed
+writer selects the current sequence even though its scope retains an older
+snapshot field for lifecycle cleanup.
 This boundary does not establish atomic capture for existing ungated non-JBD2
 durability paths.
 

@@ -1,5 +1,15 @@
 # FEATURE_PARITY
 
+> **Deferred mapping publication (2026-11-01, verification in progress):** a
+> real deep-tree regression executes 0/1/0 with 1620 filtered tests: a successful
+> batch allocation and commit still returns zeros from an old reader-cached
+> hole. Shared mappings now carry their source MVCC sequence, and cached write
+> lists compare that sequence as well. Differently versioned late fills cause
+> misses; fixed views retain their existing cache bypass. Expanded controls
+> cover read/read_into, root-stable edits, late fills, hole-punch publication,
+> retained readers and a writer whose transaction has already been consumed.
+> Runtime/compiler qualification is pending; no readiness or speedup claim.
+
 > **Scoped ext4 allocation accounting (2026-11-01):** aborted writeback batches
 > no longer spend live free-block capacity. The executed regression retained
 > inode/bitmap bytes but lost four reported blocks before the fix. Request scopes

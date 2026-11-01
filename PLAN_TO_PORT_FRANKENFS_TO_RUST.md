@@ -552,6 +552,10 @@ truncation, including data, mapping metadata and lazy-bitmap initialization.
 Successful MVCC publication installs validated accounting once; abort,
 cancellation and conflicts discard it. Large extent writes reduce their
 requested run when one group cannot satisfy it, then continue across groups.
+Current-view extent caches retain the exact committed sequence of their source
+walk. Reader refills across deferred publication must not preserve an old hole
+or freed mapping; pinned readers keep their own view. Exercise both allocation
+and hole-punch publication with readers before commit and late cache fills.
 Native image and scoped conflict/abort tests qualify these paths separately
 from the remaining mounted, crash and full-workspace acceptance.
 

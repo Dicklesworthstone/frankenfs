@@ -15,12 +15,25 @@ completed or handed off. Historical evidence remains in place.
 
 - [x] Read instructions/README; inspect the owned P0, local queue, cycles and
   current reservations. Preserve original full-workspace acceptance.
-- [ ] Execute a deep-tree regression with a public reader between staging and
+- [x] Execute a deep-tree regression with a public reader between staging and
   successful commit; preserve any real failure and exact source binding.
-- [ ] Repair confirmed cache publication/visibility defects without weakening
+  Actual red0/1/0,1620filtered,0.03s, Cargo101: correct single publication and
+  allocation debit, followed by zeros instead of the committed payload.
+  Source/worker hashes and raw resume10-cache-publication-red.log are retained.
+  A concurrent actor committed that red/TODO as3ad0b7f0a; preserve it.
+- [x] Repair confirmed cache publication/visibility defects without weakening
   tests, and cover read/read_into, pinned old readers and subsequent writes.
+  Shared mappings and write lists carry the exact source commit sequence;
+  different versions miss, including old fills arriving after publication.
+  Expanded tests cover hole-punch publication and consumed writer scopes.
+  Implementation authored; runtime verification remains in the next item.
 - [ ] Execute affected default/sharded controls where storage admission allows;
   run required workspace check, strict Clippy, formatting and changed-file UBS.
+  Fmt/whitespace0; UBS0critical in both changed source files, with existing
+  warnings. /run attempts fail101 because its mount is noexec, with zero tests;
+  a /dev scratch candidate is refused by DCG and remains untouched. No guard,
+  mount, quota or slot changes. Ordinary executable hz3 /tmp passes SBH20GiB;
+  repeat normal RCH gates there, preserving all failed logs separately.
 - [ ] Update existing specs/parity and original Bead with executed evidence,
   inspect the full diff, commit/push the cohesive change and release leases.
 - [ ] Original full-workspace/mounted acceptance remains open until executed.

@@ -1511,6 +1511,8 @@ struct ExtentCacheInner {
 #[derive(Debug)]
 struct CacheEntry {
     mapping: ExtentMapping,
+    /// Caller-owned view identity, independent of cache invalidation generation.
+    version: u64,
     generation: u64,
     /// Logical clock for LRU eviction (higher = more recent).
     last_access: AtomicU64,
@@ -1610,6 +1612,19 @@ impl ExtentCache {
     /// the extent.
     #[must_use]
     pub fn lookup(&self, ns: u64, logical_block: u32) -> Option<ExtentMapping> {
+        self.lookup_versioned(ns, logical_block, 0)
+    }
+
+    /// Look up a mapping only in the caller's exact view. A different version
+    /// is a cache miss, including when an older reader fills the cache after a
+    /// newer view has already been published. Unversioned callers use zero.
+    #[must_use]
+    pub fn lookup_versioned(
+        &self,
+        ns: u64,
+        logical_block: u32,
+        version: u64,
+    ) -> Option<ExtentMapping> {
         let shard = self.shard(ns);
         let inner = shard.read();
         let current_gen = inner.generation;
@@ -1620,12 +1635,16 @@ impl ExtentCache {
             .range(..=(ns, logical_block))
             .next_back()
             .filter(|&(&(entry_ns, _), _)| entry_ns == ns)
-            .map(|(&k, e)| (k, e.mapping, e.generation, &e.last_access));
+            .map(|(&k, e)| (k, e.mapping, e.version, e.generation, &e.last_access));
 
-        let Some((key, mapping, entry_gen, last_access)) = candidate else {
+        let Some((key, mapping, entry_version, entry_gen, last_access)) = candidate else {
             atomic_saturating_add(&inner.misses, 1);
             return None;
         };
+        if entry_version != version {
+            atomic_saturating_add(&inner.misses, 1);
+            return None;
+        }
 
         let extent_end = u64::from(mapping.logical_start) + u64::from(mapping.count);
         if u64::from(logical_block) < extent_end && entry_gen == current_gen {
@@ -1688,6 +1707,13 @@ impl ExtentCache {
     ///
     /// If the cache is at capacity, the least-recently-used entry is evicted.
     pub fn insert(&self, ns: u64, mapping: ExtentMapping) {
+        self.insert_versioned(ns, mapping, 0);
+    }
+
+    /// Cache a mapping resolved in an exact caller-owned view. Versions are
+    /// opaque identities: a late fill can replace another version's entry,
+    /// but lookups in that other view must then miss rather than return it.
+    pub fn insert_versioned(&self, ns: u64, mapping: ExtentMapping, version: u64) {
         let mut inner = self.shard(ns).write();
         if inner.capacity == 0
             || mapping.count == 0
@@ -1709,6 +1735,7 @@ impl ExtentCache {
             key,
             CacheEntry {
                 mapping,
+                version,
                 generation: current_gen,
                 last_access: AtomicU64::new(access_clock),
             },
@@ -6672,6 +6699,48 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         let stats = cache.stats();
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 1);
+    }
+
+    #[test]
+    fn cache_versioned_views_reject_stale_and_late_fills() {
+        let cache = ExtentCache::new();
+        let hole = ExtentMapping {
+            logical_start: 4,
+            physical_start: 0,
+            count: 2,
+            unwritten: false,
+        };
+        let data = ExtentMapping {
+            physical_start: 100,
+            ..hole
+        };
+        cache.insert_versioned(11, hole, 7);
+        assert_eq!(cache.lookup_versioned(11, 4, 7), Some(hole));
+        assert!(cache.lookup_versioned(11, 4, 8).is_none());
+        cache.insert_versioned(11, data, 8);
+        assert_eq!(cache.lookup_versioned(11, 4, 8), Some(data));
+        assert!(cache.lookup_versioned(11, 4, 7).is_none());
+        assert!(cache.lookup(11, 4).is_none());
+
+        // An old tree walk can finish after the new view has already filled
+        // the same key. That may cost a miss, never a wrong mapping.
+        cache.insert_versioned(11, hole, 7);
+        assert!(cache.lookup_versioned(11, 4, 8).is_none());
+        cache.insert_versioned(11, data, 8);
+        cache.insert_versioned(12, hole, 8);
+        assert_eq!(cache.lookup_versioned(11, 4, 8), Some(data));
+        assert_eq!(cache.lookup_versioned(12, 4, 8), Some(hole));
+        cache.invalidate_range(11, 4, 1);
+        assert!(cache.lookup_versioned(11, 4, 8).is_none());
+        assert_eq!(cache.lookup_versioned(12, 4, 8), Some(hole));
+
+        cache.insert_versioned(11, data, u64::MAX);
+        assert_eq!(cache.lookup_versioned(11, 4, u64::MAX), Some(data));
+        cache.invalidate_all();
+        assert!(cache.lookup_versioned(11, 4, u64::MAX).is_none());
+        cache.insert(11, hole);
+        assert_eq!(cache.lookup(11, 4), Some(hole));
+        assert!(cache.lookup_versioned(11, 4, u64::MAX).is_none());
     }
 
     #[test]
