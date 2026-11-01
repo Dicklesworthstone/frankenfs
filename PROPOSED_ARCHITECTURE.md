@@ -744,15 +744,23 @@ userspace write(fd, buf, count)
   → fuser → kernel → userspace
 ```
 
-Ext4 request-scoped truncation stages bitmap frees against private allocation
-statistics and retains per-group free-block credits in `RequestScope`.
-Both extent and indirect mappings use the transaction device. Repeated shrinks
-accumulate credits, including freed mapping-tree blocks, without changing live
-`statfs` counts. Publication enters the mutation gate, holds the allocator lock,
-validates additions, commits MVCC, then applies only those credits to current
-live counts. A failed commit or an aborted scope discards them. Repair callbacks
-run afterward; a callback error cannot undo published accounting. Sharded
-descriptor reconciliation incorporates this single-lock counter movement once.
+Ext4 request-scoped writes, fallocate and truncation stage bitmap changes
+against private allocation statistics. `RequestScope` owns signed per-group
+block deltas and bitmap-initialization transitions. Extent, indirect and e2compr
+allocation helpers use the transaction device, including mapping metadata and
+superseded compressed blocks. Repeated operations see their own bitmap writes
+and pending capacity changes without changing live `statfs` counts. Nested
+mapping helpers share the outer private allocator. Publication enters the
+mutation gate, holds the allocator lock, validates the resulting counts and
+prepares exact dual-ledger redistribution, commits MVCC, then installs counters
+and initialization flags. A failed commit or aborted/cancelled scope discards
+its accounting without restoring an old live snapshot. Compressed descriptors
+are staged with their inode rather than flushed before publication. Repair
+callbacks run afterward; callback errors cannot undo published accounting.
+Fixed-snapshot requests neither consume nor populate shared current-view extent
+caches. A private or older leaf can differ while its top-level index root stays
+byte-identical; root identity alone cannot authorize reuse. Each write still
+retains its own per-operation extent list.
 This boundary does not establish atomic capture for existing ungated non-JBD2
 durability paths.
 

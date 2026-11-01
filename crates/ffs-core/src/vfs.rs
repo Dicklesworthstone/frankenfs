@@ -522,10 +522,16 @@ pub struct RequestScope {
     /// `find | xargs stat` walk) that DO benefit from the cache warm.
     #[serde(default)]
     pub skip_readdir_prefetch: bool,
-    /// Block-free credits staged with ext4 bitmap writes. Only successful
-    /// publication transfers these credits to the live allocator.
+    /// Signed free-block changes staged with ext4 bitmap writes. Only successful
+    /// publication transfers these credits/debits to the live allocator.
     #[serde(default)]
-    pub(crate) ext4_freed_blocks: BTreeMap<usize, u32>,
+    pub(crate) ext4_block_deltas: BTreeMap<usize, i64>,
+    /// Groups whose previously undefined bitmap was initialized in this scope.
+    #[serde(default)]
+    pub(crate) ext4_initialized_bitmaps: std::collections::BTreeSet<usize>,
+    /// Nested mapping helpers already operate on the outer private allocator.
+    #[serde(skip)]
+    pub(crate) ext4_accounting_active: bool,
 }
 
 impl RequestScope {
@@ -544,7 +550,9 @@ impl RequestScope {
             read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
-            ext4_freed_blocks: BTreeMap::new(),
+            ext4_block_deltas: BTreeMap::new(),
+            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+            ext4_accounting_active: false,
         }
     }
 
@@ -557,7 +565,9 @@ impl RequestScope {
             read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
-            ext4_freed_blocks: BTreeMap::new(),
+            ext4_block_deltas: BTreeMap::new(),
+            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+            ext4_accounting_active: false,
         }
     }
 
@@ -570,7 +580,9 @@ impl RequestScope {
             read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
-            ext4_freed_blocks: BTreeMap::new(),
+            ext4_block_deltas: BTreeMap::new(),
+            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+            ext4_accounting_active: false,
         }
     }
 

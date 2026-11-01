@@ -1,5 +1,35 @@
 # FEATURE_PARITY
 
+> **Scoped ext4 allocation accounting (2026-11-01):** aborted writeback batches
+> no longer spend live free-block capacity. The executed regression retained
+> inode/bitmap bytes but lost four reported blocks before the fix. Request scopes
+> now own signed allocation/free deltas and bitmap-initialization transitions;
+> successful publication installs validated, reconciled counters once. Extent,
+> indirect and compressed helpers stage allocation bitmaps, mapping metadata,
+> superseded blocks and compressed descriptors through the transaction.
+> Fixed-snapshot mapping reads and write lists also bypass shared current-view
+> caches. A second executed regression showed a discarded deep-leaf mapping
+> surviving abort and letting a later write bypass bitmap allocation. Its
+> unit correction preserves the hole for a pinned reader after the later write.
+> A native-image probe also exposed false ENOSPC when a write exceeded one
+> group's capacity. Extent writes now try smaller runs and continue across groups.
+> Six focused tests cover eight allocator/mapping lifecycle profiles,
+> cancelled publication, overlapping-allocation conflict and mixed write/punch/
+> preallocation batches. Four real 1KiB/4KiB extent/legacy images pass all five
+> `e2fsck -fn` phases and cold readback. The 1KiB profiles initialize a real lazy
+> bitmap; extent leaves and triple-indirect metadata are exercised. Compression
+> profiles use planted inode flags and qualify unit behavior, not native legacy
+> compression interoperability. The initial shared-inode-capacity hypothesis was
+> disproved; its native test is a control, not a product-fix claim.
+> Final selections pass 35/0/5 existing ignores in both default and sharded
+> builds, with exact source/lock/toolchain bindings. Ten final images retain
+> matching worker/local hashes. Workspace/all-target check, strict Clippy in
+> both builds, and formatting pass. Unchanged UBS rules report zero critical
+> findings in the three changed code files; existing warnings remain.
+> Full workspace runtime, mounted/crash qualification and arbitrary outer-request
+> composition remain open under `bd-vuzzq`/`bd-9rutw`; no parity-rate or speedup
+> claim is added.
+
 > **Reclaimed capacity and symlink storage (2026-11-01):** tmpfile and symlink
 > births can now spend inode credits returned through the other allocator
 > family. A real inode-full image reproduced false ENOSPC for each operation

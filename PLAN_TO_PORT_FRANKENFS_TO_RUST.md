@@ -547,6 +547,14 @@ The multi-block allocator attempts allocation in this priority order:
    groups using buddy-system order.
 5. **Any free block** -- last resort; scan all groups for any free block.
 
+Request-scoped block changes remain private through writes, fallocate and
+truncation, including data, mapping metadata and lazy-bitmap initialization.
+Successful MVCC publication installs validated accounting once; abort,
+cancellation and conflicts discard it. Large extent writes reduce their
+requested run when one group cannot satisfy it, then continue across groups.
+Native image and scoped conflict/abort tests qualify these paths separately
+from the remaining mounted, crash and full-workspace acceptance.
+
 **Acceptance Criteria:**
 - Resolve the block mapping for every file in a real ext4 test image and verify
   against `debugfs` output.

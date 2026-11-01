@@ -21818,7 +21818,7 @@ impl OpenFs {
         logical_block: u32,
         hint: &mut usize,
     ) -> Result<Option<(u64, bool)>, FfsError> {
-        if inode.flags & EXT4_EXTENTS_FL != 0 {
+        if inode.flags & EXT4_EXTENTS_FL != 0 && !scope.uses_fixed_snapshot() {
             let ns = extent_cache_namespace(inode);
             let hot = self.ext4_hot_extents.load();
             if let Some(slot) = hot.as_ref()
@@ -21853,6 +21853,20 @@ impl OpenFs {
             return Ok(self
                 .resolve_indirect_block(cx, scope, inode, logical_block)?
                 .map(|phys| (phys, false)));
+        }
+
+        // Shared namespace caches describe the current committed tree. A fixed
+        // view can contain private leaf edits under an unchanged index root,
+        // or old leaves retained by a reader, so neither consume nor populate
+        // those caches from it.
+        if scope.uses_fixed_snapshot() {
+            let (header, tree) =
+                parse_inode_extent_tree(inode).map_err(|e| parse_to_ffs_error(&e))?;
+            let mappings =
+                self.walk_extent_tree_leaf(cx, scope, &tree, logical_block, header.depth)?;
+            return Ok(mappings.as_deref().and_then(|mappings| {
+                Self::ext4_resolve_block_from_mappings(mappings, logical_block)
+            }));
         }
 
         // Derive a cache namespace from the inode's extent root bytes.
@@ -22125,7 +22139,7 @@ impl OpenFs {
         // An indirect block map grows inside its pointer blocks without
         // changing `i_block`, so the root-keyed snapshot cannot tell its
         // versions apart: always re-walk it.
-        if self.ext4_inode_block_map_is_indirect(inode) {
+        if self.ext4_inode_block_map_is_indirect(inode) || scope.uses_fixed_snapshot() {
             return Ok(Arc::from(
                 self.collect_extents_with_scope(cx, scope, inode)?,
             ));
@@ -22466,29 +22480,6 @@ impl OpenFs {
     /// delta to `i_blocks` keeps directory `i_blocks` correct once the tree
     /// grows past its inline depth-0 root, the same way the file write/fallocate
     /// path does it (bd-kyp2q; file analog bd-zpe9s).
-    /// Extent-tree metadata blocks as fallocate sees them: the modes stage
-    /// tree nodes into the request transaction (preallocation) or write them
-    /// through `block_dev` (punch/collapse/insert), so count through the view
-    /// that sees both — staged first, then `block_dev`. The request scope's
-    /// snapshot sees neither of this request's new nodes.
-    fn ext4_fallocate_extent_meta_blocks(
-        cx: &Cx,
-        scope: &mut RequestScope,
-        block_dev: &dyn BlockDevice,
-        root_bytes: &[u8; 60],
-    ) -> Result<u64, FfsError> {
-        scope.tx.as_mut().map_or_else(
-            || Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, block_dev, root_bytes),
-            |tx| {
-                let tx_dev = TransactionBlockAdapter {
-                    base: block_dev,
-                    tx: Mutex::new(tx),
-                };
-                Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, &tx_dev, root_bytes)
-            },
-        )
-    }
-
     fn ext4_count_extent_tree_meta_blocks_via_dev(
         cx: &Cx,
         dev: &dyn BlockDevice,
@@ -25107,27 +25098,13 @@ impl OpenFs {
 
             let (ind_block_num, new_metadata_block) = if current_ind == 0 {
                 // Allocate a new indirect block.
-                let Ext4AllocState {
-                    geo,
-                    groups,
-                    persist_ctx,
-                } = &mut *alloc;
                 let hint = self.numa_allocation_hint(
-                    geo,
+                    &alloc.geo,
                     AllocHint::default(),
                     "ext4_indirect_block",
                     None,
                 );
-                let alloc_result = ffs_alloc::alloc_blocks_persist(
-                    cx,
-                    &block_dev,
-                    geo,
-                    groups,
-                    1,
-                    &hint,
-                    persist_ctx,
-                )?;
-                let new_block = alloc_result.start;
+                let new_block = self.allocate_one_block(cx, scope, alloc, &hint)?;
                 // Zero-fill the new indirect block.
                 let zeros = vec![0_u8; bs as usize];
                 if let Some(tx) = &mut scope.tx {
@@ -25305,17 +25282,13 @@ impl OpenFs {
         }
         let block_dev = self.block_device_adapter();
         let bs = self.block_size();
-        let Ext4AllocState {
-            geo,
-            groups,
-            persist_ctx,
-            ..
-        } = &mut *alloc;
-        let hint =
-            self.numa_allocation_hint(geo, AllocHint::default(), "ext4_indirect_block", None);
-        let result =
-            ffs_alloc::alloc_blocks_persist(cx, &block_dev, geo, groups, 1, &hint, persist_ctx)?;
-        let new_block = result.start;
+        let hint = self.numa_allocation_hint(
+            &alloc.geo,
+            AllocHint::default(),
+            "ext4_indirect_block",
+            None,
+        );
+        let new_block = self.allocate_one_block(cx, scope, alloc, &hint)?;
         let zeros = vec![0_u8; bs as usize];
         if let Some(tx) = &mut scope.tx {
             // Newly allocated indirect block: no concurrent txn writes expected.
@@ -25365,16 +25338,9 @@ impl OpenFs {
         if current != 0 {
             return Ok((BlockNumber(u64::from(current)), Vec::new()));
         }
-        let Ext4AllocState {
-            geo,
-            groups,
-            persist_ctx,
-            ..
-        } = &mut *alloc;
-        let hint = self.numa_allocation_hint(geo, AllocHint::default(), "ext4_pointer_block", None);
-        let result =
-            ffs_alloc::alloc_blocks_persist(cx, &block_dev, geo, groups, 1, &hint, persist_ctx)?;
-        let new_block = result.start;
+        let hint =
+            self.numa_allocation_hint(&alloc.geo, AllocHint::default(), "ext4_pointer_block", None);
+        let new_block = self.allocate_one_block(cx, scope, alloc, &hint)?;
         let zeros = vec![0_u8; bs as usize];
         if let Some(tx) = &mut scope.tx {
             // Newly allocated indirect block: no concurrent txn writes expected.
@@ -25877,81 +25843,104 @@ impl OpenFs {
         }
     }
 
-    /// Keep scoped bitmap frees and their accounting private until publication.
+    /// Keep scoped bitmap changes and their accounting private until publication.
     /// The caller holds the live allocator lock; only the temporary copy moves.
-    /// Retain matching credits for partial staging on error, then discard them
+    /// Retain matching deltas for partial staging on error, then discard them
     /// with the transaction: callers must abort a scope after a failed operation.
-    fn ext4_with_scoped_block_frees<T>(
+    fn ext4_with_scoped_block_counts<T>(
+        &self,
         scope: &mut RequestScope,
         alloc: &mut Ext4AllocState,
-        free: impl FnOnce(&mut RequestScope, &mut Ext4AllocState) -> Result<T, FfsError>,
+        stage: impl FnOnce(&mut RequestScope, &mut Ext4AllocState) -> Result<T, FfsError>,
     ) -> Result<T, FfsError> {
-        if scope.tx.is_none() {
-            return free(scope, alloc);
+        if scope.tx.is_none() || scope.ext4_accounting_active {
+            return stage(scope, alloc);
         }
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let groups = if let Some(sharded) = self
+            .ext4_sharded_alloc
+            .as_ref()
+            .filter(|_| self.bhh0i_sharded_ops_active())
+        {
+            sharded.birth_group_stats(&alloc.groups)?
+        } else {
+            alloc.groups.clone()
+        };
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let groups = alloc.groups.clone();
         let mut private = Ext4AllocState {
             geo: alloc.geo.clone(),
-            groups: alloc.groups.clone(),
+            groups,
             persist_ctx: alloc.persist_ctx.clone(),
         };
-        for (&idx, &count) in &scope.ext4_freed_blocks {
-            let group = private
-                .groups
-                .get_mut(idx)
-                .ok_or_else(|| FfsError::Corruption {
-                    block: 0,
-                    detail: "scoped block free references a missing allocation group".into(),
-                })?;
-            group.free_blocks =
-                group
-                    .free_blocks
-                    .checked_add(count)
-                    .ok_or_else(|| FfsError::Corruption {
-                        block: group.block_bitmap_block.0,
-                        detail: "scoped free-block count overflow".into(),
-                    })?;
-        }
+        Self::ext4_apply_scoped_block_counts(scope, &mut private.groups)?;
         let before: Vec<_> = private
             .groups
             .iter()
             .map(|group| group.free_blocks)
             .collect();
-        let result = free(scope, &mut private);
+        scope.ext4_accounting_active = true;
+        let result = stage(scope, &mut private);
+        scope.ext4_accounting_active = false;
         for (idx, (before, after)) in before.iter().zip(&private.groups).enumerate() {
-            let freed =
-                after
-                    .free_blocks
-                    .checked_sub(*before)
-                    .ok_or_else(|| FfsError::Corruption {
-                        block: after.block_bitmap_block.0,
-                        detail: "block-free operation reduced the free-block count".into(),
-                    })?;
-            if freed != 0 {
-                let pending = scope.ext4_freed_blocks.entry(idx).or_default();
+            let delta = i64::from(after.free_blocks) - i64::from(*before);
+            if delta != 0 {
+                let pending = scope.ext4_block_deltas.entry(idx).or_default();
                 *pending = pending
-                    .checked_add(freed)
+                    .checked_add(delta)
                     .ok_or_else(|| FfsError::Corruption {
                         block: after.block_bitmap_block.0,
-                        detail: "pending free-block count overflow".into(),
+                        detail: "pending block-accounting delta overflow".into(),
                     })?;
+            }
+            if !after.block_bitmap_uninit() && alloc.groups[idx].block_bitmap_uninit() {
+                scope.ext4_initialized_bitmaps.insert(idx);
             }
         }
         result
     }
 
+    fn ext4_apply_scoped_block_counts(
+        scope: &RequestScope,
+        groups: &mut [GroupStats],
+    ) -> Result<(), FfsError> {
+        for (&idx, &delta) in &scope.ext4_block_deltas {
+            let group = groups.get_mut(idx).ok_or_else(|| FfsError::Corruption {
+                block: 0,
+                detail: "scoped block accounting references a missing allocation group".into(),
+            })?;
+            group.free_blocks = i64::from(group.free_blocks)
+                .checked_add(delta)
+                .and_then(|count| u32::try_from(count).ok())
+                .ok_or_else(|| FfsError::MvccConflict {
+                    tx: scope.tx.as_ref().map_or(0, |tx| tx.id().0),
+                    block: group.block_bitmap_block.0,
+                })?;
+            group.invalidate_block_largest_free_run();
+        }
+        for &idx in &scope.ext4_initialized_bitmaps {
+            let group = groups.get_mut(idx).ok_or_else(|| FfsError::Corruption {
+                block: 0,
+                detail: "scoped bitmap initialization references a missing group".into(),
+            })?;
+            group.mark_block_bitmap_initialized();
+        }
+        Ok(())
+    }
+
     /// Publish bitmap writes and their owned accounting delta under the same
-    /// allocator guard. A failed commit consumes the transaction but credits
-    /// nothing; later abort/cleanup therefore needs no compensating I/O.
-    fn commit_scope_with_ext4_free_counts(
+    /// allocator guard. A failed commit changes no live counts; later
+    /// abort/cleanup therefore needs no compensating I/O.
+    fn commit_scope_with_ext4_block_counts(
         &self,
         scope: &mut RequestScope,
     ) -> Result<CommitSeq, FfsError> {
-        if scope.ext4_freed_blocks.is_empty() {
+        if scope.ext4_block_deltas.is_empty() && scope.ext4_initialized_bitmaps.is_empty() {
             return scope.commit_if_write(&self.mvcc_store);
         }
         if scope.tx.is_none() {
             return Err(FfsError::Format(
-                "scoped block frees have no transaction".into(),
+                "scoped block accounting has no transaction".into(),
             ));
         }
         // Deferred scopes have left their request gate. Enter before acquiring
@@ -25959,33 +25948,73 @@ impl OpenFs {
         // mvcc_flushed_through here: a boundary may hold it while draining us.
         let _gate = self.mutation_gate_guard();
         let mut alloc = self.require_alloc_state()?.write();
-        let mut updated = Vec::with_capacity(scope.ext4_freed_blocks.len());
-        for (&idx, &freed) in &scope.ext4_freed_blocks {
-            let group = alloc.groups.get(idx).ok_or_else(|| FfsError::Corruption {
-                block: 0,
-                detail: "scoped block free references a missing allocation group".into(),
-            })?;
-            let count =
-                group
-                    .free_blocks
-                    .checked_add(freed)
-                    .ok_or_else(|| FfsError::Corruption {
-                        block: group.block_bitmap_block.0,
-                        detail: "committed free-block count overflow".into(),
-                    })?;
-            updated.push((idx, count));
-        }
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let sharded = self
+            .ext4_sharded_alloc
+            .as_ref()
+            .filter(|_| self.bhh0i_sharded_ops_active());
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let mut updated = if let Some(sharded) = sharded {
+            sharded.birth_group_stats(&alloc.groups)?
+        } else {
+            alloc.groups.clone()
+        };
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let mut updated = alloc.groups.clone();
+        Self::ext4_apply_scoped_block_counts(scope, &mut updated)?;
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let publication = sharded
+            .map(|sharded| sharded.prepare_birth_publication(&alloc.groups, updated.clone()))
+            .transpose()?;
         let result = scope.commit_if_write(&self.mvcc_store);
         if result.is_ok() {
-            for (idx, count) in updated {
-                let group = &mut alloc.groups[idx];
-                group.free_blocks = count;
-                group.invalidate_block_largest_free_run();
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            if let Some((sharded, plan)) = sharded.zip(publication) {
+                let sharded_moved = plan.moves_sharded_counts();
+                updated = sharded.publish_birth(plan);
+                if sharded_moved {
+                    self.note_sharded_alloc_happened();
+                }
             }
+            alloc.groups = updated;
         }
         drop(alloc);
-        scope.ext4_freed_blocks.clear();
+        scope.ext4_block_deltas.clear();
+        scope.ext4_initialized_bitmaps.clear();
         result
+    }
+
+    /// Allocate a single block through the request's bitmap transaction.
+    fn allocate_one_block(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
+        hint: &AllocHint,
+    ) -> Result<BlockNumber, FfsError> {
+        let dev = self.block_device_adapter();
+        let snapshot_dev = scope
+            .tx
+            .as_ref()
+            .map(|tx| RegisteredSnapshotBlockAdapter::new(&dev, &self.mvcc_store, tx.snapshot()));
+        let base = snapshot_dev
+            .as_ref()
+            .map_or(&dev as &dyn BlockDevice, |dev| dev);
+        let tx_dev = scope.tx.as_mut().map(|tx| TransactionBlockAdapter {
+            base,
+            tx: Mutex::new(tx),
+        });
+        let dev = tx_dev.as_ref().map_or(base, |dev| dev);
+        ffs_alloc::alloc_blocks_persist(
+            cx,
+            dev,
+            &alloc.geo,
+            &mut alloc.groups,
+            1,
+            hint,
+            &alloc.persist_ctx,
+        )
+        .map(|allocated| allocated.start)
     }
 
     /// Free a single filesystem block through the request's bitmap transaction.
@@ -26135,7 +26164,7 @@ impl OpenFs {
         inode: &mut Ext4Inode,
         range: std::ops::Range<u64>,
     ) -> Result<u64, FfsError> {
-        Self::ext4_with_scoped_block_frees(scope, alloc, |scope, alloc| {
+        self.ext4_with_scoped_block_counts(scope, alloc, |scope, alloc| {
             self.ext4_free_indirect_range_inner(cx, scope, alloc, inode, range)
         })
     }
@@ -26467,27 +26496,13 @@ impl OpenFs {
 
         // Allocate physical blocks and write.
         for i in 0..blocks_needed {
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
             let hint = self.numa_allocation_hint(
-                geo,
+                &alloc.geo,
                 AllocHint::default(),
                 "ext4_compressed_cluster",
                 Some(ino),
             );
-            let alloc_result = ffs_alloc::alloc_blocks_persist(
-                cx,
-                &block_dev,
-                geo,
-                groups,
-                1,
-                &hint,
-                persist_ctx,
-            )?;
-            let phys_block = alloc_result.start;
+            let phys_block = self.allocate_one_block(cx, scope, alloc, &hint)?;
             new_blocks.push(phys_block);
 
             let start = i as usize * bs_usize;
@@ -26597,27 +26612,13 @@ impl OpenFs {
             let mut block_data = vec![0_u8; bs_usize];
             block_data[..end - start].copy_from_slice(&data[start..end]);
 
-            let Ext4AllocState {
-                geo,
-                groups,
-                persist_ctx,
-            } = &mut *alloc;
             let hint = self.numa_allocation_hint(
-                geo,
+                &alloc.geo,
                 AllocHint::default(),
                 "ext4_uncompressed_cluster",
                 Some(ino),
             );
-            let alloc_result = ffs_alloc::alloc_blocks_persist(
-                cx,
-                &block_dev,
-                geo,
-                groups,
-                1,
-                &hint,
-                persist_ctx,
-            )?;
-            let phys_block = alloc_result.start;
+            let phys_block = self.allocate_one_block(cx, scope, alloc, &hint)?;
             new_blocks.push(phys_block);
 
             if let Some(tx) = &mut scope.tx {
@@ -33393,7 +33394,7 @@ impl OpenFs {
             )));
         }
 
-        let mut inode = self.read_inode(cx, ino)?;
+        let mut inode = self.read_inode_with_scope(cx, scope, ino)?;
         if inode.is_dir() {
             return Err(FfsError::IsDirectory);
         }
@@ -33446,199 +33447,214 @@ impl OpenFs {
 
         let mut root_bytes = Self::extent_root(&inode);
         let mut alloc = alloc_mutex.write();
-        // Snapshot extent-tree metadata blocks before any mode mutates the tree
-        // (prealloc grows it, punch/collapse can shrink it); the net change is
-        // charged to i_blocks at the common writeback below (bd-zpe9s).
-        // Counted through the view the modes below mutate the tree through
-        // (`ext4_fallocate_extent_meta_blocks`) — NOT the request scope's
-        // snapshot, which predates the nodes a growing tree allocates here.
-        // Reading a just-grown leaf through that snapshot returned the block's
-        // previous contents ("invalid magic 0xabab" on a punch that grew the
-        // root), failing the op after its allocations had landed.
-        let fallocate_meta_before =
-            Self::ext4_fallocate_extent_meta_blocks(cx, scope, &block_dev, &root_bytes)?;
-        // Preallocation that runs out of space part-way keeps what it got and
-        // still records it in the inode, as kernel ext4 does; returning
-        // straight from the allocation loop dropped the updated extent root,
-        // leaving every block allocated so far marked in use with no owner
-        // (a fallocate of twice the free space filled the filesystem for
-        // good). The error is reported after the inode is written.
-        let mut prealloc_error: Option<FfsError> = None;
-
-        if punch_hole {
-            // Unaligned ranges are supported (bd-xnel9): deallocate the fully
-            // covered aligned interior blocks, and zero the partial in-range
-            // bytes of any WRITTEN edge blocks (holes/unwritten already read
-            // zero, so punch must not allocate them) — mirroring the kernel's
-            // ext4 punch, which keeps the edge blocks allocated. The file size is
-            // unchanged (PUNCH_HOLE is always KEEP_SIZE).
-            let interior_start = offset.div_ceil(block_size) * block_size; // align up
-            let interior_end = (end / block_size) * block_size; // align down
-
-            // Byte ranges in [offset, end) that lie OUTSIDE the freed interior
-            // and must be zeroed in place. With a full-block interior these are
-            // the head and tail partials; without one the whole range sits in one
-            // or two partial edge blocks (second slot stays empty).
-            let edge_ranges: [(u64, u64); 2] = if interior_start < interior_end {
-                [(offset, interior_start), (interior_end, end)]
-            } else {
-                [(offset, end), (end, end)]
-            };
-            for (zero_start, zero_end) in edge_ranges {
-                if zero_start >= zero_end {
-                    continue;
-                }
-                let ls = u32::try_from(zero_start / block_size).map_err(|_| FfsError::NoSpace)?;
-                let lc = zero_end
-                    .div_ceil(block_size)
-                    .saturating_sub(zero_start / block_size);
-                if lc == 0 {
-                    continue;
-                }
-                let edge_mappings =
-                    ffs_extent::map_logical_to_physical(cx, &block_dev, &root_bytes, ls, lc)?;
-                for mapping in edge_mappings {
-                    if mapping.physical_start == 0 || mapping.unwritten {
-                        continue; // hole / unwritten already reads zero
-                    }
-                    for blk_offset in 0..u64::from(mapping.count) {
-                        let logical_block = u64::from(mapping.logical_start) + blk_offset;
-                        let block_byte_start = logical_block * block_size;
-                        let from_byte = zero_start.max(block_byte_start);
-                        let to_byte = zero_end.min(block_byte_start + block_size);
-                        if from_byte >= to_byte {
-                            continue;
-                        }
-                        let phys = BlockNumber(mapping.physical_start + blk_offset);
-                        let mut buf = block_dev.read_block(cx, phys)?.into_inner();
-                        let from = usize::try_from(from_byte - block_byte_start).map_err(|_| {
-                            FfsError::Format("punch_hole partial edge offset overflow".into())
-                        })?;
-                        let to = usize::try_from(to_byte - block_byte_start).map_err(|_| {
-                            FfsError::Format("punch_hole partial edge offset overflow".into())
-                        })?;
-                        buf[from..to].fill(0);
-                        block_dev.write_block(cx, phys, &buf)?;
-                    }
-                }
-            }
-
-            // Deallocate the fully covered aligned interior blocks.
-            let extent_ns = extent_cache_namespace(&inode);
-            let logical_start =
-                u32::try_from(interior_start / block_size).map_err(|_| FfsError::NoSpace)?;
-            let logical_count =
-                u32::try_from(interior_end.saturating_sub(interior_start) / block_size)
-                    .map_err(|_| FfsError::NoSpace)?;
-            if logical_count > 0 {
-                let mappings = ffs_extent::map_logical_to_physical(
-                    cx,
-                    &block_dev,
-                    &root_bytes,
-                    logical_start,
-                    u64::from(logical_count),
-                )?;
-                let allocated_blocks_to_free = mappings
-                    .iter()
-                    .filter(|mapping| mapping.physical_start != 0)
-                    .map(|mapping| u64::from(mapping.count))
-                    .sum::<u64>();
-                let blocks_after_punch = if inode.is_huge_file() {
-                    Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        -(i128::from(allocated_blocks_to_free)),
-                    )?
-                } else {
-                    let freed_sectors = allocated_blocks_to_free
-                        .checked_mul(sectors_per_block)
-                        .ok_or_else(|| FfsError::Corruption {
-                            block: 0,
-                            detail: format!(
-                                "inode {} freed sectors overflow during punch_hole preflight",
-                                ino.0
-                            ),
-                        })?;
-                    Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        -(i128::from(freed_sectors)),
-                    )?
+        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+            let tx_dev;
+            let dev: &dyn BlockDevice = if let Some(tx) = &mut scope.tx {
+                tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(tx),
                 };
-                {
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                    } = &mut *alloc;
-                    ffs_extent::punch_hole(
+                &tx_dev
+            } else {
+                &block_dev
+            };
+            // Snapshot extent-tree metadata blocks before any mode mutates the tree
+            // (prealloc grows it, punch/collapse can shrink it); the net change is
+            // charged to i_blocks at the common writeback below (bd-zpe9s).
+            // Counted through the view the modes below mutate the tree through
+            // (the transaction device below) — NOT the request scope's
+            // snapshot, which predates the nodes a growing tree allocates here.
+            // Reading a just-grown leaf through that snapshot returned the block's
+            // previous contents ("invalid magic 0xabab" on a punch that grew the
+            // root), failing the op after its allocations had landed.
+            let fallocate_meta_before =
+                Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
+            // Preallocation that runs out of space part-way keeps what it got and
+            // still records it in the inode, as kernel ext4 does; returning
+            // straight from the allocation loop dropped the updated extent root,
+            // leaving every block allocated so far marked in use with no owner
+            // (a fallocate of twice the free space filled the filesystem for
+            // good). The error is reported after the inode is written.
+            let mut prealloc_error: Option<FfsError> = None;
+
+            if punch_hole {
+                // Unaligned ranges are supported (bd-xnel9): deallocate the fully
+                // covered aligned interior blocks, and zero the partial in-range
+                // bytes of any WRITTEN edge blocks (holes/unwritten already read
+                // zero, so punch must not allocate them) — mirroring the kernel's
+                // ext4 punch, which keeps the edge blocks allocated. The file size is
+                // unchanged (PUNCH_HOLE is always KEEP_SIZE).
+                let interior_start = offset.div_ceil(block_size) * block_size; // align up
+                let interior_end = (end / block_size) * block_size; // align down
+
+                // Byte ranges in [offset, end) that lie OUTSIDE the freed interior
+                // and must be zeroed in place. With a full-block interior these are
+                // the head and tail partials; without one the whole range sits in one
+                // or two partial edge blocks (second slot stays empty).
+                let edge_ranges: [(u64, u64); 2] = if interior_start < interior_end {
+                    [(offset, interior_start), (interior_end, end)]
+                } else {
+                    [(offset, end), (end, end)]
+                };
+                for (zero_start, zero_end) in edge_ranges {
+                    if zero_start >= zero_end {
+                        continue;
+                    }
+                    let ls =
+                        u32::try_from(zero_start / block_size).map_err(|_| FfsError::NoSpace)?;
+                    let lc = zero_end
+                        .div_ceil(block_size)
+                        .saturating_sub(zero_start / block_size);
+                    if lc == 0 {
+                        continue;
+                    }
+                    let edge_mappings =
+                        ffs_extent::map_logical_to_physical(cx, dev, &root_bytes, ls, lc)?;
+                    for mapping in edge_mappings {
+                        if mapping.physical_start == 0 || mapping.unwritten {
+                            continue; // hole / unwritten already reads zero
+                        }
+                        for blk_offset in 0..u64::from(mapping.count) {
+                            let logical_block = u64::from(mapping.logical_start) + blk_offset;
+                            let block_byte_start = logical_block * block_size;
+                            let from_byte = zero_start.max(block_byte_start);
+                            let to_byte = zero_end.min(block_byte_start + block_size);
+                            if from_byte >= to_byte {
+                                continue;
+                            }
+                            let phys = BlockNumber(mapping.physical_start + blk_offset);
+                            let mut buf = dev.read_block(cx, phys)?.into_inner();
+                            let from =
+                                usize::try_from(from_byte - block_byte_start).map_err(|_| {
+                                    FfsError::Format(
+                                        "punch_hole partial edge offset overflow".into(),
+                                    )
+                                })?;
+                            let to = usize::try_from(to_byte - block_byte_start).map_err(|_| {
+                                FfsError::Format("punch_hole partial edge offset overflow".into())
+                            })?;
+                            buf[from..to].fill(0);
+                            dev.write_block(cx, phys, &buf)?;
+                        }
+                    }
+                }
+
+                // Deallocate the fully covered aligned interior blocks.
+                let extent_ns = extent_cache_namespace(&inode);
+                let logical_start =
+                    u32::try_from(interior_start / block_size).map_err(|_| FfsError::NoSpace)?;
+                let logical_count =
+                    u32::try_from(interior_end.saturating_sub(interior_start) / block_size)
+                        .map_err(|_| FfsError::NoSpace)?;
+                if logical_count > 0 {
+                    let mappings = ffs_extent::map_logical_to_physical(
                         cx,
-                        &block_dev,
-                        &mut root_bytes,
-                        geo,
-                        groups,
+                        dev,
+                        &root_bytes,
                         logical_start,
                         u64::from(logical_count),
-                        persist_ctx,
-                        ffs_extent::ExtentOwner {
-                            ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                            generation: inode.generation,
-                        },
-                    )?
-                };
-                inode.blocks = blocks_after_punch;
-                self.invalidate_ext4_write_extent_snapshot(&inode);
-                Self::set_extent_root(&mut inode, &root_bytes);
-            }
-            // Reads of both the zeroed edges and the freed interior changed.
-            self.extent_cache.invalidate_range(
-                extent_ns,
-                u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?,
-                end.div_ceil(block_size).saturating_sub(offset / block_size),
-            );
-        } else if collapse_range {
-            // FALLOC_FL_COLLAPSE_RANGE: free [offset, offset+length) and
-            // shift everything past it left by `length`. Both must be
-            // block-aligned, and the range must not reach EOF.
-            if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    EINVAL_ERRNO,
-                )));
-            }
-            if end >= inode.size {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    EINVAL_ERRNO,
-                )));
-            }
+                    )?;
+                    let allocated_blocks_to_free = mappings
+                        .iter()
+                        .filter(|mapping| mapping.physical_start != 0)
+                        .map(|mapping| u64::from(mapping.count))
+                        .sum::<u64>();
+                    let blocks_after_punch = if inode.is_huge_file() {
+                        Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            -(i128::from(allocated_blocks_to_free)),
+                        )?
+                    } else {
+                        let freed_sectors = allocated_blocks_to_free
+                            .checked_mul(sectors_per_block)
+                            .ok_or_else(|| FfsError::Corruption {
+                                block: 0,
+                                detail: format!(
+                                    "inode {} freed sectors overflow during punch_hole preflight",
+                                    ino.0
+                                ),
+                            })?;
+                        Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            -(i128::from(freed_sectors)),
+                        )?
+                    };
+                    {
+                        let Ext4AllocState {
+                            geo,
+                            groups,
+                            persist_ctx,
+                        } = &mut *alloc;
+                        ffs_extent::punch_hole(
+                            cx,
+                            dev,
+                            &mut root_bytes,
+                            geo,
+                            groups,
+                            logical_start,
+                            u64::from(logical_count),
+                            persist_ctx,
+                            ffs_extent::ExtentOwner {
+                                ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                                generation: inode.generation,
+                            },
+                        )?
+                    };
+                    inode.blocks = blocks_after_punch;
+                    self.invalidate_ext4_write_extent_snapshot(&inode);
+                    Self::set_extent_root(&mut inode, &root_bytes);
+                }
+                // Reads of both the zeroed edges and the freed interior changed.
+                self.extent_cache.invalidate_range(
+                    extent_ns,
+                    u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?,
+                    end.div_ceil(block_size).saturating_sub(offset / block_size),
+                );
+            } else if collapse_range {
+                // FALLOC_FL_COLLAPSE_RANGE: free [offset, offset+length) and
+                // shift everything past it left by `length`. Both must be
+                // block-aligned, and the range must not reach EOF.
+                if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        EINVAL_ERRNO,
+                    )));
+                }
+                if end >= inode.size {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        EINVAL_ERRNO,
+                    )));
+                }
 
-            let logical_start =
-                u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
-            let logical_count =
-                u32::try_from(length / block_size).map_err(|_| FfsError::NoSpace)?;
-            if logical_count > 0 {
-                // Preflight inode.blocks like punch_hole does so a freed
-                // range that overflows the bookkeeping field is rejected
-                // before we mutate the tree.
-                let mappings = ffs_extent::map_logical_to_physical(
-                    cx,
-                    &block_dev,
-                    &root_bytes,
-                    logical_start,
-                    u64::from(logical_count),
-                )?;
-                let allocated_blocks_to_free = mappings
-                    .iter()
-                    .filter(|mapping| mapping.physical_start != 0)
-                    .map(|mapping| u64::from(mapping.count))
-                    .sum::<u64>();
-                let blocks_after_collapse = if inode.is_huge_file() {
-                    Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        -(i128::from(allocated_blocks_to_free)),
-                    )?
-                } else {
-                    let freed_sectors = allocated_blocks_to_free
+                let logical_start =
+                    u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
+                let logical_count =
+                    u32::try_from(length / block_size).map_err(|_| FfsError::NoSpace)?;
+                if logical_count > 0 {
+                    // Preflight inode.blocks like punch_hole does so a freed
+                    // range that overflows the bookkeeping field is rejected
+                    // before we mutate the tree.
+                    let mappings = ffs_extent::map_logical_to_physical(
+                        cx,
+                        dev,
+                        &root_bytes,
+                        logical_start,
+                        u64::from(logical_count),
+                    )?;
+                    let allocated_blocks_to_free = mappings
+                        .iter()
+                        .filter(|mapping| mapping.physical_start != 0)
+                        .map(|mapping| u64::from(mapping.count))
+                        .sum::<u64>();
+                    let blocks_after_collapse = if inode.is_huge_file() {
+                        Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            -(i128::from(allocated_blocks_to_free)),
+                        )?
+                    } else {
+                        let freed_sectors = allocated_blocks_to_free
                         .checked_mul(sectors_per_block)
                         .ok_or_else(|| FfsError::Corruption {
                             block: 0,
@@ -33647,176 +33663,355 @@ impl OpenFs {
                                 ino.0
                             ),
                         })?;
-                    Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        -(i128::from(freed_sectors)),
-                    )?
+                        Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            -(i128::from(freed_sectors)),
+                        )?
+                    };
+
+                    {
+                        let Ext4AllocState {
+                            geo,
+                            groups,
+                            persist_ctx,
+                        } = &mut *alloc;
+                        ffs_extent::collapse_range(
+                            cx,
+                            dev,
+                            &mut root_bytes,
+                            geo,
+                            groups,
+                            logical_start,
+                            logical_count,
+                            persist_ctx,
+                            ffs_extent::ExtentOwner {
+                                ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                                generation: inode.generation,
+                            },
+                        )?;
+                    }
+                    // collapse moves logical blocks; the tail of the extent
+                    // cache is now wrong everywhere past the cut, easier to
+                    // drop the whole namespace than to try to rewrite it.
+                    self.extent_cache.invalidate_all();
+                    self.invalidate_ext4_write_extent_snapshot(&inode);
+                    inode.blocks = blocks_after_collapse;
+                    inode.size = inode.size.saturating_sub(length);
+                    Self::set_extent_root(&mut inode, &root_bytes);
+                }
+            } else if insert_range {
+                // FALLOC_FL_INSERT_RANGE: shift everything past offset right by
+                // length, leaving an unallocated hole [offset, offset+length).
+                // Both must be block-aligned; offset must lie inside the file
+                // (insert at EOF would just be a truncate-up).
+                if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        EINVAL_ERRNO,
+                    )));
+                }
+                if offset >= inode.size {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        EINVAL_ERRNO,
+                    )));
+                }
+
+                let logical_start =
+                    u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
+                let logical_count =
+                    u32::try_from(length / block_size).map_err(|_| FfsError::NoSpace)?;
+                if logical_count > 0 {
+                    let new_size = inode.size.checked_add(length).ok_or_else(|| {
+                        FfsError::Format("insert_range: file size + length overflow".into())
+                    })?;
+                    // INSERT_RANGE grows i_size by `length`. The top-of-function
+                    // oversized check used offset+length, which does not bound the
+                    // post-insert size, so enforce the ext4 maximum here too — the
+                    // kernel's ext4_insert_range returns EFBIG when the insert would
+                    // push i_size past s_maxbytes (bd-a3fh8; EFBIG class of bd-3pa5m).
+                    Self::ext4_reject_oversized_file(new_size, block_size)?;
+                    {
+                        let Ext4AllocState {
+                            geo,
+                            groups,
+                            persist_ctx,
+                        } = &mut *alloc;
+                        ffs_extent::insert_range(
+                            cx,
+                            dev,
+                            &mut root_bytes,
+                            geo,
+                            groups,
+                            logical_start,
+                            logical_count,
+                            persist_ctx,
+                            ffs_extent::ExtentOwner {
+                                ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                                generation: inode.generation,
+                            },
+                        )?;
+                    }
+                    self.extent_cache.invalidate_all();
+                    // No new physical blocks allocated; inode.blocks unchanged.
+                    self.invalidate_ext4_write_extent_snapshot(&inode);
+                    inode.size = new_size;
+                    Self::set_extent_root(&mut inode, &root_bytes);
+                }
+            } else if zero_range {
+                // ZERO_RANGE: the range must read back as zero AND be preallocated
+                // (man fallocate: "blocks are preallocated and zeroed"; mirrors the
+                // kernel's ext4_zero_range and the btrfs path). So holes in the range
+                // are allocated as unwritten extents (which read zero), unwritten
+                // extents are left as-is, and written blocks have their in-range
+                // bytes zeroed. bd-c0xru.
+                let logical_start =
+                    u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
+                let logical_end = end.div_ceil(block_size);
+                let logical_count = logical_end.saturating_sub(u64::from(logical_start));
+                let zero_block = vec![
+                    0_u8;
+                    usize::try_from(block_size).map_err(|_| FfsError::Format(
+                        "block_size does not fit usize".into()
+                    ))?
+                ];
+
+                let mappings = ffs_extent::map_logical_to_physical(
+                    cx,
+                    dev,
+                    &root_bytes,
+                    logical_start,
+                    logical_count,
+                )?;
+
+                // Preflight inode.blocks for the holes we will preallocate so an
+                // overflow is rejected before any tree mutation (mirrors the
+                // fallocate-default prealloc path).
+                let planned_new_blocks = mappings
+                    .iter()
+                    .filter(|mapping| mapping.physical_start == 0 && !mapping.unwritten)
+                    .map(|mapping| u64::from(mapping.count))
+                    .sum::<u64>();
+                let blocks_after_zero = if planned_new_blocks > 0 {
+                    if inode.is_huge_file() {
+                        Some(Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            i128::from(planned_new_blocks),
+                        )?)
+                    } else {
+                        let added_sectors = planned_new_blocks
+                            .checked_mul(sectors_per_block)
+                            .ok_or_else(|| FfsError::Corruption {
+                                block: 0,
+                                detail: format!(
+                                    "inode {} added sectors overflow during zero_range preflight",
+                                    ino.0
+                                ),
+                            })?;
+                        Some(Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            i128::from(added_sectors),
+                        )?)
+                    }
+                } else {
+                    None
                 };
 
-                {
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                    } = &mut *alloc;
-                    ffs_extent::collapse_range(
-                        cx,
-                        &block_dev,
-                        &mut root_bytes,
-                        geo,
-                        groups,
-                        logical_start,
-                        logical_count,
-                        persist_ctx,
-                        ffs_extent::ExtentOwner {
-                            ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                            generation: inode.generation,
-                        },
-                    )?;
+                let mut goal_block = None;
+                let mut newly_allocated_blocks = 0_u64;
+                'zero: for mapping in mappings {
+                    // Unwritten extents already read back as zero; keep them as-is.
+                    if mapping.unwritten {
+                        if mapping.physical_start != 0 {
+                            goal_block = Some(BlockNumber(
+                                mapping.physical_start + u64::from(mapping.count),
+                            ));
+                        }
+                        continue;
+                    }
+                    if mapping.physical_start == 0 {
+                        // Hole: preallocate as an unwritten extent (reads zero), so
+                        // ZERO_RANGE actually reserves the space the kernel promises.
+                        let mut remaining = mapping.count;
+                        let mut logical = mapping.logical_start;
+                        let mut want = MAX_EXTENT_COUNT;
+                        while remaining > 0 {
+                            let chunk = remaining.min(want);
+                            let hint = self.numa_allocation_hint(
+                                &alloc.geo,
+                                AllocHint {
+                                    goal_block,
+                                    ..AllocHint::default()
+                                },
+                                "ext4_fallocate",
+                                Some(ino),
+                            );
+                            let attempt = {
+                                let Ext4AllocState {
+                                    geo,
+                                    groups,
+                                    persist_ctx,
+                                } = &mut *alloc;
+                                ffs_extent::allocate_unwritten_extent(
+                                    cx,
+                                    dev,
+                                    &mut root_bytes,
+                                    geo,
+                                    groups,
+                                    logical,
+                                    chunk,
+                                    &hint,
+                                    persist_ctx,
+                                    ffs_extent::ExtentOwner {
+                                        ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                                        generation: inode.generation,
+                                    },
+                                )
+                            };
+                            let alloc_mapping = match attempt {
+                                Ok(mapping) => mapping,
+                                // Fragmented, not full: take a smaller extent
+                                // (see the preallocation loop below).
+                                Err(FfsError::NoSpace) if chunk > 1 => {
+                                    want = chunk / 2;
+                                    continue;
+                                }
+                                Err(FfsError::NoSpace) => {
+                                    prealloc_error = Some(FfsError::NoSpace);
+                                    break 'zero;
+                                }
+                                Err(err) => return Err(err),
+                            };
+                            self.extent_cache.invalidate_all();
+                            self.invalidate_all_ext4_write_extent_snapshots();
+                            newly_allocated_blocks += u64::from(alloc_mapping.count);
+                            goal_block = Some(BlockNumber(
+                                alloc_mapping.physical_start + u64::from(alloc_mapping.count),
+                            ));
+                            logical = logical.saturating_add(alloc_mapping.count);
+                            remaining -= alloc_mapping.count;
+                        }
+                        continue;
+                    }
+                    // Written extent: zero the in-range bytes of each block.
+                    for blk_offset in 0..u64::from(mapping.count) {
+                        let logical_block = u64::from(mapping.logical_start) + blk_offset;
+                        let block_byte_start = logical_block * block_size;
+                        // Intersect this block's byte span with the requested
+                        // [offset, end) range. map_logical_to_physical only returns
+                        // blocks inside the request, so the intersection is
+                        // non-empty.
+                        let zero_from = offset.max(block_byte_start);
+                        let zero_to = end.min(block_byte_start + block_size);
+                        let phys = BlockNumber(mapping.physical_start + blk_offset);
+                        if zero_from == block_byte_start && zero_to == block_byte_start + block_size
+                        {
+                            // Whole block falls inside the range.
+                            dev.write_block(cx, phys, &zero_block)?;
+                        } else {
+                            // Partial head/tail block: read-modify-write so the
+                            // bytes outside [offset, end) are preserved. ZERO_RANGE
+                            // is byte-granular (mirrors ext4_zero_range, which
+                            // zeroes only the in-range bytes of edge blocks);
+                            // rounding out to whole blocks here corrupts neighbors.
+                            let mut buf = dev.read_block(cx, phys)?.into_inner();
+                            let from =
+                                usize::try_from(zero_from - block_byte_start).map_err(|_| {
+                                    FfsError::Format(
+                                        "zero_range partial head offset overflow".into(),
+                                    )
+                                })?;
+                            let to = usize::try_from(zero_to - block_byte_start).map_err(|_| {
+                                FfsError::Format("zero_range partial tail offset overflow".into())
+                            })?;
+                            buf[from..to].fill(0);
+                            dev.write_block(cx, phys, &buf)?;
+                        }
+                    }
+                    goal_block = Some(BlockNumber(
+                        mapping.physical_start + u64::from(mapping.count),
+                    ));
                 }
-                // collapse moves logical blocks; the tail of the extent
-                // cache is now wrong everywhere past the cut, easier to
-                // drop the whole namespace than to try to rewrite it.
                 self.extent_cache.invalidate_all();
-                self.invalidate_ext4_write_extent_snapshot(&inode);
-                inode.blocks = blocks_after_collapse;
-                inode.size = inode.size.saturating_sub(length);
-                Self::set_extent_root(&mut inode, &root_bytes);
-            }
-        } else if insert_range {
-            // FALLOC_FL_INSERT_RANGE: shift everything past offset right by
-            // length, leaving an unallocated hole [offset, offset+length).
-            // Both must be block-aligned; offset must lie inside the file
-            // (insert at EOF would just be a truncate-up).
-            if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    EINVAL_ERRNO,
-                )));
-            }
-            if offset >= inode.size {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    EINVAL_ERRNO,
-                )));
-            }
+                self.invalidate_all_ext4_write_extent_snapshots();
 
-            let logical_start =
-                u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
-            let logical_count =
-                u32::try_from(length / block_size).map_err(|_| FfsError::NoSpace)?;
-            if logical_count > 0 {
-                let new_size = inode.size.checked_add(length).ok_or_else(|| {
-                    FfsError::Format("insert_range: file size + length overflow".into())
-                })?;
-                // INSERT_RANGE grows i_size by `length`. The top-of-function
-                // oversized check used offset+length, which does not bound the
-                // post-insert size, so enforce the ext4 maximum here too — the
-                // kernel's ext4_insert_range returns EFBIG when the insert would
-                // push i_size past s_maxbytes (bd-a3fh8; EFBIG class of bd-3pa5m).
-                Self::ext4_reject_oversized_file(new_size, block_size)?;
-                {
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                    } = &mut *alloc;
-                    ffs_extent::insert_range(
-                        cx,
-                        &block_dev,
-                        &mut root_bytes,
-                        geo,
-                        groups,
-                        logical_start,
-                        logical_count,
-                        persist_ctx,
-                        ffs_extent::ExtentOwner {
-                            ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                            generation: inode.generation,
-                        },
-                    )?;
-                }
-                self.extent_cache.invalidate_all();
-                // No new physical blocks allocated; inode.blocks unchanged.
-                self.invalidate_ext4_write_extent_snapshot(&inode);
-                inode.size = new_size;
-                Self::set_extent_root(&mut inode, &root_bytes);
-            }
-        } else if zero_range {
-            // ZERO_RANGE: the range must read back as zero AND be preallocated
-            // (man fallocate: "blocks are preallocated and zeroed"; mirrors the
-            // kernel's ext4_zero_range and the btrfs path). So holes in the range
-            // are allocated as unwritten extents (which read zero), unwritten
-            // extents are left as-is, and written blocks have their in-range
-            // bytes zeroed. bd-c0xru.
-            let logical_start =
-                u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
-            let logical_end = end.div_ceil(block_size);
-            let logical_count = logical_end.saturating_sub(u64::from(logical_start));
-            let zero_block = vec![
-                0_u8;
-                usize::try_from(block_size).map_err(|_| FfsError::Format(
-                    "block_size does not fit usize".into()
-                ))?
-            ];
-
-            let mappings = ffs_extent::map_logical_to_physical(
-                cx,
-                &block_dev,
-                &root_bytes,
-                logical_start,
-                logical_count,
-            )?;
-
-            // Preflight inode.blocks for the holes we will preallocate so an
-            // overflow is rejected before any tree mutation (mirrors the
-            // fallocate-default prealloc path).
-            let planned_new_blocks = mappings
-                .iter()
-                .filter(|mapping| mapping.physical_start == 0 && !mapping.unwritten)
-                .map(|mapping| u64::from(mapping.count))
-                .sum::<u64>();
-            let blocks_after_zero = if planned_new_blocks > 0 {
-                if inode.is_huge_file() {
-                    Some(Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        i128::from(planned_new_blocks),
-                    )?)
-                } else {
-                    let added_sectors = planned_new_blocks
-                        .checked_mul(sectors_per_block)
-                        .ok_or_else(|| FfsError::Corruption {
+                if newly_allocated_blocks > 0 {
+                    inode.blocks = if prealloc_error.is_none() {
+                        blocks_after_zero.ok_or_else(|| FfsError::Corruption {
                             block: 0,
-                            detail: format!(
-                                "inode {} added sectors overflow during zero_range preflight",
-                                ino.0
-                            ),
-                        })?;
-                    Some(Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        i128::from(added_sectors),
-                    )?)
+                            detail:
+                                "planned block delta missing but blocks allocated during zero_range"
+                                    .into(),
+                        })?
+                    } else {
+                        Self::ext4_blocks_after_adding_data(
+                            &inode,
+                            ino,
+                            newly_allocated_blocks,
+                            sectors_per_block,
+                        )?
+                    };
+                    self.invalidate_ext4_write_extent_snapshot(&inode);
+                    Self::set_extent_root(&mut inode, &root_bytes);
+                }
+
+                if prealloc_error.is_none() && !keep_size && end > inode.size {
+                    inode.size = end;
                 }
             } else {
-                None
-            };
-
-            let mut goal_block = None;
-            let mut newly_allocated_blocks = 0_u64;
-            'zero: for mapping in mappings {
-                // Unwritten extents already read back as zero; keep them as-is.
-                if mapping.unwritten {
+                let logical_start =
+                    u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
+                let logical_end = end.div_ceil(block_size);
+                let logical_count = logical_end.saturating_sub(u64::from(logical_start));
+                let mappings = ffs_extent::map_logical_to_physical(
+                    cx,
+                    dev,
+                    &root_bytes,
+                    logical_start,
+                    logical_count,
+                )?;
+                let planned_new_blocks = mappings
+                    .iter()
+                    .filter(|mapping| mapping.physical_start == 0)
+                    .map(|mapping| u64::from(mapping.count))
+                    .sum::<u64>();
+                let blocks_after_prealloc = if planned_new_blocks > 0 {
+                    if inode.is_huge_file() {
+                        Some(Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            i128::from(planned_new_blocks),
+                        )?)
+                    } else {
+                        let added_sectors = planned_new_blocks
+                            .checked_mul(sectors_per_block)
+                            .ok_or_else(|| FfsError::Corruption {
+                                block: 0,
+                                detail: format!(
+                                    "inode {} added sectors overflow during fallocate preflight",
+                                    ino.0
+                                ),
+                            })?;
+                        Some(Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            i128::from(added_sectors),
+                        )?)
+                    }
+                } else {
+                    None
+                };
+                let mut goal_block = None;
+                let mut newly_allocated_blocks = 0_u64;
+                'prealloc: for mapping in mappings {
                     if mapping.physical_start != 0 {
                         goal_block = Some(BlockNumber(
                             mapping.physical_start + u64::from(mapping.count),
                         ));
+                        continue;
                     }
-                    continue;
-                }
-                if mapping.physical_start == 0 {
-                    // Hole: preallocate as an unwritten extent (reads zero), so
-                    // ZERO_RANGE actually reserves the space the kernel promises.
+
                     let mut remaining = mapping.count;
                     let mut logical = mapping.logical_start;
                     let mut want = MAX_EXTENT_COUNT;
@@ -33837,60 +34032,42 @@ impl OpenFs {
                                 groups,
                                 persist_ctx,
                             } = &mut *alloc;
-                            if let Some(tx) = &mut scope.tx {
-                                let tx_dev = TransactionBlockAdapter {
-                                    base: &block_dev,
-                                    tx: Mutex::new(tx),
-                                };
-                                ffs_extent::allocate_unwritten_extent(
-                                    cx,
-                                    &tx_dev,
-                                    &mut root_bytes,
-                                    geo,
-                                    groups,
-                                    logical,
-                                    chunk,
-                                    &hint,
-                                    persist_ctx,
-                                    ffs_extent::ExtentOwner {
-                                        ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                                        generation: inode.generation,
-                                    },
-                                )
-                            } else {
-                                ffs_extent::allocate_unwritten_extent(
-                                    cx,
-                                    &block_dev,
-                                    &mut root_bytes,
-                                    geo,
-                                    groups,
-                                    logical,
-                                    chunk,
-                                    &hint,
-                                    persist_ctx,
-                                    ffs_extent::ExtentOwner {
-                                        ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                                        generation: inode.generation,
-                                    },
-                                )
-                            }
+                            ffs_extent::allocate_unwritten_extent(
+                                cx,
+                                dev,
+                                &mut root_bytes,
+                                geo,
+                                groups,
+                                logical,
+                                chunk,
+                                &hint,
+                                persist_ctx,
+                                ffs_extent::ExtentOwner {
+                                    ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                                    generation: inode.generation,
+                                },
+                            )
                         };
                         let alloc_mapping = match attempt {
                             Ok(mapping) => mapping,
-                            // Fragmented, not full: take a smaller extent
-                            // (see the preallocation loop below).
+                            // No group holds `chunk` contiguous free blocks:
+                            // fragmented, not full. Ask for less, as kernel ext4
+                            // takes whatever extent it can find (xfstests
+                            // generic/213 failed a 1 GiB fallocate with ~1.5 GiB
+                            // free once every group held some data).
                             Err(FfsError::NoSpace) if chunk > 1 => {
                                 want = chunk / 2;
                                 continue;
                             }
                             Err(FfsError::NoSpace) => {
                                 prealloc_error = Some(FfsError::NoSpace);
-                                break 'zero;
+                                break 'prealloc;
                             }
                             Err(err) => return Err(err),
                         };
                         self.extent_cache.invalidate_all();
                         self.invalidate_all_ext4_write_extent_snapshots();
+
                         newly_allocated_blocks += u64::from(alloc_mapping.count);
                         goal_block = Some(BlockNumber(
                             alloc_mapping.physical_start + u64::from(alloc_mapping.count),
@@ -33898,274 +34075,65 @@ impl OpenFs {
                         logical = logical.saturating_add(alloc_mapping.count);
                         remaining -= alloc_mapping.count;
                     }
-                    continue;
                 }
-                // Written extent: zero the in-range bytes of each block.
-                for blk_offset in 0..u64::from(mapping.count) {
-                    let logical_block = u64::from(mapping.logical_start) + blk_offset;
-                    let block_byte_start = logical_block * block_size;
-                    // Intersect this block's byte span with the requested
-                    // [offset, end) range. map_logical_to_physical only returns
-                    // blocks inside the request, so the intersection is
-                    // non-empty.
-                    let zero_from = offset.max(block_byte_start);
-                    let zero_to = end.min(block_byte_start + block_size);
-                    let phys = BlockNumber(mapping.physical_start + blk_offset);
-                    if zero_from == block_byte_start && zero_to == block_byte_start + block_size {
-                        // Whole block falls inside the range.
-                        block_dev.write_block(cx, phys, &zero_block)?;
-                    } else {
-                        // Partial head/tail block: read-modify-write so the
-                        // bytes outside [offset, end) are preserved. ZERO_RANGE
-                        // is byte-granular (mirrors ext4_zero_range, which
-                        // zeroes only the in-range bytes of edge blocks);
-                        // rounding out to whole blocks here corrupts neighbors.
-                        let mut buf = block_dev.read_block(cx, phys)?.into_inner();
-                        let from = usize::try_from(zero_from - block_byte_start).map_err(|_| {
-                            FfsError::Format("zero_range partial head offset overflow".into())
-                        })?;
-                        let to = usize::try_from(zero_to - block_byte_start).map_err(|_| {
-                            FfsError::Format("zero_range partial tail offset overflow".into())
-                        })?;
-                        buf[from..to].fill(0);
-                        block_dev.write_block(cx, phys, &buf)?;
-                    }
-                }
-                goal_block = Some(BlockNumber(
-                    mapping.physical_start + u64::from(mapping.count),
-                ));
-            }
-            self.extent_cache.invalidate_all();
-            self.invalidate_all_ext4_write_extent_snapshots();
 
-            if newly_allocated_blocks > 0 {
-                inode.blocks = if prealloc_error.is_none() {
-                    blocks_after_zero.ok_or_else(|| FfsError::Corruption {
-                        block: 0,
-                        detail:
-                            "planned block delta missing but blocks allocated during zero_range"
-                                .into(),
-                    })?
-                } else {
-                    Self::ext4_blocks_after_adding_data(
-                        &inode,
-                        ino,
-                        newly_allocated_blocks,
-                        sectors_per_block,
-                    )?
-                };
-                self.invalidate_ext4_write_extent_snapshot(&inode);
-                Self::set_extent_root(&mut inode, &root_bytes);
-            }
-
-            if prealloc_error.is_none() && !keep_size && end > inode.size {
-                inode.size = end;
-            }
-        } else {
-            let logical_start =
-                u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
-            let logical_end = end.div_ceil(block_size);
-            let logical_count = logical_end.saturating_sub(u64::from(logical_start));
-            let mappings = ffs_extent::map_logical_to_physical(
-                cx,
-                &block_dev,
-                &root_bytes,
-                logical_start,
-                logical_count,
-            )?;
-            let planned_new_blocks = mappings
-                .iter()
-                .filter(|mapping| mapping.physical_start == 0)
-                .map(|mapping| u64::from(mapping.count))
-                .sum::<u64>();
-            let blocks_after_prealloc = if planned_new_blocks > 0 {
-                if inode.is_huge_file() {
-                    Some(Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        i128::from(planned_new_blocks),
-                    )?)
-                } else {
-                    let added_sectors = planned_new_blocks
-                        .checked_mul(sectors_per_block)
-                        .ok_or_else(|| FfsError::Corruption {
+                if newly_allocated_blocks > 0 {
+                    inode.blocks = if prealloc_error.is_none() {
+                        blocks_after_prealloc.ok_or_else(|| FfsError::Corruption {
                             block: 0,
-                            detail: format!(
-                                "inode {} added sectors overflow during fallocate preflight",
-                                ino.0
-                            ),
-                        })?;
-                    Some(Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        i128::from(added_sectors),
-                    )?)
-                }
-            } else {
-                None
-            };
-            let mut goal_block = None;
-            let mut newly_allocated_blocks = 0_u64;
-            'prealloc: for mapping in mappings {
-                if mapping.physical_start != 0 {
-                    goal_block = Some(BlockNumber(
-                        mapping.physical_start + u64::from(mapping.count),
-                    ));
-                    continue;
-                }
-
-                let mut remaining = mapping.count;
-                let mut logical = mapping.logical_start;
-                let mut want = MAX_EXTENT_COUNT;
-                while remaining > 0 {
-                    let chunk = remaining.min(want);
-                    let hint = self.numa_allocation_hint(
-                        &alloc.geo,
-                        AllocHint {
-                            goal_block,
-                            ..AllocHint::default()
-                        },
-                        "ext4_fallocate",
-                        Some(ino),
-                    );
-                    let attempt = {
-                        let Ext4AllocState {
-                            geo,
-                            groups,
-                            persist_ctx,
-                        } = &mut *alloc;
-                        if let Some(tx) = &mut scope.tx {
-                            let tx_dev = TransactionBlockAdapter {
-                                base: &block_dev,
-                                tx: Mutex::new(tx),
-                            };
-                            ffs_extent::allocate_unwritten_extent(
-                                cx,
-                                &tx_dev,
-                                &mut root_bytes,
-                                geo,
-                                groups,
-                                logical,
-                                chunk,
-                                &hint,
-                                persist_ctx,
-                                ffs_extent::ExtentOwner {
-                                    ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                                    generation: inode.generation,
-                                },
-                            )
-                        } else {
-                            ffs_extent::allocate_unwritten_extent(
-                                cx,
-                                &block_dev,
-                                &mut root_bytes,
-                                geo,
-                                groups,
-                                logical,
-                                chunk,
-                                &hint,
-                                persist_ctx,
-                                ffs_extent::ExtentOwner {
-                                    ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                                    generation: inode.generation,
-                                },
-                            )
-                        }
+                            detail: "planned block delta missing but blocks allocated".into(),
+                        })?
+                    } else {
+                        Self::ext4_blocks_after_adding_data(
+                            &inode,
+                            ino,
+                            newly_allocated_blocks,
+                            sectors_per_block,
+                        )?
                     };
-                    let alloc_mapping = match attempt {
-                        Ok(mapping) => mapping,
-                        // No group holds `chunk` contiguous free blocks:
-                        // fragmented, not full. Ask for less, as kernel ext4
-                        // takes whatever extent it can find (xfstests
-                        // generic/213 failed a 1 GiB fallocate with ~1.5 GiB
-                        // free once every group held some data).
-                        Err(FfsError::NoSpace) if chunk > 1 => {
-                            want = chunk / 2;
-                            continue;
-                        }
-                        Err(FfsError::NoSpace) => {
-                            prealloc_error = Some(FfsError::NoSpace);
-                            break 'prealloc;
-                        }
-                        Err(err) => return Err(err),
-                    };
-                    self.extent_cache.invalidate_all();
-                    self.invalidate_all_ext4_write_extent_snapshots();
+                    self.invalidate_ext4_write_extent_snapshot(&inode);
+                    Self::set_extent_root(&mut inode, &root_bytes);
+                }
 
-                    newly_allocated_blocks += u64::from(alloc_mapping.count);
-                    goal_block = Some(BlockNumber(
-                        alloc_mapping.physical_start + u64::from(alloc_mapping.count),
-                    ));
-                    logical = logical.saturating_add(alloc_mapping.count);
-                    remaining -= alloc_mapping.count;
+                if prealloc_error.is_none() && !keep_size && end > inode.size {
+                    inode.size = end;
                 }
             }
 
-            if newly_allocated_blocks > 0 {
-                inode.blocks = if prealloc_error.is_none() {
-                    blocks_after_prealloc.ok_or_else(|| FfsError::Corruption {
-                        block: 0,
-                        detail: "planned block delta missing but blocks allocated".into(),
-                    })?
-                } else {
-                    Self::ext4_blocks_after_adding_data(
-                        &inode,
-                        ino,
-                        newly_allocated_blocks,
-                        sectors_per_block,
-                    )?
-                };
-                self.invalidate_ext4_write_extent_snapshot(&inode);
-                Self::set_extent_root(&mut inode, &root_bytes);
-            }
+            // Charge the net change in extent-tree metadata blocks across whichever
+            // mode ran (prealloc growth, punch/collapse shrink) to i_blocks — the
+            // per-mode data accounting above counts only data blocks (bd-zpe9s).
+            let fallocate_meta_after = Self::ext4_count_extent_tree_meta_blocks_via_dev(
+                cx,
+                dev,
+                &Self::extent_root(&inode),
+            )?;
+            Self::ext4_apply_extent_meta_delta(
+                &mut inode,
+                ino,
+                fallocate_meta_before,
+                fallocate_meta_after,
+                sectors_per_block,
+            )?;
+            ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
+            ffs_inode::write_inode(cx, dev, &alloc.geo, &alloc.groups, ino, &inode, csum_seed)?;
 
-            if prealloc_error.is_none() && !keep_size && end > inode.size {
-                inode.size = end;
-            }
-        }
+            debug!(
+                target: "ffs::write",
+                op = "fallocate",
+                ino = ino.0,
+                offset,
+                length,
+                mode,
+                keep_size,
+                punch_hole,
+                size = inode.size,
+                blocks = inode.blocks,
+                "fallocate completed"
+            );
 
-        // Charge the net change in extent-tree metadata blocks across whichever
-        // mode ran (prealloc growth, punch/collapse shrink) to i_blocks — the
-        // per-mode data accounting above counts only data blocks (bd-zpe9s).
-        let fallocate_meta_after = Self::ext4_fallocate_extent_meta_blocks(
-            cx,
-            scope,
-            &block_dev,
-            &Self::extent_root(&inode),
-        )?;
-        Self::ext4_apply_extent_meta_delta(
-            &mut inode,
-            ino,
-            fallocate_meta_before,
-            fallocate_meta_after,
-            sectors_per_block,
-        )?;
-        ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
-        ffs_inode::write_inode(
-            cx,
-            &block_dev,
-            &alloc.geo,
-            &alloc.groups,
-            ino,
-            &inode,
-            csum_seed,
-        )?;
-
-        debug!(
-            target: "ffs::write",
-            op = "fallocate",
-            ino = ino.0,
-            offset,
-            length,
-            mode,
-            keep_size,
-            punch_hole,
-            size = inode.size,
-            blocks = inode.blocks,
-            "fallocate completed"
-        );
-
-        prealloc_error.map_or(Ok(()), Err)
+            prealloc_error.map_or(Ok(()), Err)
+        })
     }
 
     /// The largest ext4 file size addressable by the 32-bit logical block
@@ -34304,138 +34272,266 @@ impl OpenFs {
         }
 
         let mut alloc = alloc_mutex.write();
-        // Snapshot extent-tree metadata blocks before any tree mutation in this
-        // write so growth (and any later coalescing-driven shrink) is charged to
-        // i_blocks at the end, regardless of which internal path changed the
-        // tree (bd-zpe9s). sectors_per_block for the i_blocks unit conversion.
-        let write_sectors_per_block = bs / u64::from(EXT4_SECTOR_SIZE);
-        let meta_before =
-            self.ext4_count_extent_tree_meta_blocks(cx, scope, &Self::extent_root(&inode))?;
-        let mut bytes_written = 0u32;
-        let mut pos = offset;
-        let write_len = u64::try_from(data.len())
-            .map_err(|_| FfsError::Format("write length does not fit u64".into()))?;
-        let end = offset
-            .checked_add(write_len)
-            .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
-        Self::ext4_reject_oversized_file(end, bs)?;
+        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+            // Snapshot extent-tree metadata blocks before any tree mutation in this
+            // write so growth (and any later coalescing-driven shrink) is charged to
+            // i_blocks at the end, regardless of which internal path changed the
+            // tree (bd-zpe9s). sectors_per_block for the i_blocks unit conversion.
+            let write_sectors_per_block = bs / u64::from(EXT4_SECTOR_SIZE);
+            let meta_before =
+                self.ext4_count_extent_tree_meta_blocks(cx, scope, &Self::extent_root(&inode))?;
+            let mut bytes_written = 0u32;
+            let mut pos = offset;
+            let write_len = u64::try_from(data.len())
+                .map_err(|_| FfsError::Format("write length does not fit u64".into()))?;
+            let end = offset
+                .checked_add(write_len)
+                .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
+            Self::ext4_reject_oversized_file(end, bs)?;
 
-        // Logical-block range [start, end) most recently allocated by this write
-        // as a coalesced run (bd-bdro7). Blocks in it resolve as "written" on
-        // later iterations, but are freshly allocated, so a PARTIAL write to one
-        // must still zero-fill (its bytes outside the chunk are new -> zero), not
-        // read stale disk content.
-        let mut fresh_run: Option<(u32, u32)> = None;
+            // Logical-block range [start, end) most recently allocated by this write
+            // as a coalesced run (bd-bdro7). Blocks in it resolve as "written" on
+            // later iterations, but are freshly allocated, so a PARTIAL write to one
+            // must still zero-fill (its bytes outside the chunk are new -> zero), not
+            // read stale disk content.
+            let mut fresh_run: Option<(u32, u32)> = None;
 
-        // The inode's extent tree is parsed once and reused across the per-block
-        // loop. Only `allocate_extent` (which maps a previously-unmapped run that
-        // later blocks resolve into) invalidates it; `mark_written` does not (see
-        // its site below). A pure overwrite or a fallocate+write mutates the cache
-        // not at all / never re-collects, so an N-block write parses the tree once
-        // instead of once per block (O(N*E) -> O(E); bd-yqq5l, bd-e4uwb).
-        let mut cached_extents: Option<Arc<[Ext4Extent]>> = None;
+            // The inode's extent tree is parsed once and reused across the per-block
+            // loop. Only `allocate_extent` (which maps a previously-unmapped run that
+            // later blocks resolve into) invalidates it; `mark_written` does not (see
+            // its site below). A pure overwrite or a fallocate+write mutates the cache
+            // not at all / never re-collects, so an N-block write parses the tree once
+            // instead of once per block (O(N*E) -> O(E); bd-yqq5l, bd-e4uwb).
+            let mut cached_extents: Option<Arc<[Ext4Extent]>> = None;
 
-        while pos < end {
-            let logical_block = u32::try_from(pos / bs).map_err(|_| {
-                FfsError::Format("file offset exceeds ext4 32-bit logical block limit".into())
-            })?;
-            let block_offset = usize::try_from(pos % bs)
-                .map_err(|_| FfsError::Format("block offset does not fit usize".into()))?;
-            let bs_usize = usize::try_from(bs)
-                .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
-            let remaining = usize::try_from(end - pos)
-                .map_err(|_| FfsError::Format("remaining write size does not fit usize".into()))?;
-            let chunk_len = (bs_usize - block_offset).min(remaining);
+            while pos < end {
+                let logical_block = u32::try_from(pos / bs).map_err(|_| {
+                    FfsError::Format("file offset exceeds ext4 32-bit logical block limit".into())
+                })?;
+                let block_offset = usize::try_from(pos % bs)
+                    .map_err(|_| FfsError::Format("block offset does not fit usize".into()))?;
+                let bs_usize = usize::try_from(bs)
+                    .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
+                let remaining = usize::try_from(end - pos).map_err(|_| {
+                    FfsError::Format("remaining write size does not fit usize".into())
+                })?;
+                let chunk_len = (bs_usize - block_offset).min(remaining);
 
-            // Resolve or allocate the physical block.
-            if cached_extents.is_none() {
-                cached_extents = Some(self.ext4_write_extents_with_scope(cx, scope, &inode)?);
-            }
-            let extents = cached_extents.as_deref().unwrap_or(&[]);
-            // Extents come back sorted ascending by logical_block and are
-            // non-overlapping, so the only candidate covering `logical_block` is
-            // the last extent whose start is <= it (binary search), not a linear
-            // scan of all E extents per block (bd-uthzg). Identical result: any
-            // earlier extent ends at/before this candidate's start (no overlap),
-            // any later one starts after `logical_block`.
-            let resolved = {
-                let pos = extents.partition_point(|e| e.logical_block <= logical_block);
-                pos.checked_sub(1).and_then(|i| {
-                    let e = &extents[i];
-                    (logical_block < e.logical_block + u32::from(e.actual_len())).then(|| {
-                        (
-                            BlockNumber(
-                                e.physical_start + u64::from(logical_block - e.logical_block),
-                            ),
-                            e.is_unwritten(),
-                        )
-                    })
-                })
-            };
-
-            let (phys_block, zero_fill_before_write, mark_unwritten_written) = match resolved {
-                Some((b, unwritten)) => {
-                    // A block within the just-allocated run is newly allocated:
-                    // a partial write must zero-fill the rest, not read stale
-                    // disk bytes (bd-bdro7).
-                    let in_fresh_run =
-                        fresh_run.is_some_and(|(s, e)| logical_block >= s && logical_block < e);
-                    (b, unwritten || in_fresh_run, unwritten)
+                // Resolve or allocate the physical block.
+                if cached_extents.is_none() {
+                    cached_extents = Some(self.ext4_write_extents_with_scope(cx, scope, &inode)?);
                 }
-                None => {
-                    // Allocate the whole contiguous run of currently-unmapped
-                    // blocks this write touches as ONE extent, rather than one
-                    // block per iteration (bd-bdro7). Without this a sequential
-                    // write fragments into one extent per block, overflowing the
-                    // inline extent root and forcing premature tree growth into a
-                    // metadata leaf block (mis-counted in i_blocks -> e2fsck
-                    // dirty). allocate_extent allocates up to `run_len` contiguous
-                    // blocks (returning the actual count if the free run is
-                    // shorter), so a fragmented disk still yields correct (if
-                    // multiple) extents; subsequent blocks of the run resolve to
-                    // the new extent on later iterations. The shared
-                    // ffs_btree::insert is left non-coalescing so collapse_range /
-                    // insert_range bookkeeping is unaffected.
-                    const MAX_EXTENT_BLOCKS: u32 = 1 << 15; // EXT_INIT_MAX_LEN
-                    let last_touched_block = u32::try_from((end - 1) / bs).map_err(|_| {
-                        FfsError::Format(
-                            "file offset exceeds ext4 32-bit logical block limit".into(),
-                        )
-                    })?;
-                    let mut run_len: u32 = 1;
-                    while run_len < MAX_EXTENT_BLOCKS {
-                        let Some(next) = logical_block.checked_add(run_len) else {
-                            break;
-                        };
-                        if next > last_touched_block {
-                            break;
-                        }
-                        // Same binary-search covering-extent lookup as the resolve
-                        // above: is `next` mapped by any extent? (bd-uthzg)
-                        let mapped = {
-                            let p = extents.partition_point(|e| e.logical_block <= next);
-                            p.checked_sub(1).is_some_and(|i| {
-                                let e = &extents[i];
-                                next < e.logical_block + u32::from(e.actual_len())
-                            })
-                        };
-                        if mapped {
-                            break;
-                        }
-                        run_len += 1;
-                    }
+                let extents = cached_extents.as_deref().unwrap_or(&[]);
+                // Extents come back sorted ascending by logical_block and are
+                // non-overlapping, so the only candidate covering `logical_block` is
+                // the last extent whose start is <= it (binary search), not a linear
+                // scan of all E extents per block (bd-uthzg). Identical result: any
+                // earlier extent ends at/before this candidate's start (no overlap),
+                // any later one starts after `logical_block`.
+                let resolved = {
+                    let pos = extents.partition_point(|e| e.logical_block <= logical_block);
+                    pos.checked_sub(1).and_then(|i| {
+                        let e = &extents[i];
+                        (logical_block < e.logical_block + u32::from(e.actual_len())).then(|| {
+                            (
+                                BlockNumber(
+                                    e.physical_start + u64::from(logical_block - e.logical_block),
+                                ),
+                                e.is_unwritten(),
+                            )
+                        })
+                    })
+                };
 
-                    let hint = self.numa_allocation_hint(
-                        &alloc.geo,
-                        AllocHint {
-                            goal_block: extents.last().map(Self::extent_end_hint),
-                            ..AllocHint::default()
-                        },
-                        "ext4_write",
-                        Some(ino),
-                    );
+                let (phys_block, zero_fill_before_write, mark_unwritten_written) = match resolved {
+                    Some((b, unwritten)) => {
+                        // A block within the just-allocated run is newly allocated:
+                        // a partial write must zero-fill the rest, not read stale
+                        // disk bytes (bd-bdro7).
+                        let in_fresh_run =
+                            fresh_run.is_some_and(|(s, e)| logical_block >= s && logical_block < e);
+                        (b, unwritten || in_fresh_run, unwritten)
+                    }
+                    None => {
+                        // Allocate the whole contiguous run of currently-unmapped
+                        // blocks this write touches as ONE extent, rather than one
+                        // block per iteration (bd-bdro7). Without this a sequential
+                        // write fragments into one extent per block, overflowing the
+                        // inline extent root and forcing premature tree growth into a
+                        // metadata leaf block (mis-counted in i_blocks -> e2fsck
+                        // dirty). allocate_extent allocates up to `run_len` contiguous
+                        // blocks (returning the actual count if the free run is
+                        // shorter), so a fragmented disk still yields correct (if
+                        // multiple) extents; subsequent blocks of the run resolve to
+                        // the new extent on later iterations. The shared
+                        // ffs_btree::insert is left non-coalescing so collapse_range /
+                        // insert_range bookkeeping is unaffected.
+                        const MAX_EXTENT_BLOCKS: u32 = 1 << 15; // EXT_INIT_MAX_LEN
+                        let last_touched_block = u32::try_from((end - 1) / bs).map_err(|_| {
+                            FfsError::Format(
+                                "file offset exceeds ext4 32-bit logical block limit".into(),
+                            )
+                        })?;
+                        let mut run_len: u32 = 1;
+                        while run_len < MAX_EXTENT_BLOCKS {
+                            let Some(next) = logical_block.checked_add(run_len) else {
+                                break;
+                            };
+                            if next > last_touched_block {
+                                break;
+                            }
+                            // Same binary-search covering-extent lookup as the resolve
+                            // above: is `next` mapped by any extent? (bd-uthzg)
+                            let mapped = {
+                                let p = extents.partition_point(|e| e.logical_block <= next);
+                                p.checked_sub(1).is_some_and(|i| {
+                                    let e = &extents[i];
+                                    next < e.logical_block + u32::from(e.actual_len())
+                                })
+                            };
+                            if mapped {
+                                break;
+                            }
+                            run_len += 1;
+                        }
+
+                        let hint = self.numa_allocation_hint(
+                            &alloc.geo,
+                            AllocHint {
+                                goal_block: extents.last().map(Self::extent_end_hint),
+                                ..AllocHint::default()
+                            },
+                            "ext4_write",
+                            Some(ino),
+                        );
+                        let mut root_bytes = Self::extent_root(&inode);
+                        let mapping = loop {
+                            let attempt = if let Some(tx) = &mut scope.tx {
+                                let tx_dev = TransactionBlockAdapter {
+                                    base: &block_dev,
+                                    tx: Mutex::new(tx),
+                                };
+                                let Ext4AllocState {
+                                    geo,
+                                    groups,
+                                    persist_ctx,
+                                } = &mut *alloc;
+                                ffs_extent::allocate_extent_coalescing(
+                                    cx,
+                                    &tx_dev,
+                                    &mut root_bytes,
+                                    geo,
+                                    groups,
+                                    logical_block,
+                                    run_len,
+                                    &hint,
+                                    persist_ctx,
+                                    ffs_extent::ExtentOwner {
+                                        ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                                        generation: inode.generation,
+                                    },
+                                )
+                            } else {
+                                let Ext4AllocState {
+                                    geo,
+                                    groups,
+                                    persist_ctx,
+                                } = &mut *alloc;
+                                ffs_extent::allocate_extent_coalescing(
+                                    cx,
+                                    &block_dev,
+                                    &mut root_bytes,
+                                    geo,
+                                    groups,
+                                    logical_block,
+                                    run_len,
+                                    &hint,
+                                    persist_ctx,
+                                    ffs_extent::ExtentOwner {
+                                        ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                                        generation: inode.generation,
+                                    },
+                                )
+                            };
+                            match attempt {
+                                Ok(mapping) => break mapping,
+                                // A large or fragmented write can span groups even
+                                // when no group has the entire requested run.
+                                Err(FfsError::NoSpace) if run_len > 1 => run_len /= 2,
+                                Err(error) => return Err(error),
+                            }
+                        };
+                        // i_blocks rises by the actual number of blocks allocated.
+                        let alloc_blocks = u64::from(mapping.count);
+                        let added_sectors = if inode.is_huge_file() {
+                            alloc_blocks
+                        } else {
+                            alloc_blocks * u64::from(block_size / EXT4_SECTOR_SIZE)
+                        };
+                        let blocks_after_alloc = Self::ext4_checked_inode_blocks_delta(
+                            inode.blocks,
+                            ino,
+                            i128::from(added_sectors),
+                        )?;
+                        // Re-acquire block_dev so subsequent bitmap reads see the allocation (if not staged)!
+                        block_dev = self.block_device_adapter();
+                        self.extent_cache.invalidate_range(
+                            extent_cache_namespace(&inode),
+                            logical_block,
+                            alloc_blocks,
+                        );
+                        self.invalidate_ext4_write_extent_snapshot(&inode);
+                        Self::set_extent_root(&mut inode, &root_bytes);
+                        cached_extents = None; // tree mutated by allocate_extent
+                        inode.blocks = blocks_after_alloc;
+                        let run_end =
+                            logical_block.checked_add(mapping.count).ok_or_else(|| {
+                                FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG))
+                            })?;
+                        fresh_run = Some((logical_block, run_end));
+                        (BlockNumber(mapping.physical_start), true, false)
+                    }
+                };
+
+                let data_start = usize::try_from(pos - offset)
+                    .map_err(|_| FfsError::Format("write offset does not fit usize".into()))?;
+                // Build the block to stage. A FULL-block overwrite (offset 0, whole
+                // block) IS `data[data_start..]`, so take it directly — ONE memcpy —
+                // instead of `vec![0; bs]` (a full-block memset) + copy_from_slice
+                // (memcpy) whose zero-init is then entirely overwritten. Partial writes
+                // still zero-fill a freshly-allocated block (bytes outside the chunk are
+                // new → must read as zero) or read-modify-write an existing one, then
+                // patch the chunk. Byte-identical: the full-block result is the same
+                // `data`-filled block either way.
+                let (block_data, staged_base) = if block_offset == 0 && chunk_len == bs_usize {
+                    (data[data_start..data_start + chunk_len].to_vec(), None)
+                } else {
+                    let mut buf = if zero_fill_before_write {
+                        vec![0u8; bs_usize]
+                    } else {
+                        self.read_block_with_scope(cx, scope, phys_block)?
+                    };
+                    let base = scope
+                        .tx
+                        .as_ref()
+                        .filter(|tx| tx.staged_write(phys_block).is_none())
+                        .map(|_| buf.clone());
+                    buf[block_offset..block_offset + chunk_len]
+                        .copy_from_slice(&data[data_start..data_start + chunk_len]);
+                    (buf, base)
+                };
+
+                if let Some(tx) = &mut scope.tx {
+                    // Provide byte-range proof + snapshot base for adaptive merge policy.
+                    let proof = MergeProof::non_overlapping_extent_range(block_offset, chunk_len);
+                    tx.stage_write_with_proof_and_base(phys_block, block_data, proof, staged_base);
+                } else {
+                    block_dev.write_block(cx, phys_block, &block_data)?;
+                }
+
+                if mark_unwritten_written {
                     let mut root_bytes = Self::extent_root(&inode);
-                    let mapping = if let Some(tx) = &mut scope.tx {
+                    if let Some(tx) = &mut scope.tx {
                         let tx_dev = TransactionBlockAdapter {
                             base: &block_dev,
                             tx: Mutex::new(tx),
@@ -34445,236 +34541,121 @@ impl OpenFs {
                             groups,
                             persist_ctx,
                         } = &mut *alloc;
-                        ffs_extent::allocate_extent_coalescing(
+                        ffs_extent::mark_written(
                             cx,
                             &tx_dev,
                             &mut root_bytes,
                             geo,
                             groups,
                             logical_block,
-                            run_len,
-                            &hint,
+                            1,
                             persist_ctx,
                             ffs_extent::ExtentOwner {
                                 ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
                                 generation: inode.generation,
                             },
-                        )?
+                        )?;
                     } else {
                         let Ext4AllocState {
                             geo,
                             groups,
                             persist_ctx,
                         } = &mut *alloc;
-                        ffs_extent::allocate_extent_coalescing(
+                        ffs_extent::mark_written(
                             cx,
                             &block_dev,
                             &mut root_bytes,
                             geo,
                             groups,
                             logical_block,
-                            run_len,
-                            &hint,
+                            1,
                             persist_ctx,
                             ffs_extent::ExtentOwner {
                                 ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
                                 generation: inode.generation,
                             },
-                        )?
-                    };
-                    // i_blocks rises by the actual number of blocks allocated.
-                    let alloc_blocks = u64::from(mapping.count);
-                    let added_sectors = if inode.is_huge_file() {
-                        alloc_blocks
-                    } else {
-                        alloc_blocks * u64::from(block_size / EXT4_SECTOR_SIZE)
-                    };
-                    let blocks_after_alloc = Self::ext4_checked_inode_blocks_delta(
-                        inode.blocks,
-                        ino,
-                        i128::from(added_sectors),
-                    )?;
-                    // Re-acquire block_dev so subsequent bitmap reads see the allocation (if not staged)!
-                    block_dev = self.block_device_adapter();
-                    self.extent_cache.invalidate_range(
-                        extent_cache_namespace(&inode),
-                        logical_block,
-                        alloc_blocks,
-                    );
+                        )?;
+                    }
+                    self.extent_cache.invalidate_all();
                     self.invalidate_ext4_write_extent_snapshot(&inode);
                     Self::set_extent_root(&mut inode, &root_bytes);
-                    cached_extents = None; // tree mutated by allocate_extent
-                    inode.blocks = blocks_after_alloc;
-                    let run_end = logical_block.checked_add(mapping.count).ok_or_else(|| {
-                        FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG))
-                    })?;
-                    fresh_run = Some((logical_block, run_end));
-                    (BlockNumber(mapping.physical_start), true, false)
+                    // NOTE: deliberately NOT invalidating `cached_extents` here. A
+                    // mark_written split only flips the unwritten flag and splits the
+                    // extent record; it preserves the physical mapping AND leaves the
+                    // not-yet-processed suffix of the extent unwritten with the same
+                    // physical base. The loop advances `pos` monotonically and never
+                    // re-resolves an already-written block, so every later resolve
+                    // against the pre-split cache returns the identical
+                    // (physical, is_unwritten) it would against the split tree. Keeping
+                    // the cache makes fallocate+write (writing into a big unwritten
+                    // extent that splits per block) O(K) instead of O(K^2) — the splits
+                    // would otherwise grow E and re-collect per block (bd-e4uwb).
                 }
-            };
 
-            let data_start = usize::try_from(pos - offset)
-                .map_err(|_| FfsError::Format("write offset does not fit usize".into()))?;
-            // Build the block to stage. A FULL-block overwrite (offset 0, whole
-            // block) IS `data[data_start..]`, so take it directly — ONE memcpy —
-            // instead of `vec![0; bs]` (a full-block memset) + copy_from_slice
-            // (memcpy) whose zero-init is then entirely overwritten. Partial writes
-            // still zero-fill a freshly-allocated block (bytes outside the chunk are
-            // new → must read as zero) or read-modify-write an existing one, then
-            // patch the chunk. Byte-identical: the full-block result is the same
-            // `data`-filled block either way.
-            let (block_data, staged_base) = if block_offset == 0 && chunk_len == bs_usize {
-                (data[data_start..data_start + chunk_len].to_vec(), None)
-            } else {
-                let mut buf = if zero_fill_before_write {
-                    vec![0u8; bs_usize]
-                } else {
-                    self.read_block_with_scope(cx, scope, phys_block)?
-                };
-                let base = scope
-                    .tx
-                    .as_ref()
-                    .filter(|tx| tx.staged_write(phys_block).is_none())
-                    .map(|_| buf.clone());
-                buf[block_offset..block_offset + chunk_len]
-                    .copy_from_slice(&data[data_start..data_start + chunk_len]);
-                (buf, base)
-            };
+                let chunk_u64 = u64::try_from(chunk_len)
+                    .map_err(|_| FfsError::Format("chunk length does not fit u64".into()))?;
+                pos = pos.saturating_add(chunk_u64);
+                let chunk_u32 = u32::try_from(chunk_len)
+                    .map_err(|_| FfsError::Format("chunk length does not fit u32".into()))?;
+                bytes_written = bytes_written.saturating_add(chunk_u32);
+            }
+
+            // Update inode size if we extended the file.
+            if end > inode.size {
+                inode.size = end;
+            }
+            // Charge the net change in extent-tree metadata blocks (index/leaf nodes
+            // grown or freed during this write) to i_blocks — the per-extent data
+            // deltas above count only data blocks (bd-zpe9s).
+            let meta_after =
+                self.ext4_count_extent_tree_meta_blocks(cx, scope, &Self::extent_root(&inode))?;
+            Self::ext4_apply_extent_meta_delta(
+                &mut inode,
+                ino,
+                meta_before,
+                meta_after,
+                write_sectors_per_block,
+            )?;
+            ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
 
             if let Some(tx) = &mut scope.tx {
-                // Provide byte-range proof + snapshot base for adaptive merge policy.
-                let proof = MergeProof::non_overlapping_extent_range(block_offset, chunk_len);
-                tx.stage_write_with_proof_and_base(phys_block, block_data, proof, staged_base);
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(tx),
+                };
+                ffs_inode::write_inode(
+                    cx,
+                    &tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &inode,
+                    csum_seed,
+                )?;
             } else {
-                block_dev.write_block(cx, phys_block, &block_data)?;
+                ffs_inode::write_inode(
+                    cx,
+                    &block_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &inode,
+                    csum_seed,
+                )?;
             }
 
-            if mark_unwritten_written {
-                let mut root_bytes = Self::extent_root(&inode);
-                if let Some(tx) = &mut scope.tx {
-                    let tx_dev = TransactionBlockAdapter {
-                        base: &block_dev,
-                        tx: Mutex::new(tx),
-                    };
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                    } = &mut *alloc;
-                    ffs_extent::mark_written(
-                        cx,
-                        &tx_dev,
-                        &mut root_bytes,
-                        geo,
-                        groups,
-                        logical_block,
-                        1,
-                        persist_ctx,
-                        ffs_extent::ExtentOwner {
-                            ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                            generation: inode.generation,
-                        },
-                    )?;
-                } else {
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                    } = &mut *alloc;
-                    ffs_extent::mark_written(
-                        cx,
-                        &block_dev,
-                        &mut root_bytes,
-                        geo,
-                        groups,
-                        logical_block,
-                        1,
-                        persist_ctx,
-                        ffs_extent::ExtentOwner {
-                            ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                            generation: inode.generation,
-                        },
-                    )?;
-                }
-                self.extent_cache.invalidate_all();
-                self.invalidate_ext4_write_extent_snapshot(&inode);
-                Self::set_extent_root(&mut inode, &root_bytes);
-                // NOTE: deliberately NOT invalidating `cached_extents` here. A
-                // mark_written split only flips the unwritten flag and splits the
-                // extent record; it preserves the physical mapping AND leaves the
-                // not-yet-processed suffix of the extent unwritten with the same
-                // physical base. The loop advances `pos` monotonically and never
-                // re-resolves an already-written block, so every later resolve
-                // against the pre-split cache returns the identical
-                // (physical, is_unwritten) it would against the split tree. Keeping
-                // the cache makes fallocate+write (writing into a big unwritten
-                // extent that splits per block) O(K) instead of O(K^2) — the splits
-                // would otherwise grow E and re-collect per block (bd-e4uwb).
-            }
+            trace!(
+                target: "ffs::write",
+                op = "write",
+                ino = ino.0,
+                offset,
+                len = data.len(),
+                new_size = inode.size,
+                "data written"
+            );
 
-            let chunk_u64 = u64::try_from(chunk_len)
-                .map_err(|_| FfsError::Format("chunk length does not fit u64".into()))?;
-            pos = pos.saturating_add(chunk_u64);
-            let chunk_u32 = u32::try_from(chunk_len)
-                .map_err(|_| FfsError::Format("chunk length does not fit u32".into()))?;
-            bytes_written = bytes_written.saturating_add(chunk_u32);
-        }
-
-        // Update inode size if we extended the file.
-        if end > inode.size {
-            inode.size = end;
-        }
-        // Charge the net change in extent-tree metadata blocks (index/leaf nodes
-        // grown or freed during this write) to i_blocks — the per-extent data
-        // deltas above count only data blocks (bd-zpe9s).
-        let meta_after =
-            self.ext4_count_extent_tree_meta_blocks(cx, scope, &Self::extent_root(&inode))?;
-        Self::ext4_apply_extent_meta_delta(
-            &mut inode,
-            ino,
-            meta_before,
-            meta_after,
-            write_sectors_per_block,
-        )?;
-        ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
-
-        if let Some(tx) = &mut scope.tx {
-            let tx_dev = TransactionBlockAdapter {
-                base: &block_dev,
-                tx: Mutex::new(tx),
-            };
-            ffs_inode::write_inode(
-                cx,
-                &tx_dev,
-                &alloc.geo,
-                &alloc.groups,
-                ino,
-                &inode,
-                csum_seed,
-            )?;
-        } else {
-            ffs_inode::write_inode(
-                cx,
-                &block_dev,
-                &alloc.geo,
-                &alloc.groups,
-                ino,
-                &inode,
-                csum_seed,
-            )?;
-        }
-
-        trace!(
-            target: "ffs::write",
-            op = "write",
-            ino = ino.0,
-            offset,
-            len = data.len(),
-            new_size = inode.size,
-            "data written"
-        );
-
-        Ok(bytes_written)
+            Ok(bytes_written)
+        })
     }
 
     /// Write to a legacy indirect-block-mapped ext4 file (no `EXT4_EXTENTS_FL`).
@@ -34720,178 +34701,166 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
 
         let mut alloc = alloc_mutex.write();
-        // i_blocks counts 512-byte sectors per fs block (or 1 unit/block for
-        // huge_file inodes). Each newly mapped logical block costs one data
-        // block plus any indirect-metadata blocks write_block_ptr allocates.
-        let sectors_per_block = if inode.is_huge_file() {
-            1u64
-        } else {
-            u64::from(sb.block_size / EXT4_SECTOR_SIZE)
-        };
-        let mut added_sectors: u64 = 0;
-        let mut bytes_written = 0u32;
-        let mut pos = offset;
-
-        while pos < end {
-            let logical_block = u32::try_from(pos / bs).map_err(|_| {
-                FfsError::Format("file offset exceeds ext4 32-bit logical block limit".into())
-            })?;
-            let block_offset = usize::try_from(pos % bs)
-                .map_err(|_| FfsError::Format("block offset does not fit usize".into()))?;
-            let remaining = usize::try_from(end - pos)
-                .map_err(|_| FfsError::Format("remaining write size does not fit usize".into()))?;
-            let chunk_len = (bs_usize - block_offset).min(remaining);
-
-            // Resolve the mapped physical block, or allocate one for a hole /
-            // beyond-EOF block (growth). write_block_ptr grows the pointer chain
-            // (direct/single/double/triple) and reports the indirect-metadata
-            // blocks it allocated so they can be counted in i_blocks.
-            let (phys_block, is_new) = if let Some(phys) =
-                self.resolve_indirect_block(cx, scope, &inode, logical_block)?
-            {
-                (BlockNumber(phys), false)
+        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+            // i_blocks counts 512-byte sectors per fs block (or 1 unit/block for
+            // huge_file inodes). Each newly mapped logical block costs one data
+            // block plus any indirect-metadata blocks write_block_ptr allocates.
+            let sectors_per_block = if inode.is_huge_file() {
+                1u64
             } else {
-                // Hole or beyond EOF: allocate a data block, map it (growing the
-                // pointer chain + allocating indirect-metadata blocks as needed).
-                let data_block = {
-                    let hint = self.numa_allocation_hint(
-                        &alloc.geo,
-                        AllocHint::default(),
-                        "ext4_write_indirect",
-                        Some(ino),
-                    );
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                        ..
-                    } = &mut *alloc;
-                    ffs_alloc::alloc_blocks_persist(
+                u64::from(sb.block_size / EXT4_SECTOR_SIZE)
+            };
+            let mut added_sectors: u64 = 0;
+            let mut bytes_written = 0u32;
+            let mut pos = offset;
+
+            while pos < end {
+                let logical_block = u32::try_from(pos / bs).map_err(|_| {
+                    FfsError::Format("file offset exceeds ext4 32-bit logical block limit".into())
+                })?;
+                let block_offset = usize::try_from(pos % bs)
+                    .map_err(|_| FfsError::Format("block offset does not fit usize".into()))?;
+                let remaining = usize::try_from(end - pos).map_err(|_| {
+                    FfsError::Format("remaining write size does not fit usize".into())
+                })?;
+                let chunk_len = (bs_usize - block_offset).min(remaining);
+
+                // Resolve the mapped physical block, or allocate one for a hole /
+                // beyond-EOF block (growth). write_block_ptr grows the pointer chain
+                // (direct/single/double/triple) and reports the indirect-metadata
+                // blocks it allocated so they can be counted in i_blocks.
+                let (phys_block, is_new) = if let Some(phys) =
+                    self.resolve_indirect_block(cx, scope, &inode, logical_block)?
+                {
+                    (BlockNumber(phys), false)
+                } else {
+                    // Hole or beyond EOF: allocate a data block, map it (growing the
+                    // pointer chain + allocating indirect-metadata blocks as needed).
+                    let data_block = {
+                        let hint = self.numa_allocation_hint(
+                            &alloc.geo,
+                            AllocHint::default(),
+                            "ext4_write_indirect",
+                            Some(ino),
+                        );
+                        self.allocate_one_block(cx, scope, alloc, &hint)?
+                    };
+                    let data_ptr = u32::try_from(data_block.0).map_err(|_| {
+                        FfsError::InvalidGeometry(format!(
+                            "indirect data block {} exceeds 32-bit pointer range",
+                            data_block.0
+                        ))
+                    })?;
+                    let meta_blocks = self.write_block_ptr(
                         cx,
-                        &block_dev,
-                        geo,
-                        groups,
-                        1,
-                        &hint,
-                        persist_ctx,
-                    )?
-                    .start
+                        scope,
+                        &mut inode,
+                        alloc,
+                        logical_block,
+                        data_ptr,
+                    )?;
+                    // Re-acquire the adapter so later reads observe the freshly
+                    // allocated/staged blocks.
+                    block_dev = self.block_device_adapter();
+                    let new_block_count = 1 + u64::try_from(meta_blocks.len()).map_err(|_| {
+                        FfsError::Format("indirect metadata block count overflow".into())
+                    })?;
+                    added_sectors = added_sectors
+                        .saturating_add(new_block_count.saturating_mul(sectors_per_block));
+                    (data_block, true)
                 };
-                let data_ptr = u32::try_from(data_block.0).map_err(|_| {
-                    FfsError::InvalidGeometry(format!(
-                        "indirect data block {} exceeds 32-bit pointer range",
-                        data_block.0
-                    ))
-                })?;
-                let meta_blocks = self.write_block_ptr(
-                    cx,
-                    scope,
-                    &mut inode,
-                    &mut alloc,
-                    logical_block,
-                    data_ptr,
-                )?;
-                // Re-acquire the adapter so later reads observe the freshly
-                // allocated/staged blocks.
-                block_dev = self.block_device_adapter();
-                let new_block_count = 1 + u64::try_from(meta_blocks.len()).map_err(|_| {
-                    FfsError::Format("indirect metadata block count overflow".into())
-                })?;
-                added_sectors =
-                    added_sectors.saturating_add(new_block_count.saturating_mul(sectors_per_block));
-                (data_block, true)
-            };
 
-            // Read-modify-write. A newly allocated block (its on-disk contents
-            // are undefined) or a full-block write starts from zeros; a partial
-            // overwrite of an existing block reads the current contents first.
-            let mut block_data = if is_new || (block_offset == 0 && chunk_len == bs_usize) {
-                vec![0u8; bs_usize]
-            } else {
-                self.read_block_with_scope(cx, scope, phys_block)?
-            };
-            let staged_base = if block_offset == 0 && chunk_len == bs_usize {
-                None
-            } else {
-                scope
-                    .tx
-                    .as_ref()
-                    .filter(|tx| tx.staged_write(phys_block).is_none())
-                    .map(|_| block_data.clone())
-            };
-            let data_start = usize::try_from(pos - offset)
-                .map_err(|_| FfsError::Format("write offset does not fit usize".into()))?;
-            block_data[block_offset..block_offset + chunk_len]
-                .copy_from_slice(&data[data_start..data_start + chunk_len]);
+                // Read-modify-write. A newly allocated block (its on-disk contents
+                // are undefined) or a full-block write starts from zeros; a partial
+                // overwrite of an existing block reads the current contents first.
+                let mut block_data = if is_new || (block_offset == 0 && chunk_len == bs_usize) {
+                    vec![0u8; bs_usize]
+                } else {
+                    self.read_block_with_scope(cx, scope, phys_block)?
+                };
+                let staged_base = if block_offset == 0 && chunk_len == bs_usize {
+                    None
+                } else {
+                    scope
+                        .tx
+                        .as_ref()
+                        .filter(|tx| tx.staged_write(phys_block).is_none())
+                        .map(|_| block_data.clone())
+                };
+                let data_start = usize::try_from(pos - offset)
+                    .map_err(|_| FfsError::Format("write offset does not fit usize".into()))?;
+                block_data[block_offset..block_offset + chunk_len]
+                    .copy_from_slice(&data[data_start..data_start + chunk_len]);
+
+                if let Some(tx) = &mut scope.tx {
+                    let proof = MergeProof::non_overlapping_extent_range(block_offset, chunk_len);
+                    tx.stage_write_with_proof_and_base(phys_block, block_data, proof, staged_base);
+                } else {
+                    block_dev.write_block(cx, phys_block, &block_data)?;
+                }
+                // Re-acquire the adapter so any later reads observe a non-staged write.
+                block_dev = self.block_device_adapter();
+
+                let chunk_u64 = u64::try_from(chunk_len)
+                    .map_err(|_| FfsError::Format("chunk length does not fit u64".into()))?;
+                pos = pos.saturating_add(chunk_u64);
+                let chunk_u32 = u32::try_from(chunk_len)
+                    .map_err(|_| FfsError::Format("chunk length does not fit u32".into()))?;
+                bytes_written = bytes_written.saturating_add(chunk_u32);
+            }
+
+            // Extend the file size if we wrote past the old EOF, and account for any
+            // newly allocated data + indirect-metadata blocks in i_blocks.
+            if end > inode.size {
+                inode.size = end;
+            }
+            if added_sectors > 0 {
+                inode.blocks = Self::ext4_checked_inode_blocks_delta(
+                    inode.blocks,
+                    ino,
+                    i128::from(added_sectors),
+                )?;
+            }
+            ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
 
             if let Some(tx) = &mut scope.tx {
-                let proof = MergeProof::non_overlapping_extent_range(block_offset, chunk_len);
-                tx.stage_write_with_proof_and_base(phys_block, block_data, proof, staged_base);
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(tx),
+                };
+                ffs_inode::write_inode(
+                    cx,
+                    &tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &inode,
+                    csum_seed,
+                )?;
             } else {
-                block_dev.write_block(cx, phys_block, &block_data)?;
+                ffs_inode::write_inode(
+                    cx,
+                    &block_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &inode,
+                    csum_seed,
+                )?;
             }
-            // Re-acquire the adapter so any later reads observe a non-staged write.
-            block_dev = self.block_device_adapter();
 
-            let chunk_u64 = u64::try_from(chunk_len)
-                .map_err(|_| FfsError::Format("chunk length does not fit u64".into()))?;
-            pos = pos.saturating_add(chunk_u64);
-            let chunk_u32 = u32::try_from(chunk_len)
-                .map_err(|_| FfsError::Format("chunk length does not fit u32".into()))?;
-            bytes_written = bytes_written.saturating_add(chunk_u32);
-        }
+            trace!(
+                target: "ffs::write",
+                op = "write_indirect",
+                ino = ino.0,
+                offset,
+                len = data.len(),
+                new_size = inode.size,
+                "indirect data written"
+            );
 
-        // Extend the file size if we wrote past the old EOF, and account for any
-        // newly allocated data + indirect-metadata blocks in i_blocks.
-        if end > inode.size {
-            inode.size = end;
-        }
-        if added_sectors > 0 {
-            inode.blocks = Self::ext4_checked_inode_blocks_delta(
-                inode.blocks,
-                ino,
-                i128::from(added_sectors),
-            )?;
-        }
-        ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
-
-        if let Some(tx) = &mut scope.tx {
-            let tx_dev = TransactionBlockAdapter {
-                base: &block_dev,
-                tx: Mutex::new(tx),
-            };
-            ffs_inode::write_inode(
-                cx,
-                &tx_dev,
-                &alloc.geo,
-                &alloc.groups,
-                ino,
-                &inode,
-                csum_seed,
-            )?;
-        } else {
-            ffs_inode::write_inode(
-                cx,
-                &block_dev,
-                &alloc.geo,
-                &alloc.groups,
-                ino,
-                &inode,
-                csum_seed,
-            )?;
-        }
-
-        trace!(
-            target: "ffs::write",
-            op = "write_indirect",
-            ino = ino.0,
-            offset,
-            len = data.len(),
-            new_size = inode.size,
-            "indirect data written"
-        );
-
-        Ok(bytes_written)
+            Ok(bytes_written)
+        })
     }
 
     /// `fallocate` on a legacy indirect-block-mapped ext4 file (no
@@ -34944,50 +34913,185 @@ impl OpenFs {
         let sectors_per_block = block_size / u64::from(EXT4_SECTOR_SIZE);
 
         let mut alloc = alloc_mutex.write();
+        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+            if punch_hole {
+                // Unaligned ranges are supported (bd-xnel9), mirroring the
+                // extent-mapped punch path and the kernel's ext4 indirect punch:
+                // zero the partial in-range bytes of any WRITTEN edge blocks (holes
+                // already read zero, so punch must not allocate them), then
+                // deallocate only the fully covered aligned interior blocks. The
+                // file size is unchanged (PUNCH_HOLE is always KEEP_SIZE).
+                let interior_start = offset.div_ceil(block_size) * block_size; // align up
+                let interior_end = (end / block_size) * block_size; // align down
 
-        if punch_hole {
-            // Unaligned ranges are supported (bd-xnel9), mirroring the
-            // extent-mapped punch path and the kernel's ext4 indirect punch:
-            // zero the partial in-range bytes of any WRITTEN edge blocks (holes
-            // already read zero, so punch must not allocate them), then
-            // deallocate only the fully covered aligned interior blocks. The
-            // file size is unchanged (PUNCH_HOLE is always KEEP_SIZE).
-            let interior_start = offset.div_ceil(block_size) * block_size; // align up
-            let interior_end = (end / block_size) * block_size; // align down
-
-            // Byte ranges in [offset, end) outside the freed interior that must
-            // be zeroed in place. With a full-block interior these are the head
-            // and tail partials; without one the whole range sits in one or two
-            // partial edge blocks (second slot stays empty).
-            let edge_ranges: [(u64, u64); 2] = if interior_start < interior_end {
-                [(offset, interior_start), (interior_end, end)]
-            } else {
-                [(offset, end), (end, end)]
-            };
-            for (zero_start, zero_end) in edge_ranges {
-                if zero_start >= zero_end {
-                    continue;
+                // Byte ranges in [offset, end) outside the freed interior that must
+                // be zeroed in place. With a full-block interior these are the head
+                // and tail partials; without one the whole range sits in one or two
+                // partial edge blocks (second slot stays empty).
+                let edge_ranges: [(u64, u64); 2] = if interior_start < interior_end {
+                    [(offset, interior_start), (interior_end, end)]
+                } else {
+                    [(offset, end), (end, end)]
+                };
+                for (zero_start, zero_end) in edge_ranges {
+                    if zero_start >= zero_end {
+                        continue;
+                    }
+                    let mut eb = zero_start / block_size;
+                    let last_eb = (zero_end - 1) / block_size;
+                    while eb <= last_eb {
+                        let lb = u32::try_from(eb).map_err(|_| {
+                            FfsError::Format(
+                                "punch_hole edge logical block exceeds ext4 32-bit limit".into(),
+                            )
+                        })?;
+                        if let Some(phys) = self.resolve_indirect_block(cx, scope, &inode, lb)? {
+                            let blk_start = eb * block_size;
+                            let zfrom = usize::try_from(zero_start.max(blk_start) - blk_start)
+                                .map_err(|_| {
+                                    FfsError::Format("punch_hole edge head offset overflow".into())
+                                })?;
+                            let zto =
+                                usize::try_from(zero_end.min(blk_start + block_size) - blk_start)
+                                    .map_err(|_| {
+                                    FfsError::Format("punch_hole edge tail offset overflow".into())
+                                })?;
+                            if zfrom < zto {
+                                let phys_block = BlockNumber(phys);
+                                let mut buf = self.read_block_with_scope(cx, scope, phys_block)?;
+                                let staged_base = scope
+                                    .tx
+                                    .as_ref()
+                                    .filter(|tx| tx.staged_write(phys_block).is_none())
+                                    .map(|_| buf.clone());
+                                buf[zfrom..zto].fill(0);
+                                if let Some(tx) = &mut scope.tx {
+                                    let proof = MergeProof::non_overlapping_extent_range(
+                                        zfrom,
+                                        zto - zfrom,
+                                    );
+                                    tx.stage_write_with_proof_and_base(
+                                        phys_block,
+                                        buf,
+                                        proof,
+                                        staged_base,
+                                    );
+                                } else {
+                                    block_dev.write_block(cx, phys_block, &buf)?;
+                                }
+                            }
+                        }
+                        eb += 1;
+                    }
                 }
-                let mut eb = zero_start / block_size;
-                let last_eb = (zero_end - 1) / block_size;
-                while eb <= last_eb {
-                    let lb = u32::try_from(eb).map_err(|_| {
+
+                // Deallocate the fully covered aligned interior blocks.
+                let lo = interior_start / block_size;
+                let hi = interior_end / block_size;
+                let freed = if lo < hi {
+                    self.ext4_free_indirect_range(cx, scope, alloc, &mut inode, lo..hi)?
+                } else {
+                    0
+                };
+                self.extent_cache.invalidate_all();
+                self.invalidate_all_ext4_write_extent_snapshots();
+                if freed > 0 {
+                    let freed_sectors = if inode.is_huge_file() {
+                        freed
+                    } else {
+                        freed.checked_mul(sectors_per_block).ok_or_else(|| {
+                            FfsError::Corruption {
+                                block: 0,
+                                detail: format!(
+                                    "inode {} punch_hole freed sectors overflow",
+                                    ino.0
+                                ),
+                            }
+                        })?
+                    };
+                    inode.blocks = Self::ext4_checked_inode_blocks_delta(
+                        inode.blocks,
+                        ino,
+                        -(i128::from(freed_sectors)),
+                    )?;
+                }
+                // PUNCH_HOLE keeps the file size unchanged.
+            } else {
+                // default / KEEP_SIZE / ZERO_RANGE: preallocate every hole in the
+                // window as a zeroed data block.
+                let zero_block = vec![0u8; bs_usize];
+                let first_lb = offset / block_size;
+                let last_lb = (end - 1) / block_size; // end > offset (length > 0)
+                let mut added_sectors = 0u64;
+                let mut lb64 = first_lb;
+                while lb64 <= last_lb {
+                    let lb = u32::try_from(lb64).map_err(|_| {
                         FfsError::Format(
-                            "punch_hole edge logical block exceeds ext4 32-bit limit".into(),
+                            "fallocate offset exceeds ext4 32-bit logical block limit".into(),
                         )
                     })?;
-                    if let Some(phys) = self.resolve_indirect_block(cx, scope, &inode, lb)? {
-                        let blk_start = eb * block_size;
-                        let zfrom = usize::try_from(zero_start.max(blk_start) - blk_start)
-                            .map_err(|_| {
-                                FfsError::Format("punch_hole edge head offset overflow".into())
+                    let (phys_block, is_new) =
+                        if let Some(phys) = self.resolve_indirect_block(cx, scope, &inode, lb)? {
+                            (BlockNumber(phys), false)
+                        } else {
+                            let data_block = {
+                                let hint = self.numa_allocation_hint(
+                                    &alloc.geo,
+                                    AllocHint::default(),
+                                    "ext4_fallocate_indirect",
+                                    Some(ino),
+                                );
+                                self.allocate_one_block(cx, scope, alloc, &hint)?
+                            };
+                            let data_ptr = u32::try_from(data_block.0).map_err(|_| {
+                                FfsError::InvalidGeometry(format!(
+                                    "indirect data block {} exceeds 32-bit pointer range",
+                                    data_block.0
+                                ))
                             })?;
-                        let zto = usize::try_from(zero_end.min(blk_start + block_size) - blk_start)
-                            .map_err(|_| {
-                                FfsError::Format("punch_hole edge tail offset overflow".into())
+                            // Preallocated blocks must read back as zero.
+                            if let Some(tx) = &mut scope.tx {
+                                tx.stage_write_with_proof(
+                                    data_block,
+                                    zero_block.clone(),
+                                    MergeProof::DisjointBlocks,
+                                );
+                            } else {
+                                block_dev.write_block(cx, data_block, &zero_block)?;
+                            }
+                            let meta =
+                                self.write_block_ptr(cx, scope, &mut inode, alloc, lb, data_ptr)?;
+                            block_dev = self.block_device_adapter();
+                            let new_count = 1 + u64::try_from(meta.len()).map_err(|_| {
+                                FfsError::Format("indirect metadata block count overflow".into())
                             })?;
-                        if zfrom < zto {
-                            let phys_block = BlockNumber(phys);
+                            added_sectors = added_sectors
+                                .saturating_add(new_count.saturating_mul(sectors_per_block));
+                            (data_block, true)
+                        };
+
+                    if zero_range && !is_new {
+                        // Zero only the in-window bytes of an already-mapped block.
+                        let blk_start = lb64.saturating_mul(block_size);
+                        let zfrom =
+                            usize::try_from(offset.max(blk_start) - blk_start).map_err(|_| {
+                                FfsError::Format("zero_range head offset overflow".into())
+                            })?;
+                        let zto = usize::try_from(end.min(blk_start + block_size) - blk_start)
+                            .map_err(|_| {
+                                FfsError::Format("zero_range tail offset overflow".into())
+                            })?;
+                        if zfrom == 0 && zto == bs_usize {
+                            if let Some(tx) = &mut scope.tx {
+                                tx.stage_write_with_proof(
+                                    phys_block,
+                                    zero_block.clone(),
+                                    MergeProof::DisjointBlocks,
+                                );
+                            } else {
+                                block_dev.write_block(cx, phys_block, &zero_block)?;
+                            }
+                        } else {
                             let mut buf = self.read_block_with_scope(cx, scope, phys_block)?;
                             let staged_base = scope
                                 .tx
@@ -35009,192 +35113,58 @@ impl OpenFs {
                             }
                         }
                     }
-                    eb += 1;
+                    lb64 += 1;
+                }
+
+                if added_sectors > 0 {
+                    inode.blocks = Self::ext4_checked_inode_blocks_delta(
+                        inode.blocks,
+                        ino,
+                        i128::from(added_sectors),
+                    )?;
+                }
+                if !keep_size && end > inode.size {
+                    inode.size = end;
                 }
             }
 
-            // Deallocate the fully covered aligned interior blocks.
-            let lo = interior_start / block_size;
-            let hi = interior_end / block_size;
-            let freed = if lo < hi {
-                self.ext4_free_indirect_range(cx, scope, &mut alloc, &mut inode, lo..hi)?
-            } else {
-                0
-            };
-            self.extent_cache.invalidate_all();
-            self.invalidate_all_ext4_write_extent_snapshots();
-            if freed > 0 {
-                let freed_sectors = if inode.is_huge_file() {
-                    freed
-                } else {
-                    freed
-                        .checked_mul(sectors_per_block)
-                        .ok_or_else(|| FfsError::Corruption {
-                            block: 0,
-                            detail: format!("inode {} punch_hole freed sectors overflow", ino.0),
-                        })?
+            ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
+            if let Some(tx) = &mut scope.tx {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(tx),
                 };
-                inode.blocks = Self::ext4_checked_inode_blocks_delta(
-                    inode.blocks,
+                ffs_inode::write_inode(
+                    cx,
+                    &tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
                     ino,
-                    -(i128::from(freed_sectors)),
+                    &inode,
+                    csum_seed,
+                )?;
+            } else {
+                ffs_inode::write_inode(
+                    cx,
+                    &block_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &inode,
+                    csum_seed,
                 )?;
             }
-            // PUNCH_HOLE keeps the file size unchanged.
-        } else {
-            // default / KEEP_SIZE / ZERO_RANGE: preallocate every hole in the
-            // window as a zeroed data block.
-            let zero_block = vec![0u8; bs_usize];
-            let first_lb = offset / block_size;
-            let last_lb = (end - 1) / block_size; // end > offset (length > 0)
-            let mut added_sectors = 0u64;
-            let mut lb64 = first_lb;
-            while lb64 <= last_lb {
-                let lb = u32::try_from(lb64).map_err(|_| {
-                    FfsError::Format(
-                        "fallocate offset exceeds ext4 32-bit logical block limit".into(),
-                    )
-                })?;
-                let (phys_block, is_new) =
-                    if let Some(phys) = self.resolve_indirect_block(cx, scope, &inode, lb)? {
-                        (BlockNumber(phys), false)
-                    } else {
-                        let data_block = {
-                            let hint = self.numa_allocation_hint(
-                                &alloc.geo,
-                                AllocHint::default(),
-                                "ext4_fallocate_indirect",
-                                Some(ino),
-                            );
-                            let Ext4AllocState {
-                                geo,
-                                groups,
-                                persist_ctx,
-                                ..
-                            } = &mut *alloc;
-                            ffs_alloc::alloc_blocks_persist(
-                                cx,
-                                &block_dev,
-                                geo,
-                                groups,
-                                1,
-                                &hint,
-                                persist_ctx,
-                            )?
-                            .start
-                        };
-                        let data_ptr = u32::try_from(data_block.0).map_err(|_| {
-                            FfsError::InvalidGeometry(format!(
-                                "indirect data block {} exceeds 32-bit pointer range",
-                                data_block.0
-                            ))
-                        })?;
-                        // Preallocated blocks must read back as zero.
-                        if let Some(tx) = &mut scope.tx {
-                            tx.stage_write_with_proof(
-                                data_block,
-                                zero_block.clone(),
-                                MergeProof::DisjointBlocks,
-                            );
-                        } else {
-                            block_dev.write_block(cx, data_block, &zero_block)?;
-                        }
-                        let meta =
-                            self.write_block_ptr(cx, scope, &mut inode, &mut alloc, lb, data_ptr)?;
-                        block_dev = self.block_device_adapter();
-                        let new_count = 1 + u64::try_from(meta.len()).map_err(|_| {
-                            FfsError::Format("indirect metadata block count overflow".into())
-                        })?;
-                        added_sectors = added_sectors
-                            .saturating_add(new_count.saturating_mul(sectors_per_block));
-                        (data_block, true)
-                    };
 
-                if zero_range && !is_new {
-                    // Zero only the in-window bytes of an already-mapped block.
-                    let blk_start = lb64.saturating_mul(block_size);
-                    let zfrom = usize::try_from(offset.max(blk_start) - blk_start)
-                        .map_err(|_| FfsError::Format("zero_range head offset overflow".into()))?;
-                    let zto = usize::try_from(end.min(blk_start + block_size) - blk_start)
-                        .map_err(|_| FfsError::Format("zero_range tail offset overflow".into()))?;
-                    if zfrom == 0 && zto == bs_usize {
-                        if let Some(tx) = &mut scope.tx {
-                            tx.stage_write_with_proof(
-                                phys_block,
-                                zero_block.clone(),
-                                MergeProof::DisjointBlocks,
-                            );
-                        } else {
-                            block_dev.write_block(cx, phys_block, &zero_block)?;
-                        }
-                    } else {
-                        let mut buf = self.read_block_with_scope(cx, scope, phys_block)?;
-                        let staged_base = scope
-                            .tx
-                            .as_ref()
-                            .filter(|tx| tx.staged_write(phys_block).is_none())
-                            .map(|_| buf.clone());
-                        buf[zfrom..zto].fill(0);
-                        if let Some(tx) = &mut scope.tx {
-                            let proof =
-                                MergeProof::non_overlapping_extent_range(zfrom, zto - zfrom);
-                            tx.stage_write_with_proof_and_base(phys_block, buf, proof, staged_base);
-                        } else {
-                            block_dev.write_block(cx, phys_block, &buf)?;
-                        }
-                    }
-                }
-                lb64 += 1;
-            }
-
-            if added_sectors > 0 {
-                inode.blocks = Self::ext4_checked_inode_blocks_delta(
-                    inode.blocks,
-                    ino,
-                    i128::from(added_sectors),
-                )?;
-            }
-            if !keep_size && end > inode.size {
-                inode.size = end;
-            }
-        }
-
-        ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
-        if let Some(tx) = &mut scope.tx {
-            let tx_dev = TransactionBlockAdapter {
-                base: &block_dev,
-                tx: Mutex::new(tx),
-            };
-            ffs_inode::write_inode(
-                cx,
-                &tx_dev,
-                &alloc.geo,
-                &alloc.groups,
-                ino,
-                &inode,
-                csum_seed,
-            )?;
-        } else {
-            ffs_inode::write_inode(
-                cx,
-                &block_dev,
-                &alloc.geo,
-                &alloc.groups,
-                ino,
-                &inode,
-                csum_seed,
-            )?;
-        }
-
-        trace!(
-            target: "ffs::write",
-            op = "fallocate_indirect",
-            ino = ino.0,
-            offset,
-            end,
-            "indirect fallocate"
-        );
-        Ok(())
+            trace!(
+                target: "ffs::write",
+                op = "fallocate_indirect",
+                ino = ino.0,
+                offset,
+                end,
+                "indirect fallocate"
+            );
+            Ok(())
+        })
     }
 
     /// Compressed ext4 write: accumulates data into cluster-sized buffers,
@@ -35241,6 +35211,9 @@ impl OpenFs {
         let mut pending_frees = Vec::new();
         let mut pending_new_blocks = Vec::new();
 
+        let scoped = scope.tx.is_some();
+        let mut alloc = alloc_mutex.write();
+        let result = self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
         let write_result = (|| -> Result<u32, FfsError> {
             // Process data cluster-by-cluster.
             let mut pos = offset;
@@ -35295,13 +35268,12 @@ impl OpenFs {
                         .min(cluster_bytes);
 
                 // Compress and write the cluster.
-                let mut alloc = alloc_mutex.write();
                 let cluster_write = self.write_ext4_compressed_cluster(
                     cx,
                     scope,
                     ino,
                     inode,
-                    &mut alloc,
+                    alloc,
                     cluster_start,
                     cluster_nblocks,
                     method_idx,
@@ -35309,7 +35281,6 @@ impl OpenFs {
                 )?;
                 pending_frees.extend(cluster_write.old_blocks);
                 pending_new_blocks.extend(cluster_write.new_blocks);
-                drop(alloc);
 
                 // Ensure COMPRBLK_FL is set.
                 inode.flags |= ffs_types::EXT4_COMPRBLK_FL;
@@ -35327,7 +35298,6 @@ impl OpenFs {
 
             // Write updated inode and free superseded cluster blocks.
             {
-                let mut alloc = alloc_mutex.write();
                 if let Some(tx) = &mut scope.tx {
                     let tx_dev = TransactionBlockAdapter {
                         base: &block_dev,
@@ -35354,38 +35324,26 @@ impl OpenFs {
                     )?;
                 }
 
-                let mut free_block_dev = self.block_device_adapter();
                 for block in std::mem::take(&mut pending_frees) {
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                    } = &mut *alloc;
-                    if let Err(error) = ffs_alloc::free_blocks_persist(
-                        cx,
-                        &free_block_dev,
-                        geo,
-                        groups,
-                        block,
-                        1,
-                        persist_ctx,
-                    ) {
-                        warn!(
-                            block = block.0,
-                            error = %error,
-                            "e2compr: failed to release superseded cluster block after inode update"
-                        );
+                    if let Err(error) = self.free_one_block(cx, scope, alloc, block) {
+                        if scope.tx.is_some() {
+                            return Err(error);
+                        }
+                        // The direct path has already published the replacement
+                        // inode. Preserve its existing best-effort reclaim policy;
+                        // rolling back new blocks would free referenced data.
+                        warn!(block = block.0, error = %error,
+                            "e2compr: failed to release superseded cluster block after inode update");
                     }
-                    free_block_dev = self.block_device_adapter();
                 }
-                drop(alloc);
             }
             Ok(bytes_written)
         })();
 
-        if write_result.is_err() && !pending_new_blocks.is_empty() {
+        // Transactional failures discard every staged allocation on abort.
+        // Compensating writes are needed only for the unscoped direct path.
+        if scope.tx.is_none() && write_result.is_err() && !pending_new_blocks.is_empty() {
             {
-                let mut alloc = alloc_mutex.write();
                 let mut rollback_block_dev = self.block_device_adapter();
                 for block in pending_new_blocks {
                     let Ext4AllocState {
@@ -35410,19 +35368,15 @@ impl OpenFs {
                     }
                     rollback_block_dev = self.block_device_adapter();
                 }
-                drop(alloc);
             }
         }
 
-        // e2compr is a rare legacy path whose conformance test validates that the
-        // on-disk group-descriptor free counts reflect each compressed write. Under
-        // the default GDT-persistence deferral the GD is otherwise written only at a
-        // durability boundary, so force a descriptor flush here to keep the
-        // compressed-write GD eager without deferring the mainline
-        // create/write win (bd-cc-gdt-defer-default). Best-effort: the GD is a hint
-        // (bitmap authoritative), so a flush error must not fail an otherwise-durable
-        // compressed write.
-        let _ = self.ext4_flush_group_descriptors(cx);
+        // Preserve compressed writes' eager descriptor contract, but keep the
+        // descriptor and bitmap in the same transaction as the inode.
+        if write_result.is_ok() && let Some(tx) = &mut scope.tx {
+            let tx_dev = TransactionBlockAdapter { base: &block_dev, tx: Mutex::new(tx) };
+            Self::ext4_write_group_descriptors_to(cx, alloc, &tx_dev)?;
+        }
 
         trace!(
             target: "ffs::write",
@@ -35435,6 +35389,12 @@ impl OpenFs {
         );
 
         write_result
+        });
+        drop(alloc);
+        if !scoped {
+            let _ = self.ext4_flush_group_descriptors(cx);
+        }
+        result
     }
 
     /// Read a directory's mapping from the supplied operation view, including
@@ -36147,7 +36107,7 @@ impl OpenFs {
                     })?;
                     let mut root_bytes = Self::extent_root(&inode);
                     let freed =
-                        Self::ext4_with_scoped_block_frees(scope, &mut alloc, |scope, alloc| {
+                        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
                             let Ext4AllocState {
                                 geo,
                                 groups,
@@ -49277,7 +49237,9 @@ impl OpenFs {
             read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
-            ext4_freed_blocks: BTreeMap::new(),
+            ext4_block_deltas: BTreeMap::new(),
+            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+            ext4_accounting_active: false,
         };
         match self.ext4_rename2_exchange_staged(
             cx,
@@ -55384,7 +55346,9 @@ mod tests {
             read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
-            ext4_freed_blocks: BTreeMap::new(),
+            ext4_block_deltas: BTreeMap::new(),
+            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+            ext4_accounting_active: false,
         };
 
         // Reference (prior behavior): per-block read_block_with_scope. Reset
@@ -55474,7 +55438,9 @@ mod tests {
             read_snapshot_pinned: false,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
-            ext4_freed_blocks: BTreeMap::new(),
+            ext4_block_deltas: BTreeMap::new(),
+            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+            ext4_accounting_active: false,
         };
 
         let reference: Vec<Vec<u8>> = (START..START + COUNT as u64)
@@ -75521,6 +75487,706 @@ mod tests {
         assert_eq!(u64::from(fs.ext4_read_orphan_head()), child.ino.0);
         assert_eq!(*fs.ext4_pending_orphans.lock(), pending);
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn native_unlink_returns_data_blocks_to_full_allocator() {
+        use std::io::{Seek as _, Write as _};
+
+        // Deliberately retained, genuinely full native image: no forged
+        // counters, bitmap edits, TempDir destructor or fixture cleanup.
+        let image = std::env::temp_dir().join(format!(
+            "ffs-inode-capacity-{}-{}.ext4",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut output = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&image)
+            .unwrap();
+        output.set_len(16 * 1024 * 1024).unwrap();
+        let made = std::process::Command::new("mkfs.ext4")
+            .args(["-F", "-b", "4096", "-N", "64", "-O", "^has_journal"])
+            .arg(&image)
+            .output()
+            .expect("mkfs must execute");
+        assert!(
+            made.status.success(),
+            "mkfs: {}{}",
+            String::from_utf8_lossy(&made.stdout),
+            String::from_utf8_lossy(&made.stderr)
+        );
+        // Public data allocation preserves a metadata reserve. Let the native
+        // producer fill that reserve too, then require its independent checker
+        // and both FrankenFS free-space counts to agree on actual exhaustion.
+        for command in ["write /dev/null /survivor", "write /dev/null /filler"] {
+            let made = std::process::Command::new("debugfs")
+                .args(["-w", "-R", command])
+                .arg(&image)
+                .output()
+                .expect("native fixture producer must execute");
+            assert!(
+                made.status.success(),
+                "debugfs: {}{}",
+                String::from_utf8_lossy(&made.stdout),
+                String::from_utf8_lossy(&made.stderr)
+            );
+        }
+        let initial = std::fs::read(&image).unwrap();
+        let free = Ext4ImageReader::new(&initial).unwrap().sb.free_blocks_count;
+        assert!(free > 100);
+        let filled = std::process::Command::new("debugfs")
+            .args(["-w", "-R", &format!("fallocate /filler 0 {}", free - 1)])
+            .arg(&image)
+            .output()
+            .expect("native preallocation must execute");
+        assert!(
+            filled.status.success(),
+            "debugfs fallocate: {}{}",
+            String::from_utf8_lossy(&filled.stdout),
+            String::from_utf8_lossy(&filled.stderr)
+        );
+        let (clean, report) = run_e2fsck(&image).expect("initial native checker must execute");
+        assert!(clean, "full native fixture must start clean: {report}");
+        let dev = TestDevice::from_vec(std::fs::read(&image).unwrap());
+        let cx = Cx::for_testing();
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+        fs.enable_writes(&cx).unwrap();
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let root = InodeNumber(2);
+        let survivor = fs.lookup(&cx, root, OsStr::new("survivor")).unwrap();
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, 0);
+        assert_eq!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+            0
+        );
+        let value = vec![0x5a; 1024];
+        let before_full = fs.current_snapshot();
+        assert!(matches!(
+            fs.setxattr(
+                &cx,
+                survivor.ino,
+                "user.capacity",
+                &value,
+                XattrSetMode::Set
+            ),
+            Err(FfsError::NoSpace)
+        ));
+        assert_eq!(fs.current_snapshot(), before_full);
+        assert_eq!(
+            fs.getxattr(&cx, survivor.ino, "user.capacity").unwrap(),
+            None
+        );
+        fs.unlink(&cx, root, OsStr::new("filler")).unwrap();
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+        assert_eq!(
+            u64::from(fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap()),
+            free
+        );
+        // Data retirement credits the full allocator; only the inode credit
+        // uses the sharded family. Keep this as a native counterexample control.
+        assert_eq!(
+            u64::from(fs.require_alloc_state().unwrap().read().groups[0].free_blocks),
+            free
+        );
+        let before = fs.current_snapshot();
+        fs.setxattr(
+            &cx,
+            survivor.ino,
+            "user.capacity",
+            &value,
+            XattrSetMode::Set,
+        )
+        .expect("external xattr must reuse actual retired blocks");
+        assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - 1);
+        assert_ne!(fs.read_inode(&cx, survivor.ino).unwrap().file_acl, 0);
+        assert_eq!(
+            fs.getxattr(&cx, survivor.ino, "user.capacity").unwrap(),
+            Some(value.clone())
+        );
+        fs.removexattr(&cx, survivor.ino, "user.capacity").unwrap();
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+        fs.setxattr(
+            &cx,
+            survivor.ino,
+            "user.capacity",
+            &value,
+            XattrSetMode::Set,
+        )
+        .unwrap();
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        let bytes = dev.snapshot_bytes();
+        let digest = blake3::hash(&bytes);
+        output.rewind().unwrap();
+        output.write_all(&bytes).unwrap();
+        output.sync_all().unwrap();
+        let (clean, report) = run_e2fsck(&image).expect("native checker must execute");
+        println!(
+            "retained inode capacity image: {}\n{report}",
+            image.display()
+        );
+        assert!(clean, "native checker must accept the whole image");
+        assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), digest);
+        let reopened =
+            OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(bytes)), &options).unwrap();
+        let child = reopened.lookup(&cx, root, OsStr::new("survivor")).unwrap();
+        assert_eq!(child.ino, survivor.ino);
+        assert_eq!(
+            reopened.getxattr(&cx, child.ino, "user.capacity").unwrap(),
+            Some(value)
+        );
+        assert_eq!(reopened.statfs(&cx, root).unwrap().blocks_free, free - 1);
+        assert!(matches!(
+            reopened.lookup(&cx, root, OsStr::new("filler")),
+            Err(FfsError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn ext4_writeback_abort_preserves_allocated_capacity() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let child = fs
+            .create(&cx, root, OsStr::new("aborted_write"), 0o600, 0, 0)
+            .unwrap();
+        let before = fs.current_snapshot();
+        let free = fs.statfs(&cx, root).unwrap().blocks_free;
+        let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        let bitmap_free = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+        let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+        let payload = vec![0xA5; 4 * 4096];
+        assert_eq!(
+            <OpenFs as FsOps>::write(&fs, &cx, &mut scope, child.ino, 0, &payload).unwrap(),
+            u32::try_from(payload.len()).unwrap()
+        );
+        assert!(scope.pending_write_count() > 0);
+        assert_eq!(fs.current_snapshot(), before);
+        fs.abort_writeback_batch_scope(&cx, scope).unwrap();
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.getattr(&cx, child.ino).unwrap().size, 0);
+        assert_eq!(fs.read(&cx, child.ino, 0, 64).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+            bitmap_free
+        );
+        assert_eq!(
+            fs.statfs(&cx, root).unwrap().blocks_free,
+            free,
+            "aborted allocation cannot spend capacity"
+        );
+        assert_eq!(
+            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+            groups
+        );
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_writeback_accounting_mapping_lifecycle() {
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let modes = [false, true];
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let modes = [false];
+        for sharded in modes {
+            for mapping in ["extent", "indirect", "gzip", "uncompressed"] {
+                let fs = open_writable_ext4().expect("retained ext4 fixture");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                fs.set_bhh0i_sharded_ops(sharded);
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                let ino = fs
+                    .create(&cx, root, OsStr::new("batch"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                match mapping {
+                    "indirect" => {
+                        let mut inode = fs.read_inode(&cx, ino).unwrap();
+                        inode.flags &= !ffs_types::EXT4_EXTENTS_FL;
+                        inode.extent_bytes.fill(0);
+                        persist_ext4_test_inode(&fs, &cx, ino, &inode);
+                    }
+                    "gzip" => enable_e2compr_for_inode(&fs, &cx, ino, 2, 20),
+                    "uncompressed" => enable_e2compr_for_inode(&fs, &cx, ino, 2, 1),
+                    _ => {}
+                }
+                let bs = fs.block_size();
+                let block_len = usize::try_from(bs).unwrap();
+                let first = vec![b'A'; block_len];
+                let second = vec![b'B'; block_len];
+                let free = fs.statfs(&cx, root).unwrap().blocks_free;
+                let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+                let bitmap_blocks: Vec<_> = fs
+                    .require_alloc_state()
+                    .unwrap()
+                    .read()
+                    .groups
+                    .iter()
+                    .map(|group| group.block_bitmap_block)
+                    .collect();
+                let bitmaps = || -> Vec<Vec<u8>> {
+                    bitmap_blocks
+                        .iter()
+                        .map(|block| fs.read_block_vec(&cx, *block).unwrap())
+                        .collect()
+                };
+                let before_bitmap = bitmaps();
+                let before = fs.current_snapshot();
+                // The second write crosses the direct/single-indirect boundary.
+                // Abort and cancellation must discard both data and metadata.
+                for finish in ["abort", "cancel", "commit"] {
+                    let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+                    FsOps::write(&fs, &cx, &mut scope, ino, 0, &first).unwrap();
+                    FsOps::write(&fs, &cx, &mut scope, ino, 12 * u64::from(bs), &second).unwrap();
+                    assert_eq!(fs.current_snapshot(), before);
+                    assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+                    assert_eq!(bitmaps(), before_bitmap);
+                    assert_eq!(fs.getattr(&cx, ino).unwrap().size, 0);
+                    assert_eq!(
+                        FsOps::read(&fs, &cx, &mut scope, ino, 0, bs).unwrap(),
+                        first
+                    );
+                    assert_eq!(
+                        FsOps::read(&fs, &cx, &mut scope, ino, 12 * u64::from(bs), bs).unwrap(),
+                        second
+                    );
+                    match finish {
+                        "abort" => fs.abort_writeback_batch_scope(&cx, scope).unwrap(),
+                        "cancel" => {
+                            let cancelled = Cx::for_testing();
+                            cancelled.set_cancel_requested(true);
+                            assert!(matches!(
+                                fs.commit_writeback_batch_scope(&cancelled, scope),
+                                Err(FfsError::Cancelled)
+                            ));
+                        }
+                        _ => {
+                            fs.commit_writeback_batch_scope(&cx, scope).unwrap();
+                        }
+                    }
+                    assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                    if finish != "commit" {
+                        assert_eq!(fs.current_snapshot(), before);
+                        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+                        assert_eq!(bitmaps(), before_bitmap);
+                        assert_eq!(
+                            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                            groups
+                        );
+                    }
+                }
+                assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+                assert_eq!(fs.read(&cx, ino, 0, bs).unwrap(), first);
+                assert_eq!(fs.read(&cx, ino, 12 * u64::from(bs), bs).unwrap(), second);
+                assert!(
+                    fs.read(&cx, ino, u64::from(bs), 11 * bs)
+                        .unwrap()
+                        .iter()
+                        .all(|b| *b == 0)
+                );
+                let allocated = |maps: &[Vec<u8>]| -> u64 {
+                    maps.iter()
+                        .flatten()
+                        .map(|byte| u64::from(byte.count_ones()))
+                        .sum()
+                };
+                let spent = free - fs.statfs(&cx, root).unwrap().blocks_free;
+                assert!(spent >= 2, "{mapping} must allocate real blocks");
+                assert_eq!(spent, allocated(&bitmaps()) - allocated(&before_bitmap));
+                assert_eq!(
+                    fs.read_inode(&cx, ino).unwrap().blocks,
+                    spent * u64::from(bs / EXT4_SECTOR_SIZE)
+                );
+                println!(
+                    "scoped accounting: sharded={sharded} mapping={mapping} abort/cancel/commit passed, charged={spent}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_writeback_allocation_conflict_keeps_winner_capacity() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let first = fs
+            .create(&cx, root, OsStr::new("winner"), 0o600, 0, 0)
+            .unwrap();
+        let second = fs
+            .create(&cx, root, OsStr::new("loser"), 0o600, 0, 0)
+            .unwrap();
+        let free = fs.statfs(&cx, root).unwrap().blocks_free;
+        let bs = fs.block_size();
+        let payload = vec![0xAC; usize::try_from(bs).unwrap()];
+        let mut winner = fs.begin_writeback_batch_scope(&cx).unwrap();
+        let mut loser = fs.begin_writeback_batch_scope(&cx).unwrap();
+        FsOps::write(&fs, &cx, &mut winner, first.ino, 0, &payload).unwrap();
+        FsOps::write(
+            &fs,
+            &cx,
+            &mut loser,
+            second.ino,
+            0,
+            &vec![0xBD; payload.len()],
+        )
+        .unwrap();
+        fs.commit_writeback_batch_scope(&cx, winner).unwrap();
+        let committed = fs.current_snapshot();
+        let counts = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - 1);
+        assert!(matches!(
+            fs.commit_writeback_batch_scope(&cx, loser),
+            Err(FfsError::MvccConflict { .. })
+        ));
+        assert_eq!(fs.current_snapshot(), committed);
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - 1);
+        assert_eq!(
+            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+            counts
+        );
+        assert_eq!(fs.read(&cx, first.ino, 0, bs).unwrap(), payload);
+        assert_eq!(fs.getattr(&cx, second.ino).unwrap().size, 0);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_writeback_abort_does_not_publish_cached_extent_mappings() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let ino = fs
+            .create(&cx, root, OsStr::new("cached-batch"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let bs = fs.block_size();
+        let payload = vec![0x19; usize::try_from(bs).unwrap()];
+        for index in 0..10 {
+            fs.write(&cx, ino, u64::from(2 * index * bs), &payload)
+                .unwrap();
+        }
+        let inode = fs.read_inode(&cx, ino).unwrap();
+        assert!(u16::from_le_bytes([inode.extent_bytes[6], inode.extent_bytes[7]]) > 0);
+        let free = fs.statfs(&cx, root).unwrap().blocks_free;
+        let before = fs.current_snapshot();
+        let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+        FsOps::write(&fs, &cx, &mut scope, ino, u64::from(bs), &payload).unwrap();
+        // A second operation populates the write-list cache from the modified
+        // leaf while the index root remains byte-identical to committed state.
+        FsOps::write(&fs, &cx, &mut scope, ino, 0, &payload).unwrap();
+        assert_eq!(
+            fs.read_inode_with_scope(&cx, &scope, ino)
+                .unwrap()
+                .extent_bytes,
+            inode.extent_bytes
+        );
+        assert_eq!(
+            FsOps::read(&fs, &cx, &mut scope, ino, u64::from(bs), bs).unwrap(),
+            payload
+        );
+        fs.abort_writeback_batch_scope(&cx, scope).unwrap();
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+        assert_eq!(
+            fs.resolve_extent(&cx, &RequestScope::empty(), &inode, 1)
+                .unwrap(),
+            None
+        );
+        assert!(
+            fs.read(&cx, ino, u64::from(bs), bs)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        let replacement = vec![0x62; usize::try_from(bs).unwrap()];
+        let mut reader = FsOps::begin_request_scope(&fs, &cx, RequestOp::Read).unwrap();
+        fs.write(&cx, ino, u64::from(bs), &replacement).unwrap();
+        assert_eq!(
+            fs.statfs(&cx, root).unwrap().blocks_free,
+            free - 1,
+            "a discarded cached mapping must not bypass bitmap allocation"
+        );
+        assert_eq!(fs.read(&cx, ino, u64::from(bs), bs).unwrap(), replacement);
+        assert_eq!(fs.read(&cx, ino, 0, bs).unwrap(), payload);
+        assert_eq!(fs.resolve_extent(&cx, &reader, &inode, 1).unwrap(), None);
+        assert!(
+            FsOps::read(&fs, &cx, &mut reader, ino, u64::from(bs), bs)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        FsOps::end_request_scope(&fs, &cx, RequestOp::Read, reader).unwrap();
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_writeback_fallocate_mixed_accounting() {
+        for indirect in [false, true] {
+            let fs = open_writable_ext4().expect("retained ext4 fixture");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(true);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let ino = fs
+                .create(&cx, root, OsStr::new("mixed"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            if indirect {
+                let mut inode = fs.read_inode(&cx, ino).unwrap();
+                inode.flags &= !ffs_types::EXT4_EXTENTS_FL;
+                inode.extent_bytes.fill(0);
+                persist_ext4_test_inode(&fs, &cx, ino, &inode);
+            }
+            let bs = fs.block_size();
+            let payload = vec![0x53; usize::try_from(16 * bs).unwrap()];
+            let free = fs.statfs(&cx, root).unwrap().blocks_free;
+            let before = fs.current_snapshot();
+            let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            for commit in [false, true] {
+                let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+                FsOps::write(&fs, &cx, &mut scope, ino, 0, &payload).unwrap();
+                FsOps::fallocate(
+                    &fs,
+                    &cx,
+                    &mut scope,
+                    ino,
+                    u64::from(bs),
+                    u64::from(bs),
+                    0x03,
+                )
+                .unwrap();
+                FsOps::fallocate(
+                    &fs,
+                    &cx,
+                    &mut scope,
+                    ino,
+                    u64::from(16 * bs),
+                    u64::from(bs),
+                    0,
+                )
+                .unwrap();
+                assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+                assert_eq!(fs.current_snapshot(), before);
+                assert_eq!(fs.getattr(&cx, ino).unwrap().size, 0);
+                if commit {
+                    fs.commit_writeback_batch_scope(&cx, scope).unwrap();
+                } else {
+                    fs.abort_writeback_batch_scope(&cx, scope).unwrap();
+                    assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+                    assert_eq!(
+                        format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                        groups
+                    );
+                }
+            }
+            assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+            let mut expected = payload;
+            expected[usize::try_from(bs).unwrap()..usize::try_from(2 * bs).unwrap()].fill(0);
+            expected.resize(usize::try_from(17 * bs).unwrap(), 0);
+            assert_eq!(fs.read(&cx, ino, 0, 17 * bs).unwrap(), expected);
+            let spent = if indirect { 17 } else { 16 };
+            assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - spent);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
+    }
+
+    #[test]
+    fn ext4_writeback_accounting_native_image() {
+        use std::io::{Seek as _, Write as _};
+        for block_size in [1024_u32, 4096] {
+            for indirect in [false, true] {
+                let image = std::env::temp_dir().join(format!(
+                    "ffs-scoped-accounting-{block_size}-{indirect}-{}-{}.ext4",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let mut output = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&image)
+                    .unwrap();
+                // Backup-superblock groups have initialized bitmaps. Four
+                // groups provide a genuinely lazy non-backup group (group 2).
+                output
+                    .set_len(if block_size == 1024 {
+                        32 * 1024 * 1024
+                    } else {
+                        16 * 1024 * 1024
+                    })
+                    .unwrap();
+                let made = std::process::Command::new("mkfs.ext4")
+                    .args([
+                        "-F",
+                        "-b",
+                        &block_size.to_string(),
+                        "-O",
+                        if indirect {
+                            "^has_journal,^extent,^64bit"
+                        } else {
+                            "^has_journal"
+                        },
+                    ])
+                    .arg(&image)
+                    .output()
+                    .expect("native mkfs must execute");
+                assert!(
+                    made.status.success(),
+                    "mkfs: {}{}",
+                    String::from_utf8_lossy(&made.stdout),
+                    String::from_utf8_lossy(&made.stderr)
+                );
+                let dev = TestDevice::from_vec(std::fs::read(&image).unwrap());
+                let cx = Cx::for_testing();
+                let options = OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                    ..OpenOptions::default()
+                };
+                let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+                fs.enable_writes(&cx).unwrap();
+                if block_size == 1024 {
+                    assert!(
+                        fs.require_alloc_state().unwrap().read().groups[2].block_bitmap_uninit(),
+                        "native producer must provide a real lazy bitmap"
+                    );
+                }
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                fs.set_bhh0i_sharded_ops(true);
+                let root = InodeNumber(2);
+                let ino = fs
+                    .create(&cx, root, OsStr::new("scoped"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                let free = fs.statfs(&cx, root).unwrap().blocks_free;
+                let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+                let before = fs.current_snapshot();
+                // Retain the single 8500-block write that exposed false ENOSPC,
+                // then exhaust groups 0/1's combined capacity to reach group 2.
+                // Sparse tails grow an extent leaf or indirect metadata.
+                let blocks = if block_size == 1024 { 16_000 } else { 4 };
+                let first_blocks = if block_size == 1024 { 8500 } else { 4 };
+                let mut segments = vec![(
+                    0_u64,
+                    vec![0x64; usize::try_from(first_blocks * block_size).unwrap()],
+                )];
+                if block_size == 1024 {
+                    segments.push((
+                        u64::from(first_blocks * block_size),
+                        vec![0x65; usize::try_from((blocks - first_blocks) * block_size).unwrap()],
+                    ));
+                }
+                for index in 0..10_u32 {
+                    segments.push((
+                        u64::from(blocks + 2 * index + 1) * u64::from(block_size),
+                        vec![
+                            u8::try_from(index + 1).unwrap();
+                            usize::try_from(block_size).unwrap()
+                        ],
+                    ));
+                }
+                if indirect {
+                    let pointers = u64::from(block_size / 4);
+                    segments.push((
+                        (12 + pointers + pointers * pointers) * u64::from(block_size),
+                        vec![0x7E; usize::try_from(block_size).unwrap()],
+                    ));
+                }
+                for commit in [false, true] {
+                    let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+                    for (offset, bytes) in &segments {
+                        FsOps::write(&fs, &cx, &mut scope, ino, *offset, bytes).unwrap();
+                    }
+                    if block_size == 1024 {
+                        assert!(
+                            scope.ext4_initialized_bitmaps.contains(&2),
+                            "must stage real bitmap initialization"
+                        );
+                    }
+                    assert_eq!(fs.current_snapshot(), before);
+                    assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+                    assert_eq!(fs.getattr(&cx, ino).unwrap().size, 0);
+                    if commit {
+                        fs.commit_writeback_batch_scope(&cx, scope).unwrap();
+                    } else {
+                        fs.abort_writeback_batch_scope(&cx, scope).unwrap();
+                        assert_eq!(
+                            format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                            groups
+                        );
+                        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
+                    }
+                }
+                assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+                let published_free = fs.statfs(&cx, root).unwrap().blocks_free;
+                let bitmap_free: u64 = fs
+                    .require_alloc_state()
+                    .unwrap()
+                    .read()
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        u64::from(fs.count_free_blocks_in_group(&cx, group.group).unwrap())
+                    })
+                    .sum();
+                assert_eq!(published_free, bitmap_free);
+                let inode = fs.read_inode(&cx, ino).unwrap();
+                assert_eq!(
+                    inode.blocks,
+                    (free - published_free) * u64::from(block_size / EXT4_SECTOR_SIZE)
+                );
+                if !indirect {
+                    assert!(u16::from_le_bytes([inode.extent_bytes[6], inode.extent_bytes[7]]) > 0);
+                }
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                let bytes = dev.snapshot_bytes();
+                let digest = blake3::hash(&bytes);
+                output.rewind().unwrap();
+                output.write_all(&bytes).unwrap();
+                output.sync_all().unwrap();
+                let (clean, report) = run_e2fsck(&image).expect("native checker must execute");
+                println!(
+                    "retained scoped accounting image: {}\n{report}",
+                    image.display()
+                );
+                assert!(clean, "native checker must accept the complete image");
+                assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), digest);
+                let reopened =
+                    OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(bytes)), &options)
+                        .unwrap();
+                assert_eq!(
+                    reopened.statfs(&cx, root).unwrap().blocks_free,
+                    published_free
+                );
+                for (offset, payload) in segments {
+                    assert_eq!(
+                        reopened
+                            .read(&cx, ino, offset, u32::try_from(payload.len()).unwrap())
+                            .unwrap(),
+                        payload
+                    );
+                }
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            }
+        }
     }
 
     #[test]
@@ -100646,7 +101312,9 @@ mod tests {
                 read_snapshot_pinned: false,
                 commit_mode: RequestCommitMode::PerRequest,
                 skip_readdir_prefetch: false,
-                ext4_freed_blocks: BTreeMap::new(),
+                ext4_block_deltas: BTreeMap::new(),
+                ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+                ext4_accounting_active: false,
             },
         )
         .expect("end request scope");
@@ -101286,7 +101954,7 @@ mod tests {
             );
             assert!(stale.tx.is_none(), "failed commit consumes its transaction");
             assert!(
-                stale.ext4_freed_blocks.is_empty(),
+                stale.ext4_block_deltas.is_empty(),
                 "failed credits are discarded"
             );
             fs.end_request_scope(&cx, RequestOp::Setattr, stale)
@@ -101358,7 +102026,7 @@ mod tests {
                 .expect("publish deferred truncate");
             assert!(published.0 > 0);
             assert!(deferred.tx.is_none());
-            assert!(deferred.ext4_freed_blocks.is_empty());
+            assert!(deferred.ext4_block_deltas.is_empty());
             let after_publish = fs.statfs(&cx, root).expect("published accounting");
             let published_bitmaps = read_bitmaps();
             assert_eq!(after_publish.blocks_free, before_abort.blocks_free + 2);

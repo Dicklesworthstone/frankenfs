@@ -1059,6 +1059,12 @@ allocate the goal length but may trim the request if nothing is found.
 **CR_ANY_FREE:** Finds the first set of free blocks and allocates those.
 Used only when all other criteria fail.
 
+Observable allocation contract: the requested contiguous length is a goal,
+not proof that the entire filesystem is full when no single group can provide
+it. A large write can use smaller runs across groups. FrankenFS's extent-write
+loop retries a reduced run on ENOSPC until a single-block request fails, matching
+this extracted fallback behavior without copying the kernel allocator's flow.
+
 ### 6.2 Allocation Hints (Flags)
 
 ```c

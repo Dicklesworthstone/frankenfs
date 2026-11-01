@@ -4814,7 +4814,9 @@ impl FsOps for OpenFs {
             read_snapshot_pinned,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
-            ext4_freed_blocks: std::collections::BTreeMap::new(),
+            ext4_block_deltas: std::collections::BTreeMap::new(),
+            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+            ext4_accounting_active: false,
         })
     }
 
@@ -4925,6 +4927,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
     ) -> ffs_error::Result<CommitSeq> {
         if scope.tx.is_some() {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             self.reject_btrfs_unsupported_mutation()?;
         }
         let tx_id = scope.tx.as_ref().map(ffs_mvcc::Transaction::id);
@@ -4943,7 +4946,7 @@ impl FsOps for OpenFs {
         // caller-supplied scope writes are raw block publication, just like
         // the public FCW/SSI transaction API, and invalidate captured state.
         let mut view = self.btrfs_raw_publication_guard(scope.pending_write_count());
-        let result = self.commit_scope_with_ext4_free_counts(scope);
+        let result = self.commit_scope_with_ext4_block_counts(scope);
         if result.is_ok()
             && let Some(stale) = view.as_mut()
         {

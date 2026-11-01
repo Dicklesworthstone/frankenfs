@@ -2977,11 +2977,20 @@ Modules:
 - `punch.rs`: `punch_hole(cx, inode, logical_start, count)`. Removes block mappings in range without changing file size. Handles three cases: (1) extent fully within hole -- remove and free, (2) extent partially overlaps start -- truncate extent end, (3) extent partially overlaps end -- adjust extent start. May split one extent into two (hole in middle).
 - `unwritten.rs`: Unwritten (uninitialized) extent handling. `mark_written(cx, inode, logical_start, count)`: clears the unwritten flag (bit 15 of `ee_len`) on extents in range. May require splitting extents at boundaries. Used by `fallocate` (mode=0 allocates unwritten) and first write to preallocated region.
 
-For a request-scoped truncate, bitmap changes, inode mappings and free-block
-credits MUST share the transaction outcome. Before publication, other requests
-must not observe its free credits. Abort or a failed commit must preserve the
-prior bitmap, file bytes and accounting, including allocations committed by
-other requests meanwhile. This also applies to indirect data and pointer blocks.
+For request-scoped writes, fallocate and truncation, bitmap changes, inode
+mappings and block-accounting deltas MUST share the transaction outcome.
+Allocation debits, free credits and lazy-bitmap initialization remain private
+until publication, including across repeated operations in a deferred batch.
+Abort, cancellation or a failed commit must preserve prior bitmap, file bytes
+and accounting, including allocations committed by other requests meanwhile.
+This applies to extent-tree metadata, indirect data/pointer blocks and compressed
+cluster replacement; descriptor persistence must not escape the transaction.
+Live counts may change only after successful MVCC publication, with all counter
+arithmetic and dual-ledger funding checked beforehand under allocation exclusion.
+Mappings derived from a private transaction or a retained reader snapshot MUST
+NOT enter or reuse a shared current-view extent cache. An unchanged inode index
+root does not imply that its leaf versions agree. Aborting a batch must not let
+a later real write follow its discarded mapping without bitmap allocation.
 An error during staging requires aborting the request scope.
 
 Dependency rationale: depends on `ffs-btree` for extent tree operations;

@@ -11,6 +11,59 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### Scoped writeback accounting continuation — 2026-11-01
+
+- [x] Re-read all instructions/README, recheck current main and original owned
+  P0, source-aware queue/cycles and reservations; keep original acceptance.
+- [x] Execute the full-block native-image experiment. It disproves the initial
+  hypothesis: unlink returns data credits to the full allocator, not solely the
+  sharded ledger. No production change or fix credit for that hypothesis.
+- [x] Execute a separate real writeback-abort regression. Four staged data
+  blocks disappear from statfs (2770 -> 2766), although abort preserves the inode,
+  bitmap and snapshot. Preserve the failing command/source binding.
+- [x] Keep block allocations, frees and bitmap-initialization state owned by
+  the request scope; apply only after successful publication, under exclusion.
+- [x] Cover extent, indirect and compressed allocation paths without bypassing
+  the transaction; preserve read-your-writes and exact dual-ledger accounting.
+- [x] Verify multiple writes, allocation/free reuse, successful single charge,
+  cancellation/conflict/abort, metadata growth and native checker/cold reopen.
+  Five tests execute5/0/0,1693filtered,1.58s. Eight allocator/mapping lifecycle
+  profiles pass; four actual1KiB/4KiB extent/legacy images execute all5checker
+  phases and cold reopen. Native coverage reaches lazy bitmap group2, extent
+  leaves and triple-indirect metadata. A genuine8500-block write ENOSPC exposed
+  the missing smaller-run fallback; keep that input in the positive test.
+  Initial producer assumptions about group1 were false: native inspection shows
+  its backup metadata forces initialization. The final32MiB1KiB fixture checks
+  real group2 BLOCK_UNINIT before mutation and stages its transition, with no
+  forged flags or reduced assertions. Earlier failures remain in raw captures.
+- [x] Verify aborted deep-tree mappings cannot escape through shared extent
+  caches, including a later real write to the same hole. Isolate fixed-snapshot
+  reads/write lists and repeat affected runtime/compiler gates.
+  Real red0/1/0,1698filtered: later write leaves2758free instead of2757because
+  it follows the aborted cached mapping. Fixed-snapshot mapping reads/write
+  lists now bypass shared caches; the same test plus public hole resolution and
+  a pinned old reader passes. Earlier34-case results remain separate.
+- [x] Run focused default/sharded controls, native checker/cold reopen, required
+  workspace check/strict Clippy/fmt and unchanged scanner, binding exact source.
+  Final selections35/0/5existing ignores each: feature1659filtered8.83s,
+  default1580filtered1.41s, bothCargo0. Ten final16/32MiB images execute checker
+  and cold readback; all234881024copied bytes match worker SHA256. Six source/
+  lock/toolchain hashes match both workers. Final workspace check0(4m15s),
+  strict feature Clippy0(1m44s), strict default Clippy0(2m36s), fmt/whitespace0.
+  UBS unchangedrules: core0critical/16238warnings/3239info, fs_ops0/86/61,
+  vfs0/57/18. No warning-free scanner or full-suite runtime claim.
+  A stale admission sample allowed one queued lint to start below the20GiB
+  floor; cancelled it143 and pending check130 through RCH. These are not passes.
+  Reused hz4's existing /dev/shm capacity with a non-clobbering warm-cache copy;
+  no resize, cleanup, quota, slot or guard changes. Normal RCH gates then passed
+  after fresh SBH admission. Dynamic scripted image copy was refused by dcg;
+  explicit checked copy commands completed safely without an override.
+- [x] Update existing specs/parity/TODO and Bead with actual evidence and limits.
+  Deliver this verified checkpoint by normal commit/push and reservation release;
+  the session result records the final delivery receipt.
+- [ ] Original full-workspace/harness/native, concurrent/mounted and outer-scope
+  acceptance remains outstanding; do not close original Beads prematurely.
+
 ### Reclaimed tmpfile capacity continuation — 2026-11-01 06:30 UTC
 
 - [x] Recheck full instructions/README, current source, owned P0, safe tracker
