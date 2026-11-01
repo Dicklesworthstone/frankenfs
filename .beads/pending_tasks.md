@@ -15,12 +15,25 @@ completed or handed off. Historical evidence remains in place.
 
 - [x] Operator directed SSH remediation using system-performance-remediation;
   read that skill and its reclaim/RCH references before changing workers.
-- [ ] Diagnose hz3, hz4 and vmi1149989 sequentially: actual volumes, PSI,
+- [x] Diagnose hz3, hz4 and vmi1149989 sequentially: actual volumes, PSI,
   writers, deleted-open files and pure/idle/unprotected build-output inventory.
   hz3 has low pressure and appropriate VM settings. Its journal is207MB;
   diagnostic sudo logging explains the writer sample, not a disk-space leak.
   Two64h-idle pure accounting targets total4464MiB; no source/evidence or
   protected directory qualifies for removal merely by being large or idle.
+  hz4 has only recent pure output or impure/protected old directories.
+  vmi1149989's active CASS source build grows the pure target while494files
+  remain open, then exits with root at zero available bytes. Its protected
+  release archives and impure hfdt outputs remain untouched. No applicable
+  CPU/memory/service failure justifies broad process or VM changes.
+- [x] Execute the hz3 guarded reclaim preview and a complete recursive marker
+  scan, including the root ancestor. Preview0 would reclaim2214+2250MiB,
+  idle64h; free space stays8061MiB. Both accounting AGENTS files have identical
+  hashes and repeat the exact-command deletion permission rule.
+- [ ] Obtain the required exact deletion authorization and final command
+  confirmation for only hz3's accounting-sjperf a/target and b/target.
+  The operator's SSH/skill instruction is recorded; no deletion command is
+  authorized by implication. An exact-path permission request is pending.
 - [ ] Restore disk headroom using the smallest authorized action; retain all
   source, tracker, CASS, evidence, protected paths and current peer work.
   Recheck purity, all protection markers and live use immediately before any
