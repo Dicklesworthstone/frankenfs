@@ -2936,6 +2936,15 @@ initialization flags and the search cursor. The new generation derives from
 the same snapshot ancestor used to update the slot. Retrying unpublished
 preparation must not replay an already-published namespace operation.
 
+Complete inode births, including unnamed files and symlinks, MUST stage against
+the exact available capacity across the single-lock and sharded movement
+ledgers. An inode freed by one allocator family remains available to the other.
+Both live ledgers, orphan state and reused-inode cache effects follow successful
+publication; errors before commit preserve them. Symlink target bytes and the
+parent entry belong to that same publication. Readers MUST distinguish inline
+target bytes from legacy block pointers using filesystem geometry and external
+EA accounting, including the EA_INODE feature's distinct classification rule.
+
 Dependency rationale: depends on `ffs-block` for reading/writing inode
 table blocks via ARC cache; depends on `ffs-ondisk` for `Ext4Inode`
 parsing and serialization.

@@ -1753,6 +1753,29 @@ their exact reconciled result after commit. Arbitrary outer-request composition
 and concurrent parent-ACL race qualification remain open; stable-parent tests
 alone cannot qualify those behaviors.
 
+### 9.11 Symlink storage and complete birth
+
+Supplemental source checked 2026-11-01: current upstream
+[`fs/ext4/inode.c`](https://github.com/torvalds/linux/blob/HEAD/fs/ext4/inode.c)
+(`ext4_inode_is_fast_symlink`) and
+[`fs/ext4/namei.c`](https://github.com/torvalds/linux/blob/HEAD/fs/ext4/namei.c)
+(`ext4_symlink`). This is not a verified v6.19 capture.
+
+- Writer-created inline targets leave room for NUL; a 60-byte target is stored
+  in a data block, including on filesystems without the extent feature.
+- Without EA_INODE, an inline symlink has no data allocation after subtracting
+  the external-EA cluster charge. A size-only test confuses legacy block
+  pointers with target bytes. Raw huge-file accounting uses filesystem units.
+- With EA_INODE, inode block counts can include EA-value storage; the kernel
+  instead distinguishes nonempty targets shorter than the inline field.
+- FrankenFS stages target allocation/data, the final inode and parent entry
+  in its existing complete birth transaction. A symlink does not inherit its
+  parent's default POSIX ACL. Counters consult both allocator ledgers, including
+  real retirement credits; publication and cache effects follow commit.
+- Both the live filesystem and standalone image reader must follow the
+  persisted storage mapping. Legacy targets use direct block pointers; a hole
+  is an error rather than pointer bytes presented as a target.
+
 ## 10. Checksums
 
 **Source:** `ext4.h` lines 2545-2548

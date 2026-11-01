@@ -776,13 +776,28 @@ exclusion. Staging failures discard all private state; typed conflicts retry
 the complete operation up to sixteen times. Existing link/reclaim and durability
 boundaries consume the published orphan state.
 
-Named transaction-backed create, mkdir and mknod share a birth transaction:
+The tmpfile working allocator starts from exact `single + sharded - seed`
+counts, just like a full named birth. A prevalidated publication plan can fund
+its debit from a retirement credit in either family. The plan remains private
+through inheritance failures and cancellation; only commit installs both ledgers
+and arms the runtime allocator-mode guard when sharded counts actually move.
+
+Named transaction-backed create, mkdir, mknod and symlink share a birth
+transaction:
 private allocation statistics, atomically captured/pinned snapshot, complete
 operation retries on typed conflicts (sixteen attempts), and postcommit cache
 publication. Inherited access/default ACLs use the same staging device as the
 inode body and parent directory entry. A child directory retains its unmasked
 default ACL before its mode-limited access ACL is computed. Parent mode/group
 and duplicate checks are read inside the operation's view.
+
+Symlink staging includes inline target encoding or legacy/extent-backed target
+allocation and data, then parent insertion through the supplied device. It does
+not inherit the parent's default POSIX ACL. Readers pass the parsed superblock
+to inline-target classification: without EA_INODE the data-block count excludes
+the external-EA cluster charge; with EA_INODE only nonempty targets shorter than
+the inline field qualify. This preserves valid zero-data-block 60-byte inline
+images while reading writer-created 60-byte legacy-mapped targets as block data.
 
 ACL-bearing parents route through this existing allocation exclusion even with
 the sharded toggle enabled. Ordinary sharded create/mkdir hold shared allocation

@@ -997,33 +997,37 @@ unknown ro_compat: 0xAB"
 
     #[test]
     fn inode_is_fast_symlink_short_target() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_superblock_region()).unwrap();
         let mut inode = make_inode(ffs_types::S_IFLNK | 0o777, 0);
         let target = b"/bin/sh";
         inode.size = target.len() as u64;
         inode.extent_bytes[..target.len()].copy_from_slice(target);
-        assert!(inode.is_fast_symlink());
-        assert_eq!(inode.fast_symlink_target(), Some(target.as_slice()));
+        assert!(inode.is_fast_symlink(&sb));
+        assert_eq!(inode.fast_symlink_target(&sb), Some(target.as_slice()));
     }
 
     #[test]
     fn inode_is_not_fast_symlink_with_extents() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_superblock_region()).unwrap();
         let mut inode = make_inode(ffs_types::S_IFLNK | 0o777, ffs_types::EXT4_EXTENTS_FL);
         inode.size = 10;
-        assert!(!inode.is_fast_symlink());
-        assert!(inode.fast_symlink_target().is_none());
+        assert!(!inode.is_fast_symlink(&sb));
+        assert!(inode.fast_symlink_target(&sb).is_none());
     }
 
     #[test]
     fn inode_is_not_fast_symlink_too_long() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_superblock_region()).unwrap();
         let mut inode = make_inode(ffs_types::S_IFLNK | 0o777, 0);
         inode.size = 61; // > 60 max
-        assert!(!inode.is_fast_symlink());
+        assert!(!inode.is_fast_symlink(&sb));
     }
 
     #[test]
     fn inode_fast_symlink_target_none_for_regular() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_superblock_region()).unwrap();
         let inode = make_inode(ffs_types::S_IFREG | 0o644, 0);
-        assert!(inode.fast_symlink_target().is_none());
+        assert!(inode.fast_symlink_target(&sb).is_none());
     }
 
     // ── Ext4Inode timestamp tests ──────────────────────────────────────

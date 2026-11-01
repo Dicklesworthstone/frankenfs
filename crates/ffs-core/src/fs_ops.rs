@@ -929,7 +929,10 @@ impl FsOps for OpenFs {
                     ));
                 }
 
-                if let Some(target) = inode.fast_symlink_target() {
+                let sb = self
+                    .ext4_superblock()
+                    .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+                if let Some(target) = inode.fast_symlink_target(sb) {
                     // Fast symlink: data is stored directly in the inode's block field.
                     Ok(target.to_vec())
                 } else {

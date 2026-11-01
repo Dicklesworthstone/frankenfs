@@ -57,6 +57,12 @@ operational readiness.
 - [ ] `bd-rchk5` performance baselines: re-measure representative throughput/latency targets against current code and record environment metadata.
 - [x] `bd-rchk6` mounted self-healing lifecycle: implemented explicit mounted automatic repair via `--background-repair --background-scrub-ledger <jsonl>`, with read-write repair routed through the mounted MVCC repair-writeback serializer.
 - [ ] `bd-rchk7` fuzz/conformance expansion: replace remaining open-ended corpus expansion notes with completed fixtures or narrow beads.
+- [~] `bd-vuzzq`/`bd-9rutw` namespace correctness continuation: complete births
+  now share protected transaction staging; qualify tmpfile/symlink reuse of
+  retirement credits on genuinely inode-full 1KiB/4KiB extent/legacy images,
+  including standalone-reader target bytes. Full-workspace, concurrent/mounted
+  and arbitrary outer-request acceptance remains open. Detailed execution TODO
+  and source-bound commands stay in the existing Bead and pending task list.
 - [x] `bd-hk5w3` device routing: CHUNK_TREE inventory selects readers before ROOT_TREE and feeds `FS_INFO` and `DEV_INFO`, including unused devices. Admission reconciles stale nonzero device counts in memory; the next full/tree-log commit publishes the correction. Clean attached-device reads, nested reads and RAID5/6 erasure recovery have kernel-image/library-FUSE and public CLI evidence. Explicit foreign-FSID seed attachment, frozen-generation binding and nested routing pass independent kernel-created seed/sprout public-CLI qualification. The final CRC32C/xxHash64 cohort passed 78 mounts and 82 refusals; all 42 affected core controls and the actual read-only OS descriptor control passed independently. `FEATURE_PARITY.md` records the source receipts and limits; the canonical read scope is unchanged.
 
 ### 0.2 `ffs-types` (Canonical Newtypes + Shared Parsing Primitives)

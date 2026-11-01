@@ -11,6 +11,84 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### Reclaimed tmpfile capacity continuation — 2026-11-01 06:30 UTC
+
+- [x] Recheck full instructions/README, current source, owned P0, safe tracker
+  triage and allocation ledgers; reserve existing implementation/doc surfaces.
+- [x] Add and run a real small-inode image regression: consume every inode with
+  full-path FIFOs, unlink one through sharded retirement, then require tmpfile
+  to reuse that free inode in exactly one publication. Real red0/1/0,
+  1691filtered,exit101: NoSpace although statfs and the bitmap have one free inode.
+  Exact worker/local source hashes match. Initial RCH103 admission refusal ran
+  no tests; the next normal admitted invocation executes the red.
+- [x] Reconcile tmpfile's private allocation counters and prevalidate both live
+  ledgers' publication; install counters and orphan effects only after commit.
+- [x] Verify cancellation/ACL failure preserves free capacity and orphan state;
+  exercise successful reuse, real exhaustion, last-close reclaim and link.
+  Preliminary sharded selection46/0/0,1646filtered,0.36s,command0; the real
+  capacity image and three native controls execute all checker phases/reopen.
+- [x] Cover the same real reclaimed-inode boundary for fast/slow symlinks;
+  execute red before changing production. Route symlink staging through the
+  existing complete birth helper for exact counters, protected snapshot, retry,
+  parent checks and postcommit cache publication, preserving target encoding.
+  Real separate symlink red0/1/0,1691filtered,exit101 at the first59-byte
+  symlink: NoSpace despite one real free inode. Shared birth routing then
+  passes46/0/0 on the original4KiB/extent profile. Expanding the same test to
+  1KiB/4KiB with and without extents exposes another real failure: 60-byte
+  legacy-mapped targets return pointer bytes. Both extent profiles pass native
+  checker/reopen; expanded total45pass/1fail/0ignored,1646filtered. Preserve
+  this red; fix storage classification using superblock geometry and EA_INODE
+  semantics, keeping the existing60-byte/zero-data-block inline assertion.
+- [x] Pass filesystem context through fast-symlink readers and block-map
+  selection; cover real indirect-profile bytes plus planted external-EA,
+  cluster/huge-file charge and EA_INODE classification controls. No gate's
+  expected value changes. First integration compile catches a static setattr
+  helper needing the same context; convert that existing helper to a method.
+  All four real profiles then pass50/0/0. Extending the same cold-image check
+  to the standalone reader exposes an actual InvalidMagic extent parse on the
+  legacy pointer0pass/1fail/0ignored,1691filtered. Add bounded direct-pointer
+  target reads and an explicit hole error; retain the4096-byte allocation cap.
+  Its first compile catches an unqualified BlockNumber; use the module's
+  existing ffs_types qualification. Final sharded selection50/0/0,
+  1642filtered,0.99s,command0. Seven real checker executions pass all5phases,
+  including four capacity profiles, and cold reopen plus standalone-reader
+  bytes match. Seven exact16/32MiB images are copied into existing artifacts.
+  Classifier EA-inode/cluster/huge-file checks remain planted unit controls;
+  they do not qualify live EA ownership or bigalloc workloads.
+- [x] Execute default/sharded focused controls, native checker/cold reopen,
+  required workspace compiler/lint/fmt and unchanged scanner; bind source.
+  Final core selections50/0/0 active-sharded,1642filtered,0.99s and42/0/0
+  default,1571filtered,0.64s. Complete library suites: facade225/0/0,
+  FUSE715/0/1existing ignore and ondisk956/0/0, each0filtered. Actual FUSE
+  mount returns early with fusermount3 Permission denied; no mount credit.
+  Thirteen16/32MiB native images execute all5checker phases and cold reopen;
+  all13copied images (234881024bytes) match worker SHA256, and8actual capacity
+  superblocks match the requested1KiB/4KiB extent/legacy profiles. Nine exact
+  source/lock/toolchain bindings match both workers. Workspace/all-target check0
+  (1m42s Cargo), strict feature Clippy0 (10m33s cold Cargo), fmt/whitespace0.
+  Strict default Clippy passes0 (3m13s Cargo). A queued default test attempt
+  expires103 behind the cold lint job; its later admitted42-case rerun passes.
+  Initial final-run admission refusals and two integration compile failures
+  remain captured. The first pre-fmt checksum manifest was premature; a failed
+  comparison caught it and final post-fmt source bindings replace that claim.
+  UBS retains the pinned5.5.26 runner/assets and every rule: core0critical/
+  16030warnings/3214info, ondisk0/2908/276, fs_ops0/86/61, facade0/707/17,
+  each exits0. The harness scan exits1 with1critical/32warnings/14info at
+  unchanged has_command(name), whose only callers pass fixed mkfs.ext4/debugfs
+  literals. Triage as an existing false positive; no suppressions/gate edits.
+  A retained HEAD copy confirms the same flag; its artifact path also causes
+  two test-panic flags, so aggregate before/after counts are not comparable.
+- [x] Update existing specs/parity, TODO and Bead with exact evidence/limits,
+  checkpoint and publish verified work, then release reservations.
+  The existing Bead contains the exact commands, source/image bindings, all
+  actual failures and fresh process/real-work/honesty dispositions. Verification
+  is solo. No item/dependency was created or closed; no original acceptance was
+  reduced or moved. Source patch and13images remain in the existing artifact
+  directory. Final checkpoint/publication and reservation release are recorded
+  in the session completion; original full-workspace acceptance stays open.
+- [ ] Original full-workspace/native, concurrent/mounted and outer-request
+  composition acceptance remains outstanding; do not close original Beads.
+
 ### Ordinary sharded birth continuation — 2026-11-01 05:09 UTC
 
 - [x] Recheck current main, original P0 ownership, raw queue/cycles and remote

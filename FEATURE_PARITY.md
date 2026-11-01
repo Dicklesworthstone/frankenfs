@@ -1,5 +1,30 @@
 # FEATURE_PARITY
 
+> **Reclaimed capacity and symlink storage (2026-11-01):** tmpfile and symlink
+> births can now spend inode credits returned through the other allocator
+> family. A real inode-full image reproduced false ENOSPC for each operation
+> before correction. Tmpfile uses private reconciled counts and postcommit
+> redistribution; symlinks use the existing complete birth transaction,
+> including target allocation/data, protected snapshot and bounded conflict retry.
+> Expanded testing also exposed 60-byte legacy-mapped targets returned as pointer
+> bytes, then standalone-reader extent parsing of those pointers. Storage
+> classification now takes filesystem geometry and EA accounting; standalone
+> reads follow direct pointers and reject holes. Existing inline-boundary and
+> harness assertions retain their expected values.
+> Final focused controls pass 50/0/0 with sharded allocation and 42/0/0 by
+> default. Each run fills real 1KiB/4KiB extent/legacy images, unlinks an inode,
+> reuses it, checks failure rollback, then validates native checker, cold reopen
+> and standalone-reader bytes. EA-inode, cluster and huge-file classifier cases
+> are planted unit controls, not live ownership/bigalloc qualification.
+> The three full library suites pass 956 parser, 225 facade and 715 FUSE cases
+> (one existing FUSE ignore); actual mount still returns early on permission
+> denial. Thirteen native checker images retain matching worker/local hashes.
+> Workspace/all-target check, strict default/sharded Clippy and formatting pass.
+> Unchanged UBS rules report zero critical findings in changed product files;
+> the harness retains its pre-existing fixed-command-probe false positive.
+> Original `bd-vuzzq`/`bd-9rutw` full-suite, concurrent/mounted and arbitrary
+> outer-request acceptance remains open; no parity percentage or speedup is added.
+
 > **Atomic named ext4 births (2026-11-01):** ordinary sharded create/mkdir now
 > retain one group lock and shared allocation exclusion through a protected
 > snapshot transaction. Inode allocation/body, directory initialization/growth,

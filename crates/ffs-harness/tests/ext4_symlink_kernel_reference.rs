@@ -246,7 +246,7 @@ fn ext4_symlink_kernel_reference_targets_match_debugfs() {
 
         // Cross-check against e2fsprogs: fast symlinks expose the target in
         // `debugfs stat`; extent-mapped ones must be dumped from data blocks.
-        let kernel_target = if inode.is_fast_symlink() {
+        let kernel_target = if inode.is_fast_symlink(&reader.sb) {
             fast_count += 1;
             assert_eq!(
                 inode.size,

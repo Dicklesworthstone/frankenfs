@@ -3319,20 +3319,42 @@ impl Ext4Inode {
 
     /// Whether this is a "fast" (inline) symlink stored in the inode's i_block area.
     ///
-    /// ext4 stores short symlink targets (up to 60 bytes) directly in the
-    /// `i_block` field of the inode rather than in separate data blocks.
-    /// This is detected by: symlink type + no extents flag + size <= 60.
+    /// Without EA_INODE, inline storage has no data blocks after subtracting
+    /// the external xattr cluster's charge. Size alone cannot distinguish a
+    /// 60-byte legacy block-backed target from inline bytes. With EA_INODE,
+    /// Linux instead uses the nonempty, strictly-shorter-than-i_block rule
+    /// because EA values can contribute additional blocks to the inode.
     #[must_use]
-    pub fn is_fast_symlink(&self) -> bool {
-        self.is_symlink() && !self.uses_extents() && self.size <= EXT4_FAST_SYMLINK_MAX as u64
+    pub fn is_fast_symlink(&self, sb: &Ext4Superblock) -> bool {
+        if !self.is_symlink()
+            || self.uses_extents()
+            || self.flags & ffs_types::EXT4_INLINE_DATA_FL != 0
+            || self.size > EXT4_FAST_SYMLINK_MAX as u64
+        {
+            return false;
+        }
+        if sb.feature_incompat.contains(Ext4IncompatFeatures::EA_INODE) {
+            return self.size != 0 && self.size < EXT4_FAST_SYMLINK_MAX as u64;
+        }
+        let ea_blocks = if self.file_acl == 0 {
+            0
+        } else {
+            let unit = if self.is_huge_file() {
+                sb.block_size
+            } else {
+                512
+            };
+            u64::from(sb.cluster_size / unit)
+        };
+        self.blocks == ea_blocks
     }
 
     /// Read the target of a fast (inline) symlink from the inode's extent_bytes.
     ///
     /// Returns `None` if this is not a fast symlink.
     #[must_use]
-    pub fn fast_symlink_target(&self) -> Option<&[u8]> {
-        if !self.is_fast_symlink() {
+    pub fn fast_symlink_target(&self, sb: &Ext4Superblock) -> Option<&[u8]> {
+        if !self.is_fast_symlink(sb) {
             return None;
         }
         // is_fast_symlink guarantees size <= 60, so this cast is safe
@@ -5759,11 +5781,10 @@ impl Ext4ImageReader {
         }
 
         // Fast symlink: target stored in i_block area
-        if let Some(target) = inode.fast_symlink_target() {
+        if let Some(target) = inode.fast_symlink_target(&self.sb) {
             return Ok(target.to_vec());
         }
 
-        // Extent-mapped symlink: read via normal file data path
         let size = usize::try_from(inode.size)
             .map_err(|_| ParseError::IntegerConversion { field: "i_size" })?;
 
@@ -5777,6 +5798,24 @@ impl Ext4ImageReader {
         }
 
         let mut buf = vec![0_u8; size];
+        if !inode.uses_extents() {
+            // At most 4096 bytes on a filesystem with blocks >= 1024 bytes:
+            // every target block fits in the twelve direct i_block pointers.
+            let block_size = self.sb.block_size as usize;
+            for (index, chunk) in buf.chunks_mut(block_size).enumerate() {
+                let physical = read_le_u32(&inode.extent_bytes, index * 4)?;
+                if physical == 0 {
+                    return Err(ParseError::InvalidField {
+                        field: "i_block",
+                        reason: "symlink target contains an unmapped block",
+                    });
+                }
+                let data = self.read_block(image, ffs_types::BlockNumber(u64::from(physical)))?;
+                chunk.copy_from_slice(&data[..chunk.len()]);
+            }
+            return Ok(buf);
+        }
+        // Extent-mapped symlink: read via normal file data path.
         let n = self.read_inode_data(image, inode, 0, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
@@ -13208,6 +13247,9 @@ mod tests {
 
     #[test]
     fn is_fast_symlink_respects_size_boundary_and_conditions() {
+        let mut sb = Ext4ImageReader::new(&build_symlink_test_image())
+            .unwrap()
+            .sb;
         let make = |mode: u16, size: u64, flags: u32| Ext4Inode {
             mode,
             uid: 0,
@@ -13240,19 +13282,60 @@ mod tests {
         let regular = 0o100_000_u16; // S_IFREG
 
         // Size boundary: 60 bytes is an inline (fast) symlink, 61 is a slow one.
-        assert!(make(symlink, 60, 0).is_fast_symlink());
-        assert!(!make(symlink, 61, 0).is_fast_symlink());
+        assert!(make(symlink, 60, 0).is_fast_symlink(&sb));
+        assert!(!make(symlink, 61, 0).is_fast_symlink(&sb));
 
         // A symlink that uses extents is never fast (target lives in blocks).
-        assert!(!make(symlink, 10, EXT4_EXTENTS_FL).is_fast_symlink());
+        assert!(!make(symlink, 10, EXT4_EXTENTS_FL).is_fast_symlink(&sb));
 
         // A non-symlink is never a fast symlink.
-        assert!(!make(regular, 10, 0).is_fast_symlink());
+        assert!(!make(regular, 10, 0).is_fast_symlink(&sb));
 
         // fast_symlink_target follows is_fast_symlink.
-        assert!(make(symlink, 60, 0).fast_symlink_target().is_some());
-        assert!(make(symlink, 61, 0).fast_symlink_target().is_none());
-        assert!(make(regular, 10, 0).fast_symlink_target().is_none());
+        assert!(make(symlink, 60, 0).fast_symlink_target(&sb).is_some());
+        assert!(make(symlink, 61, 0).fast_symlink_target(&sb).is_none());
+        assert!(make(regular, 10, 0).fast_symlink_target(&sb).is_none());
+
+        // The same size can describe inline text or a legacy block pointer.
+        for block_size in [1024, 4096] {
+            sb.block_size = block_size;
+            sb.cluster_size = block_size;
+            let mut slow = make(symlink, 60, 0);
+            slow.blocks = u64::from(block_size / 512);
+            assert!(!slow.is_fast_symlink(&sb));
+            assert!(slow.fast_symlink_target(&sb).is_none());
+
+            let mut fast = make(symlink, 59, 0);
+            fast.file_acl = 100;
+            fast.blocks = u64::from(block_size / 512);
+            assert!(fast.is_fast_symlink(&sb), "external EA charge is not data");
+            slow.file_acl = 100;
+            slow.blocks *= 2;
+            assert!(!slow.is_fast_symlink(&sb), "data remains after EA charge");
+
+            sb.cluster_size *= 4;
+            fast.blocks *= 4;
+            assert!(fast.is_fast_symlink(&sb), "EA charge uses cluster geometry");
+            fast.flags |= ffs_types::EXT4_HUGE_FILE_FL;
+            fast.blocks = 4;
+            assert!(
+                fast.is_fast_symlink(&sb),
+                "huge-file raw blocks use fs units"
+            );
+            fast.flags |= ffs_types::EXT4_INLINE_DATA_FL;
+            assert!(!fast.is_fast_symlink(&sb), "inline-data format is separate");
+        }
+        sb.feature_incompat.0 |= Ext4IncompatFeatures::EA_INODE.0;
+        let mut ea = make(symlink, 59, 0);
+        ea.blocks = 100;
+        assert!(
+            ea.is_fast_symlink(&sb),
+            "EA-inode value blocks are not target data"
+        );
+        ea.size = 60;
+        assert!(!ea.is_fast_symlink(&sb));
+        ea.size = 0;
+        assert!(!ea.is_fast_symlink(&sb));
     }
 
     #[test]
@@ -13294,10 +13377,10 @@ mod tests {
             .unwrap();
 
         assert!(link_inode.is_symlink());
-        assert!(link_inode.is_fast_symlink());
+        assert!(link_inode.is_fast_symlink(&reader.sb));
         assert!(!link_inode.uses_extents());
 
-        let target = link_inode.fast_symlink_target().unwrap();
+        let target = link_inode.fast_symlink_target(&reader.sb).unwrap();
         assert_eq!(target, b"hello.txt");
 
         let target_via_reader = reader.read_symlink(&image, &link_inode).unwrap();
@@ -13314,11 +13397,48 @@ mod tests {
             .unwrap();
 
         assert!(link_inode.is_symlink());
-        assert!(!link_inode.is_fast_symlink()); // has extents flag
+        assert!(!link_inode.is_fast_symlink(&reader.sb)); // has extents flag
         assert!(link_inode.uses_extents());
 
         let target = reader.read_symlink(&image, &link_inode).unwrap();
         assert_eq!(target, b"/subdir/deep.txt");
+    }
+
+    #[test]
+    fn legacy_mapped_symlink_reading_and_errors() {
+        let mut image = build_symlink_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+        let mut inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(14))
+            .unwrap();
+        inode.blocks = 8;
+        inode.extent_bytes.fill(0);
+        inode.extent_bytes[..4].copy_from_slice(&50_u32.to_le_bytes());
+        image[50 * 4096..51 * 4096].fill(b't');
+        for len in [1_usize, 59, 60, 61, 4096] {
+            inode.size = u64::try_from(len).unwrap();
+            assert_eq!(
+                reader.read_symlink(&image, &inode).unwrap(),
+                vec![b't'; len]
+            );
+        }
+        inode.size = 60;
+        inode.extent_bytes[..4].fill(0);
+        assert!(matches!(
+            reader.read_symlink(&image, &inode),
+            Err(ParseError::InvalidField {
+                field: "i_block",
+                ..
+            })
+        ));
+        inode.size = 4097;
+        assert!(matches!(
+            reader.read_symlink(&image, &inode),
+            Err(ParseError::InvalidField {
+                field: "i_size",
+                ..
+            })
+        ));
     }
 
     #[test]

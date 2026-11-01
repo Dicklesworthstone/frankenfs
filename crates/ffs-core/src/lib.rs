@@ -9751,9 +9751,22 @@ impl OpenFs {
         let mut alloc = alloc_mutex.write();
         for attempt in 1..=MAX_ATTEMPTS {
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let sharded = self
+                .ext4_sharded_alloc
+                .as_ref()
+                .filter(|_| self.bhh0i_sharded_ops_active());
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let groups = if let Some(sharded) = sharded {
+                sharded.birth_group_stats(&alloc.groups)?
+            } else {
+                alloc.groups.clone()
+            };
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            let groups = alloc.groups.clone();
             let mut working = Ext4AllocState {
                 geo: alloc.geo.clone(),
-                groups: alloc.groups.clone(),
+                groups,
                 persist_ctx: alloc.persist_ctx.clone(),
             };
             let (mut txn, snapshot_dev) =
@@ -9801,6 +9814,13 @@ impl OpenFs {
                 Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                 Err(error) => return Err(error),
             };
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let publication = sharded
+                .map(|sharded| {
+                    sharded.prepare_birth_publication(&alloc.groups, working.groups.clone())
+                })
+                .transpose()?;
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let txn_id = txn.id();
             let write_blocks = if self.repair_flush_lifecycle.is_some() {
                 txn.write_set().keys().copied().collect()
@@ -9813,6 +9833,14 @@ impl OpenFs {
                     Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                     Err(error) => return Err(error),
                 };
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            if let Some((sharded, plan)) = sharded.zip(publication) {
+                let sharded_moved = plan.moves_sharded_counts();
+                working.groups = sharded.publish_birth(plan);
+                if sharded_moved {
+                    self.note_sharded_alloc_happened();
+                }
+            }
             alloc.groups = working.groups;
             self.ext4_write_orphan_head(head);
             self.ext4_pending_orphans.lock().insert(ino.0);
@@ -22097,7 +22125,7 @@ impl OpenFs {
         // An indirect block map grows inside its pointer blocks without
         // changing `i_block`, so the root-keyed snapshot cannot tell its
         // versions apart: always re-walk it.
-        if Self::ext4_inode_block_map_is_indirect(inode) {
+        if self.ext4_inode_block_map_is_indirect(inode) {
             return Ok(Arc::from(
                 self.collect_extents_with_scope(cx, scope, inode)?,
             ));
@@ -22157,7 +22185,7 @@ impl OpenFs {
         inode: &Ext4Inode,
         from_block: u32,
     ) -> Result<Vec<Ext4Extent>, FfsError> {
-        if Self::ext4_inode_block_map_is_indirect(inode) {
+        if self.ext4_inode_block_map_is_indirect(inode) {
             let mut runs = self.ext4_indirect_runs(cx, scope, inode)?;
             runs.retain(|run| run.logical_block + u32::from(run.actual_len()) > from_block);
             return Ok(runs);
@@ -23457,7 +23485,10 @@ impl OpenFs {
         }
         Self::ext4_reject_encrypted(inode)?;
         // Fast symlink: target stored inline in extent_bytes
-        if let Some(target) = inode.fast_symlink_target() {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        if let Some(target) = inode.fast_symlink_target(sb) {
             let mut buf = target.to_vec();
             if let Some(pos) = first_nul(&buf) {
                 buf.truncate(pos);
@@ -25401,7 +25432,7 @@ impl OpenFs {
     /// directory or slow symlink without `EXTENTS_FL`, inline data or e2compr
     /// (whose `i_block` slots hold a compressed-cluster sentinel). A device
     /// node's or fast symlink's `i_block` is not a block map at all.
-    fn ext4_inode_block_map_is_indirect(inode: &Ext4Inode) -> bool {
+    fn ext4_inode_block_map_is_indirect(&self, inode: &Ext4Inode) -> bool {
         const NOT_POINTERS: u32 = ffs_types::EXT4_EXTENTS_FL
             | ffs_types::EXT4_INLINE_DATA_FL
             | ffs_types::EXT4_COMPR_FL
@@ -25411,7 +25442,9 @@ impl OpenFs {
         }
         match inode.mode & 0xF000 {
             0x8000 | 0x4000 => true,
-            0xA000 => !inode.is_fast_symlink(),
+            0xA000 => self
+                .ext4_superblock()
+                .is_some_and(|sb| !inode.is_fast_symlink(sb)),
             _ => false,
         }
     }
@@ -30198,7 +30231,7 @@ impl OpenFs {
             cx,
             dev,
             backend,
-            Self::ext4_inode_block_map_is_indirect(inode),
+            self.ext4_inode_block_map_is_indirect(inode),
             &mut root,
             Ext4Extent {
                 logical_block: 0,
@@ -30511,7 +30544,7 @@ impl OpenFs {
                     physical_start: dir_alloc.start.0,
                 };
                 let mut root_bytes = Self::extent_root(&new_inode);
-                if Self::ext4_inode_block_map_is_indirect(&new_inode) {
+                if self.ext4_inode_block_map_is_indirect(&new_inode) {
                     // No EXTENTS feature: the first block is direct pointer i_block[0].
                     let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
                     Self::ext4_dir_map_extent(
@@ -31325,7 +31358,7 @@ impl OpenFs {
         // counts only the new directory data block. Read via `dev` so the
         // freshly-staged tree blocks in this txn are visible (bd-kyp2q). The
         // common case (tree still inline) costs no device reads (depth 0 → 0).
-        let indirect = Self::ext4_inode_block_map_is_indirect(&parent_upd);
+        let indirect = self.ext4_inode_block_map_is_indirect(&parent_upd);
         let dir_meta_before =
             Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         Self::ext4_dir_map_extent(
@@ -31571,7 +31604,7 @@ impl OpenFs {
             Some(parent),
         );
         let parent_extent_ns = extent_cache_namespace(&parent_upd);
-        let indirect = Self::ext4_inode_block_map_is_indirect(&parent_upd);
+        let indirect = self.ext4_inode_block_map_is_indirect(&parent_upd);
         let dir_meta_before =
             Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         Self::ext4_dir_map_extent(
@@ -31796,7 +31829,7 @@ impl OpenFs {
             Some(parent),
         );
         let parent_extent_ns = extent_cache_namespace(&parent_upd);
-        let indirect = Self::ext4_inode_block_map_is_indirect(&parent_upd);
+        let indirect = self.ext4_inode_block_map_is_indirect(&parent_upd);
         let dir_meta_before =
             Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         Self::ext4_dir_map_extent(
@@ -32063,7 +32096,7 @@ impl OpenFs {
         // directory: the per-logical-block inserts below grow the tree and the
         // tail truncate may shrink it, neither charged by the data-block delta.
         // Read via `dev` so the txn-staged tree blocks are visible (bd-kyp2q).
-        let indirect = Self::ext4_inode_block_map_is_indirect(&parent_upd);
+        let indirect = self.ext4_inode_block_map_is_indirect(&parent_upd);
         let dir_meta_before =
             Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         let mut allocated: u32 = 0;
@@ -33110,9 +33143,6 @@ impl OpenFs {
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         Self::validate_single_path_component(name)?;
-        let alloc_mutex = self.require_alloc_state()?;
-        let block_dev = self.block_device_adapter();
-        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
         let target_bytes = target.as_os_str().as_encoded_bytes();
         let fast_storage = ext4_symlink_target_is_fast(target_bytes.len());
 
@@ -33128,198 +33158,157 @@ impl OpenFs {
         }
         let csum_seed = sb.csum_seed();
 
-        let mut alloc = alloc_mutex.write();
-        let parent_inode = self.read_inode(cx, parent)?;
-        if !parent_inode.is_dir() {
-            return Err(FfsError::NotDirectory);
-        }
-        let htree_dedup_covers = parent_inode.has_htree_index()
-            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
-            && Self::htree_create_dedup_enabled();
-        if !htree_dedup_covers && self.lookup_name(cx, &parent_inode, name)?.is_some() {
-            return Err(FfsError::Exists);
-        }
-        let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
-                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-        );
-
-        // Namespace publication owns this transaction, including the target's
-        // allocation and data. Do not send a newly created inode through the
-        // older FUSE request transaction: its snapshot predates inode creation,
-        // and a separate directory commit can conflict with its staged inode.
-        // Keep the allocator locked until commit, restoring its cached state on
-        // any pre-publication failure. No compensating on-disk deletes are needed.
-        let groups_before = alloc.groups.clone();
-        let mut txn = self.mvcc_store.begin();
-        let staged = (|| -> ffs_error::Result<(InodeNumber, Ext4Inode)> {
-            let (ino, inode) = {
-                let tx_dev = TransactionBlockAdapter {
-                    base: &block_dev,
-                    tx: Mutex::new(&mut txn),
+        // The common birth boundary owns target allocation and namespace
+        // publication, including exact counters and whole-operation retries.
+        // Symlinks do not inherit a parent's default POSIX ACL.
+        let attr =
+            self.ext4_birth_transaction(cx, |tx_dev, alloc, (tstamp_secs, tstamp_nanos)| {
+                let parent_inode = self.ext4_birth_parent(cx, tx_dev, alloc, parent, name)?;
+                let parent_group = ffs_types::inode_to_group(parent, alloc.geo.inodes_per_group);
+                let gid = if parent_inode.mode & 0o2000 != 0 {
+                    parent_inode.gid
+                } else {
+                    gid
                 };
-                let Ext4AllocState {
-                    geo,
-                    groups,
-                    persist_ctx,
-                } = &mut *alloc;
-                let (ino, mut inode) = ffs_inode::prepare_inode(
+                let (ino, inode) = {
+                    let Ext4AllocState {
+                        geo,
+                        groups,
+                        persist_ctx,
+                    } = &mut *alloc;
+                    let (ino, mut inode) = ffs_inode::prepare_inode(
+                        cx,
+                        tx_dev,
+                        geo,
+                        groups,
+                        ffs_inode::file_type::S_IFLNK | 0o777,
+                        uid,
+                        gid,
+                        parent_group,
+                        tstamp_secs,
+                        tstamp_nanos,
+                        persist_ctx,
+                    )?;
+                    if fast_storage {
+                        inode.flags &= !EXT4_EXTENTS_FL;
+                        inode
+                            .extent_bytes
+                            .resize(ffs_types::EXT4_FAST_SYMLINK_MAX, 0);
+                        inode.extent_bytes.fill(0);
+                        inode.extent_bytes[..target_bytes.len()].copy_from_slice(target_bytes);
+                        inode.blocks = 0;
+                    } else if inode.flags & EXT4_EXTENTS_FL == 0 {
+                        // No EXTENTS feature (ext2/ext3): the target block is
+                        // direct pointer i_block[0], as ext4_symlink maps it.
+                        let hint = self.numa_allocation_hint(
+                            geo,
+                            AllocHint::default(),
+                            "ext4_symlink",
+                            Some(ino),
+                        );
+                        let block = ffs_alloc::alloc_blocks_persist(
+                            cx,
+                            tx_dev,
+                            geo,
+                            groups,
+                            1,
+                            &hint,
+                            persist_ctx,
+                        )?
+                        .start;
+                        let mut data = vec![0; block_size];
+                        data[..target_bytes.len()].copy_from_slice(target_bytes);
+                        tx_dev.write_block(cx, block, &data)?;
+                        let ptr = u32::try_from(block.0).map_err(|_| {
+                            FfsError::InvalidGeometry(format!(
+                                "symlink block {} exceeds the 32-bit pointer range",
+                                block.0
+                            ))
+                        })?;
+                        inode.extent_bytes.resize(60, 0);
+                        inode.extent_bytes.fill(0);
+                        inode.extent_bytes[..4].copy_from_slice(&ptr.to_le_bytes());
+                        inode.blocks = Self::ext4_checked_inode_blocks_delta(
+                            0,
+                            ino,
+                            i128::from(sb.block_size / EXT4_SECTOR_SIZE),
+                        )?;
+                    } else {
+                        let mut root_bytes = Self::extent_root(&inode);
+                        let hint = self.numa_allocation_hint(
+                            geo,
+                            AllocHint::default(),
+                            "ext4_symlink",
+                            Some(ino),
+                        );
+                        let mapping = ffs_extent::allocate_extent_coalescing(
+                            cx,
+                            tx_dev,
+                            &mut root_bytes,
+                            geo,
+                            groups,
+                            0,
+                            1,
+                            &hint,
+                            persist_ctx,
+                            ffs_extent::ExtentOwner {
+                                ino: u32::try_from(ino.0).map_err(|_| {
+                                    FfsError::Format("symlink inode exceeds u32".into())
+                                })?,
+                                generation: inode.generation,
+                            },
+                        )?;
+                        let mut data = vec![0; block_size];
+                        data[..target_bytes.len()].copy_from_slice(target_bytes);
+                        tx_dev.write_block(cx, BlockNumber(mapping.physical_start), &data)?;
+                        let metadata_blocks = Self::ext4_count_extent_tree_meta_blocks_via_dev(
+                            cx,
+                            tx_dev,
+                            &root_bytes,
+                        )?;
+                        Self::set_extent_root(&mut inode, &root_bytes);
+                        inode.blocks = Self::ext4_checked_inode_blocks_delta(
+                            0,
+                            ino,
+                            (i128::from(mapping.count) + i128::from(metadata_blocks))
+                                * i128::from(sb.block_size / EXT4_SECTOR_SIZE),
+                        )?;
+                    }
+                    inode.size = u64::try_from(target_bytes.len()).map_err(|_| {
+                        FfsError::Format("symlink target length does not fit u64".to_owned())
+                    })?;
+                    ffs_inode::write_inode(cx, tx_dev, geo, groups, ino, &inode, csum_seed)?;
+                    (ino, inode)
+                };
+                let mut backend = SingleLockDirAlloc { alloc };
+                self.ext4_insert_dir_entry_from_device(
                     cx,
-                    &tx_dev,
-                    geo,
-                    groups,
-                    ffs_inode::file_type::S_IFLNK | 0o777,
-                    uid,
-                    gid,
-                    parent_group,
+                    tx_dev,
+                    &mut backend,
+                    parent,
+                    &parent_inode,
+                    name,
+                    ino,
+                    Ext4FileType::Symlink,
+                    csum_seed,
                     tstamp_secs,
                     tstamp_nanos,
-                    persist_ctx,
                 )?;
-                self.forget_ext4_inode_caches(ino);
-                if fast_storage {
-                    inode.flags &= !EXT4_EXTENTS_FL;
-                    inode
-                        .extent_bytes
-                        .resize(ffs_types::EXT4_FAST_SYMLINK_MAX, 0);
-                    inode.extent_bytes.fill(0);
-                    inode.extent_bytes[..target_bytes.len()].copy_from_slice(target_bytes);
-                    inode.blocks = 0;
-                } else if inode.flags & EXT4_EXTENTS_FL == 0 {
-                    // No EXTENTS feature (ext2/ext3): the target block is
-                    // direct pointer i_block[0], as ext4_symlink maps it.
-                    let hint = self.numa_allocation_hint(
-                        geo,
-                        AllocHint::default(),
-                        "ext4_symlink",
-                        Some(ino),
-                    );
-                    let block = ffs_alloc::alloc_blocks_persist(
-                        cx,
-                        &tx_dev,
-                        geo,
-                        groups,
-                        1,
-                        &hint,
-                        persist_ctx,
-                    )?
-                    .start;
-                    let mut data = vec![0; block_size];
-                    data[..target_bytes.len()].copy_from_slice(target_bytes);
-                    tx_dev.write_block(cx, block, &data)?;
-                    let ptr = u32::try_from(block.0).map_err(|_| {
-                        FfsError::InvalidGeometry(format!(
-                            "symlink block {} exceeds the 32-bit pointer range",
-                            block.0
-                        ))
-                    })?;
-                    inode.extent_bytes.resize(60, 0);
-                    inode.extent_bytes.fill(0);
-                    inode.extent_bytes[..4].copy_from_slice(&ptr.to_le_bytes());
-                    inode.blocks = Self::ext4_checked_inode_blocks_delta(
-                        0,
-                        ino,
-                        i128::from(sb.block_size / EXT4_SECTOR_SIZE),
-                    )?;
-                } else {
-                    let mut root_bytes = Self::extent_root(&inode);
-                    let hint = self.numa_allocation_hint(
-                        geo,
-                        AllocHint::default(),
-                        "ext4_symlink",
-                        Some(ino),
-                    );
-                    let mapping = ffs_extent::allocate_extent_coalescing(
-                        cx,
-                        &tx_dev,
-                        &mut root_bytes,
-                        geo,
-                        groups,
-                        0,
-                        1,
-                        &hint,
-                        persist_ctx,
-                        ffs_extent::ExtentOwner {
-                            ino: u32::try_from(ino.0).map_err(|_| {
-                                FfsError::Format("symlink inode exceeds u32".into())
-                            })?,
-                            generation: inode.generation,
-                        },
-                    )?;
-                    let mut data = vec![0; block_size];
-                    data[..target_bytes.len()].copy_from_slice(target_bytes);
-                    tx_dev.write_block(cx, BlockNumber(mapping.physical_start), &data)?;
-                    let metadata_blocks =
-                        Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, &tx_dev, &root_bytes)?;
-                    Self::set_extent_root(&mut inode, &root_bytes);
-                    inode.blocks = Self::ext4_checked_inode_blocks_delta(
-                        0,
-                        ino,
-                        (i128::from(mapping.count) + i128::from(metadata_blocks))
-                            * i128::from(sb.block_size / EXT4_SECTOR_SIZE),
-                    )?;
-                }
-                inode.size = u64::try_from(target_bytes.len()).map_err(|_| {
-                    FfsError::Format("symlink target length does not fit u64".to_owned())
-                })?;
-                ffs_inode::write_inode(cx, &tx_dev, geo, groups, ino, &inode, csum_seed)?;
-                (ino, inode)
-            };
-            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-            self.ext4_stage_dir_entry(
-                cx,
-                &mut txn,
-                &mut backend,
-                parent,
-                &parent_inode,
-                name,
-                ino,
-                Ext4FileType::Symlink,
-                csum_seed,
-                tstamp_secs,
-                tstamp_nanos,
-            )?;
-            Ok((ino, inode))
-        })();
-        let (ino, symlink_inode) = match staged {
-            Ok(created) => created,
-            Err(err) => {
-                alloc.groups = groups_before;
-                return Err(err);
-            }
-        };
-        let txn_id = txn.id();
-        let write_blocks = if self.repair_flush_lifecycle.is_some() {
-            txn.write_set().keys().copied().collect()
-        } else {
-            Vec::new()
-        };
-        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
-        {
-            Ok(seq) => seq,
-            Err(err) => {
-                alloc.groups = groups_before;
-                return Err(err);
-            }
-        };
-        drop(alloc);
-        self.prune_mvcc_after_commit_if_due(commit_seq);
-        // A notification failure is post-commit: never restore allocator state
-        // after the namespace and its allocated blocks have become visible.
-        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
+                Ok((ino, inode))
+            })?;
 
         debug!(
             target: "ffs::write",
             op = "symlink",
             parent = parent.0,
-            ino = ino.0,
+            ino = attr.ino.0,
             name = %String::from_utf8_lossy(name),
             target = %target.to_string_lossy(),
             storage = if fast_storage { "fast" } else { "slow" },
             "symlink created"
         );
 
-        Ok(inode_to_attr(sb, ino, &symlink_inode))
+        Ok(attr)
     }
 
     /// Preallocate or punch file space.
@@ -35457,7 +35446,7 @@ impl OpenFs {
         inode: &Ext4Inode,
     ) -> ffs_error::Result<Vec<Ext4Extent>> {
         Self::ext4_reject_inline_data_dir(inode)?;
-        if Self::ext4_inode_block_map_is_indirect(inode) {
+        if self.ext4_inode_block_map_is_indirect(inode) {
             return self.ext4_indirect_runs_using(inode, &|block| {
                 dev.read_block(cx, block).map(BlockBuf::into_inner)
             });
@@ -36434,7 +36423,7 @@ impl OpenFs {
         Self::ext4_reject_immutable_or_append(inode)?;
         let old_size = inode.size;
         if let Some(size) = attrs.size {
-            Self::ext4_stage_setattr_size(cx, dev, alloc, ino, inode, size)?;
+            self.ext4_stage_setattr_size(cx, dev, alloc, ino, inode, size)?;
         }
         if let Some(mode) = attrs.mode {
             inode.mode = (inode.mode & 0xF000) | (mode & 0o7777);
@@ -36468,6 +36457,7 @@ impl OpenFs {
     /// combined path refuses storage layouts it cannot update atomically.
     #[allow(clippy::too_many_lines)]
     fn ext4_stage_setattr_size(
+        &self,
         cx: &Cx,
         dev: &dyn BlockDevice,
         alloc: &mut Ext4AllocState,
@@ -36501,7 +36491,7 @@ impl OpenFs {
             ));
         }
         let uses_extents = inode.flags & ffs_types::EXT4_EXTENTS_FL != 0;
-        if !uses_extents && !Self::ext4_inode_block_map_is_indirect(inode) {
+        if !uses_extents && !self.ext4_inode_block_map_is_indirect(inode) {
             return Err(FfsError::UnsupportedFeature(
                 "atomic setattr cannot interpret this ext4 block map".into(),
             ));
@@ -75534,6 +75524,252 @@ mod tests {
     }
 
     #[test]
+    fn ext4_tmpfile_atomic_reuses_retired_inode_at_capacity() {
+        use std::io::{Seek as _, Write as _};
+
+        for (block_size, extents) in [(4096, true), (1024, true), (4096, false), (1024, false)] {
+            // A real, deliberately retained image with few inodes reaches the
+            // cross-ledger boundary without planting allocator counts or bitmaps.
+            let image = std::env::temp_dir().join(format!(
+                "ffs-tmpfile-capacity-{block_size}-{extents}-{}-{}.ext4",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut output = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&image)
+                .unwrap();
+            output.set_len(16 * 1024 * 1024).unwrap();
+            let mut mkfs = std::process::Command::new("mkfs.ext4");
+            mkfs.args(["-F", "-b", &block_size.to_string(), "-N", "32"]);
+            if !extents {
+                mkfs.args(["-O", "^extent,^64bit"]);
+            }
+            let made = mkfs.arg(&image).output().expect("mkfs must execute");
+            assert!(
+                made.status.success(),
+                "mkfs: {}{}",
+                String::from_utf8_lossy(&made.stdout),
+                String::from_utf8_lossy(&made.stderr)
+            );
+            let dev = TestDevice::from_vec(std::fs::read(&image).unwrap());
+            let cx = Cx::for_testing();
+            let options = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+            fs.enable_writes(&cx).unwrap();
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(true);
+            let root = InodeNumber(2);
+            let capacity = fs.statfs(&cx, root).unwrap().files_free;
+            assert!((2..=64).contains(&capacity), "small real inode capacity");
+            let mut first = None;
+            for index in 0..capacity {
+                let child = fs
+                    .mknod(
+                        &cx,
+                        root,
+                        OsStr::new(&format!("fifo{index}")),
+                        ffs_types::S_IFIFO | 0o600,
+                        0,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                first.get_or_insert(child.ino);
+            }
+            assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 0);
+            let before_full = fs.current_snapshot();
+            assert!(matches!(
+                fs.ext4_tmpfile(&cx, root, 0o600, 0, 0),
+                Err(FfsError::NoSpace)
+            ));
+            assert_eq!(fs.current_snapshot(), before_full);
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+            fs.unlink(&cx, root, OsStr::new("fifo0")).unwrap();
+            assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 1);
+            // In sharded mode the single-lock ledger is now zero, while the
+            // retirement credit lives in the other family. The bitmap has room.
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            assert_eq!(
+                fs.require_alloc_state().unwrap().read().groups[0].free_inodes,
+                0
+            );
+            let before_cancel = fs.current_snapshot();
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            assert!(matches!(
+                fs.ext4_tmpfile(&cancelled, root, 0o600, 0, 0),
+                Err(FfsError::Cancelled)
+            ));
+            assert_eq!(fs.current_snapshot(), before_cancel);
+            assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 1);
+
+            // Fail after staging the sole free inode, not during allocation. This
+            // planted malformed ACL must not spend its real retirement credit.
+            let good_parent = fs.read_inode(&cx, root).unwrap();
+            let mut bad_parent = good_parent.clone();
+            ffs_xattr::set_xattr(
+                &mut bad_parent,
+                None,
+                POSIX_ACL_DEFAULT_XATTR,
+                &posix_acl_encode(&[PosixAclEntry {
+                    tag: POSIX_ACL_TAG_GROUP_OBJ,
+                    perm: 4,
+                    id: POSIX_ACL_UNDEFINED_ID,
+                }]),
+                XattrWriteAccess {
+                    is_owner: true,
+                    has_cap_fowner: true,
+                    has_cap_sys_admin: true,
+                },
+            )
+            .unwrap();
+            persist_ext4_test_inode(&fs, &cx, root, &bad_parent);
+            fs.forget_ext4_inode_caches(root);
+            let before_failure = fs.current_snapshot();
+            let before_groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let before_sharded = format!(
+                "{:?}",
+                fs.ext4_sharded_alloc.as_ref().unwrap().lock_group(0)
+            );
+            assert_eq!(
+                fs.ext4_tmpfile(&cx, root, 0o600, 0, 0)
+                    .unwrap_err()
+                    .to_errno(),
+                libc::EINVAL
+            );
+            assert_eq!(fs.current_snapshot(), before_failure);
+            assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 1);
+            assert_eq!(
+                fs.count_free_inodes_in_group(&cx, GroupNumber(0)).unwrap(),
+                1
+            );
+            assert_eq!(
+                format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                before_groups
+            );
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    fs.ext4_sharded_alloc.as_ref().unwrap().lock_group(0)
+                ),
+                before_sharded
+            );
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+            assert!(fs.ext4_pending_orphans.lock().is_empty());
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            persist_ext4_test_inode(&fs, &cx, root, &good_parent);
+            fs.forget_ext4_inode_caches(root);
+
+            let before = fs.current_snapshot();
+            let tmpfile = fs
+                .ext4_tmpfile(&cx, root, 0o600, 123, 456)
+                .expect("reuse the inode that unlink really freed");
+            assert_eq!(tmpfile.ino, first.unwrap());
+            assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+            assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 0);
+            assert_eq!(tmpfile.nlink, 0);
+            assert_eq!(u64::from(fs.ext4_read_orphan_head()), tmpfile.ino.0);
+            let before_full = fs.current_snapshot();
+            assert!(matches!(
+                fs.ext4_tmpfile(&cx, root, 0o600, 0, 0),
+                Err(FfsError::NoSpace)
+            ));
+            assert_eq!(fs.current_snapshot(), before_full);
+            assert_eq!(u64::from(fs.ext4_read_orphan_head()), tmpfile.ino.0);
+            assert!(fs.finalize_unlinked_inode_public(&cx, tmpfile.ino).unwrap());
+            assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 1);
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+            let before_reuse = fs.current_snapshot();
+            let reused = fs.ext4_tmpfile(&cx, root, 0o600, 123, 456).unwrap();
+            assert_eq!(reused.ino, tmpfile.ino);
+            assert_eq!(fs.current_snapshot().high.0, before_reuse.high.0 + 1);
+            assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 0);
+            fs.write(&cx, tmpfile.ino, 0, b"reused inode payload")
+                .unwrap();
+            fs.link(&cx, tmpfile.ino, root, OsStr::new("reused_tmpfile"))
+                .unwrap();
+            assert_eq!(fs.ext4_read_orphan_head(), 0);
+            assert!(fs.ext4_pending_orphans.lock().is_empty());
+            for (index, len) in [59, 60, block_size - 1].into_iter().enumerate() {
+                fs.unlink(&cx, root, OsStr::new(&format!("fifo{}", index + 1)))
+                    .unwrap();
+                assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 1);
+                let target = "s".repeat(len);
+                let name = format!("reused_symlink_{len}");
+                let before = fs.current_snapshot();
+                let child = fs
+                    .symlink(&cx, root, OsStr::new(&name), Path::new(&target), 123, 456)
+                    .expect("symlink must also reuse the real retirement credit");
+                assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+                assert_eq!(fs.statfs(&cx, root).unwrap().files_free, 0);
+                assert_eq!(fs.readlink(&cx, child.ino).unwrap(), target.as_bytes());
+                assert_eq!(
+                    fs.read_inode(&cx, child.ino)
+                        .unwrap()
+                        .is_fast_symlink(fs.ext4_superblock().unwrap()),
+                    len < 60
+                );
+            }
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let bytes = dev.snapshot_bytes();
+            let digest = blake3::hash(&bytes);
+            output.rewind().unwrap();
+            output.write_all(&bytes).unwrap();
+            output.sync_all().unwrap();
+            let (clean, report) = run_e2fsck(&image).expect("native checker must execute");
+            println!(
+                "retained tmpfile capacity image: {}\n{report}",
+                image.display()
+            );
+            assert!(clean, "native checker must accept the full image");
+            assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), digest);
+            let reopened =
+                OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(bytes)), &options).unwrap();
+            let child = reopened
+                .lookup(&cx, root, OsStr::new("reused_tmpfile"))
+                .unwrap();
+            assert_eq!(child.ino, tmpfile.ino);
+            assert_eq!(
+                (child.uid, child.gid, child.perm & 0o777),
+                (123, 456, 0o600)
+            );
+            assert_eq!(
+                reopened.read(&cx, child.ino, 0, 64).unwrap(),
+                b"reused inode payload"
+            );
+            assert_eq!(reopened.statfs(&cx, root).unwrap().files_free, 0);
+            assert_eq!(reopened.ext4_read_orphan_head(), 0);
+            let persisted = std::fs::read(&image).unwrap();
+            let reader = Ext4ImageReader::new(&persisted).unwrap();
+            for len in [59, 60, block_size - 1] {
+                let child = reopened
+                    .lookup(&cx, root, OsStr::new(&format!("reused_symlink_{len}")))
+                    .unwrap();
+                assert_eq!(child.kind, FileType::Symlink);
+                assert_eq!((child.uid, child.gid), (123, 456));
+                assert_eq!(reopened.readlink(&cx, child.ino).unwrap(), vec![b's'; len]);
+                let raw_inode = reader.read_inode(&persisted, child.ino).unwrap();
+                assert_eq!(
+                    reader.read_symlink(&persisted, &raw_inode).unwrap(),
+                    vec![b's'; len],
+                    "image reader must follow the same persisted storage mapping"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ext4_tmpfile_atomic_retained_image_passes_native_checker() {
         use std::io::Write as _;
 
@@ -80275,7 +80511,7 @@ mod tests {
         assert!(
             !fs.read_inode(&cx, slow.ino)
                 .expect("read slow symlink inode")
-                .is_fast_symlink(),
+                .is_fast_symlink(fs.ext4_superblock().unwrap()),
             "the long target must be a slow (block-mapped) symlink"
         );
 
@@ -86305,7 +86541,7 @@ mod tests {
         assert_eq!(&target, b"hello.txt");
 
         let inode = fs.read_inode(&cx, attr.ino).expect("inode");
-        assert!(inode.is_fast_symlink());
+        assert!(inode.is_fast_symlink(fs.ext4_superblock().unwrap()));
     }
 
     #[test]
@@ -86338,7 +86574,7 @@ mod tests {
 
         let inode = fs.read_inode(&cx, attr.ino).expect("inode");
         assert!(
-            !inode.is_fast_symlink(),
+            !inode.is_fast_symlink(fs.ext4_superblock().unwrap()),
             "a target this long must be a slow (block-mapped) symlink"
         );
 
@@ -86407,7 +86643,9 @@ mod tests {
                 assert_eq!(fs.readlink(&cx, attr.ino).unwrap(), target.as_bytes());
                 assert_eq!(attr.size, u64::try_from(len).unwrap());
                 assert_eq!(
-                    fs.read_inode(&cx, attr.ino).unwrap().is_fast_symlink(),
+                    fs.read_inode(&cx, attr.ino)
+                        .unwrap()
+                        .is_fast_symlink(fs.ext4_superblock().unwrap()),
                     len < 60
                 );
                 links.push((name, target));
@@ -86607,7 +86845,7 @@ mod tests {
         assert_eq!(target, long_target.as_bytes());
 
         let inode = fs.read_inode(&cx, attr.ino).expect("inode");
-        assert!(!inode.is_fast_symlink());
+        assert!(!inode.is_fast_symlink(fs.ext4_superblock().unwrap()));
     }
 
     #[test]
