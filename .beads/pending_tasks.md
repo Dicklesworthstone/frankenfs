@@ -11,6 +11,46 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### Ordinary sharded birth continuation — 2026-11-01 05:09 UTC
+
+- [x] Recheck current main, original P0 ownership, raw queue/cycles and remote
+  build-volume admission; reserve the existing implementation/doc surfaces.
+- [x] Trace ordinary sharded create/mkdir: inode, block allocations and parent
+  writes still commit independently. Retain one group lock, shared allocation
+  exclusion and private counters across the complete operation instead.
+- [x] Add and execute ordinary file/directory one-publication regressions before
+  production changes; preserve the true failures and exact tested source.
+  Actual red0pass/2fail/0ignored,1683filtered,exit101: file advances3commits
+  instead of1, directory6instead of1. Local/worker core and lockfile hashes
+  match the retained red source. No fixture/setup failure counts as this red.
+- [x] Implement a staging-only one-group directory/tree allocator. Allocation
+  outside that group or lazy block-bitmap initialization aborts the private
+  attempt and falls back to the existing full birth transaction after releasing
+  its group/read guards. Never return false ENOSPC while other groups have room.
+- [x] Stage complete sharded file/directory birth at a protected snapshot,
+  including parent ACL absence, owner/group, inode slot, directory data and
+  parent entry/link count. Commit once, then install counters/cache effects.
+- [x] Reconcile both live counter families for the full fallback's private
+  allocator; prepare bounded counter redistribution before commit and publish
+  it under exclusive allocation exclusion. Preserve `single + sharded - seed`
+  exactly, including a debit funded by frees credited to the other family.
+- [x] Preserve one-group lock ordering and conflict/cancellation rollback;
+  retry complete unpublished operations, not individual metadata writes.
+  These are implementation steps; final compiler/runtime qualification follows.
+  Initial build caught a misplaced reconciliation setup in the neighboring
+  tmpfile loop; corrected it and retained the compiler failure. First seven-case
+  execution passes6/fails1: file/directory/growth/late-duplicate and three counter
+  controls pass, native setup assumes file placement follows inode spread and
+  fails before checker execution. Setup now follows real extent allocation;
+  its first rebuild also caught a reversed fallocate argument order. Neither
+  failure is counted as native interchange proof or omitted from the captures.
+- [ ] Add failed late insertion, directory growth, actual multi-group fallback
+  and native checker/reopen coverage with deliberately retained images.
+- [ ] Run focused default/active-sharded tests, FUSE, workspace compiler/lint/fmt
+  and unchanged UBS. Bind evidence, update specs/parity and Beads, checkpoint.
+- [ ] Complete original full-workspace/native acceptance, concurrent/field
+  qualification and arbitrary outer-request composition; keep those Beads open.
+
 ### Named birth continuation — 2026-11-01 02:15 UTC
 
 - [x] Recheck the tree, original P0 ownership, raw triage and cycles;

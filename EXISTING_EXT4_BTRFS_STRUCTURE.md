@@ -1744,9 +1744,14 @@ directory data initialization and parent entry/link-count changes form one
 publication. Duplicate checks and parent metadata reads use the transaction's
 view; allocation counters and reused-inode cache invalidation follow commit.
 Precommit failure discards all staged state without a compensating delete.
-The same requirement remains open for the ordinary sharded namespace path and
-arbitrary request composition; a parent ACL change racing fast-path selection
-is not qualified by the bounded stable-parent tests.
+Ordinary sharded create/mkdir also stage the complete birth under one retained
+group lock and shared whole-allocator exclusion. Default-ACL absence is checked
+inside the protected transaction view. A group-local space limit, cross-group
+free, lazy bitmap initialization or inherited ACL discards the private attempt
+before a full-allocator transaction begins. Both allocation ledgers publish
+their exact reconciled result after commit. Arbitrary outer-request composition
+and concurrent parent-ACL race qualification remain open; stable-parent tests
+alone cannot qualify those behaviors.
 
 ## 10. Checksums
 

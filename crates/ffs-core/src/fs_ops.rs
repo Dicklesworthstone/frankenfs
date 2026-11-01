@@ -287,7 +287,7 @@ impl OpenFs {
         Ok(())
     }
 
-    pub(super) fn inherit_default_acl(
+    fn inherit_default_acl(
         &self,
         cx: &Cx,
         scope: &mut RequestScope,

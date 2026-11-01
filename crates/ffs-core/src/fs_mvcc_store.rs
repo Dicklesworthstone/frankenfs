@@ -319,7 +319,7 @@ impl FsMvccStore {
     /// fresh. `read_base` must read the same block. A device fallback is accepted
     /// only if no newer version appears before or during the read; otherwise its
     /// ancestry is ambiguous and the caller receives a retryable conflict.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[cfg(all(feature = "bhh0i_sharded_alloc", test))]
     pub(super) fn rmw_commit_block_with_proof<R, P>(
         &self,
         block: BlockNumber,

@@ -50,6 +50,13 @@ pub struct PerGroupAlloc {
     seed: Vec<SeedCounts>,
 }
 
+/// Prepared under exclusive whole-allocator exclusion, before metadata commits.
+/// Installing this plan cannot fail and preserves both families' common origin.
+pub struct ReconciledPublication {
+    single: Vec<GroupStats>,
+    sharded: Vec<GroupStats>,
+}
+
 impl PerGroupAlloc {
     /// Build the sharded records from the same `Vec<GroupStats>` the single-lock
     /// `Ext4AllocState` holds, moving each group's stats behind its own lock
@@ -199,6 +206,78 @@ impl PerGroupAlloc {
             }
         }
         out
+    }
+
+    /// Exact working counts for a whole-operation fallback. The caller holds
+    /// the whole allocator's write lock, excluding every production group writer.
+    pub(crate) fn birth_group_stats(
+        &self,
+        single: &[GroupStats],
+    ) -> Result<Vec<GroupStats>, ffs_error::FfsError> {
+        let mut actual = self.snapshot_group_stats();
+        if single.len() != actual.len() || self.seed.len() != actual.len() {
+            return Err(counter_corruption());
+        }
+        for ((stats, live), seed) in actual.iter_mut().zip(single).zip(&self.seed) {
+            stats.free_blocks = exact_count(live.free_blocks, stats.free_blocks, seed.free_blocks)?;
+            stats.free_inodes = exact_count(live.free_inodes, stats.free_inodes, seed.free_inodes)?;
+            stats.used_dirs = exact_count(live.used_dirs, stats.used_dirs, seed.used_dirs)?;
+            if !live.block_bitmap_uninit() {
+                stats.mark_block_bitmap_initialized();
+            }
+            // Either family may have changed the free runs since the other
+            // cached its hint. A stale upper bound is harmless; a lower one
+            // could cause a false ENOSPC in the complete fallback.
+            stats.block_largest_free_run = None;
+        }
+        Ok(actual)
+    }
+
+    /// Fund the fallback's counter changes from either movement ledger without
+    /// unsigned underflow. All validation and allocation happen before commit.
+    pub(crate) fn prepare_birth_publication(
+        &self,
+        single: &[GroupStats],
+        actual: Vec<GroupStats>,
+    ) -> Result<ReconciledPublication, ffs_error::FfsError> {
+        let mut sharded = self.snapshot_group_stats();
+        if single.len() != actual.len()
+            || sharded.len() != actual.len()
+            || self.seed.len() != actual.len()
+        {
+            return Err(counter_corruption());
+        }
+        let mut next_single = actual;
+        for (((next, shard), live), seed) in next_single
+            .iter_mut()
+            .zip(&mut sharded)
+            .zip(single)
+            .zip(&self.seed)
+        {
+            exact_count(live.free_blocks, shard.free_blocks, seed.free_blocks)?;
+            exact_count(live.free_inodes, shard.free_inodes, seed.free_inodes)?;
+            exact_count(live.used_dirs, shard.used_dirs, seed.used_dirs)?;
+            let blocks = split_count(next.free_blocks, shard.free_blocks, seed.free_blocks);
+            let inodes = split_count(next.free_inodes, shard.free_inodes, seed.free_inodes);
+            let dirs = split_count(next.used_dirs, shard.used_dirs, seed.used_dirs);
+            *shard = next.clone();
+            (next.free_blocks, shard.free_blocks) = blocks;
+            (next.free_inodes, shard.free_inodes) = inodes;
+            (next.used_dirs, shard.used_dirs) = dirs;
+        }
+        Ok(ReconciledPublication {
+            single: next_single,
+            sharded,
+        })
+    }
+
+    /// Publish only after the transaction commits, while exclusive allocation
+    /// exclusion is still held. At most one group lock is acquired at a time.
+    pub(crate) fn publish_birth(&self, plan: ReconciledPublication) -> Vec<GroupStats> {
+        for (group, stats) in self.groups.iter().zip(plan.sharded) {
+            *group.stats.lock() = stats;
+        }
+        plan.single
     }
 
     /// [`Self::total_free`] over the reconciled counts — the superblock free
@@ -579,6 +658,34 @@ fn apply_delta(sharded: u32, seed: u32, live: u32) -> u32 {
     }
 }
 
+fn counter_corruption() -> ffs_error::FfsError {
+    ffs_error::FfsError::Corruption {
+        block: 0,
+        detail: "ext4 allocation counter families do not reconcile".into(),
+    }
+}
+
+fn exact_count(single: u32, sharded: u32, seed: u32) -> Result<u32, ffs_error::FfsError> {
+    let total = u64::from(single) + u64::from(sharded);
+    total
+        .checked_sub(u64::from(seed))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(counter_corruption)
+}
+
+fn split_count(actual: u32, old_sharded: u32, seed: u32) -> (u32, u32) {
+    let total = u64::from(actual) + u64::from(seed);
+    let single = total
+        .saturating_sub(u64::from(old_sharded))
+        .min(u64::from(u32::MAX));
+    // total <= 2 * u32::MAX; the bounded first summand leaves a u32 remainder.
+    let sharded = total - single;
+    (
+        u32::try_from(single).expect("bounded single counter"),
+        u32::try_from(sharded).expect("bounded sharded counter"),
+    )
+}
+
 /// Aggregate free counts across all groups (see [`PerGroupAlloc::total_free`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FreeTotals {
@@ -777,6 +884,84 @@ mod tests {
             assert_eq!(rec.free_inodes, 50 + g);
             assert_eq!(rec.inode_table_block, BlockNumber(u64::from(g) * 100 + 3));
         }
+    }
+
+    #[test]
+    fn birth_publication_funds_debits_from_either_counter_family() {
+        let mut single = vec![sample_group(0, 4, 3)];
+        let sharded = PerGroupAlloc::from_group_stats(single.clone());
+        single[0].free_blocks = 0;
+        single[0].free_inodes = 0;
+        {
+            let mut stats = sharded.lock_group(0);
+            stats.free_blocks = 6; // Two blocks freed through the sharded family.
+            stats.free_inodes = 4;
+        }
+        let mut actual = sharded.birth_group_stats(&single).expect("valid movement");
+        assert_eq!((actual[0].free_blocks, actual[0].free_inodes), (2, 1));
+        actual[0].free_blocks -= 1;
+        actual[0].free_inodes -= 1;
+        actual[0].used_dirs += 1;
+        let plan = sharded
+            .prepare_birth_publication(&single, actual)
+            .expect("funded debit");
+        let published = sharded.publish_birth(plan);
+        let final_counts = sharded
+            .birth_group_stats(&published)
+            .expect("exact final counts");
+        assert_eq!(
+            (
+                final_counts[0].free_blocks,
+                final_counts[0].free_inodes,
+                final_counts[0].used_dirs
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!((published[0].free_blocks, published[0].free_inodes), (0, 0));
+        let shard = sharded.lock_group(0);
+        assert_eq!((shard.free_blocks, shard.free_inodes), (5, 3));
+    }
+
+    #[test]
+    fn birth_counter_split_preserves_exact_identity_at_boundaries() {
+        for (actual, sharded, seed, expected) in [
+            (3, 10, 7, (0, 10)),
+            (2, 10, 7, (0, 9)),
+            (u32::MAX, 0, u32::MAX, (u32::MAX, u32::MAX)),
+            (0, u32::MAX, u32::MAX, (0, u32::MAX)),
+            (u32::MAX, 0, 0, (u32::MAX, 0)),
+            (0, 0, 0, (0, 0)),
+        ] {
+            let split = split_count(actual, sharded, seed);
+            assert_eq!(split, expected);
+            assert_eq!(
+                exact_count(split.0, split.1, seed).expect("bounded split"),
+                actual
+            );
+        }
+        assert!(exact_count(0, 0, 1).is_err());
+        assert!(exact_count(u32::MAX, u32::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn birth_publication_rejects_invalid_ledger_without_mutation() {
+        let single = vec![sample_group(0, 4, 3)];
+        let sharded = PerGroupAlloc::from_group_stats(single.clone());
+        let mut invalid = single.clone();
+        invalid[0].free_blocks = 0;
+        sharded.lock_group(0).free_blocks = 3;
+        assert!(sharded.birth_group_stats(&invalid).is_err());
+        assert!(
+            sharded
+                .prepare_birth_publication(&invalid, single.clone())
+                .is_err()
+        );
+        assert_eq!(sharded.lock_group(0).free_blocks, 3);
+        assert!(
+            sharded
+                .prepare_birth_publication(&single, Vec::new())
+                .is_err()
+        );
     }
 
     #[test]

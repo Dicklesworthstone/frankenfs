@@ -785,10 +785,28 @@ default ACL before its mode-limited access ACL is computed. Parent mode/group
 and duplicate checks are read inside the operation's view.
 
 ACL-bearing parents route through this existing allocation exclusion even with
-the sharded toggle enabled. Ordinary sharded create/mkdir retain their existing
-per-group route and postcreation inheritance step. Their broader namespace
-atomicity, parent ACL changes racing route selection, concurrent scaling and
-arbitrary outer-request composition remain unfinished work.
+the sharded toggle enabled. Ordinary sharded create/mkdir hold shared allocation
+exclusion and one selected group lock across a protected snapshot transaction.
+Their directory backend stages inode slots, bitmaps, directory/htree data and
+extent nodes without invoking the former eager-commit allocation wrappers.
+Parent mode/group, duplicate checks and default-ACL absence come from this same
+view. No postcreation inheritance step follows a successful ordinary birth.
+
+If that group cannot supply a block, a rebuild must free another group's block,
+the bitmap needs whole-allocator initialization, or a default ACL is present,
+the private attempt is discarded. Both guards are released before entering the
+full birth transaction. Whole-operation typed conflicts retry at most sixteen
+times. Live counters and reused-inode cache effects follow successful commit.
+
+The full fallback stages against exact reconciled counts, `single + sharded -
+seed`. Its publication plan preserves that identity without unsigned underflow
+when one ledger must fund the other's debit. For wanted count `W`, origin `O`
+and previous sharded count `S`, it chooses `B' = min(max(W + O - S, 0), u32::MAX)`
+and `S' = W + O - B'`. All arithmetic checks and plan allocation precede commit;
+installing both ledgers then occurs under exclusive allocation exclusion.
+Bitmaps remain allocation authority; ledger values describe movement from their
+shared origin. Concurrent scaling, parent-ACL race qualification, crash/mounted
+behavior and arbitrary outer-request composition remain unfinished work.
 
 ### 6.3 Corruption Recovery Path
 

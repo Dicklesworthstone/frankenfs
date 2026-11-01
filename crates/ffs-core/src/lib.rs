@@ -1745,15 +1745,18 @@ struct Ext4AllocState {
     persist_ctx: PersistCtx,
 }
 
-/// Injection seam for the bd-bhh0i directory-GROWTH path. The growth helpers
-/// (htree leaf/dx-node split, full rebuild, linear grow) allocate directory
-/// blocks and write the parent inode; the single-lock path does that through
-/// `&mut Ext4AllocState`, the sharded (parallel-create) path lock-free.
-/// Threading `&mut dyn DirAllocBackend` through those helpers lets the SAME
-/// growth logic serve both: [`SingleLockDirAlloc`] is byte-identical to the
-/// pre-cutover path, and (feature on) `ShardedDirAlloc` composes the lock-free
-/// slice-1..7b primitives. Not yet wired into the growth helpers (that is the
-/// next, focused pass); defined here so that wiring is a mechanical threading.
+#[cfg(feature = "bhh0i_sharded_alloc")]
+struct Ext4BirthSpec<'a> {
+    parent: InodeNumber,
+    name: &'a [u8],
+    mode: u16,
+    uid: u32,
+    gid: u32,
+}
+
+/// Allocation boundary shared by directory growth, htree rebuilds and indirect
+/// mappings. The full transaction owns `Ext4AllocState`; an ordinary sharded
+/// birth owns one group's private statistics until its complete commit.
 #[allow(dead_code)]
 trait DirAllocBackend {
     /// Immutable geometry (block size, per-group counts) for growth arithmetic.
@@ -1786,7 +1789,7 @@ trait DirAllocBackend {
     /// which cannot coexist once the helper is threaded through a `&mut dyn
     /// DirAllocBackend`. `SingleLock` builds that same `GroupBlockAllocator`
     /// (byte-identical to the helpers' inline insert); `Sharded` builds a
-    /// [`ShardedTreeBlockAllocator`]. `tree_hint` is the caller-computed placement
+    /// transaction-local tree allocator. `tree_hint` is the caller-computed placement
     /// hint for the tree nodes; `ino`/`generation` key the external-node CRC32C.
     #[allow(clippy::too_many_arguments)]
     fn dir_insert_extent(
@@ -1807,7 +1810,7 @@ trait DirAllocBackend {
     /// the rebuild growth path runs so the sharded backend can route BOTH free
     /// surfaces off the single lock. `SingleLock` calls the byte-identical
     /// `truncate_extents`; `Sharded` runs `truncate_extents_with` over a
-    /// [`ShardedTreeBlockAllocator`]. `ino`/`generation` key the external-node CRC.
+    /// transaction-local tree allocator. `ino`/`generation` key the external-node CRC.
     #[allow(clippy::too_many_arguments)]
     fn dir_truncate_extents(
         &mut self,
@@ -1945,19 +1948,21 @@ impl DirAllocBackend for SingleLockDirAlloc<'_> {
     }
 }
 
-/// [`DirAllocBackend`] over the sharded per-group allocator — the lock-free
-/// growth path (bd-bhh0i). `geo` is snapshotted at construction (immutable).
+/// Transaction-only directory allocation while one selected group is locked.
+/// Running out of that group's resources aborts the whole attempt; the caller
+/// releases both guards before using the full-allocator birth transaction.
 #[cfg(feature = "bhh0i_sharded_alloc")]
-#[allow(dead_code)]
-struct ShardedDirAlloc<'a> {
-    fs: &'a OpenFs,
-    geo: FsGeometry,
+struct StagedGroupDirAlloc<'a> {
+    source: &'a Ext4AllocState,
+    group: GroupNumber,
+    stats: &'a mut GroupStats,
+    needs_full: bool,
 }
 
 #[cfg(feature = "bhh0i_sharded_alloc")]
-impl DirAllocBackend for ShardedDirAlloc<'_> {
+impl DirAllocBackend for StagedGroupDirAlloc<'_> {
     fn dir_geo(&self) -> FsGeometry {
-        self.geo.clone()
+        self.source.geo.clone()
     }
     fn dir_alloc_blocks(
         &mut self,
@@ -1966,9 +1971,33 @@ impl DirAllocBackend for ShardedDirAlloc<'_> {
         count: u32,
         hint: &ffs_alloc::AllocHint,
     ) -> Result<ffs_alloc::BlockAlloc, FfsError> {
-        self.fs
-            .ext4_sharded_alloc_blocks(cx, dev, hint, count)?
-            .ok_or(FfsError::NoSpace)
+        if self.source.geo.cluster_ratio != 1
+            || (self.stats.block_bitmap_uninit()
+                && self.source.groups[self.group.0 as usize].block_bitmap_uninit())
+        {
+            self.needs_full = true;
+            return Err(FfsError::NoSpace);
+        }
+        self.stats.mark_block_bitmap_initialized();
+        let Some(reserved) = self.stats.reserved_cache.get().cloned() else {
+            self.needs_full = true;
+            return Err(FfsError::NoSpace);
+        };
+        let allocated = ffs_alloc::try_alloc_blocks_in_group(
+            cx,
+            dev,
+            &self.source.geo,
+            self.stats,
+            self.group,
+            count,
+            hint,
+            &self.source.persist_ctx,
+            &reserved,
+        )?;
+        allocated.ok_or_else(|| {
+            self.needs_full = true;
+            FfsError::NoSpace
+        })
     }
     fn dir_write_inode(
         &mut self,
@@ -1978,8 +2007,17 @@ impl DirAllocBackend for ShardedDirAlloc<'_> {
         inode: &Ext4Inode,
         csum_seed: u32,
     ) -> Result<(), FfsError> {
-        self.fs
-            .ext4_sharded_write_inode(cx, dev, ino, inode, csum_seed)
+        let loc = ffs_inode::locate_inode(ino, &self.source.geo, &self.source.groups)
+            .ok_or_else(|| FfsError::Format("staged birth: invalid inode location".into()))?;
+        ffs_inode::write_inode_at_slot_scoped(
+            cx,
+            dev,
+            loc,
+            usize::from(self.source.geo.inode_size),
+            ino,
+            inode,
+            csum_seed,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn dir_insert_extent(
@@ -1992,14 +2030,13 @@ impl DirAllocBackend for ShardedDirAlloc<'_> {
         generation: u32,
         tree_hint: ffs_alloc::AllocHint,
     ) -> Result<(), FfsError> {
-        // Sharded tree-node allocation: build a `ShardedTreeBlockAllocator` (borrows
-        // only `&OpenFs`, locks groups internally) and run the SAME
-        // `ffs_btree::insert`, so the tree-node allocs go through the sharded
-        // structure with no single-lock `&mut alloc` borrow.
-        let mut tree_alloc = ShardedTreeBlockAllocator::new(
-            self.fs, dev, tree_hint, ino, generation,
-        )
-        .ok_or_else(|| FfsError::Format("sharded dir insert: not an ext4 filesystem".into()))?;
+        let mut tree_alloc = StagedGroupTreeAllocator {
+            backend: self,
+            dev,
+            hint: tree_hint,
+            ino,
+            generation,
+        };
         ffs_btree::insert(cx, dev, root_bytes, extent, &mut tree_alloc)
     }
     #[allow(clippy::too_many_arguments)]
@@ -2012,17 +2049,13 @@ impl DirAllocBackend for ShardedDirAlloc<'_> {
         ino: u32,
         generation: u32,
     ) -> Result<u64, FfsError> {
-        // Sharded truncate: a `ShardedTreeBlockAllocator` frees BOTH the extent-tree
-        // nodes (via `free_block`, inside `delete_range`) AND the data blocks (via
-        // `free_data_range` → `ext4_sharded_free_blocks`), all per-group-locked.
-        let mut tree_alloc = ShardedTreeBlockAllocator::new(
-            self.fs,
+        let mut tree_alloc = StagedGroupTreeAllocator {
+            backend: self,
             dev,
-            ffs_alloc::AllocHint::default(),
+            hint: ffs_alloc::AllocHint::default(),
             ino,
             generation,
-        )
-        .ok_or_else(|| FfsError::Format("sharded dir truncate: not an ext4 filesystem".into()))?;
+        };
         ffs_extent::truncate_extents_with(cx, dev, root_bytes, keep_blocks, &mut tree_alloc)
     }
     fn dir_free_blocks(
@@ -2032,7 +2065,85 @@ impl DirAllocBackend for ShardedDirAlloc<'_> {
         start: BlockNumber,
         count: u32,
     ) -> Result<(), FfsError> {
-        self.fs.ext4_sharded_free_blocks(cx, dev, start, count)
+        let geo = &self.source.geo;
+        let first = geo.group_block_to_absolute(self.group, 0).0;
+        let relative = start
+            .0
+            .checked_sub(first)
+            .and_then(|value| u32::try_from(value).ok());
+        let Some(relative) = relative.filter(|relative| {
+            relative
+                .checked_add(count)
+                .is_some_and(|end| end <= geo.blocks_in_group(self.group))
+        }) else {
+            self.needs_full = true;
+            return Err(FfsError::NoSpace);
+        };
+        let Some(reserved) = self.stats.reserved_cache.get().cloned() else {
+            self.needs_full = true;
+            return Err(FfsError::NoSpace);
+        };
+        if geo.cluster_ratio != 1 {
+            self.needs_full = true;
+            return Err(FfsError::NoSpace);
+        }
+        ffs_alloc::free_blocks_in_group(
+            cx,
+            dev,
+            geo,
+            self.stats,
+            self.group,
+            relative,
+            count,
+            &self.source.persist_ctx,
+            &reserved,
+        )
+    }
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+struct StagedGroupTreeAllocator<'a, 'b> {
+    backend: &'a mut StagedGroupDirAlloc<'b>,
+    dev: &'a dyn BlockDevice,
+    hint: AllocHint,
+    ino: u32,
+    generation: u32,
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+impl ffs_btree::BlockAllocator for StagedGroupTreeAllocator<'_, '_> {
+    fn alloc_block(&mut self, cx: &Cx) -> ffs_error::Result<BlockNumber> {
+        let allocated = self.backend.dir_alloc_blocks(cx, self.dev, 1, &self.hint)?;
+        self.hint.goal_block = allocated.start.0.checked_add(1).map(BlockNumber);
+        Ok(allocated.start)
+    }
+
+    fn free_block(&mut self, cx: &Cx, block: BlockNumber) -> ffs_error::Result<()> {
+        self.backend.dir_free_blocks(cx, self.dev, block, 1)
+    }
+
+    fn finalize_node(&self, block: &mut [u8]) {
+        let pctx = &self.backend.source.persist_ctx;
+        if pctx.has_metadata_csum {
+            ffs_ondisk::ext4::stamp_extent_block_checksum(
+                block,
+                pctx.csum_seed,
+                self.ino,
+                self.generation,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "bhh0i_sharded_alloc")]
+impl ffs_extent::TruncateBackend for StagedGroupTreeAllocator<'_, '_> {
+    fn free_data_range(
+        &mut self,
+        cx: &Cx,
+        start: BlockNumber,
+        count: u32,
+    ) -> ffs_error::Result<()> {
+        self.backend.dir_free_blocks(cx, self.dev, start, count)
     }
 }
 
@@ -2056,8 +2167,7 @@ impl DirAllocBackend for ShardedDirAlloc<'_> {
 /// number/generation). The csum key is snapshotted lock-free at construction from
 /// the immutable superblock, so external nodes are checksummed byte-identically to
 /// the single-lock path.
-#[cfg(feature = "bhh0i_sharded_alloc")]
-#[allow(dead_code)] // constructed by the sharded growth path in a later bd-bhh0i slice.
+#[cfg(all(feature = "bhh0i_sharded_alloc", test))]
 struct ShardedTreeBlockAllocator<'a> {
     fs: &'a OpenFs,
     dev: &'a dyn ffs_block::BlockDevice,
@@ -2071,8 +2181,7 @@ struct ShardedTreeBlockAllocator<'a> {
     csum_seed: u32,
 }
 
-#[cfg(feature = "bhh0i_sharded_alloc")]
-#[allow(dead_code)] // `new` is called by the sharded growth path in a later slice.
+#[cfg(all(feature = "bhh0i_sharded_alloc", test))]
 impl<'a> ShardedTreeBlockAllocator<'a> {
     /// Build a sharded extent-tree-node allocator for inode `ino`/`generation`.
     /// The `metadata_csum` key (`has_metadata_csum` + `csum_seed`) is snapshotted
@@ -2099,7 +2208,7 @@ impl<'a> ShardedTreeBlockAllocator<'a> {
     }
 }
 
-#[cfg(feature = "bhh0i_sharded_alloc")]
+#[cfg(all(feature = "bhh0i_sharded_alloc", test))]
 impl ffs_btree::BlockAllocator for ShardedTreeBlockAllocator<'_> {
     fn alloc_block(&mut self, cx: &Cx) -> Result<BlockNumber, FfsError> {
         let alloc = self
@@ -2137,7 +2246,7 @@ impl ffs_btree::BlockAllocator for ShardedTreeBlockAllocator<'_> {
 // `free_data_range` lets it drive `ffs_extent::truncate_extents_with` entirely off
 // the single lock — tree-node frees via `free_block` (above), data-block frees via
 // the sharded `ext4_sharded_free_blocks`.
-#[cfg(feature = "bhh0i_sharded_alloc")]
+#[cfg(all(feature = "bhh0i_sharded_alloc", test))]
 impl ffs_extent::TruncateBackend for ShardedTreeBlockAllocator<'_> {
     fn free_data_range(&mut self, cx: &Cx, start: BlockNumber, count: u32) -> Result<(), FfsError> {
         self.fs.ext4_sharded_free_blocks(cx, self.dev, start, count)
@@ -9522,7 +9631,11 @@ impl OpenFs {
     /// ACL-bearing births also allocate xattr storage, so use the operation's
     /// existing allocation exclusion for that complete metadata request.
     #[cfg(feature = "bhh0i_sharded_alloc")]
-    fn ext4_has_default_acl(&self, cx: &Cx, parent: &Ext4Inode) -> ffs_error::Result<bool> {
+    fn ext4_has_default_acl(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        parent: &Ext4Inode,
+    ) -> ffs_error::Result<bool> {
         if ffs_ondisk::find_ibody_xattr_by_name(parent, POSIX_ACL_DEFAULT_XATTR)
             .map_err(|error| parse_to_ffs_error(&error))?
             .is_some()
@@ -9532,8 +9645,8 @@ impl OpenFs {
         if parent.file_acl == 0 {
             return Ok(false);
         }
-        let external = self.read_block_vec(cx, BlockNumber(parent.file_acl))?;
-        ffs_ondisk::find_xattr_block_value_by_name(&external, POSIX_ACL_DEFAULT_XATTR)
+        let external = dev.read_block(cx, BlockNumber(parent.file_acl))?;
+        ffs_ondisk::find_xattr_block_value_by_name(external.as_slice(), POSIX_ACL_DEFAULT_XATTR)
             .map(|entry| entry.is_some())
             .map_err(|error| parse_to_ffs_error(&error))
     }
@@ -28859,7 +28972,7 @@ impl OpenFs {
     /// `alloc_blocks_persist` no-space result). Same device the single-lock path
     /// writes bitmaps through, so on-disk effects are identical for the same
     /// starting state.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[cfg(all(feature = "bhh0i_sharded_alloc", test))]
     fn ext4_sharded_alloc_blocks(
         &self,
         cx: &Cx,
@@ -28950,7 +29063,7 @@ impl OpenFs {
     /// on-disk effects are identical for the same starting state. `start`+`count`
     /// must lie within one group (a tree-node block or same-group extent segment —
     /// what the sharded growth/free path produces).
-    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[cfg(all(feature = "bhh0i_sharded_alloc", test))]
     fn ext4_sharded_free_blocks(
         &self,
         cx: &Cx,
@@ -28984,7 +29097,7 @@ impl OpenFs {
     /// only the group owning `ino`). Used to roll back a sharded-allocated inode
     /// when the subsequent dir-entry insert fails. `is_dir` drives the `used_dirs`
     /// decrement.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[cfg(all(feature = "bhh0i_sharded_alloc", test))]
     fn ext4_sharded_free_inode(
         &self,
         cx: &Cx,
@@ -29011,7 +29124,7 @@ impl OpenFs {
     /// `ext4_sharded_locate_inode_matches_locate_inode_bd_bhh0i`). Used by
     /// ordinary sharded inode updates; fresh inode creation uses its already
     /// locked group's private stats instead of acquiring this lock again.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[cfg(all(feature = "bhh0i_sharded_alloc", test))]
     fn ext4_sharded_locate_inode(&self, ino: InodeNumber) -> Option<ffs_inode::InodeLocation> {
         let sb = self.ext4_superblock()?;
         // Read the three verbatim superblock fields this locator needs directly,
@@ -29045,7 +29158,7 @@ impl OpenFs {
     /// The selected group remains locked through commit; its counters and cursor
     /// are installed only after the bitmap, descriptor, and inode slot publish
     /// together. Preparation failures discard private state without cleanup I/O.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[cfg(all(feature = "bhh0i_sharded_alloc", test))]
     #[allow(clippy::too_many_arguments)]
     fn ext4_sharded_create_inode(
         &self,
@@ -29211,7 +29324,7 @@ impl OpenFs {
     /// the patched block is the same bytes `write_inode_at` would land, committed
     /// to the same store; the proof and the snapshot-consistent read only matter
     /// under a concurrent writer.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[cfg(all(feature = "bhh0i_sharded_alloc", test))]
     #[allow(clippy::too_many_arguments)]
     fn ext4_sharded_stage_inode_slot(
         &self,
@@ -29288,7 +29401,7 @@ impl OpenFs {
     /// the parent-inode updates (mtime/ctime, link count) that
     /// `ext4_try_insert_existing` currently does through `write_inode(&alloc.geo,
     /// &alloc.groups, ..)`.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[cfg(all(feature = "bhh0i_sharded_alloc", test))]
     fn ext4_sharded_write_inode(
         &self,
         cx: &Cx,
@@ -29664,9 +29777,22 @@ impl OpenFs {
         let mut alloc = alloc_mutex.write();
         for attempt in 1..=MAX_ATTEMPTS {
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let sharded = self
+                .ext4_sharded_alloc
+                .as_ref()
+                .filter(|_| self.bhh0i_sharded_ops_active());
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let groups = if let Some(sharded) = sharded {
+                sharded.birth_group_stats(&alloc.groups)?
+            } else {
+                alloc.groups.clone()
+            };
+            #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+            let groups = alloc.groups.clone();
             let mut working = Ext4AllocState {
                 geo: alloc.geo.clone(),
-                groups: alloc.groups.clone(),
+                groups,
                 persist_ctx: alloc.persist_ctx.clone(),
             };
             let (mut txn, snapshot_dev) =
@@ -29683,6 +29809,12 @@ impl OpenFs {
                 Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                 Err(error) => return Err(error),
             };
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            let publication = sharded
+                .map(|sharded| {
+                    sharded.prepare_birth_publication(&alloc.groups, working.groups.clone())
+                })
+                .transpose()?;
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let txn_id = txn.id();
             let write_blocks = if self.repair_flush_lifecycle.is_some() {
@@ -29696,6 +29828,11 @@ impl OpenFs {
                     Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                     Err(error) => return Err(error),
                 };
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            if let Some((sharded, plan)) = sharded.zip(publication) {
+                working.groups = sharded.publish_birth(plan);
+                self.note_sharded_alloc_happened();
+            }
             alloc.groups = working.groups;
             self.forget_ext4_inode_caches(ino);
             drop(snapshot_dev);
@@ -29746,7 +29883,7 @@ impl OpenFs {
     fn ext4_create(
         &self,
         cx: &Cx,
-        scope: &mut RequestScope,
+        _scope: &mut RequestScope,
         parent: InodeNumber,
         name: &[u8],
         mode: u16,
@@ -29755,8 +29892,6 @@ impl OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         Self::validate_single_path_component(name)?;
         self.require_alloc_state()?;
-        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-        let _ = scope;
 
         let sb = self
             .ext4_superblock()
@@ -29769,29 +29904,14 @@ impl OpenFs {
             return Err(FfsError::NotDirectory);
         }
 
-        // bd-bhh0i cutover: when the sharded toggle is on, route to the lock-free
-        // create twin (no ext4_alloc_state.write() guard). It does its own dedup.
+        // The selected group's lock spans the complete publication. A private
+        // attempt needing another group falls through after releasing its guards.
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        if self.bhh0i_sharded_ops_active() && !self.ext4_has_default_acl(cx, &parent_inode)? {
-            let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
-            let gid = if parent_inode.mode & 0o2000 != 0 {
-                parent_inode.gid
-            } else {
-                gid
-            };
-            let attr = self.ext4_create_sharded(
-                cx,
-                parent,
-                &parent_inode,
-                name,
-                mode,
-                uid,
-                gid,
-                csum_seed,
-                tstamp_secs,
-                tstamp_nanos,
-            )?;
-            return self.inherit_default_acl(cx, scope, parent, attr);
+        if self.bhh0i_sharded_ops_active()
+            && let Some(attr) =
+                self.ext4_sharded_birth(cx, parent, name, mode | 0o100_000, uid, gid)?
+        {
+            return Ok(attr);
         }
         let attr = self.ext4_birth_transaction(cx, |tx_dev, alloc, (secs, nanos)| {
             let parent_inode = self.ext4_birth_parent(cx, tx_dev, alloc, parent, name)?;
@@ -29845,102 +29965,255 @@ impl OpenFs {
         Ok(attr)
     }
 
-    /// Sharded (no-write-lock) regular-file create — the bd-bhh0i parallel-create
-    /// CUTOVER path for [`Self::ext4_create`]. Composes the lock-free sharded
-    /// inode-create ([`Self::ext4_sharded_create_inode`] with a Part-B spread
-    /// target), [`inode_to_attr`], and [`Self::ext4_add_dir_entry`] over a
-    /// [`ShardedDirAlloc`] backend — allocating the inode + any parent-dir growth
-    /// entirely through the per-group locks instead of the whole-state
-    /// `ext4_alloc_state.write()` guard, so disjoint-group concurrent creates never
-    /// serialize. On a dir-entry-insert failure the inode is rolled back via
-    /// [`Self::ext4_sharded_free_inode`] (the fresh inode has no data blocks, so a
-    /// bitmap-free is e2fsck-clean). Not yet routed from `ext4_create` — the atomic
-    /// flag flip that routes ALL create ops here is the final cutover slice, gated
-    /// by the local e2fsck + create-bench scaling run.
+    /// Publish a complete ordinary birth under one group lock and shared
+    /// allocation exclusion. `None` requests the full transaction after every
+    /// group/read guard and unpublished attempt has been released.
     #[cfg(feature = "bhh0i_sharded_alloc")]
-    #[allow(clippy::too_many_arguments)]
-    fn ext4_create_sharded(
+    fn ext4_sharded_birth(
         &self,
         cx: &Cx,
         parent: InodeNumber,
-        parent_inode: &Ext4Inode,
         name: &[u8],
         mode: u16,
         uid: u32,
         gid: u32,
-        csum_seed: u32,
-        tstamp_secs: u64,
-        tstamp_nanos: u32,
-    ) -> ffs_error::Result<InodeAttr> {
+    ) -> ffs_error::Result<Option<InodeAttr>> {
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-        let dev = self.block_device_adapter();
-        let geo = FsGeometry::from_superblock(sb);
-
-        // Duplicate-name check (POSIX EEXIST), mirroring ext4_create.
-        self.ext4_create_duplicate_precheck(cx, parent_inode, name)?;
-
-        // Part-B spread: distinct concurrent creates start their inode scan in
-        // distinct groups (per-thread seed) so they touch distinct per-group locks
-        // + inode-table blocks; a single-thread seed of 0 keeps parent-group
-        // locality (spread_start_group's contract).
-        let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
-                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-        );
+        let base = self.block_device_adapter();
+        let alloc_lock = self.require_alloc_state()?;
+        let single = alloc_lock.read_recursive();
+        let sharded = self.ext4_sharded_alloc.as_ref().ok_or(FfsError::ReadOnly)?;
+        let parent_group = ffs_types::inode_to_group(parent, single.geo.inodes_per_group);
         let target = crate::sharded_alloc::spread_start_group(
             parent_group,
             Self::bhh0i_spread_seed(),
-            geo.group_count,
+            single.geo.group_count,
         );
-
-        let (ino, new_inode) = self.ext4_sharded_create_inode(
-            cx,
-            &dev,
-            mode | 0o100_000, // S_IFREG
+        let spec = Ext4BirthSpec {
+            parent,
+            name,
+            mode,
             uid,
             gid,
-            target,
-            false,
-            tstamp_secs,
-            tstamp_nanos,
-        )?;
-        let attr = inode_to_attr(sb, ino, &new_inode);
+        };
+        let created =
+            sharded.alloc_inode_with(target, single.geo.group_count, |group, stats| {
+                const MAX_ATTEMPTS: u32 = 16;
+                for attempt in 1..=MAX_ATTEMPTS {
+                    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                    let mut working = stats.clone();
+                    let (mut txn, snapshot_dev) =
+                        RegisteredSnapshotBlockAdapter::begin(&base, &self.mvcc_store);
+                    let result = {
+                        let dev = TransactionBlockAdapter {
+                            base: &snapshot_dev,
+                            tx: Mutex::new(&mut txn),
+                        };
+                        let mut backend = StagedGroupDirAlloc {
+                            source: &single,
+                            group,
+                            stats: &mut working,
+                            needs_full: false,
+                        };
+                        match self.ext4_stage_group_birth(cx, &dev, &mut backend, &spec) {
+                            Err(FfsError::NoSpace) if backend.needs_full => return Ok(Some(None)),
+                            other => other,
+                        }
+                    };
+                    let (ino, inode) = match result {
+                        Ok(Some(created)) => created,
+                        Ok(None) => return Ok(None),
+                        Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                        Err(error) => return Err(error),
+                    };
+                    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                    let txn_id = txn.id();
+                    let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                        txn.write_set().keys().copied().collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let seq = match RequestScope::with_transaction(txn)
+                        .commit_if_write(&self.mvcc_store)
+                    {
+                        Ok(seq) => seq,
+                        Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                        Err(error) => return Err(error),
+                    };
+                    *stats = working;
+                    return Ok(Some(Some((ino, inode, seq, txn_id, write_blocks))));
+                }
+                unreachable!("the final group birth attempt returns its result")
+            })?;
+        drop(single);
+        // A ledger can have no remaining inode credit while the other family
+        // has released inodes. The complete fallback checks the actual counts.
+        let Some(Some((ino, inode, seq, txn_id, write_blocks))) = created else {
+            return Ok(None);
+        };
+        self.note_sharded_alloc_happened();
+        self.forget_ext4_inode_caches(ino);
+        self.prune_mvcc_after_commit_if_due(seq);
+        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
+        Ok(Some(inode_to_attr(sb, ino, &inode)))
+    }
 
-        let mut backend = ShardedDirAlloc { fs: self, geo };
-        let add_result = self.ext4_add_dir_entry(
-            cx,
-            &mut backend,
-            parent,
-            parent_inode,
-            name,
-            ino,
-            ffs_ondisk::Ext4FileType::RegFile,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-        );
-        if let Err(err) = add_result {
-            // Roll back the sharded inode alloc through the per-group lock. The
-            // fresh inode has no data/xattr blocks, so freeing its bitmap bit +
-            // counts leaves the fs e2fsck-clean (a free inode's table slot is
-            // ignored). Best-effort: surface the original insert error.
-            let _ = self.ext4_sharded_free_inode(cx, &dev, ino, false);
-            return Err(err);
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn ext4_stage_group_birth(
+        &self,
+        cx: &Cx,
+        dev: &TransactionBlockAdapter<'_, '_>,
+        backend: &mut StagedGroupDirAlloc<'_>,
+        spec: &Ext4BirthSpec<'_>,
+    ) -> ffs_error::Result<Option<(InodeNumber, Ext4Inode)>> {
+        let parent = self.ext4_birth_parent(cx, dev, backend.source, spec.parent, spec.name)?;
+        if Self::ext4_has_default_acl(cx, dev, &parent)? {
+            backend.needs_full = true;
+            return Err(FfsError::NoSpace);
         }
-
-        trace!(
-            target: "ffs::write",
-            op = "create_sharded",
-            parent = parent.0,
-            ino = ino.0,
-            name = %String::from_utf8_lossy(name),
+        let is_dir = spec.mode & 0o170_000 == 0o040_000;
+        if is_dir && !parent.has_htree_index() && parent.links_count >= 65_000 {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EMLINK,
+            )));
+        }
+        let Some(allocated) = ffs_alloc::try_alloc_inode_in_group_persist_core(
+            cx,
+            dev,
+            &backend.source.geo,
+            backend.stats,
+            backend.group,
+            is_dir,
+            &backend.source.persist_ctx,
+        )?
+        else {
+            return Ok(None);
+        };
+        let (mode, gid) = if parent.mode & 0o2000 != 0 {
+            (spec.mode | if is_dir { 0o2000 } else { 0 }, parent.gid)
+        } else {
+            (spec.mode, spec.gid)
+        };
+        let (secs, nanos) = Self::now_timestamp();
+        let mut inode = ffs_inode::build_fresh_inode(
             mode,
-            "file created (sharded)"
+            spec.uid,
+            gid,
+            is_dir,
+            backend
+                .source
+                .geo
+                .feature_incompat
+                .contains(ffs_ondisk::Ext4IncompatFeatures::EXTENTS),
+            0,
+            secs,
+            nanos,
         );
+        let seed = backend.source.persist_ctx.csum_seed;
+        Self::ext4_stage_fresh_inode_slot(
+            cx,
+            dev,
+            &backend.source.geo,
+            backend.stats,
+            allocated.ino,
+            &mut inode,
+            seed,
+        )?;
+        if is_dir {
+            self.ext4_stage_group_directory(
+                cx,
+                dev,
+                backend,
+                spec.parent,
+                allocated.ino,
+                &mut inode,
+            )?;
+        }
+        self.ext4_insert_dir_entry_from_device(
+            cx,
+            dev,
+            backend,
+            spec.parent,
+            &parent,
+            spec.name,
+            allocated.ino,
+            if is_dir {
+                ffs_ondisk::Ext4FileType::Dir
+            } else {
+                ffs_ondisk::Ext4FileType::RegFile
+            },
+            seed,
+            secs,
+            nanos,
+        )?;
+        Ok(Some((allocated.ino, inode)))
+    }
 
-        Ok(attr)
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn ext4_stage_group_directory(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        backend: &mut StagedGroupDirAlloc<'_>,
+        parent: InodeNumber,
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+    ) -> ffs_error::Result<()> {
+        let hint = self.numa_allocation_hint(
+            &backend.source.geo,
+            AllocHint {
+                goal_group: Some(backend.group),
+                ..AllocHint::default()
+            },
+            "ext4_mkdir_sharded_data_block",
+            Some(ino),
+        );
+        let allocated = backend.dir_alloc_blocks(cx, dev, 1, &hint)?;
+        let bs = backend.source.geo.block_size;
+        let mut block = vec![
+            0;
+            usize::try_from(bs)
+                .map_err(|_| FfsError::Format("invalid block size".into()))?
+        ];
+        let ino_u32 =
+            u32::try_from(ino.0).map_err(|_| FfsError::Format("inode exceeds u32".into()))?;
+        let parent_u32 =
+            u32::try_from(parent.0).map_err(|_| FfsError::Format("parent exceeds u32".into()))?;
+        ffs_dir::init_dir_block(
+            &mut block,
+            ino_u32,
+            parent_u32,
+            self.ext4_dir_reserved_tail(),
+        )?;
+        self.stamp_ext4_dir_block(&mut block, ino_u32, inode.generation);
+        dev.write_block(cx, allocated.start, &block)?;
+        let mut root = Self::extent_root(inode);
+        Self::ext4_dir_map_extent(
+            cx,
+            dev,
+            backend,
+            Self::ext4_inode_block_map_is_indirect(inode),
+            &mut root,
+            Ext4Extent {
+                logical_block: 0,
+                raw_len: 1,
+                physical_start: allocated.start.0,
+            },
+            ino_u32,
+            inode.generation,
+            hint,
+        )?;
+        Self::set_extent_root(inode, &root);
+        inode.size = u64::from(bs);
+        inode.blocks = if inode.is_huge_file() {
+            1
+        } else {
+            u64::from(bs / EXT4_SECTOR_SIZE)
+        };
+        inode.links_count = 2;
+        backend.dir_write_inode(cx, dev, ino, inode, backend.source.persist_ctx.csum_seed)
     }
 
     /// Per-thread Part-B spread seed for the sharded create path: distinct threads
@@ -30115,7 +30388,7 @@ impl OpenFs {
     fn ext4_mkdir(
         &self,
         cx: &Cx,
-        scope: &mut RequestScope,
+        _scope: &mut RequestScope,
         parent: InodeNumber,
         name: &[u8],
         mode: u16,
@@ -30124,8 +30397,6 @@ impl OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         Self::validate_single_path_component(name)?;
         self.require_alloc_state()?;
-        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-        let _ = scope;
 
         let sb = self
             .ext4_superblock()
@@ -30137,30 +30408,12 @@ impl OpenFs {
             return Err(FfsError::NotDirectory);
         }
 
-        // bd-bhh0i cutover: when the sharded toggle is on, route to the lock-free
-        // mkdir twin (no ext4_alloc_state.write() guard). It does its own EMLINK
-        // guard + dedup.
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        if self.bhh0i_sharded_ops_active() && !self.ext4_has_default_acl(cx, &parent_inode)? {
-            let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
-            let (mode, gid) = if parent_inode.mode & 0o2000 != 0 {
-                (mode | 0o2000, parent_inode.gid)
-            } else {
-                (mode, gid)
-            };
-            let attr = self.ext4_mkdir_sharded(
-                cx,
-                parent,
-                &parent_inode,
-                name,
-                mode,
-                uid,
-                gid,
-                csum_seed,
-                tstamp_secs,
-                tstamp_nanos,
-            )?;
-            return self.inherit_default_acl(cx, scope, parent, attr);
+        if self.bhh0i_sharded_ops_active()
+            && let Some(attr) =
+                self.ext4_sharded_birth(cx, parent, name, mode | 0o040_000, uid, gid)?
+        {
+            return Ok(attr);
         }
         let attr = self.ext4_birth_transaction(cx, |tx_dev, alloc, (secs, nanos)| {
             let parent_inode = self.ext4_birth_parent(cx, tx_dev, alloc, parent, name)?;
@@ -30339,208 +30592,6 @@ impl OpenFs {
         trace!(target: "ffs::write", op = "mkdir", parent = parent.0,
             ino = attr.ino.0, name = %String::from_utf8_lossy(name), "directory created");
         Ok(attr)
-    }
-
-    /// Sharded (no-write-lock) `mkdir(2)` — the bd-bhh0i cutover twin of
-    /// [`Self::ext4_mkdir`]. Composes the lock-free sharded inode-create
-    /// (`is_directory=true`, Part-B spread target) with a [`ShardedDirAlloc`] backend
-    /// for the directory's own data block + extent map + inode write, then
-    /// [`Self::ext4_add_dir_entry`] to link it into the parent — all through the
-    /// per-group locks, no `ext4_alloc_state.write()` guard. On any post-alloc
-    /// failure BOTH the directory data block (`ext4_sharded_free_blocks`) and the
-    /// inode (`ext4_sharded_free_inode`) are rolled back, so the fs stays e2fsck-clean.
-    /// Needed for the cutover because the create-bench mkdir's a per-thread subdir
-    /// before its parallel creates — mkdir must go through the same sharded structure
-    /// or the two free-states diverge.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn ext4_mkdir_sharded(
-        &self,
-        cx: &Cx,
-        parent: InodeNumber,
-        parent_inode: &Ext4Inode,
-        name: &[u8],
-        mode: u16,
-        uid: u32,
-        gid: u32,
-        csum_seed: u32,
-        tstamp_secs: u64,
-        tstamp_nanos: u32,
-    ) -> ffs_error::Result<InodeAttr> {
-        let sb = self
-            .ext4_superblock()
-            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-        let dev = self.block_device_adapter();
-        let geo = FsGeometry::from_superblock(sb);
-
-        // EMLINK: a non-htree parent at the link cap can't take the new '..' link
-        // (mirrors ext4_mkdir).
-        if parent_inode.flags & ffs_types::EXT4_INDEX_FL == 0 && parent_inode.links_count >= 65_000
-        {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EMLINK,
-            )));
-        }
-
-        // Duplicate-name check (POSIX EEXIST), mirroring ext4_mkdir.
-        let htree_dedup_covers = parent_inode.has_htree_index()
-            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
-            && Self::htree_create_dedup_enabled();
-        if !htree_dedup_covers && self.lookup_name(cx, parent_inode, name)?.is_some() {
-            return Err(FfsError::Exists);
-        }
-
-        let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
-                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-        );
-        let target = crate::sharded_alloc::spread_start_group(
-            parent_group,
-            Self::bhh0i_spread_seed(),
-            geo.group_count,
-        );
-
-        // Sharded inode alloc + fresh-inode write (is_directory=true → used_dirs++).
-        let (ino, mut new_inode) = self.ext4_sharded_create_inode(
-            cx,
-            &dev,
-            mode | 0o040_000, // S_IFDIR
-            uid,
-            gid,
-            target,
-            true,
-            tstamp_secs,
-            tstamp_nanos,
-        )?;
-        let ino_u32 = u32::try_from(ino.0)
-            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
-        let parent_u32 = u32::try_from(parent.0)
-            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
-        let generation = new_inode.generation;
-        let block_size_usize = usize::try_from(geo.block_size)
-            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
-
-        let mut backend = ShardedDirAlloc {
-            fs: self,
-            geo: geo.clone(),
-        };
-
-        // Allocate the directory's first data block. Failure here rolls back only
-        // the inode (no block allocated yet).
-        let dir_hint = self.numa_allocation_hint(
-            &geo,
-            AllocHint {
-                goal_group: Some(target),
-                ..AllocHint::default()
-            },
-            "ext4_mkdir_sharded_data_block",
-            Some(ino),
-        );
-        let dir_alloc = match backend.dir_alloc_blocks(cx, &dev, 1, &dir_hint) {
-            Ok(a) => a,
-            Err(err) => {
-                let _ = self.ext4_sharded_free_inode(cx, &dev, ino, true);
-                return Err(err);
-            }
-        };
-
-        // From here, any failure frees BOTH the dir block and the inode.
-        // Initialize the dir block with '.' and '..', stamp its csum tail, write.
-        let mut dir_block = vec![0u8; block_size_usize];
-        let reserved_tail = self.ext4_dir_reserved_tail();
-        if let Err(err) =
-            ffs_dir::init_dir_block(&mut dir_block, ino_u32, parent_u32, reserved_tail)
-        {
-            let _ = self.ext4_sharded_free_blocks(cx, &dev, dir_alloc.start, 1);
-            let _ = self.ext4_sharded_free_inode(cx, &dev, ino, true);
-            return Err(err);
-        }
-        self.stamp_ext4_dir_block(&mut dir_block, ino_u32, generation);
-        if let Err(err) = dev.write_block(cx, dir_alloc.start, &dir_block) {
-            let _ = self.ext4_sharded_free_blocks(cx, &dev, dir_alloc.start, 1);
-            let _ = self.ext4_sharded_free_inode(cx, &dev, ino, true);
-            return Err(err);
-        }
-
-        // Map logical block 0 → the dir data block in the extent tree.
-        let extent = Ext4Extent {
-            logical_block: 0,
-            raw_len: 1,
-            physical_start: dir_alloc.start.0,
-        };
-        let mut root_bytes = Self::extent_root(&new_inode);
-        let tree_hint = self.numa_allocation_hint(
-            &geo,
-            AllocHint {
-                goal_group: Some(target),
-                ..AllocHint::default()
-            },
-            "ext4_mkdir_sharded_extent_tree",
-            Some(ino),
-        );
-        let indirect = Self::ext4_inode_block_map_is_indirect(&new_inode);
-        if let Err(err) = Self::ext4_dir_map_extent(
-            cx,
-            &dev,
-            &mut backend,
-            indirect,
-            &mut root_bytes,
-            extent,
-            ino_u32,
-            generation,
-            tree_hint,
-        ) {
-            let _ = self.ext4_sharded_free_blocks(cx, &dev, dir_alloc.start, 1);
-            let _ = self.ext4_sharded_free_inode(cx, &dev, ino, true);
-            return Err(err);
-        }
-        self.invalidate_ext4_write_extent_snapshot(&new_inode);
-        Self::set_extent_root(&mut new_inode, &root_bytes);
-
-        // Finalize the directory inode (size/blocks/links = '.' + parent).
-        let bs = geo.block_size;
-        new_inode.size = u64::from(bs);
-        new_inode.blocks = if new_inode.is_huge_file() {
-            1
-        } else {
-            u64::from(bs / EXT4_SECTOR_SIZE)
-        };
-        new_inode.links_count = 2;
-        if let Err(err) = backend.dir_write_inode(cx, &dev, ino, &new_inode, csum_seed) {
-            let _ = self.ext4_sharded_free_blocks(cx, &dev, dir_alloc.start, 1);
-            let _ = self.ext4_sharded_free_inode(cx, &dev, ino, true);
-            return Err(err);
-        }
-
-        // Link into the parent (updates parent timestamps + link count).
-        let add_result = self.ext4_add_dir_entry(
-            cx,
-            &mut backend,
-            parent,
-            parent_inode,
-            name,
-            ino,
-            ffs_ondisk::Ext4FileType::Dir,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-        );
-        if let Err(err) = add_result {
-            let _ = self.ext4_sharded_free_blocks(cx, &dev, dir_alloc.start, 1);
-            let _ = self.ext4_sharded_free_inode(cx, &dev, ino, true);
-            return Err(err);
-        }
-
-        trace!(
-            target: "ffs::write",
-            op = "mkdir_sharded",
-            parent = parent.0,
-            ino = ino.0,
-            name = %String::from_utf8_lossy(name),
-            "directory created (sharded)"
-        );
-
-        Ok(inode_to_attr(sb, ino, &new_inode))
     }
 
     /// Stamp the ext4 directory-block CRC32C tail in place when the filesystem
@@ -30930,42 +30981,6 @@ impl OpenFs {
         Ok(DirInsertOutcome::NeedsGrowthLinear)
     }
 
-    /// Add a directory entry by scanning existing dir blocks, or allocating a new one.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
-    #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
-    fn ext4_add_dir_entry(
-        &self,
-        cx: &Cx,
-        backend: &mut dyn DirAllocBackend,
-        parent: InodeNumber,
-        parent_inode: &Ext4Inode,
-        name: &[u8],
-        child_ino: InodeNumber,
-        file_type: Ext4FileType,
-        csum_seed: u32,
-        tstamp_secs: u64,
-        tstamp_nanos: u32,
-    ) -> ffs_error::Result<()> {
-        let mut txn = self.mvcc_store.begin();
-        self.ext4_stage_dir_entry(
-            cx,
-            &mut txn,
-            backend,
-            parent,
-            parent_inode,
-            name,
-            child_ino,
-            file_type,
-            csum_seed,
-            tstamp_secs,
-            tstamp_nanos,
-        )?;
-        self.mvcc_store
-            .commit(txn)
-            .map(|_| ())
-            .map_err(|error| FfsError::Format(error.to_string()))
-    }
-
     /// Stage directory publication into the transaction that owns its child.
     #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
     fn ext4_stage_dir_entry(
@@ -31035,7 +31050,7 @@ impl OpenFs {
         // bd-bhh0i: the injected `backend` param serves ALL of d's allocation —
         // the in-place-insert parent write, the a/c growth calls, and the
         // linear-grow append. Single-lock callers pass a byte-identical
-        // SingleLockDirAlloc; the sharded create path passes a ShardedDirAlloc.
+        // SingleLockDirAlloc; sharded births pass a StagedGroupDirAlloc.
 
         // htree (dx-indexed) directories: logical block 0 is the dx_root,
         // whose '..' rec_len slack hides the index. A linear add_entry would
@@ -74508,6 +74523,325 @@ mod tests {
         assert!(clean, "e2fsck after tmpfile + link + reclaim:\n{output}");
     }
 
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn check_sharded_birth_publication(kind: FileType) {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        fs.create(&cx, root, OsStr::new("before_sharded_birth"), 0o600, 0, 0)
+            .unwrap();
+        let before = fs.current_snapshot();
+        let parent = fs.getattr(&cx, root).unwrap();
+        let counts = fs.statfs(&cx, root).unwrap();
+        let mut old = fs.begin_request_scope(&cx, RequestOp::Lookup).unwrap();
+        let child = ext4_named_birth_for_test(&fs, &cx, root, "ordinary_birth", kind).unwrap();
+        assert_eq!(
+            fs.current_snapshot().high.0,
+            before.high.0 + 1,
+            "{kind:?}: the complete ordinary sharded birth publishes once"
+        );
+        assert!(fs.bhh0i_sharded_alloc_happened.load(Ordering::Relaxed));
+        assert_eq!(child.kind, kind);
+        assert_eq!((child.uid, child.gid), (123, 456));
+        let is_dir = kind == FileType::Directory;
+        assert_eq!(child.nlink, if is_dir { 2 } else { 1 });
+        assert_eq!(
+            fs.statfs(&cx, root).unwrap().files_free,
+            counts.files_free - 1
+        );
+        assert_eq!(
+            fs.getattr(&cx, root).unwrap().nlink,
+            parent.nlink + u32::from(is_dir)
+        );
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new("ordinary_birth"))
+                .unwrap()
+                .ino,
+            child.ino
+        );
+        assert!(matches!(
+            <OpenFs as FsOps>::lookup(&fs, &cx, &mut old, root, OsStr::new("ordinary_birth")),
+            Err(FfsError::NotFound(_))
+        ));
+        fs.end_request_scope(&cx, RequestOp::Lookup, old).unwrap();
+        assert_eq!(
+            fs.getxattr(&cx, child.ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+            None
+        );
+        if is_dir {
+            assert_eq!(fs.readdir(&cx, child.ino, 0).unwrap().len(), 2);
+            assert_eq!(
+                fs.lookup(&cx, child.ino, OsStr::new("..")).unwrap().ino,
+                OpenFs::ext4_presented_inode(root)
+            );
+            assert!(fs.read_inode(&cx, child.ino).unwrap().blocks > 0);
+        }
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn ext4_sharded_birth_file_is_one_publication() {
+        check_sharded_birth_publication(FileType::RegularFile);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn ext4_sharded_birth_directory_is_one_publication() {
+        check_sharded_birth_publication(FileType::Directory);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn ext4_sharded_birth_growth_and_late_duplicate_are_atomic() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let dir = fs
+            .mkdir(&cx, root, OsStr::new("growing"), 0o2775, 12, 34)
+            .unwrap();
+        let mut names = Vec::new();
+        for index in 0..64 {
+            let name = format!("{index:03}_{}", "long_name".repeat(24));
+            let before = fs.current_snapshot();
+            let child =
+                ext4_named_birth_for_test(&fs, &cx, dir.ino, &name, FileType::RegularFile).unwrap();
+            assert_eq!(
+                fs.current_snapshot().high.0,
+                before.high.0 + 1,
+                "growth is part of birth"
+            );
+            assert_eq!(
+                child.gid, 34,
+                "setgid inherits from the transaction's parent"
+            );
+            names.push((name, child.ino));
+        }
+        let parent = fs.read_inode(&cx, dir.ino).unwrap();
+        assert!(
+            parent.has_htree_index(),
+            "real insertion must exercise htree growth"
+        );
+        let before = fs.current_snapshot();
+        let counts = fs.statfs(&cx, root).unwrap();
+        let entries = fs.readdir(&cx, dir.ino, 0).unwrap();
+        // Htree insertion owns duplicate rejection, after inode preparation.
+        // Calling the real FsOps path avoids the facade's positive-name shortcut.
+        for kind in [FileType::RegularFile, FileType::Directory] {
+            let error = fs
+                .with_latest_scope(|scope| match kind {
+                    FileType::RegularFile => <OpenFs as FsOps>::create(
+                        &fs,
+                        &cx,
+                        scope,
+                        dir.ino,
+                        OsStr::new(&names[17].0),
+                        0o644,
+                        1,
+                        2,
+                    ),
+                    FileType::Directory => <OpenFs as FsOps>::mkdir(
+                        &fs,
+                        &cx,
+                        scope,
+                        dir.ino,
+                        OsStr::new(&names[17].0),
+                        0o755,
+                        1,
+                        2,
+                    ),
+                    _ => unreachable!(),
+                })
+                .unwrap_err();
+            assert!(matches!(error, FfsError::Exists));
+            assert_eq!(
+                fs.current_snapshot(),
+                before,
+                "no allocate/rollback commits"
+            );
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(fs.readdir(&cx, dir.ino, 0).unwrap(), entries);
+        }
+        for (name, ino) in names {
+            assert_eq!(fs.lookup(&cx, dir.ino, OsStr::new(&name)).unwrap().ino, ino);
+        }
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn ext4_sharded_birth_cross_group_fallback_passes_native_checker() {
+        use std::io::{Seek as _, Write as _};
+
+        // Exclusive creation and deliberate retention: no TempDir cleanup.
+        let image = std::env::temp_dir().join(format!(
+            "ffs-sharded-birth-{}-{}.ext4",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let mut output = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&image)
+            .unwrap();
+        output.set_len(32 * 1024 * 1024).unwrap();
+        let made = std::process::Command::new("mkfs.ext4")
+            .args(["-F", "-b", "1024", "-g", "1024"])
+            .arg(&image)
+            .output()
+            .expect("mkfs must execute");
+        assert!(
+            made.status.success(),
+            "mkfs: {}{}",
+            String::from_utf8_lossy(&made.stdout),
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let dev = TestDevice::from_vec(std::fs::read(&image).unwrap());
+        let cx = Cx::for_testing();
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+        fs.enable_writes(&cx).unwrap();
+        fs.set_bhh0i_sharded_ops(true);
+        let root = InodeNumber(2);
+        let (filler, offset, group) = fill_sharded_birth_group(&fs, &cx);
+        assert!(fs.statfs(&cx, root).unwrap().blocks_free > 100);
+        let before = fs.current_snapshot();
+        // The thread's spread target is unchanged; inode space remains in its
+        // selected group but directory data must come from a different group.
+        assert_eq!(
+            fs.ext4_sharded_birth(&cx, root, b"fallback", 0o040_755, 3, 4)
+                .unwrap(),
+            None,
+            "selected group cannot supply the directory's data block"
+        );
+        assert_eq!(
+            fs.current_snapshot(),
+            before,
+            "fallback attempt stays private"
+        );
+        let dir = fs
+            .mkdir(&cx, root, OsStr::new("fallback"), 0o755, 3, 4)
+            .unwrap();
+        assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+        let inode = fs.read_inode(&cx, dir.ino).unwrap();
+        let data = fs.collect_extents(&cx, &inode).unwrap()[0].physical_start;
+        let geo = FsGeometry::from_superblock(fs.ext4_superblock().unwrap());
+        let data_group = GroupNumber(
+            u32::try_from(
+                (data - u64::from(geo.first_data_block)) / u64::from(geo.blocks_per_group),
+            )
+            .unwrap(),
+        );
+        assert_ne!(data_group, group, "real cross-group allocation");
+        assert_eq!(
+            fs.lookup(&cx, dir.ino, OsStr::new("..")).unwrap().ino,
+            OpenFs::ext4_presented_inode(root)
+        );
+        let acl = ext4_setattr_test_acl(6, 4, 0);
+        fs.setxattr(&cx, root, POSIX_ACL_DEFAULT_XATTR, &acl, XattrSetMode::Set)
+            .unwrap();
+        let inherited = fs
+            .create(&cx, root, OsStr::new("inherited"), 0o666, 5, 6)
+            .unwrap();
+        fs.write(&cx, inherited.ino, 0, b"fallback with inherited ACL")
+            .unwrap();
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        let bytes = dev.snapshot_bytes();
+        let digest = blake3::hash(&bytes);
+        output.rewind().unwrap();
+        output.write_all(&bytes).unwrap();
+        output.sync_all().unwrap();
+        let (clean, report) = run_e2fsck(&image).expect("native checker must execute");
+        println!(
+            "retained sharded fallback image: {}\n{report}",
+            image.display()
+        );
+        assert!(clean, "native checker must accept the full image");
+        assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), digest);
+        let reopened =
+            OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(bytes)), &options).unwrap();
+        assert_eq!(
+            reopened
+                .lookup(&cx, root, OsStr::new("fallback"))
+                .unwrap()
+                .ino,
+            dir.ino
+        );
+        assert_eq!(
+            reopened.read(&cx, filler, offset - 1024, 1024).unwrap(),
+            vec![0x5a; 1024]
+        );
+        assert_eq!(
+            reopened.read(&cx, inherited.ino, 0, 64).unwrap(),
+            b"fallback with inherited ACL"
+        );
+        assert_eq!(
+            reopened
+                .getxattr(&cx, inherited.ino, POSIX_ACL_ACCESS_XATTR)
+                .unwrap(),
+            Some(acl)
+        );
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn fill_sharded_birth_group(fs: &OpenFs, cx: &Cx) -> (InodeNumber, u64, GroupNumber) {
+        let root = InodeNumber(2);
+        let filler = fs
+            .create(cx, root, OsStr::new("filler"), 0o644, 1, 2)
+            .unwrap();
+        let geo = FsGeometry::from_superblock(fs.ext4_superblock().unwrap());
+        let group = ffs_types::inode_to_group(filler.ino, geo.inodes_per_group);
+        assert_eq!(
+            group,
+            crate::sharded_alloc::spread_start_group(
+                GroupNumber(0),
+                OpenFs::bhh0i_spread_seed(),
+                geo.group_count,
+            )
+        );
+        // Real writes allocate from the file's extent goal, which can visit
+        // earlier groups before reaching this thread's inode spread target.
+        let mut offset = 0;
+        loop {
+            let free = fs.count_free_blocks_in_group(cx, group).unwrap();
+            if free == 0 {
+                break;
+            }
+            let count = if free > 64 { 32 } else { 1 };
+            let payload = vec![0x5a; count * 1024];
+            assert_eq!(
+                fs.write(cx, filler.ino, offset, &payload).unwrap(),
+                u32::try_from(payload.len()).unwrap()
+            );
+            offset += u64::try_from(payload.len()).unwrap();
+            assert!(
+                offset < 32 * 1024 * 1024,
+                "writes must reach selected group {group:?}"
+            );
+        }
+        if fs.statfs(cx, root).unwrap().blocks_free <= 100 {
+            assert_ne!(group, GroupNumber(0));
+            fs.fallocate(
+                cx,
+                filler.ino,
+                0,
+                128 * 1024,
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            )
+            .unwrap();
+        }
+        (filler.ino, offset, group)
+    }
+
     fn ext4_named_birth_for_test(
         fs: &OpenFs,
         cx: &Cx,
@@ -94392,23 +94726,9 @@ mod tests {
         };
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
-        let parent_inode = fs.read_inode(&cx, root).expect("read root inode");
-        let sb = fs.ext4_superblock().expect("ext4 superblock");
-        let csum_seed = sb.csum_seed();
-
-        fs.ext4_mkdir_sharded(
-            &cx,
-            root,
-            &parent_inode,
-            b"shardeddir",
-            0o755,
-            0,
-            0,
-            csum_seed,
-            0,
-            0,
-        )
-        .expect("sharded mkdir must succeed");
+        fs.ext4_sharded_birth(&cx, root, b"shardeddir", 0o040_755, 0, 0)
+            .expect("sharded mkdir must succeed")
+            .expect("one-group directory must remain sharded");
 
         let root_after = fs.read_inode(&cx, root).expect("re-read root inode");
         let entry = fs
@@ -94450,9 +94770,6 @@ mod tests {
         };
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
-        let parent_inode = fs.read_inode(&cx, root).expect("read root inode");
-        let sb = fs.ext4_superblock().expect("ext4 superblock");
-        let csum_seed = sb.csum_seed();
         let inodes_free_before = fs
             .ext4_sharded_alloc
             .as_ref()
@@ -94460,19 +94777,9 @@ mod tests {
             .total_free()
             .inodes;
 
-        fs.ext4_create_sharded(
-            &cx,
-            root,
-            &parent_inode,
-            b"shardedfile",
-            0o644,
-            0,
-            0,
-            csum_seed,
-            0,
-            0,
-        )
-        .expect("sharded create must succeed");
+        fs.ext4_sharded_birth(&cx, root, b"shardedfile", 0o100_644, 0, 0)
+            .expect("sharded create must succeed")
+            .expect("one-group file must remain sharded");
 
         // Findable via a fresh on-disk lookup (dir entry + inode both persisted).
         let root_after = fs.read_inode(&cx, root).expect("re-read root inode");
