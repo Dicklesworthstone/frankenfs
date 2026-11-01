@@ -11,6 +11,20 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### Deferred mapping publication continuation — 2026-11-01
+
+- [x] Read instructions/README; inspect the owned P0, local queue, cycles and
+  current reservations. Preserve original full-workspace acceptance.
+- [ ] Execute a deep-tree regression with a public reader between staging and
+  successful commit; preserve any real failure and exact source binding.
+- [ ] Repair confirmed cache publication/visibility defects without weakening
+  tests, and cover read/read_into, pinned old readers and subsequent writes.
+- [ ] Execute affected default/sharded controls where storage admission allows;
+  run required workspace check, strict Clippy, formatting and changed-file UBS.
+- [ ] Update existing specs/parity and original Bead with executed evidence,
+  inspect the full diff, commit/push the cohesive change and release leases.
+- [ ] Original full-workspace/mounted acceptance remains open until executed.
+
 ### Scoped writeback accounting continuation — 2026-11-01
 
 - [x] Re-read all instructions/README, recheck current main and original owned

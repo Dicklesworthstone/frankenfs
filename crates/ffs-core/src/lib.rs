@@ -75936,6 +75936,63 @@ mod tests {
     }
 
     #[test]
+    fn ext4_writeback_commit_replaces_reader_cached_extent_mappings() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let ino = fs
+            .create(&cx, root, OsStr::new("publish-batch"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let bs = fs.block_size();
+        let payload = vec![0x19; usize::try_from(bs).unwrap()];
+        for index in 0..10 {
+            fs.write(&cx, ino, u64::from(2 * index * bs), &payload)
+                .unwrap();
+        }
+        let inode = fs.read_inode(&cx, ino).unwrap();
+        assert!(u16::from_le_bytes([inode.extent_bytes[6], inode.extent_bytes[7]]) > 0);
+        let free = fs.statfs(&cx, root).unwrap().blocks_free;
+        let before = fs.current_snapshot();
+        let replacement = vec![0x62; usize::try_from(bs).unwrap()];
+        let mut reader = FsOps::begin_request_scope(&fs, &cx, RequestOp::Read).unwrap();
+        let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+        FsOps::write(&fs, &cx, &mut scope, ino, u64::from(bs), &replacement).unwrap();
+        assert_eq!(
+            fs.read_inode_with_scope(&cx, &scope, ino)
+                .unwrap()
+                .extent_bytes,
+            inode.extent_bytes,
+            "this edit must retain the same index root"
+        );
+        assert_eq!(
+            fs.read(&cx, ino, u64::from(bs), bs).unwrap(),
+            vec![0; bs as usize]
+        );
+        fs.commit_writeback_batch_scope(&cx, scope).unwrap();
+        assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - 1);
+        assert_eq!(fs.read(&cx, ino, u64::from(bs), bs).unwrap(), replacement);
+        let mut buffer = vec![0; bs as usize];
+        assert_eq!(
+            fs.read_into(&cx, ino, u64::from(bs), &mut buffer).unwrap(),
+            bs as usize
+        );
+        assert_eq!(buffer, replacement);
+        assert_eq!(
+            FsOps::read(&fs, &cx, &mut reader, ino, u64::from(bs), bs).unwrap(),
+            vec![0; bs as usize]
+        );
+        FsOps::end_request_scope(&fs, &cx, RequestOp::Read, reader).unwrap();
+        fs.write(&cx, ino, u64::from(bs), &payload).unwrap();
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free - 1);
+        assert_eq!(fs.read(&cx, ino, u64::from(bs), bs).unwrap(), payload);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
     fn ext4_writeback_fallocate_mixed_accounting() {
         for indirect in [false, true] {
             let fs = open_writable_ext4().expect("retained ext4 fixture");
