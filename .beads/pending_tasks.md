@@ -11,6 +11,61 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### Named birth continuation — 2026-11-01 02:15 UTC
+
+- [x] Recheck the tree, original P0 ownership, raw triage and cycles;
+  preserve the shared rewritten checkpoint and reserve the existing files.
+- [x] Trace create/mkdir/mknod and both allocator paths. ACL-bearing creation
+  will use the operation-owned boundary even with the sharded toggle enabled;
+  ordinary sharded creation keeps its existing separate publication behavior.
+- [x] Add retained-image regressions for one-publication file/directory/FIFO
+  birth, mode-only/named/default ACL propagation, old snapshot isolation and
+  failure rollback. Execute against the original production code first.
+  Original2-function red0pass/2fail,1608filtered,exit101: successful regular-file
+  creation high3 vs expected2, malformed inheritance high2 vs unchanged1.
+  A later snapshot assertion required real history rather than an unversioned
+  retained-image ancestor: diagnostic error was typed MvccConflict on block4.
+  Seeded a real prior creation; kept the exact NotFound assertion. Initial
+  corrected2/0/0 passes. A compile failure also exposed the duplicate-precheck
+  helper's existing native_repair.rs caller; restored unconditional availability.
+  Those intermediate failures are retained and are not regression proof.
+- [x] Share private allocator, protected snapshot, full-operation conflict retry
+  and postcommit publication across transaction-backed named birth paths.
+- [x] Stage inherited default/access ACLs before directory publication; defer
+  reused-inode cache invalidation until commit. Preserve non-ACL sharded routing.
+- [x] Run focused tests in default and active-sharded builds, persisted-image
+  native checker/reopen, FUSE and required workspace compiler/lint/fmt gates.
+  Expanded selection37:4new named-birth functions,15previous ACL/tmpfile/writer
+  controls,6ext4 mknod,9Btrfs mknod and3directory duplicate/link-limit controls.
+  Preliminary default37/0/0,1575filtered,0.21s,command0; both native checker
+  cases execute all5phases and reopen. Final setup additionally mixes ordinary
+  creation with later ACL-backed creation, checking persisted reconciliation.
+  Final default37/0/0,1575filtered,0.21s; active-sharded37/0/0,1646filtered,
+  0.22s, both commands0. Named checker images report21/4096files,1336/4096blocks;
+  tmpfile controls report16/4096files,1329/4096blocks. Each of the4checks executes
+  all5phases,exit0 and successful reopen. Four final16MiB images are copied
+  byte-for-byte into the existing artifact dir and retain matching worker hashes.
+  FUSE715pass/0fail/1existing ignore/0filtered,0.32s,command0; real mount still
+  returns early on fusermount3 Permission denied. Literal workspace/all-target
+  check0 (34.29s Cargo), strict Clippy0 (31.81s Cargo), fmt/whitespace0.
+  The first feature/Clippy attempts exposed a cross-module private helper call;
+  made the existing helper visible to its parent module and reran both. No
+  compiler failure is called a test result, and no lint suppression was added.
+- [x] Inspect unchanged UBS results and source bindings, retain all failures,
+  update required specs/parity and Bead evidence, sync and checkpoint locally.
+  UBS exits0: core0critical/15841warnings/3197info and fs_ops0critical/
+  86warnings/61info. Final local and postgate worker hashes match: core
+  `bb4c45fb6f838092f9c54d96ce762721b2a1952bcc0d983af451053cad4a3d8a`,
+  fs_ops `7ad1f40edc328bbea06211566f6d697d279680900863aac2d3864de82d85be95`;
+  lockfile and pinned toolchain unchanged. All raw `resume6-*` captures are
+  already in the existing artifact directory, including compile/setup reds.
+  The Bead records executed commands, proof limits, invariants/loss comparison
+  and fresh bounded process/real-work/honesty worksheets. Solo verification;
+  no independent reviewer or whole-project acceptance. No task or dependency
+  is created/closed. Tracker synchronized; cycles stay empty.
+- [ ] Complete the original full-workspace/native acceptance and remaining
+  sharded namespace/outer-request composition work; no narrow closure follows.
+
 ### Atomic tmpfile continuation — 2026-10-31 05:00 UTC
 
 - [x] Recheck main, existing P0 ownership, dependency cycles and build-volume

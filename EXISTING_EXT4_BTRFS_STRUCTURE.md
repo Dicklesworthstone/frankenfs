@@ -1729,6 +1729,25 @@ v6.19 source capture.
   arbitrary outer-request composition. Postcommit repair-notification failures
   retain the existing explicit already-committed error contract.
 
+### 9.10 Named inode birth and ACL inheritance
+
+The same creation contract in §9.9 applies to named regular files, special
+inodes and directories. A directory retains an unmasked copy of its parent's
+default ACL, while its access ACL and permissions are limited by the requested
+mode. A mode-equivalent access ACL needs no stored access attribute; a child
+directory still keeps its default ACL for subsequent descendants. Setgid
+directories supply the child's group and propagate the setgid bit to child
+directories.
+
+For FrankenFS's transaction-backed paths, allocation, final inode mode/ACLs,
+directory data initialization and parent entry/link-count changes form one
+publication. Duplicate checks and parent metadata reads use the transaction's
+view; allocation counters and reused-inode cache invalidation follow commit.
+Precommit failure discards all staged state without a compensating delete.
+The same requirement remains open for the ordinary sharded namespace path and
+arbitrary request composition; a parent ACL change racing fast-path selection
+is not qualified by the bounded stable-parent tests.
+
 ## 10. Checksums
 
 **Source:** `ext4.h` lines 2545-2548

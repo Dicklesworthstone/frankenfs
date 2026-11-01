@@ -774,8 +774,21 @@ After one successful MVCC commit, the operation installs allocator statistics,
 runtime orphan head/membership and inode-cache invalidation before releasing
 exclusion. Staging failures discard all private state; typed conflicts retry
 the complete operation up to sixteen times. Existing link/reclaim and durability
-boundaries consume the published orphan state. Named create/mkdir inheritance
-and arbitrary outer-request composition remain separate unfinished work.
+boundaries consume the published orphan state.
+
+Named transaction-backed create, mkdir and mknod share a birth transaction:
+private allocation statistics, atomically captured/pinned snapshot, complete
+operation retries on typed conflicts (sixteen attempts), and postcommit cache
+publication. Inherited access/default ACLs use the same staging device as the
+inode body and parent directory entry. A child directory retains its unmasked
+default ACL before its mode-limited access ACL is computed. Parent mode/group
+and duplicate checks are read inside the operation's view.
+
+ACL-bearing parents route through this existing allocation exclusion even with
+the sharded toggle enabled. Ordinary sharded create/mkdir retain their existing
+per-group route and postcreation inheritance step. Their broader namespace
+atomicity, parent ACL changes racing route selection, concurrent scaling and
+arbitrary outer-request composition remain unfinished work.
 
 ### 6.3 Corruption Recovery Path
 

@@ -287,7 +287,7 @@ impl OpenFs {
         Ok(())
     }
 
-    fn inherit_default_acl(
+    pub(super) fn inherit_default_acl(
         &self,
         cx: &Cx,
         scope: &mut RequestScope,
@@ -1237,10 +1237,9 @@ impl FsOps for OpenFs {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
-        let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
-        let attr = match &self.flavor {
+        match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .ext4_create(
                     cx,
@@ -1253,11 +1252,13 @@ impl FsOps for OpenFs {
                 )
                 .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => {
+                let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
                 self.check_btrfs_mutation_allowed("create")?;
-                self.btrfs_create(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
+                let attr =
+                    self.btrfs_create(cx, parent, name.as_encoded_bytes(), mode, uid, gid)?;
+                self.inherit_default_acl(cx, scope, parent, attr)
             }
-        }?;
-        self.inherit_default_acl(cx, scope, parent, attr)
+        }
     }
 
     fn touch_atime(
@@ -1321,10 +1322,9 @@ impl FsOps for OpenFs {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
-        let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
-        let attr = match &self.flavor {
+        match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .ext4_mknod(
                     cx,
@@ -1338,11 +1338,13 @@ impl FsOps for OpenFs {
                 )
                 .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => {
+                let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
                 self.check_btrfs_mutation_allowed("mknod")?;
-                self.btrfs_mknod(cx, parent, name.as_encoded_bytes(), mode, rdev, uid, gid)
+                let attr =
+                    self.btrfs_mknod(cx, parent, name.as_encoded_bytes(), mode, rdev, uid, gid)?;
+                self.inherit_default_acl(cx, scope, parent, attr)
             }
-        }?;
-        self.inherit_default_acl(cx, scope, parent, attr)
+        }
     }
 
     fn mkdir(
@@ -1358,10 +1360,9 @@ impl FsOps for OpenFs {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
-        let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, true)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
-        let attr = match &self.flavor {
+        match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .ext4_mkdir(
                     cx,
@@ -1374,11 +1375,12 @@ impl FsOps for OpenFs {
                 )
                 .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => {
+                let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, true)?;
                 self.check_btrfs_mutation_allowed("mkdir")?;
-                self.btrfs_mkdir(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
+                let attr = self.btrfs_mkdir(cx, parent, name.as_encoded_bytes(), mode, uid, gid)?;
+                self.inherit_default_acl(cx, scope, parent, attr)
             }
-        }?;
-        self.inherit_default_acl(cx, scope, parent, attr)
+        }
     }
 
     fn unlink(

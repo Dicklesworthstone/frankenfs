@@ -1,5 +1,26 @@
 # FEATURE_PARITY
 
+> **Staged named ext4 inheritance (2026-11-01):** transaction-backed create,
+> mkdir and mknod now share private allocation statistics, a protected snapshot,
+> complete-operation conflict retries and postcommit cache invalidation.
+> Inherited ACLs, final mode/group, inode body, directory initialization and
+> parent entry/link changes publish together. Child directories retain their
+> unmasked default ACL for subsequent descendants. ACL-bearing parents use this
+> boundary with the sharded toggle enabled; ordinary sharded creation retains
+> its prior route and remains part of the broader atomicity gap.
+> Four new regression functions plus existing ACL/tmpfile/snapshot, device and
+> directory controls pass in both configurations (37/0/0 each). The persisted
+> test mixes ordinary creation with later ACL-backed creation: native
+> `e2fsck -fn` executes all five phases with exit 0 and reopen preserves modes,
+> ACLs, identities and payloads. The existing tmpfile checker/reopen also passes
+> in both runs; all four final 16 MiB images are retained with matching hashes.
+> Workspace/all-target check, strict Clippy and formatting pass. FUSE reports
+> 715 passes and one existing ignore; actual mount lifecycle still returns
+> early on permission denial. These are self-verified bounded unit/image
+> results. Concurrent parent-ACL changes, ordinary sharded namespace atomicity,
+> outer-request composition, full-workspace tests and mounted/crash/performance
+> qualification remain open under the existing Beads. No parity rate is added.
+
 > **Atomic ext4 unnamed creation (2026-10-31):** `O_TMPFILE` now stages inode
 > allocation, inherited access ACL/mode, external ACL storage and the inode's
 > orphan link in one protected-snapshot MVCC transaction. Allocator counters,

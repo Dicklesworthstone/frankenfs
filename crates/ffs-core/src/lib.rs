@@ -9518,10 +9518,30 @@ impl OpenFs {
         Ok(retirement)
     }
 
-    /// Stage a regular file's access ACL from its parent's default ACL using
+    /// Detect an on-disk default ACL before selecting the sharded fast path.
+    /// ACL-bearing births also allocate xattr storage, so use the operation's
+    /// existing allocation exclusion for that complete metadata request.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn ext4_has_default_acl(&self, cx: &Cx, parent: &Ext4Inode) -> ffs_error::Result<bool> {
+        if ffs_ondisk::find_ibody_xattr_by_name(parent, POSIX_ACL_DEFAULT_XATTR)
+            .map_err(|error| parse_to_ffs_error(&error))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if parent.file_acl == 0 {
+            return Ok(false);
+        }
+        let external = self.read_block_vec(cx, BlockNumber(parent.file_acl))?;
+        ffs_ondisk::find_xattr_block_value_by_name(&external, POSIX_ACL_DEFAULT_XATTR)
+            .map(|entry| entry.is_some())
+            .map_err(|error| parse_to_ffs_error(&error))
+    }
+
+    /// Stage a new inode's ACLs from its parent's default ACL using
     /// the same transaction view as allocation. No cache, mode or external
     /// xattr block is published separately from the new inode.
-    fn ext4_stage_inherited_access_acl(
+    fn ext4_stage_inherited_acl(
         &self,
         cx: &Cx,
         dev: &TransactionBlockAdapter<'_, '_>,
@@ -9557,9 +9577,22 @@ impl OpenFs {
             }
             default = self.read_file(cx, &scope, ea_ino, 0, 65_536)?;
         }
-        let mut entries = posix_acl_parse(&ext4_expand_posix_acl_xattr_value(&default)?)?;
+        let generic = ext4_expand_posix_acl_xattr_value(&default)?;
+        let mut entries = posix_acl_parse(&generic)?;
         if entries.is_empty() {
             return Ok(());
+        }
+        if inode.is_dir() {
+            self.ext4_stage_setxattr(
+                cx,
+                dev,
+                alloc,
+                ino,
+                inode,
+                POSIX_ACL_DEFAULT_XATTR,
+                &ext4_compact_posix_acl_xattr_value(&generic)?,
+                XattrSetMode::Set,
+            )?;
         }
         let bits = posix_acl_create_masq(&mut entries, inode.mode);
         if !posix_acl_equiv_mode(&entries).1 {
@@ -9636,7 +9669,7 @@ impl OpenFs {
                     nanos,
                     &working.persist_ctx,
                 )?;
-                self.ext4_stage_inherited_access_acl(
+                self.ext4_stage_inherited_acl(
                     cx,
                     &tx_dev,
                     &mut working,
@@ -29611,13 +29644,109 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Publish a complete named inode birth. All allocation statistics and
+    /// reused-inode cache effects remain private until the transaction commits.
+    fn ext4_birth_transaction(
+        &self,
+        cx: &Cx,
+        mut stage: impl FnMut(
+            &TransactionBlockAdapter<'_, '_>,
+            &mut Ext4AllocState,
+            (u64, u32),
+        ) -> ffs_error::Result<(InodeNumber, Ext4Inode)>,
+    ) -> ffs_error::Result<InodeAttr> {
+        const MAX_ATTEMPTS: u32 = 16;
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let mut alloc = alloc_mutex.write();
+        for attempt in 1..=MAX_ATTEMPTS {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let mut working = Ext4AllocState {
+                geo: alloc.geo.clone(),
+                groups: alloc.groups.clone(),
+                persist_ctx: alloc.persist_ctx.clone(),
+            };
+            let (mut txn, snapshot_dev) =
+                RegisteredSnapshotBlockAdapter::begin(&block_dev, &self.mvcc_store);
+            let staged = {
+                let dev = TransactionBlockAdapter {
+                    base: &snapshot_dev,
+                    tx: Mutex::new(&mut txn),
+                };
+                stage(&dev, &mut working, Self::now_timestamp())
+            };
+            let (ino, inode) = match staged {
+                Ok(created) => created,
+                Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                Err(error) => return Err(error),
+            };
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let txn_id = txn.id();
+            let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                txn.write_set().keys().copied().collect()
+            } else {
+                Vec::new()
+            };
+            let commit_seq =
+                match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store) {
+                    Ok(seq) => seq,
+                    Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                    Err(error) => return Err(error),
+                };
+            alloc.groups = working.groups;
+            self.forget_ext4_inode_caches(ino);
+            drop(snapshot_dev);
+            drop(alloc);
+            self.prune_mvcc_after_commit_if_due(commit_seq);
+            self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
+            return Ok(inode_to_attr(sb, ino, &inode));
+        }
+        unreachable!("the final birth transaction attempt returns its result")
+    }
+
+    /// Check the parent and duplicate name against the birth's exact view.
+    fn ext4_birth_parent(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        alloc: &Ext4AllocState,
+        parent: InodeNumber,
+        name: &[u8],
+    ) -> ffs_error::Result<Ext4Inode> {
+        let mut inode = ffs_inode::read_inode(cx, dev, &alloc.geo, &alloc.groups, parent)?;
+        inode.number = parent.0;
+        if inode.mode == 0 {
+            return Err(FfsError::NotFound(format!("inode {}", parent.0)));
+        }
+        if !inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+        if inode.flags & ffs_types::EXT4_IMMUTABLE_FL != 0 {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
+        let insert_checks_duplicate = inode.has_htree_index()
+            && inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
+            && Self::htree_create_dedup_enabled();
+        if !insert_checks_duplicate
+            && self
+                .ext4_lookup_name_from_device(cx, dev, &inode, name)?
+                .is_some()
+        {
+            return Err(FfsError::Exists);
+        }
+        Ok(inode)
+    }
+
     /// Create a regular file in an ext4 directory.
     #[allow(clippy::significant_drop_tightening)]
     #[allow(clippy::too_many_arguments)]
     fn ext4_create(
         &self,
         cx: &Cx,
-        _scope: &mut RequestScope,
+        scope: &mut RequestScope,
         parent: InodeNumber,
         name: &[u8],
         mode: u16,
@@ -29625,9 +29754,9 @@ impl OpenFs {
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         Self::validate_single_path_component(name)?;
-        let alloc_mutex = self.require_alloc_state()?;
-        let block_dev = self.block_device_adapter();
-        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+        self.require_alloc_state()?;
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let _ = scope;
 
         let sb = self
             .ext4_superblock()
@@ -29643,8 +29772,14 @@ impl OpenFs {
         // bd-bhh0i cutover: when the sharded toggle is on, route to the lock-free
         // create twin (no ext4_alloc_state.write() guard). It does its own dedup.
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        if self.bhh0i_sharded_ops_active() {
-            return self.ext4_create_sharded(
+        if self.bhh0i_sharded_ops_active() && !self.ext4_has_default_acl(cx, &parent_inode)? {
+            let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+            let gid = if parent_inode.mode & 0o2000 != 0 {
+                parent_inode.gid
+            } else {
+                gid
+            };
+            let attr = self.ext4_create_sharded(
                 cx,
                 parent,
                 &parent_inode,
@@ -29655,56 +29790,44 @@ impl OpenFs {
                 csum_seed,
                 tstamp_secs,
                 tstamp_nanos,
-            );
+            )?;
+            return self.inherit_default_acl(cx, scope, parent, attr);
         }
-
-        self.ext4_create_duplicate_precheck(cx, &parent_inode, name)?;
-
-        let mut alloc = alloc_mutex.write();
-        let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
-                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-        );
-
-        // bd-9rutw: Stage inode allocation, inode table write, and parent
-        // directory insertion in one operation-owned MVCC transaction so a
-        // concurrent reader or durability boundary never observes an allocated
-        // child inode before its directory entry (or a compensating delete on
-        // duplicate-name / ENOSPC failure).
-        let groups_before = alloc.groups.clone();
-        let mut txn = self.mvcc_store.begin();
-        let staged = (|| -> ffs_error::Result<(InodeNumber, Ext4Inode)> {
-            let (ino, new_inode) = {
-                let tx_dev = TransactionBlockAdapter {
-                    base: &block_dev,
-                    tx: Mutex::new(&mut txn),
-                };
-                let Ext4AllocState {
-                    geo,
-                    groups,
-                    persist_ctx,
-                } = &mut *alloc;
-                let (ino, new_inode) = ffs_inode::create_inode(
-                    cx,
-                    &tx_dev,
-                    geo,
-                    groups,
-                    mode | 0o100_000, // S_IFREG
-                    uid,
-                    gid,
-                    parent_group,
-                    csum_seed,
-                    tstamp_secs,
-                    tstamp_nanos,
-                    persist_ctx,
-                )?;
-                self.forget_ext4_inode_caches(ino);
-                (ino, new_inode)
+        let attr = self.ext4_birth_transaction(cx, |tx_dev, alloc, (secs, nanos)| {
+            let parent_inode = self.ext4_birth_parent(cx, tx_dev, alloc, parent, name)?;
+            let parent_group = ffs_types::inode_to_group(parent, alloc.geo.inodes_per_group);
+            let gid = if parent_inode.mode & 0o2000 != 0 {
+                parent_inode.gid
+            } else {
+                gid
             };
-            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-            self.ext4_stage_dir_entry(
+            let (ino, mut new_inode) = ffs_inode::prepare_inode(
                 cx,
-                &mut txn,
+                tx_dev,
+                &alloc.geo,
+                &mut alloc.groups,
+                mode | 0o100_000,
+                uid,
+                gid,
+                parent_group,
+                secs,
+                nanos,
+                &alloc.persist_ctx,
+            )?;
+            self.ext4_stage_inherited_acl(cx, tx_dev, alloc, &parent_inode, ino, &mut new_inode)?;
+            ffs_inode::write_inode(
+                cx,
+                tx_dev,
+                &alloc.geo,
+                &alloc.groups,
+                ino,
+                &new_inode,
+                csum_seed,
+            )?;
+            let mut backend = SingleLockDirAlloc { alloc };
+            self.ext4_insert_dir_entry_from_device(
+                cx,
+                tx_dev,
                 &mut backend,
                 parent,
                 &parent_inode,
@@ -29712,48 +29835,13 @@ impl OpenFs {
                 ino,
                 ffs_ondisk::Ext4FileType::RegFile,
                 csum_seed,
-                tstamp_secs,
-                tstamp_nanos,
+                secs,
+                nanos,
             )?;
             Ok((ino, new_inode))
-        })();
-        let (ino, new_inode) = match staged {
-            Ok(created) => created,
-            Err(err) => {
-                alloc.groups = groups_before;
-                return Err(err);
-            }
-        };
-        let txn_id = txn.id();
-        let write_blocks = if self.repair_flush_lifecycle.is_some() {
-            txn.write_set().keys().copied().collect()
-        } else {
-            Vec::new()
-        };
-        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
-        {
-            Ok(seq) => seq,
-            Err(err) => {
-                alloc.groups = groups_before;
-                return Err(err);
-            }
-        };
-        drop(alloc);
-        self.prune_mvcc_after_commit_if_due(commit_seq);
-        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
-
-        let attr = inode_to_attr(sb, ino, &new_inode);
-
-        trace!(
-            target: "ffs::write",
-            op = "create",
-            parent = parent.0,
-            ino = ino.0,
-            name = %String::from_utf8_lossy(name),
-            mode,
-            "file created"
-        );
-
+        })?;
+        trace!(target: "ffs::write", op = "create", parent = parent.0,
+            ino = attr.ino.0, name = %String::from_utf8_lossy(name), mode, "file created");
         Ok(attr)
     }
 
@@ -29791,12 +29879,7 @@ impl OpenFs {
         let geo = FsGeometry::from_superblock(sb);
 
         // Duplicate-name check (POSIX EEXIST), mirroring ext4_create.
-        let htree_dedup_covers = parent_inode.has_htree_index()
-            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
-            && Self::htree_create_dedup_enabled();
-        if !htree_dedup_covers && self.lookup_name(cx, parent_inode, name)?.is_some() {
-            return Err(FfsError::Exists);
-        }
+        self.ext4_create_duplicate_precheck(cx, parent_inode, name)?;
 
         // Part-B spread: distinct concurrent creates start their inode scan in
         // distinct groups (per-thread seed) so they touch distinct per-group locks
@@ -29937,69 +30020,34 @@ impl OpenFs {
             )));
         }
 
-        let alloc_mutex = self.require_alloc_state()?;
-        let block_dev = self.block_device_adapter();
-        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
-
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
         let csum_seed = sb.csum_seed();
-
-        let parent_inode = self.read_inode(cx, parent)?;
-        if !parent_inode.is_dir() {
-            return Err(FfsError::NotDirectory);
-        }
-
-        // Skip the redundant positive lookup_name on a non-casefold htree dir:
-        // the insert (ext4_add_dir_entry -> add_entry_reject_existing) dup-checks
-        // the hash-correct leaf, and mknod's delete_inode rollback below frees the
-        // speculative inode on a collision — same guard as ext4_create/ext4_mkdir
-        // (bd-cc-mkdir-dedup). Casefold/linear dirs keep the pre-check.
-        let htree_dedup_covers = parent_inode.has_htree_index()
-            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
-            && Self::htree_create_dedup_enabled();
-        if !htree_dedup_covers && self.lookup_name(cx, &parent_inode, name)?.is_some() {
-            return Err(FfsError::Exists);
-        }
-
-        let mut alloc = alloc_mutex.write();
-        let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
-                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-        );
-
-        // bd-9rutw: Stage special-inode creation and directory insertion in a
-        // single MVCC transaction; restore `alloc.groups` on pre-commit error.
-        let groups_before = alloc.groups.clone();
-        let mut txn = self.mvcc_store.begin();
-        let staged = (|| -> ffs_error::Result<(InodeNumber, Ext4Inode)> {
+        self.ext4_birth_transaction(cx, |tx_dev, alloc, (tstamp_secs, tstamp_nanos)| {
+            let parent_inode = self.ext4_birth_parent(cx, tx_dev, alloc, parent, name)?;
+            let parent_group = ffs_types::inode_to_group(parent, alloc.geo.inodes_per_group);
+            let gid = if parent_inode.mode & 0o2000 != 0 {
+                parent_inode.gid
+            } else {
+                gid
+            };
             let (ino, new_inode) = {
-                let tx_dev = TransactionBlockAdapter {
-                    base: &block_dev,
-                    tx: Mutex::new(&mut txn),
-                };
-                let Ext4AllocState {
-                    geo,
-                    groups,
-                    persist_ctx,
-                } = &mut *alloc;
                 // prepare_inode (no body persist): mknod strips EXT4_EXTENTS_FL / stores
                 // rdev below and write_inode's the final inode once (bd-mkinode-defer).
                 let (ino, mut new_inode) = ffs_inode::prepare_inode(
                     cx,
-                    &tx_dev,
-                    geo,
-                    groups,
+                    tx_dev,
+                    &alloc.geo,
+                    &mut alloc.groups,
                     mode, // full mode including S_IF* bits — no S_IFREG OR
                     uid,
                     gid,
                     parent_group,
                     tstamp_secs,
                     tstamp_nanos,
-                    persist_ctx,
+                    &alloc.persist_ctx,
                 )?;
-                self.forget_ext4_inode_caches(ino);
 
                 // Devices + FIFOs + sockets do not own data extents. Strip the
                 // EXT4_EXTENTS_FL flag the create_inode helper unconditionally
@@ -30024,13 +30072,29 @@ impl OpenFs {
                 new_inode.blocks = 0;
                 new_inode.size = 0;
 
-                ffs_inode::write_inode(cx, &tx_dev, geo, groups, ino, &new_inode, csum_seed)?;
+                self.ext4_stage_inherited_acl(
+                    cx,
+                    tx_dev,
+                    alloc,
+                    &parent_inode,
+                    ino,
+                    &mut new_inode,
+                )?;
+                ffs_inode::write_inode(
+                    cx,
+                    tx_dev,
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &new_inode,
+                    csum_seed,
+                )?;
                 (ino, new_inode)
             };
-            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-            self.ext4_stage_dir_entry(
+            let mut backend = SingleLockDirAlloc { alloc };
+            self.ext4_insert_dir_entry_from_device(
                 cx,
-                &mut txn,
+                tx_dev,
                 &mut backend,
                 parent,
                 &parent_inode,
@@ -30042,33 +30106,7 @@ impl OpenFs {
                 tstamp_nanos,
             )?;
             Ok((ino, new_inode))
-        })();
-        let (ino, new_inode) = match staged {
-            Ok(created) => created,
-            Err(err) => {
-                alloc.groups = groups_before;
-                return Err(err);
-            }
-        };
-        let txn_id = txn.id();
-        let write_blocks = if self.repair_flush_lifecycle.is_some() {
-            txn.write_set().keys().copied().collect()
-        } else {
-            Vec::new()
-        };
-        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
-        {
-            Ok(seq) => seq,
-            Err(err) => {
-                alloc.groups = groups_before;
-                return Err(err);
-            }
-        };
-        drop(alloc);
-        self.prune_mvcc_after_commit_if_due(commit_seq);
-        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
-
-        Ok(inode_to_attr(sb, ino, &new_inode))
+        })
     }
 
     /// Create a directory inside an ext4 parent directory.
@@ -30077,7 +30115,7 @@ impl OpenFs {
     fn ext4_mkdir(
         &self,
         cx: &Cx,
-        _scope: &mut RequestScope,
+        scope: &mut RequestScope,
         parent: InodeNumber,
         name: &[u8],
         mode: u16,
@@ -30085,9 +30123,9 @@ impl OpenFs {
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         Self::validate_single_path_component(name)?;
-        let alloc_mutex = self.require_alloc_state()?;
-        let block_dev = self.block_device_adapter();
-        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+        self.require_alloc_state()?;
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let _ = scope;
 
         let sb = self
             .ext4_superblock()
@@ -30103,8 +30141,14 @@ impl OpenFs {
         // mkdir twin (no ext4_alloc_state.write() guard). It does its own EMLINK
         // guard + dedup.
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        if self.bhh0i_sharded_ops_active() {
-            return self.ext4_mkdir_sharded(
+        if self.bhh0i_sharded_ops_active() && !self.ext4_has_default_acl(cx, &parent_inode)? {
+            let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+            let (mode, gid) = if parent_inode.mode & 0o2000 != 0 {
+                (mode | 0o2000, parent_inode.gid)
+            } else {
+                (mode, gid)
+            };
+            let attr = self.ext4_mkdir_sharded(
                 cx,
                 parent,
                 &parent_inode,
@@ -30115,61 +30159,34 @@ impl OpenFs {
                 csum_seed,
                 tstamp_secs,
                 tstamp_nanos,
-            );
+            )?;
+            return self.inherit_default_acl(cx, scope, parent, attr);
         }
+        let attr = self.ext4_birth_transaction(cx, |tx_dev, alloc, (secs, nanos)| {
+            let parent_inode = self.ext4_birth_parent(cx, tx_dev, alloc, parent, name)?;
+            let (mode, gid) = if parent_inode.mode & 0o2000 != 0 {
+                (mode | 0o2000, parent_inode.gid)
+            } else {
+                (mode, gid)
+            };
+            // A new subdirectory adds a '..' link to the parent. The kernel's
+            // EXT4_DIR_LINK_MAX(dir) = !is_dx(dir) && i_nlink >= EXT4_LINK_MAX makes
+            // mkdir return EMLINK once a NON-htree directory reaches the link cap
+            // (65000); without this guard the parent's u16 links_count would climb to
+            // overflow and fail as a generic Corruption rather than the POSIX EMLINK.
+            // An htree directory instead pins its link count at the dir_nlink
+            // sentinel (1) — see `ext4_dir_link_inc` (bd-j12g7). Mirrors ext4_link's
+            // cap and btrfs bd-ilg79.
+            if parent_inode.flags & ffs_types::EXT4_INDEX_FL == 0
+                && parent_inode.links_count >= 65_000
+            {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::EMLINK,
+                )));
+            }
 
-        // A new subdirectory adds a '..' link to the parent. The kernel's
-        // EXT4_DIR_LINK_MAX(dir) = !is_dx(dir) && i_nlink >= EXT4_LINK_MAX makes
-        // mkdir return EMLINK once a NON-htree directory reaches the link cap
-        // (65000); without this guard the parent's u16 links_count would climb to
-        // overflow and fail as a generic Corruption rather than the POSIX EMLINK.
-        // An htree directory instead pins its link count at the dir_nlink
-        // sentinel (1) — see `ext4_dir_link_inc` (bd-j12g7). Mirrors ext4_link's
-        // cap and btrfs bd-ilg79.
-        if parent_inode.flags & ffs_types::EXT4_INDEX_FL == 0 && parent_inode.links_count >= 65_000
-        {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EMLINK,
-            )));
-        }
-
-        // Check for duplicate name — POSIX requires EEXIST. For a non-casefold
-        // htree directory the insert path (ext4_add_dir_entry ->
-        // ffs_dir::add_entry_reject_existing) performs a byte-exact duplicate
-        // check on the hash-correct target leaf — the ONLY block a duplicate of
-        // `name` could occupy — so this separate positive lookup_name (a full
-        // second htree descent + leaf read + scan) is redundant and is skipped,
-        // mirroring ext4_create's `htree_dedup_covers` (bd-cc-mkdir-dedup). On a
-        // collision the insert returns Err and mkdir's rollback below frees the
-        // just-allocated inode+dir-block, so the observable EEXIST is unchanged.
-        // Casefold htree (folded-name collisions) and linear dirs (a duplicate can
-        // sit in a block other than the one with free space) keep the pre-check.
-        let htree_dedup_covers = parent_inode.has_htree_index()
-            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
-            && Self::htree_create_dedup_enabled();
-        if !htree_dedup_covers && self.lookup_name(cx, &parent_inode, name)?.is_some() {
-            return Err(FfsError::Exists);
-        }
-
-        let mut alloc = alloc_mutex.write();
-
-        let parent_group = GroupNumber(
-            u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
-                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-        );
-
-        // bd-9rutw: Stage directory inode allocation, `.`/`..` data block
-        // initialization, child inode write, and parent directory entry
-        // insertion in a single MVCC transaction; restore `alloc.groups` on
-        // pre-commit error.
-        let groups_before = alloc.groups.clone();
-        let mut txn = self.mvcc_store.begin();
-        let staged = (|| -> ffs_error::Result<(InodeNumber, Ext4Inode)> {
+            let parent_group = ffs_types::inode_to_group(parent, alloc.geo.inodes_per_group);
             let (ino, new_inode) = {
-                let tx_dev = TransactionBlockAdapter {
-                    base: &block_dev,
-                    tx: Mutex::new(&mut txn),
-                };
                 let (ino, mut new_inode) = {
                     let Ext4AllocState {
                         geo,
@@ -30181,20 +30198,18 @@ impl OpenFs {
                     // create_inode body write would be redundant (bd-mkinode-defer).
                     ffs_inode::prepare_inode(
                         cx,
-                        &tx_dev,
+                        tx_dev,
                         geo,
                         groups,
                         mode | 0o040_000, // S_IFDIR
                         uid,
                         gid,
                         parent_group,
-                        tstamp_secs,
-                        tstamp_nanos,
+                        secs,
+                        nanos,
                         persist_ctx,
                     )?
                 };
-
-                self.forget_ext4_inode_caches(ino);
 
                 // Allocate a data block for the directory and initialize with . and ..
                 let dir_alloc = {
@@ -30212,15 +30227,7 @@ impl OpenFs {
                         "ext4_mkdir_data_block",
                         Some(ino),
                     );
-                    ffs_alloc::alloc_blocks_persist(
-                        cx,
-                        &tx_dev,
-                        geo,
-                        groups,
-                        1,
-                        &hint,
-                        persist_ctx,
-                    )?
+                    ffs_alloc::alloc_blocks_persist(cx, tx_dev, geo, groups, 1, &hint, persist_ctx)?
                 };
 
                 let block_size_usize = usize::try_from(alloc.geo.block_size)
@@ -30249,10 +30256,10 @@ impl OpenFs {
                 let mut root_bytes = Self::extent_root(&new_inode);
                 if Self::ext4_inode_block_map_is_indirect(&new_inode) {
                     // No EXTENTS feature: the first block is direct pointer i_block[0].
-                    let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+                    let mut backend = SingleLockDirAlloc { alloc: &mut *alloc };
                     Self::ext4_dir_map_extent(
                         cx,
-                        &tx_dev,
+                        tx_dev,
                         &mut backend,
                         true,
                         &mut root_bytes,
@@ -30269,7 +30276,7 @@ impl OpenFs {
                     } = &mut *alloc;
                     let mut tree_alloc = ffs_extent::GroupBlockAllocator {
                         cx,
-                        dev: &tx_dev,
+                        dev: tx_dev,
                         geo,
                         groups,
                         hint: self.numa_allocation_hint(
@@ -30285,9 +30292,8 @@ impl OpenFs {
                         ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
                         generation: new_inode.generation,
                     };
-                    ffs_btree::insert(cx, &tx_dev, &mut root_bytes, extent, &mut tree_alloc)?;
+                    ffs_btree::insert(cx, tx_dev, &mut root_bytes, extent, &mut tree_alloc)?;
                 }
-                self.invalidate_ext4_write_extent_snapshot(&new_inode);
                 Self::set_extent_root(&mut new_inode, &root_bytes);
 
                 // Update inode metadata.
@@ -30299,17 +30305,25 @@ impl OpenFs {
                     new_inode.blocks = u64::from(bs / EXT4_SECTOR_SIZE);
                 }
                 new_inode.links_count = 2; // . and parent
+                self.ext4_stage_inherited_acl(
+                    cx,
+                    tx_dev,
+                    alloc,
+                    &parent_inode,
+                    ino,
+                    &mut new_inode,
+                )?;
                 {
                     let Ext4AllocState { geo, groups, .. } = &mut *alloc;
-                    ffs_inode::write_inode(cx, &tx_dev, geo, groups, ino, &new_inode, csum_seed)?;
+                    ffs_inode::write_inode(cx, tx_dev, geo, groups, ino, &new_inode, csum_seed)?;
                 }
                 (ino, new_inode)
             };
 
-            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-            self.ext4_stage_dir_entry(
+            let mut backend = SingleLockDirAlloc { alloc };
+            self.ext4_insert_dir_entry_from_device(
                 cx,
-                &mut txn,
+                tx_dev,
                 &mut backend,
                 parent,
                 &parent_inode,
@@ -30317,47 +30331,13 @@ impl OpenFs {
                 ino,
                 ffs_ondisk::Ext4FileType::Dir,
                 csum_seed,
-                tstamp_secs,
-                tstamp_nanos,
+                secs,
+                nanos,
             )?;
             Ok((ino, new_inode))
-        })();
-        let (ino, new_inode) = match staged {
-            Ok(created) => created,
-            Err(err) => {
-                alloc.groups = groups_before;
-                return Err(err);
-            }
-        };
-        let txn_id = txn.id();
-        let write_blocks = if self.repair_flush_lifecycle.is_some() {
-            txn.write_set().keys().copied().collect()
-        } else {
-            Vec::new()
-        };
-        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
-        {
-            Ok(seq) => seq,
-            Err(err) => {
-                alloc.groups = groups_before;
-                return Err(err);
-            }
-        };
-        drop(alloc);
-        self.prune_mvcc_after_commit_if_due(commit_seq);
-        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
-
-        let attr = inode_to_attr(sb, ino, &new_inode);
-
-        trace!(
-            target: "ffs::write",
-            op = "mkdir",
-            parent = parent.0,
-            ino = ino.0,
-            name = %String::from_utf8_lossy(name),
-            "directory created"
-        );
-
+        })?;
+        trace!(target: "ffs::write", op = "mkdir", parent = parent.0,
+            ino = attr.ino.0, name = %String::from_utf8_lossy(name), "directory created");
         Ok(attr)
     }
 
@@ -74526,6 +74506,398 @@ mod tests {
             return; // e2fsck unavailable
         };
         assert!(clean, "e2fsck after tmpfile + link + reclaim:\n{output}");
+    }
+
+    fn ext4_named_birth_for_test(
+        fs: &OpenFs,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &str,
+        kind: FileType,
+    ) -> ffs_error::Result<InodeAttr> {
+        match kind {
+            FileType::RegularFile => fs.create(cx, parent, OsStr::new(name), 0o666, 123, 456),
+            FileType::Directory => fs.mkdir(cx, parent, OsStr::new(name), 0o777, 123, 456),
+            FileType::Fifo => fs.mknod(
+                cx,
+                parent,
+                OsStr::new(name),
+                ffs_types::S_IFIFO | 0o666,
+                0,
+                123,
+                456,
+            ),
+            _ => panic!("unsupported named birth test kind"),
+        }
+    }
+
+    #[test]
+    fn ext4_named_birth_acl_is_one_publication() {
+        let mode_only = posix_acl_encode(&[
+            PosixAclEntry {
+                tag: POSIX_ACL_TAG_USER_OBJ,
+                perm: 6,
+                id: POSIX_ACL_UNDEFINED_ID,
+            },
+            PosixAclEntry {
+                tag: POSIX_ACL_TAG_GROUP_OBJ,
+                perm: 4,
+                id: POSIX_ACL_UNDEFINED_ID,
+            },
+            PosixAclEntry {
+                tag: POSIX_ACL_TAG_OTHER,
+                perm: 0,
+                id: POSIX_ACL_UNDEFINED_ID,
+            },
+        ]);
+        for acl in [mode_only, ext4_setattr_test_acl(6, 4, 0)] {
+            for kind in [FileType::RegularFile, FileType::Directory, FileType::Fifo] {
+                let fs = open_writable_ext4().expect("retained ext4 fixture");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                fs.set_bhh0i_sharded_ops(true);
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                fs.setxattr(&cx, root, POSIX_ACL_DEFAULT_XATTR, &acl, XattrSetMode::Set)
+                    .unwrap();
+                // Establish directory and allocation versions before retaining
+                // the old view, rather than asking an unversioned ancestor to
+                // provide history it has never stored.
+                fs.create(&cx, root, OsStr::new("before_birth"), 0o600, 0, 0)
+                    .unwrap();
+                let old = fs.begin_request_scope(&cx, RequestOp::Lookup).unwrap();
+                let parent = fs.getattr(&cx, root).unwrap();
+                let free = fs.statfs(&cx, root).unwrap().files_free;
+                let before = fs.current_snapshot();
+                let child = ext4_named_birth_for_test(&fs, &cx, root, "acl_birth", kind).unwrap();
+                assert_eq!(
+                    fs.current_snapshot().high.0,
+                    before.high.0 + 1,
+                    "{kind:?}: one birth publication"
+                );
+                assert_eq!(child.kind, kind);
+                assert_eq!(child.perm & 0o777, 0o640);
+                assert_eq!((child.uid, child.gid), (123, 456));
+                assert_eq!(fs.statfs(&cx, root).unwrap().files_free, free - 1);
+                let is_dir = kind == FileType::Directory;
+                assert_eq!(child.nlink, if is_dir { 2 } else { 1 });
+                assert_eq!(
+                    fs.getattr(&cx, root).unwrap().nlink,
+                    parent.nlink + u32::from(is_dir)
+                );
+                assert_eq!(
+                    fs.lookup(&cx, root, OsStr::new("acl_birth")).unwrap().ino,
+                    child.ino
+                );
+                let mut old = old;
+                let old_lookup =
+                    <OpenFs as FsOps>::lookup(&fs, &cx, &mut old, root, OsStr::new("acl_birth"));
+                assert!(
+                    matches!(old_lookup, Err(FfsError::NotFound(_))),
+                    "{old_lookup:?}"
+                );
+                fs.end_request_scope(&cx, RequestOp::Lookup, old).unwrap();
+                let expected_access = (acl.len() > 100).then(|| acl.clone());
+                assert_eq!(
+                    fs.getxattr(&cx, child.ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                    expected_access
+                );
+                assert_eq!(
+                    fs.getxattr(&cx, child.ino, POSIX_ACL_DEFAULT_XATTR)
+                        .unwrap(),
+                    is_dir.then(|| acl.clone())
+                );
+                if is_dir {
+                    let before = fs.current_snapshot();
+                    let grandchild = fs
+                        .create(&cx, child.ino, OsStr::new("inherited"), 0o666, 0, 0)
+                        .unwrap();
+                    assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+                    assert_eq!(grandchild.perm & 0o777, 0o640);
+                    assert_eq!(
+                        fs.getxattr(&cx, grandchild.ino, POSIX_ACL_ACCESS_XATTR)
+                            .unwrap(),
+                        expected_access
+                    );
+                    assert_eq!(
+                        fs.lookup(&cx, child.ino, OsStr::new("..")).unwrap().ino,
+                        OpenFs::ext4_presented_inode(root)
+                    );
+                }
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_named_birth_acl_failure_publishes_nothing() {
+        for malformed in [true, false] {
+            for kind in [FileType::RegularFile, FileType::Directory, FileType::Fifo] {
+                let fs = open_writable_ext4().expect("retained ext4 fixture");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                fs.set_bhh0i_sharded_ops(true);
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                if malformed {
+                    let mut parent = fs.read_inode(&cx, root).unwrap();
+                    ffs_xattr::set_xattr(
+                        &mut parent,
+                        None,
+                        POSIX_ACL_DEFAULT_XATTR,
+                        &posix_acl_encode(&[PosixAclEntry {
+                            tag: POSIX_ACL_TAG_GROUP_OBJ,
+                            perm: 4,
+                            id: POSIX_ACL_UNDEFINED_ID,
+                        }]),
+                        XattrWriteAccess {
+                            is_owner: true,
+                            has_cap_fowner: true,
+                            has_cap_sys_admin: true,
+                        },
+                    )
+                    .unwrap();
+                    persist_ext4_test_inode(&fs, &cx, root, &parent);
+                    fs.forget_ext4_inode_caches(root);
+                } else {
+                    fs.setxattr(
+                        &cx,
+                        root,
+                        POSIX_ACL_DEFAULT_XATTR,
+                        &ext4_setattr_test_acl(6, 4, 0),
+                        XattrSetMode::Set,
+                    )
+                    .unwrap();
+                    // Plant exhaustion after storing the parent's external ACL.
+                    // Inode slots are available; child data/ACL allocation fails.
+                    for group in &mut fs.require_alloc_state().unwrap().write().groups {
+                        group.free_blocks = 0;
+                    }
+                }
+                let before = fs.current_snapshot();
+                let parent = fs.getattr(&cx, root).unwrap();
+                let counts = fs.statfs(&cx, root).unwrap();
+                let names = fs.readdir(&cx, root, 0).unwrap();
+                let head = fs.ext4_read_orphan_head();
+                let pending = fs.ext4_pending_orphans.lock().clone();
+                let error =
+                    ext4_named_birth_for_test(&fs, &cx, root, "failed_birth", kind).unwrap_err();
+                assert_eq!(
+                    error.to_errno(),
+                    if malformed {
+                        libc::EINVAL
+                    } else {
+                        libc::ENOSPC
+                    },
+                    "{kind:?}: {error:?}"
+                );
+                assert_eq!(
+                    fs.current_snapshot(),
+                    before,
+                    "{kind:?}: a failed birth publishes no blocks"
+                );
+                assert_eq!(fs.getattr(&cx, root).unwrap(), parent);
+                let after = fs.statfs(&cx, root).unwrap();
+                assert_eq!(
+                    (after.files_free, after.blocks_free),
+                    (counts.files_free, counts.blocks_free)
+                );
+                assert_eq!(fs.readdir(&cx, root, 0).unwrap(), names);
+                assert!(matches!(
+                    fs.lookup(&cx, root, OsStr::new("failed_birth")),
+                    Err(FfsError::NotFound(_))
+                ));
+                assert_eq!(fs.ext4_read_orphan_head(), head);
+                assert_eq!(*fs.ext4_pending_orphans.lock(), pending);
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_named_birth_setgid_and_non_acl_routing() {
+        for kind in [FileType::RegularFile, FileType::Directory, FileType::Fifo] {
+            let fs = open_writable_ext4().expect("retained ext4 fixture");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            fs.set_bhh0i_sharded_ops(true);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            fs.setattr(
+                &cx,
+                root,
+                &SetAttrRequest {
+                    mode: Some(0o2770),
+                    gid: Some(77),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .unwrap();
+            let attr = ext4_named_birth_for_test(&fs, &cx, root, "setgid_birth", kind).unwrap();
+            assert_eq!(attr.gid, 77);
+            assert_eq!(attr.uid, 123);
+            assert_eq!(
+                attr.perm & 0o2000,
+                if kind == FileType::Directory {
+                    0o2000
+                } else {
+                    0
+                }
+            );
+            assert_eq!(fs.getattr(&cx, attr.ino).unwrap(), attr);
+            assert_eq!(
+                fs.getxattr(&cx, attr.ino, POSIX_ACL_ACCESS_XATTR).unwrap(),
+                None
+            );
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            assert_eq!(
+                fs.bhh0i_sharded_alloc_happened
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                kind != FileType::Fifo,
+                "ordinary file/directory creation still uses the sharded allocator"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_named_birth_retained_image_passes_native_checker() {
+        use std::io::Write as _;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/images/ext4_small.img");
+        let dev = TestDevice::from_vec(std::fs::read(fixture).expect("retained ext4 fixture"));
+        let cx = Cx::for_testing();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        fs.enable_writes(&cx).unwrap();
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let root = InodeNumber(2);
+        // Mix ordinary sharded births with later ACL-bearing births. Their
+        // counter deltas must reconcile into the same persisted descriptors.
+        let ordinary = fs
+            .create(&cx, root, OsStr::new("ordinary_file"), 0o644, 1, 2)
+            .unwrap();
+        fs.mkdir(&cx, root, OsStr::new("ordinary_dir"), 0o755, 1, 2)
+            .unwrap();
+        fs.write(&cx, ordinary.ino, 0, b"ordinary payload").unwrap();
+        let acl = ext4_setattr_test_acl(6, 4, 0);
+        fs.setxattr(&cx, root, POSIX_ACL_DEFAULT_XATTR, &acl, XattrSetMode::Set)
+            .unwrap();
+        let file = ext4_named_birth_for_test(&fs, &cx, root, "native_file", FileType::RegularFile)
+            .unwrap();
+        let dir =
+            ext4_named_birth_for_test(&fs, &cx, root, "native_dir", FileType::Directory).unwrap();
+        ext4_named_birth_for_test(&fs, &cx, root, "native_fifo", FileType::Fifo).unwrap();
+        let nested = fs
+            .create(&cx, dir.ino, OsStr::new("nested"), 0o666, 123, 456)
+            .unwrap();
+        fs.write(&cx, file.ino, 0, b"named birth payload").unwrap();
+        fs.write(&cx, nested.ino, 0, b"inherited payload").unwrap();
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        // Deliberately retained; there is no destructor or cleanup command.
+        let image = std::env::temp_dir().join(format!(
+            "ffs-named-birth-{}-{}.ext4",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = dev.snapshot_bytes();
+        let digest = blake3::hash(&bytes);
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&image)
+            .unwrap();
+        output.write_all(&bytes).unwrap();
+        output.sync_all().unwrap();
+        let checked = std::process::Command::new("e2fsck")
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .expect("native checker must execute");
+        println!(
+            "retained named-birth image: {}\n{}\n{}",
+            image.display(),
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        assert!(
+            checked.status.success(),
+            "native checker status: {:?}",
+            checked.status
+        );
+        assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), digest);
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let ordinary = reopened
+            .lookup(&cx, root, OsStr::new("ordinary_file"))
+            .unwrap();
+        assert_eq!(
+            (ordinary.uid, ordinary.gid, ordinary.perm & 0o777),
+            (1, 2, 0o644)
+        );
+        assert_eq!(
+            reopened.read(&cx, ordinary.ino, 0, 64).unwrap(),
+            b"ordinary payload"
+        );
+        assert_eq!(
+            reopened
+                .getxattr(&cx, ordinary.ino, POSIX_ACL_ACCESS_XATTR)
+                .unwrap(),
+            None
+        );
+        for (name, kind) in [
+            ("native_file", FileType::RegularFile),
+            ("native_dir", FileType::Directory),
+            ("native_fifo", FileType::Fifo),
+        ] {
+            let attr = reopened.lookup(&cx, root, OsStr::new(name)).unwrap();
+            assert_eq!(attr.kind, kind);
+            assert_eq!(attr.perm & 0o777, 0o640);
+            assert_eq!((attr.uid, attr.gid), (123, 456));
+            assert_eq!(
+                reopened
+                    .getxattr(&cx, attr.ino, POSIX_ACL_ACCESS_XATTR)
+                    .unwrap(),
+                Some(acl.clone())
+            );
+            assert_eq!(
+                reopened
+                    .getxattr(&cx, attr.ino, POSIX_ACL_DEFAULT_XATTR)
+                    .unwrap(),
+                (kind == FileType::Directory).then(|| acl.clone())
+            );
+        }
+        assert_eq!(
+            reopened.read(&cx, file.ino, 0, 64).unwrap(),
+            b"named birth payload"
+        );
+        let nested = reopened.lookup(&cx, dir.ino, OsStr::new("nested")).unwrap();
+        assert_eq!(
+            reopened.read(&cx, nested.ino, 0, 64).unwrap(),
+            b"inherited payload"
+        );
+        assert_eq!(nested.perm & 0o777, 0o640);
+        assert_eq!(
+            reopened
+                .getxattr(&cx, nested.ino, POSIX_ACL_ACCESS_XATTR)
+                .unwrap(),
+            Some(acl)
+        );
     }
 
     #[test]
