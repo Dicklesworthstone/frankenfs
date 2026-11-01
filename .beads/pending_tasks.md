@@ -13,6 +13,18 @@ completed or handed off. Historical evidence remains in place.
 
 ### Deferred mapping publication continuation — 2026-11-01
 
+- [x] Recheck the committed repair and current worker state. Admission has
+  recovered externally on hz3/hz4/vmi1149989; no agent deletion, policy change
+  or reclaim credit. hz3's actual executable /tmp volume passes SBH20GiB with
+  30175281152bytes available, and the canonical fixture hash still matches.
+- [ ] Execute full ffs-extent library tests and default/sharded focused core
+  tests, including the real publication regression and existing native controls.
+- [ ] Execute workspace/all-target check, strict Clippy and formatting; bind
+  source, toolchain and commands. Use nonincremental compilation to limit
+  retained build-cache growth, without reducing checks or selected tests.
+- [ ] Repair any actual failures, re-run affected gates, update the exact
+  evidence and deliver the verified checkpoint. Original full-suite/mounted
+  acceptance remains separate and open until executed.
 - [x] Operator directed SSH remediation using system-performance-remediation;
   read that skill and its reclaim/RCH references before changing workers.
 - [x] Diagnose hz3, hz4 and vmi1149989 sequentially: actual volumes, PSI,
@@ -33,11 +45,11 @@ completed or handed off. Historical evidence remains in place.
 - [ ] Obtain the required exact deletion authorization and final command
   confirmation for only hz3's accounting-sjperf a/target and b/target.
   The operator's SSH/skill instruction is recorded; no deletion command is
-  authorized by implication. An exact-path permission request is pending.
-- [ ] Restore disk headroom using the smallest authorized action; retain all
-  source, tracker, CASS, evidence, protected paths and current peer work.
-  Recheck purity, all protection markers and live use immediately before any
-  reclaim; exact deletion authorization required by AGENTS remains binding.
+  authorized by implication. The prior request remains pending, but cleanup
+  is optional and no longer blocks verification after external recovery.
+- [x] Observe restored worker headroom without reclaiming source, tracker,
+  CASS, evidence, protected paths or peer work. Any later cleanup still needs
+  exact authorization and fresh purity/protection/live-use checks.
 - [ ] Verify restored worker admission and actual-volume SBH20GiB; resume
   normal RCH checks without changing floors, slots, quotas or mount permissions.
 - [x] Read instructions/README; inspect the owned P0, local queue, cycles and
