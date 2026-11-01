@@ -19,6 +19,11 @@ completed or handed off. Historical evidence remains in place.
   30175281152bytes available, and the canonical fixture hash still matches.
 - [ ] Execute full ffs-extent library tests and default/sharded focused core
   tests, including the real publication regression and existing native controls.
+- [ ] Execute the prescribed full workspace suite and resolve actual failures.
+  Correction to the earlier hold: the repository's explicit test commands
+  authorize their normal test-owned scratch lifecycle. Manual deletion of
+  existing remote caches remains separately gated; no unanswered approval is
+  being treated as consent. Restricted device/xfstests ACKs remain binding.
 - [ ] Execute workspace/all-target check, strict Clippy and formatting; bind
   source, toolchain and commands. Use nonincremental compilation to limit
   retained build-cache growth, without reducing checks or selected tests.
