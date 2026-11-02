@@ -162,7 +162,33 @@ jobs:
         # baseline pass that no longer passes fails the job; the known
         # failures are tracked beads (bd-wl17e, bd-55gzo, bd-tqa7z, bd-2cgl5,
         # bd-uyo9k, bd-msbk2) and a new pass is reported as progress.
-        run: sudo -E env "PATH=$PATH" ./scripts/e2e/ffs_xfstests_regression_gate.sh
+        run: |
+          set -euo pipefail
+          # sudo-rs ignores -E; pass the declared run contract explicitly.
+          sudo -n env \
+            "PATH=$PATH" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=$CARGO_HOME" \
+            "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" \
+            "RUST_BACKTRACE=$RUST_BACKTRACE" \
+            "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" \
+            "XFSTESTS_DIR=$XFSTESTS_DIR" \
+            "TEST_DEV=$TEST_DEV" \
+            "SCRATCH_DEV=$SCRATCH_DEV" \
+            "TEST_DIR=$TEST_DIR" \
+            "SCRATCH_MNT=$SCRATCH_MNT" \
+            "FSTYP=$FSTYP" \
+            "FUSE_SUBTYP=$FUSE_SUBTYP" \
+            "FFS_XFSTESTS_IMAGE_FORMAT=$FFS_XFSTESTS_IMAGE_FORMAT" \
+            "XFSTESTS_MODE=$XFSTESTS_MODE" \
+            "XFSTESTS_FILTER=$XFSTESTS_FILTER" \
+            "XFSTESTS_DRY_RUN=$XFSTESTS_DRY_RUN" \
+            "XFSTESTS_STRICT=$XFSTESTS_STRICT" \
+            "XFSTESTS_REAL_RUN_ACK=$XFSTESTS_REAL_RUN_ACK" \
+            "XFSTESTS_BASELINE_JSON=$XFSTESTS_BASELINE_JSON" \
+            "FFS_MOUNT_LOG_DIR=$FFS_MOUNT_LOG_DIR" \
+            "FFS_FUSE_SUBTYPE=$FFS_FUSE_SUBTYPE" \
+            ./scripts/e2e/ffs_xfstests_regression_gate.sh
 
       - name: Make root-owned artifacts readable
         if: always()
