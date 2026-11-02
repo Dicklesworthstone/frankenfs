@@ -76,6 +76,48 @@ def native_allocation(image: Path) -> dict[str, int | str]:
             "next_free_cluster": next_free}
 
 
+def native_root_file(image: Path, short_name: bytes) -> dict[str, object]:
+    """Byte-level footprint of a file in the initial root sector/cluster.
+
+    Used only for this runner's own dosfstools images. Pin the complete native
+    entry and allocated data (including slack), independently of ffs-fat output.
+    """
+    with image.open("rb") as stream:
+        boot = stream.read(512)
+        u16 = lambda at: int.from_bytes(boot[at:at + 2], "little")
+        u32 = lambda at: int.from_bytes(boot[at:at + 4], "little")
+        sector, spc, reserved = u16(11), boot[13], u16(14)
+        fat_sectors = u16(22) or u32(36)
+        root_sectors = (u16(17) * 32 + sector - 1) // sector
+        first_data = reserved + boot[16] * fat_sectors + root_sectors
+        width = 2 if u16(17) else 4
+        root_sector = reserved + boot[16] * fat_sectors if width == 2 else \
+            first_data + (u32(44) - 2) * spc
+        stream.seek(root_sector * sector)
+        root = stream.read(root_sectors * sector if width == 2 else spc * sector)
+        entries = [root[at:at + 32] for at in range(0, len(root), 32)
+                   if root[at:at + 11] == short_name and root[at + 11] != 0x0F]
+        check(len(entries) == 1, f"native root file is missing or ambiguous: {short_name!r}")
+        entry = entries[0]
+        cluster = int.from_bytes(entry[26:28], "little")
+        if width == 4:
+            cluster |= int.from_bytes(entry[20:22], "little") << 16
+        chain: list[int] = []
+        seen: set[int] = set()
+        result = hashlib.sha256()
+        while cluster >= 2 and cluster < (0xFFF8 if width == 2 else 0x0FFFFFF8):
+            check(cluster not in seen and len(chain) < 1_048_576, "native footprint chain cycle/budget")
+            seen.add(cluster)
+            chain.append(cluster)
+            stream.seek((first_data + (cluster - 2) * spc) * sector)
+            data = stream.read(spc * sector)
+            check(len(data) == spc * sector, "native footprint exceeds image")
+            result.update(data)
+            stream.seek(reserved * sector + cluster * width)
+            cluster = int.from_bytes(stream.read(width), "little") & (0xFFFF if width == 2 else 0x0FFFFFFF)
+        return {"entry_hex": entry.hex(), "clusters": chain, "allocated_sha256": result.hexdigest()}
+
+
 class Run:
     def __init__(self, binary: Path, root: Path, facade: Path | None = None) -> None:
         self.binary = binary
@@ -209,6 +251,7 @@ class Run:
         source.write_bytes(sentinel)
         self.command("mcopy", "-i", native, source, "::/KEEP.BIN")
         self.command("fsck.fat", "-n", native)
+        keep_before = native_root_file(native, b"KEEP    BIN")
         image = native
         options: tuple[str, ...] = ()
         if bounded:
@@ -311,6 +354,47 @@ class Run:
             check((mounted / "KEEP.BIN").read_bytes() == sentinel, "unrelated native file changed")
             acknowledged("directory growth and readdir", entries=40)
 
+            cluster = os.statvfs(mounted).f_frsize
+            # Alternate growth so both files have noncontiguous native chains.
+            with (mounted / "FRAG_A.BIN").open("x+b", buffering=0) as first, \
+                    (mounted / "FRAG_B.BIN").open("x+b", buffering=0) as second:
+                for count in range(1, 5):
+                    os.posix_fallocate(first.fileno(), 0, count * cluster)
+                    os.posix_fallocate(second.fileno(), 0, count * cluster)
+                for stream, byte, name in ((first, b"A", "FRAG_A.BIN"),
+                                            (second, b"B", "FRAG_B.BIN")):
+                    data = byte * (4 * cluster)
+                    check(stream.write(data) == len(data), "short fragmented write")
+                    os.fsync(stream.fileno())
+                    expected[name] = data
+            acknowledged("interleaved fragmented native chains", cluster_bytes=cluster)
+
+            # Fill the actual remaining allocation, overwrite without allocating,
+            # then shrink/regrow into the freed storage. The old tail must not
+            # reappear after its bytes have passed beyond the shortened EOF.
+            capacity_file = mounted / "CAPACITY.BIN"
+            with capacity_file.open("x+b", buffering=0) as stream:
+                free_before = os.statvfs(mounted).f_bavail
+                length = free_before * cluster
+                check(length > 4 * cluster, "full-volume case has no useful free allocation")
+                os.posix_fallocate(stream.fileno(), 0, length)
+                check(os.statvfs(mounted).f_bavail == 0, "fallocate did not fill the volume")
+                check(os.pwrite(stream.fileno(), b"old private tail", length - 16) == 16,
+                      "overwrite on a full volume failed")
+                expect_errno("growth on full volume", errno.ENOSPC,
+                             lambda: os.pwrite(stream.fileno(), b"X", length))
+                stream.truncate(length - 3 * cluster)
+                check(os.statvfs(mounted).f_bavail == 3, "shrink did not release exactly three clusters")
+                stream.truncate(length)
+                check(os.statvfs(mounted).f_bavail == 0, "regrowth did not reuse freed allocation")
+                check(os.pread(stream.fileno(), 3 * cluster, length - 3 * cluster) == b"\0" * (3 * cluster),
+                      "regrowth exposed old private tail bytes")
+                stream.truncate(0)
+                os.fsync(stream.fileno())
+                check(os.statvfs(mounted).f_bavail == free_before, "truncate leaked allocation")
+            expected["CAPACITY.BIN"] = b""
+            acknowledged("full-volume overwrite, ENOSPC, shrink and zeroed reuse", free_clusters=free_before)
+
             if bits == 16:
                 # dosfstools rounds the requested fixed root to sector size.
                 with native.open("rb") as stream:
@@ -351,6 +435,12 @@ class Run:
                     remaining -= len(chunk)
                 check(stream.read() == b"S" * 4096, "suffix changed outside volume")
         self.command("fsck.fat", "-n", checked_image)
+        check(native_root_file(checked_image, b"KEEP    BIN") == keep_before,
+              "unrelated native entry, chain, payload or slack changed")
+        for short_name in (b"FRAG_A  BIN", b"FRAG_B  BIN"):
+            chain = native_root_file(checked_image, short_name)["clusters"]
+            check(len(chain) == 4 and any(right != left + 1 for left, right in zip(chain, chain[1:])),
+                  "interleaved allocation did not create an independently verified fragmented chain")
         for index, (name, data) in enumerate(expected.items()):
             output = self.root / f"{tag}-native-read-{index:03d}.bin"
             self.command("mcopy", "-i", checked_image, f"::/{name}", output)
