@@ -74,6 +74,25 @@ impl Device {
         Self::new(self.0.lock().unwrap().image(retain_pending))
     }
 
+    fn restart_partial(&self, schedule: usize) -> Self {
+        assert!(schedule < 4);
+        let state = self.0.lock().unwrap();
+        let mut bytes = state.durable.clone();
+        // Successful barriers remain durable. Pending sectors may persist
+        // independently: retain alternate sectors, or just their head/tail.
+        for (index, (&at, page)) in state.pending.iter().enumerate() {
+            let range = match schedule {
+                0 if index % 2 == 0 => 0..512,
+                1 if index % 2 == 1 => 0..512,
+                2 => 0..31,
+                3 => 481..512,
+                _ => 0..0,
+            };
+            bytes[at + range.start..at + range.end].copy_from_slice(&page[range]);
+        }
+        Self::new(bytes)
+    }
+
     fn reset_audit(&self) {
         let mut state = self.0.lock().unwrap();
         assert!(state.pending.is_empty());
@@ -539,29 +558,13 @@ fn selective_pending_sector_persistence_preserves_acknowledged_files() {
                     }
                     assert!(execute(&device.open()).is_err(), "{kind} action={action} cut={cut}");
                     for schedule in 0..4 {
-                        let mut bytes = {
-                            let state = device.0.lock().unwrap();
-                            let mut bytes = state.durable.clone();
-                            // These selections deliberately persist a later
-                            // sector while losing an earlier pending sector.
-                            // Head/tail cuts also cover a torn clean-state byte.
-                            for (index, (&at, page)) in state.pending.iter().enumerate() {
-                                let range = match schedule {
-                                    0 if index % 2 == 0 => 0..512,
-                                    1 if index % 2 == 1 => 0..512,
-                                    2 => 0..31,
-                                    3 => 481..512,
-                                    _ => 0..0,
-                                };
-                                bytes[at + range.start..at + range.end]
-                                    .copy_from_slice(&page[range]);
-                            }
-                            bytes
-                        };
-                        assert_eq!(&bytes[..BASE as usize], &baseline[..BASE as usize]);
-                        let suffix = bytes.len() - BASE as usize;
-                        assert_eq!(&bytes[suffix..], &baseline[suffix..]);
-                        let crashed = Device::new(std::mem::take(&mut bytes));
+                        let crashed = device.restart_partial(schedule);
+                        {
+                            let state = crashed.0.lock().unwrap();
+                            assert_eq!(&state.durable[..BASE as usize], &baseline[..BASE as usize]);
+                            let suffix = state.durable.len() - BASE as usize;
+                            assert_eq!(&state.durable[suffix..], &baseline[suffix..]);
+                        }
                         match FatVolume::from_device(
                             &cx,
                             Box::new(crashed.clone()),
@@ -594,5 +597,158 @@ fn selective_pending_sector_persistence_preserves_acknowledged_files() {
         }
         assert!(admitted > 0 && refused_dirty > 0);
         eprintln!("selective_pending_sector_persistence kind={kind} clean={admitted} dirty={refused_dirty}");
+    }
+}
+
+type NativeNamespace = BTreeMap<String, Option<Vec<u8>>>;
+
+fn native_namespace(volume: &FatVolume) -> NativeNamespace {
+    let cx = Cx::for_testing();
+    let mut actual = BTreeMap::new();
+    for entry in volume.list(&cx, crate::Directory::Root).unwrap() {
+        let path = format!("/{}", entry.name().unwrap());
+        if entry.native.is_directory() {
+            actual.insert(path.clone(), None);
+            for child in volume.list(&cx, entry.directory().unwrap()).unwrap() {
+                assert!(!child.native.is_directory(), "fixture has only one directory level");
+                let chain = volume.file_chain(&cx, &child).unwrap();
+                actual.insert(
+                    format!("{path}/{}", child.name().unwrap()),
+                    Some(volume.read(&cx, &chain, 0, 8192).unwrap()),
+                );
+            }
+        } else {
+            let chain = volume.file_chain(&cx, &entry).unwrap();
+            actual.insert(path, Some(volume.read(&cx, &chain, 0, 8192).unwrap()));
+        }
+    }
+    actual
+}
+
+#[test]
+fn namespace_partial_persistence_preserves_the_acknowledged_prefix() {
+    use crate::reader::replacement::{
+        mkdir_in_volume, rename_in_volume, rmdir_in_volume, unlink_in_volume,
+    };
+
+    let cx = Cx::for_testing();
+    for kind in ["fat16", "fat32"] {
+        let initial = formatted(kind);
+        let volume = initial.open();
+        let mut original = NativeNamespace::new();
+        for (path, payload) in [
+            ("/keep.bin", b"previously acknowledged unrelated file".as_slice()),
+            ("/file.bin", b"acknowledged source".as_slice()),
+            ("/target.bin", b"acknowledged destination".as_slice()),
+        ] {
+            create_in_volume(&cx, &volume, path, payload, NOW, false).unwrap();
+            original.insert(path.to_owned(), Some(payload.to_vec()));
+        }
+        for path in ["/left", "/right"] {
+            mkdir_in_volume(&cx, &volume, path, NOW, false).unwrap();
+            original.insert(path.to_owned(), None);
+        }
+        // Fill one native directory cluster. New publication must first extend
+        // and initialize its storage, rather than exposing an uninitialized tail.
+        assert_eq!(volume.geometry.cluster_bytes(), 512);
+        for index in 0..14 {
+            let path = format!("/left/F{index:07}.BIN");
+            create_in_volume(&cx, &volume, &path, &[], NOW, false).unwrap();
+            original.insert(path, Some(Vec::new()));
+        }
+        clean(&volume);
+        assert_eq!(native_namespace(&volume), original);
+        let baseline = initial.0.lock().unwrap().image(false);
+        let keep = volume.resolve(&cx, "/keep.bin").unwrap().unwrap();
+        let chain = volume.file_chain(&cx, &keep).unwrap();
+        let mut untouched = vec![(BASE as usize + keep.offset as usize, 32)];
+        for &cluster in &chain.clusters {
+            untouched.push((
+                (BASE + volume.cluster_offset(cluster).unwrap()) as usize,
+                volume.geometry.cluster_bytes() as usize,
+            ));
+            for copy in 0..2 {
+                untouched.push((
+                    (BASE + volume.geometry.entry_offset(copy, cluster).unwrap()) as usize,
+                    volume.geometry.kind().entry_bytes() as usize,
+                ));
+            }
+        }
+        drop(volume);
+        for action in 0..6 {
+            let execute = |volume: &FatVolume| -> Result<serde_json::Value> {
+                match action {
+                    0 => create_in_volume(&cx, volume, "/left/Created native café.bin", b"created", NOW, false),
+                    1 => mkdir_in_volume(&cx, volume, "/New directory café", NOW, false),
+                    2 => rename_in_volume(&cx, volume, "/file.bin", "/left/moved.bin", false),
+                    3 => rename_in_volume(&cx, volume, "/file.bin", "/target.bin", false),
+                    4 => unlink_in_volume(&cx, volume, "/file.bin", false),
+                    _ => rmdir_in_volume(&cx, volume, "/right", false),
+                }
+            };
+            let mut expected = original.clone();
+            match action {
+                0 => { expected.insert("/left/Created native café.bin".into(), Some(b"created".to_vec())); }
+                1 => { expected.insert("/New directory café".into(), None); }
+                2 => {
+                    let source = expected.remove("/file.bin").unwrap();
+                    expected.insert("/left/moved.bin".into(), source);
+                }
+                3 => {
+                    let source = expected.remove("/file.bin").unwrap();
+                    expected.insert("/target.bin".into(), source);
+                }
+                4 => { expected.remove("/file.bin"); }
+                _ => { expected.remove("/right"); }
+            }
+            let success = Device::new(baseline.clone());
+            execute(&success.open()).unwrap();
+            let reopened = success.restart(false).open();
+            clean(&reopened);
+            assert_eq!(native_namespace(&reopened), expected);
+            let total = success.0.lock().unwrap().attempts;
+            assert!(total > 8);
+            let mut admitted = 0;
+            let mut dirty = 0;
+            for cut in 1..=total {
+                for tear in [0, 31, 512] {
+                    let device = Device::new(baseline.clone());
+                    {
+                        let mut state = device.0.lock().unwrap();
+                        state.fail_at = Some(cut);
+                        state.tear = tear;
+                    }
+                    assert!(execute(&device.open()).is_err(), "{kind} action={action} cut={cut}");
+                    for schedule in 0..4 {
+                        let crashed = device.restart_partial(schedule);
+                        {
+                            let state = crashed.0.lock().unwrap();
+                            for &(at, length) in &untouched {
+                                assert_eq!(
+                                    &state.durable[at..at + length], &baseline[at..at + length],
+                                    "acknowledged file changed: {kind} action={action} cut={cut} tear={tear} schedule={schedule} at={at}"
+                                );
+                            }
+                            assert_eq!(&state.durable[..BASE as usize], &baseline[..BASE as usize]);
+                            let suffix = state.durable.len() - BASE as usize;
+                            assert_eq!(&state.durable[suffix..], &baseline[suffix..]);
+                        }
+                        match FatVolume::from_device(&cx, Box::new(crashed.clone()), BASE, crashed.len_bytes() - 2 * BASE) {
+                            Ok(volume) => {
+                                admitted += 1;
+                                clean(&volume);
+                                let actual = native_namespace(&volume);
+                                assert!(actual == original || actual == expected,
+                                    "unexpected clean namespace: {kind} action={action} cut={cut} tear={tear} schedule={schedule}: {actual:?}");
+                            }
+                            Err(FfsError::UnsupportedFeature(detail)) if detail.contains("dirty") => { dirty += 1; }
+                            Err(error) => panic!("unexpected restart error: {kind} action={action} cut={cut} tear={tear} schedule={schedule}: {error}"),
+                        }
+                    }
+                }
+            }
+            assert!(admitted > 0 && dirty > 0);
+            eprintln!("namespace_partial kind={kind} action={action} cuts={total} clean={admitted} dirty={dirty}");
+        }
     }
 }
