@@ -2,7 +2,7 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
-## Active writable FAT qualification — 2026-11-02 (`bd-lby8f`, NavyElm)
+## Completed writable FAT qualification — 2026-11-02 (`bd-lby8f`, NavyElm)
 
 The operator requested continued implementation and a granular TODO. This
 checklist tracks the original native/mounted writer acceptance; it retires as
@@ -158,8 +158,12 @@ active work only when that acceptance is executed or explicitly handed off.
     Final886Rust/build inputs match the local tree and rebuilt worker. Old
     benchmark snapshot and final test manifests remain distinct; no source
     equivalence is inferred from an embedded Git label alone.
-- [ ] Record the final source commit, close bd-lby8f on its executed evidence,
-  sync Beads/Mail, reconcile main and deliver both required remote branches.
+- [x] Record final source e754166d5c7f8ad39fbdc3a6f271fdf165375167,
+  close bd-lby8f on its executed evidence, sync Beads/Mail and prepare the
+  coherent tracked closure for delivery. Closed2026-11-02T06:27:16Z;
+  dependency cycles0. Final pull/import/push/ref verification is captured in
+  resume13-delivery logs. The next dependency-unblocked FAT maintenance item
+  bd-ave6y remains unclaimed; broader native/protection roadmap items stay open.
 
 ### Bounded anti-ceremony/honesty review (`resume13`, solo)
 
@@ -177,8 +181,8 @@ native qualification. No new follow-up is used to discard original acceptance.
 Verdict: useful implementation with substantial verification cost; finish this
 delivery before adding more process. No subagents were dispatched.
 
-Inventory window:65096703f..current bd-lby8f changes, including all9 changed
-files, original failed executions and six bounded read-only CASS queries plus
+Inventory window:65096703f..current bd-lby8f changes, including the complete
+changed-code/test/runner diffs, original failed executions and six bounded read-only CASS queries plus
 their followed contexts. Numbers below correspond to the skill's20questions.
 
 1. No (checked: complete changed test/fault/runner diffs; no removed assertions,
@@ -203,8 +207,8 @@ their followed contexts. Numbers below correspond to the skill's20questions.
    failures, lint failures, admission refusals and new runner failures retained).
 10. No (checked: native stdout/stderr files, Rust logs and failed partial-run
     records retained; no successful conclusion depends on discarded stderr).
-11. No (checked: bd-lby8f remains in progress until its executed acceptance;
-    existing multi-format protection owner gains no closure from this work).
+11. No (checked: bd-lby8f closes only after its executed acceptance and final
+    source binding; the existing multi-format protection owner gains no closure).
 12. No (checked: canonical requirements unchanged; guide describes implemented
     native commands and explicit proof limits, without lowering promises).
 13–17. No (checked: solo execution; no subagent dispatch/close/report/agreement
