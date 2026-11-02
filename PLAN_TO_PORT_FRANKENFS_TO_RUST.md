@@ -556,6 +556,12 @@ Current-view extent caches retain the exact committed sequence of their source
 walk. Reader refills across deferred publication must not preserve an old hole
 or freed mapping; pinned readers keep their own view. Exercise both allocation
 and hole-punch publication with readers before commit and late cache fills.
+Also interleave a root-changing commit between inode load and mapping lookup.
+Earlier/unbound mutable scopes must not populate a new-view read-cache hole;
+retain immutable cache-effectiveness and existing write-placement goldens.
+Forced read-only must preserve committed overlay bytes and namespace after
+revoking writes. Exercise prewrite cache warming, read/read_into and managed
+read scopes, alongside no-op FORGET and denied orphan reclamation/write/RMW.
 Native image and scoped conflict/abort tests qualify these paths separately
 from the remaining mounted, crash and full-workspace acceptance.
 

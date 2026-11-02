@@ -769,6 +769,16 @@ nor root bytes alone authorize reuse across deferred publication. Hot complete
 mapping lists remain restricted to immutable read-only filesystems. A consumed
 writer selects the current sequence even though its scope retains an older
 snapshot field for lifecycle cleanup.
+Mutable read-cache eligibility compares the caller's pre-inode scope epoch
+with one captured current sequence. Earlier, unbound and consumed-writer scopes
+walk without that cache, preventing an old inline root from filling a new-view
+hole. Immutable-image cache hits and the root/sequence-keyed write list retain
+their existing contracts.
+Read visibility is distinct from write permission: retained allocator state
+identifies a potentially changed view even after forced read-only. Snapshot,
+inode, parent and mapping fast paths must not reuse immutable-image caches in
+that state. The block adapter reads the current overlay while denying all
+write/RMW entry points; ordinary immutable images keep their direct base path.
 This boundary does not establish atomic capture for existing ungated non-JBD2
 durability paths.
 

@@ -2997,6 +2997,14 @@ alone is insufficient: readers can refill the old tree before publication or
 finish an older cache fill afterward. A different sequence is a miss, never an
 authority to return a stale hole or allocated mapping. After its transaction
 is consumed, a writer reads the current view rather than its old snapshot field.
+Shared read-cache admission on mutable images MUST also match the caller's
+pre-inode scope sequence. An earlier or unbound scope bypasses that cache: a
+sequence captured only after inode acquisition can mislabel an old inline root
+as current. Validate and retain one sequence before the tree walk.
+Forced read-only transitions revoke mutation authority without discarding the
+committed overlay. Such handles MUST retain current MVCC reads and bypass
+immutable-image caches populated before writes were enabled. A current-view
+read-only block adapter MUST reject writes and RMW before invoking a patch.
 An error during staging requires aborting the request scope.
 
 Dependency rationale: depends on `ffs-btree` for extent tree operations;

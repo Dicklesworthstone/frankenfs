@@ -458,6 +458,7 @@ pub struct FsMvccBlockDevice<D: BlockDevice> {
     store: Arc<FsMvccStore>,
     ownership: SnapshotOwnership,
     read_your_writes: bool,
+    read_only_current: bool,
 }
 
 impl<D: BlockDevice> FsMvccBlockDevice<D> {
@@ -468,6 +469,7 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
             store,
             ownership: SnapshotOwnership::Inline { snapshot },
             read_your_writes: false,
+            read_only_current: false,
         }
     }
 
@@ -477,6 +479,7 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
             store,
             ownership: SnapshotOwnership::Unregistered { snapshot },
             read_your_writes: false,
+            read_only_current: false,
         }
     }
 
@@ -493,6 +496,13 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
         self
     }
 
+    /// Keep committed overlay reads after write authority has been revoked.
+    /// Selecting the current view must not grant permission to modify it.
+    pub(super) fn with_read_only_current(mut self) -> Self {
+        self.read_only_current = true;
+        self
+    }
+
     fn snapshot(&self) -> Snapshot {
         match self.ownership {
             SnapshotOwnership::Inline { snapshot }
@@ -501,7 +511,7 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
     }
 
     fn read_snapshot(&self) -> Snapshot {
-        if self.read_your_writes {
+        if self.read_your_writes || self.read_only_current {
             // Read-your-writes wants the LATEST committed content. Resolve at the
             // MAX sentinel (newest RETAINED version) rather than a freshly fetched
             // `current_snapshot()`, which has a TOCTOU with pruning: bd-bhh0i
@@ -518,7 +528,9 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
     }
 
     fn reads_base_directly(&self) -> bool {
-        matches!(self.ownership, SnapshotOwnership::Unregistered { .. }) && !self.read_your_writes
+        matches!(self.ownership, SnapshotOwnership::Unregistered { .. })
+            && !self.read_your_writes
+            && !self.read_only_current
     }
 
     fn validate_range(&self, start: BlockNumber, count: u64) -> FfsResult<()> {
@@ -543,7 +555,7 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
 
     fn validate_write_access(&self, cx: &Cx, block: BlockNumber) -> FfsResult<()> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        if self.reads_base_directly() {
+        if self.read_only_current || self.reads_base_directly() {
             return Err(FfsError::UnsupportedFeature(
                 "unregistered MVCC block device is read-only".to_owned(),
             ));
@@ -951,6 +963,49 @@ mod block_device_tests {
                 RmwKind::BitmapOr => self.device.rmw_block_bitmap_or(cx, block, patch),
                 RmwKind::BitmapDelta => self.device.rmw_block_bitmap_delta(cx, block, patch),
             }
+        }
+    }
+
+    #[test]
+    fn read_only_current_reads_overlay_without_granting_write_access() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let mut fixture = Fixture::new(store);
+            fixture.device = fixture.device.with_read_only_current();
+            let cx = Cx::for_testing();
+            let first = vec![0x11; BLOCK_SIZE as usize];
+            fixture.commit(BLOCK, first.clone());
+            assert_eq!(
+                fixture.device.read_block(&cx, BLOCK).unwrap().as_slice(),
+                first
+            );
+            let current = vec![0x22; BLOCK_SIZE as usize];
+            fixture.commit(BLOCK, current.clone());
+            assert_eq!(
+                fixture.device.read_block(&cx, BLOCK).unwrap().as_slice(),
+                current
+            );
+            let before = fixture.store.current_snapshot();
+            assert!(fixture.device.write_block(&cx, BLOCK, &first).is_err());
+            for kind in RMW_KINDS {
+                let mut called = false;
+                let error = fixture
+                    .rmw(kind, &cx, BLOCK, &mut |_| {
+                        called = true;
+                        Ok(())
+                    })
+                    .unwrap_err();
+                assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+                assert!(
+                    !called,
+                    "read-only RMW must reject before invoking the patch"
+                );
+            }
+            assert_eq!(fixture.store.current_snapshot(), before);
+            assert_eq!(
+                fixture.device.read_block(&cx, BLOCK).unwrap().as_slice(),
+                current
+            );
+            fixture.assert_image_unchanged();
         }
     }
 

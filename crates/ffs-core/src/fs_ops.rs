@@ -554,7 +554,7 @@ impl OpenFs {
         // readdir is pure dead work (~7% of a 30000-entry read-only
         // `walk --no-stat`; still ~2% under a full stat walk).
         if canonical.0 != 0
-            && !self.is_writable()
+            && !self.has_mutable_view()
             && inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
             && !self
                 .readonly_lookup_cache_disabled
@@ -806,7 +806,7 @@ impl FsOps for OpenFs {
                 // Reuse the parsed, dir-verified parent across a directory scan's
                 // repeated lookups (RO mount → immutable) instead of re-reading +
                 // re-parsing the parent inode every time (bd-cc-ext4-hotparent).
-                let read_only = !self.is_writable();
+                let read_only = !self.has_mutable_view();
                 // Hold the arc_swap Guard and BORROW the parent inode straight
                 // out of it instead of `Arc::clone`-ing the inner Arc per hit —
                 // the clone's incref/decref pair was part of the 8.46% arc_swap
@@ -4777,7 +4777,7 @@ impl FsOps for OpenFs {
         if Self::request_op_is_gated_mutation(op) {
             self.enter_mutation_gate();
         }
-        let read_snapshot_pinned = !op.is_write() && self.is_writable();
+        let read_snapshot_pinned = !op.is_write() && self.has_mutable_view();
         let (snapshot, tx) = if op.is_write() {
             // Write operations must use a transaction for isolation and atomicity.
             let txn = self.mvcc_store.begin_registered();

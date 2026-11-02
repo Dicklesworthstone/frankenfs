@@ -1793,6 +1793,13 @@ their source commit sequence; a lookup in another view misses. A reader's old
 fill arriving after publication cannot authorize reuse in the new view.
 Fixed readers and private transactions bypass those shared mappings, while a
 writer whose transaction has been consumed resumes current-view resolution.
+That sequence cannot first be captured after loading an inode root: publication
+between those steps can otherwise cache an old root under the new view. Mutable
+shared reads require a matching pre-inode scope; earlier/unbound scopes bypass
+that cache without contaminating later public reads.
+FrankenFS's forced read-only transition changes write permission, not the
+committed file contents. Its existing overlay must remain readable, including
+unlinked-but-open files; immutable-image shortcuts cannot replace that view.
 
 ## 10. Checksums
 

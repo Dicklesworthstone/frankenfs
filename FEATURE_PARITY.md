@@ -1,5 +1,30 @@
 # FEATURE_PARITY
 
+> **Read-cache origin fence (2026-11-02, verification pending):** a further
+> executed interleaving fails0/1/0 with1702filtered in0.02s: an earlier inode
+> root fills a newer cache version, and a later public read returns zeros for
+> committed bytes. The correction requires a mutable caller's pre-inode scope
+> sequence to match the captured cache sequence. Earlier/unbound scopes bypass
+> the shared read cache; fixed views retain their bypass. Existing write-list
+> root/sequence checks and immutable cache contracts remain unchanged. This is
+> an interleaved unit control, not live concurrent proof. The following results
+> precede this additional correction and must be refreshed before final claims.
+
+> **Forced read-only visibility (2026-11-02):** the earlier full workspace run
+> reports a failure in the existing orphan/FORGET read-only regression. The
+> correction separates immutable-image caching from mutation permission:
+> handles retaining write state continue reading committed MVCC data after
+> forced read-only, while writes and RMW remain denied before patch execution.
+> Controls cover orphan payload bytes, caches warmed before enabling writes,
+> read/read_into and managed read scopes. Current default controls pass
+> 57/0/5 existing ignores; the sharded build passes58/0/5 with active sharded
+> writeback controls. Both use the unoptimized dependency. Workspace/all-target
+> check, strict Clippy and formatting pass, bound to886tracked source/build
+> inputs. The original full run times out137 at the unchanged1800s budget in
+> dense native RaptorQ encoding; a full rerun with command-scoped dependency
+> optimization and debug/overflow checks retained is pending. No full baseline,
+> mounted, durability or speedup claim follows from these focused results.
+
 > **Deferred mapping publication (2026-11-01, verification in progress):** a
 > real deep-tree regression executes 0/1/0 with 1620 filtered tests: a successful
 > batch allocation and commit still returns zeros from an old reader-cached

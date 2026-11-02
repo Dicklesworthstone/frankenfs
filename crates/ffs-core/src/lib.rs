@@ -13301,6 +13301,13 @@ impl OpenFs {
                 || self.btrfs_alloc_state.is_some())
     }
 
+    /// A forced read-only transition revokes writes but retains committed
+    /// overlay state. Only an image that never enabled writes can use caches
+    /// and adapters that assume the base device is the whole current view.
+    fn has_mutable_view(&self) -> bool {
+        self.ext4_alloc_state.is_some() || self.btrfs_alloc_state.is_some()
+    }
+
     /// Incrementally checkpoint MVCC versions to this filesystem's base device.
     ///
     /// Holding the cursor mutex across the write and sync serializes concurrent
@@ -19798,7 +19805,7 @@ impl OpenFs {
     }
 
     fn can_cache_ext4_read_only_block(&self, scope: &RequestScope, block: BlockNumber) -> bool {
-        if self.is_writable() {
+        if self.has_mutable_view() {
             return false;
         }
         if scope
@@ -20347,7 +20354,7 @@ impl OpenFs {
         scope: &RequestScope,
         entries: &[DirEntry],
     ) {
-        if entries.len() < EXT4_READDIR_INODE_PREFETCH_MIN_ENTRIES || self.is_writable() {
+        if entries.len() < EXT4_READDIR_INODE_PREFETCH_MIN_ENTRIES || self.has_mutable_view() {
             return;
         }
         let Some(sb) = self.ext4_superblock() else {
@@ -20641,7 +20648,7 @@ impl OpenFs {
         // the map — pure overhead (~3% of a full stat walk). A walk-style caller
         // opts out via `readonly_lookup_cache_disabled`; the inode is still read
         // and parsed fresh, so the returned attr is identical.
-        let read_only = !self.is_writable();
+        let read_only = !self.has_mutable_view();
         let use_attr_cache = read_only
             && !self
                 .readonly_lookup_cache_disabled
@@ -21775,7 +21782,7 @@ impl OpenFs {
         scope: &RequestScope,
         inode: &Ext4Inode,
     ) -> Result<(), FfsError> {
-        if inode.flags & EXT4_EXTENTS_FL == 0 || self.is_writable() {
+        if inode.flags & EXT4_EXTENTS_FL == 0 || self.has_mutable_view() {
             return Ok(());
         }
         let ns = extent_cache_namespace(inode);
@@ -21819,7 +21826,9 @@ impl OpenFs {
         logical_block: u32,
         hint: &mut usize,
     ) -> Result<Option<(u64, bool)>, FfsError> {
-        if inode.flags & EXT4_EXTENTS_FL != 0 && !self.is_writable() && !scope.uses_fixed_snapshot()
+        if inode.flags & EXT4_EXTENTS_FL != 0
+            && !self.has_mutable_view()
+            && !scope.uses_fixed_snapshot()
         {
             let ns = extent_cache_namespace(inode);
             let hot = self.ext4_hot_extents.load();
@@ -21836,6 +21845,26 @@ impl OpenFs {
         self.resolve_extent(cx, scope, inode, logical_block)
     }
 
+    /// Select the shared read-cache sequence for an inode read in `scope`.
+    /// Mutable current-view fills require the scope to predate the inode load
+    /// and still name the current sequence; otherwise an earlier root could poison a newer view.
+    fn ext4_mapping_cache_seq(&self, scope: &RequestScope) -> Option<CommitSeq> {
+        if scope.uses_fixed_snapshot() {
+            return None;
+        }
+        let current = self.latest_snapshot().high;
+        if self.has_mutable_view()
+            && scope
+                .snapshot
+                .is_none_or(|snapshot| snapshot.high != current)
+        {
+            return None;
+        }
+        Some(current)
+    }
+
+    /// Resolve an inode root belonging to the caller's `scope`. Current scopes
+    /// must be captured before loading the inode for shared cache eligibility.
     pub fn resolve_extent(
         &self,
         cx: &Cx,
@@ -21858,10 +21887,10 @@ impl OpenFs {
         }
 
         // Shared namespace caches describe the current committed tree. A fixed
-        // view can contain private leaf edits under an unchanged index root,
-        // or old leaves retained by a reader, so neither consume nor populate
-        // those caches from it.
-        if scope.uses_fixed_snapshot() {
+        // view can contain private or old leaves under an unchanged index root.
+        // An earlier current scope may also carry an inode root loaded before
+        // publication. None of these may consume or fill the current cache.
+        let Some(commit_seq) = self.ext4_mapping_cache_seq(scope) else {
             let (header, tree) =
                 parse_inode_extent_tree(inode).map_err(|e| parse_to_ffs_error(&e))?;
             let mappings =
@@ -21869,16 +21898,14 @@ impl OpenFs {
             return Ok(mappings.as_deref().and_then(|mappings| {
                 Self::ext4_resolve_block_from_mappings(mappings, logical_block)
             }));
-        }
+        };
 
         // Inode identity separates objects; the view sequence separates leaf
         // versions even when a deferred edit keeps the same index root. Tag
-        // fills with the current sequence captured before walking. Non-fixed
-        // scopes read the current view, including after consuming their tx.
-        // A walk completing after a commit cannot make its old mappings
-        // reusable by the new view.
+        // fills with the validated sequence captured before walking. A walk
+        // completing after a commit cannot make its old mappings reusable by
+        // the new view. Unbound and consumed-writer scopes already bypassed it.
         let ns = extent_cache_namespace(inode);
-        let commit_seq = self.latest_snapshot().high;
 
         // Lock-free hot-extent fast path: a hot single-file read stream resolves
         // the same inode every read; once its full extent list is published (see
@@ -21886,7 +21913,7 @@ impl OpenFs {
         // and no `BTreeMap` query — skipping the `ExtentCache` shard `RwLock`
         // that otherwise serializes every reader on one hot file's namespace.
         let hot = self.ext4_hot_extents.load();
-        if !self.is_writable()
+        if !self.has_mutable_view()
             && let Some(slot) = hot.as_ref()
             && slot.0 == ns
         {
@@ -28063,7 +28090,7 @@ impl OpenFs {
         // them. Without this, a write followed by a read of the same block via
         // one adapter instance returns stale data (bd-vdi91: failed-mkdir /
         // rename-over-existing left a stale block-bitmap csum).
-        if self.is_writable() {
+        if self.has_mutable_view() {
             // `with_read_your_writes()` immediately converts an Inline adapter to
             // Unregistered AND releases the snapshot it just registered — so
             // `new(..).with_read_your_writes()` did a wasteful register+release
@@ -28075,7 +28102,10 @@ impl OpenFs {
             // removing a per-op serialization point from the parallel-write path
             // (bd-bhh0i). Env `FFS_WRITABLE_ADAPTER_REGISTER=1` restores the old
             // register+release round-trip for A/B.
-            if Self::writable_adapter_register() {
+            if !self.is_writable() {
+                FsMvccBlockDevice::new_unregistered(base, Arc::clone(&self.mvcc_store), snapshot)
+                    .with_read_only_current()
+            } else if Self::writable_adapter_register() {
                 FsMvccBlockDevice::new(base, Arc::clone(&self.mvcc_store), snapshot)
                     .with_read_your_writes()
             } else {
@@ -48089,10 +48119,11 @@ impl OpenFs {
     /// mount never commits, so `current_snapshot()` is invariant: resolve it
     /// once under the store `RwLock`, then cache it in `ro_snapshot` and return
     /// the cached copy (a `OnceLock` atomic load — no `RwLock`) on every later
-    /// read. A writable mount always re-reads the live snapshot.
+    /// read. A mount that enabled writes always re-reads the live snapshot,
+    /// including after a forced read-only transition.
     #[inline]
     fn latest_snapshot(&self) -> Snapshot {
-        if self.is_writable() {
+        if self.has_mutable_view() {
             self.mvcc_store.current_snapshot()
         } else {
             *self
@@ -48892,7 +48923,7 @@ impl OpenFs {
                 // negative-scales the parallel read — mirrors the btrfs
                 // hot-inode slot). RO only: the on-disk inode is immutable, so a
                 // last-writer-wins publish is safe; a writable mount skips it.
-                let read_only = !self.is_writable();
+                let read_only = !self.has_mutable_view();
                 // Hold the arc_swap Guard and BORROW straight out of it instead
                 // of `Arc::clone`-ing the inner Arc per hit (same lock-free-access
                 // tuning as the hot-parent slot below; the clone was ~6.6% of warm
@@ -74118,6 +74149,8 @@ mod tests {
             .create(&cx, root, OsStr::new("forced_readonly_orphan"), 0o600, 0, 0)
             .unwrap()
             .ino;
+        let payload = vec![0x6D; 3 * fs.block_size() as usize];
+        fs.write(&cx, victim, 0, &payload).unwrap();
         fs.install_open_handle_oracle(Arc::new(move |ino| u64::from(ino == victim)));
         fs.unlink(&cx, root, OsStr::new("forced_readonly_orphan"))
             .unwrap();
@@ -74132,7 +74165,85 @@ mod tests {
         assert!(fs.ext4_pending_orphans.lock().contains(&victim.0));
         assert_eq!(u64::from(fs.ext4_read_orphan_head()), victim.0);
         assert_ne!(fs.read_inode(&cx, victim).unwrap().mode, 0);
+        assert_eq!(fs.getattr(&cx, victim).unwrap().size, payload.len() as u64);
+        assert_eq!(
+            fs.read(&cx, victim, 0, payload.len() as u32).unwrap(),
+            payload
+        );
+        let mut buffer = vec![0; payload.len()];
+        assert_eq!(
+            fs.read_into(&cx, victim, 0, &mut buffer).unwrap(),
+            buffer.len()
+        );
+        assert_eq!(buffer, payload);
+        assert!(matches!(
+            fs.write(&cx, victim, 0, b"denied"),
+            Err(FfsError::ReadOnly)
+        ));
         assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_forced_read_only_bypasses_prewrite_immutable_caches() {
+        let (_writer, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("forced read-only regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        // Populate immutable snapshot, inode/parent and directory caches using
+        // actual public reads before enabling writes on this same instance.
+        fs.getattr(&cx, root).unwrap();
+        fs.readdir(&cx, root, 0).unwrap();
+        fs.lookup(&cx, root, OsStr::new("lost+found")).unwrap();
+        let initial = fs.current_snapshot();
+        fs.enable_writes(&cx).unwrap();
+        let file = fs
+            .create(&cx, root, OsStr::new("committed"), 0o600, 0, 0)
+            .unwrap();
+        let payload = vec![0xA3; 2 * fs.block_size() as usize];
+        fs.write(&cx, file.ino, 0, &payload).unwrap();
+        let before = fs.current_snapshot();
+        assert!(before.high > initial.high);
+        let backing = dev.snapshot_bytes();
+        fs.ext4_forced_read_only.store(true, Ordering::SeqCst);
+        assert!(!fs.is_writable());
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new("committed")).unwrap().ino,
+            file.ino
+        );
+        assert_eq!(
+            fs.getattr(&cx, file.ino).unwrap().size,
+            payload.len() as u64
+        );
+        assert_eq!(
+            fs.read(&cx, file.ino, 0, payload.len() as u32).unwrap(),
+            payload
+        );
+        let mut buffer = vec![0; payload.len()];
+        assert_eq!(
+            fs.read_into(&cx, file.ino, 0, &mut buffer).unwrap(),
+            buffer.len()
+        );
+        assert_eq!(buffer, payload);
+        let mut scope = FsOps::begin_request_scope(&fs, &cx, RequestOp::Read).unwrap();
+        assert_eq!(scope.snapshot, Some(before));
+        assert_eq!(
+            FsOps::read(&fs, &cx, &mut scope, file.ino, 0, payload.len() as u32).unwrap(),
+            payload
+        );
+        FsOps::end_request_scope(&fs, &cx, RequestOp::Read, scope).unwrap();
+        assert!(matches!(
+            fs.create(&cx, root, OsStr::new("denied"), 0o600, 0, 0),
+            Err(FfsError::ReadOnly)
+        ));
+        assert!(matches!(
+            fs.write(&cx, file.ino, 0, b"denied"),
+            Err(FfsError::ReadOnly)
+        ));
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(dev.snapshot_bytes(), backing);
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
     }
 
@@ -75948,6 +76059,59 @@ mod tests {
                 .all(|byte| *byte == 0)
         );
         FsOps::end_request_scope(&fs, &cx, RequestOp::Read, reader).unwrap();
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_writeback_current_mapping_cache_rejects_precommit_inode_root() {
+        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        fs.set_bhh0i_sharded_ops(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let ino = fs
+            .create(&cx, root, OsStr::new("root-publication"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let bs = fs.block_size();
+        let first = vec![0x31; bs as usize];
+        let replacement = vec![0x62; bs as usize];
+        fs.write(&cx, ino, 0, &first).unwrap();
+        // Interleave publication between a current reader's inode load and
+        // mapping lookup, without claiming a live concurrent execution.
+        let earlier = RequestScope::with_snapshot(fs.current_snapshot());
+        let old_inode = fs.read_inode_with_scope(&cx, &earlier, ino).unwrap();
+        fs.write(&cx, ino, 2 * u64::from(bs), &replacement).unwrap();
+        let current = fs.current_snapshot();
+        let free = fs.statfs(&cx, root).unwrap().blocks_free;
+        let current_inode = fs.read_inode(&cx, ino).unwrap();
+        assert_ne!(old_inode.extent_bytes, current_inode.extent_bytes);
+        assert!(current.high > earlier.snapshot.unwrap().high);
+        assert_eq!(
+            fs.resolve_extent(&cx, &earlier, &old_inode, 2).unwrap(),
+            None
+        );
+        assert_eq!(
+            fs.read(&cx, ino, 2 * u64::from(bs), bs).unwrap(),
+            replacement,
+            "an earlier inode root must not fill a current-version hole"
+        );
+        fs.extent_cache.invalidate_all();
+        assert_eq!(
+            fs.resolve_extent(&cx, &RequestScope::empty(), &old_inode, 2)
+                .unwrap(),
+            None
+        );
+        let mut buffer = vec![0; bs as usize];
+        assert_eq!(
+            fs.read_into(&cx, ino, 2 * u64::from(bs), &mut buffer)
+                .unwrap(),
+            buffer.len()
+        );
+        assert_eq!(buffer, replacement);
+        assert_eq!(fs.read(&cx, ino, 0, bs).unwrap(), first);
+        assert_eq!(fs.current_snapshot(), current);
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free);
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
     }
 
