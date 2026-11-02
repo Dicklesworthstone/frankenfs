@@ -26,12 +26,21 @@ completed or handed off. Historical evidence remains in place.
   pre-inode caller scope epoch and capture the cache sequence once. Earlier,
   unbound and consumed-writer scopes bypass it. Existing write-list root/
   sequence checks and immutable cache contracts stay intact.
-- [ ] Re-execute latest default/sharded controls including the new root red,
-  existing immutable cache-effectiveness and unchanged write-placement golden.
-- [ ] Refresh current check/strict Clippy/fmt/UBS and exact source bindings;
-  all pass counts below precede this final root-context correction.
+- [x] Re-execute final root-fenced default/sharded controls: default61passed/
+  0failed/5existing ignores/1558filtered in1.58s; sharded62/0/5/1636 in22.35s.
+  Both include the new root red, immutable cache-effectiveness and unchanged
+  cross-call write-placement golden. These overlapping selections use the
+  unoptimized dependency and are not a unique-test sum.
+- [x] Refresh final workspace/all-target check (0,2m35s), strict Clippy
+  (0,2m58s), fmt/whitespace (0) and UBS (0critical, existing warnings retained).
+  The first compiler refreshes refused103 before compiling; unchanged normal
+  retries pass after external root/I/O pressure recovers. Final886-file source
+  manifest matches local checkout and both workers. Source/spec changes are
+  now committed as64c841698 by a peer; do not claim that peer's git actions.
 - [ ] Re-execute the complete warm workspace selection with the same checked
   dependency profile, unchanged1800s deadline and no test filters/new ignores.
+  Running from01:40UTC on hz3 with-j2 and4test threads, after actual/tmp
+  SBH20GiB passes; resume12-root-workspace-tests-warm.log retains full output.
 - [x] Re-read instructions/README, inspect unchanged candidate and owned P0,
   local source-aware queue/cycles and reservations; preserve peer/untracked work.
 - [x] Correct the overbroad infrastructure hold: written policy permits

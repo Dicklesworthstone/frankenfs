@@ -1,14 +1,20 @@
 # FEATURE_PARITY
 
-> **Read-cache origin fence (2026-11-02, verification pending):** a further
+> **Read-cache origin fence (2026-11-02, full workspace verification pending):** a further
 > executed interleaving fails0/1/0 with1702filtered in0.02s: an earlier inode
 > root fills a newer cache version, and a later public read returns zeros for
 > committed bytes. The correction requires a mutable caller's pre-inode scope
 > sequence to match the captured cache sequence. Earlier/unbound scopes bypass
 > the shared read cache; fixed views retain their bypass. Existing write-list
 > root/sequence checks and immutable cache contracts remain unchanged. This is
-> an interleaved unit control, not live concurrent proof. The following results
-> precede this additional correction and must be refreshed before final claims.
+> an interleaved unit control, not live concurrent proof. Final default controls
+> pass61/0/5existing ignores and the sharded build passes62/0/5, including the
+> unchanged cache-effectiveness and cross-call write-placement golden. Both use
+> the unoptimized dependency. Final workspace/all-target check (2m35s), strict
+> Clippy (2m58s), formatting and the886-file source bindings pass. UBS reports
+> zero critical findings with existing warnings retained. The full warm suite
+> is running with the checked dependency profile described below; this is not
+> yet a full baseline, mounted or durability qualification.
 
 > **Forced read-only visibility (2026-11-02):** the earlier full workspace run
 > reports a failure in the existing orphan/FORGET read-only regression. The
