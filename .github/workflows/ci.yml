@@ -318,7 +318,7 @@ jobs:
       - name: Install FUSE and ext4 prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs
+          sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs attr
 
       - name: Verify FUSE availability
         run: |
@@ -342,7 +342,24 @@ jobs:
         run: cargo test -p ffs-harness --test fuse_e2e -- --nocapture
 
       - name: Run shell E2E suites
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
         run: ./scripts/e2e/ffs_smoke.sh
+
+      - name: Journaled ext4 write and recovery smoke
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
+          FFS_USE_RCH: "0"
+        run: ./scripts/e2e/ffs_ext4_rw_smoke.sh
+
+      - name: Native btrfs written-image differential
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
+          FFS_USE_RCH: "0"
+        run: ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
 
       - name: Upload E2E artifacts on failure
         if: failure()

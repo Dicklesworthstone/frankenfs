@@ -77601,6 +77601,11 @@ mod tests {
         };
         let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        eprintln!(
+            "ORACLE_RESULT|tool=e2fsck|exit={}|image={}",
+            out.status,
+            image.display()
+        );
         // Exit 0 = clean. With -n, non-zero means errors were found (not fixed).
         Some((out.status.success(), combined))
     }
@@ -77627,11 +77632,18 @@ mod tests {
     fn require_oracles_turns_a_missing_oracle_into_a_failure_bd_53dub() {
         if std::env::var_os("FFS_ORACLE_PROBE_CHILD").is_some() {
             let tmp = tempfile::TempDir::new().expect("tmpdir");
-            let _ = run_e2fsck(&tmp.path().join("absent.img"));
+            match std::env::var("FFS_ORACLE_PROBE_CHILD").as_deref() {
+                Ok("btrfs") => {
+                    let _ = run_btrfs_check(&tmp.path().join("absent.img"));
+                }
+                _ => {
+                    let _ = run_e2fsck(&tmp.path().join("absent.img"));
+                }
+            }
             return;
         }
         let empty_path = tempfile::TempDir::new().expect("empty PATH dir");
-        let run_child = |require: bool| {
+        let run_child = |require: bool, tool: &str| {
             let mut child =
                 std::process::Command::new(std::env::current_exe().expect("test executable"));
             child
@@ -77642,7 +77654,7 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env("PATH", empty_path.path())
-                .env("FFS_ORACLE_PROBE_CHILD", "1")
+                .env("FFS_ORACLE_PROBE_CHILD", tool)
                 .env_remove("FFS_REQUIRE_ORACLES");
             if require {
                 child.env("FFS_REQUIRE_ORACLES", "1");
@@ -77666,24 +77678,29 @@ mod tests {
             (out.status.success(), text)
         };
 
-        let (required_ok, required_text) = run_child(true);
-        assert!(
-            !required_ok,
-            "a missing oracle under FFS_REQUIRE_ORACLES=1 must FAIL the test:\n{required_text}"
-        );
-        assert!(
-            required_text.contains("required oracle `e2fsck` is unavailable"),
-            "the failure must name the missing oracle:\n{required_text}"
-        );
-        let (optional_ok, optional_text) = run_child(false);
-        assert!(
-            optional_ok,
-            "without the contract a missing oracle is a skip, not a failure:\n{optional_text}"
-        );
-        assert!(
-            optional_text.contains("SKIP oracle_unavailable tool=e2fsck"),
-            "the skip must print its greppable SKIP line:\n{optional_text}"
-        );
+        for tool in ["e2fsck", "btrfs"] {
+            let (required_ok, required_text) = run_child(true, tool);
+            assert!(
+                !required_ok,
+                "a missing oracle under FFS_REQUIRE_ORACLES=1 must FAIL the test:\n{required_text}"
+            );
+            assert!(
+                required_text.contains(&format!(
+                    "required oracle `{}` is unavailable",
+                    if tool == "btrfs" { "btrfs check" } else { tool }
+                )),
+                "the failure must name the missing oracle:\n{required_text}"
+            );
+            let (optional_ok, optional_text) = run_child(false, tool);
+            assert!(
+                optional_ok,
+                "without the contract a missing oracle is a skip, not a failure:\n{optional_text}"
+            );
+            assert!(
+                optional_text.contains(&format!("SKIP oracle_unavailable tool={tool}")),
+                "the skip must print its greppable SKIP line:\n{optional_text}"
+            );
+        }
     }
 
     /// Validate FrankenFS's ext4 write path against real `e2fsck` (the ext4
@@ -106848,6 +106865,11 @@ mod tests {
         };
         let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        eprintln!(
+            "ORACLE_RESULT|tool=btrfs_check|exit={}|image={}",
+            out.status,
+            image.display()
+        );
         Some((out.status.success(), combined))
     }
 

@@ -7,10 +7,9 @@
 //! - `mkfs.ext4` and `debugfs` on `$PATH`
 //! - `fusermount3` permission to mount (may fail in containers)
 //!
-//! All tests run by default and return early (soft-skip) when prerequisites
-//! are unavailable. This makes the suite CI-compatible: tests pass
-//! everywhere, and exercise FUSE when the environment supports it.
-//! Only `fuse_setattr_chown` remains `#[ignore]` as it requires root.
+//! Optional local runs print SKIP when prerequisites are unavailable.
+//! FFS_REQUIRE_FUSE=1 and FFS_REQUIRE_ORACLES=1 turn missing required
+//! capabilities into failures; CI evidence lanes enable both contracts.
 
 use asupersync::Cx;
 use ffs_core::{
@@ -54,6 +53,43 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+/// Feed probe source through an owned, retained input file instead of an
+/// interpreter command-line string. Arguments stay separate and output/status
+/// capture remains Command::output's ordinary behavior. Keeping the source
+/// also makes a failed syscall probe directly inspectable without cleanup.
+fn python_command(script: &str) -> Command {
+    let (mut source, path) = tempfile::Builder::new()
+        .prefix("ffs-python-probe-")
+        .tempfile()
+        .expect("create Python probe source")
+        .keep()
+        .expect("retain Python probe source");
+    source
+        .write_all(script.as_bytes())
+        .expect("write Python probe source");
+    source.rewind().expect("rewind Python probe source");
+    eprintln!("PYTHON_PROBE_SOURCE|path={}", path.display());
+    let mut command = Command::new("python3");
+    command.arg("-").stdin(Stdio::from(source));
+    command
+}
+
+#[test]
+fn python_probe_preserves_arguments_stderr_and_nonzero_status() {
+    if !command_available("python3") {
+        require_oracle_or_skip("python3");
+        return;
+    }
+    let argument = "-c 'quoted'\n\"café\"";
+    let output = python_command("import os, sys\nsys.stdout.buffer.write(os.fsencode(sys.argv[1]))\nsys.stderr.buffer.write(b'probe failure')\nraise SystemExit(7)\n")
+        .arg(argument)
+        .output()
+        .expect("execute retained Python probe");
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, argument.as_bytes());
+    assert_eq!(output.stderr, b"probe failure");
+}
 
 const EOPNOTSUPP_ERRNO: i64 = 95;
 const BTRFS_TEST_WORKSPACE: &str = "testdir";
@@ -100,10 +136,14 @@ fn patterned_bytes(len: usize, modulus: usize, offset: usize) -> Vec<u8> {
 }
 
 fn command_available(name: &str) -> bool {
-    Command::new("which")
+    let available = Command::new("which")
         .arg(name)
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| o.status.success());
+    if !available {
+        require_oracle_or_skip(name);
+    }
+    available
 }
 
 /// bd-53dub: `FFS_REQUIRE_FUSE=1` must be able to FAIL. Re-run this test with
@@ -112,7 +152,16 @@ fn command_available(name: &str) -> bool {
 /// without it the child must pass and print the greppable SKIP line.
 #[test]
 fn require_fuse_turns_missing_prerequisites_into_a_failure_bd_53dub() {
-    if std::env::var_os("FFS_FUSE_PROBE_CHILD").is_some() {
+    if let Ok(probe) = std::env::var("FFS_FUSE_PROBE_CHILD") {
+        if probe == "forensic" {
+            gdt_eager_mounted_forensics_bd_d2hdc();
+            return;
+        }
+        if probe == "oracle" {
+            assert!(!command_available("e2fsck"));
+            require_oracle_or_skip("e2fsck");
+            return;
+        }
         assert!(
             !fuse_available(),
             "PATH is empty, so the prerequisites cannot be found"
@@ -120,7 +169,7 @@ fn require_fuse_turns_missing_prerequisites_into_a_failure_bd_53dub() {
         return;
     }
     let empty_path = TempDir::new().expect("empty PATH dir");
-    let run_child = |require: bool| {
+    let run_child = |require: bool, probe: &str, contract: &str| {
         let mut child = Command::new(std::env::current_exe().expect("test executable"));
         child
             .args([
@@ -130,10 +179,11 @@ fn require_fuse_turns_missing_prerequisites_into_a_failure_bd_53dub() {
                 "--test-threads=1",
             ])
             .env("PATH", empty_path.path())
-            .env("FFS_FUSE_PROBE_CHILD", "1")
-            .env_remove("FFS_REQUIRE_FUSE");
+            .env("FFS_FUSE_PROBE_CHILD", probe)
+            .env_remove("FFS_REQUIRE_FUSE")
+            .env_remove("FFS_REQUIRE_ORACLES");
         if require {
-            child.env("FFS_REQUIRE_FUSE", "1");
+            child.env(contract, "1");
         }
         let out = child.output().expect("run child test");
         let text = format!(
@@ -143,24 +193,45 @@ fn require_fuse_turns_missing_prerequisites_into_a_failure_bd_53dub() {
         );
         (out.status.success(), text)
     };
-    let (required_ok, required_text) = run_child(true);
-    assert!(
-        !required_ok,
-        "missing FUSE prerequisites under FFS_REQUIRE_FUSE=1 must FAIL:\n{required_text}"
-    );
-    assert!(
-        required_text.contains("FFS_REQUIRE_FUSE=1 but the mounted test could not run"),
-        "the failure must state the contract:\n{required_text}"
-    );
-    let (optional_ok, optional_text) = run_child(false);
-    assert!(
-        optional_ok,
-        "without the contract missing prerequisites are a skip:\n{optional_text}"
-    );
-    assert!(
-        optional_text.contains("SKIP fuse_unavailable"),
-        "the skip must print its greppable SKIP line:\n{optional_text}"
-    );
+    for (probe, contract, failure, skip) in [
+        (
+            "availability",
+            "FFS_REQUIRE_FUSE",
+            "FFS_REQUIRE_FUSE=1 but the mounted test could not run",
+            "SKIP fuse_unavailable",
+        ),
+        (
+            "forensic",
+            "FFS_REQUIRE_FUSE",
+            "FFS_REQUIRE_FUSE=1 but the mounted test could not run",
+            "SKIP fuse_unavailable",
+        ),
+        (
+            "oracle",
+            "FFS_REQUIRE_ORACLES",
+            "FFS_REQUIRE_ORACLES=1 but required oracle",
+            "SKIP oracle_unavailable",
+        ),
+    ] {
+        let (required_ok, required_text) = run_child(true, probe, contract);
+        assert!(
+            !required_ok,
+            "missing FUSE prerequisites under FFS_REQUIRE_FUSE=1 must FAIL:\n{required_text}"
+        );
+        assert!(
+            required_text.contains(failure),
+            "the failure must state the contract:\n{required_text}"
+        );
+        let (optional_ok, optional_text) = run_child(false, probe, contract);
+        assert!(
+            optional_ok,
+            "without the contract missing prerequisites are a skip:\n{optional_text}"
+        );
+        assert!(
+            optional_text.contains(skip),
+            "the skip must print its greppable SKIP line:\n{optional_text}"
+        );
+    }
 }
 
 fn emit_scenario_result(scenario_id: &str, outcome: &str, detail: Option<&str>) {
@@ -254,6 +325,15 @@ fn require_fuse_or_skip(reason: &str) {
         "FFS_REQUIRE_FUSE=1 but the mounted test could not run: {reason}"
     );
     eprintln!("SKIP fuse_unavailable reason={reason}");
+}
+
+fn require_oracle_or_skip(tool: &str) {
+    assert!(
+        std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+        "FFS_REQUIRE_ORACLES=1 but required oracle `{tool}` is unavailable"
+    );
+    require_fuse_or_skip(&format!("required tool `{tool}` is unavailable"));
+    eprintln!("SKIP oracle_unavailable tool={tool}");
 }
 
 fn mountinfo_unescape(field: &str) -> Vec<u8> {
@@ -3175,9 +3255,7 @@ print(json.dumps(records, sort_keys=True))
 "#;
 
 fn run_syscall_conformance_probe(root: &Path) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(SYSCALL_CONFORMANCE_SCRIPT)
+    let output = python_command(SYSCALL_CONFORMANCE_SCRIPT)
         .arg(root)
         .output()
         .expect("run python3 syscall conformance probe");
@@ -3483,9 +3561,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 fn run_pwritev2_rwf_probe(root: &Path, flag_name: &str, file_name: &str, payload: &[u8]) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(PWRITEV2_RWF_SCRIPT)
+    let output = python_command(PWRITEV2_RWF_SCRIPT)
         .arg(root)
         .arg(flag_name)
         .arg(file_name)
@@ -3509,9 +3585,7 @@ fn run_pwritev2_rwf_hint_probe(
     payload: &[u8],
     offset: u64,
 ) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(PWRITEV2_RWF_HINT_SCRIPT)
+    let output = python_command(PWRITEV2_RWF_HINT_SCRIPT)
         .arg(root)
         .arg(flag_name)
         .arg(file_name)
@@ -3530,9 +3604,7 @@ fn run_pwritev2_rwf_hint_probe(
 }
 
 fn run_pwritev2_rwf_append_modes_probe(root: &Path) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(PWRITEV2_RWF_APPEND_MODES_SCRIPT)
+    let output = python_command(PWRITEV2_RWF_APPEND_MODES_SCRIPT)
         .arg(root)
         .output()
         .expect("run python3 pwritev2 RWF append-modes probe");
@@ -3546,9 +3618,7 @@ fn run_pwritev2_rwf_append_modes_probe(root: &Path) -> Value {
 }
 
 fn run_pwritev2_rwf_unsupported_intents_probe(root: &Path) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(PWRITEV2_RWF_UNSUPPORTED_INTENTS_SCRIPT)
+    let output = python_command(PWRITEV2_RWF_UNSUPPORTED_INTENTS_SCRIPT)
         .arg(root)
         .output()
         .expect("run python3 pwritev2 RWF unsupported-intents probe");
@@ -3803,9 +3873,7 @@ print(json.dumps(result, sort_keys=True))
 "#;
 
 fn run_inotify_rename_probe(root: &Path, mode: &str) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(INOTIFY_RENAME_SCRIPT)
+    let output = python_command(INOTIFY_RENAME_SCRIPT)
         .arg(root)
         .arg(mode)
         .output()
@@ -3888,9 +3956,7 @@ print(json.dumps({
 "#;
 
 fn run_splice_pipe_to_file_probe(root: &Path) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(SPLICE_PIPE_TO_FILE_SCRIPT)
+    let output = python_command(SPLICE_PIPE_TO_FILE_SCRIPT)
         .arg(root)
         .output()
         .expect("run python3 splice probe");
@@ -4006,9 +4072,7 @@ print(json.dumps({
 "#;
 
 fn run_copy_file_range_offsets_probe(root: &Path) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(COPY_FILE_RANGE_OFFSETS_SCRIPT)
+    let output = python_command(COPY_FILE_RANGE_OFFSETS_SCRIPT)
         .arg(root)
         .output()
         .expect("run python3 copy_file_range probe");
@@ -4140,9 +4204,7 @@ print(json.dumps({
 "#;
 
 fn run_sendfile_32m_probe(root: &Path) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(SENDFILE_32M_SCRIPT)
+    let output = python_command(SENDFILE_32M_SCRIPT)
         .arg(root)
         .output()
         .expect("run python3 sendfile probe");
@@ -4380,9 +4442,7 @@ print(json.dumps({"buffer_size": buffer_size, "cases": cases}, sort_keys=True))
 "#;
 
 fn run_splice_file_to_pipe_probe(root: &Path) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(SPLICE_FILE_TO_PIPE_SCRIPT)
+    let output = python_command(SPLICE_FILE_TO_PIPE_SCRIPT)
         .arg(root)
         .output()
         .expect("run python3 splice file-to-pipe probe");
@@ -4454,9 +4514,7 @@ print(json.dumps({
 "#;
 
 fn run_readonly_splice_pipe_merge_probe(root: &Path) -> Value {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(READONLY_SPLICE_PIPE_MERGE_SCRIPT)
+    let output = python_command(READONLY_SPLICE_PIPE_MERGE_SCRIPT)
         .arg(root)
         .output()
         .expect("run python3 read-only splice pipe probe");
@@ -4583,7 +4641,7 @@ fn syscall_conformance_reference_probe_covers_dirfd_mutation_contracts() {
 
     let result = &dirfd["result"];
     if let Some(skipped) = result["skipped"].as_str() {
-        eprintln!("dirfd mutation prerequisites not met, skipping: {skipped}");
+        eprintln!("SKIP dirfd_mutation reason={skipped}");
         return;
     }
 
@@ -4787,7 +4845,7 @@ fn syscall_conformance_reference_probe_covers_renameat2_flag_contracts() {
 
     let result = &renameat2["result"];
     if result["available"].as_bool() == Some(false) {
-        eprintln!("renameat2 unavailable on this worker, skipping");
+        eprintln!("SKIP renameat2 unavailable on this worker");
         return;
     }
     assert_eq!(result["available"].as_bool(), Some(true));
@@ -4884,16 +4942,24 @@ fn try_mount_kernel_ext4_reference(
         eprintln!("kernel ext4 reference unavailable: mkfs.ext4 missing");
         return None;
     }
-    let attached = Command::new("sudo")
+    let attached = match Command::new("sudo")
         .args(["-n", "losetup", "--find", "--show"])
         .arg(image)
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            require_fuse_or_skip(&format!(
+                "kernel ext4 loop attach could not execute: {error}"
+            ));
+            return None;
+        }
+    };
     if !attached.status.success() {
-        eprintln!(
-            "kernel ext4 reference unavailable: loop attach failed: {}",
+        require_fuse_or_skip(&format!(
+            "kernel ext4 reference loop attach failed: {}",
             String::from_utf8_lossy(&attached.stderr)
-        );
+        ));
         return None;
     }
     let loop_device = String::from_utf8(attached.stdout)
@@ -4916,6 +4982,7 @@ fn try_mount_kernel_ext4_reference(
                 .args(["-n", "losetup", "-d"])
                 .arg(&loop_device)
                 .status();
+            require_fuse_or_skip("kernel ext4 reference mount failed; full output printed above");
             return None;
         }
         Err(err) => {
@@ -4924,6 +4991,7 @@ fn try_mount_kernel_ext4_reference(
                 .args(["-n", "losetup", "-d"])
                 .arg(&loop_device)
                 .status();
+            require_fuse_or_skip("kernel ext4 reference mount could not execute");
             return None;
         }
     }
@@ -7003,7 +7071,7 @@ fn fuse_inotify_same_parent_rename_pairs_have_matching_cookies() {
         let scenario_id = "ext4_rw_inotify_same_parent_rename_cookie_pairs";
         let report = run_inotify_rename_probe(mnt, "same-parent");
         if let Some(reason) = report["skipped"].as_str() {
-            eprintln!("inotify same-parent probe unavailable, skipping: {reason}");
+            eprintln!("SKIP inotify_same_parent reason={reason}");
             return;
         }
 
@@ -7031,7 +7099,7 @@ fn fuse_inotify_cross_directory_rename_uses_move_pair_not_delete_create() {
         let scenario_id = "ext4_rw_inotify_cross_directory_rename_cookie_pair";
         let report = run_inotify_rename_probe(mnt, "cross-directory");
         if let Some(reason) = report["skipped"].as_str() {
-            eprintln!("inotify cross-directory probe unavailable, skipping: {reason}");
+            eprintln!("SKIP inotify_cross_directory reason={reason}");
             return;
         }
 
@@ -7596,10 +7664,7 @@ fn fuse_setattr_chown() {
             uid = owner_uid,
             gid = owner_gid,
         );
-        let out = Command::new("python3")
-            .args(["-c", &script])
-            .output()
-            .expect("python3 chown");
+        let out = python_command(&script).output().expect("python3 chown");
         assert!(
             out.status.success(),
             "chown to same uid/gid failed: {}",
@@ -7617,8 +7682,7 @@ fn fuse_setattr_chown() {
             "import os\ntry:\n    os.chown({path:?}, 65534, 65534)\n    print('OK')\nexcept PermissionError:\n    print('EPERM')",
             path = path.to_str().unwrap(),
         );
-        let out2 = Command::new("python3")
-            .args(["-c", &script2])
+        let out2 = python_command(&script2)
             .output()
             .expect("python3 chown to nobody");
         assert!(out2.status.success());
@@ -7642,10 +7706,7 @@ fn fuse_setattr_utimes() {
             "import os; os.utime({path:?}, (1_700_000_000, 1_700_000_000))",
             path = path.to_str().unwrap(),
         );
-        let out = Command::new("python3")
-            .args(["-c", &script])
-            .output()
-            .expect("python3 utime");
+        let out = python_command(&script).output().expect("python3 utime");
         assert!(
             out.status.success(),
             "os.utime failed: {}",
@@ -7670,8 +7731,7 @@ fn fuse_setattr_utimes() {
             "import os; os.utime({path:?}, (1_600_000_000, 1_650_000_000))",
             path = path.to_str().unwrap(),
         );
-        let out2 = Command::new("python3")
-            .args(["-c", &script2])
+        let out2 = python_command(&script2)
             .output()
             .expect("python3 utime second");
         assert!(
@@ -10334,7 +10394,7 @@ fn fuse_splice_pipe_to_file_16m_roundtrip() {
         let scenario_id = "ext4_rw_splice_pipe_to_file_16m_roundtrip";
         let report = run_splice_pipe_to_file_probe(mnt);
         if let Some(reason) = report["skipped"].as_str() {
-            eprintln!("splice probe unavailable, skipping: {reason}");
+            eprintln!("SKIP splice reason={reason}");
             return;
         }
 
@@ -10375,7 +10435,7 @@ fn fuse_xfstests_generic_249_sendfile_32m_roundtrip() {
         let scenario_id = "ext4_rw_xfstests_generic_249_sendfile_32m";
         let report = run_sendfile_32m_probe(mnt);
         if let Some(reason) = report["skipped"].as_str() {
-            eprintln!("sendfile probe unavailable, skipping: {reason}");
+            eprintln!("SKIP sendfile reason={reason}");
             return;
         }
 
@@ -10402,7 +10462,7 @@ fn fuse_sendfile_1g_is_at_least_2x_naive_read_write() {
         let scenario_id = "ext4_rw_sendfile_1g_vs_naive_read_write";
         let report = run_sendfile_vs_naive_1g_benchmark(mnt);
         if let Some(reason) = report["skipped"].as_str() {
-            eprintln!("sendfile benchmark unavailable, skipping: {reason}");
+            eprintln!("SKIP sendfile_benchmark reason={reason}");
             return;
         }
 
@@ -10433,7 +10493,7 @@ fn fuse_xfstests_generic_591_splice_file_to_pipe_modes() {
         let scenario_id = "ext4_rw_xfstests_generic_591_splice_file_to_pipe";
         let report = run_splice_file_to_pipe_probe(mnt);
         if let Some(reason) = report["skipped"].as_str() {
-            eprintln!("splice file-to-pipe probe unavailable, skipping: {reason}");
+            eprintln!("SKIP splice_file_to_pipe reason={reason}");
             return;
         }
 
@@ -10474,7 +10534,7 @@ fn fuse_xfstests_generic_680_readonly_splice_pipe_merge_isolation() {
         let scenario_id = "ext4_rw_xfstests_generic_680_readonly_splice_pipe_merge";
         let report = run_readonly_splice_pipe_merge_probe(mnt);
         if let Some(reason) = report["skipped"].as_str() {
-            eprintln!("read-only splice pipe probe unavailable, skipping: {reason}");
+            eprintln!("SKIP readonly_splice_pipe reason={reason}");
             return;
         }
 
@@ -11162,10 +11222,7 @@ fn py_getxattr(path: &Path, name: &str) -> Option<Vec<u8>> {
         path = path.to_str().unwrap(),
         name = name,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
-        .output()
-        .expect("python3 getxattr");
+    let out = python_command(&script).output().expect("python3 getxattr");
     if out.status.success() {
         Some(out.stdout)
     } else {
@@ -11179,8 +11236,7 @@ fn py_getxattr_report(path: &Path, name: &str) -> Value {
         path = path.to_str().unwrap(),
         name = name,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 getxattr JSON");
     assert!(
@@ -11198,8 +11254,7 @@ fn py_getxattr_probe_report(path: &Path, name: &str, size: usize) -> Value {
         name = name,
         size = size,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 getxattr probe JSON");
     assert!(
@@ -11216,10 +11271,7 @@ fn py_listxattr(path: &Path) -> Vec<String> {
         "import os\nfor n in os.listxattr({path:?}):\n print(n)",
         path = path.to_str().unwrap(),
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
-        .output()
-        .expect("python3 listxattr");
+    let out = python_command(&script).output().expect("python3 listxattr");
     assert!(
         out.status.success(),
         "listxattr failed: {}",
@@ -11238,8 +11290,7 @@ fn py_listxattr_probe_report(path: &Path, size: usize) -> Value {
         path = path.to_str().unwrap(),
         size = size,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 listxattr probe JSON");
     assert!(
@@ -11257,8 +11308,7 @@ fn py_removexattr(path: &Path, name: &str) -> bool {
         path = path.to_str().unwrap(),
         name = name,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 removexattr");
     out.status.success()
@@ -11270,8 +11320,7 @@ fn py_removexattr_report(path: &Path, name: &str) -> Value {
         path = path.to_str().unwrap(),
         name = name,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 removexattr JSON");
     assert!(
@@ -11288,8 +11337,7 @@ fn py_chmod_report(path: &Path, mode: u32) -> Value {
         path = path.to_str().unwrap(),
         mode = mode,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 chmod JSON");
     assert!(
@@ -11306,8 +11354,7 @@ fn py_truncate_report(path: &Path, size: u64) -> Value {
         path = path.to_str().unwrap(),
         size = size,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 truncate JSON");
     assert!(
@@ -11325,8 +11372,7 @@ fn py_utime_report(path: &Path, atime: i64, mtime: i64) -> Value {
         atime = atime,
         mtime = mtime,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 utime JSON");
     assert!(
@@ -11344,8 +11390,7 @@ fn py_renameat2_report(old_path: &Path, new_path: &Path, flags: u32) -> Value {
         new_path = new_path.to_str().unwrap(),
         flags = flags,
     );
-    let out = Command::new("python3")
-        .args(["-c", &script])
+    let out = python_command(&script)
         .output()
         .expect("python3 renameat2 JSON");
     assert!(
@@ -13016,10 +13061,14 @@ fn try_mount_btrfs_with_open_options(
 
 /// Check if we can run sudo commands (for tests that create btrfs subvolumes).
 fn can_run_sudo() -> bool {
-    Command::new("sudo")
+    let available = Command::new("sudo")
         .args(["-n", "true"])
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| o.status.success());
+    if !available {
+        require_fuse_or_skip("passwordless sudo unavailable for native mount prerequisites");
+    }
+    available
 }
 
 /// Create a btrfs image with subvolumes and snapshots using kernel btrfs tools.
@@ -13053,6 +13102,7 @@ fn create_btrfs_image_with_subvolumes(dir: &Path) -> Option<(PathBuf, Vec<String
             "mkfs.btrfs failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        require_fuse_or_skip("native btrfs subvolume fixture formatting failed");
         return None;
     }
 
@@ -13073,6 +13123,7 @@ fn create_btrfs_image_with_subvolumes(dir: &Path) -> Option<(PathBuf, Vec<String
             "sudo mount failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        require_fuse_or_skip("native btrfs subvolume fixture mount failed");
         return None;
     }
 
@@ -13095,6 +13146,7 @@ fn create_btrfs_image_with_subvolumes(dir: &Path) -> Option<(PathBuf, Vec<String
             "btrfs subvolume create failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        require_fuse_or_skip("native btrfs subvolume creation failed");
         return None;
     }
 
@@ -14340,10 +14392,7 @@ fn btrfs_fuse_setattr_utimes() {
             "import os; os.utime({path:?}, (1_700_000_000, 1_700_000_000))",
             path = path.to_str().unwrap(),
         );
-        let out = Command::new("python3")
-            .args(["-c", &script])
-            .output()
-            .expect("python3 utime");
+        let out = python_command(&script).output().expect("python3 utime");
         assert!(
             out.status.success(),
             "os.utime on btrfs failed: {}",
@@ -15229,9 +15278,7 @@ finally:
             mnt = mnt.to_str().unwrap()
         );
 
-        let out = Command::new("python3")
-            .arg("-c")
-            .arg(&script)
+        let out = python_command(&script)
             .output()
             .expect("run python3 ioctl script");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -17341,8 +17388,7 @@ finally:
 ";
     let output = btrfs_seed_sprout_run(
         directory,
-        Command::new("python3")
-            .args(["-c", script])
+        python_command(script)
             .arg(mountpoint)
             .arg(serde_json::to_string(ids).unwrap()),
     );
@@ -18881,9 +18927,7 @@ finally:
             mnt = mnt.to_str().unwrap()
         );
 
-        let out = Command::new("python3")
-            .arg("-c")
-            .arg(&script)
+        let out = python_command(&script)
             .output()
             .expect("run python3 DEV_INFO ioctl script");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -18969,9 +19013,7 @@ finally:
             child = child.to_str().unwrap()
         );
 
-        let out = Command::new("python3")
-            .arg("-c")
-            .arg(&script)
+        let out = python_command(&script)
             .output()
             .expect("run python3 INO_LOOKUP ioctl script");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -19284,8 +19326,7 @@ except OSError as error:
     report['errno'] = error.errno
 print(json.dumps(report))
 ";
-    let output = Command::new("python3")
-        .args(["-c", script])
+    let output = python_command(script)
         .current_dir(&mnt)
         .output()
         .expect("run unprivileged security xattr probe");
@@ -19379,9 +19420,7 @@ finally:
             path = file_path.to_str().unwrap()
         );
 
-        let out = Command::new("python3")
-            .arg("-c")
-            .arg(&script)
+        let out = python_command(&script)
             .output()
             .expect("run python3 ioctl script");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -22835,13 +22874,17 @@ fn jbd2_wrapped_log_crash_image_recovery_matches_kernel() {
 /// mounted operation.
 #[test]
 fn gdt_eager_mounted_forensics_bd_d2hdc() {
-    if !fuse_available()
-        || !can_run_sudo()
-        || !command_available("mkfs.ext4")
-        || !command_available("e2fsck")
-        || !command_available("fusermount3")
-    {
-        eprintln!("bd-d2hdc forensic prerequisites unavailable, skipping");
+    if !fuse_available() {
+        return;
+    }
+    for tool in ["mkfs.ext4", "e2fsck", "fusermount3"] {
+        if !command_available(tool) {
+            require_oracle_or_skip(tool);
+            return;
+        }
+    }
+    if !can_run_sudo() {
+        require_fuse_or_skip("sudo unavailable for bd-d2hdc forensic mount");
         return;
     }
     let pairs = 1000;
@@ -22915,11 +22958,13 @@ fn gdt_eager_mounted_forensics_bd_d2hdc() {
             if let Ok(Err(e)) = mount_rx.try_recv() {
                 require_fuse_or_skip(&format!("forensic FUSE mount failed: {e}"));
             } else {
-                eprintln!("timed out waiting for forensic mount readiness, skipping");
+                require_fuse_or_skip("timed out waiting for forensic mount readiness");
             }
             let _ = session_thread.join();
             return;
         }
+
+        emit_scenario_result("gdt_forensic_mount", "PASS", Some(mode));
 
         for index in 0..pairs {
             let path = mnt.join(format!("pair{index}"));
@@ -22944,8 +22989,9 @@ fn gdt_eager_mounted_forensics_bd_d2hdc() {
             .expect("spawn e2fsck");
         let rc = output.status.code().unwrap_or(-1);
         eprintln!(
-            "bd-d2hdc forensic result: mode={mode} pairs={pairs} e2fsck_rc={rc} stdout:\n{}",
-            String::from_utf8_lossy(&output.stdout)
+            "ORACLE_RESULT|tool=e2fsck|mode={mode}|pairs={pairs}|exit={rc}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
         if mode == "deferred" {
             assert!(rc == 0, "deferred control must be e2fsck-clean (rc {rc})");

@@ -48,8 +48,10 @@ create_rw_ext4_image() {
 
     dd if=/dev/zero of="$image_path" bs=1M count="$size_mb" status=none
 
-    # Disable has_journal to avoid journal-layout feature gaps in current mount path.
-    mkfs.ext4 -F -O extent,filetype,^has_journal -L e2e_rw "$image_path" >/dev/null 2>&1
+    # Exercise the normal journaled profile; a journal-free fixture cannot
+    # qualify journaled writeback or the following crash/recovery phase.
+    e2e_assert mkfs.ext4 -F -O extent,filetype,has_journal \
+        -E "root_owner=$(id -u):$(id -g)" -L e2e_rw "$image_path"
 
     local seed_file="$E2E_TEMP_DIR/seed_rw.txt"
     local seed_nested="$E2E_TEMP_DIR/seed_nested.txt"

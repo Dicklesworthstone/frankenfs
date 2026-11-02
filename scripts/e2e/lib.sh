@@ -1390,6 +1390,7 @@ e2e_skip() {
     fi
     # Recorded so result.json says SKIP, not PASS: a skipped run proved nothing.
     E2E_SKIPPED_REASON="$reason"
+    e2e_log "SKIP test=${E2E_TEST_NAME:-uninitialized} reason=$reason"
     e2e_log ""
     e2e_log "${YELLOW}SKIPPED${RESET}: $reason"
     e2e_log ""

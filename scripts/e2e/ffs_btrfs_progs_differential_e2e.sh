@@ -10,12 +10,13 @@
 #   4. Edge cases: large dirs (1000+ entries), many xattrs, deep rename chains
 #   5. Structural equivalence via btrfs inspect-internal dump-tree
 #
-# Until A1-A6 integration lands, FrankenFS-written validations XFAIL.
-# Synthetic-image fallback validates reference path immediately.
+# Default qualification requires actual mounted mutations and clean native checks.
+# FFS_BTRFS_PROGS_EXPECT_PASS=0 is an explicitly partial diagnostic profile.
 #
 # Environment:
 #   FFS_BTRFS_PROGS_EXPECT_PASS=1  - Expect FrankenFS-written checks to pass
 #   FFS_E2E_DISABLE_TEMP_CLEANUP=1 - Preserve temp artifacts for inspection
+#   FFS_SKIP_BUILD=1              - Use an already-built, source-bound FFS_CLI_BIN
 #
 # Usage: scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
 # Exit:  0 = all gates pass (or expected XFAIL), non-zero = unexpected failure
@@ -36,8 +37,8 @@ e2e_rch_add_env_allowlist CARGO_TARGET_DIR
 RCH_COMMAND_TIMEOUT_SECS="${RCH_COMMAND_TIMEOUT_SECS:-600}"
 RCH_CAPTURE_VISIBILITY="${FFS_BTRFS_PROGS_DIFF_RCH_VISIBILITY:-${RCH_VISIBILITY:-summary}}"
 
-# When durable writeback lands, set this to 1
 EXPECT_FFS_WRITTEN_PASS="${FFS_BTRFS_PROGS_EXPECT_PASS:-1}"
+FFS_SKIP_BUILD="${FFS_SKIP_BUILD:-0}"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -53,6 +54,11 @@ scenario_result() {
     local scenario_id="$1"
     local outcome="$2"
     local detail="${3:-}"
+    if [[ "$outcome" == "SKIP" || "$outcome" == "XFAIL" ]] &&
+        [[ "$EXPECT_FFS_WRITTEN_PASS" == "1" || "${FFS_REQUIRE_ORACLES:-0}" == "1" || "${FFS_REQUIRE_FUSE:-0}" == "1" ]]; then
+        detail="required capability did not execute ($outcome): $detail"
+        outcome="FAIL"
+    fi
     e2e_log "SCENARIO_RESULT|scenario_id=${scenario_id}|outcome=${outcome}|detail=${detail}"
     case "$outcome" in
         PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
@@ -101,6 +107,12 @@ EOF
 
 emit_capability_skip() {
     local reason="$1"
+    if [[ "$EXPECT_FFS_WRITTEN_PASS" == "1" || "${FFS_REQUIRE_ORACLES:-0}" == "1" || "${FFS_REQUIRE_FUSE:-0}" == "1" ]]; then
+        scenario_result "btrfs_progs_capability_check" "FAIL" "$reason"
+        e2e_fail "required btrfs oracle unavailable: $reason"
+    fi
+    E2E_SKIPPED_REASON="$reason"
+    e2e_log "SKIP oracle_unavailable reason=$reason"
     e2e_log "HOST_CAPABILITY_SKIP: $reason"
     scenario_result "btrfs_progs_capability_check" "SKIP" "HOST_CAPABILITY_SKIP: $reason"
 
@@ -120,7 +132,14 @@ JUNIT
 run_rch_capture() {
     local log_path="$1"
     shift
-    RCH_VISIBILITY="$RCH_CAPTURE_VISIBILITY" e2e_rch_capture "$log_path" "$@"
+    if [[ "${FFS_USE_RCH:-1}" == "0" ]]; then
+        # Hosted CI provisions its own build runner. Operator evidence lanes
+        # retain the default fail-closed RCH path and report it separately.
+        e2e_log "CI_CARGO_EXECUTION|command=$*|log=$log_path"
+        "$@" >"$log_path" 2>&1
+    else
+        RCH_VISIBILITY="$RCH_CAPTURE_VISIBILITY" e2e_rch_capture "$log_path" "$@"
+    fi
 }
 
 cleanup_mount() {
@@ -177,6 +196,9 @@ start_mount() {
 
 stop_mount() {
     local mount_point="$1"
+    # Flush and unmount before stopping the daemon: killing it first does not
+    # establish a clean-unmount durability boundary for the native checker.
+    e2e_assert fusermount3 -u "$mount_point"
     if [[ -n "${MOUNT_PID:-}" ]] && kill -0 "$MOUNT_PID" 2>/dev/null; then
         kill "$MOUNT_PID" 2>/dev/null || true
         local wait_count=0
@@ -191,7 +213,7 @@ stop_mount() {
     MOUNT_PID=""
 
     if mountpoint -q "$mount_point" 2>/dev/null; then
-        fusermount -u "$mount_point" 2>/dev/null || true
+        e2e_fail "mount remains active after clean unmount: $mount_point"
     fi
 }
 
@@ -292,6 +314,14 @@ else
     scenario_result "fuse_capability" "PASS" "/dev/fuse available"
 fi
 
+for tool in fusermount3 setfattr getfattr python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        emit_capability_skip "$tool not found"
+        e2e_pass
+        exit 0
+    fi
+done
+
 #######################################
 # Phase 2: Build ffs-cli
 #######################################
@@ -299,7 +329,12 @@ e2e_step "Phase 2: Build ffs-cli"
 
 BUILD_LOG="$E2E_LOG_DIR/build_ffs_cli.log"
 BUILD_START=$(date +%s%3N)
-if run_rch_capture "$BUILD_LOG" cargo build -p ffs-cli --release; then
+if [[ "$FFS_SKIP_BUILD" == "1" ]]; then
+    e2e_assert_file "$FFS_CLI_BIN"
+    [[ -x "$FFS_CLI_BIN" ]] || e2e_fail "prebuilt ffs-cli is not executable"
+    e2e_log "PREBUILT_CLI|binary=$FFS_CLI_BIN|sha256=$(sha256sum "$FFS_CLI_BIN" | cut -d' ' -f1)"
+    FFS_CLI_AVAILABLE=1
+elif run_rch_capture "$BUILD_LOG" cargo build -p ffs-cli --release; then
     BUILD_END=$(date +%s%3N)
     scenario_result "build_ffs_cli" "PASS" "ffs-cli built successfully"
     emit_executed_evidence "cargo build -p ffs-cli --release" 0 "$BUILD_LOG" "$BUILD_LOG" "$((BUILD_END - BUILD_START))" "$E2E_LOG_DIR/build_evidence.json"
@@ -335,14 +370,18 @@ e2e_log "Created sparse image: $REF_IMAGE (${REF_SIZE_MB}MB)"
 # Format with mkfs.btrfs
 MKFS_LOG="$E2E_LOG_DIR/mkfs_reference.log"
 MKFS_START=$(date +%s%3N)
-if mkfs.btrfs -f -L "ffs-progs-diff-ref" "$REF_IMAGE" > "$MKFS_LOG" 2>&1; then
+# Native producer supplies a root owned by the invoking test user, so the
+# same permission-checked workload works on unprivileged hosted CI too.
+NATIVE_ROOT="$E2E_TEMP_DIR/native-root"
+mkdir "$NATIVE_ROOT"
+if mkfs.btrfs -f --rootdir "$NATIVE_ROOT" -L "ffs-progs-diff-ref" "$REF_IMAGE" > "$MKFS_LOG" 2>&1; then
     MKFS_END=$(date +%s%3N)
     scenario_result "reference_image_created" "PASS" "mkfs.btrfs created reference"
-    emit_executed_evidence "mkfs.btrfs -f -L ffs-progs-diff-ref $REF_IMAGE" 0 "$MKFS_LOG" "$MKFS_LOG" "$((MKFS_END - MKFS_START))" "$E2E_LOG_DIR/mkfs_reference_evidence.json"
+    emit_executed_evidence "mkfs.btrfs -f --rootdir $NATIVE_ROOT -L ffs-progs-diff-ref $REF_IMAGE" 0 "$MKFS_LOG" "$MKFS_LOG" "$((MKFS_END - MKFS_START))" "$E2E_LOG_DIR/mkfs_reference_evidence.json"
 else
     MKFS_END=$(date +%s%3N)
     scenario_result "reference_image_created" "FAIL" "mkfs.btrfs failed"
-    emit_executed_evidence "mkfs.btrfs -f -L ffs-progs-diff-ref $REF_IMAGE" 1 "$MKFS_LOG" "$MKFS_LOG" "$((MKFS_END - MKFS_START))" "$E2E_LOG_DIR/mkfs_reference_evidence.json"
+    emit_executed_evidence "mkfs.btrfs -f --rootdir $NATIVE_ROOT -L ffs-progs-diff-ref $REF_IMAGE" 1 "$MKFS_LOG" "$MKFS_LOG" "$((MKFS_END - MKFS_START))" "$E2E_LOG_DIR/mkfs_reference_evidence.json"
     cat "$MKFS_LOG"
     exit 1
 fi
@@ -397,6 +436,7 @@ FFS_MOUNT="$E2E_TEMP_DIR/ffs_mount"
 # Start with a copy of the reference image
 cp "$REF_IMAGE" "$FFS_IMAGE"
 e2e_log "Copied reference image to $FFS_IMAGE"
+REFERENCE_SHA256=$(sha256sum "$REF_IMAGE" | cut -d' ' -f1)
 
 if [[ $FFS_CLI_AVAILABLE -eq 1 ]] && [[ $FUSE_AVAILABLE -eq 1 ]]; then
     e2e_log "Attempting FrankenFS mount and mutations..."
@@ -409,69 +449,98 @@ if [[ $FFS_CLI_AVAILABLE -eq 1 ]] && [[ $FUSE_AVAILABLE -eq 1 ]]; then
         e2e_log "Performing standard mutation set..."
 
         # 1. create file
-        echo "mutation-create-content" > "$FFS_MOUNT/created_file.txt" 2>/dev/null || true
+        echo "mutation-create-content" > "$FFS_MOUNT/created_file.txt"
+        e2e_assert grep -Fxq "mutation-create-content" "$FFS_MOUNT/created_file.txt"
         e2e_log "  create: created_file.txt"
 
         # 2. mkdir
-        mkdir -p "$FFS_MOUNT/created_dir" 2>/dev/null || true
+        e2e_assert mkdir "$FFS_MOUNT/created_dir"
         e2e_log "  mkdir: created_dir"
 
         # 3. write nested file
-        echo "mutation-write-nested" > "$FFS_MOUNT/created_dir/nested.txt" 2>/dev/null || true
+        echo "mutation-write-nested" > "$FFS_MOUNT/created_dir/nested.txt"
+        e2e_assert grep -Fxq "mutation-write-nested" "$FFS_MOUNT/created_dir/nested.txt"
         e2e_log "  write: created_dir/nested.txt"
 
         # 4. rename
-        echo "rename-source" > "$FFS_MOUNT/to_rename.txt" 2>/dev/null || true
-        mv "$FFS_MOUNT/to_rename.txt" "$FFS_MOUNT/renamed.txt" 2>/dev/null || true
+        echo "rename-source" > "$FFS_MOUNT/to_rename.txt"
+        e2e_assert mv "$FFS_MOUNT/to_rename.txt" "$FFS_MOUNT/renamed.txt"
+        e2e_assert grep -Fxq "rename-source" "$FFS_MOUNT/renamed.txt"
+        [[ ! -e "$FFS_MOUNT/to_rename.txt" ]] || e2e_fail "rename source still exists"
         e2e_log "  rename: to_rename.txt -> renamed.txt"
 
         # 5. unlink
-        echo "unlink-target" > "$FFS_MOUNT/to_unlink.txt" 2>/dev/null || true
-        rm "$FFS_MOUNT/to_unlink.txt" 2>/dev/null || true
+        echo "unlink-target" > "$FFS_MOUNT/to_unlink.txt"
+        e2e_assert rm "$FFS_MOUNT/to_unlink.txt"
+        [[ ! -e "$FFS_MOUNT/to_unlink.txt" ]] || e2e_fail "unlink target still exists"
         e2e_log "  unlink: to_unlink.txt"
 
         # 6. setattr
-        chmod 755 "$FFS_MOUNT/created_file.txt" 2>/dev/null || true
+        e2e_assert chmod 755 "$FFS_MOUNT/created_file.txt"
+        [[ "$(stat -c '%a' "$FFS_MOUNT/created_file.txt")" == "755" ]] || e2e_fail "chmod did not persist"
         e2e_log "  setattr: chmod 755"
 
         # 7. xattr
         if command -v setfattr &>/dev/null; then
-            setfattr -n user.test_attr -v "xattr-value" "$FFS_MOUNT/created_file.txt" 2>/dev/null || true
+            e2e_assert setfattr -n user.test_attr -v "xattr-value" "$FFS_MOUNT/created_file.txt"
+            [[ "$(getfattr --only-values -n user.test_attr "$FFS_MOUNT/created_file.txt")" == "xattr-value" ]] || e2e_fail "xattr value differs"
             e2e_log "  xattr: user.test_attr"
         fi
 
         # --- Edge case: large directory (100 entries - reduced for speed) ---
         e2e_log "Creating large directory edge case (100 entries)..."
-        mkdir -p "$FFS_MOUNT/large_dir" 2>/dev/null || true
+        e2e_assert mkdir "$FFS_MOUNT/large_dir"
         for i in $(seq 1 100); do
-            echo "entry-$i" > "$FFS_MOUNT/large_dir/file_$i.txt" 2>/dev/null || true
+            echo "entry-$i" > "$FFS_MOUNT/large_dir/file_$i.txt"
+            e2e_assert grep -Fxq "entry-$i" "$FFS_MOUNT/large_dir/file_$i.txt"
         done
         e2e_log "  large_dir: 100 entries created"
 
         # --- Edge case: many xattrs ---
         if command -v setfattr &>/dev/null; then
             e2e_log "Creating many xattrs edge case..."
-            touch "$FFS_MOUNT/many_xattrs.txt" 2>/dev/null || true
+            e2e_assert touch "$FFS_MOUNT/many_xattrs.txt"
             for i in $(seq 1 20); do
-                setfattr -n "user.attr_$i" -v "value_$i" "$FFS_MOUNT/many_xattrs.txt" 2>/dev/null || true
+                e2e_assert setfattr -n "user.attr_$i" -v "value_$i" "$FFS_MOUNT/many_xattrs.txt"
+                [[ "$(getfattr --only-values -n "user.attr_$i" "$FFS_MOUNT/many_xattrs.txt")" == "value_$i" ]] || e2e_fail "xattr $i differs"
             done
             e2e_log "  many_xattrs: 20 xattrs set"
         fi
 
         # --- Edge case: deep rename chain ---
         e2e_log "Creating deep rename chain edge case..."
-        mkdir -p "$FFS_MOUNT/rename_chain" 2>/dev/null || true
-        echo "chain-content" > "$FFS_MOUNT/rename_chain/step_0.txt" 2>/dev/null || true
+        e2e_assert mkdir "$FFS_MOUNT/rename_chain"
+        echo "chain-content" > "$FFS_MOUNT/rename_chain/step_0.txt"
         for i in $(seq 1 10); do
             prev=$((i - 1))
-            mv "$FFS_MOUNT/rename_chain/step_$prev.txt" "$FFS_MOUNT/rename_chain/step_$i.txt" 2>/dev/null || true
+            e2e_assert mv "$FFS_MOUNT/rename_chain/step_$prev.txt" "$FFS_MOUNT/rename_chain/step_$i.txt"
         done
         e2e_log "  rename_chain: 10-step rename chain"
 
         # Sync and unmount
-        sync 2>/dev/null || true
+        e2e_assert grep -Fxq "chain-content" "$FFS_MOUNT/rename_chain/step_10.txt"
+        e2e_assert sync -f "$FFS_MOUNT"
         stop_mount "$FFS_MOUNT"
         scenario_result "ffs_mutations" "PASS" "FrankenFS mutations completed"
+        if start_mount ro "$FFS_IMAGE" "$FFS_MOUNT" 30; then
+            e2e_assert grep -Fxq "mutation-create-content" "$FFS_MOUNT/created_file.txt"
+            e2e_assert grep -Fxq "mutation-write-nested" "$FFS_MOUNT/created_dir/nested.txt"
+            e2e_assert grep -Fxq "rename-source" "$FFS_MOUNT/renamed.txt"
+            e2e_assert grep -Fxq "chain-content" "$FFS_MOUNT/rename_chain/step_10.txt"
+            [[ ! -e "$FFS_MOUNT/to_rename.txt" && ! -e "$FFS_MOUNT/to_unlink.txt" ]] || e2e_fail "removed names reappeared after reopen"
+            [[ "$(stat -c '%a' "$FFS_MOUNT/created_file.txt")" == "755" ]] || e2e_fail "reopened mode differs"
+            [[ "$(getfattr --only-values -n user.test_attr "$FFS_MOUNT/created_file.txt")" == "xattr-value" ]] || e2e_fail "reopened xattr differs"
+            for i in $(seq 1 100); do
+                e2e_assert grep -Fxq "entry-$i" "$FFS_MOUNT/large_dir/file_$i.txt"
+            done
+            for i in $(seq 1 20); do
+                [[ "$(getfattr --only-values -n "user.attr_$i" "$FFS_MOUNT/many_xattrs.txt")" == "value_$i" ]] || e2e_fail "reopened xattr $i differs"
+            done
+            stop_mount "$FFS_MOUNT"
+            scenario_result "ffs_mutations_reopened" "PASS" "fresh read-only mount verifies all payloads, names, mode and21xattrs"
+        else
+            scenario_result "ffs_mutations_reopened" "FAIL" "fresh read-only mount failed"
+        fi
     else
         scenario_result "ffs_mount_rw" "XFAIL" "FrankenFS RW mount failed (integration in progress)"
         scenario_result "ffs_mutations" "XFAIL" "Skipped - mount failed"
@@ -494,6 +563,7 @@ e2e_step "Phase 7: btrfs check on FrankenFS-written image"
 FFS_CHECK_RESULT=$(run_btrfs_check "$FFS_IMAGE" "ffs_written")
 FFS_EXIT_CODE=$(echo "$FFS_CHECK_RESULT" | cut -d: -f1)
 FFS_CORRUPTION_COUNT=$(echo "$FFS_CHECK_RESULT" | cut -d: -f2)
+[[ "$(sha256sum "$REF_IMAGE" | cut -d' ' -f1)" == "$REFERENCE_SHA256" ]] || e2e_fail "mutation changed the frozen reference image"
 
 e2e_log "FrankenFS-written image check: exit=$FFS_EXIT_CODE, errors=$FFS_CORRUPTION_COUNT"
 
@@ -561,8 +631,12 @@ e2e_step "Phase 10: Unit test verification"
 # Writeback tests
 WB_LOG="$E2E_LOG_DIR/writeback_tests.log"
 if run_rch_capture "$WB_LOG" cargo test -p ffs-btrfs --lib -- writeback; then
-    WB_TESTS=$(grep -c "test writeback::" "$WB_LOG" 2>/dev/null || echo "0")
-    scenario_result "writeback_unit_tests" "PASS" "writeback tests passed ($WB_TESTS tests)"
+    WB_TESTS=$(awk '/test result: ok[.] [0-9]+ passed;/ { count += $4 } END { print count+0 }' "$WB_LOG")
+    if [[ "$WB_TESTS" -gt 0 ]]; then
+        scenario_result "writeback_unit_tests" "PASS" "writeback tests passed ($WB_TESTS tests)"
+    else
+        scenario_result "writeback_unit_tests" "FAIL" "writeback selection ran zero tests"
+    fi
 else
     scenario_result "writeback_unit_tests" "XFAIL" "writeback tests failed (integration in progress)"
 fi
@@ -570,8 +644,12 @@ fi
 # Crash consistency tests
 CC_LOG="$E2E_LOG_DIR/crash_consistency_tests.log"
 if run_rch_capture "$CC_LOG" cargo test -p ffs-btrfs --lib -- crash_consistency; then
-    CC_TESTS=$(grep -c "test crash_consistency::" "$CC_LOG" 2>/dev/null || echo "0")
-    scenario_result "crash_consistency_tests" "PASS" "crash consistency tests passed ($CC_TESTS tests)"
+    CC_TESTS=$(awk '/test result: ok[.] [0-9]+ passed;/ { count += $4 } END { print count+0 }' "$CC_LOG")
+    if [[ "$CC_TESTS" -gt 0 ]]; then
+        scenario_result "crash_consistency_tests" "PASS" "crash consistency tests passed ($CC_TESTS tests)"
+    else
+        scenario_result "crash_consistency_tests" "FAIL" "crash consistency selection ran zero tests"
+    fi
 else
     scenario_result "crash_consistency_tests" "XFAIL" "crash consistency tests failed (integration in progress)"
 fi
@@ -621,7 +699,7 @@ if [[ $FAIL_COUNT -gt 0 ]]; then
     OVERALL_EXIT=1
     echo "OVERALL: FAIL"
     scenario_result "btrfs_progs_differential_overall" "FAIL" "$FAIL_COUNT failures"
-elif [[ $XFAIL_COUNT -gt 0 ]]; then
+elif [[ $XFAIL_COUNT -gt 0 || $SKIP_COUNT -gt 0 ]]; then
     echo "OVERALL: XFAIL (expected failures - durable writeback not yet wired)"
     scenario_result "btrfs_progs_differential_overall" "XFAIL" "$XFAIL_COUNT expected failures"
 else
@@ -645,7 +723,7 @@ emit_executed_evidence \
     "$(( ($(date +%s) - ${E2E_START_TIME:-$(date +%s)}) * 1000 ))" \
     "$E2E_LOG_DIR/overall_evidence.json"
 
-if [[ $FAIL_COUNT -eq 0 ]]; then
+if [[ $FAIL_COUNT -eq 0 && $XFAIL_COUNT -eq 0 && $SKIP_COUNT -eq 0 ]]; then
     e2e_pass
 fi
 
