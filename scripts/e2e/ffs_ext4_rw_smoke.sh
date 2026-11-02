@@ -326,6 +326,9 @@ if e2e_run chmod 600 "$MOUNT_RW/persist.txt"; then
     fi
     e2e_log "chmod verification passed (mode=$FILE_MODE)"
 else
+    if [[ "${FFS_REQUIRE_FUSE:-0}" == "1" || "${FFS_REQUIRE_ORACLES:-0}" == "1" ]]; then
+        e2e_fail "required chmod operation failed"
+    fi
     e2e_log "chmod is not supported in current build (phase-gated; continuing)"
 fi
 
@@ -654,6 +657,9 @@ PY
             e2e_fail "Missing crash recovery evidence in remount log ($CURRENT_MOUNT_LOG)"
         fi
     else
+        if [[ "${FFS_REQUIRE_FUSE:-0}" == "1" || "${FFS_REQUIRE_ORACLES:-0}" == "1" ]]; then
+            e2e_fail "required post-crash remount failed"
+        fi
         if grep -qiE "journal|replay|recover|unsupported|not yet supported|failed to recover" "$CURRENT_MOUNT_LOG"; then
             e2e_log "Post-crash remount failed with explicit recovery diagnostic (phase-gated fallback)"
             e2e_run tail -n 120 "$CURRENT_MOUNT_LOG" || true
@@ -662,7 +668,7 @@ PY
         fi
     fi
 else
-    e2e_log "Skipping Phase 5 crash harness because RW mount could not be established in this environment."
+    e2e_skip "Phase 5 crash harness RW mount could not be established"
 fi
 
 e2e_pass

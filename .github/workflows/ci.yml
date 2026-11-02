@@ -327,7 +327,17 @@ jobs:
           echo "FUSE is available"
 
       - name: Build test binaries
-        run: cargo test -p ffs-harness --no-run
+        run: |
+          cargo build -p ffs-cli --bins
+          cargo test -p ffs-harness --no-run
+          mkdir -p "$RUNNER_TEMP/ffs-cli-proof/bin" "$RUNNER_TEMP/ffs-cli-proof/artifacts"
+          cp target/debug/ffs-cli target/debug/ffs-protected-mount "$RUNNER_TEMP/ffs-cli-proof/bin/"
+          {
+            echo "FFS_CLI_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-cli"
+            echo "FFS_PROTECTED_MOUNT_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-protected-mount"
+            echo "FFS_CLI_SOURCE_STAMP=$GITHUB_SHA"
+            echo "FFS_CLI_ARTIFACT_DIR=$RUNNER_TEMP/ffs-cli-proof/artifacts"
+          } >> "$GITHUB_ENV"
 
       - name: Run relocated ops tests
         run: cargo test -p ffs-ops -- --nocapture
@@ -352,6 +362,7 @@ jobs:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
           FFS_USE_RCH: "0"
+          FFS_SKIP_BUILD: "1"
         run: ./scripts/e2e/ffs_ext4_rw_smoke.sh
 
       - name: Native btrfs written-image differential
@@ -359,6 +370,7 @@ jobs:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
           FFS_USE_RCH: "0"
+          FFS_SKIP_BUILD: "1"
         run: ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
 
       - name: Upload E2E artifacts on failure

@@ -22727,6 +22727,52 @@ fn jbd2_wrapped_log_crash_image_recovery_matches_kernel() {
         file.write_all(&payload(i)).expect("write");
         file.sync_all().expect("fsync");
     }
+    // A fixed file count does not fix the kernel's checkpoint position: the
+    // strict worker produced start59/end491 after all700 fsyncs. Advance the
+    // native journal, without changing the expected namespace or payloads,
+    // until its live span actually crosses s_first. The captured image below
+    // must still satisfy the original end<start assertion independently.
+    let live_span = |path: &Path| -> Option<(u64, u64)> {
+        let dump = Command::new("debugfs")
+            .args(["-R", "logdump"])
+            .arg(path)
+            .output()
+            .expect("probe native journal position");
+        assert!(
+            dump.status.success(),
+            "native logdump: {}",
+            String::from_utf8_lossy(&dump.stderr)
+        );
+        let text = String::from_utf8_lossy(&dump.stdout);
+        let block = |marker: &str| -> Option<u64> {
+            text[text.find(marker)? + marker.len()..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        };
+        Some((
+            block("Journal starts at block ")?,
+            block("No magic number at block ")?,
+        ))
+    };
+    let mut last = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(format!("f{:05}", FILES - 1)))
+        .expect("open final native fixture file");
+    for transaction in 0..1024 {
+        if let Some((start, end)) = live_span(&img)
+            && end < start
+        {
+            eprintln!("JOURNAL_FIXTURE|extra_transactions={transaction}|start={start}|end={end}");
+            break;
+        }
+        last.rewind().expect("rewind final fixture file");
+        last.write_all(&payload(FILES - 1))
+            .expect("advance native journal");
+        last.sync_all().expect("commit native journal advance");
+    }
+    drop(last);
     let crash_image = tmp.path().join("crash.img");
     let kernel_image = tmp.path().join("crash_kernel.img");
     for copy in [&crash_image, &kernel_image] {
