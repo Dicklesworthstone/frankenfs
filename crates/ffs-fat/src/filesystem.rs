@@ -1929,29 +1929,39 @@ mod tests {
     }
 
     #[test]
-    fn fat16_readdir_cookies_survive_deletion_and_slot_reuse() {
-        let (_directory, fs) = writable_fat16();
-        let cx = Cx::for_testing();
-        for name in ["A.TXT", "B.TXT", "C.TXT"] {
-            create_file(&fs, name);
+    fn mutable_readdir_cookies_survive_deletion_and_slot_reuse() {
+        for kind in ["fat16", "fat32"] {
+            let (_directory, fs) = operations::writable_fat(kind);
+            let cx = Cx::for_testing();
+            for name in ["A.TXT", "B.TXT", "C.TXT"] {
+                create_file(&fs, name);
+            }
+            let first_page = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, 0).unwrap();
+            let first = first_page.iter().find(|entry| entry.name == b"A.TXT").unwrap();
+            let cursor = first.offset;
+            let old_ino = first.ino;
+            let old_slot = fs.node(&cx, old_ino).unwrap().entry.unwrap().offset;
+            let old_end = first_page.end_cookie().unwrap();
+            fs.unlink(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("A.TXT"))
+                .unwrap();
+            let replacement = create_file(&fs, "D.TXT");
+            assert_eq!(fs.node(&cx, replacement).unwrap().entry.unwrap().offset, old_slot);
+            assert_ne!(replacement, old_ino);
+            assert!(matches!(fs.read(&cx, &mut RequestScope::empty(), old_ino, 0, 1), Err(FfsError::NotFound(_))));
+            assert!(matches!(fs.write(&cx, &mut RequestScope::empty(), old_ino, 0, b"BAD"), Err(FfsError::NotFound(_))));
+            assert!(matches!(fs.get_inode_flags(&cx, &mut RequestScope::empty(), old_ino), Err(FfsError::NotFound(_))));
+            let resumed = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, cursor).unwrap();
+            let names: Vec<_> = resumed.iter().map(ffs_core::DirEntry::name_str).collect();
+            assert_eq!(names, ["B.TXT", "C.TXT", "D.TXT"]);
+            // The FUSE directory handle can still cap enumeration at its opening
+            // end cookie, without hiding any unchanged, previously unseen entry.
+            let bounded: Vec<_> = resumed.iter()
+                .filter(|entry| entry.offset <= old_end)
+                .map(ffs_core::DirEntry::name_str)
+                .collect();
+            assert_eq!(bounded, ["B.TXT", "C.TXT"]);
+            assert!(resumed.iter().all(|entry| entry.offset > cursor));
         }
-        let first_page = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, 0).unwrap();
-        let cursor = first_page.iter().find(|entry| entry.name == b"A.TXT").unwrap().offset;
-        let old_end = first_page.end_cookie().unwrap();
-        fs.unlink(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("A.TXT"))
-            .unwrap();
-        create_file(&fs, "D.TXT");
-        let resumed = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, cursor).unwrap();
-        let names: Vec<_> = resumed.iter().map(ffs_core::DirEntry::name_str).collect();
-        assert_eq!(names, ["B.TXT", "C.TXT", "D.TXT"]);
-        // The FUSE directory handle can still cap enumeration at its opening
-        // end cookie, without hiding any unchanged, previously unseen entry.
-        let bounded: Vec<_> = resumed.iter()
-            .filter(|entry| entry.offset <= old_end)
-            .map(ffs_core::DirEntry::name_str)
-            .collect();
-        assert_eq!(bounded, ["B.TXT", "C.TXT"]);
-        assert!(resumed.iter().all(|entry| entry.offset > cursor));
     }
 
     #[test]

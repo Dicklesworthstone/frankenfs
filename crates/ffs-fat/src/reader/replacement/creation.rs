@@ -473,7 +473,12 @@ fn reserve_slots(
     }
     // Exhausting the fixed root is native capacity exhaustion even when data
     // clusters remain free. Keep ENOSPC intact through the mounted adapter.
-    let tail = tail.ok_or(FfsError::NoSpace)?;
+    let tail = tail.ok_or_else(|| {
+        FfsError::Io(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "full FAT16 fixed root cannot grow; no contiguous directory slot set",
+        ))
+    })?;
     let per_cluster = volume.geometry.cluster_bytes() as usize / 32;
     let extra = (needed - slots.len()).div_ceil(per_cluster);
     if extra > 2

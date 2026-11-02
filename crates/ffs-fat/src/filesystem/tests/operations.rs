@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn writable_fat(kind: &str) -> (tempfile::TempDir, FatFs) {
+pub(super) fn writable_fat(kind: &str) -> (tempfile::TempDir, FatFs) {
     if kind == "fat16" {
         return writable_fat16();
     }
@@ -101,7 +101,7 @@ fn transport_flag_and_killpriv_probes_preserve_native_bytes_and_validate_inodes(
             assert!(ops.getxattr(&cx, ino, name).unwrap().is_none());
             assert!(!ops.removexattr(&cx, &mut scope, ino, name).unwrap());
         }
-        assert!(ops.listxattr(&cx, ino).unwrap().is_empty());
+        assert_eq!(ops.listxattr(&cx, ino).unwrap(), [] as [String; 0]);
         let stale = InodeNumber(u64::MAX);
         expect_errno(ops.get_inode_flags(&cx, &mut scope, stale), libc::ENOENT);
         expect_errno(ops.removexattr(&cx, &mut scope, stale, "security.capability"), libc::ENOENT);
@@ -111,6 +111,8 @@ fn transport_flag_and_killpriv_probes_preserve_native_bytes_and_validate_inodes(
         assert!(ops.removexattr(&cancelled, &mut scope, ino, "security.capability").is_err());
         assert_eq!(raw_image(&directory), before);
 
+        // End the exclusive writer before admitting a separate read-only view.
+        drop(fs);
         let volume = crate::reader::ImageArgs {
             image: directory.path().join("volume.fat"),
             offset: 0,
@@ -134,9 +136,9 @@ fn full_fixed_root_returns_enospc_without_changing_native_bytes() {
     drop(fs);
     let image = directory.path().join("volume.fat");
     let mut bytes = std::fs::read(&image).unwrap();
-    for (index, entry) in bytes[start as usize..(start + length) as usize]
-        .chunks_exact_mut(32).enumerate()
-    {
+    let (entries, remainder) = bytes[start as usize..(start + length) as usize].as_chunks_mut::<32>();
+    assert_eq!(remainder, [] as [u8; 0]);
+    for (index, entry) in entries.iter_mut().enumerate() {
         if entry[0] == 0 || entry[0] == 0xE5 {
             // Valid empty 8.3 files: no data allocation and no LFN records.
             entry.fill(0);

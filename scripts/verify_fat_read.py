@@ -228,6 +228,94 @@ class Run:
                 raise RuntimeError("FAT read-only mount admitted a writable descriptor")
             check(os.statvfs(mountpoint).f_bsize > 0, "mounted statfs returned no block size")
 
+    def protected(self, bits: int) -> dict[str, object]:
+        """Exercise the existing sidecar-backed writer, then a fresh reader.
+
+        This qualifies live FAT transport wiring, not independent-device crash
+        atomicity or recovery from damaged sidecar generations.
+        """
+        tag = f"protected-fat{bits}"
+        image = self.root / f"{tag}.img"
+        sidecar = self.root / f"{tag}.ffs-rq"
+        source = self.root / f"{tag}-source"
+        source.mkdir()
+        sentinel = bytes(range(251)) * 19 + b"protected native sentinel"
+        (source / "KEEP.BIN").write_bytes(sentinel)
+        formatted = json.loads(self.command(
+            self.binary, "format", image, "--kind", f"fat{bits}",
+            "--size-mib", "64", "--source-dir", source, "--sidecar", sidecar))
+        check(formatted["sidecar_refreshed"] is True and sidecar.is_file(),
+              "protected formatter did not publish its sidecar")
+        self.command("fsck.fat", "-n", image)
+        initial_hash, initial_sidecar = digest(image), digest(sidecar)
+        keep_before = native_root_file(image, b"KEEP    BIN")
+        events = self.root / f"{tag}-syscalls.jsonl"
+
+        def acknowledged(operation: str, **details: object) -> None:
+            with events.open("a") as stream:
+                stream.write(json.dumps({"operation": operation, "acknowledged": True,
+                                         **details}) + "\n")
+
+        options = ("--sidecar", str(sidecar))
+        payload = bytes(range(256)) * 17 + b"protected tail"
+        with self.mount_image(image, writable=True, image_options=options) as mounted:
+            check((mounted / "KEEP.BIN").read_bytes() == sentinel, "protected sentinel differs")
+            directory = mounted / "native"
+            directory.mkdir()
+            path = directory / "Protected café.txt"
+            with path.open("xb", buffering=0) as stream:
+                check(stream.write(payload) == len(payload), "short protected write")
+                stream.truncate(1031)
+                stream.truncate(8197)
+                payload = payload[:1031] + bytes(8197 - 1031)
+                os.fsync(stream.fileno())
+            acknowledged("create, write, truncate and fsync", path=str(path.name), bytes=len(payload))
+            renamed = directory / "renamed.txt"
+            path.rename(renamed)
+            acknowledged("rename", old=path.name, new=renamed.name)
+            orphan = directory / "orphan.txt"
+            with orphan.open("x+b", buffering=0) as stream:
+                check(stream.write(b"open-unlinked") == 13, "short protected orphan write")
+                orphan.unlink()
+                stream.seek(0)
+                check(stream.read() == b"open-unlinked", "protected open-unlink lost bytes")
+                os.fsync(stream.fileno())
+            acknowledged("open-unlink, read, fsync and release")
+            check(renamed.read_bytes() == payload, "protected truncate or rename lost data")
+        self.command("fsck.fat", "-n", image)
+        expected = {"KEEP.BIN": sentinel, "native/renamed.txt": payload}
+        for name, data in expected.items():
+            check(self.command("mcopy", "-i", image, f"::/{name}", "-") == data,
+                  f"native consumer differs after protected mount: {name}")
+            check(self.command(self.binary, "cat", image, f"/{name}", *options) == data,
+                  f"fresh protected reader differs: {name}")
+        names = self.command("mdir", "-i", image, "-b", "-s", "::/").decode("utf-8").splitlines()
+        check({name.removeprefix("::/").rstrip("/") for name in names}
+              == {"KEEP.BIN", "native", "native/renamed.txt"},
+              "protected namespace contains missing or leaked entries")
+        check(native_root_file(image, b"KEEP    BIN") == keep_before,
+              "protected writes changed the acknowledged native sentinel")
+        # Offline diagnosis deliberately reads original native bytes without
+        # repair authority. Protected data reads above use separate fresh opens.
+        checked = json.loads(self.command(self.binary, "check", image))
+        check(checked["clean"] is True and checked["complete"] is True
+              and checked["namespace_complete"] is True and checked["issues"] == [],
+              "native checker does not admit the protected writer's committed image")
+        final_hash, final_sidecar = digest(image), digest(sidecar)
+        check(final_hash != initial_hash and final_sidecar != initial_sidecar,
+              "protected mounted writes did not update both image and sidecar")
+        with self.mount_image(image, image_options=options) as mounted:
+            for name, data in expected.items():
+                check((mounted / name).read_bytes() == data,
+                      f"fresh protected mount differs: {name}")
+            check(not (mounted / "native/orphan.txt").exists(), "protected orphan reappeared")
+        check(digest(image) == final_hash and digest(sidecar) == final_sidecar,
+              "read-only protected verification changed image or sidecar")
+        return {"scenario": "protected_writable_mount", "format": f"FAT{bits}",
+                "initial_sha256": initial_hash, "final_sha256": final_hash,
+                "initial_sidecar_sha256": initial_sidecar, "final_sidecar_sha256": final_sidecar,
+                "files_checked": len(expected), "result": "passed"}
+
     def writable(self, bits: int, sector: int, bounded: bool) -> dict[str, object]:
         """Native -> real FUSE syscalls -> independent fsck/mtools -> fresh FUSE.
 
@@ -435,6 +523,11 @@ class Run:
                     remaining -= len(chunk)
                 check(stream.read() == b"S" * 4096, "suffix changed outside volume")
         self.command("fsck.fat", "-n", checked_image)
+        native_names = self.command("mdir", "-b", "-s", "-i", checked_image, "::/").decode("utf-8").splitlines()
+        expected_names = {f"::/{name}" for name in expected}
+        expected_names.update({"::/left/", "::/right/", "::/left/subdir/"})
+        check(len(native_names) == len(expected_names) and set(native_names) == expected_names,
+              "native namespace names differ, or an unlinked recovery record survived clean unmount")
         check(native_root_file(checked_image, b"KEEP    BIN") == keep_before,
               "unrelated native entry, chain, payload or slack changed")
         for short_name in (b"FRAG_A  BIN", b"FRAG_B  BIN"):
@@ -448,6 +541,8 @@ class Run:
         checked = json.loads(self.command(self.binary, "check", image, *options))
         check(checked["clean"] and checked["complete"] and checked["namespace_complete"],
               "mounted writes did not leave a completely checked clean volume")
+        check(checked["files"] == len(expected) and checked["directories"] == 4,
+              "mounted namespace contains missing or unexpected files/directories")
         before_readonly = digest(image)
         with self.mount_image(image, image_options=options) as mounted:
             for name, data in expected.items():
@@ -1267,6 +1362,8 @@ def main() -> None:
     parser.add_argument("--mounted", action="store_true", help="require actual FUSE reads and EROFS refusal")
     parser.add_argument("--writable-mounted", action="store_true",
                         help="also require native/FUSE writable round trips for both dialects and sector sizes")
+    parser.add_argument("--protected-mounted", action="store_true",
+                        help="also require sidecar-backed writable and fresh read-only mounts for both dialects")
     args = parser.parse_args()
     # mtools interprets argv using the native locale. Under C it writes the
     # UTF-8 bytes of cafe-with-accent as two different Unicode characters.
@@ -1291,9 +1388,9 @@ def main() -> None:
     if facade:
         check(os.access(facade, os.X_OK), "public facade consumer is not executable")
     tools = ["mkfs.fat", "fsck.fat", "mcopy", "mmd"]
-    if facade:
+    if facade or args.writable_mounted or args.protected_mounted:
         tools.append("mdir")
-    if args.mounted or args.writable_mounted:
+    if args.mounted or args.writable_mounted or args.protected_mounted:
         tools.append("fusermount3")
         check(Path("/dev/fuse").exists(), "--mounted requires /dev/fuse; no skip credit")
     for tool in tools:
@@ -1307,6 +1404,11 @@ def main() -> None:
     if facade:
         report["facade_sha256"] = digest(facade)
     try:
+        if args.protected_mounted:
+            for bits in (16, 32):
+                scenario = run.protected(bits)
+                report["scenarios"].append(scenario)
+                print(json.dumps(scenario), flush=True)
         if args.writable_mounted:
             for bits in (16, 32):
                 for sector, bounded in ((512, False), (4096, True)):
@@ -1314,13 +1416,13 @@ def main() -> None:
                     report["scenarios"].append(scenario)
                     print(json.dumps(scenario), flush=True)
         for bits in (16, 32):
-            scenario = run.dialect(bits, args.mounted or args.writable_mounted)
+            scenario = run.dialect(bits, args.mounted or args.writable_mounted or args.protected_mounted)
             report["scenarios"].append(scenario)
             print(json.dumps(scenario), flush=True)
-            formatted = run.formatted(bits, args.mounted or args.writable_mounted)
+            formatted = run.formatted(bits, args.mounted or args.writable_mounted or args.protected_mounted)
             report["scenarios"].append(formatted)
             print(json.dumps(formatted), flush=True)
-            populated = run.populated(bits, args.mounted or args.writable_mounted)
+            populated = run.populated(bits, args.mounted or args.writable_mounted or args.protected_mounted)
             report["scenarios"].append(populated)
             print(json.dumps(populated), flush=True)
         report["status"] = "passed"

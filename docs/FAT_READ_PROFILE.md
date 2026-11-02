@@ -1,10 +1,10 @@
-# Experimental FAT16/FAT32 reads, image creation and offline file replacement
+# Experimental FAT16/FAT32 image tools and writable mounts
 
 `ffs-fat` is a native Rust companion binary in `ffs-cli`. It uses the shared
 `ffs-ondisk::fat` parser and the existing `ffs-core::FsOps` / `ffs-fuse` adapter.
 It implements reads, creation of new images with native source-directory
-population, and ordered replacement of existing regular-file contents on an
-offline image, without invoking another filesystem driver or formatter.
+population, ordered offline mutation, and explicit writable FUSE mounts,
+without invoking another filesystem driver or formatter.
 The ordinary
 ext4/btrfs `ffs-cli` dispatch and `FsFlavor` are unchanged; this is not yet
 integration into the generic `ffs mount` or `OpenFs` auto-detection path.
@@ -50,14 +50,70 @@ target/debug/ffs-fat cat disk.img --offset 1048576 --length 67108864 /FILE.BIN
 target/debug/ffs-fat check disk.img --offset 1048576 --length 67108864
 ```
 
-Inspection, extraction, checking, mounts and replacement dry-runs use read-only
-handles. `replace` opens an existing regular image exclusively for an ordered
+Inspection, extraction, checking, default mounts and replacement dry-runs use
+read-only handles. `mount --rw` opens the existing image with explicit writable
+authority. `replace` opens an existing regular image exclusively for an ordered
 native file-content update; `format` exclusively creates a new image. Repair,
-recovery, resizing, writable mounts and protection initialization of existing
-volumes remain separate work. Advisory locks do not exclude kernel mounts or
+recovery, resizing and protection initialization retain their separate explicit
+commands and write-authority requirements. Advisory locks do not exclude kernel mounts or
 unrelated writers; offline ownership and source immutability are caller requirements.
 `cat` and `extract` validate allocation before output, but a later storage failure
 may still leave a previously streamed prefix on stdout and exits unsuccessfully.
+
+## Writable FUSE profile
+
+Use the normal release build for mounted workloads. Native mutation verifies
+allocation and payload before acknowledging it; large-file verification in an
+unoptimized debug build can exceed the transport's unchanged 30-second request
+deadline. A failed mutation quarantines that mount until unmount/check/recovery.
+
+```sh
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo build --release -p ffs-cli --bin ffs-fat
+"${CARGO_TARGET_DIR:-target}/release/ffs-fat" mount volume.img /mnt/fat --offline-image --rw --uid 1000 --gid 1000
+fusermount3 -u /mnt/fat
+
+# Creates and retains its own regular scratch images and execution evidence.
+python3 scripts/verify_fat_read.py --binary "${CARGO_TARGET_DIR:-target}/release/ffs-fat" --writable-mounted
+
+# Also exercise the existing sidecar-backed FAT writer and protected reopen.
+python3 scripts/verify_fat_read.py --binary "${CARGO_TARGET_DIR:-target}/release/ffs-fat" --writable-mounted --protected-mounted
+```
+
+The mountpoint must exist and be empty. Automatic unmount uses fuser's helper;
+non-root mounts require `user_allow_other` in `/etc/fuse.conf`, while fuser still
+enforces this command's owner-only session. The executed qualification uses
+root on Linux and does not establish non-root host provisioning.
+
+The writable runner covers both FAT16/FAT32 with 512-byte sectors and bounded
+4 KiB-sector volumes, real positioned writes, initialized gaps, truncate,
+preallocation, fragmented chains, full-volume reuse, rename over an open file,
+open-unlink, directory growth and FAT16 fixed-root exhaustion. Native
+`fsck.fat`, `mcopy` and recursive `mdir` check clean output, exact names and data;
+an unrelated file's native entry, allocation and slack remain byte-identical.
+Fresh read-only mounts reopen every expected file without changing the image.
+The runner also retains the existing native-created, formatter and population
+read profiles. Missing native tools and any failed required scenario fail the
+whole invocation.
+
+`--protected-mounted` additionally formats a fresh protected image for each
+dialect, exercises mounted create/write/truncate/rename/open-unlink/fsync, then
+checks native bytes with fsck/mtools and reopens through the sidecar in a fresh
+read-only mount. It retains image and sidecar hashes and acknowledged operations.
+This is transport integration evidence; independent-device sidecar crash fences
+and recovery from damaged protection generations require separate qualification.
+
+Native FAT stores neither Linux immutable/append inode flags nor
+`security.capability`; the adapter reports their absence to FUSE's ordinary
+setattr/privilege-clearing paths. DOS read-only remains separately enforced.
+Case-equivalent creation collisions return `EEXIST`; exhausting FAT16's fixed
+root returns `ENOSPC` even when data clusters are free. Native timestamps retain
+the documented UTC projection and two-second modification-time precision.
+
+These are native-image and mounted-process results. Pending/durable fault
+devices separately exercise loss, partial sector persistence and torn writes,
+including the final clean-state flush. They do not constitute device power-loss
+evidence or make native FAT rename crash-atomic. Interrupted operations may
+leave explicit dirty states or recoverable allocation requiring native checking.
 
 ## Replacing an existing file on an offline image
 
@@ -495,8 +551,9 @@ invalid fields report corruption at their directory record. Dirty volumes and
 conflicting boot copies require offline native investigation; this reader never
 repairs them automatically.
 
-FAT12, exFAT, general namespace mutation/recovery of existing FAT images, full OEM/Unicode naming parity, integrated
-MVCC/RaptorQ protection, and NTFS/ZFS implementation remain separate work.
+FAT12, exFAT, full OEM/Unicode naming parity and MVCC integration remain separate
+work. Ordered native mutation and optional RaptorQ sidecars use the explicit
+commands above; the FAT profile does not establish other formats' readiness.
 
 ## Lossless native catalog and extraction
 
