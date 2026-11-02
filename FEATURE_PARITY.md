@@ -1,5 +1,29 @@
 # FEATURE_PARITY
 
+> **Oracle/mount qualification in progress (2026-11-02, bd-53dub):** required
+> missing capabilities now fail the remaining forensic/differential paths;
+> optional skips are greppable. The original missing-tool differential exits0,
+> while the current strict negative exits1. Full journaled ext4 write/reopen/
+> e2fsck and500-file SIGKILL recovery pass. The default btrfs differential,
+> including its actual release build, mounted mutations, clean native check,
+> fresh RO reopen,50writeback tests,14crash tests and Clippy, passes without
+> FAIL/XFAIL/SKIP. Its16scenario outcomes include build/tool/lint/JUnit checks,
+> not16native workloads. Core library tests pass1600/0failed/24existing ignores,
+> with139e2fsck and55btrfs-check invocations, including damaged-image controls.
+>
+> A strict full FUSE attempt remains283passed/6failed/8existing ignores;
+> missing image-repair CLI provisioning caused all six failures. After supplying
+> it, the six protected corruption/restart/scrub/periodic-commit tests pass under
+> a privileged runner. Non-root automatic unmount was refused by host fuse.conf;
+> CI now provisions its prerequisite explicitly. Full package and hosted proof
+> remain pending, so the original Bead stays open. Workspace/all-target check,
+> strict Clippy, formatting and full changed-code UBS pass (0critical; existing
+> warnings retained). Full harness benchmarks finish60/60, with no incumbent
+> comparison or speedup claim. No filesystem algorithm or parity percentage
+> changed. Exact commands, source/ELF/tool/image identities, failed attempts and
+> proof limits: `.beads/pending_tasks.md` and
+> `artifacts/implementation/20261030_O221Lk/resume15-*`.
+
 > **Native FAT maintenance qualified (2026-11-02, bd-ave6y):** the existing
 > resize/recovery engines execute the new maintenance mode in the permanent
 > native verifier. FAT16/FAT32 at 512-byte/plain and4KiB/bounded geometry pass

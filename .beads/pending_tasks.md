@@ -49,15 +49,35 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   its namespace/payloads. Exact regression passes1onhz3 and1onhz4, each
   296filtered. Both observed extra_transactions0; the new advancing branch
   has not been observed executing and receives no separate coverage credit.
-- [ ] Finish fully provisioned strict FUSE suite onvmi1152480; retain every
-  actual failure and any feature-specific SKIPs separately from mount proof.
-- [ ] Finish full ffs-harness package and required full harness benchmark.
-  Benchmark is maintenance, with no incumbent comparison or speedup claim.
-- [ ] Finish final workspace/all-target check and strict Clippy. Earlier full
-  workspace check501988ms and Clippy236981ms pass before the final fixture edit;
-  current source needs the final repeat. Formatting/shell syntax/diff-check pass.
+- [x] Retain provisioned-vmi strict FUSE result283passed/6failed/8existing
+  ignores/0filtered,241.21s/RCH1082607ms. All six failures name the omitted
+  FFS_IMAGE_REPAIR_BIN; build and wire that third existing executable too.
+  Eight scenario-level kernel/transport unsupported SKIPs remain explicit,
+  distinct from missing oracle/mount and from the eight ignored tests. Both
+  forensic modes actually mount1000pairs each and return e2fsck0.
+- [x] Fresh normal release image-repair build passes/RCH295170ms; ELF SHA256
+  6a20c72ce0670db1ae11ac35154f1e296f1c66137c25db8a6b61ee6a65cd8332.
+  Native6-test repeat first fails0/6 under non-root automatic-unmount host
+  policy; preserved stderr names missing user_allow_other in fuse.conf.
+  Provision that only in the ephemeral CI runner; persistent worker config
+  is untouched. Privileged repeat passes6/0/0with291filtered in66.31s using
+  the retained actual current-source test ELF63288ff1 and all three CLI ELFs.
+  Targeted6pass does not convert the283/6full invocation into a full pass.
+- [ ] Finish full ffs-harness package with all three CLI proofs and the
+  explicitly privileged runner. hz4 no-run passes/RCH172204ms, but subsequent
+  root-disk admission refuses execution; actual full selection now runs onhz3.
+  Cargo-j1 matches the worker's advertised single slot, without changing
+  RCH slot accounting, admission floors, timeouts or the complete selection.
+- [x] Required full harness benchmark passes/RCH1562259ms,60started/
+  60analyzed. Its ordinary bench prelude runs0unit tests with ignores, not
+  a unit-test pass. No incumbent comparison or performance improvement.
+- [x] Final workspace/all-target check291318ms and strict Clippy140396ms pass
+  after the wrapped-fixture edit. Formatting/shell syntax/diff-check pass.
+  Subsequent code change is CI provisioning only; YAML and all FUSE-job shell
+  blocks parse. Earlier check501988ms/Clippy236981ms are retained separately.
 - [x] Run full changed-code UBS without exclusions: latest5-file scan exits0,
-  0critical/20064warnings/3959info. Initial33critical Python-command-string
+  0critical/20064warnings/3959info, including the fresh full five-file scan.
+  Initial33critical Python-command-string
   findings drove retained-input-file transport; a real subprocess regression
   preserves quoted/UTF8 arguments, stderr and nonzero exit. No suppression or
   security-vulnerability claim. Keep all scanner reports and existing warnings.
@@ -75,6 +95,110 @@ Created by CC agent 2026-04-22. Import when bead database clears.
 - [ ] Review complete gate diff and bounded honesty inventory; update original
   Bead/parity on executed evidence, preserve any unmet conditions, commit and
   deliver both required remote refs. No test/golden/deadline weakening.
+
+### Bounded review of the oracle/mount block
+
+Window:6442c489b through169775ee2 plus pending CI provisioning and verification;
+solo NavyElm. Runtime Rust source remains4efb06a0a.
+README purpose: safe native filesystem behavior through FUSE, with explicit
+transaction/durability guarantees. Actual commit inventory: a78c8937e and
+4efb06a0a are ENABLER (strict gates/test transport/CI);71aa7694e and169775ee2
+are PROCESS (claim/checklist/progress). USER0/ENABLER2/PROCESS2/UNKNOWN0;
+these labels earn no
+feature credit. No Bead is closed by this block yet. Existing filesystem
+algorithms produced the native results; this block makes missing/failed work
+fail qualification instead of disappearing behind a green exit.
+
+Real-work audit: the two-minute demo is the complete default btrfs differential
+and journaled ext4 recovery, followed by their actual native check outputs.
+Without the checklist/metadata, those results would be identical. The gate
+changes are exercised by those full scripts, core tests and planted negatives.
+The broader native durability/device-comparator, protection and six-format
+roadmap remain open; this old P1 task directly blocks trusting their evidence.
+No swarm or refusal-farming comparison applies: no subagents were launched.
+No spec reduction or replacement Bead carries an unmet acceptance condition.
+Verdict: legitimate bounded ENABLER work, with DRIFTING risk from the costly
+runtime relay and repeated capacity triage. Correction: freeze new machinery,
+finish original checks, then return to positive filesystem capability work.
+
+Process creation gate for the temporary runtime relay and negative wrapper:
+consumer=the existing complete differential shell script; gate=its real build/
+unit/lint checks and failed-final-mutation control; observed defect=controller
+FUSE permission denial, a deliberately dispatch-free native worker, and old
+suppressed mutation exits. Retire these transports at this block's end, keeping
+their files/receipts without deletion. They are not product runtime state or
+new capabilities. Integrity exception is unnecessary because the concrete
+gate applies. Current bd-53dub is the chosen ready item; an extra hour of new
+transport/report infrastructure would not justify delaying native functionality.
+Verdict: minimum temporary gate transport, no extension beyond this consumer.
+The operator-requested granular TODO retires as an active checklist when the
+original item is verified or explicitly handed off, preserving unfinished work.
+
+Honesty inventory, reviewed against the actual diffs/reflog and raw receipts:
+
+1. No (checked: entire core/FUSE/script/CI diff since6442c489b; no assertions,
+   tests, ignores, goldens or deadlines removed or weakened).
+2. No (checked: real native tools/mounts/CLI children; planted subprocess and
+   empty-PATH children are named negative controls, not positive native proof).
+3. No (checked: changed-path inventory and Git diff; no golden regeneration).
+4. Yes: this is the gate's own lane. Native journal generation adds a bounded
+   advance while retaining700files and the original captured-image wrap
+   assertion. No production algorithm is bundled with gate relaxation. The
+   command-only asupersync opt-level3 retains debug/overflow checks and ordinary
+   first-party profiles; it is disclosed, not an unmodified-debug-run claim.
+5. No (checked: original500-file/700-file/full differential selections; private
+   runtime paths live only in execution artifacts, not product hardcoding).
+6. No (checked: claimed core1600, writeback50, crash14 and exact wrap1 runs
+   actually execute. Builds/no-run phases earn build evidence only. Existing
+   ignores and filtered counts remain explicit; unfinished jobs earn no pass).
+7. No (checked: exact RCH/native stdout/stderr/statuses; no inferred hosted
+   completion or unobserved worker command is claimed).
+8. No (checked: native, planted-negative, kernel-captured journal and process
+   SIGKILL classes; no hardware-power-loss, field or performance-win claim).
+9. No (checked: initial277/12and subsequent283/6FUSE results, targeted non-root
+   0/6, all admission103s, missing attr, controller mount denial and warn-only
+   log-evidence failure remain retained; only privileged targeted6passed).
+10. No (checked: RPC keeps separate original stdout/stderr; shell suite output
+    is explicitly combined. Identical hashes in its existing evidence JSON
+    describe that combined log, not two independently captured streams).
+11. No (checked: original bd-53dub AC and current in_progress status; no
+    follow-up created to launder hosted/full-suite conditions).
+12. No (checked: canonical scope unchanged; parity will report bounded proof).
+13. No (checked: no subagents or peer closures; four commits appeared from an
+    external actor during verification, were preserved and reviewed, and are
+    not presented as independently verified or as commits executed by this agent).
+14. No (checked: no delegated work this block).
+15. No (checked: no subagent reports substituted for actual command evidence).
+16. No (checked: both full positive native suites execute, not only refusals).
+17. No (checked: solo fresh review; no agent-agreement/independence claim).
+18. No (checked: original workload sizes and complete selections retained.
+    Differential16PASS includes build/tool/unit/lint/JUnit outcomes, not16
+    native workloads or16new filesystem features).
+19. Yes: runtime transport cost, repeated pressure refusals, initial native
+    log-level mistake, CLI proof provisioning and shared commits need context.
+    The first CLI provisioning omitted the third image-repair executable;
+    that omission and non-root auto-unmount host configuration were exposed by
+    real failed runs and corrected in CI. Persistent host permissions and
+    product mount options are unchanged; privileged proof is named explicitly.
+    A dynamic extracted-shell control was blocked by automatic command review;
+    it was not overridden. A separate complete-script planted rename control
+    executes the real gate instead. An invalid Mail help spelling was corrected.
+    The first unprivileged hash enumeration could not see root-owned images;
+    a separate sudo read hashes all four actual images, with no deletion.
+20. Strongest current proof: resume15-btrfs-worker-4.log plus its actual four
+    RCH invocations and native image/tool/script/ELF identities, together with
+    resume15-journaled-ext4-worker-4.log. Re-execute the permanent scripts on
+    provisioned Linux; the runtime relay is transport, not a captured success.
+
+Disposition4/19: corrections and limitations are recorded in place and in the
+original Bead. RH-1: preserve hard assertions and fail required missing work;
+RH-2: label actual proof class; RH-7/RH-9: leave original item open while any
+acceptance condition remains. No independent verification is claimed. CASS:
+five lexical honesty phrases plus fuse_e2e.rs, limit3each, no timeouts; canonical
+archive832/messages560and3284 followed. The former shows historical filtered
+report pipelines that could mask failures; none is used as current proof. The
+latter shows original forensic test construction, not independent validation.
+This is a bounded sample, not a corpus audit; no CASS storage/index changes.
 
 ## Active native FAT maintenance — 2026-11-02 (`bd-ave6y`, NavyElm)
 
