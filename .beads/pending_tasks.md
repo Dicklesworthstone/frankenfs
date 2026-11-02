@@ -10,10 +10,19 @@ active work only when that acceptance is executed or explicitly handed off.
 
 - [x] Check local source-aware claimability, dependency cycles and ownership;
   claim bd-lby8f and reserve its existing implementation/runner surfaces.
-- [ ] Freeze FAT native constraints and errno expectations from the existing
+- [x] Freeze FAT native constraints and errno expectations from the existing
   specification and writer; identify existing fault/publication coverage.
 - [ ] Build the actual ffs-fat CLI through fail-closed RCH after actual-volume
   SBH; retain source identity, ELF hash and native tool versions.
+  - [x] Baseline CLI builds remotely on hz4 (238791ms, exit0); retain ELF
+    cc96c2a7550d9f0bce7d10fbadc4d5b9735785bc68c13234a83111110ce667ab.
+  - [x] Install missing mtools after a no-removal simulation; verify /dev/fuse
+    opens. Native tool versions and SBH are retained in resume13 artifacts.
+  - [x] Retain runner geometry failure (FAT16/64MiB with one-sector clusters);
+    correct the newly added fixture to 16MiB, preserving dialect thresholds.
+  - [x] Retain unprivileged FUSE refusal: AutoUnmount requires host
+    user_allow_other. Use root for the actual mount campaign without changing
+    the worker's global FUSE policy; do not award non-root mount proof.
 - [ ] Execute native FAT16/FAT32 read-modify-check-reopen interoperability.
 - [ ] Extend the existing runner with actual writable FUSE syscall scenarios:
   names/aliases, gaps/truncate/preallocation, rename/overwrite/cycles,
@@ -21,6 +30,10 @@ active work only when that acceptance is executed or explicitly handed off.
 - [ ] Execute bounded and 4KiB-sector variants and preserve unaffected bytes.
 - [ ] Reproduce and fix observed implementation defects with substantive
   regression tests; retain original failed executions.
+  - [x] Real mounted Unicode collision reproduces EINVAL instead of EEXIST.
+    Return typed Exists from native name planning; add file/mkdir/case/alias
+    collision and invalid-name controls with unchanged-image assertions.
+  - [ ] Execute corrected collision regression and the full mounted campaign.
 - [ ] Exercise pending/durable lost/reordered/torn writes and failed final
   clean flush at allocation/data/namespace boundaries; reopen fresh engines
   and check only the explicitly allowed acknowledged states.
