@@ -10,7 +10,7 @@ use asupersync::Cx;
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice};
 use ffs_core::{Ext4JournalReplayMode, FsOps, OpenFs, OpenOptions, XattrSetMode};
 use ffs_error::{FfsError, Result as FfsResult};
-use ffs_types::{BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BlockNumber, ByteOffset, InodeNumber};
+use ffs_types::{BlockNumber, ByteOffset, InodeNumber};
 use parking_lot::Mutex;
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -81,261 +81,41 @@ fn mem_block_device(block_size: u32, block_count: usize) -> ByteBlockDevice<MemB
     ByteBlockDevice::new(mem, block_size).expect("valid device")
 }
 
-fn open_writable_ext4_fixture() -> Option<OpenFs> {
+fn open_writable_ext4_fixture() -> OpenFs {
     let img_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../ffs-harness/tests/fixtures/images/ext4_small.img");
-    if !img_path.exists() {
-        return None;
-    }
-
+        .join("../../tests/fixtures/images/ext4_small.img");
+    let bytes = std::fs::read(img_path).expect("canonical ext4 fixture is required");
     let cx = Cx::for_testing();
     let opts = OpenOptions {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
-    let mut fs = OpenFs::open_read_write(&cx, &img_path, &opts).ok()?;
-    fs.enable_writes(&cx).ok()?;
-    Some(fs)
+    // Each test mutates its own copy, never the shared canonical image.
+    let mut fs = OpenFs::from_device(&cx, Box::new(MemByteDevice::from_bytes(bytes)), &opts)
+        .expect("open ext4 fixture");
+    fs.enable_writes(&cx).expect("enable ext4 writes");
+    fs
 }
 
-const BTRFS_ITEM_INODE_ITEM: u8 = 1;
-const BTRFS_ITEM_DIR_INDEX: u8 = 84;
-const BTRFS_ITEM_ROOT_ITEM: u8 = 132;
-const BTRFS_ITEM_EXTENT_DATA: u8 = 108;
-const BTRFS_FILE_EXTENT_REG: u8 = 1;
-const BTRFS_FT_REG_FILE: u8 = 1;
-const BTRFS_FS_TREE_OBJECTID: u64 = 5;
-
-#[allow(clippy::too_many_arguments)]
-fn write_btrfs_leaf_item(
-    image: &mut [u8],
-    leaf_off: usize,
-    idx: usize,
-    objectid: u64,
-    item_type: u8,
-    key_offset: u64,
-    data_offset: u32,
-    data_size: u32,
-) {
-    let item_off = leaf_off + 101 + idx * 25;
-    let data_offset_rel = data_offset
-        .checked_sub(101)
-        .expect("test item payload must live after the leaf header");
-    image[item_off..item_off + 8].copy_from_slice(&objectid.to_le_bytes());
-    image[item_off + 8] = item_type;
-    image[item_off + 9..item_off + 17].copy_from_slice(&key_offset.to_le_bytes());
-    image[item_off + 17..item_off + 21].copy_from_slice(&data_offset_rel.to_le_bytes());
-    image[item_off + 21..item_off + 25].copy_from_slice(&data_size.to_le_bytes());
-}
-
-fn encode_btrfs_inode_item(mode: u32, size: u64, nbytes: u64, nlink: u32) -> [u8; 160] {
-    let mut inode = [0_u8; 160];
-    inode[0..8].copy_from_slice(&1_u64.to_le_bytes());
-    inode[8..16].copy_from_slice(&1_u64.to_le_bytes());
-    inode[16..24].copy_from_slice(&size.to_le_bytes());
-    inode[24..32].copy_from_slice(&nbytes.to_le_bytes());
-    inode[40..44].copy_from_slice(&nlink.to_le_bytes());
-    inode[44..48].copy_from_slice(&1000_u32.to_le_bytes());
-    inode[48..52].copy_from_slice(&1000_u32.to_le_bytes());
-    inode[52..56].copy_from_slice(&mode.to_le_bytes());
-    inode[112..120].copy_from_slice(&10_u64.to_le_bytes());
-    inode[124..132].copy_from_slice(&10_u64.to_le_bytes());
-    inode[136..144].copy_from_slice(&10_u64.to_le_bytes());
-    inode[148..156].copy_from_slice(&10_u64.to_le_bytes());
-    inode
-}
-
-fn encode_btrfs_dir_index_entry(name: &[u8], child_objectid: u64, file_type: u8) -> Vec<u8> {
-    let mut entry = vec![0_u8; 30 + name.len()];
-    entry[0..8].copy_from_slice(&child_objectid.to_le_bytes());
-    entry[8] = BTRFS_ITEM_INODE_ITEM;
-    entry[9..17].copy_from_slice(&0_u64.to_le_bytes());
-    entry[17..25].copy_from_slice(&1_u64.to_le_bytes());
-    entry[25..27].copy_from_slice(&0_u16.to_le_bytes());
-    let name_len = u16::try_from(name.len()).expect("test name length should fit in u16");
-    entry[27..29].copy_from_slice(&name_len.to_le_bytes());
-    entry[29] = file_type;
-    entry[30..30 + name.len()].copy_from_slice(name);
-    entry
-}
-
-fn encode_btrfs_extent_regular(disk_bytenr: u64, num_bytes: u64) -> [u8; 53] {
-    let mut extent = [0_u8; 53];
-    extent[0..8].copy_from_slice(&1_u64.to_le_bytes());
-    extent[8..16].copy_from_slice(&num_bytes.to_le_bytes());
-    extent[20] = BTRFS_FILE_EXTENT_REG;
-    extent[21..29].copy_from_slice(&disk_bytenr.to_le_bytes());
-    extent[29..37].copy_from_slice(&num_bytes.to_le_bytes());
-    extent[37..45].copy_from_slice(&0_u64.to_le_bytes());
-    extent[45..53].copy_from_slice(&num_bytes.to_le_bytes());
-    extent
-}
-
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::too_many_lines)]
 fn build_btrfs_fsops_image() -> Vec<u8> {
-    let image_size: usize = 512 * 1024;
-    let mut image = vec![0_u8; image_size];
-    let sb_off = BTRFS_SUPER_INFO_OFFSET;
-
-    let root_tree_logical = 0x4_000_u64;
-    let fs_tree_logical = 0x8_000_u64;
-    let file_data_logical = 0x12_000_u64;
-    let file_bytes = b"hello from btrfs fsops";
-
-    image[sb_off + 0x40..sb_off + 0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
-    image[sb_off + 0x48..sb_off + 0x50].copy_from_slice(&1_u64.to_le_bytes());
-    image[sb_off + 0x50..sb_off + 0x58].copy_from_slice(&root_tree_logical.to_le_bytes());
-    image[sb_off + 0x58..sb_off + 0x60].copy_from_slice(&0_u64.to_le_bytes());
-    image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&(image_size as u64).to_le_bytes());
-    image[sb_off + 0x80..sb_off + 0x88].copy_from_slice(&256_u64.to_le_bytes());
-    image[sb_off + 0x88..sb_off + 0x90].copy_from_slice(&1_u64.to_le_bytes());
-    image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&4096_u32.to_le_bytes());
-    image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&4096_u32.to_le_bytes());
-    image[sb_off + 0x9C..sb_off + 0xA0].copy_from_slice(&4096_u32.to_le_bytes());
-    image[sb_off + 0xC6] = 0;
-
-    let mut chunk_array = Vec::new();
-    chunk_array.extend_from_slice(&256_u64.to_le_bytes());
-    chunk_array.push(228_u8);
-    chunk_array.extend_from_slice(&0_u64.to_le_bytes());
-    chunk_array.extend_from_slice(&(image_size as u64).to_le_bytes());
-    chunk_array.extend_from_slice(&2_u64.to_le_bytes());
-    chunk_array.extend_from_slice(&0x1_0000_u64.to_le_bytes());
-    chunk_array.extend_from_slice(&2_u64.to_le_bytes());
-    chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
-    chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
-    chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
-    chunk_array.extend_from_slice(&1_u16.to_le_bytes());
-    chunk_array.extend_from_slice(&0_u16.to_le_bytes());
-    chunk_array.extend_from_slice(&1_u64.to_le_bytes());
-    chunk_array.extend_from_slice(&0_u64.to_le_bytes());
-    chunk_array.extend_from_slice(&[0_u8; 16]);
-
-    image[sb_off + 0xA0..sb_off + 0xA4].copy_from_slice(&(chunk_array.len() as u32).to_le_bytes());
-    let array_start = sb_off + 0x32B;
-    image[array_start..array_start + chunk_array.len()].copy_from_slice(&chunk_array);
-
-    let root_leaf = root_tree_logical as usize;
-    image[root_leaf + 0x30..root_leaf + 0x38].copy_from_slice(&root_tree_logical.to_le_bytes());
-    image[root_leaf + 0x50..root_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
-    image[root_leaf + 0x58..root_leaf + 0x60].copy_from_slice(&1_u64.to_le_bytes());
-    image[root_leaf + 0x60..root_leaf + 0x64].copy_from_slice(&1_u32.to_le_bytes());
-    image[root_leaf + 0x64] = 0;
-
-    let root_item_offset: u32 = 3000;
-    let root_item_size: u32 = 239;
-    write_btrfs_leaf_item(
-        &mut image,
-        root_leaf,
-        0,
-        BTRFS_FS_TREE_OBJECTID,
-        BTRFS_ITEM_ROOT_ITEM,
-        0,
-        root_item_offset,
-        root_item_size,
+    // Public write-path tests need a natively valid device/chunk/extent tree,
+    // rather than a partial parser fixture that fails admission before CRUD.
+    let tmp = tempfile::tempdir().expect("btrfs fixture directory");
+    let image = tmp.path().join("fsops.btrfs");
+    let file = std::fs::File::create(&image).expect("create btrfs fixture");
+    file.set_len(128 * 1024 * 1024).expect("size btrfs fixture");
+    drop(file);
+    let output = std::process::Command::new("mkfs.btrfs")
+        .args(["-f", "-q"])
+        .arg(&image)
+        .output()
+        .expect("btrfs write-path integration requires mkfs.btrfs");
+    assert!(
+        output.status.success(),
+        "mkfs.btrfs failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let mut root_item = vec![0_u8; root_item_size as usize];
-    root_item[168..176].copy_from_slice(&256_u64.to_le_bytes());
-    root_item[176..184].copy_from_slice(&fs_tree_logical.to_le_bytes());
-    let root_item_last = root_item.len() - 1;
-    root_item[root_item_last] = 0;
-    let root_data_off = root_leaf + root_item_offset as usize;
-    image[root_data_off..root_data_off + root_item.len()].copy_from_slice(&root_item);
-
-    let fs_leaf = fs_tree_logical as usize;
-    image[fs_leaf + 0x30..fs_leaf + 0x38].copy_from_slice(&fs_tree_logical.to_le_bytes());
-    image[fs_leaf + 0x50..fs_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
-    image[fs_leaf + 0x58..fs_leaf + 0x60].copy_from_slice(&BTRFS_FS_TREE_OBJECTID.to_le_bytes());
-    image[fs_leaf + 0x60..fs_leaf + 0x64].copy_from_slice(&4_u32.to_le_bytes());
-    image[fs_leaf + 0x64] = 0;
-
-    let root_inode = encode_btrfs_inode_item(0o040_755, 4096, 4096, 2);
-    let file_inode = encode_btrfs_inode_item(
-        0o100_644,
-        file_bytes.len() as u64,
-        file_bytes.len() as u64,
-        1,
-    );
-    let dir_index = encode_btrfs_dir_index_entry(b"hello.txt", 257, BTRFS_FT_REG_FILE);
-    let extent = encode_btrfs_extent_regular(file_data_logical, file_bytes.len() as u64);
-
-    let root_inode_off: u32 = 3200;
-    let dir_index_off: u32 = 3060;
-    let file_inode_off: u32 = 2860;
-    let extent_off: u32 = 2780;
-
-    write_btrfs_leaf_item(
-        &mut image,
-        fs_leaf,
-        0,
-        256,
-        BTRFS_ITEM_INODE_ITEM,
-        0,
-        root_inode_off,
-        root_inode.len() as u32,
-    );
-    write_btrfs_leaf_item(
-        &mut image,
-        fs_leaf,
-        1,
-        256,
-        BTRFS_ITEM_DIR_INDEX,
-        2,
-        dir_index_off,
-        dir_index.len() as u32,
-    );
-    write_btrfs_leaf_item(
-        &mut image,
-        fs_leaf,
-        2,
-        257,
-        BTRFS_ITEM_INODE_ITEM,
-        0,
-        file_inode_off,
-        file_inode.len() as u32,
-    );
-    write_btrfs_leaf_item(
-        &mut image,
-        fs_leaf,
-        3,
-        257,
-        BTRFS_ITEM_EXTENT_DATA,
-        0,
-        extent_off,
-        extent.len() as u32,
-    );
-
-    image[fs_leaf + root_inode_off as usize..fs_leaf + root_inode_off as usize + root_inode.len()]
-        .copy_from_slice(&root_inode);
-    image[fs_leaf + dir_index_off as usize..fs_leaf + dir_index_off as usize + dir_index.len()]
-        .copy_from_slice(&dir_index);
-    image[fs_leaf + file_inode_off as usize..fs_leaf + file_inode_off as usize + file_inode.len()]
-        .copy_from_slice(&file_inode);
-    image[fs_leaf + extent_off as usize..fs_leaf + extent_off as usize + extent.len()]
-        .copy_from_slice(&extent);
-
-    let file_data_off = file_data_logical as usize;
-    image[file_data_off..file_data_off + file_bytes.len()].copy_from_slice(file_bytes);
-
-    // Stamp CRC32C checksums on tree blocks (nodesize=4096)
-    let nodesize = 4096_usize;
-    let csum_root = ffs_types::crc32c(&image[root_leaf + 0x20..root_leaf + nodesize]);
-    image[root_leaf..root_leaf + 4].copy_from_slice(&csum_root.to_le_bytes());
-    let csum_fs = ffs_types::crc32c(&image[fs_leaf + 0x20..fs_leaf + nodesize]);
-    image[fs_leaf..fs_leaf + 4].copy_from_slice(&csum_fs.to_le_bytes());
-
-    let sb_end = sb_off + ffs_types::BTRFS_SUPER_INFO_SIZE;
-    let csum = ffs_ondisk::btrfs_csum(
-        ffs_types::BTRFS_CSUM_TYPE_CRC32C,
-        &image[sb_off + ffs_ondisk::BTRFS_CSUM_FIELD_SIZE..sb_end],
-    )
-    .expect("CRC32C is supported");
-    image[sb_off..sb_off + csum.len()].copy_from_slice(&csum);
-    ffs_ondisk::verify_btrfs_superblock_checksum(&image[sb_off..sb_end])
-        .expect("fixture superblock checksum must be valid");
-
-    image
+    std::fs::read(image).expect("read native btrfs fixture")
 }
 
 fn open_writable_btrfs_fixture() -> OpenFs {
@@ -646,9 +426,7 @@ mod openfs_write_paths {
 
     #[test]
     fn utf8_filename_round_trips_through_create_write_lookup_and_read() {
-        let Some(fs) = open_writable_ext4_fixture() else {
-            return;
-        };
+        let fs = open_writable_ext4_fixture();
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let name = OsStr::new("resume_文件_é.txt");
@@ -720,9 +498,7 @@ mod openfs_write_paths {
 
     #[test]
     fn xattr_round_trip_through_public_openfs_api_on_ext4() {
-        let Some(fs) = open_writable_ext4_fixture() else {
-            return;
-        };
+        let fs = open_writable_ext4_fixture();
         let cx = Cx::for_testing();
         assert_xattr_round_trip(&fs, &cx, InodeNumber(2), OsStr::new("xattr-ext4.txt"));
     }
