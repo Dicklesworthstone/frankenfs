@@ -247,7 +247,8 @@ pub fn extract_slots(
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Resize into a new standalone image without modifying the offline source.
-    /// Preserves cluster numbers; shrinking requires a completely free tail.
+    /// Default shrink requires a free tail; --relocate can move live tail clusters.
+    /// FAT16 --root-entries can expand the fixed root. The source and dialect are retained.
     Resize {
         #[command(flatten)]
         options: resize::ResizeArgs,

@@ -79,12 +79,19 @@ The implementation includes masked-byte projection tests and native-image
 regressions for both dialects, source choice, dry-run, error/bad-marker refusal,
 stale evidence, source changes during preflight, selected-volume bounds,
 high-nibble/padding preservation, dirty lost allocation and storage faults.
-Rust compilation and these Rust tests have not executed in the authoring
-environment because Cargo is absent. Independent Python projection/fault models
-are supplementary evidence, not Rust, FUSE or native-OS qualification.
+The authoring environment originally lacked Cargo; its Python projection/fault
+models remain supplementary evidence. On 2026-11-02 the complete `ffs-fat`
+package passes 540 library and two public-consumer tests, with no failures,
+ignores or filters. The `bd-ave6y` native campaign also damages one FAT copy in
+four native-produced FAT16/FAT32 images at 512/4096-byte sectors, selects the
+known original copy explicitly, and verifies exact repaired bytes apart from
+independently reconciled hint words. Native fsck/mcopy and fresh FUSE reads pass;
+read-only diagnosis/dry-run preserve bytes. See the
+[executed maintenance profile](FAT_RESIZE_PROFILE.md#executed-native-profile-2026-11-02-bd-ave6y)
+for source binding and logs. This does not establish automatic authority choice,
+hardware power-loss, Windows or field reliability.
 
-Engine tests have moved into the `ffs-fat` library; these current verification
-commands do not imply a new execution result.
+Engine tests live in the `ffs-fat` library:
 
 ```sh
 rch exec -- cargo test -p ffs-fat --lib mirrors

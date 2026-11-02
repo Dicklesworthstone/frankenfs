@@ -2,6 +2,193 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Active native FAT maintenance — 2026-11-02 (`bd-ave6y`, NavyElm)
+
+The operator requested continued implementation and a granular TODO. Reuse the
+existing native engines and verifier; this checklist retires as active work on
+verified original acceptance or an explicit handoff, without discarding gaps.
+
+- [x] Re-read suite/project instructions and README; preserve peer/untracked
+  files. Check source-aware local queue (ready,55claimable,0foreign/permission
+  gated), dependency cycles0, claim bd-ave6y and reserve existing edit surfaces.
+- [x] Inventory exact resize/recovery contracts, implementation and existing
+  publication/fault controls before changing code. Keep the source immutable;
+  output is create-new, selected bounds and native dialect stay authoritative.
+  Existing storage tests already exercise every output write/sync cut, torn/lost
+  writes, cancellation, stale evidence and error/bad-cluster refusal. Native
+  boot restoration requires a volume-relative byte offset, not a sector number;
+  mirror authority is explicit, and parent/FSInfo/boot repair deliberately keeps
+  dirty state until separately requested ordinary recovery.
+- [x] Extend the existing native verifier with maintenance scenarios.
+  - [x] FAT16/FAT32,512-byte/plain and4KiB/bounded: grow and free-tail shrink;
+    native producer/consumer reads, writes, checks and fresh reopen.
+  - [x] Force live-tail payload/directory/root-chain allocation, free retained
+    space, then relocate on shrink; verify chain topology, raw names/aliases,
+    times/attributes, dot parents and sentinels. Existing executed Rust tests
+    supply the adversarial preallocation/active-FAT/high-bit/bad-cluster cases;
+    do not describe those combinations as native corpus executions.
+  - [x] FAT16 fixed-root expansion and FAT32 chain-backed root growth retain
+    their different native semantics; cover declared sector geometries.
+  - [x] Native recovery corpus: mirror disagreement with explicit authority,
+    dirty state, false FSInfo and corrupt parent records. Check byte-preserving
+    read-only/dry-run refusals and exact repaired native results.
+- [x] Execute native scenarios on the actual source-bound release CLI after
+  worker/actual-volume capacity admission; retain every command, hash and error.
+  - [x] First four resize profiles pass native grow/shrink/relocation/root-growth
+    and operation-output FUSE/native interchange on existing release ELF4a9a3d97.
+    Independently forced relocation moves23/6/33/7clusters across FAT16/FAT32
+    512/4096sector profiles. Raw entries/LFNs, dot parents, complete allocated
+    directory bytes, chain mappings, payload/slack and frozen source hashes pass.
+    Existing six read/formatter/population scenarios also execute; this first
+    invocation does not request their older mounted mode. Its retained root is
+    ffs-fat-native-8bo70h67; resume14-native-maintenance-first.log exits0.
+  - [x] Extended recovery passes16damaged native copies (3/3/5/5 across the
+    four geometries), including FAT32 backup-boot authority expressed in bytes.
+    Whole-image masked hashes allow only independently checked FSInfo words;
+    raw records/chains/payload/slack and bounded neighbors remain preserved.
+    Each recovered output passes native fsck/mcopy and a fresh FUSE mount.
+  - [x] Final source-bound release build exits0 in121572ms, ELF SHA256
+    edad94f2725601d03ef292683f7a8913e7120eb0d0c50e8846c463f20c905cfc,
+    Build IDb82de2d55d84792ab2ef1a20cd0600614e02522f. Final verifier SHA256
+    ed8f17f2a205f8a96ea2c537d24bc05eb141a99e42ce6561cee70da7509f0380.
+    All886Rust/build inputs match local source, hz4 andvmi1152480.
+  - [x] Final combined16-scenario invocation exits0:2554commands (2492exit0,
+    59expected exit1,3expected exit2),49actual successful FUSE sessions,
+    14resize outputs and16recovery cases; all12older profiles remain selected.
+    Ten grow/relocate/root-expand outputs additionally pass bidirectional
+    native/FrankenFS writes; four free-tail outputs have native/FUSE read proof.
+    Native root: hz4:/tmp/rch-frankenfs-vuzzq-20261101/t/ffs-fat-native-f14p1oci.
+    Metadata/stdout/stderr copied to resume14-final-native-evidence/; raw images
+    and all partial outputs remain on the worker. Logs/summary/manifests use
+    artifacts/implementation/20261030_O221Lk/resume14-*.
+- [x] Review actual defects and preserve existing profiles. No filesystem engine
+  defect was found in this maintenance campaign. Fix stale public resize help
+  that denied existing relocation/root expansion; full build/native invocation
+  exercises the actual CLI. Add explicit report cardinality/final-result checks
+  and execute negative controls rather than claiming a new filesystem fix.
+- [x] Exercise actual cancellation and source-race children during withheld
+  primary publication; both return1 with retained/no-rollback errors and zero
+  primary bytes, and fresh checks refuse those outputs. A private4MiBFAT-backed
+  FUSE output produces actual ENOSPC, retains its zero-length partial file and
+  passes backend fsck. Original source/neighbor hashes stay fixed. Existing
+  owning tests execute every modeled output write/sync/torn/lost cut; this
+  supplements process failure proof, without claiming hardware power loss.
+- [x] Run owning FAT and literal CLI anchors, affected public consumers,
+  workspace/all-target check, strict Clippy, formatting and full changed-code
+  UBS. Owning package540library+2public consumers pass,0fail/ignore/filter,
+  library407.44s/RCH448751ms. Affected CLI/facade/harness3276pass,
+  0fail/20existing ignores/0filtered across38results (RCH1160177ms).
+  Workspace check104215ms and strict Clippy126330ms pass; fmt/diff-check pass.
+  Literal CLI binary anchor exits0 but runs0tests: build evidence only. The
+  existing ignored native CLI wrapper is explicitly selected and passes1,
+  0failed/ignored,42filtered,32.88s. Full harness benchmark exits0/RCH1472029ms:
+  60started/60analyzed;31historical comparisons regress,13improve. This is
+  maintenance, not an incumbent comparison or performance improvement.
+  Complete changed-code UBS JSON exits0,2files,0critical/127warnings/159info,
+  no exclusions. Text scans with UBS_KEEP_TEMP return2 because optional tools
+  cannot retain their scratch; retain both failures. Doctor is healthy; run
+  all optional tools directly from their existing installs with nondeleting
+  options: Ruff reports2style findings, Bandit4low/0medium/0high, pip-audit
+  exits0 with no advisories in the selected source path (no resolved Python
+  dependency-environment claim). No category suppression/ignore was added.
+  Reviewed Ruff shebang mode/existing adjacent zip style and Bandit subprocess
+  import/argv calls: the retained test runner deliberately executes configured
+  binaries/native tools without a shell. Static warnings are not runtime proof.
+- [x] Execute planted negative controls for observed defects/missing oracle/
+  empty selection/final-element failure where applicable; never award skipped
+  work or unit/storage-model output as native or device-power-loss evidence.
+  Empty PATH refuses missing mkfs.fat with exit1 before fixture creation.
+  Collector rejects empty selection,zero requirement,missing final result,
+  failed final scenario and null final scenario; retained positive capture
+  replay succeeds. Those five controls are unit/capture proof, then the final
+  live16-scenario run exercises the actual strengthened collector.
+- [x] Complete bounded anti-ceremony/honesty review and update measured parity
+  plus existing resize/root/mirror/parent/FSInfo guides without lowering scope.
+- [ ] Cite final source commit in original Bead, close only on executed evidence,
+  flush tracker, commit delivery metadata, pull/import and push both branches.
+
+### Bounded review of this maintenance block
+
+Window: base31ab0bde8 through the pending bd-ave6y change set; solo NavyElm.
+README purpose: safe native filesystem interpretation/mutation, including FAT
+maintenance, with explicit durability and evidence boundaries. Mechanical diff
+inventory: existing CLI help (USER), native maintenance verifier (ENABLER,
+actually consumed by the16-scenario CLI/native/FUSE run), existing operation
+guides/parity notes (USER), this checklist and original tracker row (PROCESS).
+No new scaffolding or process-only feature was introduced. The root-expansion
+and relocation commands can be demonstrated from the retained native outputs.
+Removing tracker prose would not change those results; stop adding machinery.
+The broader six-format roadmap and older high-impact ext4/btrfs durability and
+native-device comparator work remain open. This block followed the newly closed
+FAT writer dependency; it does not replace those items or their permission gates.
+Verdict: bounded ENABLER qualification with a small public help correction,
+not a new maintenance engine or a user-feature count inflated by reports.
+
+Honesty inventory (questions from the anti-ceremony skill):
+
+1. No (checked: full pending Rust/Python diff, build/test/lint/CI configs,
+   golden paths and reflog since31ab0bde8; no tests/ignores/gates relaxed).
+2. No (checked: new native producer/consumer operations execute real tools,
+   images, CLI children and FUSE; independent raw checks are supplementary).
+3. No (checked: diff/status; no golden or snapshot bytes changed).
+4. Yes: verifier/gate code changes accompany CLI help, not filesystem engine
+   changes. Cardinality and final-element gates strictly strengthen acceptance;
+   no tolerance/deadline/retry/category suppression added. This is a single-owner
+   gate lane, with explicit planted negatives; no independent review is claimed.
+5. No (checked: both dialects/all four declared geometries, all12older profiles,
+   native fsck exits, relocation counts and original source/neighbor hashes).
+6. Yes: the required literal CLI binary anchor runs0tests. It earns build-only
+   evidence; explicitly selected native CLI wrapper1pass plus542owning tests
+   and full native invocation provide executed capability. No artificial tests
+   were added to turn the zero into a score.
+7. No (checked: terminal statuses,2554command records/49mount records,60bench
+   start/analyze pairs,38consumer results and both worker source manifests).
+8. No (checked: native, mounted, process, storage-model and collector replay
+   claims are named separately; no device-power-loss/field claim).
+9. No (checked: retained unsupported Cargo argument101, both partial UBS2 runs,
+   missing-oracle1,31benchmark regressions, existing ignores and prior failed
+   debug native campaign remain disclosed, without being counted as passes).
+10. No (checked: cited command stdout/stderr and JSON operation logs retained;
+    no failed stream was discarded to manufacture success).
+11. No (checked: original bd-ave6y AC and tracker history; closure waits for
+    actual evidence, no replacement/follow-up item created to carry its scope).
+12. No (checked: canonical specification unchanged; guides add bounded executed
+    evidence and retain original restrictions/unsupported behavior).
+13. No (checked: solo execution; no subagent closures or delegated changes).
+14. No (checked: no subagents spawned this block).
+15. No (checked: no subagent reports accepted as evidence).
+16. No (checked: single positive maintenance item, real native outputs, no
+    refusal-only item farming).
+17. No (checked: solo verification, no independence or agent-agreement claim).
+18. No (checked: required scenario count derives from selected existing CLI
+    flags; geometry/operation sets fixed before the native campaign).
+19. Yes: the inline Cargo env table was invalid and UBS_KEEP_TEMP refused
+    optional analyzer scratch. Retain the101/2 receipts, correct Cargo to
+    separate env value/force keys, run full UBS JSON plus each optional tool
+    directly without deleting or disabling a category. The initial CASS
+    physical-path follow also failed; canonical archive message-index reads
+    succeed. Earlier cm unknown flag was corrected without changing its store.
+    DCG also blocks a read-only tool-hash command on the literal mkfs path;
+    explain confirms that match. No override/retry of the blocked command is
+    used; existing native provenance and a separate CLI-help capture suffice.
+20. Strongest proof: source-bound normal release invokes actual native
+    maintenance plus all older profiles; resume14-native-all-final.log and
+    resume14-final-native-evidence/result.json are re-executable with the
+    permanent runner, required native tools and Linux /dev/fuse.
+
+CASS scope: six read-only lexical searches (five generic honesty phrases plus
+verify_fat_read.py), at most3hits each; no index/maintenance/storage changes.
+Canonical archive follow of Codex conversation954/message629 is an earlier
+honesty-search invocation, not misconduct evidence. Conversation947/message178
+is a historical source-only security audit explicitly disclosing unexecuted
+work; it is not current proof. This is a bounded sample, not a corpus audit.
+
+Disposition for4/6/19: corrected/disclosed in place as above, with fail-closed
+countermeasures for RH-1 gate self-weakening, RH-2 proof-class inflation and
+zero-run green; no scanner exclusions, test suppressions, rewritten benchmark
+baselines or changed deadlines. The collector's zero/final-result controls
+directly prevent a misleading overall pass. No independent review is claimed.
+
 ## Completed writable FAT qualification — 2026-11-02 (`bd-lby8f`, NavyElm)
 
 The operator requested continued implementation and a granular TODO. This

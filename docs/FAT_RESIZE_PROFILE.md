@@ -59,8 +59,8 @@ change in the output; selectors from the original image must not be reused there
 Planning uses an additional temporary allocation-state byte per source cluster
 and a bounded sorted map of three 32-bit words per moved cluster. Directory
 patches are bounded by the existing 131,072-object/256-depth profile. Payloads
-are streamed, not materialized. No native interoperability or runtime qualification
-is inferred merely from these checks or the authored regression tests.
+are streamed, not materialized. Native interoperability is measured separately
+from these implementation checks; the executed profile is recorded below.
 
 ## Verification and publication
 
@@ -86,5 +86,55 @@ integrity or authenticity.
 
 Sidecars are refused rather than repaired, reused at a different geometry, or
 silently detached. The output needs separately created and verified protection.
-Native filesystem-tool and mounted interoperability qualification remains required;
-constructed-image tests do not establish that qualification.
+Constructed-image tests and native interoperability have separate evidence.
+
+## Executed native profile (2026-11-02, bd-ave6y)
+
+The existing engines pass `python3 scripts/verify_fat_read.py --binary /path/to/ffs-fat
+--maintenance-mounted --writable-mounted --protected-mounted` on Linux with
+dosfstools 4.2, mtools 4.0.49 and fuse3 3.18.2. The four native-produced profiles
+exercise these sizes; all sizes below are MiB:
+
+| Dialect / sector / source selection | Source | Grow | Shrink | Live clusters moved |
+|---|---:|---:|---:|---:|
+| FAT16 / 512 bytes / plain | 16 | 24 | 12 | 23 |
+| FAT16 / 4096 bytes / bounded | 64 | 96 | 48 | 6 |
+| FAT32 / 512 bytes / plain | 64 | 80 | 48 | 33 |
+| FAT32 / 4096 bytes / bounded | 512 | 640 | 384 | 7 |
+
+Each profile grows, shrinks a separate free-tail fixture, refuses an allocated
+tail without `--relocate`, then relocates that tail with explicit authority.
+Both FAT16 profiles also expand the fixed root; both FAT32 profiles force native
+root-chain growth before relocating it. The 14 resize outputs pass native fsck,
+mtools payload reads and fresh read-only FUSE mounts. Grow/relocate/root-expand
+outputs also accept native and FrankenFS writes, each read by the other tool.
+Independent raw inventories compare native names, aliases, long-name records,
+attributes/times, chain mappings, dot parents, allocated directory bytes, payload
+and slack. Frozen source hashes include the bounded images' neighboring bytes.
+
+Sixteen damaged native copies exercise explicit mirror choice, dirty recovery,
+parent repair, and FAT32 FSInfo/backup-boot repair. Read-only checks and dry runs
+preserve every byte. Repairs preserve all other bytes, independently reconcile
+allowed FSInfo hints, and pass native fsck/mcopy plus fresh FUSE consumption.
+Cancellation and an uncooperative source writer are injected into actual CLI
+children while primary boot publication is withheld. Both fail with retained,
+unpublished outputs. A real 4 MiB FAT-backed FUSE output filesystem produces
+ENOSPC without filling shared worker storage; its zero-length partial output
+remains diagnosable and its backend passes native fsck.
+
+The complete invocation passes 16 scenarios, 2,554 commands with expected
+statuses and 49 actual FUSE sessions. Existing read/formatter/population,
+writable and protected profiles remain selected. The release ELF SHA-256 is
+`edad94f2725601d03ef292683f7a8913e7120eb0d0c50e8846c463f20c905cfc`;
+all 886 Rust/build inputs match the local tree and both verification workers.
+Logs and source manifests are under
+`artifacts/implementation/20261030_O221Lk/resume14-*`; native images and partial
+outputs remain on hz4 in
+`/tmp/rch-frankenfs-vuzzq-20261101/t/ffs-fat-native-f14p1oci`.
+
+All 540 owning library tests and two public consumers also pass, including
+active-FAT selection, reserved high bits, bad clusters, preallocation and every
+modeled output write/sync cut. Those adversarial combinations have Rust/storage
+evidence; the native campaign above uses normally mirrored mkfs images. Native
+process interruption is separate from hardware power loss. This is root/Linux
+FUSE qualification, with no Windows, bootability, field or performance claim.

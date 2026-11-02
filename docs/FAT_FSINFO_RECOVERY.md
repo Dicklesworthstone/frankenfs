@@ -103,6 +103,17 @@ ownership/four-marker assertions. Only this component ran in this invocation;
 the full runner, native 4096-byte-sector operation, kernel-FUSE, crash atomicity,
 later streaming changes and field use remain outside this evidence.
 
+The 2026-11-02 `bd-ave6y` campaign additionally executes the current complete
+`ffs-fat` package (540 library and two public consumers, no failures/ignores/
+filters) and native FAT32 FSInfo repair at both 512-byte/plain and
+4096-byte/bounded geometry. False hints and primary signature damage require
+explicit repair; ordinary recovery remains a separate step. Independent FAT
+counts validate the allowed hint words, whole-image masked hashes preserve
+every other byte and neighbor, and native fsck/mcopy plus fresh FUSE reads pass.
+See the [executed maintenance profile](FAT_RESIZE_PROFILE.md#executed-native-profile-2026-11-02-bd-ave6y)
+for exact source/ELF and logs. This adds current native/FUSE evidence without
+claiming hardware power-loss or field reliability.
+
 A separate operation-output probe also opened the recovered clean image through
 the previously qualified public `ffs` consumer (SHA-256 `e862954f...e4ef48`)
 and a strict read-only `FatFs` FUSE mount using the CLI above. Its three payloads,

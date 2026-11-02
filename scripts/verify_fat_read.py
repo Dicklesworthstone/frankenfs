@@ -17,6 +17,7 @@ import json
 import locale
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -32,9 +33,35 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def masked_digest(path: Path, ranges: dict[int, int]) -> str:
+    """Hash all bytes, normalizing only independently checked native hint words."""
+    result = hashlib.sha256()
+    at = 0
+    with path.open("rb") as stream:
+        for data in iter(lambda: stream.read(1024 * 1024), b""):
+            data = bytearray(data)
+            for start, length in ranges.items():
+                left, right = max(at, start), min(at + len(data), start + length)
+                if left < right:
+                    data[left - at:right - at] = bytes(right - left)
+            result.update(data)
+            at += len(data)
+    return result.hexdigest()
+
+
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def complete_report(report: dict[str, object], required_scenarios: int) -> None:
+    scenarios = report["scenarios"]
+    check(required_scenarios > 0 and isinstance(scenarios, list)
+          and len(scenarios) == required_scenarios,
+          "native qualification selected no scenarios or did not finish its required set")
+    check(all(isinstance(scenario, dict) and scenario.get("result") == "passed"
+              for scenario in scenarios), "native qualification has an incomplete or failed scenario")
+    report["status"] = "passed"
 
 
 
@@ -117,6 +144,161 @@ def native_root_file(image: Path, short_name: bytes) -> dict[str, object]:
             stream.seek(reserved * sector + cluster * width)
             cluster = int.from_bytes(stream.read(width), "little") & (0xFFFF if width == 2 else 0x0FFFFFFF)
         return {"entry_hex": entry.hex(), "clusters": chain, "allocated_sha256": result.hexdigest()}
+
+
+def native_inventory(image: Path) -> dict[str, object]:
+    """Independent native records/chains for this runner's retained mkfs images."""
+    with image.open("rb") as stream:
+        header = stream.read(512)
+        sector = int.from_bytes(header[11:13], "little")
+        spc = header[13]
+        reserved = int.from_bytes(header[14:16], "little")
+        roots = int.from_bytes(header[17:19], "little")
+        bits = 16 if roots else 32
+        width, mask = bits // 8, 0xFFFF if bits == 16 else 0x0FFFFFFF
+        fat_sectors = int.from_bytes(header[22:24] if bits == 16 else header[36:40], "little")
+        total = int.from_bytes(header[19:21], "little") or int.from_bytes(header[32:36], "little")
+        root_sectors = (roots * 32 + sector - 1) // sector
+        first_data = reserved + header[16] * fat_sectors + root_sectors
+        count = (total - first_data) // spc
+        check(sector in (512, 4096) and spc > 0 and header[16] == 2
+              and 4085 <= count <= 8_388_608 and total * sector == image.stat().st_size,
+              "native inventory geometry differs from its producer contract")
+        stream.seek(0)
+        boot = bytearray(stream.read(sector))
+        for start, end in ((19, 21), (28, 36), (17, 19) if bits == 16 else (44, 48),
+                           (22, 24) if bits == 16 else (36, 40)):
+            boot[start:end] = bytes(end - start)
+        stream.seek(reserved * sector)
+        fats = [stream.read(fat_sectors * sector) for _ in range(2)]
+        check(all(len(fat) == fat_sectors * sector for fat in fats), "native FAT is truncated")
+        flags = int.from_bytes(header[40:42], "little") if bits == 32 else 0
+        active = flags & 15 if flags & 128 else 0
+        check(active < 2, "invalid active native FAT")
+
+        def pointer(record: bytes) -> int:
+            first = int.from_bytes(record[26:28], "little")
+            if bits == 32:
+                first |= (int.from_bytes(record[20:22], "little") & 0x0FFF) << 16
+            return first
+
+        def chain(first: int) -> list[int]:
+            result, seen = [], set()
+            while first:
+                check(2 <= first < count + 2 and first not in seen, "native chain is invalid or cyclic")
+                seen.add(first)
+                result.append(first)
+                value = int.from_bytes(fats[active][first * width:(first + 1) * width], "little") & mask
+                if value >= (0xFFF8 if bits == 16 else 0x0FFFFFF8):
+                    break
+                check(value >= 2 and value < count + 2, "native live chain has no valid successor")
+                first = value
+            return result
+
+        def contents(clusters: list[int]) -> bytes:
+            chunks = []
+            for cluster in clusters:
+                stream.seek((first_data + (cluster - 2) * spc) * sector)
+                data = stream.read(spc * sector)
+                check(len(data) == spc * sector, "native allocation exceeds the image")
+                chunks.append(data)
+            return b"".join(chunks)
+
+        root_chain = chain(int.from_bytes(header[44:48], "little")) if bits == 32 else []
+        if bits == 16:
+            stream.seek((reserved + 2 * fat_sectors) * sector)
+            root_data = stream.read(root_sectors * sector)
+        else:
+            root_data = contents(root_chain)
+        entries = {"/": {"chain": root_chain, "record": "", "lfn": [], "directory": True}}
+        pending = [("/", root_data, 0, 0)]
+        while pending:
+            parent, data, first, expected_parent = pending.pop()
+            normalized = bytearray(data)
+            long_names = []
+            for at in range(0, len(data), 32):
+                record = data[at:at + 32]
+                check(len(record) == 32, "partial native directory record")
+                if record[0] == 0:
+                    break
+                if record[0] == 0xE5:
+                    long_names = []
+                    continue
+                if record[11] == 0x0F:
+                    long_names.append(record.hex())
+                    continue
+                start = pointer(record)
+                normalized[at + 26:at + 28] = bytes(2)
+                if bits == 32:
+                    high = int.from_bytes(record[20:22], "little") & 0xF000
+                    normalized[at + 20:at + 22] = high.to_bytes(2, "little")
+                if record[:11] in (b".          ", b"..         "):
+                    check(parent != "/" and start == (first if record[1] == 32 else expected_parent),
+                          "native dot/parent binding differs")
+                    continue
+                path = parent.rstrip("/") + "/" + record[:11].hex()
+                check(path not in entries and len(entries) < 1024, "duplicate/budgeted native namespace")
+                clusters = chain(start)
+                body = contents(clusters)
+                directory = bool(record[11] & 0x10)
+                entries[path] = {"record": bytes(normalized[at:at + 32]).hex(),
+                                 "lfn": long_names, "directory": directory, "chain": clusters,
+                                 "allocated_digest": hashlib.sha256(body).hexdigest()}
+                long_names = []
+                if directory:
+                    pending.append((path, body, start, first))
+            entries[parent]["normalized_directory"] = normalized.hex()
+        return {"bits": bits, "sector": sector, "cluster_bytes": spc * sector,
+                "root_entries": roots, "clusters": count, "active": active,
+                "flags": flags, "boot": bytes(boot).hex(), "fats": fats, "entries": entries}
+
+
+def native_preserved(before: dict[str, object], after: dict[str, object], *, relocating: bool) -> dict[int, int]:
+    for field in ("bits", "sector", "cluster_bytes", "active", "flags", "boot"):
+        check(before[field] == after[field], f"resize changed native {field}")
+    old, new = before["entries"], after["entries"]
+    check(old.keys() == new.keys(), "resize changed the raw native namespace")
+    moves = {}
+    for path, record in old.items():
+        other = new[path]
+        check(record["record"] == other["record"] and record["lfn"] == other["lfn"]
+              and record["directory"] == other["directory"], "resize changed native entry metadata")
+        check(len(record["chain"]) == len(other["chain"]), "resize changed native chain length")
+        for previous, current in zip(record["chain"], other["chain"], strict=True):
+            check(previous not in moves or moves[previous] == current, "inconsistent relocation mapping")
+            moves[previous] = current
+            if not relocating or previous < after["clusters"] + 2:
+                check(previous == current, "resize moved a retained native cluster")
+        if record["directory"]:
+            left, right = record["normalized_directory"], other["normalized_directory"]
+            check(right.startswith(left) and not any(bytes.fromhex(right[len(left):])),
+                  "resize changed allocated directory bytes outside pointer translations/zero root growth")
+        else:
+            check(hmac.compare_digest(record["allocated_digest"], other["allocated_digest"]),
+                  "resize changed native allocated payload or slack")
+    check(len(set(moves.values())) == len(moves), "relocation assigned one cluster to distinct source objects")
+    inverse = {new: old for old, new in moves.items()}
+    width, mask = before["bits"] // 8, 0xFFFF if before["bits"] == 16 else 0x0FFFFFFF
+    for copy in range(2):
+        original, output = before["fats"][copy], after["fats"][copy]
+        for cluster in range(after["clusters"] + 2):
+            previous = int.from_bytes(original[cluster * width:(cluster + 1) * width], "little") \
+                if cluster < before["clusters"] + 2 else 0
+            current = int.from_bytes(output[cluster * width:(cluster + 1) * width], "little")
+            if cluster < 2:
+                check(previous == current, "resize changed native reserved allocation words")
+                continue
+            if not relocating or (before["flags"] & 128 and copy != before["active"]):
+                check(previous == current, "resize changed preserved FAT words")
+                continue
+            origin = inverse.get(cluster, cluster)
+            value = int.from_bytes(original[origin * width:(origin + 1) * width], "little") & mask
+            value = moves.get(value, value)
+            if cluster in moves and moves[cluster] != cluster and origin == cluster:
+                value = 0
+            check(current & mask == value and current & ~mask == previous & ~mask,
+                  "resize changed FAT topology or destination high bits")
+    return {old: new for old, new in moves.items() if old != new}
 
 
 class Run:
@@ -228,6 +410,381 @@ class Run:
                 os.close(descriptor)
                 raise RuntimeError("FAT read-only mount admitted a writable descriptor")
             check(os.statvfs(mountpoint).f_bsize > 0, "mounted statfs returned no block size")
+
+    def maintenance(self, bits: int, sector: int, bounded: bool) -> dict[str, object]:
+        """Native allocation forces real relocation; every source stays frozen."""
+        tag = f"maintenance-fat{bits}-s{sector}"
+        size = 512 if bits == 32 and sector == 4096 else 64
+        if bits == 16 and sector == 512:
+            size = 16
+        smaller = size * 3 // 4
+        larger = size * 3 // 2 if bits == 16 else size * 5 // 4
+        native = self.root / f"{tag}.img"
+        with native.open("xb") as stream:
+            stream.truncate(size * 1024 * 1024)
+        roots = ("-r", "32") if bits == 16 else ()
+        self.command("mkfs.fat", "-F", str(bits), "-S", str(sector), "-s", "1", *roots, native)
+        source = self.root / f"{tag}-sentinel.bin"
+        sentinel = bytes(range(251)) * 41 + b"native maintenance sentinel"
+        source.write_bytes(sentinel)
+        self.command("mcopy", "-i", native, source, "::/KEEP.BIN")
+        padding = self.root / f"{tag}-padding.bin"
+        with padding.open("xb") as stream:
+            stream.truncate(smaller * 1024 * 1024)
+        self.command("mcopy", "-i", native, padding, "::/PAD.BIN")
+        self.command("mmd", "-i", native, "::/Native directory café")
+        self.command("mmd", "-i", native, "::/Native directory café/Nested child")
+        payloads = {"KEEP.BIN": sentinel}
+        for index, name in enumerate(("Native directory café/Payload café.txt",
+                                      "Native directory café/Nested child/Child.bin")):
+            data = bytes(range(256)) * (19 + index) + bytes([index])
+            source = self.root / f"{tag}-payload-{index}.bin"
+            source.write_bytes(data)
+            self.command("mcopy", "-i", native, source, f"::/{name}")
+            payloads[name] = data
+        if bits == 32:
+            # Root fragments are forced beyond the future shrink boundary.
+            empty = self.root / f"{tag}-empty.bin"
+            empty.write_bytes(b"")
+            for index in range(40):
+                name = f"Root growth native café {index:03d}.txt"
+                self.command("mcopy", "-i", native, empty, f"::/{name}")
+                payloads[name] = b""
+        self.command("mdel", "-i", native, "::/PAD.BIN")
+        self.command("fsck.fat", "-n", native)
+        before = native_inventory(native)
+        (self.root / f"{tag}-native-before.json").write_text(json.dumps(
+            {key: value for key, value in before.items() if key != "fats"}, indent=2) + "\n")
+        image, selection = native, ()
+        if bounded:
+            image = self.root / f"{tag}-bounded.img"
+            with image.open("xb") as stream, native.open("rb") as plain:
+                stream.write(b"P" * 4096)
+                shutil.copyfileobj(plain, stream, 1024 * 1024)
+                stream.write(b"S" * 4096)
+            selection = ("--offset", "4096", "--length", str(native.stat().st_size))
+        frozen, native_frozen = digest(image), digest(native)
+        outputs = []
+        operations = [("grow", larger, ()), ("relocate", smaller, ("--relocate",))]
+        if bits == 16:
+            operations.append(("root-expand", larger, ("--root-entries", str(before["root_entries"] * 2))))
+        for operation, target, extra in operations:
+            output = self.root / f"{tag}-{operation}.img"
+            command = (self.binary, "resize", image, *selection, "--output", output,
+                       "--size-mib", str(target), "--offline-image", *extra)
+            if operation == "relocate":
+                refusal = self.root / f"{tag}-tail-refused.img"
+                self.command(self.binary, "resize", image, *selection, "--output", refusal,
+                             "--size-mib", str(target), "--offline-image", expected_returncode=1)
+                check(not refusal.exists(), "allocated-tail refusal created an output")
+            preview = json.loads(self.command(*command, "--dry-run"))
+            check(preview["dry_run"] is True and not output.exists()
+                  and hmac.compare_digest(digest(image), frozen), "resize dry run changed an input")
+            report = json.loads(self.command(*command))
+            check(report["source_modified"] is False and report["output_volume_bytes"] == target * 1024 * 1024
+                  and hmac.compare_digest(report["sha256"], digest(output)), "resize publication report differs")
+            after = native_inventory(output)
+            moves = native_preserved(before, after, relocating=operation == "relocate")
+            check(report["relocated_clusters"] == len(moves), "reported relocation count differs from native chains")
+            (self.root / f"{tag}-{operation}-native-after.json").write_text(json.dumps(
+                {key: value for key, value in after.items() if key != "fats"}
+                | {"relocation_mapping": moves}, indent=2) + "\n")
+            if operation == "relocate":
+                check(report["relocated_clusters"] > 0 and not report["cluster_numbers_preserved"],
+                      "relocation did not move the independently forced live tail")
+                if bits == 32:
+                    check(len(before["entries"]["/"]["chain"]) > 1,
+                          "native FAT32 root did not grow across clusters")
+            self.command("fsck.fat", "-n", output)
+            for name, data in payloads.items():
+                check(self.command("mcopy", "-i", output, f"::/{name}", "-") == data,
+                      f"native resize payload differs: {operation}/{name}")
+                check(self.command(self.binary, "cat", output, f"/{name}") == data,
+                      f"fresh engine resize payload differs: {operation}/{name}")
+            self.mounted(output, payloads)
+            interchange = self.root / f"{tag}-{operation}-interchange.bin"
+            interchange.write_bytes(b"native -> FrankenFS -> native after resize")
+            self.command("mcopy", "-i", output, interchange, "::/NATIVE.BIN")
+            check(self.command(self.binary, "cat", output, "/NATIVE.BIN") == interchange.read_bytes(),
+                  "FrankenFS cannot consume native writes after resize")
+            self.command(self.binary, "replace", output, "/FRANKEN.BIN", "--create",
+                         "--source", interchange, "--offline-image")
+            check(self.command("mcopy", "-i", output, "::/FRANKEN.BIN", "-") == interchange.read_bytes(),
+                  "native reader cannot consume FrankenFS writes after resize")
+            self.command("fsck.fat", "-n", output)
+            check(hmac.compare_digest(digest(image), frozen)
+                  and hmac.compare_digest(digest(native), native_frozen), "resize changed its frozen source")
+            outputs.append({"operation": operation, "relocated_clusters": report["relocated_clusters"],
+                            "output_sha256": digest(output), "result": "passed"})
+        # A second native fixture has no tail allocation, so no relocation is allowed.
+        free = self.root / f"{tag}-free-tail.img"
+        with free.open("xb") as stream:
+            stream.truncate(size * 1024 * 1024)
+        self.command("mkfs.fat", "-F", str(bits), "-S", str(sector), "-s", "1", *roots, free)
+        self.command("mcopy", "-i", free, interchange, "::/KEEP.BIN")
+        free_before, free_hash = native_inventory(free), digest(free)
+        shrunk = self.root / f"{tag}-free-tail-shrunk.img"
+        report = json.loads(self.command(self.binary, "resize", free, "--output", shrunk,
+                                         "--size-mib", str(smaller), "--offline-image"))
+        check(report["relocated_clusters"] == 0 and report["cluster_numbers_preserved"],
+              "free-tail shrink unexpectedly relocated allocation")
+        native_preserved(free_before, native_inventory(shrunk), relocating=False)
+        self.command("fsck.fat", "-n", shrunk)
+        check(self.command("mcopy", "-i", shrunk, "::/KEEP.BIN", "-") == interchange.read_bytes(),
+              "free-tail shrink lost native data")
+        self.mounted(shrunk, {"KEEP.BIN": interchange.read_bytes()})
+        check(hmac.compare_digest(digest(free), free_hash), "free-tail shrink changed its source")
+        recovery = self.maintenance_recovery(native, before, payloads, sector, bits)
+        interruptions = []
+        if bits == 32 and sector == 4096:
+            interruptions = self.resize_interruptions(image, selection, larger, frozen)
+        return {"scenario": "native_maintenance", "format": f"FAT{bits}", "sector_bytes": sector,
+                "bounded": bounded, "source_sha256": frozen, "outputs": outputs,
+                "free_tail_output_sha256": digest(shrunk), "recovery": recovery,
+                "interruptions": interruptions, "result": "passed"}
+
+    def resize_interruptions(self, image: Path, selection: tuple[str, ...], target: int,
+                             frozen: str) -> list[dict[str, object]]:
+        results = []
+        for event in ("cancel", "source-race"):
+            source = image
+            if event == "source-race":
+                source = self.root / "resize-raced-private-source.img"
+                with source.open("xb") as output, image.open("rb") as original:
+                    shutil.copyfileobj(original, output, 1024 * 1024)
+            output = self.root / f"resize-{event}-partial.img"
+            command = [str(arg) for arg in (self.binary, "resize", source, *selection,
+                       "--output", output, "--size-mib", str(target), "--offline-image")]
+            self.sequence += 1
+            prefix = self.root / f"command-{self.sequence:03d}"
+            record = {"argv": command, "returncode": None, "expected_returncode": 1,
+                      "timeout_seconds": 120, "status": "running", "controlled_event": event}
+            prefix.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
+            process, stopped = None, False
+            try:
+                with prefix.with_suffix(".stdout").open("xb") as stdout, \
+                        prefix.with_suffix(".stderr").open("xb") as stderr:
+                    process = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+                    deadline = time.monotonic() + 120
+                    while not output.exists() or output.stat().st_blocks == 0:
+                        check(process.poll() is None, "resize finished before the interruption window")
+                        check(time.monotonic() < deadline, "resize did not reach output publication")
+                        time.sleep(0.002)
+                    # Stop only the exact child started above. No other agent,
+                    # mount daemon, service or process group receives a signal.
+                    process.send_signal(signal.SIGSTOP)
+                    stopped = True
+                    while True:
+                        status = Path(f"/proc/{process.pid}/status").read_text()
+                        if any(line.startswith("State:") and line.split()[1] == "T"
+                               for line in status.splitlines()):
+                            break
+                        check(time.monotonic() < deadline, "owned resize child did not stop")
+                        time.sleep(0.002)
+                    with output.open("rb") as stream:
+                        check(stream.read(4096) == bytes(4096), "interruption missed the withheld-primary window")
+                    record["partial_allocated_bytes_before_event"] = output.stat().st_blocks * 512
+                    if event == "cancel":
+                        process.send_signal(signal.SIGINT)
+                    else:
+                        # An uncooperative writer bypasses advisory locking on
+                        # this private copy only. Original image stays immutable.
+                        base = int(selection[1]) if selection else 0
+                        with source.open("r+b") as stream:
+                            stream.seek(base + 3)
+                            previous = stream.read(1)
+                            stream.seek(base + 3)
+                            stream.write(bytes([previous[0] ^ 1]))
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    process.send_signal(signal.SIGCONT)
+                    stopped = False
+                    code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                record.update(status="completed", returncode=code)
+                check(code == 1, f"resize {event} was acknowledged instead of refused")
+                error = prefix.with_suffix(".stderr").read_text()
+                check(("cancel" in error.lower() if event == "cancel" else "source changed" in error)
+                      and "retained" in error and "no rollback" in error,
+                      f"resize {event} failed for an unrelated reason")
+                with output.open("rb") as stream:
+                    check(stream.read(4096) == bytes(4096), "failed resize published primary boot bytes")
+                check(hmac.compare_digest(digest(image), frozen), "interrupted resize changed its original")
+                self.command(self.binary, "check", output, expected_returncode=1)
+                results.append({"event": event, "partial_output_sha256": digest(output), "result": "passed"})
+            except BaseException as error:
+                record.update(status="failed", error=f"{type(error).__name__}: {error}")
+                raise
+            finally:
+                if process is not None and process.poll() is None:
+                    if stopped:
+                        process.send_signal(signal.SIGCONT)
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=10)
+                if process is not None:
+                    record["returncode"] = process.returncode
+                prefix.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
+        # A real FAT-backed host output has insufficient capacity. This tests
+        # actual ENOSPC without filling or deleting shared worker storage.
+        backend = self.root / "resize-small-output-filesystem.img"
+        with backend.open("xb") as stream:
+            stream.truncate(4 * 1024 * 1024)
+        self.command("mkfs.fat", "-F", "16", "-s", "1", backend)
+        with self.mount_image(backend, writable=True) as mounted:
+            output = mounted / "PARTIAL.IMG"
+            self.command(self.binary, "resize", image, *selection, "--output", output,
+                         "--size-mib", str(target), "--offline-image", expected_returncode=1)
+            error = (self.root / f"command-{self.sequence:03d}.stderr").read_text()
+            check("No space left on device" in error and "retained" in error,
+                  "small-output resize failed for a reason other than ENOSPC")
+            check(output.exists() and output.stat().st_size == 0, "ENOSPC output was deleted or published")
+        self.command("fsck.fat", "-n", backend)
+        check(hmac.compare_digest(digest(image), frozen), "ENOSPC resize changed its source")
+        results.append({"event": "ENOSPC", "backing_image_sha256": digest(backend), "result": "passed"})
+        return results
+
+    def maintenance_recovery(self, native: Path, inventory: dict[str, object],
+                             payloads: dict[str, bytes], sector: int, bits: int) -> list[dict[str, object]]:
+        """Damage private native copies; each repair has explicit separate authority."""
+        frozen = digest(native)
+        with native.open("rb") as stream:
+            boot = stream.read(sector)
+        width, mask = bits // 8, 0xFFFF if bits == 16 else 0x0FFFFFFF
+        reserved = int.from_bytes(boot[14:16], "little")
+        fat_bytes = len(inventory["fats"][0])
+        dirty_mask = 0x8000 if bits == 16 else 0x08000000
+        kinds = ["mirror", "dirty", "parents"] + (["fsinfo", "boot"] if bits == 32 else [])
+        results = []
+        for damage in kinds:
+            image = self.root / f"recovery-fat{bits}-s{sector}-{damage}.img"
+            base = 4096 if sector == 4096 else 0
+            selection = ("--offset", str(base), "--length", str(native.stat().st_size)) if base else ()
+            with image.open("xb") as output, native.open("rb") as source:
+                if base:
+                    output.write(b"P" * base)
+                shutil.copyfileobj(source, output, 1024 * 1024)
+                if base:
+                    output.write(b"S" * base)
+            hint_ranges = {}
+            if bits == 32:
+                info = int.from_bytes(boot[48:50], "little")
+                backup = int.from_bytes(boot[50:52], "little")
+                hint_ranges[base + info * sector + 488] = 8
+                if damage == "fsinfo":
+                    hint_ranges[base + (backup + info) * sector + 488] = 8
+            unaffected = masked_digest(image, hint_ranges)
+            patches = {}
+            if damage == "mirror":
+                free = next(cluster for cluster in range(2, inventory["clusters"] + 2)
+                            if int.from_bytes(inventory["fats"][0][cluster * width:(cluster + 1) * width],
+                                              "little") & mask == 0)
+                at = reserved * sector + fat_bytes + free * width
+                previous = int.from_bytes(inventory["fats"][1][free * width:(free + 1) * width], "little")
+                patches[at] = ((previous & ~mask) | mask).to_bytes(width, "little")
+                command = (self.binary, "recover", image, *selection, "--offline-image", "--repair-mirrors-from", "0")
+            elif damage == "dirty":
+                for copy in range(2):
+                    value = int.from_bytes(inventory["fats"][copy][width:2 * width], "little")
+                    patches[reserved * sector + copy * fat_bytes + width] = (value & ~dirty_mask).to_bytes(width, "little")
+                command = (self.binary, "recover", image, *selection, "--offline-image")
+            elif damage == "parents":
+                root_sectors = (inventory["root_entries"] * 32 + sector - 1) // sector
+                data_start = (reserved * sector + 2 * fat_bytes + root_sectors * sector)
+                directory = next(entry for path, entry in inventory["entries"].items()
+                                 if path != "/" and entry["directory"])
+                # Native root-parent convention is zero; an unrelated free
+                # cluster is not a guessed replacement parent.
+                at = data_start + (directory["chain"][0] - 2) * inventory["cluster_bytes"] + 32
+                patches[at + 26] = (1).to_bytes(2, "little")
+                if bits == 32:
+                    patches[at + 20] = bytes(2)
+                command = (self.binary, "repair-parents", image, *selection, "--offline-image")
+            elif damage == "fsinfo":
+                info = int.from_bytes(boot[48:50], "little")
+                patches[info * sector] = b"BAD!"
+                patches[info * sector + 488] = bytes(4)
+                patches[info * sector + 492] = (2).to_bytes(4, "little")
+                command = (self.binary, "repair-fsinfo", image, *selection, "--offline-image")
+            else:
+                backup = int.from_bytes(boot[50:52], "little")
+                check(backup > 0, "native FAT32 fixture has no declared backup boot")
+                patches[11] = bytes(2)
+                patches[510] = bytes(2)
+                command = (self.binary, "recover", image, *selection, "--offline-image",
+                           "--repair-boot-from", str(backup * sector))
+            with image.open("r+b") as stream:
+                for at, value in patches.items():
+                    stream.seek(base + at)
+                    stream.write(value)
+                stream.flush()
+                os.fsync(stream.fileno())
+            damaged = digest(image)
+            self.command(self.binary, "check", image, *selection, expected_returncode=1)
+            check(hmac.compare_digest(digest(image), damaged), "read-only native diagnosis changed bytes")
+            preview = json.loads(self.command(*command, "--dry-run"))
+            check(preview["dry_run"] is True and hmac.compare_digest(digest(image), damaged),
+                  "native recovery dry run changed bytes")
+            report = json.loads(self.command(*command))
+            repair_output = f"command-{self.sequence:03d}.stdout"
+            if damage in ("parents", "fsinfo", "boot"):
+                # These authorities deliberately retain dirty state; ordinary
+                # recovery is an explicit subsequent operation, not an implicit
+                # enlargement of the selected repair's write authority.
+                self.command(self.binary, "check", image, *selection, expected_returncode=1)
+                self.command(self.binary, "recover", image, *selection, "--offline-image")
+            checked = json.loads(self.command(self.binary, "check", image, *selection))
+            check(checked["clean"] is True and checked["complete"] is True
+                  and checked["namespace_complete"] is True and checked["issues"] == [],
+                  "explicit native recovery did not restore complete clean ownership")
+            check(hmac.compare_digest(masked_digest(image, hint_ranges), unaffected),
+                  "recovery changed bytes outside repaired fields and declared hint updates")
+            if bits == 32:
+                free = [cluster for cluster in range(2, inventory["clusters"] + 2)
+                        if int.from_bytes(inventory["fats"][0][cluster * width:(cluster + 1) * width],
+                                          "little") & mask == 0]
+                with image.open("rb") as stream:
+                    stream.seek(base + info * sector + 488)
+                    hints = stream.read(8)
+                    check(int.from_bytes(hints[:4], "little") == len(free)
+                          and hints[4:] == bytes([255]) * 4, "recovery primary hints differ from native allocation")
+                    if damage == "fsinfo":
+                        stream.seek(base + (backup + info) * sector + 488)
+                        hints = stream.read(8)
+                        check(int.from_bytes(hints[:4], "little") == len(free)
+                              and int.from_bytes(hints[4:], "little") == (free[0] if free else 0xFFFFFFFF),
+                              "FSInfo backup hints differ from native allocation")
+            selected = image
+            if base:
+                selected = self.root / f"recovery-fat{bits}-s{sector}-{damage}-selected.img"
+                with selected.open("xb") as output, image.open("rb") as source:
+                    source.seek(base)
+                    remaining = native.stat().st_size
+                    while remaining:
+                        data = source.read(min(1024 * 1024, remaining))
+                        check(bool(data), "bounded recovery result is truncated")
+                        output.write(data)
+                        remaining -= len(data)
+            after = native_inventory(selected)
+            for path, entry in inventory["entries"].items():
+                actual = after["entries"][path]
+                check(entry["record"] == actual["record"] and entry["lfn"] == actual["lfn"]
+                      and entry["chain"] == actual["chain"], "recovery changed native names/metadata/allocation")
+                if not entry["directory"]:
+                    check(hmac.compare_digest(entry["allocated_digest"], actual["allocated_digest"]),
+                          "recovery changed payload or slack")
+            self.command("fsck.fat", "-n", selected)
+            for name, data in payloads.items():
+                check(self.command("mcopy", "-i", selected, f"::/{name}", "-") == data,
+                      f"native payload differs after {damage} recovery: {name}")
+            self.mounted(selected, payloads)
+            check(hmac.compare_digest(digest(native), frozen), "recovery changed the retained original")
+            results.append({"damage": damage, "damaged_sha256": damaged,
+                            "recovered_sha256": digest(image), "operation": report["operation"],
+                            "repair_report": repair_output, "result": "passed"})
+        return results
 
     def protected(self, bits: int) -> dict[str, object]:
         """Exercise the existing sidecar-backed writer, then a fresh reader.
@@ -1373,6 +1930,8 @@ def main() -> None:
                         help="also require native/FUSE writable round trips for both dialects and sector sizes")
     parser.add_argument("--protected-mounted", action="store_true",
                         help="also require sidecar-backed writable and fresh read-only mounts for both dialects")
+    parser.add_argument("--maintenance-mounted", action="store_true",
+                        help="also require native grow/shrink/relocation/root-growth output mounts")
     args = parser.parse_args()
     # mtools interprets argv using the native locale. Under C it writes the
     # UTF-8 bytes of cafe-with-accent as two different Unicode characters.
@@ -1397,9 +1956,11 @@ def main() -> None:
     if facade:
         check(os.access(facade, os.X_OK), "public facade consumer is not executable")
     tools = ["mkfs.fat", "fsck.fat", "mcopy", "mmd"]
-    if facade or args.writable_mounted or args.protected_mounted:
+    if facade or args.writable_mounted or args.protected_mounted or args.maintenance_mounted:
         tools.append("mdir")
-    if args.mounted or args.writable_mounted or args.protected_mounted:
+    if args.maintenance_mounted:
+        tools.append("mdel")
+    if args.mounted or args.writable_mounted or args.protected_mounted or args.maintenance_mounted:
         tools.append("fusermount3")
         check(Path("/dev/fuse").exists(), "--mounted requires /dev/fuse; no skip credit")
     for tool in tools:
@@ -1413,6 +1974,12 @@ def main() -> None:
     if facade:
         report["facade_sha256"] = digest(facade)
     try:
+        if args.maintenance_mounted:
+            for bits in (16, 32):
+                for sector, bounded in ((512, False), (4096, True)):
+                    scenario = run.maintenance(bits, sector, bounded)
+                    report["scenarios"].append(scenario)
+                    print(json.dumps(scenario), flush=True)
         if args.protected_mounted:
             for bits in (16, 32):
                 scenario = run.protected(bits)
@@ -1425,16 +1992,17 @@ def main() -> None:
                     report["scenarios"].append(scenario)
                     print(json.dumps(scenario), flush=True)
         for bits in (16, 32):
-            scenario = run.dialect(bits, args.mounted or args.writable_mounted or args.protected_mounted)
+            scenario = run.dialect(bits, args.mounted or args.writable_mounted or args.protected_mounted or args.maintenance_mounted)
             report["scenarios"].append(scenario)
             print(json.dumps(scenario), flush=True)
-            formatted = run.formatted(bits, args.mounted or args.writable_mounted or args.protected_mounted)
+            formatted = run.formatted(bits, args.mounted or args.writable_mounted or args.protected_mounted or args.maintenance_mounted)
             report["scenarios"].append(formatted)
             print(json.dumps(formatted), flush=True)
-            populated = run.populated(bits, args.mounted or args.writable_mounted or args.protected_mounted)
+            populated = run.populated(bits, args.mounted or args.writable_mounted or args.protected_mounted or args.maintenance_mounted)
             report["scenarios"].append(populated)
             print(json.dumps(populated), flush=True)
-        report["status"] = "passed"
+        complete_report(report, 6 + 4 * args.writable_mounted + 2 * args.protected_mounted
+                        + 4 * args.maintenance_mounted)
     except BaseException as error:
         report.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise

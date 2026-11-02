@@ -1,5 +1,42 @@
 # FEATURE_PARITY
 
+> **Native FAT maintenance qualified (2026-11-02, bd-ave6y):** the existing
+> resize/recovery engines execute the new maintenance mode in the permanent
+> native verifier. FAT16/FAT32 at 512-byte/plain and4KiB/bounded geometry pass
+> grow, free-tail shrink and live-tail relocation; FAT16 fixed roots expand,
+> and native FAT32 root chains grow and relocate. Fourteen resize outputs pass
+> native fsck/mtools and fresh read-only FUSE; the10grow/relocate/root-expand
+> outputs also pass bidirectional native/FrankenFS writes. Raw names/aliases/LFNs,
+> attributes/times, chain mappings, dot parents,
+> directory bytes, payload/slack and frozen source/neighbor hashes are checked.
+> Sixteen damaged native copies pass mirror/dirty/parent and FAT32 FSInfo/boot
+> recovery, with explicit authorities, unchanged diagnosis/dry-run and exact
+> preservation outside independently checked hint words. Actual cancellation,
+> source-race and FAT-backed ENOSPC leave truthful retained partial outputs.
+>
+> The final release invocation passes16scenarios,2554commands with expected
+> statuses and49actual FUSE sessions, preserving all12older profiles. ELF SHA
+> edad94f2725601d03ef292683f7a8913e7120eb0d0c50e8846c463f20c905cfc;
+> 886Rust/build inputs match both workers and local source. Owning tests pass
+> 540library+2public consumers; affected CLI/facade/harness pass3276 with
+> 0failed/20existing ignores/0filtered. The native CLI wrapper explicitly
+> passes1 with42filtered; the literal CLI binary anchor runs0tests and earns
+> no capability credit. Workspace/all-target check104215ms, strict Clippy
+> 126330ms and formatting pass. The full harness benchmark exits0 in1472029ms,
+> with60started/60analyzed;31historical comparisons regress and13improve on
+> the shared worker. This is maintenance, with no incumbent-relative win.
+>
+> Active-FAT/high-bit/bad-cluster/preallocation and exhaustive publication-cut
+> guarantees have executed Rust/storage-model evidence; the native corpus uses
+> normally mirrored mkfs images. Root/Linux FUSE and process interruption do
+> not establish Windows, hardware power-loss or field reliability. CLI resize
+> help now exposes the existing relocation/root-growth options correctly.
+> Report collection refuses empty/missing/failed final selections; five planted
+> collector negatives are capture/unit controls, separate from native proof.
+> Exact commands, failures and audit: `.beads/pending_tasks.md`,
+> [native profile](docs/FAT_RESIZE_PROFILE.md#executed-native-profile-2026-11-02-bd-ave6y)
+> and `artifacts/implementation/20261030_O221Lk/resume14-*`.
+
 > **Writable FAT qualification (2026-11-02, bd-lby8f):** runtime fixes in396d8f0cff
 > corrects three actual mounted defects: Unicode creation collisions now retain
 > EEXIST, ordinary FUSE truncate/killpriv probes receive truthful absent native

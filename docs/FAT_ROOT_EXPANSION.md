@@ -79,9 +79,16 @@ and runner SHA-256
 The retained log is `native-fat-root-workload-8dae-positive-0327.log` under
 `~/Library/Logs/frankenfs-verification/`; native evidence is retained on CSD in
 `/data/ssd/tmp/ffs-native-verification-7CWV8iQw/fat-root-8dae-native-a_dxn2cp`.
-Only this component of the runner was executed in that invocation. Native
-4096-byte-sector relocation, mounted operation, bootability, field use and later
-streaming changes remain outside this evidence.
+Only this component of the runner was executed in that historical invocation.
+It does not qualify later streaming changes, other geometries or mounts.
+
+The 2026-11-02 `bd-ave6y` campaign additionally executes FAT16 fixed-root
+expansion at 512/4096-byte sectors and FAT32 native root-chain growth followed
+by live-tail relocation. Native record/chain/slack preservation, native and
+FrankenFS write interchange, fsck and fresh FUSE output mounts pass. See the
+[current native maintenance profile](FAT_RESIZE_PROFILE.md#executed-native-profile-2026-11-02-bd-ave6y)
+for exact source/ELF, sizes, counts and retained evidence. Bootability and field
+use remain outside these results.
 
 A separate operation-output probe reopened this exact expanded image through
 the previously qualified public `ffs` consumer (SHA-256 `e862954f...e4ef48`)

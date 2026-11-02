@@ -55,7 +55,14 @@ crash atomicity or proof of pre-existing payload integrity. Failure may leave a
 partially repaired dirty image, with no automatic cleanup writes. Interrupted
 changes can require another diagnostic pass on a retained copy.
 
-This implementation has authored Rust regressions but has not been compiled or
-executed in the authoring environment. Native fsck/mtools/Windows qualification
-and kernel-FUSE integration are not established. Test only disposable copies
-until those execution checks have been completed.
+The original authoring environment lacked Cargo. The 2026-11-02 `bd-ave6y`
+campaign now executes the complete `ffs-fat` package (540 library and two public
+consumers, zero failures/ignores/filters). Four private native-produced
+FAT16/FAT32 images at 512/4096-byte sectors receive a corrupt `..` pointer.
+Read-only diagnosis and dry-run preserve bytes; explicit parent repair leaves
+dirty state, then separately requested ordinary recovery restores clean state.
+Exact byte/record/chain/payload checks, native fsck/mcopy and fresh FUSE reads
+pass, including bounded-image neighbors. See the
+[executed maintenance profile](FAT_RESIZE_PROFILE.md#executed-native-profile-2026-11-02-bd-ave6y)
+for source binding and logs. Windows, hardware power loss and field reliability
+remain unqualified; retain a separate copy before attempting recovery.
