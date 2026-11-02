@@ -126,6 +126,47 @@ fn transport_flag_and_killpriv_probes_preserve_native_bytes_and_validate_inodes(
 }
 
 #[test]
+fn full_fixed_root_returns_enospc_without_changing_native_bytes() {
+    use std::io::{Seek as _, Write as _};
+
+    let (directory, fs) = writable_fat16();
+    let (start, length) = fs.volume.geometry.fixed_root().unwrap();
+    drop(fs);
+    let image = directory.path().join("volume.fat");
+    let mut bytes = std::fs::read(&image).unwrap();
+    for (index, entry) in bytes[start as usize..(start + length) as usize]
+        .chunks_exact_mut(32).enumerate()
+    {
+        if entry[0] == 0 || entry[0] == 0xE5 {
+            // Valid empty 8.3 files: no data allocation and no LFN records.
+            entry.fill(0);
+            entry[..11].copy_from_slice(format!("F{index:07}BIN").as_bytes());
+            entry[11] = 0x20;
+        }
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).open(&image).unwrap();
+    file.seek(std::io::SeekFrom::Start(start)).unwrap();
+    file.write_all(&bytes[start as usize..(start + length) as usize]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let cx = Cx::for_testing();
+    let args = crate::reader::ImageArgs {
+        image, offset: 0, length: None,
+        oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii, sidecar: None,
+    };
+    let volume = crate::reader::replacement::open_volume(&cx, &args, true).unwrap();
+    assert!(volume.check(&cx).unwrap().clean);
+    let fs = FatFs::new_with_mode(&cx, volume, 1000, 1000, true).unwrap();
+    let mut scope = RequestScope::empty();
+    assert!(fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free > 0);
+    for name in ["NEW.BIN", "Long native café name.bin"] {
+        expect_errno(fs.create(&cx, &mut scope, ROOT, OsStr::new(name), 0o644, 1000, 1000), libc::ENOSPC);
+        expect_errno(fs.mkdir(&cx, &mut scope, ROOT, OsStr::new(name), 0o755, 1000, 1000), libc::ENOSPC);
+        assert_eq!(raw_image(&directory), bytes);
+    }
+}
+
+#[test]
 fn fallocate_grows_dense_native_allocation_and_preserves_existing_payload() {
     for kind in ["fat16", "fat32"] {
         let (directory, fs) = writable_fat(kind);
