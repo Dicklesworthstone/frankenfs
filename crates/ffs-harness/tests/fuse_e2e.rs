@@ -162,6 +162,10 @@ fn require_fuse_turns_missing_prerequisites_into_a_failure_bd_53dub() {
             require_oracle_or_skip("e2fsck");
             return;
         }
+        if probe == "kernel_reference" {
+            let _ = kernel_ro_mount(Path::new("absent.img"), "ext4", Path::new("absent-mount"));
+            return;
+        }
         assert!(
             !fuse_available(),
             "PATH is empty, so the prerequisites cannot be found"
@@ -211,6 +215,12 @@ fn require_fuse_turns_missing_prerequisites_into_a_failure_bd_53dub() {
             "FFS_REQUIRE_ORACLES",
             "FFS_REQUIRE_ORACLES=1 but required oracle",
             "SKIP oracle_unavailable",
+        ),
+        (
+            "kernel_reference",
+            "FFS_REQUIRE_FUSE",
+            "FFS_REQUIRE_FUSE=1 but the mounted test could not run",
+            "SKIP fuse_unavailable",
         ),
     ] {
         let (required_ok, required_text) = run_child(true, probe, contract);
@@ -1895,11 +1905,19 @@ impl Drop for KernelRoMount {
 /// is the reference reader here, so a mount it REFUSES is a test failure,
 /// while a host without loop/mount capability is a capability skip.
 fn kernel_ro_mount(image: &Path, fstype: &str, mountpoint: &Path) -> Option<KernelRoMount> {
-    let attached = Command::new("sudo")
+    let attached = match Command::new("sudo")
         .args(["-n", "losetup", "--find", "--show", "--read-only"])
         .arg(image)
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            require_fuse_or_skip(&format!(
+                "kernel reference loop attach could not execute: {error}"
+            ));
+            return None;
+        }
+    };
     if !attached.status.success() {
         require_fuse_or_skip(&format!(
             "kernel loop attach unavailable: {}",
@@ -13191,6 +13209,14 @@ fn create_btrfs_image_with_subvolumes(dir: &Path) -> Option<(PathBuf, Vec<String
         .output()
         .expect("btrfs snapshot");
     let has_snapshot = out.status.success();
+    if !has_snapshot {
+        eprintln!(
+            "native btrfs snapshot creation failed: {}\nstdout:\n{}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     if has_snapshot {
         // Write different content in snapshot
         let snap_marker = snap_path.join("snapshot_marker.txt");
@@ -20994,7 +21020,7 @@ fn btrfs_fuse_mount_snapshot_scopes_root_to_snapshot() {
         return;
     };
     if !snaps.contains(&"snap-data".to_string()) {
-        eprintln!("snapshot creation was not successful, skipping snapshot test");
+        require_fuse_or_skip("native btrfs snapshot fixture creation failed");
         return;
     }
 

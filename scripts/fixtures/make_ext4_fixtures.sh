@@ -4,7 +4,7 @@
 # This script creates reproducible ext4 filesystem images for conformance testing.
 # It uses debugfs for rootless population (no sudo required for basic content).
 #
-# Usage: ./scripts/fixtures/make_ext4_fixtures.sh
+# Usage: ./scripts/fixtures/make_ext4_fixtures.sh [--images-only]
 #
 # Output:
 #   tests/fixtures/images/ext4_small.img   (16 MiB)
@@ -15,6 +15,15 @@
 
 set -euo pipefail
 IFS=$'\n\t'
+
+IMAGES_ONLY=0
+if [[ $# -gt 0 ]]; then
+    if [[ $# -ne 1 || "$1" != "--images-only" ]]; then
+        echo "Usage: $0 [--images-only]" >&2
+        exit 2
+    fi
+    IMAGES_ONLY=1
+fi
 
 # Navigate to repo root
 cd "$(dirname "$0")/../.."
@@ -32,7 +41,10 @@ RCH_AGENT_TARGET_SUFFIX="${AGENT_NAME:-${USER:-agent}}"
 RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_frankenfs_ext4_fixtures_$RCH_AGENT_TARGET_SUFFIX}"
 
 # Ensure directories exist
-mkdir -p "$IMAGES_DIR" "$GOLDEN_DIR"
+mkdir -p "$IMAGES_DIR"
+if [[ "$IMAGES_ONLY" == "0" ]]; then
+    mkdir -p "$GOLDEN_DIR"
+fi
 
 rch_allow_env() {
     local name="$1"
@@ -71,7 +83,9 @@ write_golden_checksums() {
 }
 
 # Start logging
-exec > >(tee -a "$LOG_FILE") 2>&1
+if [[ "$IMAGES_ONLY" == "0" ]]; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 echo "=============================================="
 echo "ext4 Fixture Generation"
@@ -105,7 +119,12 @@ create_image() {
 
     # Create zero-filled image
     echo "  [1/4] Creating empty image..."
-    dd if=/dev/zero of="$img_path" bs=1M count="$size_mb" status=progress 2>&1
+    if [[ "$IMAGES_ONLY" == "1" ]]; then
+        # Clean-checkout provisioning must refuse an existing fixture.
+        dd if=/dev/zero of="$img_path" bs=1M count="$size_mb" conv=excl status=progress 2>&1
+    else
+        dd if=/dev/zero of="$img_path" bs=1M count="$size_mb" status=progress 2>&1
+    fi
     echo ""
 
     # Format as ext4
@@ -131,7 +150,7 @@ populate_image() {
     # Create temporary files for content
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    trap "rm -rf $tmp_dir" RETURN
+    echo "  Retained native producer content: $tmp_dir"
 
     # README.txt content
     cat > "$tmp_dir/README.txt" << 'EOF'
@@ -182,6 +201,11 @@ create_image "ext4_medium" 64 "extent,filetype,dir_index"
 
 # Large: add sparse_super (optimized superblock placement)
 create_image "ext4_large" 128 "extent,filetype,dir_index,sparse_super"
+
+if [[ "$IMAGES_ONLY" == "1" ]]; then
+    echo "Native ext4 input images are ready; expected golden files are unchanged."
+    exit 0
+fi
 
 echo "=== Phase 2: Building FrankenFS CLI ==="
 echo ""

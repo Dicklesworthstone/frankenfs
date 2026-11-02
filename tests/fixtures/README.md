@@ -30,6 +30,16 @@ tests/fixtures/
 
 ### ext4
 
+For a clean checkout's native unit-test inputs, CI uses:
+
+```bash
+./scripts/fixtures/make_ext4_fixtures.sh --images-only
+```
+
+This creates all three native ext4 images with exclusive creation, retains
+producer scratch and leaves the committed golden JSON and checksums unchanged.
+An existing image path makes provisioning fail.
+
 ```bash
 ./scripts/fixtures/make_ext4_fixtures.sh
 ```

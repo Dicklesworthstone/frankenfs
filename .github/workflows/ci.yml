@@ -118,6 +118,13 @@ jobs:
           sudo mkdir -p /data/tmp
           sudo chmod 1777 /data/tmp
 
+      - name: Generate native ext4 unit-test inputs
+        run: |
+          ./scripts/fixtures/make_ext4_fixtures.sh --images-only
+          for image in tests/fixtures/images/ext4_*.img; do
+            e2fsck -fn "$image"
+          done
+
       # vendor/fuser is outside the workspace, so `--workspace` never runs its
       # tests. The FUSE_INTERRUPT routing FrankenFS added there (bd-gk01h) is
       # ours; run it with the ABI the workspace builds. (The filter skips
@@ -128,7 +135,7 @@ jobs:
       - name: Unit tests
         env:
           FFS_REQUIRE_ORACLES: "1"
-        run: cargo test --workspace
+        run: cargo test --workspace -- --nocapture
 
       # The ext4 reference and kernel-differential suites compare against
       # mkfs.ext4/debugfs output. Without e2fsprogs those tests report a skip
@@ -303,7 +310,6 @@ jobs:
   fuse-e2e:
     name: FUSE E2E
     runs-on: ubuntu-latest
-    needs: lint-and-test
 
     steps:
       - name: Checkout
@@ -319,6 +325,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs attr
+          # fusermount3 needs this for fuser's automatic-unmount helper.
+          if ! grep -qxF user_allow_other /etc/fuse.conf; then
+            printf '%s\n' user_allow_other | sudo tee -a /etc/fuse.conf
+          fi
 
       - name: Verify FUSE availability
         run: |
@@ -328,13 +338,15 @@ jobs:
 
       - name: Build test binaries
         run: |
-          cargo build -p ffs-cli --bins
+          cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount
+          cargo build --release -p ffs-repair --bin ffs-image-repair
           cargo test -p ffs-harness --no-run
           mkdir -p "$RUNNER_TEMP/ffs-cli-proof/bin" "$RUNNER_TEMP/ffs-cli-proof/artifacts"
-          cp target/debug/ffs-cli target/debug/ffs-protected-mount "$RUNNER_TEMP/ffs-cli-proof/bin/"
+          cp target/release/ffs-cli target/release/ffs-protected-mount target/release/ffs-image-repair "$RUNNER_TEMP/ffs-cli-proof/bin/"
           {
             echo "FFS_CLI_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-cli"
             echo "FFS_PROTECTED_MOUNT_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-protected-mount"
+            echo "FFS_IMAGE_REPAIR_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-image-repair"
             echo "FFS_CLI_SOURCE_STAMP=$GITHUB_SHA"
             echo "FFS_CLI_ARTIFACT_DIR=$RUNNER_TEMP/ffs-cli-proof/artifacts"
           } >> "$GITHUB_ENV"
