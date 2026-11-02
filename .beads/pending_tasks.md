@@ -41,6 +41,26 @@ completed or handed off. Historical evidence remains in place.
   dependency profile, unchanged1800s deadline and no test filters/new ignores.
   Running from01:40UTC on hz3 with-j2 and4test threads, after actual/tmp
   SBH20GiB passes; resume12-root-workspace-tests-warm.log retains full output.
+- [x] Diagnose slower native-image execution in the warm run: the actual test
+  process uses root-backed/data/projects/frankenfs/.rch-tmp, while build output
+  is on/tmp. Retained process namespace/environment confirms this; host I/O
+  PSI is high. Keep the running job and peer data intact.
+- [x] Validate RAM-backed test scratch inside hz4's existing managed target
+  using Cargo's command-only TMPDIR override and one unchanged native checker
+  test. Fresh actual-volume SBH passes at39734534144free bytes. Probe is
+  passes1/0/0 with1623filtered in46.26s after compile5m28s: unchanged native
+  checker is CLEAN at2000/5000/20000files. Command0, unchanged source/fixture
+  hashes. This standalone default selection has1624cases; workspace feature
+  unification selects1703core cases. No cross-host speedup claim.
+- [x] Finish the final full core library within the workspace run:1678passed/
+  0failed/25existing ignores/0filtered in832.03s; native freshness fsync and
+  both final public-read regressions pass. This is still a partial workspace
+  result; btrfs crash-window integration is now executing.
+- [ ] Finish all non-core workspace packages on hz4 using validated managed
+  RAM scratch and the same checked dependency profile. This explicitly
+  declared complementary selection excludes only ffs-core, which remains in
+  the original full run; no individual test filters or new ignores. Fresh SBH
+  precedes the lane; resume12-root-remaining-workspace-ram.log starts02:03UTC.
 - [x] Re-read instructions/README, inspect unchanged candidate and owned P0,
   local source-aware queue/cycles and reservations; preserve peer/untracked work.
 - [x] Correct the overbroad infrastructure hold: written policy permits
