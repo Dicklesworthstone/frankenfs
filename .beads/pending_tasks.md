@@ -2,6 +2,28 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-02, continued after ff056ce92
+
+- [x] Preserve the15untracked paths; confirm source-aware queue53claimable/
+  0foreign, empty cycles, and the original owned bd-53dub conditions.
+- [x] Check actual CI:41499312225 now executes unit/FUSE jobs; its native ext4
+  producer passes. Current-source41514226494 remains queued. No hosted mount
+  pass is inferred from a running/building job.
+- [x] Resume bd-53dub and reserve only the existing census/parity/TODO surfaces.
+  hz3 root headroom recovers to51GiB; actual target SBH20GiB probe passes
+  73.7%free. Keep every admission floor/slot/deadline unchanged.
+- [ ] Finish ordinary RCH census no-run onhz3; fetch its exact worker ELF,
+  match SHA256, run the entire unchanged metadata target against actual local
+  Git and record the result. Close the last owning-target gap only on that run.
+- [ ] Inspect actual hosted mounted/oracle results and original AC before any
+  bd-53dub closure. Keep missing hosted proof in the original item.
+- [ ] Re-evaluate the next critical filesystem capability using current source
+  and the safe queue. bd-w2u82 already has its loop transport implementation;
+  its remaining measurement needs a quiet window/build-freeze disposition.
+  Prefer genuine remaining capability over duplicate wiring or meta-tests.
+- [ ] Implement and verify the selected task with appropriate gates; update
+  Beads and this checklist on executed evidence, then deliver both Git refs.
+
 ## Active oracle/mount evidence wiring — 2026-11-02 (`bd-53dub`, NavyElm)
 
 - [x] Confirm prior delivery6442c489b, source-aware ready queue54claimable/
