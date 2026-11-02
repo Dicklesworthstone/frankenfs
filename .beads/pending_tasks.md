@@ -12,24 +12,66 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   e2e_skip already fails under either required flag. Remaining bypasses are
   differential custom SKIP/XFAIL paths and swallowed mutation errors, forensic
   prerequisite/readiness returns, and the ext4 smoke fixture's disabled journal.
-- [ ] Reproduce missing-capability/failed-mutation false greens with retained
-  negative controls; preserve original source and all meaningful assertions.
-- [ ] Wire forensic prerequisites/readiness through the existing contracts;
-  make every optional skip machine-greppable, with executed oracle/mount markers.
-- [ ] Make the current differential default require successful build, real
+- [x] Reproduce missing-capability false green with retained original source:
+  original differential exits0/PASSED with missing mkfs.btrfs under both
+  required flags; current script exits1 before image creation. Shared shell
+  probes also preserve optional SKIP and fail either required contract.
+- [x] Wire forensic prerequisites/readiness and native mount failures through
+  existing contracts. Core markers retain actual oracle exits/stdout/stderr;
+  optional skips are greppable. Empty-PATH children cover e2fsck and btrfs,
+  FUSE availability, the actual forensic entry point and missing e2fsck.
+- [x] Make the current differential default require successful build, real
   mounted mutations, native check and selected Rust checks; retain explicit
   optional diagnostics without awarding them current native writer evidence.
-- [ ] Run journaled ext4 write smoke plus independent e2fsck and reopen; keep
-  its original crash/recovery phase rather than shrinking the target.
-- [ ] Execute current btrfs differential with default expectations; fix gate
-  wiring only in this lane. If native correctness fails, retain concrete images,
-  oracle output and operation logs as the original task permits, not XFAIL-green.
-- [ ] Execute required-missing-oracle/mount and failed-final-operation controls;
-  run owning/affected Rust tests and workspace fmt/check/strict Clippy through
-  admitted ordinary RCH. Keep all source/ELF/tool/image identities explicit.
+  No runtime filesystem algorithm changes. The existing100-entry/20-xattr/
+  10-rename selection remains; fresh RO reopen checks names/data/mode/21xattrs.
+- [x] Run journaled ext4 write smoke plus independent e2fsck and reopen, keeping
+  all500baseline files and original SIGKILL/recovery phase. Full worker runs2,
+  3and4 pass; the first warns-only logging override failed the recovery-evidence
+  assertion and is retained. Normal trace logging supplies that evidence.
+- [x] Execute differential with default PASS expectation. Native run3 passes
+  15checks using an explicitly prebuilt CLI. Run4 includes the original real
+  release build and passes16checks,0FAIL/XFAIL/SKIP, including50writeback/
+  14crash_consistency tests and strict Clippy via ordinary RCH. No build/test
+  output is fabricated by the temporary fixed-command transport. The earlier
+  controller mount-denied run and worker admission103 failures remain failures.
+- [x] Execute failed-final-operation control: the complete strict script hits
+  a planted exit73 at rename step10 and exits1 with its original diagnostic.
+  This is a subprocess negative control, not additional native capability.
+- [x] Core library full required-oracle selection:1600passed,0failed,
+  24existing ignores,0filtered;139e2fsck and55btrfs_check invocations. Some
+  intentionally diagnose damaged fixtures; these are not194clean images.
+- [x] Preserve initial full strict FUSE failure277passed/12failed/8existing
+  ignores. Eleven missing CLI proof inputs drove CI provisioning; the other
+  fixture had native journal start59/end491, so it did not exercise wrap.
+  Keep700expected files and the hard captured-image end<start assertion;
+  bounded extra native transactions may advance the fixture without changing
+  its namespace/payloads. Exact regression passes1onhz3 and1onhz4, each
+  296filtered. Both observed extra_transactions0; the new advancing branch
+  has not been observed executing and receives no separate coverage credit.
+- [ ] Finish fully provisioned strict FUSE suite onvmi1152480; retain every
+  actual failure and any feature-specific SKIPs separately from mount proof.
+- [ ] Finish full ffs-harness package and required full harness benchmark.
+  Benchmark is maintenance, with no incumbent comparison or speedup claim.
+- [ ] Finish final workspace/all-target check and strict Clippy. Earlier full
+  workspace check501988ms and Clippy236981ms pass before the final fixture edit;
+  current source needs the final repeat. Formatting/shell syntax/diff-check pass.
+- [x] Run full changed-code UBS without exclusions: latest5-file scan exits0,
+  0critical/20064warnings/3959info. Initial33critical Python-command-string
+  findings drove retained-input-file transport; a real subprocess regression
+  preserves quoted/UTF8 arguments, stderr and nonzero exit. No suppression or
+  security-vulnerability claim. Keep all scanner reports and existing warnings.
+- [x] Bind current886Rust/build inputs to local source,hz3 andvmi; retain shell,
+  native tool,image and ELF identities. Run4's newly built CLI SHA256 is
+  c1f3080ef34590b702bde9257055db1bb1faa8aa78ba953f716871fff096bac3.
+  Earlier strict-FUSE CLI proofs use separately retained e6e562e3/2d12827b
+  binaries; later source changes are tests/CI only, not production algorithms.
+  Native shell artifact git_sha is honestly unknown in the isolated runtime
+  copy; script/ELF hashes and the controller's real RCH invocations bind it.
 - [ ] Verify CI sets both flags for evidence lanes and actually consumes the
   journaled/differential tests. Report local CI-equivalent vs GitHub execution
-  separately; no claimed hosted CI result without an observed run.
+  separately. Run41485778495 on4efb06a0a has passed hosted Clippy/check and is
+  executing tests; no hosted test/FUSE success is claimed until observed.
 - [ ] Review complete gate diff and bounded honesty inventory; update original
   Bead/parity on executed evidence, preserve any unmet conditions, commit and
   deliver both required remote refs. No test/golden/deadline weakening.
