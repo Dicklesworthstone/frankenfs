@@ -11,16 +11,37 @@
 > not16native workloads. Core library tests pass1600/0failed/24existing ignores,
 > with139e2fsck and55btrfs-check invocations, including damaged-image controls.
 >
-> A strict full FUSE attempt remains283passed/6failed/8existing ignores;
-> missing image-repair CLI provisioning caused all six failures. After supplying
-> it, the six protected corruption/restart/scrub/periodic-commit tests pass under
-> a privileged runner. Non-root automatic unmount was refused by host fuse.conf;
-> CI now provisions its prerequisite explicitly. Full package and hosted proof
-> remain pending, so the original Bead stays open. Workspace/all-target check,
-> strict Clippy, formatting and full changed-code UBS pass (0critical; existing
-> warnings retained). Full harness benchmarks finish60/60, with no incumbent
-> comparison or speedup claim. No filesystem algorithm or parity percentage
-> changed. Exact commands, source/ELF/tool/image identities, failed attempts and
+> Full strict FUSE now passes289/0failed/8existing ignores/0filtered in379.10s
+> under a privileged private mount namespace. Eight explicit kernel/transport
+> unsupported-scenario SKIPs remain distinct from those ignores; both1000-pair
+> forensic mounts execute and return e2fsck0. All six protected CLI tests execute
+> in this full selection. The earlier288/1run failed a clean unmount with EBUSY
+> after correct readbacks; its cause remains unproven, with no relaxed shutdown
+> assertion or deadline. Earlier missing CLI inputs and non-root auto-unmount
+> refusal are retained. CI now provisions that prerequisite, all three release
+> CLI consumers and an independent FUSE job. A hosted core run1676/2failed on
+> an absent native input image; the existing producer now supplies three ext4
+> inputs through an images-only mode. Its live run passes three native checks,
+> preserves11golden hashes and refuses an existing image. No golden is regenerated.
+>
+> Ordinary harness prefix2297passes/3existing ignores, corrected compile-fail2,
+> kernel-reference17and doctest1pass. The earlier sudo-rs -E runner dropped strict
+> flags and Cargo discovery; its prefix receives ordinary unit credit only.
+> Selected-variable preservation verifies actual flags and Cargo launch. Full
+> package aggregation has2657unique passes/11existing ignores/0filtered across
+> 28target results. Three Git-dependent metadata targets pass with current,
+> hash-verified worker binaries against the real controller checkout. One census
+> target remains pending: the unchanged validator exposes three stale counts,
+> now repaired against all90actual Git-index sources, without classification or
+> validator changes. Its fresh build is refused by worker admission; it earns
+> static data-verification credit only. No successful full-package invocation
+> is claimed. Current hosted proof is still queued; bd-53dub stays BLOCKED with
+> both unmet conditions retained in the original item.
+> Workspace/all-target check, strict Clippy, formatting and six-file changed-code
+> UBS pass (0critical; existing warnings retained); final delivery scan and
+> formatting pass too. Full harness benchmarks finish60/60, with no incumbent comparison or
+> speedup claim. No filesystem algorithm or parity percentage changed.
+> Exact commands, source/ELF/tool/image identities, failed attempts and
 > proof limits: `.beads/pending_tasks.md` and
 > `artifacts/implementation/20261030_O221Lk/resume15-*`.
 

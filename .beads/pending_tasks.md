@@ -65,7 +65,72 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   Targeted6pass does not convert the283/6full invocation into a full pass.
 - [ ] Finish full ffs-harness package with all three CLI proofs and the
   explicitly privileged runner. hz4 no-run passes/RCH172204ms, but subsequent
-  root-disk admission refuses execution; actual full selection now runs onhz3.
+  root-disk admission refuses execution. The hz3 attempt records19snapshot
+  failures after privileged Cargo metadata discovery returns ENOENT and Insta
+  anchors at the crate directory. Preserve its log; cancel only owned build
+  30089403917402508 through wrapper rchw-8ec7302c-3a5e-4e82-a4e5-f070ccf023bb,
+  exit143, not a complete test result. No snapshot is regenerated. An actual
+  previously failing snapshot passes1/0/2080filtered with the documented
+  INSTA_WORKSPACE_ROOT pointing at the real checkout. The next complete-package
+  attempt passes2080library/1existing ignore,3main binary,103mounted-benchmark
+  binary,7btrfs reference and104conformance/2existing ignores, all0filtered;
+  it then fails both compile-fail tests because nested Cargo cannot launch.
+  RCH101/1021849ms, not a full pass. Worker sudo-rs ignores -E: it strips Cargo
+  discovery AND both required flags, so this prefix earns ordinary unit proof,
+  not strict mount/oracle proof. The earlier root targeted-six invocation sets
+  variables after sudo and retains its strict evidence. A real selected-env
+  control now verifies both flags equal1 and successfully launches Cargo.
+  Corrected ordinary RCH compile-fail selection passes2/0/0/0filtered in584.47s;
+  its actual compiler diagnostics match the unchanged expected files. Doctests
+  pass1/0/0/0filtered onvmi. Stop only the owned unstarted hz4 remainder wrapper
+  with SIGTERM after root headroom falls to5.6GiB; queue empties, exit-15 earns
+  no test proof. Stage and verify the same three CLI hashes on admittedvmi;
+  The next strict vmi run passes the first11integration targets (31tests), then
+  FUSE288/1failed/8existing ignores/0filtered in420.93s, RCH101/476964ms.
+  The sole failure is btrfs_cli_attached_devices_read_seeded_files: mounted
+  readbacks match, but clean unmount returns EBUSY and the guard forcibly stops
+  its child. All six protected CLI tests pass in that full FUSE invocation.
+  No gate is relaxed. The unchanged current compiled test passes1/0with296
+  filtered in72.67s inside a private mount namespace; this diagnostic does
+  not establish a root cause or turn288/1into a pass. Re-execute the complete
+  FUSE target plus the10unreached targets through ordinary RCH with mount
+  namespace isolation and the same strict flags/assertions/workloads/profiles.
+  The first request refuses103/unavailable; a normal worker health probe
+  succeeds and automatic recovery restores admission, without force/enable,
+  daemon restart or policy change. Second request runs with nested Cargo jobs1
+  too. Full FUSE now passes289/0failed/8existing ignores/0filtered in379.10s,
+  with8explicit unsupported-scenario SKIPs and both1000-pair forensic mounts/
+  e2fsck0. Kernel-reference17pass next. The invocation then fails module_census
+  and returns101/613008ms, not a complete package pass. Its worker Git index
+  ce257752 has3093library lines while current source/index has3541; don't edit
+  worker Git or relax assertions. Initial local cached ELF449bb04b is stale;
+  fetch exact worker ELF226746e2, which also exposes actual census drift on the
+  real checkout. All90entries checked against Git: three metadata modules from
+  earlier9828bfaf2grew133/281/247lines. Manually update only those measured
+  counts and four aggregate values, keeping90modules, all classifications and
+  validator code. Correct totals173326/129501meta; conformance share2528basis
+  points, meta7472. This repairs a stale source-count report, earns no feature
+  credit, and admits no new filesystem behavior. Exact refreshed census test
+  remains pending. Last8targets run through RCH with no-fail-fast (failed exit
+  remains failed): parity2passes including real MVCC execution and injected
+  build-failure control, profile3/program-gate4/raid5-1/readiness3/runbook2/
+  visibility1pass. README3pass/1fail reflects the stale worker index's125E2E
+  scripts, not current126; preserve the RCH101/654582ms run. Fetch exact current
+  worker ELFs and verify their SHA256s before running the Git-dependent targets
+  against the real controller checkout: profile3/README4/visibility1all pass.
+  README text and its validator remain unchanged. Unique owning aggregation is
+  2657passed/11existing ignores/0filtered across28target results, with the census
+  target still pending. It is not a single successful full-package invocation.
+  Census JSON SHA2567587542df7fbcc7418f55932f2d3d1d24bfccb6d079607deb365af20333b9347;
+  all90current Git-index entries and totals agree under an independent byte-
+  newline count. Updated data has not earned refreshed compiled-test credit.
+  Warm-worker metadata no-run attempts refuse103under memory/disk pressure;
+  alternate vmi1156319 SBH refuses its unchanged14%free-space floor despite
+  27.1GiBfree (7.0%). Do not lower that percentage or mount a misleading volume.
+  No deletion, ceiling/slot changes or daemon restart. Original Bead is BLOCKED,
+  retaining both exact census-runtime and current-hosted proof requirements.
+  Report
+  exhaustive same-source target aggregation, not a single full-package pass.
   Cargo-j1 matches the worker's advertised single slot, without changing
   RCH slot accounting, admission floors, timeouts or the complete selection.
 - [x] Required full harness benchmark passes/RCH1562259ms,60started/
@@ -73,37 +138,78 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   a unit-test pass. No incumbent comparison or performance improvement.
 - [x] Final workspace/all-target check291318ms and strict Clippy140396ms pass
   after the wrapped-fixture edit. Formatting/shell syntax/diff-check pass.
-  Subsequent code change is CI provisioning only; YAML and all FUSE-job shell
-  blocks parse. Earlier check501988ms/Clippy236981ms are retained separately.
+  The later kernel-helper checks below supersede these for final Rust source;
+  YAML and all FUSE-job shell blocks parse. Earlier check501988ms/
+  Clippy236981ms are retained separately.
+- [x] Final helper review finds kernel_ro_mount's remaining .output().ok()?
+  bypass. Route spawn failure through the same strict contract and add its
+  direct empty-PATH case to the existing parent test. Snapshot fixture creation
+  now reports original native stdout/stderr and fails in required mode when
+  its existing ignored snapshot case is explicitly selected. No ignore removed
+  or added. New negative passes1/0/296filtered in0.22s/RCH148887ms; current
+  workspace check228826ms and strict Clippy257564ms pass after these edits.
 - [x] Run full changed-code UBS without exclusions: latest5-file scan exits0,
-  0critical/20064warnings/3959info, including the fresh full five-file scan.
+  0critical/20064warnings/3959info for five files. The fixture-producer edit
+  expands the complete scan to six files:0critical/20067warnings/3960info,
+  exit0 and no failed modules or exclusions.
+  Delivery scan repeats all six changed code files, plus the JSON argument
+  (UBS recognizes six code files):0critical/20067warnings/3960info, exit0;
+  no exclusions/cache/suppression. Delivery formatting also passes.
   Initial33critical Python-command-string
   findings drove retained-input-file transport; a real subprocess regression
   preserves quoted/UTF8 arguments, stderr and nonzero exit. No suppression or
   security-vulnerability claim. Keep all scanner reports and existing warnings.
-- [x] Bind current886Rust/build inputs to local source,hz3 andvmi; retain shell,
+- [x] Bind the4efb886Rust/build inputs to local source,hz3 andvmi; retain shell,
   native tool,image and ELF identities. Run4's newly built CLI SHA256 is
   c1f3080ef34590b702bde9257055db1bb1faa8aa78ba953f716871fff096bac3.
   Earlier strict-FUSE CLI proofs use separately retained e6e562e3/2d12827b
   binaries; later source changes are tests/CI only, not production algorithms.
   Native shell artifact git_sha is honestly unknown in the isolated runtime
   copy; script/ELF hashes and the controller's real RCH invocations bind it.
+  The final d90d2bf8b886-input manifest matches both hz4 andvmi. Its only
+  difference from the earlier manifest is fuse_e2e.rs; production CLI and
+  benchmark runtime inputs are unchanged. The repeated full-package run onhz4
+  uses those current bytes; hz3's final queued attempt refused103 instead.
+- [x] Diagnose hosted run41485778495: core1676passed/2failed/25ignored;
+  both failures read missing gitignored ext4_small.img. Dependent FUSE job is
+  skipped, not hosted mount proof. Wire the existing native producer before
+  unit tests using a new --images-only mode. Fresh isolated execution creates
+  all three profiles and passes all three e2fsck checks with11copied golden
+  hashes unchanged. RCH_BIN=/absent/rch makes any CLI-build branch fail, yet
+  this mode succeeds. Existing-image repeat exits1/conv=excl; all three image
+  and11golden hashes remain fixed. Producer scratch is retained, not deleted.
+  Expected JSON/checksums and the two original core assertions are unchanged.
 - [ ] Verify CI sets both flags for evidence lanes and actually consumes the
   journaled/differential tests. Report local CI-equivalent vs GitHub execution
-  separately. Run41485778495 on4efb06a0a has passed hosted Clippy/check and is
-  executing tests; no hosted test/FUSE success is claimed until observed.
-- [ ] Review complete gate diff and bounded honesty inventory; update original
-  Bead/parity on executed evidence, preserve any unmet conditions, commit and
-  deliver both required remote refs. No test/golden/deadline weakening.
+  separately. Source d90d2bf8b and metadata3739034e0 are committed/pushed by
+  the external actor; refs main/master both match3739034e01d8fdbc473d1212c736de8eee4f556f.
+  CI41499312225 queues unit and FUSE jobs independently. FUSE builds the three
+  standard release CLI artifacts already qualified here; library test profiles
+  and all assertions stay intact. Unit --nocapture exposes actual oracle
+  receipts. No current hosted test/FUSE success is claimed until observed.
+- [x] Review complete gate diff and bounded honesty inventory; update original
+  Bead/parity on executed evidence and retain unmet conditions in bd-53dub.
+  Final response records the actual delivered commit and both remote refs after
+  execution. No test/golden/deadline weakening; no whole-package pass or closure.
+
+Next capability candidate, read-only triage only: bd-uxh7t. Source-aware queue
+20261102_133100_ffs_tracker_source_hygiene_NIajyg reports53ready/0foreign.
+The existing20,050-file test executes20write+fsync rounds and final native check/
+kernel readback, but the original task also owes initial kernel acceptance,
+smaller-file-count cases and exhausted-resource/reclamation attribution. Verify
+those before closing the old correctness item or promoting fsync performance
+work. No second Bead has been claimed while bd-53dub is active.
 
 ### Bounded review of the oracle/mount block
 
-Window:6442c489b through169775ee2 plus pending CI provisioning and verification;
-solo NavyElm. Runtime Rust source remains4efb06a0a.
+Window:6442c489b through the final bd-53dub handoff; solo NavyElm. The final
+source unit d90d2bf8b changes test/generator/CI setup, not production Rust.
 README purpose: safe native filesystem behavior through FUSE, with explicit
 transaction/durability guarantees. Actual commit inventory: a78c8937e and
 4efb06a0a are ENABLER (strict gates/test transport/CI);71aa7694e and169775ee2
-are PROCESS (claim/checklist/progress). USER0/ENABLER2/PROCESS2/UNKNOWN0;
+are PROCESS (claim/checklist/progress). d90d2bf8b is ENABLER and3739034e0 is
+PROCESS. The final census-data correction and verification handoff is PROCESS,
+giving USER0/ENABLER3/PROCESS4/UNKNOWN0 after its delivery;
 these labels earn no
 feature credit. No Bead is closed by this block yet. Existing filesystem
 algorithms produced the native results; this block makes missing/failed work
@@ -157,14 +263,24 @@ Honesty inventory, reviewed against the actual diffs/reflog and raw receipts:
    SIGKILL classes; no hardware-power-loss, field or performance-win claim).
 9. No (checked: initial277/12and subsequent283/6FUSE results, targeted non-root
    0/6, all admission103s, missing attr, controller mount denial and warn-only
-   log-evidence failure remain retained; only privileged targeted6passed).
+   log-evidence failure remain retained; only privileged targeted6passed.
+   Hosted1676/2and interrupted full-harness19snapshot failures are recorded,
+   with original fixtures/goldens/assertions preserved and no whole-suite pass.
+   The next package prefix passes2297tests but fails2compile-fail tests; sudo-rs
+   ignores -E and drops strict flags, so this prefix is not strict evidence.
+   Corrected compile-fail2and doctest1pass; strict FUSE288/1and its exact
+   private-namespace1pass remain distinct, with no inferred root-cause fix.
+   Full isolated FUSE289/0passes; its next census failure, stale local ELF
+   failure and current-ELF census failure are all retained. Only three other
+   current-ELF metadata targets pass against the real Git index; refreshed
+   census runtime proof and hosted proof remain pending).
 10. No (checked: RPC keeps separate original stdout/stderr; shell suite output
     is explicitly combined. Identical hashes in its existing evidence JSON
     describe that combined log, not two independently captured streams).
 11. No (checked: original bd-53dub AC and current in_progress status; no
     follow-up created to launder hosted/full-suite conditions).
 12. No (checked: canonical scope unchanged; parity will report bounded proof).
-13. No (checked: no subagents or peer closures; four commits appeared from an
+13. No (checked: no subagents or peer closures; six commits appeared from an
     external actor during verification, were preserved and reviewed, and are
     not presented as independently verified or as commits executed by this agent).
 14. No (checked: no delegated work this block).
@@ -180,6 +296,27 @@ Honesty inventory, reviewed against the actual diffs/reflog and raw receipts:
     that omission and non-root auto-unmount host configuration were exposed by
     real failed runs and corrected in CI. Persistent host permissions and
     product mount options are unchanged; privileged proof is named explicitly.
+    The hosted clean checkout also lacked required native input images: the
+    images-only producer supplies inputs, not replacement expected outputs.
+    The first full-package privileged setup lost Cargo discovery and recorded
+    19snapshot failures; a runtime workspace-root setting fixes discovery and
+    a previously failed unchanged snapshot passes. The subsequent prefix reveals
+    sudo-rs ignores -E, dropping strict flags and nested Cargo discovery. A
+    selected-variable preservation control checks actual flags and Cargo launch;
+    corrected remaining targets are pending, not inferred successes.
+    The worker's old Git index also corrupts count validation; the first local
+    metadata binary was stale and failed. Exact worker-ELF hashes precede the
+    subsequent real-checkout tests. The real census additionally drifted by
+    661metadata lines in earlier9828bfaf2; only measured counts/aggregates change,
+    with original classifications/validator code preserved and no filesystem
+    expected outputs admitted. New census runtime proof is still pending.
+    One metadata build was requested after an SSH preflight reset; RCH refused
+    103before compilation. Subsequent orchestration explicitly gates Cargo on
+    preflight success; all remaining admission refusals remain failures.
+    The initial build-id cancel
+    refused wrapper ownership, then exact owned-wrapper cancellation succeeded.
+    New producer/doc reservations were made immediately after their first edit;
+    no conflicting hold was reported, but this was late reservation discipline.
     A dynamic extracted-shell control was blocked by automatic command review;
     it was not overridden. A separate complete-script planted rename control
     executes the real gate instead. An invalid Mail help spelling was corrected.
