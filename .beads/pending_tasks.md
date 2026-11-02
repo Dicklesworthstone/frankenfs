@@ -12,7 +12,7 @@ active work only when that acceptance is executed or explicitly handed off.
   claim bd-lby8f and reserve its existing implementation/runner surfaces.
 - [x] Freeze FAT native constraints and errno expectations from the existing
   specification and writer; identify existing fault/publication coverage.
-- [ ] Build the actual ffs-fat CLI through fail-closed RCH after actual-volume
+- [x] Build the actual ffs-fat CLI through fail-closed RCH after actual-volume
   SBH; retain source identity, ELF hash and native tool versions.
   - [x] Baseline CLI builds remotely on hz4 (238791ms, exit0); retain ELF
     cc96c2a7550d9f0bce7d10fbadc4d5b9735785bc68c13234a83111110ce667ab.
@@ -23,25 +23,60 @@ active work only when that acceptance is executed or explicitly handed off.
   - [x] Retain unprivileged FUSE refusal: AutoUnmount requires host
     user_allow_other. Use root for the actual mount campaign without changing
     the worker's global FUSE policy; do not award non-root mount proof.
-- [ ] Execute native FAT16/FAT32 read-modify-check-reopen interoperability.
-- [ ] Extend the existing runner with actual writable FUSE syscall scenarios:
+- [x] Execute native FAT16/FAT32 read-modify-check-reopen interoperability.
+- [x] Extend the existing runner with actual writable FUSE syscall scenarios:
   names/aliases, gaps/truncate/preallocation, rename/overwrite/cycles,
   open-unlink/handle lifetime, directory growth and allocation reuse.
-- [ ] Execute bounded and 4KiB-sector variants and preserve unaffected bytes.
-- [ ] Reproduce and fix observed implementation defects with substantive
+- [x] Execute bounded and 4KiB-sector variants and preserve unaffected bytes.
+- [x] Reproduce and fix observed implementation defects with substantive
   regression tests; retain original failed executions.
   - [x] Real mounted Unicode collision reproduces EINVAL instead of EEXIST.
     Return typed Exists from native name planning; add file/mkdir/case/alias
     collision and invalid-name controls with unchanged-image assertions.
-  - [ ] Execute corrected collision regression and the full mounted campaign.
+  - [x] Execute corrected collision regression and the full mounted campaign.
   - [x] Execute the complete collision-fixed FAT package: 538 library and2
     consumer tests pass,0fail/ignore/filter; RCH0 in325051ms. This precedes
     the later transport correction and is not its final qualification.
   - [x] Real mounted ftruncate then exposes EOPNOTSUPP from inherited
     get_inode_flags. Wire truthful zero Linux flags and absent native security
     attributes for killpriv; add inode/cancellation/RO/unchanged-byte controls.
-  - [ ] Rebuild and execute the transport-corrected CLI and full package.
-- [ ] Exercise pending/durable lost/reordered/torn writes and failed final
+  - [x] Rebuild and execute the transport-corrected CLI and full package.
+  - [x] Mounted transport-fixed run reaches full-volume reuse, then fixed-root
+    exhaustion returns EINVAL. Return StorageFull/ENOSPC while retaining the
+    existing fixed-root diagnostic; add fixed-root file/mkdir no-write controls.
+  - [x] Rootfull-source mounted run passes FAT16/512 (69files), FAT16/4096
+    bounded (165files) and FAT32/512 (46files), including fsck/mtools and a
+    fresh mount. FAT32/4096 reaches full-volume growth, then shrink interrupts
+    and the mount quarantines; no overall runner pass. Debug ELF f93daf...;
+    normal production release qualification is pending without deadline changes.
+  - [x] Retain later full package failure:538passed/2failed/0ignored/0filtered,
+    RCH101. Restore the original root diagnostic without changing its assertion;
+    close the new test's exclusive writer before read-only admission.
+  - [x] Execute the corrected full package and broadened both-dialect stale
+    inode/cookie regression on final source; no credit for older-source runs.
+  - [x] Corrected final package on vmi1152480:540library +2public consumers,
+    0fail/ignore/filter, library517.22s after cold compile12m55s. Original
+    root diagnostic assertion and both-dialect cookie/stale-inode controls pass.
+    All886Rust/build inputs match local checkout and both verification workers.
+  - [x] Normal release build completes0 in380811ms (Cargo6m19s). Exact ELF
+    4a9a3d97c9b1c47b8502ccde262e4395e248e22c9558c92b0e88ef2e39d06965,
+    Build ID499266f9169e10aaab75085d02b9f3133c48579a; no timeout/profile-policy
+    change. Preserve debug cancellation/quarantine as a separate failed run.
+  - [x] Full release runner and fresh solo repeat both exit0:10scenarios each,
+    1350native commands with expected status and14actual successful FUSE mount
+    sessions per invocation;326writable-file checks each, without double-counting
+    repeated executions as unique coverage. Root/Linux, dosfstools4.2,
+    mtools4.0.49, fuse3.18.2; all four writable sector/bound cases pass exact
+    recursive native names, data, sentinel metadata/allocation/slack and clean
+    fsck/reopen. Existing six read/formatter/population scenarios also execute.
+  - [x] Missing-oracle negative returns1 before creating a fixture. The debug
+    last-writable-case failure leaves overall runner status failed after three
+    successful cases; neither partial nor empty work is reported as a pass.
+  - [x] Preserve the original failed large-shrink selected image, native input
+    and operation/mount/error records in an868KiB compressed counterexample;
+    large raw images remain on the worker. Local20GiB capacity check fails
+    at10GiB free, so no local heavy build or raw-image bulk copy is admitted.
+- [x] Exercise pending/durable lost/reordered/torn writes and failed final
   clean flush at allocation/data/namespace boundaries; reopen fresh engines
   and check only the explicitly allowed acknowledged states.
   - [x] Data growth/shrink/overwrite:1608 selective-sector restart states,
@@ -52,12 +87,154 @@ active work only when that acceptance is executed or explicitly handed off.
     unchanged native metadata/allocation/data of an acknowledged sentinel.
     These are storage-model results, not process-crash or device-power-loss
     proof; terminal clean-state flush errors remain errors.
-- [ ] Run owning package, affected CLI/FUSE consumers, fmt, workspace check,
+- [x] Run owning package, affected CLI/FUSE consumers, fmt, workspace check,
   strict Clippy and required harness gates through ordinary RCH lanes.
-- [ ] Re-execute final acceptance against exact source; keep unit/fault,
+  - [x] Workspace/all-target check0 (108334ms), strict Clippy0 (7402ms),
+    fmt/whitespace0; preserve the earlier two new-test lints and fix them
+    without suppression. Production UBS0critical with existing warnings;
+    original helper-test panics are separately retained/triaged as test failures.
+  - [x] Full six-code-file UBS review exposes33critical findings:5test-helper
+    panics lack their parent module's test-only context in a standalone scan;
+    28public-image digest comparisons trigger the timing-safe comparison rule.
+    Make both already-test-only modules explicitly `#![cfg(test)]` and use
+    standard hmac.compare_digest for the same digest equality predicates.
+    No scanner edit, exclusion, suppression, test ignore or relaxed assertion.
+    Complete unchanged-rule scan now exits0:0critical/550warnings/279info.
+  - [x] Re-execute full FAT tests, native campaign and compiler/lint gates
+    after these final test-annotation and digest-comparison changes.
+    Restore runtime headroom on hz4:128->144GiB tmpfs ceiling, with140GB RAM
+    available/PSI0, preserving nosuid,nodev,4M inode cap and user quota. Fresh
+    actual-volume SBH20GiB passes at39.7GB free; no deletion/persistent change.
+    Full refreshed FAT tests pass540library +2public consumers,0fail/ignore/
+    filter, library570.36s and RCH0 in598266ms. The test set is unchanged.
+    Final comparison-checked native campaign again exits0 with12scenarios,
+    1372expected command statuses,18successful FUSE sessions and330writable
+    file checks; resume13-delivery-native-evidence retains every operation and
+    mount record. Final verifier SHA0e268e2095e3ec652a6f52d4d472fbb785e06583f1cf6d6d7dee3d602cbb2555.
+    Refreshed workspace/all-target check0 in101035ms (Cargo1m39s), strict
+    Clippy0 in122339ms (Cargo2m00s), fmt/whitespace0. Final886-input manifest
+    matches the local tree and hz4; no Rust function body changed after the
+    earlier native/runtime qualification, only redundant test-only attributes.
+  - [x] Complete CLI/facade/harness selection:3276passed/0failed/
+    20existing ignores/0filtered across38results, normal RCH0 in1438847ms;
+    harness library2080/0/1, actual compile-fail and adversarial controls execute.
+  - [x] Explicit actual native CLI companion:1passed/0failed/0ignored/
+    42filtered in32.92s, normal RCH0 in784365ms after cold compile12m30s;
+    all six native read/formatter/population scenarios execute.
+  - [x] Literal ffs-fat bin anchor exits0 through RCH on final source, selecting
+    zero tests. It awards no capability evidence; the actual native wrapper,
+    package and mounted campaigns above carry that proof.
+  - [x] Finish the required harness benchmarks; record execution only, no
+    incumbent performance win from build-profile or self-comparison timings.
+    First full command compiles28m04s then times out137 at1801315ms during
+    metadata benchmarks. Retain resume13-harness-bench.log as incomplete;
+    repeat the full command warm with unchanged1800s deadline and selection,
+    fresh actual-volume SBH and source-equivalent final commit396d8f0cff.
+    Warm complete command exits0 in1339499ms, compiling12m14s and executing
+    all60Criterion cases (60started/60analyzed, no missing IDs). Standard
+    release/bench profile; timing changes against retained Criterion history
+    are self-comparisons, not incumbent wins. Benchmark snapshot's886inputs
+    match vmi1152480; the final tree differs only in the two explicit test-only
+    headers, inactive in benchmark dependencies. Their full tests rerun above.
+- [x] Re-execute final acceptance against exact source; keep unit/fault,
   native-tool and actual mounted evidence distinct. Close only if complete.
-- [ ] Update parity, tracker and Agent Mail with executed results; commit
-  coherent changes, reconcile main and push both required remote branches.
+  - [x] Execute both existing sidecar-backed writable FAT transports and fresh
+    protected readers on real FUSE; native tools check unmodified native bytes.
+    The first added FAT16 campaign passes mounted operations/native fsck/mcopy
+    then fails because the new runner incorrectly requests `check --sidecar`.
+    Keep the product's deliberate no-repair diagnostic admission unchanged;
+    correct the runner to use plain native checking plus separate protected reads.
+    Corrected protected campaign exits0 with both protected scenarios plus all
+    six old read profiles. Final combined invocation also exits0:12scenarios,
+    1372native commands with expected status,18successful FUSE sessions,
+    330writable-file checks. Both sidecar/image hashes advance on writes and
+    remain fixed on protected RO verification. Native/tool/mount evidence is
+    retained locally in resume13-final-native-evidence; raw images remain on hz4
+    under ffs-fat-native-6rnwnh2p. Final verifier SHA bf2a6b2da5d043e85775a7e38f04ad4aa1e721bd318bb54641533a915a212fe2;
+    Rust/build inputs are source-equivalent to commit396d8f0cff60418bee2c50ae7abf4d5349f8fa57.
+  - [x] Rebuild the normal release CLI after the final test-only annotations:
+    RCH0 in103039ms, Cargo1m41s. It is byte-identical to the mounted candidate
+    (4a9a3d97c9b1c47b8502ccde262e4395e248e22c9558c92b0e88ef2e39d06965).
+    Final886Rust/build inputs match the local tree and rebuilt worker. Old
+    benchmark snapshot and final test manifests remain distinct; no source
+    equivalence is inferred from an embedded Git label alone.
+- [ ] Record the final source commit, close bd-lby8f on its executed evidence,
+  sync Beads/Mail, reconcile main and deliver both required remote branches.
+
+### Bounded anti-ceremony/honesty review (`resume13`, solo)
+
+Process creation gate: this is the existing checklist explicitly requested by
+the operator ("super detailed, granular, and complete TODO list"). It serves
+continuity for bd-lby8f and retires as active work at verified closure/handoff;
+no additional dashboard/certificate/report is introduced. The last12commits
+from1ac5e0cc9 through4d0cef142 classify USER3 (the three actual FAT fixes),
+ENABLER5 (executed mount/fault qualification) and PROCESS4 (claim/checkpoints).
+The visible result is ordinary native truncate plus correct EEXIST/ENOSPC;
+the native/FUSE consumers actually exercise those fixes. Tracker prose alone
+would change no runtime behavior. The older ext4/btrfs mounted/durability
+backlog remains open; the baseline first enabled this existing FAT writer's
+native qualification. No new follow-up is used to discard original acceptance.
+Verdict: useful implementation with substantial verification cost; finish this
+delivery before adding more process. No subagents were dispatched.
+
+Inventory window:65096703f..current bd-lby8f changes, including all9 changed
+files, original failed executions and six bounded read-only CASS queries plus
+their followed contexts. Numbers below correspond to the skill's20questions.
+
+1. No (checked: complete changed test/fault/runner diffs; no removed assertions,
+   added ignores or changed CI/Cargo/lint policy; original root assertion kept).
+2. No (checked: fault device models pending/durable bytes and adversarial tears;
+   mounted qualification uses real FUSE and independent native tools).
+3. No (checked: changed paths contain no golden/snapshot regeneration).
+4. Yes: extend existing verifier beside the fixes, adding stronger native,
+   bounded-byte, full-volume and protected checks. No relaxation or suppression.
+   Incorrect new fixture geometry and invalid `check --sidecar` calls are
+   corrected in the runner; native admission/assertions stay intact (RH-1).
+5. No (checked: standard release profile and existing30s/1800s deadlines;
+   checked dependency optimization is disclosed, with no speedup claim).
+6. Yes: Cargo includes genuine zero-test bin/doctest targets. They receive
+   no capability credit; full package, actual native wrapper and mounted
+   campaigns carry the proof. Selected counts and filters are recorded (RH-2).
+7. No (checked: retained command logs and observed terminal statuses; pending
+   consumer/bench commands remain pending, not projected passes).
+8. No (checked: storage-model, native-image and root/Linux mounted evidence
+   are separate; no hardware power-loss, field or non-root readiness claim).
+9. No (checked: debug large-shrink interruption/quarantine, two package test
+   failures, lint failures, admission refusals and new runner failures retained).
+10. No (checked: native stdout/stderr files, Rust logs and failed partial-run
+    records retained; no successful conclusion depends on discarded stderr).
+11. No (checked: bd-lby8f remains in progress until its executed acceptance;
+    existing multi-format protection owner gains no closure from this work).
+12. No (checked: canonical requirements unchanged; guide describes implemented
+    native commands and explicit proof limits, without lowering promises).
+13–17. No (checked: solo execution; no subagent dispatch/close/report/agreement
+    counted as verification. Other-process Git commits are not independent review).
+18. No (checked: fixed two dialects/two sector profiles and complete selected
+    package totals; repeat runs are not added as unique semantic coverage).
+19. Yes: newly written tests initially lost an old diagnostic and retained an
+    exclusive writer before read-only admission. Both mistakes were corrected
+    with the original assertion/admission intact; complete package reruns pass.
+    Debug cancellation remains a failure, not evidence of a performance win
+    (RH-1/RH-2). The wrong release-pool path is likewise no executed run.
+    Commit396d8f0cff was made before the complete changed-file UBS scan; a
+    production-only0 did not satisfy that full gate. The later full scan's33
+    findings and correction are recorded above, and delivery awaits the full
+    verification refresh, which now passes in full. No scanner waiver is
+    inferred from manual triage.
+20. Strongest proof: exact release ELF4a9a3d97... executes actual root FUSE
+    writes, fsck.fat/mcopy/mdir and fresh reopen on both dialects, with retained
+    images, command/status/operation logs and source hashes. Re-executable via
+    the existing verifier; this is solo verification, not independent review.
+
+CASS review is bounded, not a full-history clean bill: six lexical queries
+(weaken/make-pass/skip/golden/close plus FAT16fixed-root) and followed contexts
+show no verified older gate weakening in that sample. A September19 discussion
+of FUSE skips/local compilation receives no proof credit here; current actual
+remote root mounts replace that uncertainty, without local heavy compilation.
+Historical audit queries and a formatting patch are not native proof.
+Disposition for yes findings: corrections are in place, the failure chains are
+disclosed here and in progress messages, and the named RH controls above retain
+failed evidence and forbid empty-run, gate-relaxation and proof-class inflation.
 
 ## Implementation checkpoint — 2026-10-30 (`bd-vuzzq`)
 

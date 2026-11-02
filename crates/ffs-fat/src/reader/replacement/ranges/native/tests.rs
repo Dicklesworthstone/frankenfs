@@ -1,6 +1,8 @@
 //! Native-image tests; the fault device separates pending and durable bytes.
 //! These are deterministic storage cuts, not hardware sector-atomicity claims.
 
+#![cfg(test)]
+
 use super::super::super::{create_in_volume, creation, hash_device};
 use super::super::{truncate_in_volume, write_range_in_volume};
 use super::*;

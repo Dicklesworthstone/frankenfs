@@ -1,6 +1,8 @@
 //! Native formatter-backed allocation and conditional-rename FsOps regressions.
 //! These exercise the production native engine, not a second test allocator.
 
+#![cfg(test)]
+
 use super::*;
 
 pub(super) fn writable_fat(kind: &str) -> (tempfile::TempDir, FatFs) {

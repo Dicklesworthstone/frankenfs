@@ -10,17 +10,18 @@ are failures, never skipped successes. Build the candidate before running this.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import errno
 import hashlib
+import hmac
 import json
 import locale
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 
 def digest(path: Path) -> str:
@@ -302,14 +303,16 @@ class Run:
               and checked["namespace_complete"] is True and checked["issues"] == [],
               "native checker does not admit the protected writer's committed image")
         final_hash, final_sidecar = digest(image), digest(sidecar)
-        check(final_hash != initial_hash and final_sidecar != initial_sidecar,
+        check(not hmac.compare_digest(final_hash, initial_hash)
+              and not hmac.compare_digest(final_sidecar, initial_sidecar),
               "protected mounted writes did not update both image and sidecar")
         with self.mount_image(image, image_options=options) as mounted:
             for name, data in expected.items():
                 check((mounted / name).read_bytes() == data,
                       f"fresh protected mount differs: {name}")
             check(not (mounted / "native/orphan.txt").exists(), "protected orphan reappeared")
-        check(digest(image) == final_hash and digest(sidecar) == final_sidecar,
+        check(hmac.compare_digest(digest(image), final_hash)
+              and hmac.compare_digest(digest(sidecar), final_sidecar),
               "read-only protected verification changed image or sidecar")
         return {"scenario": "protected_writable_mount", "format": f"FAT{bits}",
                 "initial_sha256": initial_hash, "final_sha256": final_hash,
@@ -549,7 +552,7 @@ class Run:
                 check((mounted / name).read_bytes() == data, f"fresh FUSE bytes differ: {name}")
             check(int((mounted / "right/Replaced café.txt").stat().st_mtime) == 1_700_000_002,
                   "native timestamp was not preserved on a fresh mount")
-        check(digest(image) == before_readonly, "fresh read-only mount changed bytes")
+        check(hmac.compare_digest(digest(image), before_readonly), "fresh read-only mount changed bytes")
         acknowledged("native fsck/mtools and fresh read-only mount", files=len(expected))
         return {"scenario": "writable_mount", "format": f"FAT{bits}", "sector_bytes": sector,
                 "bounded": bounded, "initial_sha256": initial_hash,
@@ -610,7 +613,7 @@ class Run:
 
         empty_hash = digest(image)
         self.command(*arguments, expected_returncode=1)
-        check(digest(image) == empty_hash, "refused format changed an existing image")
+        check(hmac.compare_digest(digest(image), empty_hash), "refused format changed an existing image")
         refused = self.root / f"forbidden-range-fat{bits}.img"
         self.command(self.binary, "format", refused, "--kind", f"fat{bits}",
                      "--size-mib", "64", "--offset", "512", expected_returncode=2)
@@ -650,9 +653,9 @@ class Run:
             check(actual == expected, f"formatter/native-write CLI bytes differ: FAT{bits} {name}")
         if mounted:
             self.mounted(image, payloads)
-        check(digest(image) == before, "readback changed formatter/native-written image")
+        check(hmac.compare_digest(digest(image), before), "readback changed formatter/native-written image")
         self.command("fsck.fat", "-n", image)
-        check(digest(image) == before, "native read-only check changed formatter image")
+        check(hmac.compare_digest(digest(image), before), "native read-only check changed formatter image")
         facade_reads = self.public_reads(self.facade, image, payloads) if self.facade else None
         return {"format": f"FAT{bits}", "creator": "ffs-fat format",
                 "fresh_image_sha256": empty_hash, "native_written_sha256": before,
@@ -747,7 +750,7 @@ class Run:
         if mounted:
             self.mounted(image, payloads)
         self.command(*arguments, expected_returncode=1)
-        check(digest(image) == before, "readback or refused reformat changed populated image")
+        check(hmac.compare_digest(digest(image), before), "readback or refused reformat changed populated image")
 
         # Verify that another FAT implementation can extend our allocation and
         # namespace after population, then verify its bytes through our reader.
@@ -769,7 +772,7 @@ class Run:
               checked["free_clusters"] == native_allocation(image)["free_clusters"] and
               checked["lost_clusters"] == 0 and checked["issues"] == [] and checked["omitted_issues"] == 0,
               "native extension of populated image failed allocation verification")
-        check(digest(image) == after_native, "native-extension readback changed the image")
+        check(hmac.compare_digest(digest(image), after_native), "native-extension readback changed the image")
 
         for case in ("symlink", "case-collision", "invalid-name"):
             bad_source = self.root / f"refused-{case}-fat{bits}-source"
@@ -842,9 +845,9 @@ class Run:
             check(actual == expected, f"native-image CLI bytes differ: FAT{bits} {name}")
         if mounted:
             self.mounted(image, payloads)
-        check(digest(image) == before, f"candidate changed FAT{bits} image bytes")
+        check(hmac.compare_digest(digest(image), before), f"candidate changed FAT{bits} image bytes")
         self.command("fsck.fat", "-n", image)
-        check(digest(image) == before, "read-only native checker changed the image")
+        check(hmac.compare_digest(digest(image), before), "read-only native checker changed the image")
         root_growth = self.root_growth(image, payloads) if bits == 16 else None
         fsinfo_recovery = self.fsinfo_recovery(image, payloads) if bits == 32 else None
         streaming_reads = self.streaming_reads(image, payloads)
@@ -931,15 +934,16 @@ class Run:
                 stderr = (self.root / f"command-{self.sequence:03d}.stderr").read_bytes()
                 check(output == b"" and reason in stderr,
                       "public FAT negative emitted bytes or failed for another reason")
-            check(comparisons == len(payloads) * 6 and digest(backing) == before,
+            check(comparisons == len(payloads) * 6 and hmac.compare_digest(digest(backing), before),
                   "public FAT profile omitted a read or changed backing/sentinels")
             profiles.append({"volume_offset": offset, "sha256": before,
                              "file_stats": len(payloads), "directory_listings": len(parents),
                              "byte_comparisons": comparisons, "write_refusals": 1,
                              "expected_failures": 2})
         self.command("fsck.fat", "-n", original)
-        check(digest(original) == original_hash and digest(bounded) == bounded_hash
-              and digest(facade) == facade_hash, "public FAT check changed an input or executable")
+        check(hmac.compare_digest(digest(original), original_hash)
+              and hmac.compare_digest(digest(bounded), bounded_hash)
+              and hmac.compare_digest(digest(facade), facade_hash), "public FAT check changed an input or executable")
         return {"format": native["format"], "facade_sha256": facade_hash,
                 "files_checked": len(payloads), "native_reference_reads": len(payloads),
                 "native_directory_listings": len(parents), "profiles": profiles, "result": "passed"}
@@ -1021,7 +1025,7 @@ class Run:
                 stderr = (self.root / f"command-{self.sequence:03d}.stderr").read_bytes()
                 check(refused == b"" and b"not in its selected parent" in stderr,
                       "invalid native selector emitted bytes or failed for another reason")
-            check(comparisons == len(payloads) * 2 and digest(backing) == before,
+            check(comparisons == len(payloads) * 2 and hmac.compare_digest(digest(backing), before),
                   "streaming omitted a selector or changed its image/sentinels")
             profiles.append({"volume_offset": offset, "sha256": before,
                              "byte_comparisons": comparisons, "expected_refusals": 2})
@@ -1064,9 +1068,10 @@ class Run:
             stderr = (self.root / f"command-{self.sequence:03d}.stderr").read_bytes()
             check(refused == b"" and b"cyclic FAT file chain" in stderr,
                   "cyclic native tail emitted bytes or failed for another reason")
-        check(digest(damaged) == damaged_hash, "cycle refusal changed the damaged private copy")
+        check(hmac.compare_digest(digest(damaged), damaged_hash), "cycle refusal changed the damaged private copy")
         self.command("fsck.fat", "-n", original)
-        check(digest(original) == original_hash and digest(bounded) == bounded_hash,
+        check(hmac.compare_digest(digest(original), original_hash)
+              and hmac.compare_digest(digest(bounded), bounded_hash),
               "streaming or native read-only checking changed an input")
         return {"format": native["format"], "files_checked": len(payloads),
                 "source_sha256": original_hash, "bounded_sha256": bounded_hash,
@@ -1135,7 +1140,7 @@ class Run:
             wrapped.write(b"P" * 4096)
             shutil.copyfileobj(plain, wrapped, 1024 * 1024)
             wrapped.write(b"S" * 4096)
-        check(digest(image) == expected_digest({}), "private FSInfo copy differs before damage")
+        check(hmac.compare_digest(digest(image), expected_digest({})), "private FSInfo copy differs before damage")
         damaged = {info * sector + at: bytes(4) for at in (0, 484, 488, 492, 508)}
         damaged.update({backup_info * sector + at: bytes(4) for at in (488, 492)})
         with image.open("r+b") as stream:
@@ -1145,7 +1150,7 @@ class Run:
             stream.flush()
             os.fsync(stream.fileno())
         damaged_hash = expected_digest(damaged)
-        check(digest(image) == damaged_hash, "FSInfo damage escaped its private declared fields")
+        check(hmac.compare_digest(digest(image), damaged_hash), "FSInfo damage escaped its private declared fields")
         selection = ["--offset", "4096", "--length", str(original.stat().st_size)]
         self.command(self.binary, "repair-fsinfo", image, *selection, expected_returncode=2)
         check(b"--offline-image" in (self.root / f"command-{self.sequence:03d}.stderr").read_bytes(),
@@ -1161,7 +1166,7 @@ class Run:
               and preview["backup_policy"] == "recognized_hint_copy"
               and {item["offset"] for item in preview["sectors"]} == {info * sector, backup_info * sector},
               "FSInfo plan differs from native allocation/reserved evidence")
-        check(digest(image) == damaged_hash, "refusal or FSInfo dry run changed the source")
+        check(hmac.compare_digest(digest(image), damaged_hash), "refusal or FSInfo dry run changed the source")
         rebuilt = {}
         for number in (info, backup_info):
             for at, value in ((0, 0x41615252), (484, 0x61417272), (508, 0xAA550000),
@@ -1172,7 +1177,7 @@ class Run:
         check(repaired["changed"] is True and repaired["native_recovery_required"] is True
               and repaired["allocation_links_written"] is False and repaired["reclaimed_clusters"] == 0
               and repaired["durability"] == "fsinfo_sectors_synced_and_verified_image_left_dirty"
-              and digest(image) == dirty_hash, "FSInfo repair changed bytes beyond five words and dirty markers")
+              and hmac.compare_digest(digest(image), dirty_hash), "FSInfo repair changed bytes beyond five words and dirty markers")
         checked = json.loads(self.command(self.binary, "check", image, *selection, expected_returncode=1))
         check(b"no changes were made" in (self.root / f"command-{self.sequence:03d}.stderr").read_bytes(),
               "dirty-state checker refusal has the wrong cause")
@@ -1182,7 +1187,7 @@ class Run:
               and {issue["kind"] for issue in checked["issues"]} == {"native_boot_dirty", "native_fat_dirty"},
               "reconstructed FSInfo did not leave only all four native dirty markers")
         repeated = json.loads(self.command(*repair))
-        check(repeated["changed"] is False and digest(image) == dirty_hash,
+        check(repeated["changed"] is False and hmac.compare_digest(digest(image), dirty_hash),
               "repeated FSInfo repair changed already-correct bytes")
 
         def native_payloads(label: str) -> Path:
@@ -1199,20 +1204,20 @@ class Run:
             for name, expected in payloads.items():
                 check(self.command("mcopy", "-i", selected, f"::/{name}", "-") == expected,
                       f"native payload differs after FSInfo {label}: {name}")
-            check(digest(selected) == before, "native FSInfo readback changed its image")
+            check(hmac.compare_digest(digest(selected), before), "native FSInfo readback changed its image")
             return selected
 
         native_payloads("repaired-dirty")
         recover = [self.binary, "recover", image, *selection, "--offline-image"]
         self.command(*recover, "--dry-run")
-        check(digest(image) == dirty_hash, "ordinary recovery dry run changed the image")
+        check(hmac.compare_digest(digest(image), dirty_hash), "ordinary recovery dry run changed the image")
         recovered = json.loads(self.command(*recover))
         # Ordinary recovery deliberately resets the primary next-free hint to
         # unknown; the already-verified backup FSInfo is outside its write set.
         final = rebuilt | {info * sector + 492: bytes([255]) * 4}
         final_hash = expected_digest(final)
         check(recovered["changed"] is True and recovered["reclaimed_clusters"] == 0
-              and recovered["retired_lfn_records"] == 0 and digest(image) == final_hash,
+              and recovered["retired_lfn_records"] == 0 and hmac.compare_digest(digest(image), final_hash),
               "ordinary recovery changed bytes outside its native state/hint contract")
         checked = json.loads(self.command(self.binary, "check", image, *selection))
         check(checked["clean"] is True and checked["complete"] is True
@@ -1225,7 +1230,8 @@ class Run:
         selected = native_payloads("recovered-clean")
         self.command("fsck.fat", "-n", selected)
         check(native_allocation(selected) == native, "FSInfo recovery changed native allocation")
-        check(digest(image) == final_hash and digest(original) == original_hash,
+        check(hmac.compare_digest(digest(image), final_hash)
+              and hmac.compare_digest(digest(original), original_hash),
               "FSInfo verification changed the bounded image or retained native source")
         facade_reads = self.public_reads(self.facade, selected, payloads) if self.facade else None
         return {"source_sha256": original_hash, "damaged_bounded_sha256": damaged_hash,
@@ -1288,7 +1294,7 @@ class Run:
         resize = [self.binary, "resize", source, "--output", output, "--size-mib", "64",
                   "--root-entries", "1024", "--offline-image"]
         preview = json.loads(self.command(*resize, "--dry-run"))
-        check(not output.exists() and digest(source) == source_hash,
+        check(not output.exists() and hmac.compare_digest(digest(source), source_hash),
               "root-growth dry run created output or changed source")
         check(preview["source_root_entries"] == 512 and preview["output_root_entries"] == 1024,
               "root-growth plan reports the wrong native capacities")
@@ -1320,7 +1326,8 @@ class Run:
             self.binary, "resize", bounded, "--offset", "4096", "--length", str(source.stat().st_size),
             "--output", bounded_output, "--size-mib", "64", "--root-entries", "1024", "--offline-image"))
         check(selected["source_volume_offset"] == 4096 and selected["source_modified"] is False
-              and digest(bounded) == bounded_hash and digest(bounded_output) == digest(output),
+              and hmac.compare_digest(digest(bounded), bounded_hash)
+              and hmac.compare_digest(digest(bounded_output), digest(output)),
               "bounded root growth changed sentinels or included neighboring storage")
         self.command("fsck.fat", "-n", bounded_output)
         self.command("mcopy", "-i", output, payload, "::/MORE.BIN")
@@ -1338,8 +1345,10 @@ class Run:
         refusal = self.root / f"command-{self.sequence:03d}.stderr"
         check(b"output already exists" in refusal.read_bytes().lower(),
               "repeated root growth failed for a reason other than existing output")
-        check(digest(output) == before_refusal and digest(source) == source_hash
-              and digest(original) == original_hash, "root growth or refusal changed an existing source/output")
+        check(hmac.compare_digest(digest(output), before_refusal)
+              and hmac.compare_digest(digest(source), source_hash)
+              and hmac.compare_digest(digest(original), original_hash),
+              "root growth or refusal changed an existing source/output")
         for name, expected in payloads.items():
             check(self.command("mcopy", "-i", output, f"::/{name}", "-") == expected,
                   f"new writes damaged a preserved file after root growth: {name}")

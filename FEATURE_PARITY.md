@@ -1,5 +1,54 @@
 # FEATURE_PARITY
 
+> **Writable FAT qualification (2026-11-02, bd-lby8f):** runtime fixes in396d8f0cff
+> corrects three actual mounted defects: Unicode creation collisions now retain
+> EEXIST, ordinary FUSE truncate/killpriv probes receive truthful absent native
+> flags/attributes, and exhausted FAT16 fixed roots retain ENOSPC plus their
+> original diagnostic. Final owning tests pass540library +2public-consumer
+> cases with0failures/ignores/filters. Both-dialect stale-inode/cookie controls
+> and5184selective pending-sector restart states execute (720clean,
+> 4464explicit dirty refusals); these are storage-model tests, not hardware
+> power-loss evidence or a general crash-atomic rename guarantee.
+>
+> The normal release ELF4a9a3d97c9b1c47b8502ccde262e4395e248e22c9558c92b0e88ef2e39d06965
+> executes the final verifier's12scenarios: FAT16/FAT32 writable profiles with
+> 512-byte/plain and4KiB/bounded geometry, two sidecar-backed writable profiles,
+> and all six existing native read/formatter/population profiles. All1372native
+> commands return their expected status and all18actual FUSE sessions pass;
+> 330writable-file checks include exact native names/data and unaffected-file
+> entry/allocation/slack preservation, followed by fresh read-only reopen.
+> Both image and sidecar hashes change after protected writes and remain fixed
+> during protected read-only verification. This is root/Linux transport proof;
+> non-root host provisioning and independent-device protection crash fences
+> remain unqualified. The broader protection work remains open in bd-tqrnc.
+>
+> Affected CLI/facade/harness tests pass3276/0failed/20existing ignores/
+> 0filtered across38results; explicitly selecting the existing native CLI
+> companion test passes1/0/0 with42filtered in32.92s. Workspace/all-target
+> check (101035ms), strict Clippy (122339ms) and formatting pass on the final
+> tree. Complete changed-code UBS exits0 with0critical/550warnings/279info;
+> the earlier33critical scan is retained. Explicit test-only module attributes
+> preserve all540tests, and standard hmac.compare_digest preserves the image
+> equality checks. The required full harness benchmark exits0 in1339499ms,
+> with60started/60analyzed Criterion cases; the cold28m04s compile attempt
+> timed out137 and remains incomplete. No incumbent benchmark win is claimed.
+> Tests use the disclosed checked
+> asupersync dependency optimization described below, with ordinary first-party
+> test profiles. All886Rust/build inputs match the local tree and verification
+> workers. Final owning tests rerun540+2 with0fail/ignore/filter (570.36s
+> library, RCH598266ms), and the final verifier repeats the complete12-scenario
+> native result above. Its SHA is
+> 0e268e2095e3ec652a6f52d4d472fbb785e06583f1cf6d6d7dee3d602cbb2555.
+> Benchmark inputs differ from the final tree only in the two redundant FAT
+> test-only headers, inactive in benchmark dependencies; runtime source is
+> unchanged. Exact old/new886-input manifests are retained separately.
+> Earlier failed debug512MiB shrink/cancellation, malformed new fixture,
+> diagnostic/lock regression tests, lint and admission attempts remain retained.
+> Standard-release campaigns pass without changing request/build deadlines.
+> Details: `.beads/pending_tasks.md`, `docs/FAT_READ_PROFILE.md` and
+> `artifacts/implementation/20261030_O221Lk/resume13-*`. No overall parity
+> percentage, field-readiness or performance improvement is inferred.
+
 > **Workspace baseline qualified (2026-11-02):** all25members complete through
 > four exhaustive Cargo selections: core1753/0/26existing ignores, FAT537/0/0,
 > harness2657/0/11 and other22members6937/0/21. All124 target/doctest results
