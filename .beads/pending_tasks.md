@@ -2,6 +2,35 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Active writable FAT qualification — 2026-11-02 (`bd-lby8f`, NavyElm)
+
+The operator requested continued implementation and a granular TODO. This
+checklist tracks the original native/mounted writer acceptance; it retires as
+active work only when that acceptance is executed or explicitly handed off.
+
+- [x] Check local source-aware claimability, dependency cycles and ownership;
+  claim bd-lby8f and reserve its existing implementation/runner surfaces.
+- [ ] Freeze FAT native constraints and errno expectations from the existing
+  specification and writer; identify existing fault/publication coverage.
+- [ ] Build the actual ffs-fat CLI through fail-closed RCH after actual-volume
+  SBH; retain source identity, ELF hash and native tool versions.
+- [ ] Execute native FAT16/FAT32 read-modify-check-reopen interoperability.
+- [ ] Extend the existing runner with actual writable FUSE syscall scenarios:
+  names/aliases, gaps/truncate/preallocation, rename/overwrite/cycles,
+  open-unlink/handle lifetime, directory growth and allocation reuse.
+- [ ] Execute bounded and 4KiB-sector variants and preserve unaffected bytes.
+- [ ] Reproduce and fix observed implementation defects with substantive
+  regression tests; retain original failed executions.
+- [ ] Exercise pending/durable lost/reordered/torn writes and failed final
+  clean flush at allocation/data/namespace boundaries; reopen fresh engines
+  and check only the explicitly allowed acknowledged states.
+- [ ] Run owning package, affected CLI/FUSE consumers, fmt, workspace check,
+  strict Clippy and required harness gates through ordinary RCH lanes.
+- [ ] Re-execute final acceptance against exact source; keep unit/fault,
+  native-tool and actual mounted evidence distinct. Close only if complete.
+- [ ] Update parity, tracker and Agent Mail with executed results; commit
+  coherent changes, reconcile main and push both required remote branches.
+
 ## Implementation checkpoint — 2026-10-30 (`bd-vuzzq`)
 
 The operator requested implementation after the reality check, including a
