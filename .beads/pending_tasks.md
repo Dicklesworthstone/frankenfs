@@ -2,6 +2,38 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Active oracle/mount evidence wiring — 2026-11-02 (`bd-53dub`, NavyElm)
+
+- [x] Confirm prior delivery6442c489b, source-aware ready queue54claimable/
+  0foreign/permission-gated and empty dependency cycles; claim original task
+  and reserve the existing gate/CI/script surfaces. No subagents.
+- [x] Inspect existing strict Rust/shell helpers and CI wiring before adding
+  anything. The btrfs differential already defaults to expect PASS, and shared
+  e2e_skip already fails under either required flag. Remaining bypasses are
+  differential custom SKIP/XFAIL paths and swallowed mutation errors, forensic
+  prerequisite/readiness returns, and the ext4 smoke fixture's disabled journal.
+- [ ] Reproduce missing-capability/failed-mutation false greens with retained
+  negative controls; preserve original source and all meaningful assertions.
+- [ ] Wire forensic prerequisites/readiness through the existing contracts;
+  make every optional skip machine-greppable, with executed oracle/mount markers.
+- [ ] Make the current differential default require successful build, real
+  mounted mutations, native check and selected Rust checks; retain explicit
+  optional diagnostics without awarding them current native writer evidence.
+- [ ] Run journaled ext4 write smoke plus independent e2fsck and reopen; keep
+  its original crash/recovery phase rather than shrinking the target.
+- [ ] Execute current btrfs differential with default expectations; fix gate
+  wiring only in this lane. If native correctness fails, retain concrete images,
+  oracle output and operation logs as the original task permits, not XFAIL-green.
+- [ ] Execute required-missing-oracle/mount and failed-final-operation controls;
+  run owning/affected Rust tests and workspace fmt/check/strict Clippy through
+  admitted ordinary RCH. Keep all source/ELF/tool/image identities explicit.
+- [ ] Verify CI sets both flags for evidence lanes and actually consumes the
+  journaled/differential tests. Report local CI-equivalent vs GitHub execution
+  separately; no claimed hosted CI result without an observed run.
+- [ ] Review complete gate diff and bounded honesty inventory; update original
+  Bead/parity on executed evidence, preserve any unmet conditions, commit and
+  deliver both required remote refs. No test/golden/deadline weakening.
+
 ## Active native FAT maintenance — 2026-11-02 (`bd-ave6y`, NavyElm)
 
 The operator requested continued implementation and a granular TODO. Reuse the
