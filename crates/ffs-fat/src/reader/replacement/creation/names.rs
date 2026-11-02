@@ -7,6 +7,7 @@
 use super::super::super::{Directory, FatVolume, MAX_DIRECTORY_SLOTS, checkpoint};
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
+use ffs_error::FfsError;
 use ffs_ondisk::fat::short_name_checksum;
 use std::collections::BTreeSet;
 
@@ -167,9 +168,10 @@ impl NativeName {
                 let key = volume.oem_code_page.name_key(&value);
                 let fold = collision_key(&value);
                 if key == requested || fold == folded {
-                    bail!(
-                        "--create never replaces an existing native name or short alias: {name:?}"
-                    );
+                    // Preserve the collision's errno through anyhow contexts
+                    // and the mounted FsOps adapter. A string-only refusal
+                    // otherwise degrades to Format/EINVAL at that boundary.
+                    return Err(FfsError::Exists.into());
                 }
                 native_keys.insert(key);
                 folded_keys.insert(fold);

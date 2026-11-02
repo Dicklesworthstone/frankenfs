@@ -51,6 +51,41 @@ fn raw_image(directory: &tempfile::TempDir) -> Vec<u8> {
 }
 
 #[test]
+fn create_and_mkdir_collisions_return_eexist_without_native_changes() {
+    for kind in ["fat16", "fat32"] {
+        let (directory, fs) = writable_fat(kind);
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let ino = create_file(&fs, "Native café and collision.txt");
+        fs.write(&cx, &mut scope, ino, 0, b"preserved source").unwrap();
+        let alias = fs.node(&cx, ino).unwrap().entry.unwrap().short_alias().unwrap();
+        let before = raw_image(&directory);
+        // The ASCII OEM lookup profile compares é/É exactly, but creation's
+        // documented conservative Unicode collision policy still refuses both.
+        // Transport must preserve that semantic EEXIST instead of EINVAL.
+        for name in ["Native café and collision.txt", "NATIVE CAFÉ AND COLLISION.TXT", &alias] {
+            expect_errno(
+                fs.create(&cx, &mut scope, ROOT, OsStr::new(name), 0o644, 1000, 1000),
+                libc::EEXIST,
+            );
+            expect_errno(
+                fs.mkdir(&cx, &mut scope, ROOT, OsStr::new(name), 0o755, 1000, 1000),
+                libc::EEXIST,
+            );
+            assert_eq!(raw_image(&directory), before);
+        }
+        // An invalid name remains EINVAL; do not turn every refused creation
+        // into a collision merely because it was rejected before publication.
+        expect_errno(
+            fs.create(&cx, &mut scope, ROOT, OsStr::new("invalid?.txt"), 0o644, 1000, 1000),
+            libc::EINVAL,
+        );
+        assert_eq!(raw_image(&directory), before);
+        assert_eq!(fs.read(&cx, &mut scope, ino, 0, 128).unwrap(), b"preserved source");
+    }
+}
+
+#[test]
 fn fallocate_grows_dense_native_allocation_and_preserves_existing_payload() {
     for kind in ["fat16", "fat32"] {
         let (directory, fs) = writable_fat(kind);
