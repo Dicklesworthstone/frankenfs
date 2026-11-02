@@ -104,8 +104,13 @@ verified original acceptance or an explicit handoff, without discarding gaps.
   live16-scenario run exercises the actual strengthened collector.
 - [x] Complete bounded anti-ceremony/honesty review and update measured parity
   plus existing resize/root/mirror/parent/FSInfo guides without lowering scope.
-- [ ] Cite final source commit in original Bead, close only on executed evidence,
-  flush tracker, commit delivery metadata, pull/import and push both branches.
+- [x] Cite source4058fdd969d00346176f5609641f28770142997c in original Bead,
+  close on the executed evidence above, flush tracker and prepare delivery
+  metadata. Post-close dependency cycles remain empty. Required delivery is
+  pull/rebase, immediate tracker import and push main plus its compatibility
+  ref; final remote-ref receipts are retained in resume14-final-delivery.log.
+  The first pull preflight128 refused an unstaged Beads merge-base refresh;
+  preserve and commit that tracker state instead of stashing/discarding it.
 
 ### Bounded review of this maintenance block
 
