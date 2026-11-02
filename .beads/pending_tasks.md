@@ -11,7 +11,17 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
-### Current verification and capacity recovery — 2026-11-02 (`resume12`)
+### Completed verification and capacity recovery — 2026-11-02 (`resume12`)
+
+All25 workspace members are qualified through four exhaustive Cargo selections:
+11884passed/0failed/58existing ignores/0filtered across124 target/doctest
+results, exactly matching retained Cargo metadata. This counts executions,
+not unique semantic coverage. Monolithic137 runs remain failures/incomplete;
+none is called a pass. Source repairs are committed in64c841698,6356c60aa and
+d8fba9e8d. The latter matches the final886Rust/build-input and9non-Rust-input
+manifests on both workers. Solo re-execution is not independent verification.
+bd-vuzzq is closed on this evidence; existing mounted/native-delivery items
+remain open and gain no capability credit from this baseline.
 
 - [x] Complete the cold checked-dependency core suite:1677passed/0failed/
   25existing ignores,451.78s; the native freshness fsync and original orphan
@@ -52,7 +62,7 @@ completed or handed off. Historical evidence remains in place.
   0ignored/0filtered in0.15s, compile7m04s, normal RCH0. All four ext4/btrfs
   public UTF-8/xattr cases execute. New886-input worker/local manifest matches
   and canonical image SHA is unchanged; resume12-fixture-integration.log.
-- [ ] Finish the complete corrected workspace run on hz3 with managed RAM
+- [x] Attempt the complete corrected workspace run on hz3 with managed RAM
   scratch, the checked dependency profile, no exclusions/positional filters,
   no new ignores and unchanged1800s deadline. Fresh actual-volume SBH precedes
   it. First RAM attempt refuses103 before compilation: source-namespace setup
@@ -62,15 +72,63 @@ completed or handed off. Historical evidence remains in place.
   This was introduced by the scratch configuration, not a product defect.
   Keep the test and assertions unchanged. Prepare short task-owned RAM scratch
   /tmp/rch-frankenfs-vuzzq-20261101/t on both hosts, preserving all old files.
-- [ ] Complete exhaustive workspace test execution through three Cargo package
+- [x] Complete exhaustive workspace test execution through four Cargo package
   selections on the same final source: ffs-core with bhh0i_sharded_alloc;
-  ffs-fat; workspace excluding only those two. These cover all25members from
+  ffs-fat; ffs-harness; workspace excluding only those three. These cover all25members from
   retained Cargo metadata, without changing tests or1800s per-job deadline.
   Report the monolithic137 failures separately; no claim that they exited0.
   All groups require fresh actual-volume SBH20GiB and short RAM TMPDIR.
-- [ ] Observe every complementary-run terminal result, retain all failures,
+  - [x] Core with bhh0i: all13 target/doctest results complete,1753passed/
+    0failed/26existing ignores/0filtered,RCH0 in251787ms. Library1678/0/25
+    in142.73s; native/crash integrations and corrected27-case suite pass.
+  - [x] FAT: all3 target/doctest results complete,537passed/0failed/0ignored/
+    0filtered,RCH0 in772145ms; library535/0/0 in367.11s. Original Unix socket
+    setup/refusal case passes with short scratch and unchanged assertions.
+  - [x] Harness: final complete package2657passed/0failed/11existing ignores/
+    0filtered across29results,RCH0 in667803ms. Provenance, compile-fail,
+    profile integrity and quantitative README checks execute successfully.
+    Earlier101 and all previous failures remain separate retained evidence.
+  - [x] Other22members: all79 target/doctest results complete,6937passed/
+    0failed/21existing ignores/0filtered,RCH0 in397422ms. No individual filters.
+- [x] Retain complementary-run terminal137 after1802567ms. FAT534/1/0
+  fails at Unix socket setup (long TMPDIR); harness2078/2/1 fails because its
+  cfg(test) revision helper returns unknown without.git, while real executed
+  evidence correctly resolves the validated RCH compile stamp. Both failures
+  remain explicit; no success claim for that command or incomplete trybuild.
+- [x] Correct only the harness test helper's expected revision fallback:
+  accept the compile-time RCH stamp only when it is40lowercase hex characters,
+  after the existing Git lookup. Production provenance validators, command
+  allowlists, stale/missing/nonzero rejection and all assertions stay unchanged.
+- [x] Execute full harness package including positive/stale provenance and
+  compile-fail controls; resume12-proof-harness-all.log starts02:36UTC with
+  short scratch. Final whole-package rerun completes0 as recorded above.
+- [x] Latest-source fmt/whitespace0, workspace/all-target check0 in1m34s
+  (remote97145ms), strict Clippy0 in4m22s (remote265144ms), unchanged UBS
+  rules0critical/270warnings/94info for the helper file. No warning-free claim.
+- [x] Diagnose final harness integration failures without relaxing gates:
+  profile capture/fixture bytes match both hosts, but preserve_order makes
+  the supposed canonical JSON hash depend on key order. All three Git fixture
+  revisions have identical parsed content/digest a373...; the original Feb11
+  semantic reference time and May capture are valid. New independently pinned
+  nested-object control reproduces red1passed/2failed before canonicalization.
+- [x] Canonicalize JSON object keys recursively while preserving payload and
+  array order, then execute positive and changed-payload/array negatives. Keep
+  all original freshness/sample/marker assertions, hash/time constants and
+  profile/canonical artifacts unchanged. Profile3/0/0, README4/0/0,RCH0.
+- [x] Correct source inventory drift from125to126tracked E2E shell scripts
+  and22to25workspace members (24crates plus tools/ffs-ops), including anchors
+  and dated guide inventory. Other counts independently remain63fuzz targets,
+  173Rust benchmarks and226snapshots. No capability or executed-parity claim.
+- [x] Refresh final profile-source fmt/whitespace0, check0 (0.47s,Cargo),
+  strict Clippy0 (0.48s,Cargo) and UBS0critical/28warnings/20info. Full harness
+  rerun completes0; earlier failure/timeout logs retain their status.
+- [x] Restore hz4 actual/tmp headroom without deletion: RAM153079418880bytes
+  available and memory PSI0 before runtime96->128GiB tmpfs capacity increase.
+  Free45036449792bytes passes SBH20GiB; same permissions, inode cap and quotas.
+  hz3 stays96GiB. No persistent configuration or RCH admission change.
+- [x] Observe every complementary-run terminal result, retain all failures,
   and repair actual defects; no partial/failed invocation is a complete pass.
-- [ ] Refresh fmt/check/strict Clippy/UBS for this integration-fixture change,
+- [x] Refresh fmt/check/strict Clippy/UBS for this integration-fixture change,
   verify retained canonical image hashes, and finish full workspace evidence.
 - [x] Diagnose slower native-image execution in the warm run: the actual test
   process uses root-backed/data/projects/frankenfs/.rch-tmp, while build output
@@ -87,11 +145,14 @@ completed or handed off. Historical evidence remains in place.
   0failed/25existing ignores/0filtered in832.03s; native freshness fsync and
   both final public-read regressions pass. This is still a partial workspace
   result; btrfs crash-window integration is now executing.
-- [ ] Finish all non-core workspace packages on hz4 using validated managed
+- [x] Finish all non-core workspace packages through the exhaustive selections
+  above after retaining the failed first hz4 attempt. Its original plan used
+  validated managed
   RAM scratch and the same checked dependency profile. This explicitly
   declared complementary selection excludes only ffs-core, which remains in
   the original full run; no individual test filters or new ignores. Fresh SBH
-  precedes the lane; resume12-root-remaining-workspace-ram.log starts02:03UTC.
+  precedes the lane; resume12-root-remaining-workspace-ram.log starts02:03UTC
+  and ends137. Final FAT/harness/other22 selections complete0 separately.
 - [x] Re-read instructions/README, inspect unchanged candidate and owned P0,
   local source-aware queue/cycles and reservations; preserve peer/untracked work.
 - [x] Correct the overbroad infrastructure hold: written policy permits
@@ -116,29 +177,38 @@ completed or handed off. Historical evidence remains in place.
 - [x] Execute current strict workspace/all-target Clippy on hz4: command0,
   Cargo10m18s,remote620046ms,-Dwarnings unchanged. Final886-file source check0.
   Existing Cargo nix future-incompat notices remain; no dependency-clean claim.
-- [ ] Execute all required workspace tests without removing cases or weakening
+- [x] Execute all required workspace tests without removing cases or weakening
   assertions. The earlier unchanged1800s timeout remains a failed/incomplete
   run, with native dense RaptorQ solving identified by the retained stack.
   Current full selection uses --no-fail-fast with no positional filters and
   command-only asupersync test-package opt-level3, explicitly retaining debug
-  assertions and overflow checks. All workspace source and test/validator
-  settings remain unchanged; this build variation must be reported, not called
+  assertions and overflow checks. This profile override changes no source or
+  validator settings; the authored repairs above are separate explicit changes.
+  This build variation must be reported, not called
   an unmodified unoptimized pass or a product speedup. Cargo profiles docs
   confirm these independent settings. Fresh actual-volume SBH precedes it.
-- [ ] Fix actual diagnostics/failures and re-run only affected checks before
+- [x] Fix actual diagnostics/failures and re-run affected checks before
   final qualification. Do not close the P0 without its original full evidence.
-- [ ] Assess both prior64GiB tmpfs caps after gates. Restore only if usage and
-  active peer work permit it while retaining the required20GiB headroom;
-  otherwise preserve all data and report the runtime96GiB capacity explicitly.
-- [ ] Update specs/parity/TODO and Bead with actual results, review the complete
-  change, commit/pull/import/push normally and release reservations.
+- [x] Assess tmpfs caps after gates. hz3 uses74865143808bytes, exceeding its
+  old64GiB cap; hz4 uses90859548672bytes, leaving less than20GiB at96GiB.
+  Keep runtime96GiB/128GiB respectively, preserving all data. Actual free
+  28214071296/46579404800bytes passes both SBH20GiB checks; memory PSI0.
+  Mount flags, inode limits, quotas and persistent config remain unchanged.
+- [x] Review complete source/tests/docs and commit source repairs asd8fba9e8d;
+  prepare final evidence, audit, tracker closure and normal delivery. Final
+  Git transport/reservation-release receipt belongs to the session handoff.
 
 The completed-cache deletion proposal is withdrawn as unnecessary. No unanswered
 approval authorizes deletion. The earlier blanket claim that only cleanup could
 restore the lane was incorrect. Capacity addition leaves the20GiB floor and
 RCH admission policy unchanged and avoids that destructive action.
 
-### Deferred mapping publication continuation — 2026-11-01
+### Historical mapping publication checkpoint — 2026-11-01
+
+The historical checkboxes below record earlier attempts and are superseded by
+the completed verification above. They do not create duplicate active tasks.
+Mounted/default-repair/outer-request acceptance remains in the existing
+bd-9rutw/bd-11a8t/bd-j7a4e work; this baseline grants no such qualification.
 
 - [x] Recheck the committed repair and current worker state. Admission has
   recovered externally on hz3/hz4/vmi1149989; no agent deletion, policy change

@@ -1,18 +1,30 @@
 # FEATURE_PARITY
 
-> **Latest workspace qualification (2026-11-02):** the full run passes the core
-> library1678/0/25existing ignores, then reports two cross-crate btrfs fixture
-> failures before ending137 at the unchanged1800s limit. The fixture has a zero
-> device ID; the parser correctly rejects it before UTF-8/xattr operations.
-> A separate test-only correction uses native mkfs.btrfs output and requires
-> canonical ext4 bytes in private memory copies. All27 corrected integration
-> cases pass without skips or assertion changes; canonical image SHA is
-> unchanged. Complete workspace qualification is still pending. The fresh full
-> run uses managed RAM-backed test scratch and the checked dependency profile
-> below; neither prior partial results nor the complementary non-core run is
-> being represented as a complete workspace pass.
+> **Workspace baseline qualified (2026-11-02):** all25members complete through
+> four exhaustive Cargo selections: core1753/0/26existing ignores, FAT537/0/0,
+> harness2657/0/11 and other22members6937/0/21. All124 target/doctest results
+> match Cargo metadata, with no test-name filters or new ignores. Earlier
+> monolithic137 commands remain incomplete, not passes. Formatting, workspace/
+> all-target check and strict Clippy pass; changed-file UBS has zero critical
+> findings with existing warnings retained. Source tree d8fba9e8d is bound to
+> 886tracked Rust/build inputs and9README/fixture/profile inputs on both workers.
+> Runs use short RAM-backed scratch and command-only asupersync test-package
+> opt-level3 with debug assertions and overflow checks explicitly true. All
+> first-party test code retains its ordinary test profile. This is test-baseline
+> maintenance, not an unmodified unoptimized run, independent review, current
+> performance win, mounted readiness or broader durability qualification.
 
-> **Read-cache origin fence (2026-11-02, full workspace verification pending):** a further
+> **Fixture and provenance corrections:** corrected cross-crate tests use a
+> native mkfs.btrfs image and required canonical ext4 bytes in private memory
+> copies; all27cases execute. Mirrored-checkout revision expectations use the
+> validated RCH compile stamp. Profile provenance hashes sort JSON object keys
+> recursively while retaining payload and array order; executed red/green and
+> negative controls preserve all freshness/sample/marker assertions. Capture,
+> golden, fixture bytes and original hash/time constants are unchanged. README
+> source inventory is corrected to126E2E scripts and25workspace members; these
+> counts convey no executed capability. Solo verification is explicit.
+
+> **Read-cache origin fence (2026-11-02):** a further
 > executed interleaving fails0/1/0 with1702filtered in0.02s: an earlier inode
 > root fills a newer cache version, and a later public read returns zeros for
 > committed bytes. The correction requires a mutable caller's pre-inode scope
@@ -24,9 +36,9 @@
 > unchanged cache-effectiveness and cross-call write-placement golden. Both use
 > the unoptimized dependency. Final workspace/all-target check (2m35s), strict
 > Clippy (2m58s), formatting and the886-file source bindings pass. UBS reports
-> zero critical findings with existing warnings retained. The full warm suite
-> is running with the checked dependency profile described below; this is not
-> yet a full baseline, mounted or durability qualification.
+> zero critical findings with existing warnings retained. Final complete
+> package results are recorded above; mounted and broader durability
+> qualification remain separate.
 
 > **Forced read-only visibility (2026-11-02):** the earlier full workspace run
 > reports a failure in the existing orphan/FORGET read-only regression. The
@@ -39,11 +51,11 @@
 > writeback controls. Both use the unoptimized dependency. Workspace/all-target
 > check, strict Clippy and formatting pass, bound to886tracked source/build
 > inputs. The original full run times out137 at the unchanged1800s budget in
-> dense native RaptorQ encoding; a full rerun with command-scoped dependency
-> optimization and debug/overflow checks retained is pending. No full baseline,
-> mounted, durability or speedup claim follows from these focused results.
+> dense native RaptorQ encoding; the exhaustive package runs above complete
+> with command-scoped dependency optimization and debug/overflow checks retained.
+> These focused results alone grant no mounted, durability or speedup claim.
 
-> **Deferred mapping publication (2026-11-01, verification in progress):** a
+> **Deferred mapping publication (2026-11-01):** a
 > real deep-tree regression executes 0/1/0 with 1620 filtered tests: a successful
 > batch allocation and commit still returns zeros from an old reader-cached
 > hole. Shared mappings now carry their source MVCC sequence, and cached write
@@ -51,7 +63,8 @@
 > misses; fixed views retain their existing cache bypass. Expanded controls
 > cover read/read_into, root-stable edits, late fills, hole-punch publication,
 > retained readers and a writer whose transaction has already been consumed.
-> Runtime/compiler qualification is pending; no readiness or speedup claim.
+> Runtime/compiler qualification is completed by the package runs above;
+> mounted readiness and performance remain separately unqualified.
 
 > **Scoped ext4 allocation accounting (2026-11-01):** aborted writeback batches
 > no longer spend live free-block capacity. The executed regression retained
