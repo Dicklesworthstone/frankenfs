@@ -86,6 +86,46 @@ fn create_and_mkdir_collisions_return_eexist_without_native_changes() {
 }
 
 #[test]
+fn transport_flag_and_killpriv_probes_preserve_native_bytes_and_validate_inodes() {
+    for kind in ["fat16", "fat32"] {
+        let (directory, fs) = writable_fat(kind);
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let ino = create_file(&fs, "TRANSPORT.BIN");
+        fs.write(&cx, &mut scope, ino, 0, b"native data").unwrap();
+        let before = raw_image(&directory);
+        let ops: &dyn FsOps = &fs;
+        assert_eq!(ops.get_inode_flags(&cx, &mut scope, ino).unwrap(), 0);
+        assert_eq!(ops.get_inode_flags(&cx, &mut scope, ROOT).unwrap(), 0);
+        for name in ["security.capability", "user.absent", "system.posix_acl_access"] {
+            assert!(ops.getxattr(&cx, ino, name).unwrap().is_none());
+            assert!(!ops.removexattr(&cx, &mut scope, ino, name).unwrap());
+        }
+        assert!(ops.listxattr(&cx, ino).unwrap().is_empty());
+        let stale = InodeNumber(u64::MAX);
+        expect_errno(ops.get_inode_flags(&cx, &mut scope, stale), libc::ENOENT);
+        expect_errno(ops.removexattr(&cx, &mut scope, stale, "security.capability"), libc::ENOENT);
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(ops.get_inode_flags(&cancelled, &mut scope, ino).is_err());
+        assert!(ops.removexattr(&cancelled, &mut scope, ino, "security.capability").is_err());
+        assert_eq!(raw_image(&directory), before);
+
+        let volume = crate::reader::ImageArgs {
+            image: directory.path().join("volume.fat"),
+            offset: 0,
+            length: None,
+            oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii,
+            sidecar: None,
+        }.open(&cx).unwrap();
+        let readonly = FatFs::new(&cx, volume, 1000, 1000).unwrap();
+        assert_eq!(readonly.get_inode_flags(&cx, &mut scope, ROOT).unwrap(), 0);
+        expect_errno(readonly.removexattr(&cx, &mut scope, ROOT, "security.capability"), libc::EROFS);
+        assert_eq!(raw_image(&directory), before);
+    }
+}
+
+#[test]
 fn fallocate_grows_dense_native_allocation_and_preserves_existing_payload() {
     for kind in ["fat16", "fat32"] {
         let (directory, fs) = writable_fat(kind);

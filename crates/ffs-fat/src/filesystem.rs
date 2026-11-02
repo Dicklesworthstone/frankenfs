@@ -1255,6 +1255,32 @@ impl FsOps for FatFs {
         )))
     }
 
+    fn get_inode_flags(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<u32> {
+        let _operation = self.operation(cx, false)?;
+        self.node(cx, ino)?;
+        // Native FAT has no Linux immutable/append inode flags. DOS read-only
+        // remains a separate native attribute, enforced by mutation preflight.
+        // FUSE consults this getter before ordinary setattr/truncate requests.
+        Ok(0)
+    }
+
+    fn removexattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        _name: &str,
+    ) -> Result<bool> {
+        let _operation = self.operation(cx, false)?;
+        self.ensure_writable()?;
+        self.node(cx, ino)?;
+        // This native profile stores no extended attributes, including Linux
+        // security.capability. Report absence to FUSE's killpriv path rather
+        // than inheriting the trait's read-only mutation default. No backing
+        // write occurs, and setting attributes remains unsupported.
+        Ok(false)
+    }
+
     fn statfs(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<FsStat> {
         let _operation = self.operation(cx, false)?;
         self.node(cx, ino)?;
