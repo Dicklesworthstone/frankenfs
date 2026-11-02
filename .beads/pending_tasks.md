@@ -11,25 +11,125 @@ unchanged; a syntax repair alone does not close it. This checklist serves that
 explicit continuity request and retires as active work when the listed work is
 completed or handed off. Historical evidence remains in place.
 
+### Current verification and capacity recovery — 2026-11-02 (`resume12`)
+
+- [x] Complete the cold checked-dependency core suite:1677passed/0failed/
+  25existing ignores,451.78s; the native freshness fsync and original orphan
+  regression pass. The whole invocation times out137 after1811655ms in a
+  later integration test, with no reported source test failure. Preserve the
+  compile17m57s and partial results without claiming a full workspace pass.
+- [x] Reproduce the remaining inode-load/publication/cache-fill interleaving
+  before production changes:0passed/1failed/0ignored/1702filtered,0.02s,
+  Cargo101. An actual committed sparse write is later read as zeros after the
+  earlier root fills a new-version hole. Worker/red886-file manifest match.
+- [x] Restrict the correction to shared read-cache origin: require a matching
+  pre-inode caller scope epoch and capture the cache sequence once. Earlier,
+  unbound and consumed-writer scopes bypass it. Existing write-list root/
+  sequence checks and immutable cache contracts stay intact.
+- [ ] Re-execute latest default/sharded controls including the new root red,
+  existing immutable cache-effectiveness and unchanged write-placement golden.
+- [ ] Refresh current check/strict Clippy/fmt/UBS and exact source bindings;
+  all pass counts below precede this final root-context correction.
+- [ ] Re-execute the complete warm workspace selection with the same checked
+  dependency profile, unchanged1800s deadline and no test filters/new ignores.
+- [x] Re-read instructions/README, inspect unchanged candidate and owned P0,
+  local source-aware queue/cycles and reservations; preserve peer/untracked work.
+- [x] Correct the overbroad infrastructure hold: written policy permits
+  reversible capacity provisioning under the authorized SSH remediation. hz3
+  has177121529856available RAM and memory PSI0. Temporarily expand its existing
+  executable /tmp tmpfs64->96GiB, preserving mount permissions, user quotas,
+  inode limit and all files. Actual49834254336free bytes passes SBH20GiB;
+  canonical fixture SHA stays unchanged. No deletion or persistent config edit.
+- [x] Execute current default and sharded core controls, including committed
+  mapping visibility, forced-read-only data/namespace and denied write/RMW.
+  Default selection PASS:62declared,57passed/0failed/5existing ignores,
+  1561filtered,1.57s,Cargo0. Source886-file SHA verification0. Original orphan
+  failure and new public prewrite-cache/adapter controls execute; unchanged
+  ignored compressed-indirect truncation/overflow fixtures earn no coverage.
+  Sharded selection PASS:63declared,58passed/0failed/5existing ignores,
+  1639filtered,1.73s,Cargo0. Both builds use the unoptimized dependency; active
+  sharded writeback controls execute. Do not sum overlapping selections as
+  unique coverage or claim every individual case toggled allocator modes.
+- [x] Execute current workspace/all-target check and formatting: check0,
+  Cargo2m27s,remote151137ms, including tools/ffs-ops. Fmt/whitespace0 and
+  current886-file source SHA matches both workers. Preserve all old attempts.
+- [x] Execute current strict workspace/all-target Clippy on hz4: command0,
+  Cargo10m18s,remote620046ms,-Dwarnings unchanged. Final886-file source check0.
+  Existing Cargo nix future-incompat notices remain; no dependency-clean claim.
+- [ ] Execute all required workspace tests without removing cases or weakening
+  assertions. The earlier unchanged1800s timeout remains a failed/incomplete
+  run, with native dense RaptorQ solving identified by the retained stack.
+  Current full selection uses --no-fail-fast with no positional filters and
+  command-only asupersync test-package opt-level3, explicitly retaining debug
+  assertions and overflow checks. All workspace source and test/validator
+  settings remain unchanged; this build variation must be reported, not called
+  an unmodified unoptimized pass or a product speedup. Cargo profiles docs
+  confirm these independent settings. Fresh actual-volume SBH precedes it.
+- [ ] Fix actual diagnostics/failures and re-run only affected checks before
+  final qualification. Do not close the P0 without its original full evidence.
+- [ ] Assess both prior64GiB tmpfs caps after gates. Restore only if usage and
+  active peer work permit it while retaining the required20GiB headroom;
+  otherwise preserve all data and report the runtime96GiB capacity explicitly.
+- [ ] Update specs/parity/TODO and Bead with actual results, review the complete
+  change, commit/pull/import/push normally and release reservations.
+
+The completed-cache deletion proposal is withdrawn as unnecessary. No unanswered
+approval authorizes deletion. The earlier blanket claim that only cleanup could
+restore the lane was incorrect. Capacity addition leaves the20GiB floor and
+RCH admission policy unchanged and avoids that destructive action.
+
 ### Deferred mapping publication continuation — 2026-11-01
 
 - [x] Recheck the committed repair and current worker state. Admission has
   recovered externally on hz3/hz4/vmi1149989; no agent deletion, policy change
   or reclaim credit. hz3's actual executable /tmp volume passes SBH20GiB with
   30175281152bytes available, and the canonical fixture hash still matches.
-- [ ] Execute full ffs-extent library tests and default/sharded focused core
-  tests, including the real publication regression and existing native controls.
+- [x] Execute full ffs-extent library tests:155passed/0failed/1existing ignored,
+  0filtered,0.38s runtime,Cargo0. The new versioned-view/late-fill control passes;
+  the existing ignored canonical Gate2 extent-resolution case is unchanged.
+- [ ] Execute default/sharded core controls, including the real publication
+  regression and existing native controls; workspace testing is in progress.
 - [ ] Execute the prescribed full workspace suite and resolve actual failures.
+  The original source-bound run passes the new mapping-publication and existing
+  allocation regressions, but reports a failure in the read-only orphan/FORGET
+  control. Terminal137 after1802365ms at the unchanged1800s RCH deadline leaves
+  the full suite incomplete. The final native freshness fsync remains active in
+  asupersync's dense RaptorQ ConstraintMatrix::solve (source-bound read-only GDB
+  stack and500CPU ticks/5s; clean detach, no ptrace/sysctl change).
+  A candidate correction keeps
+  committed overlays readable after forced read-only without granting writes;
+  immutable snapshot/inode/parent/mapping caches stay bypassed for such views.
+  Stronger orphan payload, prewrite cache-warming and read-only RMW controls are
+  authored. Fresh current-source runtime/compiler verification is required.
   Correction to the earlier hold: the repository's explicit test commands
   authorize their normal test-owned scratch lifecycle. Manual deletion of
   existing remote caches remains separately gated; no unanswered approval is
   being treated as consent. Restricted device/xfstests ACKs remain binding.
-- [ ] Execute workspace/all-target check, strict Clippy and formatting; bind
-  source, toolchain and commands. Use nonincremental compilation to limit
-  retained build-cache growth, without reducing checks or selected tests.
+- [x] Execute workspace/all-target check and formatting: normal RCH check exits0
+  after9m36s; local fmt/whitespace0. Both workers match all886tracked
+  Rust/TOML/lock/toolchain inputs. Existing nix future-incompat notices remain.
+- [ ] Execute strict workspace/all-target Clippy with nonincremental compilation
+  to limit retained growth. Initial -j2 attempt refuses103 after queue timeout,
+  with no compiler execution. Fresh actual-volume SBH20GiB passes at
+  22304059392bytes; the normal RCH -j1 retry is admitted on vmi1149989.
 - [ ] Repair any actual failures, re-run affected gates, update the exact
   evidence and deliver the verified checkpoint. Original full-suite/mounted
   acceptance remains separate and open until executed.
+- [ ] Verify the forced-read-only correction in default and sharded core,
+  including all block-adapter write/RMW controls. Both current selections
+  refuse103 at queue timeout after vmi root falls below RCH's critical floor;
+  neither compiles or executes tests. Retired only the obsolete pre-correction Clippy
+  wrapper through its owned RCH cancellation API, terminal143 (not a pass).
+  Current fmt/whitespace0. UBS unchanged rules: core0critical/16311warnings/
+  3240info, fs_ops0/86/61, block adapter0/146/49; no warning-free claim.
+- [x] Retire the proposed14018MiB completed-cache cleanup after the reversible
+  capacity restoration above. Permission was never received and no removal
+  occurred. The earlier pure/no-open/no-cwd/protection DRY preview remains
+  historical evidence only; MIN_IDLE_H0 was a proposed retention exception,
+  not an actual reclaim or admission change.
+- [x] Resume affected tests/check/strict Clippy through unchanged admission and
+  actual-volume SBH20GiB after capacity addition. Full workspace qualification
+  remains the active task above; preserve the old1800s timeout separately.
 - [x] Operator directed SSH remediation using system-performance-remediation;
   read that skill and its reclaim/RCH references before changing workers.
 - [x] Diagnose hz3, hz4 and vmi1149989 sequentially: actual volumes, PSI,
@@ -47,15 +147,14 @@ completed or handed off. Historical evidence remains in place.
   scan, including the root ancestor. Preview0 would reclaim2214+2250MiB,
   idle64h; free space stays8061MiB. Both accounting AGENTS files have identical
   hashes and repeat the exact-command deletion permission rule.
-- [ ] Obtain the required exact deletion authorization and final command
-  confirmation for only hz3's accounting-sjperf a/target and b/target.
-  The operator's SSH/skill instruction is recorded; no deletion command is
-  authorized by implication. The prior request remains pending, but cleanup
-  is optional and no longer blocks verification after external recovery.
+The earlier accounting-sjperf a/target and b/target cleanup proposal is
+superseded by the completed own-cache proposal above. Accounting cleanup would
+not restore the actual scratch-volume floor. No deletion is authorized by
+the operator's broad SSH/skill instruction, and neither proposal has run.
 - [x] Observe restored worker headroom without reclaiming source, tracker,
   CASS, evidence, protected paths or peer work. Any later cleanup still needs
   exact authorization and fresh purity/protection/live-use checks.
-- [ ] Verify restored worker admission and actual-volume SBH20GiB; resume
+- [x] Verify restored worker admission and actual-volume SBH20GiB; resume
   normal RCH checks without changing floors, slots, quotas or mount permissions.
 - [x] Read instructions/README; inspect the owned P0, local queue, cycles and
   current reservations. Preserve original full-workspace acceptance.
