@@ -2777,6 +2777,18 @@ mod tests {
                     None
                 }
             })
+            .or_else(|| {
+                // Ordinary RCH mirrors omit .git. Expected provenance must use
+                // the validated compile-time source stamp in that environment,
+                // just as ExecutedEvidence does; never accept an arbitrary tag.
+                let raw = option_env!("RCH_BUILD_SOURCE")?.trim();
+                let sha = raw.strip_suffix("-dirty").unwrap_or(raw);
+                (sha.len() == 40
+                    && sha
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+                .then(|| sha.to_owned())
+            })
             .unwrap_or_else(|| "unknown".to_string())
     }
 

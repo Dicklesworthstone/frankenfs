@@ -34,6 +34,15 @@ fn read_json(path: &Path) -> TestResult<Value> {
     Ok(value)
 }
 
+fn canonical_json_digest(mut value: Value) -> TestResult<String> {
+    use sha2::{Digest, Sha256};
+    // Match parsed-JSON equality regardless of serde_json's preserve_order
+    // feature; object order is irrelevant, array order and payload are not.
+    value.sort_all_objects();
+    let canonical = serde_json::to_vec(&value)?;
+    Ok(hex::encode(Sha256::digest(&canonical)))
+}
+
 fn fixture_reference_time(path: &str) -> TestResult<i64> {
     let semantic = fixture_semantic_commit_time(path)?;
     if let Some(timestamp) = semantic {
@@ -88,11 +97,7 @@ fn fixture_semantic_commit_time(path: &str) -> TestResult<Option<i64>> {
             && !root.join(".git").exists()
             && path == "conformance/golden/ext4_8mb_reference.json"
         {
-            use sha2::{Digest, Sha256};
-            let parsed = read_json(&root.join(path))?;
-            let canonical = serde_json::to_vec(&parsed)
-                .map_err(|err| test_error(format!("serialize {path}: {err}")))?;
-            let digest = hex::encode(Sha256::digest(&canonical));
+            let digest = canonical_json_digest(read_json(&root.join(path))?)?;
             if digest == "a373d05f9bbdcba2654a86f37aa681cc1dbfc6897728841805951b82c4955b3f" {
                 return Ok(Some(1_770_777_526));
             }
@@ -157,6 +162,24 @@ fn iso8601_to_epoch(timestamp: &str) -> TestResult<i64> {
         .parse()
         .map_err(|err| test_error(format!("epoch should parse for {timestamp}: {err}")))?;
     Ok(epoch)
+}
+
+#[test]
+fn canonical_json_hash_ignores_object_order_but_retains_payload_and_array_order() -> TestResult {
+    let left: Value = serde_json::from_str(r#"{"b":{"d":2,"c":1},"a":[{"z":3,"y":4},5]}"#)?;
+    let right: Value = serde_json::from_str(r#"{"a":[{"y":4,"z":3},5],"b":{"c":1,"d":2}}"#)?;
+    // Independently calculated SHA-256 of the recursively key-sorted JSON.
+    let expected = "f53578772916d563aab9beea2cc8233cab5792c5883a254384ae1468498fc9e1";
+    assert_eq!(canonical_json_digest(left.clone())?, expected);
+    assert_eq!(canonical_json_digest(right)?, expected);
+
+    let mut changed_payload = left.clone();
+    changed_payload["b"]["c"] = Value::from(9);
+    assert_ne!(canonical_json_digest(changed_payload)?, expected);
+    let mut changed_array = left;
+    changed_array["a"].as_array_mut().unwrap().reverse();
+    assert_ne!(canonical_json_digest(changed_array)?, expected);
+    Ok(())
 }
 
 #[test]

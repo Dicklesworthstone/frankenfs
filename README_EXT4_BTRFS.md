@@ -32,7 +32,7 @@
 
 **The approach.** FrankenFS extracts ext4 and btrfs behavior from ~205K lines of Linux kernel C (v6.19), re-implements that behavior in Rust with `#![forbid(unsafe_code)]`, and adds experimental layers for block-level MVCC, RaptorQ repair symbols, and explicit-opt-in FUSE writeback-cache barriers.
 
-It runs as a normal Linux process via FUSE. `ParityReport::current()` prints 97/97 from the Markdown feature table; that number is not an executed-test result or a readiness score. The workspace has **22 members**, including `tools/ffs-ops`. The 2026-09-08 source-derived test inventory found **63 fuzz targets, 173 Rust benchmark files, 125 tracked E2E scripts, and 226 tracked insta snapshots**; the evidence schema declares **23 evidence-event types**. File and enum counts are not evidence that checks ran or passed. Release readiness requires fresh execution evidence in addition to the checked-in release-gate policy. The unsafe-code ban covers first-party workspace crates; the vendored FUSE transport is outside that boundary.
+It runs as a normal Linux process via FUSE. `ParityReport::current()` prints 97/97 from the Markdown feature table; that number is not an executed-test result or a readiness score. The workspace has **25 members**, including `tools/ffs-ops`. The 2026-11-02 source-derived test inventory found **63 fuzz targets, 173 Rust benchmark files, 126 tracked E2E scripts, and 226 tracked insta snapshots**; the evidence schema declares **23 evidence-event types**. File and enum counts are not evidence that checks ran or passed. Release readiness requires fresh execution evidence in addition to the checked-in release-gate policy. The unsafe-code ban covers first-party workspace crates; the vendored FUSE transport is outside that boundary.
 
 | Pillar | What it does | Why it matters |
 |---|---|---|
@@ -1503,7 +1503,7 @@ The project uses `.beads/issues.jsonl` as the canonical task store. Reasons:
 - Git-versioned: every issue change is a diff in `issues.jsonl`, reviewable in PR diffs.
 - Multi-project hygiene: cross-project pollution is detectable via the source-aware queue-state check.
 
-### Decision 10: 125 E2E gate scripts
+### Decision 10: 126 E2E gate scripts
 
 Each E2E script is a single scenario class: writeback-cache audit, repair writeback route, mounted differential oracle, etc. They could be a single mega-test. They are separate scripts because:
 
@@ -2892,7 +2892,7 @@ frankenfs/
 │   ├── flamegraph_generate.sh  Flamegraph workflow
 │   ├── run_e2e.sh              E2E suite orchestrator
 │   ├── update-goldens.sh       Regenerate golden outputs (use with care)
-│   └── e2e/                    125 tracked E2E scripts (2026-09-08 inventory, not execution evidence)
+│   └── e2e/                    126 tracked E2E scripts (2026-11-02 inventory, not execution evidence)
 │
 ├── tools/ffs-ops/              Operational CLI (the 22nd workspace member)
 ├── benchmarks/                 Saved baseline JSON manifests
@@ -3340,7 +3340,7 @@ Crash recovery for a committing transaction depends on which side of the WAL `fs
 
 ## E2E Test Categories
 
-The 125 tracked E2E scripts in `scripts/e2e/` (2026-09-08 inventory) are organized by capability area. Their presence does not establish execution or passing results. Selected highlights, grouped by category:
+The 126 tracked E2E scripts in `scripts/e2e/` (2026-11-02 inventory) are organized by capability area. Their presence does not establish execution or passing results. Selected highlights, grouped by category:
 
 ### Conformance and baseline
 - `ffs_baseline_validation_e2e.sh`: initial conformance gate
