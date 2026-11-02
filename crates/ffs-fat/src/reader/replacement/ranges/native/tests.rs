@@ -483,3 +483,116 @@ fn every_write_and_sync_cut_only_readmits_consistent_clean_images() {
         }
     }
 }
+
+#[test]
+fn selective_pending_sector_persistence_preserves_acknowledged_files() {
+    // A successful sync persists every prior write. Before the next successful
+    // sync, distinct sectors may persist independently and may tear. Never
+    // discard durable bytes from an earlier successful barrier. This is a
+    // deterministic storage model, not evidence of hardware power-loss safety.
+    let cx = Cx::for_testing();
+    for kind in ["fat16", "fat32"] {
+        let initial = formatted(kind);
+        let volume = initial.open();
+        let cluster = u64::from(volume.geometry.cluster_bytes());
+        let original = vec![0x36; 3 * cluster as usize + 7];
+        let sentinel = b"previously acknowledged unrelated file";
+        create_in_volume(&cx, &volume, "/keep.bin", sentinel, NOW, false).unwrap();
+        create_in_volume(&cx, &volume, "/file.bin", &original, NOW, false).unwrap();
+        let baseline = initial.0.lock().unwrap().image(false);
+        drop(volume);
+        let mut admitted = 0;
+        let mut refused_dirty = 0;
+        for action in 0..3 {
+            let execute = |volume: &FatVolume| -> Result<()> {
+                match action {
+                    0 => truncate_in_volume(&cx, volume, "/file.bin", 5 * cluster + 19, NOW),
+                    1 => truncate_in_volume(&cx, volume, "/file.bin", cluster - 1, NOW),
+                    _ => write_range_in_volume(
+                        &cx,
+                        volume,
+                        "/file.bin",
+                        cluster - 3,
+                        &[0x97; 31],
+                        NOW,
+                    )
+                    .map(|_| ()),
+                }
+            };
+            let mut expected = original.clone();
+            match action {
+                0 => expected.resize((5 * cluster + 19) as usize, 0),
+                1 => expected.truncate((cluster - 1) as usize),
+                _ => expected[cluster as usize - 3..cluster as usize + 28].fill(0x97),
+            }
+            let success = Device::new(baseline.clone());
+            execute(&success.open()).unwrap();
+            let total = success.0.lock().unwrap().attempts;
+            assert!(total > 8);
+            for cut in 1..=total {
+                for tear in [0, 31, 512] {
+                    let device = Device::new(baseline.clone());
+                    {
+                        let mut state = device.0.lock().unwrap();
+                        state.fail_at = Some(cut);
+                        state.tear = tear;
+                    }
+                    assert!(execute(&device.open()).is_err(), "{kind} action={action} cut={cut}");
+                    for schedule in 0..4 {
+                        let mut bytes = {
+                            let state = device.0.lock().unwrap();
+                            let mut bytes = state.durable.clone();
+                            // These selections deliberately persist a later
+                            // sector while losing an earlier pending sector.
+                            // Head/tail cuts also cover a torn clean-state byte.
+                            for (index, (&at, page)) in state.pending.iter().enumerate() {
+                                let range = match schedule {
+                                    0 if index % 2 == 0 => 0..512,
+                                    1 if index % 2 == 1 => 0..512,
+                                    2 => 0..31,
+                                    3 => 481..512,
+                                    _ => 0..0,
+                                };
+                                bytes[at + range.start..at + range.end]
+                                    .copy_from_slice(&page[range]);
+                            }
+                            bytes
+                        };
+                        assert_eq!(&bytes[..BASE as usize], &baseline[..BASE as usize]);
+                        let suffix = bytes.len() - BASE as usize;
+                        assert_eq!(&bytes[suffix..], &baseline[suffix..]);
+                        let crashed = Device::new(std::mem::take(&mut bytes));
+                        match FatVolume::from_device(
+                            &cx,
+                            Box::new(crashed.clone()),
+                            BASE,
+                            crashed.len_bytes() - 2 * BASE,
+                        ) {
+                            Ok(reopened) => {
+                                admitted += 1;
+                                clean(&reopened);
+                                let (_, chain) = file(&reopened);
+                                let actual = reopened.read(&cx, &chain, 0, 8192).unwrap();
+                                assert!(
+                                    actual == original || actual == expected,
+                                    "{kind} action={action} cut={cut} tear={tear} schedule={schedule}"
+                                );
+                                let keep = reopened.resolve(&cx, "/keep.bin").unwrap().unwrap();
+                                let chain = reopened.file_chain(&cx, &keep).unwrap();
+                                assert_eq!(reopened.read(&cx, &chain, 0, 8192).unwrap(), sentinel);
+                            }
+                            Err(FfsError::UnsupportedFeature(detail)) if detail.contains("dirty") => {
+                                refused_dirty += 1;
+                            }
+                            Err(error) => panic!(
+                                "unexpected {kind} restart error: {error}; action={action} cut={cut} tear={tear} schedule={schedule}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(admitted > 0 && refused_dirty > 0);
+        eprintln!("selective_pending_sector_persistence kind={kind} clean={admitted} dirty={refused_dirty}");
+    }
+}

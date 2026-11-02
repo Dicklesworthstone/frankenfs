@@ -124,6 +124,10 @@ class Run:
                    "--uid", str(os.getuid()), "--gid", str(os.getgid()), *image_options]
         if writable:
             command.append("--rw")
+        metadata = self.root / f"{image.stem}-mount-{self.sequence:03d}.json"
+        record = {"argv": command, "status": "starting", "returncode": None}
+        with metadata.open("x") as stream:
+            stream.write(json.dumps(record, indent=2) + "\n")
         process = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
@@ -135,9 +139,14 @@ class Run:
                 check(process.poll() is None, f"FAT mount exited; see {log.name}")
                 check(time.monotonic() < deadline, f"FAT mount timed out; see {log.name}")
                 time.sleep(0.05)
+            record["status"] = "mounted"
             yield mountpoint
             self.command("fusermount3", "-u", mountpoint)
             check(process.wait(timeout=30) == 0, f"FAT mount did not exit cleanly; see {log.name}")
+            record["status"] = "passed"
+        except BaseException as error:
+            record.update(status="failed", error=f"{type(error).__name__}: {error}")
+            raise
         finally:
             # Only our own mountpoint/process is touched. Failed evidence stays
             # on disk; in particular, never recursively delete a mounted tree.
@@ -155,6 +164,8 @@ class Run:
                             process.wait(timeout=10)
                 finally:
                     log.close()
+                    record["returncode"] = process.poll()
+                    metadata.write_text(json.dumps(record, indent=2) + "\n")
 
     def mounted(self, image: Path, payloads: dict[str, bytes]) -> None:
         with self.mount_image(image) as mountpoint:
@@ -184,7 +195,10 @@ class Run:
         """
         tag = f"rw-fat{bits}-s{sector}-{'bounded' if bounded else 'plain'}"
         native = self.root / f"{tag}-native.img"
-        size = (512 if bits == 32 and sector == 4096 else 64) * 1024 * 1024
+        size_mib = 512 if bits == 32 and sector == 4096 else 64
+        if bits == 16 and sector == 512:
+            size_mib = 16
+        size = size_mib * 1024 * 1024
         with native.open("xb") as stream:
             stream.truncate(size)
         self.command("mkfs.fat", "-F", str(bits), "-S", str(sector), "-s", "1", native)
@@ -258,6 +272,9 @@ class Run:
                 check(destination.read_bytes() == payload, "cross-parent rename lost source")
                 check(destination.stat().st_ino != old_ino, "overwrite reused pinned inode")
             expected["right/Replaced café.txt"] = payload
+            os.utime(destination, (1_700_000_000, 1_700_000_002))
+            check(int(destination.stat().st_mtime) == 1_700_000_002,
+                  "mounted FAT UTC/two-second timestamp projection differs")
             (mounted / "left/subdir").mkdir()
             expect_errno("directory cycle", errno.EINVAL,
                          lambda: (mounted / "left").rename(mounted / "left/subdir/cycle"))
@@ -317,6 +334,8 @@ class Run:
         with self.mount_image(image, image_options=options) as mounted:
             for name, data in expected.items():
                 check((mounted / name).read_bytes() == data, f"fresh FUSE bytes differ: {name}")
+            check(int((mounted / "right/Replaced café.txt").stat().st_mtime) == 1_700_000_002,
+                  "native timestamp was not preserved on a fresh mount")
         check(digest(image) == before_readonly, "fresh read-only mount changed bytes")
         acknowledged("native fsck/mtools and fresh read-only mount", files=len(expected))
         return {"scenario": "writable_mount", "format": f"FAT{bits}", "sector_bytes": sector,
