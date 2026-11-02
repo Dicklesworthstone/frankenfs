@@ -28,22 +28,43 @@
 > kernel-reference17and doctest1pass. The earlier sudo-rs -E runner dropped strict
 > flags and Cargo discovery; its prefix receives ordinary unit credit only.
 > Selected-variable preservation verifies actual flags and Cargo launch. Full
-> package aggregation has2657unique passes/11existing ignores/0filtered across
-> 28target results. Three Git-dependent metadata targets pass with current,
-> hash-verified worker binaries against the real controller checkout. One census
-> target remains pending: the unchanged validator exposes three stale counts,
-> now repaired against all90actual Git-index sources, without classification or
-> validator changes. Its fresh build is refused by worker admission; it earns
-> static data-verification credit only. No successful full-package invocation
-> is claimed. Current hosted proof is still queued; bd-53dub stays BLOCKED with
-> both unmet conditions retained in the original item.
-> Workspace/all-target check, strict Clippy, formatting and six-file changed-code
-> UBS pass (0critical; existing warnings retained); final delivery scan and
-> formatting pass too. Full harness benchmarks finish60/60, with no incumbent comparison or
-> speedup claim. No filesystem algorithm or parity percentage changed.
+> package aggregation now has2658unique passes/11existing ignores/0filtered
+> across29target results. All four Git-dependent metadata targets pass with
+> hash-verified worker binaries against the real controller checkout. Census
+> ELF b5bb4a75 passes1/0 after an ordinary RCH no-run build1139093ms/exit0;
+> all90entries match actual Git-index sources, without validator/classification
+> changes. No successful full-package invocation is claimed.
+>
+> Hosted CI41499312225 actually executes287FUSE passes/2failures/8existing
+> ignores, including both1000-pair forensic mounts/e2fsck0. Its two failures
+> reproduce as uid1000: native ext4 fixtures have root-owned0755roots, so
+> creation correctly gets EACCES. The existing producer now sets mkfs root_owner
+> from the source directory's uid/gid, preserving permissions and assertions;
+> the complete native non-root target now passes289/0failed/8existing ignores/
+> 0filtered in216.07s, including all six protected CLI cases. A separate native
+> debugfs check confirms all three roots retain0755and owner1000:1000. Its
+> unit lane's final census failure
+> concerns the old count already corrected and verified above. Hosted shell
+> suites/differential were skipped after FUSE failed, and receive no CI credit.
+> Hosted xfstests41499312138 executes zero tests because sudo-rs ignores -E,
+> loses MODE=run and the device/tree/ACK context, then enters plan mode. The
+> workflow now forwards its full declared contract explicitly. Real sudo-rs
+> control execution verifies both formats, absent/incorrect ACK handling and
+> nonzero exit propagation with a recording endpoint; this is process-boundary
+> control evidence, not native xfstests proof. Current hosted runs are queued.
+>
+> After the ownership edit, workspace/all-target check passes222782ms/exit0,
+> strict workspace/all-target Clippy passes280055ms/exit0, formatting passes,
+> and complete six-file UBS reports0critical/20068warnings/3960info with no
+> failed modules or exclusions. Full harness
+> benchmarks finish60/60; their runtime inputs are unchanged by this test-only
+> edit. No incumbent comparison, speedup or filesystem parity change is claimed.
+> bd-53dub retains the current-source hosted shell/journaled/differential probe;
+> those steps were skipped after the old fixture failures, so no green hosted
+> run or closure is claimed from the successful worker execution.
 > Exact commands, source/ELF/tool/image identities, failed attempts and
 > proof limits: `.beads/pending_tasks.md` and
-> `artifacts/implementation/20261030_O221Lk/resume15-*`.
+> `artifacts/implementation/20261030_O221Lk/resume15-*` and `resume16-*`.
 
 > **Native FAT maintenance qualified (2026-11-02, bd-ave6y):** the existing
 > resize/recovery engines execute the new maintenance mode in the permanent

@@ -16576,10 +16576,14 @@ fn protected_sidecar_fixture(
         .set_len(if fstype == "ext4" { 32 } else { 128 } * 1024 * 1024)
         .unwrap();
     if fstype == "ext4" {
+        let owner = fs::metadata(&source).unwrap();
+        let root_owner = format!("root_owner={}:{}", owner.uid(), owner.gid());
         btrfs_seed_sprout_run(
             directory,
             Command::new("mkfs.ext4")
-                .args(["-q", "-F", "-b", "4096", "-O", "has_journal", "-d"])
+                .args(["-q", "-F", "-b", "4096", "-O", "has_journal", "-E"])
+                .arg(root_owner)
+                .arg("-d")
                 .arg(&source)
                 .arg(&image),
         );

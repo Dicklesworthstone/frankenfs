@@ -12,15 +12,77 @@ Created by CC agent 2026-04-22. Import when bead database clears.
 - [x] Resume bd-53dub and reserve only the existing census/parity/TODO surfaces.
   hz3 root headroom recovers to51GiB; actual target SBH20GiB probe passes
   73.7%free. Keep every admission floor/slot/deadline unchanged.
-- [ ] Finish ordinary RCH census no-run onhz3; fetch its exact worker ELF,
+- [x] Finish ordinary RCH census no-run onhz3; fetch its exact worker ELF,
   match SHA256, run the entire unchanged metadata target against actual local
   Git and record the result. Close the last owning-target gap only on that run.
+  Build1139093ms/exit0; exact ELFb5bb4a756fae3ee4ab0523bb7ec91ad7255e9472cddc2323329d037c9521f9bf
+  matches the worker, and the real-checkout target passes1/0/0/0filtered.
+  This completes the prior-source owning aggregation2658/11existing ignores;
+  later fixture changes below require their own executed proof.
 - [ ] Inspect actual hosted mounted/oracle results and original AC before any
   bd-53dub closure. Keep missing hosted proof in the original item.
+  Hosted FUSE41499312225 executes287pass/2fail/8existing ignores,208.64s;
+  both forensic modes execute1000pairs/e2fsck0. Two ext4 protected CLI cases
+  fail EACCES for the non-root runner; shell suites/differential are skipped.
+- [x] Trace hosted xfstests41499312138: both formats execute plan mode after
+  sudo-rs drops -E environment, with113unexpected missing-result regressions.
+  Fix the existing workflow's privilege boundary to pass all11declared step
+  variables plus toolchain/tree/device/directory context explicitly. No list,
+  baseline, ACK value, deadline or validator change.
+- [x] Verify the complete workflow boundary with real sudo-rs0.2.13 and a
+  substituted recording endpoint: pinned ff056ce92 loses the run contract;
+  new ext4/btrfs cases preserve exact values/empty subtype, retain an incorrect
+  ACK unchanged, reject an unset ACK before invocation, and propagate exit71.
+  This is process-control proof, with zero native xfstests execution credit.
+  Initial control accidentally read moving HEAD after another actor committed
+  the fix; its failed assertion is retained. The corrected baseline is pinned.
+  External commits bf4457290 and0257d55f2 are preserved, not independent review
+  and not commit commands executed by this agent.
+- [x] Reproduce the hosted ext4 fixture failure as uid1000 with the retained
+  ELF63288ff1: scrub1passes, corruption/restart and periodic commit2fail with
+  EACCES,294filtered. Enable CI's user_allow_other only through a bind-mounted
+  fixture inside a private mount namespace; host fuse.conf hash28c34f67 stays
+  unchanged. No persistent permission/policy changes or deletion.
+- [x] Fix protected ext4 image creation to pass mkfs root_owner from its actual
+  source-directory uid/gid. Keep filesystem permissions and all test assertions.
+- [x] Build the fixed FUSE target, verify source/ELF identity, execute non-root
+  protection and complete FUSE coverage, then workspace check/Clippy/format/UBS.
+  First hz3 check refuses103during source-namespace initialization(status73,
+  Killed), before a source grant/Cargo execution; no command result to recover.
+  The fixed-target hz3 preparation also refuses103; vmi's actual workspace/
+  all-target check passes222782ms/exit0. Its later test-build admission refuses
+  critical memory pressure before Cargo. No limits or other jobs are changed.
+  A fresh normal hz3 retry passes the no-run build71671ms/exit0; all886worker
+  Rust/build inputs match. ELF77f6bb13911ded1854c715a1b50cc9fe3b8252c4d0db51893285b32d712baae1
+  is copied/hash-verified before native non-root execution. Formatting/diff
+  checks pass; complete six-code-file UBS passes0critical/20068warnings/
+  3960info, no failed modules/exclusions. Strict workspace/all-target Clippy
+  passes onvmi280055ms/exit0. Its hz3 predecessor refuses103before Cargo.
+  Native uid1000 protected-six passes6/0/0/291filtered in66.45s, then the
+  complete target passes289/0/8existing ignores/0filtered in216.07s. All eight
+  unsupported-scenario SKIPs remain explicit; both1000-pair forensic mounts
+  execute/e2fsck0. Native debugfs independently confirms all three ext4 roots
+  retain0755and change only owner0:0to1000:1000. Final CLI/test ELF and host
+  fuse.conf hashes remain fixed. These are live Linux tests, not field or
+  hardware-power-loss proof; the documented asupersync dependency profile stays.
+- [x] Inspect the completed hosted unit lane: its only final failure is the
+  old census count1316vs1449; the current exact-ELF real-checkout census pass
+  above verifies the already-landed correction. Hosted kernel-reference
+  tests pass17/0. This failed hosted run remains a failure.
+- [ ] Observe actual native xfstests execution after the workflow repair;
+  retain the original item until all required hosted evidence is available.
+  The corrected FUSE setup is fully exercised locally, but the hosted shell/
+  journaled/differential steps were skipped after the earlier EACCES failures.
+  Keep their named current-source CI probe in bd-53dub rather than closing it.
 - [ ] Re-evaluate the next critical filesystem capability using current source
   and the safe queue. bd-w2u82 already has its loop transport implementation;
   its remaining measurement needs a quiet window/build-freeze disposition.
   Prefer genuine remaining capability over duplicate wiring or meta-tests.
+  bd-jhuob's apparent easy tree-log promotion was already measured as a loss
+  and rolled back; do not repeat that promotion. bd-uxh7t remains a useful
+  correctness probe. Its existing fixture builder catches create/fsync errors
+  yet can return0after validating only the partial requested population; repair
+  that producer before relying on it for the owed kernel-accepted bisection.
 - [ ] Implement and verify the selected task with appropriate gates; update
   Beads and this checklist on executed evidence, then deliver both Git refs.
 
@@ -248,6 +310,16 @@ No spec reduction or replacement Bead carries an unmet acceptance condition.
 Verdict: legitimate bounded ENABLER work, with DRIFTING risk from the costly
 runtime relay and repeated capacity triage. Correction: freeze new machinery,
 finish original checks, then return to positive filesystem capability work.
+
+Continuation0257d55f2: actual hosted failures exposed two additional setup
+defects, not a reason to weaken gates. The workflow forwards its existing
+contract through sudo-rs, and the ext4 producer preserves the creating user's
+ownership. Red native uid1000 baseline1/2becomes six-case6/0and complete289/0;
+debugfs verifies ownership and unchanged0755. All final compiler/lint/format/
+scanner checks pass. Solo self-review only; no independent verifier claimed.
+Keep hosted current-source shell/differential proof pending in the same Bead.
+No specification, baseline, ignore, deadline, assertion or admission relaxation;
+no deleted file, incumbent-relative performance win or field reliability claim.
 
 Process creation gate for the temporary runtime relay and negative wrapper:
 consumer=the existing complete differential shell script; gate=its real build/
