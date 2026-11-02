@@ -17,6 +17,9 @@ implementations over the same bytes. The kernel's listing is compared against
 the names and sizes we asked for, entry by entry, and a single mismatch fails
 the build.
 
+Every requested create and durability boundary must also succeed. Kernel
+readability of a partial population does not make a failed build successful.
+
 So this is also a correctness check of the btrfs write path, and it should be
 read as one. bd-giw9n is the standing hazard -- a btrfs image was UNMOUNTABLE
 after ~32k creates -- which is why `--count` defaults well below that and why
@@ -173,6 +176,7 @@ def build(args: argparse.Namespace) -> int:
               f"and are excluded from the check")
     names = fixture_names(args.count)
     expected: dict[str, int] = {}
+    creation_error: OSError | None = None
     started = time.monotonic()
     try:
         batch = commit_batch_size(args.count, args.commits)
@@ -191,6 +195,7 @@ def build(args: argparse.Namespace) -> int:
                 finally:
                     os.close(handle)
     except OSError as err:
+        creation_error = err
         print(f"create failed at {len(expected)} of {args.count}: {err}")
         print("that is a result about the btrfs write path, not a script bug (bd-giw9n)")
     elapsed = time.monotonic() - started
@@ -208,6 +213,10 @@ def build(args: argparse.Namespace) -> int:
     difference = compare_listings(expected, actual, preexisting)
     if difference:
         print(f"FAIL: {difference}")
+        return 1
+    if creation_error is not None or len(expected) != args.count:
+        print(f"FAIL: requested {args.count} files, created {len(expected)}; "
+              "kernel readback verified only the completed writes, not a successful build")
         return 1
     print(f"VERIFIED by the kernel: {len(actual)} files, every name and size matches")
     print(f"fixture ready: {args.out}")

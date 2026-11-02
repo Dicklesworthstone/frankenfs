@@ -1,5 +1,32 @@
 # FEATURE_PARITY
 
+> **Btrfs small-write ENOSPC investigation qualified (2026-11-02, bd-uxh7t):**
+> fresh2048/8192/20050-file fixtures created through FrankenFS pass kernel
+> name/size acceptance before mutation. Seven sustained post-reopen workloads
+> pass512actual4KiB overwrite/fsync cycles, clean native btrfs checks and kernel
+> final namespace/payload readback. A20,050-file fixture with growth disabled
+> from creation rejects the first fsync only when growth remains disabled;
+> the identical pristine input with the default policy passes128cycles.
+> Allocator diagnostics attribute the rejection to METADATA(flags4):32MiB
+> total/used,17924096bytes pinned, largest gap0, with data space available.
+>
+> Sixteen fresh growth-off bisection trials find an observed adjacent boundary:
+> 18215files pass,18216return ENOSPC. Every image passes native checks before/
+> after; kernel readback checks all names/sizes/payloads and preserves the exact
+> committed preimage after rejection. This is not a default-policy capacity
+> limit. At2k with growth off, metadata remains2015232of33554432bytes from
+> fsync1through128; default20k metadata stabilizes18841600bytes by cycle8
+> through128. These bounded probes support reuse/reclamation, not arbitrary-time
+> guarantees. No growth policy, production filesystem code or parity percentage
+> changed. The existing producer now fails after caught create/fsync errors,
+> including a final-boundary error with every name present; pinned-original
+> negative controls returned0where the fix returns1. Those errors are planted
+> controls, distinct from the real allocator ENOSPC above. Selftest20cases and
+> complete7-code-file UBS0critical pass. Exact commands, inputs, earlier failed
+> diagnostic and results: `artifacts/implementation/20261030_O221Lk/resume16-uxh7t-*`.
+> A separately observed mounted SPACE_INFO variable-payload failure isbd-k3hon;
+> this probe instead reads committed accounting with native extent-tree dumps.
+
 > **Oracle/mount qualification in progress (2026-11-02, bd-53dub):** required
 > missing capabilities now fail the remaining forensic/differential paths;
 > optional skips are greppable. The original missing-tool differential exits0,

@@ -74,7 +74,7 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   The corrected FUSE setup is fully exercised locally, but the hosted shell/
   journaled/differential steps were skipped after the earlier EACCES failures.
   Keep their named current-source CI probe in bd-53dub rather than closing it.
-- [ ] Re-evaluate the next critical filesystem capability using current source
+- [x] Re-evaluate the next critical filesystem capability using current source
   and the safe queue. bd-w2u82 already has its loop transport implementation;
   its remaining measurement needs a quiet window/build-freeze disposition.
   Prefer genuine remaining capability over duplicate wiring or meta-tests.
@@ -83,8 +83,79 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   correctness probe. Its existing fixture builder catches create/fsync errors
   yet can return0after validating only the partial requested population; repair
   that producer before relying on it for the owed kernel-accepted bisection.
-- [ ] Implement and verify the selected task with appropriate gates; update
+- [x] Implement and verify the selected task with appropriate gates; update
   Beads and this checklist on executed evidence, then deliver both Git refs.
+
+## Active btrfs allocation probe — 2026-11-02 (`bd-uxh7t`, NavyElm)
+
+- [x] Keep bd-53dub blocked on its named hosted probe; claim only bd-uxh7t
+  from the fresh source-aware53claimable/0foreign queue and reserve the existing
+  native fixture producer. Published ownership fix804e6abcb reaches both refs.
+- [x] Inspect current allocator growth/reclamation, existing20k regression and
+  the exact original owed probe. Preserve default growth and all performance
+  policies; bd-jhuob's measured loss is not a reason to promote its fast path.
+- [x] Fix the existing fixture producer's false-success path: keep a caught
+  creation/fsync error through native readback and reject partial population,
+  including an error at the final durability boundary after all names exist.
+- [x] Execute pinned-original and fixed producer against actual native/FUSE
+  fixtures with planted early-create and final-fsync errors. Label the planted
+  errors as negative controls, not actual allocator ENOSPC evidence.
+  Original returns0for both; fixed returns1for both, with actual native readback.
+  Final producer SHA256a63dd65a66538a32fbef5e528b9e7b1820cd084b0b66651c1afe233ffa5b0032
+  matches the worker; production CLI remains c1f3080e, unchanged Rust inputs.
+- [x] Build fresh2k/intermediate/20,050-file fixtures through the real producer;
+  require kernel name/size acceptance before each 4KiB fsync workload.
+  Counts2048/8192/20050,4creation commits each; all requested files plus the
+  native sentinel are kernel-accepted and pass native btrfs check. The additional
+  20,050fixture disables growth from creation onward, avoiding the confound of
+  metadata already grown by the default producer.
+- [x] Run repeated overwrite/fsync with default and explicit growth-off control;
+  capture allocator metadata/data resources plus DAG counts and native checks.
+  Bisect only if a real failing file-count bracket is observed.
+  Six initial cases pass384actual4KiB overwrite/fsyncs:128at2k and32at8k/20k,
+  each default/off. The strict no-growth-created20k input rejects its first
+  growth-off post-reopen fsync: DAG1133,needed16384,required_flags4(METADATA),
+  total/used33554432,pinned17924096,largest_free0; DATA remains available.
+  The same pristine input with default policy passes128fsyncs, so sustained
+  successes total512, not640. Sixteen fresh growth-off bisection trials find
+  adjacent18215pass/18216ENOSPC, all native checks clean before/after. Kernel
+  checks every name, size and payload, requiring exact old bytes after rejected
+  commits and new bytes after successful ones. This is an observed boundary
+  for this fixed construction/policy, not a default-policy capacity limit.
+- [x] Test sustained fixed-population fsync at2k to distinguish reclamation from
+  capacity growth. Verify native final namespace/payloads and btrfs check.
+  With growth disabled, metadata stays2015232of33554432bytes from fsync1
+  through128, DAG116; data use stays bounded. The20k default repeat stabilizes
+  at18841600metadata bytes by cycle8through128 after growing one chunk. This
+  is bounded reclamation/reuse evidence, not a proof about arbitrary time.
+- [x] Run source-appropriate producer selftest/static checks/UBS, retain every
+  failure and raw command, update original Bead/parity, then deliver both refs.
+  Selftest20/0; Python compiles without bytecode, format/diff checks pass.
+  Full7code-file UBS0critical/20074warnings/3990info; final Python-only scan
+  and unchanged-Rust compiler/lint evidence remain separately recorded.
+- [x] Retain the failed diagnostic: native df refuses FUSE; ioctl slots0returns
+  count3but slots8returnsEIO. Native extent-tree dumps provide committed group
+  accounting instead. File the independently observed transport defectbd-k3hon;
+  it is not an allocation-probe condition moved out to justify closure.
+- [x] Retain first strict-control probe's exit1: its success-only size assertion
+  incorrectly expected4096after a rejected fsync. Do not convert that run into
+  a pass. The separate bisection checks the exact committed preimage on every
+  rejection; the default128cycle repeat keeps the original full-success checks.
+  Dynamic launcher and optional formatter-version queries blocked by DCG are
+  not executed/overridden. Static read-only query and other identity checks
+  succeed; only this task's abandoned mount is normally unmounted.
+- [x] Close bd-uxh7t with the cited executed probes and sync the tracker. Keep
+  bd-53dub's hosted probe and the separate bd-k3hon defect open. Final producer
+  selftest20/0, Python UBS0critical/6warnings/30info, format/diff checks pass;
+  the final delivery receipt records the actual Git ref comparison separately.
+
+Bounded audit of this continuation: one producer error path fixed; no new
+product framework, filesystem algorithm, growth default, test assertion,
+baseline or admission change. Current default has no failing bracket through
+20,050files; the explicit growth-off control supplies attribution, not a new
+product regression or performance win. Solo self-review; no independent review,
+unbounded-time, hardware-power-loss or field reliability claim. The one-off
+native probes retire here with their inputs/results retained, not deleted.
 
 ## Active oracle/mount evidence wiring — 2026-11-02 (`bd-53dub`, NavyElm)
 
