@@ -34,9 +34,24 @@ active work only when that acceptance is executed or explicitly handed off.
     Return typed Exists from native name planning; add file/mkdir/case/alias
     collision and invalid-name controls with unchanged-image assertions.
   - [ ] Execute corrected collision regression and the full mounted campaign.
+  - [x] Execute the complete collision-fixed FAT package: 538 library and2
+    consumer tests pass,0fail/ignore/filter; RCH0 in325051ms. This precedes
+    the later transport correction and is not its final qualification.
+  - [x] Real mounted ftruncate then exposes EOPNOTSUPP from inherited
+    get_inode_flags. Wire truthful zero Linux flags and absent native security
+    attributes for killpriv; add inode/cancellation/RO/unchanged-byte controls.
+  - [ ] Rebuild and execute the transport-corrected CLI and full package.
 - [ ] Exercise pending/durable lost/reordered/torn writes and failed final
   clean flush at allocation/data/namespace boundaries; reopen fresh engines
   and check only the explicitly allowed acknowledged states.
+  - [x] Data growth/shrink/overwrite:1608 selective-sector restart states,
+    240clean/1368dirty, both dialects, all named write/flush cuts.
+  - [x] Create/directory growth, mkdir, cross-parent/overwrite rename, unlink
+    and rmdir:3576 partial-persistence states,480clean/3096dirty, both
+    dialects. Reopen fresh engines; compare explicit old/new namespaces and
+    unchanged native metadata/allocation/data of an acknowledged sentinel.
+    These are storage-model results, not process-crash or device-power-loss
+    proof; terminal clean-state flush errors remain errors.
 - [ ] Run owning package, affected CLI/FUSE consumers, fmt, workspace check,
   strict Clippy and required harness gates through ordinary RCH lanes.
 - [ ] Re-execute final acceptance against exact source; keep unit/fault,
