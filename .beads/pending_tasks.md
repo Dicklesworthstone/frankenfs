@@ -37,10 +37,23 @@ completed or handed off. Historical evidence remains in place.
   retries pass after external root/I/O pressure recovers. Final886-file source
   manifest matches local checkout and both workers. Source/spec changes are
   now committed as64c841698 by a peer; do not claim that peer's git actions.
-- [ ] Re-execute the complete warm workspace selection with the same checked
+- [x] Execute the complete warm workspace selection with the same checked
   dependency profile, unchanged1800s deadline and no test filters/new ignores.
-  Running from01:40UTC on hz3 with-j2 and4test threads, after actual/tmp
-  SBH20GiB passes; resume12-root-workspace-tests-warm.log retains full output.
+  Terminal137 after1802681ms, not a workspace pass. The full core library
+  passes1678/0/25; cross_crate_integration reports25/2/0 because its synthetic
+  btrfs image has zero devid and fails admission before UTF-8/xattr operations.
+  The command reaches FAT tests before timeout; preserve every failed result.
+- [x] Repair the malformed btrfs integration fixture with native mkfs.btrfs
+  output, preserving every operation assertion and parser rejection. Remove
+  the incomplete manual image encoder. Make ext4 integration cases require the
+  actual canonical image and mutate private memory copies; the former wrong
+  optional path could silently skip or directly mutate a shared fixture.
+- [ ] Execute all27 corrected cross-crate integration cases. Normal RCH hz3
+  with checked dependency profile and managed RAM scratch is compiling after
+  fresh SBH20GiB. New886-input manifest distinguishes this fixture-only edit
+  from the previously qualified product source; resume12-fixture-integration.log.
+- [ ] Refresh fmt/check/strict Clippy/UBS for this integration-fixture change,
+  verify retained canonical image hashes, and finish full workspace evidence.
 - [x] Diagnose slower native-image execution in the warm run: the actual test
   process uses root-backed/data/projects/frankenfs/.rch-tmp, while build output
   is on/tmp. Retained process namespace/environment confirms this; host I/O
