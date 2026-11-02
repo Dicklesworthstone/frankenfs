@@ -201,7 +201,9 @@ class Run:
         size = size_mib * 1024 * 1024
         with native.open("xb") as stream:
             stream.truncate(size)
-        self.command("mkfs.fat", "-F", str(bits), "-S", str(sector), "-s", "1", native)
+        root_options = ("-r", "32") if bits == 16 else ()
+        self.command("mkfs.fat", "-F", str(bits), "-S", str(sector), "-s", "1",
+                     *root_options, native)
         sentinel = bytes(range(251)) * 37 + b"native file must survive unrelated writes"
         source = self.root / f"{tag}-sentinel.bin"
         source.write_bytes(sentinel)
@@ -308,6 +310,32 @@ class Run:
             check(len(names) == 40 and len(set(names)) == 40, "grown readdir lost/duplicated names")
             check((mounted / "KEEP.BIN").read_bytes() == sentinel, "unrelated native file changed")
             acknowledged("directory growth and readdir", entries=40)
+
+            if bits == 16:
+                # dosfstools rounds the requested fixed root to sector size.
+                with native.open("rb") as stream:
+                    boot = stream.read(512)
+                capacity = int.from_bytes(boot[17:19], "little")
+                filled = 0
+                for index in range(capacity + 1):
+                    relative = f"F{index:07d}.BIN"
+                    try:
+                        with (mounted / relative).open("xb"):
+                            pass
+                    except OSError as error:
+                        check(error.errno == errno.ENOSPC,
+                              f"fixed-root exhaustion returned {error.errno}, expected ENOSPC")
+                        break
+                    expected[relative] = b""
+                    filled += 1
+                else:
+                    raise RuntimeError("FAT16 fixed root grew beyond its native capacity")
+                check(filled > 0, "fixed-root exhaustion did not exercise any available slots")
+                expect_errno("mkdir in full fixed root", errno.ENOSPC,
+                             lambda: (mounted / "FULLROOT").mkdir())
+                check((mounted / "KEEP.BIN").read_bytes() == sentinel,
+                      "fixed-root exhaustion changed an unrelated file")
+                acknowledged("fixed-root exhaustion", empty_files=filled, root_slots=capacity)
 
         # fsck has no bounded-image selector: extract only our selected range.
         checked_image = image
