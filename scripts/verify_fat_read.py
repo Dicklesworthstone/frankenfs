@@ -10,6 +10,7 @@ are failures, never skipped successes. Build the candidate before running this.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import errno
 import hashlib
 import json
@@ -110,13 +111,21 @@ class Run:
               f"unexpected command status: {command!r}; see {prefix}.stderr")
         return prefix.with_suffix(".stdout").read_bytes()
 
-    def mounted(self, image: Path, payloads: dict[str, bytes]) -> None:
+    @contextmanager
+    def mount_image(self, image: Path, *, writable: bool = False,
+                    image_options: tuple[str, ...] = ()):
         mountpoint = self.root / f"{image.stem}-mount"
-        mountpoint.mkdir()
-        log = (self.root / f"{image.stem}-mount.stderr").open("wb")
+        mountpoint.mkdir(exist_ok=True)
+        check(not os.path.ismount(mountpoint) and not any(mountpoint.iterdir()),
+              "candidate mountpoint is not empty and unmounted")
+        self.sequence += 1
+        log = (self.root / f"{image.stem}-mount-{self.sequence:03d}.stderr").open("xb")
+        command = [str(self.binary), "mount", str(image), str(mountpoint), "--offline-image",
+                   "--uid", str(os.getuid()), "--gid", str(os.getgid()), *image_options]
+        if writable:
+            command.append("--rw")
         process = subprocess.Popen(
-            [str(self.binary), "mount", str(image), str(mountpoint), "--offline-image",
-             "--uid", str(os.getuid()), "--gid", str(os.getgid())],
+            command,
             stdout=subprocess.DEVNULL,
             stderr=log,
         )
@@ -126,22 +135,7 @@ class Run:
                 check(process.poll() is None, f"FAT mount exited; see {log.name}")
                 check(time.monotonic() < deadline, f"FAT mount timed out; see {log.name}")
                 time.sleep(0.05)
-            for name, expected in payloads.items():
-                path = mountpoint / name
-                check(path.read_bytes() == expected, f"mounted FAT bytes differ: {name}")
-                check(path.stat().st_size == len(expected), f"mounted FAT size differs: {name}")
-                with path.open("rb") as stream:
-                    stream.seek(507)
-                    check(stream.read(1031) == expected[507:1538], f"mounted unaligned read differs: {name}")
-            first = mountpoint / next(iter(payloads))
-            try:
-                descriptor = os.open(first, os.O_WRONLY)
-            except OSError as error:
-                check(error.errno == errno.EROFS, f"write-open returned {error.errno}, expected EROFS")
-            else:
-                os.close(descriptor)
-                raise RuntimeError("FAT read-only mount admitted a writable descriptor")
-            check(os.statvfs(mountpoint).f_bsize > 0, "mounted statfs returned no block size")
+            yield mountpoint
             self.command("fusermount3", "-u", mountpoint)
             check(process.wait(timeout=30) == 0, f"FAT mount did not exit cleanly; see {log.name}")
         finally:
@@ -161,6 +155,173 @@ class Run:
                             process.wait(timeout=10)
                 finally:
                     log.close()
+
+    def mounted(self, image: Path, payloads: dict[str, bytes]) -> None:
+        with self.mount_image(image) as mountpoint:
+            for name, expected in payloads.items():
+                path = mountpoint / name
+                check(path.read_bytes() == expected, f"mounted FAT bytes differ: {name}")
+                check(path.stat().st_size == len(expected), f"mounted FAT size differs: {name}")
+                with path.open("rb") as stream:
+                    stream.seek(507)
+                    check(stream.read(1031) == expected[507:1538], f"mounted unaligned read differs: {name}")
+            first = mountpoint / next(iter(payloads))
+            try:
+                descriptor = os.open(first, os.O_WRONLY)
+            except OSError as error:
+                check(error.errno == errno.EROFS, f"write-open returned {error.errno}, expected EROFS")
+            else:
+                os.close(descriptor)
+                raise RuntimeError("FAT read-only mount admitted a writable descriptor")
+            check(os.statvfs(mountpoint).f_bsize > 0, "mounted statfs returned no block size")
+
+    def writable(self, bits: int, sector: int, bounded: bool) -> dict[str, object]:
+        """Native -> real FUSE syscalls -> independent fsck/mtools -> fresh FUSE.
+
+        These are newly created, retained regular images, never host devices.
+        Unlink/overwrite below are the operations under test, not scratch cleanup.
+        FAT timestamps use the adapter's documented UTC/two-second projection.
+        """
+        tag = f"rw-fat{bits}-s{sector}-{'bounded' if bounded else 'plain'}"
+        native = self.root / f"{tag}-native.img"
+        size = (512 if bits == 32 and sector == 4096 else 64) * 1024 * 1024
+        with native.open("xb") as stream:
+            stream.truncate(size)
+        self.command("mkfs.fat", "-F", str(bits), "-S", str(sector), "-s", "1", native)
+        sentinel = bytes(range(251)) * 37 + b"native file must survive unrelated writes"
+        source = self.root / f"{tag}-sentinel.bin"
+        source.write_bytes(sentinel)
+        self.command("mcopy", "-i", native, source, "::/KEEP.BIN")
+        self.command("fsck.fat", "-n", native)
+        image = native
+        options: tuple[str, ...] = ()
+        if bounded:
+            image = self.root / f"{tag}-wrapped.img"
+            with image.open("xb") as stream, native.open("rb") as plain:
+                stream.write(b"P" * 4096)
+                shutil.copyfileobj(plain, stream)
+                stream.write(b"S" * 4096)
+            options = ("--offset", "4096", "--length", str(size))
+        initial_hash = digest(image)
+        expected = {"KEEP.BIN": sentinel}
+        events = self.root / f"{tag}-syscalls.jsonl"
+
+        def acknowledged(operation: str, **details: object) -> None:
+            with events.open("a") as stream:
+                stream.write(json.dumps({"operation": operation, "acknowledged": True,
+                                         **details}) + "\n")
+
+        def expect_errno(operation: str, wanted: int, action) -> None:
+            try:
+                action()
+            except OSError as error:
+                check(error.errno == wanted,
+                      f"{operation}: errno {error.errno}, expected {wanted}")
+                acknowledged(operation, errno=error.errno)
+            else:
+                raise RuntimeError(f"{operation}: unexpectedly succeeded, expected errno {wanted}")
+
+        with self.mount_image(image, writable=True, image_options=options) as mounted:
+            check((mounted / "KEEP.BIN").read_bytes() == sentinel, "initial native bytes differ")
+            (mounted / "left").mkdir()
+            (mounted / "right").mkdir()
+            name = "left/Native café and collision.txt"
+            path = mounted / name
+            payload = bytes(range(256)) * 17 + b"tail"
+            with path.open("xb", buffering=0) as stream:
+                check(stream.write(payload) == len(payload), "short mounted write")
+                stream.seek(8197)
+                check(stream.write(b"gap tail") == 8, "short positioned mounted write")
+                payload += b"\0" * (8197 - len(payload)) + b"gap tail"
+                os.fsync(stream.fileno())
+            check(path.read_bytes() == payload, "gap exposed unrelated data")
+            expect_errno("case collision", errno.EEXIST,
+                         lambda: (mounted / name.upper()).open("xb"))
+            with path.open("r+b", buffering=0) as stream:
+                stream.truncate(1031)
+                payload = payload[:1031]
+                stream.truncate(12291)
+                payload += b"\0" * (12291 - len(payload))
+                os.posix_fallocate(stream.fileno(), 0, 16391)
+                payload += b"\0" * (16391 - len(payload))
+                os.fsync(stream.fileno())
+            check(path.read_bytes() == payload, "truncate/preallocation exposed unrelated data")
+            acknowledged("range write, gap, shrink, grow and preallocation", bytes=len(payload))
+
+            # Overwrite a pinned destination: its old descriptor keeps old data.
+            destination = mounted / "right/Replaced café.txt"
+            destination.write_bytes(b"old destination")
+            with destination.open("rb", buffering=0) as old:
+                old_ino = os.fstat(old.fileno()).st_ino
+                path.rename(destination)
+                check(old.read() == b"old destination", "overwrite changed pinned destination")
+                check(destination.read_bytes() == payload, "cross-parent rename lost source")
+                check(destination.stat().st_ino != old_ino, "overwrite reused pinned inode")
+            expected["right/Replaced café.txt"] = payload
+            (mounted / "left/subdir").mkdir()
+            expect_errno("directory cycle", errno.EINVAL,
+                         lambda: (mounted / "left").rename(mounted / "left/subdir/cycle"))
+            acknowledged("cross-parent overwrite with pinned destination")
+
+            orphan = mounted / "open-unlink.bin"
+            orphan.write_bytes(b"old handle data")
+            with orphan.open("r+b", buffering=0) as old:
+                old_ino = os.fstat(old.fileno()).st_ino
+                orphan.unlink()
+                check(not orphan.exists(), "unlinked name remains visible")
+                orphan.write_bytes(b"new namespace data")
+                check(old.read() == b"old handle data", "unlink/reuse changed pinned bytes")
+                old.seek(4)
+                old.write(b"HANDLE")
+                os.fsync(old.fileno())
+                old.seek(0)
+                check(old.read() == b"old HANDLE data", "unlinked positioned write differs")
+                check(orphan.read_bytes() == b"new namespace data", "old handle overwrote new file")
+                check(orphan.stat().st_ino != old_ino, "unlink reused pinned inode")
+            expected["open-unlink.bin"] = b"new namespace data"
+            acknowledged("open-unlink, new namespace allocation and old-handle fsync")
+
+            # Long entries force the subdirectory past its initial cluster.
+            for index in range(40):
+                relative = f"left/subdir/Long directory growth café {index:03d}.txt"
+                data = f"entry {index:03d}".encode()
+                (mounted / relative).write_bytes(data)
+                expected[relative] = data
+            names = [entry.name for entry in (mounted / "left/subdir").iterdir()]
+            check(len(names) == 40 and len(set(names)) == 40, "grown readdir lost/duplicated names")
+            check((mounted / "KEEP.BIN").read_bytes() == sentinel, "unrelated native file changed")
+            acknowledged("directory growth and readdir", entries=40)
+
+        # fsck has no bounded-image selector: extract only our selected range.
+        checked_image = image
+        if bounded:
+            checked_image = self.root / f"{tag}-after.img"
+            with image.open("rb") as stream, checked_image.open("xb") as output:
+                check(stream.read(4096) == b"P" * 4096, "prefix changed outside volume")
+                remaining = size
+                while remaining:
+                    chunk = stream.read(min(remaining, 1024 * 1024))
+                    check(bool(chunk), "bounded image was truncated")
+                    output.write(chunk)
+                    remaining -= len(chunk)
+                check(stream.read() == b"S" * 4096, "suffix changed outside volume")
+        self.command("fsck.fat", "-n", checked_image)
+        for index, (name, data) in enumerate(expected.items()):
+            output = self.root / f"{tag}-native-read-{index:03d}.bin"
+            self.command("mcopy", "-i", checked_image, f"::/{name}", output)
+            check(output.read_bytes() == data, f"native reopen bytes differ: {name}")
+        checked = json.loads(self.command(self.binary, "check", image, *options))
+        check(checked["clean"] and checked["complete"] and checked["namespace_complete"],
+              "mounted writes did not leave a completely checked clean volume")
+        before_readonly = digest(image)
+        with self.mount_image(image, image_options=options) as mounted:
+            for name, data in expected.items():
+                check((mounted / name).read_bytes() == data, f"fresh FUSE bytes differ: {name}")
+        check(digest(image) == before_readonly, "fresh read-only mount changed bytes")
+        acknowledged("native fsck/mtools and fresh read-only mount", files=len(expected))
+        return {"scenario": "writable_mount", "format": f"FAT{bits}", "sector_bytes": sector,
+                "bounded": bounded, "initial_sha256": initial_hash,
+                "final_sha256": before_readonly, "files_checked": len(expected), "result": "passed"}
 
 
     def formatted(self, bits: int, mounted: bool) -> dict[str, object]:
@@ -967,6 +1128,8 @@ def main() -> None:
     parser.add_argument("--facade-binary", type=Path,
                         help="also execute the public ffs native_reader on plain/bounded images")
     parser.add_argument("--mounted", action="store_true", help="require actual FUSE reads and EROFS refusal")
+    parser.add_argument("--writable-mounted", action="store_true",
+                        help="also require native/FUSE writable round trips for both dialects and sector sizes")
     args = parser.parse_args()
     # mtools interprets argv using the native locale. Under C it writes the
     # UTF-8 bytes of cafe-with-accent as two different Unicode characters.
@@ -993,7 +1156,7 @@ def main() -> None:
     tools = ["mkfs.fat", "fsck.fat", "mcopy", "mmd"]
     if facade:
         tools.append("mdir")
-    if args.mounted:
+    if args.mounted or args.writable_mounted:
         tools.append("fusermount3")
         check(Path("/dev/fuse").exists(), "--mounted requires /dev/fuse; no skip credit")
     for tool in tools:
@@ -1007,14 +1170,20 @@ def main() -> None:
     if facade:
         report["facade_sha256"] = digest(facade)
     try:
+        if args.writable_mounted:
+            for bits in (16, 32):
+                for sector, bounded in ((512, False), (4096, True)):
+                    scenario = run.writable(bits, sector, bounded)
+                    report["scenarios"].append(scenario)
+                    print(json.dumps(scenario), flush=True)
         for bits in (16, 32):
-            scenario = run.dialect(bits, args.mounted)
+            scenario = run.dialect(bits, args.mounted or args.writable_mounted)
             report["scenarios"].append(scenario)
             print(json.dumps(scenario), flush=True)
-            formatted = run.formatted(bits, args.mounted)
+            formatted = run.formatted(bits, args.mounted or args.writable_mounted)
             report["scenarios"].append(formatted)
             print(json.dumps(formatted), flush=True)
-            populated = run.populated(bits, args.mounted)
+            populated = run.populated(bits, args.mounted or args.writable_mounted)
             report["scenarios"].append(populated)
             print(json.dumps(populated), flush=True)
         report["status"] = "passed"
