@@ -1,5 +1,17 @@
 # FEATURE_PARITY
 
+> **Latest workspace qualification (2026-11-02):** the full run passes the core
+> library1678/0/25existing ignores, then reports two cross-crate btrfs fixture
+> failures before ending137 at the unchanged1800s limit. The fixture has a zero
+> device ID; the parser correctly rejects it before UTF-8/xattr operations.
+> A separate test-only correction uses native mkfs.btrfs output and requires
+> canonical ext4 bytes in private memory copies. All27 corrected integration
+> cases pass without skips or assertion changes; canonical image SHA is
+> unchanged. Complete workspace qualification is still pending. The fresh full
+> run uses managed RAM-backed test scratch and the checked dependency profile
+> below; neither prior partial results nor the complementary non-core run is
+> being represented as a complete workspace pass.
+
 > **Read-cache origin fence (2026-11-02, full workspace verification pending):** a further
 > executed interleaving fails0/1/0 with1702filtered in0.02s: an earlier inode
 > root fills a newer cache version, and a later public read returns zeros for

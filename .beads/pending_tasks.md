@@ -48,10 +48,28 @@ completed or handed off. Historical evidence remains in place.
   the incomplete manual image encoder. Make ext4 integration cases require the
   actual canonical image and mutate private memory copies; the former wrong
   optional path could silently skip or directly mutate a shared fixture.
-- [ ] Execute all27 corrected cross-crate integration cases. Normal RCH hz3
-  with checked dependency profile and managed RAM scratch is compiling after
-  fresh SBH20GiB. New886-input manifest distinguishes this fixture-only edit
-  from the previously qualified product source; resume12-fixture-integration.log.
+- [x] Execute all27 corrected cross-crate integration cases:27passed/0failed/
+  0ignored/0filtered in0.15s, compile7m04s, normal RCH0. All four ext4/btrfs
+  public UTF-8/xattr cases execute. New886-input worker/local manifest matches
+  and canonical image SHA is unchanged; resume12-fixture-integration.log.
+- [ ] Finish the complete corrected workspace run on hz3 with managed RAM
+  scratch, the checked dependency profile, no exclusions/positional filters,
+  no new ignores and unchanged1800s deadline. Fresh actual-volume SBH precedes
+  it. First RAM attempt refuses103 before compilation: source-namespace setup
+  killed73; resume12-fixture-full-workspace-ram.log. No pass credit.
+- [x] Diagnose the FAT complementary-run failure: its UnixListener cannot bind
+  the long pooled-target TMPDIR (SUN_LEN), before the formatter is exercised.
+  This was introduced by the scratch configuration, not a product defect.
+  Keep the test and assertions unchanged. Prepare short task-owned RAM scratch
+  /tmp/rch-frankenfs-vuzzq-20261101/t on both hosts, preserving all old files.
+- [ ] Complete exhaustive workspace test execution through three Cargo package
+  selections on the same final source: ffs-core with bhh0i_sharded_alloc;
+  ffs-fat; workspace excluding only those two. These cover all25members from
+  retained Cargo metadata, without changing tests or1800s per-job deadline.
+  Report the monolithic137 failures separately; no claim that they exited0.
+  All groups require fresh actual-volume SBH20GiB and short RAM TMPDIR.
+- [ ] Observe every complementary-run terminal result, retain all failures,
+  and repair actual defects; no partial/failed invocation is a complete pass.
 - [ ] Refresh fmt/check/strict Clippy/UBS for this integration-fixture change,
   verify retained canonical image hashes, and finish full workspace evidence.
 - [x] Diagnose slower native-image execution in the warm run: the actual test
