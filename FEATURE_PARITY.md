@@ -20,7 +20,10 @@
 > require a named nonempty pass, mount skips cannot claim PASS, and seeded
 > mounted payloads must match. Seven process controls, three real unit selections,
 > rejection controls, real mounted24/21byte readbacks and clean e2fsck qualify
-> those components. The full hosted shell run remains pending in the original
+> those components. Final selection checks accept both actual text and libtest
+> JSON output; six real unit positives and ten rejection controls pass across
+> those formats without Cargo/full-shell proof credit. The full hosted shell
+> run remains pending in the original
 > Bead. No parity percentage or whole-project readiness claim changes.
 
 > **Current qualification follow-up (2026-11-03, bd-53dub):** hosted d1085d606

@@ -11,6 +11,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - 'scripts/fixtures/make_ext4_fixtures.sh'
       - '.github/workflows/btrfs-reads.yml'
   pull_request:
     branches: [main]

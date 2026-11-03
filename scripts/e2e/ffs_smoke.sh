@@ -203,8 +203,40 @@ run_exact_harness_test() {
     local output_path="$1"
     local test_name="$2"
     if run_rch_cargo_capture "$output_path" test -p ffs-harness --lib -- --exact "$test_name" --color=never; then
-        if grep -Fxq "test $test_name ... ok" "$output_path" \
-            && grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$output_path"; then
+        if python3 - "$output_path" "$test_name" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+name = sys.argv[2]
+events = []
+for line in lines:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    if isinstance(event, dict) and event.get("type") in ("suite", "test"):
+        events.append(event)
+if events:
+    suites = [e for e in events if e["type"] == "suite"]
+    tests = [e for e in events if e["type"] == "test"]
+    valid = (
+        len(suites) == 2 and suites[0].get("event") == "started"
+        and suites[0].get("test_count") == 1 and suites[1].get("event") == "ok"
+        and all(suites[1].get(k) == v for k, v in (("passed", 1), ("failed", 0), ("ignored", 0)))
+        and len(tests) == 2 and all(e.get("name") == name for e in tests)
+        and [e.get("event") for e in tests] == ["started", "ok"]
+    )
+else:
+    valid = lines.count(f"test {name} ... ok") == 1 and sum(
+        re.match(r"^test result: ok\. 1 passed; 0 failed; 0 ignored;", line) is not None
+        for line in lines
+    ) == 1
+sys.exit(0 if valid else 1)
+PY
+        then
             return 0
         fi
         e2e_log "LIBTEST_SELECTION_REJECTED|expected=$test_name|log=$output_path"

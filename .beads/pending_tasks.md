@@ -100,6 +100,9 @@ Created by CC agent 2026-04-22. Import when bead database clears.
 - [ ] Run one complete owning-package invocation with the corrected private
   namespace and runtime scratch, retaining full selection and no-fail-fast.
   The existing2660pass aggregate does not satisfy this single-invocation check.
+  First launcher uses invalid SBH --path/--min-free arguments, exits2before
+  Cargo; retain that refusal. Correct --need20G plus positional path checks
+  both pass, and ordinary RCH executes the full package with jobs1 forced.
 - [x] Fix and execute the feature-specific allocator parity selection separately;
   report its opt-in configuration without changing production defaults.
   Exact required names exist but were cfg-disabled, not obsolete. core-lib now
@@ -149,6 +152,14 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   prebuilt unit selections prove three positives; old short names select zero
   and are rejected. Ignored selection and a real planted child failure reject
   too. These are unit/process controls with zero Cargo/native mount credit.
+- [x] Fresh review catches a defect in the first smoke repair: its text-only
+  selection check rejects RCH's actual libtest JSON. Accept one named executed
+  pass in either output format, retaining exact suite/test counts and no
+  failed/ignored credit. Actual prebuilt unit executions in both formats pass
+  six positives and reject six zero selections/two ignored/two planted failures.
+  These16controls run no Cargo and do not qualify full remote shell execution.
+  Bash syntax and changed-file UBS0critical pass; keep the earlier text-only
+  implementation in history rather than claiming it worked remotely.
 - [x] Stop marking missing/disabled/unavailable mounts as PASS; use explicit
   SKIP plus existing strict e2e_skip enforcement. Managed-mode unknown failures
   now fail rather than pass. Require both seeded mounted payloads byte-for-byte;
@@ -173,6 +184,7 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   input step before the unchanged core test command and require oracles1.
   YAML, every shell block, ordering and strict flag validate locally; the
   main workflow already executes this producer. New lane execution is pending.
+  Include the producer in this lane's path triggers so changes rerun its gate.
 - [ ] Observe both repaired Btrfs Read Recovery matrix jobs; count neither
   static wiring nor the main workflow's producer as a pass of this lane.
 - [ ] Recheck the original hosted acceptance conditions, update Beads/parity,
