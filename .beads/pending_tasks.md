@@ -16,15 +16,149 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   preserve nosuid/nodev/inode/quota flags and all files. Both actual target/
   runtime SBH0.7.12 checks now0,24.9GBfree, complete RAM admission0. Ordinary
   RCH admits the red test there. No deletion, admission-floor or slot change.
-- [ ] Plant a positive exact-sequence assertion after the unchanged inner
-  refusal/data/accounting checks; execute red before production wiring.
-- [ ] Wire only the existing safe retry, if execution confirms the cause.
-  Preserve the original random property, fixture size and acceptance.
-- [ ] Execute exact regression, original property, true no-reclaimable-space
+- [x] Check the initial positive hypothesis against the fixture's actual
+  geometry: its512KiB DATA-only group cannot support a metadata commit. The
+  added unconditional success expectation is unsound and withdrawn; the entire
+  original public-refusal regression and original random property are restored
+  byte-identically. The already admitted historical probe really fails0/1/
+  1626filtered,0.11s, RCH1249894ms101/wall1332.956s; retain this experimental
+  loss, not proof that wiring a retry can fix an invalid fixture contract.
+- [x] Reproduce the real retry gap on native-format images through old actual
+  CLI9aa52c04/core88d7f333: fill data pool, punch128KiB and commit, overwrite
+  64KiB victim twice, then truncate47198. Unshared and imported native-reflink
+  shared cases both returnENOSPC with unchanged size/bytes, siblings intact,
+  final btrfs check0 and sourcef110e847 unchanged. First log has one successful
+  prefix then fails unsupported FUSE FICLONE; separately native-prepared shared
+  log exits0. These are2aggregate mounted baselines, not a successful full
+  two-case invocation or FUSE clone-creation proof.
+- [x] Wire the existing safe retry into public setattr and preserve a failed
+  commit's actual cancellation/I/O error instead of replacing it withENOSPC.
+  Failed shrink rolls back before the commit; retry is at most once and only
+  after NoSpace, pinned data and successful durable commit. No pin is released
+  on a failed commit. Candidate coreea029563/fs_opsbf206b28, qualified below.
+  New native-image regression covers8shared/unshared success/full/cancel/I/O
+  cells, metadata space available, bounded existing data pool. Existing required
+  oracle tools and ext4_small b8722122 are verified on the admitted worker.
+- [x] Execute exact regression, original property, true no-reclaimable-space
   negative and commit/cancellation-failure controls; verify all file bytes.
-- [ ] Run required Rust gates and affected mounted checks through admitted RCH.
+  Ordinary-profile RCH executes5passed/0failed/0ignored/1623filtered,28.85s;
+  new native test includes8internal cells, not8extra test rows. Two actual
+  btrfs check invocations exit0. RCH159760ms0/wall228.280s. Original property
+  and pre-existing refused-shrink regression are byte-identical to58acc82d5.
+  Changed-core UBS2files0critical/16522warnings/3321info, fmt/diff0.
+- [ ] Run affected btrfs/clone library selection, fresh CLI build, required
+  workspace/all-target check and strict Clippy through admitted ordinary RCH.
+  These are scoped affected-library tests, not another full core-package run.
+  Every heavy command has a new actual target/runtime20GiB admission.
+  Affected selection now passes558/0failed/10existing ignores/1060filtered,
+  139.64s; RCH145185ms0/wall199.401s. Fresh CLI build passes, RCH1458259ms0/
+  wall1503.539s; ELF72c32b44. All884tracked Rust/build inputs match the live
+  Cargo source root. Workspace check and strict Clippy remain pending.
+- [x] Execute the same old-CLI reclaim baselines against the fresh CLI and
+  compare actual mounted truncation, sibling/alias bytes and native checks.
+  One actual invocation compares old9aa52c04/new72c32b44 on identical input
+  images per shared/unshared pair: old2ENOSPC/new2success; all4native checks
+  and4kernel readbacks pass, including sibling bytes and reextended zero
+  tails. Source image unchanged;14.192s/0, receipt resume19-native-fuse-reclaim-
+  comparison-v2.log. UID0/private mount namespace, standard runtime, growth
+  disabled, shared inputs prepared by native FICLONE. No FUSE clone-creation
+  or performance claim. First invocation stops after checker0 because this
+  kernel rejects standalone nologreplay; retained log. Documented equivalent
+  rescue=nologreplay preserves no-replay intent; no checksum/root bypass.
+  Host fuse.conf SHA28c34f67 unchanged and no owned comparison mount remains.
+- [x] Inspect newly completed hosted evidence. On58acc82d5, job126005093992
+  executes291FUSE passes/8existing ignores, full shell smoke and journaled
+  ext4 smoke pass, then btrfs written-image differential fails reopening
+  created_file.txt. Original bd-53dub acceptance stays open; inspect daemon
+  exit ordering, do not weaken reopen assertions. On949d12e81, x86 core has
+  1602passes/1NoSpace property failure/24existing ignores; ARM passes. New
+  seed0393f69e32f8a92f58a7e4886ef05798c1fe62f0fad9b75df085b28990251e52
+  is additional evidence for the still-open property contract, not a claim
+  that this candidate passed hosted CI.
+- [x] Resolve the demonstrated differential stop-order failure separately from
+  the runtime change. Actual CLI72c32b44 process controls: immediate SIGTERM
+  after unmount exits-15 and loses the created file; awaiting normal exit0
+  preserves it. Existing production destroy already commits. The shell helper
+  now waits for normal exit and requires status0, retaining the20half-second
+  polls and every reopen/native assertion. Missing PID, exit7 and deadline
+  controls reject; normal exit0 passes. These4process controls stub only the
+  unmount/query commands and are not native proof. Real script functions and
+  phases6-9 pass6/0fail/0skip/0xfail in11.758s on an existing512MiB fixture,
+  uid0/private namespace/actual ELF72c/ephemeral flag unchanged; includes all
+  payloads,100directory entries,21xattrs, modes, names, native check and inspect.
+  Scope excludes original128MiB producer and Cargo phases10-11; no full-script
+  or hosted-pass claim. First focused runner wrongly inherits /data/tmp and
+  fails mount; second reaches reopen but lacks real attr tools. Both failures
+  retained. Stage genuine attr2.5.2 binaries into owned tmpfs, verify hashes/
+  versions and all prerequisites; third run passes. No shim or skipped xattr.
+  Bash syntax0; UBS1file0critical/1warning/3info. ShellCheck retains the same
+  pre-existing SC1091/SC2034/SC2329/SC2155/SC2012 findings; no suppression.
+  Committed helper90bd80ea is also executed as actual uid1000 in a private
+  mount namespace: the same6scenarios pass/0fail/0skip/0xfail in11.047s,
+  including native check0. This repeats the6scenario scope on another UID;
+  it is not12unique scenarios or full hosted proof. Receipt resume19-
+  differential-exit-order-uid1000.log. ShellCheck baseline/current JSON rule,
+  severity and message sets compare exactly, both existing exit1.
 - [ ] Reconcile current hosted results, update measured evidence/Beads, perform
   bounded fresh self-review and publish qualified code with original AC intact.
+  Runtime/test bytes are checkpointed externally in fea1f0fe8; this agent did
+  not execute that commit command or treat it as review. Separate stop-order
+  correction is committed by this agent in d4ec93c07. Final local source-aware
+  queue54claimable/0foreign/0permission-gated, cycles empty, owned P0 retained.
+
+Bounded resume19 self-review (author checks, not independent approval):
+
+1. Original gates weakened? No (checked: original refusal function and entire
+   property/tail compare byte-identically with58acc82d5; CI/config/goldens
+   unchanged). Yes, an initially added synthetic success expectation was
+   unsound: removed that new expectation, retained its failed receipt and
+   original refusal assertions; never count the loss as a product red.
+2. Specialized mock to manufacture success? No (checked: existing fault
+   device plants cancellation/I/O failures in native-image unit cells; live
+   FUSE/native checks are separate; shell process stubs have no native credit).
+3. Goldens regenerated? No (checked: changed paths and complete source diff).
+4. Gate changes or bypasses? Yes, separate stop helper waits/requires exit0
+   after observed SIGTERM loss. Same10s bound and all original assertions;
+   nonzero/missing/deadline controls reject. No relaxation or suppression.
+5. Contrived release pass? No (checked: growth-disabled pressure scope explicit;
+   native CLI pairs use identical inputs; actual wait/reopen checks unchanged).
+6. Zero-run green? No (checked:5selected and558affected test rows;8cells are
+   inside1test;6actual differential phase scenarios and4process controls).
+7. Unobserved execution claimed? No (checked: raw result/exit receipts; compiler
+   and new hosted qualification still pending, not reported passed).
+8. Proof inflation? No (checked: planted faults/unit, live CLI, native reference,
+   actual kernel readback and hosted old revisions identified separately).
+9. Material failure hidden? No (checked: synthetic0/1, RCH103, unsupported mount
+   option, initial runner mount/missing-tool failures retained above).
+10. Evidence stderr discarded? No (checked: evidence commands capture both
+    streams; process probes explicitly log their expected failures).
+11. Premature closure/follow-up laundering? No (checked: bd-wcbvk remainsP0/
+    in_progress; bd-53dub remainsopen; original acceptance text unchanged).
+12. Spec edited downward? No (checked: architecture describes actual bounded
+    retry; parity adds scoped results with no percentage/readiness change).
+13–17. Solo; no delegated closes, gaming criteria, unchecked agent reports or
+    agreement counted as confirmation. External commits are not independent.
+18. Denominator chosen afterward? No (checked: predeclared btrfs/clone selection
+    and four old/new cells; overlaps and filtered/ignored counts disclosed).
+19. Explain-before-replay points: initial invalid synthetic success expectation
+    was corrected in place; local differential runner first used wrong scratch
+    and then lacked real attr tools. Countermeasures RH-1/RH-2: preserve old
+    assertions and verify actual fixture geometry/prerequisites before credit.
+20. Strongest proof: one live same-input old/new invocation yields2old refusals/
+    2new successes with4native checks/readbacks. Receipts are re-executable;
+    this remains author execution, not independent review or field proof.
+
+Real-work inventory after58acc82d5: USER1runtime fix; ENABLER2(worker admission
+restoration exercised by RCH, differential stop-order repair exercised by the
+real CLI); PROCESSrequested tracking/spec evidence and external note checkpoints.
+The invalid synthetic-positive checkpoint is an experimental loss, no capability
+credit. Two-minute demo is the same-input mounted shrink comparison. Omitting
+process notes would not change runtime behavior; add no further audit machinery.
+Current verdict HEALTHY for the delivered runtime change, with remaining original
+acceptance explicitly open. CASS six bounded queries find older matches; followed
+Oct10message629 is a prior audit command, not new independent evidence. Refresh
+exits9 with oversized-source/malformed-line intake diagnostics, so this is not an
+exhaustive older-session audit or a claim of complete archive coverage.
 
 ## Current execution — 2026-11-03, bd-wcbvk after54ebca569
 
