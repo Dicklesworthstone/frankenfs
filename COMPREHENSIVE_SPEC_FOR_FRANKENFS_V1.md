@@ -1921,7 +1921,7 @@ async fn gc_region(cx: &Cx, store: &RwLock<MvccStore>, region: RegionId) -> Resu
 | **M7** | At most one committed version per (block, CommitSeq) | `commit()` |
 | **M8** | Snapshot.high immutable after creation | Type system |
 
-For compatibility-mode btrfs shrink operations, a returned error MUST preserve
+For compatibility-mode btrfs setattr size changes, a returned error MUST preserve
 the pre-operation inode, readable bytes, extent references, checksum items and
 allocation accounting. Preparing an EOF-sector COW replacement MUST NOT discard
 the old mapping before replacement data and checksums are ready. Later metadata
@@ -4300,10 +4300,28 @@ fn lseek_impl(engine: &FrankenFsEngine, cx: &Cx, ino: InodeNumber,
 
 #### 12.1.6 truncate (via setattr)
 
-- **Shrink:** deallocate extents beyond new size, zero partial tail block,
+- **Ext4 shrink:** deallocate extents beyond new size, zero partial tail block,
   update `i_size`/`i_blocks`/extent tree. Single MVCC transaction.
-- **Extend:** update `i_size` only (no allocation; extended region is a hole).
+- **Ext4 extend:** update `i_size` only (no allocation; extended region is a hole).
+- **Btrfs regular-extent shrink:** retain the sector-aligned partial EOF
+  mapping and remove later mappings by reference. Lack of a spare DATA block
+  MUST NOT by itself reject this shrink. Shared peers remain byte-identical.
+  Bytes beyond `i_size` remain inaccessible; a later setattr, write, fallocate
+  or clone destination growth MUST clear any retained bytes in the newly
+  exposed gap before publishing its new size. Existing visible data and new
+  write/clone payloads remain intact. Clearing a nonzero retained tail can
+  require COW data space and can fail with `ENOSPC`; a refused setattr growth
+  preserves its old size, bytes, references, checksums and allocation state.
+  Whole-sector sparse extension still allocates no data. Small inline shrinks
+  trim their payload; subsequent growth zero-extends or converts that payload.
 - Updates `mtime` and `ctime`. Deallocated blocks' groups get stale RaptorQ markers.
+
+The btrfs specialization records native behavior: one full shared-image probe
+shrinks 65536 to 65535 successfully; a separate full-image probe refuses a later
+extension without byte drift. Evidence is recorded in `EXISTING_EXT4_BTRFS_STRUCTURE.md`
+and `artifacts/implementation/20261030_O221Lk/resume19-eof-native-ffs-comparison.log`
+plus `resume18-native-refused-grow.log`. It does not authorize relaxing the
+original randomized property or any conformance gate (`bd-wcbvk`).
 
 #### 12.1.7 fallocate
 
