@@ -130827,6 +130827,62 @@ mod tests {
                 .total_free(BTRFS_BLOCK_GROUP_DATA)
                 >= free_before
         );
+
+        // The original property also permits a growth immediately after this
+        // shrink. Observe its real space requirement without weakening that
+        // property's expectation: an admitted growth must expose a zero byte;
+        // a full-DATA refusal must preserve the complete checkpointed state.
+        let snapshot = || {
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            let lo = BtrfsKey {
+                objectid: 0,
+                item_type: 0,
+                offset: 0,
+            };
+            let hi = BtrfsKey {
+                objectid: u64::MAX,
+                item_type: u8::MAX,
+                offset: u64::MAX,
+            };
+            (
+                alloc.fs_tree.range(&lo, &hi).unwrap(),
+                alloc.csum_tree.range(&lo, &hi).unwrap(),
+                alloc.extent_alloc.extent_tree().range(&lo, &hi).unwrap(),
+                alloc.extent_alloc.space_info(),
+                alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA),
+            )
+        };
+        let before_growth = snapshot();
+        match fs.setattr(
+            &cx,
+            inos[0],
+            &SetAttrRequest {
+                size: Some(47_199),
+                ..SetAttrRequest::default()
+            },
+        ) {
+            Ok(_) => {
+                model[0].resize(47_199, 0);
+                eprintln!(
+                    "RECORDED_EOF_GROWTH|outcome=success|free_before={}",
+                    before_growth.5
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.to_errno(), libc::ENOSPC);
+                assert!(
+                    before_growth.5 < 4096,
+                    "a free DATA sector must allow growth"
+                );
+                assert_eq!(snapshot(), before_growth, "refused growth must be atomic");
+                eprintln!(
+                    "RECORDED_EOF_GROWTH|outcome=ENOSPC|free_before={}",
+                    before_growth.5
+                );
+            }
+        }
+        verify_files(&model);
     }
 
     #[test]

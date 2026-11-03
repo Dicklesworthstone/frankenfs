@@ -32,6 +32,9 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   source qualifications as current. Keep failures and explicit host limits.
 - [x] Bind the final tracked source inputs, regression seeds, actual compiler
   scratch, pinned toolchain and runtime profile to the executed results.
+- [ ] Check the unchanged property's unconditional growth expectation against
+  the executed native full-data EOF-growth refusal. Keep the gate unchanged
+  pending a concrete counterexample and any required independent gate review.
 - [ ] Update specs/parity/Beads with executed evidence, perform bounded fresh
   self-review, publish and leave any unmet original acceptance explicit.
 
