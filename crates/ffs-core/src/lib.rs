@@ -130973,6 +130973,27 @@ mod tests {
                         attempts.load(AtomicOrdering::SeqCst),
                         usize::from(failure == "commit_io")
                     );
+                    if failure == "cancel" {
+                        // Also cancel after the real allocation refusal, so
+                        // the reclaiming commit itself must propagate Cancelled
+                        // and must not start a second growth attempt.
+                        let mut operation_attempts = 0;
+                        let error = fs
+                            .btrfs_retry_after_unpin(&cx, || {
+                                operation_attempts += 1;
+                                let result = fs.btrfs_setattr(&cx, victim, &attrs);
+                                if matches!(&result, Err(FfsError::NoSpace)) {
+                                    cx.set_cancel_requested(true);
+                                }
+                                result
+                            })
+                            .expect_err("cancelled reclaim must not retry growth");
+                        cx.set_cancel_requested(false);
+                        assert!(matches!(error, FfsError::Cancelled), "{error}");
+                        assert_eq!(operation_attempts, 1);
+                        assert_eq!(snapshot(), before);
+                        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 0);
+                    }
                 }
                 if shared {
                     assert_eq!(fs.read(&cx, peer, 0, (3 * BS) as u32).unwrap(), peer_bytes);
