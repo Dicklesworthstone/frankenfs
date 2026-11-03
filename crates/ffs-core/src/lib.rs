@@ -37996,35 +37996,20 @@ impl OpenFs {
         }
     }
 
-    /// Allocate, write, and register ONE uncompressed regular data extent that is
-    /// already sector-aligned in both offset and length. `data.len()` must be a
-    /// multiple of the sector size and `aligned_offset` sector-aligned; the
-    /// emitted extent has `ram_bytes == num_bytes == disk_num_bytes == data.len()`
-    /// so the on-disk image stays btrfs-check-clean (bd-7mi0p). Handles the
-    /// fs_tree item, the EXTENT_ITEM/EXTENT_DATA_REF backref, and (for datasum
-    /// inodes) the per-sector EXTENT_CSUMs, unwinding each step on failure.
-    /// Shared by the write read-modify-write path and the truncate tail rewrite.
-    fn btrfs_emit_aligned_extent(
+    /// Reserve and prepare one uncompressed sector-aligned data extent without
+    /// publishing its mapping. Truncate keeps the old EOF mapping until this
+    /// fallible data/checksum preparation succeeds (bd-wcbvk).
+    fn btrfs_prepare_aligned_extent(
         &self,
         cx: &Cx,
         alloc: &mut BtrfsAllocState,
-        canonical: u64,
-        aligned_offset: u64,
         data: &[u8],
         is_datasum: bool,
-    ) -> ffs_error::Result<u64> {
+    ) -> ffs_error::Result<BtrfsPreparedDataExtent> {
         let alloc_size = u64::try_from(data.len())
             .map_err(|_| FfsError::InvalidGeometry("aligned extent length overflow".into()))?;
         let disk_bytenr = self.btrfs_alloc_data_with_growth(alloc, alloc_size)?.bytenr;
-        self.btrfs_emit_aligned_extent_at(
-            cx,
-            alloc,
-            canonical,
-            aligned_offset,
-            data,
-            is_datasum,
-            disk_bytenr,
-        )
+        self.btrfs_prepare_aligned_extent_at(cx, alloc, data, is_datasum, disk_bytenr)
     }
 
     /// Write `data` (sector-aligned, at `aligned_start`) into the preallocated
@@ -38227,7 +38212,7 @@ impl OpenFs {
         Ok(subvolume || generation <= last_snapshot)
     }
 
-    /// `btrfs_emit_aligned_extent`, but writing into an ALREADY-ALLOCATED extent.
+    /// Write and publish a sector-aligned extent into an already allocated range.
     ///
     /// Split out for bd-72tn8: an overwrite must secure its replacement space
     /// before it destroys what it is replacing, so the caller allocates first and
@@ -45628,140 +45613,172 @@ impl OpenFs {
 
         let mut alloc = alloc_mutex.write();
         let mut inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
-        let original_size = inode.size;
+        // Shrinking may remove several mappings and references before a later
+        // metadata step fails. Reuse the COW rollback used by fallocate: a
+        // refused truncate must preserve the old inode, mappings, checksums,
+        // pinned space and any chunk-growth bookkeeping (bd-wcbvk).
+        let checkpoint = attrs.size.filter(|&size| size < inode.size).map(|_| {
+            let fs_tree = alloc.fs_tree.checkpoint();
+            (fs_tree, BtrfsCommitSnapshot::take(&mut alloc, self))
+        });
+        let result = (|| {
+            let original_size = inode.size;
 
-        if let Some(mode) = attrs.mode {
-            inode.mode = (inode.mode & !0o7777) | u32::from(mode & 0o7777);
-        }
-        if let Some(uid) = attrs.uid {
-            inode.uid = uid;
-        }
-        if let Some(gid) = attrs.gid {
-            inode.gid = gid;
-        }
-        if let Some(size) = attrs.size {
-            let file_type = Self::btrfs_mode_to_file_type(inode.mode);
-            if file_type == FileType::Directory {
-                return Err(FfsError::IsDirectory);
+            if let Some(mode) = attrs.mode {
+                inode.mode = (inode.mode & !0o7777) | u32::from(mode & 0o7777);
             }
-            if file_type == FileType::Symlink {
-                return Err(FfsError::Format("cannot truncate a symlink".into()));
+            if let Some(uid) = attrs.uid {
+                inode.uid = uid;
             }
-            // Immutable files cannot be truncated; append-only files cannot
-            // shrink — the kernel returns EPERM (matches ext4_setattr, bd-xpsq4).
-            if inode.flags & BTRFS_INODE_IMMUTABLE != 0 {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+            if let Some(gid) = attrs.gid {
+                inode.gid = gid;
             }
-            if inode.flags & BTRFS_INODE_APPEND != 0 && size < inode.size {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
-            }
-            // ftruncate(2)/EFBIG: extending past the btrfs maximum file size must
-            // be rejected (the VFS inode_newsize_ok check), not silently accepted
-            // into an out-of-range i_size (bd-d9129).
-            Self::btrfs_reject_oversized_file(size)?;
+            if let Some(size) = attrs.size {
+                let file_type = Self::btrfs_mode_to_file_type(inode.mode);
+                if file_type == FileType::Directory {
+                    return Err(FfsError::IsDirectory);
+                }
+                if file_type == FileType::Symlink {
+                    return Err(FfsError::Format("cannot truncate a symlink".into()));
+                }
+                // Immutable files cannot be truncated; append-only files cannot
+                // shrink — the kernel returns EPERM (matches ext4_setattr, bd-xpsq4).
+                if inode.flags & BTRFS_INODE_IMMUTABLE != 0 {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+                }
+                if inode.flags & BTRFS_INODE_APPEND != 0 && size < inode.size {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+                }
+                // ftruncate(2)/EFBIG: extending past the btrfs maximum file size must
+                // be rejected (the VFS inode_newsize_ok check), not silently accepted
+                // into an out-of-range i_size (bd-d9129).
+                Self::btrfs_reject_oversized_file(size)?;
 
-            let old_size = inode.size;
-            inode.size = size;
+                let old_size = inode.size;
+                inode.size = size;
 
-            // If truncating to a smaller size, drop every extent past the new EOF
-            // so stale tail bytes cannot reappear if the file is extended later.
-            // To keep every extent sector-aligned (bd-7mi0p / bd-70gyh): trim at
-            // the sector boundary above the EOF sector, and when the new size
-            // falls mid-sector, rewrite that EOF sector with its head preserved
-            // and the [size, aligned) tail zeroed (a hole/all-zero head stays a
-            // hole — no spurious extent). Splitting at the raw unaligned `size`
-            // would re-insert a non-sector-aligned left remnant.
-            if size < old_size {
-                let ss = u64::from(alloc.sectorsize);
-                if size % ss == 0 {
-                    self.btrfs_remove_overlapping_extent_data(
-                        cx,
-                        &mut alloc,
-                        canonical,
-                        size,
-                        u64::MAX,
-                    )?;
-                } else {
-                    let eof_floor = size & !(ss - 1);
-                    let head_len = usize::try_from(size - eof_floor).map_err(|_| {
-                        FfsError::InvalidGeometry("truncate eof head length overflow".into())
-                    })?;
-                    let ss_usize = usize::try_from(ss).map_err(|_| {
-                        FfsError::InvalidGeometry("btrfs sectorsize overflow".into())
-                    })?;
-                    let mut sector = vec![0_u8; ss_usize];
-                    self.btrfs_read_existing_range_into(
-                        cx,
-                        &alloc,
-                        canonical,
-                        eof_floor,
-                        &mut sector[..head_len],
-                    )?;
-                    // Drop the EOF sector and everything after it (aligned bound).
-                    self.btrfs_remove_overlapping_extent_data(
-                        cx,
-                        &mut alloc,
-                        canonical,
-                        eof_floor,
-                        u64::MAX,
-                    )?;
-                    // Re-emit the EOF sector only if its preserved head holds data
-                    // (a hole/prealloc head reads as zeros, so leave it a hole).
-                    if sector[..head_len].iter().any(|&b| b != 0) {
-                        let is_datasum = inode.flags & BTRFS_INODE_NODATASUM == 0;
-                        self.btrfs_emit_aligned_extent(
-                            cx, &mut alloc, canonical, eof_floor, &sector, is_datasum,
+                // If truncating to a smaller size, drop every extent past the new EOF
+                // so stale tail bytes cannot reappear if the file is extended later.
+                // To keep every extent sector-aligned (bd-7mi0p / bd-70gyh): trim at
+                // the sector boundary above the EOF sector, and when the new size
+                // falls mid-sector, rewrite that EOF sector with its head preserved
+                // and the [size, aligned) tail zeroed (a hole/all-zero head stays a
+                // hole — no spurious extent). Splitting at the raw unaligned `size`
+                // would re-insert a non-sector-aligned left remnant.
+                if size < old_size {
+                    let ss = u64::from(alloc.sectorsize);
+                    if size % ss == 0 {
+                        self.btrfs_remove_overlapping_extent_data(
+                            cx,
+                            &mut alloc,
+                            canonical,
+                            size,
+                            u64::MAX,
                         )?;
+                    } else {
+                        let eof_floor = size & !(ss - 1);
+                        let head_len = usize::try_from(size - eof_floor).map_err(|_| {
+                            FfsError::InvalidGeometry("truncate eof head length overflow".into())
+                        })?;
+                        let ss_usize = usize::try_from(ss).map_err(|_| {
+                            FfsError::InvalidGeometry("btrfs sectorsize overflow".into())
+                        })?;
+                        let mut sector = vec![0_u8; ss_usize];
+                        self.btrfs_read_existing_range_into(
+                            cx,
+                            &alloc,
+                            canonical,
+                            eof_floor,
+                            &mut sector[..head_len],
+                        )?;
+                        // Reserve and finish fallible replacement I/O before any
+                        // old mapping is removed. The checkpoint also covers later
+                        // metadata failures; unpublished COW bytes cannot overwrite
+                        // the original pinned data.
+                        let prepared = if sector[..head_len].iter().any(|&b| b != 0) {
+                            Some(self.btrfs_prepare_aligned_extent(
+                                cx,
+                                &mut alloc,
+                                &sector,
+                                inode.flags & BTRFS_INODE_NODATASUM == 0,
+                            )?)
+                        } else {
+                            None
+                        };
+                        // Drop the EOF sector and everything after it (aligned bound).
+                        self.btrfs_remove_overlapping_extent_data(
+                            cx,
+                            &mut alloc,
+                            canonical,
+                            eof_floor,
+                            u64::MAX,
+                        )?;
+                        // Re-emit the EOF sector only if its preserved head holds data
+                        // (a hole/prealloc head reads as zeros, so leave it a hole).
+                        if let Some(prepared) = prepared {
+                            Self::btrfs_publish_aligned_extent(
+                                &mut alloc, canonical, eof_floor, prepared,
+                            )?;
+                        }
                     }
                 }
+
+                self.btrfs_fill_implicit_holes(
+                    &mut alloc,
+                    canonical,
+                    old_size.min(size),
+                    u64::MAX,
+                    size,
+                )?;
+                inode.nbytes = Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?;
+            }
+            // Explicit times may predate 1970 (xfstests generic/258): the on-disk
+            // seconds are a signed __le64, stored here as raw bits.
+            if let Some(atime) = attrs.atime {
+                let (secs, nsec) = system_time_to_signed(atime);
+                inode.atime_sec = secs.cast_unsigned();
+                inode.atime_nsec = nsec;
+            }
+            if let Some(mtime) = attrs.mtime {
+                let (secs, nsec) = system_time_to_signed(mtime);
+                inode.mtime_sec = secs.cast_unsigned();
+                inode.mtime_nsec = nsec;
+            }
+            let (secs, nanos) = Self::btrfs_now_timestamp();
+            inode.ctime_sec = secs;
+            inode.ctime_nsec = nanos;
+            // A size-changing truncate is a data modification, so POSIX requires
+            // mtime (not just ctime) to be updated. The kernel sends only
+            // ATTR_SIZE/ATTR_CTIME on truncate (FUSE: FATTR_SIZE without
+            // FATTR_MTIME), so the filesystem owns this mtime bump — ext4 does the
+            // same. An explicit utimes mtime (attrs.mtime) takes precedence (bd-pssza).
+            if attrs.size.is_some() && inode.size != original_size && attrs.mtime.is_none() {
+                inode.mtime_sec = secs;
+                inode.mtime_nsec = nanos;
             }
 
-            self.btrfs_fill_implicit_holes(
-                &mut alloc,
-                canonical,
-                old_size.min(size),
-                u64::MAX,
-                size,
-            )?;
-            inode.nbytes = Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?;
+            let inode_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: 0,
+            };
+            alloc
+                .fs_tree
+                .update(&inode_key, &inode.to_bytes())
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            Ok(self.btrfs_inode_to_attr(canonical, &inode))
+        })();
+        if let Some((fs_tree, snapshot)) = checkpoint {
+            if result.is_err() {
+                alloc.fs_tree.rollback_to(fs_tree);
+                snapshot.restore(&mut alloc, self);
+            } else {
+                alloc.fs_tree.release_checkpoint();
+                snapshot.release(&mut alloc);
+            }
         }
-        // Explicit times may predate 1970 (xfstests generic/258): the on-disk
-        // seconds are a signed __le64, stored here as raw bits.
-        if let Some(atime) = attrs.atime {
-            let (secs, nsec) = system_time_to_signed(atime);
-            inode.atime_sec = secs.cast_unsigned();
-            inode.atime_nsec = nsec;
-        }
-        if let Some(mtime) = attrs.mtime {
-            let (secs, nsec) = system_time_to_signed(mtime);
-            inode.mtime_sec = secs.cast_unsigned();
-            inode.mtime_nsec = nsec;
-        }
-        let (secs, nanos) = Self::btrfs_now_timestamp();
-        inode.ctime_sec = secs;
-        inode.ctime_nsec = nanos;
-        // A size-changing truncate is a data modification, so POSIX requires
-        // mtime (not just ctime) to be updated. The kernel sends only
-        // ATTR_SIZE/ATTR_CTIME on truncate (FUSE: FATTR_SIZE without
-        // FATTR_MTIME), so the filesystem owns this mtime bump — ext4 does the
-        // same. An explicit utimes mtime (attrs.mtime) takes precedence (bd-pssza).
-        if attrs.size.is_some() && inode.size != original_size && attrs.mtime.is_none() {
-            inode.mtime_sec = secs;
-            inode.mtime_nsec = nanos;
-        }
-
-        let inode_key = BtrfsKey {
-            objectid: canonical,
-            item_type: BTRFS_ITEM_INODE_ITEM,
-            offset: 0,
-        };
-        alloc
-            .fs_tree
-            .update(&inode_key, &inode.to_bytes())
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         drop(alloc);
-
-        Ok(self.btrfs_inode_to_attr(canonical, &inode))
+        result
     }
 
     /// Preallocate extents in a btrfs filesystem.
@@ -130087,6 +130104,303 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn btrfs_truncate_tail_preparation_faults_preserve_shared_data_bd_wcbvk() {
+        const BS: usize = 4096;
+        for shared in [false, true] {
+            for failure in ["none", "cancel", "checksum"] {
+                let (fs, cx) = open_writable_btrfs();
+                let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+                let victim = fs
+                    .create(&cx, root, OsStr::new("victim"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                let peer = fs
+                    .create(&cx, root, OsStr::new("peer"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                let original = vec![0x69; 3 * BS];
+                fs.write(&cx, victim, 0, &original).unwrap();
+                if shared {
+                    fs.clone_file_range(
+                        &cx,
+                        &mut RequestScope::empty(),
+                        peer,
+                        victim,
+                        0,
+                        (3 * BS) as u64,
+                        0,
+                    )
+                    .unwrap();
+                }
+                let snapshot = || {
+                    let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                    let start = BtrfsKey {
+                        objectid: 0,
+                        item_type: 0,
+                        offset: 0,
+                    };
+                    let end = BtrfsKey {
+                        objectid: u64::MAX,
+                        item_type: u8::MAX,
+                        offset: u64::MAX,
+                    };
+                    (
+                        alloc.fs_tree.range(&start, &end).unwrap(),
+                        alloc.csum_tree.range(&start, &end).unwrap(),
+                        alloc
+                            .extent_alloc
+                            .extent_tree()
+                            .range(&start, &end)
+                            .unwrap(),
+                        alloc.extent_alloc.space_info(),
+                        alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                    )
+                };
+                let before = snapshot();
+                if failure == "checksum" {
+                    // Construction fails after replacement data reaches MVCC,
+                    // before any replacement checksum can be published.
+                    fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = u16::MAX;
+                }
+                cx.set_cancel_requested(failure == "cancel");
+                let result = fs.btrfs_setattr(
+                    &cx,
+                    victim,
+                    &SetAttrRequest {
+                        size: Some((BS + 37) as u64),
+                        ..SetAttrRequest::default()
+                    },
+                );
+                cx.set_cancel_requested(false);
+                fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = 0;
+                if failure == "none" {
+                    result.unwrap();
+                    assert_eq!(
+                        fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(),
+                        original[..BS + 37]
+                    );
+                    fs.setattr(
+                        &cx,
+                        victim,
+                        &SetAttrRequest {
+                            size: Some((3 * BS) as u64),
+                            ..SetAttrRequest::default()
+                        },
+                    )
+                    .unwrap();
+                    let mut expected = original.clone();
+                    expected[BS + 37..].fill(0);
+                    assert_eq!(fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(), expected);
+                } else {
+                    let error = result.expect_err("tail preparation fault must be reported");
+                    assert!(
+                        if failure == "cancel" {
+                            matches!(error, FfsError::Cancelled)
+                        } else {
+                            error.to_string().contains("unsupported btrfs csum_type")
+                        },
+                        "{failure}: {error}"
+                    );
+                    assert_eq!(snapshot(), before, "shared={shared}, failure={failure}");
+                    assert_eq!(fs.getattr(&cx, victim).unwrap().size, (3 * BS) as u64);
+                    assert_eq!(fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(), original);
+                }
+                if shared {
+                    assert_eq!(fs.read(&cx, peer, 0, (3 * BS) as u32).unwrap(), original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_truncate_late_metadata_error_restores_prior_removals_bd_wcbvk() {
+        const BS: usize = 4096;
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("victim"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let canonical = fs.btrfs_canonical_inode(ino).unwrap();
+        // Separate items ensure the removal loop mutates valid mappings before
+        // it reaches the deliberately corrupt final extent item.
+        for block in 0..3 {
+            fs.write(&cx, ino, (block * BS) as u64, &[0x73; BS])
+                .unwrap();
+        }
+        let broken_key = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: (4 * BS) as u64,
+        };
+        fs.btrfs_alloc_state
+            .as_ref()
+            .unwrap()
+            .write()
+            .fs_tree
+            .insert(broken_key, &[0])
+            .unwrap();
+        let snapshot = || {
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            let start = BtrfsKey {
+                objectid: 0,
+                item_type: 0,
+                offset: 0,
+            };
+            let end = BtrfsKey {
+                objectid: u64::MAX,
+                item_type: u8::MAX,
+                offset: u64::MAX,
+            };
+            (
+                alloc.fs_tree.range(&start, &end).unwrap(),
+                alloc.csum_tree.range(&start, &end).unwrap(),
+                alloc
+                    .extent_alloc
+                    .extent_tree()
+                    .range(&start, &end)
+                    .unwrap(),
+                alloc.extent_alloc.space_info(),
+                alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+            )
+        };
+        let before = snapshot();
+        let error = fs
+            .setattr(
+                &cx,
+                ino,
+                &SetAttrRequest {
+                    size: Some(0),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .expect_err("malformed final item must reject truncate after earlier removals");
+        assert!(
+            matches!(error, FfsError::Format(_) | FfsError::Corruption { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "earlier mappings, checksums, references and space must roll back"
+        );
+        assert_eq!(fs.getattr(&cx, ino).unwrap().size, (3 * BS) as u64);
+        assert_eq!(
+            fs.read(&cx, ino, 0, (3 * BS) as u32).unwrap(),
+            vec![0x73; 3 * BS]
+        );
+    }
+
+    #[test]
+    fn btrfs_truncate_nospace_preserves_data_and_accounting_bd_wcbvk() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let mut inos = Vec::new();
+        let mut model = vec![Vec::new(); 3];
+        for index in 0..3 {
+            inos.push(
+                fs.create(
+                    &cx,
+                    root,
+                    OsStr::new(&format!("rl{index}.bin")),
+                    0o644,
+                    0,
+                    0,
+                )
+                .unwrap()
+                .ino,
+            );
+        }
+        // Exact writes preceding the hosted shrunk failure, not a new random
+        // sample. Failed writes leave the byte model unchanged, as in the
+        // original property; every file is checked after every operation.
+        let writes = [
+            (0, 11_674, 37_479, 0),
+            (0, 61_112, 37_193, 0),
+            (0, 12_627, 20_142, 91),
+            (2, 109_901, 27_228, 148),
+            (2, 42_983, 25_463, 121),
+            (1, 185_206, 18_549, 226),
+            (2, 124_511, 33_316, 203),
+            (2, 109_989, 6_878, 247),
+            (0, 50_722, 36_429, 192),
+            (2, 164_069, 13_811, 60),
+            (2, 61_140, 39_196, 13),
+            (0, 39_498, 38_835, 176),
+        ];
+        let verify_files = |model: &[Vec<u8>]| {
+            for (&ino, expected) in inos.iter().zip(model) {
+                assert_eq!(fs.getattr(&cx, ino).unwrap().size, expected.len() as u64);
+                let got = fs
+                    .read(&cx, ino, 0, u32::try_from(expected.len()).unwrap())
+                    .unwrap();
+                assert_eq!(got.len(), expected.len());
+                assert!(
+                    got == *expected,
+                    "inode {ino:?} changed at byte {:?}; all files must survive a refused truncate",
+                    got.iter().zip(expected).position(|(a, b)| a != b)
+                );
+            }
+        };
+        for (file, offset, len, byte) in writes {
+            let data = vec![byte; len];
+            match fs.write(&cx, inos[file], offset as u64, &data) {
+                Ok(written) => {
+                    assert_eq!(written as usize, len);
+                    let new_len = model[file].len().max(offset + len);
+                    model[file].resize(new_len, 0);
+                    model[file][offset..offset + len].copy_from_slice(&data);
+                }
+                Err(error) => assert_eq!(error.to_errno(), libc::ENOSPC),
+            }
+            verify_files(&model);
+        }
+        let snapshot = || {
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            let start = BtrfsKey {
+                objectid: 0,
+                item_type: 0,
+                offset: 0,
+            };
+            let end = BtrfsKey {
+                objectid: u64::MAX,
+                item_type: u8::MAX,
+                offset: u64::MAX,
+            };
+            (
+                alloc.fs_tree.range(&start, &end).unwrap(),
+                alloc.csum_tree.range(&start, &end).unwrap(),
+                alloc
+                    .extent_alloc
+                    .extent_tree()
+                    .range(&start, &end)
+                    .unwrap(),
+                alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA),
+                alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                alloc.extent_alloc.pinned_extent_count(),
+            )
+        };
+        let before = snapshot();
+        let error = fs
+            .setattr(
+                &cx,
+                inos[0],
+                &SetAttrRequest {
+                    size: Some(47_198),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .expect_err("the recorded full-image EOF-sector COW needs data space");
+        assert_eq!(error.to_errno(), libc::ENOSPC);
+        verify_files(&model);
+        assert_eq!(
+            snapshot(),
+            before,
+            "failed truncate must retain mappings, refs and space"
+        );
     }
 
     // Property-based metamorphic check of the btrfs REFLINK surface
