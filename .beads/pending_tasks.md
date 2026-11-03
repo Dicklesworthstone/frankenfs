@@ -27,7 +27,7 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   preserves every file's bytes and target size47198: native ENOSPC in both,
   final checks0/0, source hashes unchanged; resume18-native-refused-grow.log,
   wall4.342s/0. This reference does not qualify FrankenFS execution.
-- [ ] Fix the demonstrated production defect using existing COW preparation/
+- [x] Fix the demonstrated production defect using existing COW preparation/
   reservation machinery where possible. Keep the original random property,
   fixture capacity, acceptance, assertions and gate configuration unchanged.
   Candidate core52d86875 reserves/prepares before removing the EOF mapping and
@@ -35,8 +35,21 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   old single-use emit helper becomes the reserve/prepare helper. Three inline
   regressions cover exact ENOSPC,6shared/unshared success/cancel/checksum cells
   and a late corrupt-metadata refusal after earlier removals. Property bytes
-  are unchanged. Candidate is not yet runtime-qualified.
-- [ ] Run the deterministic regression, original property and affected truncate/
+  are unchanged. Ordinary-profile RCH now executes3passed/0failed/0ignored/
+  1624filtered, including6success/cancel/checksum cells inside the shared-data
+  test;0.02s, RCH274218ms0, wall319.708s. This binds52d86875. Final88d7f333
+  removes the now-unused emit wrapper and routes its unchanged checksum
+  assertions through production prepare/publish. Full final-source owning
+  qualification completes successfully: all local core targets1675passed/
+  0failed/25existing ignores/0filtered in one ordinary-profile package run.
+  Worker also auto-discovers untracked tests/repro_create.rs with3passes;
+  raw total1678includes these, which receive no project credit. No worker file
+  is removed. Library1603/0/24ignores, ten local integrations72/0/1ignore,
+  plus0doctests; RCH1156282ms0, wrapperwall1210.604s. All884tracked Rust/build
+  inputs match the worker. Live binary46b99d87 matches source88d7f333, strict
+  oracle flag1/jobs1/qualified TMPDIR. The long freshness case is active
+  RaptorQ encoding in its observed GDB stack and eventually passes; detach0.
+- [x] Run the deterministic regression, original property and affected truncate/
   reflink/write/cancellation tests through admitted ordinary RCH. Include no-space,
   I/O-failure, shared-data, unaligned EOF and shrink/reextend cases as relevant.
   First green attempt refuses103for hz3pressure before Cargo. Alternatevmi
@@ -44,22 +57,178 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   zero tests executed; wall1864.118s. Retain it without OOM attribution. Current
   source's3exact tests are admitted onhz3 after fresh privileged target/runtime
   SBH20G0; earlier cache is rebuilding, no pass inferred.
-- [ ] Complete required workspace check/strict Clippy/fmt, owner tests and
+  That optimized-dependency attempt is deliberately cancelled before any test
+  executes: wrapper-15/daemon130; exact owned rchw-44defe8a recovery proves
+  remote143/terminal_acknowledged=true. First cancel RPC times out, but the
+  remote completion exists; retry/recovery reconcile it without replay. Carrying
+  opt3into three small controls was avoidable cost. The ordinary test profile,
+  with default debug assertions/overflow checks, supplies the3/0proof above.
+  Full owning core package now runs unchanged selection/no-fail-fast/four
+  threads with FFS_REQUIRE_ORACLES1 and preverified ext4 fixture b8722122.
+  It now passes, including the unchanged random property and native checker
+  cases for unaligned, shared and snapshot-backed truncation. This random run
+  does not settle the known seeded property's unconditional-success contract;
+  original Bead stays in progress for that separate disposition and final gates.
+- [x] Complete required workspace check/strict Clippy/fmt, owner tests and
   changed-code UBS. Bind results to source/configuration; no selected-zero or
   skipped native proof. Update measured parity without claiming global readiness.
   First hz3check refuses103after source-namespace init73/Killed before Cargo.
   A fresh admitted check now runs onvmi. Source formatting passes. Final core
   UBS0critical/16388warnings/3254info; diagnostics remain unsuppressed.
+  The firstvmi check also refuses103before Cargo on overlapping source ownership.
+  A later admitted retry/check+Clippy sequence is running; no lock is removed.
+  Cold workspace check reaches first-party/TUI crates then exits137at1802693ms
+  under the unchanged1800s cap; wall1978.534s. It is not a pass. A fresh20G
+  admitted warm retry now checks the final core/harness; strict Clippy follows
+  only after successful check. No source, assertion, slot or deadline relaxation.
+  Warm workspace/all-target check now exits0, wall423.846s; strict workspace
+  Clippy now exits0, wall1070.461s, on the same final source after fresh
+  SBH20G admission. Both commands cover --workspace --all-targets; Clippy keeps
+  -D warnings. Final formatting/diff checks pass. Core UBS0critical is distinct
+  from the existing5CLI scanner findings and their bounded dispositions below.
+- [x] Preserve CLI scanner findings independently of the one-line diagnostic:
+  UBS reports5critical/2220warnings/999info, not a clean scan. All5sites precede
+  this change. Data-flow review: timestamp names a create_new(true) fixture,
+  not an authentication token; three exe parameters originate at current_exe
+  with child-ELF identity verification; formatter path is fixed in production
+  and injectable only through private test/setup helpers. These are bounded
+  false-positive dispositions, not independent review or a changed scanner rule.
 - [x] Inspect hosted checkpoint8c435daa3: main lint/tests, parity, canonical
   gates and golden verification pass. FUSE passes; full shell catalog124passes,
   then real workspace build/inspect/scrub/parity execute. Shell rejects the
   standard+managed-timeout diagnostic, which omits the supported per-core mode.
-- [ ] Validate the one-line public diagnostic correction under bd-53dub.
+- [x] Validate the one-line public diagnostic correction under bd-53dub.
   Production now names managed or per-core; the existing shell gate is unchanged.
   This is a separate public CLI fix, not a btrfs test relaxation or original-AC
   transfer. Native journaled/differential hosted steps remain skipped.
-- [ ] Fresh self-review against the original Bead, update its cited execution
-  evidence/status, flush/cycle check, publish both refs and release owned leases.
+  Actual old C1CLI exits1with only managed in the reason and fails the unchanged
+  required per-core wording. Fresh ordinary RCH cargo-run executes the corrected
+  binary and exits1with the exact required diagnostic: expected_diagnostic=true,
+  cargo_executed_binary=true, RCH953920ms, wrapper997.908s. Receipt
+  resume18-cli-runtime-diagnostic-exit.json. This is a negative CLI proof, not
+  a mounted test or full hosted shell success.
+- [x] Execute the existing four mounted btrfs setattr cases on final source,
+  retaining strict FUSE/oracle requirements and private fuse.conf binding.
+  First preflight finds the old scratch fuse.conf absent and stops before
+  Cargo. Recreate a private scratch fixture; host configuration is unchanged.
+  DCG rejects the dynamic shell runner before execution. Use the simpler
+  ordinary RCH no-run build followed by an explicit static SSH test launch;
+  compilation remains remote and the guard is neither overridden nor weakened.
+  RCH no-run completes0 in298966ms, wrapper410.571s. Final ELFdda574ff/core
+  88d7f333 executes4passed/0failed/0ignored/295filtered,0.10s, as uid1000 in
+  a private mount namespace with required FUSE/oracles. Actual truncate/chmod/
+  utimes and EROFS-no-drift checks execute. Host fuse.conf SHA28c34f67 stays
+  fixed. Receipts resume18-mounted-setattr-build* and -final.log.
+- [x] Inspect current hosted9375d6e4f rather than extrapolating older green.
+  CI41648707173: hosted FUSE291/0/8existing ignores,210.95s; corrected public
+  diagnostic passes its unchanged shell scenario. Shell next aborts on find's
+  permission denial traversing root-owned0700lost+found. Both read-recovery
+  architectures pass core regressions then fail strict Clippy on the obsolete
+  emit helper; final88d7f333 already removes it without suppression. Original
+  hosted journaled/differential probes remain skipped, not qualified.
+- [x] Correct only the owned smoke fixture's lost+found UID, preserving0700,
+  recursive find, payload checks, deadlines and exit predicates. Separate
+  fixture commit1ab8db9f4, not bundled with runtime repair. Actual CLI9aa52c04
+  uid1000/private-namespace controls on imageb8722122: old fixture find1;
+  assigned-owner find0 and exact24/21byte payloads; unrelated denied testdir
+  find1. All3e2fsck checks0, source SHA unchanged. Receipt
+  resume18-smoke-fixture-owner-private.log; first host-namespace attempt fails
+  on missing user_allow_other before any mount, retained separately. Static
+  shell substitution control was DCG-rejected before execution; explicit
+  shell-free Python process control executes without a guard override.
+- [x] Recheck current local tracker directly: live/source-aware script passes,
+  54ready/0foreign,41s, cycles empty; report directory
+  artifacts/e2e/20261103_095920_ffs_tracker_source_hygiene_QsWDRJ.
+- [x] Fresh self-review against the original Bead, update its cited execution
+  evidence/status, flush/cycle check and publish the qualified runtime/fixture
+  changes. Both required remote refs equal949d12e81e8d51b75f66aab480fbc604d20ed7ed.
+  Core source remains88d7f333; final fmt/diff checks0. Session-final tracking
+  checkpoint and owned lease release follow; neither adds capability credit.
+- [ ] Original bd-wcbvk acceptance: resolve the known seeded property's
+  unconditional-success contract using admitted/rejected native and allocator
+  evidence. A successful new random run is insufficient; no gate edit or
+  premature closure. Original bd-53dub still needs nonempty hosted shell,
+  journaled and written-image differential execution on the published repairs.
+
+Bounded resume18 audit, after54ebca569 through949d12e81 and final-source checks;
+solo self-review, not independent verification. Actual Git diff/reflog and
+raw command receipts were reread. README purpose: a memory-safe Rust filesystem
+with compatible mounts, concurrent transactions and self-healing durability.
+Real-work inventory: USER2 (refused-truncate data preservation and accurate CLI
+diagnostic); ENABLER1 (smoke fixture ownership plus its negative controls);
+PROCESS2 (spec/architecture notes and requested tracker/TODO/evidence updates);
+UNKNOWN0. This classifies coupled work units, not credits or commit throughput.
+External checkpoint commits68656b6ec/d29d07d3f/d4fdd5775/9375d6e4f capture this
+agent's earlier edits; their commit execution is not attributed to this agent
+or counted as independent review. This agent commits fixture1ab8db9f4 and
+obsolete-helper cleanup949d12e81; the latter preserves its regression assertions
+and supplies no additional user-visible capability.
+Real-work questions1–6: (1) replay the12writes/refused shrink and show all three
+files unchanged; (2) removing these process notes changes no runtime outcome;
+(3) actual mounted fixture controls consume the ownership correction;
+(4) older open read-performance work such as bd-kdmu4 remains, but demonstrated
+silent data loss takes priority; (5) solo, no pane/close competition;
+(6) no lowered spec or acceptance-carrying follow-up: both original Beads stay
+open. Verdict: concrete USER progress, with avoidable verification cost from
+opt3/cold builds. Finish the active gates and publish before more machinery.
+
+Process worksheet for this requested existing TODO/evidence update: running
+product code does not branch on it. Consumer is the operator who explicitly
+requested a granular TODO; gate is the status/closure claim for these exact
+repairs; observed defect is ENOSPC data loss plus the hosted fixture failure.
+Retire active updating after the corresponding qualification/handoff, preserving
+historical notes under the no-deletion rule. No new report/dashboard/framework.
+Integrity exception is not needed (explicit operator request supplies the gate).
+Opportunity cost: bd-wcbvk is the active P0; an hour on another report would be
+worse, so limit this to one bounded update. Verdict: minimal requested tracking,
+zero capability credit.
+
+Honesty inventory, all20prompts, same bounded window:
+1. No (checked full baseline-to-final core/CLI/shell diff and workflow/config
+   diff): original property, assertions, ignores, selections and gates retained.
+2. New synthetic inline fault inputs exercise real storage paths; native Linux
+   reference and actual FUSE mounts are separately labelled, not interchangeable.
+3. No (checked changed paths/diffs): no golden regeneration.
+4. Fixture setup changes in a separate reviewed unit; lost+found mode and all
+   checks remain. Existing checksum regression calls the same production
+   prepare/publish logic directly after obsolete wrapper removal; all assertions
+   retained. No added suppression, pressure/deadline relaxation or bypass flag.
+5. No (checked invocation/profile/source diff): ordinary Cargo test profile,
+   debug assertions/overflow checks unchanged, no hardcoded runtime success.
+6. No (checked named outputs/counts):3controls,1675owned package passes and
+   4mounted cases execute. Zero doctests are not execution credit.
+7. No (checked raw receipts): queued/refused/cancelled commands are not passes;
+   externally executed checkpoint commits are identified above.
+8. No (checked report labels): synthetic storage, native-reference and actual
+   FrankenFS mounts stay distinct; no field or power-loss claim.
+9. Failures remain visible: planted red, RCH103 refusals, two cold137timeouts,
+   cancelled opt3run, CLI UBS5critical dispositions and current hosted failures.
+   No whole-project readiness, full hosted green or settled seed is claimed.
+10. No (checked cited launchers): stdout/stderr are retained together; no
+    diagnostic is discarded to make a cited command look successful.
+11. No (checked tracker diff): no closures, no essential-AC follow-up transfer.
+12. No (checked three spec additions): strengthen failure atomicity rather
+    than lowering the existing target; native observations remain bounded.
+13–16. Not applicable: no delegation, subagent closes, reports or panes.
+17. No (checked review wording): self-review/hosted execution are labelled;
+    neither external checkpoints nor repeated same-origin runs are independent
+    acceptance review.
+18. The predeclared owner scope is all local project targets. Worker discovers
+    an extra untracked3-test target; disclose raw1678 and exclude those3from
+    owned1675, rather than inflating project coverage. No selected-zero credit.
+19. Explain avoidable cost: optimized-dependency cold controls timed out or
+    were cancelled before tests; a cold workspace check also timed out. Warm
+    ordinary-profile commands supply actual proof. Repeated skill reads and
+    overbroad process/log output added no capability. Missing scratch config,
+    static-runner guard rejection and first smoke mount admission all stop
+    visibly; use explicit private-namespace controls, not guard overrides.
+20. Strongest reproducible evidence: exact old-production red vs final three
+    deterministic regressions, full owning1675/0 and mounted4/0, bound to
+    core88d7f333. Native Linux reference is supporting evidence only.
+Older-session scope: earlier bounded inventories remain above/below; this is
+not a new historical certification. Disposition: keep both Beads open, preserve
+failed receipts and raw/owned count split (RH-2/RH-7), retain original property
+(RH-1/RH-9), stop redundant verification after the required gates finish.
 
 ## Current execution — 2026-11-03, continued after d1085d606
 

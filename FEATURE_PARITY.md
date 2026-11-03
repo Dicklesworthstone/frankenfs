@@ -1,5 +1,29 @@
 # FEATURE_PARITY
 
+> **Btrfs refused-shrink repair (bd-wcbvk, 2026-11-03):** the exact hosted
+> sequence demonstrates old data loss after ENOSPC at byte45056. Wiring the
+> existing COW checkpoints and EOF prepare/publish path preserves old state:
+> ordinary-profile RCH executes3regressions/0failed/0ignored/1624filtered,
+> including shared/unshared preparation faults and late metadata rollback.
+> That selection binds core52d86875. Final helper cleanup88d7f333 now passes
+> the full core package:1675project tests/0failed/25existing ignores/0filtered,
+> plus3worker-only probes excluded from project credit and0doctests. Required
+> oracles are enabled; all884tracked Rust/build inputs match the worker.
+> Native Linux pressure probes independently show successful
+> shrink and refused reextension with unchanged files. They do not qualify a
+> FrankenFS mount. The original randomized property is unchanged; its remaining
+> ENOSPC expectation needs separate disposition, so the P0 Bead stays in progress.
+> Workspace/all-target check and strict Clippy pass. Final-source mounted setattr selection
+> passes4/0failed/0ignored/295filtered with required FUSE/oracles. Formatting
+> also passes. The fresh CLI returns the exact supported
+> managed-or-per-core diagnostic on the invalid standard-mode invocation;
+> full hosted shell/journaled/differential acceptance remains open. Hosted
+> 9375d6e4f passes291FUSE cases and the corrected CLI scenario, then encounters
+> a root-owned0700lost+found fixture traversal error. Separate fixture correction
+> 1ab8db9f4 preserves permissions and every assertion: actual mounted controls
+> reject the old fixture and an unrelated denied directory, accept the owned
+> fixture, and compare both payloads exactly. No feature percentage changes.
+
 > **Qualified Rust repair (bd-53dub, 2026-11-03,8d7278eae):** workspace check,
 > strict workspace Clippy, standalone feature-off core Clippy and formatting
 > pass. Existing native selections execute11ordinary/15sharded cases with
