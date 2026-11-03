@@ -2,6 +2,23 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-03, resume19 after58acc82d5
+
+- [x] Preserve the15untracked paths and continue only the owned P0bd-wcbvk.
+  Read current Beads/triage; hosted CI/read-recovery still queued, no pass.
+- [x] Trace the remaining exact-sequence failure through public dispatch.
+  Existing btrfs_retry_after_unpin is used by write/fallocate but not setattr;
+  the new failure-atomic shrink checkpoint may now safely enable that retry.
+- [ ] Plant a positive exact-sequence assertion after the unchanged inner
+  refusal/data/accounting checks; execute red before production wiring.
+- [ ] Wire only the existing safe retry, if execution confirms the cause.
+  Preserve the original random property, fixture size and acceptance.
+- [ ] Execute exact regression, original property, true no-reclaimable-space
+  negative and commit/cancellation-failure controls; verify all file bytes.
+- [ ] Run required Rust gates and affected mounted checks through admitted RCH.
+- [ ] Reconcile current hosted results, update measured evidence/Beads, perform
+  bounded fresh self-review and publish qualified code with original AC intact.
+
 ## Current execution — 2026-11-03, bd-wcbvk after54ebca569
 
 - [x] Preserve15untracked paths; source-aware live queue54claimable/0foreign,
