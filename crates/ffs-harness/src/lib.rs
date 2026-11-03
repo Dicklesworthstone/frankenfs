@@ -1688,11 +1688,11 @@ const PARITY_SUITES: &[ParitySuite] = &[
         targets: &["--test", "profile_artifacts"],
         exact: &["canonical_profile_artifacts_are_committed_and_structured"],
     },
-    // ffs-core owns the high-level file operations the ext4 range rows describe.
+    // Core operation evidence includes the opt-in sharded allocator tests.
     ParitySuite {
         id: "core-lib",
         package: "ffs-core",
-        targets: &["--lib"],
+        targets: &["--lib", "--features", "bhh0i_sharded_alloc"],
         exact: &[
             "tests::ext4_collapse_range_preserves_preallocated_zeros_and_data",
             "tests::ext4_insert_range_preserves_preallocated_zeros_and_data",

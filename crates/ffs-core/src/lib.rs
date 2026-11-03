@@ -77048,24 +77048,39 @@ mod tests {
         f.set_len(size_mb * 1024 * 1024).expect("set image size");
         drop(f);
 
-        let out = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "4096", image.to_str().unwrap()])
-            .output();
-        let out = match out {
-            Ok(o) if o.status.success() => o,
-            _ => return None,
-        };
-        let _ = out; // suppress unused warning
-
-        // Make root writable.
-        let _ = std::process::Command::new("debugfs")
-            .args([
-                "-w",
-                "-R",
-                "set_inode_field / mode 040777",
-                image.to_str().unwrap(),
-            ])
-            .output();
+        let mut formatter = std::process::Command::new("mkfs.ext4");
+        formatter.args(["-F", "-b", "4096", image.to_str().unwrap()]);
+        let mut permissions = std::process::Command::new("debugfs");
+        permissions.args([
+            "-w",
+            "-R",
+            "set_inode_field / mode 040777",
+            image.to_str().unwrap(),
+        ]);
+        for (tool, mut command) in [("mkfs.ext4", formatter), ("debugfs", permissions)] {
+            let out = match command.output() {
+                Ok(out) => out,
+                Err(error) => {
+                    eprintln!("ext4 fixture setup failed: tool={tool} error={error}");
+                    oracle_unavailable(tool);
+                    return None;
+                }
+            };
+            eprintln!(
+                "ORACLE_RESULT|tool={tool}|exit={}|image={}",
+                out.status,
+                image.display()
+            );
+            if !out.status.success() {
+                eprintln!(
+                    "ext4 fixture setup failed: tool={tool}\n{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                oracle_unavailable(tool);
+                return None;
+            }
+        }
 
         let cx = Cx::for_testing();
         let data = std::fs::read(&image).expect("read image");
@@ -77077,6 +77092,11 @@ mod tests {
         let mut fs = OpenFs::from_device(&cx, Box::new(dev), &opts).expect("open ext4");
         fs.enable_writes(&cx).expect("enable writes");
         assert!(fs.is_writable());
+        assert_eq!(
+            fs.getattr(&cx, InodeNumber(2)).expect("fixture root").perm,
+            0o777,
+            "debugfs must make the fixture root writable"
+        );
         Some((fs, tmp))
     }
 
@@ -77636,6 +77656,9 @@ mod tests {
                 Ok("btrfs") => {
                     let _ = run_btrfs_check(&tmp.path().join("absent.img"));
                 }
+                Ok("mkfs.ext4") => {
+                    let _ = open_writable_ext4_mkfs(16);
+                }
                 _ => {
                     let _ = run_e2fsck(&tmp.path().join("absent.img"));
                 }
@@ -77678,7 +77701,7 @@ mod tests {
             (out.status.success(), text)
         };
 
-        for tool in ["e2fsck", "btrfs"] {
+        for tool in ["e2fsck", "btrfs", "mkfs.ext4"] {
             let (required_ok, required_text) = run_child(true, tool);
             assert!(
                 !required_ok,
