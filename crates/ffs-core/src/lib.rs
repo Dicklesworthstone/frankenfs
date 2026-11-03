@@ -37936,7 +37936,9 @@ impl OpenFs {
     /// `op`, and on ENOSPC with pinned data bytes commits and runs it once
     /// more. Only for requests that change nothing before their allocation
     /// fails, or that repeat idempotently (write reserves first, bd-72tn8;
-    /// fallocate skips ranges it already preallocated).
+    /// fallocate skips ranges it already preallocated; shrink rolls back its
+    /// checkpoint, bd-wcbvk). A failed reclaiming commit retains its actual
+    /// cancellation or I/O error and never starts another operation attempt.
     fn btrfs_retry_after_unpin<T>(
         &self,
         cx: &Cx,
@@ -37950,13 +37952,10 @@ impl OpenFs {
                         .extent_alloc
                         .pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA)
                 });
-                if pinned == 0
-                    || self
-                        .btrfs_full_transaction_commit(cx, "btrfs-enospc-unpin")
-                        .is_err()
-                {
+                if pinned == 0 {
                     return Err(FfsError::NoSpace);
                 }
+                self.btrfs_full_transaction_commit(cx, "btrfs-enospc-unpin")?;
                 op()
             }
             other => other,
@@ -130365,7 +130364,7 @@ mod tests {
         };
         let before = snapshot();
         let error = fs
-            .btrfs_setattr(
+            .setattr(
                 &cx,
                 inos[0],
                 &SetAttrRequest {
@@ -130381,25 +130380,173 @@ mod tests {
             before,
             "failed truncate must retain mappings, refs and space"
         );
+    }
 
-        // The inner refusal is atomic, so the public dispatch may commit and
-        // unpin the old COW extents before retrying. This exact hosted sequence
-        // must then succeed without changing any sibling's bytes.
-        assert!(
-            before.4 > 0,
-            "the recorded failure has reclaimable pinned data"
-        );
-        fs.setattr(
-            &cx,
-            inos[0],
-            &SetAttrRequest {
-                size: Some(47_198),
-                ..SetAttrRequest::default()
-            },
-        )
-        .expect("public truncate must retry after committing pinned data");
-        model[0].resize(47_198, 0);
-        verify_files(&model);
+    #[test]
+    fn btrfs_truncate_retries_pinned_space_on_native_image_bd_wcbvk() {
+        const BS: usize = 4096;
+        for shared in [false, true] {
+            for failure in ["none", "full", "cancel", "commit_io"] {
+                let Some((initial_fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(128) else {
+                    return;
+                };
+                drop(initial_fs);
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let fault = ValidationFaultDevice {
+                    inner: dev.clone(),
+                    attempts: Arc::clone(&attempts),
+                    fail_on: if failure == "commit_io" {
+                        1
+                    } else {
+                        usize::MAX
+                    },
+                    events: Arc::new(Mutex::new(Vec::new())),
+                };
+                let cx = Cx::for_testing();
+                let mut fs =
+                    OpenFs::from_device(&cx, Box::new(fault), &OpenOptions::default()).unwrap();
+                fs.enable_writes(&cx).unwrap();
+                // Bound this probe to the native image's existing data pool.
+                // Metadata space remains available for the reclaiming commit.
+                fs.set_btrfs_grow_chunks(false);
+                let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+                let victim = fs
+                    .create(&cx, root, OsStr::new("victim"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                let peer = fs
+                    .create(&cx, root, OsStr::new("peer"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                let filler = fs
+                    .create(&cx, root, OsStr::new("filler"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                let peer_bytes = vec![0x69; 3 * BS];
+                fs.write(&cx, victim, 0, &peer_bytes).unwrap();
+                if shared {
+                    fs.clone_file_range(&cx, &mut RequestScope::empty(), peer, victim, 0, 0, 0)
+                        .unwrap();
+                }
+                let original = if failure == "full" {
+                    peer_bytes.clone()
+                } else {
+                    fs.write(&cx, victim, 0, &[0x5B; 3 * BS]).unwrap();
+                    fs.write(&cx, victim, 0, &[0x5A; 3 * BS]).unwrap();
+                    vec![0x5A; 3 * BS]
+                };
+                let mut filler_len = 0_u64;
+                for len in [64 * 1024, BS] {
+                    let bytes = vec![0x7A; len];
+                    loop {
+                        match fs.btrfs_write(&cx, filler, filler_len, &bytes) {
+                            Ok(written) => {
+                                assert_eq!(written as usize, len);
+                                filler_len += len as u64;
+                            }
+                            Err(error) => {
+                                assert_eq!(error.to_errno(), libc::ENOSPC);
+                                break;
+                            }
+                        }
+                    }
+                }
+                let snapshot = || {
+                    let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                    let lo = BtrfsKey {
+                        objectid: 0,
+                        item_type: 0,
+                        offset: 0,
+                    };
+                    let hi = BtrfsKey {
+                        objectid: u64::MAX,
+                        item_type: u8::MAX,
+                        offset: u64::MAX,
+                    };
+                    (
+                        alloc.fs_tree.range(&lo, &hi).unwrap(),
+                        alloc.csum_tree.range(&lo, &hi).unwrap(),
+                        alloc.extent_alloc.extent_tree().range(&lo, &hi).unwrap(),
+                        alloc.extent_alloc.space_info(),
+                        alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                    )
+                };
+                let before = snapshot();
+                assert_eq!(attempts.load(AtomicOrdering::SeqCst), 0);
+                assert!(filler_len > 0);
+                assert_eq!(before.4 == 0, failure == "full");
+                let attrs = SetAttrRequest {
+                    size: Some((BS + 37) as u64),
+                    mode: Some(0o640),
+                    ..SetAttrRequest::default()
+                };
+                let refused = fs.btrfs_setattr(&cx, victim, &attrs).unwrap_err();
+                assert_eq!(refused.to_errno(), libc::ENOSPC);
+                assert_eq!(snapshot(), before, "inner refusal must restore all state");
+
+                cx.set_cancel_requested(failure == "cancel");
+                let result = fs.setattr(&cx, victim, &attrs);
+                cx.set_cancel_requested(false);
+                if failure == "none" {
+                    let attr = result.expect("public shrink must commit pinned data and retry");
+                    assert_eq!(attr.size, (BS + 37) as u64);
+                    assert_eq!(attr.perm, 0o640);
+                    assert!(attempts.load(AtomicOrdering::SeqCst) > 0);
+                    assert_eq!(
+                        fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(),
+                        original[..BS + 37]
+                    );
+                    fs.setattr(
+                        &cx,
+                        victim,
+                        &SetAttrRequest {
+                            size: Some((3 * BS) as u64),
+                            ..SetAttrRequest::default()
+                        },
+                    )
+                    .unwrap();
+                    let mut expected = original.clone();
+                    expected[BS + 37..].fill(0);
+                    assert_eq!(fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(), expected);
+                } else {
+                    let error = result.expect_err("failed reclaim must not acknowledge the shrink");
+                    match failure {
+                        "full" => assert_eq!(error.to_errno(), libc::ENOSPC),
+                        "cancel" => assert!(matches!(error, FfsError::Cancelled), "{error}"),
+                        "commit_io" => assert!(
+                            error
+                                .to_string()
+                                .contains("injected native validation write failure"),
+                            "{error}"
+                        ),
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(snapshot(), before, "shared={shared}, failure={failure}");
+                    assert_eq!(fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(), original);
+                    assert_eq!(
+                        attempts.load(AtomicOrdering::SeqCst),
+                        usize::from(failure == "commit_io")
+                    );
+                }
+                if shared {
+                    assert_eq!(fs.read(&cx, peer, 0, (3 * BS) as u32).unwrap(), peer_bytes);
+                }
+                let filler_bytes = fs
+                    .read(&cx, filler, 0, u32::try_from(filler_len).unwrap())
+                    .unwrap();
+                assert_eq!(filler_bytes.len() as u64, filler_len);
+                assert!(filler_bytes.iter().all(|&byte| byte == 0x7A));
+                if failure == "none" {
+                    fs.btrfs_full_transaction_commit(&cx, "truncate-unpin-check")
+                        .unwrap();
+                    std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+                    let Some((clean, output)) = run_btrfs_check(&image) else {
+                        return;
+                    };
+                    assert!(clean, "shared={shared}: {output}");
+                }
+            }
+        }
     }
 
     // Property-based metamorphic check of the btrfs REFLINK surface

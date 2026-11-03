@@ -148,7 +148,9 @@ impl OpenFs {
                 .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => {
                 self.check_btrfs_mutation_allowed("setattr")?;
-                self.btrfs_setattr(cx, ino, attrs)
+                // EOF-sector COW is the data-allocation path here. Its failed
+                // shrink restores the checkpoint before a reclaiming commit.
+                self.btrfs_retry_after_unpin(cx, || self.btrfs_setattr(cx, ino, attrs))
             }
         }
     }
