@@ -1,5 +1,33 @@
 # FEATURE_PARITY
 
+> **Current qualification follow-up (2026-11-03, bd-53dub):** hosted d1085d606
+> passes the workspace unit step and all six protected CLI cases, but its FUSE
+> job finishes288passed/1clean-unmount EBUSY failure/8existing ignores. Later
+> journaled/shell/differential steps remain skipped. A controlled real-mount
+> interleaving confirms a pre-exec sibling can retain a CLOEXEC client FD;
+> this does not identify the actual hosted holder. Isolating the two CLI read
+> clients into separate processes preserves four parent test threads and all
+> clean-shutdown assertions. The complete uid1000 target passes290/0failed/
+> 8existing ignores/0filtered in141.13s; the root busy-mount negative separately
+> passes1/0 in5.05s. Exact ELF c112339a and commands: `resume17-native-full-fuse-*`
+> and `resume17-root-busy-unmount.*` under the implementation artifact directory.
+>
+> Executed parity also exposes cfg-disabled allocator evidence: required names
+> exist, but core-lib omitted bhh0i_sharded_alloc. Its selection now enables
+> that feature without changing production defaults or exact requirements.
+> The old allocator test passes even with an absent formatter and required
+> oracles; fixture setup now rejects missing/failed mkfs.ext4/debugfs and checks
+> root permissions. Final-source two native allocator cases and the extended
+> missing-tool control pass3/0/1700filtered. Full parity execution remains pending.
+>
+> xfstests executes118ext4 baseline comparisons with one generic294 diagnostic
+> mismatch from uutils; btrfs reaches its60min limit after102completed tests
+> totaling3367s, including2245s in generic027. The reference job now uses GNU's
+> ubuntu24.04 environment and release binaries; expected results, selected
+> tests, loop counts and deadline remain unchanged. Syntax and real sudo-rs
+> environment controls pass, not a native xfstests qualification. No parity
+> percentage, speedup or completed-project claim; original hosted probes stay open.
+
 > **Btrfs small-write ENOSPC investigation qualified (2026-11-02, bd-uxh7t):**
 > fresh2048/8192/20050-file fixtures created through FrankenFS pass kernel
 > name/size acceptance before mutation. Seven sustained post-reopen workloads

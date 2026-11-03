@@ -2,6 +2,144 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-03, continued after d1085d606
+
+- [x] Read actual hosted outcomes and the current source-aware queue:53ready,
+  0foreign, empty cycles; preserve the15untracked paths and resume bd-53dub.
+- [x] Hosted current source passes the full workspace unit step and all six
+  protected CLI cases. FUSE instead fails288/1/8existing ignores on a clean
+  unmount after successful multi-device readback. The later shell/differential
+  steps remain skipped; no green hosted claim.
+- [x] xfstests now executes its real selected suite: ext4's118baseline comparisons
+  have one generic294regression; btrfs hits the job limit. Environment wiring
+  is effective, without changing baseline/list/deadline. Preserve both logs.
+- [x] Identify the separate parity configuration failure: core-lib selects two
+  bhh0i_sharded_alloc tests without enabling their compile-time feature. Keep
+  any correction in its own reviewed gate-binding unit, preserving exact tests.
+- [x] Reproduce inherited client-FD lifetime across subprocess creation using
+  a real mount. Distinguish the controlled interleaving from unobserved CI
+  holder attribution; keep true EBUSY rejection and all existing exit assertions.
+  A blocked pre-exec child retains the CLOEXEC mount FD after its parent closes
+  it: native unmount returns EBUSY. After exec/release it returns0; a client
+  opened in a separate post-exec process does not leak into that sibling.
+  Image SHA2b611f2c stays fixed. This does not identify the actual hosted holder.
+- [x] Correct CLI read-test process isolation if the probe confirms the defect
+  class, without retries, lazy success, disabled tests or deadline changes.
+  Both CLI multi-device cases now run in separate client processes; parent
+  concurrency remains4. Child success requires the exact named test once,
+  plus exit0. Child events go to stderr to avoid double-counting parent JSON.
+  Actual empty-selection negative passes1/0/297filtered.
+- [ ] Run the complete native FUSE target, its explicit busy-mount negative,
+  required Rust check/Clippy/fmt and changed-code UBS; bind source/ELF evidence.
+  Full uid1000 target passes290/0failed/8existing ignores/0filtered,141.13s;
+  root-only busy-mount negative separately passes1/0/297filtered,5.05s.
+  ELF c112339af3a24c24ac2704bbbf2eb39ccf703b4503e700851d6963b49061b8b9;
+  all886Rust/build inputs matched its snapshot before later test-helper and
+  parity-binding edits. FUSE/runtime source unchanged since that snapshot.
+  Private fuse.conf bind leaves host SHA28c34f67 unchanged. Changed-code UBS
+  FUSE1file0critical/3741warnings/714info; core/parity2files final0critical/
+  16586warnings/3323info. Earlier scanner1critical on a literal-selected dynamic
+  command is retained; explicit literal Command constructors resolve it without
+  suppression or a vulnerability claim. Formatting/diff checks pass.
+  Initial workspace/all-target check and final-source strict workspace Clippy
+  pass; a final warm check, full required-oracle/FUSE package invocation and
+  benchmark are queued/running via ordinary RCH. No pass inferred from queue.
+  Final core ELF482a0a21 matches source6564e392: missing formatter and missing
+  debugfs each fail101; optional missing formatter prints SKIP and returns0.
+- [ ] Fix and execute the feature-specific allocator parity selection separately;
+  report its opt-in configuration without changing production defaults.
+  Exact required names exist but were cfg-disabled, not obsolete. core-lib now
+  enables bhh0i_sharded_alloc; no requirement/validator/default changes. An old
+  allocator ELF falsely passes with empty PATH and REQUIRE_ORACLES1. Fixture
+  setup now requires successful mkfs.ext4/debugfs and verifies writable root;
+  existing missing-oracle parent covers the formatter. Final-source ordinary
+  RCH run passes3/0/1700filtered, including two real allocator fixtures and the
+  negative parent. First final attempt refuses103for pressure before Cargo;
+  unchanged admitted retry executes successfully. Actual parity runner pending.
+- [x] Inspect actual generic294 regression and btrfs timeout artifacts; fix
+  concrete implementation defects rather than editing expected results.
+  generic294 has correct errno classes but uutils0.10stderr differs from the
+  pinned GNU expectations. Reference workflow uses ubuntu24.04 and release CLI/
+  harness, explicitly forwarding the23rd variable FFS_HARNESS_BIN through sudo.
+  btrfs completed102tests totaling3367s; generic027alone2245s. generic313 merely
+  starts last, so no deadlock attribution. Lists/baselines/allowlist/loop counts/
+  60min limit unchanged. YAML/bash checks and both-format real sudo-rs recording
+  endpoint controls pass, including incorrect/unset ACK/unset harness/exit71;
+  process-boundary proof only, with zero native xfstests pass credit.
+  Final review binds both native build caches to ubuntu24.04 too, preventing
+  restoration of newer-image executables; all workflow shell blocks parse.
+- [ ] Recheck the original hosted acceptance conditions, update Beads/parity,
+  audit the concrete changes and deliver both Git refs with no premature close.
+
+Bounded real-work audit, resume17 (actual diff, latest five commits, current
+Bead and open/closed queue samples): the README's goal is a memory-safe native
+filesystem with compatible mounts, concurrent transactions and self-healing.
+This block has USER0, ENABLER3 (CLI-test isolation, allocator proof binding/
+fixture guard, reference-job environment), PROCESS2 (requested TODO/tracker,
+parity evidence notes), UNKNOWN0. No production filesystem feature is credited.
+1. No new user-visible runtime demo shipped in this block; the concrete demo
+   is the full concurrent native mount target, not a new filesystem algorithm.
+2. Without the process notes the runtime outcome is unchanged; retain only the
+   requested checklist and evidence needed to reproduce the original task.
+3. Native FUSE290cases and allocator fixtures exercise the first two enablers;
+   the hosted reference-job correction still needs its actual selected run.
+4. The oldest user-facing item in the bounded sample is bd-w2u82 (Aug17),
+   whose transport implementation already exists but whose comparative result
+   still needs a quiet measurement window. Current work repairs the proof lane
+   rather than claiming another implementation of that transport.
+5. Solo; no panes, agents or closure competition.
+6. No spec reduction, new requirement-carrying follow-up or closure. bd-53dub
+   retains its original acceptance probes. Verdict DRIFTING: verification has
+   consumed a large block with no new runtime capability. Freeze new machinery,
+   finish the existing commands and deliver these fixes before another audit.
+
+Honesty inventory, same bounded window, solo self-review:
+1. No (checked every current test/workflow diff): no assertions/ignores/list/
+   baselines/loops/deadline removed. Parent concurrency remains4.
+2. The recording endpoint and blocked pre-exec child are explicit controls;
+   neither supplies native xfstests or actual hosted-holder attribution.
+3. No (checked tracked diff): no golden/snapshot regeneration.
+4. Yes, gate binding and CI changed. Review the feature binding as its own
+   unit with the exact required names intact; no relaxation/default flip.
+   Workflow image/release/cache changes are separate from FUSE isolation.
+5. No (checked commands/diffs): no benchmark hardcoding, hidden failure masks,
+   timeout/pressure changes or alternate build-dispatch route.
+6. The old formatter-absent allocator control really is false green. Corrected
+   selected tests execute3; child isolation rejects zero selected tests. Actual
+   parity execution remains pending and receives no execution credit yet.
+7. No (checked raw commands/logs): queued/refused runs are not test passes.
+8. No (checked evidence labels): process controls, synthetic unit inputs and
+   actual native mounts/oracles remain distinct; no field/power-loss claim.
+9. Failures retained: hosted288/1, parity missing-feature, xfstests mismatch/
+   timeout, RCH103 refusals, first UBS1critical and standalone-control typo.
+10. No (checked cited launchers): stdout/stderr retained together or separately;
+    nested JSON goes to parent stderr to prevent duplicate pass accounting.
+11. No (checked tracker diff): no item closed this block; original AC remain.
+12. No (checked specs/parity diff): only evidence status changes, no lower goals.
+13. Not applicable: solo, no delegated closes.
+14. Not applicable: no subagent dispatch.
+15. Not applicable: no subagent reports accepted.
+16. Not applicable: no swarm; this block's enabler-only drift is admitted above.
+17. No (checked reports): self-review is not independent verification.
+18. No (checked selections): whole FUSE target and exact allocator selection
+    were named before execution; nested child counts add no extra test credit.
+19. Explain the avoidable cost: an attempted text read of the RCH executable
+    dumped binary noise; no useful evidence. A standalone assertion expected
+    SKIP-colon instead of the existing SKIP-space contract and stopped after
+    two controls; a separate exact-contract follow-up verifies optional skip
+    and required missing-debugfs failure. DCG blocked a dynamic follow-up
+    launcher before execution; static inspectable commands complete it without
+    override. No source assertion was changed to accommodate these mistakes.
+20. Strongest proof is the hash-bound full native FUSE290/0run, plus the real
+    inherited-FD EBUSY/clean-unmount control; exact commands/ELFs are retained.
+Older-session scope is the existing bounded CASS sample below, not a fresh or
+exhaustive historical audit. Disposition: correct misleading cfg wording in
+place, retain/disclose actual failures, and counter RH-1/RH-2/RH-7/RH-11 with
+unchanged exact requirements, explicit proof classes, no close and no new
+framework. These one-off probes retire after this qualification; their raw
+artifacts remain preserved. Next claimed product item must target runtime
+capability rather than another reporting/control framework.
+
 ## Current execution — 2026-11-02, continued after ff056ce92
 
 - [x] Preserve the15untracked paths; confirm source-aware queue53claimable/

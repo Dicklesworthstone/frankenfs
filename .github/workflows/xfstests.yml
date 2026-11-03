@@ -23,7 +23,9 @@ env:
 jobs:
   xfstests-fuse:
     name: xfstests generic subset on FrankenFS (FUSE, ${{ matrix.fs }})
-    runs-on: ubuntu-latest
+    # The pinned upstream goldens assert GNU coreutils diagnostics. Newer
+    # ubuntu-latest images provide uutils with different stderr wording.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -46,6 +48,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-xfstests-ubuntu-24.04
 
       - name: Install FUSE, ext4 and xfstests prerequisites
         run: |
@@ -62,7 +66,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/xfstests-dev
-          key: xfstests-dev-v2026.03.20-${{ runner.os }}-v1
+          key: xfstests-dev-v2026.03.20-${{ runner.os }}-ubuntu-24.04-v1
 
       - name: Build xfstests
         if: steps.xfstests-cache.outputs.cache-hit != 'true'
@@ -105,12 +109,14 @@ jobs:
           make -C src
 
       - name: Build FrankenFS
-        run: cargo build -p ffs-cli -p ffs-harness
+        # Exercise the production binaries; the debug btrfs generic/027 run
+        # alone consumed 2245 seconds of the existing 60-minute job budget.
+        run: cargo build --release -p ffs-cli -p ffs-harness
 
       - name: Install the mount helper and test images
         run: |
           set -euo pipefail
-          sudo install -m 0755 target/debug/ffs-cli /usr/local/bin/ffs-cli
+          sudo install -m 0755 target/release/ffs-cli /usr/local/bin/ffs-cli
           sudo install -m 0755 scripts/e2e/mount.fuse.ffs /sbin/mount.fuse.ffs
           # Core dumps to a plain file, so a test's own `ulimit -c 0` holds.
           # With the runner's systemd-coredump pipe the kernel ignores
@@ -148,6 +154,7 @@ jobs:
           FSTYP: fuse
           FUSE_SUBTYP: .ffs
           FFS_XFSTESTS_IMAGE_FORMAT: ${{ matrix.fs }}
+          FFS_HARNESS_BIN: ${{ github.workspace }}/target/release/ffs-harness
           XFSTESTS_MODE: run
           XFSTESTS_FILTER: generic
           XFSTESTS_DRY_RUN: 0
@@ -180,6 +187,7 @@ jobs:
             "FSTYP=$FSTYP" \
             "FUSE_SUBTYP=$FUSE_SUBTYP" \
             "FFS_XFSTESTS_IMAGE_FORMAT=$FFS_XFSTESTS_IMAGE_FORMAT" \
+            "FFS_HARNESS_BIN=$FFS_HARNESS_BIN" \
             "XFSTESTS_MODE=$XFSTESTS_MODE" \
             "XFSTESTS_FILTER=$XFSTESTS_FILTER" \
             "XFSTESTS_DRY_RUN=$XFSTESTS_DRY_RUN" \
