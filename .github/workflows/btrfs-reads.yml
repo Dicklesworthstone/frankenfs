@@ -37,7 +37,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y e2fsprogs btrfs-progs
+      - name: Generate native ext4 unit-test inputs
+        run: |
+          ./scripts/fixtures/make_ext4_fixtures.sh --images-only
+          for image in tests/fixtures/images/ext4_*.img; do
+            e2fsck -fn "$image"
+          done
       - name: Core library regressions
+        env:
+          FFS_REQUIRE_ORACLES: "1"
         run: cargo test -p ffs-core --locked --lib
       - name: Core Clippy
         run: cargo clippy -p ffs-core --locked --all-targets -- -D warnings

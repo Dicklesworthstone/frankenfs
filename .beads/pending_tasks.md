@@ -165,6 +165,16 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   informational finding; no suppression or scanner-clean claim.
 - [ ] Deliver the hosted smoke change and observe its original named full-CI
   probes; retain missing hosted evidence in bd-53dub, not a replacement item.
+- [x] Diagnose Btrfs Read Recovery41575682848 on both architectures: core
+  tests ext4_named_birth_retained_image_passes_native_checker and
+  ext4_tmpfile_atomic_retained_image_passes_native_checker fail on an absent
+  ext4_small.img. The lane installed tools but omitted the main workflow's
+  existing --images-only producer/checker step. Wire that identical native
+  input step before the unchanged core test command and require oracles1.
+  YAML, every shell block, ordering and strict flag validate locally; the
+  main workflow already executes this producer. New lane execution is pending.
+- [ ] Observe both repaired Btrfs Read Recovery matrix jobs; count neither
+  static wiring nor the main workflow's producer as a pass of this lane.
 - [ ] Recheck the original hosted acceptance conditions, update Beads/parity,
   audit the concrete changes and deliver both Git refs with no premature close.
 
