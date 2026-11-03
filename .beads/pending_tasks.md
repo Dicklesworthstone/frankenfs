@@ -11,16 +11,27 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   Red source7dabc2e2 executes1failed/0passed/0ignored/1628filtered in0.01s:
   the old shrink returnsNoSpace at the stronger native-success assertion.
   Ordinary RCH963211ms101/wall1039.805s, including cold dependency build.
-- [ ] Preserve the partial EOF extent on shrink. Keep rollback on metadata
+- [x] Preserve the partial EOF extent on shrink. Keep rollback on metadata
   failure and cancellation; handle inline extents without stale-byte exposure.
-- [ ] Sanitize exposed EOF gaps on setattr grow, sparse write, fallocate grow,
+- [x] Sanitize exposed EOF gaps on setattr grow, sparse write, fallocate grow,
   and clone destination growth; preserve current bytes outside each gap.
-- [ ] Roll back every fallible growth path before returning an error. Cover
+- [x] Roll back the checkpointed growth paths before returning an error. Cover
   cancellation, checksum/I/O failure, NoSpace, shared peers and allocation refs.
-- [ ] Execute targeted red/green and original properties through ordinary RCH
+- [x] Execute targeted red/green and original properties through ordinary RCH
   with fresh actual-volume/RAM20GiB admission; retain failed attempts.
-- [ ] Execute affected owner tests and required fmt/check/strict Clippy. Bind
-  source and runtime; qualify native checks and fresh mounted old/new behavior.
+- [x] Replay the unchanged original property with both hosted seeds persisted
+  in the existing regression file, then execute the affected btrfs/clone tests.
+- [x] Execute the post-ENOSPC reclaim-cancellation control added in fresh review;
+  the already-cancelled public setattr case alone no longer covers that branch.
+- [ ] Build a fresh CLI and compare native/old/candidate on the frozen full
+  shared image; require all bytes, fsync/unmount, native checks and readbacks.
+- [ ] Execute workspace/all-target cargo check on the final source.
+- [ ] Execute strict workspace/all-target Clippy on the final source.
+- [x] Execute local fmt and diff checks (repeat after any later source edit).
+- [ ] Refresh applicable harness test/benchmark gates without claiming older
+  source qualifications as current. Keep failures and explicit host limits.
+- [ ] Bind the final tracked source inputs, regression seeds, actual compiler
+  scratch, pinned toolchain and runtime profile to the executed results.
 - [ ] Update specs/parity/Beads with executed evidence, perform bounded fresh
   self-review, publish and leave any unmet original acceptance explicit.
 
@@ -49,6 +60,27 @@ run config only selects the already provisioned114tmpfs target, retaining
 jobs1, assertions, strict oracles and1800s limits. Fmt/diff pass; static scan
 reports0critical/16569warnings/3335info on2files, with added test unwraps and
 existing production patterns reviewed, not a warning-free claim.
+
+Final candidatee9568c3c adds a commit-entry Cx checkpoint after the new
+post-NoSpace cancellation control exposes5device writes before cancellation
+is noticed. Keep the assertion; do not weaken it. The first final selection
+oncec550c6 executes7passed/1failed/0ignored/1623filtered,13.24s (one native
+checker0 before the failure); RCH95263ms101/wall134.968s. The corrected same
+8test selection executes8passed/0failed/0ignored/1623filtered,11.63s with
+both native checkers0; RCH84877ms0/wall107.592s. Original property still
+SHAc3ca28419f540cc5, both exact hosted seeds now tracked (fileSHA64d714e4).
+The wider btrfs/clone selection executes563passed/0failed/10existing ignores/
+1058filtered,56.36s; RCH58138ms0/wall67.714s. Its8test subset overlaps;
+these are not571unique passes or a full-package test result.
+
+The separate114cold run of7de8prefix hits the unchanged1800s cap while
+compiling core:137/RCH1802936ms/wall1927.032s, no test result and no OOM
+claim. Worker115self-recovers root headroom to15GiB and52GiBavailable RAM;
+normal probe/admission and new actual-volume20GiB+RAM checks pass. No
+unowned process was stopped and no cleanup/floor/slot/deadline change was
+used. Final tests and wider owner run use115's warm cache. Fresh CLI build
+on114 and workspace/all-target check on115 are now running. They have
+separate existing runtime configs, identical gates, and named real targets.
 
 ## Current execution — 2026-11-03, resume19 after58acc82d5
 
