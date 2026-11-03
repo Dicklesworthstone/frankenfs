@@ -258,7 +258,7 @@ struct MountRuntimeConfig {
 impl MountRuntimeConfig {
     fn validate(self) -> Result<Self> {
         if self.mode == MountRuntimeMode::Standard && self.managed_unmount_timeout_secs.is_some() {
-            bail!("--managed-unmount-timeout-secs requires --runtime-mode managed");
+            bail!("--managed-unmount-timeout-secs requires --runtime-mode managed or per-core");
         }
         Ok(self)
     }
