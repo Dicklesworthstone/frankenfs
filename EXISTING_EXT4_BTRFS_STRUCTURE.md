@@ -2813,6 +2813,14 @@ For metadata blocks, verification includes:
     own EOF replacement is refused. Exact counterexample/reference receipts:
     `.beads/pending_tasks.md`, bd-wcbvk and `resume18-*` implementation artifacts.
 
+    A later same-input full-image probe (`resume19-eof-native-ffs-comparison`)
+    narrows the contract: native65536to65535 shrink of a shared regular extent
+    succeeds and keeps its sector-aligned65536byte mapping. Native retains the
+    shared physical bytes beyond the new inode size; subsequent exposure must
+    sanitize them. The current FrankenFS CLI instead refuses that shrink with
+    ENOSPC while preserving old bytes. Deferring data COW is safe only when
+    every later growth path zeros exposed EOF gaps before publishing its size.
+
 ### 16.3 Key Implementation Patterns
 
 #### ext4 Block Address Reconstruction

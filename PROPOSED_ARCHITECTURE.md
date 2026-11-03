@@ -111,18 +111,33 @@
 > extra subvolume trees. Counters saturate conservatively; this is a dirty-write
 > budget, not an exact resident-memory measurement.
 
-> **Btrfs shrink failure atomicity (`bd-wcbvk`):** `ffs-core::btrfs_setattr`
+> **Btrfs EOF failure atomicity (`bd-wcbvk`, candidate under qualification):** `ffs-core::btrfs_setattr`
 > holds allocator-write exclusion and reuses the existing COW checkpoints for
 > the FS tree and `BtrfsCommitSnapshot` for allocation, checksums and chunk
-> growth. EOF replacement uses the existing reserve/prepare/publish helpers.
-> A refused shrink restores the checkpoint; a successful shrink releases it.
+> growth. Size changes take this checkpoint; ordinary metadata-only setattr
+> does not. A refused size change restores it; success releases it.
 > Unreferenced replacement bytes never authorize mutation of old physical data.
-> Ordinary metadata-only setattr and growth do not take this shrink checkpoint.
 > Public setattr uses the existing write/fallocate commit-and-unpin retry:
 > only `NoSpace` with pinned data triggers one full commit, after the failed
 > attempt has restored its checkpoint. The operation retries once after commit
 > success. A failed commit propagates its actual cancellation/I/O error and
 > never authorizes a retry or premature release of old pins.
+
+> **Native EOF contract (`bd-wcbvk`, implementation in progress):** regular
+> extent views remain sector aligned after shrink. A shared final sector may
+> retain bytes beyond `i_size`; those bytes are inaccessible until a later size
+> increase. Before publishing growth, setattr, write, fallocate and reflink
+> destination paths must zero any newly exposed gap in that sector through COW,
+> preserving existing visible bytes and shared peers. A failed growth restores
+> the FS/allocation/checksum checkpoint. Unaligned plain fallocate's earlier
+> KEEP_SIZE reservation can survive refusal of its separate exact-size growth;
+> this does not expose bytes, and allocation accounting must stay coherent.
+> Small inline shrinks trim the payload; inline growth either extends that
+> payload with zeros or converts it to a regular extent at the sector boundary.
+> The inode size is the durable cutoff;
+> no private on-disk flag or volatile-only tail marker is introduced. Native
+> reference: `resume19-eof-native-ffs-comparison.log` (same full shared image,
+> kernel shrink succeeds while eager EOF COW returns `ENOSPC`).
 
 > **Protected mount workers (`bd-11a8t`):** the CLI-private
 > `mount_worker` module shares that child-region and completion-drain ownership
