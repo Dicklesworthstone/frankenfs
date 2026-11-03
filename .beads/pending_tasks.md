@@ -2,6 +2,65 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-03, bd-wcbvk after54ebca569
+
+- [x] Preserve15untracked paths; source-aware live queue54claimable/0foreign,
+  cycles empty. Release bd-53dub to open with its hosted acceptance intact,
+  claim only bd-wcbvk and reserve core/TODO/parity. Fresh hosted checkpoint CI
+  starts checkout; no completed smoke/differential execution inferred.
+- [x] Replay the exact12writes+truncate from the hosted shrunk sequence in an
+  inline regression. Compare every file, extent mappings, checksums, allocation
+  accounting and references after any refused truncate; retain the initial red.
+  Executed unchanged-production red0passed/1failed/1624filtered,0.02s,
+  RCH55166ms/101, wall97.775s: ENOSPC preserves size but destroys bytes starting
+  45056in inode258. This is demonstrated data loss, not only a property mismatch.
+- [x] Inspect native btrfs truncate under real space pressure using owned test
+  artifacts; distinguish ENOSPC permission from failure atomicity and success.
+  DCG refuses new-image formatting before execution; no override. Safer copies
+  of existing btrfs-check-clean512MiB image f110e847 execute in a private mount
+  namespace. Linux7.0.0-31/progs6.17.1: unshared and reflink-shared shrink/fsync
+  succeed after fallocate ENOSPC down to4KiB; reextend returnsENOSPC. Siblings
+  and alias unchanged, final native checks0/0, original image SHA unchanged.
+  Receipt resume18-native-btrfs-pressure-copy.log, wall4.766s/0; no native
+  shrink ENOSPC observation or blanket justification to widen the property.
+  Follow-up on copies of both retained full images proves failed reextension
+  preserves every file's bytes and target size47198: native ENOSPC in both,
+  final checks0/0, source hashes unchanged; resume18-native-refused-grow.log,
+  wall4.342s/0. This reference does not qualify FrankenFS execution.
+- [ ] Fix the demonstrated production defect using existing COW preparation/
+  reservation machinery where possible. Keep the original random property,
+  fixture capacity, acceptance, assertions and gate configuration unchanged.
+  Candidate core52d86875 reserves/prepares before removing the EOF mapping and
+  reuses existing FS/commit checkpoints to roll back any failed shrink. The
+  old single-use emit helper becomes the reserve/prepare helper. Three inline
+  regressions cover exact ENOSPC,6shared/unshared success/cancel/checksum cells
+  and a late corrupt-metadata refusal after earlier removals. Property bytes
+  are unchanged. Candidate is not yet runtime-qualified.
+- [ ] Run the deterministic regression, original property and affected truncate/
+  reflink/write/cancellation tests through admitted ordinary RCH. Include no-space,
+  I/O-failure, shared-data, unaligned EOF and shrink/reextend cases as relevant.
+  First green attempt refuses103for hz3pressure before Cargo. Alternatevmi
+  compiles dependencies but exits137at RCH1805168ms under the1800s cap, with
+  zero tests executed; wall1864.118s. Retain it without OOM attribution. Current
+  source's3exact tests are admitted onhz3 after fresh privileged target/runtime
+  SBH20G0; earlier cache is rebuilding, no pass inferred.
+- [ ] Complete required workspace check/strict Clippy/fmt, owner tests and
+  changed-code UBS. Bind results to source/configuration; no selected-zero or
+  skipped native proof. Update measured parity without claiming global readiness.
+  First hz3check refuses103after source-namespace init73/Killed before Cargo.
+  A fresh admitted check now runs onvmi. Source formatting passes. Final core
+  UBS0critical/16388warnings/3254info; diagnostics remain unsuppressed.
+- [x] Inspect hosted checkpoint8c435daa3: main lint/tests, parity, canonical
+  gates and golden verification pass. FUSE passes; full shell catalog124passes,
+  then real workspace build/inspect/scrub/parity execute. Shell rejects the
+  standard+managed-timeout diagnostic, which omits the supported per-core mode.
+- [ ] Validate the one-line public diagnostic correction under bd-53dub.
+  Production now names managed or per-core; the existing shell gate is unchanged.
+  This is a separate public CLI fix, not a btrfs test relaxation or original-AC
+  transfer. Native journaled/differential hosted steps remain skipped.
+- [ ] Fresh self-review against the original Bead, update its cited execution
+  evidence/status, flush/cycle check, publish both refs and release owned leases.
+
 ## Current execution — 2026-11-03, continued after d1085d606
 
 - [x] Read actual hosted outcomes and the current source-aware queue:53ready,
