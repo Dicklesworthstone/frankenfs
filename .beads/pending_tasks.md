@@ -8,8 +8,9 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   original randomized properties, known native red and prior qualification.
 - [x] Add a regression requiring a regular shared EOF shrink with no spare
   data blocks to succeed, preserving all peers and aligned extent references.
-  Red source7dabc2e2 is executing through ordinary RCH on vmi1152480; the
-  cold test dependency build is not yet an executed test result.
+  Red source7dabc2e2 executes1failed/0passed/0ignored/1628filtered in0.01s:
+  the old shrink returnsNoSpace at the stronger native-success assertion.
+  Ordinary RCH963211ms101/wall1039.805s, including cold dependency build.
 - [ ] Preserve the partial EOF extent on shrink. Keep rollback on metadata
   failure and cancellation; handle inline extents without stale-byte exposure.
 - [ ] Sanitize exposed EOF gaps on setattr grow, sparse write, fallocate grow,
@@ -37,6 +38,17 @@ exact-size growth fails; byte/size/peer preservation and nbytes coherence are
 still required. Its existing multi-request reservation behavior is not claimed
 as a globally atomic rollback. GitHub CLI status read returns403rate-limit;
 connector returns no run rows for21d7, so fresh hosted status is unknown.
+Candidate7de8e78a is now admitted on vmi1149989 after both actual target/
+runtime20GiB checks and complete RAM admissions pass (22.8GBvolume free,
+35.5GBRAM available). vmi1152480's first green attempt103refuses before
+Cargo: its root fell below10GB while dedicated target/runtime checks passed.
+Root then reads4.3GiBfree; no floor/slot changes or deletion. Two own diagnostic
+SSH sessions finish naturally before attempted TERM (both exact PIDs already
+absent; no process stopped). No unowned process is signaled. The existing
+run config only selects the already provisioned114tmpfs target, retaining
+jobs1, assertions, strict oracles and1800s limits. Fmt/diff pass; static scan
+reports0critical/16569warnings/3335info on2files, with added test unwraps and
+existing production patterns reviewed, not a warning-free claim.
 
 ## Current execution — 2026-11-03, resume19 after58acc82d5
 
