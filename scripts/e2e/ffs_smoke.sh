@@ -313,6 +313,10 @@ RCH_INPUT_DIR="$REPO_ROOT/artifacts/rch_input/$(basename "$E2E_LOG_DIR")"
 mkdir -p "$RCH_INPUT_DIR"
 TEST_IMAGE="$RCH_INPUT_DIR/e2e_test.ext4"
 e2e_create_ext4_image "$TEST_IMAGE" 16
+# mkfs leaves lost+found root-owned and mode0700. The smoke runner must own
+# this fixture directory to exercise the unchanged recursive traversal below.
+# Preserve its permissions so unrelated access failures still fail the suite.
+e2e_run debugfs -w -R "set_inode_field /lost+found uid $(id -u)" "$TEST_IMAGE"
 
 #######################################
 # Phase 3: CLI Commands
