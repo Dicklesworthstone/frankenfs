@@ -9,6 +9,13 @@ Created by CC agent 2026-04-22. Import when bead database clears.
 - [x] Trace the remaining exact-sequence failure through public dispatch.
   Existing btrfs_retry_after_unpin is used by write/fallocate but not setattr;
   the new failure-atomic shrink checkpoint may now safely enable that retry.
+- [x] Restore admitted worker capacity using the authorized SSH remediation:
+  hz3root1.8GiB and vmi1227854root7.2GiB cause normal RCH103refusals before
+  Cargo. Other workers' real20GiB checks fail. On vmi1149989,43GBavailable RAM
+  and zero memory pressure permit increasing its existing tmpfs30to36GiB;
+  preserve nosuid/nodev/inode/quota flags and all files. Both actual target/
+  runtime SBH0.7.12 checks now0,24.9GBfree, complete RAM admission0. Ordinary
+  RCH admits the red test there. No deletion, admission-floor or slot change.
 - [ ] Plant a positive exact-sequence assertion after the unchanged inner
   refusal/data/accounting checks; execute red before production wiring.
 - [ ] Wire only the existing safe retry, if execution confirms the cause.
