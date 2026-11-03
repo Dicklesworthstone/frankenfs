@@ -196,21 +196,24 @@ start_mount() {
 
 stop_mount() {
     local mount_point="$1"
-    # Flush and unmount before stopping the daemon: killing it first does not
-    # establish a clean-unmount durability boundary for the native checker.
+    # Unmount requests destroy; the daemon must finish its final commit and
+    # exit successfully before reopening or checking the written image.
+    [[ -n "${MOUNT_PID:-}" ]] || e2e_fail "no mount daemon to await"
     e2e_assert fusermount3 -u "$mount_point"
-    if [[ -n "${MOUNT_PID:-}" ]] && kill -0 "$MOUNT_PID" 2>/dev/null; then
-        kill "$MOUNT_PID" 2>/dev/null || true
-        local wait_count=0
-        while kill -0 "$MOUNT_PID" 2>/dev/null && [[ $wait_count -lt 20 ]]; do
-            sleep 0.5
-            wait_count=$((wait_count + 1))
-        done
-        if kill -0 "$MOUNT_PID" 2>/dev/null; then
-            kill -9 "$MOUNT_PID" 2>/dev/null || true
-        fi
+    local wait_count=0
+    while kill -0 "$MOUNT_PID" 2>/dev/null && [[ $wait_count -lt 20 ]]; do
+        sleep 0.5
+        wait_count=$((wait_count + 1))
+    done
+    if kill -0 "$MOUNT_PID" 2>/dev/null; then
+        e2e_fail "mount daemon did not exit after clean unmount: $MOUNT_PID"
     fi
+    local daemon_exit=0
+    wait "$MOUNT_PID" || daemon_exit=$?
     MOUNT_PID=""
+    if [[ "$daemon_exit" -ne 0 ]]; then
+        e2e_fail "mount daemon failed its final flush (exit=$daemon_exit)"
+    fi
 
     if mountpoint -q "$mount_point" 2>/dev/null; then
         e2e_fail "mount remains active after clean unmount: $mount_point"
