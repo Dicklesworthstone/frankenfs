@@ -16160,14 +16160,11 @@ fn run_isolated_cli_read_test(test_name: &str) -> bool {
         .env(CHILD_ENV, test_name)
         .output()
         .expect("spawn isolated CLI read test");
-    // Child events belong to the same case. Keep them out of the parent's
-    // libtest JSON stdout so evidence consumers cannot count the case twice.
-    std::io::stderr()
-        .write_all(&output.stdout)
-        .expect("forward isolated test stdout");
-    std::io::stderr()
-        .write_all(&output.stderr)
-        .expect("forward isolated test stderr");
+    // RCH merges both worker streams. Use libtest's captured diagnostic path
+    // so child events stay inside the parent's test output instead of becoming
+    // extra suite blocks in the protocol stream.
+    eprint!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     let passed = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -16198,6 +16195,44 @@ fn isolated_cli_read_test_refuses_empty_selection() {
             message.contains("named CLI case was not executed exactly once")
         }),
         "must reject empty selection, not fail for an unrelated reason"
+    );
+}
+
+#[test]
+fn isolated_cli_read_test_keeps_child_events_inside_parent_output() {
+    let name = "isolated_cli_read_test_refuses_empty_selection";
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--exact",
+            name,
+            "-Z",
+            "unstable-options",
+            "--format=json",
+            "--show-output",
+        ])
+        .output()
+        .expect("spawn real libtest protocol control");
+    assert!(output.status.success(), "nested protocol control failed");
+    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parent libtest JSON"))
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "test"
+                && event["event"] == "ok"
+                && event["name"] == name)
+            .count(),
+        1,
+        "the named parent case must execute once"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .is_ok_and(|event| event["type"] == "suite" || event["type"] == "test")
+        }),
+        "raw child events would corrupt RCH's merged libtest protocol"
     );
 }
 
