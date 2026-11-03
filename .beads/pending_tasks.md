@@ -35,7 +35,8 @@ Created by CC agent 2026-04-22. Import when bead database clears.
 - [ ] Update specs/parity/Beads with executed evidence, perform bounded fresh
   self-review, publish and leave any unmet original acceptance explicit.
 
-Candidate implementation is present, not yet qualified: shrink retains the
+The implementation has bounded qualification below; full package gates remain
+pending. Shrink retains the
 regular partial EOF sector; small inline payloads are trimmed in metadata.
 Setattr growth, sparse writes, aligned fallocate growth and reflink destination
 gaps sanitize before size publication under existing COW checkpoints. Write
@@ -108,6 +109,120 @@ Full harness package tests run on115. The normal full cargo bench gate runs
 on114 after fresh actual-volume/RAM20GiB admission. hz4's optional preflight
 refuses before a build: root6.6GiB, ram_scratch_pressure despite41.3GBvolume
 free (tmpfs above half RAM, low swap). No cleanup or capacity-limit change.
+
+Full harness cold compilation reaches the unchanged1800s cap:137,
+RCH1804124ms/wall1818.089s, no tests executed. The same command's warm retry
+has started real tests, including its nested compile-fail checks; completion
+is still pending. The full benchmark cold build also ends137 at its1800s
+cap, RCH1807036ms/wall1863.463s, before benchmark execution. Neither is an
+OOM diagnosis. A retry mistakenly used a nonexistent local RCH_CONFIG_DIR,
+so it selected the default root target and300s limit, rather than the
+preflighted RAM target. It is not qualified. Exact owned wrapper
+rchw-2129e4fa-a791-461f-b713-09ff8384f738 was cancelled through `rch jobs
+cancel` (wrapper exit-15/wall201.345s); no unowned process was signaled and
+no files were deleted. Initial numeric cancel refused ownership mismatch.
+The corrected retry asserts the existing config files, storage route and
+1800s value before launch and records their path/hash; fresh target/runtime
+20GiB plus complete RAM checks pass. Its actual execution remains pending.
+
+The unchanged128MiB differential producer and runtime probe on fresh CLI7a5
+executes12PASS/3FAIL/0XFAIL/0SKIP,17s, overallFAIL. Runtime inspection,
+writeback/reopen, geometry and native checks pass. Three validator commands
+never execute because that sudo environment lacks `rch`: writeback tests,
+crash-consistency tests and Clippy. The initial commentary incorrectly said
+inspection failed; it is explicitly corrected. The staged exact script has
+no Git checkout, so report revision is unknown; this is neither full hosted
+nor release-build proof. bd-53dub stays open with its original acceptance.
+
+Fresh solo review reexecutes the same three-arm mounted command after new
+actual-runtime20GiB/full RAM admission. `resume20-native-fresh-review.log`
+passes all3arms,3native checkers and3kernel readbacks on unchanged seedcb774
+and binary7a5, with every controlled byte checked. The old CLI's shrink
+still returnsENOSPC; native/new succeed. This is reexecution, not independent
+review. No performance claim or sum of overlapping tests is made.
+
+Bounded end-of-block audit (21d7d5cce..d4249f309,13commits; solo):
+- Purpose from README: native filesystem behavior in Rust through FUSE and
+  offline-image tools, with explicit writeback/durability gates.
+- USER: de4a5bd74 and09fc52cc5 (EOF behavior and early cancellation).
+  ENABLER: d01e69c51 andb8669c9cd (persistent seeds and negative control).
+  PROCESS: the other9spec/parity/tracker commits. These commits were made
+  by the external writer as edits appeared, not an authored microcommit plan.
+- Most visible demo: full shared-file shrink now succeeds and later growth
+  never resurrects the removed byte. Without process artifacts the runtime
+  result is identical; their purpose is review and recovery, not capability.
+- Enablers exercised by the unchanged original property and the cancellation
+  control that failed before the producer checkpoint was added.
+- Oldest open item in bounded ascending tracker read: bd-xmh5g upstream
+  performance gaps (2026-06-02); current P0 data-integrity/native-parity
+  failure takes priority over that performance work. No swarm or close-count
+  comparison applies. No work item closed in this block or new follow-up
+  minted to transfer an original condition. Specs describe native behavior
+  measured before implementation; they do not substitute for it.
+- Verdict: DRIFTING in reporting volume and repeated build waiting, despite
+  a real delivered runtime repair. Stop adding apparatus; finish mandatory
+  gates and publish this coherent fix. The user explicitly requested the
+  granular TODO and skill audit; append to this existing file only.
+
+Honesty inventory (same bounded window; answers1..20):
+1. No weakening (checked: every source/test hunk21d7..d4249, original property
+   SHA, regression additions, unchanged CI/config/goldens/ignore attributes).
+   Former shrink-allocation fault cases now exercise the actual growth COW;
+   full-image shrink now requires success, not an ENOSPC waiver.
+2. No specialized success stub (checked: real engine paths and image-backed
+   tests; planted checksum/cancel/I/O controls remain labeled unit controls).
+3. No golden regeneration (checked: complete nine-file diff inventory).
+4. No gate/lint/profile/deadline relaxation (checked: source diff and exact
+   Cargo commands). Incorrect retry config did change route/cap unintentionally;
+   cancelled, disclosed and excluded, then assert the real config before retry.
+5. No hardcoded runtime success path (checked: production EOF helper/callers).
+   Runtime scratch routing is infrastructure, not a benchmark speedup claim.
+6. No zero-run green claimed (checked:8and563executed rows and3mounted arms;
+   package totals and host skips remain pending, timed builds are failures).
+7. Yes: inspection was initially reported failed; actual report saysPASS.
+   Corrected commentary and this record; three missing-rch validators fail.
+8. No proof-class inflation (checked: native mount logs versus inline tests;
+   row counts do not imply mounted/hosted/power-loss proof).
+9. No concealed failures in final ledger (checked: baseline red, cancelled
+   five-write control,103admission/137caps, differential3FAIL all retained).
+10. No cited stderr discarded (checked: commands combine it into retained
+    logs or save separate stderr; native daemons have retained private logs).
+11. No premature close (checked: bd-wcbvk stillin_progress,bd-53dub open;
+    original descriptions untouched and no follow-up acceptance transfer).
+12. No lowered byte-correctness promise (checked: canonical spec/native
+    extraction diff, native observation predates its implementation).
+13..17. Not applicable: solo; no delegation, peer agreement or verifier claim.
+18. No chosen-after-result metric denominator (checked: named8test and
+    affected-filter scopes,2sharedx7opsx3fault cells,3predeclared native arms).
+19. Explain the wrong RCH route, incorrect inspection summary, speculative
+    cache-transfer detour and reporting volume before the owner replays them.
+    Both attempted old diagnostic TERM PIDs were absent; no cleanup occurred.
+    Nested DCG launcher refused; direct literal source was inspected/allowed,
+    with no bypass. FUSE skips are not mounted proof; solo is not independent.
+20. Strongest evidence: reproducible three-arm native/old/new command bound
+    to seedcb774,old72c,new7a5, all bytes+fsync+natural unmount+3checks+3RO
+    readbacks, successfully reexecuted in fresh review.
+
+Cass audit: status healthy, bounded incremental index exits9partial because
+two Oct30Codex logs exceed100MiB enrichment budget; do not increase it or
+claim exhaustive history. Five suggested queries and session-derived bead/
+property queries run with bounded lexical results and no search timeouts.
+Read exact message-index hits in conversations390,832,954and229. They show
+zero-run gate design, explicit FUSE-skip recognition, an older audit invocation
+and prior property output; none alone establishes current correctness. The
+current bd-wcbvk query has no indexed match, not proof of absent history.
+Disposition: incorrect claims corrected and disclosed; RH-2/RH-17/RH-1
+countermeasure is explicit proof scope, retained failed receipts and asserted
+existing config/source identity, not another runtime/reporting framework.
+Process-artifact gate: this existing TODO is for the requesting owner and
+session recovery; it gates the truthful P0 completion report after the real
+NoSpace corruption/parity incident. Retire its active checklist at handoff,
+retain the historical record without deletion. No separate audit system.
+Integrity exception is not needed: the explicit user request supplies the
+consumer/gate. Raw command/source/result receipts are the minimal recovery
+protection against loss across compaction; source code is not generated from
+them. Highest-value ready work remains this P0; an extra hour of prose would
+deliver less than finishing its gates. Stop expanding the audit now.
 
 ## Current execution — 2026-11-03, resume19 after58acc82d5
 
