@@ -38212,28 +38212,6 @@ impl OpenFs {
         Ok(subvolume || generation <= last_snapshot)
     }
 
-    /// Write and publish a sector-aligned extent into an already allocated range.
-    ///
-    /// Split out for bd-72tn8: an overwrite must secure its replacement space
-    /// before it destroys what it is replacing, so the caller allocates first and
-    /// hands the reservation down. Every failure path still frees `disk_bytenr`,
-    /// so an aborted emit leaks nothing.
-    #[allow(clippy::too_many_arguments)]
-    fn btrfs_emit_aligned_extent_at(
-        &self,
-        cx: &Cx,
-        alloc: &mut BtrfsAllocState,
-        canonical: u64,
-        aligned_offset: u64,
-        data: &[u8],
-        is_datasum: bool,
-        disk_bytenr: u64,
-    ) -> ffs_error::Result<u64> {
-        let prepared =
-            self.btrfs_prepare_aligned_extent_at(cx, alloc, data, is_datasum, disk_bytenr)?;
-        Self::btrfs_publish_aligned_extent(alloc, canonical, aligned_offset, prepared)
-    }
-
     /// Finish fallible data I/O and checksum construction while the old file
     /// mappings are intact. On failure only the unpublished reservation is freed.
     fn btrfs_prepare_aligned_extent_at(
@@ -114318,15 +114296,17 @@ mod tests {
                 // no file mapping or back-reference may survive the refusal.
                 alloc.csum_type = u16::MAX;
             }
-            let result = fs.btrfs_emit_aligned_extent_at(
-                &cx,
-                &mut alloc,
-                canonical,
-                0,
-                &[0x5A; BS],
-                true,
-                allocation.bytenr,
-            );
+            let result = fs
+                .btrfs_prepare_aligned_extent_at(
+                    &cx,
+                    &mut alloc,
+                    &[0x5A; BS],
+                    true,
+                    allocation.bytenr,
+                )
+                .and_then(|prepared| {
+                    OpenFs::btrfs_publish_aligned_extent(&mut alloc, canonical, 0, prepared)
+                });
             if reject_checksum {
                 assert!(matches!(
                     result,
