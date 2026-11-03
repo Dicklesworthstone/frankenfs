@@ -16113,6 +16113,9 @@ fn btrfs_attached_devices_read_seeded_files_xxhash64() {
 #[test]
 fn btrfs_cli_attached_devices_read_seeded_files() {
     if let Some(cli) = btrfs_cli_proof_binary() {
+        if run_isolated_cli_read_test("btrfs_cli_attached_devices_read_seeded_files") {
+            return;
+        }
         assert_btrfs_attached_devices_read_seeded_files(
             "crc32c",
             ffs_types::BTRFS_CSUM_TYPE_CRC32C,
@@ -16124,12 +16127,78 @@ fn btrfs_cli_attached_devices_read_seeded_files() {
 #[test]
 fn btrfs_cli_attached_devices_read_seeded_files_xxhash64() {
     if let Some(cli) = btrfs_cli_proof_binary() {
+        if run_isolated_cli_read_test("btrfs_cli_attached_devices_read_seeded_files_xxhash64") {
+            return;
+        }
         assert_btrfs_attached_devices_read_seeded_files(
             "xxhash",
             ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
             Some(&cli),
         );
     }
+}
+
+/// A sibling test's subprocess can inherit an open mount reference until exec,
+/// even with CLOEXEC and after the reading thread closes its own descriptor.
+/// Keep these CLI clients in separate descriptor tables while the parent suite
+/// continues to exercise independent mounts concurrently.
+fn run_isolated_cli_read_test(test_name: &str) -> bool {
+    const CHILD_ENV: &str = "FFS_CLI_READ_TEST_CHILD";
+    if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let output = Command::new(std::env::current_exe().expect("current FUSE test binary"))
+        .args([
+            "--exact",
+            test_name,
+            "--nocapture",
+            "--test-threads=1",
+            "-Z",
+            "unstable-options",
+            "--format=json",
+        ])
+        .env(CHILD_ENV, test_name)
+        .output()
+        .expect("spawn isolated CLI read test");
+    // Child events belong to the same case. Keep them out of the parent's
+    // libtest JSON stdout so evidence consumers cannot count the case twice.
+    std::io::stderr()
+        .write_all(&output.stdout)
+        .expect("forward isolated test stdout");
+    std::io::stderr()
+        .write_all(&output.stderr)
+        .expect("forward isolated test stderr");
+    let passed = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            event["type"] == "test" && event["event"] == "ok" && event["name"] == test_name
+        })
+        .count();
+    assert_eq!(
+        passed, 1,
+        "named CLI case was not executed exactly once: {test_name}; status={}",
+        output.status
+    );
+    assert!(
+        output.status.success(),
+        "isolated CLI case failed: {test_name}"
+    );
+    true
+}
+
+#[test]
+fn isolated_cli_read_test_refuses_empty_selection() {
+    let error = std::panic::catch_unwind(|| {
+        run_isolated_cli_read_test("nonexistent_cli_read_case_zero_selection_control");
+    })
+    .expect_err("zero selected tests must not certify a CLI read case");
+    assert!(
+        error.downcast_ref::<String>().is_some_and(|message| {
+            message.contains("named CLI case was not executed exactly once")
+        }),
+        "must reject empty selection, not fail for an unrelated reason"
+    );
 }
 
 fn btrfs_cli_proof_binary() -> Option<PathBuf> {
