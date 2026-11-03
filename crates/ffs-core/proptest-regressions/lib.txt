@@ -4,6 +4,8 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+cc 9e4cab0432470094eb7cb30453e0efed000dbdc9b3c5f41c069be6fa5763fca4 # bd-wcbvk: hosted 13-operation EOF shrink failure
+cc 0393f69e32f8a92f58a7e4886ef05798c1fe62f0fad9b75df085b28990251e52 # bd-wcbvk: second hosted EOF failure
 cc ac4eabfecb4f4ffba1c400bab2bb04d6689ab19b6ebbf7478ee52a1a59c28cef # shrinks to ops = [(0, 25316, 15645, 0), (0, 8192, 1, 0), (1, 2207, 4948, 69), (0, 47012, 9253, 62), (1, 48477, 15962, 238), (0, 27082, 12422, 238)]
 cc 2f2f82aa83d404bfe780f0f32be068d11ea6b3c8c93b1b51278a39ce78d6df98 # shrinks to ops = [(1, 0, 0, 184320, 0, 1, 0), (0, 0, 0, 108744, 0, 30521, 0), (2, 0, 1, 118784, 106504, 1524, 213), (3, 0, 1, 141337, 129953, 10563, 179), (0, 1, 0, 125864, 2496, 20733, 1)]
 cc 4e6664dbfd7ad3afb1568d4dad7cfce21d5a5f0fcc6b7c14d296701e0bbb1ca9 # shrinks to ops = [(0, 2, 0, 34654, 0, 34979, 1), (0, 0, 0, 0, 0, 4097, 0), (0, 1, 0, 87882, 47, 39094, 68), (3, 2, 0, 69713, 35500, 25022, 120), (3, 1, 2, 121612, 73078, 28581, 214), (3, 1, 2, 39410, 90003, 18388, 47), (0, 2, 1, 129560, 22479, 17161, 84), (0, 2, 0, 170237, 122469, 36723, 248), (0, 2, 2, 148083, 87304, 20568, 227), (1, 2, 2, 199382, 153392, 22208, 55), (2, 2, 1, 173838, 122947, 10834, 58), (0, 2, 0, 163348, 75113, 33324, 67), (0, 0, 1, 109494, 45026, 39892, 120)]
