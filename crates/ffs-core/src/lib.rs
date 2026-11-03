@@ -37930,6 +37930,103 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Clear retained bytes between the old EOF and newly exposed data. Shrink
+    /// leaves the partial EOF sector mapped, as native btrfs does, so it needs
+    /// no spare DATA block. Every size-growing caller sanitizes this gap before
+    /// publishing i_size and checkpoints its metadata around this fallible COW.
+    fn btrfs_zero_eof_gap(
+        &self,
+        cx: &Cx,
+        alloc: &mut BtrfsAllocState,
+        canonical: u64,
+        old_size: u64,
+        gap_end: u64,
+    ) -> ffs_error::Result<()> {
+        let ss = u64::from(alloc.sectorsize);
+        if old_size.is_multiple_of(ss) || gap_end <= old_size {
+            return Ok(());
+        }
+        let floor = Self::btrfs_align_down(old_size, ss);
+        let sector_end = Self::btrfs_align_up(old_size, ss)?;
+        let inline_key = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: 0,
+        };
+        let mut convert_inline = false;
+        if floor == 0 {
+            let first = alloc
+                .fs_tree
+                .range(&inline_key, &inline_key)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            if let Some((_, bytes)) = first.first() {
+                let extent = parse_extent_data(bytes).map_err(|e| parse_to_ffs_error(&e))?;
+                if matches!(extent, BtrfsExtentData::Inline { .. })
+                    && Self::btrfs_extent_logical_len(&extent)? < gap_end
+                {
+                    if gap_end < ss {
+                        let mut data = self.btrfs_materialize_extent(cx, &extent)?;
+                        data.resize(
+                            usize::try_from(gap_end).map_err(|_| {
+                                FfsError::InvalidGeometry("inline EOF growth overflow".into())
+                            })?,
+                            0,
+                        );
+                        let visible = usize::try_from(old_size).map_err(|_| {
+                            FfsError::InvalidGeometry("inline EOF cutoff overflow".into())
+                        })?;
+                        data[visible..].fill(0);
+                        let extent = BtrfsExtentData::Inline {
+                            generation: alloc.generation,
+                            ram_bytes: gap_end,
+                            compression: 0,
+                            data,
+                        };
+                        alloc
+                            .fs_tree
+                            .update(&inline_key, &extent.to_bytes())
+                            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                        return Ok(());
+                    }
+                    // A grown file that reaches a full sector cannot retain
+                    // an inline item, even when its newly exposed bytes are zero.
+                    convert_inline = true;
+                }
+            }
+        }
+        let start = usize::try_from(old_size - floor)
+            .map_err(|_| FfsError::InvalidGeometry("EOF gap start overflow".into()))?;
+        let stop = usize::try_from(gap_end.min(sector_end) - floor)
+            .map_err(|_| FfsError::InvalidGeometry("EOF gap end overflow".into()))?;
+        let mut sector = vec![
+            0;
+            usize::try_from(ss).map_err(|_| FfsError::InvalidGeometry(
+                "EOF sector size overflow".into()
+            ))?
+        ];
+        self.btrfs_read_existing_range_into(cx, alloc, canonical, floor, &mut sector)?;
+        if !convert_inline && sector[start..stop].iter().all(|&byte| byte == 0) {
+            return Ok(());
+        }
+        sector[start..stop].fill(0);
+        let inode = self.btrfs_read_inode_from_tree(alloc, canonical)?;
+        let prepared = if sector.iter().any(|&byte| byte != 0) {
+            Some(self.btrfs_prepare_aligned_extent(
+                cx,
+                alloc,
+                &sector,
+                inode.flags & BTRFS_INODE_NODATASUM == 0,
+            )?)
+        } else {
+            None
+        };
+        self.btrfs_remove_overlapping_extent_data(cx, alloc, canonical, floor, sector_end)?;
+        if let Some(prepared) = prepared {
+            Self::btrfs_publish_aligned_extent(alloc, canonical, floor, prepared)?;
+        }
+        Ok(())
+    }
+
     /// bd-xfh0k: freed data extents stay pinned until the next superblock
     /// lands, so a request can run out of space that a commit would give back.
     /// Kernel btrfs commits to unpin before it fails an allocation; this runs
@@ -37996,7 +38093,7 @@ impl OpenFs {
     }
 
     /// Reserve and prepare one uncompressed sector-aligned data extent without
-    /// publishing its mapping. Truncate keeps the old EOF mapping until this
+    /// publishing its mapping. EOF growth keeps the old mapping until this
     /// fallible data/checksum preparation succeeds (bd-wcbvk).
     fn btrfs_prepare_aligned_extent(
         &self,
@@ -38617,310 +38714,334 @@ impl OpenFs {
             .checked_add(carve_len)
             .ok_or_else(|| FfsError::InvalidGeometry("clone carve dest end overflow".into()))?;
 
-        let lo = BtrfsKey {
-            objectid: src_canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: 0,
-        };
-        let hi = BtrfsKey {
-            objectid: src_canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: u64::MAX,
-        };
-        let src_extents = alloc
-            .fs_tree
-            .range(&lo, &hi)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let old_dst_size = self.btrfs_read_inode_from_tree(alloc, dst_canonical)?.size;
+        let clears_eof_gap = dest_offset > old_dst_size && !old_dst_size.is_multiple_of(ss);
+        let checkpoint = clears_eof_gap.then(|| {
+            let fs_tree = alloc.fs_tree.checkpoint();
+            (fs_tree, BtrfsCommitSnapshot::take(alloc, self))
+        });
+        let result = (|| {
+            let lo = BtrfsKey {
+                objectid: src_canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: 0,
+            };
+            let hi = BtrfsKey {
+                objectid: src_canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: u64::MAX,
+            };
+            let src_extents = alloc
+                .fs_tree
+                .range(&lo, &hi)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-        // Build the dst shares BEFORE mutating, so an unsupported extent aborts
-        // cleanly with no half-done clone.
-        // Tuple: (dst_file_offset, dst EXTENT_DATA bytes, disk_bytenr,
-        // disk_num_bytes, EXTENT_DATA_REF offset).
-        let mut shares: Vec<(u64, Vec<u8>, u64, u64, u64)> = Vec::new();
-        // Inline extents have no shared disk extent, so a partial reflink of one
-        // is a data COPY: (dst_file_offset, sliced logical bytes) written to dst
-        // as a fresh extent after the destination window is cleared (bd-iypb9).
-        let mut inline_copies: Vec<(u64, Vec<u8>)> = Vec::new();
-        for (key, data) in &src_extents {
-            let extent = parse_extent_data(data).map_err(|e| parse_to_ffs_error(&e))?;
-            let logical_len = Self::btrfs_extent_logical_len(&extent)?;
-            let f = key.offset;
-            let f_end = f.checked_add(logical_len).ok_or_else(|| {
-                FfsError::InvalidGeometry("src extent logical end overflow".into())
-            })?;
-            let overlap_start = f.max(src_offset);
-            let overlap_end = f_end.min(src_end);
-            if overlap_start >= overlap_end {
-                continue;
-            }
-            match extent {
-                BtrfsExtentData::Regular {
-                    generation,
-                    ram_bytes,
-                    extent_type,
-                    compression,
-                    disk_bytenr,
-                    disk_num_bytes,
-                    extent_offset,
-                    num_bytes: _,
-                } => {
-                    if disk_bytenr == 0 {
-                        continue; // hole: dst stays sparse across this gap
-                    }
-                    // Compressed extents CAN be carved by view (bd-sialu): the
-                    // share keeps disk_bytenr/disk_num_bytes/ram_bytes/compression
-                    // (the whole compressed blob) and adjusts extent_offset/
-                    // num_bytes to the sub-range; the reader decompresses the full
-                    // blob then slices by extent_offset/num_bytes
-                    // (btrfs_decompressed_extent_slice). So no special-casing is
-                    // needed beyond carrying `compression` into the new extent.
-                    let delta = overlap_start - f;
-                    let new_extent_offset = extent_offset.checked_add(delta).ok_or_else(|| {
-                        FfsError::InvalidGeometry("clone extent_offset overflow".into())
-                    })?;
-                    let new_num_bytes = overlap_end - overlap_start;
-                    let dst_file_offset = dest_offset
-                        .checked_add(overlap_start - src_offset)
-                        .ok_or_else(|| {
-                            FfsError::InvalidGeometry("clone dst offset overflow".into())
-                        })?;
-                    let new_extent = BtrfsExtentData::Regular {
+            // Build the dst shares BEFORE mutating, so an unsupported extent aborts
+            // cleanly with no half-done clone.
+            // Tuple: (dst_file_offset, dst EXTENT_DATA bytes, disk_bytenr,
+            // disk_num_bytes, EXTENT_DATA_REF offset).
+            let mut shares: Vec<(u64, Vec<u8>, u64, u64, u64)> = Vec::new();
+            // Inline extents have no shared disk extent, so a partial reflink of one
+            // is a data COPY: (dst_file_offset, sliced logical bytes) written to dst
+            // as a fresh extent after the destination window is cleared (bd-iypb9).
+            let mut inline_copies: Vec<(u64, Vec<u8>)> = Vec::new();
+            for (key, data) in &src_extents {
+                let extent = parse_extent_data(data).map_err(|e| parse_to_ffs_error(&e))?;
+                let logical_len = Self::btrfs_extent_logical_len(&extent)?;
+                let f = key.offset;
+                let f_end = f.checked_add(logical_len).ok_or_else(|| {
+                    FfsError::InvalidGeometry("src extent logical end overflow".into())
+                })?;
+                let overlap_start = f.max(src_offset);
+                let overlap_end = f_end.min(src_end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                match extent {
+                    BtrfsExtentData::Regular {
                         generation,
                         ram_bytes,
                         extent_type,
                         compression,
                         disk_bytenr,
                         disk_num_bytes,
-                        extent_offset: new_extent_offset,
-                        num_bytes: new_num_bytes,
-                    };
-                    // u64-wrapping backref offset (see btrfs_clone_file_data):
-                    // a sub-range view has new_extent_offset > dst_file_offset.
-                    let ref_offset = dst_file_offset.wrapping_sub(new_extent_offset);
-                    shares.push((
-                        dst_file_offset,
-                        new_extent.to_bytes(),
-                        disk_bytenr,
-                        disk_num_bytes,
-                        ref_offset,
-                    ));
-                }
-                BtrfsExtentData::Inline {
-                    ram_bytes,
-                    compression,
-                    data: inline_data,
-                    ..
-                } => {
-                    // An inline extent stores its bytes in the item itself (no
-                    // shareable disk extent), so carve the overlapping logical
-                    // bytes and copy them to dst (bd-iypb9). Decompress first when
-                    // the inline payload is compressed.
-                    let logical = if compression == 0 {
-                        inline_data
-                    } else {
-                        Self::btrfs_decompress(
-                            &inline_data,
-                            compression,
-                            usize::try_from(ram_bytes).map_err(|_| {
-                                FfsError::InvalidGeometry("inline ram_bytes overflow".into())
-                            })?,
-                        )?
-                    };
-                    let slice_start = usize::try_from(overlap_start - f).map_err(|_| {
-                        FfsError::InvalidGeometry("inline slice start overflow".into())
-                    })?;
-                    let slice_end = usize::try_from(overlap_end - f).map_err(|_| {
-                        FfsError::InvalidGeometry("inline slice end overflow".into())
-                    })?;
-                    // The inline payload may be shorter than ram_bytes (implicit
-                    // trailing zeros); zero-pad the carved chunk to the overlap.
-                    let mut chunk = vec![0_u8; slice_end - slice_start];
-                    if slice_start < logical.len() {
-                        let copy_end = slice_end.min(logical.len());
-                        chunk[..copy_end - slice_start]
-                            .copy_from_slice(&logical[slice_start..copy_end]);
-                    }
-                    let dst_file_offset = dest_offset
-                        .checked_add(overlap_start - src_offset)
-                        .ok_or_else(|| {
+                        extent_offset,
+                        num_bytes: _,
+                    } => {
+                        if disk_bytenr == 0 {
+                            continue; // hole: dst stays sparse across this gap
+                        }
+                        // Compressed extents CAN be carved by view (bd-sialu): the
+                        // share keeps disk_bytenr/disk_num_bytes/ram_bytes/compression
+                        // (the whole compressed blob) and adjusts extent_offset/
+                        // num_bytes to the sub-range; the reader decompresses the full
+                        // blob then slices by extent_offset/num_bytes
+                        // (btrfs_decompressed_extent_slice). So no special-casing is
+                        // needed beyond carrying `compression` into the new extent.
+                        let delta = overlap_start - f;
+                        let new_extent_offset =
+                            extent_offset.checked_add(delta).ok_or_else(|| {
+                                FfsError::InvalidGeometry("clone extent_offset overflow".into())
+                            })?;
+                        let new_num_bytes = overlap_end - overlap_start;
+                        let dst_file_offset = dest_offset
+                            .checked_add(overlap_start - src_offset)
+                            .ok_or_else(|| {
                             FfsError::InvalidGeometry("clone dst offset overflow".into())
                         })?;
-                    inline_copies.push((dst_file_offset, chunk));
+                        let new_extent = BtrfsExtentData::Regular {
+                            generation,
+                            ram_bytes,
+                            extent_type,
+                            compression,
+                            disk_bytenr,
+                            disk_num_bytes,
+                            extent_offset: new_extent_offset,
+                            num_bytes: new_num_bytes,
+                        };
+                        // u64-wrapping backref offset (see btrfs_clone_file_data):
+                        // a sub-range view has new_extent_offset > dst_file_offset.
+                        let ref_offset = dst_file_offset.wrapping_sub(new_extent_offset);
+                        shares.push((
+                            dst_file_offset,
+                            new_extent.to_bytes(),
+                            disk_bytenr,
+                            disk_num_bytes,
+                            ref_offset,
+                        ));
+                    }
+                    BtrfsExtentData::Inline {
+                        ram_bytes,
+                        compression,
+                        data: inline_data,
+                        ..
+                    } => {
+                        // An inline extent stores its bytes in the item itself (no
+                        // shareable disk extent), so carve the overlapping logical
+                        // bytes and copy them to dst (bd-iypb9). Decompress first when
+                        // the inline payload is compressed.
+                        let logical = if compression == 0 {
+                            inline_data
+                        } else {
+                            Self::btrfs_decompress(
+                                &inline_data,
+                                compression,
+                                usize::try_from(ram_bytes).map_err(|_| {
+                                    FfsError::InvalidGeometry("inline ram_bytes overflow".into())
+                                })?,
+                            )?
+                        };
+                        let slice_start = usize::try_from(overlap_start - f).map_err(|_| {
+                            FfsError::InvalidGeometry("inline slice start overflow".into())
+                        })?;
+                        let slice_end = usize::try_from(overlap_end - f).map_err(|_| {
+                            FfsError::InvalidGeometry("inline slice end overflow".into())
+                        })?;
+                        // The inline payload may be shorter than ram_bytes (implicit
+                        // trailing zeros); zero-pad the carved chunk to the overlap.
+                        let mut chunk = vec![0_u8; slice_end - slice_start];
+                        if slice_start < logical.len() {
+                            let copy_end = slice_end.min(logical.len());
+                            chunk[..copy_end - slice_start]
+                                .copy_from_slice(&logical[slice_start..copy_end]);
+                        }
+                        let dst_file_offset = dest_offset
+                            .checked_add(overlap_start - src_offset)
+                            .ok_or_else(|| {
+                            FfsError::InvalidGeometry("clone dst offset overflow".into())
+                        })?;
+                        inline_copies.push((dst_file_offset, chunk));
+                    }
                 }
             }
-        }
 
-        // Inline copies need fresh data, unlike reference-only shares. Reject
-        // a latched allocation refusal before removing destination mappings.
-        if !inline_copies.is_empty() {
-            self.require_btrfs_allocation_space()?;
-        }
+            // Inline copies need fresh data, unlike reference-only shares. Reject
+            // a latched allocation refusal before removing destination mappings.
+            if !inline_copies.is_empty() {
+                self.require_btrfs_allocation_space()?;
+            }
 
-        // Secure every inline copy before carving the destination. Otherwise
-        // ordinary allocator ENOSPC could erase a destination mapping first.
-        let sectorsize = usize::try_from(alloc.sectorsize)
-            .map_err(|_| FfsError::InvalidGeometry("sectorsize does not fit usize".into()))?;
-        let mut inline_segments = Vec::new();
-        for (file_offset, mut chunk) in inline_copies {
-            if is_block_all_zero(&chunk) {
-                continue;
+            // Secure every inline copy before carving the destination. Otherwise
+            // ordinary allocator ENOSPC could erase a destination mapping first.
+            let sectorsize = usize::try_from(alloc.sectorsize)
+                .map_err(|_| FfsError::InvalidGeometry("sectorsize does not fit usize".into()))?;
+            let mut inline_segments = Vec::new();
+            for (file_offset, mut chunk) in inline_copies {
+                if is_block_all_zero(&chunk) {
+                    continue;
+                }
+                let padded =
+                    chunk.len().checked_add(sectorsize - 1).ok_or_else(|| {
+                        FfsError::InvalidGeometry("inline copy pad overflow".into())
+                    })? & !(sectorsize - 1);
+                chunk.resize(padded, 0);
+                let size = u64::try_from(padded)
+                    .map_err(|_| FfsError::InvalidGeometry("inline copy size overflow".into()))?;
+                inline_segments.push((file_offset, chunk, size));
             }
-            let padded = chunk
-                .len()
-                .checked_add(sectorsize - 1)
-                .ok_or_else(|| FfsError::InvalidGeometry("inline copy pad overflow".into()))?
-                & !(sectorsize - 1);
-            chunk.resize(padded, 0);
-            let size = u64::try_from(padded)
-                .map_err(|_| FfsError::InvalidGeometry("inline copy size overflow".into()))?;
-            inline_segments.push((file_offset, chunk, size));
-        }
-        let is_datasum = !inline_segments.is_empty()
-            && self.btrfs_read_inode_from_tree(alloc, dst_canonical)?.flags & BTRFS_INODE_NODATASUM
-                == 0;
-        let release = |alloc: &mut BtrfsAllocState,
-                       reservations: &[ffs_btrfs::ExtentAllocation]| {
-            for reservation in reservations {
-                let _ = alloc.extent_alloc.free_extent(
-                    reservation.bytenr,
-                    reservation.num_bytes,
-                    false,
-                );
-            }
-        };
-        let mut reservations: Vec<ffs_btrfs::ExtentAllocation> = Vec::new();
-        for (_, _, size) in &inline_segments {
-            match self.btrfs_alloc_data_with_growth(alloc, *size) {
-                Ok(allocation) => reservations.push(allocation),
-                Err(error) => {
-                    release(alloc, &reservations);
-                    return Err(error);
+            let is_datasum = !inline_segments.is_empty()
+                && self.btrfs_read_inode_from_tree(alloc, dst_canonical)?.flags
+                    & BTRFS_INODE_NODATASUM
+                    == 0;
+            let release = |alloc: &mut BtrfsAllocState,
+                           reservations: &[ffs_btrfs::ExtentAllocation]| {
+                for reservation in reservations {
+                    let _ = alloc.extent_alloc.free_extent(
+                        reservation.bytenr,
+                        reservation.num_bytes,
+                        false,
+                    );
+                }
+            };
+            let mut reservations: Vec<ffs_btrfs::ExtentAllocation> = Vec::new();
+            for (_, _, size) in &inline_segments {
+                match self.btrfs_alloc_data_with_growth(alloc, *size) {
+                    Ok(allocation) => reservations.push(allocation),
+                    Err(error) => {
+                        release(alloc, &reservations);
+                        return Err(error);
+                    }
                 }
             }
-        }
 
-        // Complete every copy's data write and checksum construction before
-        // removing any destination mapping. A cancelled write must not turn
-        // the old destination range into a hole.
-        let mut prepared = Vec::with_capacity(inline_segments.len());
-        for ((file_offset, chunk, _), allocation) in inline_segments.into_iter().zip(&reservations)
-        {
-            match self.btrfs_prepare_aligned_extent_at(
+            // Complete every copy's data write and checksum construction before
+            // removing any destination mapping. A cancelled write must not turn
+            // the old destination range into a hole.
+            let mut prepared = Vec::with_capacity(inline_segments.len());
+            for ((file_offset, chunk, _), allocation) in
+                inline_segments.into_iter().zip(&reservations)
+            {
+                match self.btrfs_prepare_aligned_extent_at(
+                    cx,
+                    alloc,
+                    &chunk,
+                    is_datasum,
+                    allocation.bytenr,
+                ) {
+                    Ok(extent) => prepared.push((file_offset, extent)),
+                    Err(error) => {
+                        // The failing preparation freed its own reservation.
+                        for other in &reservations {
+                            if other.bytenr != allocation.bytenr {
+                                release(alloc, std::slice::from_ref(other));
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            // Replace any existing dst data in the destination window (sector-aligned
+            // bounds), then graft in the shared extents.
+            if let Err(error) = self.btrfs_remove_overlapping_extent_data(
                 cx,
                 alloc,
-                &chunk,
-                is_datasum,
-                allocation.bytenr,
+                dst_canonical,
+                dest_offset,
+                carve_dest_end,
             ) {
-                Ok(extent) => prepared.push((file_offset, extent)),
-                Err(error) => {
-                    // The failing preparation freed its own reservation.
-                    for other in &reservations {
-                        if other.bytenr != allocation.bytenr {
-                            release(alloc, std::slice::from_ref(other));
-                        }
+                release(alloc, &reservations);
+                return Err(error);
+            }
+            for (dst_file_offset, new_data, disk_bytenr, disk_num_bytes, ref_offset) in shares {
+                let dst_key = BtrfsKey {
+                    objectid: dst_canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: dst_file_offset,
+                };
+                if let Err(error) = alloc.fs_tree.insert(dst_key, &new_data) {
+                    release(alloc, &reservations);
+                    return Err(btrfs_mutation_to_ffs(&error));
+                }
+                let root = alloc.fs_root_objectid;
+                if let Err(error) = alloc.extent_alloc.add_data_extent_ref(
+                    disk_bytenr,
+                    disk_num_bytes,
+                    root,
+                    dst_canonical,
+                    ref_offset,
+                ) {
+                    release(alloc, &reservations);
+                    return Err(btrfs_mutation_to_ffs(&error));
+                }
+            }
+            // Publish prepared extents without another fallible data write.
+            // Padding beyond i_size is allocation slack; zero chunks stay sparse.
+            let mut prepared = prepared.into_iter().zip(reservations);
+            while let Some(((file_offset, extent), _)) = prepared.next() {
+                if let Err(error) =
+                    Self::btrfs_publish_aligned_extent(alloc, dst_canonical, file_offset, extent)
+                {
+                    for (_, unused) in prepared {
+                        release(alloc, std::slice::from_ref(&unused));
                     }
                     return Err(error);
                 }
             }
-        }
 
-        // Replace any existing dst data in the destination window (sector-aligned
-        // bounds), then graft in the shared extents.
-        if let Err(error) = self.btrfs_remove_overlapping_extent_data(
-            cx,
-            alloc,
-            dst_canonical,
-            dest_offset,
-            carve_dest_end,
-        ) {
-            release(alloc, &reservations);
-            return Err(error);
-        }
-        for (dst_file_offset, new_data, disk_bytenr, disk_num_bytes, ref_offset) in shares {
-            let dst_key = BtrfsKey {
+            if clears_eof_gap {
+                self.btrfs_zero_eof_gap(cx, alloc, dst_canonical, old_dst_size, dest_offset)?;
+            }
+
+            // Recompute dst size/nbytes from the resulting extent set (nbytes counts
+            // num_bytes of allocated regular extents + ram_bytes of inline; holes
+            // contribute nothing).
+            let mut dst_inode = self.btrfs_read_inode_from_tree(alloc, dst_canonical)?;
+            let mut nbytes = 0_u64;
+            let d_lo = BtrfsKey {
                 objectid: dst_canonical,
                 item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: dst_file_offset,
+                offset: 0,
             };
-            if let Err(error) = alloc.fs_tree.insert(dst_key, &new_data) {
-                release(alloc, &reservations);
-                return Err(btrfs_mutation_to_ffs(&error));
-            }
-            let root = alloc.fs_root_objectid;
-            if let Err(error) = alloc.extent_alloc.add_data_extent_ref(
-                disk_bytenr,
-                disk_num_bytes,
-                root,
-                dst_canonical,
-                ref_offset,
-            ) {
-                release(alloc, &reservations);
-                return Err(btrfs_mutation_to_ffs(&error));
-            }
-        }
-        // Publish prepared extents without another fallible data write.
-        // Padding beyond i_size is allocation slack; zero chunks stay sparse.
-        let mut prepared = prepared.into_iter().zip(reservations);
-        while let Some(((file_offset, extent), _)) = prepared.next() {
-            if let Err(error) =
-                Self::btrfs_publish_aligned_extent(alloc, dst_canonical, file_offset, extent)
+            let d_hi = BtrfsKey {
+                objectid: dst_canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: u64::MAX,
+            };
+            for (_, data) in alloc
+                .fs_tree
+                .range(&d_lo, &d_hi)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?
             {
-                for (_, unused) in prepared {
-                    release(alloc, std::slice::from_ref(&unused));
+                match parse_extent_data(&data).map_err(|e| parse_to_ffs_error(&e))? {
+                    BtrfsExtentData::Regular {
+                        disk_bytenr,
+                        num_bytes,
+                        ..
+                    } if disk_bytenr > 0 => {
+                        nbytes = nbytes.saturating_add(num_bytes);
+                    }
+                    BtrfsExtentData::Inline { ram_bytes, .. } => {
+                        nbytes = nbytes.saturating_add(ram_bytes);
+                    }
+                    _ => {}
                 }
-                return Err(error);
+            }
+            dst_inode.nbytes = nbytes;
+            if dest_end > dst_inode.size {
+                dst_inode.size = dest_end;
+            }
+            let dst_inode_key = BtrfsKey {
+                objectid: dst_canonical,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: 0,
+            };
+            alloc
+                .fs_tree
+                .update(&dst_inode_key, &dst_inode.to_bytes())
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            Ok(())
+        })();
+        if let Some((fs_tree, snapshot)) = checkpoint {
+            if result.is_err() {
+                alloc.fs_tree.rollback_to(fs_tree);
+                snapshot.restore(alloc, self);
+            } else {
+                alloc.fs_tree.release_checkpoint();
+                snapshot.release(alloc);
             }
         }
-
-        // Recompute dst size/nbytes from the resulting extent set (nbytes counts
-        // num_bytes of allocated regular extents + ram_bytes of inline; holes
-        // contribute nothing).
-        let mut dst_inode = self.btrfs_read_inode_from_tree(alloc, dst_canonical)?;
-        let mut nbytes = 0_u64;
-        let d_lo = BtrfsKey {
-            objectid: dst_canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: 0,
-        };
-        let d_hi = BtrfsKey {
-            objectid: dst_canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: u64::MAX,
-        };
-        for (_, data) in alloc
-            .fs_tree
-            .range(&d_lo, &d_hi)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?
-        {
-            match parse_extent_data(&data).map_err(|e| parse_to_ffs_error(&e))? {
-                BtrfsExtentData::Regular {
-                    disk_bytenr,
-                    num_bytes,
-                    ..
-                } if disk_bytenr > 0 => {
-                    nbytes = nbytes.saturating_add(num_bytes);
-                }
-                BtrfsExtentData::Inline { ram_bytes, .. } => {
-                    nbytes = nbytes.saturating_add(ram_bytes);
-                }
-                _ => {}
-            }
-        }
-        dst_inode.nbytes = nbytes;
-        if dest_end > dst_inode.size {
-            dst_inode.size = dest_end;
-        }
-        let dst_inode_key = BtrfsKey {
-            objectid: dst_canonical,
-            item_type: BTRFS_ITEM_INODE_ITEM,
-            offset: 0,
-        };
-        alloc
-            .fs_tree
-            .update(&dst_inode_key, &dst_inode.to_bytes())
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        Ok(())
+        result
     }
 
     /// Register the extent-tree `EXTENT_ITEM` + inline `EXTENT_DATA_REF` backref
@@ -43495,325 +43616,358 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
         let sectorsize = u64::from(sb.sectorsize);
 
-        // For simplicity in V1, write data as an inline extent if small enough,
-        // otherwise allocate a data extent and write through the device.
-        let nodesize = alloc.nodesize;
-        // Max inline data size — matches the kernel's BTRFS_MAX_INLINE_DATA_SIZE
-        // (nodesize / 2, capped to avoid leaf overflow with other items).
-        let max_inline = u64::from(nodesize) / 2;
-        // btrfs inline extent overhead: BTRFS_HEADER_SIZE(101) + BTRFS_ITEM_SIZE(25)
-        // + BTRFS_FILE_EXTENT_INLINE_DATA_START(21) = 147 bytes per item slot.
-        // Use 160 to leave room for the dir item and inode item in the same leaf.
-        //
-        // A btrfs inline extent must also fit within a single sector: a file whose
-        // size reaches `sectorsize` needs a regular extent, and `btrfs check`
-        // rejects an inline extent whose data reaches a full sector with
-        // I_ERR_FILE_EXTENT_TOO_LARGE ("inline file extent too large"). Without this
-        // bound, files in [sectorsize, nodesize/2] were written as invalid inline
-        // extents (bd-jctlm). The kernel likewise only inlines small files below
-        // the sector boundary.
-        let mut can_be_inline = end.max(inode.size) < sectorsize
-            && end.max(inode.size) <= u64::from(nodesize).saturating_sub(160)
-            && u64::try_from(data.len()).unwrap_or(u64::MAX) <= max_inline;
-        let mut existing_inline = None;
+        let clears_eof_gap = offset > inode.size && !inode.size.is_multiple_of(sectorsize);
+        let checkpoint = clears_eof_gap.then(|| {
+            let fs_tree = alloc.fs_tree.checkpoint();
+            (fs_tree, BtrfsCommitSnapshot::take(&mut alloc, self))
+        });
+        let result = (|| {
+            // For simplicity in V1, write data as an inline extent if small enough,
+            // otherwise allocate a data extent and write through the device.
+            let nodesize = alloc.nodesize;
+            // Max inline data size — matches the kernel's BTRFS_MAX_INLINE_DATA_SIZE
+            // (nodesize / 2, capped to avoid leaf overflow with other items).
+            let max_inline = u64::from(nodesize) / 2;
+            // btrfs inline extent overhead: BTRFS_HEADER_SIZE(101) + BTRFS_ITEM_SIZE(25)
+            // + BTRFS_FILE_EXTENT_INLINE_DATA_START(21) = 147 bytes per item slot.
+            // Use 160 to leave room for the dir item and inode item in the same leaf.
+            //
+            // A btrfs inline extent must also fit within a single sector: a file whose
+            // size reaches `sectorsize` needs a regular extent, and `btrfs check`
+            // rejects an inline extent whose data reaches a full sector with
+            // I_ERR_FILE_EXTENT_TOO_LARGE ("inline file extent too large"). Without this
+            // bound, files in [sectorsize, nodesize/2] were written as invalid inline
+            // extents (bd-jctlm). The kernel likewise only inlines small files below
+            // the sector boundary.
+            let mut can_be_inline = end.max(inode.size) < sectorsize
+                && end.max(inode.size) <= u64::from(nodesize).saturating_sub(160)
+                && u64::try_from(data.len()).unwrap_or(u64::MAX) <= max_inline;
+            let mut existing_inline = None;
 
-        if can_be_inline {
-            let ext_start = BtrfsKey {
-                objectid: canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: 0,
-            };
-            let ext_end = BtrfsKey {
-                objectid: canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: u64::MAX,
-            };
-            let extents = alloc
-                .fs_tree
-                .range(&ext_start, &ext_end)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            for (k, edata) in extents {
-                let extent = parse_extent_data(&edata).map_err(|e| parse_to_ffs_error(&e))?;
-                if k.offset > 0 || !matches!(extent, BtrfsExtentData::Inline { .. }) {
-                    can_be_inline = false;
-                    existing_inline = None;
-                    break;
-                }
-                existing_inline = Some(extent);
-            }
-        }
-
-        let nbytes_after_write = if can_be_inline {
-            self.require_btrfs_allocation_space()?;
-            // Inline extent: store data directly in the tree item.
-            let existing_inline_len = match &existing_inline {
-                Some(BtrfsExtentData::Inline {
-                    compression,
-                    data,
-                    ram_bytes,
-                    ..
-                }) => {
-                    if *compression != 0 {
-                        usize::try_from(*ram_bytes).map_err(|_| {
-                            FfsError::InvalidGeometry(
-                                "inline extent ram_bytes does not fit usize".into(),
-                            )
-                        })?
-                    } else {
-                        data.len()
+            if can_be_inline {
+                let ext_start = BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: 0,
+                };
+                let ext_end = BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: u64::MAX,
+                };
+                let extents = alloc
+                    .fs_tree
+                    .range(&ext_start, &ext_end)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                for (k, edata) in extents {
+                    let extent = parse_extent_data(&edata).map_err(|e| parse_to_ffs_error(&e))?;
+                    if k.offset > 0 || !matches!(extent, BtrfsExtentData::Inline { .. }) {
+                        can_be_inline = false;
+                        existing_inline = None;
+                        break;
                     }
+                    existing_inline = Some(extent);
                 }
-                _ => 0,
-            };
-            let inline_len = usize::try_from(end.max(inode.size))
-                .map_err(|_| FfsError::InvalidGeometry("end offset does not fit usize".into()))?
-                .max(existing_inline_len);
-            let extent = BtrfsExtentData::Inline {
-                generation: alloc.generation,
-                ram_bytes: u64::try_from(inline_len).map_err(|_| {
-                    FfsError::InvalidGeometry("inline extent length does not fit u64".into())
-                })?,
-                compression: 0,
-                data: {
-                    // Build the full file content, preserving any existing tail.
-                    let mut content = vec![0u8; inline_len];
-                    // Read any existing inline data.
-                    if let Some(BtrfsExtentData::Inline {
+            }
+
+            let nbytes_after_write = if can_be_inline {
+                self.require_btrfs_allocation_space()?;
+                // Inline extent: store data directly in the tree item.
+                let existing_inline_len = match &existing_inline {
+                    Some(BtrfsExtentData::Inline {
                         compression,
-                        data: prev,
+                        data,
                         ram_bytes,
                         ..
-                    }) = existing_inline
-                    {
-                        let prev_bytes = if compression != 0 {
-                            Self::btrfs_decompress(
-                                &prev,
-                                compression,
-                                usize::try_from(ram_bytes).map_err(|_| {
-                                    FfsError::InvalidGeometry(
-                                        "inline extent ram_bytes does not fit usize".into(),
-                                    )
-                                })?,
-                            )?
+                    }) => {
+                        if *compression != 0 {
+                            usize::try_from(*ram_bytes).map_err(|_| {
+                                FfsError::InvalidGeometry(
+                                    "inline extent ram_bytes does not fit usize".into(),
+                                )
+                            })?
                         } else {
-                            prev
-                        };
-                        let copy_len = prev_bytes.len().min(content.len());
-                        content[..copy_len].copy_from_slice(&prev_bytes[..copy_len]);
+                            data.len()
+                        }
                     }
-                    let offset_usize = usize::try_from(offset).map_err(|_| {
-                        FfsError::InvalidGeometry("offset does not fit usize".into())
-                    })?;
-                    let end_usize = offset_usize.checked_add(data.len()).ok_or_else(|| {
-                        FfsError::InvalidGeometry("inline write end overflow".into())
-                    })?;
-                    content[offset_usize..end_usize].copy_from_slice(data);
-                    content
-                },
-            };
-            let extent_key = BtrfsKey {
-                objectid: canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: 0,
-            };
-            let extent_bytes = extent.to_bytes();
-            alloc
-                .fs_tree
-                .update(&extent_key, &extent_bytes)
-                .or_else(|err| match err {
-                    BtrfsMutationError::KeyNotFound => {
-                        alloc.fs_tree.insert(extent_key, &extent_bytes)
-                    }
-                    other => Err(other),
-                })
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?
-        } else {
-            // btrfs requires every uncompressed regular extent to be
-            // sector-aligned in BOTH its file offset (key.offset) and its length
-            // (ram_bytes == num_bytes == disk_num_bytes), with the file's true
-            // (sub-sector) EOF carried in i_size; a non-aligned extent is
-            // btrfs-check-invalid ("bad file extent", bd-7mi0p). Implement a
-            // read-modify-write: widen the write to the enclosing sector grid,
-            // read back the partial head/tail sectors so surrounding data is
-            // preserved, then emit ONE aligned extent. (collect_extents/read cap
-            // by i_size, so the sector-padding tail past EOF reads as nothing.)
-            let aligned_start = offset & !(sectorsize - 1);
-            let aligned_end = end
-                .checked_add(sectorsize - 1)
-                .ok_or_else(|| FfsError::InvalidGeometry("aligned write end overflow".into()))?
-                & !(sectorsize - 1);
-            let alloc_size = aligned_end - aligned_start;
-            let alloc_size_usize = usize::try_from(alloc_size)
-                .map_err(|_| FfsError::InvalidGeometry("aligned write size overflow".into()))?;
-
-            // Build the sector-aligned buffer: zero-fill, restore the existing
-            // partial head [aligned_start, offset) and tail [end, aligned_end)
-            // sectors, then overlay the new data.
-            let mut merged = vec![0_u8; alloc_size_usize];
-            if offset > aligned_start {
-                let head_len = usize::try_from(offset - aligned_start)
-                    .map_err(|_| FfsError::InvalidGeometry("rmw head length overflow".into()))?;
-                self.btrfs_read_existing_range_into(
-                    cx,
-                    &alloc,
-                    canonical,
-                    aligned_start,
-                    &mut merged[..head_len],
-                )?;
-            }
-            if aligned_end > end {
-                let tail_off = usize::try_from(end - aligned_start)
-                    .map_err(|_| FfsError::InvalidGeometry("rmw tail offset overflow".into()))?;
-                self.btrfs_read_existing_range_into(
-                    cx,
-                    &alloc,
-                    canonical,
-                    end,
-                    &mut merged[tail_off..],
-                )?;
-            }
-            let data_off = usize::try_from(offset - aligned_start)
-                .map_err(|_| FfsError::InvalidGeometry("rmw data offset overflow".into()))?;
-            merged[data_off..data_off + data.len()].copy_from_slice(data);
-
-            let is_datasum = inode.flags & BTRFS_INODE_NODATASUM == 0;
-            if self.btrfs_try_write_into_prealloc(
-                cx,
-                &mut alloc,
-                canonical,
-                aligned_start,
-                &merged,
-                is_datasum,
-            )? {
-                // In place: preallocated bytes were already counted (bd-a5lko).
-                inode.nbytes
+                    _ => 0,
+                };
+                let inline_len = usize::try_from(end.max(inode.size))
+                    .map_err(|_| FfsError::InvalidGeometry("end offset does not fit usize".into()))?
+                    .max(existing_inline_len);
+                let extent = BtrfsExtentData::Inline {
+                    generation: alloc.generation,
+                    ram_bytes: u64::try_from(inline_len).map_err(|_| {
+                        FfsError::InvalidGeometry("inline extent length does not fit u64".into())
+                    })?,
+                    compression: 0,
+                    data: {
+                        // Build the full file content, preserving any existing tail.
+                        let mut content = vec![0u8; inline_len];
+                        // Read any existing inline data.
+                        if let Some(BtrfsExtentData::Inline {
+                            compression,
+                            data: prev,
+                            ram_bytes,
+                            ..
+                        }) = existing_inline
+                        {
+                            let prev_bytes = if compression != 0 {
+                                Self::btrfs_decompress(
+                                    &prev,
+                                    compression,
+                                    usize::try_from(ram_bytes).map_err(|_| {
+                                        FfsError::InvalidGeometry(
+                                            "inline extent ram_bytes does not fit usize".into(),
+                                        )
+                                    })?,
+                                )?
+                            } else {
+                                prev
+                            };
+                            let copy_len = prev_bytes
+                                .len()
+                                .min(content.len())
+                                .min(usize::try_from(inode.size).unwrap_or(usize::MAX));
+                            content[..copy_len].copy_from_slice(&prev_bytes[..copy_len]);
+                        }
+                        let offset_usize = usize::try_from(offset).map_err(|_| {
+                            FfsError::InvalidGeometry("offset does not fit usize".into())
+                        })?;
+                        let end_usize = offset_usize.checked_add(data.len()).ok_or_else(|| {
+                            FfsError::InvalidGeometry("inline write end overflow".into())
+                        })?;
+                        content[offset_usize..end_usize].copy_from_slice(data);
+                        content
+                    },
+                };
+                let extent_key = BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: 0,
+                };
+                let extent_bytes = extent.to_bytes();
+                alloc
+                    .fs_tree
+                    .update(&extent_key, &extent_bytes)
+                    .or_else(|err| match err {
+                        BtrfsMutationError::KeyNotFound => {
+                            alloc.fs_tree.insert(extent_key, &extent_bytes)
+                        }
+                        other => Err(other),
+                    })
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?
             } else {
-                // Secure the replacement extent BEFORE destroying what it replaces
-                // (bd-72tn8). The removal below is not reversible: it drops this
-                // inode's EXTENT_DATA items and refcounts. If the allocation that
-                // follows it failed — ENOSPC is an ordinary, recoverable answer a
-                // caller is entitled to read as "nothing happened" — the old data was
-                // already gone, i_size was left untouched, and the range silently read
-                // back as a hole full of zeros.
-                //
-                // Reserving first can return ENOSPC where the old order would have
-                // squeezed by on the space the removal itself frees. That is the
-                // correct trade and matches the kernel, which reserves up front: a
-                // spurious ENOSPC is recoverable, destroyed data is not.
-                let merged_len = u64::try_from(merged.len()).map_err(|_| {
-                    FfsError::InvalidGeometry("merged write length overflow".into())
-                })?;
-                let pure_append = aligned_start >= inode.size
-                    && Self::btrfs_last_extent_end(&alloc, canonical)? <= aligned_start;
-                let reserved_bytenr = self
-                    .btrfs_alloc_data_with_growth(&mut alloc, merged_len)?
-                    .bytenr;
-                let prepared = self.btrfs_prepare_aligned_extent_at(
+                // btrfs requires every uncompressed regular extent to be
+                // sector-aligned in BOTH its file offset (key.offset) and its length
+                // (ram_bytes == num_bytes == disk_num_bytes), with the file's true
+                // (sub-sector) EOF carried in i_size; a non-aligned extent is
+                // btrfs-check-invalid ("bad file extent", bd-7mi0p). Implement a
+                // read-modify-write: widen the write to the enclosing sector grid,
+                // read back the partial head/tail sectors so surrounding data is
+                // preserved, then emit ONE aligned extent. (collect_extents/read cap
+                // by i_size, so the sector-padding tail past EOF reads as nothing.)
+                let aligned_start = offset & !(sectorsize - 1);
+                let aligned_end = end.checked_add(sectorsize - 1).ok_or_else(|| {
+                    FfsError::InvalidGeometry("aligned write end overflow".into())
+                })? & !(sectorsize - 1);
+                let alloc_size = aligned_end - aligned_start;
+                let alloc_size_usize = usize::try_from(alloc_size)
+                    .map_err(|_| FfsError::InvalidGeometry("aligned write size overflow".into()))?;
+
+                // Build the sector-aligned buffer: zero-fill, restore the existing
+                // partial head [aligned_start, offset) and tail [end, aligned_end)
+                // sectors, then overlay the new data.
+                let mut merged = vec![0_u8; alloc_size_usize];
+                let head_end = offset.min(inode.size);
+                if head_end > aligned_start {
+                    let head_len = usize::try_from(head_end - aligned_start).map_err(|_| {
+                        FfsError::InvalidGeometry("rmw head length overflow".into())
+                    })?;
+                    self.btrfs_read_existing_range_into(
+                        cx,
+                        &alloc,
+                        canonical,
+                        aligned_start,
+                        &mut merged[..head_len],
+                    )?;
+                }
+                let tail_end = aligned_end.min(inode.size);
+                if tail_end > end {
+                    let tail_off = usize::try_from(end - aligned_start).map_err(|_| {
+                        FfsError::InvalidGeometry("rmw tail offset overflow".into())
+                    })?;
+                    let tail_len = usize::try_from(tail_end - end).map_err(|_| {
+                        FfsError::InvalidGeometry("rmw tail length overflow".into())
+                    })?;
+                    self.btrfs_read_existing_range_into(
+                        cx,
+                        &alloc,
+                        canonical,
+                        end,
+                        &mut merged[tail_off..tail_off + tail_len],
+                    )?;
+                }
+                let data_off = usize::try_from(offset - aligned_start)
+                    .map_err(|_| FfsError::InvalidGeometry("rmw data offset overflow".into()))?;
+                merged[data_off..data_off + data.len()].copy_from_slice(data);
+
+                let is_datasum = inode.flags & BTRFS_INODE_NODATASUM == 0;
+                if self.btrfs_try_write_into_prealloc(
                     cx,
                     &mut alloc,
+                    canonical,
+                    aligned_start,
                     &merged,
                     is_datasum,
-                    reserved_bytenr,
-                )?;
-                let removed_nbytes_delta = if pure_append {
-                    // Pure append: no EXTENT_DATA item reaches the aligned write
-                    // range, so the removal query would only prove an empty
-                    // intersection. Decided from the inode's last extent, not
-                    // from `nbytes > size`: holes earlier in the file lower
-                    // nbytes and hid a KEEP_SIZE preallocation past EOF, and the
-                    // write then overlapped it (fsx, xfstests generic/091).
-                    0
+                )? {
+                    // In place: preallocated bytes were already counted (bd-a5lko).
+                    inode.nbytes
                 } else {
-                    match self.btrfs_remove_overlapping_extent_data(
+                    // Secure the replacement extent BEFORE destroying what it replaces
+                    // (bd-72tn8). The removal below is not reversible: it drops this
+                    // inode's EXTENT_DATA items and refcounts. If the allocation that
+                    // follows it failed — ENOSPC is an ordinary, recoverable answer a
+                    // caller is entitled to read as "nothing happened" — the old data was
+                    // already gone, i_size was left untouched, and the range silently read
+                    // back as a hole full of zeros.
+                    //
+                    // Reserving first can return ENOSPC where the old order would have
+                    // squeezed by on the space the removal itself frees. That is the
+                    // correct trade and matches the kernel, which reserves up front: a
+                    // spurious ENOSPC is recoverable, destroyed data is not.
+                    let merged_len = u64::try_from(merged.len()).map_err(|_| {
+                        FfsError::InvalidGeometry("merged write length overflow".into())
+                    })?;
+                    let pure_append = aligned_start >= inode.size
+                        && Self::btrfs_last_extent_end(&alloc, canonical)? <= aligned_start;
+                    let reserved_bytenr = self
+                        .btrfs_alloc_data_with_growth(&mut alloc, merged_len)?
+                        .bytenr;
+                    let prepared = self.btrfs_prepare_aligned_extent_at(
                         cx,
+                        &mut alloc,
+                        &merged,
+                        is_datasum,
+                        reserved_bytenr,
+                    )?;
+                    let removed_nbytes_delta = if pure_append {
+                        // Pure append: no EXTENT_DATA item reaches the aligned write
+                        // range, so the removal query would only prove an empty
+                        // intersection. Decided from the inode's last extent, not
+                        // from `nbytes > size`: holes earlier in the file lower
+                        // nbytes and hid a KEEP_SIZE preallocation past EOF, and the
+                        // write then overlapped it (fsx, xfstests generic/091).
+                        0
+                    } else {
+                        match self.btrfs_remove_overlapping_extent_data(
+                            cx,
+                            &mut alloc,
+                            canonical,
+                            aligned_start,
+                            aligned_end,
+                        ) {
+                            Ok(delta) => delta,
+                            Err(e) => {
+                                // Nothing was destroyed, so give the reservation back
+                                // rather than leaking it for the life of the mount.
+                                let _ = alloc.extent_alloc.free_extent(
+                                    reserved_bytenr,
+                                    merged_len,
+                                    false,
+                                );
+                                return Err(e);
+                            }
+                        }
+                    };
+                    let nbytes_after_remove =
+                        match Self::btrfs_apply_nbytes_delta(inode.nbytes, removed_nbytes_delta) {
+                            Ok(nbytes) => nbytes,
+                            Err(error) => {
+                                let _ = alloc.extent_alloc.free_extent(
+                                    reserved_bytenr,
+                                    merged_len,
+                                    false,
+                                );
+                                return Err(error);
+                            }
+                        };
+
+                    // Data and checksum construction succeeded before removal.
+                    // Publish their mapping/backref/csum items without another write.
+                    let emitted_nbytes = Self::btrfs_publish_aligned_extent(
                         &mut alloc,
                         canonical,
                         aligned_start,
-                        aligned_end,
-                    ) {
-                        Ok(delta) => delta,
-                        Err(e) => {
-                            // Nothing was destroyed, so give the reservation back
-                            // rather than leaking it for the life of the mount.
-                            let _ =
-                                alloc
-                                    .extent_alloc
-                                    .free_extent(reserved_bytenr, merged_len, false);
-                            return Err(e);
-                        }
-                    }
-                };
-                let nbytes_after_remove =
-                    match Self::btrfs_apply_nbytes_delta(inode.nbytes, removed_nbytes_delta) {
-                        Ok(nbytes) => nbytes,
-                        Err(error) => {
-                            let _ =
-                                alloc
-                                    .extent_alloc
-                                    .free_extent(reserved_bytenr, merged_len, false);
-                            return Err(error);
-                        }
-                    };
+                        prepared,
+                    )?;
+                    nbytes_after_remove
+                        .checked_add(emitted_nbytes)
+                        .ok_or_else(|| {
+                            FfsError::InvalidGeometry("btrfs inode nbytes overflow".into())
+                        })?
+                }
+            };
 
-                // Data and checksum construction succeeded before removal.
-                // Publish their mapping/backref/csum items without another write.
-                let emitted_nbytes = Self::btrfs_publish_aligned_extent(
-                    &mut alloc,
-                    canonical,
-                    aligned_start,
-                    prepared,
-                )?;
-                nbytes_after_remove
-                    .checked_add(emitted_nbytes)
-                    .ok_or_else(|| {
-                        FfsError::InvalidGeometry("btrfs inode nbytes overflow".into())
-                    })?
+            // Update inode metadata.
+            let size_before = inode.size;
+            if clears_eof_gap {
+                self.btrfs_zero_eof_gap(cx, &mut alloc, canonical, size_before, offset)?;
             }
-        };
+            if end > inode.size {
+                inode.size = end;
+            }
+            // A write past EOF skips [size_before, offset); one into a hole item
+            // drops that whole item.
+            self.btrfs_fill_implicit_holes(
+                &mut alloc,
+                canonical,
+                offset.min(size_before),
+                end,
+                inode.size,
+            )?;
 
-        // Update inode metadata.
-        let size_before = inode.size;
-        if end > inode.size {
-            inode.size = end;
+            inode.nbytes = if clears_eof_gap {
+                Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?
+            } else {
+                nbytes_after_write
+            };
+
+            let (secs, nanos) = Self::btrfs_now_timestamp();
+            inode.mtime_sec = secs;
+            inode.mtime_nsec = nanos;
+            inode.ctime_sec = secs;
+            inode.ctime_nsec = nanos;
+            let inode_bytes = inode.to_bytes();
+            alloc
+                .fs_tree
+                .update(&inode_key, &inode_bytes)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            trace!(
+                target: "ffs::write",
+                op = "btrfs_write",
+                ino = canonical,
+                offset,
+                len = data.len(),
+                new_size = inode.size,
+                "btrfs data written"
+            );
+
+            let written = u32::try_from(data.len())
+                .map_err(|_| FfsError::InvalidGeometry("write length exceeds u32".into()))?;
+            Ok(written)
+        })();
+        if let Some((fs_tree, snapshot)) = checkpoint {
+            if result.is_err() {
+                alloc.fs_tree.rollback_to(fs_tree);
+                snapshot.restore(&mut alloc, self);
+            } else {
+                alloc.fs_tree.release_checkpoint();
+                snapshot.release(&mut alloc);
+            }
         }
-        // A write past EOF skips [size_before, offset); one into a hole item
-        // drops that whole item.
-        self.btrfs_fill_implicit_holes(
-            &mut alloc,
-            canonical,
-            offset.min(size_before),
-            end,
-            inode.size,
-        )?;
-
-        inode.nbytes = nbytes_after_write;
-
-        let (secs, nanos) = Self::btrfs_now_timestamp();
-        inode.mtime_sec = secs;
-        inode.mtime_nsec = nanos;
-        inode.ctime_sec = secs;
-        inode.ctime_nsec = nanos;
-        let inode_bytes = inode.to_bytes();
-        alloc
-            .fs_tree
-            .update(&inode_key, &inode_bytes)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        drop(alloc);
-
-        trace!(
-            target: "ffs::write",
-            op = "btrfs_write",
-            ino = canonical,
-            offset,
-            len = data.len(),
-            new_size = inode.size,
-            "btrfs data written"
-        );
-
-        let written = u32::try_from(data.len())
-            .map_err(|_| FfsError::InvalidGeometry("write length exceeds u32".into()))?;
-        Ok(written)
+        result
     }
 
     /// Create a regular file in a btrfs directory.
@@ -45585,16 +45739,16 @@ impl OpenFs {
         attrs: &SetAttrRequest,
     ) -> ffs_error::Result<InodeAttr> {
         self.require_btrfs_rw_allowed("setattr")?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let alloc_mutex = self.require_btrfs_alloc_state()?;
         let canonical = self.btrfs_canonical_inode(ino)?;
 
         let mut alloc = alloc_mutex.write();
         let mut inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
-        // Shrinking may remove several mappings and references before a later
-        // metadata step fails. Reuse the COW rollback used by fallocate: a
-        // refused truncate must preserve the old inode, mappings, checksums,
-        // pinned space and any chunk-growth bookkeeping (bd-wcbvk).
-        let checkpoint = attrs.size.filter(|&size| size < inode.size).map(|_| {
+        // Shrink can remove mappings before a metadata error; growth can fail
+        // while clearing the retained EOF sector. Both must leave the old file
+        // and its allocation/checksum state intact (bd-wcbvk).
+        let checkpoint = attrs.size.filter(|&size| size != inode.size).map(|_| {
             let fs_tree = alloc.fs_tree.checkpoint();
             (fs_tree, BtrfsCommitSnapshot::take(&mut alloc, self))
         });
@@ -45634,70 +45788,56 @@ impl OpenFs {
                 let old_size = inode.size;
                 inode.size = size;
 
-                // If truncating to a smaller size, drop every extent past the new EOF
-                // so stale tail bytes cannot reappear if the file is extended later.
-                // To keep every extent sector-aligned (bd-7mi0p / bd-70gyh): trim at
-                // the sector boundary above the EOF sector, and when the new size
-                // falls mid-sector, rewrite that EOF sector with its head preserved
-                // and the [size, aligned) tail zeroed (a hole/all-zero head stays a
-                // hole — no spurious extent). Splitting at the raw unaligned `size`
-                // would re-insert a non-sector-aligned left remnant.
+                // Native btrfs retains the partial EOF sector. Trim references
+                // only at the next sector boundary: shrinking a shared regular
+                // extent must work even with no free DATA blocks. Later growth
+                // clears the retained tail before exposing it through i_size.
                 if size < old_size {
                     let ss = u64::from(alloc.sectorsize);
-                    if size % ss == 0 {
-                        self.btrfs_remove_overlapping_extent_data(
-                            cx,
-                            &mut alloc,
-                            canonical,
-                            size,
-                            u64::MAX,
-                        )?;
-                    } else {
-                        let eof_floor = size & !(ss - 1);
-                        let head_len = usize::try_from(size - eof_floor).map_err(|_| {
-                            FfsError::InvalidGeometry("truncate eof head length overflow".into())
-                        })?;
-                        let ss_usize = usize::try_from(ss).map_err(|_| {
-                            FfsError::InvalidGeometry("btrfs sectorsize overflow".into())
-                        })?;
-                        let mut sector = vec![0_u8; ss_usize];
-                        self.btrfs_read_existing_range_into(
-                            cx,
-                            &alloc,
-                            canonical,
-                            eof_floor,
-                            &mut sector[..head_len],
-                        )?;
-                        // Reserve and finish fallible replacement I/O before any
-                        // old mapping is removed. The checkpoint also covers later
-                        // metadata failures; unpublished COW bytes cannot overwrite
-                        // the original pinned data.
-                        let prepared = if sector[..head_len].iter().any(|&b| b != 0) {
-                            Some(self.btrfs_prepare_aligned_extent(
-                                cx,
-                                &mut alloc,
-                                &sector,
-                                inode.flags & BTRFS_INODE_NODATASUM == 0,
-                            )?)
-                        } else {
-                            None
+                    if size > 0 && size < ss {
+                        let key = BtrfsKey {
+                            objectid: canonical,
+                            item_type: BTRFS_ITEM_EXTENT_DATA,
+                            offset: 0,
                         };
-                        // Drop the EOF sector and everything after it (aligned bound).
-                        self.btrfs_remove_overlapping_extent_data(
-                            cx,
-                            &mut alloc,
-                            canonical,
-                            eof_floor,
-                            u64::MAX,
-                        )?;
-                        // Re-emit the EOF sector only if its preserved head holds data
-                        // (a hole/prealloc head reads as zeros, so leave it a hole).
-                        if let Some(prepared) = prepared {
-                            Self::btrfs_publish_aligned_extent(
-                                &mut alloc, canonical, eof_floor, prepared,
-                            )?;
+                        let first = alloc
+                            .fs_tree
+                            .range(&key, &key)
+                            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                        if let Some((_, bytes)) = first.first() {
+                            let extent =
+                                parse_extent_data(bytes).map_err(|e| parse_to_ffs_error(&e))?;
+                            if matches!(extent, BtrfsExtentData::Inline { .. }) {
+                                let mut data = self.btrfs_materialize_extent(cx, &extent)?;
+                                data.truncate(usize::try_from(size).map_err(|_| {
+                                    FfsError::InvalidGeometry("inline shrink size overflow".into())
+                                })?);
+                                let extent = BtrfsExtentData::Inline {
+                                    generation: alloc.generation,
+                                    ram_bytes: u64::try_from(data.len()).map_err(|_| {
+                                        FfsError::InvalidGeometry(
+                                            "inline shrink length overflow".into(),
+                                        )
+                                    })?,
+                                    compression: 0,
+                                    data,
+                                };
+                                alloc
+                                    .fs_tree
+                                    .update(&key, &extent.to_bytes())
+                                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                            }
                         }
                     }
+                    self.btrfs_remove_overlapping_extent_data(
+                        cx,
+                        &mut alloc,
+                        canonical,
+                        Self::btrfs_align_up(size, ss)?,
+                        u64::MAX,
+                    )?;
+                } else if size > old_size {
+                    self.btrfs_zero_eof_gap(cx, &mut alloc, canonical, old_size, size)?;
                 }
 
                 self.btrfs_fill_implicit_holes(
@@ -45916,7 +46056,8 @@ impl OpenFs {
         // A failed inline conversion must leave a complete old file for the
         // ENOSPC commit-and-retry path. Include later preallocation and inode
         // accounting in this checkpoint: they can fail after conversion, too.
-        // Ordinary regular-extent requests need no extra checkpoint here.
+        // Growing across a retained partial EOF sector also needs rollback if
+        // clearing that sector fails after preallocation changes the tree.
         let inline_key = BtrfsKey {
             objectid: canonical,
             item_type: BTRFS_ITEM_EXTENT_DATA,
@@ -45934,7 +46075,12 @@ impl OpenFs {
                 .transpose()?
                 .filter(|extent| matches!(extent, BtrfsExtentData::Inline { .. }))
         };
-        let checkpoint = inline.as_ref().map(|_| {
+        let clears_eof_gap = !keep_size
+            && !collapse_range
+            && !insert_range
+            && new_end > inode.size
+            && !inode.size.is_multiple_of(sectorsize);
+        let checkpoint = (inline.is_some() || clears_eof_gap).then(|| {
             let fs_tree = alloc.fs_tree.checkpoint();
             (fs_tree, BtrfsCommitSnapshot::take(&mut alloc, self))
         });
@@ -46204,6 +46350,9 @@ impl OpenFs {
             }
 
             let size_before = inode.size;
+            if clears_eof_gap {
+                self.btrfs_zero_eof_gap(cx, &mut alloc, canonical, size_before, new_end)?;
+            }
             if !keep_size && !collapse_range && !insert_range && new_end > inode.size {
                 inode.size = new_end;
             }
@@ -46214,7 +46363,7 @@ impl OpenFs {
                 new_end,
                 inode.size,
             )?;
-            inode.nbytes = match window {
+            inode.nbytes = match window.filter(|_| !clears_eof_gap) {
                 Some((lo, before)) => {
                     let after = Self::btrfs_window_nbytes(&alloc, canonical, lo, new_end)?;
                     // A stale nbytes on entry would underflow: re-walk instead.
@@ -110573,8 +110722,8 @@ mod tests {
     }
 
     /// bd-70gyh: truncating a file DOWN to a non-sector-aligned size must keep
-    /// every extent sector-aligned (the EOF sector is rewritten with its tail
-    /// zeroed) so `btrfs check` stays clean — splitting at the raw size would
+    /// every extent sector-aligned (the partial EOF sector remains mapped)
+    /// so `btrfs check` stays clean — splitting at the raw size would
     /// leave a non-aligned extent. Skips when btrfs-progs is unavailable.
     #[test]
     fn btrfs_truncate_to_unaligned_size_passes_btrfs_check_bd_70gyh() {
@@ -110622,7 +110771,7 @@ mod tests {
     /// must keep the on-disk extents sector-aligned (btrfs check clean) AND
     /// preserve byte-exact content. The single-op btrfs-check tests don't cover
     /// the interactions between the read-modify-write write path, the overwrite
-    /// split, and the truncate EOF-sector rewrite. Skips without btrfs-progs.
+    /// split, and sanitizing a retained EOF sector on growth. Skips without btrfs-progs.
     #[test]
     fn btrfs_write_truncate_churn_passes_btrfs_check_bd_7mi0p() {
         let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
@@ -130086,6 +130235,318 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_full_shared_eof_shrink_needs_no_data_allocation_bd_wcbvk() {
+        const BS: usize = 4096;
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let victim = fs
+            .create(&cx, root, OsStr::new("victim"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let peer = fs
+            .create(&cx, root, OsStr::new("peer"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let filler = fs
+            .create(&cx, root, OsStr::new("filler"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let original = vec![0x69; 3 * BS];
+        fs.write(&cx, victim, 0, &original).unwrap();
+        fs.clone_file_range(&cx, &mut RequestScope::empty(), peer, victim, 0, 0, 0)
+            .unwrap();
+        let mut filled = 0;
+        for len in [64 * 1024, BS] {
+            loop {
+                match fs.btrfs_write(&cx, filler, filled, &vec![0x5A; len]) {
+                    Ok(n) => {
+                        assert_eq!(n as usize, len);
+                        filled += u64::from(n);
+                    }
+                    Err(e) => {
+                        assert_eq!(e.to_errno(), libc::ENOSPC);
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(filled > 0);
+        fs.setattr(
+            &cx,
+            victim,
+            &SetAttrRequest {
+                size: Some((3 * BS - 1) as u64),
+                ..SetAttrRequest::default()
+            },
+        )
+        .expect(
+            "native-compatible shrink must retain the shared EOF sector without allocating data",
+        );
+        assert_eq!(
+            fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(),
+            original[..3 * BS - 1]
+        );
+        assert_eq!(fs.read(&cx, peer, 0, (3 * BS) as u32).unwrap(), original);
+        let error = fs
+            .setattr(
+                &cx,
+                victim,
+                &SetAttrRequest {
+                    size: Some((3 * BS) as u64),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .expect_err("exposing stale shared tail bytes needs a COW allocation");
+        assert_eq!(error.to_errno(), libc::ENOSPC);
+        assert_eq!(fs.getattr(&cx, victim).unwrap().size, (3 * BS - 1) as u64);
+        assert_eq!(
+            fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(),
+            original[..3 * BS - 1]
+        );
+        assert_eq!(fs.read(&cx, peer, 0, (3 * BS) as u32).unwrap(), original);
+    }
+
+    #[test]
+    fn btrfs_retained_eof_growth_paths_preserve_bytes_bd_wcbvk() {
+        const BS: usize = 4096;
+        const CUT: usize = BS + 37;
+        for shared in [false, true] {
+            for operation in [
+                "setattr",
+                "setattr_near",
+                "write_near",
+                "write_far",
+                "fallocate",
+                "fallocate_unaligned",
+                "clone",
+            ] {
+                for failure in ["none", "cancel", "checksum"] {
+                    let (fs, cx) = open_writable_btrfs();
+                    let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+                    let victim = fs
+                        .create(&cx, root, OsStr::new("victim"), 0o600, 0, 0)
+                        .unwrap()
+                        .ino;
+                    let peer = fs
+                        .create(&cx, root, OsStr::new("peer"), 0o600, 0, 0)
+                        .unwrap()
+                        .ino;
+                    let source = fs
+                        .create(&cx, root, OsStr::new("source"), 0o600, 0, 0)
+                        .unwrap()
+                        .ino;
+                    let original = vec![0x69; 3 * BS];
+                    fs.write(&cx, victim, 0, &original).unwrap();
+                    fs.write(&cx, source, 0, &[0x7D; BS]).unwrap();
+                    if shared {
+                        fs.clone_file_range(&cx, &mut RequestScope::empty(), peer, victim, 0, 0, 0)
+                            .unwrap();
+                    }
+                    fs.setattr(
+                        &cx,
+                        victim,
+                        &SetAttrRequest {
+                            size: Some(CUT as u64),
+                            ..SetAttrRequest::default()
+                        },
+                    )
+                    .unwrap();
+                    let snapshot = || {
+                        let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                        let lo = BtrfsKey {
+                            objectid: 0,
+                            item_type: 0,
+                            offset: 0,
+                        };
+                        let hi = BtrfsKey {
+                            objectid: u64::MAX,
+                            item_type: u8::MAX,
+                            offset: u64::MAX,
+                        };
+                        (
+                            alloc.fs_tree.range(&lo, &hi).unwrap(),
+                            alloc.csum_tree.range(&lo, &hi).unwrap(),
+                            alloc.extent_alloc.extent_tree().range(&lo, &hi).unwrap(),
+                            alloc.extent_alloc.space_info(),
+                            alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                        )
+                    };
+                    let before = snapshot();
+                    if failure == "checksum" {
+                        fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = u16::MAX;
+                    }
+                    cx.set_cancel_requested(failure == "cancel");
+                    let result = match operation {
+                        "setattr" => fs
+                            .btrfs_setattr(
+                                &cx,
+                                victim,
+                                &SetAttrRequest {
+                                    size: Some((3 * BS) as u64),
+                                    ..SetAttrRequest::default()
+                                },
+                            )
+                            .map(|_| ()),
+                        "setattr_near" => fs
+                            .btrfs_setattr(
+                                &cx,
+                                victim,
+                                &SetAttrRequest {
+                                    size: Some((CUT + 36) as u64),
+                                    ..SetAttrRequest::default()
+                                },
+                            )
+                            .map(|_| ()),
+                        "write_near" => fs
+                            .btrfs_write(&cx, victim, (CUT + 19) as u64, &[0x7D; 17])
+                            .map(|_| ()),
+                        "write_far" => fs
+                            .btrfs_write(&cx, victim, (3 * BS + 19) as u64, &[0x7D; 17])
+                            .map(|_| ()),
+                        "fallocate" => {
+                            fs.btrfs_fallocate(&cx, victim, (2 * BS) as u64, BS as u64, 0)
+                        }
+                        "fallocate_unaligned" => fs.btrfs_fallocate(
+                            &cx,
+                            victim,
+                            (2 * BS + 19) as u64,
+                            (BS + 7) as u64,
+                            0,
+                        ),
+                        "clone" => fs.clone_file_range(
+                            &cx,
+                            &mut RequestScope::empty(),
+                            victim,
+                            source,
+                            0,
+                            BS as u64,
+                            (3 * BS) as u64,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    cx.set_cancel_requested(false);
+                    fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = 0;
+                    let context =
+                        format!("shared={shared}, operation={operation}, failure={failure}");
+                    let mut expected = original[..CUT].to_vec();
+                    if failure == "none" {
+                        result.unwrap_or_else(|error| panic!("{context}: {error}"));
+                        let (end, data_start, data_len) = match operation {
+                            "setattr" | "fallocate" => (3 * BS, 0, 0),
+                            "setattr_near" => (CUT + 36, 0, 0),
+                            "fallocate_unaligned" => (3 * BS + 26, 0, 0),
+                            "write_near" => (CUT + 36, CUT + 19, 17),
+                            "write_far" => (3 * BS + 36, 3 * BS + 19, 17),
+                            "clone" => (4 * BS, 3 * BS, BS),
+                            _ => unreachable!(),
+                        };
+                        expected.resize(end, 0);
+                        expected[data_start..data_start + data_len].fill(0x7D);
+                    } else {
+                        let error = result.expect_err(&context);
+                        assert!(
+                            if failure == "cancel" {
+                                matches!(error, FfsError::Cancelled)
+                            } else {
+                                error.to_string().contains("unsupported btrfs csum_type")
+                            },
+                            "{context}: {error}"
+                        );
+                        // An unaligned plain fallocate reserves its rounded
+                        // range with KEEP_SIZE before attempting exact i_size.
+                        // Those reservations may survive failure, never bytes.
+                        if operation != "fallocate_unaligned" {
+                            assert_eq!(snapshot(), before, "{context}");
+                        }
+                    }
+                    assert_eq!(
+                        fs.getattr(&cx, victim).unwrap().size,
+                        expected.len() as u64,
+                        "{context}"
+                    );
+                    assert_eq!(
+                        fs.read(&cx, victim, 0, (5 * BS) as u32).unwrap(),
+                        expected,
+                        "{context}"
+                    );
+                    if failure == "none" && operation == "setattr_near" {
+                        fs.setattr(
+                            &cx,
+                            victim,
+                            &SetAttrRequest {
+                                size: Some((3 * BS) as u64),
+                                ..SetAttrRequest::default()
+                            },
+                        )
+                        .unwrap();
+                        expected.resize(3 * BS, 0);
+                        assert_eq!(
+                            fs.read(&cx, victim, 0, (5 * BS) as u32).unwrap(),
+                            expected,
+                            "second growth: {context}"
+                        );
+                    }
+                    if shared {
+                        assert_eq!(
+                            fs.read(&cx, peer, 0, (3 * BS) as u32).unwrap(),
+                            original,
+                            "{context}"
+                        );
+                    }
+                    assert_eq!(
+                        fs.read(&cx, source, 0, BS as u32).unwrap(),
+                        [0x7D; BS],
+                        "{context}"
+                    );
+                    let canonical = fs.btrfs_canonical_inode(victim).unwrap();
+                    let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                    assert_eq!(
+                        fs.btrfs_read_inode_from_tree(&alloc, canonical)
+                            .unwrap()
+                            .nbytes,
+                        OpenFs::btrfs_recompute_inode_nbytes(&alloc, canonical).unwrap(),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_inline_shrink_and_growth_zero_new_bytes_bd_wcbvk() {
+        for end in [137, 4096, 8193] {
+            let (fs, cx) = open_writable_btrfs();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let victim = fs
+                .create(&cx, root, OsStr::new("inline"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            fs.write(&cx, victim, 0, &[0x69; 200]).unwrap();
+            fs.setattr(
+                &cx,
+                victim,
+                &SetAttrRequest {
+                    size: Some(37),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .unwrap();
+            fs.setattr(
+                &cx,
+                victim,
+                &SetAttrRequest {
+                    size: Some(end),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .unwrap();
+            let mut expected = vec![0x69; 37];
+            expected.resize(end as usize, 0);
+            assert_eq!(fs.read(&cx, victim, 0, end as u32).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn btrfs_truncate_tail_preparation_faults_preserve_shared_data_bd_wcbvk() {
         const BS: usize = 4096;
         for shared in [false, true] {
@@ -130114,6 +130575,15 @@ mod tests {
                     )
                     .unwrap();
                 }
+                fs.btrfs_setattr(
+                    &cx,
+                    victim,
+                    &SetAttrRequest {
+                        size: Some((BS + 37) as u64),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .unwrap();
                 let snapshot = || {
                     let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
                     let start = BtrfsKey {
@@ -130149,7 +130619,7 @@ mod tests {
                     &cx,
                     victim,
                     &SetAttrRequest {
-                        size: Some((BS + 37) as u64),
+                        size: Some((3 * BS) as u64),
                         ..SetAttrRequest::default()
                     },
                 );
@@ -130157,19 +130627,6 @@ mod tests {
                 fs.btrfs_alloc_state.as_ref().unwrap().write().csum_type = 0;
                 if failure == "none" {
                     result.unwrap();
-                    assert_eq!(
-                        fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(),
-                        original[..BS + 37]
-                    );
-                    fs.setattr(
-                        &cx,
-                        victim,
-                        &SetAttrRequest {
-                            size: Some((3 * BS) as u64),
-                            ..SetAttrRequest::default()
-                        },
-                    )
-                    .unwrap();
                     let mut expected = original.clone();
                     expected[BS + 37..].fill(0);
                     assert_eq!(fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(), expected);
@@ -130184,8 +130641,11 @@ mod tests {
                         "{failure}: {error}"
                     );
                     assert_eq!(snapshot(), before, "shared={shared}, failure={failure}");
-                    assert_eq!(fs.getattr(&cx, victim).unwrap().size, (3 * BS) as u64);
-                    assert_eq!(fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(), original);
+                    assert_eq!(fs.getattr(&cx, victim).unwrap().size, (BS + 37) as u64);
+                    assert_eq!(
+                        fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(),
+                        original[..BS + 37]
+                    );
                 }
                 if shared {
                     assert_eq!(fs.read(&cx, peer, 0, (3 * BS) as u32).unwrap(), original);
@@ -130274,7 +130734,7 @@ mod tests {
     }
 
     #[test]
-    fn btrfs_truncate_nospace_preserves_data_and_accounting_bd_wcbvk() {
+    fn btrfs_truncate_recorded_full_sequence_succeeds_bd_wcbvk() {
         let (fs, cx) = open_writable_btrfs();
         let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
         let mut inos = Vec::new();
@@ -130319,7 +130779,7 @@ mod tests {
                 assert_eq!(got.len(), expected.len());
                 assert!(
                     got == *expected,
-                    "inode {ino:?} changed at byte {:?}; all files must survive a refused truncate",
+                    "inode {ino:?} changed at byte {:?}; all files must match the operation model",
                     got.iter().zip(expected).position(|(a, b)| a != b)
                 );
             }
@@ -130337,53 +130797,37 @@ mod tests {
             }
             verify_files(&model);
         }
-        let snapshot = || {
-            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
-            let start = BtrfsKey {
-                objectid: 0,
-                item_type: 0,
-                offset: 0,
-            };
-            let end = BtrfsKey {
-                objectid: u64::MAX,
-                item_type: u8::MAX,
-                offset: u64::MAX,
-            };
-            (
-                alloc.fs_tree.range(&start, &end).unwrap(),
-                alloc.csum_tree.range(&start, &end).unwrap(),
-                alloc
-                    .extent_alloc
-                    .extent_tree()
-                    .range(&start, &end)
-                    .unwrap(),
-                alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA),
-                alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
-                alloc.extent_alloc.pinned_extent_count(),
-            )
-        };
-        let before = snapshot();
-        let error = fs
-            .setattr(
-                &cx,
-                inos[0],
-                &SetAttrRequest {
-                    size: Some(47_198),
-                    ..SetAttrRequest::default()
-                },
-            )
-            .expect_err("the recorded full-image EOF-sector COW needs data space");
-        assert_eq!(error.to_errno(), libc::ENOSPC);
+        let free_before = fs
+            .btrfs_alloc_state
+            .as_ref()
+            .unwrap()
+            .read()
+            .extent_alloc
+            .total_free(BTRFS_BLOCK_GROUP_DATA);
+        fs.setattr(
+            &cx,
+            inos[0],
+            &SetAttrRequest {
+                size: Some(47_198),
+                ..SetAttrRequest::default()
+            },
+        )
+        .expect("the recorded regular-extent shrink must not allocate DATA");
+        model[0].resize(47_198, 0);
         verify_files(&model);
-        assert_eq!(
-            snapshot(),
-            before,
-            "failed truncate must retain mappings, refs and space"
+        assert!(
+            fs.btrfs_alloc_state
+                .as_ref()
+                .unwrap()
+                .read()
+                .extent_alloc
+                .total_free(BTRFS_BLOCK_GROUP_DATA)
+                >= free_before
         );
     }
 
     #[test]
-    fn btrfs_truncate_retries_pinned_space_on_native_image_bd_wcbvk() {
+    fn btrfs_eof_growth_retries_pinned_space_on_native_image_bd_wcbvk() {
         const BS: usize = 4096;
         for shared in [false, true] {
             for failure in ["none", "full", "cancel", "commit_io"] {
@@ -130451,6 +130895,17 @@ mod tests {
                         }
                     }
                 }
+                // Shrink itself must need no data write, even on the full
+                // image. Re-exposing the retained last byte needs safe COW.
+                fs.setattr(
+                    &cx,
+                    victim,
+                    &SetAttrRequest {
+                        size: Some((3 * BS - 1) as u64),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .unwrap();
                 let snapshot = || {
                     let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
                     let lo = BtrfsKey {
@@ -130476,7 +130931,7 @@ mod tests {
                 assert!(filler_len > 0);
                 assert_eq!(before.4 == 0, failure == "full");
                 let attrs = SetAttrRequest {
-                    size: Some((BS + 37) as u64),
+                    size: Some((3 * BS) as u64),
                     mode: Some(0o640),
                     ..SetAttrRequest::default()
                 };
@@ -130488,28 +130943,15 @@ mod tests {
                 let result = fs.setattr(&cx, victim, &attrs);
                 cx.set_cancel_requested(false);
                 if failure == "none" {
-                    let attr = result.expect("public shrink must commit pinned data and retry");
-                    assert_eq!(attr.size, (BS + 37) as u64);
+                    let attr = result.expect("public growth must commit pinned data and retry");
+                    assert_eq!(attr.size, (3 * BS) as u64);
                     assert_eq!(attr.perm, 0o640);
                     assert!(attempts.load(AtomicOrdering::SeqCst) > 0);
-                    assert_eq!(
-                        fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(),
-                        original[..BS + 37]
-                    );
-                    fs.setattr(
-                        &cx,
-                        victim,
-                        &SetAttrRequest {
-                            size: Some((3 * BS) as u64),
-                            ..SetAttrRequest::default()
-                        },
-                    )
-                    .unwrap();
                     let mut expected = original.clone();
-                    expected[BS + 37..].fill(0);
+                    expected[3 * BS - 1..].fill(0);
                     assert_eq!(fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(), expected);
                 } else {
-                    let error = result.expect_err("failed reclaim must not acknowledge the shrink");
+                    let error = result.expect_err("failed reclaim must not acknowledge growth");
                     match failure {
                         "full" => assert_eq!(error.to_errno(), libc::ENOSPC),
                         "cancel" => assert!(matches!(error, FfsError::Cancelled), "{error}"),
@@ -130522,7 +130964,11 @@ mod tests {
                         _ => unreachable!(),
                     }
                     assert_eq!(snapshot(), before, "shared={shared}, failure={failure}");
-                    assert_eq!(fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(), original);
+                    assert_eq!(fs.getattr(&cx, victim).unwrap().size, (3 * BS - 1) as u64);
+                    assert_eq!(
+                        fs.read(&cx, victim, 0, (3 * BS) as u32).unwrap(),
+                        original[..3 * BS - 1]
+                    );
                     assert_eq!(
                         attempts.load(AtomicOrdering::SeqCst),
                         usize::from(failure == "commit_io")
