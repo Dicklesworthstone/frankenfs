@@ -1,24 +1,34 @@
 # FEATURE_PARITY
 
-> **Feature-off build repair (bd-53dub, 2026-11-03):** both read-recovery
-> architectures now execute their native input generator and pass core
-> regressions; ARM records1600passed/0failed/24existing ignores/0filtered.
-> Both then expose the same unused-self Clippy error hidden by workspace
-> feature unification. The accounting helper is now associated, preserving
-> all seven callers and its behavior; standalone strict core Clippy passes.
-> Post-refactor workspace and12ordinary/16sharded native selections are pending.
-> Native FUSE/benchmark totals below qualify the earlier Rust snapshot, not
-> this refactor by themselves. No feature-percentage change is claimed.
+> **Qualified Rust repair (bd-53dub, 2026-11-03,8d7278eae):** workspace check,
+> strict workspace Clippy, standalone feature-off core Clippy and formatting
+> pass. Existing native selections execute11ordinary/15sharded cases with
+> 0failures and the same1existing e2compr ignore in each configuration.
+> Hosted non-root FUSE passes291/0failed/8existing ignores/0filtered in192.19s
+> with fresh public CLI binaries. ARM read-recovery passes all steps; x86
+> instead exposes a random reflink/truncate NoSpace case, recorded with exact
+> seed/13ops inbd-wcbvk. The property is unchanged pending replay and native
+> comparison. No whole-project readiness or feature-percentage change is claimed.
+>
+> The full owning package on39a3aa9d7 also now passes in one invocation:
+> 2660passed/0failed/11existing ignores/0filtered across29target results,
+> RCH1551355ms. Its test dependency asupersync usesopt3 with assertions/overflow
+> checks enabled. Subsequent helper refactoring has the separate checks above.
+> The hosted shell step next exposed stale catalog data:10existing suites and
+> 4existing tracker bindings were missing. The unchanged shell validator now
+> passes all124registered suites;4Rust embedding checks and full hosted shell/
+> journaled/differential execution remain pending. Catalog registrations are
+> source declarations and receive no execution or mounted-parity credit.
 
-> **Latest executed qualification (2026-11-03, bd-53dub):** final non-root FUSE
+> **Retained component qualification (2026-11-03, bd-53dub):** non-root FUSE
 > target passes291/0failed/8existing ignores/0filtered in176.90s with four parent
 > threads; final ELF55da4d51 matches all886Rust/build inputs. Child diagnostics
 > use libtest capture: actual RCH merged transport executes2/2controls in one
 > suite, preserving rejection of zero selection. Existing unsupported-scenario
 > SKIPs remain distinct from ignores. Workspace check, strict Clippy, formatting,
-> changed-code UBS and doctest pass. Owning harness coverage aggregates2660unique
-> passes/11existing ignores across29component results; this is not one successful
-> full-package invocation. The unchanged full benchmark completes60/60cases on
+> changed-code UBS and doctest pass. These2660passes/11existing ignores were
+> initially aggregated across29component results before the later successful
+> full-package invocation above. The unchanged full benchmark completes60/60cases on
 > its warm retry; the earlier cold27m19sbuild/19case/exit137attempt stays failed.
 > There is no incumbent comparison or performance-win claim.
 >

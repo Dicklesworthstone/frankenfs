@@ -6348,7 +6348,11 @@
           "category": "happy",
           "status": "active",
           "evidence": "SCENARIO_RESULT|scenario_id=tracker_source_hygiene_strict_mode|outcome=PASS"
-        }
+        },
+        {"id": "tracker_source_hygiene_bv_source_aware_triage_clean", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=tracker_source_hygiene_bv_source_aware_triage_clean|outcome=PASS"},
+        {"id": "tracker_source_hygiene_partial_graph_rejected", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=tracker_source_hygiene_partial_graph_rejected|outcome=PASS"},
+        {"id": "tracker_source_hygiene_release_readiness_blocked_by_open_p0", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=tracker_source_hygiene_release_readiness_blocked_by_open_p0|outcome=PASS"},
+        {"id": "tracker_source_hygiene_lossless_projection_self_check", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=tracker_source_hygiene_lossless_projection_self_check|outcome=PASS"}
       ]
     },
     {
@@ -7825,6 +7829,150 @@
           "status": "active",
           "evidence": "numa_placement_self_check_missing_report"
         }
+      ]
+    },
+    {
+      "suite_id": "ffs_btrfs_fuse_crash_injection",
+      "script": "scripts/e2e/ffs_btrfs_fuse_crash_injection_e2e.sh",
+      "required_categories": ["recovery", "error"],
+      "scenarios": [
+        {"id_pattern": "^crash_inject_[0-9]+_fsck$", "category": "recovery", "status": "active", "evidence": "btrfs check PASSED"},
+        {"id_pattern": "^crash_inject_[0-9]+_remount$", "category": "recovery", "status": "active", "evidence": "RO remount successful"},
+        {"id_pattern": "^crash_inject_[0-9]+_readable$", "category": "recovery", "status": "active", "evidence": "Filesystem readable"},
+        {"id_pattern": "^crash_inject_[0-9]+$", "category": "error", "status": "active", "evidence": "Initial mount failed"}
+      ]
+    },
+    {
+      "suite_id": "ffs_btrfs_progs_differential",
+      "script": "scripts/e2e/ffs_btrfs_progs_differential_e2e.sh",
+      "required_categories": ["happy", "recovery", "error"],
+      "scenarios": [
+        {"id": "btrfs_progs_diff_missing_capability", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_progs_capability_check|outcome=FAIL"},
+        {"id": "btrfs_progs_diff_capability_present", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_progs_capability|outcome=PASS"},
+        {"id": "btrfs_progs_diff_fuse_available", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=fuse_capability|outcome=PASS"},
+        {"id": "btrfs_progs_diff_build_cli", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=build_ffs_cli|outcome=PASS"},
+        {"id": "btrfs_progs_diff_reference_image", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=reference_image_created|outcome=PASS"},
+        {"id": "btrfs_progs_diff_reference_check", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=reference_btrfs_check|outcome=PASS"},
+        {"id": "btrfs_progs_diff_reference_super", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=reference_dump_super|outcome=PASS"},
+        {"id": "btrfs_progs_diff_mount_rw", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ffs_mount_rw|outcome=PASS"},
+        {"id": "btrfs_progs_diff_mutations_written", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ffs_mutations|outcome=PASS"},
+        {"id": "btrfs_progs_diff_mutations_reopened", "category": "recovery", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ffs_mutations_reopened|outcome=PASS"},
+        {"id": "btrfs_progs_diff_written_check", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ffs_written_btrfs_check|outcome=PASS"},
+        {"id": "btrfs_progs_diff_geometry_match", "category": "edge", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=geometry_match|outcome=PASS"},
+        {"id": "btrfs_progs_diff_inspect_written", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ffs_inspect_ffs_written|outcome=PASS"},
+        {"id": "btrfs_progs_diff_writeback_tests", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=writeback_unit_tests|outcome=PASS"},
+        {"id": "btrfs_progs_diff_crash_tests", "category": "recovery", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=crash_consistency_tests|outcome=PASS"},
+        {"id": "btrfs_progs_diff_clippy_clean", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=clippy_clean|outcome=PASS"},
+        {"id": "btrfs_progs_diff_junit_written", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=junit_xml_generated|outcome=PASS"},
+        {"id": "btrfs_progs_diff_overall_pass", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_progs_differential_overall|outcome=PASS"}
+      ]
+    },
+    {
+      "suite_id": "ffs_btrfs_rw_durable",
+      "script": "scripts/e2e/ffs_btrfs_rw_durable_e2e.sh",
+      "required_categories": ["happy", "recovery"],
+      "scenarios": [
+        {"id": "btrfs_durable_crash_module", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=crash_consistency_module_exists|outcome=PASS"},
+        {"id": "btrfs_durable_writeback_module", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=writeback_module_exists|outcome=PASS"},
+        {"id": "btrfs_durable_dpor_infrastructure", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=dpor_infrastructure_present|outcome=PASS"},
+        {"id": "btrfs_durable_writeback_oracles", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=wb_oracles_present|outcome=PASS"},
+        {"id": "btrfs_durable_dependency_dag", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=write_dependency_dag_present|outcome=PASS"},
+        {"id": "btrfs_durable_crash_tests", "category": "recovery", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=crash_consistency_tests|outcome=PASS"},
+        {"id": "btrfs_durable_dpor_crash_points", "category": "recovery", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=dpor_min_8_crash_points|outcome=PASS"},
+        {"id": "btrfs_durable_metamorphic_property", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=mr_wb_proptest_present|outcome=PASS"},
+        {"id": "btrfs_durable_writeback_tests", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=writeback_tests|outcome=PASS"},
+        {"id": "btrfs_durable_clippy_clean", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=clippy_clean|outcome=PASS"},
+        {"id": "btrfs_durable_crash_harness", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=crash_harness_api|outcome=PASS"},
+        {"id": "btrfs_durable_dpor_function", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=run_dpor_crash_test_fn|outcome=PASS"},
+        {"id": "btrfs_durable_overall_pass", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_rw_durable_overall|outcome=PASS"}
+      ]
+    },
+    {
+      "suite_id": "ffs_btrfs_rw_durable_remount",
+      "script": "scripts/e2e/ffs_btrfs_rw_durable_remount_e2e.sh",
+      "required_categories": ["happy", "recovery"],
+      "scenarios": [
+        {"id": "btrfs_remount_formatter_available", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=capability_mkfs_btrfs|outcome=PASS"},
+        {"id": "btrfs_remount_fuse_available", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=capability_fuse|outcome=PASS"},
+        {"id": "btrfs_remount_build_cli", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=build_ffs_cli|outcome=PASS"},
+        {"id": "btrfs_remount_cli_exists", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ffs_cli_binary_exists|outcome=PASS"},
+        {"id": "btrfs_remount_create_image", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=create_btrfs_image|outcome=PASS"},
+        {"id": "btrfs_remount_mount_rw", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=mount_rw|outcome=PASS"},
+        {"id": "btrfs_remount_perform_mutations", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=perform_mutations|outcome=PASS"},
+        {"id": "btrfs_remount_unmount_rw", "category": "recovery", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=unmount_rw|outcome=PASS"},
+        {"id": "btrfs_remount_reopen_ro", "category": "recovery", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=remount_ro|outcome=PASS"},
+        {"id": "btrfs_remount_persistence_check", "category": "recovery", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=persistence_check|outcome=PASS"},
+        {"id": "btrfs_remount_inspect_image", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ffs_cli_inspect|outcome=PASS"},
+        {"id": "btrfs_remount_overall_pass", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_durable_remount_overall|outcome=PASS"}
+      ]
+    },
+    {
+      "suite_id": "ffs_btrfs_rw_interlock",
+      "script": "scripts/e2e/ffs_btrfs_rw_interlock_e2e.sh",
+      "required_categories": ["happy", "error"],
+      "scenarios": [
+        {"id": "btrfs_interlock_compile_targets", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_rw_interlock_compile|outcome=PASS"},
+        {"id": "btrfs_interlock_unit_tests", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_rw_interlock_unit_tests|outcome=PASS"},
+        {"id": "btrfs_interlock_erofs_refusal", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_rw_interlock_erofs_without_flag|outcome=PASS"},
+        {"id": "btrfs_interlock_ephemeral_allowance", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_rw_interlock_allows_with_flag|outcome=PASS"},
+        {"id": "btrfs_interlock_structured_log", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_rw_interlock_structured_log|outcome=PASS"},
+        {"id": "btrfs_interlock_all_guards", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_rw_interlock_all_mutations_guarded|outcome=PASS"},
+        {"id": "btrfs_interlock_overall_pass", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=btrfs_rw_interlock_overall|outcome=PASS"}
+      ]
+    },
+    {
+      "suite_id": "ffs_btrfs_tree_log_fast_fsync",
+      "script": "scripts/e2e/ffs_btrfs_tree_log_fast_fsync_e2e.sh",
+      "required_categories": ["happy", "recovery"],
+      "scenarios": [
+        {"id": "btrfs_tree_log_unit_lab", "category": "recovery", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=tree_log_unit_and_lab_tests|outcome=PASS"},
+        {"id": "btrfs_tree_log_latency_metric", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=tree_log_latency_metric|outcome=PASS"},
+        {"id": "btrfs_tree_log_fsync_contract", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=tree_log_fast_fsync_contract|outcome=PASS"}
+      ]
+    },
+    {
+      "suite_id": "ffs_inspect_sandbox_native",
+      "script": "scripts/e2e/ffs_inspect_sandbox_native_e2e.sh",
+      "required_categories": ["happy", "corruption"],
+      "scenarios": [
+        {"id": "inspect_sandbox_ext4_identified", "category": "happy", "status": "active", "evidence": "scenario_result ext4_inspect PASS"},
+        {"id": "inspect_sandbox_ext4_readback", "category": "happy", "status": "active", "evidence": "expect_extraction ext4_read_matches_source"},
+        {"id": "inspect_sandbox_btrfs_readback", "category": "happy", "status": "active", "evidence": "expect_extraction btrfs_read_matches_source"},
+        {"id_pattern": "^fat16_independent_check$", "category": "happy", "status": "active", "evidence": "scenario_result \"${kind}_independent_check\" PASS"},
+        {"id_pattern": "^fat32_independent_check$", "category": "happy", "status": "active", "evidence": "scenario_result \"${kind}_independent_check\" PASS"},
+        {"id_pattern": "^fat16_cat_matches_source$", "category": "happy", "status": "active", "evidence": "expect_extraction \"${kind}_cat_matches_source\""},
+        {"id_pattern": "^fat32_cat_matches_source$", "category": "happy", "status": "active", "evidence": "expect_extraction \"${kind}_cat_matches_source\""},
+        {"id": "inspect_sandbox_random_refused", "category": "corruption", "status": "active", "evidence": "expect_refusal random_bytes_refused"},
+        {"id": "inspect_sandbox_truncation_refused", "category": "corruption", "status": "active", "evidence": "expect_refusal truncated_fat32_refused"},
+        {"id": "inspect_sandbox_policy_recorded", "category": "happy", "status": "active", "evidence": "scenario_result evidence_records_policy PASS"}
+      ]
+    },
+    {
+      "suite_id": "ffs_mvcc_merge_proof_mounted",
+      "script": "scripts/e2e/ffs_mvcc_merge_proof_mounted_e2e.sh",
+      "required_categories": ["unsupported_op"],
+      "scenarios": [
+        {"id": "mvcc_merge_proof_status_report", "category": "unsupported_op", "status": "active", "evidence": "Merge proof status written to:"}
+      ]
+    },
+    {
+      "suite_id": "ffs_parity_honesty",
+      "script": "scripts/e2e/ffs_parity_honesty_e2e.sh",
+      "required_categories": ["happy", "error"],
+      "scenarios": [
+        {"id": "parity_honesty_fabricated_rejection", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=fabricated_row_rejection|outcome=PASS"},
+        {"id": "parity_honesty_ignored_rejection", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ignored_test_rejection|outcome=PASS"},
+        {"id": "parity_honesty_failing_rejection", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=failing_test_rejection|outcome=PASS"},
+        {"id": "parity_honesty_execution_foundation", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=execution_gated_foundation|outcome=PASS"}
+      ]
+    },
+    {
+      "suite_id": "ffs_xfstests_executed_evidence",
+      "script": "scripts/e2e/ffs_xfstests_executed_evidence_e2e.sh",
+      "required_categories": ["happy", "error"],
+      "scenarios": [
+        {"id": "xfstests_executed_evidence_dispatch", "category": "happy", "status": "active", "evidence": "\"$SCRIPT_DIR/ffs_xfstests_e2e.sh\""},
+        {"id": "xfstests_executed_evidence_missing_suite", "category": "error", "status": "active", "evidence": "SKIP: xfstests not available"}
       ]
     }
   ],

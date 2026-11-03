@@ -97,7 +97,7 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   SKIPs remain separate from ignores. Final root-only busy negative passes
   1/0failed/298filtered in5.82s; the expected panic is caught and the owned
   busy mount is cleaned up. No clean-unmount failure is treated as success.
-- [ ] Run one complete owning-package invocation with the corrected private
+- [x] Run one complete owning-package invocation with the corrected private
   namespace and runtime scratch, retaining full selection and no-fail-fast.
   The existing2660pass aggregate does not satisfy this single-invocation check.
   First launcher uses invalid SBH --path/--min-free arguments, exits2before
@@ -110,6 +110,11 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   package pass. The identical warm retry on39a3aa9d7 runs with fresh20G checks;
   its real env confirms both strict flags1, jobs1, qualified TMPDIR and private
   namespace. It has completed FUSE and is running the adversarial parity target.
+  Completed warm invocation on39a3aa9d7 exits0:2660passed/0failed/11existing
+  ignores/0filtered across29target results, including FUSE291/0in173.81s,
+  adversarial parity2/0in626.40s and doctest1/0. RCH1551355ms; wall1614.472s.
+  This is now one successful full-package invocation. Asupersync test opt3 has
+  assertions/overflow checks enabled; first-party tests retain their test profile.
 - [x] Fix and execute the feature-specific allocator parity selection separately;
   report its opt-in configuration without changing production defaults.
   Exact required names exist but were cfg-disabled, not obsolete. core-lib now
@@ -204,15 +209,52 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   no lint suppression or functional expectation changes. Rustfmt also formats
   the existing compressed-write closure. Core SHA51329719. Feature-off strict
   core/all-target Clippy passes278.493s; fmt/diff and UBS0critical pass.
-- [ ] Verify the new helper with12existing native regression selections in
+- [x] Verify the new helper with12existing native regression selections in
   the ordinary configuration and16with the sharded feature, including abort/
   conflict accounting, compressed and indirect writes/truncation, allocator
   fixtures and missing-oracle negative. Both require real oracles; queued/running.
-- [ ] Complete post-refactor workspace check and strict Clippy. First check
+  Actual ordinary result11passed/0failed/1existing ignore/1612filtered;
+  sharded15passed/0failed/1existing ignore/1687filtered. Both select the same
+  already-ignored unsupported e2compr indirect-truncate case, which earns no
+  execution credit. These are26executions across2configs, not26unique tests.
+- [x] Complete post-refactor workspace check and strict Clippy. First check
   refuses103after300s queue_timeout with no Cargo; admitted-target SBH checks
   do not by themselves prove a worker slot is available. Retry through the
   unchanged normal queue. Earlier full FUSE/package evidence belongs to the
   pre-refactor Rust revision and does not qualify this new source by itself.
+  Source51329719/8d7278eae workspace check474.932s/0 and strict workspace
+  Clippy303.743s/0 now execute successfully through ordinary RCH. Standalone
+  feature-off Clippy0 remains a separate configuration check. All formatting,
+  diff and changed-file UBS checks pass with0critical; scanner warnings remain.
+- [x] Check optional CI-debug replay admission before running it. Privileged
+  SBH refuses RAM scratch pressure before any native test; no mount or test
+  credit. User and sudo SBH binaries disagree: the automatic compiler sequence
+  used its original passing user preflight and completed, while sudo sees the
+  stricter RAM warning. Retain both facts, stop further launches onhz4 and use
+  sudo SBH plus normal RCH for later work. HZ3 Clippy separately refuses103
+  critical disk/I/O pressure. No limit, floor, service or shared config changes.
+- [x] Read final hosted8d7278eae: actual non-root FUSE291passed/0failed/
+  8existing ignores/0filtered192.19s, including native public CLI/oracles.
+  Shell smoke then fails on10uncataloged existing scripts; downstream original
+  journaled/differential probes stay unexecuted. Do not close bd-53dub.
+- [x] Register the10existing E2E suites and74source bindings; full unchanged
+  validator then exposes4missing tracker-hygiene bindings, also registered.
+  Catalog grows114to124suites. Every original binding, ID regex, taxonomy and
+  gate minimum stays unchanged; existing canonical-ID/evidence aliases are
+  reused. The diagnostic-only merge-proof status script earns no mounted proof.
+  Actual shell validator fails before and passes after all124suites. These78
+  bindings are source declarations, not78executed scenarios or parity gains.
+- [ ] Run the four existing Rust artifact-manifest checks that embed the new
+  catalog through ordinary RCH. Sudo SBH20G checks pass on the actualhz3target
+  and runtime volumes; normal RCH admission has recovered and compiles them.
+- [x] ARM read-recovery8d7278eae passes all steps, including strict Clippy.
+  X86 instead fails1599/1/24existing ignores on a random btrfs reflink/truncate
+  NoSpace sequence. Preserve exact seed/13ops in separate P1bd-wcbvk; original
+  property is unchanged. Allocation defect versus legitimate full-image COW
+  refusal is unresolved. Native comparison and failure-atomicity proof must
+  precede any separately reviewed gate correction; no fixture enlargement,
+  accepted-error widening or silent rerun-to-green. This new issue carries no
+  acceptance condition removed from bd-53dub, which remains in progress.
 - [ ] Recheck the original hosted acceptance conditions, update Beads/parity,
   audit the concrete changes and deliver both Git refs with no premature close.
 
