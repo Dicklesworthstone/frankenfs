@@ -122,6 +122,8 @@
 > attempt has restored its checkpoint. The operation retries once after commit
 > success. A failed commit propagates its actual cancellation/I/O error and
 > never authorizes a retry or premature release of old pins.
+> Commit entry checks `Cx` before draining file data or writing tree nodes,
+> so an already-cancelled reclaim issues no device writes.
 
 > **Native EOF contract (`bd-wcbvk`, implementation in progress):** regular
 > extent views remain sector aligned after shrink. A shared final sector may
