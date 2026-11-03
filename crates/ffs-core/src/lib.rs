@@ -130365,7 +130365,7 @@ mod tests {
         };
         let before = snapshot();
         let error = fs
-            .setattr(
+            .btrfs_setattr(
                 &cx,
                 inos[0],
                 &SetAttrRequest {
@@ -130381,6 +130381,25 @@ mod tests {
             before,
             "failed truncate must retain mappings, refs and space"
         );
+
+        // The inner refusal is atomic, so the public dispatch may commit and
+        // unpin the old COW extents before retrying. This exact hosted sequence
+        // must then succeed without changing any sibling's bytes.
+        assert!(
+            before.4 > 0,
+            "the recorded failure has reclaimable pinned data"
+        );
+        fs.setattr(
+            &cx,
+            inos[0],
+            &SetAttrRequest {
+                size: Some(47_198),
+                ..SetAttrRequest::default()
+            },
+        )
+        .expect("public truncate must retry after committing pinned data");
+        model[0].resize(47_198, 0);
+        verify_files(&model);
     }
 
     // Property-based metamorphic check of the btrfs REFLINK surface
