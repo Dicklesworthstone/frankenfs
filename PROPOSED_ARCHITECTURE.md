@@ -118,6 +118,11 @@
 > A refused shrink restores the checkpoint; a successful shrink releases it.
 > Unreferenced replacement bytes never authorize mutation of old physical data.
 > Ordinary metadata-only setattr and growth do not take this shrink checkpoint.
+> Public setattr uses the existing write/fallocate commit-and-unpin retry:
+> only `NoSpace` with pinned data triggers one full commit, after the failed
+> attempt has restored its checkpoint. The operation retries once after commit
+> success. A failed commit propagates its actual cancellation/I/O error and
+> never authorizes a retry or premature release of old pins.
 
 > **Protected mount workers (`bd-11a8t`):** the CLI-private
 > `mount_worker` module shares that child-region and completion-drain ownership

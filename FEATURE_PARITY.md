@@ -1,5 +1,35 @@
 # FEATURE_PARITY
 
+> **Btrfs differential daemon ordering (bd-53dub, 2026-11-03):** hosted
+>58acc82d5 passes full shell and journaled ext4 smoke, then fails btrfs reopen.
+> Actual process controls show immediate post-unmount SIGTERM loses a created
+> file; awaiting daemon exit0 preserves it. The helper now awaits exit0 within
+> its unchanged deadline. Exact script functions and phases6-9 execute6passes,
+>0failures/skips/XFAILs, including all payload/attribute checks and clean native
+> check. Local UID0 and UID1000 runs use an existing512MiB input and exclude producer/
+> Cargo phases; original full hosted acceptance remains open. No assertion is
+> relaxed, and no filesystem capability percentage changes.
+
+> **Btrfs reclaiming shrink (bd-wcbvk, 2026-11-03):** public setattr
+> now uses the existing commit/unpin retry after its atomic refusal; a failed
+> commit retains its cancellation/I/O error. On coreea029563/fs_opsbf206b28,
+> five selected tests pass, including eight shared/unshared native-image
+> success/full/cancel/I/O cells and two clean native checker results. The wider
+> btrfs/clone library selection passes558/0failed/10existing ignores; this is
+> not a full-package count. Existing data pools are deliberately bounded with
+> growth disabled in the pressure probes. Old CLI9aa52c04 actual mounted
+> baselines refuse both shared and unshared shrinks despite reclaimable pins.
+> In one actual mounted comparison, old9aa52c04/new72c32b44 use identical
+> starting images per pair: old refuses both, new completes both shrinks.
+> All four native checks and kernel readbacks pass, including shared peers
+> and zero tails after reextension. UID0/private mount namespace, standard
+> runtime; imported shared inputs are prepared with native FICLONE. This is
+> correctness proof, not FUSE clone-creation or performance proof. Compiler
+> qualification is pending. The tiny
+> DATA-only property's original expectations and refusal regression remain
+> unchanged; its separate contract disposition remains open. No percentage or
+> whole-project readiness claim changes.
+
 > **Btrfs refused-shrink repair (bd-wcbvk, 2026-11-03):** the exact hosted
 > sequence demonstrates old data loss after ENOSPC at byte45056. Wiring the
 > existing COW checkpoints and EOF prepare/publish path preserves old state:
