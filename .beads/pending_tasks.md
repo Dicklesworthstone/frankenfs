@@ -46,14 +46,46 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   btrfs check invocations exit0. RCH159760ms0/wall228.280s. Original property
   and pre-existing refused-shrink regression are byte-identical to58acc82d5.
   Changed-core UBS2files0critical/16522warnings/3321info, fmt/diff0.
-- [ ] Run affected btrfs/clone library selection, fresh CLI build, required
+- [x] Run affected btrfs/clone library selection, fresh CLI build, required
   workspace/all-target check and strict Clippy through admitted ordinary RCH.
   These are scoped affected-library tests, not another full core-package run.
   Every heavy command has a new actual target/runtime20GiB admission.
   Affected selection now passes558/0failed/10existing ignores/1060filtered,
   139.64s; RCH145185ms0/wall199.401s. Fresh CLI build passes, RCH1458259ms0/
   wall1503.539s; ELF72c32b44. All884tracked Rust/build inputs match the live
-  Cargo source root. Workspace check and strict Clippy remain pending.
+  Cargo source root. Final workspace check and strict Clippy pass below.
+  Cold workspace check reaches all first-party tools, then exits137at the
+  unchanged1800s RCH cap (1801966ms; wall1873.797s). No OOM attribution.
+  First warm preflight refuses before Cargo:22.0GBfree satisfies disk bytes,
+  but both swap devices are full and complete RAM-scratch admission rejects.
+  Correct the initial shorthand "storage floor": this is RAM/swap pressure.
+  Fresh48.3GBavailable RAM/30.1GBfree permit draining only the existing8GB
+  /swapfile, leaving zram active. Drain/reactivate takes445.528s; original
+  priorities retained(-1disk/100zram), swapfile usage0, PSIavg10=0.01.
+  Both actual-volume20GiB and complete RAM admissions now0; no deletion,
+  reformat, global swap toggle, slot/floor/deadline change or unowned kill.
+  Receipt resume19-vmi1149989-swap-remediation.log. Normal RCH warm2check
+  now passes0,wall456.479s, with --workspace --all-targets unchanged. Strict
+  Clippy now runs with -D warnings after check0 and a new complete preflight.
+  That first Clippy exits101,wall470.352s/RCH410905ms: conformance target has
+  seven E0463missing-crate metadata errors, not a passed gate or lint waiver.
+  Existing artifacts are preserved; no cargo clean or cache deletion. Verbose
+  retry refuses103before Cargo under renewed root-disk I/O pressure; then the
+  full RAM-scratch preflight also refuses as other workloads refill swap.
+  hz4complete RAM admission still rejects. On vmi1152480,52GBavailable RAM/
+  16GBfree swap/zero PSI permit a new owned32GiB tmpfs at /tmp/frankenfs-
+  qualification-20261103-qv7q1o9m. Both actual target/runtime20GiB and full RAM
+  checks0. Preserve old route config/targets; change only the disposable RCH
+  store/TMPDIR route, no worker slots/admission/profile/lint policy. Ordinary
+  RCH admits the same full strict Clippy with verbose diagnostics against a
+  fresh target there. Metadata error cause remains an environment/cache
+  hypothesis, not a demonstrated source defect. Fresh strict Clippy now
+  passes0,RCH1626922ms/wall1685.615s with the full workspace/all-target scope
+  and -D warnings unchanged. It passes the formerly failing conformance
+  target and all subsequent targets. All884tracked Rust/build inputs match
+  its live source root; actual compiler TMPDIR matches qualified scratch,
+  driver is pinned nightly2026-08-31, build namespace is host1832, not private.
+  Existing nix0.29/0.31future-incompatibility notices remain unsuppressed.
 - [x] Execute the same old-CLI reclaim baselines against the fresh CLI and
   compare actual mounted truncation, sibling/alias bytes and native checks.
   One actual invocation compares old9aa52c04/new72c32b44 on identical input
@@ -99,12 +131,46 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   it is not12unique scenarios or full hosted proof. Receipt resume19-
   differential-exit-order-uid1000.log. ShellCheck baseline/current JSON rule,
   severity and message sets compare exactly, both existing exit1.
-- [ ] Reconcile current hosted results, update measured evidence/Beads, perform
+- [x] Reconcile current hosted results, update measured evidence/Beads, perform
   bounded fresh self-review and publish qualified code with original AC intact.
   Runtime/test bytes are checkpointed externally in fea1f0fe8; this agent did
   not execute that commit command or treat it as review. Separate stop-order
   correction is committed by this agent in d4ec93c07. Final local source-aware
   queue54claimable/0foreign/0permission-gated, cycles empty, owned P0 retained.
+  Qualified code is already on both remote refs atad2f28d10. Fresh hosted
+  CI41680297354/read-recovery41680297297/xfstests41680297870 remainqueued;
+  no completed hosted proof is inferred. Final fmt/diff0; both original Bead
+  acceptance descriptions unchanged, only these2Beads mutated. Post-Clippy
+  worker115actual target/runtime complete admissions0 with33.513GBfree;
+  host fuse.conf SHA28c34f67 unchanged. Final evidence checkpoint follows.
+- [x] Probe the remaining native EOF contract without changing the property.
+  Fresh native512MiB copies are filled with451870720bytes of preallocation
+  down to a refused4KiB allocation. Unshared and native-reflink-shared
+  65536to65535 shrinks BOTH succeed and fsync, all file/peer bytes correct;
+  both native checks0/source unchanged,2.850s/0. Receipt resume19-native-
+  eof-contract.log. No native shrink ENOSPC observation and no oracle waiver.
+  Native dump-tree retains the shared65536byte extent beyond i_size65535.
+  Production inspection: ffs eagerly COW-zeroes that tail during shrink;
+  btrfs_fill_implicit_holes on grow only covers aligned gaps and does not
+  sanitize a retained partial sector. Deferral would therefore require
+  auditing/wiring EVERY exposure path (setattr grow, sparse write, fallocate,
+  clone destination), plus rollback and native reopen proof. Merely skipping
+  zeroing would leak old bytes. Keep this architectural question in the same
+  P0; do not declare the original property defective from fixture size alone.
+  Same-invocation comparison then confirms a real native-image parity loss:
+  exact starting hashcb774b02/native succeeds to65535, actual CLI72c32b44
+  returnsENOSPC and preserves65536. Victim/peer bytes, filler size/edge bytes,
+  and both native checks pass; frozen source/seed unchanged,5.537s/0. No
+  growth-disable override in the FFS arm. Receipt resume19-eof-native-ffs-
+  comparison.log. This is a demonstrated remaining gap, not a fix or closure.
+  DCG initially rejects a conditional argv at the unmount sink; explicit
+  separate fixed argv branches are accepted, with no allowlist or bypass.
+- [ ] Continue P0 native-compatible EOF behavior: preserve aligned shared EOF
+  mappings on shrink and sanitize stale partial-sector bytes before ANY later
+  size exposure. Audit setattr/write/fallocate/clone and failed growth before
+  changing production; retain all original property/atomicity assertions.
+  Verify the exact hosted seeds, native full-image red, both remount consumers,
+  and crash/cancel/I/O rollback. Original acceptance remains here.
 
 Bounded resume19 self-review (author checks, not independent approval):
 
@@ -125,7 +191,8 @@ Bounded resume19 self-review (author checks, not independent approval):
 6. Zero-run green? No (checked:5selected and558affected test rows;8cells are
    inside1test;6actual differential phase scenarios and4process controls).
 7. Unobserved execution claimed? No (checked: raw result/exit receipts; compiler
-   and new hosted qualification still pending, not reported passed).
+   gates stayed pending until their observed0; new hosted qualification is
+   still pending and is not reported passed).
 8. Proof inflation? No (checked: planted faults/unit, live CLI, native reference,
    actual kernel readback and hosted old revisions identified separately).
 9. Material failure hidden? No (checked: synthetic0/1, RCH103, unsupported mount

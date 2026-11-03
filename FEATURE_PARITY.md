@@ -1,5 +1,13 @@
 # FEATURE_PARITY
 
+> **Remaining native EOF parity gap (bd-wcbvk, 2026-11-03):** in one
+> invocation on identical full shared-image inputs, native btrfs shrinks
+>65536to65535 successfully; current CLI72c32b44 returnsENOSPC and preserves
+>65536and all victim/peer bytes. Both native checks pass. Native retains the
+> shared EOF extent; ffs eagerly COW-zeroes its tail. Deferral needs every
+> later growth/exposure path to sanitize stale bytes. This is a demonstrated
+> remaining gap, with no test relaxation, percentage change or P0 closure.
+
 > **Btrfs differential daemon ordering (bd-53dub, 2026-11-03):** hosted
 >58acc82d5 passes full shell and journaled ext4 smoke, then fails btrfs reopen.
 > Actual process controls show immediate post-unmount SIGTERM loses a created
@@ -24,8 +32,10 @@
 > All four native checks and kernel readbacks pass, including shared peers
 > and zero tails after reextension. UID0/private mount namespace, standard
 > runtime; imported shared inputs are prepared with native FICLONE. This is
-> correctness proof, not FUSE clone-creation or performance proof. Compiler
-> qualification is pending. The tiny
+> correctness proof, not FUSE clone-creation or performance proof. Workspace/
+> all-target check and strict Clippy pass, the latter on a fresh admitted
+> target after an earlier metadata-load failure. All884Rust/build inputs match
+> the live source; compiler scratch and pinned driver are verified. The tiny
 > DATA-only property's original expectations and refusal regression remain
 > unchanged; its separate contract disposition remains open. No percentage or
 > whole-project readiness claim changes.
