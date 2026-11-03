@@ -1921,6 +1921,14 @@ async fn gc_region(cx: &Cx, store: &RwLock<MvccStore>, region: RegionId) -> Resu
 | **M7** | At most one committed version per (block, CommitSeq) | `commit()` |
 | **M8** | Snapshot.high immutable after creation | Type system |
 
+For compatibility-mode btrfs shrink operations, a returned error MUST preserve
+the pre-operation inode, readable bytes, extent references, checksum items and
+allocation accounting. Preparing an EOF-sector COW replacement MUST NOT discard
+the old mapping before replacement data and checksums are ready. Later metadata
+failure MUST roll back the operation's tree and allocator changes. Unpublished
+replacement bytes are not acknowledged data. Successful shrink/reextension MUST
+not expose the discarded tail or modify a reflink peer (`bd-wcbvk`).
+
 ---
 
 ### 5.8 Journal Interaction

@@ -2800,6 +2800,19 @@ For metadata blocks, verification includes:
     Ordinary FUSE `syncfs(2)` delivery is a separate kernel interface; wiring
     this ioctl does not establish that delivery.
 
+17. Space pressure does not remove truncate's content and sharing obligations.
+    An executed reference probe on Linux7.0.0-31/btrfs-progs6.17.1 fills two
+    copies of a512MiB image until fallocate returns ENOSPC even for4KiB.
+    Unshared and reflink-shared files both shrink to47198bytes and fsync;
+    reextension returns ENOSPC, with sibling/alias data unchanged and both
+    final `btrfs check --readonly` invocations successful. This is an observed
+    pair of outcomes, not a guarantee that all shrink requests succeed.
+    The kernel's [partial-block preparation](https://linux.googlesource.com/linux/kernel/git/torvalds/linux/+/c010e13b470463928d91a75f51c99b63096d0f42/fs/btrfs/inode.c#4938)
+    reserves space before dirtying replacement data and propagates reservation
+    errors. FrankenFS must preserve old readable data and ownership when its
+    own EOF replacement is refused. Exact counterexample/reference receipts:
+    `.beads/pending_tasks.md`, bd-wcbvk and `resume18-*` implementation artifacts.
+
 ### 16.3 Key Implementation Patterns
 
 #### ext4 Block Address Reconstruction

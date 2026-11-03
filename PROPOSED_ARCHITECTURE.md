@@ -111,6 +111,14 @@
 > extra subvolume trees. Counters saturate conservatively; this is a dirty-write
 > budget, not an exact resident-memory measurement.
 
+> **Btrfs shrink failure atomicity (`bd-wcbvk`):** `ffs-core::btrfs_setattr`
+> holds allocator-write exclusion and reuses the existing COW checkpoints for
+> the FS tree and `BtrfsCommitSnapshot` for allocation, checksums and chunk
+> growth. EOF replacement uses the existing reserve/prepare/publish helpers.
+> A refused shrink restores the checkpoint; a successful shrink releases it.
+> Unreferenced replacement bytes never authorize mutation of old physical data.
+> Ordinary metadata-only setattr and growth do not take this shrink checkpoint.
+
 > **Protected mount workers (`bd-11a8t`):** the CLI-private
 > `mount_worker` module shares that child-region and completion-drain ownership
 > with `ffs-protected-mount`. Writable protected mounts also start the same
