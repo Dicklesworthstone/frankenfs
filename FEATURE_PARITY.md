@@ -18,7 +18,13 @@
 > The old allocator test passes even with an absent formatter and required
 > oracles; fixture setup now rejects missing/failed mkfs.ext4/debugfs and checks
 > root permissions. Final-source two native allocator cases and the extended
-> missing-tool control pass3/0/1700filtered. Full parity execution remains pending.
+> missing-tool control pass3/0/1700filtered. Actual core-lib parity now executes
+> all21exact tests:21passed/0failed/0skipped/1682filtered, verifying its eight
+> mapped contracts with no source-binding error. This selected run leaves
+> readiness_verified=false and does not qualify the other89rows. Ordinary RCH
+> completes724156ms/exit0; source is18e47ba6d. The direct three-case probe uses
+> the disclosed optimized asupersync test dependency; parity uses its ordinary
+> default test profile. No runtime defaults or requirements changed.
 >
 > xfstests executes118ext4 baseline comparisons with one generic294 diagnostic
 > mismatch from uutils; btrfs reaches its60min limit after102completed tests
