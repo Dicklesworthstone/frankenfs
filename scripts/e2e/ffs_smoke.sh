@@ -17,11 +17,12 @@
 #   RUST_LOG - Log level (default: info)
 #   RUST_BACKTRACE - Backtrace (default: 1)
 #   SKIP_MOUNT - Set to 1 to skip FUSE mount tests
+#   FFS_USE_RCH - Defaults to 1; 0 permits Cargo on a provisioned GitHub Actions runner
 
 set -euo pipefail
 
 # Navigate to repo root
-cd "$(dirname "$0")/../.."
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 REPO_ROOT="$(pwd)"
 export REPO_ROOT
 
@@ -33,6 +34,7 @@ export RUST_LOG="${RUST_LOG:-info}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/rch_target_frankenfs_smoke}"
 RCH_BIN="${RCH_BIN:-rch}"
+FFS_USE_RCH="${FFS_USE_RCH:-1}"
 RCH_VISIBILITY="${RCH_VISIBILITY:-summary}"
 RCH_COMMAND_TIMEOUT_SECS="${RCH_COMMAND_TIMEOUT_SECS:-900}"
 RCH_ARTIFACT_RETRIEVAL_GRACE_SECS="${RCH_ARTIFACT_RETRIEVAL_GRACE_SECS:-8}"
@@ -86,6 +88,26 @@ run_rch_capture() {
     local required_artifact="${RCH_REQUIRED_ARTIFACT:-}"
     local wait_status
     shift
+
+    case "$FFS_USE_RCH" in
+        0)
+            if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+                e2e_log "CI_CARGO_EXECUTION_REJECTED|reason=GitHub_Actions_runner_required"
+                return 99
+            fi
+            e2e_log "CI_CARGO_EXECUTION|command=$*|log=$output_path"
+            if timeout "$RCH_COMMAND_TIMEOUT_SECS" "$@" >"$output_path" 2>&1; then
+                return 0
+            else
+                return "$?"
+            fi
+            ;;
+        1) ;;
+        *)
+            e2e_log "CARGO_EXECUTION_MODE_REJECTED|FFS_USE_RCH=$FFS_USE_RCH"
+            return 99
+            ;;
+    esac
 
     : >"$output_path"
     set +e
@@ -177,6 +199,22 @@ run_rch_cargo_capture() {
     run_rch_capture "$output_path" cargo "$@"
 }
 
+run_exact_harness_test() {
+    local output_path="$1"
+    local test_name="$2"
+    if run_rch_cargo_capture "$output_path" test -p ffs-harness --lib -- --exact "$test_name" --color=never; then
+        if grep -Fxq "test $test_name ... ok" "$output_path" \
+            && grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$output_path"; then
+            return 0
+        fi
+        e2e_log "LIBTEST_SELECTION_REJECTED|expected=$test_name|log=$output_path"
+        print_rch_log "$output_path"
+        return 1
+    else
+        return "$?"
+    fi
+}
+
 run_remote_cli_capture() {
     local output_path="$1"
     shift
@@ -204,13 +242,18 @@ run_local_cli_capture() {
     env RUST_LOG=off "$FFS_CLI_BIN" "$@" >"$output_path" 2>&1
 }
 
+# Sourcing exposes the helpers without launching builds or mounts.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 # Initialize test
 e2e_init "ffs_smoke"
 
 # Print environment
 e2e_print_env
 
-if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+if [[ "$FFS_USE_RCH" == "1" ]] && ! command -v "$RCH_BIN" >/dev/null 2>&1; then
     e2e_skip "rch not found; this suite requires offloaded cargo execution"
 fi
 
@@ -282,7 +325,6 @@ e2e_step "Phase 3b: Mount Runtime Mode CLI Contract"
 
 RUNTIME_HELP_OUT="$E2E_LOG_DIR/mount_runtime_help.txt"
 RUNTIME_INVALID_STD_OUT="$E2E_LOG_DIR/mount_runtime_invalid_standard_timeout.txt"
-RUNTIME_UNWIRED_MANAGED_OUT="$E2E_LOG_DIR/mount_runtime_unwired_managed.txt"
 
 # Scenario 1: help output documents runtime controls
 run_remote_cli_assert "$RUNTIME_HELP_OUT" "ffs mount --help" mount --help
@@ -339,14 +381,16 @@ fi
 if grep -q -- "FUSE managed mount failed\|mountpoint.*does not exist\|failed to open" "$RUNTIME_MANAGED_BAD_MP_OUT"; then
     scenario_result "cli_mount_runtime_managed_bad_mountpoint" "PASS" "managed mode wired and fails on bad mountpoint"
 else
-    scenario_result "cli_mount_runtime_managed_bad_mountpoint" "PASS" "managed mode wired (non-zero exit with expected failure)"
+    print_rch_log "$RUNTIME_MANAGED_BAD_MP_OUT"
+    scenario_result "cli_mount_runtime_managed_bad_mountpoint" "FAIL" "expected mount rejection missing"
+    e2e_fail "managed runtime mode did not reach the expected mount rejection"
 fi
 
 # Scenario 4: benchmark taxonomy covers mount runtime mode operations
 e2e_log ""
 e2e_log "Testing: benchmark taxonomy mount runtime mode coverage"
 RUNTIME_BENCH_TAXONOMY_OUT="$E2E_LOG_DIR/mount_runtime_benchmark_taxonomy.txt"
-if run_rch_cargo_capture "$RUNTIME_BENCH_TAXONOMY_OUT" test -p ffs-harness --lib -- mount_runtime_mode_benchmarks_registered --exact; then
+if run_exact_harness_test "$RUNTIME_BENCH_TAXONOMY_OUT" benchmark_taxonomy::tests::mount_runtime_mode_benchmarks_registered; then
     bench_taxonomy_rc=0
 else
     bench_taxonomy_rc=$?
@@ -362,7 +406,7 @@ fi
 e2e_log ""
 e2e_log "Testing: benchmark taxonomy degraded throughput coverage"
 DEGRADED_BENCH_TAXONOMY_OUT="$E2E_LOG_DIR/degraded_throughput_benchmark_taxonomy.txt"
-if run_rch_cargo_capture "$DEGRADED_BENCH_TAXONOMY_OUT" test -p ffs-harness --lib -- degraded_throughput_benchmarks_registered --exact; then
+if run_exact_harness_test "$DEGRADED_BENCH_TAXONOMY_OUT" benchmark_taxonomy::tests::degraded_throughput_benchmarks_registered; then
     degraded_taxonomy_rc=0
 else
     degraded_taxonomy_rc=$?
@@ -378,7 +422,7 @@ fi
 e2e_log ""
 e2e_log "Testing: triage module family coverage"
 TRIAGE_FAMILIES_OUT="$E2E_LOG_DIR/triage_module_family_coverage.txt"
-if run_rch_cargo_capture "$TRIAGE_FAMILIES_OUT" test -p ffs-harness --lib -- triage_module_covers_all_taxonomy_families --exact; then
+if run_exact_harness_test "$TRIAGE_FAMILIES_OUT" benchmark_taxonomy::tests::triage_module_covers_all_taxonomy_families; then
     triage_families_rc=0
 else
     triage_families_rc=$?
@@ -406,17 +450,17 @@ fi
 e2e_step "Phase 4: FUSE Mount"
 
 if [[ "${SKIP_MOUNT:-}" == "1" ]]; then
-    e2e_log "Skipping mount tests (SKIP_MOUNT=1)"
-    scenario_result "cli_smoke_mount_probe" "PASS" "skipped: SKIP_MOUNT=1"
+    scenario_result "cli_smoke_mount_probe" "SKIP" "SKIP_MOUNT=1"
+    e2e_skip "mount probe disabled by SKIP_MOUNT=1"
 elif [[ ! -e /dev/fuse ]]; then
-    e2e_log "Skipping mount tests (/dev/fuse not available)"
-    scenario_result "cli_smoke_mount_probe" "PASS" "skipped: /dev/fuse not available"
+    scenario_result "cli_smoke_mount_probe" "SKIP" "/dev/fuse not available"
+    e2e_skip "/dev/fuse not available"
 elif [[ ! -r /dev/fuse ]] || [[ ! -w /dev/fuse ]]; then
-    e2e_log "Skipping mount tests (/dev/fuse not accessible)"
-    scenario_result "cli_smoke_mount_probe" "PASS" "skipped: /dev/fuse not accessible"
+    scenario_result "cli_smoke_mount_probe" "SKIP" "/dev/fuse not accessible"
+    e2e_skip "/dev/fuse not accessible"
 elif [[ ! -x "$FFS_CLI_BIN" ]]; then
-    e2e_log "Skipping mount tests (local ffs-cli unavailable at $FFS_CLI_BIN)"
-    scenario_result "cli_smoke_mount_probe" "PASS" "skipped: local ffs-cli unavailable after remote CLI checks"
+    scenario_result "cli_smoke_mount_probe" "SKIP" "local ffs-cli unavailable at $FFS_CLI_BIN"
+    e2e_skip "local ffs-cli unavailable at $FFS_CLI_BIN"
 else
     MOUNT_POINT="$E2E_TEMP_DIR/mnt"
     MOUNT_LOG="$E2E_LOG_DIR/smoke_mount.log"
@@ -440,7 +484,7 @@ else
             e2e_log "Mount process exited before readiness; tail follows:"
             e2e_run tail -n 120 "$MOUNT_LOG" || true
             if grep -qiE "Permission denied|Operation not permitted" "$MOUNT_LOG"; then
-                scenario_result "cli_smoke_mount_probe" "PASS" "skipped: FUSE mount not permitted; log=${MOUNT_LOG}"
+                scenario_result "cli_smoke_mount_probe" "SKIP" "FUSE mount not permitted; log=${MOUNT_LOG}"
                 e2e_skip "FUSE mount not permitted in this environment"
             fi
             scenario_result "cli_smoke_mount_probe" "FAIL" "mount exited before readiness; log=${MOUNT_LOG}"
@@ -466,20 +510,20 @@ else
     find "$MOUNT_POINT" -maxdepth 2 -type f 2>&1 | while IFS= read -r line; do e2e_log "    $line"; done
 
     e2e_log ""
-    e2e_log "  cat $MOUNT_POINT/readme.txt"
-    if [[ -f "$MOUNT_POINT/readme.txt" ]]; then
-        cat "$MOUNT_POINT/readme.txt" 2>&1 | while IFS= read -r line; do e2e_log "    $line"; done
-    else
-        e2e_log "    (file not found)"
-    fi
+    e2e_run python3 - "$MOUNT_POINT" <<'PY'
+from pathlib import Path
+import sys
 
-    e2e_log ""
-    e2e_log "  cat $MOUNT_POINT/testdir/hello.txt"
-    if [[ -f "$MOUNT_POINT/testdir/hello.txt" ]]; then
-        cat "$MOUNT_POINT/testdir/hello.txt" 2>&1 | while IFS= read -r line; do e2e_log "    $line"; done
-    else
-        e2e_log "    (file not found)"
-    fi
+root = Path(sys.argv[1])
+for name, expected in (
+    ("readme.txt", b"FrankenFS E2E Test File\n"),
+    ("testdir/hello.txt", b"Hello from E2E test!\n"),
+):
+    actual = (root / name).read_bytes()
+    if actual != expected:
+        raise SystemExit(f"mounted payload mismatch: {name}: {actual!r}")
+    print(f"MOUNTED_READBACK|path={name}|bytes={len(actual)}|matched=true")
+PY
 
     # Unmount
     e2e_log ""

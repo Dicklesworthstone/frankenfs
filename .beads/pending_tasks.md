@@ -27,9 +27,10 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   class, without retries, lazy success, disabled tests or deadline changes.
   Both CLI multi-device cases now run in separate client processes; parent
   concurrency remains4. Child success requires the exact named test once,
-  plus exit0. Child events go to stderr to avoid double-counting parent JSON.
+  plus exit0. Initial direct stderr forwarding was insufficient for RCH's
+  merged streams; the subsequent correction and actual transport proof follow.
   Actual empty-selection negative passes1/0/297filtered.
-- [ ] Run the complete native FUSE target, its explicit busy-mount negative,
+- [x] Run the complete native FUSE target, its explicit busy-mount negative,
   required Rust check/Clippy/fmt and changed-code UBS; bind source/ELF evidence.
   Full uid1000 target passes290/0failed/8existing ignores/0filtered,141.13s;
   root-only busy-mount negative separately passes1/0/297filtered,5.05s.
@@ -61,7 +62,45 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   and runtime volumes. Execute all22remaining targets with no-fail-fast/four
   threads; keep completed prefix and every later result separate. The earlier
   hash-bound non-root FUSE290/0private run is unaffected by this launcher error.
-- [ ] Fix and execute the feature-specific allocator parity selection separately;
+  Recovery acknowledges remote143 (wrapper-15/daemon130 were cancellation
+  observations), without replay. Corrected22-target invocation passes359/0/
+  8existing ignores/0filtered; FUSE290/0in138.00s, kernel-reference17/0. Live
+  env proves strict flags1, jobs1, qualified TMPDIR and namespace distinct from
+  host. All three relevant Rust hashes match local and ELF remainsc112339a.
+  Four worker metadata binaries are copied/hash-verified and pass against the
+  real controller Git: census1/profile3/readme4/visibility1; these9are repeat
+  contexts, not additional unique tests. Pre-protocol-source aggregation is
+  2658unique passes/11existing ignores across28target results; doctest pending.
+  Alternate-worker workspace/all-target check passes before the last protocol
+  change, and the new post-protocol workspace check also passes. Strict Clippy
+  retry and doctest remain pending after one prep103refusal, no Cargo executed.
+- [x] Reproduce and fix the isolated-child protocol leak discovered in final
+  review. Old ELF's real empty-selection control emits4parent events on stdout
+  and2raw child-suite events on stderr; RCH merges both, invalidating the
+  initial claim that stderr alone prevents duplicate protocol accounting.
+  Route complete diagnostics through libtest's captured eprint path. Add one
+  inline real-subprocess regression requiring the named parent exactly once
+  and no raw suite/test events on stderr; no validator/parser relaxation.
+- [x] Build and execute both controls through ordinary RCH with its actual
+  merged JSON transport:2selected/2passed/0failed/0skipped/297filtered, one
+  parent suite and6events. Old raw-stream control is retained, not rewritten.
+  Full886Rust/build inputs match the worker. Copied final ELF55da4d515e3b8788bb8533bc9ee3a2f4698058527f1b7a5b06793fa895093e99.
+  Final file UBS0critical/3746warnings/715info and formatting/diff checks pass.
+- [x] Execute complete final non-root FUSE299-case target (291expected passes/
+  8existing ignores) with four parent threads, plus final compiler/lint/doc
+  gates. Do not convert the earlier290-source passes into this run's outcome.
+  Final current ELF55da4d51 actually passes291/0failed/8existing ignores/
+  0filtered in176.90s as uid1000. Post-change workspace check and strict Clippy
+  pass; doctest1/0passes. Including the replacement FUSE target, owning coverage
+  aggregates2660unique passes/11existing ignores across29target results, not
+  one successful full-package invocation. Eight explicit unsupported-scenario
+  SKIPs remain separate from ignores. Final root-only busy negative passes
+  1/0failed/298filtered in5.82s; the expected panic is caught and the owned
+  busy mount is cleaned up. No clean-unmount failure is treated as success.
+- [ ] Run one complete owning-package invocation with the corrected private
+  namespace and runtime scratch, retaining full selection and no-fail-fast.
+  The existing2660pass aggregate does not satisfy this single-invocation check.
+- [x] Fix and execute the feature-specific allocator parity selection separately;
   report its opt-in configuration without changing production defaults.
   Exact required names exist but were cfg-disabled, not obsolete. core-lib now
   enables bhh0i_sharded_alloc; no requirement/validator/default changes. An old
@@ -70,7 +109,10 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   existing missing-oracle parent covers the formatter. Final-source ordinary
   RCH run passes3/0/1700filtered, including two real allocator fixtures and the
   negative parent. First final attempt refuses103for pressure before Cargo;
-  unchanged admitted retry executes successfully. Actual parity runner pending.
+  unchanged admitted retry executes successfully. Actual default-profile
+  core-lib parity passes21/0failed/0skipped/1682filtered, all8mapped contracts
+  verified with no source-binding error, RCH724156ms/exit0on18e47ba6d.
+  readiness_verified=false; no credit for the other89rows or global completion.
 - [x] Inspect actual generic294 regression and btrfs timeout artifacts; fix
   concrete implementation defects rather than editing expected results.
   generic294 has correct errno classes but uutils0.10stderr differs from the
@@ -83,6 +125,46 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   process-boundary proof only, with zero native xfstests pass credit.
   Final review binds both native build caches to ubuntu24.04 too, preventing
   restoration of newer-image executables; all workflow shell blocks parse.
+- [x] Finish required benchmark with unchanged case selection/warmup/sampling
+  and deadline. Cold full cargo bench builds27m19s, analyzes19of60cases, then
+  exits137at1805889ms under the unchanged1800s wrapper. Timing is consistent
+  with the deadline, not proof of OOM. The same full command is retried with
+  the warm cache after fresh target/runtime SBH20G checks. No partial-run pass
+  or performance-win claim; the incumbent is absent from this invocation.
+  First warm retry refuses103during namespace preparation, before Cargo. The
+  next unchanged full invocation passes60/60analyzed cases, RCH1321493ms/exit0,
+  with12m02sbuild time. No sampling, case, deadline or admission changes.
+- [x] Observe actual hosted18e47ba6d: both xfstests jobs125718503371/125718503648
+  complete successfully with original baselines/lists/limits. FUSE290-source
+  target passes, then shell smoke fails because hosted CI has no rch. The
+  downstream journaled/differential steps remain skipped; do not close bd-53dub.
+- [x] Wire the smoke suite to the adjacent scripts' explicit hosted execution
+  mode. FFS_USE_RCH0 requires CI=true AND GITHUB_ACTIONS=true, logs actual
+  CI_CARGO_EXECUTION and propagates real command exits under the original900s
+  command cap. Workflow retains both required flags and selects its existing
+  Cargo target cache. The default remote evidence checks are byte-identical;
+  there is no fake rch binary, fake remote marker or operator local fallback.
+- [x] Close smoke's three zero-run taxonomy holes: fully qualified exact names
+  must produce one named pass and a1passed/0failed/0ignored summary. Real
+  prebuilt unit selections prove three positives; old short names select zero
+  and are rejected. Ignored selection and a real planted child failure reject
+  too. These are unit/process controls with zero Cargo/native mount credit.
+- [x] Stop marking missing/disabled/unavailable mounts as PASS; use explicit
+  SKIP plus existing strict e2e_skip enforcement. Managed-mode unknown failures
+  now fail rather than pass. Require both seeded mounted payloads byte-for-byte;
+  missing/corrupt host fixtures fail even with PYTHONOPTIMIZE1. A real uid1000
+  FUSE mount reads24/21correct bytes through the actual e2e_run stdin path,
+  unmounts cleanly and passes e2fsck0. Real managed-mode bad-mountpoint refusal
+  matches the retained class check. No full shell/Cargo run is inferred.
+- [x] Seven actual executor process controls verify success/stdout, stderr/
+  exit73, rejected non-CI/non-Actions/neither/unknown mode, and timeout124.
+  Dynamic inline control launcher was blocked by DCG before execution; replace
+  it with a static script sourcing normal guarded helpers, without override.
+  Bash/YAML checks pass; final Bash UBS0critical. ShellCheck -x removes the old
+  unused-variable warning and retains only its pre-existing directory-listing
+  informational finding; no suppression or scanner-clean claim.
+- [ ] Deliver the hosted smoke change and observe its original named full-CI
+  probes; retain missing hosted evidence in bd-53dub, not a replacement item.
 - [ ] Recheck the original hosted acceptance conditions, update Beads/parity,
   audit the concrete changes and deliver both Git refs with no premature close.
 
@@ -96,8 +178,8 @@ parity evidence notes), UNKNOWN0. No production filesystem feature is credited.
    is the full concurrent native mount target, not a new filesystem algorithm.
 2. Without the process notes the runtime outcome is unchanged; retain only the
    requested checklist and evidence needed to reproduce the original task.
-3. Native FUSE290cases and allocator fixtures exercise the first two enablers;
-   the hosted reference-job correction still needs its actual selected run.
+3. Final native FUSE291cases and allocator fixtures exercise the first two
+   enablers; both hosted reference jobs now pass. Full hosted smoke remains.
 4. The oldest user-facing item in the bounded sample is bd-w2u82 (Aug17),
    whose transport implementation already exists but whose comparative result
    still needs a quiet measurement window. Current work repairs the proof lane
@@ -121,14 +203,17 @@ Honesty inventory, same bounded window, solo self-review:
    timeout/pressure changes or alternate build-dispatch route.
 6. The old formatter-absent allocator control really is false green. Corrected
    selected tests execute3; child isolation rejects zero selected tests. Actual
-   parity execution remains pending and receives no execution credit yet.
+   parity execution now passes21/0 with all8mapped contracts verified.
 7. No (checked raw commands/logs): queued/refused runs are not test passes.
 8. No (checked evidence labels): process controls, synthetic unit inputs and
    actual native mounts/oracles remain distinct; no field/power-loss claim.
 9. Failures retained: hosted288/1, parity missing-feature, xfstests mismatch/
    timeout, RCH103 refusals, first UBS1critical and standalone-control typo.
-10. No (checked cited launchers): stdout/stderr retained together or separately;
-    nested JSON goes to parent stderr to prevent duplicate pass accounting.
+10. No discarded stderr (checked cited launchers): streams remain retained.
+    The initial claim that stderr forwarding prevented duplicates was wrong
+    for RCH's merged transport; the old real subprocess exposes it, and the
+    actual two-case RCH JSON control verifies captured diagnostics. Native
+    case counts always come from the outer target, without adding child counts.
 11. No (checked tracker diff): no item closed this block; original AC remain.
 12. No (checked specs/parity diff): only evidence status changes, no lower goals.
 13. Not applicable: solo, no delegated closes.

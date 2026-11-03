@@ -367,6 +367,8 @@ jobs:
         env:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
+          FFS_USE_RCH: "0"
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: ./scripts/e2e/ffs_smoke.sh
 
       - name: Journaled ext4 write and recovery smoke

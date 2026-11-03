@@ -1,5 +1,28 @@
 # FEATURE_PARITY
 
+> **Latest executed qualification (2026-11-03, bd-53dub):** final non-root FUSE
+> target passes291/0failed/8existing ignores/0filtered in176.90s with four parent
+> threads; final ELF55da4d51 matches all886Rust/build inputs. Child diagnostics
+> use libtest capture: actual RCH merged transport executes2/2controls in one
+> suite, preserving rejection of zero selection. Existing unsupported-scenario
+> SKIPs remain distinct from ignores. Workspace check, strict Clippy, formatting,
+> changed-code UBS and doctest pass. Owning harness coverage aggregates2660unique
+> passes/11existing ignores across29component results; this is not one successful
+> full-package invocation. The unchanged full benchmark completes60/60cases on
+> its warm retry; the earlier cold27m19sbuild/19case/exit137attempt stays failed.
+> There is no incumbent comparison or performance-win claim.
+>
+> Hosted18e47ba6d now passes both ext4/btrfs xfstests jobs with unchanged
+> baselines, lists, loops and deadline. Its FUSE target passes290/0, but the next
+> shell smoke step fails because rch is absent, leaving journaled/differential
+> steps skipped. The smoke repair explicitly admits GitHub's actual Cargo
+> executor, retaining the default remote checks; exact taxonomy selections now
+> require a named nonempty pass, mount skips cannot claim PASS, and seeded
+> mounted payloads must match. Seven process controls, three real unit selections,
+> rejection controls, real mounted24/21byte readbacks and clean e2fsck qualify
+> those components. The full hosted shell run remains pending in the original
+> Bead. No parity percentage or whole-project readiness claim changes.
+
 > **Current qualification follow-up (2026-11-03, bd-53dub):** hosted d1085d606
 > passes the workspace unit step and all six protected CLI cases, but its FUSE
 > job finishes288passed/1clean-unmount EBUSY failure/8existing ignores. Later
