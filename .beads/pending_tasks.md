@@ -103,6 +103,13 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   First launcher uses invalid SBH --path/--min-free arguments, exits2before
   Cargo; retain that refusal. Correct --need20G plus positional path checks
   both pass, and ordinary RCH executes the full package with jobs1 forced.
+  Cold attempt passes2080library/3CLI/103benchmark-utility/7btrfs-reference/
+  104conformance/2compile-fail tests plus early native targets, but loses SSH
+  during FUSE after1863.675s. Owned rchw-8f6f4e85 recovery acknowledges255 and
+  retires source/tree/pair resources; this is not a timeout attribution or
+  package pass. The identical warm retry on39a3aa9d7 runs with fresh20G checks;
+  its real env confirms both strict flags1, jobs1, qualified TMPDIR and private
+  namespace. It has completed FUSE and is running the adversarial parity target.
 - [x] Fix and execute the feature-specific allocator parity selection separately;
   report its opt-in configuration without changing production defaults.
   Exact required names exist but were cfg-disabled, not obsolete. core-lib now
@@ -187,6 +194,25 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   Include the producer in this lane's path triggers so changes rerun its gate.
 - [ ] Observe both repaired Btrfs Read Recovery matrix jobs; count neither
   static wiring nor the main workflow's producer as a pass of this lane.
+  Both architectures now pass the native input step and core regressions;
+  ARM records1600passed/0failed/24existing ignores/0filtered in1148.99s.
+  Both then fail the same feature-off Clippy unused-self diagnostic. Workspace
+  feature unification had hidden it; this is not an ARM-specific runtime bug.
+- [x] Refactor the allocator accounting helper into an associated function,
+  with its filesystem argument named only for the sharded configuration.
+  Preserve all seven call sites, branch ordering, locks, accounting and errors;
+  no lint suppression or functional expectation changes. Rustfmt also formats
+  the existing compressed-write closure. Core SHA51329719. Feature-off strict
+  core/all-target Clippy passes278.493s; fmt/diff and UBS0critical pass.
+- [ ] Verify the new helper with12existing native regression selections in
+  the ordinary configuration and16with the sharded feature, including abort/
+  conflict accounting, compressed and indirect writes/truncation, allocator
+  fixtures and missing-oracle negative. Both require real oracles; queued/running.
+- [ ] Complete post-refactor workspace check and strict Clippy. First check
+  refuses103after300s queue_timeout with no Cargo; admitted-target SBH checks
+  do not by themselves prove a worker slot is available. Retry through the
+  unchanged normal queue. Earlier full FUSE/package evidence belongs to the
+  pre-refactor Rust revision and does not qualify this new source by itself.
 - [ ] Recheck the original hosted acceptance conditions, update Beads/parity,
   audit the concrete changes and deliver both Git refs with no premature close.
 

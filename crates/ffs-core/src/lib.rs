@@ -25890,8 +25890,11 @@ impl OpenFs {
     /// The caller holds the live allocator lock; only the temporary copy moves.
     /// Retain matching deltas for partial staging on error, then discard them
     /// with the transaction: callers must abort a scope after a failed operation.
-    fn ext4_with_scoped_block_counts<T>(
-        &self,
+    /// Only the sharded allocator needs filesystem state; the ordinary path
+    /// operates entirely on the supplied allocation state and request scope.
+    fn with_ext4_block_counts<T>(
+        #[cfg(feature = "bhh0i_sharded_alloc")] fs: &Self,
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))] _: &Self,
         scope: &mut RequestScope,
         alloc: &mut Ext4AllocState,
         stage: impl FnOnce(&mut RequestScope, &mut Ext4AllocState) -> Result<T, FfsError>,
@@ -25900,10 +25903,10 @@ impl OpenFs {
             return stage(scope, alloc);
         }
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        let groups = if let Some(sharded) = self
+        let groups = if let Some(sharded) = fs
             .ext4_sharded_alloc
             .as_ref()
-            .filter(|_| self.bhh0i_sharded_ops_active())
+            .filter(|_| fs.bhh0i_sharded_ops_active())
         {
             sharded.birth_group_stats(&alloc.groups)?
         } else {
@@ -26207,7 +26210,7 @@ impl OpenFs {
         inode: &mut Ext4Inode,
         range: std::ops::Range<u64>,
     ) -> Result<u64, FfsError> {
-        self.ext4_with_scoped_block_counts(scope, alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, alloc, |scope, alloc| {
             self.ext4_free_indirect_range_inner(cx, scope, alloc, inode, range)
         })
     }
@@ -33493,7 +33496,7 @@ impl OpenFs {
 
         let mut root_bytes = Self::extent_root(&inode);
         let mut alloc = alloc_mutex.write();
-        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
             let tx_dev;
             let dev: &dyn BlockDevice = if let Some(tx) = &mut scope.tx {
                 tx_dev = TransactionBlockAdapter {
@@ -34318,7 +34321,7 @@ impl OpenFs {
         }
 
         let mut alloc = alloc_mutex.write();
-        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
             // Snapshot extent-tree metadata blocks before any tree mutation in this
             // write so growth (and any later coalescing-driven shrink) is charged to
             // i_blocks at the end, regardless of which internal path changed the
@@ -34747,7 +34750,7 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
 
         let mut alloc = alloc_mutex.write();
-        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
             // i_blocks counts 512-byte sectors per fs block (or 1 unit/block for
             // huge_file inodes). Each newly mapped logical block costs one data
             // block plus any indirect-metadata blocks write_block_ptr allocates.
@@ -34959,7 +34962,7 @@ impl OpenFs {
         let sectors_per_block = block_size / u64::from(EXT4_SECTOR_SIZE);
 
         let mut alloc = alloc_mutex.write();
-        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
             if punch_hole {
                 // Unaligned ranges are supported (bd-xnel9), mirroring the
                 // extent-mapped punch path and the kernel's ext4 indirect punch:
@@ -35259,182 +35262,187 @@ impl OpenFs {
 
         let scoped = scope.tx.is_some();
         let mut alloc = alloc_mutex.write();
-        let result = self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
-        let write_result = (|| -> Result<u32, FfsError> {
-            // Process data cluster-by-cluster.
-            let mut pos = offset;
-            while pos < end {
-                let logical_block = u32::try_from(pos / bs).map_err(|_| {
-                    FfsError::InvalidGeometry(format!(
-                        "e2compr: file offset {pos} produces logical block exceeding u32"
-                    ))
-                })?;
-                let cluster_start = logical_block - (logical_block % cluster_nblocks);
-                let cluster_file_offset = u64::from(cluster_start) * bs;
-                let cluster_end_offset = cluster_file_offset + cluster_bytes as u64;
+        let result = Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
+            let write_result = (|| -> Result<u32, FfsError> {
+                // Process data cluster-by-cluster.
+                let mut pos = offset;
+                while pos < end {
+                    let logical_block = u32::try_from(pos / bs).map_err(|_| {
+                        FfsError::InvalidGeometry(format!(
+                            "e2compr: file offset {pos} produces logical block exceeding u32"
+                        ))
+                    })?;
+                    let cluster_start = logical_block - (logical_block % cluster_nblocks);
+                    let cluster_file_offset = u64::from(cluster_start) * bs;
+                    let cluster_end_offset = cluster_file_offset + cluster_bytes as u64;
 
-                // Gather the full cluster data: existing data + new writes.
-                let mut cluster_data = vec![0_u8; cluster_bytes];
+                    // Gather the full cluster data: existing data + new writes.
+                    let mut cluster_data = vec![0_u8; cluster_bytes];
 
-                // Read existing data for this cluster (if any).
-                let existing_end = inode.size.min(cluster_end_offset);
-                if existing_end > cluster_file_offset {
-                    let existing_len = (existing_end - cluster_file_offset) as usize;
-                    let existing_len_u32 = u32::try_from(existing_len).unwrap_or(u32::MAX);
-                    let existing = self.read_ext4_compressed(
+                    // Read existing data for this cluster (if any).
+                    let existing_end = inode.size.min(cluster_end_offset);
+                    if existing_end > cluster_file_offset {
+                        let existing_len = (existing_end - cluster_file_offset) as usize;
+                        let existing_len_u32 = u32::try_from(existing_len).unwrap_or(u32::MAX);
+                        let existing = self.read_ext4_compressed(
+                            cx,
+                            scope,
+                            inode,
+                            cluster_file_offset,
+                            existing_len_u32,
+                        )?;
+                        let copy_len = existing.len().min(cluster_bytes);
+                        cluster_data[..copy_len].copy_from_slice(&existing[..copy_len]);
+                    }
+
+                    // Overlay the new data.
+                    let write_start_in_cluster = (pos - cluster_file_offset) as usize;
+                    let data_offset = (pos - offset) as usize;
+                    let write_end_in_cluster =
+                        ((end - cluster_file_offset) as usize).min(cluster_bytes);
+                    let write_len = write_end_in_cluster - write_start_in_cluster;
+                    cluster_data[write_start_in_cluster..write_end_in_cluster]
+                        .copy_from_slice(&data[data_offset..data_offset + write_len]);
+                    // `existing_end` (= inode.size capped to this cluster) can be
+                    // BELOW `cluster_file_offset` when a new/short file is extended
+                    // into a later cluster — the read-existing block above is
+                    // guarded for exactly that case. Use saturating_sub so the
+                    // amount of pre-existing data in this cluster floors at 0
+                    // instead of underflowing (debug panic / release wrap masked
+                    // only by the later `.min`).
+                    let cluster_data_len =
+                        usize::try_from(existing_end.saturating_sub(cluster_file_offset))
+                            .unwrap_or(cluster_bytes)
+                            .max(write_end_in_cluster)
+                            .min(cluster_bytes);
+
+                    // Compress and write the cluster.
+                    let cluster_write = self.write_ext4_compressed_cluster(
                         cx,
                         scope,
-                        inode,
-                        cluster_file_offset,
-                        existing_len_u32,
-                    )?;
-                    let copy_len = existing.len().min(cluster_bytes);
-                    cluster_data[..copy_len].copy_from_slice(&existing[..copy_len]);
-                }
-
-                // Overlay the new data.
-                let write_start_in_cluster = (pos - cluster_file_offset) as usize;
-                let data_offset = (pos - offset) as usize;
-                let write_end_in_cluster =
-                    ((end - cluster_file_offset) as usize).min(cluster_bytes);
-                let write_len = write_end_in_cluster - write_start_in_cluster;
-                cluster_data[write_start_in_cluster..write_end_in_cluster]
-                    .copy_from_slice(&data[data_offset..data_offset + write_len]);
-                // `existing_end` (= inode.size capped to this cluster) can be
-                // BELOW `cluster_file_offset` when a new/short file is extended
-                // into a later cluster — the read-existing block above is
-                // guarded for exactly that case. Use saturating_sub so the
-                // amount of pre-existing data in this cluster floors at 0
-                // instead of underflowing (debug panic / release wrap masked
-                // only by the later `.min`).
-                let cluster_data_len =
-                    usize::try_from(existing_end.saturating_sub(cluster_file_offset))
-                        .unwrap_or(cluster_bytes)
-                        .max(write_end_in_cluster)
-                        .min(cluster_bytes);
-
-                // Compress and write the cluster.
-                let cluster_write = self.write_ext4_compressed_cluster(
-                    cx,
-                    scope,
-                    ino,
-                    inode,
-                    alloc,
-                    cluster_start,
-                    cluster_nblocks,
-                    method_idx,
-                    &cluster_data[..cluster_data_len],
-                )?;
-                pending_frees.extend(cluster_write.old_blocks);
-                pending_new_blocks.extend(cluster_write.new_blocks);
-
-                // Ensure COMPRBLK_FL is set.
-                inode.flags |= ffs_types::EXT4_COMPRBLK_FL;
-
-                let written_this_cluster = write_len as u32;
-                bytes_written = bytes_written.saturating_add(written_this_cluster);
-                pos = cluster_end_offset.min(end);
-            }
-
-            // Update inode size if we extended the file.
-            if end > inode.size {
-                inode.size = end;
-            }
-            ffs_inode::touch_mtime_ctime(inode, tstamp_secs, tstamp_nanos);
-
-            // Write updated inode and free superseded cluster blocks.
-            {
-                if let Some(tx) = &mut scope.tx {
-                    let tx_dev = TransactionBlockAdapter {
-                        base: &block_dev,
-                        tx: Mutex::new(tx),
-                    };
-                    ffs_inode::write_inode(
-                        cx,
-                        &tx_dev,
-                        &alloc.geo,
-                        &alloc.groups,
                         ino,
                         inode,
-                        csum_seed,
+                        alloc,
+                        cluster_start,
+                        cluster_nblocks,
+                        method_idx,
+                        &cluster_data[..cluster_data_len],
                     )?;
-                } else {
-                    ffs_inode::write_inode(
-                        cx,
-                        &block_dev,
-                        &alloc.geo,
-                        &alloc.groups,
-                        ino,
-                        inode,
-                        csum_seed,
-                    )?;
+                    pending_frees.extend(cluster_write.old_blocks);
+                    pending_new_blocks.extend(cluster_write.new_blocks);
+
+                    // Ensure COMPRBLK_FL is set.
+                    inode.flags |= ffs_types::EXT4_COMPRBLK_FL;
+
+                    let written_this_cluster = write_len as u32;
+                    bytes_written = bytes_written.saturating_add(written_this_cluster);
+                    pos = cluster_end_offset.min(end);
                 }
 
-                for block in std::mem::take(&mut pending_frees) {
-                    if let Err(error) = self.free_one_block(cx, scope, alloc, block) {
-                        if scope.tx.is_some() {
-                            return Err(error);
-                        }
-                        // The direct path has already published the replacement
-                        // inode. Preserve its existing best-effort reclaim policy;
-                        // rolling back new blocks would free referenced data.
-                        warn!(block = block.0, error = %error,
+                // Update inode size if we extended the file.
+                if end > inode.size {
+                    inode.size = end;
+                }
+                ffs_inode::touch_mtime_ctime(inode, tstamp_secs, tstamp_nanos);
+
+                // Write updated inode and free superseded cluster blocks.
+                {
+                    if let Some(tx) = &mut scope.tx {
+                        let tx_dev = TransactionBlockAdapter {
+                            base: &block_dev,
+                            tx: Mutex::new(tx),
+                        };
+                        ffs_inode::write_inode(
+                            cx,
+                            &tx_dev,
+                            &alloc.geo,
+                            &alloc.groups,
+                            ino,
+                            inode,
+                            csum_seed,
+                        )?;
+                    } else {
+                        ffs_inode::write_inode(
+                            cx,
+                            &block_dev,
+                            &alloc.geo,
+                            &alloc.groups,
+                            ino,
+                            inode,
+                            csum_seed,
+                        )?;
+                    }
+
+                    for block in std::mem::take(&mut pending_frees) {
+                        if let Err(error) = self.free_one_block(cx, scope, alloc, block) {
+                            if scope.tx.is_some() {
+                                return Err(error);
+                            }
+                            // The direct path has already published the replacement
+                            // inode. Preserve its existing best-effort reclaim policy;
+                            // rolling back new blocks would free referenced data.
+                            warn!(block = block.0, error = %error,
                             "e2compr: failed to release superseded cluster block after inode update");
+                        }
+                    }
+                }
+                Ok(bytes_written)
+            })();
+
+            // Transactional failures discard every staged allocation on abort.
+            // Compensating writes are needed only for the unscoped direct path.
+            if scope.tx.is_none() && write_result.is_err() && !pending_new_blocks.is_empty() {
+                {
+                    let mut rollback_block_dev = self.block_device_adapter();
+                    for block in pending_new_blocks {
+                        let Ext4AllocState {
+                            geo,
+                            groups,
+                            persist_ctx,
+                        } = &mut *alloc;
+                        if let Err(error) = ffs_alloc::free_blocks_persist(
+                            cx,
+                            &rollback_block_dev,
+                            geo,
+                            groups,
+                            block,
+                            1,
+                            persist_ctx,
+                        ) {
+                            warn!(
+                                block = block.0,
+                                error = %error,
+                                "e2compr: failed to release newly allocated block after write rollback"
+                            );
+                        }
+                        rollback_block_dev = self.block_device_adapter();
                     }
                 }
             }
-            Ok(bytes_written)
-        })();
 
-        // Transactional failures discard every staged allocation on abort.
-        // Compensating writes are needed only for the unscoped direct path.
-        if scope.tx.is_none() && write_result.is_err() && !pending_new_blocks.is_empty() {
+            // Preserve compressed writes' eager descriptor contract, but keep the
+            // descriptor and bitmap in the same transaction as the inode.
+            if write_result.is_ok()
+                && let Some(tx) = &mut scope.tx
             {
-                let mut rollback_block_dev = self.block_device_adapter();
-                for block in pending_new_blocks {
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                    } = &mut *alloc;
-                    if let Err(error) = ffs_alloc::free_blocks_persist(
-                        cx,
-                        &rollback_block_dev,
-                        geo,
-                        groups,
-                        block,
-                        1,
-                        persist_ctx,
-                    ) {
-                        warn!(
-                            block = block.0,
-                            error = %error,
-                            "e2compr: failed to release newly allocated block after write rollback"
-                        );
-                    }
-                    rollback_block_dev = self.block_device_adapter();
-                }
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(tx),
+                };
+                Self::ext4_write_group_descriptors_to(cx, alloc, &tx_dev)?;
             }
-        }
 
-        // Preserve compressed writes' eager descriptor contract, but keep the
-        // descriptor and bitmap in the same transaction as the inode.
-        if write_result.is_ok() && let Some(tx) = &mut scope.tx {
-            let tx_dev = TransactionBlockAdapter { base: &block_dev, tx: Mutex::new(tx) };
-            Self::ext4_write_group_descriptors_to(cx, alloc, &tx_dev)?;
-        }
+            trace!(
+                target: "ffs::write",
+                op = "compressed_write",
+                ino = ino.0,
+                offset,
+                len = data.len(),
+                new_size = inode.size,
+                "e2compr data written"
+            );
 
-        trace!(
-            target: "ffs::write",
-            op = "compressed_write",
-            ino = ino.0,
-            offset,
-            len = data.len(),
-            new_size = inode.size,
-            "e2compr data written"
-        );
-
-        write_result
+            write_result
         });
         drop(alloc);
         if !scoped {
@@ -36153,7 +36161,7 @@ impl OpenFs {
                     })?;
                     let mut root_bytes = Self::extent_root(&inode);
                     let freed =
-                        self.ext4_with_scoped_block_counts(scope, &mut alloc, |scope, alloc| {
+                        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
                             let Ext4AllocState {
                                 geo,
                                 groups,

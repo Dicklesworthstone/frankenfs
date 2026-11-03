@@ -1,5 +1,15 @@
 # FEATURE_PARITY
 
+> **Feature-off build repair (bd-53dub, 2026-11-03):** both read-recovery
+> architectures now execute their native input generator and pass core
+> regressions; ARM records1600passed/0failed/24existing ignores/0filtered.
+> Both then expose the same unused-self Clippy error hidden by workspace
+> feature unification. The accounting helper is now associated, preserving
+> all seven callers and its behavior; standalone strict core Clippy passes.
+> Post-refactor workspace and12ordinary/16sharded native selections are pending.
+> Native FUSE/benchmark totals below qualify the earlier Rust snapshot, not
+> this refactor by themselves. No feature-percentage change is claimed.
+
 > **Latest executed qualification (2026-11-03, bd-53dub):** final non-root FUSE
 > target passes291/0failed/8existing ignores/0filtered in176.90s with four parent
 > threads; final ELF55da4d51 matches all886Rust/build inputs. Child diagnostics
