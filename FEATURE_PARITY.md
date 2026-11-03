@@ -16,9 +16,10 @@
 > checks enabled. Subsequent helper refactoring has the separate checks above.
 > The hosted shell step next exposed stale catalog data:10existing suites and
 > 4existing tracker bindings were missing. The unchanged shell validator now
-> passes all124registered suites;4Rust embedding checks and full hosted shell/
-> journaled/differential execution remain pending. Catalog registrations are
-> source declarations and receive no execution or mounted-parity credit.
+> passes all124registered suites. The4existing Rust embedding checks execute
+> through ordinary RCH onhz3:4passed/0failed/0ignored/2077filtered, exit0.
+> Full hosted shell/journaled/differential execution remains pending. Catalog
+> registrations are source declarations and receive no mounted-parity credit.
 
 > **Retained component qualification (2026-11-03, bd-53dub):** non-root FUSE
 > target passes291/0failed/8existing ignores/0filtered in176.90s with four parent

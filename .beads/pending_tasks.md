@@ -244,9 +244,11 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   reused. The diagnostic-only merge-proof status script earns no mounted proof.
   Actual shell validator fails before and passes after all124suites. These78
   bindings are source declarations, not78executed scenarios or parity gains.
-- [ ] Run the four existing Rust artifact-manifest checks that embed the new
+- [x] Run the four existing Rust artifact-manifest checks that embed the new
   catalog through ordinary RCH. Sudo SBH20G checks pass on the actualhz3target
-  and runtime volumes; normal RCH admission has recovered and compiles them.
+  and runtime volumes; normal RCH admission has recovered. All4existing checks
+  pass/0failed/0ignored/2077filtered in0.02s; RCH754170ms/exit0, wrapper
+  wall804.777s. Receipt resume17-catalog-rust-hz3.log and its command/exit JSON.
 - [x] ARM read-recovery8d7278eae passes all steps, including strict Clippy.
   X86 instead fails1599/1/24existing ignores on a random btrfs reflink/truncate
   NoSpace sequence. Preserve exact seed/13ops in separate P1bd-wcbvk; original
@@ -255,21 +257,36 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   precede any separately reviewed gate correction; no fixture enlargement,
   accepted-error widening or silent rerun-to-green. This new issue carries no
   acceptance condition removed from bd-53dub, which remains in progress.
-- [ ] Recheck the original hosted acceptance conditions, update Beads/parity,
-  audit the concrete changes and deliver both Git refs with no premature close.
+- [x] Recheck the original hosted acceptance conditions and update Beads/parity.
+  Hosted8dFUSE291/0 and ARM read-recovery are real passes; the shell step fails
+  before its remaining probes. Fresh catalog-fix CI41595589616 and checkpoint
+  CI41596144855 are queued at07:30UTC. No hosted shell/journaled/differential
+  result is inferred. Keep bd-53dub in progress and bd-wcbvk open/unassigned.
+  The next GitHub status refresh returns API403/rate limit; retain that last
+  observed state rather than infer a final result from an unavailable refresh.
+- [ ] Observe successful nonempty hosted smoke, journaled and differential
+  execution before closing bd-53dub; retain all original acceptance conditions.
+- [ ] Replay bd-wcbvk's exact13operations, inspect failure atomicity and native
+  btrfs behavior before choosing a production fix or separately reviewed oracle
+  correction. This separate unassigned issue does not replace bd-53dub's AC.
+- [x] Deliver the final evidence notes on both Git refs, verify empty cycles
+  and preserve all15untracked paths. Release only this agent's reservations.
 
 Bounded real-work audit, resume17 (actual diff, latest five commits, current
 Bead and open/closed queue samples): the README's goal is a memory-safe native
 filesystem with compatible mounts, concurrent transactions and self-healing.
-This block has USER0, ENABLER3 (CLI-test isolation, allocator proof binding/
-fixture guard, reference-job environment), PROCESS2 (requested TODO/tracker,
-parity evidence notes), UNKNOWN0. No production filesystem feature is credited.
+The latest five commits through8c435daa3 have USER0, ENABLER4 (catalog bindings,
+feature-off helper repair, smoke JSON execution check, native read-recovery
+inputs), PROCESS1 (new failure's tracker note), UNKNOWN0. Earlier isolation/
+allocator/reference repairs are separate enablers. No new filesystem feature
+is credited; counts describe commits, not capabilities or closed items.
 1. No new user-visible runtime demo shipped in this block; the concrete demo
    is the full concurrent native mount target, not a new filesystem algorithm.
 2. Without the process notes the runtime outcome is unchanged; retain only the
    requested checklist and evidence needed to reproduce the original task.
-3. Final native FUSE291cases and allocator fixtures exercise the first two
-   enablers; both hosted reference jobs now pass. Full hosted smoke remains.
+3. Final native FUSE291cases, allocator fixtures and the complete2660pass
+   owning invocation execute. Current hosted FUSE291/0 and ARM read-recovery
+   pass; the full hosted smoke chain and new x86 property failure remain open.
 4. The oldest user-facing item in the bounded sample is bd-w2u82 (Aug17),
    whose transport implementation already exists but whose comparative result
    still needs a quiet measurement window. Current work repairs the proof lane
@@ -289,6 +306,8 @@ Honesty inventory, same bounded window, solo self-review:
 4. Yes, gate binding and CI changed. Review the feature binding as its own
    unit with the exact required names intact; no relaxation/default flip.
    Workflow image/release/cache changes are separate from FUSE isolation.
+   Catalog additions preserve every existing binding, regex and gate minimum;
+   their source validation earns no scenario-execution credit.
 5. No (checked commands/diffs): no benchmark hardcoding, hidden failure masks,
    timeout/pressure changes or alternate build-dispatch route.
 6. The old formatter-absent allocator control really is false green. Corrected
@@ -299,6 +318,10 @@ Honesty inventory, same bounded window, solo self-review:
    actual native mounts/oracles remain distinct; no field/power-loss claim.
 9. Failures retained: hosted288/1, parity missing-feature, xfstests mismatch/
    timeout, RCH103 refusals, first UBS1critical and standalone-control typo.
+   Also retained: SSH255, cold benchmark137, feature-off Clippy, stale catalog
+   and the exact NoSpace property seed. Superseded hosted runs cancelled while
+   active are not passes or diagnosed hangs. Privileged SBH's RAM refusal
+   overrides the older user check for future dispatch; no further hz4 launches.
 10. No discarded stderr (checked cited launchers): streams remain retained.
     The initial claim that stderr forwarding prevented duplicates was wrong
     for RCH's merged transport; the old real subprocess exposes it, and the
@@ -324,8 +347,10 @@ Honesty inventory, same bounded window, solo self-review:
     detailed above. The first succeeded prefix is retained, not converted into
     a successful complete invocation. The extra one-line tracker sync-base
     commit is bookkeeping with zero capability credit.
-20. Strongest proof is the hash-bound full native FUSE290/0run, plus the real
-    inherited-FD EBUSY/clean-unmount control; exact commands/ELFs are retained.
+20. Strongest proof is hosted fresh-CLI FUSE291/0 on8d7278eae and the complete
+    owning invocation2660/0 on39a3aa9d7, with the inherited-FD native control.
+    Later source changes have explicit separate compiler/native/catalog checks;
+    no old full-suite result is relabeled as a new-revision execution.
 Older-session scope is the existing bounded CASS sample below, not a fresh or
 exhaustive historical audit. Disposition: correct misleading cfg wording in
 place, retain/disclose actual failures, and counter RH-1/RH-2/RH-7/RH-11 with
