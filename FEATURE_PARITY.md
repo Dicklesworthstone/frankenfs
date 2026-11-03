@@ -1,12 +1,20 @@
 # FEATURE_PARITY
 
-> **Remaining native EOF parity gap (bd-wcbvk, 2026-11-03):** in one
-> invocation on identical full shared-image inputs, native btrfs shrinks
->65536to65535 successfully; current CLI72c32b44 returnsENOSPC and preserves
->65536and all victim/peer bytes. Both native checks pass. Native retains the
-> shared EOF extent; ffs eagerly COW-zeroes its tail. Deferral needs every
-> later growth/exposure path to sanitize stale bytes. This is a demonstrated
-> remaining gap, with no test relaxation, percentage change or P0 closure.
+> **Native shared EOF shrink repaired (bd-wcbvk, 2026-11-03):** coree9568c3c
+> retains the aligned partial EOF mapping and sanitizes newly exposed gaps
+> through setattr, write, fallocate and reflink growth. Commit entry observes
+> cancellation before device I/O. Eight selected tests pass, including the
+> unchanged original property with both hosted seeds persisted; the wider
+> btrfs/clone selection passes563/0failed/10existing ignores, not a full-package
+> count. In one actual mounted invocation with identical full shared-image
+> inputs, native btrfs and new CLI7a5c9adc shrink65536to65535 successfully;
+> old72c32b44 returnsENOSPC without byte drift. Native/new preserve the short
+> file when growth is refused, then reclaim filler space and reextend with a
+> zero tail and intact peer. All controlled file bytes are checked. All3final
+> native checks and3kernel readbacks pass; both FUSE daemons exit0 naturally.
+> The seed and binaries remain unchanged, with default chunk growth and a
+> private mount namespace. Full harness/benchmark qualification remains in
+> progress; no test relaxation, percentage change or P0 closure is claimed.
 
 > **Btrfs differential daemon ordering (bd-53dub, 2026-11-03):** hosted
 >58acc82d5 passes full shell and journaled ext4 smoke, then fails btrfs reopen.
