@@ -2,6 +2,42 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-03, resume20 native EOF parity
+
+- [x] Resume the owned P0bd-wcbvk; preserve15untracked paths, original AC,
+  original randomized properties, known native red and prior qualification.
+- [x] Add a regression requiring a regular shared EOF shrink with no spare
+  data blocks to succeed, preserving all peers and aligned extent references.
+  Red source7dabc2e2 is executing through ordinary RCH on vmi1152480; the
+  cold test dependency build is not yet an executed test result.
+- [ ] Preserve the partial EOF extent on shrink. Keep rollback on metadata
+  failure and cancellation; handle inline extents without stale-byte exposure.
+- [ ] Sanitize exposed EOF gaps on setattr grow, sparse write, fallocate grow,
+  and clone destination growth; preserve current bytes outside each gap.
+- [ ] Roll back every fallible growth path before returning an error. Cover
+  cancellation, checksum/I/O failure, NoSpace, shared peers and allocation refs.
+- [ ] Execute targeted red/green and original properties through ordinary RCH
+  with fresh actual-volume/RAM20GiB admission; retain failed attempts.
+- [ ] Execute affected owner tests and required fmt/check/strict Clippy. Bind
+  source and runtime; qualify native checks and fresh mounted old/new behavior.
+- [ ] Update specs/parity/Beads with executed evidence, perform bounded fresh
+  self-review, publish and leave any unmet original acceptance explicit.
+
+Candidate implementation is present, not yet qualified: shrink retains the
+regular partial EOF sector; small inline payloads are trimmed in metadata.
+Setattr growth, sparse writes, aligned fallocate growth and reflink destination
+gaps sanitize before size publication under existing COW checkpoints. Write
+RMW copies only old visible bytes. Added42shared/unshared success/cancel/
+checksum path cells plus3inline grow cases; the native8cell retry probe moves
+the fallible EOF allocation to growth, preserving all negative controls. The
+recorded13operation shrink now requires success, a stronger positive contract.
+The original randomized property is byte-identical (SHAc3ca28419f540cc5).
+Unaligned plain fallocate can retain its preceding KEEP_SIZE reservation if
+exact-size growth fails; byte/size/peer preservation and nbytes coherence are
+still required. Its existing multi-request reservation behavior is not claimed
+as a globally atomic rollback. GitHub CLI status read returns403rate-limit;
+connector returns no run rows for21d7, so fresh hosted status is unknown.
+
 ## Current execution — 2026-11-03, resume19 after58acc82d5
 
 - [x] Preserve the15untracked paths and continue only the owned P0bd-wcbvk.
