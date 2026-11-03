@@ -23,14 +23,14 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   in the existing regression file, then execute the affected btrfs/clone tests.
 - [x] Execute the post-ENOSPC reclaim-cancellation control added in fresh review;
   the already-cancelled public setattr case alone no longer covers that branch.
-- [ ] Build a fresh CLI and compare native/old/candidate on the frozen full
+- [x] Build a fresh CLI and compare native/old/candidate on the frozen full
   shared image; require all bytes, fsync/unmount, native checks and readbacks.
-- [ ] Execute workspace/all-target cargo check on the final source.
-- [ ] Execute strict workspace/all-target Clippy on the final source.
+- [x] Execute workspace/all-target cargo check on the final source.
+- [x] Execute strict workspace/all-target Clippy on the final source.
 - [x] Execute local fmt and diff checks (repeat after any later source edit).
 - [ ] Refresh applicable harness test/benchmark gates without claiming older
   source qualifications as current. Keep failures and explicit host limits.
-- [ ] Bind the final tracked source inputs, regression seeds, actual compiler
+- [x] Bind the final tracked source inputs, regression seeds, actual compiler
   scratch, pinned toolchain and runtime profile to the executed results.
 - [ ] Update specs/parity/Beads with executed evidence, perform bounded fresh
   self-review, publish and leave any unmet original acceptance explicit.
@@ -81,6 +81,33 @@ unowned process was stopped and no cleanup/floor/slot/deadline change was
 used. Final tests and wider owner run use115's warm cache. Fresh CLI build
 on114 and workspace/all-target check on115 are now running. They have
 separate existing runtime configs, identical gates, and named real targets.
+
+Workspace/all-target check passes0/RCH421684ms/wall434.354s; strict Clippy
+passes0/RCH465255ms/wall498.848s. Both workers match all884Rust/build
+inputs plus the regression file. Worker115's ext4_small fixture matches
+b8722122 and retains its2026-10-30mtime; all required tools are present.
+Final changed-core static scan:1file,0critical/16489warnings/3281info,
+not a warning-free scan. The fresh CLI build on114 passes0/RCH1551755ms/
+wall1733.817s; actual ELF7a5c9adc matches the retrieved and staged bytes.
+
+The actual mounted comparison passes3arms in one invocation: native/new
+successfully shrink the identical full shared seedcb774b02; old72c32b44
+returnsENOSPC without drift. Native/new refuse growth while full with every
+controlled byte intact, then filler truncate+fsync returns data space and
+both grow with zero EOF tails and unchanged peers. Streaming full filler
+hashes replace the earlier edge-only control. All3final btrfs check invocations
+and3kernel RO readbacks pass. Both FUSE daemons naturally exit0 within10s.
+Private mountns4026533730 and temporary fuse.conf bind are restored; seed and
+binaries unchanged. The first nested launcher is blocked by DCG's unverified
+inline-source rule; its nested diagnostic hits the parser budget. Direct
+literal source is inspected/allowed and executes0. No guard/allowlist/timeout
+change or allow-once approval is used. Exact command and log are retained as
+resume20-native-eof-comparison*. Native proof has no performance claim.
+
+Full harness package tests run on115. The normal full cargo bench gate runs
+on114 after fresh actual-volume/RAM20GiB admission. hz4's optional preflight
+refuses before a build: root6.6GiB, ram_scratch_pressure despite41.3GBvolume
+free (tmpfs above half RAM, low swap). No cleanup or capacity-limit change.
 
 ## Current execution — 2026-11-03, resume19 after58acc82d5
 
