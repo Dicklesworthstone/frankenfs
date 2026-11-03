@@ -46,6 +46,21 @@ Created by CC agent 2026-04-22. Import when bead database clears.
   benchmark are queued/running via ordinary RCH. No pass inferred from queue.
   Final core ELF482a0a21 matches source6564e392: missing formatter and missing
   debugfs each fail101; optional missing formatter prints SKIP and returns0.
+  The full package attempt actually passes2299tests/3existing ignores across
+  lib/main/benchmark-utility/btrfs-reference/conformance/compile-fail targets.
+  Live env verifies both strict flags1 and jobs1, but sudo restores TMPDIR to
+  /data/tmp. Its root-volume SBH20G check returns1/critical(6.63%free), despite
+  the qualified target tmpfs; do not treat raw60GiB free as admission. An early
+  commentary claimed sufficient scratch before reading this return; corrected
+  immediately on inspection. Cancel only our owned wrapper rchw-2695ade0 via
+  rch jobs cancel (the first build-id cancellation refuses ownership mismatch).
+  Outer attempt exits-15before integration coverage, so no full-package pass.
+  The temporary launcher also selected build.incremental instead of the runner
+  argument, leaving unshare absent. Correct by parsing the actual runner array,
+  asserting its explicit namespace/TMPDIR entries, and preflighting both target
+  and runtime volumes. Execute all22remaining targets with no-fail-fast/four
+  threads; keep completed prefix and every later result separate. The earlier
+  hash-bound non-root FUSE290/0private run is unaffected by this launcher error.
 - [ ] Fix and execute the feature-specific allocator parity selection separately;
   report its opt-in configuration without changing production defaults.
   Exact required names exist but were cfg-disabled, not obsolete. core-lib now
@@ -130,6 +145,10 @@ Honesty inventory, same bounded window, solo self-review:
     and required missing-debugfs failure. DCG blocked a dynamic follow-up
     launcher before execution; static inspectable commands complete it without
     override. No source assertion was changed to accommodate these mistakes.
+    The later package launcher/volume mistakes and owned cancellation are
+    detailed above. The first succeeded prefix is retained, not converted into
+    a successful complete invocation. The extra one-line tracker sync-base
+    commit is bookkeeping with zero capability credit.
 20. Strongest proof is the hash-bound full native FUSE290/0run, plus the real
     inherited-FD EBUSY/clean-unmount control; exact commands/ELFs are retained.
 Older-session scope is the existing bounded CASS sample below, not a fresh or
