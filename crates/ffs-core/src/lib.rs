@@ -41593,6 +41593,9 @@ impl OpenFs {
         subvol_trees: &[(u64, InMemoryCowBtrfsTree)],
         durable: &mut bool,
     ) -> ffs_error::Result<BtrfsWritebackStats> {
+        // Refuse cancellation already visible at entry before draining data
+        // or issuing metadata writes for a reclaiming commit (bd-wcbvk).
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let started = std::time::Instant::now();
         // The subvolume this commit publishes (5 unless --subvol/--snapshot).
         let fs_root = alloc.fs_root_objectid;
