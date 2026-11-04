@@ -2,6 +2,36 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-04, fresh-eyes decoder review
+
+Owner IvoryGate; `bd-msaxh`. User requested review of all new/modified code,
+concrete fixes, and continued high-value Beads execution. Keep this checklist
+until its execution evidence is recorded; it is not a new project roadmap.
+
+- [x] Refresh status and local queue; preserve unrelated untracked files.
+- [x] Read the complete prior Rust diff: sync dispatch, FAT health, mount
+  options/frontends/device lifetime, INIT/SYNCFS decoding, vendor dispatch,
+  and new crash/native tests. Trace scope and decoder callers.
+- [x] Check top P0 `bd-w2u82`: implementation already exists; acceptance still
+  needs controlled incumbent measurements. Do not claim implementation credit.
+- [x] Find three production length panics before the handler panic fence:
+  undersized declared header, WRITE size assertion, IOCTL input slicing.
+- [x] File/claim one cohesive bug bead and reserve the decoder edit surface.
+- [x] Add adversarial wire regressions and execute them on the old decoder:
+  `decoder-planted-red.log`, exit101, three failures. Header/WRITE panic;
+  IOCTL fails its missing-validation assertion (the accessor panic is static).
+- [x] Reject malformed lengths with decoder errors, preserving valid payloads.
+- [x] Re-read the complete fix and callers; AmberPine independently reviewed
+  the actual decoder diff, ABI offsets, Display and high-level dispatch.
+- [ ] Execute full vendored ABI7.42 and default-feature suites.
+  First ABI run:108passes/1mount-permission failure; rerun with root/private
+  mount namespace rather than change the test or count it as a pass.
+- [ ] Execute workspace/all-target check, strict Clippy and formatting checks.
+- [ ] Scan the final change; distinguish concrete findings from scanner noise.
+- [ ] Record exact revision and executed evidence; close only satisfied work.
+- [ ] Export tracker, check cycles, publish main and its compatibility ref,
+  release reservations, and report remaining gaps without inflated claims.
+
 ## Current execution — 2026-11-04, Linux filesystem-wide sync
 
 Owner IvoryGate; completed implementation `bd-yek6e`, protocol fix `bd-6q10i`

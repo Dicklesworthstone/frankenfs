@@ -22,6 +22,8 @@ pub enum RequestError {
     UnknownOperation(u32),
     /// Not enough data for arguments (short read).
     ShortRead(usize, usize),
+    /// Declared request length is smaller than its required header.
+    InvalidLength(usize),
     /// Insufficient argument data.
     InsufficientData,
 }
@@ -201,6 +203,11 @@ impl fmt::Display for RequestError {
             RequestError::ShortRead(len, total) => {
                 write!(f, "Short read of FUSE request ({len} < {total})")
             }
+            RequestError::InvalidLength(len) => write!(
+                f,
+                "Invalid FUSE request length ({len} < {})",
+                mem::size_of::<fuse_in_header>()
+            ),
             RequestError::InsufficientData => write!(f, "Insufficient argument data"),
         }
     }
@@ -1386,7 +1393,7 @@ mod op {
     impl_request!(IoCtl<'a>);
     impl IoCtl<'_> {
         pub fn in_data(&self) -> &[u8] {
-            &self.data[..self.arg.in_size as usize]
+            self.data
         }
         #[allow(dead_code)]
         pub fn unrestricted(&self) -> bool {
@@ -1775,7 +1782,9 @@ mod op {
                     arg: data.fetch()?,
                     data: data.fetch_all(),
                 };
-                assert!(out.data().len() == out.arg.size as usize);
+                if out.data().len() != out.arg.size as usize {
+                    return None;
+                }
                 out
             }),
             fuse_opcode::FUSE_STATFS => Operation::StatFs(StatFs { header }),
@@ -1877,11 +1886,14 @@ mod op {
                 arg: data.fetch()?,
             }),
             fuse_opcode::FUSE_DESTROY => Operation::Destroy(Destroy { header }),
-            fuse_opcode::FUSE_IOCTL => Operation::IoCtl(IoCtl {
-                header,
-                arg: data.fetch()?,
-                data: data.fetch_all(),
-            }),
+            fuse_opcode::FUSE_IOCTL => {
+                let arg: &fuse_ioctl_in = data.fetch()?;
+                Operation::IoCtl(IoCtl {
+                    header,
+                    arg,
+                    data: data.fetch_slice(arg.in_size as usize)?,
+                })
+            }
             fuse_opcode::FUSE_POLL => Operation::Poll(Poll {
                 header,
                 arg: data.fetch()?,
@@ -2293,6 +2305,9 @@ impl<'a> TryFrom<&'a [u8]> for AnyRequest<'a> {
             .fetch()
             .ok_or_else(|| RequestError::ShortReadHeader(arg_iter.len()))?;
         // Check data size
+        if (header.len as usize) < mem::size_of::<fuse_in_header>() {
+            return Err(RequestError::InvalidLength(header.len as usize));
+        }
         if data_len < header.len as usize {
             return Err(RequestError::ShortRead(data_len, header.len as usize));
         }
@@ -2414,6 +2429,82 @@ mod tests {
             AnyRequest::try_from(&INIT_REQUEST[..48]),
             Err(RequestError::ShortRead(48, 56))
         ));
+    }
+
+    #[test]
+    fn malformed_length_declared_frame_smaller_than_header_is_rejected() {
+        let mut bytes = AlignedData([0_u8; 56]);
+        bytes.0.copy_from_slice(&INIT_REQUEST[..]);
+        for declared_len in 0..mem::size_of::<fuse_in_header>() {
+            bytes.0[..4].copy_from_slice(&(declared_len as u32).to_ne_bytes());
+            assert!(
+                AnyRequest::try_from(&bytes[..]).is_err(),
+                "length {declared_len}"
+            );
+        }
+    }
+
+    fn length_test_request(opcode: fuse_opcode, body_len: usize) -> AlignedData<[u8; 128]> {
+        let mut bytes = AlignedData([0_u8; 128]);
+        let frame_len = mem::size_of::<fuse_in_header>() + body_len;
+        assert!(frame_len <= bytes.0.len());
+        bytes.0[..4].copy_from_slice(&(frame_len as u32).to_ne_bytes());
+        bytes.0[4..8].copy_from_slice(&(opcode as u32).to_ne_bytes());
+        bytes
+    }
+
+    #[test]
+    fn malformed_length_write_size_must_match_complete_frame_payload() {
+        let header_len = mem::size_of::<fuse_in_header>();
+        let arg_len = mem::size_of::<abi::fuse_write_in>();
+        for payload in [b"".as_slice(), b"abc"] {
+            let frame_len = header_len + arg_len + payload.len();
+            for declared_size in [0_u32, 1, 3, 4, u32::MAX] {
+                let mut bytes =
+                    length_test_request(fuse_opcode::FUSE_WRITE, arg_len + payload.len());
+                bytes.0[header_len + 16..header_len + 20]
+                    .copy_from_slice(&declared_size.to_ne_bytes());
+                bytes.0[header_len + arg_len..frame_len].copy_from_slice(payload);
+                let request = AnyRequest::try_from(&bytes[..frame_len]).unwrap();
+                if declared_size as usize == payload.len() {
+                    let Operation::Write(write) = request.operation().expect("valid WRITE") else {
+                        panic!("expected WRITE");
+                    };
+                    assert_eq!(write.data(), payload);
+                } else {
+                    assert!(matches!(
+                        request.operation(),
+                        Err(RequestError::InsufficientData)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_length_ioctl_requires_all_declared_input_bytes() {
+        let header_len = mem::size_of::<fuse_in_header>();
+        let arg_len = mem::size_of::<abi::fuse_ioctl_in>();
+        let payload = b"abc";
+        let frame_len = header_len + arg_len + payload.len();
+        for declared_size in [0_u32, 1, 3, 4, u32::MAX] {
+            let mut bytes = length_test_request(fuse_opcode::FUSE_IOCTL, arg_len + payload.len());
+            bytes.0[header_len + 24..header_len + 28].copy_from_slice(&declared_size.to_ne_bytes());
+            bytes.0[header_len + arg_len..frame_len].copy_from_slice(payload);
+            let request = AnyRequest::try_from(&bytes[..frame_len]).unwrap();
+            if declared_size as usize <= payload.len() {
+                let Operation::IoCtl(ioctl) = request.operation().expect("valid IOCTL") else {
+                    panic!("expected IOCTL");
+                };
+                assert_eq!(ioctl.in_data(), &payload[..declared_size as usize]);
+                assert!(!request.to_string().is_empty());
+            } else {
+                assert!(matches!(
+                    request.operation(),
+                    Err(RequestError::InsufficientData)
+                ));
+            }
+        }
     }
 
     #[test]
