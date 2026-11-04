@@ -1035,14 +1035,16 @@ mod op {
     #[derive(Debug)]
     pub struct Init<'a> {
         header: &'a fuse_in_header,
-        arg: &'a fuse_init_in,
+        arg: &'a fuse_init_in_prefix,
+        #[cfg(feature = "abi-7-36")]
+        extension: Option<&'a fuse_init_in_extension>,
     }
     impl_request!(Init<'a>);
     impl<'a> Init<'a> {
         pub fn capabilities(&self) -> u64 {
             #[cfg(feature = "abi-7-36")]
-            if self.arg.flags & (FUSE_INIT_EXT as u32) != 0 {
-                return (self.arg.flags as u64) | ((self.arg.flags2 as u64) << 32);
+            if let Some(extension) = self.extension {
+                return (self.arg.flags as u64) | ((extension.flags2 as u64) << 32);
             }
             self.arg.flags as u64
         }
@@ -1812,10 +1814,23 @@ mod op {
                 header,
                 arg: data.fetch()?,
             }),
-            fuse_opcode::FUSE_INIT => Operation::Init(Init {
-                header,
-                arg: data.fetch()?,
-            }),
+            fuse_opcode::FUSE_INIT => {
+                // The kernel's flag, not our maximum compiled ABI, selects
+                // the extension. Older kernels send only the 16-byte prefix.
+                let arg: &fuse_init_in_prefix = data.fetch()?;
+                #[cfg(feature = "abi-7-36")]
+                let extension = if arg.flags & (FUSE_INIT_EXT as u32) != 0 {
+                    Some(data.fetch()?)
+                } else {
+                    None
+                };
+                Operation::Init(Init {
+                    header,
+                    arg,
+                    #[cfg(feature = "abi-7-36")]
+                    extension,
+                })
+            }
             fuse_opcode::FUSE_OPENDIR => Operation::OpenDir(OpenDir {
                 header,
                 arg: data.fetch()?,
@@ -2416,6 +2431,63 @@ mod tests {
         if let Operation::Init(x) = operation {
             assert_eq!(x.version(), Version(7, 8));
             assert_eq!(x.max_readahead(), 4096);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "abi-7-36")]
+    fn init_extension_requires_the_kernel_flag_and_preserves_high_capabilities() {
+        for advertised in [false, true] {
+            let mut bytes = AlignedData([0_u8; 104]);
+            bytes.0[..56].copy_from_slice(&INIT_REQUEST[..]);
+            bytes.0[..4].copy_from_slice(&104_u32.to_ne_bytes());
+            bytes.0[44..48].copy_from_slice(&42_u32.to_ne_bytes());
+            let low_flags = if advertised { 0x4000_0001_u32 } else { 1 };
+            bytes.0[52..56].copy_from_slice(&low_flags.to_ne_bytes());
+            bytes.0[56..60].copy_from_slice(&0x8000_0001_u32.to_ne_bytes());
+            let request = AnyRequest::try_from(&bytes[..]).unwrap();
+            let Operation::Init(init) = request.operation().unwrap() else {
+                panic!("expected INIT");
+            };
+            assert_eq!(init.version(), Version(7, 42));
+            assert_eq!(init.max_readahead(), 4096);
+            assert_eq!(
+                init.capabilities(),
+                if advertised { 0x8000_0001_4000_0001 } else { 1 },
+                "unadvertised tail bytes must not grant capabilities",
+            );
+        }
+    }
+
+    #[test]
+    fn init_rejects_every_truncated_prefix() {
+        let mut bytes = AlignedData([0_u8; 56]);
+        bytes.0.copy_from_slice(&INIT_REQUEST[..]);
+        for body_len in 0..16 {
+            let frame_len = 40 + body_len;
+            bytes.0[..4].copy_from_slice(&(frame_len as u32).to_ne_bytes());
+            let request = AnyRequest::try_from(&bytes[..frame_len]).unwrap();
+            assert!(matches!(
+                request.operation(),
+                Err(RequestError::InsufficientData)
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "abi-7-36")]
+    fn init_rejects_every_truncated_advertised_extension() {
+        let mut bytes = AlignedData([0_u8; 104]);
+        bytes.0[..56].copy_from_slice(&INIT_REQUEST[..]);
+        bytes.0[52..56].copy_from_slice(&0x4000_0000_u32.to_ne_bytes());
+        for body_len in 16..64 {
+            let frame_len = 40 + body_len;
+            bytes.0[..4].copy_from_slice(&(frame_len as u32).to_ne_bytes());
+            let request = AnyRequest::try_from(&bytes[..frame_len]).unwrap();
+            assert!(matches!(
+                request.operation(),
+                Err(RequestError::InsufficientData)
+            ));
         }
     }
 

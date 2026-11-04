@@ -899,6 +899,23 @@ pub struct fuse_access_in {
 
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
+pub struct fuse_init_in_prefix {
+    pub major: u32,
+    pub minor: u32,
+    pub max_readahead: u32,
+    pub flags: u32,
+}
+
+#[cfg(feature = "abi-7-36")]
+#[repr(C)]
+#[derive(Debug, FromBytes, KnownLayout, Immutable)]
+pub struct fuse_init_in_extension {
+    pub flags2: u32,
+    pub unused: [u32; 11],
+}
+
+#[repr(C)]
+#[derive(Debug, FromBytes, KnownLayout, Immutable)]
 pub struct fuse_init_in {
     pub major: u32,
     pub minor: u32,
