@@ -742,6 +742,16 @@ writable backend. Read-only dispatch is a zero-write no-op. Protocol decoding,
 exclusive dispatch and error propagation belong in the existing vendored
 transport and FUSE adapter (`bd-yek6e`).
 
+The Linux mount transport must also enable delivery: current kernels send
+FUSE_SYNCFS only for `fuseblk`. The explicit block-backed image mode borrows a
+caller-owned loop device, validates its image identity and full-image extent,
+and selects `fuseblk` without falling back to ordinary FUSE. The caller owns
+attachment and detachment; the CLI holds the borrowed device throughout the
+mount. The caller must keep that association and the image/device paths stable:
+holding the device prevents autoclear reuse, but does not prevent privileged
+loop reconfiguration. Ordinary FUSE mounts do not gain global-sync delivery
+from an ABI bump.
+
 > **Status:** vendored `fuser` is a patched dependency, excluded from first-party workspace lint enforcement. `ffs-fuse` implements `fuser::Filesystem`; mounts reach ext4 and btrfs paths, including a wired per-core dispatcher. Default mount is read-only; read-write behavior remains experimental, and complete V1 acceptance requires execution evidence beyond this architecture map.
 
 ---

@@ -32,12 +32,12 @@ pub use notify::{Notifier, PollHandle};
 #[cfg(feature = "abi-7-40")]
 pub use passthrough::BackingId;
 pub use reply::ReplyPoll;
+pub use reply::ReplySender;
 #[cfg(feature = "abi-7-40")]
 pub use reply::ReplyStatx;
 #[cfg(target_os = "macos")]
 pub use reply::ReplyXTimes;
 pub use reply::ReplyXattr;
-pub use reply::ReplySender;
 pub use reply::{Reply, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen};
 pub use reply::{
     ReplyBmap, ReplyCreate, ReplyDirectory, ReplyDirectoryPlus, ReplyIoctl, ReplyLock, ReplyLseek,
@@ -630,8 +630,9 @@ pub trait Filesystem {
 
     /// Synchronize all prior writes and required filesystem metadata.
     ///
-    /// Linux sends this for `syncfs(2)` starting with protocol 7.34. Returning
-    /// ENOSYS disables subsequent requests and is treated by Linux as success;
+    /// Linux's block-backed `fuseblk` mounts send this for `syncfs(2)` with
+    /// protocol 7.34 or newer; ordinary FUSE mounts do not enable delivery.
+    /// Returning ENOSYS disables subsequent requests and is treated as success;
     /// the default returns EOPNOTSUPP so an omitted implementation stays visible.
     #[cfg(feature = "abi-7-36")]
     fn syncfs(&mut self, _req: &Request<'_>, reply: ReplyEmpty) {

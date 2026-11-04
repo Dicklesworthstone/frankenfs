@@ -66,6 +66,7 @@ mod cmd_dump;
 mod cmd_evidence;
 mod cmd_inspect;
 mod cmd_repair;
+mod loop_device;
 mod mount_console;
 mod mount_worker;
 mod repair_btrfs_parsers;
@@ -139,6 +140,7 @@ use ffs_repair::scrub::{
 #[cfg(test)]
 use ffs_types::{BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE};
 use ffs_types::{BlockNumber, ByteOffset, GroupNumber, InodeNumber, MountMode};
+use loop_device::validate_borrowed_loop_device;
 use mount_console::{
     MountConsoleConfig, MountConsoleCore, MountConsoleObservation, emit_mount_console,
 };
@@ -649,6 +651,8 @@ struct MountCmdOptions {
     read_write: bool,
     /// FUSE fsname (the /proc/mounts source); `None` = `frankenfs`.
     fsname: Option<String>,
+    /// Caller-owned loop device for an explicit block-backed FUSE mount.
+    fuseblk_device: Option<PathBuf>,
     /// FUSE subtype; `None` = `ffs`, empty = none (plain `fuse` type).
     subtype: Option<String>,
     atime: AtimePolicy,
@@ -1334,6 +1338,14 @@ enum Command {
         /// TEST_DEV/SCRATCH_DEV, need a distinct name per mount.
         #[arg(long)]
         fsname: Option<String>,
+        /// Mount as `fuseblk` using an already attached, caller-owned loop device.
+        ///
+        /// The device must map this entire regular image at offset zero without
+        /// a size limit. Requires mount privileges; FrankenFS never attaches or
+        /// detaches the device. Block-backed mounts receive Linux `syncfs`
+        /// requests and must be explicitly unmounted if the daemon exits.
+        #[arg(long, conflicts_with = "fsname", value_name = "PATH")]
+        fuseblk_device: Option<PathBuf>,
         /// FUSE subtype; the mount type shows as `fuse.<subtype>` (default
         /// `ffs`). An empty value sets none, so the type is plain `fuse`.
         #[arg(long)]
@@ -2706,6 +2718,7 @@ fn run() -> Result<()> {
             allow_other,
             rw,
             fsname,
+            fuseblk_device,
             subtype,
             atime,
             dev,
@@ -2755,6 +2768,7 @@ fn run() -> Result<()> {
                     allow_other,
                     read_write: rw,
                     fsname,
+                    fuseblk_device,
                     subtype,
                     atime: atime.policy(),
                     dev,
@@ -7449,6 +7463,7 @@ fn mount_with_fuse(
         ioctl_trace_path: None,
         worker_threads: fuse_dispatch_workers_from_env()?,
         fsname: options.fsname.clone(),
+        fuseblk: options.fuseblk_device.is_some(),
         subtype: options.subtype.clone(),
         atime: options.atime,
         dev: options.dev,
@@ -7526,6 +7541,7 @@ struct ManagedMountParams<'a> {
     allow_other: bool,
     auto_unmount: bool,
     fsname: Option<&'a str>,
+    fuseblk: bool,
     subtype: Option<&'a str>,
     atime: AtimePolicy,
     dev: bool,
@@ -7647,6 +7663,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
             ioctl_trace_path: None,
             worker_threads: fuse_dispatch_workers_from_env()?,
             fsname: params.fsname.map(str::to_owned),
+            fuseblk: params.fuseblk,
             subtype: params.subtype.map(str::to_owned),
             atime: params.atime,
             dev: params.dev,
@@ -7877,6 +7894,7 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
             ioctl_trace_path: None,
             worker_threads: worker_count as usize,
             fsname: params.fsname.map(str::to_owned),
+            fuseblk: params.fuseblk,
             subtype: params.subtype.map(str::to_owned),
             atime: params.atime,
             dev: params.dev,
@@ -8578,6 +8596,20 @@ fn wait_for_image_writer_to_exit(image_path: &Path) -> Result<()> {
 }
 
 fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) -> Result<()> {
+    // Declared before mount/session/worker guards so its device reference is
+    // released only after each runtime has unmounted and drained its workers.
+    let borrowed_loop_device = match (&options.fuseblk_device, &options.fsname) {
+        (Some(_), Some(_)) => bail!("--fuseblk-device conflicts with --fsname"),
+        (Some(device), None) => Some(validate_borrowed_loop_device(image_path, device)?),
+        (None, _) => None,
+    };
+    let block_options = borrowed_loop_device.as_ref().map(|device| {
+        let mut options = options.clone();
+        options.fsname = Some(device.fsname().to_owned());
+        options
+    });
+    let options = block_options.as_ref().unwrap_or(options);
+
     if env_bool("FFS_MOUNT_BENCH_EVIDENCE", false)? {
         let sha = elf_self_sha256().context("self-hash executing mounted benchmark ELF")?;
         eprintln!("mount_bench_evidence,binary_sha256={sha}");
@@ -8675,7 +8707,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         );
     }
 
-    let auto_unmount = env_bool("FFS_AUTO_UNMOUNT", true)?;
+    let auto_unmount = env_bool("FFS_AUTO_UNMOUNT", true)? && options.fuseblk_device.is_none();
     let requested_runtime = options.runtime;
     let operation_id = mount_operation_id(
         image_path,
@@ -8923,6 +8955,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                     allow_other: options.allow_other,
                     auto_unmount,
                     fsname: options.fsname.as_deref(),
+                    fuseblk: options.fuseblk_device.is_some(),
                     subtype: options.subtype.as_deref(),
                     atime: options.atime,
                     dev: options.dev,
@@ -10871,6 +10904,7 @@ mod tests {
         MountCmdOptions {
             allow_other: false,
             fsname: None,
+            fuseblk_device: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
             dev: false,
@@ -15875,6 +15909,7 @@ mod tests {
                     &MountCmdOptions {
                         allow_other: false,
                         fsname: None,
+                        fuseblk_device: None,
                         subtype: None,
                         atime: AtimePolicy::Relatime,
                         dev: false,
@@ -15961,6 +15996,7 @@ mod tests {
             &MountCmdOptions {
                 allow_other: false,
                 fsname: None,
+                fuseblk_device: None,
                 subtype: None,
                 atime: AtimePolicy::Relatime,
                 dev: false,
@@ -16007,6 +16043,7 @@ mod tests {
             &MountCmdOptions {
                 allow_other: false,
                 fsname: None,
+                fuseblk_device: None,
                 subtype: None,
                 atime: AtimePolicy::Relatime,
                 dev: false,
@@ -16153,6 +16190,7 @@ mod tests {
         let open_options = build_mount_open_options(&MountCmdOptions {
             allow_other: false,
             fsname: None,
+            fuseblk_device: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
             dev: false,
@@ -16250,6 +16288,7 @@ mod tests {
         let options = |verify: bool| MountCmdOptions {
             allow_other: false,
             fsname: None,
+            fuseblk_device: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
             dev: false,
@@ -16296,6 +16335,7 @@ mod tests {
         let open_options = build_mount_open_options(&MountCmdOptions {
             allow_other: false,
             fsname: None,
+            fuseblk_device: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
             dev: false,
@@ -16337,6 +16377,7 @@ mod tests {
         let open_options = build_mount_open_options(&MountCmdOptions {
             allow_other: false,
             fsname: None,
+            fuseblk_device: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
             dev: false,
@@ -16382,6 +16423,7 @@ mod tests {
                 &MountCmdOptions {
                     allow_other: false,
                     fsname: None,
+                    fuseblk_device: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
                     dev: false,
@@ -16436,6 +16478,7 @@ mod tests {
                 &MountCmdOptions {
                     allow_other: false,
                     fsname: None,
+                    fuseblk_device: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
                     dev: false,
@@ -16491,6 +16534,7 @@ mod tests {
                 &MountCmdOptions {
                     allow_other: false,
                     fsname: None,
+                    fuseblk_device: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
                     dev: false,
@@ -16563,6 +16607,7 @@ mod tests {
                 &MountCmdOptions {
                     allow_other: false,
                     fsname: None,
+                    fuseblk_device: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
                     dev: false,
@@ -16676,6 +16721,50 @@ mod tests {
                 "expected mount command"
             ),
         }
+    }
+
+    #[test]
+    fn mount_fuseblk_device_defaults_off_and_parses_explicit_device() {
+        let cli = Cli::try_parse_from(["ffs", "mount", "/img", "/mnt"])
+            .expect("ordinary mount should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Mount {
+                fuseblk_device: None,
+                fsname: None,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "/img",
+            "/mnt",
+            "--fuseblk-device",
+            "/dev/loop7",
+        ])
+        .expect("explicit borrowed loop should parse");
+        let Command::Mount { fuseblk_device, .. } = cli.command else {
+            panic!("expected mount command");
+        };
+        assert_eq!(fuseblk_device, Some(PathBuf::from("/dev/loop7")));
+    }
+
+    #[test]
+    fn mount_fuseblk_device_rejects_fsname_override() {
+        let Err(error) = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "/img",
+            "/mnt",
+            "--fuseblk-device",
+            "/dev/loop7",
+            "--fsname",
+            "unrelated-source",
+        ]) else {
+            panic!("the validated block source cannot be overridden");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

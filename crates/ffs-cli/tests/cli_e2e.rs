@@ -2668,7 +2668,85 @@ fn cli_mount_btrfs_sync_ioctl_survives_sigkill_bd_8u2a5() {
     emit_scenario_result("cli_mount_btrfs_sync_ioctl_sigkill", "PASS", None);
 }
 
-/// Ordinary syncfs must reach the native commit boundary before it returns.
+/// Own a freshly attached scratch loop until the mounted superblock takes over.
+struct SyncfsTestLoop(Option<String>);
+
+impl SyncfsTestLoop {
+    fn attach(image: &Path) -> Self {
+        let attached = Command::new("losetup")
+            .args(["--find", "--show", "--nooverlap"])
+            .arg(image)
+            .output()
+            .unwrap();
+        assert!(
+            attached.status.success(),
+            "attach scratch loop: {attached:?}"
+        );
+        Self(Some(
+            String::from_utf8(attached.stdout)
+                .unwrap()
+                .trim()
+                .to_owned(),
+        ))
+    }
+
+    fn device(&self) -> &str {
+        self.0.as_deref().expect("owned scratch loop")
+    }
+
+    fn release_to_mount(&mut self) -> std::io::Result<()> {
+        let detached = Command::new("losetup")
+            .args(["--detach", self.device()])
+            .output()?;
+        if !detached.status.success() {
+            return Err(std::io::Error::other(format!(
+                "mark scratch loop autoclear: {detached:?}"
+            )));
+        }
+        // The mounted block superblock and CLI hold references. Autoclear
+        // releases the mapping after SIGKILL/unmount; never detach a reused ID.
+        self.0 = None;
+        Ok(())
+    }
+}
+
+impl Drop for SyncfsTestLoop {
+    fn drop(&mut self) {
+        if let Some(device) = &self.0 {
+            match Command::new("losetup").args(["--detach", device]).status() {
+                Ok(status) if status.success() => {}
+                result => eprintln!("scratch loop cleanup failed for {device}: {result:?}"),
+            }
+        }
+    }
+}
+
+/// Keep a failed assertion from leaving this test's daemon or mount alive.
+struct SyncfsTestMount {
+    child: std::process::Child,
+    mountpoint: PathBuf,
+}
+
+impl Drop for SyncfsTestMount {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // fuseblk is a privileged block mount; fusermount3 deliberately
+        // rejects it. The test owns this mount in its private namespace.
+        let unmounted = Command::new("umount")
+            .arg(&self.mountpoint)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !unmounted {
+            let _ = Command::new("umount")
+                .arg("-l")
+                .arg(&self.mountpoint)
+                .status();
+        }
+    }
+}
+
+/// Linux syncfs must reach the native boundary through the fuseblk transport.
 /// Run as root in a private mount namespace for the independent kernel readback.
 #[test]
 fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
@@ -2688,6 +2766,7 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
             "mount",
             "umount",
             "sync",
+            "losetup",
             "fusermount3",
         ]
         .iter()
@@ -2714,6 +2793,10 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
         "CLI SHA256: {}",
         sha256_file(Path::new(env!("CARGO_BIN_EXE_ffs-cli")))
     );
+    println!(
+        "FAT CLI SHA256: {}",
+        sha256_file(Path::new(env!("CARGO_BIN_EXE_ffs-fat")))
+    );
     for tool in [
         "sync",
         "mkfs.ext4",
@@ -2725,6 +2808,7 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
         "mount",
         "umount",
         "fusermount3",
+        "losetup",
     ] {
         let resolved = Command::new("which").arg(tool).output().unwrap();
         assert!(resolved.status.success(), "resolve {tool}");
@@ -2733,13 +2817,15 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
     }
     let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
     for format in ["ext4", "btrfs", "fat16", "fat32"] {
+        let is_fat = format.starts_with("fat");
+        let binary = Path::new(if is_fat {
+            env!("CARGO_BIN_EXE_ffs-fat")
+        } else {
+            env!("CARGO_BIN_EXE_ffs-cli")
+        });
         // FAT already flushes each ordered mutation; an omitted-sync loss is
         // neither expected nor claimed for those two formats.
-        let arms: &[bool] = if format.starts_with("fat") {
-            &[true]
-        } else {
-            &[false, true]
-        };
+        let arms: &[bool] = if is_fat { &[true] } else { &[false, true] };
         for &do_sync in arms {
             let dir = root.join(format!("{format}-{do_sync}"));
             fs::create_dir(&dir).unwrap();
@@ -2771,32 +2857,65 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
             );
             let mnt = dir.join("fuse");
             fs::create_dir(&mnt).unwrap();
-            let Some(mut child) = spawn_cli_mount(
+            let mut loop_device = SyncfsTestLoop::attach(&image);
+            let mut args = vec!["--rw", "--fuseblk-device", loop_device.device()];
+            if is_fat {
+                args.push("--offline-image");
+            } else {
+                args.extend(["--commit-interval-secs", "0"]);
+            }
+            let Some(child) = spawn_cli_mount_binary(
+                binary,
                 &image,
                 &mnt,
                 &dir.join("mount.log"),
-                &["--rw", "--commit-interval-secs", "0"],
+                &args,
                 &[
                     ("FFS_BTRFS_DIRTY_BYTES_THRESHOLD", "0"),
                     ("RUST_LOG", "info,fuser=debug"),
                 ],
-                "cli_mount_syncfs_sigkill",
-                require,
+                ("cli_mount_syncfs_sigkill", require),
             ) else {
                 return;
             };
-            if let Err(error) = fs::write(mnt.join("durable.bin"), &payload) {
-                sigkill_cli_mount(&mut child, &mnt);
-                panic!("{format} write failed: {error}");
-            }
+            let mount = SyncfsTestMount {
+                child,
+                mountpoint: mnt.clone(),
+            };
+            let mountpoint = mnt.canonicalize().unwrap();
+            let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap();
+            fs::write(dir.join("mountinfo"), &mountinfo).unwrap();
+            let block_mount = mountinfo.lines().any(|line| {
+                line.split(' ').nth(4) == mountpoint.to_str()
+                    && line.split_once(" - ").is_some_and(|(_, suffix)| {
+                        suffix
+                            .split(' ')
+                            .next()
+                            .is_some_and(|kind| kind == "fuseblk" || kind.starts_with("fuseblk."))
+                    })
+            });
+            assert!(
+                block_mount,
+                "{format}: kernel did not mount the requested fuseblk transport"
+            );
+            loop_device
+                .release_to_mount()
+                .expect("scratch loop handoff");
+            fs::write(mnt.join("durable.bin"), &payload).expect("mounted payload write");
             if do_sync {
                 let synced = Command::new("sync").arg("-f").arg(&mnt).output();
-                if !synced.as_ref().is_ok_and(|output| output.status.success()) {
-                    sigkill_cli_mount(&mut child, &mnt);
-                    panic!("{format} syncfs failed: {synced:?}");
-                }
+                assert!(
+                    synced.as_ref().is_ok_and(|output| output.status.success()),
+                    "{format} syncfs failed: {synced:?}"
+                );
+                assert!(
+                    fs::read_to_string(dir.join("mount.log"))
+                        .unwrap()
+                        .contains("SYNCFS nodeid"),
+                    "{format}: returned syncfs must actually reach the userspace transport"
+                );
             }
-            sigkill_cli_mount(&mut child, &mnt);
+            drop(mount);
             let mut checker = match format {
                 "ext4" => {
                     let mut c = Command::new("e2fsck");
@@ -2825,7 +2944,7 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
             fs::create_dir(&native).unwrap();
             let options = match format {
                 "ext4" => "loop,ro,noload",
-                "btrfs" => "loop,ro,nologreplay",
+                "btrfs" => "loop,ro,rescue=nologreplay",
                 _ => "loop,ro",
             };
             let mounted = Command::new("mount")
@@ -2851,20 +2970,32 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
                     "{format}: returned syncfs lost data"
                 );
                 let before = sha256_file(&image);
-                let Some(mut remounted) = spawn_cli_mount(
+                let mut read_loop = SyncfsTestLoop::attach(&image);
+                let mut read_args = vec!["--fuseblk-device", read_loop.device()];
+                if is_fat {
+                    read_args.push("--offline-image");
+                }
+                let Some(child) = spawn_cli_mount_binary(
+                    binary,
                     &image,
                     &mnt,
                     &dir.join("remount.log"),
+                    &read_args,
                     &[],
-                    &[],
-                    "cli_mount_syncfs_sigkill_remount",
-                    require,
+                    ("cli_mount_syncfs_sigkill_remount", require),
                 ) else {
                     return;
                 };
+                let remounted = SyncfsTestMount {
+                    child,
+                    mountpoint: mnt.clone(),
+                };
+                read_loop
+                    .release_to_mount()
+                    .expect("read-only scratch loop handoff");
                 let bytes = fs::read(mnt.join("durable.bin"));
                 let synced = Command::new("sync").arg("-f").arg(&mnt).output();
-                sigkill_cli_mount(&mut remounted, &mnt);
+                drop(remounted);
                 assert_eq!(bytes.unwrap(), payload, "{format} FUSE readback");
                 assert!(
                     synced.unwrap().status.success(),
@@ -2876,8 +3007,15 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
                     "read-only syncfs wrote the image"
                 );
             } else {
+                let bytes = match native_bytes {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        None
+                    }
+                };
                 assert_ne!(
-                    native_bytes.ok().as_deref(),
+                    bytes.as_deref(),
                     Some(payload.as_slice()),
                     "omitted syncfs did not expose the missing durability boundary for {format}"
                 );
@@ -3062,7 +3200,29 @@ fn spawn_cli_mount(
     scenario: &str,
     require: bool,
 ) -> Option<std::process::Child> {
+    spawn_cli_mount_binary(
+        Path::new(env!("CARGO_BIN_EXE_ffs-cli")),
+        image,
+        mnt,
+        log_path,
+        extra_args,
+        envs,
+        (scenario, require),
+    )
+}
+
+fn spawn_cli_mount_binary(
+    binary: &Path,
+    image: &Path,
+    mnt: &Path,
+    log_path: &Path,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+    expectation: (&str, bool),
+) -> Option<std::process::Child> {
     use std::time::{Duration, Instant};
+
+    let (scenario, require) = expectation;
 
     let mnt_key = mnt
         .canonicalize()
@@ -3070,7 +3230,7 @@ fn spawn_cli_mount(
         .to_string_lossy()
         .into_owned();
     // A file, not a pipe: an unread pipe would block a chatty daemon.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ffs-cli"))
+    let mut child = Command::new(binary)
         .arg("mount")
         .args(extra_args)
         .arg(image)
@@ -3102,8 +3262,7 @@ fn spawn_cli_mount(
             return None;
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            sigkill_cli_mount(&mut child, mnt);
             panic!("`ffs mount` did not appear in mountinfo within 30s");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -3348,8 +3507,8 @@ fn btrfs_commit_sigkill_arm(
         panic!("write unsynced btrfs payload: {error}");
     }
     if sync_ioctl {
-        // btrfs-progs issues BTRFS_IOC_SYNC directly. Keep this ioctl proof
-        // distinct from the ordinary syncfs(2) protocol regression.
+        // btrfs-progs issues BTRFS_IOC_SYNC directly. Ordinary FUSE mounts do
+        // not deliver syncfs(2); its separate regression uses fuseblk.
         let synced = Command::new("btrfs")
             .args(["filesystem", "sync"])
             .arg(&mnt)

@@ -4638,6 +4638,11 @@ ext4 behavior).
 **Filesystem-wide synchronization:** Linux `syncfs(2)` / `sync -f` MUST reach
 the backend's full-volume durability boundary through `FUSE_SYNCFS` (protocol
 7.34 and later), rather than being acknowledged as an unsupported operation.
+The mount transport MUST enable kernel delivery, not merely advertise a new
+protocol version. Linux v6.19 and v7.0 enable it for `fuseblk`; ordinary FUSE
+mounts do not satisfy this boundary. An explicit block-backed image mount MUST
+verify that its borrowed loop device maps the supplied image with zero offset
+and no size limit, and MUST NOT fall back to ordinary FUSE on failure.
 The boundary includes all prior completed writes: ext4 journal publication and
 checkpoint, btrfs full transaction publication even in an ephemeral/tree-log
 configuration, or the native ordered FAT volume flush. Return required write,

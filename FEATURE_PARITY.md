@@ -1,12 +1,27 @@
 # FEATURE_PARITY
 
-> **Filesystem-wide sync wiring (bd-yek6e, 2026-11-04, qualification in progress):**
+> **Filesystem-wide sync wiring (bd-yek6e, 2026-11-04):**
 > Linux FUSE_SYNCFS now dispatches to the existing ext4 journal checkpoint,
 > btrfs full transaction commit and FAT backing-volume sync. Read-only mounts
 > acknowledge without backing I/O; unsupported writable backends return an
 > error. The raw protocol regression fails on the old transport with
-> UnknownOperation(50), then the complete dispatch selection passes11/11.
-> Mounted SIGKILL/native readback and workspace gates are pending. The full
+> UnknownOperation(50), then the complete dispatch selection passes12/12;
+> the FUSE library passes724/0failed/1existing ignore and FAT passes543/0failed
+> on the block-transport implementation. Workspace/all-target check and strict
+> Clippy pass. The broader harness records2076 passes/4failures/1existingignore:
+> its source-identity gates reject the uncommitted overlay marker. A rerun from
+> the committed implementation is pending; no gate is relaxed. The actual
+> ordinary-mount ext4 probe FAILS: sync-f returns0, but after SIGKILL a clean
+> native kernel mount finds no payload. INIT7.42 produces no SYNCFS request.
+> Linux6.19/7.0 enable that request only for fuseblk. Explicit validated loop
+> transport now passes all six mounted crash cases: synced ext4/btrfs/FAT16/FAT32
+> survive SIGKILL, native checkers, native kernel reads and fresh FUSE reads;
+> omitted-sync ext4/btrfs controls expose the missing boundary. Four read-only
+> block remounts leave image hashes unchanged. Retained execution is
+> `artifacts/implementation/20261104_syncfs_XZfkFQ/block-native-ram-final.log`,
+> base07905734a plus overlaycb81112f36e0b08eff61fcf199ea165312c36cace1300de504c73d8cacc2896b.
+> A follow-up run is adding explicit FAT request-log verification; FAT mutations
+> already flush, so persistence alone is not proof of its SYNCFS dispatch. The full
 > vendored ABI7.42 suite aborts in its unchanged reply_create test; it is not
 > counted as green. No parity percentage or general crash-atomicity claim changes.
 

@@ -367,6 +367,10 @@ pub enum Command {
         /// Confirm the image will not be modified by a kernel mount or another program.
         #[arg(long, required = true)]
         offline_image: bool,
+        /// Caller-owned whole-image loop device for Linux's privileged fuseblk transport.
+        /// It must map this image with zero loop offset and no size limit.
+        #[arg(long, value_name = "PATH")]
+        fuseblk_device: Option<PathBuf>,
         /// Mount read-write instead of read-only.
         #[arg(long)]
         rw: bool,
@@ -482,6 +486,99 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn mount_fuseblk_device_defaults_off_and_preserves_volume_ranges() {
+        let Command::Mount {
+            fuseblk_device,
+            rw,
+            image,
+            ..
+        } = Cli::try_parse_from([
+            "ffs-fat",
+            "mount",
+            "disk.img",
+            "/mnt/fat",
+            "--offline-image",
+        ])
+        .expect("ordinary mount remains valid")
+        .command
+        else {
+            panic!("expected mount");
+        };
+        assert!(fuseblk_device.is_none());
+        assert!(!rw);
+        assert_eq!((image.offset, image.length), (0, None));
+
+        for read_write in [false, true] {
+            let mut args = vec![
+                "ffs-fat",
+                "mount",
+                "disk.img",
+                "/mnt/fat",
+                "--offline-image",
+                "--fuseblk-device",
+                "/dev/loop7",
+                "--offset",
+                "1024",
+                "--length",
+                "4096",
+            ];
+            if read_write {
+                args.push("--rw");
+            }
+            let Command::Mount {
+                image,
+                mountpoint,
+                offline_image,
+                fuseblk_device,
+                rw,
+                ..
+            } = Cli::try_parse_from(args)
+                .expect("explicit block transport preserves volume selection")
+                .command
+            else {
+                panic!("expected mount");
+            };
+            assert_eq!(image.image, PathBuf::from("disk.img"));
+            assert_eq!((image.offset, image.length), (1024, Some(4096)));
+            assert_eq!(mountpoint, PathBuf::from("/mnt/fat"));
+            assert!(offline_image);
+            assert_eq!(fuseblk_device, Some(PathBuf::from("/dev/loop7")));
+            assert_eq!(rw, read_write);
+        }
+    }
+
+    #[test]
+    fn mount_fuseblk_device_still_requires_offline_authority_and_a_path() {
+        let error = Cli::try_parse_from([
+            "ffs-fat",
+            "mount",
+            "disk.img",
+            "/mnt/fat",
+            "--fuseblk-device",
+            "/dev/loop7",
+            "--rw",
+        ])
+        .expect_err("block mode does not grant offline write authority");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--offline-image"));
+
+        let error = Cli::try_parse_from([
+            "ffs-fat",
+            "mount",
+            "disk.img",
+            "/mnt/fat",
+            "--offline-image",
+            "--fuseblk-device",
+        ])
+        .expect_err("the block device path must be explicit");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("--fuseblk-device"));
     }
 
     #[test]

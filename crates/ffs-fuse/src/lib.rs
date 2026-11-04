@@ -2292,6 +2292,13 @@ pub struct MountOptions {
     pub read_only: bool,
     pub allow_other: bool,
     pub auto_unmount: bool,
+    /// Use Linux's privileged block-backed `fuseblk` transport.
+    ///
+    /// [`Self::fsname`] must name a block device backed by the same storage as
+    /// the supplied [`FsOps`]. The caller owns that binding and the device's
+    /// lifetime; this API checks only that the source is a block device.
+    /// This mode bypasses the mount helper and disables auto-unmount.
+    pub fuseblk: bool,
     /// Explicit opt-in to the kernel FUSE `writeback_cache` mount option.
     ///
     /// Defaults off. Callers must only enable this after the writeback-cache
@@ -2311,6 +2318,7 @@ pub struct MountOptions {
     /// Mount source shown in `/proc/mounts` (FUSE `fsname`); `None` means
     /// `frankenfs`. Tools that find a mount by its source (xfstests matches
     /// `TEST_DEV`/`SCRATCH_DEV` against it) need distinct names per mount.
+    /// With [`Self::fuseblk`], this must instead be the actual block-device path.
     pub fsname: Option<String>,
     /// FUSE `subtype`; the kernel reports the mount type as `fuse.<subtype>`.
     /// `None` means `ffs`; an empty string sets no subtype, so the type is plain
@@ -2332,6 +2340,7 @@ impl Default for MountOptions {
             read_only: true,
             allow_other: false,
             auto_unmount: true,
+            fuseblk: false,
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
@@ -2455,6 +2464,9 @@ fn apply_mount_option(
         "noauto_unmount" => {
             reject_mount_option_value(key, value)?;
             options.auto_unmount = false;
+        }
+        "fuseblk" => {
+            options.fuseblk = parse_mount_bool_or_flag(key, value, true)?;
         }
         "writeback_cache" => {
             options.writeback_cache =
@@ -8353,12 +8365,16 @@ fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
     if options.allow_other {
         opts.push(MountOption::AllowOther);
     }
+    if options.fuseblk {
+        opts.push(MountOption::CUSTOM("blkdev".to_owned()));
+    }
     // fuser mounts nodev,nosuid unless Dev/Suid are present. AutoUnmount makes
     // fuser mount through fusermount3, and distributions confine that binary
     // to nodev,nosuid mounts even for root (Ubuntu's AppArmor profile denies
     // anything else with EACCES). So a dev/suid mount, which only root may
-    // make, goes through mount(2) directly and forgoes auto-unmount.
-    if options.auto_unmount && !options.dev && !options.suid {
+    // make, goes through mount(2) directly and forgoes auto-unmount. Block-backed
+    // mounts also require the privileged direct path to preserve fuseblk.
+    if options.auto_unmount && !options.dev && !options.suid && !options.fuseblk {
         opts.push(MountOption::AutoUnmount);
     }
     if options.dev {
@@ -8375,6 +8391,35 @@ fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
 }
 
 fn validate_mount_options(options: &MountOptions) -> Result<(), FuseError> {
+    if options.fuseblk {
+        #[cfg(not(target_os = "linux"))]
+        return Err(
+            FfsError::UnsupportedFeature("fuseblk is only supported on Linux".to_owned()).into(),
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::FileTypeExt;
+
+            let source = options
+                .fsname
+                .as_deref()
+                .filter(|source| !source.is_empty())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "fuseblk requires fsname to name its backing block device",
+                    )
+                })?;
+            if !std::fs::metadata(source)?.file_type().is_block_device() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("fuseblk source is not a block device: {source}"),
+                )
+                .into());
+            }
+        }
+    }
     if options.writeback_cache.is_enabled() && options.read_only {
         return Err(FfsError::UnsupportedFeature(
             "kernel FUSE writeback_cache requires an explicit read-write mount; flush is non-durable and fsync/fsyncdir are the durability boundaries"
@@ -13622,6 +13667,7 @@ mod tests {
         assert!(opts.read_only);
         assert!(!opts.allow_other);
         assert!(opts.auto_unmount);
+        assert!(!opts.fuseblk);
         assert!(!opts.writeback_cache.is_enabled());
         assert!(opts.ioctl_trace_path.is_none());
         assert_eq!(
@@ -24216,6 +24262,7 @@ mod tests {
             read_only: false,
             allow_other: false,
             auto_unmount: true,
+            fuseblk: false,
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
@@ -24237,6 +24284,7 @@ mod tests {
             read_only: true,
             allow_other: true,
             auto_unmount: false,
+            fuseblk: false,
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
@@ -24279,6 +24327,38 @@ mod tests {
         // fusermount3 (taken for AutoUnmount) is confined to nodev,nosuid.
         assert!(!has(&both, &MountOption::AutoUnmount));
         assert!(!has(&dev_only, &MountOption::AutoUnmount));
+    }
+
+    #[test]
+    fn build_mount_options_fuseblk_preserves_source_and_bypasses_helper() {
+        // Option construction does not inspect or attach this device. The
+        // separate mounted tests must prove actual Linux syncfs delivery.
+        let opts = MountOptions {
+            fuseblk: true,
+            fsname: Some("/dev/loop0".to_owned()),
+            ..MountOptions::default()
+        };
+        assert!(
+            opts.auto_unmount,
+            "the block mode must override the default"
+        );
+        assert_eq!(
+            build_mount_options(&opts),
+            vec![
+                MountOption::FSName("/dev/loop0".to_owned()),
+                MountOption::Subtype("ffs".to_owned()),
+                MountOption::DefaultPermissions,
+                MountOption::NoAtime,
+                MountOption::CUSTOM(format!("max_read={FUSE_MAX_READ_BYTES}")),
+                MountOption::RO,
+                MountOption::CUSTOM("blkdev".to_owned()),
+            ]
+        );
+
+        let ordinary = build_mount_options(&MountOptions::default());
+        assert!(ordinary.contains(&MountOption::AutoUnmount));
+        assert!(!ordinary.contains(&MountOption::CUSTOM("blkdev".to_owned())));
+        assert!(ordinary.contains(&MountOption::FSName("frankenfs".to_owned())));
     }
 
     #[test]
@@ -24335,6 +24415,7 @@ mod tests {
             read_only: true,
             allow_other: false,
             auto_unmount: true,
+            fuseblk: false,
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 8,
@@ -24367,6 +24448,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_mount_options_fuseblk_is_explicit_and_accepts_boolean_overrides() {
+        assert!(!parse_mount_option_text("").expect("defaults").fuseblk);
+        let opts = parse_mount_option_text("rw,fuseblk,fsname=/dev/loop0")
+            .expect("explicit block transport should parse");
+        assert!(opts.fuseblk);
+        assert_eq!(opts.fsname.as_deref(), Some("/dev/loop0"));
+        assert!(!opts.read_only);
+        assert!(
+            !parse_mount_option_text("fuseblk,fuseblk=false")
+                .expect("last boolean option wins")
+                .fuseblk
+        );
+        assert!(
+            parse_mount_option_text("fuseblk=false,fuseblk=true")
+                .expect("last boolean option wins")
+                .fuseblk
+        );
+        assert_eq!(
+            parse_mount_option_text("fuseblk=maybe").expect_err("invalid boolean"),
+            MountOptionParseError::InvalidValue {
+                option: "fuseblk".to_owned(),
+                value: "maybe".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn parse_mount_options_rejects_malformed_csv() {
         assert!(matches!(
             parse_mount_options_for_fuzzing(b"rw,,allow_other"),
@@ -24388,6 +24496,7 @@ mod tests {
             read_only: true,
             allow_other: false,
             auto_unmount: true,
+            fuseblk: false,
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
@@ -24458,6 +24567,7 @@ mod tests {
                     read_only: false,
                     allow_other: true,
                     auto_unmount: false,
+                    fuseblk: false,
                     writeback_cache: WritebackCacheMode::Disabled,
                     ioctl_trace_path: None,
                     worker_threads: 8,
@@ -24571,6 +24681,95 @@ mod tests {
             message.contains("writeback_cache requires an explicit read-write mount"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn validate_mount_options_ordinary_transport_accepts_source_labels() {
+        validate_mount_options(&MountOptions::default()).expect("ordinary default mount");
+        validate_mount_options(&MountOptions {
+            fsname: Some("ffs-scratch".to_owned()),
+            ..MountOptions::default()
+        })
+        .expect("ordinary FUSE source names need not identify a device");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_mount_options_fuseblk_requires_a_nonempty_source() {
+        for fsname in [None, Some(String::new())] {
+            let err = validate_mount_options(&MountOptions {
+                fuseblk: true,
+                fsname,
+                ..MountOptions::default()
+            })
+            .expect_err("block-backed mounts must not default to a source label");
+            assert!(
+                matches!(&err, FuseError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput),
+                "unexpected source validation error: {err}"
+            );
+            assert!(err.to_string().contains("fuseblk requires fsname"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_mount_options_fuseblk_rejects_non_block_sources() {
+        for source in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            env!("CARGO_MANIFEST_DIR"),
+            "/dev/null",
+        ] {
+            let err = validate_mount_options(&MountOptions {
+                fuseblk: true,
+                fsname: Some(source.to_owned()),
+                ..MountOptions::default()
+            })
+            .expect_err("files, directories and character devices are not block sources");
+            assert!(
+                matches!(&err, FuseError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput),
+                "unexpected error for {source}: {err}"
+            );
+            assert!(err.to_string().contains("source is not a block device"));
+            assert!(err.to_string().contains(source));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_mount_options_fuseblk_propagates_source_metadata_errors() {
+        // A character device cannot contain a child, so this path cannot
+        // accidentally name a device created by another concurrent test.
+        let source = "/dev/null/frankenfs-fuseblk-source";
+        let expected = std::fs::metadata(source).expect_err("no child of /dev/null");
+        let err = validate_mount_options(&MountOptions {
+            fuseblk: true,
+            fsname: Some(source.to_owned()),
+            ..MountOptions::default()
+        })
+        .expect_err("metadata failures must prevent mounting");
+        assert!(
+            matches!(err, FuseError::Io(error) if error.raw_os_error() == expected.raw_os_error()),
+            "the source metadata error must be retained"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn validate_mount_options_fuseblk_rejects_unsupported_platforms() {
+        let err = validate_mount_options(&MountOptions {
+            fuseblk: true,
+            fsname: Some("/dev/disk0".to_owned()),
+            ..MountOptions::default()
+        })
+        .expect_err("fuseblk is Linux-only");
+        assert!(
+            matches!(
+                &err,
+                FuseError::UnsupportedFeature(FfsError::UnsupportedFeature(_))
+            ),
+            "unexpected platform rejection: {err}"
+        );
+        assert!(err.to_string().contains("only supported on Linux"));
     }
 
     // ── should_shed backpressure tests ───────────────────────────────────
@@ -25236,6 +25435,7 @@ AllowOther"#;
             read_only: false,
             allow_other: true,
             auto_unmount: false,
+            fuseblk: false,
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 4,
@@ -25273,6 +25473,7 @@ AllowOther"#;
             read_only: true,
             allow_other: true,
             auto_unmount: false,
+            fuseblk: false,
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,

@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 //! Command transport for the reusable native FAT engine.
 
+#[path = "../../loop_device.rs"]
+mod loop_device;
+
 use anyhow::{Context, Result, bail};
 use asupersync::types::CancelKind;
 use clap::Parser;
@@ -8,6 +11,7 @@ use ffs_fat::{
     Cli, Command, Directory, FatFs, extract_slots, formatter, native_catalog, reader, resize,
     stream_file,
 };
+use loop_device::validate_borrowed_loop_device;
 use std::io::{self, Write};
 
 fn main() -> Result<()> {
@@ -182,6 +186,7 @@ fn main() -> Result<()> {
             image,
             mountpoint,
             offline_image,
+            fuseblk_device,
             rw,
             uid,
             gid,
@@ -189,6 +194,11 @@ fn main() -> Result<()> {
             if !offline_image {
                 bail!("--offline-image is required; shared locks do not exclude unrelated writers");
             }
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .try_init()
+                .map_err(|error| anyhow::anyhow!("initialize FAT mount diagnostics: {error}"))?;
             let mountpoint = mountpoint
                 .canonicalize()
                 .context("resolve FAT mountpoint")?;
@@ -203,6 +213,12 @@ fn main() -> Result<()> {
             if image.image.canonicalize()?.starts_with(&mountpoint) {
                 bail!("mountpoint would hide the backing image");
             }
+            // Validate the caller's loop association before any writable image
+            // open, then retain its descriptor through the blocking mount.
+            let borrowed_loop_device = fuseblk_device
+                .as_deref()
+                .map(|device| validate_borrowed_loop_device(&image.image, device))
+                .transpose()?;
             let volume = if rw {
                 reader::replacement::open_volume(&cx, &image, true)?
             } else {
@@ -212,14 +228,19 @@ fn main() -> Result<()> {
             let options = ffs_fuse::MountOptions {
                 read_only: !rw,
                 allow_other: false,
-                auto_unmount: true,
+                auto_unmount: borrowed_loop_device.is_none(),
+                fuseblk: borrowed_loop_device.is_some(),
+                fsname: borrowed_loop_device
+                    .as_ref()
+                    .map(|device| device.fsname().to_owned()),
                 ..ffs_fuse::MountOptions::default()
             };
             eprintln!(
                 "experimental FAT {} mount; native FAT timestamps use a UTC wall-clock projection",
                 if rw { "read-write" } else { "read-only" }
             );
-            let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+            ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+            drop(borrowed_loop_device);
         }
     }
     Ok(())

@@ -79,6 +79,17 @@ fn fuse_mount_pure(
     mountpoint: &OsStr,
     options: &[MountOption],
 ) -> Result<(File, Option<UnixStream>), io::Error> {
+    let block_backed = block_mount_requested(options);
+    if block_backed && options.contains(&MountOption::AutoUnmount) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "fuseblk requires a direct mount; auto_unmount is not supported",
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if block_backed {
+        return Err(Error::new(ErrorKind::Unsupported, "fuseblk requires Linux"));
+    }
     if options.contains(&MountOption::AutoUnmount) {
         // Auto unmount is only supported via fusermount
         return fuse_mount_fusermount(mountpoint, options);
@@ -87,10 +98,29 @@ fn fuse_mount_pure(
     let res = fuse_mount_sys(mountpoint, options)?;
     match res {
         Some(file) => Ok((file, None)),
+        None if block_backed => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "fuseblk requires permission to mount the supplied block device; refusing ordinary FUSE fallback",
+        )),
         _ => {
             // Retry
             fuse_mount_fusermount(mountpoint, options)
         }
+    }
+}
+
+fn block_mount_requested(options: &[MountOption]) -> bool {
+    options
+        .iter()
+        .any(|option| matches!(option, MountOption::CUSTOM(value) if value == "blkdev"))
+}
+
+#[cfg(target_os = "linux")]
+fn kernel_filesystem_type(options: &[MountOption]) -> &'static str {
+    if block_mount_requested(options) {
+        "fuseblk"
+    } else {
+        "fuse"
     }
 }
 
@@ -354,10 +384,10 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
         nix::unistd::getgid()
     );
 
-    for option in options
-        .iter()
-        .filter(|x| option_group(x) == MountOptionGroup::KernelOption)
-    {
+    for option in options.iter().filter(|x| {
+        option_group(x) == MountOptionGroup::KernelOption
+            || (block_mount_requested(options) && matches!(x, MountOption::Subtype(_)))
+    }) {
         mount_options.push(',');
         mount_options.push_str(&option_to_string(option));
     }
@@ -414,7 +444,7 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
         #[cfg(target_os = "linux")]
         {
             let c_options = CString::new(mount_options).unwrap();
-            let c_type = CString::new("fuse").unwrap();
+            let c_type = CString::new(kernel_filesystem_type(options)).unwrap();
             libc::mount(
                 c_source.as_ptr(),
                 c_mountpoint.as_ptr(),
@@ -460,6 +490,7 @@ pub fn option_group(option: &MountOption) -> MountOptionGroup {
     match option {
         MountOption::FSName(_) => MountOptionGroup::Fusermount,
         MountOption::Subtype(_) => MountOptionGroup::Fusermount,
+        MountOption::CUSTOM(value) if value == "blkdev" => MountOptionGroup::Fusermount,
         MountOption::CUSTOM(_) => MountOptionGroup::KernelOption,
         MountOption::AutoUnmount => MountOptionGroup::Fusermount,
         MountOption::AllowOther => MountOptionGroup::KernelOption,
@@ -517,5 +548,49 @@ pub fn option_to_flag(option: &MountOption) -> libc::c_int {
         MountOption::Async => 0,
         MountOption::Sync => libc::MNT_SYNCHRONOUS,
         _ => unreachable!(),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod block_mount_tests {
+    use super::*;
+
+    #[test]
+    fn block_transport_requires_explicit_opt_in_not_a_source_label() {
+        assert_eq!(kernel_filesystem_type(&[]), "fuse");
+        let source = MountOption::FSName("/dev/loop7".to_owned());
+        assert_eq!(kernel_filesystem_type(&[source.clone()]), "fuse");
+        assert_eq!(
+            kernel_filesystem_type(&[source, MountOption::CUSTOM("blkdev".to_owned())]),
+            "fuseblk"
+        );
+        assert_eq!(
+            kernel_filesystem_type(&[MountOption::CUSTOM("blksize=4096".to_owned())]),
+            "fuse"
+        );
+    }
+
+    #[test]
+    fn block_marker_selects_transport_instead_of_becoming_a_kernel_parameter() {
+        assert!(
+            option_group(&MountOption::CUSTOM("blkdev".to_owned())) == MountOptionGroup::Fusermount
+        );
+        assert!(
+            option_group(&MountOption::CUSTOM("max_read=4096".to_owned()))
+                == MountOptionGroup::KernelOption
+        );
+    }
+
+    #[test]
+    fn block_transport_cannot_enter_the_auto_unmount_helper_path() {
+        let error = fuse_mount_pure(
+            OsStr::new("/nonexistent-fuseblk-test-mount"),
+            &[
+                MountOption::AutoUnmount,
+                MountOption::CUSTOM("blkdev".to_owned()),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 }

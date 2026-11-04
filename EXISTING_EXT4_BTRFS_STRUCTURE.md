@@ -2801,7 +2801,11 @@ For metadata blocks, verification includes:
     this ioctl does not establish that delivery.
     Linux v6.19's [`fuse_sync_fs`](https://github.com/torvalds/linux/blob/v6.19/fs/fuse/inode.c#L687-L724)
     waits for outstanding writes and sends FUSE_SYNCFS (opcode50, an8-byte
-    reserved payload) when protocol7.34 or later is negotiated. ENOSYS is
+    reserved payload) only when `fc->sync_fs` is enabled. Linux v6.19 and v7.0
+    initialize that flag for `fuseblk` in `fuse_fill_super_common`; ordinary
+    `fuse` mounts leave it disabled. Protocol7.34 support alone is insufficient.
+    `fuse_get_tree` requires a real block device for the block-backed mode.
+    ENOSYS is
     treated as success and disables later requests; transport rejection can
     therefore hide a missing durability boundary. A supporting server must
     dispatch that request to the full filesystem commit and return native
