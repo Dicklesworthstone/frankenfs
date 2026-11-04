@@ -4,7 +4,8 @@ Created by CC agent 2026-04-22. Import when bead database clears.
 
 ## Current execution — 2026-11-04, fresh-eyes decoder review
 
-Owner IvoryGate; `bd-msaxh`. User requested review of all new/modified code,
+Owner IvoryGate; completed `bd-msaxh` on cited execution and independent
+source/evidence review. User requested review of all new/modified code,
 concrete fixes, and continued high-value Beads execution. Keep this checklist
 until its execution evidence is recorded; it is not a new project roadmap.
 
@@ -23,14 +24,35 @@ until its execution evidence is recorded; it is not a new project roadmap.
 - [x] Reject malformed lengths with decoder errors, preserving valid payloads.
 - [x] Re-read the complete fix and callers; AmberPine independently reviewed
   the actual decoder diff, ABI offsets, Display and high-level dispatch.
-- [ ] Execute full vendored ABI7.42 and default-feature suites.
+- [x] Execute full vendored ABI7.42 and default-feature suites on
+  `45ed438273bcd925547061057db2222e53de3eaa`:109unit+1integration and
+  102unit+1integration respectively, zero failures/ignores/filters. Receipts
+  under `artifacts/implementation/20261104_fresh_BN0Fih/committed-vendor-*.log`.
   First ABI run:108passes/1mount-permission failure; rerun with root/private
   mount namespace rather than change the test or count it as a pass.
-- [ ] Execute workspace/all-target check, strict Clippy and formatting checks.
-- [ ] Scan the final change; distinguish concrete findings from scanner noise.
-- [ ] Record exact revision and executed evidence; close only satisfied work.
-- [ ] Export tracker, check cycles, publish main and its compatibility ref,
-  release reservations, and report remaining gaps without inflated claims.
+- [x] Execute workspace/all-target check, strict Clippy and formatting checks
+  on the same committed source; check/Clippy through strict RCH, exit0.
+  Decoder formatting uses edition2024 as declared by its Cargo.toml.
+- [x] Scan the final change: UBS0critical/136warnings/33info, one file;
+  warnings retained, not a clean-warning scan. New flags concern bounded test
+  slices/assertions and integer equality misclassified as float equality.
+- [x] Execute the complete FUSE library suite against the committed decoder:
+  `committed-fuse-library-nonincremental.log`, exit0 on `45ed43827`,
+  724passes/0failures/1existing ignore/0filters. RCH receipt binds tree
+  `6f7e3790fa02c64b65f6031e1728f8e4eaa062f7`; no native/crash credit added.
+  Initial default incremental build exits101 before tests: seven E0463 /
+  missing external artifacts. Read-only stat confirms the named thiserror
+  output directory is absent; no source cause or cache-removal cause proven.
+  Preserve the cache and rerun the established nonincremental/asupersync-opt3
+  profile with debug and overflow checks enabled; no test scope changes.
+- [x] Record exact revision and all executed evidence in the exported Bead
+  notes; close only this bug. AmberPine verified the committed blob and all
+  final receipts, with no independent-execution claim or gate relaxation.
+- [x] Export tracker and verify an empty active dependency-cycle result.
+- Publication/lifecycle closeout follows this metadata commit: push main and
+  its compatibility ref, verify both remote hashes, then release reservations.
+  The final response records the observed outcome. Native writer, repair,
+  benchmark and complete release acceptance Beads remain open.
 
 ## Current execution — 2026-11-04, Linux filesystem-wide sync
 
