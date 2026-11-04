@@ -3032,7 +3032,7 @@ fn space_info_consumer_bounds_and_late_failures_do_not_emit_partial_json() {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/ffs_space_info.py");
     let output = Command::new("python3")
         .arg("-c")
-        .arg(r#"
+        .arg(r"
 import contextlib, errno, fcntl, io, json, os, runpy, struct, sys, tempfile
 from unittest.mock import patch
 m = runpy.run_path(sys.argv[1])
@@ -3083,7 +3083,7 @@ with tempfile.TemporaryDirectory() as directory:
     with patch.object(m['platform'], 'machine', lambda: 'ppc64le'):
         case([], False, 0, 'Linux x86_64')
 print('consumer bounds and late-failure controls: PASS')
-"#)
+")
         .arg(&script)
         .output()
         .expect("run public space-info consumer fault controls");
@@ -3222,7 +3222,7 @@ fn cli_mount_btrfs_space_info_records_bd_k3hon() {
         dump.status.success(),
         "native durable block-group oracle: {dump:?}"
     );
-    let block_groups = Command::new("python3").arg("-c").arg(r#"
+    let block_groups = Command::new("python3").arg("-c").arg(r"
 import json, re, sys
 bits = dict(DATA=1, SYSTEM=2, METADATA=4, RAID0=8, RAID1=16, DUP=32, RAID10=64, RAID5=128, RAID6=256, RAID1C3=512, RAID1C4=1024, SINGLE=0)
 groups, pending, count = {}, None, 0
@@ -3243,7 +3243,7 @@ for line in open(sys.argv[1], encoding='utf-8'):
             pending, count = None, count+1
 assert pending is None and count >= 3, 'incomplete native block-group dump'
 print(json.dumps(dict(total_spaces=len(groups), spaces=list(groups.values())), sort_keys=True))
-"#).arg(dir.join("extent-tree.stdout")).output().unwrap();
+").arg(dir.join("extent-tree.stdout")).output().unwrap();
     fs::write(dir.join("block-groups.json"), &block_groups.stdout).unwrap();
     fs::write(dir.join("block-groups.stderr"), &block_groups.stderr).unwrap();
     assert!(
@@ -3279,7 +3279,7 @@ print(json.dumps(dict(total_spaces=len(groups), spaces=list(groups.values())), s
                 .is_some_and(|(_, suffix)| suffix.starts_with("fuse"))
     }));
     let mounted_hash = sha256_file(&image);
-    let probe = Command::new("python3").arg("-c").arg(r#"
+    let probe = Command::new("python3").arg("-c").arg(r"
 import errno, fcntl, json, os, struct, sys
 fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
 def query(command, slots, size):
@@ -3306,7 +3306,7 @@ try:
     assert count <= 8
     print(json.dumps({'total_spaces': count, 'spaces': [dict(zip(['flags','total_bytes','used_bytes'], struct.unpack_from('<QQQ', complete, 16+i*24))) for i in range(count)]}, sort_keys=True))
 finally: os.close(fd)
-"#).arg(&mnt).output().unwrap();
+").arg(&mnt).output().unwrap();
     fs::write(dir.join("probe.stdout"), &probe.stdout).unwrap();
     fs::write(dir.join("probe.stderr"), &probe.stderr).unwrap();
     let observed = Command::new("python3")
