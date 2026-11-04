@@ -15772,15 +15772,15 @@ mod tests {
             let mut data = Vec::new();
             data.extend_from_slice(&0_u64.to_le_bytes());
             data.extend_from_slice(&3_u64.to_le_bytes());
-            for (flags, total, used) in [
-                (1_u64, 4096_u64, 1024_u64),
-                (2, 8192, 2048),
-                (4, 16384, 4096),
+            for record in [
+                [1_u64, 4096_u64, 1024_u64],
+                [2, 8192, 2048],
+                [4, 16384, 4096],
             ]
             .into_iter()
             .take(usize::try_from(slots).unwrap_or(usize::MAX))
             {
-                for value in [flags, total, used] {
+                for value in record {
                     data.extend_from_slice(&value.to_le_bytes());
                 }
             }

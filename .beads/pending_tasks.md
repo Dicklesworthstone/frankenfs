@@ -48,6 +48,23 @@ Retain this execution list until its final evidence is recorded; no new roadmap.
   Retain all failed fleet preflights. A bounded read of existing project ELFs
   recovered swap headroom on114; the complete20GiB/RAM preflight then passes
   (`114-bounded-warm-final-preflight.json`). No guard, deadline or slot changed.
+  First strict Clippy run detects three needless raw-string delimiters in the
+  new CLI tests; remove only those delimiters, preserving every program and
+  assertion. Current source `aae56539d` includes that correction; production
+  and consumer blobs are identical to `ec9ad27f6`. A concurrent checkout rebase
+  changed ancestry and tracker metadata only; retain the old source receipts.
+  First native CLI build (`ec9ad27f6`) times out during asupersync compilation:
+  exit137 after1811s, zero tests executed. Retain it; do not call it a test pass.
+  Independent profile review permits reducing only dependency debug symbols,
+  retaining opt3, debug assertions, overflow checks and the normal deadline.
+  Worker115's actual nested32GiB build volume passes complete20GiB/RAM admission.
+  Restore worker114 `/tmp` to its original36GiB after its job exits: exit0,
+  flags preserved, files retained (`114-capacity-restored.log`).
+  Strict workspace/all-target Clippy with `--keep-going` now passes on
+  `aae56539d` plus the explicit FUSE test-fixture overlay
+  (`array-fixture-workspace-clippy.log`, exit0,236.7s). The second failed run
+  exposed a tuple-to-array lint in the new test double; store the same three
+  records as arrays, with no value or assertion change. Retain both failed runs.
 - [ ] Record exact source/ELF/options/tool/image identities and actual results;
   complete the honesty inventory, close only satisfied work, export/cycle-check.
 - Post-commit closeout: publish both required refs, verify remote hashes and
