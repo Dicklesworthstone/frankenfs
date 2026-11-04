@@ -2744,27 +2744,26 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
             let dir = root.join(format!("{format}-{do_sync}"));
             fs::create_dir(&dir).unwrap();
             let image = dir.join("volume.img");
-            match format {
-                "ext4" => format_ext4_owned_by_caller(&image, 64 << 20),
-                _ => {
-                    fs::File::create(&image)
-                        .unwrap()
-                        .set_len(256 << 20)
-                        .unwrap();
-                    let mut command = if format == "btrfs" {
-                        let mut command = Command::new("mkfs.btrfs");
-                        command.args(["-f", "-q"]);
-                        command
-                    } else {
-                        let mut command = Command::new("mkfs.fat");
-                        command.args(["-F", if format == "fat16" { "16" } else { "32" }]);
-                        command
-                    };
-                    let output = command.arg(&image).output().unwrap();
-                    fs::write(dir.join("format.stdout"), &output.stdout).unwrap();
-                    fs::write(dir.join("format.stderr"), &output.stderr).unwrap();
-                    assert!(output.status.success(), "format {format}: {output:?}");
-                }
+            if format == "ext4" {
+                format_ext4_owned_by_caller(&image, 64 << 20);
+            } else {
+                fs::File::create(&image)
+                    .unwrap()
+                    .set_len(256 << 20)
+                    .unwrap();
+                let mut command = if format == "btrfs" {
+                    let mut command = Command::new("mkfs.btrfs");
+                    command.args(["-f", "-q"]);
+                    command
+                } else {
+                    let mut command = Command::new("mkfs.fat");
+                    command.args(["-F", if format == "fat16" { "16" } else { "32" }]);
+                    command
+                };
+                let output = command.arg(&image).output().unwrap();
+                fs::write(dir.join("format.stdout"), &output.stdout).unwrap();
+                fs::write(dir.join("format.stderr"), &output.stderr).unwrap();
+                assert!(output.status.success(), "format {format}: {output:?}");
             }
             println!(
                 "{format} sync={do_sync} input SHA256: {}",
@@ -2815,12 +2814,12 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
                     c
                 }
             };
-            let checked = checker.arg(&image).output().unwrap();
-            fs::write(dir.join("check.stdout"), &checked.stdout).unwrap();
-            fs::write(dir.join("check.stderr"), &checked.stderr).unwrap();
+            let outcome = checker.arg(&image).output().unwrap();
+            fs::write(dir.join("check.stdout"), &outcome.stdout).unwrap();
+            fs::write(dir.join("check.stderr"), &outcome.stderr).unwrap();
             assert!(
-                checked.status.success(),
-                "{format} native checker failed: {checked:?}"
+                outcome.status.success(),
+                "{format} native checker failed: {outcome:?}"
             );
             let native = dir.join("native");
             fs::create_dir(&native).unwrap();
