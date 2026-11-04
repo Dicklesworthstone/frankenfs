@@ -125,6 +125,7 @@ fn crossing_slot(op: &ll::Operation<'_>) -> usize {
         ll::Operation::GetAttr(_) => 1,
         ll::Operation::GetXAttr(_) => 2,
         ll::Operation::ReadDir(_) => 3,
+        #[cfg(feature = "abi-7-21")]
         ll::Operation::ReadDirPlus(_) => 4,
         ll::Operation::Open(_) => 5,
         ll::Operation::OpenDir(_) => 6,
@@ -246,9 +247,8 @@ pub static CROSSING_NANOS: [std::sync::atomic::AtomicU64; CROSSING_SLOTS] =
 /// the numbers are ever printed, so the default mount pays nothing.
 fn dispatch_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var("FFS_MOUNT_BENCH_EVIDENCE").is_ok_and(|value| value != "0"))
 }
 
 /// Accumulates dispatch time on DROP, so no return path can skip it.
@@ -1189,7 +1189,10 @@ mod concurrency_classification_tests {
     fn request_bytes(opcode: u32, payload_len: usize) -> AlignedData<[u8; 256]> {
         let mut buffer = AlignedData([0_u8; 256]);
         let total = HEADER_LEN + payload_len;
-        assert!(total <= buffer.len(), "payload does not fit the test buffer");
+        assert!(
+            total <= buffer.len(),
+            "payload does not fit the test buffer"
+        );
         let total_u32 = u32::try_from(total).expect("request length fits in u32");
         buffer[0..4].copy_from_slice(&total_u32.to_ne_bytes());
         buffer[4..8].copy_from_slice(&opcode.to_ne_bytes());
@@ -1217,7 +1220,10 @@ mod concurrency_classification_tests {
         let open_in = std::mem::size_of::<abi::fuse_open_in>();
         let release_in = std::mem::size_of::<abi::fuse_release_in>();
 
-        assert!(classify(abi::fuse_opcode::FUSE_OPEN as u32, open_in), "OPEN");
+        assert!(
+            classify(abi::fuse_opcode::FUSE_OPEN as u32, open_in),
+            "OPEN"
+        );
         assert!(
             classify(abi::fuse_opcode::FUSE_OPENDIR as u32, open_in),
             "OPENDIR"
