@@ -46,7 +46,7 @@ struct DeferredFs {
 
 impl Filesystem for DeferredFs {
     #[cfg(feature = "abi-7-36")]
-    fn syncfs(&mut self, _request: &Request<'_>, reply: ReplyEmpty) {
+    fn syncfs(&mut self, _request: &Request<'_>, reply: crate::ReplyEmpty) {
         assert!(crate::current_read_request_interrupt().is_none());
         self.syncs.fetch_add(1, Ordering::SeqCst);
         match self.sync_errno.load(Ordering::SeqCst) {
@@ -114,7 +114,7 @@ fn packet(opcode: u32, unique: u64, payload: &[u8]) -> AlignedData<[u8; 256]> {
     bytes
 }
 
-fn dispatch(session: &mut Session<DeferredFs>, wire: &Arc<Wire>, bytes: &[u8]) {
+fn dispatch<F: Filesystem>(session: &mut Session<F>, wire: &Arc<Wire>, bytes: &[u8]) {
     let len = u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let sender: Arc<dyn ReplySender> = wire.clone();
     let request = Request::new_with_sender(sender, &bytes[..len]).expect("valid wire request");
@@ -145,7 +145,10 @@ fn syncfs_wire_request_requires_its_complete_payload() {
     let header_len = std::mem::size_of::<abi::fuse_in_header>();
     let bytes = packet(50, 77, &[0; 8]);
     let decoded = crate::ll::AnyRequest::try_from(&bytes[..header_len + 8]).unwrap();
-    assert_eq!(decoded.operation().expect("decode FUSE_SYNCFS").to_string(), "SYNCFS");
+    assert_eq!(
+        decoded.operation().expect("decode FUSE_SYNCFS").to_string(),
+        "SYNCFS nodeid 1"
+    );
     let sender: Arc<dyn ReplySender> = wire.clone();
     let request = Request::new_with_sender(sender, &bytes[..header_len + 8]).unwrap();
     assert!(!request.is_concurrency_safe());
@@ -159,8 +162,24 @@ fn syncfs_wire_request_requires_its_complete_payload() {
 
 #[cfg(feature = "abi-7-36")]
 #[test]
+fn syncfs_default_cannot_acknowledge_an_unimplemented_boundary() {
+    struct NoSync;
+    impl Filesystem for NoSync {}
+
+    let fd = std::fs::File::open("/dev/null").unwrap();
+    let mut session = Session::from_fd(NoSync, fd.into(), SessionACL::All);
+    session.initialized = true;
+    let wire = Arc::new(Wire::default());
+    dispatch(&mut session, &wire, &packet(50, 77, &[0; 8])[..]);
+    let replies = wire.replies.lock().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(reply_header(&replies[0]), (77, -libc::EOPNOTSUPP));
+}
+
+#[cfg(feature = "abi-7-36")]
+#[test]
 fn syncfs_wire_dispatch_preserves_backend_errors_and_kernel_credentials() {
-    for errno in [0, EIO, EINTR] {
+    for errno in [0, libc::EIO, EINTR] {
         let (mut session, wire) = session();
         // Global sync can originate in a kernel worker without the mount UID.
         session.allowed = SessionACL::Owner;

@@ -2799,6 +2799,13 @@ For metadata blocks, verification includes:
     [`BTRFS_IOC_SYNC` dispatch](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/ioctl.c#L4952-L4963).
     Ordinary FUSE `syncfs(2)` delivery is a separate kernel interface; wiring
     this ioctl does not establish that delivery.
+    Linux v6.19's [`fuse_sync_fs`](https://github.com/torvalds/linux/blob/v6.19/fs/fuse/inode.c#L687-L724)
+    waits for outstanding writes and sends FUSE_SYNCFS (opcode50, an8-byte
+    reserved payload) when protocol7.34 or later is negotiated. ENOSYS is
+    treated as success and disables later requests; transport rejection can
+    therefore hide a missing durability boundary. A supporting server must
+    dispatch that request to the full filesystem commit and return native
+    errors. Per-file fsync or a successful protocol reply alone is insufficient.
 
 17. Space pressure does not remove truncate's content and sharing obligations.
     An executed reference probe on Linux7.0.0-31/btrfs-progs6.17.1 fills two

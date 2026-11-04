@@ -1,5 +1,15 @@
 # FEATURE_PARITY
 
+> **Filesystem-wide sync wiring (bd-yek6e, 2026-11-04, qualification in progress):**
+> Linux FUSE_SYNCFS now dispatches to the existing ext4 journal checkpoint,
+> btrfs full transaction commit and FAT backing-volume sync. Read-only mounts
+> acknowledge without backing I/O; unsupported writable backends return an
+> error. The raw protocol regression fails on the old transport with
+> UnknownOperation(50), then the complete dispatch selection passes11/11.
+> Mounted SIGKILL/native readback and workspace gates are pending. The full
+> vendored ABI7.42 suite aborts in its unchanged reply_create test; it is not
+> counted as green. No parity percentage or general crash-atomicity claim changes.
+
 > **Native shared EOF shrink repaired (bd-wcbvk, 2026-11-03):** coree9568c3c
 > retains the aligned partial EOF mapping and sanitizes newly exposed gaps
 > through setattr, write, fallocate and reflink growth. Commit entry observes

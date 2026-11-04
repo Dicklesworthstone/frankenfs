@@ -632,10 +632,10 @@ pub trait Filesystem {
     ///
     /// Linux sends this for `syncfs(2)` starting with protocol 7.34. Returning
     /// ENOSYS disables subsequent requests and is treated by Linux as success;
-    /// writable filesystems must implement their actual durability boundary.
+    /// the default returns EOPNOTSUPP so an omitted implementation stays visible.
     #[cfg(feature = "abi-7-36")]
     fn syncfs(&mut self, _req: &Request<'_>, reply: ReplyEmpty) {
-        reply.error(ENOSYS);
+        reply.error(libc::EOPNOTSUPP);
     }
 
     /// Open a directory.

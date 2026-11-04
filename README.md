@@ -51,6 +51,14 @@ per-format profiles define the actual admission rules.
 | **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection, physical allocation checking and FUSE | The exact read profile controls admission. Restricted volatile `$LogFile` recovery exists; neither recovery nor allocation checking grants native write authority or a general Windows consistency claim. General NTFS mutation remains unfinished. |
 | **ZFS** | `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction and volatile ZIL recovery | Read-only root selection is not native writable pool ownership. Missing-member extraction is committed-view-only and forbids ZIL replay. Native allocation/TXG writing remains unfinished. |
 
+On Linux with FUSE protocol 7.34 or later, `sync -f /mnt/ffs` requests a
+filesystem-wide durability boundary on an admitted writable mount. It reaches
+the ext4 journal checkpoint, btrfs full transaction commit or FAT backing-volume
+sync; backing errors propagate to the caller. Read-only mounts acknowledge
+without writing the image. FAT retains ordered publication rather than atomic
+multi-operation transactions. See [current qualification](FEATURE_PARITY.md)
+for the executed evidence and remaining checks.
+
 The companion engines are reusable libraries: `ffs-fat`, `ffs-ntfs` and
 `ffs-zfs`. Their binaries and the protected mount import the same implementation.
 The `ffs` facade provides `open_read_only(cx, path, options)` for all six formats,

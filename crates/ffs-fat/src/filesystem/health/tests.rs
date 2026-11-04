@@ -476,7 +476,10 @@ fn filesystem_wide_sync_flushes_both_fat_dialects_and_preserves_failures() {
         ));
         assert_eq!(device.counts().2, after.2 + 1);
         fs.sync_fs(&cx, &mut RequestScope::empty()).unwrap();
-        assert_eq!(fs.read(&cx, &mut RequestScope::empty(), ino, 0, 8).unwrap(), b"original");
+        assert_eq!(
+            fs.read(&cx, &mut RequestScope::empty(), ino, 0, 8).unwrap(),
+            b"original"
+        );
 
         let cancelled = Cx::for_testing();
         cancelled.set_cancel_requested(true);

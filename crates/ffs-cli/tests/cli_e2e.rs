@@ -2668,6 +2668,210 @@ fn cli_mount_btrfs_sync_ioctl_survives_sigkill_bd_8u2a5() {
     emit_scenario_result("cli_mount_btrfs_sync_ioctl_sigkill", "PASS", None);
 }
 
+/// Ordinary syncfs must reach the native commit boundary before it returns.
+/// Run as root in a private mount namespace for the independent kernel readback.
+#[test]
+fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
+    let prerequisites = Path::new("/dev/fuse").exists()
+        && Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"0\n")
+        && [
+            "mkfs.ext4",
+            "mkfs.btrfs",
+            "mkfs.fat",
+            "e2fsck",
+            "btrfs",
+            "fsck.fat",
+            "mount",
+            "umount",
+            "sync",
+            "fusermount3",
+        ]
+        .iter()
+        .all(|tool| command_available(tool));
+    if !prerequisites {
+        assert!(
+            !require,
+            "required syncfs mount/native oracle prerequisites missing"
+        );
+        emit_scenario_result(
+            "cli_mount_syncfs_sigkill",
+            "SKIP",
+            Some("native_mount_prerequisites"),
+        );
+        return;
+    }
+    let root = tempfile::Builder::new()
+        .prefix("ffs-syncfs-")
+        .tempdir()
+        .expect("retained syncfs evidence")
+        .keep();
+    println!("syncfs evidence: {}", root.display());
+    println!(
+        "CLI SHA256: {:x}",
+        Sha256::digest(fs::read(env!("CARGO_BIN_EXE_ffs-cli")).unwrap())
+    );
+    let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
+    for format in ["ext4", "btrfs", "fat16", "fat32"] {
+        // FAT already flushes each ordered mutation; an omitted-sync loss is
+        // neither expected nor claimed for those two formats.
+        let arms: &[bool] = if format.starts_with("fat") {
+            &[true]
+        } else {
+            &[false, true]
+        };
+        for &do_sync in arms {
+            let dir = root.join(format!("{format}-{do_sync}"));
+            fs::create_dir(&dir).unwrap();
+            let image = dir.join("volume.img");
+            match format {
+                "ext4" => format_ext4_owned_by_caller(&image, 64 << 20),
+                _ => {
+                    fs::File::create(&image)
+                        .unwrap()
+                        .set_len(256 << 20)
+                        .unwrap();
+                    let mut command = if format == "btrfs" {
+                        let mut command = Command::new("mkfs.btrfs");
+                        command.args(["-f", "-q"]);
+                        command
+                    } else {
+                        let mut command = Command::new("mkfs.fat");
+                        command.args(["-F", if format == "fat16" { "16" } else { "32" }]);
+                        command
+                    };
+                    let output = command.arg(&image).output().unwrap();
+                    fs::write(dir.join("format.stdout"), &output.stdout).unwrap();
+                    fs::write(dir.join("format.stderr"), &output.stderr).unwrap();
+                    assert!(output.status.success(), "format {format}: {output:?}");
+                }
+            }
+            println!(
+                "{format} sync={do_sync} input SHA256: {:x}",
+                Sha256::digest(fs::read(&image).unwrap())
+            );
+            let mnt = dir.join("fuse");
+            fs::create_dir(&mnt).unwrap();
+            let Some(mut child) = spawn_cli_mount(
+                &image,
+                &mnt,
+                &dir.join("mount.log"),
+                &["--rw", "--commit-interval-secs", "0"],
+                &[
+                    ("FFS_BTRFS_DIRTY_BYTES_THRESHOLD", "0"),
+                    ("RUST_LOG", "info,fuser=debug"),
+                ],
+                "cli_mount_syncfs_sigkill",
+                require,
+            ) else {
+                return;
+            };
+            if let Err(error) = fs::write(mnt.join("durable.bin"), &payload) {
+                sigkill_cli_mount(&mut child, &mnt);
+                panic!("{format} write failed: {error}");
+            }
+            if do_sync {
+                let synced = Command::new("sync").arg("-f").arg(&mnt).output();
+                if !synced.as_ref().is_ok_and(|output| output.status.success()) {
+                    sigkill_cli_mount(&mut child, &mnt);
+                    panic!("{format} syncfs failed: {synced:?}");
+                }
+            }
+            sigkill_cli_mount(&mut child, &mnt);
+            let mut checker = match format {
+                "ext4" => {
+                    let mut c = Command::new("e2fsck");
+                    c.arg("-fn");
+                    c
+                }
+                "btrfs" => {
+                    let mut c = Command::new("btrfs");
+                    c.args(["check", "--readonly"]);
+                    c
+                }
+                _ => {
+                    let mut c = Command::new("fsck.fat");
+                    c.arg("-n");
+                    c
+                }
+            };
+            let checked = checker.arg(&image).output().unwrap();
+            fs::write(dir.join("check.stdout"), &checked.stdout).unwrap();
+            fs::write(dir.join("check.stderr"), &checked.stderr).unwrap();
+            assert!(
+                checked.status.success(),
+                "{format} native checker failed: {checked:?}"
+            );
+            let native = dir.join("native");
+            fs::create_dir(&native).unwrap();
+            let options = match format {
+                "ext4" => "loop,ro,noload",
+                "btrfs" => "loop,ro,nologreplay",
+                _ => "loop,ro",
+            };
+            let mounted = Command::new("mount")
+                .args(["-o", options])
+                .arg(&image)
+                .arg(&native)
+                .output()
+                .unwrap();
+            assert!(
+                mounted.status.success(),
+                "{format} native mount: {mounted:?}"
+            );
+            let native_bytes = fs::read(native.join("durable.bin"));
+            let detached = Command::new("umount").arg(&native).output().unwrap();
+            assert!(
+                detached.status.success(),
+                "native unmount failed: {detached:?}"
+            );
+            if do_sync {
+                assert_eq!(
+                    native_bytes.unwrap(),
+                    payload,
+                    "{format}: returned syncfs lost data"
+                );
+                let before = Sha256::digest(fs::read(&image).unwrap());
+                let Some(mut remounted) = spawn_cli_mount(
+                    &image,
+                    &mnt,
+                    &dir.join("remount.log"),
+                    &[],
+                    &[],
+                    "cli_mount_syncfs_sigkill_remount",
+                    require,
+                ) else {
+                    return;
+                };
+                let bytes = fs::read(mnt.join("durable.bin"));
+                let synced = Command::new("sync").arg("-f").arg(&mnt).output();
+                sigkill_cli_mount(&mut remounted, &mnt);
+                assert_eq!(bytes.unwrap(), payload, "{format} FUSE readback");
+                assert!(
+                    synced.unwrap().status.success(),
+                    "{format} read-only syncfs"
+                );
+                assert_eq!(
+                    Sha256::digest(fs::read(&image).unwrap()),
+                    before,
+                    "read-only syncfs wrote the image"
+                );
+            } else {
+                assert_ne!(
+                    native_bytes.ok().as_deref(),
+                    Some(payload.as_slice()),
+                    "omitted syncfs did not expose the missing durability boundary for {format}"
+                );
+            }
+            println!("{format} sync={do_sync}: PASS");
+        }
+    }
+    emit_scenario_result("cli_mount_syncfs_sigkill", "PASS", None);
+}
+
 /// Real mount ownership and cancellation of both idle background workers.
 #[test]
 fn cli_mount_background_workers_drain_on_unmount_bd_11a8t() {
@@ -3128,8 +3332,8 @@ fn btrfs_commit_sigkill_arm(
         panic!("write unsynced btrfs payload: {error}");
     }
     if sync_ioctl {
-        // btrfs-progs issues BTRFS_IOC_SYNC directly. syncfs(2) on an ordinary
-        // FUSE mount does not request a userspace filesystem-wide boundary.
+        // btrfs-progs issues BTRFS_IOC_SYNC directly. Keep this ioctl proof
+        // distinct from the ordinary syncfs(2) protocol regression.
         let synced = Command::new("btrfs")
             .args(["filesystem", "sync"])
             .arg(&mnt)

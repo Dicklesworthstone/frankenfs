@@ -1787,7 +1787,7 @@ mod op {
             }),
             #[cfg(feature = "abi-7-36")]
             fuse_opcode::FUSE_SYNCFS => {
-                let _arg: &abi::fuse_syncfs_in = data.fetch()?;
+                let _arg: &fuse_syncfs_in = data.fetch()?;
                 Operation::FSyncFs(FSyncFs { header })
             }
             fuse_opcode::FUSE_SETXATTR => Operation::SetXAttr(SetXAttr {
@@ -2082,7 +2082,7 @@ impl fmt::Display for Operation<'_> {
                 x.fdatasync()
             ),
             #[cfg(feature = "abi-7-36")]
-            Operation::FSyncFs(_) => write!(f, "SYNCFS"),
+            Operation::FSyncFs(x) => write!(f, "SYNCFS nodeid {}", x.nodeid().0),
             Operation::SetXAttr(x) => {
                 write!(f, "SETXATTR size {}, flags {:#x}", x.size(), x.flags())
             }
