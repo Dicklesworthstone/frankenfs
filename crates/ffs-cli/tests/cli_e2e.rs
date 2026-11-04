@@ -2711,9 +2711,26 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
         .keep();
     println!("syncfs evidence: {}", root.display());
     println!(
-        "CLI SHA256: {:x}",
-        Sha256::digest(fs::read(env!("CARGO_BIN_EXE_ffs-cli")).unwrap())
+        "CLI SHA256: {}",
+        sha256_file(Path::new(env!("CARGO_BIN_EXE_ffs-cli")))
     );
+    for tool in [
+        "sync",
+        "mkfs.ext4",
+        "mkfs.btrfs",
+        "mkfs.fat",
+        "e2fsck",
+        "btrfs",
+        "fsck.fat",
+        "mount",
+        "umount",
+        "fusermount3",
+    ] {
+        let resolved = Command::new("which").arg(tool).output().unwrap();
+        assert!(resolved.status.success(), "resolve {tool}");
+        let path = PathBuf::from(String::from_utf8(resolved.stdout).unwrap().trim());
+        println!("{tool} {} SHA256: {}", path.display(), sha256_file(&path));
+    }
     let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
     for format in ["ext4", "btrfs", "fat16", "fat32"] {
         // FAT already flushes each ordered mutation; an omitted-sync loss is
@@ -2750,8 +2767,8 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
                 }
             }
             println!(
-                "{format} sync={do_sync} input SHA256: {:x}",
-                Sha256::digest(fs::read(&image).unwrap())
+                "{format} sync={do_sync} input SHA256: {}",
+                sha256_file(&image)
             );
             let mnt = dir.join("fuse");
             fs::create_dir(&mnt).unwrap();
@@ -2834,7 +2851,7 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
                     payload,
                     "{format}: returned syncfs lost data"
                 );
-                let before = Sha256::digest(fs::read(&image).unwrap());
+                let before = sha256_file(&image);
                 let Some(mut remounted) = spawn_cli_mount(
                     &image,
                     &mnt,
@@ -2855,7 +2872,7 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
                     "{format} read-only syncfs"
                 );
                 assert_eq!(
-                    Sha256::digest(fs::read(&image).unwrap()),
+                    sha256_file(&image),
                     before,
                     "read-only syncfs wrote the image"
                 );
