@@ -42,6 +42,12 @@ Retain this execution list until its final evidence is recorded; no new roadmap.
   the original Bead scope. Their source reviews do not qualify mounted proof.
 - [ ] Run owning library/CLI tests, workspace check/strict Clippy/fmt and
   required harness gates through admitted strict RCH, retaining failed attempts.
+  Exact committed `ec9ad27f6` workspace/all-target check passes through strict
+  RCH (`committed-workspace-check-j1.log`); local `cargo fmt --check` passes.
+  Mounted CLI execution is running with mandatory native/FUSE prerequisites.
+  Retain all failed fleet preflights. A bounded read of existing project ELFs
+  recovered swap headroom on114; the complete20GiB/RAM preflight then passes
+  (`114-bounded-warm-final-preflight.json`). No guard, deadline or slot changed.
 - [ ] Record exact source/ELF/options/tool/image identities and actual results;
   complete the honesty inventory, close only satisfied work, export/cycle-check.
 - Post-commit closeout: publish both required refs, verify remote hashes and
