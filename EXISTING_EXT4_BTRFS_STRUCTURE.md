@@ -2816,6 +2816,20 @@ For metadata blocks, verification includes:
     dispatch that request to the full filesystem commit and return native
     errors. Per-file fsync or a successful protocol reply alone is insufficient.
 
+    SPACE_INFO has a distinct transport restriction. Linux 6.19
+    [`fuse_do_ioctl`](https://github.com/torvalds/linux/blob/v6.19/fs/fuse/ioctl.c)
+    obtains restricted input/output lengths from the command and rejects both
+    retry requests and oversized replies. The native btrfs command encodes a
+    16-byte header despite its flexible array. Therefore an ordinary FUSE
+    implementation cannot return records with that exact command. FrankenFS's
+    explicitly sized variant must advertise the complete array, bound slot
+    counts, preserve the total count on partial queries, and reject malformed
+    windows; it is not an unrestricted native btrfs ABI implementation.
+    The native [`btrfs_ioctl_space_info`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/ioctl.c)
+    also appends a transient global-reserve record and reports the number copied
+    on nonzero queries. A native client must recheck cardinality to detect growth;
+    persisted block-group aggregates do not describe the kernel's global reserve.
+
 17. Space pressure does not remove truncate's content and sharing obligations.
     An executed reference probe on Linux7.0.0-31/btrfs-progs6.17.1 fills two
     copies of a512MiB image until fallocate returns ENOSPC even for4KiB.

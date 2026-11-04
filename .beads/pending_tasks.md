@@ -2,6 +2,51 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-04, mounted btrfs space accounting
+
+Owner IvoryGate; existing `bd-k3hon`, claimed after local ready/source-authority
+and cycle checks. User requested high-value capability work and granular TODOs.
+Retain this execution list until its final evidence is recorded; no new roadmap.
+
+- [x] Inspect ready work and current source; distinguish already implemented
+  benchmark work from unfinished native writers and this disconnected query.
+- [x] Claim one existing Bead and reserve code, consumer, tests and spec/docs.
+- [x] Trace Linux6.19 restricted ioctl behavior: encoded `_IOC_SIZE` controls
+  buffers; unrestricted retry is unavailable. Canonical SPACE_INFO encodes16B.
+- [x] Add old-path regressions and execute the old handler: strict RCH on
+  baseline `811320fb8` plus test-only lib overlay returns0passes/2failures/
+  725filtered, exit101. Legacy returns88B through a16B window; sized command
+  returns ENOTTY. Retain `space-old-handler-red.log` and exact overlay source.
+- [x] Add a bounded explicitly sized SPACE_INFO command builder and dispatch;
+  preserve the legacy zero-slot count query and reject undersized replies.
+- [x] Connect the existing engine records to a usable public consumer with
+  bounded count/requery logic and no partial-success output.
+- [x] Add valid/partial/zero-slot/malformed/oversized/backend-error unit cases.
+  Full affected library passes730tests/0failures/1existing ignore/0filters
+  on the retained two-file source overlay; committed-source validation follows.
+- [ ] Execute real mounted legacy count, legacy nonzero, sized complete/partial
+  and undersized-buffer cases, then the public consumer against native btrfs
+  and FrankenFS. Compare complete block-group records to a native extent-tree
+  dump, retain all native ioctl rows including transient GLOBAL_RSV separately,
+  and retain unchanged input hashes. Do not filter that runtime row to claim
+  native-ABI parity; the original draft equality oracle used the wrong contract.
+- [x] Execute the newly found native-consumer count-growth bug as a mocked
+  negative: it returns one record after two calls when two are available.
+  Fix native mode with post-array count checks; the same control now returns
+  two records after five calls. Add bounded-growth/no-op/late-field controls
+  and an explicit Linux x86_64 encoding guard. These are not mounted proof.
+- [x] Update existing behavior/architecture/spec/parity and README with the
+  Linux/FUSE extension, supported profile and remaining native-tool limitation.
+- [x] Re-read code and obtain independent source review: AmberPine reviewed
+  bounds/dispatch/response; GoldenCliff reviewed consumer/native semantics and
+  the original Bead scope. Their source reviews do not qualify mounted proof.
+- [ ] Run owning library/CLI tests, workspace check/strict Clippy/fmt and
+  required harness gates through admitted strict RCH, retaining failed attempts.
+- [ ] Record exact source/ELF/options/tool/image identities and actual results;
+  complete the honesty inventory, close only satisfied work, export/cycle-check.
+- Post-commit closeout: publish both required refs, verify remote hashes and
+  release reservations; final response records the actual outcome.
+
 ## Current execution — 2026-11-04, fresh-eyes decoder review
 
 Owner IvoryGate; completed `bd-msaxh` on cited execution and independent

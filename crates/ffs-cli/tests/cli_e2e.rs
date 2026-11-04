@@ -3026,6 +3026,361 @@ fn cli_mount_syncfs_survives_sigkill_bd_yek6e() {
     emit_scenario_result("cli_mount_syncfs_sigkill", "PASS", None);
 }
 
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn space_info_consumer_bounds_and_late_failures_do_not_emit_partial_json() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/ffs_space_info.py");
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(r#"
+import contextlib, errno, fcntl, io, json, os, runpy, struct, sys, tempfile
+from unittest.mock import patch
+m = runpy.run_path(sys.argv[1])
+with tempfile.TemporaryDirectory() as directory:
+    def case(responses, success, expected_calls, diagnostic=None, native=False):
+        calls = []
+        def ioctl(fd, command, data, mutable):
+            assert fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+            assert mutable
+            slots = struct.unpack_from('<Q', data)[0]
+            assert len(data) == 16 + slots * 24
+            if native: assert command == 0xc0109414
+            else: assert len(data) == ((command >> 16) & 0x3fff)
+            calls.append(slots)
+            response = responses[len(calls)-1]
+            if isinstance(response, Exception): raise response
+            if response == 'noop': return 0
+            if response == 'nonzero': return 1
+            total, records = response
+            struct.pack_into('<QQ', data, 0, slots, total)
+            for index, record in enumerate(records):
+                struct.pack_into('<QQQ', data, 16 + index*24, *record)
+            return 0
+        out, err = io.StringIO(), io.StringIO()
+        argv = ['ffs_space_info.py', directory] + (['--kernel-btrfs'] if native else [])
+        with patch.object(fcntl, 'ioctl', ioctl), patch.object(sys, 'argv', argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = m['main']()
+        assert len(calls) == expected_calls, calls
+        if success:
+            assert result == 0 and not err.getvalue()
+            parsed = json.loads(out.getvalue())
+            assert parsed['total_spaces'] == len(parsed['spaces'])
+            return parsed
+        assert result == 1 and out.getvalue() == '', (result, out.getvalue(), err.getvalue())
+        assert diagnostic in err.getvalue(), err.getvalue()
+    good = [(1, 4096, 1024), (4, 8192, 2048)]
+    assert case([(2, []), (2, good)], True, 2)['spaces'][1]['used_bytes'] == 2048
+    assert case([(0, []), (0, [])], True, 2)['spaces'] == []
+    case([(2, []), (2, [good[0], (4, 8192, 8193)])], False, 2, 'more used')
+    case([(2, []), (2, [good[0]])], False, 2, 'not completely returned')
+    case(['noop'], False, 1, 'count is missing')
+    case(['nonzero'], False, 1, 'nonzero result')
+    case([(m['MAX_SLOTS'] + 1, [])], False, 1, 'bounded ioctl capacity')
+    case([OSError(errno.ENOTTY, 'missing oracle')], False, 1, 'missing oracle')
+    case([(1, []), (2, good[:1]), (3, good), (4, good + [(2, 16384, 0)])], False, 4, 'kept growing')
+    assert case([(1, []), (1, good[:1]), (2, []), (2, good), (2, [])], True, 5, native=True)['total_spaces'] == 2
+    case([(1, []), (1, good[:1]), (2, []), (2, good), (3, []), (3, good + [(2, 16384, 0)]), (4, [])], False, 7, 'kept growing', native=True)
+    with patch.object(m['platform'], 'machine', lambda: 'ppc64le'):
+        case([], False, 0, 'Linux x86_64')
+print('consumer bounds and late-failure controls: PASS')
+"#)
+        .arg(&script)
+        .output()
+        .expect("run public space-info consumer fault controls");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("controls: PASS"));
+}
+
+/// Own only this test's native mount, including the failed-unmount path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct SpaceInfoNativeMount(Option<PathBuf>);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Drop for SpaceInfoNativeMount {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0
+            && !Command::new("umount")
+                .arg(path)
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            let _ = Command::new("umount").arg("-l").arg(path).status();
+        }
+    }
+}
+
+/// Native durable block groups and real restricted-FUSE buffer lengths.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn cli_mount_btrfs_space_info_records_bd_k3hon() {
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
+    let mount_capable = fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+            .is_some_and(|capabilities| capabilities & (1 << 21) != 0)
+    });
+    let prerequisites = mount_capable
+        && Path::new("/dev/fuse").exists()
+        && Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
+        && ["mkfs.btrfs", "btrfs", "mount", "umount", "python3", "which"]
+            .iter()
+            .all(|tool| command_available(tool));
+    if !prerequisites {
+        assert!(
+            !require,
+            "required mounted space-info/native oracle prerequisites missing"
+        );
+        emit_scenario_result(
+            "cli_mount_btrfs_space_info",
+            "SKIP",
+            Some("native_mount_prerequisites"),
+        );
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("ffs-space-info-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!("space-info evidence: {}", dir.display());
+    for tool in ["mkfs.btrfs", "btrfs", "mount", "umount", "python3"] {
+        let resolved = Command::new("which").arg(tool).output().unwrap();
+        assert!(resolved.status.success(), "resolve {tool}");
+        let path = PathBuf::from(String::from_utf8(resolved.stdout).unwrap().trim());
+        println!("{tool} {} SHA256: {}", path.display(), sha256_file(&path));
+    }
+    let image = dir.join("volume.img");
+    fs::File::create(&image)
+        .unwrap()
+        .set_len(512 << 20)
+        .unwrap();
+    let formatted = Command::new("mkfs.btrfs")
+        .args(["-f", "-q"])
+        .arg(&image)
+        .output()
+        .unwrap();
+    fs::write(dir.join("format.stdout"), &formatted.stdout).unwrap();
+    fs::write(dir.join("format.stderr"), &formatted.stderr).unwrap();
+    assert!(
+        formatted.status.success(),
+        "format native btrfs: {formatted:?}"
+    );
+    let native = dir.join("native");
+    let mnt = dir.join("fuse");
+    fs::create_dir(&native).unwrap();
+    fs::create_dir(&mnt).unwrap();
+    let baseline = sha256_file(&image);
+    let mounted = Command::new("mount")
+        .args(["-o", "loop,ro,rescue=nologreplay"])
+        .arg(&image)
+        .arg(&native)
+        .output()
+        .unwrap();
+    assert!(
+        mounted.status.success(),
+        "native readonly mount: {mounted:?}"
+    );
+    let mut native_mount = SpaceInfoNativeMount(Some(native.clone()));
+    let consumer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/ffs_space_info.py");
+    let native_query = Command::new("python3")
+        .arg(&consumer)
+        .arg("--kernel-btrfs")
+        .arg(&native)
+        .output();
+    let detached = Command::new("umount").arg(&native).output().unwrap();
+    assert!(detached.status.success(), "native unmount: {detached:?}");
+    native_mount.0 = None;
+    let native_query = native_query.unwrap();
+    fs::write(dir.join("native.stdout"), &native_query.stdout).unwrap();
+    fs::write(dir.join("native.stderr"), &native_query.stderr).unwrap();
+    assert!(
+        native_query.status.success(),
+        "native consumer: {native_query:?}"
+    );
+    assert_eq!(
+        sha256_file(&image),
+        baseline,
+        "native readonly query changed its input"
+    );
+    let dump = Command::new("btrfs")
+        .args(["inspect-internal", "dump-tree", "-t", "extent"])
+        .arg(&image)
+        .output()
+        .unwrap();
+    fs::write(dir.join("extent-tree.stdout"), &dump.stdout).unwrap();
+    fs::write(dir.join("extent-tree.stderr"), &dump.stderr).unwrap();
+    assert!(
+        dump.status.success(),
+        "native durable block-group oracle: {dump:?}"
+    );
+    let block_groups = Command::new("python3").arg("-c").arg(r#"
+import json, re, sys
+bits = dict(DATA=1, SYSTEM=2, METADATA=4, RAID0=8, RAID1=16, DUP=32, RAID10=64, RAID5=128, RAID6=256, RAID1C3=512, RAID1C4=1024, SINGLE=0)
+groups, pending, count = {}, None, 0
+for line in open(sys.argv[1], encoding='utf-8'):
+    if 'BLOCK_GROUP_ITEM' in line:
+        assert pending is None, 'missing final block-group body'
+        key = re.search(r'key \((\d+) BLOCK_GROUP_ITEM (\d+)\)', line)
+        assert key, line
+        pending = int(key[2])
+    elif pending is not None:
+        body = re.search(r'block group used (\d+) chunk_objectid \d+ flags (\S+)', line)
+        if body:
+            flags = 0
+            for name in body[2].upper().split('|'): flags |= bits[name]
+            record = groups.setdefault(flags, dict(flags=flags, total_bytes=0, used_bytes=0))
+            record['total_bytes'] += pending
+            record['used_bytes'] += int(body[1])
+            pending, count = None, count+1
+assert pending is None and count >= 3, 'incomplete native block-group dump'
+print(json.dumps(dict(total_spaces=len(groups), spaces=list(groups.values())), sort_keys=True))
+"#).arg(dir.join("extent-tree.stdout")).output().unwrap();
+    fs::write(dir.join("block-groups.json"), &block_groups.stdout).unwrap();
+    fs::write(dir.join("block-groups.stderr"), &block_groups.stderr).unwrap();
+    assert!(
+        block_groups.status.success(),
+        "parse the complete native block-group oracle: {block_groups:?}"
+    );
+    assert_eq!(
+        sha256_file(&image),
+        baseline,
+        "native accounting oracle changed its input"
+    );
+    let Some(child) = spawn_cli_mount(
+        &image,
+        &mnt,
+        &dir.join("mount.log"),
+        &["--rw", "--commit-interval-secs", "0"],
+        &[("FFS_BTRFS_DIRTY_BYTES_THRESHOLD", "0")],
+        "cli_mount_btrfs_space_info",
+        require,
+    ) else {
+        return;
+    };
+    let mount = SyncfsTestMount {
+        child,
+        mountpoint: mnt.clone(),
+    };
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    fs::write(dir.join("mountinfo"), &mountinfo).unwrap();
+    assert!(mountinfo.lines().any(|line| {
+        line.split(' ').nth(4) == mnt.to_str()
+            && line
+                .split_once(" - ")
+                .is_some_and(|(_, suffix)| suffix.starts_with("fuse"))
+    }));
+    let mounted_hash = sha256_file(&image);
+    let probe = Command::new("python3").arg("-c").arg(r#"
+import errno, fcntl, json, os, struct, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+def query(command, slots, size):
+    data = bytearray(size)
+    struct.pack_into('<QQ', data, 0, slots, 0)
+    fcntl.ioctl(fd, command, data, True)
+    return data
+try:
+    count = struct.unpack_from('<Q', query(0xc0109414, 0, 16), 8)[0]
+    assert count > 1, count
+    for command, slots, size, expected in [
+        (0xc0109414, 8, 208, errno.EOVERFLOW),
+        (0xc0289414, 8, 208, errno.EOVERFLOW),
+        (0xc0119414, 0, 17, errno.EINVAL),
+    ]:
+        try: query(command, slots, size)
+        except OSError as error: assert error.errno == expected, (error, expected)
+        else: raise AssertionError('undersized query unexpectedly succeeded')
+    partial = query(0xc0289414, 1, 40)
+    assert struct.unpack_from('<Q', partial, 8)[0] == count
+    assert struct.unpack_from('<Q', partial, 16)[0] != 0
+    complete = query(0xc0d09414, 8, 208)
+    assert struct.unpack_from('<Q', complete, 8)[0] == count
+    assert count <= 8
+    print(json.dumps({'total_spaces': count, 'spaces': [dict(zip(['flags','total_bytes','used_bytes'], struct.unpack_from('<QQQ', complete, 16+i*24))) for i in range(count)]}, sort_keys=True))
+finally: os.close(fd)
+"#).arg(&mnt).output().unwrap();
+    fs::write(dir.join("probe.stdout"), &probe.stdout).unwrap();
+    fs::write(dir.join("probe.stderr"), &probe.stderr).unwrap();
+    let observed = Command::new("python3")
+        .arg(&consumer)
+        .arg(&mnt)
+        .output()
+        .unwrap();
+    fs::write(dir.join("consumer.stdout"), &observed.stdout).unwrap();
+    fs::write(dir.join("consumer.stderr"), &observed.stderr).unwrap();
+    let query_hash = sha256_file(&image);
+    drop(mount);
+    assert!(
+        probe.status.success(),
+        "actual ioctl-window probe: {probe:?}"
+    );
+    assert!(
+        observed.status.success(),
+        "public consumer on FUSE: {observed:?}"
+    );
+    assert_eq!(
+        query_hash, mounted_hash,
+        "read queries changed the backing image"
+    );
+    let canonical = |bytes: &[u8]| {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let mut records = value["spaces"].as_array_mut().unwrap().clone();
+        records.sort_by_key(|record| record["flags"].as_u64().unwrap());
+        assert_eq!(
+            records.len() as u64,
+            value["total_spaces"].as_u64().unwrap()
+        );
+        records
+    };
+    assert_eq!(
+        canonical(&observed.stdout),
+        canonical(&block_groups.stdout),
+        "complete records differ from the native durable block-group oracle"
+    );
+    assert_eq!(canonical(&probe.stdout), canonical(&block_groups.stdout));
+    // Retain the entire kernel ioctl output, including its transient global
+    // reserve, instead of filtering it into a false native-ABI parity claim.
+    let native_records = canonical(&native_query.stdout);
+    println!(
+        "kernel ioctl full records: {}",
+        String::from_utf8_lossy(&native_query.stdout)
+    );
+    println!(
+        "FrankenFS allocator full records: {}",
+        String::from_utf8_lossy(&observed.stdout)
+    );
+    println!(
+        "native_ioctl_records_equal: {}",
+        canonical(&observed.stdout) == native_records
+    );
+    let checked = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&image)
+        .output()
+        .unwrap();
+    fs::write(dir.join("check.stdout"), &checked.stdout).unwrap();
+    fs::write(dir.join("check.stderr"), &checked.stderr).unwrap();
+    assert!(
+        checked.status.success(),
+        "native image checker: {checked:?}"
+    );
+    println!(
+        "CLI SHA256: {}",
+        sha256_file(Path::new(env!("CARGO_BIN_EXE_ffs-cli")))
+    );
+    println!("consumer SHA256: {}", sha256_file(&consumer));
+    println!("input SHA256: {baseline}; mounted-before={mounted_hash}; mounted-after={query_hash}");
+    emit_scenario_result("cli_mount_btrfs_space_info", "PASS", None);
+}
+
 /// Real mount ownership and cancellation of both idle background workers.
 #[test]
 fn cli_mount_background_workers_drain_on_unmount_bd_11a8t() {

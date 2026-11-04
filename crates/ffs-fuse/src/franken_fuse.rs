@@ -1533,6 +1533,23 @@ impl FrankenFuse {
         Ok(InodeNumber(donor_meta.ino()))
     }
 
+    fn checked_space_info_response(data: Vec<u8>, slots: u64, encoded_size: u32) -> IoctlResult {
+        if data.len() < BTRFS_SPACE_ARGS_HEADER_SIZE as usize
+            || data.len() > usize::try_from(encoded_size).unwrap_or(0)
+        {
+            return IoctlResult::Error(libc::EIO);
+        }
+        let total = u64::from_le_bytes(data[8..16].try_into().expect("validated space-info header"));
+        let records = slots.min(total);
+        let expected_size = records
+            .checked_mul(u64::from(BTRFS_SPACE_INFO_RECORD_SIZE))
+            .and_then(|size| size.checked_add(u64::from(BTRFS_SPACE_ARGS_HEADER_SIZE)));
+        if Some(u64::try_from(data.len()).unwrap_or(u64::MAX)) != expected_size {
+            return IoctlResult::Error(libc::EIO);
+        }
+        IoctlResult::Data(data)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn dispatch_ioctl(
         &self,
@@ -2439,18 +2456,33 @@ impl FrankenFuse {
                     Err(error) => IoctlResult::Error(error.to_errno()),
                 }
             }
-            BTRFS_IOC_SPACE_INFO => {
-                // Input: 16-byte header with space_slots (number of entries caller can receive)
-                // Output: header (space_slots ignored, total_spaces set) + array of space_info
-                if in_data.len() < BTRFS_SPACE_ARGS_HEADER_SIZE as usize {
+            space_cmd
+                if space_cmd & !LINUX_IOCTL_SIZE_MASK
+                    == BTRFS_IOC_SPACE_INFO & !LINUX_IOCTL_SIZE_MASK =>
+            {
+                // Restricted FUSE copies only the bytes encoded in the command,
+                // regardless of the size of the caller's actual allocation.
+                // The legacy 16-byte command can therefore only return a count.
+                let encoded_size = (space_cmd & LINUX_IOCTL_SIZE_MASK) >> 16;
+                if encoded_size < BTRFS_SPACE_ARGS_HEADER_SIZE
+                    || !(encoded_size - BTRFS_SPACE_ARGS_HEADER_SIZE)
+                        .is_multiple_of(BTRFS_SPACE_INFO_RECORD_SIZE)
+                    || out_size < encoded_size
+                    || in_data.len() < usize::try_from(encoded_size).unwrap_or(usize::MAX)
+                {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let space_slots = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
+                let capacity = (encoded_size - BTRFS_SPACE_ARGS_HEADER_SIZE)
+                    / BTRFS_SPACE_INFO_RECORD_SIZE;
+                if space_slots > u64::from(capacity) {
+                    return IoctlResult::Error(libc::EOVERFLOW);
+                }
                 let cx = Self::cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_btrfs_space_info(cx, scope, space_slots)
                 }) {
-                    Ok(data) => IoctlResult::Data(data),
+                    Ok(data) => Self::checked_space_info_response(data, space_slots, encoded_size),
                     Err(error) => IoctlResult::Error(error.to_errno()),
                 }
             }

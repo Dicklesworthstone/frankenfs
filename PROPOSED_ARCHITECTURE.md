@@ -757,6 +757,20 @@ holding the device prevents autoclear reuse, but does not prevent privileged
 loop reconfiguration. Ordinary FUSE mounts do not gain global-sync delivery
 from an ABI bump.
 
+Mounted btrfs space queries reuse `FsOps::get_btrfs_space_info` and the existing
+allocator's records. `ffs-fuse::btrfs_space_info_ioctl_command` encodes a complete
+16-byte header plus bounded 24-byte records for the Linux x86_64/FUSE transport. The
+adapter validates command, input/output windows, requested slots and returned
+cardinality; the engine retains ownership of accounting and admission. The
+standard command remains a count query. `scripts/ffs_space_info.py` is a public
+consumer with bounded count/requery logic, an explicit native-kernel mode and
+no partial-success JSON. This is a transport extension, not native tool/ABI
+parity; current `OpenFs` accounting requires writable btrfs (`bd-k3hon`).
+Native-mode consumption rechecks the count after each array query because
+the kernel's nonzero query reports records copied. Kernel global reserve is
+transient runtime accounting, distinct from the on-disk block-group records
+reported by the current FrankenFS allocator.
+
 > **Status:** vendored `fuser` is a patched dependency, excluded from first-party workspace lint enforcement. `ffs-fuse` implements `fuser::Filesystem`; mounts reach ext4 and btrfs paths, including a wired per-core dispatcher. Default mount is read-only; read-write behavior remains experimental, and complete V1 acceptance requires execution evidence beyond this architecture map.
 
 ---

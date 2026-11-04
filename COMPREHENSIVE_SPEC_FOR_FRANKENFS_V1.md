@@ -4656,6 +4656,22 @@ barrier. A read-only mount performs no backing writes and can acknowledge the
 empty boundary. This does not imply power-loss atomicity for native FAT or wait
 for RaptorQ re-encoding. Work item: `bd-yek6e`.
 
+**Mounted btrfs space accounting:** A Linux/FUSE SPACE_INFO extension MAY encode
+the complete 16-byte header plus 24-byte records in the command size field.
+It MUST bound the array to that field, reject requested slots beyond the
+advertised window, preserve total cardinality on partial queries and reject
+short or oversized backend replies. The standard 16-byte command MUST retain
+its count query and MUST NOT acknowledge a nonzero-slot request with a
+count-only response. The public consumer MUST cap allocations and requery
+attempts and emit success only after collecting the complete array. Existing
+backend admission remains explicit: current `OpenFs` accounting requires a
+writable btrfs mount. This extension does not complete native btrfs ioctl/tool
+compatibility or read-only accounting. The consumer's native-kernel mode MUST
+recheck cardinality after nonzero queries; it MUST preserve the kernel's
+additional transient global-reserve record rather than remove it to claim
+native parity. The current sized encoding is defined for Linux x86_64.
+Work item: `bd-k3hon`.
+
 ### 13.3 fallocate
 
 **mode=0 (default):** Allocate and zero blocks for `[offset, offset+length)`.

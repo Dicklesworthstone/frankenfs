@@ -70,6 +70,25 @@ durability boundaries there. This is daemon-crash evidence, not hardware
 power-loss qualification; FAT retains ordered publication rather than atomic
 multi-operation transactions. See [current qualification](FEATURE_PARITY.md).
 
+For block-group space accounting on an experimental writable btrfs mount:
+
+```bash
+python3 scripts/ffs_space_info.py /mnt/ffs
+# For comparison with a native kernel btrfs mount:
+python3 scripts/ffs_space_info.py --kernel-btrfs /mnt/native-btrfs
+```
+
+The consumer uses Python's standard library on Linux x86_64 and returns the complete array of
+profile flags, allocated bytes and used bytes as JSON. FrankenFS uses an
+explicit Linux/FUSE sized-command extension; the standard 16-byte SPACE_INFO
+command supports only the zero-slot count query through this transport.
+Nonzero legacy requests return EOVERFLOW. This does not make native
+`btrfs filesystem df` support FUSE. The current engine's accounting requires
+a writable mount; the queries themselves do not request filesystem mutation.
+The native kernel also reports a transient global-reserve row, which the
+FrankenFS allocator does not currently expose. Native ioctl output is therefore
+not identical to the block-group array.
+
 The companion engines are reusable libraries: `ffs-fat`, `ffs-ntfs` and
 `ffs-zfs`. Their binaries and the protected mount import the same implementation.
 The `ffs` facade provides `open_read_only(cx, path, options)` for all six formats,

@@ -1925,6 +1925,33 @@ const BTRFS_SUPPORTED_FEATURE_FLAGS_SIZE: u32 = 72;
 /// Input: 16-byte header with space_slots count. Output: header + space_info array.
 const BTRFS_IOC_SPACE_INFO: u32 = 0xC010_9414;
 const BTRFS_SPACE_ARGS_HEADER_SIZE: u32 = 16;
+const BTRFS_SPACE_INFO_RECORD_SIZE: u32 = 24;
+const LINUX_IOCTL_SIZE_MASK: u32 = 0x3FFF_0000;
+
+/// Largest complete space-info array that fits Linux's 14-bit ioctl size field.
+pub const FUSE_BTRFS_SPACE_INFO_MAX_SLOTS: u32 =
+    ((LINUX_IOCTL_SIZE_MASK >> 16) - BTRFS_SPACE_ARGS_HEADER_SIZE) / BTRFS_SPACE_INFO_RECORD_SIZE;
+
+/// Encode a bounded SPACE_INFO query for Linux x86_64's restricted FUSE transport.
+///
+/// The payload is the native 16-byte btrfs header followed by `space_slots`
+/// 24-byte records. Unlike the native kernel btrfs ioctl, this FUSE extension
+/// encodes the complete buffer size in the command, so Linux can copy all the
+/// records without an unrestricted ioctl retry. Zero slots yields the standard
+/// count-query command. Returns `None` if the array cannot fit the size field.
+/// This is an explicit x86_64 command encoding, not ioctl-layout negotiation
+/// for architectures with a different size field.
+/// Current `OpenFs` accounting requires a writable btrfs mount; this encoder
+/// neither enables writes nor changes that backend admission rule.
+#[must_use]
+pub const fn btrfs_space_info_ioctl_command(space_slots: u32) -> Option<u32> {
+    if space_slots > FUSE_BTRFS_SPACE_INFO_MAX_SLOTS {
+        return None;
+    }
+    let bytes = BTRFS_SPACE_ARGS_HEADER_SIZE + space_slots * BTRFS_SPACE_INFO_RECORD_SIZE;
+    Some((BTRFS_IOC_SPACE_INFO & !LINUX_IOCTL_SIZE_MASK) | (bytes << 16))
+}
+
 /// `BTRFS_IOC_INO_PATHS` = `_IOWR(0x94, 35, struct btrfs_ioctl_ino_path_args)`.
 /// Given an inode number, returns all file paths that reference it.
 const BTRFS_IOC_INO_PATHS: u32 = 0xC038_9423;
@@ -14557,6 +14584,7 @@ mod tests {
         GetFsLabel,
         SetFsLabel(Vec<u8>),
         GetBtrfsFsInfo,
+        GetBtrfsSpaceInfo(u64),
         BtrfsStartTransaction,
         BtrfsEndTransaction,
         BtrfsStartSync,
@@ -15726,6 +15754,37 @@ mod tests {
                 return Err(FfsError::Io(std::io::Error::from_raw_os_error(errno)));
             }
             Ok(())
+        }
+
+        fn get_btrfs_space_info(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            slots: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.calls
+                .lock()
+                .expect("lock ioctl calls")
+                .push(IoctlCall::GetBtrfsSpaceInfo(slots));
+            if let Some(errno) = self.commit_errno {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(errno)));
+            }
+            let mut data = Vec::new();
+            data.extend_from_slice(&0_u64.to_le_bytes());
+            data.extend_from_slice(&3_u64.to_le_bytes());
+            for (flags, total, used) in [
+                (1_u64, 4096_u64, 1024_u64),
+                (2, 8192, 2048),
+                (4, 16384, 4096),
+            ]
+            .into_iter()
+            .take(usize::try_from(slots).unwrap_or(usize::MAX))
+            {
+                for value in [flags, total, used] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            Ok(data)
         }
 
         fn commit_request_scope(
@@ -18478,6 +18537,170 @@ mod tests {
         let response = dispatch_ioctl_for_testing(&fuse, 1, 0, BTRFS_IOC_SET_FEATURES, &input, 0);
         assert_eq!(response, IoctlResult::Error(libc::EROFS));
         assert!(calls.lock().expect("lock ioctl calls").is_empty());
+    }
+
+    #[test]
+    fn dispatch_ioctl_space_info_legacy_count_and_nonzero_slots_respect_transport() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fuse = FrankenFuse::new(Box::new(IoctlRecordingFs::new(0, Arc::clone(&calls))));
+        let mut input = vec![0_u8; 16];
+        let response = dispatch_ioctl_for_testing(&fuse, 1, 0, BTRFS_IOC_SPACE_INFO, &input, 16);
+        let mut expected = vec![0_u8; 16];
+        expected[8..16].copy_from_slice(&3_u64.to_le_bytes());
+        assert_eq!(response, IoctlResult::Data(expected));
+        calls.lock().unwrap().clear();
+        input[..8].copy_from_slice(&8_u64.to_le_bytes());
+        assert_eq!(
+            dispatch_ioctl_for_testing(&fuse, 1, 0, BTRFS_IOC_SPACE_INFO, &input, 16),
+            IoctlResult::Error(libc::EOVERFLOW),
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "reject before reading the backend"
+        );
+    }
+
+    #[test]
+    fn dispatch_ioctl_space_info_sized_query_returns_real_records() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fuse = FrankenFuse::new(Box::new(IoctlRecordingFs::new(0, Arc::clone(&calls))));
+        let mut input = vec![0_u8; 208];
+        input[..8].copy_from_slice(&8_u64.to_le_bytes());
+        let response = dispatch_ioctl_for_testing(&fuse, 1, 0, 0xC0D0_9414, &input, 208);
+        let IoctlResult::Data(data) = response else {
+            panic!("sized query must return records: {response:?}");
+        };
+        assert_eq!(data.len(), 16 + 3 * 24);
+        assert_eq!(&data[8..16], &3_u64.to_le_bytes());
+        assert_eq!(
+            &data[16..40],
+            &[1_u64, 4096, 1024]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &data[64..88],
+            &[4_u64, 16384, 4096]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                IoctlCall::Begin(RequestOp::IoctlRead),
+                IoctlCall::GetBtrfsSpaceInfo(8),
+                IoctlCall::End(RequestOp::IoctlRead),
+            ]
+        );
+    }
+
+    #[test]
+    fn space_info_command_builder_is_bounded_and_keeps_the_count_abi() {
+        assert_eq!(
+            btrfs_space_info_ioctl_command(0),
+            Some(BTRFS_IOC_SPACE_INFO)
+        );
+        assert_eq!(btrfs_space_info_ioctl_command(1), Some(0xC028_9414));
+        assert_eq!(btrfs_space_info_ioctl_command(8), Some(0xC0D0_9414));
+        assert_eq!(FUSE_BTRFS_SPACE_INFO_MAX_SLOTS, 681);
+        assert_eq!(btrfs_space_info_ioctl_command(681), Some(0xFFE8_9414));
+        for count in [682, u32::MAX] {
+            assert_eq!(btrfs_space_info_ioctl_command(count), None);
+        }
+    }
+
+    #[test]
+    fn dispatch_ioctl_space_info_rejects_invalid_windows_before_backend_io() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fuse = FrankenFuse::new(Box::new(IoctlRecordingFs::new(0, Arc::clone(&calls))));
+        for (cmd, size, out_size, slots, errno) in [
+            (BTRFS_IOC_SPACE_INFO, 15, 16, 0, libc::EINVAL),
+            (BTRFS_IOC_SPACE_INFO, 16, 15, 0, libc::EINVAL),
+            (BTRFS_IOC_SPACE_INFO, 208, 208, 1, libc::EOVERFLOW),
+            (0xC011_9414, 17, 17, 0, libc::EINVAL),
+            (0xC0D0_9414, 207, 208, 8, libc::EINVAL),
+            (0xC0D0_9414, 208, 207, 8, libc::EINVAL),
+            (0xC0D0_9414, 208, 208, 9, libc::EOVERFLOW),
+            (0xC0D0_9414, 208, 208, u64::MAX, libc::EOVERFLOW),
+            (0x80D0_9414, 208, 208, 8, libc::ENOTTY),
+        ] {
+            let mut input = vec![0_u8; size];
+            input[..8].copy_from_slice(&slots.to_le_bytes());
+            assert_eq!(
+                dispatch_ioctl_for_testing(&fuse, 1, 0, cmd, &input, out_size),
+                IoctlResult::Error(errno)
+            );
+            assert!(calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn dispatch_ioctl_space_info_partial_arrays_and_backend_errors_are_explicit() {
+        for errno in [None, Some(libc::EIO), Some(libc::EOPNOTSUPP)] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = IoctlRecordingFs::new(0, Arc::clone(&calls));
+            backend.commit_errno = errno;
+            let fuse = FrankenFuse::new(Box::new(backend));
+            let mut input = vec![0_u8; 40];
+            input[..8].copy_from_slice(&1_u64.to_le_bytes());
+            let response = dispatch_ioctl_for_testing(&fuse, 1, 0, 0xC028_9414, &input, 40);
+            if let Some(errno) = errno {
+                assert_eq!(response, IoctlResult::Error(errno));
+            } else {
+                let IoctlResult::Data(data) = response else {
+                    panic!("expected partial array")
+                };
+                assert_eq!(data.len(), 40);
+                assert_eq!(
+                    &data[8..16],
+                    &3_u64.to_le_bytes(),
+                    "total count must not be truncated"
+                );
+            }
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                &[
+                    IoctlCall::Begin(RequestOp::IoctlRead),
+                    IoctlCall::GetBtrfsSpaceInfo(1),
+                    IoctlCall::End(RequestOp::IoctlRead),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn space_info_response_never_accepts_a_short_or_oversized_array() {
+        for (length, slots, total, window) in [
+            (15, 0, 0, 16),
+            (17, 0, 0, 16),
+            (16, 1, 1, 40),
+            (39, 1, 1, 40),
+            (41, 1, 1, 64),
+            (40, 0, 1, 40),
+            (40, 2, 2, 64),
+            (40, u64::MAX, u64::MAX, 64),
+        ] {
+            let mut data = vec![0_u8; length];
+            if length >= 16 {
+                data[8..16].copy_from_slice(&total.to_le_bytes());
+            }
+            assert_eq!(
+                FrankenFuse::checked_space_info_response(data, slots, window),
+                IoctlResult::Error(libc::EIO)
+            );
+        }
+        let mut header = vec![0_u8; 16];
+        header[8..16].copy_from_slice(&3_u64.to_le_bytes());
+        assert_eq!(
+            FrankenFuse::checked_space_info_response(header.clone(), 0, 16),
+            IoctlResult::Data(header)
+        );
+        assert_eq!(
+            FrankenFuse::checked_space_info_response(vec![0; 16], 8, 208),
+            IoctlResult::Data(vec![0; 16])
+        );
     }
 
     #[test]

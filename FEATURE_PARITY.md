@@ -1,5 +1,16 @@
 # FEATURE_PARITY
 
+> **Mounted btrfs space accounting in progress (bd-k3hon, 2026-11-04):**
+> The existing allocator records are connected through an explicitly sized
+> Linux/FUSE SPACE_INFO command and the public `scripts/ffs_space_info.py`
+> consumer. Standard zero-slot count queries remain; nonzero legacy queries
+> fail explicitly instead of sending oversized replies. Current backend
+> admission requires a writable btrfs mount. Native btrfs tool/ABI compatibility
+> and read-only accounting remain separate gaps; in particular, the native
+> kernel's transient global-reserve row is not an allocator block group.
+> The consumer is currently limited to Linux x86_64. Unit/native execution is
+> pending; no parity percentage or mounted completion credit is added here.
+
 > **Filesystem-wide sync wiring (bd-yek6e, 2026-11-04):**
 > Linux FUSE_SYNCFS now dispatches to the existing ext4 journal checkpoint,
 > btrfs full transaction commit and FAT backing-volume sync. Read-only mounts
