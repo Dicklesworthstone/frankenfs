@@ -734,6 +734,11 @@ pub trait RepairManager: Send + Sync {
 | `MountOption` | Mount configuration (read-only, allow_other, auto_unmount) |
 | `Session` | FUSE session lifecycle management |
 
+The INIT decoder borrows the 16-byte protocol prefix and, when `FUSE_INIT_EXT`
+is advertised, its 48-byte extension. Compiling a newer maximum ABI does not
+change the minimum incoming prefix length. Missing advertised extension bytes
+fail; unadvertised tail bytes do not supply capabilities (`bd-6q10i`).
+
 Linux filesystem-wide synchronization uses the transport's `FUSE_SYNCFS`
 request and `Filesystem::syncfs` callback, then `FrankenFuse`'s explicit context
 and `FsOps::sync_fs`. The native engine owns the full-volume commit/flush;

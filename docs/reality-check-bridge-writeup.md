@@ -1,5 +1,115 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Implementation follow-through — 2026-11-04
+
+The new wiring connects Linux filesystem-wide sync to
+the existing native durability engines. `FUSE_SYNCFS` reaches ext4 checkpoint,
+btrfs full transaction publication and FAT volume sync through an explicitly
+validated `--fuseblk-device` mount. The caller supplies and retains a whole-image
+loop mapping; both CLI frontends validate its backing identity and bounds and
+retain the device through mount teardown. Unsupported writable backends return
+an error; RO sync does no backing I/O. Implementation: `bd-yek6e`, source
+`1c9a990ef`, followed by the INIT decoder and default-build corrections through
+`919150045`. The final Linux profile is qualified below.
+
+The initial kernel premise was wrong: ordinary Linux FUSE does not deliver
+SYNCFS. An actual ext4 mount returned success from sync-f, then lost the payload
+after daemon SIGKILL. That failure is retained. Linux6.19/7.0 enable the request
+only for fuseblk; the new explicit transport supplies that prerequisite. Ordinary
+mounts retain their per-file durability boundaries and the documented global-sync
+limitation. No kernel ABI, engine promise or project goal was reduced to hide it.
+
+Initial execution on `1c9a990ef`, repeated on final `919150045`, passed all six
+live crash cells: synced ext4, btrfs,
+FAT16 and FAT32 survive SIGKILL, native checking, native kernel reads and fresh
+RO FUSE reads; omitted-sync ext4/btrfs controls lose the payload. All four synced
+formats record an actual SYNCFS request, and RO remounts preserve image hashes.
+FAT mutations already flush, so persistence alone would not establish its request
+dispatch or necessity. Five CLI validator/parser unit tests also pass. These
+overlapping scopes are not a whole-workspace test result.
+
+Receipts under `artifacts/implementation/20261104_syncfs_XZfkFQ/`:
+
+| Scope | Source | Observed result and receipt |
+|---|---|---|
+| CLI units and six required-FUSE crash cells | `919150045` | 5 unit tests and all 6 live cells pass, exit 0/325636 ms; `final-cli-native-warm.log`, with request/native-tool logs in `native-919150045-vlGlpl/` |
+| Full FAT/FUSE libraries | `92fc5b916` | 543/724 pass, zero failures, one existing FUSE ignore; `final-committed-components.log` supersedes the earlier overlay receipt |
+| Full ordinary harness, default parallelism | `92fc5b916` | Exit 0, all targets and doctest complete; library 2,080 pass, native target 291 successful functions/8 existing ignores; `gate-fixed-full-harness.log` |
+| Full vendor ABI 7.42/default configurations | `919150045` | 106/99 unit tests pass respectively, plus each integration target; zero failures/ignores; `final-vendor-abi.log`, `final-vendor-default.log` |
+| Workspace/all-target check and strict Clippy | `919150045` | Both exit 0; `final-workspace-check.log`, `final-workspace-clippy.log`; workspace and edited-vendor formatting pass |
+| Full harness benchmark command | `1c9a990ef` | Exit 0, 60 measured cases; `committed-harness-bench.log`. Maintenance qualification, no incumbent speed win |
+| Refreshed affected harness, library and mounted target | `919150045` | 2,080 library tests/1 existing ignore and 291 successful native-target functions/8 existing ignores, zero failures; `final-affected-harness-privileged.log` |
+
+The ordinary harness logs optional CLI-artifact prerequisite skips and kernel
+capability skips. Its successful function count is not 291 separately qualified
+mounted capabilities. The separate six-cell CLI command requires FUSE and
+actually executes every named positive and omitted-sync control. The first cold
+final-source CLI invocation hit the unchanged 1,800-second deadline after its
+five units and one omission control; `final-cli-native.log` remains a failed
+exit-137 receipt. The identical command/profile/deadline then passed with warm
+compiled artifacts. These overlapping results are never added together.
+
+Final executing ELF SHA-256 values are
+`b13c76f0a3e090527a81d20cc0d632aef8c845ba83e7cb8e8d8d668aff621876`
+(main) and `73aac00e2d731939c7aba7579a179e966d808c7cf926260df84bfc6a2ed9828f`
+(FAT). `final-native-wire-events.log` contains all four actual SYNCFS arrivals;
+per-cell native checks, mount types and hashes remain alongside the command log.
+
+Broader harness execution
+on `1c9a990ef` passes 2,080 library tests but stops at two native fixture failures:
+a concurrent global sync can erase a btrfs crash log, and independently copying a
+changing ext4 image gives recovery modes different unsynced file bytes. Both
+original cases pass unchanged in an isolated two-case diagnostic. That supports
+the fixture diagnosis without proving it is the only possible cause.
+
+Separate gate owner GoldenCliff corrected those inputs in `92fc5b916`; AmberPine
+independently reviewed the actual diff. The correction captures once, clones and
+hashes identical inputs before replay, and scopes two global syncs to their own
+mounts. Existing live-log, bytes/nlink, fsck, read-only, interrupted-recovery and
+idempotence assertions remain. No timeout, retry, filter, ignore or golden changed.
+Win: identical oracle inputs and no unrelated commit. Loss: incidental global
+commits and comparisons of three live-image instants. The original full harness
+then passed with default parallel selection, including both named failures and
+identical 64 MiB inputs, before `bd-1hbtg` closed on its cited evidence.
+
+The full vendor ABI run also exposed an inherited positive fixture passing
+`0xcc`, which includes PASSTHROUGH without a backing ID. Its abort reproduces
+on pre-feature `54b2a6db5`. Separate owner GoldenCliff changed only the positive
+input and matching flag bytes to valid literal `0x03`; AmberPine reviewed the
+actual diff. The production guard remains. Win: valid exact flag serialization;
+loss: the positive no longer requests an invalid flag pattern, which the guard
+still rejects (`bd-i2f6g`). The next full run found a real decoder defect:
+valid 16-byte INIT requests failed under an ABI 7.42 build. `bd-6q10i` keeps
+that original regression unchanged and reads a safe 16-byte prefix plus the
+48-byte extension only when advertised. High flags survive; all truncated base
+and advertised-extension lengths reject. Default compilation then exposed a
+missing READDIRPLUS feature guard in a production counter match; the corrected
+guard preserves every slot and test. Both full feature configurations now pass.
+Raw protocol tests establish decoding, not an actual old-kernel mount; the
+macOS bit-30 overlap is outside this Linux qualification.
+
+UBS scanning was missed before the first fixture commit, then
+executed before publication: exit1, nine critical flags, 9,850 warnings and 2,497
+info. Independent source/caller review confirms no introduced production defect
+among those nine flags: test-only panic, inherited valid musl zero initialization,
+a create-new fixture filename, and fixed/current/Cargo-provided executables.
+The raw scan remains nonzero; its warnings are not cleared by that bounded review.
+No suppression or scanner change was made. The timing lapse is retained in the
+honesty inventory.
+
+Exact commands, source/ELF/tool identities, failures and per-cell logs are under
+`artifacts/implementation/20261104_syncfs_XZfkFQ/`; the granular checklist is in
+`.beads/pending_tasks.md`. Independent review is source review; the parent ran
+the live and compiler checks. No hardware-power-loss or field claim follows.
+All compilation used strict RCH. Queue/setup refusals, cache admission failures
+and the cancelled incorrect namespace launcher remain retained; none is test
+credit. Temporary scratch limits on workers 122 and 114 were restored to their
+original 36 GiB after execution, with their flags and files preserved.
+
+The major gaps identified in the assessment below remain: native NTFS/ZFS
+writable lifecycle, default automatic repair, runtime ownership and full release
+qualification. The feature and its fixture correction do not close those goals.
+
 ## Reality check — 2026-11-03 (`d96778ec1`)
 
 **Verdict: FrankenFS has substantial native filesystem functionality and has

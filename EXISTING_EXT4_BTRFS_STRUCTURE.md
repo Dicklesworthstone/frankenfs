@@ -2797,6 +2797,11 @@ For metadata blocks, verification includes:
     boundary rather than a default success response, a pressure-admission
     shortcut, or per-file tree logging. See the
     [`BTRFS_IOC_SYNC` dispatch](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/ioctl.c#L4952-L4963).
+    INIT protocol7.36 adds an extension selected by `FUSE_INIT_EXT` in
+    [the kernel ABI](https://github.com/torvalds/linux/blob/v6.19/include/uapi/linux/fuse.h).
+    The previous 16-byte prefix remains a valid request shape. A daemon's
+    compiled maximum ABI does not require every peer to send the extension;
+    advertised extension bytes must be present, and only then supply flags2.
     Ordinary FUSE `syncfs(2)` delivery is a separate kernel interface; wiring
     this ioctl does not establish that delivery.
     Linux v6.19's [`fuse_sync_fs`](https://github.com/torvalds/linux/blob/v6.19/fs/fuse/inode.c#L687-L724)

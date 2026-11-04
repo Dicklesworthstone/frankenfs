@@ -4635,6 +4635,11 @@ committed dirty blocks to device. Does NOT wait for RaptorQ re-encoding.
 compound transaction contains dirty blocks for this file (matches kernel
 ext4 behavior).
 
+**INIT wire lengths:** Request decoding MUST accept the 16-byte INIT prefix
+independently of the maximum compiled ABI. `FUSE_INIT_EXT` selects the additional
+48 bytes; an advertised but truncated extension MUST fail. Unadvertised tail
+bytes MUST NOT grant high-word capabilities (`bd-6q10i`).
+
 **Filesystem-wide synchronization:** Linux `syncfs(2)` / `sync -f` MUST reach
 the backend's full-volume durability boundary through `FUSE_SYNCFS` (protocol
 7.34 and later), rather than being acknowledged as an unsupported operation.

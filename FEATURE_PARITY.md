@@ -4,13 +4,16 @@
 > Linux FUSE_SYNCFS now dispatches to the existing ext4 journal checkpoint,
 > btrfs full transaction commit and FAT backing-volume sync. Read-only mounts
 > acknowledge without backing I/O; unsupported writable backends return an
-> error. The raw protocol regression fails on the old transport with
-> UnknownOperation(50), then the complete dispatch selection passes12/12;
-> the FUSE library passes724/0failed/1existing ignore and FAT passes543/0failed
-> on the block-transport implementation. Workspace/all-target check and strict
-> Clippy pass. The broader harness records2076 passes/4failures/1existingignore:
-> its source-identity gates reject the uncommitted overlay marker. A rerun from
-> the committed implementation is pending; no gate is relaxed. The actual
+> error. The old transport fails with UnknownOperation(50). Committed
+> `92fc5b916` passes the full FAT/FUSE libraries (543/724 tests, zero failures,
+> one existing FUSE ignore) and the full ordinary harness, all targets and
+> doctest. The latter includes 2,080 library tests and 291 successful native
+> test functions/8 existing ignores; optional CLI-artifact and kernel-capability
+> skips are not mounted qualification. Two prior parallel fixture failures pass
+> after separately owned/reviewed same-input capture and scoped-sync corrections;
+> original data, fsck, replay and idempotence assertions remain unchanged.
+> Workspace/all-target check, strict Clippy and fmt pass on `919150045`.
+> Earlier failures remain retained. The actual
 > ordinary-mount ext4 probe FAILS: sync-f returns0, but after SIGKILL a clean
 > native kernel mount finds no payload. INIT7.42 produces no SYNCFS request.
 > Linux6.19/7.0 enable that request only for fuseblk. Explicit validated loop
@@ -18,12 +21,25 @@
 > survive SIGKILL, native checkers, native kernel reads and fresh FUSE reads;
 > omitted-sync ext4/btrfs controls expose the missing boundary. Four read-only
 > block remounts leave image hashes unchanged. Retained execution is
-> `artifacts/implementation/20261104_syncfs_XZfkFQ/block-native-ram-final.log`,
-> base07905734a plus overlaycb81112f36e0b08eff61fcf199ea165312c36cace1300de504c73d8cacc2896b.
-> A follow-up run is adding explicit FAT request-log verification; FAT mutations
-> already flush, so persistence alone is not proof of its SYNCFS dispatch. The full
-> vendored ABI7.42 suite aborts in its unchanged reply_create test; it is not
-> counted as green. No parity percentage or general crash-atomicity claim changes.
+> `artifacts/implementation/20261104_syncfs_XZfkFQ/final-cli-native-warm.log`,
+> source `919150045`, repeating the earlier `1c9a990ef` proof. All four synced
+> formats record actual SYNCFS requests; the same
+> command also passes 5 CLI validator/parser tests. FAT mutations already flush,
+> so persistence alone would not prove its dispatch or necessity. The complete
+> harness benchmark command passes with 60 measured cases; no incumbent win is
+> claimed. The inherited create-reply fixture abort reproduces on the old source;
+> a valid positive flag pattern now preserves the production passthrough guard.
+> Full testing also found and fixed rejection of valid short INIT payloads and
+> an unguarded optional opcode in default compilation. Final-source full vendor
+> ABI7.42/default runs pass 106/99 unit tests respectively plus each integration
+> target. Fresh final-source CLI execution passes all six cells and five units;
+> affected harness execution passes 2,080 library tests and 291 native-target
+> functions with the existing ignores/skips retained. Its first cold CLI attempt
+> timed out137; the identical warm command passes, with no deadline change.
+> Raw legacy INIT proof is not an old-kernel live mount claim.
+> UBS's full-file scan remains nonzero; its bounded critical-site review and
+> warnings are disclosed in the bridge report. No parity percentage, general
+> crash-atomicity, hardware-power-loss or whole-project readiness claim changes.
 
 > **Native shared EOF shrink repaired (bd-wcbvk, 2026-11-03):** coree9568c3c
 > retains the aligned partial EOF mapping and sanitizes newly exposed gaps

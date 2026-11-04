@@ -51,7 +51,8 @@ per-format profiles define the actual admission rules.
 | **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection, physical allocation checking and FUSE | The exact read profile controls admission. Restricted volatile `$LogFile` recovery exists; neither recovery nor allocation checking grants native write authority or a general Windows consistency claim. General NTFS mutation remains unfinished. |
 | **ZFS** | `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction and volatile ZIL recovery | Read-only root selection is not native writable pool ownership. Missing-member extraction is committed-view-only and forbids ZIL replay. Native allocation/TXG writing remains unfinished. |
 
-On Linux, `--fuseblk-device PATH` enables filesystem-wide `sync -f` through the
+On Linux kernels supporting FUSE_SYNCFS (protocol 7.34+), `--fuseblk-device PATH`
+enables filesystem-wide `sync -f` through the
 existing ext4 checkpoint, btrfs transaction commit or FAT backing-volume sync.
 The caller must supply an already attached loop device mapping the entire
 image at offset zero with no size limit, and keep that association and both

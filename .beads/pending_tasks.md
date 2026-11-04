@@ -2,6 +2,140 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-04, Linux filesystem-wide sync
+
+Owner IvoryGate; completed implementation `bd-yek6e`, protocol fix `bd-6q10i`
+and separately owned fixture corrections `bd-1hbtg`/`bd-i2f6g`. Each closed on
+the cited execution and independent source/evidence review. This list is
+the implementation follow-through from the requested reality check; it does
+not supersede the native EOF owner's tasks below or close the project roadmap.
+
+- [x] Read the suite/project instructions and README fully; apply the requested
+  reality-check and anti-ceremony skills. Refresh the existing assessment and
+  connect missing critical-path dependencies (`bd-k3ixn`, `54b2a6db5`).
+- [x] Find an existing engine boundary with no Linux request path: ext4 full
+  checkpoint, btrfs transaction publication, and FAT volume sync.
+- [x] Execute the old transport regression: opcode50 is UnknownOperation.
+- [x] Implement protocol7.34/SYNCFS parsing, exclusive dispatch, explicit
+  context/scope, error/cancellation propagation, RO no-I/O, and an honest
+  unsupported writable default. Wire FAT to its existing flush/failure fence.
+- [x] Test the initial premise on a real mount. Ordinary Linux FUSE returns
+  success from sync-f without delivering SYNCFS and loses the ext4 payload
+  after daemon SIGKILL. Retain and disclose this failed premise.
+- [x] Add explicit pure-transport fuseblk mounting and a shared borrowed-loop
+  validator; wire both main and FAT frontends, holding the validated device
+  through mount and drain. Preserve caller ownership and loop configuration.
+- [x] Cover wrong-image, nonzero-offset and bounded-loop rejection with actual
+  borrowed devices and unchanged image hashes. Do not detach caller devices.
+- [x] Execute full affected FAT/FUSE libraries:543/724 passes respectively,
+  zero failures; FUSE retains one existing ignore. These counts overlap earlier
+  selections and are not a whole-workspace result.
+- [x] Execute five shared-validator/parser unit tests from committed1c9a990ef.
+- [x] Execute all six live cells from that commit: synced ext4/btrfs/FAT16/FAT32
+  and omitted-sync ext4/btrfs. Require actual fuseblk mount type and a real
+  SYNCFS request for each synced format, native checker, native kernel read,
+  fresh RO FUSE read and unchanged image SHA. FAT mutations already flush;
+  its persistence alone does not establish request arrival or necessity.
+- [x] Execute workspace/all-target check, strict Clippy and fmt for production
+  source later committed as1c9a990ef; preserve earlier failures.
+- [x] Execute the committed harness. Source-identity tests pass; native target
+  records289passes/2failures/8existing ignores. Later targets did not run.
+- [x] Diagnose both native failures unchanged and alone:2passes on1c9a990ef,
+  not a full-gate pass. Global sync can commit another test's tree log; three
+  copies of a changing mounted image can have different unsynced file bytes.
+- [x] Assign fixture correction to GoldenCliff in its own gate lane; have
+  AmberPine independently inspect the actual diff and retained assertions.
+- [x] Commit92fc5b916: scope the two global syncs, take one ext4 capture, clone
+  it for all recovery modes, assert streaming BLAKE3 and length equality before
+  replay. No retries, deadlines, filters, ignores, goldens or recovery checks
+  change. Win: same oracle inputs, no cross-test commit. Loss: incidental
+  global commits and comparisons between three live-image instants removed.
+- [x] Complete the original full harness on92fc5b916 with default parallelism
+  and no filter:exit0/1654161ms,2,080library tests,291successful native-target
+  test functions/8existing ignores, all later targets and doctest. Optional CLI
+  artifact and kernel-capability skips remain explicit, not mounted proof.
+  Close only the separately qualified fixture beadbd-1hbtg.
+- [x] Execute the full harness benchmark command on1c9a990ef: exit0,60measured
+  cases. This is maintenance qualification, not an incumbent performance win.
+- [x] Execute the committed vendor dispatch/transport selection:15passes on
+ 92fc5b916. The full ABI7.42 suite's reply_create abort also reproduces on
+  original54b2a6db5; it is not a new transport regression or a green suite.
+- [x] Resolve that stale create-reply positive fixture in separate gate lane
+  `bd-i2f6g`, retain the passthrough guard, obtain independent review and execute
+  the full ABI7.42/default-feature vendor suites. This adds no filesystem credit.
+- [x] Independently review/commit980f40a9b: valid literal0x03flags and matching
+  byte expectations, unchanged passthrough guard. Full ABI run executes102pass/
+  1fail in the unchanged valid short INIT regression. It is a decoder bug, not
+  permission to expand the original fixture.
+- [x] Track/implementbd-6q10i in5899dc26e: safe16-byte prefix plus48-byte
+  extension only when advertised, preserve high capabilities, reject every
+  truncated base/advertised extension. Original init fixture remains unchanged.
+- [x] Obtain AmberPine's independent actual-diff review and targeted precommit
+  UBS0critical/115warnings/24info; no runtime/macOS/old-kernel-live claim from it.
+- [x] Execute full ABI/default vendor suites on final919150045:106/99unit
+  tests respectively plus each integration target pass, zero failures/ignores.
+  Default compilation first exposed a production READDIRPLUS arm missing its
+  matching feature guard; fix it without gating tests or changing slot indices.
+- [x] Refresh modern live mount/CLI, workspace check/strictClippy/fmt and
+  affected harness on919150045 after the production decoder change. CLI passes
+  5units plus all6live cells; harness2080library tests/1existing ignore plus
+  291native-target functions/8existing ignores. Optional internal skips remain
+  explicit, not native-capability credit. No full-workspace test claim.
+- [x] Repeat workspace/all-target check, strict Clippy and fmt on92fc5b916.
+- [x] Run UBS over all17changed Rust files and review its9critical findings
+  against actual source/callers with AmberPine. Raw exit1/9850warnings/2497info
+  remains retained, not a clean scan. No introduced production bug is confirmed
+  in the9critical sites; the warnings are not cleared by this bounded review.
+  The scan was missed before the fixture commit; disclose that timing lapse.
+- [x] Refresh the parity/report with final source, exact commands and results.
+- [x] Recheck the original acceptance and written honesty inventory against
+  final receipts; label peer source review and parent execution separately.
+- [x] Close each original bead only on its cited evidence; keep release,
+  native-writer, automatic-repair and runtime-ownership gaps open.
+- [x] Flush the tracker and verify cycles. Publish verified source919150045 to
+  main and its compatibility ref. Restore workers122/114to their original36GiB
+  scratch limits with flags/files preserved; no manual deletion or guard change.
+
+Final metadata publication and release of remaining documentation leases are
+post-commit session actions; their observed results are recorded in the final
+session response rather than a self-referential commit receipt.
+
+Evidence root: `artifacts/implementation/20261104_syncfs_XZfkFQ/`.
+`committed-cli-native-final.log` binds source1c9a990ef and executing ELF hashes
+362a0b8658492abbd213390e74dd66662549b18369e15ab76004355da9497139
+(main) and c4464f15f4776291a1aa7f546deae8b850c441dff34f5bcf0069fbb77ca8a0f1
+(FAT). Retained request/native-tool logs are in `native-1c9a990ef-oK1vvR/`;
+`committed-native-wire-events.log` lists all four actual SYNCFS arrivals.
+`committed-harness-final.log` preserves the two parallel fixture failures;
+`harness-failures-serial-diagnosis.log` is the unchanged two-case diagnosis.
+`committed-harness-bench.log` records the full benchmark execution.
+
+The final919source receipts supersede the initial live cut above:
+`final-cli-native-warm.log` executes5units/all6cells, exit0/325636ms;
+`final-affected-harness-privileged.log` executes2080/291successful functions;
+`final-vendor-abi.log`/`final-vendor-default.log` execute106/99units plus each
+integration target. `final-workspace-check.log`, `final-workspace-clippy.log`,
+`final-source-format.log` and `final-vendor-format.log` pass. Source tree is
+`5fe953b92b21ed50e2286d192a28a5af8a06d767`. Main ELF SHA256 is
+`b13c76f0a3e090527a81d20cc0d632aef8c845ba83e7cb8e8d8d668aff621876`;
+FAT is `73aac00e2d731939c7aba7579a179e966d808c7cf926260df84bfc6a2ed9828f`.
+`native-919150045-vlGlpl/` retains native checks/mountinfo/request logs;
+`final-native-wire-events.log` contains four real SYNCFS arrivals. The first
+cold final-source CLI run's exit137 after5units/onecontrol remains a failure;
+the identical command/profile/deadline passes warm, never counted as extra
+coverage. Alternate-harness queue103 and cancelled wrong-launcher143 have no
+test credit. The corrected launcher uses a privileged private mount namespace.
+
+Every compiler invocation uses strict RCH, a real committed source and existing
+resource admission. Test execution uses the ordinary first-party profile;
+asupersync alone uses opt3 with debug/overflow checks retained. A RAM-backed
+scratch filesystem on122was temporarily expanded36to48GiB without deleting
+files or changing guard thresholds. Failed admission stopped launches;
+bounded read-only cache reads recovered actual swap; later refused admissions
+still stopped launches. Both122and114are restored to36GiB after verification.
+No hardware-power-loss, universal native-writer, whole-workspace
+test, field-readiness or whole-project completion claim follows.
+
 ## Current execution — 2026-11-03, resume20 native EOF parity
 
 - [x] Resume the owned P0bd-wcbvk; preserve15untracked paths, original AC,
