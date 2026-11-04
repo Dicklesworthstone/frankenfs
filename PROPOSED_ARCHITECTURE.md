@@ -734,6 +734,14 @@ pub trait RepairManager: Send + Sync {
 | `MountOption` | Mount configuration (read-only, allow_other, auto_unmount) |
 | `Session` | FUSE session lifecycle management |
 
+Linux filesystem-wide synchronization uses the transport's `FUSE_SYNCFS`
+request and `Filesystem::syncfs` callback, then `FrankenFuse`'s explicit context
+and `FsOps::sync_fs`. The native engine owns the full-volume commit/flush;
+the transport does not invent a per-inode fsync or acknowledge an unimplemented
+writable backend. Read-only dispatch is a zero-write no-op. Protocol decoding,
+exclusive dispatch and error propagation belong in the existing vendored
+transport and FUSE adapter (`bd-yek6e`).
+
 > **Status:** vendored `fuser` is a patched dependency, excluded from first-party workspace lint enforcement. `ffs-fuse` implements `fuser::Filesystem`; mounts reach ext4 and btrfs paths, including a wired per-core dispatcher. Default mount is read-only; read-write behavior remains experimental, and complete V1 acceptance requires execution evidence beyond this architecture map.
 
 ---

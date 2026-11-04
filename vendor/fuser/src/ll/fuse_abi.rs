@@ -410,6 +410,9 @@ pub enum fuse_opcode {
     FUSE_LSEEK = 46,
     #[cfg(feature = "abi-7-28")]
     FUSE_COPY_FILE_RANGE = 47,
+    // Protocol 7.34; abi-7-36 is the first configured superset.
+    #[cfg(feature = "abi-7-36")]
+    FUSE_SYNCFS = 50,
     // FrankenFS: O_TMPFILE (protocol 7.37); gated with the newest ABI feature
     // this crate defines.
     #[cfg(feature = "abi-7-40")]
@@ -482,6 +485,8 @@ impl TryFrom<u32> for fuse_opcode {
             46 => Ok(fuse_opcode::FUSE_LSEEK),
             #[cfg(feature = "abi-7-28")]
             47 => Ok(fuse_opcode::FUSE_COPY_FILE_RANGE),
+            #[cfg(feature = "abi-7-36")]
+            50 => Ok(fuse_opcode::FUSE_SYNCFS),
             #[cfg(feature = "abi-7-40")]
             51 => Ok(fuse_opcode::FUSE_TMPFILE),
             #[cfg(feature = "abi-7-40")]
@@ -827,6 +832,13 @@ pub struct fuse_fsync_in {
     pub fh: u64,
     pub fsync_flags: u32,
     pub padding: u32,
+}
+
+#[cfg(feature = "abi-7-36")]
+#[repr(C)]
+#[derive(Debug, FromBytes, KnownLayout, Immutable)]
+pub struct fuse_syncfs_in {
+    pub padding: u64,
 }
 
 #[repr(C)]

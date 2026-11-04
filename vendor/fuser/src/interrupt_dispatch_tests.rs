@@ -38,9 +38,23 @@ struct DeferredFs {
     notifications: Arc<AtomicUsize>,
     reads: Arc<AtomicUsize>,
     writes: Arc<AtomicUsize>,
+    #[cfg(feature = "abi-7-36")]
+    syncs: Arc<AtomicUsize>,
+    #[cfg(feature = "abi-7-36")]
+    sync_errno: Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl Filesystem for DeferredFs {
+    #[cfg(feature = "abi-7-36")]
+    fn syncfs(&mut self, _request: &Request<'_>, reply: ReplyEmpty) {
+        assert!(crate::current_read_request_interrupt().is_none());
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        match self.sync_errno.load(Ordering::SeqCst) {
+            0 => reply.ok(),
+            error => reply.error(error),
+        }
+    }
+
     fn read(
         &mut self,
         request: &Request<'_>,
@@ -122,6 +136,43 @@ fn reply_header(bytes: &[u8]) -> (u64, i32) {
         u64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
         i32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
     )
+}
+
+#[cfg(feature = "abi-7-36")]
+#[test]
+fn syncfs_wire_request_requires_its_complete_payload() {
+    let (_, wire) = session();
+    let header_len = std::mem::size_of::<abi::fuse_in_header>();
+    let bytes = packet(50, 77, &[0; 8]);
+    let decoded = crate::ll::AnyRequest::try_from(&bytes[..header_len + 8]).unwrap();
+    assert_eq!(decoded.operation().expect("decode FUSE_SYNCFS").to_string(), "SYNCFS");
+    let sender: Arc<dyn ReplySender> = wire.clone();
+    let request = Request::new_with_sender(sender, &bytes[..header_len + 8]).unwrap();
+    assert!(!request.is_concurrency_safe());
+
+    for payload_len in 0..8 {
+        let truncated = packet(50, 78, &vec![0; payload_len]);
+        let request = crate::ll::AnyRequest::try_from(&truncated[..header_len + payload_len]).unwrap();
+        assert!(request.operation().is_err(), "payload length {payload_len}");
+    }
+}
+
+#[cfg(feature = "abi-7-36")]
+#[test]
+fn syncfs_wire_dispatch_preserves_backend_errors_and_kernel_credentials() {
+    for errno in [0, EIO, EINTR] {
+        let (mut session, wire) = session();
+        // Global sync can originate in a kernel worker without the mount UID.
+        session.allowed = SessionACL::Owner;
+        session.session_owner = 1000;
+        session.filesystem.sync_errno.store(errno, Ordering::SeqCst);
+        dispatch(&mut session, &wire, &packet(50, 77, &[0; 8])[..]);
+        assert_eq!(session.filesystem.syncs.load(Ordering::SeqCst), 1);
+        let replies = wire.replies.lock().unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].len(), 16);
+        assert_eq!(reply_header(&replies[0]), (77, -errno));
+    }
 }
 
 #[test]

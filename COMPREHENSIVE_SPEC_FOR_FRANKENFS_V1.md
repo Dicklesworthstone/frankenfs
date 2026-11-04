@@ -4635,6 +4635,17 @@ committed dirty blocks to device. Does NOT wait for RaptorQ re-encoding.
 compound transaction contains dirty blocks for this file (matches kernel
 ext4 behavior).
 
+**Filesystem-wide synchronization:** Linux `syncfs(2)` / `sync -f` MUST reach
+the backend's full-volume durability boundary through `FUSE_SYNCFS` (protocol
+7.34 and later), rather than being acknowledged as an unsupported operation.
+The boundary includes all prior completed writes: ext4 journal publication and
+checkpoint, btrfs full transaction publication even in an ephemeral/tree-log
+configuration, or the native ordered FAT volume flush. Return required write,
+flush and cancellation failures to the caller; do not acknowledge a failed
+barrier. A read-only mount performs no backing writes and can acknowledge the
+empty boundary. This does not imply power-loss atomicity for native FAT or wait
+for RaptorQ re-encoding. Work item: `bd-yek6e`.
+
 ### 13.3 fallocate
 
 **mode=0 (default):** Allocate and zero blocks for `[offset, offset+length)`.

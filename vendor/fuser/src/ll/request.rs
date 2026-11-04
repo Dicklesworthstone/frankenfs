@@ -861,6 +861,15 @@ mod op {
         }
     }
 
+    /// Synchronize all prior writes in the filesystem, not one file handle.
+    #[cfg(feature = "abi-7-36")]
+    #[derive(Debug)]
+    pub struct FSyncFs<'a> {
+        header: &'a fuse_in_header,
+    }
+    #[cfg(feature = "abi-7-36")]
+    impl_request!(FSyncFs<'a>);
+
     /// Set an extended attribute.
     #[derive(Debug)]
     pub struct SetXAttr<'a> {
@@ -1776,6 +1785,11 @@ mod op {
                 header,
                 arg: data.fetch()?,
             }),
+            #[cfg(feature = "abi-7-36")]
+            fuse_opcode::FUSE_SYNCFS => {
+                let _arg: &abi::fuse_syncfs_in = data.fetch()?;
+                Operation::FSyncFs(FSyncFs { header })
+            }
             fuse_opcode::FUSE_SETXATTR => Operation::SetXAttr(SetXAttr {
                 header,
                 arg: data.fetch()?,
@@ -1957,6 +1971,8 @@ pub enum Operation<'a> {
     StatFs(StatFs<'a>),
     Release(Release<'a>),
     FSync(FSync<'a>),
+    #[cfg(feature = "abi-7-36")]
+    FSyncFs(FSyncFs<'a>),
     SetXAttr(SetXAttr<'a>),
     GetXAttr(GetXAttr<'a>),
     ListXAttr(ListXAttr<'a>),
@@ -2065,6 +2081,8 @@ impl fmt::Display for Operation<'_> {
                 x.file_handle(),
                 x.fdatasync()
             ),
+            #[cfg(feature = "abi-7-36")]
+            Operation::FSyncFs(_) => write!(f, "SYNCFS"),
             Operation::SetXAttr(x) => {
                 write!(f, "SETXATTR size {}, flags {:#x}", x.size(), x.flags())
             }

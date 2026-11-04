@@ -628,6 +628,16 @@ pub trait Filesystem {
         reply.error(ENOSYS);
     }
 
+    /// Synchronize all prior writes and required filesystem metadata.
+    ///
+    /// Linux sends this for `syncfs(2)` starting with protocol 7.34. Returning
+    /// ENOSYS disables subsequent requests and is treated by Linux as success;
+    /// writable filesystems must implement their actual durability boundary.
+    #[cfg(feature = "abi-7-36")]
+    fn syncfs(&mut self, _req: &Request<'_>, reply: ReplyEmpty) {
+        reply.error(ENOSYS);
+    }
+
     /// Open a directory.
     /// Filesystem may store an arbitrary file handle (pointer, index, etc) in fh, and
     /// use this in other all other directory stream operations (readdir, releasedir,

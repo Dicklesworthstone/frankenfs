@@ -449,12 +449,44 @@ fn readonly_sync_and_flush_do_not_add_backing_io() {
     let cx = Cx::for_testing();
     let mut scope = RequestScope::empty();
     let before = device.counts();
+    fs.sync_fs(&cx, &mut RequestScope::empty()).unwrap();
     fs.fsync(&cx, &mut scope, ino, 0, false).unwrap();
     fs.fsyncdir(&cx, &mut scope, ROOT, 0, false).unwrap();
     fs.flush(&cx, &mut scope, ino, 0, 0).unwrap();
     fs.flush_on_destroy(&cx).unwrap();
     assert_eq!(device.counts(), before);
     assert_eq!(fs.health.epoch.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn filesystem_wide_sync_flushes_both_fat_dialects_and_preserves_failures() {
+    for kind in ["fat16", "fat32"] {
+        let (fs, device, ino) = fixture(kind, true);
+        let cx = Cx::for_testing();
+        let before = device.counts();
+        fs.sync_fs(&cx, &mut RequestScope::empty()).unwrap();
+        let after = device.counts();
+        assert_eq!(after.1, before.1, "sync must not rewrite native metadata");
+        assert_eq!(after.2, before.2 + 1, "one real backing sync");
+
+        device.0.lock().unwrap().fail_sync = true;
+        assert!(matches!(
+            fs.sync_fs(&cx, &mut RequestScope::empty()),
+            Err(FfsError::Io(_))
+        ));
+        assert_eq!(device.counts().2, after.2 + 1);
+        fs.sync_fs(&cx, &mut RequestScope::empty()).unwrap();
+        assert_eq!(fs.read(&cx, &mut RequestScope::empty(), ino, 0, 8).unwrap(), b"original");
+
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        let before = device.counts();
+        assert!(matches!(
+            fs.sync_fs(&cancelled, &mut RequestScope::empty()),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(device.counts(), before, "cancelled sync cannot issue I/O");
+    }
 }
 
 #[test]

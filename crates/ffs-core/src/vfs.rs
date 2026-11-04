@@ -1894,8 +1894,12 @@ pub trait FsOps: Send + Sync {
     ///
     /// For btrfs: commits current transaction if in RW mode.
     /// For ext4: triggers journal checkpoint.
+    /// Writable backends must implement their real durability boundary rather
+    /// than inherit a successful no-op. Read-only FUSE dispatch does no I/O.
     fn sync_fs(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
-        Ok(())
+        Err(FfsError::UnsupportedFeature(
+            "filesystem-wide synchronization is not supported by this backend".to_owned(),
+        ))
     }
 
     /// Start a btrfs transaction sync for `BTRFS_IOC_START_SYNC`.

@@ -1363,6 +1363,15 @@ impl FsOps for FatFs {
         operation.complete(())
     }
 
+    fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> Result<()> {
+        let operation = self.operation(cx, true)?;
+        if self.writable {
+            sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
+        }
+        checkpoint(cx)?;
+        operation.complete(())
+    }
+
     fn fsyncdir(
         &self,
         cx: &Cx,

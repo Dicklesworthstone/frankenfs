@@ -538,6 +538,8 @@ impl<'a> Request<'a> {
                     | ll::Operation::FSyncDir(_)
                     | ll::Operation::Release(_)
                     | ll::Operation::ReleaseDir(_) => {}
+                    #[cfg(feature = "abi-7-36")]
+                    ll::Operation::FSyncFs(_) => {}
                     _ => {
                         return Err(Errno::EACCES);
                     }
@@ -844,6 +846,10 @@ impl<'a> Request<'a> {
                     x.fdatasync(),
                     self.reply(),
                 );
+            }
+            #[cfg(feature = "abi-7-36")]
+            ll::Operation::FSyncFs(_) => {
+                se.filesystem.syncfs(self, self.reply());
             }
             ll::Operation::OpenDir(x) => {
                 se.filesystem

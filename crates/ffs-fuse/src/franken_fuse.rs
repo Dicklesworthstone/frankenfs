@@ -402,6 +402,19 @@ impl FrankenFuse {
         .map_err(|error| error.to_errno())
     }
 
+    pub(super) fn dispatch_syncfs(&self, cx: &Cx) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if self.inner.read_only {
+            return Ok(());
+        }
+        if let Some(errno) = self.backpressure_errno(cx, RequestOp::Fsync) {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(errno)));
+        }
+        self.with_request_scope(cx, RequestOp::Fsync, |cx, scope| {
+            self.inner.ops.sync_fs(cx, scope)
+        })
+    }
+
     /// Execute release without a live kernel mount.
     #[doc(hidden)]
     pub fn release_for_fuzzing(

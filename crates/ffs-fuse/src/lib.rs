@@ -7706,6 +7706,22 @@ impl Filesystem for FrankenFuse {
         }
     }
 
+    fn syncfs(&mut self, _req: &Request<'_>, reply: ReplyEmpty) {
+        let cx = Self::cx_for_request();
+        match self.dispatch_syncfs(&cx) {
+            Ok(()) => reply.ok(),
+            Err(error) => Self::reply_error_empty(
+                &FuseErrorContext {
+                    error: &error,
+                    operation: "syncfs",
+                    ino: 1,
+                    offset: None,
+                },
+                reply,
+            ),
+        }
+    }
+
     fn fsyncdir(
         &mut self,
         _req: &Request<'_>,
@@ -14487,6 +14503,7 @@ mod tests {
         Begin(RequestOp),
         Fiemap(InodeNumber, u64, u64),
         Fsync(InodeNumber, u64, bool),
+        SyncFs,
         GetEncryptionPolicy(InodeNumber),
         GetEncryptionPolicyEx(InodeNumber),
         GetFlags(InodeNumber),
@@ -15653,6 +15670,18 @@ mod tests {
             Ok(())
         }
 
+        fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            self.calls
+                .lock()
+                .expect("lock ioctl calls")
+                .push(IoctlCall::SyncFs);
+            if let Some(errno) = self.commit_errno {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(errno)));
+            }
+            Ok(())
+        }
+
         fn commit_request_scope(
             &self,
             _cx: &Cx,
@@ -16641,6 +16670,78 @@ mod tests {
             dispatch_ioctl_for_testing(&fuse, 2, 0, FS_IOC_SETFSLABEL, b"not-terminated", 0);
         assert_eq!(response, IoctlResult::Error(libc::EINVAL));
         assert!(calls.lock().expect("lock ioctl calls").is_empty());
+    }
+
+    #[test]
+    fn syncfs_dispatch_commits_the_native_boundary_and_preserves_errors() {
+        for errno in [None, Some(libc::EIO), Some(libc::ENOSPC), Some(libc::EINTR)] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = IoctlRecordingFs::new(0, Arc::clone(&calls));
+            backend.commit_errno = errno;
+            let fuse = FrankenFuse::with_options(
+                Box::new(backend),
+                &MountOptions {
+                    read_only: false,
+                    ..MountOptions::default()
+                },
+            );
+            let result = fuse.dispatch_syncfs(&Cx::for_testing());
+            assert_eq!(result.err().map(|error| error.to_errno()), errno);
+            assert_eq!(
+                calls.lock().expect("lock ioctl calls").as_slice(),
+                &[
+                    IoctlCall::Begin(RequestOp::Fsync),
+                    IoctlCall::SyncFs,
+                    IoctlCall::End(RequestOp::Fsync)
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn syncfs_readonly_and_precancelled_requests_do_not_touch_the_backend() {
+        for read_only in [true, false] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let fuse = FrankenFuse::with_options(
+                Box::new(IoctlRecordingFs::new(0, Arc::clone(&calls))),
+                &MountOptions {
+                    read_only,
+                    ..MountOptions::default()
+                },
+            );
+            let cx = Cx::for_testing();
+            if !read_only {
+                cx.set_cancel_requested(true);
+            }
+            let result = fuse.dispatch_syncfs(&cx);
+            if read_only {
+                result.expect("read-only sync has no pending writes");
+            } else {
+                assert!(matches!(result, Err(FfsError::Cancelled)));
+            }
+            assert!(calls.lock().expect("lock ioctl calls").is_empty());
+        }
+    }
+
+    #[test]
+    fn syncfs_unspecified_writable_backend_cannot_acknowledge_durability() {
+        let backend = ScopeCountingFs::default();
+        let (begins, ends) = (Arc::clone(&backend.begins), Arc::clone(&backend.ends));
+        let fuse = FrankenFuse::with_options(
+            Box::new(backend),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        );
+        assert_eq!(
+            fuse.dispatch_syncfs(&Cx::for_testing())
+                .expect_err("no sync implementation")
+                .to_errno(),
+            libc::EOPNOTSUPP,
+        );
+        assert_eq!(begins.load(Ordering::SeqCst), 1);
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
     }
 
     #[test]
