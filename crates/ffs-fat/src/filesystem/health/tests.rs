@@ -469,18 +469,6 @@ fn filesystem_wide_sync_flushes_both_fat_dialects_and_preserves_failures() {
         assert_eq!(after.1, before.1, "sync must not rewrite native metadata");
         assert_eq!(after.2, before.2 + 1, "one real backing sync");
 
-        device.0.lock().unwrap().fail_sync = true;
-        assert!(matches!(
-            fs.sync_fs(&cx, &mut RequestScope::empty()),
-            Err(FfsError::Io(_))
-        ));
-        assert_eq!(device.counts().2, after.2 + 1);
-        fs.sync_fs(&cx, &mut RequestScope::empty()).unwrap();
-        assert_eq!(
-            fs.read(&cx, &mut RequestScope::empty(), ino, 0, 8).unwrap(),
-            b"original"
-        );
-
         let cancelled = Cx::for_testing();
         cancelled.set_cancel_requested(true);
         let before = device.counts();
@@ -489,6 +477,38 @@ fn filesystem_wide_sync_flushes_both_fat_dialects_and_preserves_failures() {
             Err(FfsError::Cancelled)
         ));
         assert_eq!(device.counts(), before, "cancelled sync cannot issue I/O");
+
+        device.0.lock().unwrap().fail_sync = true;
+        assert!(matches!(
+            fs.sync_fs(&cx, &mut RequestScope::empty()),
+            Err(FfsError::Io(_))
+        ));
+        assert_eq!(device.counts().2, after.2 + 1);
+        // Failed native synchronization leaves durability uncertain. Preserve
+        // the existing mount fence rather than retry through stale cache state.
+        let before = device.counts();
+        assert!(matches!(
+            fs.sync_fs(&cx, &mut RequestScope::empty()),
+            Err(FfsError::Io(_))
+        ));
+        assert_eq!(device.counts(), before);
+        assert_quarantined(&fs, &device, ino);
+
+        let volume = device.open();
+        let checked = volume.check(&cx).unwrap();
+        assert!(checked.clean && checked.complete && checked.namespace_complete);
+        let reopened = FatFs::new_with_mode(&cx, volume, 1000, 1000, true).unwrap();
+        reopened.sync_fs(&cx, &mut RequestScope::empty()).unwrap();
+        let ino = reopened
+            .lookup(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("file.bin"))
+            .unwrap()
+            .ino;
+        assert_eq!(
+            reopened
+                .read(&cx, &mut RequestScope::empty(), ino, 0, 8)
+                .unwrap(),
+            b"original"
+        );
     }
 }
 
