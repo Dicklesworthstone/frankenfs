@@ -402,7 +402,7 @@ impl FrankenFuse {
         .map_err(|error| error.to_errno())
     }
 
-    pub(super) fn dispatch_syncfs(&self, cx: &Cx) -> ffs_error::Result<()> {
+    pub(crate) fn dispatch_syncfs(&self, cx: &Cx) -> ffs_error::Result<()> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         if self.inner.read_only {
             return Ok(());
