@@ -10594,7 +10594,13 @@ fn fuse_spec_i3_write_and_persist_after_remount() {
         file.write_all(b"persisted across remount\n")
             .expect("write persistence payload");
         file.sync_all().expect("sync persistence payload");
-        let out = Command::new("sync").output().expect("sync command");
+        // Flush this persistence probe without committing other tests' live
+        // kernel crash fixtures.
+        let out = Command::new("sync")
+            .arg("-f")
+            .arg(&mount_a)
+            .output()
+            .expect("sync command");
         assert!(
             out.status.success(),
             "sync command failed: {}",
@@ -18450,10 +18456,12 @@ fn assert_btrfs_attached_devices_read_seeded_files(
             // compress-force skips the heuristic. Sync first so `payload`
             // (expected uncompressed) is written back before the option applies;
             // it is switched off again after the compressed copy is synced.
+            // Only this mount should commit; other tests retain live logs.
             let remount = |option: &str| {
                 assert!(
                     Command::new("sudo")
-                        .args(["-n", "sync"])
+                        .args(["-n", "sync", "-f"])
+                        .arg(&kernel_mount)
                         .status()
                         .unwrap()
                         .success()
@@ -21887,17 +21895,22 @@ fn run_fc_kernel_scenario_with(
     // Step 5: FC-eligible changes, each made durable only by fsync.
     changes(&dir);
 
-    // Step 6: the crash state — two copies of the image taken while it is
-    // still mounted. The loop device uses direct I/O, so everything the
-    // fsyncs made durable is already in the backing file.
+    // Step 6: capture the still-mounted image once, then clone that immutable
+    // crash state for every recovery mode. The loop uses direct I/O, so file
+    // fsyncs have reached the backing image, but unsynced sibling files can
+    // still write back between independent captures of the live image.
     let crash_image = tmp.path().join("crash_state.img");
     let kernel_image = tmp.path().join("crash_state_kernel.img");
     // Untouched copy for SimulateOverlay recovery, which must not write it.
     let overlay_image = tmp.path().join("crash_state_overlay.img");
-    for copy in [&crash_image, &kernel_image, &overlay_image] {
+    for (source, copy) in [
+        (&img, &crash_image),
+        (&crash_image, &kernel_image),
+        (&crash_image, &overlay_image),
+    ] {
         let output = Command::new("sudo")
             .args(["-n", "cp"])
-            .arg(&img)
+            .arg(source)
             .arg(copy)
             .output()
             .expect("copy crash image");
@@ -21906,6 +21919,32 @@ fn run_fc_kernel_scenario_with(
             .args(["-n", "chmod", "a+rw"])
             .arg(copy)
             .output();
+    }
+    let input_identity = |path: &Path| {
+        let mut file = fs::File::open(path).expect("open crash input for hashing");
+        let bytes = file.metadata().expect("crash input metadata").len();
+        let mut hasher = blake3::Hasher::new();
+        hasher
+            .update_reader(&mut file)
+            .expect("stream crash input hash");
+        (bytes, hasher.finalize())
+    };
+    let captured_identity = input_identity(&crash_image);
+    for copy in [&kernel_image, &overlay_image] {
+        let cloned_identity = input_identity(copy);
+        eprintln!(
+            "CRASH_INPUT_IDENTITY|scenario={scenario}|capture={}|clone={}|bytes={}|blake3={}",
+            crash_image.display(),
+            copy.display(),
+            cloned_identity.0,
+            cloned_identity.1,
+        );
+        assert_eq!(
+            cloned_identity,
+            captured_identity,
+            "{scenario}: every recovery mode must start from identical captured bytes: {}",
+            copy.display(),
+        );
     }
 
     // Step 7: clean up the kernel mount and loop device
