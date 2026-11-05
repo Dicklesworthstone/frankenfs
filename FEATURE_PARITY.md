@@ -8,8 +8,10 @@
 > admission requires a writable btrfs mount. Native btrfs tool/ABI compatibility
 > and read-only accounting remain separate gaps; in particular, the native
 > kernel's transient global-reserve row is not an allocator block group.
-> The consumer is currently limited to Linux x86_64. Unit/native execution is
-> pending; no parity percentage or mounted completion credit is added here.
+> The consumer is currently limited to Linux x86_64. Initial mounted execution
+> exposed dropped DUP profile bits in allocator loading; the focused preservation
+> fix and final execution remain pending. No parity percentage or mounted
+> completion credit is added here.
 
 > **Filesystem-wide sync wiring (bd-yek6e, 2026-11-04):**
 > Linux FUSE_SYNCFS now dispatches to the existing ext4 journal checkpoint,

@@ -6103,7 +6103,7 @@ pub struct BtrfsBlockGroupItem {
     pub total_bytes: u64,
     /// Bytes currently allocated.
     pub used_bytes: u64,
-    /// Type flags (DATA, METADATA, SYSTEM).
+    /// Block group type (DATA, METADATA, SYSTEM) and profile (DUP, RAID) flags.
     pub flags: u64,
 }
 
@@ -23073,6 +23073,63 @@ mod tests {
         let bg = alloc.block_group(0x1_0000).expect("bg");
         assert_eq!(bg.used_bytes, 4096);
         assert_eq!(bg.free_bytes(), 0x10_0000 - 4096);
+    }
+
+    #[test]
+    fn space_info_preserves_profiles_and_type_based_placement() {
+        use ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_DUP;
+
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("allocator");
+        for (start, total_bytes, flags) in [
+            (0x10_0000, 4096, BTRFS_BLOCK_GROUP_DATA),
+            (0x20_0000, 4096, BTRFS_BLOCK_GROUP_DATA),
+            (
+                0x30_0000,
+                16384,
+                BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_DUP,
+            ),
+            (
+                0x40_0000,
+                16384,
+                BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_DUP,
+            ),
+            (
+                0x08_0000,
+                8192,
+                BTRFS_BLOCK_GROUP_SYSTEM | BTRFS_BLOCK_GROUP_DUP,
+            ),
+        ] {
+            alloc.add_block_group(
+                start,
+                BtrfsBlockGroupItem {
+                    total_bytes,
+                    used_bytes: 0,
+                    flags,
+                },
+            );
+        }
+        // The two SINGLE groups cannot individually satisfy this request.
+        // DUP remains eligible for DATA without making SYSTEM eligible.
+        let data = alloc.alloc_data(8192).expect("DUP data allocation");
+        assert_eq!(data.block_group_start, 0x30_0000);
+        let metadata = alloc.alloc_metadata(4096).expect("DUP metadata allocation");
+        assert_eq!(metadata.block_group_start, 0x40_0000);
+        assert_eq!(
+            alloc.space_info(),
+            vec![
+                (1, 8192, 0),
+                (33, 16384, 8192),
+                (34, 8192, 0),
+                (36, 16384, 4096),
+            ]
+        );
+        let before = alloc.space_info();
+        assert_eq!(alloc.alloc_data(32768), Err(BtrfsMutationError::NoSpace));
+        assert_eq!(
+            alloc.space_info(),
+            before,
+            "failed allocation changed usage"
+        );
     }
 
     #[test]

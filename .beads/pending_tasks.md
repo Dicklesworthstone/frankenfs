@@ -30,6 +30,23 @@ Retain this execution list until its final evidence is recorded; no new roadmap.
   dump, retain all native ioctl rows including transient GLOBAL_RSV separately,
   and retain unchanged input hashes. Do not filter that runtime row to claim
   native-ABI parity; the original draft equality oracle used the wrong contract.
+- [x] Execute mounted `7df03b83f`: all ioctl-window/error probes and public
+  consumer reach full record comparison; byte counts match, but FFS reports
+  flags1/2/4 instead of native1/34/36. Retain the real1pass/1fail/44filtered
+  result (`current-cli-native-symbols0-warm.log`) and all small mount artifacts.
+  The failed mount's image independently passes native `btrfs check --readonly`.
+- [x] Find the cause: core allocator loading stores only type-class bits,
+  dropping DUP. Retain `alloc_flags | chunk.chunk_type` so native profile flags
+  survive without changing the allocation type mask. GoldenCliff independently
+  verified placement/commit consumers and the mask invariant; mounted oracle
+  unchanged. Strengthen the new allocation regression with SYSTEM lowest.
+- [ ] Execute the new profile/placement/ENOSPC regression and the unchanged
+  mounted native comparison on the final corrected source.
+- [ ] Repair the harness execution environment: its first full run executes
+  substantial suites but fails two compile-fail cases because sudo loses the
+  cached Cargo environment. Preserve cache/toolchain/target variables, retain
+  the failures, restore ownership of this job's generated scratch, and reconcile
+  only its exact RCH job before rerunning. Do not skip or relax compile-fail tests.
 - [x] Execute the newly found native-consumer count-growth bug as a mocked
   negative: it returns one record after two calls when two are available.
   Fix native mode with post-array count checks; the same control now returns

@@ -4660,7 +4660,8 @@ for RaptorQ re-encoding. Work item: `bd-yek6e`.
 the complete 16-byte header plus 24-byte records in the command size field.
 It MUST bound the array to that field, reject requested slots beyond the
 advertised window, preserve total cardinality on partial queries and reject
-short or oversized backend replies. The standard 16-byte command MUST retain
+short or oversized backend replies. Native block-group profile flags MUST
+survive the engine's allocation type classification. The standard 16-byte command MUST retain
 its count query and MUST NOT acknowledge a nonzero-slot request with a
 count-only response. The public consumer MUST cap allocations and requery
 attempts and emit success only after collecting the complete array. Existing

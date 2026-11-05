@@ -14340,7 +14340,9 @@ impl OpenFs {
                 BtrfsBlockGroupItem {
                     total_bytes: chunk.length,
                     used_bytes: synthetic_used,
-                    flags: alloc_flags,
+                    // Allocation selects by type bits, but reporting must also
+                    // retain the native DUP/RAID profile (bd-k3hon).
+                    flags: alloc_flags | chunk.chunk_type,
                 },
             );
         }

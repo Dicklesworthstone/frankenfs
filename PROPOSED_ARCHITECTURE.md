@@ -761,7 +761,9 @@ Mounted btrfs space queries reuse `FsOps::get_btrfs_space_info` and the existing
 allocator's records. `ffs-fuse::btrfs_space_info_ioctl_command` encodes a complete
 16-byte header plus bounded 24-byte records for the Linux x86_64/FUSE transport. The
 adapter validates command, input/output windows, requested slots and returned
-cardinality; the engine retains ownership of accounting and admission. The
+cardinality; the engine retains ownership of accounting and admission. Loading
+allocation state preserves native profile bits alongside its type classification,
+so SPACE_INFO does not flatten DUP groups into SINGLE groups. The
 standard command remains a count query. `scripts/ffs_space_info.py` is a public
 consumer with bounded count/requery logic, an explicit native-kernel mode and
 no partial-success JSON. This is a transport extension, not native tool/ABI
