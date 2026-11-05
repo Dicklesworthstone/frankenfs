@@ -40,6 +40,33 @@ benchmark qualifications, recovery/writeback discussion and historical evidence.
 The format matrix below is the front-page overview of the broader project;
 per-format profiles define the actual admission rules.
 
+## Live ext4/btrfs dashboard
+
+Run a read-only mount and watch its cache, MVCC and transport counters in one
+process. The mountpoint must already exist:
+
+```bash
+ffs-cli tui image.ext4 --mountpoint /mnt/ffs
+ffs-cli tui image.btrfs --mountpoint /mnt/ffs --refresh-ms 250 --scrub
+ffs-cli tui image.ext4 --snapshot-json
+```
+
+The live view refreshes every second by default (100–1000 ms is supported).
+It shows the source image, mountpoint and monotonic sample time. Filesystem
+activity through that mount feeds its counters; unavailable pressure sources
+are labeled explicitly. The memory gauge represents cache occupancy.
+`--scrub` enables the existing background scrub worker.
+Ctrl+C or an external unmount ends the view and shuts down the owned mount.
+A closed output pipe also triggers shutdown. Sampling and rendering run on
+the owner thread, so slow device reads or a blocked output stream can delay
+refreshes; the interval is not a hard I/O deadline.
+
+Terminal output redraws in place; redirected output contains complete frames.
+`--snapshot-json` retains the offline, single-snapshot mode and does not mount.
+For an explicitly configured managed or per-core mount, add
+`--console-live[=MILLISECONDS]` to `ffs-cli mount`. Shutdown report artifacts
+remain separately controlled by `--console`.
+
 ## Current format surface
 
 | Format | Entry point | Implemented surface | Important boundary |

@@ -108,7 +108,7 @@ jobs:
       - name: Install ext4/btrfs oracle tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs btrfs-progs
+          sudo apt-get install -y e2fsprogs btrfs-progs fuse3
 
       # The mounted comparator's scratch-root guard only accepts paths under
       # /data/tmp (the offload hosts' scratch volume), and its unit tests
@@ -357,6 +357,12 @@ jobs:
 
       - name: Run relocated ops tests
         run: cargo test -p ffs-ops -- --nocapture
+
+      - name: Live CLI telemetry on native ext4 and btrfs mounts
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
+        run: cargo test -p ffs-cli --test cli_e2e cli_live_tui_one_process_observes_real_mounts_and_cleans_up -- --exact --nocapture --test-threads=1
 
       # bd-53dub: a mounted test that cannot mount fails here instead of
       # passing vacuously (FUSE, fuse3, e2fsprogs and btrfs-progs are installed

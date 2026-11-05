@@ -8779,6 +8779,67 @@ impl MountHandle {
         (metrics, per_core_metrics)
     }
 
+    /// Observe the running mount at `interval` until shutdown or session exit.
+    ///
+    /// The observer runs on the waiting caller, so it should finish promptly.
+    /// Slow observers skip elapsed ticks rather than queueing more work. An
+    /// observer error still requests unmount before it is returned to the caller.
+    /// No observer task is spawned. Success requires a session join receipt;
+    /// an unmount timeout or missing receipt is returned as a cleanup error.
+    ///
+    /// # Errors
+    /// Returns an observer or cleanup error, or `InvalidInput` for a zero or
+    /// unrepresentable interval. Successful calls return transport counters as
+    /// `wait_with_per_core_metrics` does.
+    pub fn wait_with_observer(
+        mut self,
+        interval: std::time::Duration,
+        mut observe: impl FnMut(&MetricsSnapshot) -> std::io::Result<()>,
+    ) -> std::io::Result<(MetricsSnapshot, Option<PerCoreTransportMetrics>)> {
+        let mut next_tick = std::time::Instant::now();
+        let result = loop {
+            let now = std::time::Instant::now();
+            let Some(following_tick) = now.checked_add(interval).filter(|_| !interval.is_zero())
+            else {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "mount observation interval must be positive and representable",
+                ));
+            };
+            if self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                || self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.guard.is_finished())
+            {
+                break Ok(());
+            }
+            if now >= next_tick {
+                if let Err(error) = observe(&self.metrics.snapshot()) {
+                    break Err(error);
+                }
+                // Schedule from this sample's start, preserving the requested
+                // rate when sampling is quick and dropping missed deadlines.
+                next_tick = following_tick;
+            }
+            std::thread::sleep(
+                next_tick
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(MOUNT_HANDLE_WAIT_POLL_INTERVAL),
+            );
+        };
+        let cleanup = self.join_session();
+        if let Err(error) = &cleanup {
+            error!(%error, "FUSE observer cleanup failed");
+        }
+        let metrics = self.metrics.snapshot();
+        let per_core = self
+            .per_core_metrics
+            .as_ref()
+            .map(|metrics| PerCoreTransportMetrics::from(metrics.snapshot()));
+        result.and(cleanup).map(|()| (metrics, per_core))
+    }
+
     fn wait_for_shutdown(&self) {
         info!(mountpoint = %self.mountpoint.display(), "waiting for shutdown signal");
         loop {
@@ -8812,7 +8873,15 @@ impl MountHandle {
 
     fn do_unmount(&mut self) -> MetricsSnapshot {
         let snap = self.metrics.snapshot();
+        if let Err(error) = self.join_session() {
+            error!(%error, "FUSE unmount failed");
+        }
+        snap
+    }
+
+    fn join_session(&mut self) -> std::io::Result<()> {
         if let Some(session) = self.session.take() {
+            let snap = self.metrics.snapshot();
             info!(
                 mountpoint = %self.mountpoint.display(),
                 requests_total = snap.requests_total,
@@ -8848,23 +8917,32 @@ impl MountHandle {
                 });
                 match completed {
                     Ok(Ok(joined)) => {
-                        let _ = runtime.block_on(region.close());
+                        runtime
+                            .block_on(region.close())
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
                         if let Err(payload) = joined {
                             error!("FUSE background session join failed during unmount");
                             if !std::thread::panicking() {
                                 std::panic::resume_unwind(payload);
                             }
-                            return snap;
+                            return Err(std::io::Error::other("FUSE background session panicked"));
                         }
                         info!(mountpoint = %self.mountpoint.display(), "unmount complete");
                     }
                     Ok(Err(_)) => {
                         let _ = region.cancel(asupersync::types::CancelReason::shutdown());
                         error!("FUSE unmount worker ended without a join completion receipt");
+                        return Err(std::io::Error::other(
+                            "FUSE unmount worker ended without a join completion receipt",
+                        ));
                     }
                     Err(_) => {
                         let _ = region.cancel(asupersync::types::CancelReason::timeout());
                         warn!("unmount timed out after {:?}", timeout);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "FUSE session join timed out",
+                        ));
                     }
                 }
             } else {
@@ -8873,9 +8951,12 @@ impl MountHandle {
                     mountpoint = %self.mountpoint.display(),
                     "FUSE unmount worker region unavailable; dispatch was not joined"
                 );
+                return Err(std::io::Error::other(
+                    "FUSE unmount worker region unavailable",
+                ));
             }
         }
-        snap
+        Ok(())
     }
 }
 
@@ -23971,6 +24052,91 @@ mod tests {
         // Unmount returns final snapshot.
         let final_snap = handle.unmount();
         assert_eq!(final_snap.requests_ok, 2);
+    }
+
+    fn observation_test_handle(
+        metrics: Arc<AtomicMetrics>,
+        shutdown: Arc<AtomicBool>,
+    ) -> MountHandle {
+        MountHandle {
+            diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
+            session: None,
+            mountpoint: PathBuf::from("/mnt/observation-test"),
+            shutdown,
+            metrics,
+            per_core_metrics: None,
+            config: MountConfig::default(),
+        }
+    }
+
+    #[test]
+    fn mount_observer_keeps_sampling_current_metrics_until_cancelled() {
+        let metrics = Arc::new(AtomicMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = observation_test_handle(Arc::clone(&metrics), Arc::clone(&shutdown));
+        let mut samples = Vec::new();
+        let mut times = Vec::new();
+        let interval = Duration::from_millis(5);
+        let (final_metrics, per_core) = handle
+            .wait_with_observer(interval, |sample| {
+                times.push(std::time::Instant::now());
+                samples.push((sample.requests_total, sample.bytes_read));
+                metrics.record_ok();
+                metrics.record_bytes_read(4096);
+                if samples.len() == 3 {
+                    shutdown.store(true, Ordering::Release);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(samples, [(0, 0), (1, 4096), (2, 8192)]);
+        assert!(
+            times
+                .windows(2)
+                .all(|pair| pair[1].duration_since(pair[0]) >= interval)
+        );
+        assert_eq!(final_metrics.requests_total, 3);
+        assert_eq!(final_metrics.bytes_read, 12_288);
+        assert!(per_core.is_none());
+    }
+
+    #[test]
+    fn mount_observer_preserves_output_error_and_rejects_invalid_intervals() {
+        let handle = observation_test_handle(
+            Arc::new(AtomicMetrics::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut calls = 0;
+        let error = handle
+            .wait_with_observer(Duration::from_millis(5), |_| {
+                calls += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "reader closed",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        for interval in [Duration::ZERO, Duration::MAX] {
+            let handle = observation_test_handle(
+                Arc::new(AtomicMetrics::new()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let error = handle
+                .wait_with_observer(interval, |_| panic!("invalid interval called observer"))
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        let handle = observation_test_handle(
+            Arc::new(AtomicMetrics::new()),
+            Arc::new(AtomicBool::new(true)),
+        );
+        handle
+            .wait_with_observer(Duration::from_millis(5), |_| {
+                panic!("cancelled observer ran")
+            })
+            .unwrap();
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub struct MountConsoleConfig {
     enabled: bool,
     json_path: Option<PathBuf>,
     summary_path: Option<PathBuf>,
+    live_refresh: Option<std::time::Duration>,
 }
 
 impl MountConsoleConfig {
@@ -53,15 +54,37 @@ impl MountConsoleConfig {
             enabled: console,
             json_path,
             summary_path,
+            live_refresh: None,
         })
+    }
+
+    /// Enable live rendering without requiring shutdown report artifacts.
+    pub fn with_live_refresh(mut self, milliseconds: Option<u64>) -> Result<Self> {
+        if let Some(milliseconds) = milliseconds {
+            if !(100..=1000).contains(&milliseconds) {
+                bail!("live refresh interval must be between 100 and 1000 milliseconds");
+            }
+            self.live_refresh = Some(std::time::Duration::from_millis(milliseconds));
+        }
+        Ok(self)
+    }
+
+    /// Live rendering cadence, when requested independently of artifacts.
+    pub const fn live_refresh(&self) -> Option<std::time::Duration> {
+        self.live_refresh
     }
 
     /// Reject `--console` on the standard runtime mode, which has no managed
     /// runtime metrics surface to snapshot.
     pub fn reject_unsupported_runtime(&self, runtime_mode_is_standard: bool) -> Result<()> {
-        if self.enabled && runtime_mode_is_standard {
+        if (self.enabled || self.live_refresh.is_some()) && runtime_mode_is_standard {
+            let flag = if self.live_refresh.is_some() {
+                "--console-live"
+            } else {
+                "--console"
+            };
             bail!(
-                "--console requires --runtime-mode managed or --runtime-mode per-core; \
+                "{flag} requires --runtime-mode managed or --runtime-mode per-core; \
                  the standard runtime exposes no managed metrics to snapshot"
             );
         }
@@ -80,6 +103,7 @@ impl MountConsoleConfig {
             enabled: false,
             json_path: None,
             summary_path: None,
+            live_refresh: None,
         }
     }
 }
@@ -453,6 +477,25 @@ mod tests {
         assert!(!config.is_enabled());
         emit_mount_console(&config, &observation(RuntimeConsoleMode::Managed))
             .expect("disabled console must be a no-op");
+    }
+
+    #[test]
+    fn live_console_has_its_own_cadence_without_shutdown_artifacts() {
+        let config = MountConsoleConfig::from_cli(false, None, None)
+            .unwrap()
+            .with_live_refresh(Some(100))
+            .unwrap();
+        assert!(!config.is_enabled());
+        assert_eq!(config.live_refresh(), Some(Duration::from_millis(100)));
+        assert!(config.reject_unsupported_runtime(true).is_err());
+        config.reject_unsupported_runtime(false).unwrap();
+        for milliseconds in [0, 99, 1001, u64::MAX] {
+            assert!(
+                MountConsoleConfig::default()
+                    .with_live_refresh(Some(milliseconds))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

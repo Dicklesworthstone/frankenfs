@@ -191,6 +191,279 @@ fn run_ffs_cli(args: &[&str]) -> std::process::Output {
         .expect("failed to execute ffs-cli")
 }
 
+/// Exercise one actual TUI process and its mounted filesystem. Python's stdlib
+/// supplies the PTY and nonblocking output collection; no metrics are injected.
+fn run_live_tui_profile(image: &Path, mode: &str, require_payload: bool) -> String {
+    const PROFILE: &str = r#"
+import errno, hashlib, json, os, pathlib, pty, re, signal, subprocess, sys, time
+binary, image, root, mode, require_payload = sys.argv[1:]
+require_payload = require_payload == 'true'
+root = pathlib.Path(root)
+mount = root / ('live-' + mode)
+mount.mkdir()
+def digest():
+    h = hashlib.sha256()
+    with open(image, 'rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+before_hash = digest()
+stderr_path = root / (mode + '-stderr.log')
+output = bytearray()
+master = None
+with open(stderr_path, 'wb') as errors:
+    if mode == 'terminal':
+        master, slave = pty.openpty()
+        destination = slave
+    else:
+        destination = subprocess.PIPE
+    arguments = [binary, 'tui', image, '--mountpoint', str(mount)]
+    if mode == 'scrub':
+        arguments.append('--scrub')
+    if mode == 'fast':
+        arguments.extend(['--refresh-ms', '250'])
+    if mode == 'per-core':
+        arguments = [binary, 'mount', image, str(mount), '--runtime-mode=per-core', '--console-live']
+    process = subprocess.Popen(
+        arguments,
+        stdin=subprocess.DEVNULL, stdout=destination, stderr=errors,
+        env=dict(os.environ, RUST_LOG='error'))
+    if master is not None:
+        os.close(slave)
+        reader = master
+    else:
+        reader = process.stdout.fileno()
+    os.set_blocking(reader, False)
+    def collect():
+        while reader is not None:
+            try:
+                block = os.read(reader, 65536)
+                if not block:
+                    break
+                output.extend(block)
+            except BlockingIOError:
+                break
+            except OSError as error:
+                if master is not None and error.errno == errno.EIO:
+                    break
+                raise
+    def samples():
+        return [tuple(map(int, match)) for match in re.findall(
+            rb'Sample: ([0-9]+) ms \| Requests: ([0-9]+) \| Read: ([0-9]+) bytes', output)]
+    def until(predicate, timeout=20):
+        deadline = time.monotonic() + timeout
+        while True:
+            collect()
+            if predicate():
+                return
+            if process.poll() is not None:
+                raise AssertionError('TUI exited before completing live observations: ' + stderr_path.read_text())
+            if time.monotonic() >= deadline:
+                raise AssertionError('live TUI timed out: ' + stderr_path.read_text())
+            time.sleep(0.01)
+    def ticks():
+        fields = pathlib.Path('/proc/' + str(process.pid) + '/stat').read_text().rsplit(') ', 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    try:
+        until(lambda: len(samples()) >= 2 and os.path.ismount(mount))
+        assert image.encode() in output, 'source identity missing'
+        assert str(mount).encode() in output, 'mount identity missing'
+        assert b'=== FrankenFS Live Telemetry ===' in output
+        if mode == 'broken':
+            process.stdout.close()
+            reader = None
+            result = process.wait(timeout=10)
+            assert result != 0, 'closed reader was silently acknowledged'
+            assert 'Broken pipe' in stderr_path.read_text(), stderr_path.read_text()
+            idle_cpu = None
+        else:
+            start_ticks = ticks()
+            start_time = time.monotonic()
+            count = len(samples())
+            until(lambda: len(samples()) >= count + (20 if mode == 'fast' else 5))
+            idle_cpu = (ticks() - start_ticks) / os.sysconf('SC_CLK_TCK') / (time.monotonic() - start_time)
+            assert idle_cpu < 0.01, ('idle CPU target exceeded', idle_cpu)
+            prior = samples()[-1]
+            # These are actual filesystem calls through the mount. statvfs is
+            # dispatched even when the kernel has cached directory attributes.
+            for _ in range(4):
+                os.statvfs(mount)
+                list(mount.iterdir())
+            payload = mount / 'payload.bin'
+            if require_payload:
+                assert payload.exists(), 'native payload missing from mounted namespace'
+                assert payload.read_bytes() == bytes([0x5a]) * 65536
+            try:
+                fd = os.open(mount / 'must-stay-readonly', os.O_WRONLY | os.O_CREAT, 0o600)
+            except OSError as error:
+                assert error.errno == errno.EROFS, error
+            else:
+                os.close(fd)
+                raise AssertionError('standalone TUI admitted a source mutation')
+            until(lambda: samples()[-1][1] > prior[1])
+            if require_payload:
+                assert samples()[-1][2] > prior[2], 'real reads did not reach telemetry'
+            if mode == 'scrub':
+                scanned = re.findall(rb'Scanned:\s+([0-9]+)', output)
+                assert scanned and max(map(int, scanned)) > 0, 'background scrub did not reach telemetry'
+            if mode == 'external':
+                unmount = subprocess.run(['fusermount3', '-u', str(mount)], capture_output=True, timeout=10)
+                assert unmount.returncode == 0, unmount.stderr.decode()
+            else:
+                process.send_signal(signal.SIGINT)
+            result = process.wait(timeout=10)
+            collect()
+            assert result == 0, stderr_path.read_text()
+            elapsed = [sample[0] for sample in samples()]
+            gaps = [later - earlier for earlier, later in zip(elapsed, elapsed[1:])]
+            requested_ms = 250 if mode == 'fast' else 1000
+            assert gaps and min(gaps) >= requested_ms - 1, gaps
+            assert max(gaps) <= requested_ms + 100, ('refresh exceeded 100ms scheduling budget', gaps)
+            if mode == 'fast':
+                assert max(gaps) < 1000, ('live updates fell below 1Hz', gaps)
+        assert not os.path.ismount(mount), 'TUI left its mount active'
+        assert digest() == before_hash, 'read-only source bytes changed'
+        assert (b'\x1b[H\x1b[2J' in output) == (mode == 'terminal')
+        print(json.dumps(dict(
+            mode=mode, argv=arguments, pid=process.pid, exit=result, samples=samples(),
+            idle_cpu_fraction=idle_cpu, image_sha256=before_hash,
+            executable_sha256=hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest(),
+            image_unchanged=True, mount_active=False)))
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+        if os.path.ismount(mount):
+            cleanup = subprocess.run(['fusermount3', '-u', str(mount)], capture_output=True, timeout=10)
+            if cleanup.returncode:
+                print(cleanup.stderr.decode(), file=sys.stderr)
+        if master is not None:
+            os.close(master)
+        (root / (mode + '-stdout.log')).write_bytes(output)
+"#;
+    let root = image.parent().unwrap();
+    let output = Command::new("python3")
+        .args(["-c", PROFILE, env!("CARGO_BIN_EXE_ffs-cli")])
+        .arg(image)
+        .arg(root)
+        .arg(mode)
+        .arg(require_payload.to_string())
+        .output()
+        .expect("execute actual live TUI profile");
+    fs::write(root.join(format!("{mode}-profile.stdout")), &output.stdout).unwrap();
+    fs::write(root.join(format!("{mode}-profile.stderr")), &output.stderr).unwrap();
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "live TUI {mode} failed; retained {}: {}",
+        root.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn cli_live_tui_one_process_observes_real_mounts_and_cleans_up() {
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+    let available = Path::new("/dev/fuse").exists()
+        && [
+            "mkfs.ext4",
+            "mkfs.btrfs",
+            "debugfs",
+            "e2fsck",
+            "btrfs",
+            "fusermount3",
+            "python3",
+        ]
+        .iter()
+        .all(|tool| command_available(tool));
+    if !available {
+        assert!(
+            !require,
+            "required live TUI/native prerequisites are missing"
+        );
+        emit_scenario_result(
+            "cli_live_tui",
+            "SKIP",
+            Some("fuse_or_native_tools_unavailable"),
+        );
+        return;
+    }
+    let ext4_root = tempfile::Builder::new()
+        .prefix("ffs-live-tui-ext4-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let ext4 = ext4_root.join("native.ext4");
+    fs::File::create(&ext4)
+        .unwrap()
+        .set_len(32 * 1024 * 1024)
+        .unwrap();
+    let format = Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-b", "4096"])
+        .arg(&ext4)
+        .output()
+        .unwrap();
+    println!("native ext4 producer: {format:?}");
+    assert!(format.status.success(), "{format:?}");
+    let payload = ext4_root.join("payload");
+    fs::write(&payload, vec![0x5a; 65536]).unwrap();
+    let populate = Command::new("debugfs")
+        .args(["-w", "-R"])
+        .arg(format!("write \"{}\" /payload.bin", payload.display()))
+        .arg(&ext4)
+        .output()
+        .unwrap();
+    assert!(populate.status.success(), "{populate:?}");
+    println!("native ext4 population: {populate:?}");
+    let check = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(&ext4)
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "{check:?}");
+    println!("native ext4 check: {check:?}");
+    for mode in [
+        "captured", "terminal", "external", "broken", "scrub", "per-core", "fast",
+    ] {
+        run_live_tui_profile(&ext4, mode, true);
+    }
+    let btrfs_root = tempfile::Builder::new()
+        .prefix("ffs-live-tui-btrfs-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let btrfs = btrfs_root.join("native.btrfs");
+    fs::File::create(&btrfs)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    let source = btrfs_root.join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("payload.bin"), vec![0x5a; 65536]).unwrap();
+    let format = Command::new("mkfs.btrfs")
+        .args(["-f", "-q", "--rootdir"])
+        .arg(&source)
+        .arg(&btrfs)
+        .output()
+        .unwrap();
+    println!("native btrfs producer: {format:?}");
+    assert!(format.status.success(), "{format:?}");
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&btrfs)
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "{check:?}");
+    println!("native btrfs check: {check:?}");
+    run_live_tui_profile(&btrfs, "captured", true);
+    emit_scenario_result("cli_live_tui", "PASS", None);
+}
+
 fn required_env_path(name: &str) -> PathBuf {
     std::env::var_os(name).map_or_else(
         || panic!("{name} must be set for the ignored bd-b9dug driver"),
@@ -4296,7 +4569,7 @@ fn gate7_full_conformance_and_tools() {
     assert_eq!(fsck_json["outcome"], "clean");
     assert_eq!(fsck_json["exit_code"], 0);
 
-    // 4. TUI dashboard telemetry at 1 Hz (JSON snapshot + ASCII 1 Hz tick)
+    // 4. Offline JSON plus one continuous mounted TUI process at nominal 1Hz.
     let tui_json_out = run_ffs_cli(&["tui", image_str, "--scrub", "--snapshot-json"]);
     assert!(
         tui_json_out.status.success(),
@@ -4309,14 +4582,8 @@ fn gate7_full_conformance_and_tools() {
     assert!(tui_snap["cache_capacity"].as_u64().unwrap_or(0) > 0);
     assert!(tui_snap["scrub_blocks_scanned"].as_u64().unwrap_or(0) > 0);
 
-    let tui_ascii_out = run_ffs_cli(&["tui", image_str, "--scrub", "--refresh-ms", "1000"]);
-    assert!(
-        tui_ascii_out.status.success(),
-        "ffs tui ASCII render failed: {}",
-        String::from_utf8_lossy(&tui_ascii_out.stderr)
-    );
-    let tui_ascii = String::from_utf8_lossy(&tui_ascii_out.stdout);
-    assert!(tui_ascii.contains("=== FrankenFS Live Telemetry ==="));
+    let tui_live = run_live_tui_profile(&image, "captured", false);
+    assert!(tui_live.contains("\"image_unchanged\": true"));
 
     // 5. User-facing error diagnostics and parity declarations
     cli_inspect_empty_file_reports_error();

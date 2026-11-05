@@ -1327,6 +1327,11 @@ enum Command {
         /// Write the runtime console snapshot as a Markdown summary (requires `--console`).
         #[arg(long = "console-summary")]
         console_summary: Option<PathBuf>,
+        /// Continuously display real mount telemetry (100..=1000 ms; default 1000).
+        /// Requires managed or per-core runtime; Ctrl+C unmounts the filesystem.
+        #[arg(long = "console-live", num_args = 0..=1, require_equals = true,
+            default_missing_value = "1000", value_parser = clap::value_parser!(u64).range(100..=1000))]
+        console_live: Option<u64>,
         /// Allow other users to access the mount.
         #[arg(long)]
         allow_other: bool,
@@ -1573,14 +1578,22 @@ enum Command {
     Tui {
         /// Path to the filesystem image (ext4 or btrfs).
         image: PathBuf,
+        /// Mount the image read-only here while displaying live telemetry.
+        #[arg(
+            long,
+            required_unless_present = "snapshot_json",
+            conflicts_with = "snapshot_json"
+        )]
+        mountpoint: Option<PathBuf>,
         /// Emit a single live telemetry snapshot as JSON and exit.
         #[arg(long = "snapshot-json")]
         snapshot_json: bool,
-        /// Run an initial scrub pass to populate live scrub/repair telemetry.
+        /// Enable background scrub while mounted, or scrub the offline JSON snapshot.
         #[arg(long)]
         scrub: bool,
-        /// Interactive TUI refresh interval in milliseconds.
-        #[arg(long = "refresh-ms", default_value_t = 1000)]
+        /// Live refresh interval in milliseconds (100..=1000).
+        #[arg(long = "refresh-ms", default_value_t = 1000,
+            value_parser = clap::value_parser!(u64).range(100..=1000))]
         refresh_ms: u64,
     },
 }
@@ -2489,11 +2502,15 @@ fn main() {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let log_format = init_logging(cli.log_format)?;
-    let command_name = cli.command.name();
+    execute_command(cli.command, log_format)
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
+    let command_name = command.name();
     let run_span = info_span!(
         target: "ffs::cli",
         "command",
@@ -2504,7 +2521,7 @@ fn run() -> Result<()> {
     let started = Instant::now();
 
     let evidence_must_be_first = matches!(
-        &cli.command,
+        &command,
         Command::BenchEvidence
             | Command::CreateBenchCutoverGate { .. }
             | Command::ReadPoolCutoverGate { .. }
@@ -2522,7 +2539,7 @@ fn run() -> Result<()> {
         );
     }
 
-    let result = match cli.command {
+    let result = match command {
         Command::BenchEvidence => bench_evidence_cmd(),
         Command::Inspect {
             image,
@@ -2715,6 +2732,7 @@ fn run() -> Result<()> {
             console,
             console_json,
             console_summary,
+            console_live,
             allow_other,
             rw,
             fsname,
@@ -2759,7 +2777,8 @@ fn run() -> Result<()> {
                 console,
                 console_json,
                 console_summary,
-            )?;
+            )?
+            .with_live_refresh(console_live)?;
             console.reject_unsupported_runtime(runtime_mode == MountRuntimeMode::Standard)?;
             mount_cmd(
                 &image,
@@ -2849,10 +2868,18 @@ fn run() -> Result<()> {
         } => mkfs_cmd(&output, size_mb, block_size, &label, json),
         Command::Tui {
             image,
+            mountpoint,
             snapshot_json,
             scrub,
             refresh_ms,
-        } => tui_cmd(&image, snapshot_json, scrub, refresh_ms),
+        } => tui_cmd(
+            &image,
+            mountpoint.as_deref(),
+            snapshot_json,
+            scrub,
+            refresh_ms,
+            log_format,
+        ),
     };
 
     let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -7702,7 +7729,11 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
         "managed_mount_waiting_for_shutdown"
     );
 
-    let metrics = handle.wait();
+    let metrics = if params.console.live_refresh().is_some() {
+        wait_with_live_dashboard(handle, fs_for_console.as_ref(), params)?.0
+    } else {
+        handle.wait()
+    };
     let mount_ended = std::time::SystemTime::now();
     log_mount_shutdown_metrics(
         params.operation_id,
@@ -7742,6 +7773,63 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
     Ok(())
 }
 
+/// Render samples from the same OpenFs and transport that serve this mount.
+/// Sampling stays on the owner thread and preserves collector history; the
+/// mount handle owns shutdown, observer-error cleanup and dispatch retirement.
+fn wait_with_live_dashboard(
+    handle: ffs_fuse::MountHandle,
+    fs: &OpenFs,
+    params: &ManagedMountParams<'_>,
+) -> Result<(ffs_fuse::MetricsSnapshot, Option<PerCoreTransportMetrics>)> {
+    use std::io::IsTerminal;
+
+    let interval = params
+        .console
+        .live_refresh()
+        .context("live refresh is enabled")?;
+    let started = Instant::now();
+    let mut collector = ffs_tui::LiveTelemetryCollector::new();
+    let mountpoint = params.mountpoint.display().to_string();
+    let stdout = std::io::stdout();
+    let terminal = stdout.is_terminal();
+    let mut output = stdout.lock();
+    handle
+        .wait_with_observer(interval, |metrics| {
+            let elapsed = started.elapsed();
+            let repair = params
+                .repair_metrics
+                .map(ffs_repair::pipeline::RepairPipelineMetrics::snapshot);
+            let snapshot = collector.sample_open_fs(
+                fs,
+                &mountpoint,
+                elapsed,
+                Some(metrics.bytes_read),
+                None,
+                params.adaptive_runtime_plan.map(|plan| plan.fsm.as_ref()),
+                None,
+                repair.as_ref(),
+            );
+            if terminal {
+                write!(output, "\x1b[H\x1b[2J")?;
+            }
+            writeln!(
+                output,
+                "Source: {}\nSample: {} ms | Requests: {} | Read: {} bytes",
+                params.image_path.display(),
+                elapsed.as_millis(),
+                metrics.requests_total,
+                metrics.bytes_read,
+            )?;
+            write!(
+                output,
+                "{}",
+                ffs_tui::Dashboard::with_snapshot(snapshot).render_ascii()
+            )?;
+            output.flush()
+        })
+        .context("live dashboard failed during observation or mount shutdown")
+}
+
 /// Runtime counters lifted from a `MetricsSnapshot` for the console observation.
 #[derive(Clone, Copy)]
 struct MountConsoleRuntimeMetrics {
@@ -7778,9 +7866,7 @@ fn mount_console_observation(
         .backpressure
         .as_ref()
         .map_or(DegradationLevel::Normal, |gate| gate.level());
-    let uptime_seconds = shutdown_at
-        .duration_since(started_at)
-        .map_or(0, |duration| duration.as_secs());
+    let uptime = shutdown_at.duration_since(started_at).unwrap_or_default();
     let dashboard_snapshot = open_fs.map(|fs| {
         let mut collector = ffs_tui::LiveTelemetryCollector::new();
         let repair_snap = params
@@ -7790,9 +7876,9 @@ fn mount_console_observation(
         collector.sample_open_fs(
             fs,
             &mountpoint_label,
-            uptime_seconds,
+            uptime,
             Some(metrics.bytes_read),
-            0,
+            None,
             params.adaptive_runtime_plan.map(|plan| plan.fsm.as_ref()),
             None,
             repair_snap.as_ref(),
@@ -7923,7 +8009,11 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
         "per_core_mount_waiting_for_shutdown"
     );
 
-    let (metrics, transport_metrics) = handle.wait_with_per_core_metrics();
+    let (metrics, transport_metrics) = if params.console.live_refresh().is_some() {
+        wait_with_live_dashboard(handle, fs_for_console.as_ref(), params)?
+    } else {
+        handle.wait_with_per_core_metrics()
+    };
     let mount_ended = std::time::SystemTime::now();
 
     let transport_metrics = transport_metrics.ok_or_else(|| {
@@ -10576,16 +10666,23 @@ fn build_live_tui_snapshot(
     Ok(collector.sample_open_fs(
         &open_fs,
         &image_label,
-        0,
+        std::time::Duration::ZERO,
         None,
-        0,
+        None,
         None,
         scrub_report.as_ref(),
         None,
     ))
 }
 
-fn tui_cmd(image_path: &Path, snapshot_json: bool, run_scrub: bool, refresh_ms: u64) -> Result<()> {
+fn tui_cmd(
+    image_path: &Path,
+    mountpoint: Option<&Path>,
+    snapshot_json: bool,
+    run_scrub: bool,
+    refresh_ms: u64,
+    log_format: LogFormat,
+) -> Result<()> {
     let command_span = info_span!(
         target: "ffs::cli::tui",
         "tui",
@@ -10598,17 +10695,36 @@ fn tui_cmd(image_path: &Path, snapshot_json: bool, run_scrub: bool, refresh_ms: 
     let started = Instant::now();
     info!(target: "ffs::cli::tui", "tui_start");
 
-    let snap = build_live_tui_snapshot(image_path, run_scrub)?;
-
-    if snapshot_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&snap).context("serialize live TUI snapshot")?
-        );
-    } else {
-        let dashboard = ffs_tui::Dashboard::with_snapshot(snap);
-        print!("{}", dashboard.render_ascii());
+    if !snapshot_json {
+        let mountpoint = mountpoint.context(
+            "live TUI requires --mountpoint; use --snapshot-json for an offline snapshot",
+        )?;
+        // Reuse the mount command's actual defaults, validation and ownership;
+        // the standalone dashboard always mounts read-only. `--` keeps paths
+        // beginning with '-' from being interpreted as options.
+        let mut arguments = vec![
+            std::ffi::OsString::from("ffs-cli"),
+            std::ffi::OsString::from("mount"),
+            std::ffi::OsString::from("--runtime-mode=managed"),
+            std::ffi::OsString::from(format!("--console-live={refresh_ms}")),
+        ];
+        arguments.push(std::ffi::OsString::from(if run_scrub {
+            "--background-scrub"
+        } else {
+            "--no-background-scrub"
+        }));
+        arguments.push(std::ffi::OsString::from("--"));
+        arguments.push(image_path.as_os_str().to_owned());
+        arguments.push(mountpoint.as_os_str().to_owned());
+        let mount = Cli::try_parse_from(arguments).context("configure live read-only mount")?;
+        return execute_command(mount.command, log_format);
     }
+
+    let snap = build_live_tui_snapshot(image_path, run_scrub)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snap).context("serialize live TUI snapshot")?
+    );
 
     info!(
         target: "ffs::cli::tui",
@@ -21996,11 +22112,13 @@ mod tests {
         match cli.command {
             Command::Tui {
                 image,
+                mountpoint,
                 snapshot_json,
                 scrub,
                 refresh_ms,
             } => {
                 assert_eq!(image, PathBuf::from("/tmp/fs.img"));
+                assert!(mountpoint.is_none());
                 assert!(snapshot_json);
                 assert!(scrub);
                 assert_eq!(refresh_ms, 500);
@@ -22022,6 +22140,73 @@ mod tests {
             Command::Mount { console, .. } => assert!(console),
             other => panic!("expected Command::Mount, got {}", other.name()),
         }
+    }
+
+    #[test]
+    fn cli_live_tui_requires_a_mount_and_valid_refresh_interval() {
+        assert!(Cli::try_parse_from(["ffs", "tui", "/tmp/fs.img"]).is_err());
+        let command = Cli::try_parse_from([
+            "ffs",
+            "tui",
+            "/tmp/fs.img",
+            "--mountpoint",
+            "/tmp/live",
+            "--refresh-ms",
+            "1000",
+        ])
+        .unwrap()
+        .command;
+        assert!(matches!(
+            command,
+            Command::Tui {
+                mountpoint: Some(_),
+                snapshot_json: false,
+                ..
+            }
+        ));
+        for value in ["0", "99", "1001"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ffs",
+                    "tui",
+                    "/tmp/fs.img",
+                    "--mountpoint",
+                    "/tmp/live",
+                    "--refresh-ms",
+                    value,
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ffs",
+                "tui",
+                "/tmp/fs.img",
+                "--mountpoint",
+                "/tmp/live",
+                "--snapshot-json",
+            ])
+            .is_err()
+        );
+        let command = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "--runtime-mode=managed",
+            "--console-live",
+            "/tmp/fs.img",
+            "/tmp/live",
+        ])
+        .unwrap()
+        .command;
+        assert!(matches!(
+            command,
+            Command::Mount {
+                console_live: Some(1000),
+                rw: false,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -146,12 +146,12 @@ pub struct DashboardSnapshot {
 
     // Degradation / pressure
     pub degradation_level: DegradationLevel,
-    /// Fraction in [0.0, 1.0].
-    pub cpu_pressure: f64,
+    /// Budget-derived pressure in [0.0, 1.0], when a runtime source is present.
+    pub cpu_pressure: Option<f64>,
     /// Fraction in [0.0, 1.0].
     pub memory_pressure: f64,
-    /// Current I/O queue depth (converted to pressure gauge via cap).
-    pub io_queue_depth: usize,
+    /// Current I/O queue depth, or `None` when the caller cannot observe it.
+    pub io_queue_depth: Option<usize>,
     /// Recent transitions (newest is expected at the end of this vector).
     pub degradation_events: Vec<DegradationEvent>,
 
@@ -206,9 +206,9 @@ impl DashboardSnapshot {
             mvcc_version_count: mvcc.version_count,
             mvcc_versioned_blocks: mvcc.versioned_blocks,
             degradation_level: fs.degradation_level(),
-            cpu_pressure: 0.0,
+            cpu_pressure: None,
             memory_pressure,
-            io_queue_depth: 0,
+            io_queue_depth: None,
             degradation_events: Vec::new(),
             scrub_blocks_scanned: 0,
             scrub_blocks_corrupt: 0,
@@ -257,7 +257,7 @@ impl DashboardSnapshot {
         if fsm_level > self.degradation_level {
             self.degradation_level = fsm_level;
         }
-        self.cpu_pressure = normalized_pressure(1.0 - f64::from(fsm.headroom()));
+        self.cpu_pressure = Some(normalized_pressure(1.0 - f64::from(fsm.headroom())));
         self
     }
 
@@ -319,10 +319,10 @@ impl DashboardSnapshot {
         }
     }
 
-    /// Queue-depth-derived I/O pressure in [0.0, 1.0].
+    /// Queue-depth-derived pressure, with no pressure contribution when unknown.
     #[must_use]
     pub fn io_pressure(&self) -> f64 {
-        let normalized = self.io_queue_depth as f64 / IO_QUEUE_PRESSURE_CAP as f64;
+        let normalized = self.io_queue_depth.unwrap_or(0) as f64 / IO_QUEUE_PRESSURE_CAP as f64;
         normalized_pressure(normalized)
     }
 
@@ -358,7 +358,7 @@ pub struct LiveTelemetryCollector {
     last_degradation_level: DegradationLevel,
     last_commits_total: u64,
     last_io_bytes: u64,
-    last_uptime_seconds: u64,
+    last_uptime: std::time::Duration,
     initialized: bool,
 }
 
@@ -380,7 +380,7 @@ impl LiveTelemetryCollector {
             last_degradation_level: DegradationLevel::Normal,
             last_commits_total: 0,
             last_io_bytes: 0,
-            last_uptime_seconds: 0,
+            last_uptime: std::time::Duration::ZERO,
             initialized: false,
         }
     }
@@ -392,14 +392,14 @@ impl LiveTelemetryCollector {
         &mut self,
         fs: &ffs::OpenFs,
         mount_point: &str,
-        uptime_seconds: u64,
+        uptime: std::time::Duration,
         bytes_read_override: Option<u64>,
-        io_queue_depth: usize,
+        io_queue_depth: Option<usize>,
         fsm: Option<&ffs::DegradationFsm>,
         scrub_report: Option<&ffs_repair::scrub::ScrubReport>,
         repair_metrics: Option<&ffs_repair::pipeline::RepairMetricsSnapshot>,
     ) -> DashboardSnapshot {
-        let mut snap = DashboardSnapshot::from_open_fs(fs, mount_point, uptime_seconds);
+        let mut snap = DashboardSnapshot::from_open_fs(fs, mount_point, uptime.as_secs());
         if let Some(bytes_read) = bytes_read_override {
             snap.bytes_read_total = bytes_read;
         }
@@ -415,14 +415,23 @@ impl LiveTelemetryCollector {
         }
 
         let mvcc = fs.mvcc_telemetry();
+        self.record_sample(snap, mvcc.commits_total, uptime)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_sample(
+        &mut self,
+        mut snap: DashboardSnapshot,
+        commits_total: u64,
+        uptime: std::time::Duration,
+    ) -> DashboardSnapshot {
         let io_bytes = snap
             .bytes_read_total
             .saturating_add(snap.bytes_written_total);
-        let elapsed_secs = uptime_seconds
-            .saturating_sub(self.last_uptime_seconds)
-            .max(1) as f64;
+        let elapsed_secs = uptime.saturating_sub(self.last_uptime).as_secs_f64();
 
         if self.initialized && snap.degradation_level != self.last_degradation_level {
+            let uptime_seconds = uptime.as_secs();
             let h = uptime_seconds / 3600;
             let m = (uptime_seconds % 3600) / 60;
             let s = uptime_seconds % 60;
@@ -440,24 +449,32 @@ impl LiveTelemetryCollector {
 
         self.hit_rate_history.push(snap.cache_hit_ratio());
         let commit_delta = if self.initialized {
-            mvcc.commits_total.saturating_sub(self.last_commits_total)
+            commits_total.saturating_sub(self.last_commits_total)
         } else {
-            mvcc.commits_total
+            commits_total
         };
-        self.commit_rate_history
-            .push(commit_delta as f64 / elapsed_secs);
 
         let io_delta_bytes = if self.initialized {
             io_bytes.saturating_sub(self.last_io_bytes)
         } else {
             io_bytes
         };
-        let io_mb_per_sec = (io_delta_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+        // Duplicate or backwards timestamps have no measurable rate. Keep
+        // subsecond precision: live refreshes may be as short as 100 ms.
+        let (commits_per_sec, io_mb_per_sec) = if elapsed_secs > 0.0 {
+            (
+                commit_delta as f64 / elapsed_secs,
+                (io_delta_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        self.commit_rate_history.push(commits_per_sec);
         self.io_throughput_history.push(io_mb_per_sec);
 
-        self.last_commits_total = mvcc.commits_total;
+        self.last_commits_total = commits_total;
         self.last_io_bytes = io_bytes;
-        self.last_uptime_seconds = uptime_seconds;
+        self.last_uptime = uptime;
         self.initialized = true;
 
         snap.hit_rate_history = self.hit_rate_history.clone();
@@ -489,9 +506,9 @@ impl Default for DashboardSnapshot {
             mvcc_version_count: 0,
             mvcc_versioned_blocks: 0,
             degradation_level: DegradationLevel::Normal,
-            cpu_pressure: 0.0,
+            cpu_pressure: None,
             memory_pressure: 0.0,
-            io_queue_depth: 0,
+            io_queue_depth: None,
             degradation_events: Vec::new(),
             scrub_blocks_scanned: 0,
             scrub_blocks_corrupt: 0,
@@ -778,18 +795,27 @@ fn build_system_health_text(snap: &DashboardSnapshot) -> Text<'_> {
     let mut lines = vec![
         Line::from_spans([Span::raw("Degradation: "), level_span]),
         Line::raw(""),
-        Line::raw(format!(
-            "CPU:    {}",
-            render_pressure_gauge(snap.cpu_pressure, PRESSURE_BAR_WIDTH)
+        Line::raw(snap.cpu_pressure.map_or_else(
+            || "CPU:    unavailable".to_owned(),
+            |pressure| {
+                format!(
+                    "CPU:    {}",
+                    render_pressure_gauge(pressure, PRESSURE_BAR_WIDTH)
+                )
+            },
         )),
         Line::raw(format!(
             "Memory: {}",
             render_pressure_gauge(snap.memory_pressure, PRESSURE_BAR_WIDTH)
         )),
-        Line::raw(format!(
-            "I/O:    {} depth={}",
-            render_pressure_gauge(snap.io_pressure(), PRESSURE_BAR_WIDTH),
-            snap.io_queue_depth
+        Line::raw(snap.io_queue_depth.map_or_else(
+            || "I/O:    unavailable".to_owned(),
+            |depth| {
+                format!(
+                    "I/O:    {} depth={depth}",
+                    render_pressure_gauge(snap.io_pressure(), PRESSURE_BAR_WIDTH),
+                )
+            },
         )),
         Line::raw(""),
         Line::raw("Recent events:"),
@@ -886,9 +912,9 @@ mod tests {
     fn representative_system_health_snapshot() -> DashboardSnapshot {
         DashboardSnapshot {
             degradation_level: DegradationLevel::Critical,
-            cpu_pressure: 0.78,
+            cpu_pressure: Some(0.78),
             memory_pressure: 0.62,
-            io_queue_depth: 22,
+            io_queue_depth: Some(22),
             degradation_events: vec![
                 DegradationEvent {
                     timestamp: "12:34:05".to_owned(),
@@ -919,9 +945,9 @@ mod tests {
         assert_eq!(snap.mvcc_active_snapshots, 0);
         assert!(snap.mvcc_watermark.is_none());
         assert_eq!(snap.degradation_level, DegradationLevel::Normal);
-        assert!((snap.cpu_pressure - 0.0).abs() < f64::EPSILON);
+        assert_eq!(snap.cpu_pressure, None);
         assert!((snap.memory_pressure - 0.0).abs() < f64::EPSILON);
-        assert_eq!(snap.io_queue_depth, 0);
+        assert_eq!(snap.io_queue_depth, None);
         assert_eq!(snap.degradation_events, [] as [DegradationEvent; 0]);
         assert_eq!(snap.scrub_blocks_scanned, 0);
         assert_eq!(snap.scrub_findings_count, 0);
@@ -932,6 +958,45 @@ mod tests {
         assert_eq!(render_pressure_gauge(-1.0, 10), "[..........]   0%");
         assert_eq!(render_pressure_gauge(0.5, 10), "[#####.....]  50%");
         assert_eq!(render_pressure_gauge(1.5, 10), "[##########] 100%");
+    }
+
+    #[test]
+    fn absent_pressure_sources_are_distinct_from_observed_zero() {
+        let mut snapshot = DashboardSnapshot::default();
+        let output = snapshot.render_ascii();
+        assert!(output.contains("CPU:    unavailable"));
+        assert!(output.contains("I/O:    unavailable"));
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["cpu_pressure"].is_null());
+        assert!(json["io_queue_depth"].is_null());
+        snapshot.cpu_pressure = Some(0.0);
+        snapshot.io_queue_depth = Some(0);
+        let output = snapshot.render_ascii();
+        assert!(output.contains("CPU:    [..........]   0%"));
+        assert!(output.contains("I/O:    [..........]   0% depth=0"));
+        assert!(!output.contains("unavailable"));
+    }
+
+    #[test]
+    fn live_rates_preserve_subsecond_time_and_handle_missing_intervals() {
+        use std::time::Duration;
+
+        let mut collector = LiveTelemetryCollector::new();
+        let sample = |bytes| DashboardSnapshot {
+            bytes_read_total: bytes,
+            ..Default::default()
+        };
+        let first = collector.record_sample(sample(0), 0, Duration::ZERO);
+        assert_eq!(first.io_throughput_history.latest(), Some(0.0));
+        let next = collector.record_sample(sample(1024 * 1024), 2, Duration::from_millis(250));
+        assert_eq!(next.io_throughput_history.latest(), Some(4.0));
+        assert_eq!(next.commit_rate_history.latest(), Some(8.0));
+        assert_eq!(next.io_throughput_history.len(), 2);
+        let duplicate = collector.record_sample(sample(1024 * 1024), 2, Duration::from_millis(250));
+        assert_eq!(duplicate.io_throughput_history.latest(), Some(0.0));
+        let reset = collector.record_sample(sample(0), 0, Duration::from_millis(200));
+        assert_eq!(reset.commit_rate_history.latest(), Some(0.0));
+        assert_eq!(reset.io_throughput_history.latest(), Some(0.0));
     }
 
     #[test]
@@ -1092,9 +1157,9 @@ mod tests {
             scrub_blocks_io_error: 1,
             scrub_findings_count: 5,
             degradation_level: DegradationLevel::Warning,
-            cpu_pressure: 0.4,
+            cpu_pressure: Some(0.4),
             memory_pressure: 0.2,
-            io_queue_depth: 6,
+            io_queue_depth: Some(6),
             degradation_events: vec![DegradationEvent {
                 timestamp: "12:34:05".to_owned(),
                 from: DegradationLevel::Normal,
@@ -1195,7 +1260,7 @@ mod tests {
     #[test]
     fn io_pressure_at_cap() {
         let snap = DashboardSnapshot {
-            io_queue_depth: IO_QUEUE_PRESSURE_CAP,
+            io_queue_depth: Some(IO_QUEUE_PRESSURE_CAP),
             ..Default::default()
         };
         assert!((snap.io_pressure() - 1.0).abs() < f64::EPSILON);
@@ -1204,7 +1269,7 @@ mod tests {
     #[test]
     fn io_pressure_over_cap_clamps_to_one() {
         let snap = DashboardSnapshot {
-            io_queue_depth: IO_QUEUE_PRESSURE_CAP * 2,
+            io_queue_depth: Some(IO_QUEUE_PRESSURE_CAP * 2),
             ..Default::default()
         };
         assert!((snap.io_pressure() - 1.0).abs() < f64::EPSILON);
@@ -1213,7 +1278,7 @@ mod tests {
     #[test]
     fn io_pressure_half_cap() {
         let snap = DashboardSnapshot {
-            io_queue_depth: IO_QUEUE_PRESSURE_CAP / 2,
+            io_queue_depth: Some(IO_QUEUE_PRESSURE_CAP / 2),
             ..Default::default()
         };
         assert!((snap.io_pressure() - 0.5).abs() < f64::EPSILON);
@@ -1445,9 +1510,9 @@ mod tests {
     fn dashboard_view_narrow_terminal() {
         let dash = Dashboard::with_snapshot(DashboardSnapshot {
             degradation_level: DegradationLevel::Emergency,
-            cpu_pressure: 0.95,
+            cpu_pressure: Some(0.95),
             memory_pressure: 0.88,
-            io_queue_depth: 50,
+            io_queue_depth: Some(50),
             ..Default::default()
         });
         let mut pool = ftui::GraphemePool::new();
