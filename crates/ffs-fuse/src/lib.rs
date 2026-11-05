@@ -8825,7 +8825,10 @@ impl MountHandle {
             std::thread::sleep(
                 next_tick
                     .saturating_duration_since(std::time::Instant::now())
-                    .min(MOUNT_HANDLE_WAIT_POLL_INTERVAL),
+                    // Ten shutdown checks per second keep cancellation prompt
+                    // without waking an idle observer a hundred times a second.
+                    // Short refresh intervals still sleep only to their tick.
+                    .min(std::time::Duration::from_millis(100)),
             );
         };
         let cleanup = self.join_session();
