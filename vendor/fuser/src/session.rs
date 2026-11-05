@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io,
     ops::DerefMut,
 };
@@ -97,7 +97,20 @@ struct QueuedRequest {
 #[derive(Debug, Default)]
 struct PerCoreLane {
     pending: Mutex<VecDeque<QueuedRequest>>,
-    active_handles: Mutex<HashSet<u64>>,
+}
+
+/// Enqueue order for one handle across every CPU lane. The active request
+/// remains at the head until completion; later requests cannot overtake it.
+#[derive(Debug, Default)]
+struct PerCoreHandleOrder {
+    lanes: VecDeque<usize>,
+    active: bool,
+}
+
+impl PerCoreHandleOrder {
+    fn is_ready_on(&self, lane: usize) -> bool {
+        !self.active && self.lanes.front() == Some(&lane)
+    }
 }
 
 /// Immutable counters exported from the real per-core transport scheduler.
@@ -171,6 +184,9 @@ impl PerCoreMetrics {
 struct PerCoreScheduler {
     cpus: Box<[usize]>,
     lanes: Box<[PerCoreLane]>,
+    // Whenever both locks are needed, take a lane's pending lock first, then
+    // this connection-wide order lock. No path acquires them in reverse.
+    handle_order: Mutex<HashMap<u64, PerCoreHandleOrder>>,
     metrics: Arc<PerCoreMetrics>,
 }
 
@@ -190,6 +206,7 @@ impl PerCoreScheduler {
                 .map(|_| PerCoreLane::default())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            handle_order: Mutex::new(HashMap::new()),
             metrics,
         }
     }
@@ -201,40 +218,54 @@ impl PerCoreScheduler {
             .unwrap_or_else(|| cpu % self.lanes.len())
     }
 
-    fn enqueue(&self, cpu: usize, bytes: Vec<u8>, file_handle: Option<u64>) {
-        let lane = self.lane_for_cpu(cpu);
+    // Queue operations take lane indices, never CPU IDs. The transport maps
+    // its current CPU once, before entering these methods. Mapping twice can
+    // select the wrong lane when the allowed CPU set is not zero-based.
+    fn enqueue(&self, lane: usize, bytes: Vec<u8>, file_handle: Option<u64>) {
         let mut pending = self.lanes[lane]
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(file_handle) = file_handle {
+            self.handle_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(file_handle)
+                .or_default()
+                .lanes
+                .push_back(lane);
+        }
         pending.push_back(QueuedRequest { bytes, file_handle });
     }
 
     fn pop_local(&self, lane: usize) -> Option<QueuedRequest> {
-        let lane = self.lane_for_cpu(lane);
         let queue = &self.lanes[lane];
         let mut pending = queue
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut active = queue
-            .active_handles
+        let mut handle_order = self
+            .handle_order
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let position = pending.iter().position(|request| {
-            request
-                .file_handle
-                .is_none_or(|file_handle| !active.contains(&file_handle))
+            request.file_handle.is_none_or(|file_handle| {
+                handle_order
+                    .get(&file_handle)
+                    .is_some_and(|order| order.is_ready_on(lane))
+            })
         })?;
         let request = pending.remove(position)?;
-        if let Some(file_handle) = request.file_handle {
-            active.insert(file_handle);
+        if let Some(order) = request
+            .file_handle
+            .and_then(|file_handle| handle_order.get_mut(&file_handle))
+        {
+            order.active = true;
         }
         Some(request)
     }
 
     fn steal_ready(&self, receiver: usize) -> Option<(usize, QueuedRequest)> {
-        let receiver = self.lane_for_cpu(receiver);
         let mut donor = None;
         let mut donor_depth = 0;
         for (lane, queue) in self.lanes.iter().enumerate() {
@@ -245,16 +276,18 @@ impl PerCoreScheduler {
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let active = queue
-                .active_handles
+            let handle_order = self
+                .handle_order
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let eligible = pending
                 .iter()
                 .filter(|request| {
-                    request
-                        .file_handle
-                        .is_none_or(|file_handle| !active.contains(&file_handle))
+                    request.file_handle.is_none_or(|file_handle| {
+                        handle_order
+                            .get(&file_handle)
+                            .is_some_and(|order| order.is_ready_on(lane))
+                    })
                 })
                 .count();
             if eligible > donor_depth {
@@ -263,37 +296,30 @@ impl PerCoreScheduler {
             }
         }
         let donor = donor?;
-        let mut pending = self.lanes[donor]
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut active = self.lanes[donor]
-            .active_handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let position = pending.iter().position(|request| {
-            request
-                .file_handle
-                .is_none_or(|file_handle| !active.contains(&file_handle))
-        })?;
-        let request = pending.remove(position)?;
-        if let Some(file_handle) = request.file_handle {
-            active.insert(file_handle);
-        }
+        // Recheck eligibility under the same locks used by a local worker:
+        // another worker may have claimed the handle after the donor scan.
+        let request = self.pop_local(donor)?;
         PerCoreMetrics::increment(&self.metrics.stolen_from[donor]);
         PerCoreMetrics::increment(&self.metrics.stolen_to[receiver]);
         Some((donor, request))
     }
 
     fn complete(&self, source_lane: usize, processing_lane: usize, file_handle: Option<u64>) {
-        let source_lane = self.lane_for_cpu(source_lane);
-        let processing_lane = self.lane_for_cpu(processing_lane);
         if let Some(file_handle) = file_handle {
-            self.lanes[source_lane]
-                .active_handles
+            let mut handle_order = self
+                .handle_order
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&file_handle);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(order) = handle_order.get_mut(&file_handle)
+                && order.active
+                && order.lanes.front() == Some(&source_lane)
+            {
+                order.lanes.pop_front();
+                order.active = false;
+                if order.lanes.is_empty() {
+                    handle_order.remove(&file_handle);
+                }
+            }
         }
         PerCoreMetrics::increment(&self.metrics.requests[processing_lane]);
     }
@@ -590,7 +616,7 @@ impl<FS: Filesystem> Session<FS> {
     fn current_cpu(&self) -> usize {
         #[cfg(target_os = "linux")]
         {
-            return sched_getcpu().unwrap_or(self.dispatch_worker);
+            sched_getcpu().unwrap_or(self.dispatch_worker)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1085,7 +1111,7 @@ impl fmt::Debug for BackgroundSession {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
-    use super::{DispatchGate, PerCoreScheduler};
+    use super::{DispatchGate, PerCoreMetrics, PerCoreScheduler};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -1095,11 +1121,98 @@ mod dispatch_gate_tests {
         let scheduler = PerCoreScheduler::new(4);
         // CPU 5 maps to lane 1. The worker CPU is intentionally not an inode
         // or PID: the lane is selected at receive time by sched_getcpu.
-        scheduler.enqueue(5, vec![1], None);
+        let lane = scheduler.lane_for_cpu(5);
+        assert_eq!(lane, 1);
+        scheduler.enqueue(lane, vec![1], None);
         assert!(scheduler.pop_local(0).is_none());
-        let request = scheduler.pop_local(5).expect("request queued for CPU 5");
+        let request = scheduler.pop_local(lane).expect("request queued for CPU 5");
         assert_eq!(request.bytes, vec![1]);
-        scheduler.complete(5, 5, request.file_handle);
+        scheduler.complete(lane, lane, request.file_handle);
+    }
+
+    #[test]
+    fn per_core_nonidentity_cpu_sets_preserve_source_and_processing_lanes() {
+        for cpus in [vec![1, 2], vec![2, 5, 8, 11]] {
+            let scheduler = PerCoreScheduler::with_metrics(
+                cpus.clone(),
+                Arc::new(PerCoreMetrics::new(cpus.clone())),
+            );
+            for (source, &cpu) in cpus.iter().enumerate() {
+                // The transport resolves CPU IDs once, before calling the
+                // queue. In particular, lane 1 must not become CPU 1 again.
+                assert_eq!(scheduler.lane_for_cpu(cpu), source);
+                let receiver = (source + 1) % cpus.len();
+                scheduler.enqueue(source, vec![1], Some(77));
+                scheduler.enqueue(source, vec![2], Some(77));
+                assert!(scheduler.pop_local(receiver).is_none());
+
+                let (donor, first) = scheduler
+                    .steal_ready(receiver)
+                    .expect("steal first request");
+                assert_eq!(donor, source);
+                assert_eq!(first.bytes, vec![1]);
+                assert!(scheduler.pop_local(source).is_none());
+                scheduler.complete(donor, receiver, first.file_handle);
+
+                let second = scheduler.pop_local(source).expect("source handle released");
+                assert_eq!(second.bytes, vec![2]);
+                scheduler.complete(source, source, second.file_handle);
+            }
+            let metrics = scheduler.metrics().snapshot();
+            assert_eq!(metrics.cpus, cpus);
+            assert_eq!(metrics.requests, vec![2; metrics.cpus.len()]);
+            assert_eq!(metrics.stolen_from, vec![1; metrics.cpus.len()]);
+            assert_eq!(metrics.stolen_to, vec![1; metrics.cpus.len()]);
+        }
+    }
+
+    #[test]
+    fn same_handle_keeps_global_enqueue_order_across_cpu_lanes() {
+        let scheduler = PerCoreScheduler::new(3);
+        scheduler.enqueue(0, vec![1], Some(77));
+        scheduler.enqueue(1, vec![2], Some(77));
+        scheduler.enqueue(0, vec![3], Some(77));
+        scheduler.enqueue(2, vec![9], Some(88));
+        scheduler.enqueue(1, vec![8], None);
+
+        // A later same-handle request cannot overtake a pending predecessor
+        // on another lane. Unrelated metadata behind it can still run.
+        let metadata = scheduler.pop_local(1).expect("independent metadata");
+        assert_eq!(metadata.bytes, vec![8]);
+        scheduler.complete(1, 1, metadata.file_handle);
+        assert!(scheduler.pop_local(1).is_none());
+
+        let first = scheduler.pop_local(0).expect("first handle request");
+        let independent = scheduler.pop_local(2).expect("independent handle");
+        assert_eq!(first.bytes, vec![1]);
+        assert_eq!(independent.bytes, vec![9]);
+        assert!(scheduler.pop_local(0).is_none());
+        assert!(scheduler.pop_local(1).is_none());
+        assert!(scheduler.steal_ready(2).is_none());
+        scheduler.complete(2, 2, independent.file_handle);
+        scheduler.complete(0, 0, first.file_handle);
+
+        // Completion unlocks only the next request in global enqueue order,
+        // not a later request that happens to share the original CPU lane.
+        assert!(scheduler.pop_local(0).is_none());
+        let (source, second) = scheduler.steal_ready(0).expect("second request");
+        assert_eq!(source, 1);
+        assert_eq!(second.bytes, vec![2]);
+        assert!(scheduler.pop_local(0).is_none());
+        scheduler.complete(source, 0, second.file_handle);
+
+        let (source, third) = scheduler.steal_ready(1).expect("third request");
+        assert_eq!(source, 0);
+        assert_eq!(third.bytes, vec![3]);
+        scheduler.complete(source, 1, third.file_handle);
+        assert!(scheduler.steal_ready(2).is_none());
+
+        // Reusing a drained handle does not inherit an active predecessor.
+        scheduler.enqueue(2, vec![4], Some(77));
+        let reused = scheduler.pop_local(2).expect("reused handle");
+        assert_eq!(reused.bytes, vec![4]);
+        scheduler.complete(2, 2, reused.file_handle);
+        assert!(scheduler.handle_order.lock().unwrap().is_empty());
     }
 
     #[test]
