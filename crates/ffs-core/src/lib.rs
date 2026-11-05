@@ -130800,6 +130800,16 @@ mod tests {
                 }
                 Err(error) => assert_eq!(error.to_errno(), libc::ENOSPC),
             }
+            {
+                let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                eprintln!(
+                    "RECORDED_EOF_WRITE|file={file}|offset={offset}|len={len}|data_free={}|data_allocatable={}|pinned={}|commit_out_of_space={}",
+                    alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA),
+                    alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+                    alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                    fs.btrfs_commit_out_of_space.load(Ordering::Acquire)
+                );
+            }
             verify_files(&model);
         }
         let free_before = fs
@@ -130834,6 +130844,8 @@ mod tests {
         // shrink. Observe its real space requirement without weakening that
         // property's expectation: an admitted growth must expose a zero byte;
         // a full-DATA refusal must preserve the complete checkpointed state.
+        // Freed bytes pinned by the previous transaction are not allocatable
+        // until a superblock commit; total_free alone includes those bytes.
         let snapshot = || {
             let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
             let lo = BtrfsKey {
@@ -130856,6 +130868,19 @@ mod tests {
             )
         };
         let before_growth = snapshot();
+        eprintln!(
+            "RECORDED_EOF_GROWTH_PREFLIGHT|data_free={}|data_pinned={}|data_allocatable={}|commit_out_of_space={}|spaces={:?}",
+            before_growth.5,
+            before_growth.4,
+            fs.btrfs_alloc_state
+                .as_ref()
+                .unwrap()
+                .read()
+                .extent_alloc
+                .allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+            fs.btrfs_commit_out_of_space.load(Ordering::Acquire),
+            before_growth.3
+        );
         match fs.setattr(
             &cx,
             inos[0],
@@ -130874,8 +130899,8 @@ mod tests {
             Err(error) => {
                 assert_eq!(error.to_errno(), libc::ENOSPC);
                 assert!(
-                    before_growth.5 < 4096,
-                    "a free DATA sector must allow growth"
+                    before_growth.5.saturating_sub(before_growth.4) < 4096,
+                    "an unpinned DATA sector must allow growth"
                 );
                 assert_eq!(snapshot(), before_growth, "refused growth must be atomic");
                 eprintln!(
