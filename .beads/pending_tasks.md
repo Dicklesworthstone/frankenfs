@@ -2,6 +2,44 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-04, native engine fuzzing
+
+Owner IvoryGate; existing P1 `bd-2tzok`, claimed only after the local source-aware
+report lists it as claimable (53ready,0foreign,0permission-gated). User requested
+high-value functional progress and a detailed TODO. This list tracks one unit of
+work, not separate target/implementation/test mini-closures.
+
+- [x] Refresh repository rules, README, raw/source-aware queue and dependencies;
+  preserve unrelated untracked files. Inspect critical writer and fsync tasks:
+  native writers require new engines; the previous fsync lever measured a loss.
+- [x] Claim existing P1 fuzz gap and reserve initial targets/manifest/seeds/docs;
+  announce original acceptance, positive/negative probes and no-claim boundary.
+- [ ] Trace public native readers, pure parser/transform/recovery entry points,
+  existing limits and source authority. Identify independent resource budgets.
+- [ ] Add real FAT traversal/name/chain/allocation target with bounded inputs.
+- [ ] Add real NTFS MFT/catalog/index/stream/recovery/transform/accounting target.
+- [ ] Add real ZFS label/config/topology/DMU/ZPL/ZIL/transform target.
+- [ ] Seed actual native-produced paths plus malicious boundary/cycle/expansion/
+  retry/final-element cases. Preserve native provenance separately from crafted
+  fixtures and fuzz mutations; do not present synthetic bytes as native proof.
+- [ ] Exercise cancellation, physical-read/decode/memory/depth/reference/retry
+  limits, late failure, repeatability and strict read-only storage authority.
+- [ ] Obtain complete actual-volume20GiB/RAM fleet admission, build through
+  strict RCH, and execute reproducible campaigns with sanitizer/overflow checks.
+  Record fixed source/toolchain/ELF/corpus/seeds, run time, iterations, execution
+  rate and actual coverage; stop shallow targets and improve their inputs.
+- [ ] Minimize each discovered counterexample, fix its production cause and add
+  a regression. Re-execute the original failure and corrected campaign.
+- [ ] Run owning libraries and affected public-consumer tests, workspace
+  check/strict Clippy/fmt and required harness gates. Retain failures and count
+  selected passes/failures/ignores/filters; no skip or empty-run qualification.
+- [ ] Update source-derived inventories/parity for actual changes and evidence;
+  fresh-eyes source/evidence review, final honesty/real-work audit, close only
+  original acceptance satisfied, tracker export and empty dependency cycles.
+- Publication closeout follows final evidence: commit/push both required refs,
+  verify remote hashes, release leases and record the actual outcome. Missing
+  native campaigns, resource bounds or required probes keep the Bead open.
+
 ## Current execution — 2026-11-04, mounted btrfs space accounting
 
 Owner IvoryGate; existing `bd-k3hon`, claimed after local ready/source-authority
