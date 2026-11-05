@@ -1,4 +1,6 @@
 artifacts/e2e/
+# Local implementation evidence includes host-specific tool symlinks, not source.
+artifacts/implementation/
 beads_compliance_audit/
 # Generated libtool alias; its regular-file target ../libtest.la is transferred.
 third_party/xfstests-dev/lib/.libs/libtest.la

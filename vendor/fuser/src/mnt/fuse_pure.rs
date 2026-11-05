@@ -58,13 +58,16 @@ impl Drop for Mount {
             // living at the same mountpoint
             return;
         }
-        if let Some(sock) = mem::take(&mut self.auto_unmount_socket) {
-            drop(sock);
-            // fusermount in auto-unmount mode, no more work to do.
-            return;
-        }
         if let Err(err) = super::libc_umount(&self.mountpoint) {
             if err.kind() == PermissionDenied {
+                if let Some(sock) = mem::take(&mut self.auto_unmount_socket) {
+                    // Nonprivileged mounts rely on the helper. Try the direct
+                    // unmount first: a confined auto-unmount helper may fail
+                    // to create its private mount namespace during shutdown,
+                    // leaving the session's dispatch threads blocked forever.
+                    drop(sock);
+                    return;
+                }
                 // Linux always returns EPERM for non-root users.  We have to let the
                 // library go through the setuid-root "fusermount -u" to unmount.
                 fuse_unmount_pure(&self.mountpoint)

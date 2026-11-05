@@ -227,7 +227,7 @@ with open(stderr_path, 'wb') as errors:
     process = subprocess.Popen(
         arguments,
         stdin=subprocess.DEVNULL, stdout=destination, stderr=errors,
-        env=dict(os.environ, RUST_LOG='error'))
+        env=dict(os.environ, RUST_LOG='error,ffs_fuse=info'))
     if master is not None:
         os.close(slave)
         reader = master
@@ -300,7 +300,8 @@ with open(stderr_path, 'wb') as errors:
             else:
                 os.close(fd)
                 raise AssertionError('standalone TUI admitted a source mutation')
-            until(lambda: samples()[-1][1] > prior[1])
+            until(lambda: samples()[-1][1] > prior[1]
+                  and (not require_payload or samples()[-1][2] > prior[2]))
             if require_payload:
                 assert samples()[-1][2] > prior[2], 'real reads did not reach telemetry'
             if mode == 'scrub':
@@ -322,6 +323,7 @@ with open(stderr_path, 'wb') as errors:
             if mode == 'fast':
                 assert max(gaps) < 1000, ('live updates fell below 1Hz', gaps)
         assert not os.path.ismount(mount), 'TUI left its mount active'
+        assert 'unmount complete' in stderr_path.read_text(), 'dispatch join receipt missing'
         assert digest() == before_hash, 'read-only source bytes changed'
         assert (b'\x1b[H\x1b[2J' in output) == (mode == 'terminal')
         print(json.dumps(dict(
@@ -341,6 +343,7 @@ with open(stderr_path, 'wb') as errors:
             cleanup = subprocess.run(['fusermount3', '-u', str(mount)], capture_output=True, timeout=10)
             if cleanup.returncode:
                 print(cleanup.stderr.decode(), file=sys.stderr)
+        collect()
         if master is not None:
             os.close(master)
         (root / (mode + '-stdout.log')).write_bytes(output)
@@ -4534,8 +4537,12 @@ fn build_gate7_ext4_image() -> Vec<u8> {
 #[test]
 #[ignore = "canonical spec §22.1 Gate 7: full conformance and user-facing tools"]
 fn gate7_full_conformance_and_tools() {
-    let tmpdir = tempfile::tempdir().expect("create temp dir");
-    let image = tmpdir.path().join("gate7.ext4");
+    let tmpdir = tempfile::Builder::new()
+        .prefix("ffs-gate7-")
+        .tempdir()
+        .expect("create temp dir")
+        .keep();
+    let image = tmpdir.join("gate7.ext4");
     fs::write(&image, build_gate7_ext4_image()).expect("write gate7 ext4 image");
     let image_str = image.to_str().expect("utf-8 path");
 

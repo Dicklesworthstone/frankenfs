@@ -1585,7 +1585,7 @@ enum Command {
             conflicts_with = "snapshot_json"
         )]
         mountpoint: Option<PathBuf>,
-        /// Emit a single live telemetry snapshot as JSON and exit.
+        /// Emit a single offline telemetry snapshot as JSON and exit.
         #[arg(long = "snapshot-json")]
         snapshot_json: bool,
         /// Enable background scrub while mounted, or scrub the offline JSON snapshot.
@@ -7786,7 +7786,7 @@ fn wait_with_live_dashboard(
     let interval = params
         .console
         .live_refresh()
-        .context("live refresh is enabled")?;
+        .context("live dashboard requires --console-live")?;
     let started = Instant::now();
     let mut collector = ffs_tui::LiveTelemetryCollector::new();
     let mountpoint = params.mountpoint.display().to_string();
