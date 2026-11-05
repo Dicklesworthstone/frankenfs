@@ -459,9 +459,10 @@ impl LiveTelemetryCollector {
         } else {
             io_bytes
         };
-        // Duplicate or backwards timestamps have no measurable rate. Keep
-        // subsecond precision: live refreshes may be as short as 100 ms.
-        let (commits_per_sec, io_mb_per_sec) = if elapsed_secs > 0.0 {
+        // The first sample establishes a baseline. Duplicate or backwards
+        // timestamps also have no measurable rate. Keep subsecond precision:
+        // live refreshes may be as short as 100 ms.
+        let (commits_per_sec, io_mb_per_sec) = if self.initialized && elapsed_secs > 0.0 {
             (
                 commit_delta as f64 / elapsed_secs,
                 (io_delta_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs,
@@ -997,6 +998,24 @@ mod tests {
         let reset = collector.record_sample(sample(0), 0, Duration::from_millis(200));
         assert_eq!(reset.commit_rate_history.latest(), Some(0.0));
         assert_eq!(reset.io_throughput_history.latest(), Some(0.0));
+    }
+
+    #[test]
+    fn first_live_sample_does_not_attribute_preexisting_work_to_this_interval() {
+        use std::time::Duration;
+
+        let mut collector = LiveTelemetryCollector::new();
+        let sample = |bytes| DashboardSnapshot {
+            bytes_read_total: bytes,
+            ..Default::default()
+        };
+        let first = collector.record_sample(sample(5 * 1024 * 1024), 100, Duration::from_secs(60));
+        assert_eq!(first.io_throughput_history.latest(), Some(0.0));
+        assert_eq!(first.commit_rate_history.latest(), Some(0.0));
+        let next =
+            collector.record_sample(sample(6 * 1024 * 1024), 102, Duration::from_millis(60_250));
+        assert_eq!(next.io_throughput_history.latest(), Some(4.0));
+        assert_eq!(next.commit_rate_history.latest(), Some(8.0));
     }
 
     #[test]
