@@ -310,6 +310,10 @@ jobs:
   fuse-e2e:
     name: FUSE E2E
     runs-on: ubuntu-latest
+    env:
+      # Nested Cargo gates in the differential suite must share the runner's
+      # writable build tree rather than defaulting to offload-host scratch.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
       - name: Checkout
@@ -368,7 +372,6 @@ jobs:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
           FFS_USE_RCH: "0"
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: ./scripts/e2e/ffs_smoke.sh
 
       - name: Journaled ext4 write and recovery smoke
