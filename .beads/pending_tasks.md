@@ -24,12 +24,19 @@ Retain this execution list until its final evidence is recorded; no new roadmap.
 - [x] Add valid/partial/zero-slot/malformed/oversized/backend-error unit cases.
   Full affected library passes730tests/0failures/1existing ignore/0filters
   on the retained two-file source overlay; committed-source validation follows.
-- [ ] Execute real mounted legacy count, legacy nonzero, sized complete/partial
+- [x] Execute real mounted legacy count, legacy nonzero, sized complete/partial
   and undersized-buffer cases, then the public consumer against native btrfs
   and FrankenFS. Compare complete block-group records to a native extent-tree
   dump, retain all native ioctl rows including transient GLOBAL_RSV separately,
   and retain unchanged input hashes. Do not filter that runtime row to claim
   native-ABI parity; the original draft equality oracle used the wrong contract.
+  Final corrected source `882dac071` passes the unchanged mounted test and
+  public consumer controls:2pass/0fail/0ignore/44filtered, native checker0.
+  All three records match the native persisted oracle, including DUP flags;
+  input/mounted-before/mounted-after SHA256 all equal67dfdbde88c34e6b…758f0.
+  CLI SHA256cd7bdc8f…ad682, consumer SHA256f2a41681…52d5f. Full hashes/tool
+  identities in `corrected-cli-native.log`; small artifacts retained locally
+  under `native-success-UBZlS0/`. Entire kernel4-row output remains separate.
 - [x] Execute mounted `7df03b83f`: all ioctl-window/error probes and public
   consumer reach full record comparison; byte counts match, but FFS reports
   flags1/2/4 instead of native1/34/36. Retain the real1pass/1fail/44filtered
@@ -40,13 +47,36 @@ Retain this execution list until its final evidence is recorded; no new roadmap.
   survive without changing the allocation type mask. GoldenCliff independently
   verified placement/commit consumers and the mask invariant; mounted oracle
   unchanged. Strengthen the new allocation regression with SYSTEM lowest.
-- [ ] Execute the new profile/placement/ENOSPC regression and the unchanged
-  mounted native comparison on the final corrected source.
-- [ ] Repair the harness execution environment: its first full run executes
+- [x] Execute the new profile/placement/ENOSPC regression. The unchanged mounted
+  native comparison passes on corrected source `882dac071` as recorded above.
+  Full default btrfs/FUSE libraries also pass on the same clean committed source:
+  btrfs488passes/0failures/1existing ignore; FUSE730passes/0failures/1existing
+  ignore; both0filtered. `corrected-full-component-libraries-retry.log`, exit0.
+- [x] Repair the harness execution environment: its first full run executes
   substantial suites but fails two compile-fail cases because sudo loses the
   cached Cargo environment. Preserve cache/toolchain/target variables, retain
   the failures, restore ownership of this job's generated scratch, and reconcile
   only its exact RCH job before rerunning. Do not skip or relax compile-fail tests.
+  Ownership restored on four generated directories after retaining their files;
+  supported recovery of rchw-16fef7f1-cfa6-4c21-b5c7-d5e8cd8bdd1e acknowledges
+  its original exit101. Corrected root-worker full rerun preserves the Cargo
+  cache, target and toolchain environment. Its cold run reaches2080library
+  passes and several integration suites, then times out compiling trybuild
+  dependencies (exit137,1801.7s). The unchanged warm run is executing those
+  compile-fail cases; no compile-fail assertion or golden has been changed.
+  That warm run passes both compile-fail cases (1421.96s),291mounted FUSE
+  integration tests (8existing ignores), and the preceding suites, then reaches
+  the normal1800s deadline during the public adversarial gate's nested MVCC
+  dependency build: exit137/1802177ms. Keep this failed complete invocation.
+  The next unchanged retry is refused103 before compilation while RCH recovers
+  the worker. Actual-volume20GiB/RAM preflight passes; supported connectivity
+  probing succeeds. Do not override eligibility or silence expected ENOSPC logs.
+  Two supported healthy probes restore ordinary eligibility with no bypass
+  override. The unchanged rerun now passes all29targets:2660passes/0failures/
+  11existing ignores/0filters,8scenario SKIPs/0FAIL, including both unchanged
+  compile-fail fixtures and both public adversarial parity cases. Clean source
+  882dac071/treec8ed6379, remote899543ms, RCH exit0;
+  `corrected-full-harness-warm-3.log`. The refused retry remains warm-2.log.
 - [x] Execute the newly found native-consumer count-growth bug as a mocked
   negative: it returns one record after two calls when two are available.
   Fix native mode with post-array count checks; the same control now returns
@@ -57,11 +87,11 @@ Retain this execution list until its final evidence is recorded; no new roadmap.
 - [x] Re-read code and obtain independent source review: AmberPine reviewed
   bounds/dispatch/response; GoldenCliff reviewed consumer/native semantics and
   the original Bead scope. Their source reviews do not qualify mounted proof.
-- [ ] Run owning library/CLI tests, workspace check/strict Clippy/fmt and
+- [x] Run owning library/CLI tests, workspace check/strict Clippy/fmt and
   required harness gates through admitted strict RCH, retaining failed attempts.
   Exact committed `ec9ad27f6` workspace/all-target check passes through strict
   RCH (`committed-workspace-check-j1.log`); local `cargo fmt --check` passes.
-  Mounted CLI execution is running with mandatory native/FUSE prerequisites.
+  Mounted CLI execution passes with mandatory native/FUSE prerequisites.
   Retain all failed fleet preflights. A bounded read of existing project ELFs
   recovered swap headroom on114; the complete20GiB/RAM preflight then passes
   (`114-bounded-warm-final-preflight.json`). No guard, deadline or slot changed.
@@ -82,8 +112,34 @@ Retain this execution list until its final evidence is recorded; no new roadmap.
   (`array-fixture-workspace-clippy.log`, exit0,236.7s). The second failed run
   exposed a tuple-to-array lint in the new test double; store the same three
   records as arrays, with no value or assertion change. Retain both failed runs.
-- [ ] Record exact source/ELF/options/tool/image identities and actual results;
+  Final production source `882dac071` passes the complete owning libraries and
+  real mounted CLI case recorded above. Final workspace/all-target check and
+  strict Clippy pass using7df03b83f plus the explicit two-file profile fix;
+  their core/btrfs blobs exactly match882dac071. Receipts are
+  `profile-preservation-workspace-check.log` (594.8s) and
+  `profile-preservation-workspace-clippy.log` (255.6s); these are overlay runs,
+  not clean882runs. Formatting also passes. The complete default
+  `cargo bench -j1 -p ffs-harness` passes on clean882after an unchanged warm
+  rerun (565976ms remote); its first cold run times out137 after1826.6s.
+  Benchmarks are maintenance evidence, with no incumbent or speedup claim.
+  Full harness completion was the remaining gate and now passes as above.
+  Worker115's project-owned
+  tmpfs was temporarily enlarged32to48GiB after a capacity failure; complete
+  20GiB/RAM admission then passes. Restore its original32GiB after the gate if
+  the retained footprint fits, without deleting files or changing guard rules.
+  Restored32GiB at2026-11-05 02:04:31UTC, exit0: original nosuid/nodev/relatime/
+  mode755/inode64 flags preserved; retained footprint19143184384bytes fits.
+  `1152480-capacity-restored.log`. No manual file deletion, guard change or
+  outstanding temporary capacity expansion remains.
+- [x] Record exact source/ELF/options/tool/image identities and actual results;
   complete the honesty inventory, close only satisfied work, export/cycle-check.
+  AmberPine's final independent source/retained-evidence review clears original
+  acceptance on882dac071/treec8ed6379 after the full harness exit0. This is not
+  independent live execution. All20honesty answers, real-work/creation audit,
+  exact source/hash/command evidence and failed attempts are attached in Bead
+  comments; artifacts `completion-evidence.txt` and `final-honesty.txt` under
+  `artifacts/implementation/20261104_space_8rS2PW/`. Closed onlybd-k3hon at
+  2026-11-05 02:07:42UTC on those cited executions; broader project goals remain.
 - Post-commit closeout: publish both required refs, verify remote hashes and
   release reservations; final response records the actual outcome.
 

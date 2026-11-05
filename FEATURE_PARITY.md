@@ -1,6 +1,6 @@
 # FEATURE_PARITY
 
-> **Mounted btrfs space accounting in progress (bd-k3hon, 2026-11-04):**
+> **Mounted btrfs block-group query verified (bd-k3hon, 2026-11-04):**
 > The existing allocator records are connected through an explicitly sized
 > Linux/FUSE SPACE_INFO command and the public `scripts/ffs_space_info.py`
 > consumer. Standard zero-slot count queries remain; nonzero legacy queries
@@ -9,8 +9,21 @@
 > and read-only accounting remain separate gaps; in particular, the native
 > kernel's transient global-reserve row is not an allocator block group.
 > The consumer is currently limited to Linux x86_64. Initial mounted execution
-> exposed dropped DUP profile bits in allocator loading; the focused preservation
-> fix and final execution remain pending. No parity percentage or mounted
+> exposed dropped DUP profile bits in allocator loading; source `882dac071`
+> preserves them. The unchanged mounted comparison now matches all three native
+> block-group records (flags1/34/36, allocated bytes and used bytes); legacy count,
+> partial arrays and malformed windows execute through real FUSE. The selected
+> CLI suite passes2/2tests,0failures,44filtered; query image hashes remain equal
+> and native `btrfs check --readonly` succeeds. The complete native ioctl array
+> is retained separately, including its fourth global-reserve row. See
+> `cli_mount_btrfs_space_info_records_bd_k3hon` in `crates/ffs-cli/tests/cli_e2e.rs`.
+> Complete btrfs/FUSE libraries pass488/730tests respectively, each with one
+> existing ignore and no filters. Workspace check, strict Clippy, formatting
+> and the default harness benchmarks also pass. The full harness completes on
+> the same committed source:2660passes/0failures/11existing ignores/0filters,
+> with8explicit scenario SKIPs retained. Receipts are under
+> `artifacts/implementation/20261104_space_8rS2PW/`; failed attempts remain there
+> too. No global parity percentage, performance win or native-tool/ABI
 > completion credit is added here.
 
 > **Filesystem-wide sync wiring (bd-yek6e, 2026-11-04):**
