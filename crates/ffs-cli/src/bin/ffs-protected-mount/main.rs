@@ -860,7 +860,7 @@ fn serve(
     if announce.is_err() || periodic.is_err() || background.is_err() {
         flag.store(true, Ordering::Release);
     }
-    let _metrics = handle.wait();
+    let mount_result = handle.wait().context("protected FUSE mount cleanup failed");
     // Cancel both workers before draining either. Final filesystem cleanup must
     // not race a periodic boundary or lose either worker's completion receipt.
     let commit_cancel = match periodic.as_ref() {
@@ -884,6 +884,7 @@ fn serve(
     drop(periodic?);
     commit_cancel?;
     scrub_cancel?;
+    mount_result?;
     commit_result.and(scrub_result)
 }
 

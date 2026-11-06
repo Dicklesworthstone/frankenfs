@@ -8758,25 +8758,29 @@ impl MountHandle {
     /// Block until the shutdown flag is set, then unmount cleanly.
     ///
     /// Returns the final metrics snapshot.
-    #[must_use]
-    pub fn wait(mut self) -> MetricsSnapshot {
+    ///
+    /// # Errors
+    /// Returns session cleanup or final filesystem flush failures.
+    pub fn wait(mut self) -> std::io::Result<MetricsSnapshot> {
         self.wait_for_shutdown();
         self.do_unmount()
     }
 
     /// Wait for shutdown and return metrics from the real per-core transport,
     /// when this handle was mounted through [`mount_managed_per_core`].
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns session cleanup or final filesystem flush failures.
     pub fn wait_with_per_core_metrics(
         mut self,
-    ) -> (MetricsSnapshot, Option<PerCoreTransportMetrics>) {
+    ) -> std::io::Result<(MetricsSnapshot, Option<PerCoreTransportMetrics>)> {
         self.wait_for_shutdown();
-        let metrics = self.do_unmount();
+        let metrics = self.do_unmount()?;
         let per_core_metrics = self
             .per_core_metrics
             .as_ref()
             .map(|metrics| PerCoreTransportMetrics::from(metrics.snapshot()));
-        (metrics, per_core_metrics)
+        Ok((metrics, per_core_metrics))
     }
 
     /// Observe the running mount at `interval` until shutdown or session exit.
@@ -8869,17 +8873,16 @@ impl MountHandle {
     /// Trigger a graceful unmount.
     ///
     /// Returns the final metrics snapshot.
-    #[must_use]
-    pub fn unmount(mut self) -> MetricsSnapshot {
+    ///
+    /// # Errors
+    /// Returns session cleanup or final filesystem flush failures.
+    pub fn unmount(mut self) -> std::io::Result<MetricsSnapshot> {
         self.do_unmount()
     }
 
-    fn do_unmount(&mut self) -> MetricsSnapshot {
-        let snap = self.metrics.snapshot();
-        if let Err(error) = self.join_session() {
-            error!(%error, "FUSE unmount failed");
-        }
-        snap
+    fn do_unmount(&mut self) -> std::io::Result<MetricsSnapshot> {
+        self.join_session()?;
+        Ok(self.metrics.snapshot())
     }
 
     fn join_session(&mut self) -> std::io::Result<()> {
@@ -8908,9 +8911,8 @@ impl MountHandle {
                     // Dropping the session only requests unmount and detaches
                     // its dispatch thread. The receipt must follow the actual
                     // destroy callback and thread retirement, including errors.
-                    let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        session.join();
-                    }));
+                    let joined =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.join()));
                     if let Ok(permit) = tx.reserve(&notify_cx) {
                         let _ = permit.send(joined);
                     }
@@ -8920,17 +8922,16 @@ impl MountHandle {
                 });
                 match completed {
                     Ok(Ok(joined)) => {
-                        runtime
+                        let closed = runtime
                             .block_on(region.close())
-                            .map_err(|error| std::io::Error::other(error.to_string()))?;
-                        if let Err(payload) = joined {
-                            error!("FUSE background session join failed during unmount");
-                            if !std::thread::panicking() {
-                                std::panic::resume_unwind(payload);
-                            }
-                            return Err(std::io::Error::other("FUSE background session panicked"));
+                            .map_err(|error| std::io::Error::other(error.to_string()));
+                        if let Err(error) = &closed {
+                            error!(%error, "FUSE unmount region cleanup failed");
                         }
-                        info!(mountpoint = %self.mountpoint.display(), "unmount complete");
+                        joined.map_err(|_| {
+                            std::io::Error::other("FUSE background session cleanup panicked")
+                        })??;
+                        closed?;
                     }
                     Ok(Err(_)) => {
                         let _ = region.cancel(asupersync::types::CancelReason::shutdown());
@@ -8959,14 +8960,26 @@ impl MountHandle {
                 ));
             }
         }
+        // The destroy callback cannot return an error through fuser. Its shared
+        // latch is authoritative only after the actual dispatch thread retires.
+        // Preserve the native errno just as the foreground mount owner does.
+        self.diagnostics
+            .final_flush_result()
+            .map_err(|error| match error {
+                FuseError::Io(error) => error,
+                error => std::io::Error::other(error),
+            })?;
+        info!(mountpoint = %self.mountpoint.display(), "unmount complete");
         Ok(())
     }
 }
 
 impl Drop for MountHandle {
     fn drop(&mut self) {
-        if self.session.is_some() {
-            self.do_unmount();
+        if self.session.is_some()
+            && let Err(error) = self.do_unmount()
+        {
+            error!(%error, "FUSE unmount failed during drop");
         }
     }
 }
@@ -8999,7 +9012,7 @@ impl std::fmt::Debug for MountHandle {
 /// // Wire Ctrl+C to the shutdown flag (e.g. via ctrlc crate):
 /// let flag = handle.shutdown_flag().clone();
 /// // ... register signal handler that sets `flag.store(true, ...)` ...
-/// let stats = handle.wait();
+/// let stats = handle.wait().expect("mount cleanup and final flush succeeded");
 /// println!("served {} requests", stats.requests_total);
 /// # }
 /// ```
@@ -12294,6 +12307,110 @@ mod tests {
         let mut clean = FrankenFuse::with_options(Box::new(MinimalTestFs), &options);
         clean.destroy();
         assert!(clean.final_flush_result().is_ok());
+    }
+
+    #[test]
+    fn managed_shutdown_checks_final_flush_for_every_public_exit() {
+        // Component proof: invoke the actual destroy callback, then consume its
+        // retained result through each owner API. No kernel mount is claimed.
+        for fails in [false, true] {
+            for exit in 0..4 {
+                let ops: Box<dyn FsOps> = if fails {
+                    Box::new(FinalFlushFailsTestFs)
+                } else {
+                    Box::new(MinimalTestFs)
+                };
+                let mut diagnostics = FrankenFuse::new(ops);
+                diagnostics.destroy();
+                let handle = MountHandle {
+                    metrics: Arc::clone(&diagnostics.inner.metrics),
+                    diagnostics,
+                    session: None,
+                    mountpoint: PathBuf::from("/mnt/final-flush-component-test"),
+                    shutdown: Arc::new(AtomicBool::new(true)),
+                    per_core_metrics: None,
+                    config: MountConfig::default(),
+                };
+                let result = match exit {
+                    0 => handle.unmount().map(|_| ()),
+                    1 => handle.wait().map(|_| ()),
+                    2 => handle.wait_with_per_core_metrics().map(|_| ()),
+                    _ => handle
+                        .wait_with_observer(Duration::from_millis(1), |_| {
+                            panic!("an already stopped mount must not be observed")
+                        })
+                        .map(|_| ()),
+                };
+                if fails {
+                    assert_eq!(
+                        result
+                            .expect_err("failed final flush must not return success")
+                            .raw_os_error(),
+                        Some(libc::ENOSPC),
+                        "public exit {exit} must retain the original errno",
+                    );
+                } else {
+                    result.expect("clean final flush must succeed");
+                }
+            }
+        }
+    }
+
+    /// Real kernel transport and callback evidence with a deliberately failing
+    /// test backend. This is not native-image or crash-durability qualification.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_shutdown_returns_actual_destroy_flush_errno() {
+        let required = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+        for per_core in [false, true] {
+            let unique = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "ffs-managed-final-flush-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).expect("create retained lifecycle mountpoint");
+            let config = MountConfig {
+                options: MountOptions {
+                    read_only: false,
+                    auto_unmount: false,
+                    worker_threads: if per_core { 2 } else { 1 },
+                    ..MountOptions::default()
+                },
+                ..MountConfig::default()
+            };
+            let mounted = if per_core {
+                mount_managed_per_core(Box::new(FinalFlushFailsTestFs), &directory, &config)
+            } else {
+                mount_managed(Box::new(FinalFlushFailsTestFs), &directory, &config)
+            };
+            let handle = match mounted {
+                Ok(handle) => handle,
+                Err(error) => {
+                    assert!(!required, "required real FUSE mount failed: {error}");
+                    eprintln!("SKIP fuse_unavailable reason={error}");
+                    return;
+                }
+            };
+            // The backend intentionally refuses getattr. This syscall must
+            // reach it through FUSE before the destroy callback fails ENOSPC.
+            assert!(std::fs::metadata(&directory).is_err());
+            assert!(handle.metrics_snapshot().requests_err > 0);
+            handle.shutdown_flag().store(true, Ordering::Release);
+            let error = if per_core {
+                handle.wait_with_per_core_metrics().map(|_| ())
+            } else {
+                handle.unmount().map(|_| ())
+            };
+            assert_eq!(
+                error
+                    .expect_err("actual final flush must fail")
+                    .raw_os_error(),
+                Some(libc::ENOSPC)
+            );
+        }
     }
 
     struct CountingMissingXattrFs {
@@ -24053,7 +24170,7 @@ mod tests {
         assert_eq!(snap.bytes_read, 8192);
 
         // Unmount returns final snapshot.
-        let final_snap = handle.unmount();
+        let final_snap = handle.unmount().expect("session-free cleanup succeeds");
         assert_eq!(final_snap.requests_ok, 2);
     }
 
@@ -24245,7 +24362,7 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let snap = handle.wait();
+        let snap = handle.wait().expect("shutdown cleanup succeeds");
         let returned_at = std::time::Instant::now();
         let elapsed = started.elapsed();
         let set_at = shutdown_thread
@@ -24298,7 +24415,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let snap = handle.wait();
+        let snap = handle.wait().expect("shutdown cleanup succeeds");
         let elapsed = started.elapsed();
 
         shutdown_thread.join().unwrap();
@@ -24509,7 +24626,9 @@ mod tests {
         });
         let (result, retired_on_return) =
             completed.expect("actual managed-unmount completion receipt");
-        result.expect("real session join must not panic");
+        result
+            .expect("real session join must not panic")
+            .expect("real session cleanup and final flush must succeed");
         unmount.join().expect("managed-unmount caller retired");
         // Also drain the OLD-source failure path before its negative assertion:
         // its detached session may still be leaving the released callback.

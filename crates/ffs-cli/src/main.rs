@@ -7732,7 +7732,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
     let metrics = if params.console.live_refresh().is_some() {
         wait_with_live_dashboard(handle, fs_for_console.as_ref(), params)?.0
     } else {
-        handle.wait()
+        handle.wait().context("managed FUSE mount cleanup failed")?
     };
     let mount_ended = std::time::SystemTime::now();
     log_mount_shutdown_metrics(
@@ -8012,7 +8012,9 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
     let (metrics, transport_metrics) = if params.console.live_refresh().is_some() {
         wait_with_live_dashboard(handle, fs_for_console.as_ref(), params)?
     } else {
-        handle.wait_with_per_core_metrics()
+        handle
+            .wait_with_per_core_metrics()
+            .context("per-core FUSE mount cleanup failed")?
     };
     let mount_ended = std::time::SystemTime::now();
 

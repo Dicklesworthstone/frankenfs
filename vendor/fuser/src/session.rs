@@ -1084,7 +1084,9 @@ impl BackgroundSession {
         self.per_core_metrics.as_ref().map(Arc::clone)
     }
     /// Unmount the filesystem and join the background thread.
-    pub fn join(self) {
+    ///
+    /// Returns the session's I/O error, or an error if the thread panicked.
+    pub fn join(self) -> io::Result<()> {
         let Self {
             guard,
             sender: _,
@@ -1092,7 +1094,9 @@ impl BackgroundSession {
             ..
         } = self;
         drop(_mount);
-        guard.join().unwrap().unwrap();
+        guard
+            .join()
+            .map_err(|_| io::Error::other("FUSE background session panicked"))?
     }
 
     /// Returns an object that can be used to send notifications to the kernel
@@ -1111,10 +1115,33 @@ impl fmt::Debug for BackgroundSession {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
-    use super::{DispatchGate, PerCoreMetrics, PerCoreScheduler};
+    use super::{BackgroundSession, DispatchGate, PerCoreMetrics, PerCoreScheduler};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn background_join_preserves_io_errors_and_reports_panics() {
+        let session = |work: fn() -> std::io::Result<()>| BackgroundSession {
+            guard: std::thread::spawn(work),
+            sender: crate::channel::Channel::new(Arc::new(
+                std::fs::File::open("/dev/null").unwrap(),
+            ))
+            .sender(),
+            _mount: None,
+            per_core_metrics: None,
+        };
+        session(|| Ok(())).join().expect("clean worker joins");
+        let error = session(|| Err(std::io::Error::from_raw_os_error(libc::ENOSPC)))
+            .join()
+            .expect_err("worker failure must reach the caller");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        let error = session(|| panic!("worker panic control"))
+            .join()
+            .expect_err("worker panic must return an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("panicked"));
+    }
 
     #[test]
     fn per_core_queue_is_keyed_by_the_requesting_cpu() {
