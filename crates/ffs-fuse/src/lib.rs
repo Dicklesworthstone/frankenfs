@@ -8599,6 +8599,10 @@ pub fn mount(
     } else {
         session.run()?;
     }
+    // Ordinary FUSE may end without a DESTROY request. Session::drop invokes
+    // the fallback destroy callback, which fills the shared final-flush latch.
+    // Finish that callback before reading the latch or final counters.
+    drop(session);
     // bd-xfe7z: emit the per-opcode CROSSING counts, gated like the rest of the
     // mount evidence. Emitted here because the session has ended, so these cover
     // the whole mount and cannot be read mid-run and mistaken for a steady state.
@@ -12402,6 +12406,168 @@ mod tests {
         let mut clean = FrankenFuse::with_options(Box::new(MinimalTestFs), &options);
         clean.destroy();
         assert!(clean.final_flush_result().is_ok());
+    }
+
+    /// Actual foreground owner/transport control, not native-image durability.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreground_shutdown_observes_drop_time_final_flush() {
+        struct OwnedMountCleanup<'handle, 'scope> {
+            mountpoint: Option<PathBuf>,
+            worker:
+                &'handle std::thread::ScopedJoinHandle<'scope, Result<MetricsSnapshot, FuseError>>,
+        }
+        impl Drop for OwnedMountCleanup<'_, '_> {
+            fn drop(&mut self) {
+                let Some(path) = self.mountpoint.take() else {
+                    return;
+                };
+                loop {
+                    // Only this test's fresh private path is ever used here.
+                    // Retire dispatch before an assertion unwinds its scope.
+                    // A failed setup can still publish its mount after the
+                    // first cleanup attempt. Check retirement BEFORE attempting
+                    // cleanup so the last attempt follows any late publication.
+                    let retired = self.worker.is_finished();
+                    let result = std::process::Command::new("fusermount3")
+                        .args(["-u", "-z"])
+                        .arg(&path)
+                        .output();
+                    match result {
+                        Ok(output) if !output.status.success() => {
+                            eprintln!("owned foreground test cleanup failed: {output:?}");
+                        }
+                        Err(error) => {
+                            eprintln!("owned foreground test cleanup failed: {error}");
+                        }
+                        _ => {}
+                    }
+                    if retired {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        let required = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+        let helper_available = std::process::Command::new("fusermount3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !Path::new("/dev/fuse").exists() || !helper_available {
+            assert!(!required, "required foreground FUSE prerequisites missing");
+            eprintln!("SKIP fuse_unavailable reason=foreground prerequisites missing");
+            return;
+        }
+        for worker_threads in [1, 2] {
+            for fails in [false, true] {
+                let unique = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir().join(format!(
+                    "ffs-foreground-flush-{}-{unique}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&root).unwrap();
+                let mountpoint = root.join("mount");
+                std::fs::create_dir(&mountpoint).unwrap();
+                let mountpoint = mountpoint.canonicalize().unwrap();
+                let options = MountOptions {
+                    read_only: true,
+                    auto_unmount: false,
+                    worker_threads,
+                    ..MountOptions::default()
+                };
+                let ops: Box<dyn FsOps> = if fails {
+                    Box::new(FinalFlushFailsTestFs)
+                } else {
+                    Box::new(MinimalTestFs)
+                };
+                let (ready, result) = std::thread::scope(|scope| {
+                    let worker = scope.spawn(|| mount(ops, &mountpoint, &options));
+                    let mut cleanup = OwnedMountCleanup {
+                        mountpoint: Some(mountpoint.clone()),
+                        worker: &worker,
+                    };
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        let records = std::fs::read("/proc/thread-self/mountinfo").unwrap();
+                        if let Some(entry) = records.split(|byte| *byte == b'\n').find(|line| {
+                            !line.is_empty()
+                                && mountinfo_contains_mountpoint(line, &mountpoint).unwrap()
+                        }) {
+                            let fields: Vec<_> = entry.split(|byte| *byte == b' ').collect();
+                            assert!(
+                                fields[5]
+                                    .split(|byte| *byte == b',')
+                                    .any(|flag| flag == b"ro")
+                            );
+                            assert!(
+                                entry
+                                    .windows(b" - fuse.".len())
+                                    .any(|part| part == b" - fuse.")
+                            );
+                            break;
+                        }
+                        if worker.is_finished() {
+                            drop(cleanup);
+                            return (false, worker.join().expect("foreground mount thread"));
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "foreground mount readiness timed out"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    // Both backends refuse getattr. ENOENT proves INIT and
+                    // real dispatch completed before the external unmount.
+                    let getattr = std::fs::metadata(&mountpoint);
+                    let unmount = std::process::Command::new("fusermount3")
+                        .arg("-u")
+                        .arg(&mountpoint)
+                        .output()
+                        .unwrap();
+                    std::fs::write(root.join("unmount.stdout"), &unmount.stdout).unwrap();
+                    std::fs::write(root.join("unmount.stderr"), &unmount.stderr).unwrap();
+                    assert!(unmount.status.success(), "{unmount:?}");
+                    let records = std::fs::read("/proc/thread-self/mountinfo").unwrap();
+                    assert!(!mountinfo_contains_mountpoint(&records, &mountpoint).unwrap());
+                    cleanup.mountpoint = None;
+                    drop(cleanup);
+                    let result = worker.join().expect("foreground mount thread");
+                    assert_eq!(getattr.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+                    (true, result)
+                });
+                if !ready {
+                    let unavailable = matches!(
+                        &result,
+                        Err(FuseError::Io(error)) if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                        )
+                    );
+                    assert!(
+                        !required && unavailable,
+                        "foreground mount ended before readiness: {result:?}"
+                    );
+                    eprintln!("SKIP fuse_unavailable reason={result:?}");
+                    return;
+                }
+                if fails {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(FuseError::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC)
+                        ),
+                        "foreground owner must retain final ENOSPC"
+                    );
+                } else {
+                    assert!(result.expect("clean foreground shutdown").requests_err > 0);
+                }
+            }
+        }
     }
 
     #[test]
