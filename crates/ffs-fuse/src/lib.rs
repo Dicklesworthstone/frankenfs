@@ -8649,6 +8649,73 @@ pub fn mount_background(
 
 // ── Mount lifecycle ─────────────────────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
+fn mountinfo_contains_mountpoint(mountinfo: &[u8], mountpoint: &Path) -> std::io::Result<bool> {
+    if mountinfo.iter().all(|byte| *byte == b'\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty mountinfo while confirming FUSE cleanup",
+        ));
+    }
+    // Linux escapes these four bytes in mountinfo fields. Encode the known
+    // pre-mount path once; do not resolve or stat a disconnected FUSE mount.
+    let mut encoded = Vec::new();
+    for byte in mountpoint.as_os_str().as_bytes() {
+        match byte {
+            b'\t' => encoded.extend_from_slice(b"\\011"),
+            b'\n' => encoded.extend_from_slice(b"\\012"),
+            b' ' => encoded.extend_from_slice(b"\\040"),
+            b'\\' => encoded.extend_from_slice(b"\\134"),
+            byte => encoded.push(*byte),
+        }
+    }
+    let mut occupied = false;
+    for line in mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let fields: Vec<_> = line.split(|byte| *byte == b' ').collect();
+        let valid = fields.len() >= 10
+            // Namespace bind mounts use roots such as net:[4026533814].
+            && !fields[3].is_empty()
+            && fields[4].starts_with(b"/")
+            && fields[6..]
+                .iter()
+                .position(|field| *field == b"-")
+                .is_some_and(|offset| offset + 10 == fields.len());
+        if !valid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid mountinfo record while confirming FUSE cleanup",
+            ));
+        }
+        occupied |= fields[4] == encoded.as_slice();
+    }
+    Ok(occupied)
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_mountpoint_detached(
+    mountinfo: &mut std::fs::File,
+    mountpoint: &Path,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    mountinfo.seek(SeekFrom::Start(0))?;
+    let mut records = Vec::new();
+    mountinfo.read_to_end(&mut records)?;
+    if mountinfo_contains_mountpoint(&records, mountpoint)? {
+        // Dispatch can end after a connection abort without removing its mount.
+        // A replacement also means this path is occupied; report it rather than
+        // attempting an ownership-unsafe second pathname unmount.
+        return Err(std::io::Error::other(format!(
+            "FUSE dispatch joined but mountpoint remains mounted: {}",
+            mountpoint.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Configuration for a managed mount with lifecycle control.
 #[derive(Debug, Clone)]
 pub struct MountConfig {
@@ -8683,12 +8750,18 @@ impl Default for MountConfig {
 /// `MountHandle` exposes a shared `shutdown` flag (`Arc<AtomicBool>`).
 /// The CLI (or any owner) should wire SIGTERM / SIGINT handlers that set
 /// this flag.  [`Self::wait`] polls the flag and triggers unmount when set.
-/// The `AutoUnmount` fuser option provides a safety net: the kernel
-/// unmounts the filesystem if the process exits without a clean unmount.
+/// The `AutoUnmount` fuser option asks a helper to detach the mount on exit.
+/// On Linux, successful explicit cleanup also requires the original path to be
+/// unoccupied in the constructor's mount namespace. A replacement at that path
+/// is reported as an error and is never unmounted by this confirmation check.
 pub struct MountHandle {
     diagnostics: FrankenFuse,
     session: Option<fuser::BackgroundSession>,
     mountpoint: PathBuf,
+    // Opened before mounting to retain the constructor thread's namespace/root
+    // view, even if the handle is later joined from another mount namespace.
+    #[cfg(target_os = "linux")]
+    mountinfo: Option<std::fs::File>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     metrics: Arc<AtomicMetrics>,
     per_core_metrics: Option<Arc<fuser::PerCoreMetrics>>,
@@ -8884,6 +8957,8 @@ impl MountHandle {
     }
 
     fn join_session(&mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let had_session = self.session.is_some();
         let mut region_cleanup = Ok(());
         if let Some(session) = self.session.take() {
             let snap = self.metrics.snapshot();
@@ -8968,6 +9043,13 @@ impl MountHandle {
                 error => std::io::Error::other(error),
             })?;
         region_cleanup?;
+        #[cfg(target_os = "linux")]
+        if had_session {
+            let mountinfo = self.mountinfo.as_mut().ok_or_else(|| {
+                std::io::Error::other("FUSE mount namespace view was not retained")
+            })?;
+            confirm_mountpoint_detached(mountinfo, &self.mountpoint)?;
+        }
         info!(mountpoint = %self.mountpoint.display(), "unmount complete");
         Ok(())
     }
@@ -9023,6 +9105,12 @@ pub fn mount_managed(
     validate_mount_options(&config.options)?;
     let mountpoint = mountpoint.as_ref();
     validate_mountpoint(mountpoint)?;
+    // Resolve before mounting: canonicalizing a disconnected FUSE root later
+    // may fail, and mountinfo always records the absolute kernel path.
+    let mountpoint = mountpoint.canonicalize()?;
+    let mountpoint = mountpoint.as_path();
+    #[cfg(target_os = "linux")]
+    let mountinfo = std::fs::File::open("/proc/thread-self/mountinfo")?;
 
     let thread_count = config.options.resolved_thread_count();
     info!(
@@ -9063,6 +9151,8 @@ pub fn mount_managed(
         diagnostics: notifier_owner,
         session: Some(session),
         mountpoint: mountpoint.to_owned(),
+        #[cfg(target_os = "linux")]
+        mountinfo: Some(mountinfo),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         metrics: metrics_ref,
         per_core_metrics: None,
@@ -9081,6 +9171,10 @@ pub fn mount_managed_per_core(
     validate_mount_options(&config.options)?;
     let mountpoint = mountpoint.as_ref();
     validate_mountpoint(mountpoint)?;
+    let mountpoint = mountpoint.canonicalize()?;
+    let mountpoint = mountpoint.as_path();
+    #[cfg(target_os = "linux")]
+    let mountinfo = std::fs::File::open("/proc/thread-self/mountinfo")?;
 
     let thread_count = config.options.resolved_thread_count();
     if thread_count < 2 {
@@ -9109,6 +9203,8 @@ pub fn mount_managed_per_core(
         diagnostics: notifier_owner,
         session: Some(session),
         mountpoint: mountpoint.to_owned(),
+        #[cfg(target_os = "linux")]
+        mountinfo: Some(mountinfo),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         metrics: metrics_ref,
         per_core_metrics,
@@ -12326,6 +12422,8 @@ mod tests {
                     diagnostics,
                     session: None,
                     mountpoint: PathBuf::from("/mnt/final-flush-component-test"),
+                    #[cfg(target_os = "linux")]
+                    mountinfo: None,
                     shutdown: Arc::new(AtomicBool::new(true)),
                     per_core_metrics: None,
                     config: MountConfig::default(),
@@ -12410,6 +12508,97 @@ mod tests {
                 Some(libc::ENOSPC)
             );
         }
+    }
+
+    /// Actual kernel connection abort: dispatch retirement must not certify
+    /// removal of a mount that still appears in the constructor's namespace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_shutdown_rejects_aborted_attached_mount() {
+        let required = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "ffs-managed-aborted-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let config = MountConfig {
+            options: MountOptions {
+                read_only: true,
+                auto_unmount: false,
+                worker_threads: 1,
+                ..MountOptions::default()
+            },
+            ..MountConfig::default()
+        };
+        let handle = match mount_managed(Box::new(MinimalTestFs), &directory, &config) {
+            Ok(handle) => handle,
+            Err(error) => {
+                assert!(!required, "required real FUSE mount failed: {error}");
+                eprintln!("SKIP fuse_unavailable reason={error}");
+                return;
+            }
+        };
+        let records = std::fs::read("/proc/thread-self/mountinfo").unwrap();
+        let entry = records
+            .split(|byte| *byte == b'\n')
+            .find(|line| {
+                !line.is_empty()
+                    && mountinfo_contains_mountpoint(line, handle.mountpoint()).unwrap()
+            })
+            .expect("owned mount must be present before disconnect");
+        let fields: Vec<_> = entry.split(|byte| *byte == b' ').collect();
+        assert!(
+            fields[5]
+                .split(|byte| *byte == b',')
+                .any(|flag| flag == b"ro")
+        );
+        assert!(
+            entry
+                .windows(b" - fuse.".len())
+                .any(|part| part == b" - fuse.")
+        );
+        let device = std::str::from_utf8(fields[2]).unwrap();
+        let (major, minor) = device.split_once(':').unwrap();
+        assert_eq!(
+            major, "0",
+            "only an owned ordinary FUSE connection may be aborted"
+        );
+        let connection: u32 = minor.parse().unwrap();
+        // The live handle retains this connection; its device number cannot be
+        // reused between reading its kernel entry and opening its control file.
+        let mut abort = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(format!("/sys/fs/fuse/connections/{connection}/abort"))
+            .expect("open only the owned read-only connection's abort control");
+        abort.write_all(b"1\n").unwrap();
+        let result = handle.unmount();
+        let mut mountinfo = std::fs::File::open("/proc/thread-self/mountinfo").unwrap();
+        let still_attached = confirm_mountpoint_detached(&mut mountinfo, &directory).is_err();
+        if still_attached {
+            let cleanup = std::process::Command::new("fusermount3")
+                .args(["-u", "-z"])
+                .arg(&directory)
+                .output()
+                .unwrap();
+            assert!(cleanup.status.success(), "{cleanup:?}");
+        }
+        confirm_mountpoint_detached(&mut mountinfo, &directory).unwrap();
+        assert!(
+            still_attached,
+            "abort must leave the original mount attached"
+        );
+        let error = result.expect_err("joined dispatch must not acknowledge an attached mount");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            error.to_string().contains("mountpoint remains mounted"),
+            "{error}"
+        );
     }
 
     struct CountingMissingXattrFs {
@@ -24154,6 +24343,8 @@ mod tests {
             diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/test"),
+            #[cfg(target_os = "linux")]
+            mountinfo: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::clone(&metrics),
             per_core_metrics: None,
@@ -24173,6 +24364,47 @@ mod tests {
         assert_eq!(final_snap.requests_ok, 2);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_cleanup_matches_exact_kernel_paths_including_replacements() {
+        let records = b"711 634 0:72 / /tmp/live ro - fuse.ffs frankenfs ro\n\
+712 634 0:73 / /tmp/live-child rw - tmpfs replacement rw\n\
+713 634 0:74 / /tmp/with\\040space\\011tab\\012line\\134040 rw - tmpfs replacement rw\n\
+714 634 0:75 / /tmp/vertical\x0bform\x0c\xff rw - tmpfs replacement rw\n\
+636 632 0:5 net:[4026533814] /run/docker/netns/17ccb5a24dfd rw - nsfs nsfs rw\n";
+        for path in [
+            Path::new("/tmp/live"),
+            Path::new("/tmp/live-child"),
+            Path::new("/tmp/with space\ttab\nline\\040"),
+            Path::new(OsStr::from_bytes(b"/tmp/vertical\x0bform\x0c\xff")),
+            Path::new("/run/docker/netns/17ccb5a24dfd"),
+        ] {
+            assert!(
+                mountinfo_contains_mountpoint(records, path).unwrap(),
+                "{path:?}"
+            );
+        }
+        for path in ["/tmp/liv", "/tmp/live/", "/tmp/live-child/missing", "/tmp"] {
+            assert!(!mountinfo_contains_mountpoint(records, Path::new(path)).unwrap());
+        }
+        assert!(mountinfo_contains_mountpoint(b"", Path::new("/tmp/live")).is_err());
+        assert!(mountinfo_contains_mountpoint(b"broken record\n", Path::new("/tmp/live")).is_err());
+        assert!(
+            mountinfo_contains_mountpoint(
+                b"711 634 0:72  /tmp/live ro - fuse.ffs frankenfs ro\n",
+                Path::new("/tmp/live")
+            )
+            .is_err()
+        );
+        let replacement = b"712 634 0:73 / /tmp/live rw - tmpfs replacement rw\n";
+        assert!(mountinfo_contains_mountpoint(replacement, Path::new("/tmp/live")).unwrap());
+        let mut mountinfo = std::fs::File::open("/proc/thread-self/mountinfo").unwrap();
+        assert!(
+            confirm_mountpoint_detached(&mut mountinfo, Path::new("/")).is_err(),
+            "a real mounted root must never be acknowledged as detached"
+        );
+    }
+
     fn observation_test_handle(
         metrics: Arc<AtomicMetrics>,
         shutdown: Arc<AtomicBool>,
@@ -24181,6 +24413,8 @@ mod tests {
             diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/observation-test"),
+            #[cfg(target_os = "linux")]
+            mountinfo: None,
             shutdown,
             metrics,
             per_core_metrics: None,
@@ -24292,6 +24526,8 @@ mod tests {
             diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/dbg"),
+            #[cfg(target_os = "linux")]
+            mountinfo: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(AtomicMetrics::new()),
             per_core_metrics: None,
@@ -24308,6 +24544,8 @@ mod tests {
             diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/drop"),
+            #[cfg(target_os = "linux")]
+            mountinfo: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(AtomicMetrics::new()),
             per_core_metrics: None,
@@ -24328,6 +24566,8 @@ mod tests {
             diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/wait"),
+            #[cfg(target_os = "linux")]
+            mountinfo: None,
             shutdown: Arc::clone(&shutdown),
             metrics,
             per_core_metrics: None,
@@ -24400,6 +24640,8 @@ mod tests {
             diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/timeout"),
+            #[cfg(target_os = "linux")]
+            mountinfo: None,
             shutdown: Arc::clone(&shutdown),
             metrics: Arc::new(AtomicMetrics::new()),
             per_core_metrics: None,
