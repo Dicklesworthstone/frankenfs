@@ -191,11 +191,71 @@ fn run_ffs_cli(args: &[&str]) -> std::process::Output {
         .expect("failed to execute ffs-cli")
 }
 
-/// Exercise one actual TUI process and its mounted filesystem. Python's stdlib
-/// supplies the PTY and nonblocking output collection; no metrics are injected.
-fn run_live_tui_profile(image: &Path, mode: &str, require_payload: bool) -> String {
-    const PROFILE: &str = r#"
-import errno, hashlib, json, os, pathlib, pty, re, signal, subprocess, sys, time
+/// Native observation and its policy unit controls share this implementation.
+/// The self-test exits before creating any filesystem or process resources.
+const LIVE_TUI_PROFILE: &str = r"
+import errno, hashlib, json, math, os, pathlib, pty, re, signal, subprocess, sys, time
+
+def latest_scanned(data):
+    values = re.findall(rb'Scanned:\s+([0-9]+)', data)
+    assert values, 'scrub telemetry missing'
+    return int(values[-1])
+
+def classify_cpu(mode, cpu, start_scanned, end_scanned):
+    assert math.isfinite(cpu) and cpu >= 0, 'CPU measurement invalid'
+    assert start_scanned is not None and end_scanned is not None, 'scrub count missing'
+    assert 0 <= start_scanned <= end_scanned, 'scrub count decreased'
+    delta = end_scanned - start_scanned
+    if mode == 'scrub':
+        assert delta > 0, 'scrub made no progress during CPU measurement'
+        return None, cpu, delta
+    assert start_scanned == end_scanned == 0, 'idle window contained scrub work'
+    assert cpu < 0.01, ('idle CPU target exceeded', cpu)
+    return cpu, None, delta
+
+def metrics_advanced(prior, current, require_payload):
+    return current[1] > prior[1] and (not require_payload or current[2] > prior[2])
+
+if sys.argv[1:] == ['--self-test']:
+    cases = 0
+    assert latest_scanned(b'Scanned: 7780\nScanned: 15560\n') == 15560
+    cases += 1
+    assert classify_cpu('captured', 0.005, 0, 0) == (0.005, None, 0)
+    cases += 1
+    assert classify_cpu('scrub', 0.06, 7780, 15560) == (None, 0.06, 7780)
+    cases += 1
+    for data in [b'', b'Scanned: unavailable']:
+        try:
+            latest_scanned(data)
+        except AssertionError:
+            cases += 1
+        else:
+            raise AssertionError('missing scrub telemetry admitted')
+    for arguments in [
+        ('captured', 0.01, 0, 0), ('captured', 0.02, 0, 0),
+        ('captured', -0.001, 0, 0), ('captured', float('nan'), 0, 0),
+        ('captured', float('inf'), 0, 0), ('captured', 0.005, None, 0),
+        ('scrub', 0.06, 0, None), ('scrub', 0.06, 10, 10),
+        ('scrub', 0.06, 20, 10), ('captured', 0.005, 10, 10),
+        ('captured', 0.005, 0, 10), ('scrub', 0.06, -1, 1),
+    ]:
+        try:
+            classify_cpu(*arguments)
+        except AssertionError:
+            cases += 1
+        else:
+            raise AssertionError(('invalid CPU observation admitted', arguments))
+    for current, required, expected in [
+        ((2000, 1, 0), True, False), ((2000, 2, 0), True, False),
+        ((2000, 1, 65536), True, False), ((2000, 2, 65536), True, True),
+        ((2000, 2, 0), False, True), ((2000, 1, 65536), False, False),
+    ]:
+        assert metrics_advanced((1000, 1, 0), current, required) == expected
+        cases += 1
+    assert cases == 23
+    print(json.dumps(dict(evidence_class='policy_unit', cases=cases)))
+    sys.exit(0)
+
 binary, image, root, mode, require_payload = sys.argv[1:]
 require_payload = require_payload == 'true'
 root = pathlib.Path(root)
@@ -223,7 +283,8 @@ with open(stderr_path, 'wb') as errors:
     if mode == 'fast':
         arguments.extend(['--refresh-ms', '250'])
     if mode == 'per-core':
-        arguments = [binary, 'mount', image, str(mount), '--runtime-mode=per-core', '--console-live']
+        arguments = [binary, 'mount', image, str(mount), '--runtime-mode=per-core',
+                     '--console-live', '--no-background-scrub']
     process = subprocess.Popen(
         arguments,
         stdin=subprocess.DEVNULL, stdout=destination, stderr=errors,
@@ -264,6 +325,7 @@ with open(stderr_path, 'wb') as errors:
     def ticks():
         fields = pathlib.Path('/proc/' + str(process.pid) + '/stat').read_text().rsplit(') ', 1)[1].split()
         return int(fields[11]) + int(fields[12])
+    idle_cpu = active_cpu = scanned_delta = None
     try:
         until(lambda: len(samples()) >= 2 and os.path.ismount(mount))
         assert image.encode() in output, 'source identity missing'
@@ -275,14 +337,15 @@ with open(stderr_path, 'wb') as errors:
             result = process.wait(timeout=10)
             assert result != 0, 'closed reader was silently acknowledged'
             assert 'Broken pipe' in stderr_path.read_text(), stderr_path.read_text()
-            idle_cpu = None
         else:
+            start_scanned = latest_scanned(output)
             start_ticks = ticks()
             start_time = time.monotonic()
             count = len(samples())
             until(lambda: len(samples()) >= count + (20 if mode == 'fast' else 5))
-            idle_cpu = (ticks() - start_ticks) / os.sysconf('SC_CLK_TCK') / (time.monotonic() - start_time)
-            assert idle_cpu < 0.01, ('idle CPU target exceeded', idle_cpu)
+            measured_cpu = (ticks() - start_ticks) / os.sysconf('SC_CLK_TCK') / (time.monotonic() - start_time)
+            idle_cpu, active_cpu, scanned_delta = classify_cpu(
+                mode, measured_cpu, start_scanned, latest_scanned(output))
             prior = samples()[-1]
             # These are actual filesystem calls through the mount. statvfs is
             # dispatched even when the kernel has cached directory attributes.
@@ -300,8 +363,7 @@ with open(stderr_path, 'wb') as errors:
             else:
                 os.close(fd)
                 raise AssertionError('standalone TUI admitted a source mutation')
-            until(lambda: samples()[-1][1] > prior[1]
-                  and (not require_payload or samples()[-1][2] > prior[2]))
+            until(lambda: metrics_advanced(prior, samples()[-1], require_payload))
             if require_payload:
                 assert samples()[-1][2] > prior[2], 'real reads did not reach telemetry'
             if mode == 'scrub':
@@ -329,6 +391,7 @@ with open(stderr_path, 'wb') as errors:
         print(json.dumps(dict(
             mode=mode, argv=arguments, pid=process.pid, exit=result, samples=samples(),
             idle_cpu_fraction=idle_cpu, image_sha256=before_hash,
+            active_cpu_fraction=active_cpu, scrub_blocks_scanned_delta=scanned_delta,
             executable_sha256=hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest(),
             image_unchanged=True, mount_active=False)))
     finally:
@@ -347,10 +410,14 @@ with open(stderr_path, 'wb') as errors:
         if master is not None:
             os.close(master)
         (root / (mode + '-stdout.log')).write_bytes(output)
-"#;
+";
+
+/// Exercise one actual TUI process and its mounted filesystem. Python's stdlib
+/// supplies the PTY and nonblocking output collection; no metrics are injected.
+fn run_live_tui_profile(image: &Path, mode: &str, require_payload: bool) -> String {
     let root = image.parent().unwrap();
     let output = Command::new("python3")
-        .args(["-c", PROFILE, env!("CARGO_BIN_EXE_ffs-cli")])
+        .args(["-c", LIVE_TUI_PROFILE, env!("CARGO_BIN_EXE_ffs-cli")])
         .arg(image)
         .arg(root)
         .arg(mode)
@@ -367,6 +434,24 @@ with open(stderr_path, 'wb') as errors:
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn cli_live_tui_policy_rejects_unproven_observations() {
+    let output = Command::new("python3")
+        .args(["-c", LIVE_TUI_PROFILE, "--self-test"])
+        .output()
+        .expect("execute live observation policy unit controls");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!({"evidence_class": "policy_unit", "cases": 23})
+    );
 }
 
 #[test]
