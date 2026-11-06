@@ -1,7 +1,7 @@
-//! CLI binary E2E tests for ffs-cli.
+//! CLI binary E2E tests and explicit observation-policy component controls.
 //!
-//! These tests spawn actual `cargo run -p ffs-cli` processes against real
-//! filesystem images created via mkfs.ext4/mkfs.btrfs. No mocks are used.
+//! Native scenarios execute the CLI against real filesystem images created by
+//! mkfs.ext4/mkfs.btrfs. Component controls label planted failures separately.
 
 #![allow(
     clippy::uninlined_format_args,
@@ -496,6 +496,85 @@ fn cli_live_tui_policy_rejects_unproven_observations() {
         report,
         serde_json::json!({"evidence_class": "policy_unit", "cases": 36})
     );
+}
+
+#[test]
+fn cli_live_tui_retains_output_and_closes_pty_when_cleanup_inspection_fails() {
+    // Component proof only: echo supplies real child output, not a filesystem
+    // or telemetry observation. Fail only the final mount-table inspection.
+    const SETUP: &str = r"
+import errno, json, os, pathlib, sys
+case_root, case_mode = pathlib.Path(sys.argv[1]), sys.argv[2]
+case_root.mkdir()
+case_image = case_root / 'component-marker.img'
+case_image.write_bytes(b'component control only')
+sys.argv = ['cleanup-control', '/bin/echo', str(case_image), str(case_root), case_mode, 'false']
+original_read_bytes = pathlib.Path.read_bytes
+failed_inspections = []
+def fail_cleanup_inspection(path):
+    if path == pathlib.Path('/proc/thread-self/mountinfo'):
+        failed_inspections.append(str(path))
+        raise OSError(errno.EIO, 'planted cleanup inspection failure')
+    return original_read_bytes(path)
+pathlib.Path.read_bytes = fail_cleanup_inspection
+try:
+";
+    const CHECK: &str = r"
+except OSError as error:
+    assert error.errno == errno.EIO and 'planted cleanup inspection failure' in str(error), error
+    assert failed_inspections == ['/proc/thread-self/mountinfo'], failed_inspections
+    assert process.poll() == 0, 'owned component child did not retire'
+    retained = original_read_bytes(root / (mode + '-stdout.log'))
+    assert str(case_image).encode() in retained and b'--mountpoint' in retained, retained
+    if master is not None:
+        try:
+            os.fstat(master)
+        except OSError as closed:
+            assert closed.errno == errno.EBADF, closed
+        else:
+            raise AssertionError('cleanup inspection failure leaked the PTY')
+    print(json.dumps(dict(evidence_class='cleanup_component_fault', mode=mode,
+                         child_exit=process.returncode, retained_bytes=len(retained),
+                         pty_closed=master is not None)))
+else:
+    raise AssertionError('cleanup inspection failure was suppressed')
+finally:
+    pathlib.Path.read_bytes = original_read_bytes
+";
+    let root = tempfile::Builder::new()
+        .prefix("ffs-live-cleanup-fault-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let mut script = String::from(SETUP);
+    for line in LIVE_TUI_PROFILE.lines() {
+        script.push_str("    ");
+        script.push_str(line);
+        script.push('\n');
+    }
+    script.push_str(CHECK);
+    for mode in ["captured", "terminal"] {
+        let output = Command::new("python3")
+            .args(["-c", &script])
+            .arg(root.join(mode))
+            .arg(mode)
+            .output()
+            .expect("execute cleanup fault component control");
+        fs::write(root.join(format!("{mode}-control.stdout")), &output.stdout).unwrap();
+        fs::write(root.join(format!("{mode}-control.stderr")), &output.stderr).unwrap();
+        assert!(
+            output.status.success(),
+            "cleanup fault control {mode} failed; retained {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["evidence_class"], "cleanup_component_fault");
+        assert_eq!(report["mode"], mode);
+        assert_eq!(report["child_exit"], 0);
+        assert!(report["retained_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(report["pty_closed"], mode == "terminal");
+    }
 }
 
 #[test]
