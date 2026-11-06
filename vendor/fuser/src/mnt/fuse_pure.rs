@@ -58,9 +58,14 @@ impl Drop for Mount {
             // living at the same mountpoint
             return;
         }
-        // Orderly shutdown must unmount explicitly, including the nonprivileged
-        // fallback. Merely closing the auto-unmount monitor can leave dispatch
-        // blocked when a confined helper cannot create its private namespace.
+        if let Some(sock) = mem::take(&mut self.auto_unmount_socket) {
+            // The original connection may survive a lazy detach while another
+            // filesystem occupies this path. Only the original auto-unmount
+            // helper may clean it up; a pathname fallback can unmount its
+            // replacement. A failed helper must remain a reported join failure.
+            drop(sock);
+            return;
+        }
         if let Err(err) = super::libc_umount(&self.mountpoint) {
             if err.kind() == PermissionDenied {
                 // Linux always returns EPERM for non-root users.  We have to let the
@@ -70,7 +75,6 @@ impl Drop for Mount {
                 error!("Unmount failed: {}", err)
             }
         }
-        drop(mem::take(&mut self.auto_unmount_socket));
     }
 }
 

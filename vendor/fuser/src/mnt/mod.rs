@@ -189,4 +189,60 @@ mod test {
         // Filesystem may have been lazy unmounted, so we can't assert this:
         // assert!(!is_mounted(&file));
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_unmount_preserves_replacement_after_lazy_detach() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Run in a private mount namespace with CAP_SYS_ADMIN and /dev/fuse.
+        // Keep the directory for diagnosis, including when an assertion fails.
+        let directory = ManuallyDrop::new(
+            tempfile::Builder::new()
+                .prefix("fuser-unmount-ownership-")
+                .tempdir()
+                .unwrap(),
+        );
+        let path = directory.path();
+        let (file, mount) =
+            Mount::new(path, &[MountOption::AutoUnmount, MountOption::AllowOther]).unwrap();
+        // O_PATH retains the original mount without waiting for FUSE INIT.
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
+            .unwrap();
+        let target = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) },
+            0
+        );
+        assert!(
+            is_mounted(&file),
+            "retained original connection must stay live"
+        );
+
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    c"fuser-owned-replacement".as_ptr(),
+                    target.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV,
+                    c"size=1M".as_ptr().cast(),
+                )
+            },
+            0
+        );
+        let marker = path.join("replacement-marker");
+        std::fs::write(&marker, b"replacement mount must survive").unwrap();
+        drop(mount);
+        let observed = std::fs::read(&marker);
+        if observed.is_ok() {
+            super::libc_umount(&target).unwrap();
+        }
+        drop(retained);
+        drop(file);
+        assert_eq!(observed.unwrap(), b"replacement mount must survive");
+    }
 }
