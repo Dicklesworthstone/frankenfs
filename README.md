@@ -51,6 +51,10 @@ ffs-cli tui image.btrfs --mountpoint /mnt/ffs --refresh-ms 250 --scrub
 ffs-cli tui image.ext4 --snapshot-json
 ```
 
+Live mode needs the same FUSE permissions as `mount`. Non-root users need
+`user_allow_other` enabled in `/etc/fuse.conf` for the default auto-unmount
+helper, or can explicitly set `FFS_AUTO_UNMOUNT=0` to use orderly unmount only.
+
 The live view refreshes every second by default (100–1000 ms is supported).
 It shows the source image, mountpoint and monotonic sample time. Filesystem
 activity through that mount feeds its counters; unavailable pressure sources

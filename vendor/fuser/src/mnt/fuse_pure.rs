@@ -58,16 +58,11 @@ impl Drop for Mount {
             // living at the same mountpoint
             return;
         }
+        // Orderly shutdown must unmount explicitly, including the nonprivileged
+        // fallback. Merely closing the auto-unmount monitor can leave dispatch
+        // blocked when a confined helper cannot create its private namespace.
         if let Err(err) = super::libc_umount(&self.mountpoint) {
             if err.kind() == PermissionDenied {
-                if let Some(sock) = mem::take(&mut self.auto_unmount_socket) {
-                    // Nonprivileged mounts rely on the helper. Try the direct
-                    // unmount first: a confined auto-unmount helper may fail
-                    // to create its private mount namespace during shutdown,
-                    // leaving the session's dispatch threads blocked forever.
-                    drop(sock);
-                    return;
-                }
                 // Linux always returns EPERM for non-root users.  We have to let the
                 // library go through the setuid-root "fusermount -u" to unmount.
                 fuse_unmount_pure(&self.mountpoint)
@@ -75,6 +70,7 @@ impl Drop for Mount {
                 error!("Unmount failed: {}", err)
             }
         }
+        drop(mem::take(&mut self.auto_unmount_socket));
     }
 }
 
