@@ -4,24 +4,25 @@ use super::{
     Arc, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_INO_LOOKUP_USER_ARGS_SIZE,
     BTRFS_INO_LOOKUP_USER_NAME_OFFSET, BTRFS_INO_LOOKUP_USER_NAME_SIZE,
     BTRFS_INO_LOOKUP_USER_PATH_OFFSET, BTRFS_INO_LOOKUP_USER_PATH_SIZE,
-    BTRFS_INO_PATHS_MAX_BYTES_U64, BTRFS_INODE_NODATASUM, BTRFS_ITEM_EXTENT_DATA,
-    BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM,
-    BTRFS_MAX_ROOTREF_BUFFER_NUM, BTRFS_ROOT_SUBVOL_RDONLY, BTRFS_ROOTREF_ENTRY_SIZE,
-    BTRFS_SUBVOL_ROOTREF_ARGS_SIZE, BTRFS_SUBVOL_ROOTREF_NUM_ITEMS_OFFSET, BTRFS_SUPER_INFO_OFFSET,
-    BTRFS_TREE_SEARCH_KEY_SIZE, BTRFS_TREE_SEARCH_V2_HEADER_SIZE, BTRFS_USER_SETTABLE_FSFLAGS,
-    BTRFS_USER_SETTABLE_XFLAGS, BlockDevice, BlockNumber, BtrfsBTree, BtrfsExtentData, BtrfsKey,
-    BtrfsParsedNode, BtrfsQgroupLimitRequest, BtrfsRootItem, BtrfsTreeSearchKey, ByteOffset,
-    CommitSeq, Cx, DirEntry, DirNameIndex, EXT4_ENCRYPTION_XATTR_NAME, EXT4_SB_CHECKSUM_OFFSET,
-    Ext4FileType, Ext4Inode, Ext4MoveExtRequest, Ext4Superblock, Ext4Xattr,
-    FSCRYPT_CONTEXT_V1_SIZE, FSCRYPT_CONTEXT_V2_SIZE, FSCRYPT_POLICY_V1_SIZE,
-    FSCRYPT_POLICY_V1_VERSION, FSCRYPT_POLICY_V2_SIZE, FSCRYPT_POLICY_V2_VERSION, FfsError,
-    FiemapExtent, FileType, FsFlavor, FsGeometry, FsOps, FsStat, FsxattrInfo, InodeAttr,
-    InodeNumber, LINUX_PATH_MAX, LINUX_SYMLINK_TARGET_MAX, Mutex, OpenFs, OsStr, Path, QuotaInfo,
-    ReaddirPage, ReaddirValidation, RequestCommitMode, RequestOp, RequestScope, SeekWhence,
-    SetAttrRequest, TransactionBlockAdapter, XattrSetMode, btrfs_dev_info_enodev,
-    btrfs_inode_flags_to_fsflags, btrfs_inode_flags_to_xflags, btrfs_mutation_to_ffs,
-    btrfs_ro_readdir_snapshot_enabled, clear_readdir_snapshot, dir_entry_file_type,
-    encode_btrfs_dev_info_args, encode_btrfs_fs_info_args, encode_btrfs_ino_paths_container,
+    BTRFS_INO_PATHS_MAX_BYTES_U64, BTRFS_INODE_APPEND, BTRFS_INODE_IMMUTABLE,
+    BTRFS_INODE_NODATASUM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM,
+    BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM, BTRFS_MAX_ROOTREF_BUFFER_NUM,
+    BTRFS_ROOT_SUBVOL_RDONLY, BTRFS_ROOTREF_ENTRY_SIZE, BTRFS_SUBVOL_ROOTREF_ARGS_SIZE,
+    BTRFS_SUBVOL_ROOTREF_NUM_ITEMS_OFFSET, BTRFS_SUPER_INFO_OFFSET, BTRFS_TREE_SEARCH_KEY_SIZE,
+    BTRFS_TREE_SEARCH_V2_HEADER_SIZE, BTRFS_USER_SETTABLE_FSFLAGS, BTRFS_USER_SETTABLE_XFLAGS,
+    BlockDevice, BlockNumber, BtrfsBTree, BtrfsExtentData, BtrfsKey, BtrfsParsedNode,
+    BtrfsQgroupLimitRequest, BtrfsRootItem, BtrfsTreeSearchKey, ByteOffset, CommitSeq, Cx,
+    DirEntry, DirNameIndex, EXT4_ENCRYPTION_XATTR_NAME, EXT4_SB_CHECKSUM_OFFSET, Ext4FileType,
+    Ext4Inode, Ext4MoveExtRequest, Ext4Superblock, Ext4Xattr, FSCRYPT_CONTEXT_V1_SIZE,
+    FSCRYPT_CONTEXT_V2_SIZE, FSCRYPT_POLICY_V1_SIZE, FSCRYPT_POLICY_V1_VERSION,
+    FSCRYPT_POLICY_V2_SIZE, FSCRYPT_POLICY_V2_VERSION, FfsError, FiemapExtent, FileType, FsFlavor,
+    FsGeometry, FsOps, FsStat, FsxattrInfo, InodeAttr, InodeNumber, LINUX_PATH_MAX,
+    LINUX_SYMLINK_TARGET_MAX, Mutex, OpenFs, OsStr, Path, QuotaInfo, ReaddirPage,
+    ReaddirValidation, RequestCommitMode, RequestOp, RequestScope, SeekWhence, SetAttrRequest,
+    TransactionBlockAdapter, XattrSetMode, btrfs_dev_info_enodev, btrfs_inode_flags_to_fsflags,
+    btrfs_inode_flags_to_xflags, btrfs_mutation_to_ffs, btrfs_ro_readdir_snapshot_enabled,
+    clear_readdir_snapshot, dir_entry_file_type, encode_btrfs_dev_info_args,
+    encode_btrfs_fs_info_args, encode_btrfs_ino_paths_container,
     encode_btrfs_supported_feature_flags, encode_btrfs_tree_search_results,
     encode_btrfs_tree_search_results_with_limit, ext4_flags_to_xflags, ext4_present_xattr_value,
     first_nul, fsflags_to_btrfs_inode_flags, generate_send_stream, info,
@@ -3965,6 +3966,12 @@ impl FsOps for OpenFs {
                     return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                         libc::EINVAL,
                     )));
+                }
+                // Check destination protections before the empty-EOF fast path.
+                // A protected source remains readable, but even a clone at EOF
+                // cannot target an append-only inode.
+                if dst_inode.flags & (BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND) != 0 {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
                 }
                 let src_size = src_inode.size;
                 // Zero input length means "to source EOF", not truncate dst.
