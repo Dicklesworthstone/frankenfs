@@ -27,8 +27,11 @@ use crate::MountOption;
 use crate::interrupt::InterruptRegistry;
 use crate::ll::fuse_abi as abi;
 use crate::request::Request;
-use crate::{channel::Channel, mnt::Mount};
 use crate::{channel::ChannelSender, notify::Notifier};
+use crate::{
+    channel::{Channel, ReceiveStop},
+    mnt::Mount,
+};
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -618,6 +621,7 @@ impl<FS: Filesystem> Session<FS> {
 
     fn dispatch_next(&mut self, buf: &mut [u8]) -> io::Result<bool> {
         match self.ch.receive(buf) {
+            Ok(0) => Ok(false),
             Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
                 Some(req) => {
                     self.dispatch_request(&req);
@@ -676,6 +680,7 @@ impl<FS: Filesystem> Session<FS> {
         }
 
         match self.ch.receive(buf) {
+            Ok(0) => Ok(false),
             Ok(size) => {
                 let bytes = buf[..size].to_vec();
                 let Some(request) = Request::new(self.ch.sender(), &bytes) else {
@@ -1018,16 +1023,72 @@ pub struct BackgroundSession {
     _mount: Option<Mount>,
     /// Real request-queue metrics when this session uses per-core routing.
     per_core_metrics: Option<Arc<PerCoreMetrics>>,
+    receive_stop: Option<Arc<ReceiveStop>>,
+}
+
+fn background_receive_stop(
+    channel: &mut Channel,
+    mount: Option<&Mount>,
+) -> io::Result<Option<Arc<ReceiveStop>>> {
+    #[cfg(all(target_os = "linux", fuser_mount_impl = "pure-rust"))]
+    if mount.is_some_and(Mount::can_close_read_only) {
+        return channel.enable_receive_stop().map(Some);
+    }
+    #[cfg(not(all(target_os = "linux", fuser_mount_impl = "pure-rust")))]
+    let _ = (channel, mount);
+    Ok(None)
+}
+
+struct BackgroundUnmount {
+    sender: Option<ChannelSender>,
+    mount: Option<Mount>,
+    read_only: bool,
+}
+
+impl BackgroundUnmount {
+    fn finish(&mut self, timeout: std::time::Duration) -> io::Result<()> {
+        let started = std::time::Instant::now();
+        drop(self.sender.take());
+        let Some(mount) = self.mount.take() else {
+            return Ok(());
+        };
+        if self.read_only {
+            #[cfg(all(target_os = "linux", fuser_mount_impl = "pure-rust"))]
+            return mount.finish_read_only_auto_unmount(timeout.saturating_sub(started.elapsed()));
+            #[cfg(not(all(target_os = "linux", fuser_mount_impl = "pure-rust")))]
+            {
+                let _ = timeout;
+                drop(mount);
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "read-only descriptor teardown unavailable",
+                ));
+            }
+        }
+        drop(mount);
+        Ok(())
+    }
+}
+
+impl Drop for BackgroundUnmount {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish(std::time::Duration::ZERO) {
+            warn!("FUSE background unmount resources failed to retire: {error}");
+        }
+    }
 }
 
 impl BackgroundSession {
     /// Create a new background session for the given session by running its
     /// session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the given session ends.
-    pub fn new<FS: Filesystem + Send + 'static>(se: Session<FS>) -> io::Result<BackgroundSession> {
+    pub fn new<FS: Filesystem + Send + 'static>(
+        mut se: Session<FS>,
+    ) -> io::Result<BackgroundSession> {
         let sender = se.ch.sender();
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *se.mount.lock().unwrap()).map(|(_, mount)| mount);
+        let receive_stop = background_receive_stop(&mut se.ch, mount.as_ref())?;
         let guard = thread::spawn(move || {
             let mut se = se;
             se.run()
@@ -1037,6 +1098,7 @@ impl BackgroundSession {
             sender,
             _mount: mount,
             per_core_metrics: None,
+            receive_stop,
         })
     }
 
@@ -1044,12 +1106,13 @@ impl BackgroundSession {
     /// concurrent threads (see [`Session::run_with_workers`]). A count of 1 is
     /// the historical single-threaded loop.
     pub fn new_with_workers<FS: Filesystem + Clone + Send + 'static>(
-        se: Session<FS>,
+        mut se: Session<FS>,
         worker_count: usize,
     ) -> io::Result<BackgroundSession> {
         let sender = se.ch.sender();
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *se.mount.lock().unwrap()).map(|(_, mount)| mount);
+        let receive_stop = background_receive_stop(&mut se.ch, mount.as_ref())?;
         let guard = thread::spawn(move || {
             let mut se = se;
             se.run_with_workers(worker_count)
@@ -1059,16 +1122,18 @@ impl BackgroundSession {
             sender,
             _mount: mount,
             per_core_metrics: None,
+            receive_stop,
         })
     }
 
     /// Start a background session with CPU-keyed queues and work stealing.
     pub fn new_with_per_core_workers<FS: Filesystem + Clone + Send + 'static>(
-        se: Session<FS>,
+        mut se: Session<FS>,
         worker_count: usize,
     ) -> io::Result<BackgroundSession> {
         let sender = se.ch.sender();
         let mount = std::mem::take(&mut *se.mount.lock().unwrap()).map(|(_, mount)| mount);
+        let receive_stop = background_receive_stop(&mut se.ch, mount.as_ref())?;
         let cpus = per_core_cpus(worker_count.max(1))?;
         let metrics = Arc::new(PerCoreMetrics::new(cpus));
         let worker_metrics = Arc::clone(&metrics);
@@ -1081,6 +1146,7 @@ impl BackgroundSession {
             sender,
             _mount: mount,
             per_core_metrics: Some(metrics),
+            receive_stop,
         })
     }
 
@@ -1092,17 +1158,51 @@ impl BackgroundSession {
     /// Unmount the filesystem and join the background thread.
     ///
     /// Returns the session's I/O error, or an error if the thread panicked.
+    /// Read-only auto-unmount also reports retained device owners or helper
+    /// failures instead of treating descriptor release as completed detach.
     pub fn join(self) -> io::Result<()> {
+        let (dispatch, finish) = self.join_dispatch();
+        let unmount = finish(std::time::Duration::MAX);
+        dispatch.and(unmount)
+    }
+
+    /// Retire dispatch and return ownership of the remaining unmount work.
+    ///
+    /// Drop external notifier/reply owners after this returns, then invoke the
+    /// returned closure. It closes the read-only device before helper EOF.
+    /// Supply the remaining unmount grace period; it also reaps the helper and
+    /// checks the constructor's namespace for actual mountpoint absence.
+    /// Writable/direct mounts retain their existing unmount-before-join order.
+    /// The closure also attempts cleanup if abandoned, logging any failure.
+    #[must_use]
+    pub fn join_dispatch(
+        self,
+    ) -> (
+        io::Result<()>,
+        impl FnOnce(std::time::Duration) -> io::Result<()> + Send + 'static,
+    ) {
         let Self {
             guard,
-            sender: _,
+            sender,
             _mount,
+            receive_stop,
             ..
         } = self;
-        drop(_mount);
-        guard
+        let mut unmount = BackgroundUnmount {
+            sender: Some(sender),
+            mount: _mount,
+            read_only: receive_stop.is_some(),
+        };
+        if let Some(stop) = receive_stop {
+            stop.request_stop();
+        } else {
+            drop(unmount.mount.take());
+        }
+        let dispatch = guard
             .join()
-            .map_err(|_| io::Error::other("FUSE background session panicked"))?
+            .map_err(|_| io::Error::other("FUSE background session panicked"))
+            .and_then(|result| result);
+        (dispatch, move |timeout| unmount.finish(timeout))
     }
 
     /// Returns an object that can be used to send notifications to the kernel
@@ -1196,6 +1296,7 @@ mod dispatch_gate_tests {
             .sender(),
             _mount: None,
             per_core_metrics: None,
+            receive_stop: None,
         };
         session(|| Ok(())).join().expect("clean worker joins");
         let error = session(|| Err(std::io::Error::from_raw_os_error(libc::ENOSPC)))
@@ -1207,6 +1308,39 @@ mod dispatch_gate_tests {
             .expect_err("worker panic must return an error");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(error.to_string().contains("panicked"));
+    }
+
+    #[test]
+    fn background_join_dispatch_preserves_results_and_defers_release() {
+        for fail in [false, true] {
+            let device = Arc::new(std::fs::File::open("/dev/null").unwrap());
+            let observed = Arc::downgrade(&device);
+            let session = BackgroundSession {
+                guard: std::thread::spawn(move || {
+                    if fail {
+                        Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+                    } else {
+                        Ok(())
+                    }
+                }),
+                sender: crate::channel::Channel::new(device).sender(),
+                _mount: None,
+                per_core_metrics: None,
+                receive_stop: None,
+            };
+            let (dispatch, finish) = session.join_dispatch();
+            assert!(
+                observed.upgrade().is_some(),
+                "release ran before the consumer could drain notifiers"
+            );
+            if fail {
+                assert_eq!(dispatch.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
+            } else {
+                dispatch.unwrap();
+            }
+            finish(Duration::from_secs(1)).unwrap();
+            assert!(observed.upgrade().is_none());
+        }
     }
 
     #[test]

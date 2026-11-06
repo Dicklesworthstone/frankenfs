@@ -193,6 +193,49 @@ mod test {
     #[cfg(target_os = "linux")]
     #[test]
     fn auto_unmount_preserves_replacement_after_lazy_detach() {
+        replacement_survives_auto_unmount(false);
+    }
+
+    #[cfg(all(target_os = "linux", fuser_mount_impl = "pure-rust"))]
+    #[test]
+    fn read_only_auto_unmount_preserves_replacement_after_lazy_detach() {
+        replacement_survives_auto_unmount(true);
+    }
+
+    #[cfg(all(target_os = "linux", fuser_mount_impl = "pure-rust"))]
+    #[test]
+    fn read_only_auto_unmount_rejects_duplicate_device_descriptor() {
+        let directory = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let path = directory.path();
+        let (file, mount) = Mount::new(
+            path,
+            &[
+                MountOption::RO,
+                MountOption::AutoUnmount,
+                MountOption::AllowOther,
+            ],
+        )
+        .unwrap();
+        // This is an independent OS descriptor, not another Arc owner.
+        let duplicate = file.try_clone().unwrap();
+        drop(file);
+        let result = mount.finish_read_only_auto_unmount(std::time::Duration::from_millis(200));
+        assert!(
+            duplicate.metadata().is_ok(),
+            "external descriptor was forcibly closed"
+        );
+        drop(duplicate);
+        let target = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        super::libc_umount(&target).unwrap();
+        let error = result.expect_err("device Arc ownership alone cannot prove detached state");
+        assert!(
+            matches!(error.kind(), io::ErrorKind::Other | io::ErrorKind::TimedOut),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replacement_survives_auto_unmount(read_only: bool) {
         use std::os::unix::fs::OpenOptionsExt;
 
         // Run in a private mount namespace with CAP_SYS_ADMIN and /dev/fuse.
@@ -204,8 +247,11 @@ mod test {
                 .unwrap(),
         );
         let path = directory.path();
-        let (file, mount) =
-            Mount::new(path, &[MountOption::AutoUnmount, MountOption::AllowOther]).unwrap();
+        let mut options = vec![MountOption::AutoUnmount, MountOption::AllowOther];
+        if read_only {
+            options.push(MountOption::RO);
+        }
+        let (file, mount) = Mount::new(path, &options).unwrap();
         // O_PATH retains the original mount without waiting for FUSE INIT.
         let retained = std::fs::OpenOptions::new()
             .read(true)
@@ -236,13 +282,32 @@ mod test {
         );
         let marker = path.join("replacement-marker");
         std::fs::write(&marker, b"replacement mount must survive").unwrap();
-        drop(mount);
+        #[cfg(fuser_mount_impl = "pure-rust")]
+        let release = if read_only {
+            drop(file);
+            Some(mount.finish_read_only_auto_unmount(std::time::Duration::from_secs(10)))
+        } else {
+            drop(mount);
+            drop(file);
+            None
+        };
+        #[cfg(not(fuser_mount_impl = "pure-rust"))]
+        {
+            drop(mount);
+            drop(file);
+        }
         let observed = std::fs::read(&marker);
         if observed.is_ok() {
             super::libc_umount(&target).unwrap();
         }
         drop(retained);
-        drop(file);
         assert_eq!(observed.unwrap(), b"replacement mount must survive");
+        #[cfg(fuser_mount_impl = "pure-rust")]
+        if let Some(result) = release {
+            let error =
+                result.expect_err("replacement must not be reported as an empty mountpoint");
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(error.to_string().contains("mountpoint remains mounted"));
+        }
     }
 }

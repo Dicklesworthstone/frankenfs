@@ -3,10 +3,11 @@ use std::{
     io,
     os::{
         fd::{AsFd, BorrowedFd},
+        unix::net::UnixStream,
         unix::prelude::AsRawFd,
     },
-    sync::Arc,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::{Arc, Mutex},
 };
 
 use libc::{c_int, c_void, size_t};
@@ -19,6 +20,7 @@ use crate::reply::ReplySender;
 #[derive(Debug)]
 pub struct Channel {
     device: Arc<File>,
+    receive_stop: Option<Arc<ReceiveStop>>,
     /// Live spin budget for adaptive mode (bd-warm-stat-is-the-fuse-floor-4wxw9).
     /// Relaxed ordering is sufficient: this is a hint that self-corrects within a
     /// few requests, never a correctness invariant, and contending workers racing
@@ -34,8 +36,33 @@ impl Clone for Channel {
     fn clone(&self) -> Self {
         Self {
             device: self.device.clone(),
+            receive_stop: self.receive_stop.clone(),
             spin_budget: AtomicU32::new(self.spin_budget.load(Ordering::Relaxed)),
         }
+    }
+}
+
+/// Persistent EOF wakes every cloned reader; no worker consumes the wakeup.
+#[derive(Debug)]
+pub(crate) struct ReceiveStop {
+    receiver: UnixStream,
+    sender: Mutex<Option<UnixStream>>,
+    stopped: AtomicBool,
+}
+
+impl ReceiveStop {
+    pub(crate) fn request_stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(sender);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 }
 
@@ -59,8 +86,35 @@ impl Channel {
     pub(crate) fn new(device: Arc<File>) -> Self {
         Self {
             device,
+            receive_stop: None,
             spin_budget: AtomicU32::new(0),
         }
+    }
+
+    pub(crate) fn enable_receive_stop(&mut self) -> io::Result<Arc<ReceiveStop>> {
+        if let Some(stop) = &self.receive_stop {
+            return Ok(Arc::clone(stop));
+        }
+        let (receiver, sender) = UnixStream::pair()?;
+        let flags = unsafe { libc::fcntl(self.device.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe {
+                libc::fcntl(
+                    self.device.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let stop = Arc::new(ReceiveStop {
+            receiver,
+            sender: Mutex::new(Some(sender)),
+            stopped: AtomicBool::new(false),
+        });
+        self.receive_stop = Some(Arc::clone(&stop));
+        Ok(stop)
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
@@ -87,7 +141,9 @@ impl Channel {
         static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *CACHED.get_or_init(|| {
             Self::adaptive_from_value(
-                std::env::var("FFS_FUSE_RECEIVE_SPIN_ADAPTIVE").ok().as_deref(),
+                std::env::var("FFS_FUSE_RECEIVE_SPIN_ADAPTIVE")
+                    .ok()
+                    .as_deref(),
             )
         })
     }
@@ -191,6 +247,13 @@ impl Channel {
     /// and on a shared box an always-spinning daemon degrades every other tenant.
     /// This is an A/B handle for a latency-bound serial workload, not a default.
     pub fn receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self
+            .receive_stop
+            .as_ref()
+            .is_some_and(|stop| stop.is_stopped())
+        {
+            return Ok(0);
+        }
         let configured = Self::spin_iterations();
         // Adaptive mode: the configured value is a CEILING, not a fixed cost. The
         // budget starts there and follows whether spinning is actually paying, so
@@ -211,6 +274,13 @@ impl Channel {
                 revents: 0,
             };
             for _ in 0..spins {
+                if self
+                    .receive_stop
+                    .as_ref()
+                    .is_some_and(|stop| stop.is_stopped())
+                {
+                    return Ok(0);
+                }
                 // Zero timeout: ask whether a request is already queued, never
                 // sleep here. If one is, fall through to the read below and skip
                 // the block entirely.
@@ -248,20 +318,54 @@ impl Channel {
         }
         if adaptive && configured > 0 {
             let b = self.spin_budget.load(Ordering::Relaxed);
-            self.spin_budget
-                .store(Self::next_spin_budget(b, paid, configured), Ordering::Relaxed);
+            self.spin_budget.store(
+                Self::next_spin_budget(b, paid, configured),
+                Ordering::Relaxed,
+            );
         }
-        let rc = unsafe {
-            libc::read(
-                self.device.as_raw_fd(),
-                buffer.as_ptr() as *mut c_void,
-                buffer.len() as size_t,
-            )
-        };
-        if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(rc as usize)
+        loop {
+            if self
+                .receive_stop
+                .as_ref()
+                .is_some_and(|stop| stop.is_stopped())
+            {
+                return Ok(0);
+            }
+            let rc = unsafe {
+                libc::read(
+                    self.device.as_raw_fd(),
+                    buffer.as_ptr() as *mut c_void,
+                    buffer.len() as size_t,
+                )
+            };
+            if rc >= 0 {
+                // A successfully received request still belongs to dispatch,
+                // even if stop was requested concurrently with this read.
+                return Ok(rc as usize);
+            }
+            let error = io::Error::last_os_error();
+            let Some(stop) = self
+                .receive_stop
+                .as_ref()
+                .filter(|_| error.kind() == io::ErrorKind::WouldBlock)
+            else {
+                return Err(error);
+            };
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: self.device.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop.receiver.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            if unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
     }
 
@@ -343,7 +447,10 @@ mod adaptive_spin_tests {
     #[test]
     fn a_single_hit_revives_a_collapsed_budget() {
         let b = Channel::next_spin_budget(0, true, 2000);
-        assert!(b >= 1, "a hit from zero must produce a usable budget, got {b}");
+        assert!(
+            b >= 1,
+            "a hit from zero must produce a usable budget, got {b}"
+        );
     }
 
     /// Degenerate ceilings must not produce a spinning daemon or panic.
@@ -362,7 +469,10 @@ mod adaptive_spin_tests {
     fn adaptive_knob_is_opt_in_and_typo_safe() {
         assert!(!Channel::adaptive_from_value(None));
         for off in ["0", "false", "off", "", "yes", "maybe", "ON!"] {
-            assert!(!Channel::adaptive_from_value(Some(off)), "{off:?} must not enable");
+            assert!(
+                !Channel::adaptive_from_value(Some(off)),
+                "{off:?} must not enable"
+            );
         }
         for on in ["1", "true", "on", "TRUE", " 1 "] {
             assert!(Channel::adaptive_from_value(Some(on)), "{on:?} must enable");
@@ -373,6 +483,54 @@ mod adaptive_spin_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_receive_stop_wakes_all_readers_and_keeps_received_bytes() {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        use std::time::Duration;
+
+        let (reader, mut peer) = UnixStream::pair().unwrap();
+        let mut channel = Channel::new(Arc::new(File::from(OwnedFd::from(reader))));
+        let stop = channel.enable_receive_stop().unwrap();
+        peer.write_all(b"received request").unwrap();
+        let mut buffer = [0; 64];
+        let count = channel.receive(&mut buffer).unwrap();
+        assert_eq!(&buffer[..count], b"received request");
+
+        std::thread::scope(|scope| {
+            // Dropping this peer also releases readers if an assertion fails.
+            let _release_peer = peer;
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            for _ in 0..3 {
+                let channel = channel.clone();
+                let ready = ready_tx.clone();
+                let done = done_tx.clone();
+                scope.spawn(move || {
+                    let _ = ready.send(());
+                    let mut buffer = [0; 64];
+                    let _ = done.send(channel.receive(&mut buffer));
+                });
+            }
+            for _ in 0..3 {
+                ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+            stop.request_stop();
+            stop.request_stop();
+            for _ in 0..3 {
+                assert_eq!(
+                    done_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+            }
+        });
+        assert_eq!(channel.receive(&mut buffer).unwrap(), 0);
+    }
 
     /// THE NEGATIVE CASE: the default must be 0, and anything unrecognised must
     /// fail CLOSED to 0.

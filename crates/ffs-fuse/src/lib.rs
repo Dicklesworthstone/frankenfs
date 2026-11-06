@@ -8961,9 +8961,11 @@ impl MountHandle {
     }
 
     fn join_session(&mut self) -> std::io::Result<()> {
+        let started = Instant::now();
         #[cfg(target_os = "linux")]
         let had_session = self.session.is_some();
         let mut region_cleanup = Ok(());
+        let mut unmount_cleanup = Ok(());
         if let Some(session) = self.session.take() {
             let snap = self.metrics.snapshot();
             info!(
@@ -8989,8 +8991,9 @@ impl MountHandle {
                     // Dropping the session only requests unmount and detaches
                     // its dispatch thread. The receipt must follow the actual
                     // destroy callback and thread retirement, including errors.
-                    let joined =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.join()));
+                    let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        session.join_dispatch()
+                    }));
                     if let Ok(permit) = tx.reserve(&notify_cx) {
                         let _ = permit.send(joined);
                     }
@@ -9006,9 +9009,17 @@ impl MountHandle {
                         if let Err(error) = &region_cleanup {
                             error!(%error, "FUSE unmount region cleanup failed");
                         }
-                        joined.map_err(|_| {
+                        let (dispatch, finish_unmount) = joined.map_err(|_| {
                             std::io::Error::other("FUSE background session cleanup panicked")
-                        })??;
+                        })?;
+                        // The join worker's region is closed first: notifier
+                        // callbacks need that blocking pool to remain available.
+                        self.diagnostics.retire_kernel_notifier();
+                        unmount_cleanup = finish_unmount(timeout.saturating_sub(started.elapsed()));
+                        if let Err(error) = &unmount_cleanup {
+                            error!(%error, "FUSE helper cleanup failed");
+                        }
+                        dispatch?;
                     }
                     Ok(Err(_)) => {
                         let _ = region.cancel(asupersync::types::CancelReason::shutdown());
@@ -9046,6 +9057,7 @@ impl MountHandle {
                 FuseError::Io(error) => error,
                 error => std::io::Error::other(error),
             })?;
+        unmount_cleanup?;
         region_cleanup?;
         #[cfg(target_os = "linux")]
         if had_session {

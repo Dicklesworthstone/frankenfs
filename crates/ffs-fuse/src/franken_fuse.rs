@@ -182,6 +182,15 @@ impl FrankenFuse {
         }
     }
 
+    fn retire_kernel_notifier(&self) {
+        let queue = self.inner.kernel_notifier.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Dispatch has retired. Drain callbacks without the slot mutex and
+        // outside the blocking worker whose completion we just received.
+        drop(queue);
+    }
+
     fn notify_entry_invalidation(&self, parent: u64, name: &OsStr) {
         // An entry invalidation names a parent/name, not the inode displaced by
         // a rename-over or removed by unlink. Drop every pending READDIRPLUS

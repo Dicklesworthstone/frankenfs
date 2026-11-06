@@ -136,6 +136,13 @@ jobs:
       - name: Vendored fuser interrupt tests
         run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- interrupt
 
+      - name: Vendored fuser shutdown controls
+        run: |
+          cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- channel::tests::read_only
+          cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- mnt::fuse_pure::block_mount_tests::read_only
+          cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- background_join
+          cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- dispatch_join
+
       - name: Unit tests
         env:
           FFS_REQUIRE_ORACLES: "1"
@@ -362,6 +369,30 @@ jobs:
       - name: Run relocated ops tests
         run: cargo test -p ffs-ops -- --nocapture
 
+      - name: FUSE shutdown ownership and final-flush controls
+        env:
+          FFS_REQUIRE_FUSE: "1"
+        run: |
+          cargo test -p ffs-fuse foreground_shutdown_observes_drop_time_final_flush -- --nocapture --test-threads=1
+          cargo test -p ffs-fuse managed_shutdown_ -- --nocapture --test-threads=1
+
+      - name: Preserve replacement mounts during shutdown
+        run: |
+          cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 --no-run --message-format=json > "$RUNNER_TEMP/fuser-shutdown-build.jsonl"
+          python3 - "$RUNNER_TEMP/fuser-shutdown-build.jsonl" "$RUNNER_TEMP/fuser-shutdown-path" <<'PY'
+          import json, pathlib, sys
+          executables = []
+          for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+              item = json.loads(line)
+              if item.get('reason') == 'compiler-artifact' and item.get('executable') and item['target']['name'] == 'fuser' and item['profile']['test']:
+                  executables.append(item['executable'])
+          assert len(executables) == 1, executables
+          pathlib.Path(sys.argv[2]).write_text(executables[0] + '\n')
+          PY
+          test_bin="$(cat "$RUNNER_TEMP/fuser-shutdown-path")"
+          sudo unshare --mount --propagation private "$test_bin" auto_unmount_preserves_replacement_after_lazy_detach --nocapture --test-threads=1
+          sudo unshare --mount --propagation private "$test_bin" read_only_auto_unmount_rejects_duplicate_device_descriptor --nocapture --test-threads=1
+
       - name: Live CLI telemetry on native ext4 and btrfs mounts
         env:
           FFS_REQUIRE_FUSE: "1"
@@ -409,6 +440,9 @@ jobs:
           path: |
             artifacts/e2e/**/*.log
             artifacts/e2e/**/*.json
+            /tmp/ffs-live-tui-*/*.log
+            /tmp/ffs-live-tui-*/*-profile.stdout
+            /tmp/ffs-live-tui-*/*-profile.stderr
 
   # Warn if goldens are modified in a PR
   golden-change-check:

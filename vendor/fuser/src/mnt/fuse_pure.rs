@@ -13,14 +13,15 @@ use log::{debug, error};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::{Error, ErrorKind, Read};
+use std::io::{Error, ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 const FUSERMOUNT_BIN: &str = "fusermount";
@@ -28,14 +29,141 @@ const FUSERMOUNT3_BIN: &str = "fusermount3";
 const FUSERMOUNT_COMM_ENV: &str = "_FUSE_COMMFD";
 
 #[derive(Debug)]
+struct AutoUnmountHelper {
+    socket: Option<UnixStream>,
+    child: Child,
+}
+
+impl AutoUnmountHelper {
+    fn cancel_and_reap(&mut self) {
+        // ECHILD can mean another reaper released the numeric PID. Never
+        // signal a cached PID/group after losing the child ownership witness.
+        match self.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => return,
+            Err(error) => {
+                error!("auto-unmount helper ownership check failed: {error}");
+                return;
+            }
+        }
+        // fusermount's daemon calls setsid; include its namespace-check child.
+        // Before setsid this group does not exist, so kill the owned PID too.
+        if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        if let Err(error) = self.child.kill() {
+            debug!("auto-unmount helper cancellation: {error}");
+        }
+        if let Err(error) = self.child.wait() {
+            error!("auto-unmount helper reap failed: {error}");
+        }
+    }
+
+    fn finish(&mut self, timeout: Duration) -> io::Result<()> {
+        let started = Instant::now();
+        drop(self.socket.take());
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(Error::other(format!(
+                            "auto-unmount helper failed: {status}"
+                        )))
+                    };
+                }
+                Ok(None) => {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        self.cancel_and_reap();
+                        return Err(Error::new(
+                            ErrorKind::TimedOut,
+                            "auto-unmount helper did not finish",
+                        ));
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadOnlyUnmountView {
+    mountinfo: File,
+    encoded_path: Vec<u8>,
+}
+
+impl ReadOnlyUnmountView {
+    fn new(path: &Path) -> io::Result<Self> {
+        let mut encoded_path = Vec::new();
+        for byte in path.as_os_str().as_bytes() {
+            match byte {
+                b'\t' => encoded_path.extend_from_slice(b"\\011"),
+                b'\n' => encoded_path.extend_from_slice(b"\\012"),
+                b' ' => encoded_path.extend_from_slice(b"\\040"),
+                b'\\' => encoded_path.extend_from_slice(b"\\134"),
+                byte => encoded_path.push(*byte),
+            }
+        }
+        Ok(Self {
+            mountinfo: File::open("/proc/thread-self/mountinfo")?,
+            encoded_path,
+        })
+    }
+
+    fn confirm_detached(&mut self) -> io::Result<()> {
+        self.mountinfo.seek(SeekFrom::Start(0))?;
+        let mut records = Vec::new();
+        self.mountinfo.read_to_end(&mut records)?;
+        if records.iter().all(|byte| *byte == b'\n') {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "empty mountinfo after auto-unmount",
+            ));
+        }
+        for record in records
+            .split(|byte| *byte == b'\n')
+            .filter(|record| !record.is_empty())
+        {
+            let fields: Vec<_> = record.split(|byte| *byte == b' ').collect();
+            if fields.len() < 10 || !fields[4].starts_with(b"/") {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid mountinfo after auto-unmount",
+                ));
+            }
+            if fields[4] == self.encoded_path.as_slice() {
+                return Err(Error::other(
+                    "auto-unmount helper exited but mountpoint remains mounted",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub struct Mount {
     mountpoint: CString,
-    auto_unmount_socket: Option<UnixStream>,
-    fuse_device: Arc<File>,
+    auto_unmount_socket: Option<AutoUnmountHelper>,
+    fuse_device: Option<Arc<File>>,
+    read_only_view: Option<ReadOnlyUnmountView>,
 }
 impl Mount {
     pub fn new(mountpoint: &Path, options: &[MountOption]) -> io::Result<(Arc<File>, Mount)> {
         let mountpoint = mountpoint.canonicalize()?;
+        // Capture only the namespace/root view, before creating the mount.
+        // This holds no reference to the mounted FUSE root.
+        let read_only_view = if read_only_auto_unmount(options) {
+            Some(ReadOnlyUnmountView::new(&mountpoint)?)
+        } else {
+            None
+        };
         let (file, sock) = fuse_mount_pure(mountpoint.as_os_str(), options)?;
         let file = Arc::new(file);
         Ok((
@@ -43,27 +171,87 @@ impl Mount {
             Mount {
                 mountpoint: CString::new(mountpoint.as_os_str().as_bytes())?,
                 auto_unmount_socket: sock,
-                fuse_device: file,
+                fuse_device: Some(file),
+                read_only_view,
             },
         ))
     }
+
+    pub(crate) fn can_close_read_only(&self) -> bool {
+        self.read_only_view.is_some()
+    }
+
+    /// Dispatch and external notifier owners must retire before this call.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn finish_read_only_auto_unmount(mut self, timeout: Duration) -> io::Result<()> {
+        let started = Instant::now();
+        if self.read_only_view.is_none() || self.auto_unmount_socket.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "read-only auto-unmount was not negotiated",
+            ));
+        }
+        let device = self
+            .fuse_device
+            .take()
+            .ok_or_else(|| Error::other("FUSE device already released"))?;
+        match Arc::try_unwrap(device) {
+            Ok(device) => drop(device),
+            Err(device) => {
+                drop(device);
+                if let Some(mut helper) = self.auto_unmount_socket.take() {
+                    helper.cancel_and_reap();
+                }
+                return Err(Error::new(
+                    ErrorKind::WouldBlock,
+                    "FUSE device still has external reply or notifier owners",
+                ));
+            }
+        }
+        // Last device close ends this proven read-only connection. Only then
+        // may the existing crash helper inspect ENOTCONN and detach its mount.
+        self.auto_unmount_socket
+            .take()
+            .unwrap()
+            .finish(timeout.saturating_sub(started.elapsed()))?;
+        self.read_only_view.as_mut().unwrap().confirm_detached()
+    }
+}
+
+fn read_only_auto_unmount(options: &[MountOption]) -> bool {
+    cfg!(target_os = "linux")
+        && options.contains(&MountOption::RO)
+        && options.contains(&MountOption::AutoUnmount)
+        && !options.contains(&MountOption::RW)
+        && options.iter().all(|option| match option {
+            MountOption::CUSTOM(value) => value
+                .strip_prefix("max_read=")
+                .is_some_and(|size| size.parse::<u32>().is_ok_and(|size| size > 0)),
+            MountOption::FSName(value) | MountOption::Subtype(value) => {
+                !value.chars().any(|byte| matches!(byte, ',' | '\\' | '\0'))
+            }
+            _ => true,
+        })
 }
 
 impl Drop for Mount {
     fn drop(&mut self) {
         use std::io::ErrorKind::PermissionDenied;
-        if !is_mounted(&self.fuse_device) {
+        let Some(device) = self.fuse_device.as_ref() else {
+            return;
+        };
+        if !is_mounted(device) {
             // If the filesystem has already been unmounted, avoid unmounting it again.
             // Unmounting it a second time could cause a race with a newly mounted filesystem
             // living at the same mountpoint
             return;
         }
-        if let Some(sock) = mem::take(&mut self.auto_unmount_socket) {
+        if let Some(mut helper) = mem::take(&mut self.auto_unmount_socket) {
             // The original connection may survive a lazy detach while another
             // filesystem occupies this path. Only the original auto-unmount
             // helper may clean it up; a pathname fallback can unmount its
             // replacement. A failed helper must remain a reported join failure.
-            drop(sock);
+            drop(helper.socket.take());
             return;
         }
         if let Err(err) = super::libc_umount(&self.mountpoint) {
@@ -81,7 +269,7 @@ impl Drop for Mount {
 fn fuse_mount_pure(
     mountpoint: &OsStr,
     options: &[MountOption],
-) -> Result<(File, Option<UnixStream>), io::Error> {
+) -> Result<(File, Option<AutoUnmountHelper>), io::Error> {
     let block_backed = block_mount_requested(options);
     if block_backed && options.contains(&MountOption::AutoUnmount) {
         return Err(Error::new(
@@ -271,7 +459,7 @@ fn receive_fusermount_message(socket: &UnixStream) -> Result<File, Error> {
 fn fuse_mount_fusermount(
     mountpoint: &OsStr,
     options: &[MountOption],
-) -> Result<(File, Option<UnixStream>), Error> {
+) -> Result<(File, Option<AutoUnmountHelper>), Error> {
     let (child_socket, receive_socket) = UnixStream::pair()?;
 
     unsafe {
@@ -290,7 +478,7 @@ fn fuse_mount_fusermount(
         .arg(mountpoint)
         .env(FUSERMOUNT_COMM_ENV, child_socket.as_raw_fd().to_string());
 
-    let fusermount_child = builder.spawn()?;
+    let mut fusermount_child = builder.spawn()?;
 
     drop(child_socket); // close socket in parent
 
@@ -308,17 +496,19 @@ fn fuse_mount_fusermount(
             };
         }
     };
-    let mut receive_socket = Some(receive_socket);
-
     if !options.contains(&MountOption::AutoUnmount) {
         // Only close the socket, if auto unmount is not set.
         // fusermount will keep running until the socket is closed, if auto unmount is set
-        drop(mem::take(&mut receive_socket));
+        drop(receive_socket);
         let output = fusermount_child.wait_with_output()?;
         debug!("fusermount: {}", String::from_utf8_lossy(&output.stdout));
         debug!("fusermount: {}", String::from_utf8_lossy(&output.stderr));
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        return Ok((file, None));
     } else {
-        if let Some(mut stdout) = fusermount_child.stdout {
+        if let Some(mut stdout) = fusermount_child.stdout.take() {
             let stdout_fd = stdout.as_raw_fd();
             unsafe {
                 let mut flags = libc::fcntl(stdout_fd, libc::F_GETFL, 0);
@@ -330,7 +520,7 @@ fn fuse_mount_fusermount(
                 debug!("fusermount: {}", String::from_utf8_lossy(&buf[..len]));
             }
         }
-        if let Some(mut stderr) = fusermount_child.stderr {
+        if let Some(mut stderr) = fusermount_child.stderr.take() {
             let stderr_fd = stderr.as_raw_fd();
             unsafe {
                 let mut flags = libc::fcntl(stderr_fd, libc::F_GETFL, 0);
@@ -348,7 +538,13 @@ fn fuse_mount_fusermount(
         libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
     }
 
-    Ok((file, receive_socket))
+    Ok((
+        file,
+        Some(AutoUnmountHelper {
+            socket: Some(receive_socket),
+            child: fusermount_child,
+        }),
+    ))
 }
 
 // If returned option is none. Then fusermount binary should be tried
@@ -557,6 +753,109 @@ pub fn option_to_flag(option: &MountOption) -> libc::c_int {
 #[cfg(all(test, target_os = "linux"))]
 mod block_mount_tests {
     use super::*;
+
+    #[test]
+    fn read_only_auto_unmount_rejects_ambiguous_options() {
+        let base = vec![MountOption::RO, MountOption::AutoUnmount];
+        assert!(read_only_auto_unmount(&base));
+        assert!(!read_only_auto_unmount(&[MountOption::RO]));
+        assert!(!read_only_auto_unmount(&[MountOption::AutoUnmount]));
+        for option in [
+            MountOption::RW,
+            MountOption::CUSTOM("rw".into()),
+            MountOption::CUSTOM("max_read=4096,rw".into()),
+            MountOption::CUSTOM("max_read=0".into()),
+            MountOption::FSName("name,rw".into()),
+            MountOption::Subtype("name\\,rw".into()),
+            MountOption::FSName("name\0".into()),
+        ] {
+            let mut options = base.clone();
+            options.push(option);
+            assert!(!read_only_auto_unmount(&options));
+        }
+        let mut safe = base;
+        safe.extend([
+            MountOption::FSName("frankenfs".into()),
+            MountOption::Subtype("ffs".into()),
+            MountOption::CUSTOM("max_read=16777216".into()),
+        ]);
+        assert!(read_only_auto_unmount(&safe));
+    }
+
+    fn component_helper(program: &str, own_group: bool) -> AutoUnmountHelper {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::process::CommandExt;
+        let (socket, child_socket) = UnixStream::pair().unwrap();
+        let mut command = Command::new(program);
+        if own_group {
+            command.process_group(0);
+        }
+        if program == "sleep" {
+            command.arg("60");
+        }
+        let child = command
+            .stdin(Stdio::from(OwnedFd::from(child_socket)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        AutoUnmountHelper {
+            socket: Some(socket),
+            child,
+        }
+    }
+
+    #[test]
+    fn read_only_helper_deadline_reaps_owned_process() {
+        for own_group in [false, true] {
+            let mut helper = component_helper("sleep", own_group);
+            if own_group {
+                assert_eq!(
+                    unsafe { libc::getpgid(helper.child.id() as i32) },
+                    helper.child.id() as i32
+                );
+            }
+            let error = helper.finish(Duration::from_millis(20)).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::TimedOut);
+            assert!(
+                helper.child.try_wait().unwrap().is_some(),
+                "timed-out helper was not reaped (own_group={own_group})"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_release_closes_device_and_rejects_external_owners() {
+        use std::io::Read;
+        use std::mem::ManuallyDrop;
+        use std::os::fd::OwnedFd;
+        let root = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        for retained in [false, true] {
+            let (device, mut peer) = UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let device = Arc::new(File::from(OwnedFd::from(device)));
+            let external = retained.then(|| Arc::clone(&device));
+            let helper = component_helper("cat", false);
+            let mount = Mount {
+                mountpoint: CString::new(root.path().as_os_str().as_bytes()).unwrap(),
+                auto_unmount_socket: Some(helper),
+                fuse_device: Some(device),
+                read_only_view: Some(ReadOnlyUnmountView::new(root.path()).unwrap()),
+            };
+            let result = mount.finish_read_only_auto_unmount(Duration::from_secs(1));
+            if retained {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::WouldBlock);
+                assert!(external.as_ref().unwrap().metadata().is_ok());
+                assert_eq!(
+                    peer.read(&mut [0]).unwrap_err().kind(),
+                    ErrorKind::WouldBlock
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            }
+        }
+    }
 
     #[test]
     fn block_transport_requires_explicit_opt_in_not_a_source_label() {
