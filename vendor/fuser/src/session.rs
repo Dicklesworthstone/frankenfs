@@ -627,7 +627,10 @@ impl<FS: Filesystem> Session<FS> {
                     self.dispatch_request(&req);
                     Ok(true)
                 }
-                None => Ok(false),
+                None => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid FUSE request received",
+                )),
             },
             Err(err) => match err.raw_os_error() {
                 Some(ENOENT | EINTR | EAGAIN) => Ok(true),
@@ -684,7 +687,10 @@ impl<FS: Filesystem> Session<FS> {
             Ok(size) => {
                 let bytes = buf[..size].to_vec();
                 let Some(request) = Request::new(self.ch.sender(), &bytes) else {
-                    return Ok(false);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid FUSE request received",
+                    ));
                 };
                 if request.is_interrupt() {
                     self.dispatch_request(&request);
@@ -1458,7 +1464,10 @@ mod dispatch_gate_tests {
                     }
                     assert_eq!(calls.load(Ordering::Acquire), 1);
                 } else {
-                    result.unwrap().unwrap();
+                    assert_eq!(
+                        result.unwrap().unwrap_err().kind(),
+                        std::io::ErrorKind::InvalidData
+                    );
                     assert_eq!(calls.load(Ordering::Acquire), 0);
                 }
                 assert_eq!(destroyed.load(Ordering::Acquire), 1);

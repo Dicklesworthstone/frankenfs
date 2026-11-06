@@ -146,7 +146,7 @@ jobs:
       - name: Unit tests
         env:
           FFS_REQUIRE_ORACLES: "1"
-        run: cargo test --workspace -- --nocapture
+        run: cargo test --workspace --no-fail-fast -- --nocapture
 
       # The ext4 reference and kernel-differential suites compare against
       # mkfs.ext4/debugfs output. Without e2fsprogs those tests report a skip
@@ -358,6 +358,9 @@ jobs:
           cargo test -p ffs-harness --no-run
           mkdir -p "$RUNNER_TEMP/ffs-cli-proof/bin" "$RUNNER_TEMP/ffs-cli-proof/artifacts"
           cp target/release/ffs-cli target/release/ffs-protected-mount target/release/ffs-image-repair "$RUNNER_TEMP/ffs-cli-proof/bin/"
+          printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/ffs-cli-proof/source-revision.txt"
+          rustc --version --verbose > "$RUNNER_TEMP/ffs-cli-proof/toolchain.txt"
+          (cd "$RUNNER_TEMP/ffs-cli-proof" && sha256sum bin/*) > "$RUNNER_TEMP/ffs-cli-proof/sha256sums.txt"
           {
             echo "FFS_CLI_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-cli"
             echo "FFS_PROTECTED_MOUNT_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-protected-mount"
@@ -365,6 +368,17 @@ jobs:
             echo "FFS_CLI_SOURCE_STAMP=$GITHUB_SHA"
             echo "FFS_CLI_ARTIFACT_DIR=$RUNNER_TEMP/ffs-cli-proof/artifacts"
           } >> "$GITHUB_ENV"
+
+      - name: Retain native CLI binaries for host reproduction
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-cli-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/ffs-cli-proof/bin/
+            ${{ runner.temp }}/ffs-cli-proof/source-revision.txt
+            ${{ runner.temp }}/ffs-cli-proof/toolchain.txt
+            ${{ runner.temp }}/ffs-cli-proof/sha256sums.txt
 
       - name: Run relocated ops tests
         run: cargo test -p ffs-ops -- --nocapture
@@ -441,10 +455,12 @@ jobs:
             id
           } > artifacts/e2e/fuse-helper-diagnostics/environment.log
           sudo journalctl -k --since '-30min' --no-pager > artifacts/e2e/fuse-helper-diagnostics/kernel.log
-          if test -r /sys/kernel/security/apparmor/profiles; then
-            cat /sys/kernel/security/apparmor/profiles > artifacts/e2e/fuse-helper-diagnostics/apparmor.log
+          if sudo cat /sys/kernel/security/apparmor/profiles > artifacts/e2e/fuse-helper-diagnostics/apparmor.log 2>&1; then
+            cat artifacts/e2e/fuse-helper-diagnostics/apparmor.log
           else
-            sudo cat /sys/kernel/security/apparmor/profiles > artifacts/e2e/fuse-helper-diagnostics/apparmor.log
+            profile_read_status=$?
+            printf 'AppArmor profile list unavailable (exit %s); command error retained below.\n' "$profile_read_status"
+            cat artifacts/e2e/fuse-helper-diagnostics/apparmor.log
           fi
 
       - name: Upload E2E artifacts on failure
