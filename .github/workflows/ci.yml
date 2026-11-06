@@ -352,6 +352,7 @@ jobs:
           echo "FUSE is available"
 
       - name: Build test binaries
+        id: native_build
         run: |
           cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount
           cargo build --release -p ffs-repair --bin ffs-image-repair
@@ -381,9 +382,14 @@ jobs:
             ${{ runner.temp }}/ffs-cli-proof/sha256sums.txt
 
       - name: Run relocated ops tests
+        # Keep independent native suites running after a test failure. The
+        # original failure stays fatal; failed setup/builds and cancellation
+        # still prevent admission of every test step below.
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         run: cargo test -p ffs-ops -- --nocapture
 
       - name: FUSE shutdown ownership and final-flush controls
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         env:
           FFS_REQUIRE_FUSE: "1"
         run: |
@@ -391,6 +397,7 @@ jobs:
           cargo test -p ffs-fuse managed_shutdown_ -- --nocapture --test-threads=1
 
       - name: Preserve replacement mounts during shutdown
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         run: |
           cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 --no-run --message-format=json > "$RUNNER_TEMP/fuser-shutdown-build.jsonl"
           python3 - "$RUNNER_TEMP/fuser-shutdown-build.jsonl" "$RUNNER_TEMP/fuser-shutdown-path" <<'PY'
@@ -408,6 +415,7 @@ jobs:
           sudo unshare --mount --propagation private "$test_bin" read_only_auto_unmount_rejects_duplicate_device_descriptor --nocapture --test-threads=1
 
       - name: Live CLI telemetry on native ext4 and btrfs mounts
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         env:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
@@ -417,12 +425,14 @@ jobs:
       # passing vacuously (FUSE, fuse3, e2fsprogs and btrfs-progs are installed
       # above, so a skip would mean the lane proved nothing).
       - name: Run FUSE E2E tests
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         env:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
         run: cargo test -p ffs-harness --test fuse_e2e -- --nocapture
 
       - name: Run shell E2E suites
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         env:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
@@ -430,6 +440,7 @@ jobs:
         run: ./scripts/e2e/ffs_smoke.sh
 
       - name: Journaled ext4 write and recovery smoke
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         env:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
@@ -438,6 +449,7 @@ jobs:
         run: ./scripts/e2e/ffs_ext4_rw_smoke.sh
 
       - name: Native btrfs written-image differential
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         env:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
