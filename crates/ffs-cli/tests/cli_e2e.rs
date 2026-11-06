@@ -216,6 +216,22 @@ def classify_cpu(mode, cpu, start_scanned, end_scanned):
 def metrics_advanced(prior, current, require_payload):
     return current[1] > prior[1] and (not require_payload or current[2] > prior[2])
 
+def mount_present(path, records=None):
+    if records is None:
+        records = pathlib.Path('/proc/thread-self/mountinfo').read_bytes()
+    assert records.strip(b'\n'), 'mount table is empty'
+    escapes = {9: b'\\011', 10: b'\\012', 32: b'\\040', 92: b'\\134'}
+    encoded = b''.join(escapes.get(byte, bytes([byte])) for byte in os.fsencode(path))
+    occupied = False
+    for line in records.split(b'\n'):
+        if not line:
+            continue
+        fields = line.split(b' ')
+        assert len(fields) >= 10 and fields[3] and fields[4].startswith(b'/'), 'invalid mount record'
+        assert b'-' in fields[6:] and fields[6:].index(b'-') + 10 == len(fields), 'invalid mount fields'
+        occupied |= fields[4] == encoded
+    return occupied
+
 if sys.argv[1:] == ['--self-test']:
     cases = 0
     assert latest_scanned(b'Scanned: 7780\nScanned: 15560\n') == 15560
@@ -252,13 +268,35 @@ if sys.argv[1:] == ['--self-test']:
     ]:
         assert metrics_advanced((1000, 1, 0), current, required) == expected
         cases += 1
-    assert cases == 23
+    records = (b'711 634 0:72 / /tmp/live ro - fuse.ffs frankenfs ro\n'
+               b'712 634 0:73 / /tmp/live-child rw - tmpfs replacement rw\n'
+               b'713 634 0:74 / /tmp/with\\040space\\011tab\\012line\\134040 rw - tmpfs replacement rw\n'
+               b'714 634 0:75 / /tmp/vertical\x0bform\x0c\xff rw - tmpfs replacement rw\n'
+               b'636 632 0:5 net:[4026533814] /run/docker/netns/17ccb5a24dfd rw - nsfs nsfs rw\n')
+    for path, expected in [
+        (b'/tmp/live', True), (b'/tmp/live-child', True),
+        (b'/tmp/with space\ttab\nline\\040', True),
+        (b'/tmp/vertical\x0bform\x0c\xff', True),
+        (b'/run/docker/netns/17ccb5a24dfd', True),
+        (b'/tmp/liv', False), (b'/tmp/live/', False), (b'/tmp', False),
+    ]:
+        assert mount_present(path, records) == expected
+        cases += 1
+    for invalid in [b'', b'\n', b'broken record\n', b'711 634 0:72 / /tmp/live ro - fuse.ffs\n',
+                    b'711 634 0:72  /tmp/live ro - fuse.ffs frankenfs ro\n']:
+        try:
+            mount_present(b'/tmp/live', invalid)
+        except AssertionError:
+            cases += 1
+        else:
+            raise AssertionError('invalid mount table admitted')
+    assert cases == 36
     print(json.dumps(dict(evidence_class='policy_unit', cases=cases)))
     sys.exit(0)
 
 binary, image, root, mode, require_payload = sys.argv[1:]
 require_payload = require_payload == 'true'
-root = pathlib.Path(root)
+root = pathlib.Path(root).resolve(strict=True)
 mount = root / ('live-' + mode)
 mount.mkdir()
 def digest():
@@ -327,7 +365,7 @@ with open(stderr_path, 'wb') as errors:
         return int(fields[11]) + int(fields[12])
     idle_cpu = active_cpu = scanned_delta = None
     try:
-        until(lambda: len(samples()) >= 2 and os.path.ismount(mount))
+        until(lambda: len(samples()) >= 2 and mount_present(mount))
         assert image.encode() in output, 'source identity missing'
         assert str(mount).encode() in output, 'mount identity missing'
         assert b'=== FrankenFS Live Telemetry ===' in output
@@ -384,7 +422,7 @@ with open(stderr_path, 'wb') as errors:
             assert max(gaps) <= requested_ms + 100, ('refresh exceeded 100ms scheduling budget', gaps)
             if mode == 'fast':
                 assert max(gaps) < 1000, ('live updates fell below 1Hz', gaps)
-        assert not os.path.ismount(mount), 'TUI left its mount active'
+        assert not mount_present(mount), 'TUI left its mount active'
         assert 'unmount complete' in stderr_path.read_text(), 'dispatch join receipt missing'
         assert digest() == before_hash, 'read-only source bytes changed'
         assert (b'\x1b[H\x1b[2J' in output) == (mode == 'terminal')
@@ -395,21 +433,27 @@ with open(stderr_path, 'wb') as errors:
             executable_sha256=hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest(),
             image_unchanged=True, mount_active=False)))
     finally:
-        if process.poll() is None:
-            process.send_signal(signal.SIGINT)
+        try:
+            if process.poll() is None:
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+            if mount_present(mount):
+                cleanup = subprocess.run(['fusermount3', '-u', str(mount)], capture_output=True, timeout=10)
+                if cleanup.returncode:
+                    print(cleanup.stderr.decode(), file=sys.stderr)
+        finally:
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
-        if os.path.ismount(mount):
-            cleanup = subprocess.run(['fusermount3', '-u', str(mount)], capture_output=True, timeout=10)
-            if cleanup.returncode:
-                print(cleanup.stderr.decode(), file=sys.stderr)
-        collect()
-        if master is not None:
-            os.close(master)
-        (root / (mode + '-stdout.log')).write_bytes(output)
+                collect()
+            finally:
+                try:
+                    (root / (mode + '-stdout.log')).write_bytes(output)
+                finally:
+                    if master is not None:
+                        os.close(master)
 ";
 
 /// Exercise one actual TUI process and its mounted filesystem. Python's stdlib
@@ -450,7 +494,7 @@ fn cli_live_tui_policy_rejects_unproven_observations() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         report,
-        serde_json::json!({"evidence_class": "policy_unit", "cases": 23})
+        serde_json::json!({"evidence_class": "policy_unit", "cases": 36})
     );
 }
 
