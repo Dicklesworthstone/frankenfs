@@ -6307,12 +6307,10 @@ impl Filesystem for FrankenFuse {
         let cx = Self::cx_for_request();
         if let Err(e) = self.inner.ops.flush_on_destroy(&cx) {
             self.record_final_flush_failure(&e);
-            // ERROR, not WARN, and the only `error!` in this file — deliberately.
-            //
-            // This is the last chance to persist. If it fails, everything the
-            // application was told had succeeded is GONE, and nothing downstream
-            // will say so: FUSE `destroy` returns `()` so the failure cannot be
-            // propagated, `fusermount -u` reports success, and the daemon exits 0.
+            // Filesystem::destroy cannot return errors through fuser. Both
+            // foreground and managed owners check the retained errno before
+            // returning success; keep this diagnostic for drop-only callers and
+            // to identify which durability boundary failed.
             //
             // Measured 2026-08-20 on a 512 MB image: 20000 creates all returned
             // success, this call failed with ENOSPC, and the unmounted image was
@@ -8886,6 +8884,7 @@ impl MountHandle {
     }
 
     fn join_session(&mut self) -> std::io::Result<()> {
+        let mut region_cleanup = Ok(());
         if let Some(session) = self.session.take() {
             let snap = self.metrics.snapshot();
             info!(
@@ -8922,16 +8921,15 @@ impl MountHandle {
                 });
                 match completed {
                     Ok(Ok(joined)) => {
-                        let closed = runtime
+                        region_cleanup = runtime
                             .block_on(region.close())
                             .map_err(|error| std::io::Error::other(error.to_string()));
-                        if let Err(error) = &closed {
+                        if let Err(error) = &region_cleanup {
                             error!(%error, "FUSE unmount region cleanup failed");
                         }
                         joined.map_err(|_| {
                             std::io::Error::other("FUSE background session cleanup panicked")
                         })??;
-                        closed?;
                     }
                     Ok(Err(_)) => {
                         let _ = region.cancel(asupersync::types::CancelReason::shutdown());
@@ -8969,6 +8967,7 @@ impl MountHandle {
                 FuseError::Io(error) => error,
                 error => std::io::Error::other(error),
             })?;
+        region_cleanup?;
         info!(mountpoint = %self.mountpoint.display(), "unmount complete");
         Ok(())
     }

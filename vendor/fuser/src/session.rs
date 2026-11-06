@@ -39,6 +39,26 @@ pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 /// up to MAX_WRITE_SIZE bytes in a write request, we use that value plus some extra space.
 const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
 
+/// Retire every dispatch worker, retaining the primary or first worker error.
+fn join_dispatch_workers(
+    mut result: io::Result<()>,
+    workers: Vec<thread::ScopedJoinHandle<'_, io::Result<()>>>,
+) -> io::Result<()> {
+    for worker in workers {
+        let joined = match worker.join() {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::other("FUSE dispatch worker panicked")),
+        };
+        if let Err(error) = joined {
+            warn!("FUSE dispatch worker failed: {error}");
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
+    }
+    result
+}
+
 /// One dispatch-gate slot, padded to its own cache line.
 ///
 /// The padding is the whole point: an unpadded `RwLock<()>` array would put
@@ -756,14 +776,7 @@ impl<FS: Filesystem> Session<FS> {
                 );
             }
             let primary = self.run_classic_loop(buf);
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => warn!("FUSE dispatch worker failed: {error}"),
-                    Err(_) => warn!("FUSE dispatch worker panicked"),
-                }
-            }
-            primary
+            join_dispatch_workers(primary, workers)
         })
     }
 
@@ -826,14 +839,7 @@ impl<FS: Filesystem> Session<FS> {
             }
             pin_current_worker(cpus[0])?;
             let primary = self.run_per_core_loop(buf);
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => warn!("FUSE per-core worker failed: {error}"),
-                    Err(_) => warn!("FUSE per-core worker panicked"),
-                }
-            }
-            primary
+            join_dispatch_workers(primary, workers)
         })
     }
 
@@ -1115,10 +1121,70 @@ impl fmt::Debug for BackgroundSession {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
-    use super::{BackgroundSession, DispatchGate, PerCoreMetrics, PerCoreScheduler};
+    use super::{
+        BackgroundSession, DispatchGate, PerCoreMetrics, PerCoreScheduler, join_dispatch_workers,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn dispatch_join_drains_workers_and_preserves_primary_or_first_failure() {
+        struct Retired(Arc<AtomicUsize>);
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
+        }
+        for (primary_errno, worker_errno, panic_worker) in [
+            (None, None, false),
+            (None, Some(libc::ENOSPC), false),
+            (None, Some(libc::ENOSPC), true),
+            (Some(libc::EIO), Some(libc::ENOSPC), true),
+            (None, None, true),
+        ] {
+            let retired = Arc::new(AtomicUsize::new(0));
+            std::thread::scope(|scope| {
+                let workers = (0..3)
+                    .map(|index| {
+                        let retirement = Retired(Arc::clone(&retired));
+                        scope.spawn(move || {
+                            let _retirement = retirement;
+                            if index == 0
+                                && let Some(errno) = worker_errno
+                            {
+                                return Err(std::io::Error::from_raw_os_error(errno));
+                            }
+                            assert!(!(panic_worker && index == 1), "worker panic control");
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                let primary = primary_errno.map_or(Ok(()), |errno| {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                });
+                let joined = join_dispatch_workers(primary, workers);
+                assert_eq!(
+                    retired.load(Ordering::Acquire),
+                    3,
+                    "every worker must retire"
+                );
+                if let Some(errno) = primary_errno.or(worker_errno) {
+                    assert_eq!(
+                        joined.expect_err("retain I/O failure").raw_os_error(),
+                        Some(errno)
+                    );
+                } else if panic_worker {
+                    assert_eq!(
+                        joined.expect_err("report worker panic").kind(),
+                        std::io::ErrorKind::Other
+                    );
+                } else {
+                    joined.expect("all clean workers succeed");
+                }
+            });
+        }
+    }
 
     #[test]
     fn background_join_preserves_io_errors_and_reports_panics() {
