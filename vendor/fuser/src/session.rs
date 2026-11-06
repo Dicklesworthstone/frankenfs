@@ -764,23 +764,33 @@ impl<FS: Filesystem> Session<FS> {
         self.dispatch_worker = 0;
         info!("FUSE dispatch workers: {worker_count}");
         thread::scope(|scope| {
+            // This must live inside the scope: a setup error or unwind must
+            // stop readers before thread::scope implicitly waits for them.
+            let readers = self.ch.stop_readers_on_drop();
             let mut workers = Vec::with_capacity(worker_count - 1);
             for index in 1..worker_count {
                 let mut worker = self.worker_clone(index);
-                workers.push(
-                    thread::Builder::new()
-                        .name(format!("fuse-dispatch-{index}"))
-                        .spawn_scoped(scope, move || {
-                            let mut worker_buffer = vec![0; BUFFER_SIZE];
-                            let worker_buf = aligned_sub_buf(
-                                worker_buffer.deref_mut(),
-                                std::mem::align_of::<abi::fuse_in_header>(),
-                            );
-                            worker.run_classic_loop(worker_buf)
-                        })?,
-                );
+                let spawned = thread::Builder::new()
+                    .name(format!("fuse-dispatch-{index}"))
+                    .spawn_scoped(scope, move || {
+                        let _readers = worker.ch.stop_readers_on_drop();
+                        let mut worker_buffer = vec![0; BUFFER_SIZE];
+                        let worker_buf = aligned_sub_buf(
+                            worker_buffer.deref_mut(),
+                            std::mem::align_of::<abi::fuse_in_header>(),
+                        );
+                        worker.run_classic_loop(worker_buf)
+                    });
+                match spawned {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => {
+                        drop(readers);
+                        return join_dispatch_workers(Err(error), workers);
+                    }
+                }
             }
             let primary = self.run_classic_loop(buf);
+            drop(readers);
             join_dispatch_workers(primary, workers)
         })
     }
@@ -825,25 +835,32 @@ impl<FS: Filesystem> Session<FS> {
         self.dispatch_worker = 0;
         info!("FUSE CPU-keyed dispatch workers: {worker_count}");
         thread::scope(|scope| {
+            let readers = self.ch.stop_readers_on_drop();
             let mut workers = Vec::with_capacity(worker_count - 1);
             for (index, &cpu) in cpus.iter().enumerate().skip(1) {
                 let mut worker = self.worker_clone(index);
-                workers.push(
-                    thread::Builder::new()
-                        .name(format!("fuse-per-core-{index}"))
-                        .spawn_scoped(scope, move || {
-                            pin_current_worker(cpu)?;
-                            let mut worker_buffer = vec![0; BUFFER_SIZE];
-                            let worker_buf = aligned_sub_buf(
-                                worker_buffer.deref_mut(),
-                                std::mem::align_of::<abi::fuse_in_header>(),
-                            );
-                            worker.run_per_core_loop(worker_buf)
-                        })?,
-                );
+                let spawned = thread::Builder::new()
+                    .name(format!("fuse-per-core-{index}"))
+                    .spawn_scoped(scope, move || {
+                        let _readers = worker.ch.stop_readers_on_drop();
+                        pin_current_worker(cpu)?;
+                        let mut worker_buffer = vec![0; BUFFER_SIZE];
+                        let worker_buf = aligned_sub_buf(
+                            worker_buffer.deref_mut(),
+                            std::mem::align_of::<abi::fuse_in_header>(),
+                        );
+                        worker.run_per_core_loop(worker_buf)
+                    });
+                match spawned {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => {
+                        drop(readers);
+                        return join_dispatch_workers(Err(error), workers);
+                    }
+                }
             }
-            pin_current_worker(cpus[0])?;
-            let primary = self.run_per_core_loop(buf);
+            let primary = pin_current_worker(cpus[0]).and_then(|()| self.run_per_core_loop(buf));
+            drop(readers);
             join_dispatch_workers(primary, workers)
         })
     }
@@ -1340,6 +1357,112 @@ mod dispatch_gate_tests {
             }
             finish(Duration::from_secs(1)).unwrap();
             assert!(observed.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn dispatch_join_stops_sibling_readers_on_exit_and_unwind() {
+        use std::io::Write;
+        use std::net::Shutdown;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        #[derive(Clone)]
+        struct PanicFs {
+            calls: Arc<AtomicUsize>,
+            destroyed: Arc<AtomicUsize>,
+        }
+        impl crate::Filesystem for PanicFs {
+            fn getattr(
+                &mut self,
+                _request: &crate::Request<'_>,
+                _ino: u64,
+                _fh: Option<u64>,
+                _reply: crate::ReplyAttr,
+            ) {
+                self.calls.fetch_add(1, Ordering::Release);
+                panic!("dispatch callback unwind control");
+            }
+
+            fn destroy(&mut self) {
+                self.destroyed.fetch_add(1, Ordering::Release);
+            }
+        }
+
+        // Transport component: real scoped readers over a socket, with a
+        // planted bad packet or callback panic. This is not a kernel mount.
+        for (configured_stop, panic_callback) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let destroyed = Arc::new(AtomicUsize::new(0));
+            std::thread::scope(|scope| {
+                // The peer also closes on assertion unwind, before scope's
+                // implicit joins, so even the old deadlock fails boundedly.
+                let (reader, mut peer) = UnixStream::pair().unwrap();
+                let mut session = super::Session::from_fd(
+                    PanicFs {
+                        calls: Arc::clone(&calls),
+                        destroyed: Arc::clone(&destroyed),
+                    },
+                    OwnedFd::from(reader),
+                    super::SessionACL::All,
+                );
+                session.initialized = true;
+                session.proto_major = 7;
+                session.proto_minor = super::abi::FUSE_KERNEL_MINOR_VERSION;
+                if configured_stop {
+                    session.ch.enable_receive_stop().unwrap();
+                }
+                let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+                let worker = scope.spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        session.run_with_workers(2)
+                    }));
+                    drop(session);
+                    let _ = completed_tx.send(result);
+                });
+                if panic_callback {
+                    // Native-endian FUSE_GETATTR: 40-byte header, 16-byte body.
+                    let mut packet = [0u8; 56];
+                    packet[..4].copy_from_slice(&56u32.to_ne_bytes());
+                    packet[4..8].copy_from_slice(&3u32.to_ne_bytes());
+                    packet[8..16].copy_from_slice(&1u64.to_ne_bytes());
+                    packet[16..24].copy_from_slice(&1u64.to_ne_bytes());
+                    peer.write_all(&packet).unwrap();
+                } else {
+                    peer.write_all(&[1]).unwrap();
+                }
+                let completed = completed_rx.recv_timeout(Duration::from_secs(2));
+                let completed_unaided = completed.is_ok();
+                let result = match completed {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // An unconfigured legacy channel is the planted red:
+                        // one terminated reader strands its live sibling.
+                        // Rescue either mode before inspecting the outcome.
+                        peer.shutdown(Shutdown::Both).unwrap();
+                        completed_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+                    }
+                };
+                worker.join().unwrap();
+                assert_eq!(
+                    completed_unaided, configured_stop,
+                    "reader retirement differs from the bounded legacy control (panic={panic_callback})"
+                );
+                if panic_callback {
+                    match result {
+                        Err(_) => {} // Primary callback unwound after retiring siblings.
+                        Ok(Err(error)) => assert!(error.to_string().contains("panicked")),
+                        Ok(Ok(())) => panic!("callback panic was reported as success"),
+                    }
+                    assert_eq!(calls.load(Ordering::Acquire), 1);
+                } else {
+                    result.unwrap().unwrap();
+                    assert_eq!(calls.load(Ordering::Acquire), 0);
+                }
+                assert_eq!(destroyed.load(Ordering::Acquire), 1);
+            });
         }
     }
 

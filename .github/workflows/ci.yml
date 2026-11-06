@@ -431,6 +431,22 @@ jobs:
           FFS_SKIP_BUILD: "1"
         run: ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
 
+      - name: Collect FUSE helper diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p artifacts/e2e/fuse-helper-diagnostics
+          {
+            uname -a
+            fusermount3 --version
+            id
+          } > artifacts/e2e/fuse-helper-diagnostics/environment.log
+          sudo journalctl -k --since '-30min' --no-pager > artifacts/e2e/fuse-helper-diagnostics/kernel.log
+          if test -r /sys/kernel/security/apparmor/profiles; then
+            cat /sys/kernel/security/apparmor/profiles > artifacts/e2e/fuse-helper-diagnostics/apparmor.log
+          else
+            sudo cat /sys/kernel/security/apparmor/profiles > artifacts/e2e/fuse-helper-diagnostics/apparmor.log
+          fi
+
       - name: Upload E2E artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4

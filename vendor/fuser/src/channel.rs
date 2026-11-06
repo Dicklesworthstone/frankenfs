@@ -50,6 +50,18 @@ pub(crate) struct ReceiveStop {
     stopped: AtomicBool,
 }
 
+/// A terminating dispatcher must release sibling readers before scope joins.
+#[derive(Debug)]
+pub(crate) struct ReceiveStopGuard(Option<Arc<ReceiveStop>>);
+
+impl Drop for ReceiveStopGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.request_stop();
+        }
+    }
+}
+
 impl ReceiveStop {
     pub(crate) fn request_stop(&self) {
         self.stopped.store(true, Ordering::Release);
@@ -115,6 +127,10 @@ impl Channel {
         });
         self.receive_stop = Some(Arc::clone(&stop));
         Ok(stop)
+    }
+
+    pub(crate) fn stop_readers_on_drop(&self) -> ReceiveStopGuard {
+        ReceiveStopGuard(self.receive_stop.clone())
     }
 
     /// Receives data up to the capacity of the given buffer (can block).

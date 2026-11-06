@@ -116,7 +116,7 @@ impl ReadOnlyUnmountView {
         })
     }
 
-    fn confirm_detached(&mut self) -> io::Result<()> {
+    fn confirm_detached(&mut self, helper_pid: u32) -> io::Result<()> {
         self.mountinfo.seek(SeekFrom::Start(0))?;
         let mut records = Vec::new();
         self.mountinfo.read_to_end(&mut records)?;
@@ -138,9 +138,9 @@ impl ReadOnlyUnmountView {
                 ));
             }
             if fields[4] == self.encoded_path.as_slice() {
-                return Err(Error::other(
-                    "auto-unmount helper exited but mountpoint remains mounted",
-                ));
+                return Err(Error::other(format!(
+                    "auto-unmount helper exited but mountpoint remains mounted (helper pid={helper_pid})"
+                )));
             }
         }
         Ok(())
@@ -210,11 +210,13 @@ impl Mount {
         }
         // Last device close ends this proven read-only connection. Only then
         // may the existing crash helper inspect ENOTCONN and detach its mount.
-        self.auto_unmount_socket
-            .take()
+        let mut helper = self.auto_unmount_socket.take().unwrap();
+        let helper_pid = helper.child.id();
+        helper.finish(timeout.saturating_sub(started.elapsed()))?;
+        self.read_only_view
+            .as_mut()
             .unwrap()
-            .finish(timeout.saturating_sub(started.elapsed()))?;
-        self.read_only_view.as_mut().unwrap().confirm_detached()
+            .confirm_detached(helper_pid)
     }
 }
 
