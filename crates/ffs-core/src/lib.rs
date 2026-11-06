@@ -115380,6 +115380,140 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_reflink_respects_destination_inode_flags() {
+        const BS: usize = 4096;
+        for flag in [BTRFS_INODE_IMMUTABLE, BTRFS_INODE_APPEND] {
+            let (fs, cx) = open_writable_btrfs();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let src = fs
+                .create(&cx, root, OsStr::new("protected-source"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let dst = fs
+                .create(&cx, root, OsStr::new("protected-destination"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let writable = fs
+                .create(&cx, root, OsStr::new("writable-destination"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let mut source = vec![0x35; 2 * BS];
+            source[BS..].fill(0xA6);
+            let destination = vec![0x72; 3 * BS];
+            fs.write(&cx, src, 0, &source).unwrap();
+            fs.write(&cx, dst, 0, &destination).unwrap();
+            {
+                let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
+                for ino in [src, dst] {
+                    let canonical = fs.btrfs_canonical_inode(ino).unwrap();
+                    let mut inode = fs.btrfs_read_inode_from_tree(&alloc, canonical).unwrap();
+                    inode.flags |= flag;
+                    alloc
+                        .fs_tree
+                        .update(
+                            &BtrfsKey {
+                                objectid: canonical,
+                                item_type: BTRFS_ITEM_INODE_ITEM,
+                                offset: 0,
+                            },
+                            &inode.to_bytes(),
+                        )
+                        .unwrap();
+                }
+            }
+            let snapshot = || {
+                let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                let start = BtrfsKey {
+                    objectid: 0,
+                    item_type: 0,
+                    offset: 0,
+                };
+                let end = BtrfsKey {
+                    objectid: u64::MAX,
+                    item_type: u8::MAX,
+                    offset: u64::MAX,
+                };
+                (
+                    alloc.fs_tree.range(&start, &end).unwrap(),
+                    alloc.csum_tree.range(&start, &end).unwrap(),
+                    alloc
+                        .extent_alloc
+                        .extent_tree()
+                        .range(&start, &end)
+                        .unwrap(),
+                    alloc.extent_alloc.space_info(),
+                    alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                )
+            };
+            let before = snapshot();
+            assert_eq!(
+                fs.clone_file(&cx, &mut RequestScope::empty(), dst, src)
+                    .expect_err("FICLONE must reject a protected destination")
+                    .to_errno(),
+                libc::EPERM,
+                "destination flag {flag:#x}"
+            );
+            assert_eq!(
+                snapshot(),
+                before,
+                "rejected FICLONE must not mutate metadata"
+            );
+            for (src_offset, length, dest_offset) in [
+                (0, 0, 0),                       // implicit whole-source clone
+                (0, (2 * BS) as u64, 0),         // explicit whole-source clone
+                (BS as u64, BS as u64, 0),       // partial overwrite
+                (0, BS as u64, (3 * BS) as u64), // at destination EOF
+                (0, BS as u64, (4 * BS) as u64), // past destination EOF
+                ((2 * BS) as u64, 0, 0),         // empty EOF range
+            ] {
+                assert_eq!(
+                    fs.clone_file_range(
+                        &cx,
+                        &mut RequestScope::empty(),
+                        dst,
+                        src,
+                        src_offset,
+                        length,
+                        dest_offset,
+                    )
+                    .expect_err("FICLONERANGE must reject a protected destination")
+                    .to_errno(),
+                    libc::EPERM,
+                    "destination flag {flag:#x}, range ({src_offset}, {length}, {dest_offset})"
+                );
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "rejected clone must preserve mappings, checksums, references and space"
+                );
+            }
+            assert_eq!(fs.getattr(&cx, dst).unwrap().size, (3 * BS) as u64);
+            assert_eq!(fs.read(&cx, dst, 0, (3 * BS) as u32).unwrap(), destination);
+
+            // Source flags restrict mutations, not reads. Both ioctl entry
+            // points must still clone a protected source into an ordinary file.
+            fs.clone_file(&cx, &mut RequestScope::empty(), writable, src)
+                .expect("FICLONE from a protected source");
+            assert_eq!(fs.read(&cx, writable, 0, (2 * BS) as u32).unwrap(), source);
+            fs.clone_file_range(
+                &cx,
+                &mut RequestScope::empty(),
+                writable,
+                src,
+                BS as u64,
+                BS as u64,
+                0,
+            )
+            .expect("FICLONERANGE from a protected source");
+            assert_eq!(
+                fs.read(&cx, writable, 0, (2 * BS) as u32).unwrap(),
+                vec![0xA6; 2 * BS]
+            );
+            assert_eq!(fs.read(&cx, src, 0, (2 * BS) as u32).unwrap(), source);
+        }
+    }
+
+    #[test]
     fn btrfs_reflink_preserves_reservations_outside_logical_range() {
         let _guard = log_contract_guard();
         for src_length in [None, Some(0), Some(4096)] {
