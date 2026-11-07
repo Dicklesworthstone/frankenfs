@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'crates/ffs-core/**'
+      - 'crates/ffs-alloc/**'
       - 'crates/ffs-btrfs/**'
       - 'crates/ffs-ondisk/**'
       - 'crates/ffs-block/**'
