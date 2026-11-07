@@ -6225,10 +6225,14 @@ impl BlockDevice for TransactionBlockAdapter<'_, '_> {
         if let Some(staged) = tx.staged_write(block) {
             return Ok(BlockBuf::new(staged.to_vec()));
         }
+        let snapshot = tx.snapshot();
         drop(tx);
 
-        // Fall back to base device.
-        self.base.read_block(cx, block)
+        // Writable base adapters read the latest head. Unstaged metadata must
+        // instead use the transaction's ancestor, just like stage_rmw below.
+        self.base
+            .read_merge_ancestor_at_snapshot(cx, block, snapshot)
+            .map(|(buf, _)| buf)
     }
 
     fn write_block(&self, _cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<(), FfsError> {
@@ -34382,6 +34386,20 @@ impl OpenFs {
             return Ok(0);
         }
 
+        if scope.tx.is_none() {
+            // The direct SDK supplies a snapshot-only scope. Without an owned
+            // transaction, allocation and data blocks publish individually;
+            // ENOSPC can leave mappings published before the final inode update.
+            // Pin the ancestor until publication or error, including unwind.
+            let base = self.block_device_adapter();
+            let (tx, _snapshot_pin) =
+                RegisteredSnapshotBlockAdapter::begin(&base, &self.mvcc_store);
+            let mut write_scope = RequestScope::with_transaction(tx);
+            let written = self.ext4_write(cx, &mut write_scope, ino, offset, data)?;
+            self.commit_request_scope(cx, &mut write_scope)?;
+            return Ok(written);
+        }
+
         let alloc_mutex = self.require_alloc_state()?;
         let mut block_dev = self.block_device_adapter();
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
@@ -34464,11 +34482,8 @@ impl OpenFs {
         }
 
         if (inode.flags & ffs_types::EXT4_EXTENTS_FL) == 0 {
-            // Legacy indirect-block-mapped file (no EXT4_EXTENTS_FL). bd-laay3
-            // increment 1: in-place OVERWRITE of already-mapped blocks. Growth
-            // (extending size / filling holes, which needs data + indirect-block
-            // allocation and chain growth) is a later increment and still
-            // returns UnsupportedFeature from the helper.
+            // Legacy files resolve existing block pointers and allocate missing
+            // data and indirect-metadata blocks through the same request scope.
             return self.ext4_write_indirect(cx, scope, ino, inode, offset, data);
         }
 
@@ -102605,6 +102620,140 @@ mod tests {
     }
 
     #[test]
+    fn ext4_sdk_write_enospc_preserves_file_and_accounting_native() {
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let modes = [false, true];
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let modes = [false];
+
+        for sharded in modes {
+            for indirect in [false, true] {
+                let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                    .expect("SDK ENOSPC regression requires mkfs.ext4");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                {
+                    assert!(!fs.set_bhh0i_sharded_ops(sharded));
+                    assert_eq!(fs.bhh0i_sharded_ops_active(), sharded);
+                }
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                let ino = fs
+                    .create(&cx, root, OsStr::new("sdk-write"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino;
+                if indirect {
+                    let mut inode = fs.read_inode(&cx, ino).unwrap();
+                    inode.flags &= !ffs_types::EXT4_EXTENTS_FL;
+                    inode.extent_bytes.fill(0);
+                    fs.persist_ext4_inode_for_testing(&cx, ino, &inode).unwrap();
+                }
+                let bs = fs.block_size() as usize;
+                let prefix = vec![0x31; bs];
+                let before_success = fs.current_snapshot();
+                assert_eq!(fs.write(&cx, ino, 0, &prefix).unwrap(), bs as u32);
+                assert_eq!(fs.current_snapshot().high.0, before_success.high.0 + 1);
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                fs.flush_mvcc_to_device(&cx).unwrap();
+
+                let before = fs.current_snapshot();
+                let inode = fs.read_inode(&cx, ino).unwrap();
+                let counts = fs.statfs(&cx, root).unwrap();
+                let group_counts = || {
+                    let groups = fs.ext4_superblock().unwrap().groups_count();
+                    (0..groups)
+                        .map(|group| {
+                            fs.count_free_blocks_in_group(&cx, GroupNumber(group))
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let free_by_group = group_counts();
+                assert_eq!(fs.write(&cx, ino, 0, &[]).unwrap(), 0);
+                assert_eq!(fs.current_snapshot(), before);
+
+                // Include the already mapped prefix, which needs no allocation.
+                // Physical free space also covers legacy allocation, which does
+                // not apply the extent allocator's reserved data budget.
+                let overrun_blocks = usize::try_from(counts.blocks_free).unwrap() + 2;
+                let payload = vec![0xA7; overrun_blocks.checked_mul(bs).unwrap()];
+                let error = fs.write(&cx, ino, 0, &payload).unwrap_err();
+                assert!(matches!(error, FfsError::NoSpace), "{error:?}");
+                assert_eq!(
+                    fs.current_snapshot(),
+                    before,
+                    "failed write published blocks"
+                );
+                assert_eq!(fs.read_inode(&cx, ino).unwrap(), inode);
+                assert_eq!(fs.read(&cx, ino, 0, (2 * bs) as u32).unwrap(), prefix);
+                assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                assert_eq!(group_counts(), free_by_group);
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                assert!(fs.try_close_mutation_gate().is_some(), "SDK gate leaked");
+
+                let cancelled = Cx::for_testing();
+                cancelled.set_cancel_requested(true);
+                assert!(matches!(
+                    fs.write(&cancelled, ino, 0, &payload[..bs]),
+                    Err(FfsError::Cancelled)
+                ));
+                assert_eq!(fs.current_snapshot(), before);
+                assert_eq!(fs.read_inode(&cx, ino).unwrap(), inode);
+                assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                assert!(fs.try_close_mutation_gate().is_some());
+
+                let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+                FsOps::write(&fs, &cx, &mut scope, ino, bs as u64, &payload[..bs]).unwrap();
+                assert!(
+                    scope.pending_write_count() > 0,
+                    "cancellation follows staging"
+                );
+                assert!(!scope.ext4_block_deltas.is_empty());
+                assert_eq!(fs.current_snapshot(), before);
+                assert!(matches!(
+                    fs.commit_request_scope(&cancelled, &mut scope),
+                    Err(FfsError::Cancelled)
+                ));
+                fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+                assert_eq!(fs.current_snapshot(), before);
+                assert_eq!(fs.read_inode(&cx, ino).unwrap(), inode);
+                assert_eq!(fs.read(&cx, ino, 0, (2 * bs) as u32).unwrap(), prefix);
+                assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                assert_eq!(group_counts(), free_by_group);
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                assert!(fs.try_close_mutation_gate().is_some());
+
+                // Export the actual post-error MVCC view, not the original mkfs
+                // image, then use an independent checker and reopen the bytes.
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                let bytes = dev.snapshot_bytes();
+                let image = tmp.path().join("test.ext4");
+                std::fs::write(&image, &bytes).unwrap();
+                let (clean, output) = run_e2fsck(&image).expect("native checker required");
+                assert!(clean, "sharded={sharded} indirect={indirect}: {output}");
+                assert_eq!(
+                    std::fs::read(&image).unwrap(),
+                    bytes,
+                    "checker changed bytes"
+                );
+                let reopened = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(bytes)),
+                    &OpenOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(reopened.read(&cx, ino, 0, (2 * bs) as u32).unwrap(), prefix);
+                assert_eq!(reopened.read_inode(&cx, ino).unwrap(), inode);
+                println!(
+                    "SDK ENOSPC isolation: sharded={sharded} indirect={indirect} \
+                     requested_blocks={overrun_blocks} free_blocks={} native_clean={clean}",
+                    counts.blocks_free
+                );
+            }
+        }
+    }
+
+    #[test]
     fn writer_snapshot_reads_reject_newer_ancestors_and_preserve_staged_bytes() {
         for single_store in [false, true] {
             let cx = Cx::for_testing();
@@ -102628,6 +102777,21 @@ mod tests {
                 fs.read_block_with_scope(&cx, &scope, block),
                 Err(FfsError::MvccConflict { block: 20, .. })
             ));
+            {
+                let base = fs.block_device_adapter();
+                let adapter = TransactionBlockAdapter {
+                    base: &base,
+                    tx: Mutex::new(scope.tx.as_mut().unwrap()),
+                };
+                assert!(matches!(
+                    adapter.read_block(&cx, block),
+                    Err(FfsError::MvccConflict { block: 20, .. })
+                ));
+                assert_eq!(
+                    adapter.read_block(&cx, BlockNumber(21)).unwrap().as_slice(),
+                    gap
+                );
+            }
             assert!(matches!(
                 fs.read_block_arc_with_scope(&cx, &scope, block),
                 Err(FfsError::MvccConflict { block: 20, .. })
@@ -102654,6 +102818,14 @@ mod tests {
 
             let own = vec![0x31; bs];
             scope.tx.as_mut().unwrap().stage_write(block, own.clone());
+            {
+                let base = fs.block_device_adapter();
+                let adapter = TransactionBlockAdapter {
+                    base: &base,
+                    tx: Mutex::new(scope.tx.as_mut().unwrap()),
+                };
+                assert_eq!(adapter.read_block(&cx, block).unwrap().as_slice(), own);
+            }
             assert_eq!(fs.read_block_with_scope(&cx, &scope, block).unwrap(), own);
             assert_eq!(
                 fs.read_block_arc_with_scope(&cx, &scope, block)
@@ -102700,7 +102872,7 @@ mod tests {
             fs.block_device_adapter()
                 .write_block(&cx, block, &old)
                 .unwrap();
-            let scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
             let snapshot = scope.snapshot.unwrap();
             assert_eq!(scope.tx.as_ref().unwrap().snapshot(), snapshot);
             assert_eq!(fs.mvcc_active_snapshot_count(), 1);
@@ -102709,6 +102881,14 @@ mod tests {
                 .unwrap();
             assert_eq!(fs.mvcc_store.prune_safe(), snapshot.high);
             assert_eq!(fs.read_block_with_scope(&cx, &scope, block).unwrap(), old);
+            {
+                let base = fs.block_device_adapter();
+                let adapter = TransactionBlockAdapter {
+                    base: &base,
+                    tx: Mutex::new(scope.tx.as_mut().unwrap()),
+                };
+                assert_eq!(adapter.read_block(&cx, block).unwrap().as_slice(), old);
+            }
             fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
             assert_eq!(fs.mvcc_active_snapshot_count(), 0);
 
