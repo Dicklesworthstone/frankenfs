@@ -75080,10 +75080,48 @@ mod tests {
             }
             let count = if free > 64 { 32 } else { 1 };
             let payload = vec![0x5a; count * 1024];
-            assert_eq!(
-                fs.write(cx, filler.ino, offset, &payload).unwrap(),
-                u32::try_from(payload.len()).unwrap()
-            );
+            let written = fs
+                .write(cx, filler.ino, offset, &payload)
+                .unwrap_or_else(|error| {
+                    // Uninitialized on-disk bitmaps are raw diagnostic bytes;
+                    // the reconciled allocator counts are the space authority.
+                    let raw_bitmap_free: Vec<_> = (0..geo.group_count)
+                        .map(|index| fs.count_free_blocks_in_group(cx, GroupNumber(index)))
+                        .collect();
+                    let groups = {
+                        let alloc = fs.ext4_alloc_state.as_ref().unwrap().read();
+                        fs.ext4_sharded_alloc
+                            .as_ref()
+                            .unwrap()
+                            .birth_group_stats(&alloc.groups)
+                            .map(|groups| {
+                                groups
+                                    .into_iter()
+                                    .map(|stats| {
+                                        (
+                                            stats.free_blocks,
+                                            stats.free_inodes,
+                                            stats.block_bitmap_uninit(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                    };
+                    let extents = fs
+                        .read_inode(cx, filler.ino)
+                        .and_then(|inode| fs.collect_extents(cx, &inode));
+                    panic!(
+                        "fill selected group failed: {error:?}; group={group:?}; \
+                     offset={offset}; requested={}; target_free={free}; \
+                     metadata_reserve={}; statfs={:?}; raw_bitmap_free={raw_bitmap_free:?}; \
+                     reconciled_groups(free_blocks,free_inodes,block_uninit)={groups:?}; \
+                     extents={extents:?}",
+                        payload.len(),
+                        ffs_alloc::reserved_metadata_blocks(&geo),
+                        fs.statfs(cx, root),
+                    );
+                });
+            assert_eq!(written, u32::try_from(payload.len()).unwrap());
             offset += u64::try_from(payload.len()).unwrap();
             assert!(
                 offset < 32 * 1024 * 1024,
