@@ -35929,11 +35929,6 @@ impl OpenFs {
         new_name: &[u8],
         no_replace: bool,
     ) -> ffs_error::Result<()> {
-        // POSIX: rename(old, new) where old == new is a successful no-op.
-        if !no_replace && parent == new_parent && name == new_name {
-            return Ok(());
-        }
-
         Self::validate_single_path_component(name)?;
         Self::validate_single_path_component(new_name)?;
         let alloc_mutex = self.require_alloc_state()?;
@@ -36074,9 +36069,39 @@ impl OpenFs {
         {
             return Err(FfsError::Exists);
         }
+        // The source and directories now actually exist. An exact same-path
+        // no-op needs no insertion preflight, even for an existing Unicode name.
+        if parent == new_parent && name == new_name {
+            return Ok((None, new_parent_inode));
+        }
+
+        // The preflight reads the new_name hash-target leaf; on a non-casefold
+        // htree dir it also reports whether new_name already exists there, letting
+        // us skip a second full htree descent (`lookup_name`) below. The scan is
+        // valid until the target leaf is mutated — nothing between here and the
+        // consumption touches new_parent's leaf (the child `..`-update below writes
+        // only the moved dir's own block), and the whole rename holds one
+        // `alloc.write()`, so there is no TOCTOU (bd-cc-rename-probe).
+        let target_probe =
+            self.ext4_preflight_dir_entry_insert(cx, block_dev, &new_parent_inode, new_name, ft)?;
+
+        // Resolve before may_delete-style checks: two names of one inode do not
+        // remove anything, including when that inode or its parents are flagged.
+        let existing_target = match target_probe {
+            RenameTargetProbe::Present(entry) => Some(entry),
+            RenameTargetProbe::Absent => None,
+            RenameTargetProbe::NotChecked => {
+                self.ext4_lookup_name_from_device(cx, block_dev, &new_parent_inode, new_name)?
+            }
+        };
+        if existing_target
+            .as_ref()
+            .is_some_and(|existing| u64::from(existing.inode) == child_ino.0)
+        {
+            return Ok((None, new_parent_inode));
+        }
         Self::ext4_reject_immutable_or_append(&parent_inode)?;
         Self::ext4_reject_immutable(&new_parent_inode)?;
-        // Immutable and append-only files cannot be renamed (kernel: EPERM).
         Self::ext4_reject_immutable_or_append(&child_inode)?;
         if child_inode.is_dir()
             && parent != new_parent
@@ -36089,16 +36114,6 @@ impl OpenFs {
                 detail: "cannot move a directory into its own descendant".into(),
             });
         }
-
-        // The preflight reads the new_name hash-target leaf; on a non-casefold
-        // htree dir it also reports whether new_name already exists there, letting
-        // us skip a second full htree descent (`lookup_name`) below. The scan is
-        // valid until the target leaf is mutated — nothing between here and the
-        // consumption touches new_parent's leaf (the child `..`-update below writes
-        // only the moved dir's own block), and the whole rename holds one
-        // `alloc.write()`, so there is no TOCTOU (bd-cc-rename-probe).
-        let target_probe =
-            self.ext4_preflight_dir_entry_insert(cx, block_dev, &new_parent_inode, new_name, ft)?;
 
         let planned_child_dir_update = if child_inode.is_dir() && parent != new_parent {
             // Preflight the old parent's `..`-backref decrement (applied below):
@@ -36135,29 +36150,8 @@ impl OpenFs {
             None
         };
 
-        // Resolve target existence from the preflight probe when it definitively
-        // checked (non-casefold htree); otherwise fall back to a real lookup
-        // (casefold needs fold-aware matching, linear/stale-index may hold the name
-        // in any block).
-        let existing_target = match target_probe {
-            RenameTargetProbe::Present(entry) => Some(entry),
-            RenameTargetProbe::Absent => None,
-            RenameTargetProbe::NotChecked => {
-                self.ext4_lookup_name_from_device(cx, block_dev, &new_parent_inode, new_name)?
-            }
-        };
         let retired_target = if let Some(existing) = existing_target {
             let existing_ino = InodeNumber(u64::from(existing.inode));
-            // POSIX: renaming a file onto one of its own hard links (old and new
-            // resolve to the same inode) is a no-op: the kernel's vfs_rename
-            // short-circuits `if (source == target) return 0`, leaving both
-            // names and the link count intact. No mutation has happened yet, so
-            // returning here destroys neither name; without it the block below
-            // would unlink the target name and decrement the shared inode's
-            // link count, silently dropping a hard link (bd-f7q6k).
-            if existing_ino == child_ino {
-                return Ok((None, new_parent_inode));
-            }
             if new_parent_inode.flags & ffs_types::EXT4_APPEND_FL != 0 {
                 return Err(FfsError::RequestRejected {
                     errno: libc::EPERM,
@@ -49770,11 +49764,6 @@ impl OpenFs {
         let new_parent = Self::ext4_canonical_inode(new_parent);
         let name_bytes = name.as_encoded_bytes();
         let new_name_bytes = new_name.as_encoded_bytes();
-
-        // POSIX: exchange of an entry with itself is a successful no-op.
-        if parent == new_parent && name_bytes == new_name_bytes {
-            return Ok(());
-        }
 
         Self::validate_single_path_component(name_bytes)?;
         Self::validate_single_path_component(new_name_bytes)?;
@@ -95732,6 +95721,42 @@ mod tests {
                     .ino;
                 fs.write(&cx, a, 0, b"left").unwrap();
                 fs.write(&cx, b, 0, b"right").unwrap();
+                for rename_flags in [0, libc::RENAME_EXCHANGE, libc::RENAME_NOREPLACE] {
+                    for (parent, name, errno) in [
+                        (left, "missing", libc::ENOENT),
+                        (left, ".", libc::EINVAL),
+                        (left, "..", libc::EINVAL),
+                        (left, "bad/name", libc::EINVAL),
+                        (left, "bad\0name", libc::EINVAL),
+                        (a, "missing", libc::ENOTDIR),
+                    ] {
+                        let before = fs.current_snapshot();
+                        let counts = fs.statfs(&cx, root).unwrap();
+                        let inodes =
+                            [root, left, right, a, b].map(|ino| fs.read_inode(&cx, ino).unwrap());
+                        let error = FsOps::rename2(
+                            &fs,
+                            &cx,
+                            &mut RequestScope::empty(),
+                            parent,
+                            OsStr::new(name),
+                            parent,
+                            OsStr::new(name),
+                            rename_flags,
+                        )
+                        .expect_err("equal text cannot bypass name and source validation");
+                        assert_eq!(error.to_errno(), errno, "{name:?}: {error:?}");
+                        assert_eq!(fs.current_snapshot(), before);
+                        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                        assert_eq!(
+                            [root, left, right, a, b].map(|ino| fs.read_inode(&cx, ino).unwrap()),
+                            inodes
+                        );
+                        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                        assert!(fs.try_close_mutation_gate().is_some());
+                        assert!(fs.is_writable());
+                    }
+                }
                 for protected in [left, right, a, b] {
                     let mut inode = fs.read_inode(&cx, protected).unwrap();
                     let original_flags = inode.flags;
@@ -95788,31 +95813,98 @@ mod tests {
                 assert_eq!(fs.lookup(&cx, left, OsStr::new("a")).unwrap().ino, b);
                 assert_eq!(fs.lookup(&cx, right, OsStr::new("b")).unwrap().ino, a);
                 fs.link(&cx, a, root, OsStr::new("alias")).unwrap();
-                let mut inode = fs.read_inode(&cx, a).unwrap();
-                let original_flags = inode.flags;
-                inode.flags |= flag;
-                fs.persist_ext4_inode_for_testing(&cx, a, &inode).unwrap();
-                let inode = fs.read_inode(&cx, a).unwrap();
+                fs.link(&cx, b, root, OsStr::new("other")).unwrap();
+                for protected in [a, right, root] {
+                    let mut inode = fs.read_inode(&cx, protected).unwrap();
+                    let original_flags = inode.flags;
+                    inode.flags |= flag;
+                    fs.persist_ext4_inode_for_testing(&cx, protected, &inode)
+                        .unwrap();
+                    let inode = fs.read_inode(&cx, protected).unwrap();
+                    let before = fs.current_snapshot();
+                    let counts = fs.statfs(&cx, root).unwrap();
+                    let inodes =
+                        [root, left, right, a, b].map(|ino| fs.read_inode(&cx, ino).unwrap());
+                    for rename_flags in [0, libc::RENAME_EXCHANGE, libc::RENAME_NOREPLACE] {
+                        for (destination, target, errno) in [
+                            (right, "b", 0),
+                            (root, "alias", 0),
+                            (root, "other", libc::EPERM),
+                        ] {
+                            let result = FsOps::rename2(
+                                &fs,
+                                &cx,
+                                &mut RequestScope::empty(),
+                                right,
+                                OsStr::new("b"),
+                                destination,
+                                OsStr::new(target),
+                                rename_flags,
+                            );
+                            if rename_flags == libc::RENAME_NOREPLACE {
+                                assert_eq!(result.unwrap_err().to_errno(), libc::EEXIST);
+                            } else if errno != 0 {
+                                assert_eq!(result.unwrap_err().to_errno(), errno);
+                            } else {
+                                result.expect("resolved protected inode aliases must be no-ops");
+                            }
+                            assert_eq!(fs.current_snapshot(), before);
+                            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                            assert_eq!(
+                                [root, left, right, a, b]
+                                    .map(|ino| fs.read_inode(&cx, ino).unwrap()),
+                                inodes
+                            );
+                            assert_eq!(fs.read_inode(&cx, protected).unwrap(), inode);
+                            assert_eq!(fs.lookup(&cx, right, OsStr::new("b")).unwrap().ino, a);
+                            assert_eq!(fs.lookup(&cx, root, OsStr::new("alias")).unwrap().ino, a);
+                            assert_eq!(fs.lookup(&cx, root, OsStr::new("other")).unwrap().ino, b);
+                            assert_eq!(fs.read(&cx, a, 0, 4).unwrap(), b"left");
+                            assert_eq!(fs.read(&cx, b, 0, 5).unwrap(), b"right");
+                            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                            assert!(fs.try_close_mutation_gate().is_some());
+                            assert!(fs.is_writable());
+                        }
+                        let error = FsOps::rename2(
+                            &fs,
+                            &cx,
+                            &mut RequestScope::empty(),
+                            right,
+                            OsStr::new("missing"),
+                            right,
+                            OsStr::new("missing"),
+                            rename_flags,
+                        )
+                        .expect_err("even a protected parent requires source resolution");
+                        assert_eq!(error.to_errno(), libc::ENOENT);
+                        assert_eq!(fs.current_snapshot(), before);
+                        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                        assert_eq!(
+                            [root, left, right, a, b].map(|ino| fs.read_inode(&cx, ino).unwrap()),
+                            inodes
+                        );
+                    }
+                    let mut restored = fs.read_inode(&cx, protected).unwrap();
+                    restored.flags = original_flags;
+                    fs.persist_ext4_inode_for_testing(&cx, protected, &restored)
+                        .unwrap();
+                }
                 let before = fs.current_snapshot();
-                FsOps::rename2(
-                    &fs,
+                fs.rename(
                     &cx,
-                    &mut RequestScope::empty(),
-                    right,
-                    OsStr::new("b"),
                     root,
-                    OsStr::new("alias"),
-                    libc::RENAME_EXCHANGE,
+                    OsStr::new("other"),
+                    root,
+                    OsStr::new("renamed-other"),
                 )
-                .expect("exchanging two names of one protected inode is a no-op");
-                assert_eq!(fs.current_snapshot(), before);
-                assert_eq!(fs.read_inode(&cx, a).unwrap(), inode);
-                assert_eq!(fs.lookup(&cx, right, OsStr::new("b")).unwrap().ino, a);
-                assert_eq!(fs.lookup(&cx, root, OsStr::new("alias")).unwrap().ino, a);
-                let mut restored = fs.read_inode(&cx, a).unwrap();
-                restored.flags = original_flags;
-                fs.persist_ext4_inode_for_testing(&cx, a, &restored)
-                    .unwrap();
+                .expect("a fresh legal mutation must still publish after the no-op controls");
+                assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+                assert_eq!(
+                    fs.lookup(&cx, root, OsStr::new("renamed-other"))
+                        .unwrap()
+                        .ino,
+                    b
+                );
                 fs.flush_mvcc_to_device(&cx).unwrap();
                 let bytes = dev.snapshot_bytes();
                 let image = tmp.path().join("exchange-admission.ext4");
@@ -95826,6 +95918,13 @@ mod tests {
                 .unwrap();
                 assert_eq!(reopened.lookup(&cx, left, OsStr::new("a")).unwrap().ino, b);
                 assert_eq!(reopened.lookup(&cx, right, OsStr::new("b")).unwrap().ino, a);
+                assert_eq!(
+                    reopened
+                        .lookup(&cx, root, OsStr::new("renamed-other"))
+                        .unwrap()
+                        .ino,
+                    b
+                );
                 assert_eq!(reopened.read(&cx, a, 0, 4).unwrap(), b"left");
                 assert_eq!(reopened.read(&cx, b, 0, 5).unwrap(), b"right");
             }

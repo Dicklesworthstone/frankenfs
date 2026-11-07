@@ -1487,7 +1487,10 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<()> {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
-        self.reject_rename_dir_change(cx, scope, parent, new_parent, new_name)?;
+        // Ext4 resolves no-ops and checks flags in its publication transaction.
+        if !self.is_ext4() {
+            self.reject_rename_dir_change(cx, scope, parent, new_parent, new_name)?;
+        }
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
@@ -1589,8 +1592,11 @@ impl FsOps for OpenFs {
 
         if flags & RENAME_EXCHANGE != 0 {
             // Both names are removed and re-added.
-            self.reject_dir_entry_change(cx, scope, parent, true)?;
-            self.reject_dir_entry_change(cx, scope, new_parent, true)?;
+            // Ext4 checks both parents after resolving a possible inode alias.
+            if !self.is_ext4() {
+                self.reject_dir_entry_change(cx, scope, parent, true)?;
+                self.reject_dir_entry_change(cx, scope, new_parent, true)?;
+            }
             clear_readdir_snapshot(&self.readdir_snapshot);
             return match &self.flavor {
                 FsFlavor::Ext4(_) => {
