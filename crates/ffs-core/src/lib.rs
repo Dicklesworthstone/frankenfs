@@ -26653,7 +26653,12 @@ impl OpenFs {
         for i in 0..blocks_needed {
             let hint = self.numa_allocation_hint(
                 &alloc.geo,
-                Self::ext4_file_allocation_hint(&alloc.geo, ino, None),
+                Self::ext4_file_allocation_hint(
+                    &self.numa_allocation_policy,
+                    &alloc.geo,
+                    ino,
+                    None,
+                ),
                 "ext4_compressed_cluster",
                 Some(ino),
             );
@@ -26769,7 +26774,12 @@ impl OpenFs {
 
             let hint = self.numa_allocation_hint(
                 &alloc.geo,
-                Self::ext4_file_allocation_hint(&alloc.geo, ino, None),
+                Self::ext4_file_allocation_hint(
+                    &self.numa_allocation_policy,
+                    &alloc.geo,
+                    ino,
+                    None,
+                ),
                 "ext4_uncompressed_cluster",
                 Some(ino),
             );
@@ -28077,18 +28087,19 @@ impl OpenFs {
         BlockNumber(ext.physical_start + u64::from(ext.actual_len()))
     }
 
-    /// Start a file's data beside its inode, then follow its physical extent
-    /// goal. An explicit group takes precedence over `goal_block` in mballoc,
-    /// so retaining the inode group after the first allocation would defeat
-    /// contiguous growth when that allocation falls back to another group.
+    /// Start a file's data beside its inode when NUMA placement is disabled.
+    /// Otherwise leave the initial goal open for the requested NUMA policy.
+    /// After allocation, follow the physical extent goal: an explicit group
+    /// takes precedence over `goal_block` in mballoc and would defeat contiguous
+    /// growth when the first allocation falls back to another group.
     fn ext4_file_allocation_hint(
+        policy: &NumaAllocationPolicy,
         geo: &FsGeometry,
         ino: InodeNumber,
         goal_block: Option<BlockNumber>,
     ) -> AllocHint {
         AllocHint {
-            goal_group: goal_block
-                .is_none()
+            goal_group: (matches!(policy, NumaAllocationPolicy::Disabled) && goal_block.is_none())
                 .then(|| ffs_types::inode_to_group(ino, geo.inodes_per_group)),
             goal_block,
             ..AllocHint::default()
@@ -33379,7 +33390,12 @@ impl OpenFs {
                         // direct pointer i_block[0], as ext4_symlink maps it.
                         let hint = self.numa_allocation_hint(
                             geo,
-                            Self::ext4_file_allocation_hint(geo, ino, None),
+                            Self::ext4_file_allocation_hint(
+                                &self.numa_allocation_policy,
+                                geo,
+                                ino,
+                                None,
+                            ),
                             "ext4_symlink",
                             Some(ino),
                         );
@@ -33414,7 +33430,12 @@ impl OpenFs {
                         let mut root_bytes = Self::extent_root(&inode);
                         let hint = self.numa_allocation_hint(
                             geo,
-                            Self::ext4_file_allocation_hint(geo, ino, None),
+                            Self::ext4_file_allocation_hint(
+                                &self.numa_allocation_policy,
+                                geo,
+                                ino,
+                                None,
+                            ),
                             "ext4_symlink",
                             Some(ino),
                         );
@@ -34016,7 +34037,12 @@ impl OpenFs {
                             let chunk = remaining.min(want);
                             let hint = self.numa_allocation_hint(
                                 &alloc.geo,
-                                Self::ext4_file_allocation_hint(&alloc.geo, ino, goal_block),
+                                Self::ext4_file_allocation_hint(
+                                    &self.numa_allocation_policy,
+                                    &alloc.geo,
+                                    ino,
+                                    goal_block,
+                                ),
                                 "ext4_fallocate",
                                 Some(ino),
                             );
@@ -34192,7 +34218,12 @@ impl OpenFs {
                         let chunk = remaining.min(want);
                         let hint = self.numa_allocation_hint(
                             &alloc.geo,
-                            Self::ext4_file_allocation_hint(&alloc.geo, ino, goal_block),
+                            Self::ext4_file_allocation_hint(
+                                &self.numa_allocation_policy,
+                                &alloc.geo,
+                                ino,
+                                goal_block,
+                            ),
                             "ext4_fallocate",
                             Some(ino),
                         );
@@ -34568,6 +34599,7 @@ impl OpenFs {
                         let hint = self.numa_allocation_hint(
                             &alloc.geo,
                             Self::ext4_file_allocation_hint(
+                                &self.numa_allocation_policy,
                                 &alloc.geo,
                                 ino,
                                 extents.last().map(Self::extent_end_hint),
@@ -34910,7 +34942,12 @@ impl OpenFs {
                     let data_block = {
                         let hint = self.numa_allocation_hint(
                             &alloc.geo,
-                            Self::ext4_file_allocation_hint(&alloc.geo, ino, None),
+                            Self::ext4_file_allocation_hint(
+                                &self.numa_allocation_policy,
+                                &alloc.geo,
+                                ino,
+                                None,
+                            ),
                             "ext4_write_indirect",
                             Some(ino),
                         );
@@ -35208,7 +35245,12 @@ impl OpenFs {
                             let data_block = {
                                 let hint = self.numa_allocation_hint(
                                     &alloc.geo,
-                                    Self::ext4_file_allocation_hint(&alloc.geo, ino, None),
+                                    Self::ext4_file_allocation_hint(
+                                        &self.numa_allocation_policy,
+                                        &alloc.geo,
+                                        ino,
+                                        None,
+                                    ),
                                     "ext4_fallocate_indirect",
                                     Some(ino),
                                 );
@@ -53254,8 +53296,9 @@ mod tests {
     #[test]
     fn ext4_file_allocation_follows_physical_goal_after_fallback() {
         let geo = numa_test_geometry();
+        let policy = NumaAllocationPolicy::Disabled;
         let ino = InodeNumber(u64::from(geo.inodes_per_group) * 3 + 1);
-        let first = OpenFs::ext4_file_allocation_hint(&geo, ino, None);
+        let first = OpenFs::ext4_file_allocation_hint(&policy, &geo, ino, None);
         assert_eq!(
             ffs_alloc::allocation_group_order(&geo, &first).unwrap()[0],
             GroupNumber(3),
@@ -53265,13 +53308,77 @@ mod tests {
         // A full inode group may place the first extent elsewhere. Its next
         // block must stay next to that extent, rather than jumping back.
         let next = BlockNumber(u64::from(geo.first_data_block + geo.blocks_per_group) + 17);
-        let continuation = OpenFs::ext4_file_allocation_hint(&geo, ino, Some(next));
+        let continuation = OpenFs::ext4_file_allocation_hint(&policy, &geo, ino, Some(next));
         assert_eq!(continuation.goal_block, Some(next));
         assert_eq!(
             ffs_alloc::allocation_group_order(&geo, &continuation).unwrap()[0],
             GroupNumber(1),
             "a physical continuation takes precedence over inode locality"
         );
+    }
+
+    #[test]
+    fn ext4_file_allocation_respects_requested_numa_policy() {
+        let geo = numa_test_geometry();
+        let policy = preferred_node_policy(observed_runtime_numa_topology(1_000, 60));
+        let ino = InodeNumber(11); // Inode group 0, preferred node owns groups 2 and 3.
+        let initial = OpenFs::numa_allocation_hint_from_policy(
+            &policy,
+            &geo,
+            OpenFs::ext4_file_allocation_hint(&policy, &geo, ino, None),
+            "test_file_initial",
+            Some(ino),
+            1_010,
+        );
+        assert_eq!(
+            ffs_alloc::allocation_group_order(&geo, &initial).unwrap()[0],
+            GroupNumber(2),
+            "requested NUMA placement must win over the initial inode default"
+        );
+
+        let next = BlockNumber(u64::from(geo.first_data_block + geo.blocks_per_group) + 17);
+        let continuation = OpenFs::numa_allocation_hint_from_policy(
+            &policy,
+            &geo,
+            OpenFs::ext4_file_allocation_hint(&policy, &geo, ino, Some(next)),
+            "test_file_continuation",
+            Some(ino),
+            1_010,
+        );
+        assert_eq!(continuation.goal_block, Some(next));
+        assert_eq!(
+            ffs_alloc::allocation_group_order(&geo, &continuation).unwrap()[0],
+            GroupNumber(1),
+            "a physical continuation must retain precedence over NUMA"
+        );
+
+        let unknown = NumaAllocationPolicy::PreferredNode {
+            topology: NumaAllocationTopology {
+                source: ffs_alloc::NumaTopologySource::Unknown {
+                    reason: "host topology unavailable".to_owned(),
+                },
+                evidence_claim: ffs_alloc::NumaEvidenceClaim::AdvisoryOnly,
+                downstream_consumers: numa_required_consumers(),
+            },
+            preferred_node: NumaNodeId(1),
+            claim_tier: NumaAllocationClaimTier::CapabilityDowngraded,
+        };
+        let distant_inode = InodeNumber(u64::from(geo.inodes_per_group) * 3 + 1);
+        for (requested, now) in [(&policy, 1_061), (&unknown, 1_010)] {
+            let fallback = OpenFs::numa_allocation_hint_from_policy(
+                requested,
+                &geo,
+                OpenFs::ext4_file_allocation_hint(requested, &geo, distant_inode, None),
+                "test_file_fallback",
+                Some(distant_inode),
+                now,
+            );
+            assert_eq!(
+                ffs_alloc::allocation_group_order(&geo, &fallback).unwrap()[0],
+                GroupNumber(0),
+                "stale or unknown NUMA topology must preserve the existing fallback"
+            );
+        }
     }
 
     fn numa_required_consumers() -> Vec<String> {
