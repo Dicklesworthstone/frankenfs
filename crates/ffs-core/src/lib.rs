@@ -20722,9 +20722,9 @@ impl OpenFs {
 
     /// Read the block allocation bitmap for a group.
     ///
-    /// Returns the raw bitmap bytes. The bitmap has one bit per block in the
-    /// group. A 0 bit indicates a free block, a 1 bit indicates an allocated
-    /// block.
+    /// Returns the raw bitmap bytes, including undefined bytes for lazy groups.
+    /// Each bit represents a block, or a cluster with BIGALLOC. Use
+    /// [`Self::count_free_blocks_in_group`] for a logical free-block count.
     ///
     /// # Errors
     ///
@@ -20753,7 +20753,7 @@ impl OpenFs {
             ffs_ondisk::ext4::verify_block_bitmap_checksum(
                 &bitmap,
                 sb.csum_seed(),
-                sb.blocks_per_group,
+                Self::block_bitmap_units_per_group(&FsGeometry::from_superblock(sb)),
                 &gd,
                 sb.group_desc_size(),
             )
@@ -20801,9 +20801,10 @@ impl OpenFs {
 
     /// Count free blocks in a specific group by reading and analyzing the bitmap.
     ///
-    /// This reads the block bitmap from disk and counts zero bits (free blocks).
-    /// For the last group, only the bits corresponding to actual blocks are
-    /// counted.
+    /// Initialized groups are counted from bitmap bits; authenticated lazy
+    /// groups use their metadata reservations instead of undefined bitmap bytes.
+    /// BIGALLOC cluster bits are converted to physical blocks, bounded by the
+    /// actual size of the last group. Inspection never initializes a bitmap.
     ///
     /// # Errors
     ///
@@ -20814,10 +20815,74 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
 
         let geo = FsGeometry::from_superblock(sb);
+        if group.0 >= geo.group_count {
+            return Err(FfsError::InvalidGeometry(
+                "ext4 group is out of range".into(),
+            ));
+        }
         let blocks_in_group = geo.blocks_in_group(group);
-
+        // Writers acquire the whole allocator before a group record. Keep both
+        // guards through the bitmap read: a deferred descriptor may still say
+        // UNINIT after either allocator family committed a real allocation.
+        let alloc = self
+            .ext4_alloc_state
+            .as_ref()
+            .map(|state| state.read_recursive());
+        let index = usize::try_from(group.0)
+            .map_err(|_| FfsError::InvalidGeometry("group index overflow".into()))?;
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let sharded = if let Some(state) = self.ext4_sharded_alloc.as_ref() {
+            if index >= state.group_count() {
+                return Err(FfsError::InvalidGeometry(
+                    "missing sharded ext4 group".into(),
+                ));
+            }
+            Some(state.lock_group(index))
+        } else {
+            None
+        };
+        let gd = self.read_group_desc(cx, group)?;
+        let uninitialized = gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT != 0
+            && sb.group_desc_checksum_kind() != ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None
+            && alloc.as_ref().is_none_or(|state| {
+                state
+                    .groups
+                    .get(index)
+                    .is_some_and(GroupStats::block_bitmap_uninit)
+            });
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let uninitialized = uninitialized
+            && sharded
+                .as_ref()
+                .is_none_or(|stats| stats.block_bitmap_uninit());
+        if uninitialized {
+            let first = u64::from(geo.first_data_block)
+                + u64::from(group.0) * u64::from(geo.blocks_per_group);
+            let reserved = self.ext4_allocated_blocks_in_range(
+                cx,
+                group,
+                first,
+                first + u64::from(blocks_in_group),
+            )?;
+            return u32::try_from(u64::from(blocks_in_group) - reserved)
+                .map_err(|_| FfsError::InvalidGeometry("free-block count overflow".into()));
+        }
         let bitmap = self.read_block_bitmap(cx, group)?;
-        Ok(bitmap_count_free(&bitmap, blocks_in_group))
+        let ratio = geo.cluster_ratio.max(1);
+        if u64::from(blocks_in_group.div_ceil(ratio)) > bitmap.len() as u64 * 8 {
+            return Err(FfsError::InvalidGeometry(
+                "ext4 allocation bitmap is truncated".into(),
+            ));
+        }
+        let full_clusters = blocks_in_group / ratio;
+        let mut free = bitmap_count_free(&bitmap, full_clusters) * ratio;
+        if !blocks_in_group.is_multiple_of(ratio) && !bitmap_get(&bitmap, full_clusters) {
+            free += blocks_in_group % ratio;
+        }
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        drop(sharded);
+        drop(alloc);
+        Ok(free)
     }
 
     /// Length of the longest contiguous run of free blocks anywhere in the
@@ -21148,7 +21213,18 @@ impl OpenFs {
 
             // Get group descriptor values for comparison
             let gd = self.read_group_desc(cx, group)?;
-            gd_free_blocks += u64::from(gd.free_blocks_count);
+            let ratio = geo.cluster_ratio;
+            let declared_blocks = u64::from(gd.free_blocks_count) * u64::from(ratio);
+            // A free partial last cluster contributes only its real blocks.
+            // The logical count's remainder records whether that cluster is
+            // free; full clusters always contribute a multiple of the ratio.
+            let tail = geo.blocks_in_group(group) % ratio;
+            let padding = if tail != 0 && !free_blocks.is_multiple_of(ratio) {
+                u64::from(ratio - tail)
+            } else {
+                0
+            };
+            gd_free_blocks += declared_blocks.saturating_sub(padding);
             gd_free_inodes += u64::from(gd.free_inodes_count);
         }
 
@@ -57995,6 +58071,7 @@ mod tests {
             image[second_gd..second_gd + 4].copy_from_slice(&66_u32.to_le_bytes());
             image[second_gd + 4..second_gd + 8].copy_from_slice(&67_u32.to_le_bytes());
             image[second_gd + 8..second_gd + 12].copy_from_slice(&120_u32.to_le_bytes());
+            set_group_desc_free_counts_at(&mut image, 1, 52, 128);
             let lazy_gd = 4096 + usize::try_from(lazy_group).unwrap() * 32;
             image[lazy_gd + 0x12..lazy_gd + 0x14]
                 .copy_from_slice(&ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT.to_le_bytes());
@@ -58012,7 +58089,7 @@ mod tests {
             }
             let cx = Cx::for_testing();
             let dev = TestDevice::from_vec(image.clone());
-            let fs = OpenFs::from_device(
+            let mut fs = OpenFs::from_device(
                 &cx,
                 Box::new(dev.clone()),
                 &OpenOptions {
@@ -58023,10 +58100,19 @@ mod tests {
             .expect("open checksummed group descriptors");
             if lazy_group == 0 {
                 assert!(matches!(
+                    fs.count_free_blocks_in_group(&cx, GroupNumber(0)),
+                    Err(FfsError::InvalidGeometry(_))
+                ));
+                assert!(matches!(
                     fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 56, 64),
                     Err(FfsError::InvalidGeometry(_))
                 ));
             } else {
+                assert_eq!(
+                    fs.count_free_blocks_in_group(&cx, GroupNumber(1)).unwrap(),
+                    52,
+                    "12 metadata blocks, irrespective of undefined byte {undefined_byte:#x}"
+                );
                 for (start, end, expected) in [(120, 128, 8), (112, 120, 0), (64, 68, 4)] {
                     assert_eq!(
                         fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(1), start, end)
@@ -58041,6 +58127,48 @@ mod tests {
                 image,
                 "read-only allocation inspection"
             );
+            if lazy_group == 1 && undefined_byte == 0 {
+                fs.enable_writes(&cx).unwrap();
+                assert!(ffs_alloc::gdt_persistence_deferred());
+                let base = fs.block_device_adapter();
+                let mut txn = fs.begin_transaction();
+                let mut alloc = fs.require_alloc_state().unwrap().write();
+                let allocation = {
+                    let staged = TransactionBlockAdapter {
+                        base: &base,
+                        tx: parking_lot::Mutex::new(&mut txn),
+                    };
+                    let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                    ffs_alloc::alloc_blocks(
+                        &cx,
+                        &staged,
+                        geo,
+                        groups,
+                        1,
+                        &AllocHint {
+                            goal_group: Some(GroupNumber(1)),
+                            goal_block: Some(BlockNumber(68)),
+                            ..AllocHint::default()
+                        },
+                    )
+                    .unwrap()
+                };
+                assert_eq!(allocation.start, BlockNumber(68));
+                assert!(!alloc.groups[1].block_bitmap_uninit());
+                fs.commit_transaction(&cx, txn).unwrap();
+                drop(alloc);
+                assert_ne!(
+                    fs.read_group_desc(&cx, GroupNumber(1)).unwrap().flags
+                        & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT,
+                    0,
+                    "descriptor has not been flushed"
+                );
+                assert_eq!(
+                    fs.count_free_blocks_in_group(&cx, GroupNumber(1)).unwrap(),
+                    51,
+                    "a committed bitmap allocation overrides the stale lazy descriptor"
+                );
+            }
         }
     }
 
@@ -58049,6 +58177,7 @@ mod tests {
         let mut image = build_ext4_image_with_extents();
         image[4096 + 0x12..4096 + 0x14]
             .copy_from_slice(&ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT.to_le_bytes());
+        image[2 * 4096..3 * 4096].fill(0);
         image[2 * 4096 + 7] = 1 << 4; // Allocated block 60, no descriptor checksum.
         let cx = Cx::for_testing();
         let fs = OpenFs::from_device(
@@ -58057,6 +58186,11 @@ mod tests {
             &OpenOptions::default(),
         )
         .expect("open unchecked group flags");
+        assert_eq!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+            63,
+            "an unauthenticated lazy flag must not conceal an allocated bitmap bit"
+        );
         assert_eq!(
             fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 56, 64)
                 .expect("allocation bitmap remains authoritative"),
@@ -58099,13 +58233,23 @@ mod tests {
             .copy_from_slice(&ffs_ondisk::Ext4RoCompatFeatures::BIGALLOC.0.to_le_bytes());
         image[2 * 4096..3 * 4096].fill(0);
         image[2 * 4096 + 3] = 1 << 6; // Cluster 30 owns blocks 60 and 61.
+        set_group_desc_free_counts(&mut image, 31, 128);
         let cx = Cx::for_testing();
         let fs = OpenFs::from_device(
             &cx,
-            Box::new(TestDevice::from_vec(image)),
+            Box::new(TestDevice::from_vec(image.clone())),
             &OpenOptions::default(),
         )
         .expect("open bigalloc fixture");
+        assert_eq!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+            62,
+            "one allocated two-block cluster"
+        );
+        let summary = fs.free_space_summary(&cx).unwrap();
+        assert_eq!(summary.free_blocks_total, 62);
+        assert_eq!(summary.gd_free_blocks_total, 62);
+        assert!(!summary.blocks_mismatch);
         for (start, end, expected) in [(60, 62, 2), (61, 62, 1), (62, 64, 0), (59, 61, 1)] {
             assert_eq!(
                 fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), start, end)
@@ -58114,6 +58258,29 @@ mod tests {
                 "range [{start}, {end})"
             );
         }
+        let mut partial = image;
+        partial[sb + 4..sb + 8].copy_from_slice(&63_u32.to_le_bytes());
+        let partial = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(partial)),
+            &OpenOptions::default(),
+        )
+        .expect("open partial bigalloc group");
+        assert_eq!(
+            partial
+                .count_free_blocks_in_group(&cx, GroupNumber(0))
+                .unwrap(),
+            61,
+            "the last free cluster contains only one real block"
+        );
+        let summary = partial.free_space_summary(&cx).unwrap();
+        assert_eq!(summary.free_blocks_total, 61);
+        assert_eq!(summary.gd_free_blocks_total, 61);
+        assert!(!summary.blocks_mismatch);
+        assert!(matches!(
+            partial.count_free_blocks_in_group(&cx, GroupNumber(1)),
+            Err(FfsError::InvalidGeometry(_))
+        ));
     }
 
     #[test]
@@ -74970,6 +75137,50 @@ mod tests {
             ..OpenOptions::default()
         };
         let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+        let original = blake3::hash(&dev.snapshot_bytes());
+        let sb = fs.ext4_superblock().unwrap();
+        assert_eq!(FsGeometry::from_superblock(sb).cluster_ratio, 1);
+        assert_ne!(
+            sb.group_desc_checksum_kind(),
+            ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None
+        );
+        let mut lazy_groups = 0;
+        let mut initialized_groups = 0;
+        for index in 0..sb.groups_count() {
+            let group = GroupNumber(index);
+            let gd = fs.read_group_desc(&cx, group).unwrap();
+            if gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT == 0 {
+                initialized_groups += 1;
+            } else {
+                lazy_groups += 1;
+            }
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, group).unwrap(),
+                gd.free_blocks_count,
+                "native free-space oracle for {group:?}, flags={:#x}",
+                gd.flags
+            );
+        }
+        assert!(lazy_groups > 0 && initialized_groups > 0);
+        assert!(!fs.is_writable());
+        assert_eq!(blake3::hash(&dev.snapshot_bytes()), original);
+        let initialized = fs.read_group_desc(&cx, GroupNumber(0)).unwrap();
+        assert_eq!(
+            initialized.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT,
+            0
+        );
+        assert!(sb.has_metadata_csum());
+        let mut corrupt = dev.snapshot_bytes();
+        corrupt[usize::try_from(initialized.block_bitmap * u64::from(sb.block_size)).unwrap()] ^= 1;
+        let corrupt =
+            OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(corrupt)), &options).unwrap();
+        let error = corrupt
+            .count_free_blocks_in_group(&cx, GroupNumber(0))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("block bitmap CRC32C mismatch"),
+            "initialized bitmap corruption must stay fatal: {error:?}"
+        );
         fs.enable_writes(&cx).unwrap();
         fs.set_bhh0i_sharded_ops(true);
         let root = InodeNumber(2);
@@ -75083,9 +75294,7 @@ mod tests {
             let written = fs
                 .write(cx, filler.ino, offset, &payload)
                 .unwrap_or_else(|error| {
-                    // Uninitialized on-disk bitmaps are raw diagnostic bytes;
-                    // the reconciled allocator counts are the space authority.
-                    let raw_bitmap_free: Vec<_> = (0..geo.group_count)
+                    let logical_bitmap_free: Vec<_> = (0..geo.group_count)
                         .map(|index| fs.count_free_blocks_in_group(cx, GroupNumber(index)))
                         .collect();
                     let groups = {
@@ -75113,7 +75322,7 @@ mod tests {
                     panic!(
                         "fill selected group failed: {error:?}; group={group:?}; \
                      offset={offset}; requested={}; target_free={free}; \
-                     metadata_reserve={}; statfs={:?}; raw_bitmap_free={raw_bitmap_free:?}; \
+                     metadata_reserve={}; statfs={:?}; logical_bitmap_free={logical_bitmap_free:?}; \
                      reconciled_groups(free_blocks,free_inodes,block_uninit)={groups:?}; \
                      extents={extents:?}",
                         payload.len(),
