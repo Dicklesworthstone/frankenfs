@@ -274,7 +274,7 @@ impl OpenFs {
     /// from `parent`, adds one to `new_parent`, and removes one there too when
     /// it replaces an existing name (kernel `vfs_rename`: `may_delete` on the
     /// source, `may_create` or `may_delete` on the target).
-    fn reject_rename_dir_change(
+    pub(super) fn reject_rename_dir_change(
         &self,
         cx: &Cx,
         scope: &mut RequestScope,

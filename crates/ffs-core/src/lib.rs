@@ -95452,6 +95452,7 @@ mod tests {
         inode.flags |= ffs_types::EXT4_IMMUTABLE_FL;
         fs.persist_ext4_inode_for_testing(&cx, src.ino, &inode)
             .unwrap();
+        let inode = fs.read_inode(&cx, src.ino).unwrap();
         for (source, target, errno) in [
             ("nr_block_src.txt", "nr_block_src.txt", libc::EEXIST),
             ("nr_block_src.txt", "nr_block_alias.txt", libc::EEXIST),
@@ -95791,6 +95792,7 @@ mod tests {
                 let original_flags = inode.flags;
                 inode.flags |= flag;
                 fs.persist_ext4_inode_for_testing(&cx, a, &inode).unwrap();
+                let inode = fs.read_inode(&cx, a).unwrap();
                 let before = fs.current_snapshot();
                 FsOps::rename2(
                     &fs,
@@ -104587,7 +104589,7 @@ mod tests {
                 let base = fs.block_device_adapter();
                 let adapter = TransactionBlockAdapter {
                     base: &base,
-                    tx: Mutex::new(scope.tx.as_mut().unwrap()),
+                    tx: parking_lot::Mutex::new(scope.tx.as_mut().unwrap()),
                 };
                 assert!(matches!(
                     adapter.read_block(&cx, block),
@@ -104628,7 +104630,7 @@ mod tests {
                 let base = fs.block_device_adapter();
                 let adapter = TransactionBlockAdapter {
                     base: &base,
-                    tx: Mutex::new(scope.tx.as_mut().unwrap()),
+                    tx: parking_lot::Mutex::new(scope.tx.as_mut().unwrap()),
                 };
                 assert_eq!(adapter.read_block(&cx, block).unwrap().as_slice(), own);
             }
@@ -104691,7 +104693,7 @@ mod tests {
                 let base = fs.block_device_adapter();
                 let adapter = TransactionBlockAdapter {
                     base: &base,
-                    tx: Mutex::new(scope.tx.as_mut().unwrap()),
+                    tx: parking_lot::Mutex::new(scope.tx.as_mut().unwrap()),
                 };
                 assert_eq!(adapter.read_block(&cx, block).unwrap().as_slice(), old);
             }
