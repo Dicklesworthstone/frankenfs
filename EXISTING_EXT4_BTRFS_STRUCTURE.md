@@ -2919,4 +2919,23 @@ memory pages.
 
 ---
 
+### 16.4 Rename admission and protected inodes
+
+Linux v6.19 `fs/namei.c` resolves rename names under the parent namespace locks.
+`RENAME_NOREPLACE` rejects an existing destination with `EEXIST`; the decision
+must remain valid until publication. A separate unlocked existence check is
+insufficient when another caller can create the destination before mutation.
+
+`may_delete` rejects removal from an append-only directory and removal of an
+immutable or append-only inode. Directory write permission also rejects an
+immutable parent. An append-only destination permits a new name but not
+replacement. `RENAME_EXCHANGE` removes both names, so both parents and both
+participating inodes must pass these checks. In `vfs_rename`, two resolved names
+of the same inode return success before deletion permission checks; this is not
+the `RENAME_NOREPLACE` existing-destination case.
+
+Source: [Linux v6.19 fs/namei.c](https://github.com/torvalds/linux/blob/v6.19/fs/namei.c)
+(`may_create`, `may_delete`, `vfs_rename`, `do_renameat2`). These are required
+behaviors, not a claim that every flagged no-op frontend path is qualified.
+
 *End of Behavioral Extraction Spec*

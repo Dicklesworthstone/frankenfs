@@ -1493,11 +1493,11 @@ impl FsOps for OpenFs {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_rename(
                 cx,
-                scope,
                 Self::ext4_canonical_inode(parent),
                 name.as_encoded_bytes(),
                 Self::ext4_canonical_inode(new_parent),
                 new_name.as_encoded_bytes(),
+                false,
             ),
             FsFlavor::Btrfs(_) => {
                 self.check_btrfs_mutation_allowed("rename")?;
@@ -1533,27 +1533,45 @@ impl FsOps for OpenFs {
         const SUPPORTED: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE;
         const KNOWN: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
         if flags & !KNOWN != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EINVAL,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "unknown rename flags".into(),
+            });
         }
         if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
             // EINVAL per renameat2(2): NOREPLACE + EXCHANGE is contradictory.
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EINVAL,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "RENAME_NOREPLACE and RENAME_EXCHANGE are mutually exclusive".into(),
+            });
         }
         if flags & !SUPPORTED != 0 {
             // RENAME_WHITEOUT still needs a fresh char-device inode from
             // the unused-inode pool. Return EINVAL until it lands so the
             // kernel surfaces a real error rather than degrading to
             // overwrite.
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EINVAL,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "RENAME_WHITEOUT is not supported".into(),
+            });
         }
 
         if flags & RENAME_NOREPLACE != 0 {
+            if self.is_ext4() {
+                // The core checks target absence and all permission flags in
+                // the same transaction that publishes the rename. SDK callers
+                // do not hold FUSE's parent-inode locks across a preflight.
+                let _namespace = self.begin_namespace_mutation();
+                clear_readdir_snapshot(&self.readdir_snapshot);
+                return self.ext4_rename(
+                    cx,
+                    Self::ext4_canonical_inode(parent),
+                    name.as_encoded_bytes(),
+                    Self::ext4_canonical_inode(new_parent),
+                    new_name.as_encoded_bytes(),
+                    true,
+                );
+            }
             // The caller (FUSE dispatcher) holds parent + new_parent inode
             // guards via FuseInodeLocks, so the lookup + rename below is
             // one atomic critical section against concurrent

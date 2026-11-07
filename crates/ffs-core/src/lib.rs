@@ -21758,7 +21758,13 @@ impl OpenFs {
         let already_staged = staged.is_some();
         let mut block_data = match staged {
             Some(bytes) => bytes,
-            None => block_dev.read_block(cx, loc.block)?.as_slice().to_vec(),
+            // A latest-head base could include post-snapshot flag changes and
+            // falsely authorize merging this captured inode over those flags.
+            None => block_dev
+                .read_merge_ancestor_at_snapshot(cx, loc.block, tx.snapshot())?
+                .0
+                .as_slice()
+                .to_vec(),
         };
         if loc.byte_offset + inode_size > block_data.len() {
             return Err(FfsError::Corruption {
@@ -35917,14 +35923,14 @@ impl OpenFs {
     fn ext4_rename(
         &self,
         cx: &Cx,
-        _scope: &mut RequestScope,
         parent: InodeNumber,
         name: &[u8],
         new_parent: InodeNumber,
         new_name: &[u8],
+        no_replace: bool,
     ) -> ffs_error::Result<()> {
         // POSIX: rename(old, new) where old == new is a successful no-op.
-        if parent == new_parent && name == new_name {
+        if !no_replace && parent == new_parent && name == new_name {
             return Ok(());
         }
 
@@ -35957,6 +35963,7 @@ impl OpenFs {
                     name,
                     new_parent,
                     new_name,
+                    no_replace,
                 )
             };
             let (retirement, target_parent_inode) = match staged {
@@ -36014,6 +36021,7 @@ impl OpenFs {
         name: &[u8],
         new_parent: InodeNumber,
         new_name: &[u8],
+        no_replace: bool,
     ) -> ffs_error::Result<(Option<Ext4StagedInodeRetirement<'a>>, Ext4Inode)> {
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
 
@@ -36043,8 +36051,6 @@ impl OpenFs {
                 detail: format!("rename source references free inode {}", child_ino.0),
             });
         }
-        // Immutable and append-only files cannot be renamed (kernel: EPERM).
-        Self::ext4_reject_immutable_or_append(&child_inode)?;
         let ft = inode_dir_entry_file_type(&child_inode);
 
         // Check if target already exists — if so, remove it first.
@@ -36057,6 +36063,21 @@ impl OpenFs {
         if !new_parent_inode.is_dir() {
             return Err(FfsError::NotDirectory);
         }
+        // This decision belongs to the fresh transaction under alloc.write(),
+        // not a frontend lookup that another SDK mutation can invalidate.
+        // NOREPLACE rejects an existing name before file-flag permissions or
+        // same-inode no-ops, matching namei's admission order.
+        if no_replace
+            && self
+                .ext4_lookup_name_from_device(cx, block_dev, &new_parent_inode, new_name)?
+                .is_some()
+        {
+            return Err(FfsError::Exists);
+        }
+        Self::ext4_reject_immutable_or_append(&parent_inode)?;
+        Self::ext4_reject_immutable(&new_parent_inode)?;
+        // Immutable and append-only files cannot be renamed (kernel: EPERM).
+        Self::ext4_reject_immutable_or_append(&child_inode)?;
         if child_inode.is_dir()
             && parent != new_parent
             && self.ext4_directory_is_descendant_from_device(
@@ -36136,6 +36157,12 @@ impl OpenFs {
             // link count, silently dropping a hard link (bd-f7q6k).
             if existing_ino == child_ino {
                 return Ok((None, new_parent_inode));
+            }
+            if new_parent_inode.flags & ffs_types::EXT4_APPEND_FL != 0 {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EPERM,
+                    detail: "cannot replace an entry in an append-only directory".into(),
+                });
             }
             let mut existing_inode =
                 ffs_inode::read_inode(cx, block_dev, &alloc.geo, &alloc.groups, existing_ino)?;
@@ -49713,7 +49740,11 @@ impl OpenFs {
             new_name,
         ) {
             Ok(()) => {
-                self.commit_request_scope(cx, &mut local_scope)?;
+                // Caller-owned scopes return above. This operation-owned
+                // no-op must not advance even the single store's sequence.
+                if local_scope.pending_write_count() != 0 {
+                    self.commit_request_scope(cx, &mut local_scope)?;
+                }
                 Ok(())
             }
             Err(err) => Err(err),
@@ -49787,6 +49818,15 @@ impl OpenFs {
             .map_err(|_| FfsError::Format("destination inode exceeds u32".into()))?;
         let src_inode = self.read_inode_with_scope(cx, scope, InodeNumber(u64::from(src_ino)))?;
         let dst_inode = self.read_inode_with_scope(cx, scope, InodeNumber(u64::from(dst_ino)))?;
+        // Swapping two hard links of the same inode is a true no-op. Keep this
+        // before the permission guards and timestamp writes, as vfs_rename does.
+        if src_ino == dst_ino {
+            return Ok(());
+        }
+        Self::ext4_reject_immutable_or_append(&parent_inode)?;
+        Self::ext4_reject_immutable_or_append(&new_parent_inode)?;
+        Self::ext4_reject_immutable_or_append(&src_inode)?;
+        Self::ext4_reject_immutable_or_append(&dst_inode)?;
         let cross_parent = parent != new_parent;
         let src_is_dir = src_inode.is_dir();
         let dst_is_dir = dst_inode.is_dir();
@@ -95363,13 +95403,14 @@ mod tests {
 
     #[test]
     fn ext4_rename2_noreplace_existing_target_returns_eexist() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
 
-        let _src = fs
+        let src = fs
             .create(&cx, root, OsStr::new("nr_block_src.txt"), 0o644, 0, 0)
             .expect("create src");
         let dst = fs
@@ -95405,6 +95446,36 @@ mod tests {
             dst_after.ino, dst_ino,
             "dst inode must be unchanged after EEXIST"
         );
+        fs.link(&cx, src.ino, root, OsStr::new("nr_block_alias.txt"))
+            .unwrap();
+        let mut inode = fs.read_inode(&cx, src.ino).unwrap();
+        inode.flags |= ffs_types::EXT4_IMMUTABLE_FL;
+        fs.persist_ext4_inode_for_testing(&cx, src.ino, &inode)
+            .unwrap();
+        for (source, target, errno) in [
+            ("nr_block_src.txt", "nr_block_src.txt", libc::EEXIST),
+            ("nr_block_src.txt", "nr_block_alias.txt", libc::EEXIST),
+            ("missing-source", "nr_block_dst.txt", libc::ENOENT),
+        ] {
+            let before = fs.current_snapshot();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let error = FsOps::rename2(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                root,
+                OsStr::new(source),
+                root,
+                OsStr::new(target),
+                libc::RENAME_NOREPLACE,
+            )
+            .expect_err("NOREPLACE must resolve existence before permission/no-op admission");
+            assert_eq!(error.to_errno(), errno, "{source} -> {target}: {error:?}");
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(fs.read_inode(&cx, src.ino).unwrap(), inode);
+            assert!(fs.is_writable());
+        }
     }
 
     #[test]
@@ -95441,6 +95512,572 @@ mod tests {
             .lookup(&cx, root, OsStr::new("nr_ok_dst.txt"))
             .expect("dst lookup");
         assert_eq!(dst.ino, src_ino, "renamed inode preserved");
+    }
+
+    #[test]
+    fn ext4_rename_rechecks_admission_in_its_publication_view() {
+        for (label, flags, source_protected, create_target, no_replace) in [
+            (
+                "immutable source parent",
+                ffs_types::EXT4_IMMUTABLE_FL,
+                true,
+                false,
+                false,
+            ),
+            (
+                "append source parent",
+                ffs_types::EXT4_APPEND_FL,
+                true,
+                false,
+                false,
+            ),
+            (
+                "immutable destination parent",
+                ffs_types::EXT4_IMMUTABLE_FL,
+                false,
+                false,
+                false,
+            ),
+            (
+                "append destination replacement",
+                ffs_types::EXT4_APPEND_FL,
+                false,
+                true,
+                false,
+            ),
+            ("noreplace destination creation", 0, false, true, true),
+        ] {
+            let (mut fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("rename admission regression requires mkfs.ext4");
+            fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let source_parent = fs
+                .mkdir(&cx, root, OsStr::new("source-parent"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let destination = fs
+                .mkdir(&cx, root, OsStr::new("destination"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let source = fs
+                .create(&cx, source_parent, OsStr::new("source"), 0o644, 0, 0)
+                .unwrap()
+                .ino;
+            fs.write(&cx, source, 0, b"source").unwrap();
+            let protected = if source_protected {
+                source_parent
+            } else {
+                destination
+            };
+            let original_flags = fs.read_inode(&cx, protected).unwrap().flags;
+            // Append-only insertion is legal. Let the real frontend admit an
+            // absent target, then create it before the core starts its txn.
+            if create_target && flags != 0 {
+                let mut inode = fs.read_inode(&cx, protected).unwrap();
+                inode.flags |= flags;
+                fs.persist_ext4_inode_for_testing(&cx, protected, &inode)
+                    .unwrap();
+            }
+            fs.reject_rename_dir_change(
+                &cx,
+                &mut RequestScope::empty(),
+                source_parent,
+                destination,
+                OsStr::new("moved"),
+            )
+            .expect("the earlier frontend preflight must actually admit this view");
+            let victim = if create_target {
+                let ino = fs
+                    .create(&cx, destination, OsStr::new("moved"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino;
+                fs.write(&cx, ino, 0, b"kept").unwrap();
+                Some(ino)
+            } else {
+                let mut inode = fs.read_inode(&cx, protected).unwrap();
+                inode.flags |= flags;
+                fs.persist_ext4_inode_for_testing(&cx, protected, &inode)
+                    .unwrap();
+                None
+            };
+            let before = fs.current_snapshot();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let inode = fs.read_inode(&cx, source).unwrap();
+            // Deliberately enter after the frontend preflight, modeling its
+            // interleaving with another SDK mutation. This is a component
+            // schedule, not a claim of mounted concurrent execution.
+            let error = fs
+                .ext4_rename(
+                    &cx,
+                    source_parent,
+                    b"source",
+                    destination,
+                    b"moved",
+                    no_replace,
+                )
+                .expect_err("the publication view must revalidate admission");
+            assert_eq!(
+                error.to_errno(),
+                if no_replace {
+                    libc::EEXIST
+                } else {
+                    libc::EPERM
+                },
+                "{label}: {error:?}"
+            );
+            assert_eq!(fs.current_snapshot(), before, "{label}");
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts, "{label}");
+            assert_eq!(fs.read_inode(&cx, source).unwrap(), inode);
+            assert_eq!(
+                fs.lookup(&cx, source_parent, OsStr::new("source"))
+                    .unwrap()
+                    .ino,
+                source
+            );
+            assert_eq!(fs.read(&cx, source, 0, 6).unwrap(), b"source");
+            if let Some(victim) = victim {
+                assert_eq!(
+                    fs.lookup(&cx, destination, OsStr::new("moved"))
+                        .unwrap()
+                        .ino,
+                    victim
+                );
+                assert_eq!(fs.read(&cx, victim, 0, 4).unwrap(), b"kept");
+            } else {
+                assert!(matches!(
+                    fs.lookup(&cx, destination, OsStr::new("moved")),
+                    Err(FfsError::NotFound(_))
+                ));
+            }
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+            assert!(fs.is_writable(), "{label} is a policy rejection, not I/O");
+            // Read fresh metadata so clearing the flag preserves any inode
+            // changes made by the intervening, successful destination create.
+            let mut restored = fs.read_inode(&cx, protected).unwrap();
+            restored.flags = original_flags;
+            fs.persist_ext4_inode_for_testing(&cx, protected, &restored)
+                .unwrap();
+            let retry = fs.current_snapshot();
+            fs.rename(
+                &cx,
+                source_parent,
+                OsStr::new("source"),
+                destination,
+                OsStr::new("moved"),
+            )
+            .expect("a legal ordinary rename must still succeed");
+            assert_eq!(fs.current_snapshot().high.0, retry.high.0 + 1);
+            assert_eq!(
+                fs.lookup(&cx, destination, OsStr::new("moved"))
+                    .unwrap()
+                    .ino,
+                source
+            );
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let bytes = dev.snapshot_bytes();
+            let image = tmp.path().join("rename-admission.ext4");
+            native_parity_fsck(&dev, &image);
+            assert_eq!(
+                std::fs::read(&image).unwrap(),
+                bytes,
+                "checker must not alter bytes"
+            );
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(bytes)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let renamed = reopened
+                .lookup(&cx, destination, OsStr::new("moved"))
+                .unwrap();
+            assert_eq!(renamed.ino, source);
+            assert_eq!(reopened.read(&cx, renamed.ino, 0, 6).unwrap(), b"source");
+        }
+    }
+
+    #[test]
+    fn ext4_exchange_rechecks_protected_parents_and_inodes() {
+        for single_store in [false, true] {
+            for flag in [ffs_types::EXT4_IMMUTABLE_FL, ffs_types::EXT4_APPEND_FL] {
+                let (mut fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                    .expect("exchange admission regression requires mkfs.ext4");
+                fs.mvcc_store = Arc::new(if single_store {
+                    FsMvccStore::single()
+                } else {
+                    FsMvccStore::sharded()
+                });
+                fs.set_mvcc_conflict_policy(ffs_mvcc::ConflictPolicy::SafeMerge);
+                fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                let left = fs
+                    .mkdir(&cx, root, OsStr::new("left"), 0o755, 0, 0)
+                    .unwrap()
+                    .ino;
+                let right = fs
+                    .mkdir(&cx, root, OsStr::new("right"), 0o755, 0, 0)
+                    .unwrap()
+                    .ino;
+                let a = fs
+                    .create(&cx, left, OsStr::new("a"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino;
+                let b = fs
+                    .create(&cx, right, OsStr::new("b"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino;
+                fs.write(&cx, a, 0, b"left").unwrap();
+                fs.write(&cx, b, 0, b"right").unwrap();
+                for protected in [left, right, a, b] {
+                    let mut inode = fs.read_inode(&cx, protected).unwrap();
+                    let original_flags = inode.flags;
+                    inode.flags |= flag;
+                    fs.persist_ext4_inode_for_testing(&cx, protected, &inode)
+                        .unwrap();
+                    let inode = fs.read_inode(&cx, protected).unwrap();
+                    let before = fs.current_snapshot();
+                    let counts = fs.statfs(&cx, root).unwrap();
+                    let error = fs
+                        .ext4_rename2_exchange(
+                            &cx,
+                            &mut RequestScope::empty(),
+                            left,
+                            OsStr::new("a"),
+                            right,
+                            OsStr::new("b"),
+                        )
+                        .expect_err("the staged exchange must enforce every protected participant");
+                    assert_eq!(
+                        error.to_errno(),
+                        libc::EPERM,
+                        "flag={flag} protected={protected:?}"
+                    );
+                    assert!(matches!(error, FfsError::RequestRejected { .. }));
+                    assert_eq!(fs.current_snapshot(), before);
+                    assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                    assert_eq!(fs.read_inode(&cx, protected).unwrap(), inode);
+                    assert_eq!(fs.lookup(&cx, left, OsStr::new("a")).unwrap().ino, a);
+                    assert_eq!(fs.lookup(&cx, right, OsStr::new("b")).unwrap().ino, b);
+                    assert_eq!(fs.read(&cx, a, 0, 4).unwrap(), b"left");
+                    assert_eq!(fs.read(&cx, b, 0, 5).unwrap(), b"right");
+                    assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                    assert!(fs.try_close_mutation_gate().is_some());
+                    assert!(fs.is_writable());
+                    let mut restored = fs.read_inode(&cx, protected).unwrap();
+                    restored.flags = original_flags;
+                    fs.persist_ext4_inode_for_testing(&cx, protected, &restored)
+                        .unwrap();
+                }
+                let before = fs.current_snapshot();
+                FsOps::rename2(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    left,
+                    OsStr::new("a"),
+                    right,
+                    OsStr::new("b"),
+                    libc::RENAME_EXCHANGE,
+                )
+                .expect("an unprotected exchange must still succeed");
+                assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+                assert_eq!(fs.lookup(&cx, left, OsStr::new("a")).unwrap().ino, b);
+                assert_eq!(fs.lookup(&cx, right, OsStr::new("b")).unwrap().ino, a);
+                fs.link(&cx, a, root, OsStr::new("alias")).unwrap();
+                let mut inode = fs.read_inode(&cx, a).unwrap();
+                let original_flags = inode.flags;
+                inode.flags |= flag;
+                fs.persist_ext4_inode_for_testing(&cx, a, &inode).unwrap();
+                let before = fs.current_snapshot();
+                FsOps::rename2(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    right,
+                    OsStr::new("b"),
+                    root,
+                    OsStr::new("alias"),
+                    libc::RENAME_EXCHANGE,
+                )
+                .expect("exchanging two names of one protected inode is a no-op");
+                assert_eq!(fs.current_snapshot(), before);
+                assert_eq!(fs.read_inode(&cx, a).unwrap(), inode);
+                assert_eq!(fs.lookup(&cx, right, OsStr::new("b")).unwrap().ino, a);
+                assert_eq!(fs.lookup(&cx, root, OsStr::new("alias")).unwrap().ino, a);
+                let mut restored = fs.read_inode(&cx, a).unwrap();
+                restored.flags = original_flags;
+                fs.persist_ext4_inode_for_testing(&cx, a, &restored)
+                    .unwrap();
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                let bytes = dev.snapshot_bytes();
+                let image = tmp.path().join("exchange-admission.ext4");
+                native_parity_fsck(&dev, &image);
+                assert_eq!(std::fs::read(&image).unwrap(), bytes);
+                let reopened = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(bytes)),
+                    &OpenOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(reopened.lookup(&cx, left, OsStr::new("a")).unwrap().ino, b);
+                assert_eq!(reopened.lookup(&cx, right, OsStr::new("b")).unwrap().ino, a);
+                assert_eq!(reopened.read(&cx, a, 0, 4).unwrap(), b"left");
+                assert_eq!(reopened.read(&cx, b, 0, 5).unwrap(), b"right");
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_scoped_inode_write_cannot_erase_post_snapshot_flags() {
+        let (seed, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("inode snapshot regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let mut by_table = std::collections::BTreeMap::new();
+        let mut pair = None;
+        let candidates = {
+            let alloc = seed.require_alloc_state().unwrap().read();
+            let slots = alloc.geo.block_size / u32::from(alloc.geo.inode_size);
+            seed.ext4_superblock()
+                .unwrap()
+                .groups_count()
+                .saturating_mul(slots + 1)
+        };
+        for index in 0..candidates {
+            let ino = seed
+                .create(
+                    &cx,
+                    root,
+                    OsStr::new(&format!("snapshot-inode-{index}")),
+                    0o644,
+                    0,
+                    0,
+                )
+                .unwrap()
+                .ino;
+            let block = {
+                let alloc = seed.require_alloc_state().unwrap().read();
+                ffs_inode::locate_inode(ino, &alloc.geo, &alloc.groups)
+                    .unwrap()
+                    .block
+            };
+            if let Some(&other) = by_table.get(&block) {
+                pair = Some((other, ino));
+                break;
+            }
+            by_table.insert(block, ino);
+        }
+        let (ino, sibling) =
+            pair.expect("native input needs distinct inodes sharing one table block");
+        seed.write(&cx, ino, 0, b"original").unwrap();
+        seed.flush_mvcc_to_device(&cx).unwrap();
+        let baseline = dev.snapshot_bytes();
+        drop(seed);
+        for single_store in [false, true] {
+            let device = TestDevice::from_vec(baseline.clone());
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default())
+                    .unwrap();
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            fs.enable_writes(&cx).unwrap();
+            fs.set_mvcc_conflict_policy(ffs_mvcc::ConflictPolicy::SafeMerge);
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Setattr).unwrap();
+            let mut stale = fs.read_inode_with_scope(&cx, &scope, ino).unwrap();
+            stale.mode = (stale.mode & !0o7777) | 0o600;
+            let mut protected = fs.read_inode(&cx, ino).unwrap();
+            protected.flags |= ffs_types::EXT4_IMMUTABLE_FL;
+            // Commit through the real metadata writer without checkpointing
+            // over the still-open scope's physical ancestor.
+            {
+                let alloc = fs.require_alloc_state().unwrap().read();
+                ffs_inode::write_inode(
+                    &cx,
+                    &fs.block_device_adapter(),
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &protected,
+                    fs.ext4_superblock().unwrap().csum_seed(),
+                )
+                .unwrap();
+            }
+            let before = fs.current_snapshot();
+            assert!(before.high > scope.tx.as_ref().unwrap().snapshot().high);
+            let protected = fs.read_inode(&cx, ino).unwrap();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let staged = {
+                let alloc = fs.require_alloc_state().unwrap().read();
+                OpenFs::write_inode_with_scope(
+                    &cx,
+                    &mut scope,
+                    &fs.block_device_adapter(),
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &stale,
+                    fs.ext4_superblock().unwrap().csum_seed(),
+                )
+            };
+            let result = match staged {
+                Err(error) => Err(error),
+                Ok(()) => fs.commit_request_scope(&cx, &mut scope).map(|_| ()),
+            };
+            fs.end_request_scope(&cx, RequestOp::Setattr, scope)
+                .unwrap();
+            let error =
+                result.expect_err("a stale inode must not overwrite newer protection flags");
+            assert!(matches!(error, FfsError::MvccConflict { .. }), "{error:?}");
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), protected);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(fs.read(&cx, ino, 0, 8).unwrap(), b"original");
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+            assert!(fs.is_writable());
+            fs.create(&cx, root, OsStr::new("after-conflict"), 0o644, 0, 0)
+                .expect("a fresh legal mutation still succeeds");
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let bytes = device.snapshot_bytes();
+            let image = tmp.path().join(if single_store {
+                "snapshot-single.ext4"
+            } else {
+                "snapshot-sharded.ext4"
+            });
+            native_parity_fsck(&device, &image);
+            assert_eq!(std::fs::read(&image).unwrap(), bytes);
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(bytes)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(reopened.read_inode(&cx, ino).unwrap(), protected);
+            assert_eq!(reopened.read(&cx, ino, 0, 8).unwrap(), b"original");
+        }
+
+        // A retained ancestor must also stay exact inside the staged block.
+        // Inspect raw sibling bytes so neither an inode cache nor a later
+        // commit rejection can hide a latest-head read in either store.
+        for single_store in [false, true] {
+            let device = TestDevice::from_vec(baseline.clone());
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default())
+                    .unwrap();
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            fs.enable_writes(&cx).unwrap();
+            fs.set_mvcc_conflict_policy(ffs_mvcc::ConflictPolicy::SafeMerge);
+            let mut first = fs.read_inode(&cx, ino).unwrap();
+            first.mode = (first.mode & !0o7777) | 0o640;
+            let (loc, inode_size) = {
+                let alloc = fs.require_alloc_state().unwrap().read();
+                ffs_inode::write_inode(
+                    &cx,
+                    &fs.block_device_adapter(),
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &first,
+                    fs.ext4_superblock().unwrap().csum_seed(),
+                )
+                .unwrap();
+                let loc = ffs_inode::locate_inode(sibling, &alloc.geo, &alloc.groups).unwrap();
+                assert_eq!(
+                    loc.block,
+                    ffs_inode::locate_inode(ino, &alloc.geo, &alloc.groups)
+                        .unwrap()
+                        .block
+                );
+                (loc, usize::from(alloc.geo.inode_size))
+            };
+            let first = fs.read_inode(&cx, ino).unwrap();
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Setattr).unwrap();
+            let expected = fs.read_block_with_scope(&cx, &scope, loc.block).unwrap()
+                [loc.byte_offset..loc.byte_offset + inode_size]
+                .to_vec();
+            let mut captured = fs.read_inode_with_scope(&cx, &scope, ino).unwrap();
+            captured.mode = (captured.mode & !0o7777) | 0o600;
+            let mut protected = fs.read_inode(&cx, sibling).unwrap();
+            protected.flags |= ffs_types::EXT4_IMMUTABLE_FL;
+            {
+                let alloc = fs.require_alloc_state().unwrap().read();
+                ffs_inode::write_inode(
+                    &cx,
+                    &fs.block_device_adapter(),
+                    &alloc.geo,
+                    &alloc.groups,
+                    sibling,
+                    &protected,
+                    fs.ext4_superblock().unwrap().csum_seed(),
+                )
+                .unwrap();
+            }
+            let before = fs.current_snapshot();
+            assert!(before.high > scope.tx.as_ref().unwrap().snapshot().high);
+            let protected = fs.read_inode(&cx, sibling).unwrap();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let staged = {
+                let alloc = fs.require_alloc_state().unwrap().read();
+                OpenFs::write_inode_with_scope(
+                    &cx,
+                    &mut scope,
+                    &fs.block_device_adapter(),
+                    &alloc.geo,
+                    &alloc.groups,
+                    ino,
+                    &captured,
+                    fs.ext4_superblock().unwrap().csum_seed(),
+                )
+            };
+            let observed = staged.as_ref().ok().map(|()| {
+                scope.tx.as_ref().unwrap().staged_write(loc.block).unwrap()
+                    [loc.byte_offset..loc.byte_offset + inode_size]
+                    .to_vec()
+            });
+            // Abort before assertions, so an old-code failure cannot strand
+            // the managed request gate or snapshot registration.
+            fs.end_request_scope(&cx, RequestOp::Setattr, scope)
+                .unwrap();
+            staged.expect("the pinned baseline table version must remain readable");
+            assert_eq!(
+                observed.unwrap(),
+                expected,
+                "post-snapshot sibling flags leaked into staged bytes"
+            );
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), first);
+            assert_eq!(fs.read_inode(&cx, sibling).unwrap(), protected);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let bytes = device.snapshot_bytes();
+            let image = tmp.path().join(if single_store {
+                "sibling-single.ext4"
+            } else {
+                "sibling-sharded.ext4"
+            });
+            native_parity_fsck(&device, &image);
+            assert_eq!(std::fs::read(&image).unwrap(), bytes);
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(bytes)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(reopened.read_inode(&cx, ino).unwrap(), first);
+            assert_eq!(reopened.read_inode(&cx, sibling).unwrap(), protected);
+        }
     }
 
     // ── bd-5lxot: renameat2 RENAME_EXCHANGE atomic dual-entry swap ────────
