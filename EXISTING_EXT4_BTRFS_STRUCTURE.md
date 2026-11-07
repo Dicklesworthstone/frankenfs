@@ -439,6 +439,27 @@ Sources: [ext4 namei.c](https://raw.githubusercontent.com/torvalds/linux/v6.19/f
 [fscrypt.h](https://raw.githubusercontent.com/torvalds/linux/v6.19/include/linux/fscrypt.h)
 (`fscrypt_prepare_symlink`, non-encrypted implementation).
 
+Device inode `i_block[0]`/`i_block[1]` encodes a device number, not file-data
+pointers. Linux v6.19 installs special-file operations for character/block
+devices, FIFOs and sockets. Its ext4 size setter rejects nonregular inodes
+before testing whether the requested size is unchanged. Metadata-only chmod,
+chown and timestamp updates remain valid. See
+[ext4 inode.c](https://raw.githubusercontent.com/torvalds/linux/v6.19/fs/ext4/inode.c)
+(`ext4_do_update_inode`, `ext4_iget`, `ext4_setattr`) and
+[ext4 namei.c](https://raw.githubusercontent.com/torvalds/linux/v6.19/fs/ext4/namei.c)
+(`ext4_mknod`, `ext4_special_inode_operations`).
+
+The image SDK must reject nonempty data writes, nonzero allocation requests and
+all size requests on these inodes before interpreting their block-map bytes. Its
+regular-file allocation API preserves FIFO `ESPIPE` and character/socket
+`ENODEV` rejection; block-device
+driver allocation is outside this API and returns `EOPNOTSUPP`. This differs
+from Linux VFS, which can dispatch block-device allocation to a device driver:
+[fs/open.c](https://github.com/torvalds/linux/blob/v6.19/fs/open.c)
+(`vfs_fallocate`). Deliberate request rejection is distinct from a storage I/O
+failure with the same errno; only the latter triggers the configured data-error
+policy.
+
 ### 3.1 Standard Inode Fields (First 128 Bytes)
 
 The first 128 bytes (`EXT4_GOOD_OLD_INODE_SIZE = 128`) constitute the

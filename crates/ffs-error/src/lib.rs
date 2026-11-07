@@ -59,6 +59,7 @@
 //! | Variant | errno | Constant |
 //! |---------|-------|----------|
 //! | `Io` | `raw_os_error` → passthrough, else filesystem/network `ErrorKind` map, else `EIO` | varies |
+//! | `RequestRejected` | positive request errno, else `EIO` | varies |
 //! | `Corruption` | `EIO` | 5 |
 //! | `Format` | `EINVAL` | 22 |
 //! | `Parse` | `EINVAL` | 22 |
@@ -101,6 +102,15 @@ pub enum FfsError {
     /// Operating system I/O error (wraps `std::io::Error`).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A request failed a semantic check, rather than a storage operation.
+    ///
+    /// Use this for deliberate POSIX rejections such as EFBIG or EPERM. Keep
+    /// device and journal errors as `Io`, even when their errno is the same:
+    /// storage failure policies must distinguish origin, not errno alone.
+    /// Nonpositive errno values map to EIO rather than a successful FUSE reply.
+    #[error("request rejected: {detail} (errno {errno})")]
+    RequestRejected { errno: i32, detail: String },
 
     /// On-disk metadata corruption detected at a known block.
     ///
@@ -235,6 +245,13 @@ impl FfsError {
     #[must_use]
     pub fn to_errno(&self) -> libc::c_int {
         match self {
+            Self::RequestRejected { errno, .. } => {
+                if *errno > 0 {
+                    *errno
+                } else {
+                    libc::EIO
+                }
+            }
             Self::Io(err) => match err.raw_os_error() {
                 Some(errno) if errno > 0 => errno,
                 Some(_) => libc::EIO,
@@ -315,6 +332,13 @@ mod tests {
         let cases: Vec<(FfsError, libc::c_int)> = vec![
             (FfsError::Io(std::io::Error::other("test")), libc::EIO),
             (
+                FfsError::RequestRejected {
+                    errno: libc::EFBIG,
+                    detail: "file size limit".into(),
+                },
+                libc::EFBIG,
+            ),
+            (
                 FfsError::Corruption {
                     block: 0,
                     detail: "test".into(),
@@ -363,6 +387,31 @@ mod tests {
                 *expected_errno,
                 "wrong errno for {error:?}",
             );
+        }
+    }
+
+    #[test]
+    fn request_rejection_preserves_positive_errno_and_rejects_invalid_values() {
+        for errno in [
+            libc::EPERM,
+            libc::EINVAL,
+            libc::EFBIG,
+            libc::ENODEV,
+            libc::ESPIPE,
+        ] {
+            let rejected = FfsError::RequestRejected {
+                errno,
+                detail: "invalid request".into(),
+            };
+            assert_eq!(rejected.to_errno(), errno);
+            assert!(rejected.to_string().contains("invalid request"));
+        }
+        for errno in [0, -libc::EINVAL, i32::MIN] {
+            let malformed = FfsError::RequestRejected {
+                errno,
+                detail: "invalid errno".into(),
+            };
+            assert_eq!(malformed.to_errno(), libc::EIO);
         }
     }
 

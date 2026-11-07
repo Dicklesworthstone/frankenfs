@@ -33571,28 +33571,32 @@ impl OpenFs {
         // punch_hole-first branch below silently runs a punch and ignores the
         // requested zeroing (and the btrfs port would silently zero instead).
         if punch_hole && zero_range {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                EINVAL_ERRNO,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: EINVAL_ERRNO,
+                detail: "PUNCH_HOLE and ZERO_RANGE are mutually exclusive".into(),
+            });
         }
         if punch_hole && !keep_size {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                EINVAL_ERRNO,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: EINVAL_ERRNO,
+                detail: "PUNCH_HOLE requires KEEP_SIZE".into(),
+            });
         }
         // FALLOC_FL_COLLAPSE_RANGE is mutually exclusive with all other
         // mode bits per fs/ext4/extents.c::ext4_collapse_range, and the
         // kernel rejects KEEP_SIZE in particular.
         if collapse_range && (mode & !COLLAPSE_RANGE) != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                EINVAL_ERRNO,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: EINVAL_ERRNO,
+                detail: "COLLAPSE_RANGE cannot be combined with another mode".into(),
+            });
         }
         // FALLOC_FL_INSERT_RANGE is also exclusive (inverse of collapse).
         if insert_range && (mode & !INSERT_RANGE) != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                EINVAL_ERRNO,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: EINVAL_ERRNO,
+                detail: "INSERT_RANGE cannot be combined with another mode".into(),
+            });
         }
 
         let mut inode = self.read_inode_with_scope(cx, scope, ino)?;
@@ -33602,6 +33606,21 @@ impl OpenFs {
         if inode.is_symlink() {
             return Err(FfsError::Format("cannot fallocate a symlink".into()));
         }
+        if !inode.is_regular() {
+            // Device-number bytes are not a file block map. Device-driver I/O
+            // is outside this image API; retain VFS errors for FIFOs and sockets.
+            let errno = if inode.is_fifo() {
+                libc::ESPIPE
+            } else if inode.is_blkdev() {
+                libc::EOPNOTSUPP
+            } else {
+                libc::ENODEV
+            };
+            return Err(FfsError::RequestRejected {
+                errno,
+                detail: "ext4 fallocate requires a regular file".into(),
+            });
+        }
         Self::ext4_reject_encrypted(&inode)?;
         Self::ext4_reject_verity(&inode)?;
         // Immutable files reject all fallocate; append-only files reject the
@@ -33610,7 +33629,10 @@ impl OpenFs {
         if inode.flags & ffs_types::EXT4_APPEND_FL != 0
             && (punch_hole || collapse_range || zero_range || insert_range)
         {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EPERM,
+                detail: "cannot alter existing data in an append-only inode".into(),
+            });
         }
         if Self::ext4_inode_uses_inline_data(&inode) {
             return Err(FfsError::UnsupportedFeature(
@@ -33818,14 +33840,16 @@ impl OpenFs {
                 // shift everything past it left by `length`. Both must be
                 // block-aligned, and the range must not reach EOF.
                 if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) {
-                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                        EINVAL_ERRNO,
-                    )));
+                    return Err(FfsError::RequestRejected {
+                        errno: EINVAL_ERRNO,
+                        detail: "COLLAPSE_RANGE requires aligned offset and length".into(),
+                    });
                 }
                 if end >= inode.size {
-                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                        EINVAL_ERRNO,
-                    )));
+                    return Err(FfsError::RequestRejected {
+                        errno: EINVAL_ERRNO,
+                        detail: "COLLAPSE_RANGE must end before EOF".into(),
+                    });
                 }
 
                 let logical_start =
@@ -33907,14 +33931,16 @@ impl OpenFs {
                 // Both must be block-aligned; offset must lie inside the file
                 // (insert at EOF would just be a truncate-up).
                 if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) {
-                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                        EINVAL_ERRNO,
-                    )));
+                    return Err(FfsError::RequestRejected {
+                        errno: EINVAL_ERRNO,
+                        detail: "INSERT_RANGE requires aligned offset and length".into(),
+                    });
                 }
                 if offset >= inode.size {
-                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                        EINVAL_ERRNO,
-                    )));
+                    return Err(FfsError::RequestRejected {
+                        errno: EINVAL_ERRNO,
+                        detail: "INSERT_RANGE must start before EOF".into(),
+                    });
                 }
 
                 let logical_start =
@@ -34363,7 +34389,10 @@ impl OpenFs {
     /// EINVAL on write/fallocate (`bd-3pa5m`).
     fn ext4_reject_oversized_file(end: u64, block_size: u64) -> ffs_error::Result<()> {
         if end > Self::ext4_max_file_size(block_size) {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EFBIG,
+                detail: "write or size change exceeds the ext4 file size limit".into(),
+            });
         }
         Ok(())
     }
@@ -34461,6 +34490,12 @@ impl OpenFs {
         if inode.is_symlink() {
             return Err(FfsError::Format("cannot write to a symlink".into()));
         }
+        if !inode.is_regular() {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "cannot write to a non-regular file".into(),
+            });
+        }
         // No fscrypt support: refuse to store plaintext into encrypted blocks.
         Self::ext4_reject_encrypted(&inode)?;
         // No fs-verity support: writing would break the Merkle tree.
@@ -34469,7 +34504,10 @@ impl OpenFs {
         Self::ext4_reject_immutable(&inode)?;
         if inode.flags & ffs_types::EXT4_APPEND_FL != 0 && offset != inode.size {
             // Append-only: writes may only extend the file at EOF.
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EPERM,
+                detail: "an append-only write must start at EOF".into(),
+            });
         }
         let write_len = u64::try_from(data.len())
             .map_err(|_| FfsError::Format("write length does not fit u64".into()))?;
@@ -34723,7 +34761,11 @@ impl OpenFs {
                         inode.blocks = blocks_after_alloc;
                         let run_end =
                             logical_block.checked_add(mapping.count).ok_or_else(|| {
-                                FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG))
+                                FfsError::RequestRejected {
+                                    errno: libc::EFBIG,
+                                    detail: "allocated extent exceeds the logical block limit"
+                                        .into(),
+                                }
                             })?;
                         fresh_run = Some((logical_block, run_end));
                         (BlockNumber(mapping.physical_start), true, false)
@@ -36333,13 +36375,22 @@ impl OpenFs {
             if inode.is_symlink() {
                 return Err(FfsError::Format("cannot truncate a symlink".into()));
             }
+            if !inode.is_regular() {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EINVAL,
+                    detail: "cannot truncate a non-regular file".into(),
+                });
+            }
             // fs-verity files are read-only; truncation breaks the Merkle tree.
             Self::ext4_reject_verity(&inode)?;
             // Immutable files cannot be truncated; append-only files cannot
             // shrink (the kernel returns EPERM).
             Self::ext4_reject_immutable(&inode)?;
             if inode.flags & ffs_types::EXT4_APPEND_FL != 0 && new_size < inode.size {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EPERM,
+                    detail: "cannot shrink an append-only inode".into(),
+                });
             }
             // ftruncate(2)/EFBIG: extending past the ext4 maximum file size must
             // fail. The extend branch below only sets i_size, so without this an
@@ -36683,16 +36734,17 @@ impl OpenFs {
         if inode.is_symlink() {
             return Err(FfsError::Format("cannot truncate a symlink".into()));
         }
+        if !inode.is_regular() {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "cannot truncate a non-regular file".into(),
+            });
+        }
         Self::ext4_reject_verity(inode)?;
         let block_size = alloc.geo.block_size;
         Self::ext4_reject_oversized_file(new_size, u64::from(block_size))?;
         if new_size == inode.size {
             return Ok(());
-        }
-        if inode.mode & 0xF000 != 0x8000 {
-            return Err(FfsError::Format(
-                "cannot truncate a non-regular file".into(),
-            ));
         }
         Self::ext4_reject_encrypted(inode)?;
         if Self::ext4_inode_uses_inline_data(inode)
@@ -37735,7 +37787,10 @@ impl OpenFs {
     /// enforce the attribute on its direct API where no VFS layer does (bd-hbld5).
     fn ext4_reject_immutable(inode: &Ext4Inode) -> Result<(), FfsError> {
         if inode.flags & ffs_types::EXT4_IMMUTABLE_FL != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EPERM,
+                detail: "cannot mutate an immutable inode".into(),
+            });
         }
         Ok(())
     }
@@ -37747,7 +37802,10 @@ impl OpenFs {
     /// has no fs-verity support, so it must never mutate such a file (bd-yz6c6).
     fn ext4_reject_verity(inode: &Ext4Inode) -> Result<(), FfsError> {
         if inode.flags & ffs_types::EXT4_VERITY_FL != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EPERM,
+                detail: "cannot mutate an fs-verity inode".into(),
+            });
         }
         Ok(())
     }
@@ -37756,7 +37814,10 @@ impl OpenFs {
     /// `chattr +i` and `+a` both forbid removing or renaming the file (bd-hbld5).
     fn ext4_reject_immutable_or_append(inode: &Ext4Inode) -> Result<(), FfsError> {
         if inode.flags & (ffs_types::EXT4_IMMUTABLE_FL | ffs_types::EXT4_APPEND_FL) != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EPERM,
+                detail: "operation forbidden on an immutable or append-only inode".into(),
+            });
         }
         Ok(())
     }
@@ -48893,12 +48954,9 @@ impl OpenFs {
             // Dropped before the pressure commit below, which is a boundary and
             // waits for the gate to drain (bd-9rutw).
             let _gate = self.mutation_gate_guard();
-            self.handle_ext4_write_result(
-                "write",
-                self.with_latest_scope(|scope| {
-                    <Self as FsOps>::write(self, cx, scope, ino, offset, data)
-                }),
-            )?
+            self.with_latest_scope(|scope| {
+                <Self as FsOps>::write(self, cx, scope, ino, offset, data)
+            })?
         };
         // Library writes bypass `end_request_scope`, where the FUSE path runs
         // this; data volume is what fills a journal (bd-1o6tq).
@@ -74415,9 +74473,10 @@ mod tests {
 
     #[test]
     fn immutable_and_append_attributes_enforced_on_writes_bd_hbld5() {
-        let Some((fs, _tmp)) = open_writable_ext4_mkfs(8) else {
+        let Some((mut fs, _tmp)) = open_writable_ext4_mkfs(8) else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
 
@@ -82757,66 +82816,202 @@ mod tests {
     /// allocated block, or non-zero size on these inodes would surface here.
     #[test]
     fn ext4_special_files_pass_e2fsck() {
-        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
-            return; // format tool unavailable
-        };
+        let (mut fs, dev, tmp) = open_writable_ext4_mkfs_with_device(64)
+            .expect("special-inode integrity regression requires mkfs.ext4");
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let image = tmp.path().join("test.ext4");
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
 
-        fs.mknod(
-            &cx,
-            root,
-            OsStr::new("cdev"),
-            (libc::S_IFCHR as u16) | 0o644,
-            259, // makedev(1, 3), e.g. /dev/null
-            0,
-            0,
-        )
-        .expect("mknod character device");
-        fs.mknod(
-            &cx,
-            root,
-            OsStr::new("bdev"),
-            (libc::S_IFBLK as u16) | 0o644,
-            2048, // makedev(8, 0), e.g. /dev/sda
-            0,
-            0,
-        )
-        .expect("mknod block device");
-        fs.mknod(
-            &cx,
-            root,
-            OsStr::new("fifo"),
-            (libc::S_IFIFO as u16) | 0o644,
-            0,
-            0,
-            0,
-        )
-        .expect("mknod FIFO");
+        let cdev = fs
+            .mknod(
+                &cx,
+                root,
+                OsStr::new("cdev"),
+                (libc::S_IFCHR as u16) | 0o644,
+                259, // makedev(1, 3), e.g. /dev/null
+                0,
+                0,
+            )
+            .expect("mknod character device");
+        let bdev = fs
+            .mknod(
+                &cx,
+                root,
+                OsStr::new("bdev"),
+                (libc::S_IFBLK as u16) | 0o644,
+                2048, // makedev(8, 0), e.g. /dev/sda
+                0,
+                0,
+            )
+            .expect("mknod block device");
+        let fifo = fs
+            .mknod(
+                &cx,
+                root,
+                OsStr::new("fifo"),
+                (libc::S_IFIFO as u16) | 0o644,
+                0,
+                0,
+                0,
+            )
+            .expect("mknod FIFO");
         // A large device number (minor >= 256, so it does not fit the 16-bit old
         // encoding) exercises the NEW rdev encoding stored in i_block[1] with
         // i_block[0] zero — a separate code path from the three nodes above.
-        fs.mknod(
-            &cx,
-            root,
-            OsStr::new("bigdev"),
-            (libc::S_IFCHR as u16) | 0o644,
-            1_050_668, // makedev(8, 300): minor 300 forces the new (i_block[1]) form
-            0,
-            0,
-        )
-        .expect("mknod large-rdev character device");
+        let bigdev = fs
+            .mknod(
+                &cx,
+                root,
+                OsStr::new("bigdev"),
+                (libc::S_IFCHR as u16) | 0o644,
+                1_050_668, // makedev(8, 300): minor 300 forces the new (i_block[1]) form
+                0,
+                0,
+            )
+            .expect("mknod large-rdev character device");
 
+        let protected = fs.require_alloc_state().unwrap().read().groups[0].block_bitmap_block;
+        let encoded_block = u32::try_from(protected.0).unwrap();
+        assert!(encoded_block > 0 && u16::try_from(encoded_block).is_ok());
+        let mut specials = vec![cdev, bdev, fifo, bigdev];
+        for (name, kind, rdev) in [
+            ("bitmap-char", ffs_types::S_IFCHR, encoded_block),
+            ("bitmap-block", ffs_types::S_IFBLK, encoded_block),
+            ("socket", ffs_types::S_IFSOCK, 0),
+        ] {
+            specials.push(
+                fs.mknod(&cx, root, OsStr::new(name), kind | 0o644, rdev, 0, 0)
+                    .unwrap(),
+            );
+        }
+        let bs = u64::from(fs.block_size());
+        let payload = vec![0xA7; bs as usize];
+        let mut final_inodes = Vec::new();
+        for attr in specials {
+            let inode = fs.read_inode(&cx, attr.ino).unwrap();
+            let before = fs.current_snapshot();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let protected_bytes = fs.read_block_vec(&cx, protected).unwrap();
+            let assert_unchanged = || {
+                assert_eq!(fs.current_snapshot(), before);
+                assert_eq!(fs.read_inode(&cx, attr.ino).unwrap(), inode);
+                assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                assert_eq!(fs.read_block_vec(&cx, protected).unwrap(), protected_bytes);
+                assert!(
+                    fs.is_writable(),
+                    "request rejection triggered data_err=abort"
+                );
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                assert!(fs.try_close_mutation_gate().is_some());
+            };
+            for scoped in [false, true] {
+                for (operation, size, mode) in [
+                    ("write", 0, None),
+                    ("fallocate", 0, None),
+                    ("truncate", 1, None),
+                    ("truncate", 0, None),
+                    ("truncate", 1, Some(0o640)),
+                    ("truncate", 0, Some(0o640)),
+                ] {
+                    let op = match operation {
+                        "write" => RequestOp::Write,
+                        "fallocate" => RequestOp::Fallocate,
+                        _ => RequestOp::Setattr,
+                    };
+                    let mut scope = scoped.then(|| fs.begin_request_scope(&cx, op).unwrap());
+                    let request = SetAttrRequest {
+                        size: Some(size),
+                        mode,
+                        ..SetAttrRequest::default()
+                    };
+                    let result = match (operation, scope.as_mut()) {
+                        ("write", Some(scope)) => {
+                            FsOps::write(&fs, &cx, scope, attr.ino, 0, &payload).map(|_| ())
+                        }
+                        ("write", None) => fs.write(&cx, attr.ino, 0, &payload).map(|_| ()),
+                        ("fallocate", Some(scope)) => {
+                            FsOps::fallocate(&fs, &cx, scope, attr.ino, 0, bs, 0)
+                        }
+                        ("fallocate", None) => fs.fallocate(&cx, attr.ino, 0, bs, 0),
+                        (_, Some(scope)) => {
+                            FsOps::setattr(&fs, &cx, scope, attr.ino, &request).map(|_| ())
+                        }
+                        (_, None) => fs.setattr(&cx, attr.ino, &request).map(|_| ()),
+                    };
+                    let pending = scope.as_ref().map_or(0, RequestScope::pending_write_count);
+                    if let Some(scope) = scope {
+                        fs.end_request_scope(&cx, op, scope).unwrap();
+                    }
+                    let error = result.unwrap_err();
+                    let expected = if operation == "fallocate" {
+                        match attr.kind {
+                            FileType::Fifo => libc::ESPIPE,
+                            FileType::BlockDevice => libc::EOPNOTSUPP,
+                            _ => libc::ENODEV,
+                        }
+                    } else {
+                        libc::EINVAL
+                    };
+                    assert_eq!(
+                        error.to_errno(),
+                        expected,
+                        "{operation} scoped={scoped} kind={:?}",
+                        attr.kind
+                    );
+                    assert_eq!(pending, 0, "type rejection must precede staging");
+                    assert_unchanged();
+                }
+            }
+            // Metadata operations still apply to special inodes; their device
+            // number must retain its interpretation through chmod/chown.
+            fs.setattr(
+                &cx,
+                attr.ino,
+                &SetAttrRequest {
+                    mode: Some(0o640),
+                    uid: Some(2001),
+                    gid: Some(3002),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .unwrap();
+            let changed = fs.read_inode(&cx, attr.ino).unwrap();
+            assert_eq!(changed.mode & 0o7777, 0o640);
+            assert_eq!(changed.file_type_mode(), inode.file_type_mode());
+            assert_eq!((changed.uid, changed.gid), (2001, 3002));
+            assert_eq!((changed.size, changed.blocks), (0, 0));
+            assert_eq!(changed.extent_bytes, inode.extent_bytes);
+            final_inodes.push((attr.ino, changed));
+        }
+        let regular = fs
+            .create(&cx, root, OsStr::new("regular"), 0o644, 0, 0)
+            .unwrap();
+        assert_eq!(fs.write(&cx, regular.ino, 0, &payload).unwrap(), bs as u32);
+        assert_eq!(fs.read(&cx, regular.ino, 0, bs as u32).unwrap(), payload);
         fs.flush_mvcc_to_device(&cx).expect("flush mvcc to device");
-        std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
+        let bytes = dev.snapshot_bytes();
+        let digest = blake3::hash(&bytes);
+        std::fs::write(&image, &bytes).expect("write modified image");
 
-        let Some((clean, output)) = run_e2fsck(&image) else {
-            return; // e2fsck unavailable
-        };
+        let (clean, output) = run_e2fsck(&image).expect("special-inode regression requires e2fsck");
         assert!(
             clean,
             "e2fsck must accept FrankenFS-written ext4 device nodes (old + new rdev encoding) and a FIFO:\n{output}"
+        );
+        assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), digest);
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        for (ino, inode) in final_inodes {
+            assert_eq!(reopened.read_inode(&cx, ino).unwrap(), inode);
+        }
+        assert_eq!(
+            reopened.read(&cx, regular.ino, 0, bs as u32).unwrap(),
+            payload
         );
     }
 
@@ -98332,9 +98527,10 @@ mod tests {
 
     #[test]
     fn write_past_max_file_size_returns_efbig() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let max = OpenFs::ext4_max_file_size(u64::from(fs.block_size()));
@@ -103113,6 +103309,142 @@ mod tests {
             assert_eq!(fs.read_block_with_scope(&cx, &fresh, block).unwrap(), new);
             fs.end_request_scope(&cx, RequestOp::Read, fresh).unwrap();
             assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
+    }
+
+    #[test]
+    fn ext4_sdk_write_data_error_policy_preserves_storage_error_origin() {
+        #[derive(Debug)]
+        struct FailingDataRead {
+            inner: TestDevice,
+            target: ByteOffset,
+            armed: Arc<AtomicBool>,
+            failures: Arc<AtomicUsize>,
+            errno: i32,
+        }
+        impl ByteDevice for FailingDataRead {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                if self.armed.load(Ordering::Acquire) && offset == self.target {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                    return Err(std::io::Error::from_raw_os_error(self.errno).into());
+                }
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.write_all_at(cx, offset, buf)
+            }
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        let (seeded, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("data error policy regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let ino = seeded
+            .create(&cx, InodeNumber(2), OsStr::new("data-error"), 0o644, 0, 0)
+            .unwrap()
+            .ino;
+        let bs = seeded.block_size();
+        let payload = vec![0x31; bs as usize];
+        seeded.write(&cx, ino, 0, &payload).unwrap();
+        let inode = seeded.read_inode(&cx, ino).unwrap();
+        let target = ByteOffset(
+            seeded
+                .resolve_extent(&cx, &RequestScope::empty(), &inode, 0)
+                .unwrap()
+                .unwrap()
+                .0
+                * u64::from(bs),
+        );
+        seeded.flush_mvcc_to_device(&cx).unwrap();
+        let original = dev.snapshot_bytes();
+        drop(seeded);
+        for policy in [
+            Ext4DataErrPolicy::Ignore,
+            Ext4DataErrPolicy::Continue,
+            Ext4DataErrPolicy::Abort,
+        ] {
+            for errno in [libc::EIO, libc::EFBIG, libc::ENODEV] {
+                for scoped in [false, true] {
+                    let armed = Arc::new(AtomicBool::new(false));
+                    let failures = Arc::new(AtomicUsize::new(0));
+                    let device = FailingDataRead {
+                        inner: TestDevice::from_vec(original.clone()),
+                        target,
+                        armed: Arc::clone(&armed),
+                        failures: Arc::clone(&failures),
+                        errno,
+                    };
+                    let options = OpenOptions {
+                        ext4_data_err_policy: policy,
+                        ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                        ..OpenOptions::default()
+                    };
+                    let mut fs = OpenFs::from_device(&cx, Box::new(device), &options).unwrap();
+                    fs.enable_writes(&cx).unwrap();
+                    // Exercise backing I/O even if mount-time prefetch covered
+                    // the seeded data block. Cache hits cannot prove policy.
+                    fs.ext4_base_block_cache.clear();
+                    fs.ext4_file_data_block_cache.clear();
+                    let before = fs.current_snapshot();
+                    let counts = fs.statfs(&cx, InodeNumber(2)).unwrap();
+                    let mut scope =
+                        scoped.then(|| fs.begin_request_scope(&cx, RequestOp::Write).unwrap());
+                    armed.store(true, Ordering::Release);
+                    let result = if let Some(scope) = &mut scope {
+                        FsOps::write(&fs, &cx, scope, ino, 1, b"X")
+                    } else {
+                        fs.write(&cx, ino, 1, b"X")
+                    };
+                    armed.store(false, Ordering::Release);
+                    if let Some(scope) = scope {
+                        fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+                    }
+                    let error = result.unwrap_err();
+                    assert!(matches!(&error, FfsError::Io(_)), "{error:?}");
+                    assert_eq!(error.to_errno(), errno);
+                    assert_eq!(
+                        failures.load(Ordering::Relaxed),
+                        1,
+                        "must execute the injected ByteDevice failure once"
+                    );
+                    assert_eq!(fs.current_snapshot(), before);
+                    assert_eq!(fs.read_inode(&cx, ino).unwrap(), inode);
+                    assert_eq!(fs.read(&cx, ino, 0, bs).unwrap(), payload);
+                    assert_eq!(fs.statfs(&cx, InodeNumber(2)).unwrap(), counts);
+                    assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                    assert!(fs.try_close_mutation_gate().is_some());
+                    assert_eq!(fs.is_writable(), policy != Ext4DataErrPolicy::Abort);
+                    if policy == Ext4DataErrPolicy::Abort {
+                        assert!(matches!(
+                            fs.write(&cx, ino, 1, b"Y"),
+                            Err(FfsError::ReadOnly)
+                        ));
+                    } else {
+                        assert_eq!(fs.write(&cx, ino, 1, b"Y").unwrap(), 1);
+                        let mut expected = payload.clone();
+                        expected[1] = b'Y';
+                        assert_eq!(fs.read(&cx, ino, 0, bs).unwrap(), expected);
+                    }
+                    println!(
+                        "injected ByteDevice failure: policy={policy:?} errno={errno} scoped={scoped}"
+                    );
+                }
+            }
         }
     }
 

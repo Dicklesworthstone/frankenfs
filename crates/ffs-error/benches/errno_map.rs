@@ -22,6 +22,16 @@ use std::io::ErrorKind;
 #[inline(never)]
 fn frozen_to_errno(error: &FfsError) -> libc::c_int {
     match error {
+        // Added only for exhaustiveness after the error type grew. This variant
+        // did not exist in the frozen implementation and is outside both
+        // retained input catalogs; all incumbent mappings remain unchanged.
+        FfsError::RequestRejected { errno, .. } => {
+            if *errno > 0 {
+                *errno
+            } else {
+                libc::EIO
+            }
+        }
         FfsError::Io(error) => match error.raw_os_error() {
             Some(errno) if errno > 0 => errno,
             Some(_) => libc::EIO,

@@ -50,10 +50,13 @@ jobs:
           FFS_REQUIRE_ORACLES: "1"
         run: |
           cargo test -p ffs-alloc --locked --lib
+          cargo test -p ffs-error --locked --lib
           cargo test -p ffs-alloc --locked --lib --features bhh0i_sharded_alloc
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_file_ -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_repair_tail_ -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_sdk_write_ -- --nocapture
+          cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_special_files_pass_e2fsck -- --nocapture
+          cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc immutable_and_append_attributes_enforced_on_writes_bd_hbld5 -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc write_past_max_file_size_returns_efbig -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_write_at_the_last_logical_block_and_one_past_it -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_eager_concurrent_storm_is_consistent_bd_hyysq -- --nocapture

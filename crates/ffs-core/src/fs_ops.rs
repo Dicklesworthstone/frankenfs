@@ -1590,9 +1590,10 @@ impl FsOps for OpenFs {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
-            FsFlavor::Ext4(_) => {
-                self.ext4_write(cx, scope, Self::ext4_canonical_inode(ino), offset, data)
-            }
+            FsFlavor::Ext4(_) => self.handle_ext4_write_result(
+                "write",
+                self.ext4_write(cx, scope, Self::ext4_canonical_inode(ino), offset, data),
+            ),
             FsFlavor::Btrfs(_) => {
                 self.check_btrfs_mutation_allowed("write")?;
                 self.btrfs_retry_after_unpin(cx, || self.btrfs_write(cx, ino, offset, data))
