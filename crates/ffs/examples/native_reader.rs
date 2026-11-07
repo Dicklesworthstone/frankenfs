@@ -58,6 +58,12 @@ struct Args {
     /// Opt into NTFS index-directed lookup; does not certify unvisited siblings.
     #[arg(long, conflicts_with_all = ["zfs_dataset", "zfs_snapshot"])]
     ntfs_indexed_lookup: bool,
+    /// Apply supported NTFS journal recovery to a volatile read-only view.
+    #[arg(
+        long,
+        conflicts_with_all = ["ext4_journal", "btrfs_device", "btrfs_subvolume", "btrfs_subvolume_id", "zfs_dataset", "zfs_snapshot", "zfs_device", "zfs_pool_guid", "zfs_candidate"]
+    )]
+    ntfs_recover_logfile: bool,
     /// Repeat for each raw ZFS dataset-name component.
     #[arg(long)]
     zfs_dataset: Vec<OsString>,
@@ -188,9 +194,10 @@ impl Args {
                 root,
                 additional_devices: image_sources(&self.btrfs_device)?,
             })
-        } else if self.ntfs_indexed_lookup {
+        } else if self.ntfs_indexed_lookup || self.ntfs_recover_logfile {
             Ok(ReadOnlyBackend::Ntfs {
-                indexed_lookup: true,
+                indexed_lookup: self.ntfs_indexed_lookup,
+                recover_logfile: self.ntfs_recover_logfile,
             })
         } else if self.zfs_dataset.is_empty()
             && self.zfs_snapshot.is_none()
@@ -534,6 +541,43 @@ mod tests {
                 "/",
             ])
             .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn ntfs_recovery_is_explicit_composable_and_cannot_select_another_backend() {
+        for indexed_lookup in [false, true] {
+            let mut arguments = vec!["native_reader", "image.img", "--ntfs-recover-logfile"];
+            if indexed_lookup {
+                arguments.push("--ntfs-indexed-lookup");
+            }
+            arguments.extend(["read", "/payload.bin"]);
+            let args = Args::try_parse_from(arguments).unwrap();
+            assert!(matches!(
+                args.backend().unwrap(),
+                ReadOnlyBackend::Ntfs {
+                    indexed_lookup: actual,
+                    recover_logfile: true,
+                } if actual == indexed_lookup
+            ));
+        }
+        let defaults = Args::try_parse_from(["native_reader", "image.img", "stat", "/"]).unwrap();
+        assert!(matches!(defaults.backend().unwrap(), ReadOnlyBackend::Auto));
+        for foreign in [
+            vec!["--ext4-journal", "journal.img", "0", "rest"],
+            vec!["--btrfs-device", "member.img", "0", "rest"],
+            vec!["--btrfs-subvolume", "data"],
+            vec!["--btrfs-subvolume-id", "256"],
+            vec!["--zfs-dataset", "data"],
+            vec!["--zfs-snapshot", "before"],
+            vec!["--zfs-device", "member.img", "0", "rest"],
+            vec!["--zfs-pool-guid", "42"],
+        ] {
+            let mut arguments = vec!["native_reader", "image.img", "--ntfs-recover-logfile"];
+            arguments.extend(foreign);
+            arguments.extend(["stat", "/"]);
+            let error = Args::try_parse_from(arguments).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }

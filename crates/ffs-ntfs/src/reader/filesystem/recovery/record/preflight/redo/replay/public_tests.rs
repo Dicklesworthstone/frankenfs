@@ -293,6 +293,263 @@ fn value(volume: &NtfsVolume, number: u64) -> Vec<u8> {
     volume.read(&cx, &stream, 0, 64).unwrap()
 }
 
+fn mount_filename(name: &str) -> Vec<u8> {
+    let units: Vec<_> = name.encode_utf16().collect();
+    let mut bytes = vec![0; 66 + units.len() * 2];
+    bytes[..8].copy_from_slice(&((7_u64 << 48) | 5).to_le_bytes());
+    bytes[40..48].copy_from_slice(&8_u64.to_le_bytes());
+    bytes[48..56].copy_from_slice(&8_u64.to_le_bytes());
+    bytes[64] = units.len() as u8;
+    bytes[65] = 1;
+    for (index, unit) in units.iter().enumerate() {
+        bytes[66 + index * 2..68 + index * 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+fn mount_index() -> Vec<u8> {
+    let mut value = vec![0; 32];
+    value[..4].copy_from_slice(&0x30_u32.to_le_bytes());
+    value[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    value[8..12].copy_from_slice(&4096_u32.to_le_bytes());
+    value[12] = 8;
+    value[16..20].copy_from_slice(&16_u32.to_le_bytes());
+    for (number, name) in [(43_u64, "loser"), (42, "winner")] {
+        let name = mount_filename(name);
+        let mut entry = vec![0; (16 + name.len()).next_multiple_of(8)];
+        let length = entry.len() as u16;
+        entry[..8].copy_from_slice(&((7_u64 << 48) | number).to_le_bytes());
+        entry[8..10].copy_from_slice(&length.to_le_bytes());
+        entry[10..12].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        entry[16..16 + name.len()].copy_from_slice(&name);
+        value.extend(entry);
+    }
+    let mut end = [0; 16];
+    end[8] = 16;
+    end[12] = 2;
+    value.extend(end);
+    let length = value.len() as u32 - 16;
+    value[20..24].copy_from_slice(&length.to_le_bytes());
+    value[24..28].copy_from_slice(&length.to_le_bytes());
+
+    let mut attribute = vec![0; (32 + value.len()).next_multiple_of(8)];
+    let length = attribute.len() as u32;
+    attribute[..4].copy_from_slice(&0x90_u32.to_le_bytes());
+    attribute[4..8].copy_from_slice(&length.to_le_bytes());
+    attribute[9] = 4;
+    attribute[10..12].copy_from_slice(&24_u16.to_le_bytes());
+    attribute[14..16].copy_from_slice(&1_u16.to_le_bytes());
+    attribute[16..20].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    attribute[20..22].copy_from_slice(&32_u16.to_le_bytes());
+    attribute[24..32].copy_from_slice(&[b'$', 0, b'I', 0, b'3', 0, b'0', 0]);
+    attribute[32..32 + value.len()].copy_from_slice(&value);
+    attribute
+}
+
+fn mountable_image(bank: bool, decision: u16) -> Vec<u8> {
+    let mut bytes = image(bank, decision);
+    let mut standard = [0; 72];
+    for field in 0..4 {
+        standard[field * 8..field * 8 + 8]
+            .copy_from_slice(&116_444_736_000_000_000_u64.to_le_bytes());
+    }
+    let standard = resident(0x10, 0, &standard);
+    let mut root = file(5, &[standard.clone(), mount_index()]);
+    root[22..24].copy_from_slice(&3_u16.to_le_bytes());
+    let upcase = file(10, &[mapped(1024, 256)]);
+    for (number, record) in [(5, root), (10, upcase)] {
+        let at = BASE + 128 * 512 + number * 1024;
+        bytes[at..at + 1024].copy_from_slice(&record);
+    }
+    for unit in 0..=u16::MAX {
+        let upper = if (97..=122).contains(&unit) {
+            unit - 32
+        } else {
+            unit
+        };
+        let at = BASE + 1024 * 512 + usize::from(unit) * 2;
+        bytes[at..at + 2].copy_from_slice(&upper.to_le_bytes());
+    }
+    for (number, name, data, action) in [
+        (42, "winner", &b"original"[..], 2),
+        (43, "loser", &b"loserbad"[..], 4),
+    ] {
+        let filename = resident(0x30, 1, &mount_filename(name));
+        let data_offset = (64 + standard.len() + filename.len()) as u16;
+        let mut record = file(
+            number,
+            &[standard.clone(), filename, resident(DATA, 2, data)],
+        );
+        record[40..42].copy_from_slice(&3_u16.to_le_bytes());
+        let at = BASE + 128 * 512 + number as usize * 1024;
+        bytes[at..at + 1024].copy_from_slice(&record);
+        let page = if bank { 2 * PAGE } else { RING };
+        let at = BASE + LOG_LCN * 512 + page + POSITIONS[action] + 48 + 16;
+        bytes[at..at + 2].copy_from_slice(&data_offset.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn recovered_fsops_expose_complete_redo_undo_without_backing_writes() {
+    use crate::NtfsFs;
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    for bank in [false, true] {
+        for indexed in [false, true] {
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            let original = mountable_image(bank, 0x1A);
+            let volume = open(original.clone(), &trace).unwrap();
+            let fs = if indexed {
+                NtfsFs::new_recovered_indexed(&cx, volume, 123, 456)
+            } else {
+                NtfsFs::new_recovered(&cx, volume, 123, 456)
+            }
+            .unwrap();
+            let mut scope = RequestScope::empty();
+            let root = InodeNumber(1);
+            let entries = fs.readdir(&cx, &mut scope, root, 0).unwrap();
+            assert!(entries.iter().any(|entry| entry.name == b"winner"));
+            assert!(entries.iter().any(|entry| entry.name == b"loser"));
+            for (name, expected) in [("WINNER", b"winner!!"), ("LOSER", b"original")] {
+                let file = fs.lookup(&cx, &mut scope, root, OsStr::new(name)).unwrap();
+                assert_eq!((file.uid, file.gid, file.size), (123, 456, 8));
+                assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(), expected);
+                assert_eq!(
+                    fs.read(&cx, &mut scope, file.ino, 2, 3).unwrap(),
+                    &expected[2..5]
+                );
+                assert!(fs.read(&cx, &mut scope, file.ino, 8, 1).unwrap().is_empty());
+                assert!(matches!(
+                    fs.write(&cx, &mut scope, file.ino, 0, b"change"),
+                    Err(FfsError::ReadOnly)
+                ));
+                fs.fsync(&cx, &mut scope, file.ino, 0, false).unwrap();
+            }
+            assert!(matches!(
+                fs.create(&cx, &mut scope, root, OsStr::new("new"), 0o644, 0, 0),
+                Err(FfsError::ReadOnly)
+            ));
+            assert!(matches!(
+                fs.unlink(&cx, &mut scope, root, OsStr::new("winner")),
+                Err(FfsError::ReadOnly)
+            ));
+            fs.fsyncdir(&cx, &mut scope, root, 0, false).unwrap();
+            assert_eq!(fs.volume().volume_flags, 1);
+            assert!(
+                !fs.volume()
+                    .logfile_recovery
+                    .as_ref()
+                    .unwrap()
+                    .restart
+                    .is_clean()
+            );
+            let mut backing = vec![0; VOLUME_BYTES];
+            fs.volume()
+                .source
+                .device
+                .read_exact_at(&cx, ByteOffset(0), &mut backing)
+                .unwrap();
+            assert_eq!(backing, original[BASE..BASE + VOLUME_BYTES]);
+            assert_eq!(trace.lock().unwrap().writes, 0);
+        }
+    }
+}
+
+#[test]
+fn recovered_fsops_do_not_weaken_clean_only_constructors() {
+    use crate::NtfsFs;
+
+    for indexed in [false, true] {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let volume = open(mountable_image(true, 0x1A), &trace).unwrap();
+        let result = if indexed {
+            NtfsFs::new_indexed(&Cx::for_testing(), volume, 0, 0)
+        } else {
+            NtfsFs::new(&Cx::for_testing(), volume, 0, 0)
+        };
+        assert!(matches!(result, Err(FfsError::UnsupportedFeature(_))));
+        assert_eq!(trace.lock().unwrap().writes, 0);
+    }
+}
+
+#[test]
+fn recovered_fsops_cannot_be_authorized_by_public_diagnostic_metadata() {
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let mut recovered = open(mountable_image(false, 0x1A), &trace).unwrap();
+    let mut bytes = mountable_image(false, 0x1A);
+    let flags = BASE + 128 * 512 + 3 * 1024 + 64 + 24 + 10;
+    bytes[flags..flags + 2].fill(0);
+    let mut volume = NtfsVolume::from_device(
+        &Cx::for_testing(),
+        Box::new(Memory {
+            bytes,
+            trace: Arc::clone(&trace),
+        }),
+        BASE as u64,
+        VOLUME_BYTES as u64,
+    )
+    .unwrap();
+    volume.logfile_recovery = recovered.logfile_recovery.take();
+    assert!(matches!(
+        crate::NtfsFs::new_recovered(&Cx::for_testing(), volume, 0, 0),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    assert_eq!(trace.lock().unwrap().writes, 0);
+}
+
+#[test]
+fn recovered_fsops_reject_geometry_or_flags_changed_after_recovery() {
+    for change_geometry in [false, true] {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let bytes = mountable_image(false, 0x1A);
+        let mut volume = open(bytes.clone(), &trace).unwrap();
+        if change_geometry {
+            let mut boot = bytes[BASE..BASE + 512].to_vec();
+            boot[72..80].copy_from_slice(&1_u64.to_le_bytes());
+            volume.geometry = reader::NtfsGeometry::parse(&boot, VOLUME_BYTES as u64).unwrap();
+        } else {
+            volume.volume_flags = 0;
+        }
+        assert!(matches!(
+            crate::NtfsFs::new_recovered_indexed(&Cx::for_testing(), volume, 0, 0),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert_eq!(trace.lock().unwrap().writes, 0);
+    }
+}
+
+#[test]
+fn recovered_fsops_refuse_unsupported_torn_and_cancelled_recovery() {
+    for fault in 0..4 {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let mut bytes = mountable_image(true, if fault == 0 { 0x19 } else { 0x1A });
+        let tail = BASE + LOG_LCN * 512 + 2 * PAGE;
+        match fault {
+            1 => bytes[tail + 511] ^= 1,
+            2 => {
+                let at = tail + POSITIONS[4] + 48;
+                bytes[at..at + 2].copy_from_slice(&0x15_u16.to_le_bytes());
+            }
+            3 => trace.lock().unwrap().fail_at = Some(tail as u64),
+            _ => {}
+        }
+        let result = open(bytes, &trace)
+            .and_then(|volume| crate::NtfsFs::new_recovered(&Cx::for_testing(), volume, 0, 0));
+        assert!(
+            result.is_err(),
+            "invalid recovery case {fault} admitted a view"
+        );
+        if fault == 3 {
+            assert!(matches!(result, Err(FfsError::Cancelled)));
+        }
+        assert_eq!(trace.lock().unwrap().writes, 0);
+    }
+}
+
 #[test]
 fn public_constructor_uses_checkpoint_and_post_restart_commit_before_loser_undo() {
     for bank in [false, true] {

@@ -604,6 +604,7 @@ fn concrete_volume_adapter_uses_selected_bounds_fragmented_mft_and_native_bitmap
         },
         volume_flags: 0,
         logfile_recovery: None,
+        recovered_view: None,
     };
     let mut targets = targets();
     targets.clusters.get_mut(&(24, 84)).unwrap().lcn = Some(52);

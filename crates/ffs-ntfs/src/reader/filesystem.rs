@@ -82,14 +82,15 @@ pub struct NtfsFs {
 
 impl NtfsFs {
     /// Borrow the admitted immutable volume for native stream/metadata access.
-    /// This retains the filesystem's backing capability and clean-log admission.
+    /// This retains the filesystem's backing capability and its explicit clean
+    /// or recovered-view admission.
     #[must_use]
     pub fn volume(&self) -> &NtfsVolume {
         &self.volume
     }
 
     pub fn new(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
-        Self::build(cx, volume, uid, gid, false)
+        Self::build(cx, volume, uid, gid, false, false)
     }
 
     /// Explicit branch-directed LOOKUP for immutable native images. This does
@@ -97,7 +98,23 @@ impl NtfsFs {
     /// READDIR remains a complete validated enumeration in both modes.
     /// Native journal, root, provider and host projection admission is unchanged.
     pub fn new_indexed(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
-        Self::build(cx, volume, uid, gid, true)
+        Self::build(cx, volume, uid, gid, true, false)
+    }
+
+    /// Mount the volatile view produced by an explicit, successful native
+    /// `$LogFile` recovery open. The original journal may remain dirty: backing
+    /// bytes are never rewritten, and every mutation still returns read-only.
+    /// Unsupported, partial or failed recovery cannot establish this admission.
+    /// Ordinary `new` retains its clean-log requirement.
+    pub fn new_recovered(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
+        Self::build(cx, volume, uid, gid, false, true)
+    }
+
+    /// Branch-directed lookup over an explicitly recovered immutable view.
+    /// Recovery admission is identical to `new_recovered`; directory listing
+    /// still validates the entire native index.
+    pub fn new_recovered_indexed(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
+        Self::build(cx, volume, uid, gid, true, true)
     }
 
     fn build(
@@ -106,9 +123,18 @@ impl NtfsFs {
         uid: u32,
         gid: u32,
         indexed_lookup: bool,
+        recovered_view: bool,
     ) -> Result<Self> {
         checkpoint(cx)?;
-        recovery::admit(cx, &volume)?;
+        if recovered_view {
+            if !volume.has_verified_recovered_view() {
+                return Err(unsupported(
+                    "NTFS recovered filesystem view requires a successful explicit $LogFile recovery open",
+                ));
+            }
+        } else {
+            recovery::admit(cx, &volume)?;
+        }
         let record = volume.record(cx, 5, None)?;
         if !record.is_directory() {
             return Err(corrupt(0, "NTFS root is not a directory"));

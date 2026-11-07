@@ -30,18 +30,30 @@ The six-format facade exposes the same explicit selection:
 ```rust,no_run
 # fn example(cx: &asupersync::Cx) -> ffs_error::Result<()> {
 let opened = ffs::open_read_only(cx, "volume.img", &ffs::ReadOnlyOpenOptions {
-    backend: ffs::ReadOnlyBackend::Ntfs { indexed_lookup: true },
+    backend: ffs::ReadOnlyBackend::Ntfs {
+        indexed_lookup: true,
+        recover_logfile: false,
+    },
     ..ffs::ReadOnlyOpenOptions::default()
 })?;
 # Ok(()) }
 ```
 
-`Auto` and `Ntfs { indexed_lookup: false }` retain strict construction and
+`Auto` and `Ntfs { indexed_lookup: false, recover_logfile: false }` retain strict construction and
 full-directory lookup. Explicit NTFS selection still refuses another detected
 format or ambiguous signatures. Both modes retain the same bounded, locked,
 OS-read-only image handle, ownership projection and native stream accessor.
 Indexed lookup does not populate a complete-directory cache; an indexed view's
 `readdir` can still fail on a damaged sibling which a selected lookup never read.
+
+Set `recover_logfile: true` to select verified volatile journal recovery with
+either lookup mode. Direct callers first open the volume with
+`NtfsVolume::open_with_options(cx, path, base, length, true)`, then use
+`NtfsFs::new_recovered` or `NtfsFs::new_recovered_indexed`. These constructors
+require successful recovery admission; unsupported or incomplete replay fails.
+The original `new` and `new_indexed` constructors keep their clean-log requirement.
+Recovery applies the admitted resident/INDEX_ROOT edits only in memory and never
+grants native write authority or clears the backing volume's dirty state.
 
 The standalone public consumer accepts `--ntfs-indexed-lookup` before its
 subcommand. Its ordinary and exact named-stream paths use the selected mode;
