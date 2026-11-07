@@ -206,12 +206,20 @@ impl DataStreamMetadata {
     }
 }
 
+struct RecoveredViewIdentity {
+    geometry: NtfsGeometry,
+    volume_flags: u16,
+}
+
 pub struct NtfsVolume {
     source: Source,
     pub geometry: NtfsGeometry,
     mft: Stream,
     pub volume_flags: u16,
     pub logfile_recovery: Option<ffs_ondisk::ntfs::NtfsLogFilePlan>,
+    // Only a successful explicit open can establish this admission. The public
+    // recovery plan is diagnostic metadata and cannot authorize a mounted view.
+    recovered_view: Option<RecoveredViewIdentity>,
 }
 impl NtfsVolume {
     pub fn open(cx: &Cx, path: &Path, base: u64, length: Option<u64>) -> Result<Self> {
@@ -311,6 +319,7 @@ impl NtfsVolume {
             mft,
             volume_flags: 0,
             logfile_recovery: None,
+            recovered_view: None,
         };
         // Read record zero again through the actual MFT map, not boot arithmetic.
         if volume.record(cx, 0, None)?.used_bytes() != primary.used_bytes() {
@@ -344,9 +353,19 @@ impl NtfsVolume {
                 )));
             }
             volume.apply_logfile_recovery(cx)?;
+            volume.recovered_view = Some(RecoveredViewIdentity {
+                geometry: volume.geometry.clone(),
+                volume_flags: flags,
+            });
         }
         checkpoint(cx)?;
         Ok(volume)
+    }
+
+    fn has_verified_recovered_view(&self) -> bool {
+        self.recovered_view.as_ref().is_some_and(|identity| {
+            identity.geometry == self.geometry && identity.volume_flags == self.volume_flags
+        })
     }
 
     fn apply_logfile_recovery(&mut self, cx: &Cx) -> Result<()> {

@@ -137,14 +137,19 @@ fn native_fat_both_dialects_open_through_bounded_facade_and_preserve_container()
         exclusive.try_lock().unwrap();
         drop(exclusive);
         for indexed_lookup in [false, true] {
-            let mismatched = ReadOnlyOpenOptions {
-                backend: ReadOnlyBackend::Ntfs { indexed_lookup },
-                ..ReadOnlyOpenOptions::default()
-            };
-            assert!(matches!(
-                open_read_only(&cx, &image, &mismatched),
-                Err(FfsError::Format(_))
-            ));
+            for recover_logfile in [false, true] {
+                let mismatched = ReadOnlyOpenOptions {
+                    backend: ReadOnlyBackend::Ntfs {
+                        indexed_lookup,
+                        recover_logfile,
+                    },
+                    ..ReadOnlyOpenOptions::default()
+                };
+                assert!(matches!(
+                    open_read_only(&cx, &image, &mismatched),
+                    Err(FfsError::Format(_))
+                ));
+            }
         }
         let truncated = ReadOnlyOpenOptions {
             length: Some(512),
@@ -715,13 +720,26 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
         ];
         if kind == "ntfs" {
             for indexed_lookup in [false, true] {
-                views.push((&image, 0, None, ReadOnlyBackend::Ntfs { indexed_lookup }));
-                views.push((
-                    &bounded,
-                    4096,
-                    Some(native.len() as u64),
-                    ReadOnlyBackend::Ntfs { indexed_lookup },
-                ));
+                for recover_logfile in [false, true] {
+                    views.push((
+                        &image,
+                        0,
+                        None,
+                        ReadOnlyBackend::Ntfs {
+                            indexed_lookup,
+                            recover_logfile,
+                        },
+                    ));
+                    views.push((
+                        &bounded,
+                        4096,
+                        Some(native.len() as u64),
+                        ReadOnlyBackend::Ntfs {
+                            indexed_lookup,
+                            recover_logfile,
+                        },
+                    ));
+                }
             }
         }
         for (path, offset, length, backend) in views {
@@ -834,6 +852,121 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
         }
         if kind == "ntfs" {
             let volume = ffs_ntfs::NtfsVolume::open(&cx, &image, 0, None).unwrap();
+            // Keep the independently produced clean journal intact and plant
+            // only the native dirty flag. This proves the public option selects
+            // verified recovery without clearing native state or writing back.
+            // Real redo/undo transactions are covered in ffs-ntfs's recovery
+            // suite; this producer case exercises the public capability boundary.
+            let record = volume.record(&cx, 3, None).unwrap();
+            let record_bytes = record.used_bytes();
+            let mut attribute =
+                usize::from(u16::from_le_bytes(record_bytes[20..22].try_into().unwrap()));
+            let flags_offset = loop {
+                let kind =
+                    u32::from_le_bytes(record_bytes[attribute..attribute + 4].try_into().unwrap());
+                assert_ne!(kind, u32::MAX, "native volume information must exist");
+                if kind == ffs_ondisk::ntfs::VOLUME_INFORMATION {
+                    assert_eq!(record_bytes[attribute + 8], 0, "resident information");
+                    let value = usize::from(u16::from_le_bytes(
+                        record_bytes[attribute + 20..attribute + 22]
+                            .try_into()
+                            .unwrap(),
+                    ));
+                    break attribute + value + 10;
+                }
+                let length = u32::from_le_bytes(
+                    record_bytes[attribute + 4..attribute + 8]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                assert!(length >= 24);
+                attribute += length;
+            };
+            assert_eq!(&record_bytes[flags_offset..flags_offset + 2], &[0, 0]);
+            // A word wholly within a sector can be changed without rewriting
+            // its USA trailer. Check that property against this native record.
+            assert!(flags_offset % 512 < 510);
+            let primary = record_offset(&cx, &volume, 3);
+            let mirror = usize::try_from(
+                volume.geometry.mirror_cluster() * u64::from(volume.geometry.cluster_bytes())
+                    + 3 * u64::from(volume.geometry.record_bytes()),
+            )
+            .unwrap();
+            for at in [primary, mirror] {
+                let mirrored = ffs_ondisk::ntfs::NtfsFileRecord::parse(
+                    &native[at..at + volume.geometry.record_bytes() as usize],
+                )
+                .unwrap();
+                assert_eq!(mirrored.used_bytes(), record_bytes);
+            }
+            for offset in [0, 4096] {
+                let mut dirty = if offset == 0 {
+                    native.clone()
+                } else {
+                    container.clone()
+                };
+                for at in [primary, mirror] {
+                    dirty[offset + at + flags_offset..offset + at + flags_offset + 2]
+                        .copy_from_slice(&1_u16.to_le_bytes());
+                }
+                let path = directory.join(format!("dirty-volume-{offset}.img"));
+                fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&dirty)
+                    .unwrap();
+                let mut options = ReadOnlyOpenOptions {
+                    offset: offset as u64,
+                    length: Some(native.len() as u64),
+                    ..ReadOnlyOpenOptions::default()
+                };
+                for backend in [
+                    ReadOnlyBackend::Auto,
+                    ReadOnlyBackend::Ntfs {
+                        indexed_lookup: false,
+                        recover_logfile: false,
+                    },
+                    ReadOnlyBackend::Ntfs {
+                        indexed_lookup: true,
+                        recover_logfile: false,
+                    },
+                ] {
+                    options.backend = backend;
+                    assert!(matches!(
+                        open_read_only(&cx, &path, &options),
+                        Err(FfsError::UnsupportedFeature(_))
+                    ));
+                }
+                for indexed_lookup in [false, true] {
+                    options.backend = ReadOnlyBackend::Ntfs {
+                        indexed_lookup,
+                        recover_logfile: true,
+                    };
+                    let opened = open_read_only(&cx, &path, &options).unwrap();
+                    assert_eq!(opened.ntfs_volume().unwrap().volume_flags, 1);
+                    let mut scope = RequestScope::empty();
+                    let file = opened
+                        .filesystem
+                        .lookup(&cx, &mut scope, InodeNumber(1), name)
+                        .unwrap();
+                    assert_eq!(
+                        opened
+                            .filesystem
+                            .read(&cx, &mut scope, file.ino, 0, payload.len() as u32)
+                            .unwrap(),
+                        payload
+                    );
+                    assert!(matches!(
+                        opened
+                            .filesystem
+                            .write(&cx, &mut scope, file.ino, 0, b"forbidden"),
+                        Err(FfsError::ReadOnly)
+                    ));
+                }
+                assert_eq!(fs::read(&path).unwrap(), dirty);
+            }
             let selected = volume
                 .resolve_no_follow(&cx, "/Native payload.bin")
                 .unwrap();
@@ -872,6 +1005,7 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                         ReadOnlyBackend::Auto,
                         ReadOnlyBackend::Ntfs {
                             indexed_lookup: false,
+                            recover_logfile: false,
                         },
                     ] {
                         options.backend = backend;
@@ -882,6 +1016,7 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
                     }
                     options.backend = ReadOnlyBackend::Ntfs {
                         indexed_lookup: true,
+                        recover_logfile: false,
                     };
                     let opened = open_read_only(&cx, &path, &options).unwrap();
                     let mut scope = RequestScope::empty();

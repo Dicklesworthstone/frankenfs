@@ -46,6 +46,9 @@ pub enum ReadOnlyBackend {
     /// selected native search range; directory enumeration remains complete.
     Ntfs {
         indexed_lookup: bool,
+        /// Admit the verified volatile `$LogFile` recovery view. The backing
+        /// image stays immutable; automatic detection retains clean admission.
+        recover_logfile: bool,
     },
     Zfs(ZfsReadOptions),
 }
@@ -220,7 +223,8 @@ fn selection_matches(backend: &ReadOnlyBackend, format: FsFormatKind) -> bool {
 ///
 /// The image must remain offline and immutable. Advisory locking is not a
 /// substitute for that precondition. ext4 recovery is confined to a volatile
-/// overlay; NTFS retains its existing clean-log FsOps admission. ZFS automatic
+/// overlay; NTFS recovery requires explicit selection and a completed native
+/// recovery admission before exposing its volatile view. ZFS automatic
 /// selection, explicit extraction and replay retain their native refusal rules.
 /// No runtime or process-wide signal handler is created.
 ///
@@ -319,16 +323,31 @@ pub fn open_read_only(
         }
         DetectedFilesystem::Ntfs(_) => {
             let length = device.len_bytes();
-            let volume = ffs_ntfs::NtfsVolume::from_device(cx, Box::new(device), 0, length)?;
-            let filesystem = if matches!(
-                &options.backend,
+            let (indexed_lookup, recover_logfile) = match &options.backend {
                 ReadOnlyBackend::Ntfs {
-                    indexed_lookup: true
+                    indexed_lookup,
+                    recover_logfile,
+                } => (*indexed_lookup, *recover_logfile),
+                _ => (false, false),
+            };
+            let volume = ffs_ntfs::NtfsVolume::from_device_with_options(
+                cx,
+                Box::new(device),
+                0,
+                length,
+                recover_logfile,
+            )?;
+            let filesystem = match (indexed_lookup, recover_logfile) {
+                (false, false) => ffs_ntfs::NtfsFs::new(cx, volume, options.uid, options.gid)?,
+                (true, false) => {
+                    ffs_ntfs::NtfsFs::new_indexed(cx, volume, options.uid, options.gid)?
                 }
-            ) {
-                ffs_ntfs::NtfsFs::new_indexed(cx, volume, options.uid, options.gid)?
-            } else {
-                ffs_ntfs::NtfsFs::new(cx, volume, options.uid, options.gid)?
+                (false, true) => {
+                    ffs_ntfs::NtfsFs::new_recovered(cx, volume, options.uid, options.gid)?
+                }
+                (true, true) => {
+                    ffs_ntfs::NtfsFs::new_recovered_indexed(cx, volume, options.uid, options.gid)?
+                }
             };
             let filesystem = Arc::new(filesystem);
             ntfs = Some(Arc::clone(&filesystem));

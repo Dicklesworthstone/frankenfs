@@ -21,7 +21,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "ffs-ntfs",
-    about = "Inspect immutable NTFS images and extract streams without replay or writes"
+    about = "Inspect and mount offline NTFS images with optional volatile log recovery"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -70,7 +70,7 @@ struct ImageArgs {
     /// Optional RaptorQ sidecar archive for read-verification and repair.
     #[arg(long)]
     sidecar: Option<PathBuf>,
-    /// Replay NTFS $LogFile (RSTR/RCRD) ARIES redo/undo records into an in-memory read overlay.
+    /// Apply supported NTFS $LogFile redo/undo to a read-only in-memory view.
     #[arg(long)]
     recover_logfile: bool,
 }
@@ -657,7 +657,11 @@ fn main() -> Result<()> {
                 bail!("NTFS mountpoint would hide its backing image");
             }
             let volume = image.open(&cx)?;
-            let fs = reader::filesystem::NtfsFs::new(&cx, volume, uid, gid)?;
+            let fs = if image.recover_logfile {
+                reader::filesystem::NtfsFs::new_recovered(&cx, volume, uid, gid)?
+            } else {
+                reader::filesystem::NtfsFs::new(&cx, volume, uid, gid)?
+            };
             let options = ffs_fuse::MountOptions {
                 read_only: true,
                 allow_other: false,
@@ -665,7 +669,12 @@ fn main() -> Result<()> {
                 ..ffs_fuse::MountOptions::default()
             };
             eprintln!(
-                "experimental NTFS read-only mount: offline immutable image required; no log replay or native ACL enforcement"
+                "experimental NTFS read-only mount: {} view; offline immutable image required; native ACLs are not enforced",
+                if image.recover_logfile {
+                    "volatile log-recovery"
+                } else {
+                    "clean-log"
+                }
             );
             let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
         }
@@ -1109,6 +1118,20 @@ mod tests {
             (1024, Some(65536), 123, 456)
         );
         assert_eq!(mountpoint, PathBuf::from("/mnt/ntfs"));
+        assert!(!image.recover_logfile);
+        let recovered = Cli::try_parse_from([
+            "ffs-ntfs",
+            "mount",
+            "disk.img",
+            "/mnt/ntfs",
+            "--offline-image",
+            "--recover-logfile",
+        ])
+        .unwrap();
+        let Command::Mount { image, .. } = recovered.command else {
+            panic!("mount");
+        };
+        assert!(image.recover_logfile);
         assert!(
             Cli::try_parse_from([
                 "ffs-ntfs",

@@ -1,4 +1,4 @@
-//! Offline preparation of allocator-owned ext4 repair tails.
+//! Allocator-owned ext4 repair tails, source validation and active freshness.
 //!
 //! Preparation creates ownership, not usable parity. The immutable owner's
 //! unwritten extents reserve physical space without exposing previous contents
@@ -12,7 +12,7 @@ use super::{
     ext4_superblock_requires_journal_recovery, parse_extent_tree, parse_to_ffs_error,
 };
 use asupersync::sync::{
-    Mutex as NativeMutex, MutexGuard as NativeMutexGuard, OnceCell, TryLockError,
+    LockError, Mutex as NativeMutex, MutexGuard as NativeMutexGuard, OnceCell, TryLockError,
 };
 use ffs_block::{BlockBuf, ByteDevice};
 use ffs_repair::codec::{DirectEncodeRequest, direct_encode_workspace_bytes, encode_group_direct};
@@ -22,7 +22,10 @@ use ffs_repair::storage::{RawRefreshAdmission, RepairGroupLayout, RepairGroupSto
 use ffs_repair::symbol::RepairGroupDescExt;
 use ffs_types::ByteOffset;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 const OWNER_NAME: &str = ".frankenfs-repair";
 const OWNER_MAGIC: &[u8; 8] = b"FFSNAT01";
@@ -175,13 +178,26 @@ struct NativeFreshnessState {
 }
 
 /// The only writable handle published after native freshness admission.
+/// Source reads validate current digests and durably repair clean generations.
 /// Internal ownership publication uses `inner` under the same state lock.
-struct NativeFreshnessDevice {
+pub(super) struct NativeFreshnessDevice {
     inner: Arc<dyn ByteDevice>,
     sb: Ext4Superblock,
     state: NativeMutex<NativeFreshnessState>,
     codec_budget: u64,
     ownership: NativeOwnershipConstraints,
+}
+
+struct NativeLockWake(std::thread::Thread);
+
+impl Wake for NativeLockWake {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
 }
 
 struct NativeOwnedBytes {
@@ -406,12 +422,11 @@ fn read_native_group_desc(
 impl NativeFreshnessDevice {
     fn lock(&self, cx: &Cx) -> Result<NativeMutexGuard<'_, NativeFreshnessState>, FfsError> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        let state = self.state.try_lock().map_err(|error| match error {
-            TryLockError::Locked => {
-                FfsError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))
-            }
-            TryLockError::Poisoned => freshness_error("state mutex is poisoned"),
-        })?;
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Locked) => self.wait_for_lock(cx)?,
+            Err(TryLockError::Poisoned) => return Err(freshness_error("state mutex is poisoned")),
+        };
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         if state.phase == FreshnessPhase::Poisoned {
             return Err(freshness_error(
@@ -419,6 +434,35 @@ impl NativeFreshnessDevice {
             ));
         }
         Ok(state)
+    }
+
+    fn wait_for_lock(
+        &self,
+        cx: &Cx,
+    ) -> Result<NativeMutexGuard<'_, NativeFreshnessState>, FfsError> {
+        // ByteDevice operations are synchronous. Poll only this mutex future;
+        // its holder performs synchronous I/O and never needs this thread's
+        // executor to release the guard. Retain FIFO queueing and cancellation
+        // cleanup instead of returning EAGAIN for ordinary concurrent reads.
+        let waker = Waker::from(Arc::new(NativeLockWake(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut waiting = std::pin::pin!(self.state.lock(cx));
+        loop {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            match waiting.as_mut().poll(&mut context) {
+                Poll::Ready(result) => {
+                    return result.map_err(|error| match error {
+                        LockError::Cancelled => FfsError::Cancelled,
+                        other => freshness_error(&format!("state mutex wait failed: {other}")),
+                    });
+                }
+                Poll::Pending => {
+                    // Unlock unparks immediately; cancellation does not notify
+                    // the mutex waker, so periodically recheck its Cx as well.
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     fn device(&self) -> ByteDeviceBlockAdapter<'_> {
@@ -451,7 +495,7 @@ impl NativeFreshnessDevice {
         Ok(())
     }
 
-    fn check_group_authority(
+    fn check_group_validation_authority(
         &self,
         cx: &Cx,
         state: &NativeFreshnessState,
@@ -460,7 +504,7 @@ impl NativeFreshnessDevice {
         let baseline = &state.baseline;
         let tail = &baseline.storage.tails[index];
         let dev = self.device();
-        let owner = check_native_owner_prefix(
+        let owner = check_native_validation_owner_prefix(
             cx,
             &dev,
             &self.sb,
@@ -470,7 +514,6 @@ impl NativeFreshnessDevice {
         )?;
         if owner[OWNER_HEADER_BYTES..PLAN_HEADER_START]
             != state.tables[index][..VALIDATION_HEADER_BYTES]
-            || read_native_parity_intent(cx, &dev, &self.sb, baseline, tail)? != state.parity[index]
         {
             return Err(validation_error(
                 tail,
@@ -491,8 +534,91 @@ impl NativeFreshnessDevice {
                 "native validation authority changed",
             ));
         }
-        native_sealed_generation(cx, &dev, &self.sb, baseline, tail, false)?;
         Ok(())
+    }
+
+    fn check_group_authority(
+        &self,
+        cx: &Cx,
+        state: &NativeFreshnessState,
+        index: usize,
+        degraded_parity: bool,
+    ) -> Result<(), FfsError> {
+        self.check_group_validation_authority(cx, state, index)?;
+        if read_native_parity_intent(
+            cx,
+            &self.device(),
+            &self.sb,
+            &state.baseline,
+            &state.baseline.storage.tails[index],
+        )? != state.parity[index]
+        {
+            return Err(validation_error(
+                &state.baseline.storage.tails[index],
+                "native parity ownership changed during active epoch",
+            ));
+        }
+        native_sealed_generation(
+            cx,
+            &self.device(),
+            &self.sb,
+            &state.baseline,
+            &state.baseline.storage.tails[index],
+            degraded_parity,
+        )?;
+        Ok(())
+    }
+
+    fn inspect_clean_validation(
+        &self,
+        cx: &Cx,
+        state: &NativeFreshnessState,
+    ) -> Result<(), FfsError> {
+        if state.phase != FreshnessPhase::Clean {
+            return Err(freshness_error(
+                "read-only inspection requires a sealed clean epoch",
+            ));
+        }
+        self.check_plan(
+            cx,
+            &state.baseline,
+            ValidationIntent::Sealed(state.baseline.plan_root),
+        )?;
+        for (index, tail) in state.baseline.storage.tails.iter().enumerate() {
+            self.check_group_validation_authority(cx, state, index)?;
+            verify_validation_table(
+                cx,
+                &self.device(),
+                &self.sb,
+                tail,
+                &state.tables[index],
+                &state.baseline.roots[index],
+            )?;
+        }
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)
+    }
+
+    fn inspect_validation(&self, cx: &Cx) -> Result<NativeValidationReport, FfsError> {
+        let state = self.lock(cx)?;
+        self.inspect_clean_validation(cx, &state)?;
+        native_validation_report(&self.sb, &state.baseline.storage)
+    }
+
+    fn inspect_repair(&self, cx: &Cx) -> Result<NativeRepairReport, FfsError> {
+        let state = self.lock(cx)?;
+        self.inspect_clean_validation(cx, &state)?;
+        for index in 0..state.baseline.storage.tails.len() {
+            self.check_group_authority(cx, &state, index, false)?;
+        }
+        native_repair_report(
+            &self.sb,
+            &state.baseline,
+            state
+                .parity
+                .iter()
+                .map(|intent| intent.generation())
+                .collect(),
+        )
     }
 
     fn check_authority(&self, cx: &Cx, state: &NativeFreshnessState) -> Result<(), FfsError> {
@@ -504,9 +630,179 @@ impl NativeFreshnessDevice {
         };
         self.check_plan(cx, &state.baseline, intent)?;
         for index in 0..state.baseline.storage.tails.len() {
-            self.check_group_authority(cx, state, index)?;
+            self.check_group_authority(cx, state, index, false)?;
         }
         Ok(())
+    }
+
+    fn check_read_repair_authority(
+        &self,
+        cx: &Cx,
+        state: &NativeFreshnessState,
+        index: usize,
+    ) -> Result<(), FfsError> {
+        self.check_plan(
+            cx,
+            &state.baseline,
+            ValidationIntent::Sealed(state.baseline.plan_root),
+        )?;
+        self.check_group_authority(cx, state, index, true)
+    }
+
+    /// Restore a clean generation without changing its source authority. The
+    /// caller holds the freshness lock, excluding writes and epoch publication.
+    fn repair_clean_read(
+        &self,
+        cx: &Cx,
+        state: &mut NativeFreshnessState,
+        block: BlockNumber,
+    ) -> Result<(), FfsError> {
+        if state.phase != FreshnessPhase::Clean {
+            return Err(FfsError::Corruption {
+                block: block.0,
+                detail: "native read digest mismatch; dirty epochs cannot use stale parity".into(),
+            });
+        }
+        let baseline = &state.baseline;
+        let tail = native_target(&baseline.storage, block)?;
+        let index = tail.group.0 as usize;
+        native_codec_budget(&self.sb, &baseline.storage, tail, self.codec_budget, true)?;
+        self.check_read_repair_authority(cx, state, index)?;
+        let dev = self.device();
+        let table = &state.tables[index];
+        let corrupt = native_corrupt_indices(cx, &dev, &self.sb, tail, table)?;
+        let requested =
+            u32::try_from(block.0 - tail.group_start.0).expect("admitted native source index");
+        if !corrupt.contains(&requested) {
+            return Err(validation_error(
+                tail,
+                "read repair target changed before decoding",
+            ));
+        }
+        let view = NativeDigestDevice {
+            dev: &dev,
+            tail,
+            table,
+            corrupt: &corrupt,
+        };
+        let capture = NativeReconstructionCapture {
+            blocks: OnceCell::new(),
+        };
+        let (layout, expected) = native_layout(&self.sb, tail)?;
+        let result = GroupRecoveryOrchestrator::new_with_writeback(
+            &view,
+            &capture,
+            self.sb.uuid,
+            layout,
+            tail.group_start,
+            u32::from(expected.source_block_count),
+        )?
+        .with_decoded_block_validator(&view)
+        .recover_from_indices(cx, &corrupt);
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if !result.is_success() || result.evidence.generation != state.parity[index].generation() {
+            return Err(FfsError::RepairFailed(format!(
+                "native read reconstruction failed: {:?}",
+                result.evidence.reason
+            )));
+        }
+        let recovered = capture.blocks.into_inner().ok_or_else(|| {
+            validation_error(tail, "native read reconstruction produced no capture")
+        })?;
+        // All intact inputs and the complete compare gate must still agree
+        // before the first source write, not merely when the decoder read them.
+        for source in 0..u32::from(expected.source_block_count) {
+            view.read_block(cx, BlockNumber(tail.group_start.0 + u64::from(source)))?;
+        }
+        for recovered in &recovered {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if dev.read_block(cx, recovered.block)?.as_slice() != recovered.expected_current {
+                return Err(validation_error(tail, "native read repair target changed"));
+            }
+            self.ownership.check(recovered.block, &recovered.data)?;
+        }
+        self.check_read_repair_authority(cx, state, index)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+
+        // Restoration writes only already-attested bytes. It neither creates
+        // a Dirty epoch nor derives new digests from the damaged device. Any
+        // failure from this point leaves durability ambiguous and poisons the
+        // live handle, including cancellation after a partial write or sync.
+        state.phase = FreshnessPhase::Poisoned;
+        for recovered in &recovered {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            dev.write_block(cx, recovered.block, &recovered.data)?;
+        }
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        self.inner.sync(cx)?;
+        verify_validation_table(cx, &dev, &self.sb, tail, table, &baseline.roots[index])?;
+        self.check_read_repair_authority(cx, state, index)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        state.phase = FreshnessPhase::Clean;
+        Ok(())
+    }
+
+    fn read_verified(&self, cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> Result<(), FfsError> {
+        let mut state = self.lock(cx)?;
+        let end = offset
+            .0
+            .checked_add(bytes.len() as u64)
+            .filter(|end| *end <= self.inner.len_bytes())
+            .ok_or_else(|| freshness_error("read exceeds admitted image"))?;
+        let size = u64::from(self.sb.block_size);
+        let mut cursor = offset.0;
+        let mut repaired = false;
+        let result = (|| {
+            while cursor < end {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                let block = BlockNumber(cursor / size);
+                let start = (cursor % size) as usize;
+                let count = (end - cursor).min(size - cursor % size) as usize;
+                let output = (cursor - offset.0) as usize;
+                if let Some(tail) = native_source_tail(&state.baseline.storage, block) {
+                    let digest_offset =
+                        VALIDATION_HEADER_BYTES + (block.0 - tail.group_start.0) as usize * 32;
+                    let expected: [u8; 32] =
+                        state.intended.get(&block).copied().unwrap_or_else(|| {
+                            state.tables[tail.group.0 as usize][digest_offset..digest_offset + 32]
+                                .try_into()
+                                .expect("admitted native source digest")
+                        });
+                    let mut data = self.device().read_block(cx, block)?;
+                    if blake3::hash(data.as_slice()).as_bytes() != &expected {
+                        self.repair_clean_read(cx, &mut state, block)?;
+                        repaired = true;
+                        data = self.device().read_block(cx, block)?;
+                        if blake3::hash(data.as_slice()).as_bytes() != &expected {
+                            state.phase = FreshnessPhase::Poisoned;
+                            return Err(FfsError::Corruption {
+                                block: block.0,
+                                detail: "native read repair changed after durable verification"
+                                    .into(),
+                            });
+                        }
+                    }
+                    bytes[output..output + count]
+                        .copy_from_slice(&data.as_slice()[start..start + count]);
+                } else {
+                    // Owned control/parity tails and uncovered bytes (including
+                    // ext4's 1 KiB boot block) retain their physical-read contract.
+                    // Their consumers validate their own headers and authority;
+                    // these bytes are never admitted as source-repair targets.
+                    self.inner.read_exact_at(
+                        cx,
+                        ByteOffset(cursor),
+                        &mut bytes[output..output + count],
+                    )?;
+                }
+                cursor += count as u64;
+            }
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)
+        })();
+        if result.is_err() && repaired {
+            state.phase = FreshnessPhase::Poisoned;
+        }
+        result
     }
 
     fn stage_intended(
@@ -680,7 +976,7 @@ impl NativeFreshnessDevice {
         let dev = self.device();
         for (index, tail) in next.storage.tails.iter().enumerate() {
             self.check_plan(cx, next, ValidationIntent::Pending(next.plan_root))?;
-            self.check_group_authority(cx, state, index)?;
+            self.check_group_authority(cx, state, index, false)?;
             let validation = ValidationAdmission {
                 epoch: next.epoch,
                 root: next.roots[index],
@@ -863,7 +1159,7 @@ impl ByteDevice for NativeFreshnessDevice {
     }
 
     fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> Result<(), FfsError> {
-        self.inner.read_exact_at(cx, offset, bytes)
+        self.read_verified(cx, offset, bytes)
     }
 
     fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> Result<(), FfsError> {
@@ -997,6 +1293,25 @@ fn check_native_owner_prefix(
     generation: u32,
     tail: &NativeRepairTail,
 ) -> Result<Vec<u8>, FfsError> {
+    let bytes = check_native_validation_owner_prefix(cx, dev, sb, storage, generation, tail)?;
+    parity_intent(
+        &bytes[PARITY_HEADER_START..PARITY_HEADER_END],
+        sb,
+        storage,
+        generation,
+        tail,
+    )?;
+    Ok(bytes)
+}
+
+fn check_native_validation_owner_prefix(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    tail: &NativeRepairTail,
+) -> Result<Vec<u8>, FfsError> {
     let bytes = dev.read_block(cx, tail.start)?.into_inner();
     let expected = owner_header(
         sb,
@@ -1019,13 +1334,6 @@ fn check_native_owner_prefix(
         &bytes[OWNER_HEADER_BYTES..PLAN_HEADER_START],
         sb,
         storage.owner_inode,
-        generation,
-        tail,
-    )?;
-    parity_intent(
-        &bytes[PARITY_HEADER_START..PARITY_HEADER_END],
-        sb,
-        storage,
         generation,
         tail,
     )?;
@@ -1466,13 +1774,23 @@ fn native_target(
     storage: &NativeRepairStorage,
     block: BlockNumber,
 ) -> Result<&NativeRepairTail, FfsError> {
-    storage
+    native_source_tail(storage, block).ok_or_else(|| {
+        FfsError::RepairFailed("requested block is outside native source coverage".into())
+    })
+}
+
+fn native_source_tail(
+    storage: &NativeRepairStorage,
+    block: BlockNumber,
+) -> Option<&NativeRepairTail> {
+    // Admission orders tails by group. Avoid scanning every group for every
+    // block in the physical read path on large images.
+    let index = storage
         .tails
-        .iter()
-        .find(|tail| block.0 >= tail.group_start.0 && block.0 < tail.start.0)
-        .ok_or_else(|| {
-            FfsError::RepairFailed("requested block is outside native source coverage".into())
-        })
+        .partition_point(|tail| tail.group_start.0 <= block.0)
+        .checked_sub(1)?;
+    let tail = &storage.tails[index];
+    (block.0 < tail.start.0).then_some(tail)
 }
 
 fn read_native_parity_intent(
@@ -1627,6 +1945,21 @@ fn native_codec_budget(
         .and_then(|bytes| bytes.checked_add(storage.tails.len() as u64 * 4096))
         .and_then(|bytes| bytes.checked_add(u64::from(sb.block_size) * 16))
         .ok_or_else(|| validation_error(tail, "native resource estimate overflows"))?;
+    let metadata = if decoding {
+        // The codec estimate excludes caller-owned allocations. The recovery
+        // orchestrator retains beforeimages and decoded blocks while capture
+        // copies both; charge four payloads plus headers/indices per source.
+        // Beforeimages are captured before the redundancy feasibility check,
+        // so this must cover every source, not only the parity symbol count.
+        u64::from(sb.block_size)
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(256))
+            .and_then(|bytes| bytes.checked_mul(u64::from(sources)))
+            .and_then(|bytes| bytes.checked_add(metadata))
+            .ok_or_else(|| validation_error(tail, "native recovery capture estimate overflows"))?
+    } else {
+        metadata
+    };
     let budget = allowed.checked_sub(metadata).ok_or_else(|| {
         validation_error(tail, "native working budget is below metadata estimate")
     })?;
@@ -2015,8 +2348,15 @@ impl BlockValidator for NativeDigestDevice<'_> {
 }
 
 #[derive(Debug)]
+struct NativeRecoveredBlock {
+    block: BlockNumber,
+    expected_current: Vec<u8>,
+    data: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct NativeReconstructionCapture {
-    blocks: OnceCell<Vec<(BlockNumber, Vec<u8>)>>,
+    blocks: OnceCell<Vec<NativeRecoveredBlock>>,
 }
 
 impl RecoveryWriteback for NativeReconstructionCapture {
@@ -2034,7 +2374,11 @@ impl RecoveryWriteback for NativeReconstructionCapture {
                     "native reconstruction target changed during decode".into(),
                 ));
             }
-            captured.push((block.block, block.data.to_vec()));
+            captured.push(NativeRecoveredBlock {
+                block: block.block,
+                expected_current: block.expected_current.to_vec(),
+                data: block.data.to_vec(),
+            });
         }
         self.blocks
             .set(captured)
@@ -2484,7 +2828,10 @@ impl OpenFs {
         Ok(constraints)
     }
 
-    /// Admit sealed native protection and fence all subsequent source writes.
+    /// Admit sealed native protection, verify reads and fence source writes.
+    /// Clean-epoch readable source corruption is automatically reconstructed,
+    /// synced and verified within the admitted resource budget. Dirty epochs
+    /// validate intended bytes without falling back to stale parity.
     /// The caller must exclusively own the image and activate before recovery
     /// or writable operation. No unwrapped device handle is returned.
     ///
@@ -2498,7 +2845,7 @@ impl OpenFs {
     ) -> Result<NativeRepairReport, FfsError> {
         self.require_write_authority()?;
         self.require_native_mode("activate_native_repair")?;
-        if self.native_repair_active {
+        if self.native_repair_device.is_some() {
             return Err(freshness_error("device is already active"));
         }
         if self.ext4_replay_overlay {
@@ -2556,7 +2903,7 @@ impl OpenFs {
         }
         ensure_native_baseline(self, cx, &baseline)?;
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        self.dev = Arc::new(NativeFreshnessDevice {
+        let device = Arc::new(NativeFreshnessDevice {
             inner: Arc::clone(&self.dev),
             sb,
             state: NativeMutex::new(NativeFreshnessState {
@@ -2569,7 +2916,8 @@ impl OpenFs {
             codec_budget,
             ownership,
         });
-        self.native_repair_active = true;
+        self.dev = device.clone();
+        self.native_repair_device = Some(device);
         Ok(report)
     }
 
@@ -2629,6 +2977,9 @@ impl OpenFs {
     /// Refuses pending/missing authority, damaged or changed data and I/O errors.
     pub fn check_native_ext4_repair(&self, cx: &Cx) -> Result<NativeRepairReport, FfsError> {
         self.require_native_mode("check_native_repair")?;
+        if let Some(device) = &self.native_repair_device {
+            return device.inspect_repair(cx);
+        }
         let baseline = read_native_baseline(self, cx)?;
         self.check_native_ext4_validation(cx)?;
         let sb = self
@@ -2655,6 +3006,8 @@ impl OpenFs {
     /// # Errors
     /// Refuses intact/non-source targets, missing or changed authority, resource
     /// excess, insufficient parity, invalid decoded bytes, cancellation and I/O.
+    /// Active native devices are refused before I/O: their ordinary reads may
+    /// repair the image, which is incompatible with this offline export API.
     pub fn reconstruct_native_ext4_block(
         &self,
         cx: &Cx,
@@ -2662,6 +3015,11 @@ impl OpenFs {
         max_working_bytes: u64,
     ) -> Result<NativeReconstruction, FfsError> {
         self.require_native_mode("reconstruct_native_block")?;
+        if self.native_repair_device.is_some() {
+            return Err(freshness_error(
+                "offline reconstruction requires an inactive device",
+            ));
+        }
         let owned = self.native_ext4_repair_storage(cx)?;
         let selected = native_target(&owned, block)?;
         let sb = self
@@ -2740,7 +3098,7 @@ impl OpenFs {
             .ok_or_else(|| validation_error(tail, "native reconstruction produced no capture"))?;
         let data = captured
             .into_iter()
-            .find_map(|(number, bytes)| (number == block).then_some(bytes))
+            .find_map(|recovered| (recovered.block == block).then_some(recovered.data))
             .ok_or_else(|| validation_error(tail, "requested block missing from reconstruction"))?;
         Ok(NativeReconstruction {
             block,
@@ -2836,6 +3194,9 @@ impl OpenFs {
         cx: &Cx,
     ) -> Result<NativeValidationReport, FfsError> {
         self.require_native_mode("check_native_validation")?;
+        if let Some(device) = &self.native_repair_device {
+            return device.inspect_validation(cx);
+        }
         let storage = self.native_ext4_repair_storage(cx)?;
         let sb = self.ext4_superblock().expect("validated ext4 ownership");
         let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
@@ -3548,6 +3909,221 @@ impl OpenFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct NativeReadCountDevice {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl ByteDevice for NativeReadCountDevice {
+        fn len_bytes(&self) -> u64 {
+            1024
+        }
+
+        fn read_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ByteOffset,
+            bytes: &mut [u8],
+        ) -> Result<(), FfsError> {
+            if offset
+                .0
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|end| end > 1024)
+            {
+                return Err(FfsError::Format("test read is out of bounds".into()));
+            }
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            bytes.fill(0xA7);
+            Ok(())
+        }
+
+        fn write_all_at(
+            &self,
+            _cx: &Cx,
+            _offset: ByteOffset,
+            _bytes: &[u8],
+        ) -> Result<(), FfsError> {
+            Err(FfsError::ReadOnly)
+        }
+
+        fn sync(&self, _cx: &Cx) -> Result<(), FfsError> {
+            Err(FfsError::ReadOnly)
+        }
+    }
+
+    fn native_read_lock_fixture() -> (NativeFreshnessDevice, Arc<AtomicUsize>) {
+        // Only the physical intact-read/locking path is under test here. Real
+        // native fixtures in lib.rs separately admit ownership and parity.
+        let mut region = [0; 1024];
+        region[0x38..0x3A].copy_from_slice(&ffs_types::EXT4_SUPER_MAGIC.to_le_bytes());
+        let sb = Ext4Superblock::parse_superblock_region(&region).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut table = vec![0; 1024];
+        table[VALIDATION_HEADER_BYTES..VALIDATION_HEADER_BYTES + 32]
+            .copy_from_slice(blake3::hash(&[0xA7; 1024]).as_bytes());
+        let device = NativeFreshnessDevice {
+            inner: Arc::new(NativeReadCountDevice {
+                reads: Arc::clone(&reads),
+            }),
+            sb,
+            state: NativeMutex::new(NativeFreshnessState {
+                baseline: NativeBaseline {
+                    storage: NativeRepairStorage {
+                        owner_inode: InodeNumber(12),
+                        repair_basis_points: 500,
+                        tails: vec![NativeRepairTail {
+                            group: GroupNumber(0),
+                            group_start: BlockNumber(0),
+                            blocks_per_group: 6,
+                            start: BlockNumber(1),
+                            validation_blocks: 1,
+                            repair_blocks: 1,
+                        }],
+                    },
+                    owner_generation: 1,
+                    epoch: 1,
+                    plan_root: [0; 32],
+                    roots: vec![[0; 32]],
+                },
+                tables: vec![table],
+                parity: vec![ParityIntent::Sealed {
+                    generation: 1,
+                    source_root: [0; 32],
+                    manifest: [0; 32],
+                }],
+                intended: BTreeMap::new(),
+                phase: FreshnessPhase::Clean,
+            }),
+            codec_budget: 0,
+            ownership: NativeOwnershipConstraints {
+                blocks: BTreeMap::new(),
+                remaining_budget: 0,
+            },
+        };
+        (device, reads)
+    }
+
+    fn wait_for_native_readers(device: &NativeFreshnessDevice, count: usize) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while device.state.waiters() != count {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        true
+    }
+
+    #[test]
+    fn native_freshness_concurrent_reads_wait_for_shared_authority() {
+        let (device, reads) = native_read_lock_fixture();
+        let held = device.state.try_lock().unwrap();
+        std::thread::scope(|scope| {
+            let read = || {
+                let cx = Cx::for_testing();
+                let mut bytes = [0; 31];
+                device
+                    .read_exact_at(&cx, ByteOffset(17), &mut bytes)
+                    .map(|()| bytes)
+            };
+            let first = scope.spawn(read);
+            let second = scope.spawn(read);
+            let queued = wait_for_native_readers(&device, 2);
+            let before = reads.load(Ordering::SeqCst);
+            // Release before assertions, including failure paths, so scoped
+            // threads cannot remain blocked while unwinding a failed test.
+            drop(held);
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+            assert!(
+                queued,
+                "physical readers returned early instead of joining the mutex queue"
+            );
+            assert_eq!(before, 0, "queued read bypassed the held source authority");
+            assert_eq!(first.unwrap(), [0xA7; 31]);
+            assert_eq!(second.unwrap(), [0xA7; 31]);
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(device.state.waiters(), 0);
+    }
+
+    #[test]
+    fn native_freshness_waiting_read_cancellation_removes_mutex_waiter() {
+        let (device, reads) = native_read_lock_fixture();
+        let held = device.state.try_lock().unwrap();
+        let waiting_cx = Cx::for_testing();
+        std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let reader = &device;
+            let request = &waiting_cx;
+            let worker = scope.spawn(move || {
+                let result = reader.read_exact_at(request, ByteOffset(17), &mut [0; 31]);
+                sender.send(result).unwrap();
+            });
+            let queued = wait_for_native_readers(&device, 1);
+            waiting_cx.set_cancel_requested(true);
+            let cancelled_while_held = receiver.recv_timeout(Duration::from_secs(1));
+            let remaining = device.state.waiters();
+            let before = reads.load(Ordering::SeqCst);
+            drop(held);
+            worker.join().unwrap();
+            assert!(queued, "request did not join the mutex queue");
+            assert!(matches!(cancelled_while_held, Ok(Err(FfsError::Cancelled))));
+            assert_eq!(
+                remaining, 0,
+                "cancelled request left a queued or granted waiter"
+            );
+            assert_eq!(before, 0, "cancelled waiter performed physical I/O");
+        });
+        let mut bytes = [0; 31];
+        device
+            .read_exact_at(&Cx::for_testing(), ByteOffset(17), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [0xA7; 31]);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_freshness_decode_budget_includes_recovery_captures() {
+        let mut region = [0; 1024];
+        region[0x38..0x3A].copy_from_slice(&ffs_types::EXT4_SUPER_MAGIC.to_le_bytes());
+        let sb = Ext4Superblock::parse_superblock_region(&region).unwrap();
+        let storage = NativeRepairStorage {
+            owner_inode: InodeNumber(12),
+            repair_basis_points: 500,
+            tails: vec![NativeRepairTail {
+                group: GroupNumber(0),
+                group_start: BlockNumber(1),
+                blocks_per_group: 1124,
+                start: BlockNumber(1025),
+                validation_blocks: 33,
+                repair_blocks: 64,
+            }],
+        };
+        let tail = &storage.tails[0];
+        let encoder = direct_encode_workspace_bytes(1024, 1024, 64).unwrap();
+        let decoder = encoder * 8;
+        // 33 KiB validation capacity, one group and 16 temporary blocks.
+        let metadata = 155_648;
+        // Four 1 KiB copies and 256 bytes of bookkeeping for all 1024 sources.
+        let capture = 4_456_448;
+        assert_eq!(
+            native_codec_budget(&sb, &storage, tail, metadata + encoder, false).unwrap(),
+            encoder,
+            "encoding must not be charged for recovery captures"
+        );
+        assert!(native_codec_budget(&sb, &storage, tail, metadata + decoder, true).is_err());
+        assert!(
+            native_codec_budget(&sb, &storage, tail, metadata + capture + decoder - 1, true)
+                .is_err()
+        );
+        assert_eq!(
+            native_codec_budget(&sb, &storage, tail, metadata + capture + decoder, true).unwrap(),
+            decoder,
+            "exact capture-inclusive admission boundary must remain usable"
+        );
+    }
 
     #[test]
     fn native_owner_unwritten_extents_split_before_initialized_length_sentinel() {
