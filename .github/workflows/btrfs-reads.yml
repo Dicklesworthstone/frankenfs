@@ -54,6 +54,9 @@ jobs:
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_file_ -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_repair_tail_ -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_sdk_write_ -- --nocapture
+          cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc write_past_max_file_size_returns_efbig -- --nocapture
+          cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_write_at_the_last_logical_block_and_one_past_it -- --nocapture
+          cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_eager_concurrent_storm_is_consistent_bd_hyysq -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc writer_snapshot_reads_reject_newer_ancestors_and_preserve_staged_bytes -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_sharded_birth_cross_group_fallback_passes_native_checker -- --exact --nocapture
           cargo test -p ffs-core --locked --lib

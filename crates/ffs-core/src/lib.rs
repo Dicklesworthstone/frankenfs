@@ -34391,13 +34391,30 @@ impl OpenFs {
             // transaction, allocation and data blocks publish individually;
             // ENOSPC can leave mappings published before the final inode update.
             // Pin the ancestor until publication or error, including unwind.
-            let base = self.block_device_adapter();
-            let (tx, _snapshot_pin) =
-                RegisteredSnapshotBlockAdapter::begin(&base, &self.mvcc_store);
-            let mut write_scope = RequestScope::with_transaction(tx);
-            let written = self.ext4_write(cx, &mut write_scope, ino, offset, data)?;
-            self.commit_request_scope(cx, &mut write_scope)?;
-            return Ok(written);
+            const MAX_ATTEMPTS: u32 = 16;
+            let mut attempt = 0;
+            loop {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                attempt += 1;
+                let base = self.block_device_adapter();
+                let (tx, _snapshot_pin) =
+                    RegisteredSnapshotBlockAdapter::begin(&base, &self.mvcc_store);
+                let mut write_scope = RequestScope::with_transaction(tx);
+                let result = self
+                    .ext4_write(cx, &mut write_scope, ino, offset, data)
+                    .and_then(|written| {
+                        self.commit_request_scope(cx, &mut write_scope)?;
+                        Ok(written)
+                    });
+                match result {
+                    // Allocations or shared inode-table blocks can conflict
+                    // with another writer. A fresh attempt owns no published
+                    // bytes. Postcommit notification errors are RepairFailed,
+                    // so they must never reach this retry arm.
+                    Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => {}
+                    result => return result,
+                }
+            }
         }
 
         let alloc_mutex = self.require_alloc_state()?;
@@ -34454,6 +34471,14 @@ impl OpenFs {
             // Append-only: writes may only extend the file at EOF.
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
         }
+        let write_len = u64::try_from(data.len())
+            .map_err(|_| FfsError::Format("write length does not fit u64".into()))?;
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
+        // Validate before dispatch: compressed writes calculate cluster offsets
+        // and legacy writes otherwise bypass the extent path's size limit.
+        Self::ext4_reject_oversized_file(end, bs)?;
         // e2compr compressed write: route to cluster-based write path.
         //
         // The historic e2compr method field aliases the old compression flag
@@ -34498,12 +34523,6 @@ impl OpenFs {
                 self.ext4_count_extent_tree_meta_blocks(cx, scope, &Self::extent_root(&inode))?;
             let mut bytes_written = 0u32;
             let mut pos = offset;
-            let write_len = u64::try_from(data.len())
-                .map_err(|_| FfsError::Format("write length does not fit u64".into()))?;
-            let end = offset
-                .checked_add(write_len)
-                .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
-            Self::ext4_reject_oversized_file(end, bs)?;
 
             // Logical-block range [start, end) most recently allocated by this write
             // as a coalesced run (bd-bdro7). Blocks in it resolve as "written" on
@@ -98318,16 +98337,44 @@ mod tests {
         };
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
-        let ino = fs
-            .create(&cx, root, OsStr::new("bigwrite.txt"), 0o644, 0, 0)
-            .expect("create")
-            .ino;
-
-        // A write whose end offset exceeds the ext4 max file size is EFBIG.
-        let err = fs
-            .write(&cx, ino, 1 << 50, b"x")
-            .expect_err("write past the ext4 max file size must fail");
-        assert_eq!(err.to_errno(), libc::EFBIG);
+        let max = OpenFs::ext4_max_file_size(u64::from(fs.block_size()));
+        for layout in ["extent", "indirect", "compressed"] {
+            let name = format!("bigwrite-{layout}.txt");
+            let ino = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("create")
+                .ino;
+            match layout {
+                "indirect" => {
+                    let mut inode = fs.read_inode(&cx, ino).unwrap();
+                    inode.flags &= !ffs_types::EXT4_EXTENTS_FL;
+                    inode.extent_bytes.fill(0);
+                    fs.persist_ext4_inode_for_testing(&cx, ino, &inode).unwrap();
+                }
+                "compressed" => enable_e2compr_for_inode(&fs, &cx, ino, 2, 20),
+                _ => {}
+            }
+            let before = fs.current_snapshot();
+            let inode = fs.read_inode(&cx, ino).unwrap();
+            let counts = fs.statfs(&cx, root).unwrap();
+            for (offset, errno) in [
+                (1 << 50, libc::EFBIG),
+                (max, libc::EFBIG),
+                (u64::MAX, libc::EINVAL),
+            ] {
+                let error = fs.write(&cx, ino, offset, b"x").unwrap_err();
+                assert_eq!(error.to_errno(), errno, "layout={layout} offset={offset}");
+                assert_eq!(fs.current_snapshot(), before);
+                assert_eq!(fs.read_inode(&cx, ino).unwrap(), inode);
+                assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                assert!(fs.try_close_mutation_gate().is_some());
+            }
+            assert_eq!(fs.write(&cx, ino, u64::MAX, &[]).unwrap(), 0);
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.write(&cx, ino, 0, b"ok").unwrap(), 2);
+            assert_eq!(fs.read(&cx, ino, 0, 2).unwrap(), b"ok");
+        }
     }
 
     #[test]
@@ -103067,6 +103114,42 @@ mod tests {
             fs.end_request_scope(&cx, RequestOp::Read, fresh).unwrap();
             assert_eq!(fs.mvcc_active_snapshot_count(), 0);
         }
+    }
+
+    #[test]
+    fn ext4_sdk_write_does_not_retry_a_postcommit_notification_conflict() {
+        #[derive(Debug)]
+        struct ConflictingNotification;
+        impl RepairFlushLifecycle for ConflictingNotification {
+            fn on_flush_committed(
+                &self,
+                _cx: &Cx,
+                _blocks: &[BlockNumber],
+            ) -> ffs_error::Result<()> {
+                Err(FfsError::MvccConflict { tx: 0, block: 0 })
+            }
+        }
+
+        let (mut fs, _dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+            .expect("SDK notification regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let ino = fs
+            .create(&cx, InodeNumber(2), OsStr::new("notify-write"), 0o644, 0, 0)
+            .unwrap()
+            .ino;
+        fs.attach_repair_flush_lifecycle(Arc::new(ConflictingNotification));
+        let before = fs.current_snapshot();
+        let payload = [0xC9; 17];
+        let error = fs.write(&cx, ino, 0, &payload).unwrap_err();
+        assert!(
+            matches!(error, FfsError::RepairFailed(ref detail)
+            if detail.contains("already committed")),
+            "{error:?}"
+        );
+        assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+        assert_eq!(fs.read(&cx, ino, 0, 64).unwrap(), payload);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        assert!(fs.try_close_mutation_gate().is_some());
     }
 
     #[test]
