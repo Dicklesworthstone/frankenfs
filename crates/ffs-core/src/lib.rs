@@ -26610,7 +26610,7 @@ impl OpenFs {
         for i in 0..blocks_needed {
             let hint = self.numa_allocation_hint(
                 &alloc.geo,
-                AllocHint::default(),
+                Self::ext4_file_allocation_hint(&alloc.geo, ino, None),
                 "ext4_compressed_cluster",
                 Some(ino),
             );
@@ -26726,7 +26726,7 @@ impl OpenFs {
 
             let hint = self.numa_allocation_hint(
                 &alloc.geo,
-                AllocHint::default(),
+                Self::ext4_file_allocation_hint(&alloc.geo, ino, None),
                 "ext4_uncompressed_cluster",
                 Some(ino),
             );
@@ -28032,6 +28032,24 @@ impl OpenFs {
     /// Last physical block after an extent (for allocation hint).
     fn extent_end_hint(ext: &Ext4Extent) -> BlockNumber {
         BlockNumber(ext.physical_start + u64::from(ext.actual_len()))
+    }
+
+    /// Start a file's data beside its inode, then follow its physical extent
+    /// goal. An explicit group takes precedence over `goal_block` in mballoc,
+    /// so retaining the inode group after the first allocation would defeat
+    /// contiguous growth when that allocation falls back to another group.
+    fn ext4_file_allocation_hint(
+        geo: &FsGeometry,
+        ino: InodeNumber,
+        goal_block: Option<BlockNumber>,
+    ) -> AllocHint {
+        AllocHint {
+            goal_group: goal_block
+                .is_none()
+                .then(|| ffs_types::inode_to_group(ino, geo.inodes_per_group)),
+            goal_block,
+            ..AllocHint::default()
+        }
     }
 
     fn runtime_numa_now_secs() -> u64 {
@@ -33318,7 +33336,7 @@ impl OpenFs {
                         // direct pointer i_block[0], as ext4_symlink maps it.
                         let hint = self.numa_allocation_hint(
                             geo,
-                            AllocHint::default(),
+                            Self::ext4_file_allocation_hint(geo, ino, None),
                             "ext4_symlink",
                             Some(ino),
                         );
@@ -33353,7 +33371,7 @@ impl OpenFs {
                         let mut root_bytes = Self::extent_root(&inode);
                         let hint = self.numa_allocation_hint(
                             geo,
-                            AllocHint::default(),
+                            Self::ext4_file_allocation_hint(geo, ino, None),
                             "ext4_symlink",
                             Some(ino),
                         );
@@ -33955,10 +33973,7 @@ impl OpenFs {
                             let chunk = remaining.min(want);
                             let hint = self.numa_allocation_hint(
                                 &alloc.geo,
-                                AllocHint {
-                                    goal_block,
-                                    ..AllocHint::default()
-                                },
+                                Self::ext4_file_allocation_hint(&alloc.geo, ino, goal_block),
                                 "ext4_fallocate",
                                 Some(ino),
                             );
@@ -34134,10 +34149,7 @@ impl OpenFs {
                         let chunk = remaining.min(want);
                         let hint = self.numa_allocation_hint(
                             &alloc.geo,
-                            AllocHint {
-                                goal_block,
-                                ..AllocHint::default()
-                            },
+                            Self::ext4_file_allocation_hint(&alloc.geo, ino, goal_block),
                             "ext4_fallocate",
                             Some(ino),
                         );
@@ -34512,10 +34524,11 @@ impl OpenFs {
 
                         let hint = self.numa_allocation_hint(
                             &alloc.geo,
-                            AllocHint {
-                                goal_block: extents.last().map(Self::extent_end_hint),
-                                ..AllocHint::default()
-                            },
+                            Self::ext4_file_allocation_hint(
+                                &alloc.geo,
+                                ino,
+                                extents.last().map(Self::extent_end_hint),
+                            ),
                             "ext4_write",
                             Some(ino),
                         );
@@ -34854,7 +34867,7 @@ impl OpenFs {
                     let data_block = {
                         let hint = self.numa_allocation_hint(
                             &alloc.geo,
-                            AllocHint::default(),
+                            Self::ext4_file_allocation_hint(&alloc.geo, ino, None),
                             "ext4_write_indirect",
                             Some(ino),
                         );
@@ -35152,7 +35165,7 @@ impl OpenFs {
                             let data_block = {
                                 let hint = self.numa_allocation_hint(
                                     &alloc.geo,
-                                    AllocHint::default(),
+                                    Self::ext4_file_allocation_hint(&alloc.geo, ino, None),
                                     "ext4_fallocate_indirect",
                                     Some(ino),
                                 );
@@ -53193,6 +53206,29 @@ mod tests {
             first_inode: 11,
             cluster_ratio: 1,
         }
+    }
+
+    #[test]
+    fn ext4_file_allocation_follows_physical_goal_after_fallback() {
+        let geo = numa_test_geometry();
+        let ino = InodeNumber(u64::from(geo.inodes_per_group) * 3 + 1);
+        let first = OpenFs::ext4_file_allocation_hint(&geo, ino, None);
+        assert_eq!(
+            ffs_alloc::allocation_group_order(&geo, &first).unwrap()[0],
+            GroupNumber(3),
+            "an empty file should begin in its inode's group"
+        );
+
+        // A full inode group may place the first extent elsewhere. Its next
+        // block must stay next to that extent, rather than jumping back.
+        let next = BlockNumber(u64::from(geo.first_data_block + geo.blocks_per_group) + 17);
+        let continuation = OpenFs::ext4_file_allocation_hint(&geo, ino, Some(next));
+        assert_eq!(continuation.goal_block, Some(next));
+        assert_eq!(
+            ffs_alloc::allocation_group_order(&geo, &continuation).unwrap()[0],
+            GroupNumber(1),
+            "a physical continuation takes precedence over inode locality"
+        );
     }
 
     fn numa_required_consumers() -> Vec<String> {
@@ -75084,6 +75120,129 @@ mod tests {
             assert_eq!(fs.lookup(&cx, dir.ino, OsStr::new(&name)).unwrap().ino, ino);
         }
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn ext4_file_initial_data_uses_inode_group_on_native_image() {
+        use std::io::{Seek as _, Write as _};
+
+        let image = std::env::temp_dir().join(format!(
+            "ffs-file-locality-{}-{}.ext4",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let mut output = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&image)
+            .unwrap();
+        output.set_len(32 * 1024 * 1024).unwrap();
+        let made = std::process::Command::new("mkfs.ext4")
+            .args(["-F", "-b", "1024", "-g", "1024"])
+            .arg(&image)
+            .output()
+            .expect("mkfs must execute");
+        assert!(made.status.success(), "mkfs: {made:?}");
+        let dev = TestDevice::from_vec(std::fs::read(&image).unwrap());
+        let cx = Cx::for_testing();
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+        fs.enable_writes(&cx).unwrap();
+        fs.set_bhh0i_sharded_ops(false);
+        let root = InodeNumber(2);
+        let parent = fs
+            .mkdir(&cx, root, OsStr::new("local"), 0o755, 0, 0)
+            .unwrap();
+        let geo = FsGeometry::from_superblock(fs.ext4_superblock().unwrap());
+        let group = ffs_types::inode_to_group(parent.ino, geo.inodes_per_group);
+        assert_ne!(group, GroupNumber(0), "Orlov must exercise a nonzero group");
+        let mut files = Vec::new();
+        for (name, mode) in [
+            ("write", None),
+            ("preallocate", Some(0)),
+            ("zero-range", Some(libc::FALLOC_FL_ZERO_RANGE)),
+        ] {
+            let file = fs
+                .create(&cx, parent.ino, OsStr::new(name), 0o644, 0, 0)
+                .unwrap();
+            assert_eq!(
+                ffs_types::inode_to_group(file.ino, geo.inodes_per_group),
+                group
+            );
+            if let Some(mode) = mode {
+                fs.fallocate(&cx, file.ino, 0, 1024, mode).unwrap();
+            } else {
+                fs.write(&cx, file.ino, 0, &[0x5a; 1024]).unwrap();
+            }
+            let inode = fs.read_inode(&cx, file.ino).unwrap();
+            let extents = fs.collect_extents(&cx, &inode).unwrap();
+            let actual = geo
+                .absolute_to_group_block(BlockNumber(extents[0].physical_start))
+                .0;
+            assert_eq!(
+                actual, group,
+                "{name}: initial data must follow inode locality"
+            );
+            files.push((name, file.ino, mode.is_none()));
+        }
+        let target = "x".repeat(80);
+        let symlink = fs
+            .symlink(
+                &cx,
+                parent.ino,
+                OsStr::new("link"),
+                Path::new(&target),
+                0,
+                0,
+            )
+            .unwrap();
+        let inode = fs.read_inode(&cx, symlink.ino).unwrap();
+        let extents = fs.collect_extents(&cx, &inode).unwrap();
+        assert_eq!(
+            geo.absolute_to_group_block(BlockNumber(extents[0].physical_start))
+                .0,
+            group,
+            "slow symlink data must follow inode locality"
+        );
+
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        let bytes = dev.snapshot_bytes();
+        let digest = blake3::hash(&bytes);
+        output.rewind().unwrap();
+        output.write_all(&bytes).unwrap();
+        output.sync_all().unwrap();
+        let (clean, report) = run_e2fsck(&image).expect("native checker must execute");
+        assert!(
+            clean,
+            "native checker must accept allocation locality:\n{report}"
+        );
+        assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), digest);
+        let reopened =
+            OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(bytes)), &options).unwrap();
+        for (name, ino, written) in files {
+            let expected = vec![if written { 0x5a } else { 0 }; 1024];
+            assert_eq!(
+                reopened.read(&cx, ino, 0, 1024).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            reopened.readlink(&cx, symlink.ino).unwrap(),
+            target.as_bytes()
+        );
+        println!(
+            "retained allocation-locality image: {}\n{report}",
+            image.display()
+        );
     }
 
     #[cfg(feature = "bhh0i_sharded_alloc")]
