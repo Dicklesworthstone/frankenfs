@@ -20710,7 +20710,7 @@ impl OpenFs {
 
     /// Read the block allocation bitmap for a group.
     ///
-    /// Returns the raw bitmap bytes, including undefined bytes for lazy groups.
+    /// Returns raw bitmap bytes. Lazy-group allocation bits are undefined.
     /// Each bit represents a block, or a cluster with BIGALLOC. Use
     /// [`Self::count_free_blocks_in_group`] for a logical free-block count.
     ///
@@ -20754,7 +20754,8 @@ impl OpenFs {
     ///
     /// Returns the raw bitmap bytes. The bitmap has one bit per inode in the
     /// group. A 0 bit indicates a free inode, a 1 bit indicates an allocated
-    /// inode.
+    /// inode, except that lazy-group bits are undefined. Use
+    /// [`Self::count_free_inodes_in_group`] for a logical count.
     ///
     /// # Errors
     ///
@@ -20787,17 +20788,13 @@ impl OpenFs {
         Ok(bitmap)
     }
 
-    /// Count free blocks in a specific group by reading and analyzing the bitmap.
-    ///
-    /// Initialized groups are counted from bitmap bits; authenticated lazy
-    /// groups use their metadata reservations instead of undefined bitmap bytes.
-    /// BIGALLOC cluster bits are converted to physical blocks, bounded by the
-    /// actual size of the last group. Inspection never initializes a bitmap.
-    ///
-    /// # Errors
-    ///
-    /// Returns `FfsError::Format` if this is not an ext4 filesystem.
-    pub fn count_free_blocks_in_group(&self, cx: &Cx, group: GroupNumber) -> Result<u32, FfsError> {
+    /// Observe bitmap state while excluding initialization by either allocator.
+    fn with_ext4_bitmap_view<T>(
+        &self,
+        cx: &Cx,
+        group: GroupNumber,
+        read: impl FnOnce(&FsGeometry, u16) -> Result<T, FfsError>,
+    ) -> Result<T, FfsError> {
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
@@ -20808,7 +20805,6 @@ impl OpenFs {
                 "ext4 group is out of range".into(),
             ));
         }
-        let blocks_in_group = geo.blocks_in_group(group);
         // Writers acquire the whole allocator before a group record. Keep both
         // guards through the bitmap read: a deferred descriptor may still say
         // UNINIT after either allocator family committed a real allocation.
@@ -20830,47 +20826,74 @@ impl OpenFs {
             None
         };
         let gd = self.read_group_desc(cx, group)?;
-        let uninitialized = gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT != 0
-            && sb.group_desc_checksum_kind() != ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None
-            && alloc.as_ref().is_none_or(|state| {
-                state
-                    .groups
-                    .get(index)
-                    .is_some_and(GroupStats::block_bitmap_uninit)
-            });
+        let mut uninitialized = if sb.group_desc_checksum_kind()
+            == ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None
+        {
+            0
+        } else {
+            gd.flags
+                & (ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT | ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT)
+        };
+        if let Some(state) = alloc.as_ref() {
+            uninitialized &= state.groups.get(index).map_or(0, |stats| stats.flags);
+        }
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        let uninitialized = uninitialized
-            && sharded
-                .as_ref()
-                .is_none_or(|stats| stats.block_bitmap_uninit());
-        if uninitialized {
-            let first = u64::from(geo.first_data_block)
-                + u64::from(group.0) * u64::from(geo.blocks_per_group);
-            let reserved = self.ext4_allocated_blocks_in_range(
-                cx,
-                group,
-                first,
-                first + u64::from(blocks_in_group),
-            )?;
-            return u32::try_from(u64::from(blocks_in_group) - reserved)
-                .map_err(|_| FfsError::InvalidGeometry("free-block count overflow".into()));
+        if let Some(stats) = sharded.as_ref() {
+            uninitialized &= stats.flags;
         }
-        let bitmap = self.read_block_bitmap(cx, group)?;
-        let ratio = geo.cluster_ratio.max(1);
-        if u64::from(blocks_in_group.div_ceil(ratio)) > bitmap.len() as u64 * 8 {
-            return Err(FfsError::InvalidGeometry(
-                "ext4 allocation bitmap is truncated".into(),
-            ));
-        }
-        let full_clusters = blocks_in_group / ratio;
-        let mut free = bitmap_count_free(&bitmap, full_clusters) * ratio;
-        if !blocks_in_group.is_multiple_of(ratio) && !bitmap_get(&bitmap, full_clusters) {
-            free += blocks_in_group % ratio;
-        }
+        let result = read(&geo, uninitialized);
         #[cfg(feature = "bhh0i_sharded_alloc")]
         drop(sharded);
         drop(alloc);
-        Ok(free)
+        result
+    }
+
+    /// Count free blocks in a specific group by reading and analyzing the bitmap.
+    ///
+    /// Initialized groups are counted from bitmap bits; authenticated lazy
+    /// groups use their metadata reservations instead of undefined bitmap bytes.
+    /// BIGALLOC cluster bits are converted to physical blocks, bounded by the
+    /// actual size of the last group. Inspection never initializes a bitmap.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FfsError::Format` if this is not an ext4 filesystem.
+    pub fn count_free_blocks_in_group(&self, cx: &Cx, group: GroupNumber) -> Result<u32, FfsError> {
+        self.with_ext4_bitmap_view(cx, group, |geo, flags| {
+            let blocks_in_group = geo.blocks_in_group(group);
+            if u64::from(geo.blocks_per_group.div_ceil(geo.cluster_ratio.max(1)))
+                > u64::from(geo.block_size) * 8
+            {
+                return Err(FfsError::InvalidGeometry(
+                    "ext4 allocation bitmap cannot represent the group".into(),
+                ));
+            }
+            if flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT != 0 {
+                let first = u64::from(geo.first_data_block)
+                    + u64::from(group.0) * u64::from(geo.blocks_per_group);
+                let reserved = self.ext4_allocated_blocks_in_range(
+                    cx,
+                    group,
+                    first,
+                    first + u64::from(blocks_in_group),
+                )?;
+                return u32::try_from(u64::from(blocks_in_group) - reserved)
+                    .map_err(|_| FfsError::InvalidGeometry("free-block count overflow".into()));
+            }
+            let bitmap = self.read_block_bitmap(cx, group)?;
+            let ratio = geo.cluster_ratio.max(1);
+            if u64::from(blocks_in_group.div_ceil(ratio)) > bitmap.len() as u64 * 8 {
+                return Err(FfsError::InvalidGeometry(
+                    "ext4 allocation bitmap is truncated".into(),
+                ));
+            }
+            let full_clusters = blocks_in_group / ratio;
+            let mut free = bitmap_count_free(&bitmap, full_clusters) * ratio;
+            if !blocks_in_group.is_multiple_of(ratio) && !bitmap_get(&bitmap, full_clusters) {
+                free += blocks_in_group % ratio;
+            }
+            Ok(free)
+        })
     }
 
     /// Length of the longest contiguous run of free blocks anywhere in the
@@ -21030,6 +21053,12 @@ impl OpenFs {
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
         let geo = FsGeometry::from_superblock(sb);
+        let required_units = geo.blocks_per_group.div_ceil(geo.cluster_ratio.max(1));
+        if u64::from(required_units) > u64::from(geo.block_size) * 8 {
+            return Err(FfsError::InvalidGeometry(
+                "ext4 allocation bitmap cannot represent the group".into(),
+            ));
+        }
         let group_start =
             u64::from(geo.first_data_block) + u64::from(group.0) * u64::from(geo.blocks_per_group);
         let group_end = group_start.saturating_add(u64::from(geo.blocks_in_group(group)));
@@ -21063,7 +21092,7 @@ impl OpenFs {
         } else {
             let bitmap = self.read_block_vec(cx, BlockNumber(gd.block_bitmap))?;
             let bitmap_units = Self::block_bitmap_units_per_group(&geo);
-            if u64::from(bitmap_units) > bitmap.len() as u64 * 8 {
+            if u64::from(required_units) > bitmap.len() as u64 * 8 {
                 return Err(FfsError::InvalidGeometry(
                     "ext4 allocation bitmap cannot represent the group".into(),
                 ));
@@ -21148,23 +21177,37 @@ impl OpenFs {
 
     /// Count free inodes in a specific group by reading and analyzing the bitmap.
     ///
-    /// This reads the inode bitmap from disk and counts zero bits (free inodes).
-    /// For the last group, only the bits corresponding to actual inodes are
-    /// counted.
+    /// Initialized bitmap bits remain authoritative. Authenticated lazy groups
+    /// contain only free inodes, irrespective of their undefined bitmap bytes.
+    /// Counts exclude padding beyond the last group's actual inode capacity.
     ///
     /// # Errors
     ///
     /// Returns `FfsError::Format` if this is not an ext4 filesystem.
     pub fn count_free_inodes_in_group(&self, cx: &Cx, group: GroupNumber) -> Result<u32, FfsError> {
-        let sb = self
-            .ext4_superblock()
-            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-
-        let geo = FsGeometry::from_superblock(sb);
-        let inodes_in_group = geo.inodes_in_group(group);
-
-        let bitmap = self.read_inode_bitmap(cx, group)?;
-        Ok(bitmap_count_free(&bitmap, inodes_in_group))
+        self.with_ext4_bitmap_view(cx, group, |geo, flags| {
+            let inodes_in_group = geo.inodes_in_group(group);
+            if u64::from(geo.inodes_per_group) > u64::from(geo.block_size) * 8 {
+                return Err(FfsError::InvalidGeometry(
+                    "ext4 inode bitmap cannot represent the group".into(),
+                ));
+            }
+            if flags & ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT != 0 {
+                if group.0 == 0 {
+                    return Err(FfsError::InvalidGeometry(
+                        "ext4 group zero cannot have an uninitialized inode bitmap".into(),
+                    ));
+                }
+                return Ok(inodes_in_group);
+            }
+            let bitmap = self.read_inode_bitmap(cx, group)?;
+            if u64::from(inodes_in_group) > bitmap.len() as u64 * 8 {
+                return Err(FfsError::InvalidGeometry(
+                    "ext4 inode bitmap is truncated".into(),
+                ));
+            }
+            Ok(bitmap_count_free(&bitmap, inodes_in_group))
+        })
     }
 
     /// Compute a free-space summary for the entire ext4 filesystem.
@@ -58083,23 +58126,32 @@ mod tests {
 
     #[test]
     fn ext4_repair_tail_checks_lazy_group_authority_bd_plamw() {
-        for (lazy_group, undefined_byte) in [(1_u32, 0_u8), (1, 0xFF), (0, 0)] {
+        for (lazy_group, undefined_byte, total_inodes) in [
+            (1_u32, 0_u8, 256_u32),
+            (1, 0xFF, 256),
+            (1, 0xFF, 200),
+            (0, 0, 256),
+        ] {
             let mut image = build_ext4_image_with_extents();
             image.resize(128 * 4096, 0);
             let sb = EXT4_SUPERBLOCK_OFFSET;
             image[sb + 4..sb + 8].copy_from_slice(&128_u32.to_le_bytes());
-            image[sb..sb + 4].copy_from_slice(&256_u32.to_le_bytes());
+            image[sb..sb + 4].copy_from_slice(&total_inodes.to_le_bytes());
             image[sb + 0x64..sb + 0x68]
                 .copy_from_slice(&ffs_ondisk::Ext4RoCompatFeatures::GDT_CSUM.0.to_le_bytes());
             let second_gd = 4096 + 32;
             image[second_gd..second_gd + 4].copy_from_slice(&66_u32.to_le_bytes());
             image[second_gd + 4..second_gd + 8].copy_from_slice(&67_u32.to_le_bytes());
             image[second_gd + 8..second_gd + 12].copy_from_slice(&120_u32.to_le_bytes());
-            set_group_desc_free_counts_at(&mut image, 1, 52, 128);
+            let free_inodes = total_inodes - 128;
+            set_group_desc_free_counts_at(&mut image, 1, 52, u16::try_from(free_inodes).unwrap());
             let lazy_gd = 4096 + usize::try_from(lazy_group).unwrap() * 32;
-            image[lazy_gd + 0x12..lazy_gd + 0x14]
-                .copy_from_slice(&ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT.to_le_bytes());
+            image[lazy_gd + 0x12..lazy_gd + 0x14].copy_from_slice(
+                &(ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT | ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT)
+                    .to_le_bytes(),
+            );
             image[66 * 4096..67 * 4096].fill(undefined_byte);
+            image[67 * 4096..68 * 4096].fill(undefined_byte);
             for group in 0..2_u32 {
                 let offset = 4096 + usize::try_from(group).unwrap() * 32;
                 ffs_ondisk::ext4::stamp_group_desc_checksum(
@@ -58124,6 +58176,10 @@ mod tests {
             .expect("open checksummed group descriptors");
             if lazy_group == 0 {
                 assert!(matches!(
+                    fs.count_free_inodes_in_group(&cx, GroupNumber(0)),
+                    Err(FfsError::InvalidGeometry(_))
+                ));
+                assert!(matches!(
                     fs.count_free_blocks_in_group(&cx, GroupNumber(0)),
                     Err(FfsError::InvalidGeometry(_))
                 ));
@@ -58132,6 +58188,11 @@ mod tests {
                     Err(FfsError::InvalidGeometry(_))
                 ));
             } else {
+                assert_eq!(
+                    fs.count_free_inodes_in_group(&cx, GroupNumber(1)).unwrap(),
+                    free_inodes,
+                    "lazy inode capacity excludes padding, independent of byte {undefined_byte:#x}"
+                );
                 assert_eq!(
                     fs.count_free_blocks_in_group(&cx, GroupNumber(1)).unwrap(),
                     52,
@@ -58157,13 +58218,13 @@ mod tests {
                 let base = fs.block_device_adapter();
                 let mut txn = fs.begin_transaction();
                 let mut alloc = fs.require_alloc_state().unwrap().write();
-                let allocation = {
+                let (allocation, inode_allocation) = {
                     let staged = TransactionBlockAdapter {
                         base: &base,
                         tx: parking_lot::Mutex::new(&mut txn),
                     };
                     let Ext4AllocState { geo, groups, .. } = &mut *alloc;
-                    ffs_alloc::alloc_blocks(
+                    let block = ffs_alloc::alloc_blocks(
                         &cx,
                         &staged,
                         geo,
@@ -58175,10 +58236,16 @@ mod tests {
                             ..AllocHint::default()
                         },
                     )
-                    .unwrap()
+                    .unwrap();
+                    let inode =
+                        ffs_alloc::alloc_inode(&cx, &staged, geo, groups, GroupNumber(1), false)
+                            .unwrap();
+                    (block, inode)
                 };
                 assert_eq!(allocation.start, BlockNumber(68));
+                assert_eq!(inode_allocation.ino, InodeNumber(129));
                 assert!(!alloc.groups[1].block_bitmap_uninit());
+                assert!(!alloc.groups[1].inode_bitmap_uninit());
                 fs.commit_transaction(&cx, txn).unwrap();
                 drop(alloc);
                 assert_ne!(
@@ -58192,6 +58259,72 @@ mod tests {
                     51,
                     "a committed bitmap allocation overrides the stale lazy descriptor"
                 );
+                assert_ne!(
+                    fs.read_group_desc(&cx, GroupNumber(1)).unwrap().flags
+                        & ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT,
+                    0,
+                    "inode descriptor has not been flushed"
+                );
+                assert_eq!(
+                    fs.count_free_inodes_in_group(&cx, GroupNumber(1)).unwrap(),
+                    127,
+                    "a committed inode bitmap overrides the stale lazy descriptor"
+                );
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                {
+                    let mut sharded_fs = OpenFs::from_device(
+                        &cx,
+                        Box::new(TestDevice::from_vec(image.clone())),
+                        &OpenOptions {
+                            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                            ..OpenOptions::default()
+                        },
+                    )
+                    .unwrap();
+                    sharded_fs.enable_writes(&cx).unwrap();
+                    let base = sharded_fs.block_device_adapter();
+                    let single = sharded_fs.require_alloc_state().unwrap().read_recursive();
+                    assert!(single.groups[1].inode_bitmap_uninit());
+                    let (ino, _) = sharded_fs
+                        .ext4_sharded_create_inode(
+                            &cx,
+                            &base,
+                            0o100_600,
+                            0,
+                            0,
+                            GroupNumber(1),
+                            false,
+                            0,
+                            0,
+                        )
+                        .unwrap();
+                    assert_eq!(ino, InodeNumber(129));
+                    assert!(single.groups[1].inode_bitmap_uninit());
+                    drop(single);
+                    assert!(
+                        !sharded_fs
+                            .ext4_sharded_alloc
+                            .as_ref()
+                            .unwrap()
+                            .lock_group(1)
+                            .inode_bitmap_uninit()
+                    );
+                    assert_ne!(
+                        sharded_fs
+                            .read_group_desc(&cx, GroupNumber(1))
+                            .unwrap()
+                            .flags
+                            & ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT,
+                        0
+                    );
+                    assert_eq!(
+                        sharded_fs
+                            .count_free_inodes_in_group(&cx, GroupNumber(1))
+                            .unwrap(),
+                        127,
+                        "the initialized sharded family overrides both stale single state and GDT"
+                    );
+                }
             }
         }
     }
@@ -58199,10 +58332,14 @@ mod tests {
     #[test]
     fn ext4_repair_tail_unchecked_lazy_flag_cannot_hide_allocations_bd_plamw() {
         let mut image = build_ext4_image_with_extents();
-        image[4096 + 0x12..4096 + 0x14]
-            .copy_from_slice(&ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT.to_le_bytes());
+        image[4096 + 0x12..4096 + 0x14].copy_from_slice(
+            &(ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT | ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT)
+                .to_le_bytes(),
+        );
         image[2 * 4096..3 * 4096].fill(0);
         image[2 * 4096 + 7] = 1 << 4; // Allocated block 60, no descriptor checksum.
+        image[3 * 4096..4 * 4096].fill(0);
+        image[3 * 4096] = 1; // One allocated inode; unchecked flags cannot hide it.
         let cx = Cx::for_testing();
         let fs = OpenFs::from_device(
             &cx,
@@ -58210,6 +58347,10 @@ mod tests {
             &OpenOptions::default(),
         )
         .expect("open unchecked group flags");
+        assert_eq!(
+            fs.count_free_inodes_in_group(&cx, GroupNumber(0)).unwrap(),
+            127
+        );
         assert_eq!(
             fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
             63,
@@ -58324,6 +58465,48 @@ mod tests {
         .expect("open corrupted geometry with validation explicitly skipped");
         assert!(matches!(
             fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 60, 64),
+            Err(FfsError::InvalidGeometry(_))
+        ));
+        assert!(matches!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)),
+            Err(FfsError::InvalidGeometry(_))
+        ));
+        let mut image = build_ext4_image_with_extents();
+        image[sb + 0x20..sb + 0x24].copy_from_slice(&65_537_u32.to_le_bytes());
+        image[sb + 0x1C..sb + 0x20].copy_from_slice(&3_u32.to_le_bytes());
+        image[sb + 0x24..sb + 0x28].copy_from_slice(&32_768_u32.to_le_bytes());
+        image[sb + 0x64..sb + 0x68]
+            .copy_from_slice(&ffs_ondisk::Ext4RoCompatFeatures::BIGALLOC.0.to_le_bytes());
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions {
+                skip_validation: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("inspect odd bigalloc group beyond bitmap capacity");
+        assert!(matches!(
+            fs.count_free_blocks_in_group(&cx, GroupNumber(0)),
+            Err(FfsError::InvalidGeometry(_))
+        ));
+        assert!(matches!(
+            fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 60, 64),
+            Err(FfsError::InvalidGeometry(_))
+        ));
+        let mut image = build_ext4_image_with_extents();
+        image[sb + 0x28..sb + 0x2C].copy_from_slice(&32_769_u32.to_le_bytes());
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions {
+                skip_validation: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("inspect unrepresentable inode geometry");
+        assert!(matches!(
+            fs.count_free_inodes_in_group(&cx, GroupNumber(0)),
             Err(FfsError::InvalidGeometry(_))
         ));
     }
@@ -75292,6 +75475,7 @@ mod tests {
             ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None
         );
         let mut lazy_groups = 0;
+        let mut lazy_inode_groups = 0;
         let mut initialized_groups = 0;
         for index in 0..sb.groups_count() {
             let group = GroupNumber(index);
@@ -75301,14 +75485,28 @@ mod tests {
             } else {
                 lazy_groups += 1;
             }
+            if gd.flags & ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT != 0 {
+                lazy_inode_groups += 1;
+            }
             assert_eq!(
                 fs.count_free_blocks_in_group(&cx, group).unwrap(),
                 gd.free_blocks_count,
                 "native free-space oracle for {group:?}, flags={:#x}",
                 gd.flags
             );
+            assert_eq!(
+                fs.count_free_inodes_in_group(&cx, group).unwrap(),
+                gd.free_inodes_count,
+                "native inode oracle for {group:?}, flags={:#x}",
+                gd.flags
+            );
         }
         assert!(lazy_groups > 0 && initialized_groups > 0);
+        assert!(lazy_inode_groups > 0);
+        let summary = fs.free_space_summary(&cx).unwrap();
+        assert_eq!(summary.free_blocks_total, sb.free_blocks_count);
+        assert_eq!(summary.free_inodes_total, u64::from(sb.free_inodes_count));
+        assert!(!summary.blocks_mismatch && !summary.inodes_mismatch);
         assert!(!fs.is_writable());
         assert_eq!(blake3::hash(&dev.snapshot_bytes()), original);
         let initialized = fs.read_group_desc(&cx, GroupNumber(0)).unwrap();
@@ -75327,6 +75525,21 @@ mod tests {
         assert!(
             error.to_string().contains("block bitmap CRC32C mismatch"),
             "initialized bitmap corruption must stay fatal: {error:?}"
+        );
+        assert_eq!(
+            initialized.flags & ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT,
+            0
+        );
+        let mut corrupt = dev.snapshot_bytes();
+        corrupt[usize::try_from(initialized.inode_bitmap * u64::from(sb.block_size)).unwrap()] ^= 1;
+        let corrupt =
+            OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(corrupt)), &options).unwrap();
+        let error = corrupt
+            .count_free_inodes_in_group(&cx, GroupNumber(0))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("inode bitmap CRC32C mismatch"),
+            "initialized inode bitmap corruption must stay fatal: {error:?}"
         );
         fs.enable_writes(&cx).unwrap();
         fs.set_bhh0i_sharded_ops(true);

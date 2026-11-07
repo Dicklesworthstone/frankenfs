@@ -368,7 +368,14 @@ bitmap bytes do not establish free space. Reserved superblock/GDT, bitmap and
 inode-table clusters remain occupied; partial final-group padding is unavailable.
 Bigalloc indexes clusters, not individual blocks. Repair admission must account
 for those reservations, including FLEX_BG metadata, before treating a tail as
-free. In [`fs/ext4/super.c::ext4_check_descriptors`](https://github.com/torvalds/linux/blob/v6.19/fs/ext4/super.c),
+free. The matching inode-bitmap contract in
+[`fs/ext4/ialloc.c::ext4_read_inode_bitmap`](https://github.com/torvalds/linux/blob/v6.19/fs/ext4/ialloc.c)
+also authenticates `INODE_UNINIT` with descriptor checksums and rejects lazy
+group zero. Valid inode slots in another lazy group are logically free;
+undefined bytes and padding beyond the actual inode capacity cannot determine
+the count. Read-only inspection must not initialize either bitmap.
+
+In [`fs/ext4/super.c::ext4_check_descriptors`](https://github.com/torvalds/linux/blob/v6.19/fs/ext4/super.c),
 FLEX_BG descriptor bounds cover the whole filesystem, so a repair proof must
 include metadata owned by groups outside the nominal flex neighborhood too.
 This extracted contract is separate from executed repair evidence.
