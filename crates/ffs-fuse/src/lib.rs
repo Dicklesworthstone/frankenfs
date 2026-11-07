@@ -20245,6 +20245,64 @@ mod tests {
         assert_eq!(record.donor_fd, 7);
         assert_eq!(record.errno, Some(libc::EOPNOTSUPP));
         assert_ne!(record.operation_id, "");
+
+        for (error, errno, error_class, outcome) in [
+            (
+                FfsError::RequestRejected {
+                    errno: libc::EPERM,
+                    detail: "immutable donor".into(),
+                },
+                libc::EPERM,
+                "permission_denied",
+                "rejected",
+            ),
+            (
+                FfsError::RequestRejected {
+                    errno: libc::EIO,
+                    detail: "policy rejection".into(),
+                },
+                libc::EIO,
+                "request_rejected",
+                "failed",
+            ),
+            (
+                FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO)),
+                libc::EIO,
+                "io_error",
+                "failed",
+            ),
+            (
+                FfsError::RequestRejected {
+                    errno: 0,
+                    detail: "malformed rejection".into(),
+                },
+                libc::EIO,
+                "request_rejected",
+                "failed",
+            ),
+        ] {
+            let record = FrankenFuse::move_ext_error_log_record(
+                MoveExtLogContext {
+                    operation_id: &operation_id,
+                    ino: 9,
+                    donor_ino: Some(InodeNumber(123)),
+                    donor_fd: 7,
+                    orig_start: 11,
+                    donor_start: 22,
+                    len: 33,
+                },
+                &error,
+            );
+            assert_eq!(record.error_class, error_class);
+            assert_eq!(record.outcome, outcome);
+            assert_eq!(record.errno, Some(errno));
+            assert_eq!(record.operation_id, operation_id);
+            assert_eq!(record.donor_ino, Some(123));
+            assert_eq!(
+                (record.orig_start, record.donor_start, record.len),
+                (11, 22, 33)
+            );
+        }
     }
 
     #[test]
@@ -25083,12 +25141,19 @@ mod tests {
         assert!(gate.retired.load(Ordering::Acquire));
     }
 
-    // ── FuseErrorContext errno mapping for all 21 variants (bd-2s4.6) ──
+    // ── FuseErrorContext errno mapping for all 22 variants (bd-2s4.6) ──
 
     #[test]
     fn fuse_error_context_log_and_errno_covers_all_variants() {
         let cases: Vec<(FfsError, libc::c_int)> = vec![
             (FfsError::Io(std::io::Error::other("test")), libc::EIO),
+            (
+                FfsError::RequestRejected {
+                    errno: libc::EFBIG,
+                    detail: "size limit".into(),
+                },
+                libc::EFBIG,
+            ),
             (
                 FfsError::Corruption {
                     block: 1,
@@ -25126,13 +25191,14 @@ mod tests {
             (FfsError::NameTooLong, libc::ENAMETOOLONG),
             (FfsError::Exists, libc::EEXIST),
             (FfsError::RepairFailed("checksum".into()), libc::EIO),
+            (FfsError::ModeViolation("compat mode".into()), libc::EPERM),
         ];
 
-        // 20 variants listed; verify count matches expectation.
+        // Every current variant is represented, including semantic rejections.
         assert_eq!(
             cases.len(),
-            20,
-            "expected all 20 constructible FfsError variants"
+            22,
+            "expected all 22 constructible FfsError variants"
         );
 
         for (error, expected) in &cases {

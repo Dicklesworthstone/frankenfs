@@ -1411,6 +1411,15 @@ impl FrankenFuse {
                 "invalid_request"
             }
             FfsError::NotFound(_) => "not_found",
+            FfsError::RequestRejected { .. } => match error.to_errno() {
+                libc::EBADF => "bad_donor_fd",
+                libc::EINVAL => "invalid_request",
+                libc::EPERM | libc::EACCES => "permission_denied",
+                libc::EROFS => "read_only",
+                libc::EOPNOTSUPP => "unsupported_feature",
+                libc::ENOTTY => "unsupported_ioctl",
+                _ => "request_rejected",
+            },
             FfsError::Io(io_error) => match io_error.raw_os_error() {
                 Some(libc::EBADF) => "bad_donor_fd",
                 Some(libc::EINVAL) => "invalid_request",
