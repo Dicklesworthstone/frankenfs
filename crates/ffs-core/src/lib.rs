@@ -3243,8 +3243,8 @@ pub struct OpenFs {
     /// set. This allows the repair subsystem to mark the corresponding groups
     /// as dirty and queue repair symbol refresh (per spec §12.1.3).
     repair_flush_lifecycle: Option<Arc<dyn RepairFlushLifecycle>>,
-    /// The shared physical device has admitted native write freshness.
-    native_repair_active: bool,
+    /// The shared physical device and its non-healing inspection authority.
+    native_repair_device: Option<Arc<native_repair::NativeFreshnessDevice>>,
     /// Journal replay writes only to an in-memory diagnostic overlay.
     ext4_replay_overlay: bool,
     /// Userspace ioctl donor-fd registrations for ext4 `EXT4_IOC_MOVE_EXT`.
@@ -8327,7 +8327,7 @@ impl OpenFs {
             #[cfg(test)]
             htree_leaf_splits: std::sync::atomic::AtomicUsize::new(0),
             repair_flush_lifecycle: None,
-            native_repair_active: false,
+            native_repair_device: None,
             ext4_replay_overlay: matches!(
                 options.ext4_journal_replay_mode,
                 Ext4JournalReplayMode::SimulateOverlay
@@ -8785,10 +8785,10 @@ impl OpenFs {
 
     /// Whether the physical device enforces native write freshness.
     /// A dirty or failed epoch remains fenced; this does not certify a clean
-    /// baseline or enable automatic corruption recovery.
+    /// baseline. Read repair is available only for a verified clean epoch.
     #[must_use]
     pub fn has_native_repair_device(&self) -> bool {
-        self.native_repair_active
+        self.native_repair_device.is_some()
     }
 
     /// Block size in bytes.
@@ -80209,6 +80209,442 @@ mod tests {
     }
 
     #[test]
+    fn native_freshness_reads_repair_whole_blocks_and_preserve_sealed_authority() {
+        let baseline = native_freshness_baseline();
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(baseline.sealed.clone());
+        let durable = TestDevice::from_vec(baseline.sealed.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: durable.clone(),
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            corrupt_on: None,
+            events: Arc::clone(&events),
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options()).unwrap();
+        let file = fs
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        let payload = native_existing_payload_block(&fs, &cx).0 * 1024;
+        assert!(payload + 2048 < baseline.storage.tails[0].start.0 * 1024);
+        fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        assert!(events.lock().unwrap().is_empty());
+
+        // A partial request crosses two source blocks. The first corruption
+        // lies outside the requested slice and must still trigger repair.
+        for offset in [payload + 7, payload + 1024 + 17] {
+            let damaged = [baseline.sealed[offset as usize] ^ 0x40];
+            dev.write_all_at(&cx, ByteOffset(offset), &damaged).unwrap();
+            durable
+                .write_all_at(&cx, ByteOffset(offset), &damaged)
+                .unwrap();
+        }
+        let start = payload + 1000;
+        let mut bytes = [0; 80];
+        fs.dev
+            .read_exact_at(&cx, ByteOffset(start), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, baseline.sealed[start as usize..start as usize + 80]);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![Some(payload), Some(payload + 1024), None],
+            "all reconstructed source blocks must be durable before the read succeeds"
+        );
+        assert!(dev.snapshot_bytes() == baseline.sealed);
+        assert!(durable.snapshot_bytes() == baseline.sealed);
+
+        // Exercise the public filesystem path separately from physical reads.
+        events.lock().unwrap().clear();
+        let damaged = [baseline.sealed[payload as usize] ^ 0x80];
+        dev.write_all_at(&cx, ByteOffset(payload), &damaged)
+            .unwrap();
+        durable
+            .write_all_at(&cx, ByteOffset(payload), &damaged)
+            .unwrap();
+        assert_eq!(fs.read(&cx, file.ino, 0, 8192).unwrap(), vec![0xA7; 8192]);
+        assert_eq!(*events.lock().unwrap(), vec![Some(payload), None]);
+        assert!(durable.snapshot_bytes() == baseline.sealed);
+
+        // Boot bytes and owned control tails are not source blocks. They must
+        // remain readable so physical authority inspection does not recurse.
+        let mut boot_and_superblock = [0; 1100];
+        fs.dev
+            .read_exact_at(&cx, ByteOffset(0), &mut boot_and_superblock)
+            .unwrap();
+        assert_eq!(boot_and_superblock, baseline.sealed[..1100]);
+        let mut owner = [0; 1024];
+        let owner_offset = baseline.storage.tails[0].start.0 as usize * 1024;
+        fs.dev
+            .read_exact_at(&cx, ByteOffset(owner_offset as u64), &mut owner)
+            .unwrap();
+        assert_eq!(owner, baseline.sealed[owner_offset..owner_offset + 1024]);
+        assert_eq!(
+            fs.check_native_ext4_repair(&cx).unwrap().generations,
+            vec![1, 1]
+        );
+        assert_eq!(*events.lock().unwrap(), vec![Some(payload), None]);
+        drop(fs);
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(durable.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        assert_eq!(
+            cold.check_native_ext4_repair(&cx).unwrap().generations,
+            vec![1, 1]
+        );
+        let reopened = cold
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        assert_eq!(
+            cold.read(&cx, reopened.ino, 0, 8192).unwrap(),
+            vec![0xA7; 8192]
+        );
+        let temp = tempfile::tempdir().unwrap();
+        native_parity_fsck(&durable, &temp.path().join("native-read-repair.ext4"));
+    }
+
+    #[test]
+    fn native_freshness_read_repair_uses_verified_surviving_parity() {
+        let baseline = native_freshness_baseline();
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(baseline.sealed.clone());
+        let durable = TestDevice::from_vec(baseline.sealed.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: durable.clone(),
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            corrupt_on: None,
+            events: Arc::clone(&events),
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options()).unwrap();
+        let payload = native_existing_payload_block(&fs, &cx).0 * 1024;
+        fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        let tail = &baseline.storage.tails[0];
+        let symbol = (tail.start.0 + 1 + u64::from(tail.validation_blocks)) * 1024 + 9;
+        let damaged_symbol = baseline.sealed[symbol as usize] ^ 0x40;
+        for offset in [payload + 111, symbol] {
+            let changed = [baseline.sealed[offset as usize] ^ 0x40];
+            dev.write_all_at(&cx, ByteOffset(offset), &changed).unwrap();
+            durable
+                .write_all_at(&cx, ByteOffset(offset), &changed)
+                .unwrap();
+        }
+        let mut bytes = [0; 1024];
+        fs.dev
+            .read_exact_at(&cx, ByteOffset(payload), &mut bytes)
+            .unwrap();
+        assert_eq!(
+            bytes,
+            baseline.sealed[payload as usize..payload as usize + 1024]
+        );
+        assert_eq!(*events.lock().unwrap(), vec![Some(payload), None]);
+        let mut expected = baseline.sealed.clone();
+        expected[symbol as usize] = damaged_symbol;
+        assert!(dev.snapshot_bytes() == expected);
+        assert!(durable.snapshot_bytes() == expected);
+        // Source repair does not bless or regenerate the damaged parity. A
+        // full protection check still reports that separate loss of redundancy.
+        fs.check_native_ext4_repair(&cx)
+            .expect_err("damaged parity must remain visible after source restoration");
+        assert_eq!(fs.check_native_ext4_validation(&cx).unwrap().groups, 2);
+        assert_eq!(*events.lock().unwrap(), vec![Some(payload), None]);
+
+        // Validation-only inspection also remains independent of the parity
+        // header. Restore the symbol to isolate malformed parity authority.
+        let parity_header = tail.start.0 * 1024 + 320;
+        let changed_header = [baseline.sealed[parity_header as usize] ^ 0x40];
+        for device in [&dev, &durable] {
+            device
+                .write_all_at(&cx, ByteOffset(symbol), &[baseline.sealed[symbol as usize]])
+                .unwrap();
+            device
+                .write_all_at(&cx, ByteOffset(parity_header), &changed_header)
+                .unwrap();
+        }
+        let damaged_header = dev.snapshot_bytes();
+        assert_eq!(fs.check_native_ext4_validation(&cx).unwrap().groups, 2);
+        fs.check_native_ext4_repair(&cx)
+            .expect_err("full protection inspection must reject malformed parity authority");
+        assert_eq!(*events.lock().unwrap(), vec![Some(payload), None]);
+        assert!(dev.snapshot_bytes() == damaged_header);
+        assert!(durable.snapshot_bytes() == damaged_header);
+    }
+
+    #[test]
+    fn native_freshness_read_only_checks_do_not_heal_and_export_refuses_active_device() {
+        let baseline = native_freshness_baseline();
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(baseline.sealed.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = ValidationFaultDevice {
+            inner: dev.clone(),
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            events: Arc::clone(&events),
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options()).unwrap();
+        let block = native_existing_payload_block(&fs, &cx);
+        let payload = block.0 * 1024;
+        fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        dev.write_all_at(
+            &cx,
+            ByteOffset(payload),
+            &[baseline.sealed[payload as usize] ^ 0x40],
+        )
+        .unwrap();
+        let damaged = dev.snapshot_bytes();
+        fs.check_native_ext4_validation(&cx)
+            .expect_err("validation must report corruption without repairing it");
+        fs.check_native_ext4_repair(&cx)
+            .expect_err("protection inspection must report corruption without repairing it");
+        let error = fs
+            .reconstruct_native_ext4_block(&cx, block, NATIVE_PARITY_TEST_BUDGET)
+            .expect_err("offline export cannot use an automatically repairing physical view");
+        assert!(error.to_string().contains("inactive device"), "{error}");
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "read-only APIs wrote or synced"
+        );
+        assert!(dev.snapshot_bytes() == damaged);
+
+        // The failed inspections did not poison or heal the device. Its normal
+        // read path still repairs, and healthy active inspections still work.
+        let mut byte = [0];
+        fs.dev
+            .read_exact_at(&cx, ByteOffset(payload), &mut byte)
+            .unwrap();
+        assert_eq!(byte, [baseline.sealed[payload as usize]]);
+        let repaired = events.lock().unwrap().clone();
+        assert_eq!(repaired, vec![Some(payload), None]);
+        assert_eq!(fs.check_native_ext4_validation(&cx).unwrap().groups, 2);
+        assert_eq!(
+            fs.check_native_ext4_repair(&cx).unwrap().generations,
+            vec![1, 1]
+        );
+        assert_eq!(*events.lock().unwrap(), repaired);
+        assert!(dev.snapshot_bytes() == baseline.sealed);
+
+        fs.dev
+            .write_all_at(&cx, ByteOffset(payload + 17), &[0x3D])
+            .unwrap();
+        let dirty = dev.snapshot_bytes();
+        let written = events.lock().unwrap().clone();
+        fs.check_native_ext4_validation(&cx)
+            .expect_err("dirty epoch is not sealed validation");
+        fs.check_native_ext4_repair(&cx)
+            .expect_err("dirty epoch is not sealed protection");
+        assert_eq!(*events.lock().unwrap(), written);
+        assert!(dev.snapshot_bytes() == dirty);
+    }
+
+    #[test]
+    fn native_freshness_reads_follow_intended_digests_without_stale_repair() {
+        let baseline = native_freshness_baseline();
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(baseline.sealed.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = ValidationFaultDevice {
+            inner: dev.clone(),
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            events: Arc::clone(&events),
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options()).unwrap();
+        let payload = native_existing_payload_block(&fs, &cx).0 * 1024;
+        fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        fs.dev
+            .write_all_at(&cx, ByteOffset(payload + 17), &[0x3D; 31])
+            .unwrap();
+        let intended = dev.snapshot_bytes();
+        let recorded = events.lock().unwrap().clone();
+        let mut bytes = [0; 70];
+        fs.dev
+            .read_exact_at(&cx, ByteOffset(payload + 5), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, intended[payload as usize + 5..payload as usize + 75]);
+        assert_eq!(*events.lock().unwrap(), recorded);
+
+        // Both an intended-write block and an untouched block remain ineligible
+        // for old parity while the filesystem has an unsealed write epoch.
+        for block in [payload, payload + 1024] {
+            let offset = block + 20;
+            dev.write_all_at(&cx, ByteOffset(offset), &[intended[offset as usize] ^ 0x40])
+                .unwrap();
+            let damaged = dev.snapshot_bytes();
+            let error = fs
+                .dev
+                .read_exact_at(&cx, ByteOffset(block + 90), &mut [0; 1])
+                .unwrap_err();
+            assert!(matches!(error, FfsError::Corruption { .. }), "{error}");
+            assert!(error.to_string().contains("dirty epochs"), "{error}");
+            assert!(
+                dev.snapshot_bytes() == damaged,
+                "dirty read rolled back current bytes"
+            );
+            assert_eq!(*events.lock().unwrap(), recorded);
+        }
+    }
+
+    #[test]
+    fn native_freshness_read_repair_refuses_changed_authority_and_exhausted_parity() {
+        let baseline = native_freshness_baseline();
+        let tail = &baseline.storage.tails[0];
+        for fault in ["plan", "table", "parity-owner", "descriptor", "all-symbols"] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = ValidationFaultDevice {
+                inner: dev.clone(),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: usize::MAX,
+                events: Arc::clone(&events),
+            };
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options())
+                    .unwrap();
+            let payload = native_existing_payload_block(&fs, &cx).0 * 1024;
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            dev.write_all_at(
+                &cx,
+                ByteOffset(payload),
+                &[baseline.sealed[payload as usize] ^ 0x40],
+            )
+            .unwrap();
+            let symbols = (tail.start.0 + 1 + u64::from(tail.validation_blocks)) * 1024;
+            let (offset, length) = match fault {
+                "plan" => (tail.start.0 * 1024 + 192, 1),
+                "table" => ((tail.start.0 + 1) * 1024 + 128, 1),
+                "parity-owner" => (tail.start.0 * 1024 + 320, 1),
+                "descriptor" => (
+                    (tail.group_start.0 + u64::from(tail.blocks_per_group) - 2) * 1024,
+                    1,
+                ),
+                "all-symbols" => (symbols, tail.repair_blocks as usize * 1024),
+                _ => unreachable!(),
+            };
+            let mut damaged = baseline.sealed[offset as usize..offset as usize + length].to_vec();
+            for byte in &mut damaged {
+                *byte ^= 0x40;
+            }
+            dev.write_all_at(&cx, ByteOffset(offset), &damaged).unwrap();
+            let before_read = dev.snapshot_bytes();
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            assert!(matches!(
+                fs.dev
+                    .read_exact_at(&cancelled, ByteOffset(payload), &mut [0; 1]),
+                Err(FfsError::Cancelled)
+            ));
+            fs.dev
+                .read_exact_at(&cx, ByteOffset(payload), &mut [0; 1])
+                .expect_err(fault);
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "{fault} caused a repair write or sync"
+            );
+            assert!(
+                dev.snapshot_bytes() == before_read,
+                "{fault} changed damaged evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn native_freshness_read_repair_writeback_failures_poison_every_io_path() {
+        let baseline = native_freshness_baseline();
+        for fault in ["partial-write", "late-cancel", "sync", "readback"] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let initial =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+                    .unwrap();
+            let payload = ByteOffset(native_existing_payload_block(&initial, &cx).0 * 1024);
+            drop(initial);
+            let durable = TestDevice::from_vec(baseline.sealed.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = ValidationSyncFaultDevice {
+                inner: dev.clone(),
+                durable: durable.clone(),
+                syncs: Arc::new(AtomicUsize::new(0)),
+                fail_on: if fault == "sync" { 1 } else { usize::MAX },
+                corrupt_on: (fault == "readback").then_some((1, payload)),
+                events: Arc::clone(&events),
+            };
+            let device: Box<dyn ByteDevice> = if matches!(fault, "partial-write" | "late-cancel") {
+                Box::new(NativeFreshnessSourceFault {
+                    inner: observed,
+                    target: payload,
+                    cancel_after_write: fault == "late-cancel",
+                })
+            } else {
+                Box::new(observed)
+            };
+            let mut fs = OpenFs::from_device(&cx, device, &native_preparation_options()).unwrap();
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            let damaged_offset = ByteOffset(payload.0 + 111);
+            let damaged_byte = [baseline.sealed[damaged_offset.0 as usize] ^ 0x40];
+            dev.write_all_at(&cx, damaged_offset, &damaged_byte)
+                .unwrap();
+            durable
+                .write_all_at(&cx, damaged_offset, &damaged_byte)
+                .unwrap();
+            let error = fs.dev.read_exact_at(&cx, payload, &mut [0; 1]).unwrap_err();
+            if fault == "late-cancel" {
+                assert!(matches!(error, FfsError::Cancelled), "{fault}: {error}");
+            }
+            let recorded = events.lock().unwrap().clone();
+            let expected = if matches!(fault, "sync" | "readback") {
+                vec![Some(payload.0), None]
+            } else {
+                vec![Some(payload.0)]
+            };
+            assert_eq!(recorded, expected, "{fault}");
+            let visible = dev.snapshot_bytes();
+            let persisted = durable.snapshot_bytes();
+            assert!(
+                persisted != baseline.sealed,
+                "{fault} falsely established durable restoration"
+            );
+            let fresh = Cx::for_testing();
+            assert!(matches!(
+                fs.dev.read_exact_at(&fresh, payload, &mut [0; 1]),
+                Err(FfsError::RepairFailed(_))
+            ));
+            assert!(matches!(
+                fs.dev.sync(&fresh),
+                Err(FfsError::RepairFailed(_))
+            ));
+            assert!(matches!(
+                fs.dev.write_all_at(&fresh, payload, &[0x55]),
+                Err(FfsError::RepairFailed(_))
+            ));
+            assert_eq!(
+                *events.lock().unwrap(),
+                recorded,
+                "{fault} poisoned handle performed I/O"
+            );
+            assert!(dev.snapshot_bytes() == visible);
+            assert!(durable.snapshot_bytes() == persisted);
+        }
+    }
+
+    #[test]
     fn native_freshness_fence_sync_failure_precedes_source_write_and_poisons_handle() {
         let baseline = native_freshness_baseline();
         let cx = Cx::for_testing();
@@ -80500,8 +80936,22 @@ mod tests {
                 "ownership refusal performed fence/source I/O (change_inode={change_inode})"
             );
             assert!(dev.snapshot_bytes() == baseline.sealed);
+            assert!(matches!(
+                fs.check_native_ext4_repair(&cx),
+                Err(FfsError::RepairFailed(_))
+            ));
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "poisoned inspection performed I/O"
+            );
+            let offline = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                &native_preparation_options(),
+            )
+            .unwrap();
             assert_eq!(
-                fs.check_native_ext4_repair(&cx).unwrap().generations,
+                offline.check_native_ext4_repair(&cx).unwrap().generations,
                 vec![1, 1],
                 "rejected ownership change altered the sealed baseline"
             );

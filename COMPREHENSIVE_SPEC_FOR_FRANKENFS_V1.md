@@ -1055,8 +1055,11 @@ padding at 120. Prepared is state 3; Pending is 1; Sealed is 2. Groups other
 than zero retain zero plan bytes 192–319. All owner bytes after 447 stay zero.
 For serial native groups with complete blocks `T >= 1024`, `R <= K`, supported
 RFC parameters and unique erasures, decoding admits eight times the direct
-encoder working estimate plus native table/plan buffers. Dense wavefront
-decoding retains its equations and RHS snapshots; width four is not a four-row
+encoder working estimate plus native table/plan buffers, four block-sized
+payloads and 256 bookkeeping bytes per source for retained beforeimages,
+decoded blocks and recovery captures. This allowance covers every source,
+including beforeimages captured before redundancy feasibility is known. Dense
+wavefront decoding retains its equations and RHS snapshots; width four is not a four-row
 memory bound. This is an allocation estimate, excluding backing devices, global
 cache retention and allocator overhead, not a hard RSS or solve-latency bound.
 
@@ -1104,6 +1107,12 @@ freshly observed after writes MUST NOT independently establish new authority.
 All ordinary writes to owned tails or outside source coverage MUST refuse.
 An explicit internal publication authority alone may write those tails.
 
+Contending synchronous physical operations MUST queue for that authority
+instead of returning a spurious `EAGAIN`. Waiting MUST observe request
+cancellation and retire cancelled queue entries. The synchronous mutex bridge
+uses its normal wakeup on unlock and parks for at most 10 ms between
+cancellation checks; it does not create a runtime or spin while contended.
+
 Before the first source write of an epoch, group zero's whole-plan record MUST
 publish and sync Dirty (state 4, retaining only the prior sealed root, with no
 next-root authority). Failed fence sync
@@ -1124,9 +1133,35 @@ remain unavailable until an explicit transition-aware recovery path proves
 their exact whole-plan authority; existing initialization is not that path.
 
 The FUSE path, public byte-device view and metadata compactor MUST share the
-same admitted device rather than reopen an independent image handle. This
-bounded explicit activation does not satisfy default activation, automatic
-native read repair, Pending/Dirty restart reconciliation, Btrfs ownership or
+same admitted device rather than reopen an independent image handle. Physical
+source reads through that device MUST validate each complete covered block,
+including blocks only partly requested, under the same state lock as writes.
+Dirty-epoch reads MUST use intended-write digests where present and MUST NOT
+reconstruct from the preceding parity generation. Poisoned handles MUST refuse
+reads as well as writes and sync. Owned control/parity tails and bytes outside
+source coverage retain their existing physical-read contract; their consumers
+validate their headers and authority, and they are never source-repair targets.
+
+An active clean epoch MAY automatically restore a readable corrupt source from
+its admitted sealed generation. Decode resource admission, verified surviving
+symbols, validation of intact inputs and reconstructed bytes, unchanged target
+beforeimages, and whole-plan/local/parity authority revalidation MUST precede
+source writeback. Recovery MUST use the inner device under the held state lock,
+restore only attested bytes, and preserve the validation epoch, digests and
+parity generation. Successful reads after repair require source sync, digest
+readback and authority revalidation. Any failure or cancellation after writeback
+begins MUST poison the handle and return an error. Unreadable sources and
+insufficient working memory or redundancy remain errors; they MUST NOT cause
+unchecked reads, rebaselining or stale-generation rollback.
+
+Read-only validation and protection checks on an active device MUST hold the
+same state lock and inspect the inner device without triggering repair or sync.
+They require a clean epoch; a validation-only check need not require intact
+parity symbols. The historical read-only reconstruction/export API MUST refuse
+active devices before I/O, since their ordinary source reads can repair data.
+
+This bounded explicit activation and clean-epoch read repair do not satisfy
+default activation, Pending/Dirty restart reconciliation, Btrfs ownership or
 the synchronous solver's cancellation-latency target.
 
 ### 3.16 Tail Group and Metadata Special Cases
