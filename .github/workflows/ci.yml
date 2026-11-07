@@ -136,9 +136,10 @@ jobs:
       - name: Vendored fuser interrupt tests
         run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- interrupt
 
-      - name: Vendored fuser shutdown controls
+      - name: Vendored fuser channel and shutdown controls
         run: |
-          cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- channel::tests::read_only
+          cargo test --manifest-path vendor/fuser/Cargo.toml --lib -- channel::tests
+          cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- channel::tests
           cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- mnt::fuse_pure::block_mount_tests::read_only
           cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- background_join
           cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- dispatch_join

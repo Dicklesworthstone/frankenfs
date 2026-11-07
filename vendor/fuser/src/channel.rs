@@ -401,21 +401,49 @@ impl Channel {
 #[derive(Clone, Debug)]
 pub struct ChannelSender(Arc<File>);
 
+impl ChannelSender {
+    fn send_with(
+        bufs: &[io::IoSlice<'_>],
+        mut writev: impl FnMut(&[io::IoSlice<'_>]) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        let expected = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+        loop {
+            match writev(bufs) {
+                Ok(written) if written == expected => return Ok(()),
+                // FUSE writes are complete messages, not a byte stream. Retrying
+                // a short write would submit a separate, malformed reply.
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "incomplete FUSE reply write",
+                    ));
+                }
+                // EINTR means no bytes were written, so the entire reply is safe
+                // to retry. ReplyRaw consumes its sender even on error; letting
+                // EINTR escape would leave the kernel request unanswered.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 impl ReplySender for ChannelSender {
     fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
-        let rc = unsafe {
-            libc::writev(
-                self.0.as_raw_fd(),
-                bufs.as_ptr() as *const libc::iovec,
-                bufs.len() as c_int,
-            )
-        };
-        if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc as usize);
-            Ok(())
-        }
+        Self::send_with(bufs, |bufs| {
+            let rc = unsafe {
+                libc::writev(
+                    self.0.as_raw_fd(),
+                    bufs.as_ptr() as *const libc::iovec,
+                    bufs.len() as c_int,
+                )
+            };
+            if rc < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(rc as usize)
+            }
+        })
     }
 
     #[cfg(feature = "abi-7-40")]
@@ -499,6 +527,84 @@ mod adaptive_spin_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_reply_retries_the_complete_message() {
+        let bufs = [io::IoSlice::new(b"header"), io::IoSlice::new(b"payload")];
+        let mut attempts = 0;
+        ChannelSender::send_with(&bufs, |retry_bufs| {
+            assert_eq!(retry_bufs.len(), 2);
+            assert_eq!(&*retry_bufs[0], b"header");
+            assert_eq!(&*retry_bufs[1], b"payload");
+            attempts += 1;
+            match attempts {
+                1 | 2 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                3 => Ok(b"headerpayload".len()),
+                _ => panic!("a successfully written reply must not be sent again"),
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn reply_write_preserves_non_interrupted_errors_without_retry() {
+        let bufs = [io::IoSlice::new(b"reply")];
+        for errno in [libc::EIO, libc::ENOENT, libc::EAGAIN] {
+            for interrupted_first in [false, true] {
+                let mut attempts = 0;
+                let error = ChannelSender::send_with(&bufs, |_| {
+                    attempts += 1;
+                    if interrupted_first && attempts == 1 {
+                        return Err(io::Error::from_raw_os_error(libc::EINTR));
+                    }
+                    assert_eq!(attempts, 1 + usize::from(interrupted_first));
+                    Err(io::Error::from_raw_os_error(errno))
+                })
+                .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(errno));
+                assert_eq!(attempts, 1 + usize::from(interrupted_first));
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_reply_writes_fail_without_sending_a_second_message() {
+        let bufs = [io::IoSlice::new(b"header"), io::IoSlice::new(b"payload")];
+        for written in [0, 1, b"headerpayload".len() - 1] {
+            let mut attempts = 0;
+            let error = ChannelSender::send_with(&bufs, |_| {
+                attempts += 1;
+                assert_eq!(attempts, 1, "a partial FUSE message cannot be retried");
+                Ok(written)
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
+    fn channel_sender_delivers_a_complete_vectored_reply() {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::time::Duration;
+
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let sender = ChannelSender(Arc::new(File::from(OwnedFd::from(writer))));
+        let bufs = [io::IoSlice::new(b"header"), io::IoSlice::new(b"payload")];
+        sender.send(&bufs).unwrap();
+        let mut received = [0; b"headerpayload".len()];
+        reader.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"headerpayload");
+
+        reader.set_nonblocking(true).unwrap();
+        let error = reader.read(&mut [0]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
 
     #[test]
     fn read_only_receive_stop_wakes_all_readers_and_keeps_received_bytes() {
