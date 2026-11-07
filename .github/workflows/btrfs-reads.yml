@@ -48,6 +48,8 @@ jobs:
         env:
           FFS_REQUIRE_ORACLES: "1"
         run: |
+          cargo test -p ffs-alloc --locked --lib
+          cargo test -p ffs-alloc --locked --lib --features bhh0i_sharded_alloc
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_repair_tail_ -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_sharded_birth_cross_group_fallback_passes_native_checker -- --exact --nocapture
           cargo test -p ffs-core --locked --lib

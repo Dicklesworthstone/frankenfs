@@ -1906,7 +1906,8 @@ pub fn read_block_bitmap_for_update(
 ///
 /// Returns a sorted `Vec` of relative block offsets within the group that are
 /// occupied by: the superblock copy, the group descriptor table, the block
-/// bitmap, the inode bitmap, and the inode table.
+/// bitmap, the inode bitmap, and the inode table. With FLEX_BG, descriptor-owned
+/// metadata may reside outside its owner's flex neighborhood.
 #[must_use]
 pub fn reserved_blocks_in_group(
     geo: &FsGeometry,
@@ -1929,76 +1930,129 @@ pub fn reserved_blocks_in_group(
         return Arc::clone(cached);
     }
 
-    let gs = &groups[gidx];
-    let group_start =
-        u64::from(geo.first_data_block) + u64::from(group.0) * u64::from(geo.blocks_per_group);
     let blocks_in_group = geo.blocks_in_group(group);
-    let mut reserved = Vec::new();
-
-    // Helper: convert absolute block to relative offset in this group,
-    // and add to reserved if it falls within the group.
-    let add_abs = |reserved: &mut Vec<u32>, abs: u64| {
-        if abs >= group_start {
-            let rel = abs - group_start;
-            if rel < u64::from(blocks_in_group) {
-                #[expect(clippy::cast_possible_truncation)]
-                reserved.push(rel as u32);
-            }
-        }
-    };
-
     let base_meta_blocks = geo.base_meta_blocks_in_group(group).min(blocks_in_group);
-    for rel in 0..base_meta_blocks {
-        reserved.push(rel);
-    }
-
-    // Block bitmap, inode bitmap.
-    add_abs(&mut reserved, gs.block_bitmap_block.0);
-    add_abs(&mut reserved, gs.inode_bitmap_block.0);
-
-    // Inode table spans multiple blocks.
-    let inode_table_blocks = if geo.inodes_per_group > 0 && geo.inode_size > 0 && geo.block_size > 0
+    let mut ranges = vec![(0, base_meta_blocks)];
+    // FLEX_BG relaxes placement to the whole filesystem, even when the flex
+    // size is one. Restricting this scan to an owner's flex neighborhood can
+    // expose its bitmaps or inode table to allocation and freeing elsewhere.
+    let owners = if geo
+        .feature_incompat
+        .contains(ffs_ondisk::Ext4IncompatFeatures::FLEX_BG)
     {
+        groups
+    } else {
+        std::slice::from_ref(&groups[gidx])
+    };
+    for owner in owners {
+        for (start, count) in metadata_block_ranges(geo, owner) {
+            reserve_metadata_range(geo, group, &mut ranges, start, count);
+        }
+    }
+    cache_reserved_metadata_ranges(&groups[gidx], ranges)
+}
+
+fn metadata_block_ranges(geo: &FsGeometry, owner: &GroupStats) -> [(u64, u64); 3] {
+    let table_blocks = if geo.block_size == 0 {
+        0
+    } else {
         (u64::from(geo.inodes_per_group) * u64::from(geo.inode_size))
             .div_ceil(u64::from(geo.block_size))
-    } else {
-        0
     };
-    for i in 0..inode_table_blocks {
-        add_abs(&mut reserved, gs.inode_table_block.0 + i);
+    [
+        (owner.block_bitmap_block.0, 1),
+        (owner.inode_bitmap_block.0, 1),
+        (owner.inode_table_block.0, table_blocks),
+    ]
+}
+
+fn reserve_metadata_range(
+    geo: &FsGeometry,
+    group: GroupNumber,
+    ranges: &mut Vec<(u32, u32)>,
+    start: u64,
+    count: u64,
+) {
+    let group_start = geo.group_block_to_absolute(group, 0).0;
+    let group_end = group_start.saturating_add(u64::from(geo.blocks_in_group(group)));
+    let first = start.max(group_start);
+    let end = start.saturating_add(count).min(group_end);
+    if first < end {
+        // Both differences are bounded by the group's u32 block count.
+        ranges.push(((first - group_start) as u32, (end - group_start) as u32));
     }
+}
 
-    // FLEX_BG support: other groups' metadata (bitmaps, inode tables) may
-    // reside within THIS group.
-    let gpf = geo.groups_per_flex();
-    if gpf > 1 {
-        // Only check groups in the same flex group. Metadata for group G
-        // is always stored within the same flex group F where F = G / gpf.
-        let flex_index = group.0 / gpf;
-        let first_group = flex_index.saturating_mul(gpf);
-        let last_group = first_group.saturating_add(gpf).min(geo.group_count);
+fn cache_reserved_metadata_ranges(stats: &GroupStats, mut ranges: Vec<(u32, u32)>) -> Arc<[u32]> {
+    ranges.sort_unstable();
+    let mut reserved = Vec::new();
+    let mut covered = 0;
+    // Merge before expanding: overlapping or repeated descriptors cannot
+    // multiply the number of block offsets retained for a physical group.
+    for (start, end) in ranges {
+        reserved.extend(start.max(covered)..end);
+        covered = covered.max(end);
+    }
+    Arc::clone(stats.reserved_cache.get_or_init(|| Arc::from(reserved)))
+}
 
-        for g in first_group..last_group {
-            if g == group.0 {
-                continue; // Already handled above.
+/// Populate immutable metadata reservations before splitting allocator state.
+///
+/// Distribute each descriptor range only to the physical groups it intersects.
+/// This avoids scanning every descriptor for every group on FLEX_BG images,
+/// while preserving the same sorted reservations as lazy single-group queries.
+pub fn populate_reserved_block_caches(geo: &FsGeometry, groups: &[GroupStats]) {
+    let group_count = groups.len().min(geo.group_count as usize);
+    if !geo
+        .feature_incompat
+        .contains(ffs_ondisk::Ext4IncompatFeatures::FLEX_BG)
+        || geo.blocks_per_group == 0
+    {
+        for index in 0..group_count {
+            let _ = reserved_blocks_in_group(geo, groups, GroupNumber(index as u32));
+        }
+        return;
+    }
+    let mut pending: Vec<_> = (0..group_count)
+        .map(|index| {
+            groups[index].reserved_cache.get().is_none().then(|| {
+                let group = GroupNumber(index as u32);
+                vec![(
+                    0,
+                    geo.base_meta_blocks_in_group(group)
+                        .min(geo.blocks_in_group(group)),
+                )]
+            })
+        })
+        .collect();
+    let first_data = u64::from(geo.first_data_block);
+    for owner in groups {
+        for (start, count) in metadata_block_ranges(geo, owner) {
+            let end = start.saturating_add(count).min(geo.total_blocks);
+            let start = start.max(first_data);
+            if start >= end {
+                continue;
             }
-            if let Some(other_gs) = groups.get(g as usize) {
-                add_abs(&mut reserved, other_gs.block_bitmap_block.0);
-                add_abs(&mut reserved, other_gs.inode_bitmap_block.0);
-                for i in 0..inode_table_blocks {
-                    add_abs(&mut reserved, other_gs.inode_table_block.0 + i);
+            let first_group = (start - first_data) / u64::from(geo.blocks_per_group);
+            let end_group = (end - first_data).div_ceil(u64::from(geo.blocks_per_group));
+            for index in first_group..end_group.min(group_count as u64) {
+                if let Some(ranges) = &mut pending[index as usize] {
+                    reserve_metadata_range(
+                        geo,
+                        GroupNumber(index as u32),
+                        ranges,
+                        start,
+                        end - start,
+                    );
                 }
             }
         }
     }
-
-    reserved.sort_unstable();
-    reserved.dedup();
-    // Populate the cache for subsequent allocations in this group. `set` may
-    // race under concurrent allocation; first writer wins, the rest reuse it.
-    let arc: Arc<[u32]> = Arc::from(reserved.as_slice());
-    let _ = groups[gidx].reserved_cache.set(Arc::clone(&arc));
-    arc
+    for (stats, ranges) in groups.iter().zip(pending) {
+        if let Some(ranges) = ranges {
+            let _ = cache_reserved_metadata_ranges(stats, ranges);
+        }
+    }
 }
 
 /// Check if a relative block offset in a group is reserved.
@@ -7782,6 +7836,147 @@ mod tests {
             reserved.contains(&60),
             "metadata stored inside the current group must still be reserved"
         );
+    }
+
+    #[test]
+    fn reserved_blocks_include_metadata_beyond_the_flex_neighborhood() {
+        for log_groups_per_flex in [0, 1] {
+            let mut geo = make_batch_equivalence_geometry();
+            geo.feature_incompat =
+                ffs_ondisk::Ext4IncompatFeatures(ffs_ondisk::Ext4IncompatFeatures::FLEX_BG.0);
+            geo.log_groups_per_flex = log_groups_per_flex;
+            let mut groups = make_batch_equivalence_groups(&geo);
+            groups[3].block_bitmap_block = BlockNumber(84);
+            groups[3].inode_bitmap_block = BlockNumber(85);
+            groups[3].inode_table_block = BlockNumber(86);
+
+            let reserved = reserved_blocks_in_group(&geo, &groups, GroupNumber(1));
+            assert_eq!(reserved.as_ref(), &[0, 1, 2, 3, 4, 20, 21, 22, 23]);
+            assert!(!reserved.contains(&24), "adjacent data remains available");
+            assert!(Arc::ptr_eq(
+                &reserved,
+                &reserved_blocks_in_group(&geo, &groups, GroupNumber(1))
+            ));
+        }
+    }
+
+    #[test]
+    fn cross_flex_metadata_survives_lazy_allocation_and_cannot_be_freed() {
+        for uninitialized in [false, true] {
+            let cx = test_cx();
+            let mut geo = make_batch_equivalence_geometry();
+            geo.feature_incompat =
+                ffs_ondisk::Ext4IncompatFeatures(ffs_ondisk::Ext4IncompatFeatures::FLEX_BG.0);
+            geo.log_groups_per_flex = 1;
+            let mut groups = make_batch_equivalence_groups(&geo);
+            groups[3].block_bitmap_block = BlockNumber(84);
+            groups[3].inode_bitmap_block = BlockNumber(85);
+            groups[3].inode_table_block = BlockNumber(86);
+            let dev = MemBlockDevice::new(geo.block_size);
+            let pctx = make_batch_equivalence_persist_ctx(&geo);
+            let mut bitmap = vec![0_u8; geo.block_size as usize];
+            // Independent layout: this group's base/own metadata and group 3's
+            // two bitmaps plus its two-block inode table occupy nine blocks.
+            for rel in [0, 1, 2, 3, 4, 20, 21, 22, 23] {
+                bitmap_set(&mut bitmap, rel);
+            }
+            groups[1].free_blocks = 55;
+            if uninitialized {
+                groups[1].flags |= GD_FLAG_BLOCK_UNINIT;
+                bitmap.fill(0xa5); // Lazy bitmap bytes carry no allocation truth.
+            }
+            dev.write_block(&cx, groups[1].block_bitmap_block, &bitmap)
+                .unwrap();
+            seed_gdt_block(&dev, &pctx, &groups);
+            let metadata = vec![0x6d; geo.block_size as usize];
+            for block in 84..88 {
+                dev.write_block(&cx, BlockNumber(block), &metadata).unwrap();
+            }
+            let allocation = alloc_blocks_persist(
+                &cx,
+                &dev,
+                &geo,
+                &mut groups,
+                1,
+                &AllocHint {
+                    goal_block: Some(BlockNumber(84)),
+                    ..AllocHint::default()
+                },
+                &pctx,
+            )
+            .expect("allocate adjacent data without consuming foreign metadata");
+            assert_eq!(allocation.start, BlockNumber(88));
+            dev.write_block(&cx, allocation.start, &vec![0x5a; geo.block_size as usize])
+                .unwrap();
+            for block in 84..88 {
+                assert_eq!(
+                    dev.read_block(&cx, BlockNumber(block)).unwrap().as_slice(),
+                    metadata
+                );
+            }
+
+            let before = dev.blocks.lock().unwrap().clone();
+            let free_before = groups[1].free_blocks;
+            for block in 84..88 {
+                assert!(matches!(
+                    free_blocks_persist(&cx, &dev, &geo, &mut groups, BlockNumber(block), 1, &pctx),
+                    Err(FfsError::Corruption { .. })
+                ));
+            }
+            assert_eq!(*dev.blocks.lock().unwrap(), before);
+            assert_eq!(groups[1].free_blocks, free_before);
+            free_blocks_persist(&cx, &dev, &geo, &mut groups, allocation.start, 1, &pctx)
+                .expect("ordinary data remains reclaimable");
+            assert_eq!(groups[1].free_blocks, 55);
+        }
+    }
+
+    #[test]
+    fn prewarmed_reservations_clip_cross_group_tables_without_wrapping() {
+        let mut geo = make_batch_equivalence_geometry();
+        geo.feature_incompat =
+            ffs_ondisk::Ext4IncompatFeatures(ffs_ondisk::Ext4IncompatFeatures::FLEX_BG.0);
+        geo.log_groups_per_flex = 1;
+        geo.first_data_block = 1;
+        geo.total_blocks = 1 + 3 * 64 + 48;
+        geo.inodes_per_group = 64; // Eight blocks per inode table.
+        geo.total_inodes = 256;
+        let mut groups = make_batch_equivalence_groups(&geo);
+        for (index, stats) in groups.iter_mut().enumerate() {
+            let group = GroupNumber(u32::try_from(index).unwrap());
+            stats.block_bitmap_block = geo.group_block_to_absolute(group, 10);
+            stats.inode_bitmap_block = geo.group_block_to_absolute(group, 11);
+            stats.inode_table_block = geo.group_block_to_absolute(group, 12);
+        }
+        groups[0].block_bitmap_block = geo.group_block_to_absolute(GroupNumber(3), 30);
+        groups[0].inode_bitmap_block = geo.group_block_to_absolute(GroupNumber(2), 25);
+        groups[0].inode_table_block = geo.group_block_to_absolute(GroupNumber(1), 61);
+        // Invalid tails must still be bounded if this helper is used before
+        // descriptor admission; they cannot wrap and reserve unrelated blocks.
+        groups[2].inode_table_block = geo.group_block_to_absolute(GroupNumber(3), 44);
+        groups[3].inode_table_block = BlockNumber(u64::MAX - 2);
+        let prewarmed = groups.clone();
+        populate_reserved_block_caches(&geo, &prewarmed);
+        let expected = [
+            vec![0, 1],
+            vec![0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 61, 62, 63],
+            vec![0, 1, 2, 3, 4, 10, 11, 25],
+            vec![0, 1, 10, 11, 30, 44, 45, 46, 47],
+        ];
+        for (index, expected) in expected.iter().enumerate() {
+            let group = GroupNumber(u32::try_from(index).unwrap());
+            let lazy = reserved_blocks_in_group(&geo, &groups, group);
+            let eager = prewarmed[index].reserved_cache.get().unwrap();
+            assert_eq!(lazy.as_ref(), expected, "lazy group {index}");
+            assert_eq!(eager.as_ref(), expected, "prewarmed group {index}");
+            assert!(eager.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+        let retained = Arc::clone(prewarmed[2].reserved_cache.get().unwrap());
+        populate_reserved_block_caches(&geo, &prewarmed);
+        assert!(Arc::ptr_eq(
+            &retained,
+            prewarmed[2].reserved_cache.get().unwrap()
+        ));
     }
 
     #[test]

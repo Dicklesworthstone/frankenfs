@@ -13678,23 +13678,11 @@ impl OpenFs {
                     )));
                 }
                 let alloc_state = self.load_ext4_alloc_state(cx)?;
-                // bd-bhh0i: pre-populate every group's reserved-set cache while the
-                // FULL group slice is still reachable. A flex_bg group's reserved
-                // set references sibling groups' (immutable, mkfs-fixed) inode-table
-                // locators, which the sharded per-group alloc path cannot reach once
-                // each group is behind its own lock. `reserved_blocks_in_group`
-                // fills the per-group `reserved_cache` OnceLock through `&self`; the
-                // clone below carries it (Arc refcount), so the sharded path reads
-                // each locked group's own reserved set. Guarded so production
-                // (feature off) keeps the single-lock lazy-compute unchanged.
-                #[cfg(feature = "bhh0i_sharded_alloc")]
-                for g in 0..alloc_state.groups.len() {
-                    let _ = ffs_alloc::reserved_blocks_in_group(
-                        &alloc_state.geo,
-                        &alloc_state.groups,
-                        ffs_types::GroupNumber(u32::try_from(g).expect("group index fits u32")),
-                    );
-                }
+                // Index all descriptor-owned metadata by physical group before
+                // splitting the allocator. FLEX_BG permits metadata outside its
+                // owner's flex neighborhood; one range-distribution pass avoids
+                // an all-descriptor scan for every group's first allocation.
+                ffs_alloc::populate_reserved_block_caches(&alloc_state.geo, &alloc_state.groups);
                 // Mirror the per-group records into the default-off sharded
                 // structure (clone leaves the single-lock path's initial state
                 // identical). Unused until the sharded alloc path is wired.
