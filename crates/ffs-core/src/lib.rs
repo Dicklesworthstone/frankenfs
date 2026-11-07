@@ -27710,15 +27710,17 @@ fn xflags_to_ext4_flags(xflags: u32, current_flags: u32) -> ffs_error::Result<u3
         | ffs_types::EXT4_NODUMP_FL
         | ffs_types::EXT4_PROJINHERIT_FL;
     if xflags & xflags::FS_XFLAG_HASATTR != 0 {
-        return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-            libc::EINVAL,
-        )));
+        return Err(FfsError::RequestRejected {
+            errno: libc::EINVAL,
+            detail: "FS_XFLAG_HASATTR is not user-settable".into(),
+        });
     }
     let unsupported = xflags & !(SUPPORTED | xflags::FS_XFLAG_HASATTR);
     if unsupported != 0 {
-        return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-            libc::EOPNOTSUPP,
-        )));
+        return Err(FfsError::RequestRejected {
+            errno: libc::EOPNOTSUPP,
+            detail: format!("unsupported ext4 xflags: 0x{unsupported:08x}"),
+        });
     }
 
     let mut ext4 = current_flags & !EXT4_USER_FROM_XFLAGS;
@@ -30090,9 +30092,7 @@ impl OpenFs {
         if !inode.is_dir() {
             return Err(FfsError::NotDirectory);
         }
-        if inode.flags & ffs_types::EXT4_IMMUTABLE_FL != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
-        }
+        Self::ext4_reject_immutable(&inode)?;
         let insert_checks_duplicate = inode.has_htree_index()
             && inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
             && Self::htree_create_dedup_enabled();
@@ -30304,9 +30304,10 @@ impl OpenFs {
         }
         let is_dir = spec.mode & 0o170_000 == 0o040_000;
         if is_dir && !parent.has_htree_index() && parent.links_count >= 65_000 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EMLINK,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EMLINK,
+                detail: "parent directory has reached its link limit".into(),
+            });
         }
         let Some(allocated) = ffs_alloc::try_alloc_inode_in_group_persist_core(
             cx,
@@ -30511,15 +30512,17 @@ impl OpenFs {
             ffs_types::S_IFIFO => (ffs_ondisk::Ext4FileType::Fifo, false),
             ffs_types::S_IFSOCK => (ffs_ondisk::Ext4FileType::Sock, false),
             _ => {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    libc::EINVAL,
-                )));
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EINVAL,
+                    detail: "mknod requires a supported special-file type".into(),
+                });
             }
         };
         if !accepts_rdev && rdev != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EINVAL,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "only device nodes accept a device number".into(),
+            });
         }
 
         let sb = self
@@ -30662,9 +30665,10 @@ impl OpenFs {
             if parent_inode.flags & ffs_types::EXT4_INDEX_FL == 0
                 && parent_inode.links_count >= 65_000
             {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    libc::EMLINK,
-                )));
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EMLINK,
+                    detail: "parent directory has reached its link limit".into(),
+                });
             }
 
             let parent_group = ffs_types::inode_to_group(parent, alloc.geo.inodes_per_group);
@@ -33158,8 +33162,6 @@ impl OpenFs {
         new_name: &[u8],
     ) -> ffs_error::Result<InodeAttr> {
         const EXT4_LINK_MAX: u16 = 65_000;
-        const EPERM_ERRNO: i32 = 1;
-        const EMLINK_ERRNO: i32 = 31;
 
         Self::validate_single_path_component(new_name)?;
         let alloc_mutex = self.require_alloc_state()?;
@@ -33179,19 +33181,20 @@ impl OpenFs {
 
         let src_inode = self.read_inode(cx, ino)?;
         if src_inode.is_dir() {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(EPERM_ERRNO)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EPERM,
+                detail: "hard links to directories are not allowed".into(),
+            });
         }
         // No hard link may be created to an immutable OR append-only file: the
         // kernel's vfs_link returns EPERM for both ("A link to an append-only or
         // immutable file cannot be created") — bd-69ich.
-        Self::ext4_reject_immutable(&src_inode)?;
-        if src_inode.flags & ffs_types::EXT4_APPEND_FL != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(EPERM_ERRNO)));
-        }
+        Self::ext4_reject_immutable_or_append(&src_inode)?;
         if src_inode.links_count >= EXT4_LINK_MAX {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                EMLINK_ERRNO,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EMLINK,
+                detail: "inode has reached its hard-link limit".into(),
+            });
         }
 
         let new_parent_inode = self.read_inode(cx, new_parent)?;
@@ -36060,9 +36063,10 @@ impl OpenFs {
                 cx, block_dev, alloc, new_parent, child_ino,
             )?
         {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EINVAL,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "cannot move a directory into its own descendant".into(),
+            });
         }
 
         // The preflight reads the new_name hash-target leaf; on a non-casefold
@@ -37345,9 +37349,10 @@ impl OpenFs {
                 // missing-attribute errno and the kernel. Returning NotFound
                 // here surfaced ENOENT on the library API (the FUSE layer
                 // separately papered over it via a getattr heuristic). (bd-dssi7)
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    libc::ENODATA,
-                )));
+                return Err(FfsError::RequestRejected {
+                    errno: libc::ENODATA,
+                    detail: "cannot replace a missing extended attribute".into(),
+                });
             }
             XattrSetMode::Set | XattrSetMode::Create | XattrSetMode::Replace => {}
         }
@@ -37643,7 +37648,7 @@ impl OpenFs {
         value: &[u8],
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
-        let entries = posix_acl_parse(value)?;
+        let entries = posix_acl_parse_input(value)?;
         let (bits, equivalent) = posix_acl_equiv_mode(&entries);
         let compacted = ext4_compact_posix_acl_xattr_value(value)?;
         self.ext4_xattr_transaction(cx, ino, |dev, alloc, inode| {
@@ -47253,9 +47258,10 @@ impl OpenFs {
     fn xattr_name_within_limit_or_erange(name: &str) -> ffs_error::Result<()> {
         const XATTR_NAME_MAX: usize = 255;
         if name.len() > XATTR_NAME_MAX {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::ERANGE,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::ERANGE,
+                detail: "extended attribute name exceeds XATTR_NAME_MAX".into(),
+            });
         }
         Ok(())
     }
@@ -49797,9 +49803,10 @@ impl OpenFs {
             && dst_is_dir
             && self.ext4_directory_is_descendant_of(cx, parent, InodeNumber(u64::from(dst_ino)))?;
         if src_would_move_under_self || dst_would_move_under_self {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EINVAL,
-            )));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "directory exchange would create an ancestry cycle".into(),
+            });
         }
 
         // Walk each parent's data blocks, retarget the matching entry.
@@ -51475,6 +51482,19 @@ fn posix_acl_parse(value: &[u8]) -> ffs_error::Result<Vec<PosixAclEntry>> {
         return Err(einval());
     }
     Ok(entries)
+}
+
+/// Classify only caller-supplied ACL validation as a request rejection.
+/// The parser performs no I/O. Stored-ACL consumers keep using the original
+/// parser so malformed metadata retains its existing errno and abort policy.
+fn posix_acl_parse_input(value: &[u8]) -> ffs_error::Result<Vec<PosixAclEntry>> {
+    posix_acl_parse(value).map_err(|error| match error {
+        error @ FfsError::Io(_) => FfsError::RequestRejected {
+            errno: error.to_errno(),
+            detail: "malformed or unsupported POSIX ACL input".into(),
+        },
+        error => error,
+    })
 }
 
 fn posix_acl_encode(entries: &[PosixAclEntry]) -> Vec<u8> {
@@ -55678,10 +55698,12 @@ mod tests {
         // The output-only HASATTR bit may not be set by userspace -> EINVAL.
         let err = xflags_to_ext4_flags(xflags::FS_XFLAG_HASATTR, 0).unwrap_err();
         assert_eq!(err.to_errno(), libc::EINVAL);
+        assert!(matches!(err, FfsError::RequestRejected { .. }));
 
         // An xflag ext4 does not support (NODEFRAG) -> EOPNOTSUPP.
         let err = xflags_to_ext4_flags(xflags::FS_XFLAG_NODEFRAG, 0).unwrap_err();
         assert_eq!(err.to_errno(), libc::EOPNOTSUPP);
+        assert!(matches!(err, FfsError::RequestRejected { .. }));
 
         // Non-user-settable current flags (EXTENTS) are preserved when applying
         // xflags — clobbering them would make the extent tree uninterpretable.
@@ -74538,9 +74560,10 @@ mod tests {
 
     #[test]
     fn immutable_and_append_attributes_enforced_on_metadata_ops_bd_hbld5() {
-        let Some((fs, _tmp)) = open_writable_ext4_mkfs(8) else {
+        let Some((mut fs, _tmp)) = open_writable_ext4_mkfs(8) else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let set_flag = |ino: InodeNumber, flag: u32| {
@@ -74597,6 +74620,10 @@ mod tests {
             fs.setattr(&cx, imm.ino, &chown).is_err(),
             "chown of an immutable file must be rejected"
         );
+        assert!(
+            fs.is_writable(),
+            "metadata rejections are not storage faults"
+        );
 
         // Append-only: delete, rename, and hard-link rejected. The kernel's
         // vfs_link forbids a link to an append-only file too (bd-69ich).
@@ -74633,6 +74660,21 @@ mod tests {
             libc::EPERM,
             "setxattr on an append-only file must be EPERM (xattr_permission, bd-kf7uw)"
         );
+        assert!(
+            fs.is_writable(),
+            "append-only rejections must not abort writes"
+        );
+        let writable = fs
+            .create(&cx, root, OsStr::new("after-rejections"), 0o644, 0, 0)
+            .unwrap();
+        assert_eq!(
+            fs.write(&cx, writable.ino, 0, b"still writable").unwrap(),
+            14
+        );
+        assert_eq!(
+            fs.read(&cx, writable.ino, 0, 14).unwrap(),
+            b"still writable"
+        );
     }
 
     /// `chattr +i` / `+a` on a DIRECTORY (kernel `may_create` / `may_delete`):
@@ -74643,9 +74685,10 @@ mod tests {
     /// these operations succeeded on a mount (xfstests generic/079).
     #[test]
     fn immutable_and_append_only_directories_guard_their_entries() {
-        let Some((fs, _tmp)) = open_writable_ext4_mkfs(8) else {
+        let Some((mut fs, _tmp)) = open_writable_ext4_mkfs(8) else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let set_flag = |ino: InodeNumber, flag: u32| {
@@ -74698,6 +74741,10 @@ mod tests {
             "rename out",
         );
         assert!(fs.lookup(&cx, imm.ino, name("file")).is_ok());
+        assert!(
+            fs.is_writable(),
+            "immutable parent rejection must not abort writes"
+        );
 
         let app = fs
             .mkdir(&cx, root, OsStr::new("app.d"), 0o755, 0, 0)
@@ -74712,6 +74759,15 @@ mod tests {
             .expect("creating in an append-only directory is allowed");
         fs.link(&cx, outside.ino, app.ino, name("linked"))
             .expect("linking into an append-only directory is allowed");
+        let rename_source = fs
+            .create(&cx, root, name("rename-source"), 0o644, 0, 0)
+            .unwrap();
+        fs.rename(&cx, root, name("rename-source"), app.ino, name("renamed"))
+            .expect("renaming into an absent append-only directory entry is allowed");
+        assert_eq!(
+            fs.lookup(&cx, app.ino, name("renamed")).unwrap().ino,
+            rename_source.ino
+        );
         eperm(
             fs.unlink(&cx, app.ino, name("old")),
             "unlink in append-only dir",
@@ -74725,6 +74781,7 @@ mod tests {
             "rename replacing an entry of an append-only dir",
         );
         assert!(fs.lookup(&cx, app.ino, name("old")).is_ok());
+        assert!(fs.is_writable());
     }
 
     #[test]
@@ -87621,9 +87678,10 @@ mod tests {
 
     #[test]
     fn write_mkdir_at_dir_link_max_returns_emlink_bd_j12g7() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let free_inodes_before = fs
@@ -87643,13 +87701,17 @@ mod tests {
             0,
             "root must be non-htree for the EMLINK path"
         );
+        let root_links_before = root_inode.links_count;
         root_inode.links_count = 65_000;
         persist_ext4_test_inode(&fs, &cx, root, &root_inode);
+        let before = fs.current_snapshot();
 
         let err = fs
             .mkdir(&cx, root, OsStr::new("overflow_dir"), 0o755, 0, 0)
             .expect_err("mkdir at the directory link cap must fail");
         assert_eq!(err.to_errno(), libc::EMLINK);
+        assert_eq!(fs.current_snapshot(), before);
+        assert!(fs.is_writable(), "link limit is not a storage fault");
 
         let lookup_err = fs
             .lookup(&cx, root, OsStr::new("overflow_dir"))
@@ -87670,6 +87732,10 @@ mod tests {
             free_blocks_after, free_blocks_before,
             "failed mkdir should not leak directory block allocation"
         );
+        root_inode.links_count = root_links_before;
+        persist_ext4_test_inode(&fs, &cx, root, &root_inode);
+        fs.mkdir(&cx, root, OsStr::new("after-link-limit"), 0o755, 0, 0)
+            .expect("a legal mkdir still succeeds after the rejection");
     }
 
     #[test]
@@ -88942,26 +89008,44 @@ mod tests {
 
     #[test]
     fn write_link_directory_rejected_with_eperm() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let dir_attr = fs
             .mkdir(&cx, root, OsStr::new("link_dir"), 0o755, 0, 0)
             .expect("mkdir");
+        let before = fs.current_snapshot();
+        let counts = fs.statfs(&cx, root).unwrap();
 
         let err = fs
             .link(&cx, dir_attr.ino, root, OsStr::new("dir_hardlink"))
             .unwrap_err();
         assert_eq!(err.to_errno(), libc::EPERM);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+        assert!(
+            fs.is_writable(),
+            "a directory hard-link rejection is not I/O"
+        );
+        let file = fs
+            .create(&cx, root, OsStr::new("regular-link-source"), 0o644, 0, 0)
+            .unwrap();
+        let linked = fs
+            .link(&cx, file.ino, root, OsStr::new("regular-link"))
+            .expect("a regular-file hard link still succeeds");
+        assert_eq!(linked.ino, file.ino);
+        assert_eq!(linked.nlink, 2);
     }
 
     #[test]
     fn write_link_rejected_at_emlink_limit() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
 
@@ -88988,11 +89072,22 @@ mod tests {
         )
         .expect("persist nlink update");
         drop(alloc);
+        let before = fs.current_snapshot();
+        let counts = fs.statfs(&cx, root).unwrap();
 
         let err = fs
             .link(&cx, src.ino, root, OsStr::new("emlink_dst.txt"))
             .unwrap_err();
         assert_eq!(err.to_errno(), libc::EMLINK);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+        assert!(fs.is_writable());
+        inode.links_count = 1;
+        persist_ext4_test_inode(&fs, &cx, src.ino, &inode);
+        let linked = fs
+            .link(&cx, src.ino, root, OsStr::new("emlink_dst.txt"))
+            .expect("a link below the limit still succeeds");
+        assert_eq!(linked.nlink, 2);
     }
 
     #[test]
@@ -91537,9 +91632,10 @@ mod tests {
 
     #[test]
     fn ext4_setxattr_value_over_xattr_size_max_returns_e2big() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let ino = fs
@@ -91551,11 +91647,20 @@ mod tests {
         // dispatcher rejects it before any storage attempt, so this is
         // deterministic regardless of ext4's external-block capacity. Pre-fix
         // ext4 surfaced EINVAL (Format via ffs_xattr).
+        let before = fs.current_snapshot();
         let too_large = vec![0xAB_u8; 65_537];
         let err = fs
             .setxattr(&cx, ino, "user.big", &too_large, XattrSetMode::Set)
             .expect_err("an oversized xattr value must be rejected");
         assert_eq!(err.to_errno(), libc::E2BIG);
+        assert_eq!(fs.current_snapshot(), before);
+        assert!(fs.is_writable());
+        fs.setxattr(&cx, ino, "user.big", b"valid", XattrSetMode::Set)
+            .expect("a legal xattr value still succeeds");
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.big").unwrap(),
+            Some(b"valid".to_vec())
+        );
     }
 
     /// Kernel tree-checker contract: every dir item inside an XATTR_ITEM
@@ -91632,9 +91737,10 @@ mod tests {
 
     #[test]
     fn ext4_xattr_name_over_xattr_name_max_returns_erange() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let ino = fs
@@ -91646,6 +91752,7 @@ mod tests {
         // ERANGE per the kernel's pre-fs name copy — not ENAMETOOLONG (setxattr)
         // nor a spurious ENODATA/not-found (getxattr). 5 + 256 = 261 bytes.
         let long_name = format!("user.{}", "a".repeat(256));
+        let before = fs.current_snapshot();
 
         let set_err = fs
             .setxattr(&cx, ino, &long_name, b"v", XattrSetMode::Set)
@@ -91661,6 +91768,11 @@ mod tests {
             .removexattr(&cx, ino, &long_name)
             .expect_err("removexattr of an over-long name must be ERANGE");
         assert_eq!(rm_err.to_errno(), libc::ERANGE);
+        assert_eq!(fs.current_snapshot(), before);
+        assert!(fs.is_writable());
+        fs.setxattr(&cx, ino, "user.valid", b"valid", XattrSetMode::Set)
+            .expect("a legal xattr name still succeeds");
+        assert!(fs.removexattr(&cx, ino, "user.valid").unwrap());
     }
 
     #[test]
@@ -91753,9 +91865,10 @@ mod tests {
 
     #[test]
     fn write_setxattr_respects_create_and_replace_modes() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
 
@@ -91766,6 +91879,8 @@ mod tests {
 
         fs.setxattr(&cx, ino, "user.color", b"blue", XattrSetMode::Create)
             .expect("initial create");
+        let before = fs.current_snapshot();
+        let counts = fs.statfs(&cx, root).unwrap();
 
         let err = fs
             .setxattr(&cx, ino, "user.color", b"green", XattrSetMode::Create)
@@ -91778,6 +91893,22 @@ mod tests {
         // setxattr(2): XATTR_REPLACE on a missing attribute is ENODATA, not
         // ENOENT — same missing-attribute errno as getxattr/removexattr (bd-dssi7).
         assert_eq!(err.to_errno(), libc::ENODATA);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+        assert!(
+            fs.is_writable(),
+            "missing replacement is not a storage fault"
+        );
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.color").unwrap(),
+            Some(b"blue".to_vec())
+        );
+        fs.setxattr(&cx, ino, "user.color", b"green", XattrSetMode::Replace)
+            .expect("a valid replacement still succeeds");
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.color").unwrap(),
+            Some(b"green".to_vec())
+        );
     }
 
     #[test]
@@ -94224,11 +94355,14 @@ mod tests {
 
     #[test]
     fn ext4_mknod_fifo_with_nonzero_rdev_returns_einval() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
+        let before = fs.current_snapshot();
+        let counts = fs.statfs(&cx, root).unwrap();
 
         // FIFO + non-zero rdev: rdev is meaningless for FIFOs and the
         // POSIX mknod(2) man page requires it to be 0 (or ignored).
@@ -94245,15 +94379,33 @@ mod tests {
             )
             .expect_err("FIFO + rdev != 0 must fail");
         assert_eq!(err.to_errno(), libc::EINVAL);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+        assert!(fs.is_writable(), "invalid rdev is not a storage fault");
+        let fifo = fs
+            .mknod(
+                &cx,
+                root,
+                OsStr::new("bad.fifo"),
+                ffs_types::S_IFIFO | 0o644,
+                0,
+                0,
+                0,
+            )
+            .expect("a FIFO with zero rdev still succeeds");
+        assert_eq!(fifo.kind, FileType::Fifo);
     }
 
     #[test]
     fn ext4_mknod_unsupported_file_type_returns_einval() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
+        let before = fs.current_snapshot();
+        let counts = fs.statfs(&cx, root).unwrap();
 
         // S_IFREG is handled by `create`, S_IFDIR by `mkdir`, S_IFLNK
         // by `symlink`. Calling mknod with a regular-file mode is
@@ -94271,6 +94423,11 @@ mod tests {
             )
             .expect_err("mknod with S_IFREG must be rejected");
         assert_eq!(err.to_errno(), libc::EINVAL);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+        assert!(fs.is_writable(), "wrong mknod type is not a storage fault");
+        fs.create(&cx, root, OsStr::new("wrong_api.txt"), 0o644, 0, 0)
+            .expect("the correct regular-file creation API still succeeds");
     }
 
     // ── bd-z01zm: overlayfs trusted.overlay.* xattr round-trip ────────────
@@ -95681,6 +95838,7 @@ mod tests {
         )
         .expect_err("exchange must not move a directory under itself");
         assert_eq!(err.to_errno(), libc::EINVAL);
+        assert!(matches!(err, FfsError::RequestRejected { .. }));
 
         let dir_after = fs
             .lookup(&cx, root, OsStr::new("ex_cycle_dir"))
@@ -99806,9 +99964,10 @@ mod tests {
 
     #[test]
     fn write_rename_directory_into_own_child_returns_einval() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
 
@@ -99818,6 +99977,8 @@ mod tests {
         let child = fs
             .mkdir(&cx, dir.ino, OsStr::new("child"), 0o755, 0, 0)
             .expect("mkdir child");
+        let before = fs.current_snapshot();
+        let counts = fs.statfs(&cx, root).unwrap();
 
         let err = fs
             .rename(
@@ -99829,6 +99990,12 @@ mod tests {
             )
             .expect_err("rename must not move a directory under itself");
         assert_eq!(err.to_errno(), libc::EINVAL);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+        assert!(
+            fs.is_writable(),
+            "ancestry rejection is not a storage fault"
+        );
 
         let dir_after = fs
             .lookup(&cx, root, OsStr::new("cycle_dir"))
@@ -99838,6 +100005,18 @@ mod tests {
             .expect("child remains under directory");
         assert_eq!(dir_after.ino, dir.ino);
         assert_eq!(child_after.ino, child.ino);
+        fs.rename(
+            &cx,
+            root,
+            OsStr::new("cycle_dir"),
+            root,
+            OsStr::new("after-cycle"),
+        )
+        .expect("a legal directory rename still succeeds");
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new("after-cycle")).unwrap().ino,
+            dir.ino
+        );
     }
 
     #[test]
@@ -103321,6 +103500,7 @@ mod tests {
             armed: Arc<AtomicBool>,
             failures: Arc<AtomicUsize>,
             errno: i32,
+            one_shot: bool,
         }
         impl ByteDevice for FailingDataRead {
             fn len_bytes(&self) -> u64 {
@@ -103332,7 +103512,13 @@ mod tests {
                 offset: ByteOffset,
                 buf: &mut [u8],
             ) -> ffs_error::Result<()> {
-                if self.armed.load(Ordering::Acquire) && offset == self.target {
+                let should_fail = offset == self.target
+                    && if self.one_shot {
+                        self.armed.swap(false, Ordering::AcqRel)
+                    } else {
+                        self.armed.load(Ordering::Acquire)
+                    };
+                if should_fail {
                     self.failures.fetch_add(1, Ordering::Relaxed);
                     return Err(std::io::Error::from_raw_os_error(self.errno).into());
                 }
@@ -103378,7 +103564,19 @@ mod tests {
             Ext4DataErrPolicy::Continue,
             Ext4DataErrPolicy::Abort,
         ] {
-            for errno in [libc::EIO, libc::EFBIG, libc::ENODEV] {
+            for errno in [
+                libc::EIO,
+                libc::EFBIG,
+                libc::ENODEV,
+                libc::EPERM,
+                libc::EINVAL,
+                libc::EMLINK,
+                libc::ENODATA,
+                libc::EOPNOTSUPP,
+                libc::E2BIG,
+                libc::ERANGE,
+                libc::EACCES,
+            ] {
                 for scoped in [false, true] {
                     let armed = Arc::new(AtomicBool::new(false));
                     let failures = Arc::new(AtomicUsize::new(0));
@@ -103388,6 +103586,7 @@ mod tests {
                         armed: Arc::clone(&armed),
                         failures: Arc::clone(&failures),
                         errno,
+                        one_shot: false,
                     };
                     let options = OpenOptions {
                         ext4_data_err_policy: policy,
@@ -103445,6 +103644,111 @@ mod tests {
                     );
                 }
             }
+        }
+
+        // A transient lookup error is not proof that a protected destination
+        // is absent. The old is_ok() check swallowed it, allowing the following
+        // rename to replace that entry when its second read succeeded.
+        let namespace_device = TestDevice::from_vec(original);
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            ..OpenOptions::default()
+        };
+        let mut namespace_seed =
+            OpenFs::from_device(&cx, Box::new(namespace_device.clone()), &options).unwrap();
+        namespace_seed.enable_writes(&cx).unwrap();
+        let root = InodeNumber(2);
+        let source = namespace_seed
+            .create(&cx, root, OsStr::new("rename-source"), 0o644, 0, 0)
+            .unwrap()
+            .ino;
+        namespace_seed.write(&cx, source, 0, b"source").unwrap();
+        let parent = namespace_seed
+            .mkdir(&cx, root, OsStr::new("append-parent"), 0o755, 0, 0)
+            .unwrap()
+            .ino;
+        let kept = namespace_seed
+            .create(&cx, parent, OsStr::new("kept"), 0o644, 0, 0)
+            .unwrap()
+            .ino;
+        namespace_seed.write(&cx, kept, 0, b"kept").unwrap();
+        let mut parent_inode = namespace_seed.read_inode(&cx, parent).unwrap();
+        assert!(!parent_inode.has_htree_index());
+        parent_inode.flags |= ffs_types::EXT4_APPEND_FL;
+        namespace_seed
+            .persist_ext4_inode_for_testing(&cx, parent, &parent_inode)
+            .unwrap();
+        let target = ByteOffset(
+            namespace_seed
+                .resolve_extent(&cx, &RequestScope::empty(), &parent_inode, 0)
+                .unwrap()
+                .unwrap()
+                .0
+                * u64::from(bs),
+        );
+        namespace_seed.flush_mvcc_to_device(&cx).unwrap();
+        let namespace_bytes = namespace_device.snapshot_bytes();
+        drop(namespace_seed);
+        for errno in [libc::EIO, libc::EPERM] {
+            let armed = Arc::new(AtomicBool::new(false));
+            let failures = Arc::new(AtomicUsize::new(0));
+            let device = FailingDataRead {
+                inner: TestDevice::from_vec(namespace_bytes.clone()),
+                target,
+                armed: Arc::clone(&armed),
+                failures: Arc::clone(&failures),
+                errno,
+                one_shot: true,
+            };
+            let options = OpenOptions {
+                ext4_data_err_policy: Ext4DataErrPolicy::Abort,
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::from_device(&cx, Box::new(device), &options).unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.ext4_base_block_cache.clear();
+            fs.ext4_file_data_block_cache.clear();
+            let before = fs.current_snapshot();
+            let counts = fs.statfs(&cx, root).unwrap();
+            armed.store(true, Ordering::Release);
+            let error = fs
+                .rename(
+                    &cx,
+                    root,
+                    OsStr::new("rename-source"),
+                    parent,
+                    OsStr::new("kept"),
+                )
+                .expect_err("a destination lookup failure must abort rename");
+            armed.store(false, Ordering::Release);
+            assert!(matches!(&error, FfsError::Io(_)), "{error:?}");
+            assert_eq!(error.to_errno(), errno);
+            assert_eq!(failures.load(Ordering::Relaxed), 1);
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new("rename-source"))
+                    .unwrap()
+                    .ino,
+                source
+            );
+            assert_eq!(
+                fs.lookup(&cx, parent, OsStr::new("kept")).unwrap().ino,
+                kept
+            );
+            assert_eq!(fs.read(&cx, source, 0, 6).unwrap(), b"source");
+            assert_eq!(fs.read(&cx, kept, 0, 4).unwrap(), b"kept");
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+            assert!(
+                !fs.is_writable(),
+                "genuine lookup I/O must retain Abort policy"
+            );
+            assert!(matches!(
+                fs.write(&cx, source, 0, b"changed"),
+                Err(FfsError::ReadOnly)
+            ));
         }
     }
 
@@ -114066,10 +114370,16 @@ mod tests {
             let encoded = posix_acl_encode(&entries);
             let parsed = posix_acl_parse(&encoded).expect("valid ACL");
             assert_eq!(posix_acl_encode(&parsed), encoded);
+            let input = posix_acl_parse_input(&encoded).expect("valid caller input");
+            assert_eq!(posix_acl_encode(&input), encoded);
         }
         for (label, value, errno) in acl_input_rejection_cases() {
             let err = posix_acl_parse(&value).expect_err(label);
             assert_eq!(err.to_errno(), errno, "{label}: {err:?}");
+            assert!(matches!(err, FfsError::Io(_)), "stored ACL: {label}");
+            let input = posix_acl_parse_input(&value).expect_err(label);
+            assert_eq!(input.to_errno(), errno, "input ACL: {label}");
+            assert!(matches!(input, FfsError::RequestRejected { .. }), "{label}");
         }
     }
 
@@ -114199,7 +114509,8 @@ mod tests {
 
     #[test]
     fn acl_input_invalid_updates_preserve_existing_permissions_and_attributes() {
-        let fs = open_writable_ext4().expect("retained ext4 fixture");
+        let mut fs = open_writable_ext4().expect("retained ext4 fixture");
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let named = ext4_setattr_test_acl(6, 4, 0);
@@ -114230,7 +114541,109 @@ mod tests {
                     groups
                 );
                 assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                assert!(fs.is_writable(), "{name} {label} must not abort writes");
             }
+        }
+        let valid = ext4_setattr_test_acl(4, 4, 0);
+        fs.setxattr(&cx, root, POSIX_ACL_ACCESS_XATTR, &valid, XattrSetMode::Set)
+            .expect("a valid ACL still succeeds after all rejected inputs");
+        assert_eq!(
+            fs.getxattr(&cx, root, POSIX_ACL_ACCESS_XATTR).unwrap(),
+            Some(valid)
+        );
+        let file = fs
+            .create(&cx, root, OsStr::new("default-acl-file"), 0o644, 0, 0)
+            .unwrap()
+            .ino;
+        let before = fs.current_snapshot();
+        let inode = fs.read_inode(&cx, file).unwrap();
+        let error = fs
+            .setxattr(
+                &cx,
+                file,
+                POSIX_ACL_DEFAULT_XATTR,
+                &named,
+                XattrSetMode::Set,
+            )
+            .expect_err("a regular file cannot have a default ACL");
+        assert_eq!(error.to_errno(), libc::EACCES);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.read_inode(&cx, file).unwrap(), inode);
+        assert!(fs.is_writable());
+        assert_eq!(fs.write(&cx, file, 0, b"ok").unwrap(), 2);
+    }
+
+    #[test]
+    fn acl_stored_corruption_preserves_error_origin_and_aborts_metadata_mutation() {
+        for inherit in [false, true] {
+            let mut fs = open_writable_ext4().expect("retained ext4 fixture");
+            fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let target = if inherit {
+                root
+            } else {
+                fs.create(&cx, root, OsStr::new("stored-acl"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            };
+            let name = if inherit {
+                POSIX_ACL_DEFAULT_XATTR
+            } else {
+                POSIX_ACL_ACCESS_XATTR
+            };
+            let mut stored =
+                ext4_compact_posix_acl_xattr_value(&ext4_setattr_test_acl(6, 4, 0)).unwrap();
+            // Plant an invalid permission in real stored ACL bytes, bypassing
+            // caller-input validation while keeping the xattr encoding/checksums.
+            stored[6..8].copy_from_slice(&8_u16.to_le_bytes());
+            fs.ext4_xattr_transaction(&cx, target, |dev, alloc, inode| {
+                fs.ext4_stage_setxattr(
+                    &cx,
+                    dev,
+                    alloc,
+                    target,
+                    inode,
+                    name,
+                    &stored,
+                    XattrSetMode::Set,
+                )?;
+                Ok(true)
+            })
+            .unwrap();
+            let before = fs.current_snapshot();
+            let inode = fs.read_inode(&cx, target).unwrap();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let error = if inherit {
+                fs.create(&cx, root, OsStr::new("bad-inherited-acl"), 0o644, 0, 0)
+                    .map(|_| ())
+            } else {
+                fs.setattr(
+                    &cx,
+                    target,
+                    &SetAttrRequest {
+                        mode: Some(0o600),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .map(|_| ())
+            }
+            .expect_err("malformed stored ACL must stop the metadata mutation");
+            assert!(matches!(&error, FfsError::Io(_)), "{error:?}");
+            assert_eq!(error.to_errno(), libc::EINVAL);
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.read_inode(&cx, target).unwrap(), inode);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert!(matches!(
+                fs.lookup(&cx, root, OsStr::new("bad-inherited-acl")),
+                Err(FfsError::NotFound(_))
+            ));
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+            assert!(
+                !fs.is_writable(),
+                "stored ACL error must retain Abort behavior"
+            );
         }
     }
 

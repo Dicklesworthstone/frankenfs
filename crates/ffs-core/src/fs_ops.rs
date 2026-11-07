@@ -170,7 +170,7 @@ impl OpenFs {
         if matches!(&self.flavor, FsFlavor::Ext4(_)) {
             return self.ext4_set_access_acl(cx, Self::ext4_canonical_inode(ino), value, mode);
         }
-        let entries = super::posix_acl_parse(value)?;
+        let entries = super::posix_acl_parse_input(value)?;
         let (bits, equivalent) = super::posix_acl_equiv_mode(&entries);
         let attr = <Self as FsOps>::getattr(self, cx, scope, ino)?;
         if equivalent {
@@ -262,7 +262,10 @@ impl OpenFs {
             ffs_types::EXT4_IMMUTABLE_FL
         };
         if flags & forbidden != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::EPERM,
+                detail: "directory flags forbid this entry change".into(),
+            });
         }
         Ok(())
     }
@@ -282,10 +285,17 @@ impl OpenFs {
         self.reject_dir_entry_change(cx, scope, parent, true)?;
         self.reject_dir_entry_change(cx, scope, new_parent, false)?;
         let flags = <Self as FsOps>::get_inode_flags(self, cx, scope, new_parent)?;
-        if flags & ffs_types::EXT4_APPEND_FL != 0
-            && <Self as FsOps>::lookup(self, cx, scope, new_parent, new_name).is_ok()
-        {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+        if flags & ffs_types::EXT4_APPEND_FL != 0 {
+            match <Self as FsOps>::lookup(self, cx, scope, new_parent, new_name) {
+                Ok(_) => {
+                    return Err(FfsError::RequestRejected {
+                        errno: libc::EPERM,
+                        detail: "cannot replace an entry in an append-only directory".into(),
+                    });
+                }
+                Err(FfsError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -1180,12 +1190,15 @@ impl FsOps for OpenFs {
         // and then checks the value size, so the name check comes first.
         Self::xattr_name_within_limit_or_erange(name)?;
         if value.len() > XATTR_SIZE_MAX {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::E2BIG)));
+            return Err(FfsError::RequestRejected {
+                errno: libc::E2BIG,
+                detail: "extended attribute value exceeds XATTR_SIZE_MAX".into(),
+            });
         }
         if matches!(
             name,
             super::POSIX_ACL_ACCESS_XATTR | super::POSIX_ACL_DEFAULT_XATTR
-        ) && (value.is_empty() || super::posix_acl_parse(value)?.is_empty())
+        ) && (value.is_empty() || super::posix_acl_parse_input(value)?.is_empty())
         {
             // A null ACL clears storage without deriving new permission bits.
             // This also succeeds for an absent default ACL on a regular file.
@@ -1195,12 +1208,13 @@ impl FsOps for OpenFs {
             return self.set_access_acl(cx, scope, ino, value, mode);
         }
         if name == super::POSIX_ACL_DEFAULT_XATTR {
-            super::posix_acl_parse(value)?;
+            super::posix_acl_parse_input(value)?;
             // Only a directory has a default ACL (kernel: EACCES otherwise).
             if <Self as FsOps>::getattr(self, cx, scope, ino)?.kind != FileType::Directory {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    libc::EACCES,
-                )));
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EACCES,
+                    detail: "only directories accept a default POSIX ACL".into(),
+                });
             }
         }
         self.setxattr_stored(cx, scope, ino, name, value, mode)
