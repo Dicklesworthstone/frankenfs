@@ -6576,7 +6576,7 @@ impl Filesystem for FrankenFuse {
         _fh: u64,
         offset: i64,
         size: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
@@ -6586,6 +6586,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EINVAL);
             return;
         };
+        debug!(ino, flags, byte_offset, size, "FUSE read request");
         match self.read_with_readahead(&cx, InodeNumber(ino), byte_offset, size) {
             Ok(data) => {
                 self.inner
@@ -6593,7 +6594,7 @@ impl Filesystem for FrankenFuse {
                     .record_bytes_read(u64::try_from(data.len()).unwrap_or(u64::MAX));
                 // Before the reply: the kernel drops its cached atime when the
                 // READ completes, and the GETATTR that follows must see ours.
-                self.record_access(&cx, ino);
+                self.record_access(&cx, ino, flags);
                 reply.data(&data);
             }
             Err(e) => {
@@ -7996,7 +7997,14 @@ impl FrankenFuse {
 
     /// Apply the mount's [`AtimePolicy`] to a READ of `ino`. A failure only
     /// costs the atime update, so it is logged, not returned.
-    fn record_access(&self, cx: &Cx, ino: u64) {
+    fn record_access(&self, cx: &Cx, ino: u64, flags: i32) {
+        // READ carries the open flags even when zero-message OPEN is active.
+        #[cfg(target_os = "linux")]
+        if flags & libc::O_NOATIME != 0 {
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = flags;
         let strict = match self.inner.atime {
             AtimePolicy::NoAtime => return,
             AtimePolicy::Relatime => false,

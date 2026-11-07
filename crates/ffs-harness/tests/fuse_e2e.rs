@@ -11436,12 +11436,29 @@ struct FileStateSnapshot {
     mtime_nsec: i64,
 }
 
-/// Read, THEN stat: the read is an access, and under the mount's default
-/// relatime it moves atime the first time after a write. Stat-then-read let
-/// the snapshot's own read change the atime the next snapshot sees; read-then-
-/// stat makes a repeated snapshot stable, so a difference is the operation's.
+/// Read without changing atime, then capture the metadata. An ordinary read
+/// would make the observer itself a mutation when relatime is due.
 fn snapshot_file_state(path: &Path) -> FileStateSnapshot {
-    let bytes = fs::read(path).expect("read file state");
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        let read_only = nix::sys::statvfs::statvfs(path)
+            .expect("inspect snapshot mount flags")
+            .flags()
+            .contains(nix::sys::statvfs::FsFlags::ST_RDONLY);
+        // Seeded read-only files can belong to another uid. Their mount cannot
+        // update atime, and O_NOATIME would unnecessarily require ownership.
+        if !read_only {
+            options.custom_flags(libc::O_NOATIME);
+        }
+    }
+    let mut bytes = Vec::new();
+    options
+        .open(path)
+        .expect("open file state without updating atime")
+        .read_to_end(&mut bytes)
+        .expect("read file state");
     let meta = fs::metadata(path).expect("stat file state");
     FileStateSnapshot {
         bytes,
@@ -11460,6 +11477,88 @@ fn assert_file_state_unchanged(path: &Path, before: &FileStateSnapshot, context:
         after, *before,
         "{context} must not change file contents or metadata"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_uncached_reads_respect_noatime(mnt: &Path) {
+    assert!(
+        command_available("python3"),
+        "native read-flag probe requires python3"
+    );
+    let script = r"
+import ctypes, json, mmap, os, struct, sys
+path = sys.argv[1]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.statx.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+libc.statx.restype = ctypes.c_int
+def metadata():
+    raw = ctypes.create_string_buffer(256)
+    # BTIME requests the native STATX path rather than GETATTR's attribute memo.
+    assert libc.statx(-100, os.fsencode(path), 0x2000, 0xfff, raw) == 0, ctypes.get_errno()
+    assert struct.unpack_from('=I', raw, 0)[0] & 0x7ff == 0x7ff
+    return dict(mode=struct.unpack_from('=H', raw, 28)[0],
+                ino=struct.unpack_from('=Q', raw, 32)[0],
+                size=struct.unpack_from('=Q', raw, 40)[0],
+                atime=struct.unpack_from('=qI', raw, 64),
+                ctime=struct.unpack_from('=qI', raw, 96),
+                mtime=struct.unpack_from('=qI', raw, 112))
+payload = b'Q' * 65536
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    assert os.write(fd, payload) == len(payload)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+records = []
+for label, flag in [('noatime', os.O_NOATIME), ('ordinary', 0)]:
+    os.utime(path, ns=(1000000000000000000, 1000000000000000000))
+    before = metadata()
+    assert before['atime'] == (1000000000, 0)
+    flags = os.O_RDONLY | os.O_DIRECT | flag
+    fd = os.open(path, flags)
+    buffer = mmap.mmap(-1, len(payload))
+    try:
+        count = os.preadv(fd, [buffer], 0)
+        assert count == len(payload) and buffer[:] == payload
+    finally:
+        buffer.close()
+        os.close(fd)
+    after = metadata()
+    for field in ['mode', 'ino', 'size', 'ctime', 'mtime']:
+        assert after[field] == before[field], (label, field, before, after)
+    if flag:
+        assert after['atime'] == before['atime'], ('O_NOATIME changed atime', before, after)
+    else:
+        assert after['atime'] > before['atime'], ('ordinary direct read did not update atime', before, after)
+    records.append(dict(mode=label, flags=flags, before=before, after=after, bytes=count))
+print(json.dumps(records))
+";
+    let output = python_command(script)
+        .arg(mnt.join("noatime-direct-read"))
+        .output()
+        .expect("execute native uncached read-flag probe");
+    assert!(
+        output.status.success(),
+        "native read-flag probe failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!(
+        "NATIVE_READ_FLAGS|{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ext4_fuse_uncached_reads_respect_noatime() {
+    with_rw_mount(assert_uncached_reads_respect_noatime);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn btrfs_fuse_uncached_reads_respect_noatime() {
+    with_btrfs_rw_mount(assert_uncached_reads_respect_noatime);
 }
 
 fn snapshot_directory_entries(path: &Path) -> HashSet<String> {
