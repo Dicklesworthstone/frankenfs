@@ -5028,7 +5028,7 @@ impl FsOps for OpenFs {
             {
                 // Abort revokes new publications, not durability for writes
                 // already accepted before teardown.
-                self.flush_revoked_ext4_commits(cx)?;
+                self.flush_ext4_checkpoint(cx, false)?;
             }
             return Ok(());
         }
@@ -5055,12 +5055,17 @@ impl FsOps for OpenFs {
 
         // Flush committed MVCC block versions (covers ext4 metadata and any
         // file-data extents staged through the block-versioned path).
-        let flushed = self.flush_mvcc_to_device(cx)?;
+        let flushed = if self.metadata_log.is_some() {
+            self.handle_ext4_write_result(
+                "flush_on_destroy",
+                self.flush_ext4_checkpoint(cx, false),
+            )?
+        } else {
+            self.flush_mvcc_to_device(cx)?
+        };
         if flushed > 0 {
             info!(flushed_blocks = flushed, "flush_on_destroy");
         }
-        self.checkpoint_metadata_log(*self.mvcc_flushed_through.lock())?;
-
         // btrfs commit-on-destroy: flush dirty COW trees to disk so
         // mutations performed through the mounted FUSE path survive
         // unmount/remount. The full transaction commit allocates real

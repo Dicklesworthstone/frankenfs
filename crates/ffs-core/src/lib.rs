@@ -5252,6 +5252,25 @@ struct MetadataLog {
     index: BTreeMap<BlockNumber, Arc<[u8]>>,
 }
 
+impl MetadataLog {
+    /// The caller holds append exclusion and has synced the full home image.
+    fn checkpoint(&mut self, durable_through: CommitSeq) -> Result<(), FfsError> {
+        let header_size = self
+            .writer
+            .truncate_after_checkpoint(durable_through.0)
+            .map_err(FfsError::from)?;
+        self.logged_through = self.logged_through.max(durable_through);
+        self.index.clear();
+        info!(
+            target: "ffs::mvcc::metadata_log",
+            checkpoint_through = self.logged_through.0,
+            wal_bytes = header_size,
+            "metadata WAL compacted into base checkpoint"
+        );
+        Ok(())
+    }
+}
+
 /// Adapter for ext4 external-journal replay.
 ///
 /// Journal reads come from the separate external journal device, while replayed
@@ -13341,6 +13360,11 @@ impl OpenFs {
     /// previous log boundary, then hand the same immutable block images to the
     /// background home-location compactor.
     fn flush_ext4_metadata_log(&self, cx: &Cx) -> Result<usize, FfsError> {
+        self.reject_ext4_revoked_publication(true)?;
+        // Keep the captured bitmap/inode versions and derived counts at one
+        // head whenever this caller can quiesce requests. Gated O_SYNC callers
+        // retain the existing reentrant path. Gate admission precedes the WAL.
+        let _boundary = self.close_mutation_gate();
         let log_mutex = self.metadata_log.as_ref().ok_or_else(|| {
             FfsError::Format("append-only metadata log is not enabled".to_owned())
         })?;
@@ -13387,11 +13411,12 @@ impl OpenFs {
         for (block, data) in &batch {
             log.index.insert(*block, Arc::clone(data));
         }
-        drop(log);
-
+        // Queue order must equal WAL order. Releasing append exclusion first
+        // lets a newer fsync enqueue before this older batch and get overwritten.
         if let Some(compactor) = self.metadata_compactor.lock().as_ref() {
             compactor.enqueue(batch);
         }
+        drop(log);
         trace!(
             target: "ffs::mvcc::metadata_log",
             durable_through = durable_through.0,
@@ -13408,28 +13433,6 @@ impl OpenFs {
         if let Some(mut compactor) = compactor {
             compactor.shutdown();
         }
-    }
-
-    /// Retire the WAL only after every current MVCC version and derived ext4
-    /// summary has reached the base device and that device has synced.
-    fn checkpoint_metadata_log(&self, durable_through: CommitSeq) -> Result<(), FfsError> {
-        let Some(log_mutex) = &self.metadata_log else {
-            return Ok(());
-        };
-        let mut log = log_mutex.lock();
-        let header_size = log
-            .writer
-            .truncate_after_checkpoint(durable_through.0)
-            .map_err(FfsError::from)?;
-        log.logged_through = log.logged_through.max(durable_through);
-        log.index.clear();
-        info!(
-            target: "ffs::mvcc::metadata_log",
-            checkpoint_through = log.logged_through.0,
-            wal_bytes = header_size,
-            "metadata WAL compacted into base checkpoint"
-        );
-        Ok(())
     }
 
     /// Select the MVCC conflict policy for commits on this filesystem
@@ -13529,8 +13532,13 @@ impl OpenFs {
                 Err(error)
             };
         }
-        if self.is_ext4() && self.ext4_forced_read_only.load(Ordering::SeqCst) {
-            return self.flush_revoked_ext4_commits(cx);
+        if self.is_ext4()
+            && (self.metadata_log.is_some() || self.ext4_forced_read_only.load(Ordering::SeqCst))
+        {
+            return self.handle_ext4_write_result(
+                "flush_mvcc_to_device",
+                self.flush_ext4_checkpoint(cx, true),
+            );
         }
         self.handle_ext4_write_result(
             "flush_mvcc_to_device",
@@ -13583,20 +13591,37 @@ impl OpenFs {
         )
     }
 
-    /// Materialize prior ext4 commits after Abort without admitting new ones.
-    /// Capture all derived accounting before any home I/O, and advance the
-    /// durability cursor only after the complete image has been synced.
-    fn flush_revoked_ext4_commits(&self, cx: &Cx) -> ffs_error::Result<usize> {
+    /// Fence WAL appends and old compaction across a complete home checkpoint.
+    /// A closed gate captures committed-only accounting. An ordinary reentrant
+    /// caller retains its existing unquiesced capture, without chain eviction;
+    /// a revoked reentrant caller must refuse before I/O.
+    fn flush_ext4_checkpoint(&self, cx: &Cx, keep_compactor: bool) -> ffs_error::Result<usize> {
         self.require_write_authority()?;
-        // A gated caller cannot certify a committed-only accounting snapshot.
-        // Refuse before taking cursor/store locks or performing any I/O.
-        let boundary = self.close_mutation_gate().ok_or(FfsError::ReadOnly)?;
-        let mut cursor = self.mvcc_flushed_through.lock();
-        // Fence an append that passed its pre-latch check, then join all old
-        // home-write batches. A late enqueue observes the removed compactor.
-        if let Some(log) = &self.metadata_log {
-            drop(log.lock());
+        // Never wait for request quiescence while holding the cursor or WAL:
+        // an in-flight O_SYNC request can itself need those locks.
+        let boundary = self.close_mutation_gate();
+        if boundary.is_none() && self.ext4_forced_read_only.load(Ordering::SeqCst) {
+            return Err(FfsError::ReadOnly);
         }
+        let mut cursor = self.mvcc_flushed_through.lock();
+        let mut log = self.metadata_log.as_ref().map(|log| log.lock());
+        // Start an idle replacement before changing home storage. Failure leaves
+        // the old worker intact. On later errors RAII joins this unused worker;
+        // the next successful public checkpoint can resume compaction again.
+        let replacement = if keep_compactor
+            && log.is_some()
+            && !self.ext4_forced_read_only.load(Ordering::SeqCst)
+        {
+            Some(MetadataCompactor::start(
+                cx,
+                Arc::clone(&self.dev),
+                self.block_size(),
+            )?)
+        } else {
+            None
+        };
+        // Append/index/enqueue all hold log, so no old batch can arrive after
+        // this join or overwrite the checkpoint once it is acknowledged.
         self.shutdown_metadata_compactor();
         let capture =
             MetadataLogCaptureDevice::new(self.dev.as_ref(), self.block_size(), BTreeMap::new());
@@ -13606,7 +13631,15 @@ impl OpenFs {
             .flush_to_device_after(cx, &capture, *cursor)?;
         // Derive summaries even when no MVCC blocks remain: an earlier failed
         // boundary may have left only its accounting updates unmaterialized.
-        self.ext4_capture_committed_accounting(cx, &capture, &boundary)?;
+        if self.ext4_alloc_state.is_some() {
+            if let Some(boundary) = &boundary {
+                self.ext4_capture_committed_accounting(cx, &capture, boundary)?;
+            } else {
+                self.ext4_capture_group_descriptors(cx, &capture)?;
+                self.ext4_sync_superblock_free_totals_to(cx, &capture)?;
+                self.reject_ext4_revoked_publication(true)?;
+            }
+        }
         let mut writes = capture.take_writes();
         if !writes.is_empty() {
             if let Some(journal) = self.jbd2_writer.as_ref() {
@@ -13621,7 +13654,9 @@ impl OpenFs {
         }
         // Old WAL records must not replay over the newer durable home image.
         // A failure retains versions and the cursor for an idempotent retry.
-        self.checkpoint_metadata_log(durable_through)?;
+        if let Some(log) = log.as_mut() {
+            log.checkpoint(durable_through)?;
+        }
         *cursor = (*cursor).max(durable_through);
         self.ext4_group_desc_cache.clear();
         self.ext4_base_block_cache.clear();
@@ -13629,7 +13664,14 @@ impl OpenFs {
             .store(0, Ordering::Release);
         self.jbd2_block_writes_at_boundary
             .fetch_max(writes_before, Ordering::AcqRel);
-        self.evict_durable_mvcc_chains(durable_through);
+        if boundary.is_some() {
+            self.evict_durable_mvcc_chains(durable_through);
+        }
+        if !self.ext4_forced_read_only.load(Ordering::SeqCst)
+            && let Some(replacement) = replacement
+        {
+            *self.metadata_compactor.lock() = Some(replacement);
+        }
         Ok(flushed)
     }
 
@@ -13773,7 +13815,7 @@ impl OpenFs {
                 if self.ext4_forced_read_only.load(Ordering::SeqCst) {
                     // Preserve accepted writes and reset the WAL before an
                     // explicit recovery request rebuilds mutable state.
-                    self.flush_revoked_ext4_commits(cx)?;
+                    self.flush_ext4_checkpoint(cx, false)?;
                 }
                 let alloc_state = self.load_ext4_alloc_state(cx)?;
                 // Index all descriptor-owned metadata by physical group before
@@ -49305,25 +49347,11 @@ impl OpenFs {
         if !self.is_writable() {
             return Err(FfsError::ReadOnly);
         }
+        if self.is_ext4() {
+            return self.flush_mvcc_to_device(cx).map(|_| ());
+        }
         let base_dev = self.direct_block_device_adapter();
         self.flush_mvcc_versions_to_device(cx, &base_dev)?;
-        self.clear_ext4_writable_group_desc_cache();
-        // When GDT persistence is deferred (bd-cc-gdt-defer), write every group
-        // descriptor here from the authoritative in-memory GroupStats — the
-        // per-op GDT write was skipped to avoid the ~80k version-chain on the
-        // one shared GDT block (~2.3x create). Must run on THIS path too:
-        // sync_all_to_device is the CLI / create-bench durability boundary.
-        self.ext4_flush_group_descriptors(cx)?;
-        // Sync the superblock free-block/free-inode TOTALS from the in-memory
-        // alloc state so a device snapshot is e2fsck-consistent (bd-wvud1): the
-        // per-group descriptors + bitmaps are kept current during writes, but
-        // nothing updates the superblock totals s_free_blocks_count /
-        // s_free_inodes_count on this flush path. `flush_mvcc_to_device` already
-        // does this; `sync_all_to_device` (the CLI / create-bench durability
-        // boundary) omitted it, leaving every persisted image reporting
-        // "Free inodes count wrong" off by exactly the number of created files.
-        // No-op for btrfs / read-only ext4.
-        self.ext4_sync_superblock_free_totals(cx)?;
         Ok(())
     }
 
@@ -103255,6 +103283,259 @@ mod tests {
     }
 
     #[test]
+    fn metadata_log_checkpoint_fences_old_compaction_and_resumes_after_retry() {
+        struct ReleaseOldWrite(std::sync::mpsc::SyncSender<()>);
+        impl Drop for ReleaseOldWrite {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
+        #[derive(Debug)]
+        struct PausedOldHomeWrite {
+            inner: CrashDevice,
+            target: u64,
+            old_payload: Vec<u8>,
+            armed: AtomicBool,
+            entered: std::sync::mpsc::SyncSender<()>,
+            resume: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl ByteDevice for PausedOldHomeWrite {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                // Compaction coalesces adjacent blocks. Match only the old
+                // file payload within this run, never a newer checkpoint write.
+                let old = self
+                    .target
+                    .checked_sub(offset.0)
+                    .and_then(|relative| usize::try_from(relative).ok())
+                    .and_then(|relative| buf.get(relative..))
+                    .is_some_and(|bytes| bytes.starts_with(&self.old_payload));
+                if old && self.armed.swap(false, Ordering::AcqRel) {
+                    self.entered
+                        .send(())
+                        .map_err(|error| FfsError::Io(std::io::Error::other(error.to_string())))?;
+                    self.resume
+                        .lock()
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|error| FfsError::Io(std::io::Error::other(error.to_string())))?;
+                }
+                self.inner.write_all_at(cx, offset, buf)
+            }
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        let _flocks = wal_flock_holder();
+        for mode in ["flush", "sync_all", "reentrant"] {
+            for fail_sync in [false, true] {
+                let (seed, dev, tmp) = open_writable_ext4_mkfs_with_crash_device(16)
+                    .expect("metadata checkpoint regression requires mkfs.ext4");
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                let ino = seed
+                    .create(&cx, root, OsStr::new("accepted"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino;
+                let bs = seed.block_size();
+                seed.write(&cx, ino, 0, &vec![0x11; bs as usize]).unwrap();
+                seed.flush_mvcc_to_device(&cx).unwrap();
+                let inode = seed.read_inode(&cx, ino).unwrap();
+                let physical = seed
+                    .resolve_extent(&cx, &RequestScope::empty(), &inode, 0)
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                drop(seed);
+                let wal = tmp.path().join("ordered-checkpoint.wal");
+                let options = OpenOptions {
+                    metadata_log_enabled: true,
+                    mvcc_wal_path: Some(wal.clone()),
+                    ext4_data_err_policy: Ext4DataErrPolicy::Continue,
+                    ..OpenOptions::default()
+                };
+                let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+                let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+                let old_payload = vec![0x22; bs as usize];
+                let mut fs = OpenFs::from_device(
+                    &cx,
+                    Box::new(PausedOldHomeWrite {
+                        inner: dev.clone(),
+                        target: physical * u64::from(bs),
+                        old_payload: old_payload.clone(),
+                        armed: AtomicBool::new(true),
+                        entered: entered_tx,
+                        resume: parking_lot::Mutex::new(resume_rx),
+                    }),
+                    &options,
+                )
+                .unwrap();
+                let _release_on_error = ReleaseOldWrite(resume_tx.clone());
+                fs.enable_writes(&cx).unwrap();
+                let cursor = *fs.mvcc_flushed_through.lock();
+                fs.write(&cx, ino, 0, &old_payload).unwrap();
+                {
+                    let _inside_request = (mode == "reentrant").then(|| fs.mutation_gate_guard());
+                    fs.fsync(&cx, ino, 0, false).unwrap();
+                }
+                // An actual append queued this worker; no direct queue injection.
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let (old_horizon, old_index, old_wal_size) = {
+                    let log = fs.metadata_log.as_ref().unwrap().lock();
+                    assert!(!log.index.is_empty());
+                    (log.logged_through, log.index.clone(), log.writer.size())
+                };
+                let mut payload = vec![0x33; (2 * bs + 17) as usize];
+                fs.write(&cx, ino, 0, &payload).unwrap();
+                let accepted = fs.current_snapshot();
+                let counts = fs.statfs(&cx, root).unwrap();
+                assert!(accepted.high > old_horizon);
+                // The paused old batch syncs once; the captured checkpoint has
+                // one physical final sync after that joined batch completes.
+                let failing_sync = dev.sync_count() + 2;
+                if fail_sync {
+                    dev.arm_sync_failure(failing_sync);
+                }
+                let checkpoint = |fs: &OpenFs| {
+                    let _inside_request = (mode == "reentrant").then(|| fs.mutation_gate_guard());
+                    if mode == "sync_all" {
+                        fs.sync_all_to_device(&Cx::for_testing())
+                    } else {
+                        fs.flush_mvcc_to_device(&Cx::for_testing()).map(|_| ())
+                    }
+                };
+                let (result, draining, premature) = std::thread::scope(|threads| {
+                    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+                    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+                    let fs_ref = &fs;
+                    let checkpoint_ref = &checkpoint;
+                    let worker = threads.spawn(move || {
+                        started_tx.send(()).unwrap();
+                        let result = checkpoint_ref(fs_ref);
+                        done_tx.send(()).unwrap();
+                        result
+                    });
+                    let started = started_rx.recv_timeout(Duration::from_secs(10));
+                    // Observe actual drain admission, not a sleep after thread
+                    // startup. The old worker has been taken out of its slot
+                    // but remains blocked on the payload write until released.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut draining = fs.metadata_compactor.lock().is_none();
+                    let mut premature = done_rx.try_recv();
+                    while !draining
+                        && matches!(premature, Err(std::sync::mpsc::TryRecvError::Empty))
+                        && Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                        draining = fs.metadata_compactor.lock().is_none();
+                        premature = done_rx.try_recv();
+                    }
+                    // Release old I/O before every assertion or thread join.
+                    let released = resume_tx.send(());
+                    let result = worker.join();
+                    started.unwrap();
+                    released.unwrap();
+                    (result.unwrap(), draining, premature)
+                });
+                assert!(
+                    draining,
+                    "checkpoint must join the actual paused old worker"
+                );
+                assert!(matches!(
+                    premature,
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+                if fail_sync {
+                    assert!(matches!(result, Err(FfsError::Io(_))), "{result:?}");
+                    assert_eq!(dev.sync_count(), failing_sync);
+                    assert_eq!(*fs.mvcc_flushed_through.lock(), cursor);
+                    let log = fs.metadata_log.as_ref().unwrap().lock();
+                    assert_eq!(log.logged_through, old_horizon);
+                    assert_eq!(log.index, old_index);
+                    assert_eq!(log.writer.size(), old_wal_size);
+                    assert_eq!(std::fs::metadata(&wal).unwrap().len(), old_wal_size);
+                    drop(log);
+                    assert!(fs.metadata_compactor.lock().is_none());
+                    assert!(fs.is_writable());
+                    dev.disarm();
+                    checkpoint(&fs).unwrap();
+                } else {
+                    result.unwrap();
+                }
+                let header_size = u64::try_from(ffs_mvcc::wal::HEADER_SIZE).unwrap();
+                assert_eq!(*fs.mvcc_flushed_through.lock(), accepted.high);
+                assert_eq!(std::fs::metadata(&wal).unwrap().len(), header_size);
+                assert!(fs.metadata_log.as_ref().unwrap().lock().index.is_empty());
+                assert!(fs.metadata_compactor.lock().is_some());
+                assert_eq!(fs.read(&cx, ino, 0, 3 * bs).unwrap(), payload);
+                assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                let bytes = dev.durable_bytes();
+                assert_eq!(dev.volatile.lock().as_slice(), bytes);
+                let image = tmp.path().join("ordered-checkpoint.ext4");
+                native_parity_fsck(&TestDevice::from_vec(bytes.clone()), &image);
+                assert_eq!(std::fs::read(&image).unwrap(), bytes);
+                let home = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(bytes)),
+                    &OpenOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    home.lookup(&cx, root, OsStr::new("accepted")).unwrap().ino,
+                    ino
+                );
+                assert_eq!(home.read(&cx, ino, 0, 3 * bs).unwrap(), payload);
+                assert_eq!(home.statfs(&cx, root).unwrap(), counts);
+                drop(home);
+
+                // A later real fsync must append and compact through the
+                // replacement, including after a failed checkpoint/retry.
+                payload[..7].copy_from_slice(b"resumed");
+                fs.write(&cx, ino, 0, b"resumed").unwrap();
+                let inode = fs.read_inode(&cx, ino).unwrap();
+                fs.fsync(&cx, ino, 0, false).unwrap();
+                assert!(std::fs::metadata(&wal).unwrap().len() > header_size);
+                fs.shutdown_metadata_compactor();
+                let start = usize::try_from(physical * u64::from(bs)).unwrap();
+                assert_eq!(
+                    &dev.durable_bytes()[start..start + bs as usize],
+                    &payload[..bs as usize]
+                );
+                // Retain this same WAL: drop does not call flush_on_destroy.
+                drop(fs);
+                let mut reopened =
+                    OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+                let recovery = reopened.mvcc_wal_recovery().unwrap();
+                assert_eq!(recovery.commits_replayed, 1);
+                assert!(recovery.versions_replayed > 0);
+                assert_eq!(recovery.records_discarded, 0);
+                reopened.enable_writes(&cx).unwrap();
+                assert_eq!(reopened.read(&cx, ino, 0, 3 * bs).unwrap(), payload);
+                assert_eq!(reopened.read_inode(&cx, ino).unwrap(), inode);
+                assert_eq!(reopened.statfs(&cx, root).unwrap(), counts);
+                reopened.flush_on_destroy(&cx).unwrap();
+                assert!(reopened.metadata_compactor.lock().is_none());
+                assert_eq!(std::fs::metadata(&wal).unwrap().len(), header_size);
+            }
+        }
+    }
+
+    #[test]
     fn append_only_metadata_log_replays_then_checkpoints_clean() {
         let _flocks = wal_flock_holder();
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -105543,91 +105824,98 @@ mod tests {
     #[test]
     fn ext4_flush_sync_failure_retains_cursor_and_teardown_retries_after_abort() {
         for single_store in [false, true] {
-            for (allocate, barrier) in [(false, 1), (false, 2), (true, 2)] {
-                let (mut fs, dev, tmp) = open_writable_ext4_mkfs_with_crash_device(16)
-                    .expect("flush retry regression requires mkfs.ext4");
-                fs.mvcc_store = Arc::new(if single_store {
-                    FsMvccStore::single()
-                } else {
-                    FsMvccStore::sharded()
-                });
-                fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
-                let cx = Cx::for_testing();
-                let root = InodeNumber(2);
-                let ino = fs
-                    .create(&cx, root, OsStr::new("accepted"), 0o644, 0, 0)
-                    .unwrap()
-                    .ino;
-                let bs = fs.block_size();
-                let old = vec![0x21; bs as usize];
-                fs.write(&cx, ino, 0, &old).unwrap();
-                fs.flush_mvcc_to_device(&cx).unwrap();
-                let cursor = *fs.mvcc_flushed_through.lock();
-                let durable_before = dev.durable_bytes();
-                let counts_before = fs.statfs(&cx, root).unwrap();
-                let payload = vec![0x42; bs as usize];
-                let offset = if allocate { u64::from(bs) } else { 0 };
-                fs.write(&cx, ino, offset, &payload).unwrap();
-                let expected = if allocate {
-                    [old.as_slice(), payload.as_slice()].concat()
-                } else {
-                    payload.clone()
-                };
-                let accepted = fs.current_snapshot();
-                assert!(accepted.high > cursor);
-                let counts = fs.statfs(&cx, root).unwrap();
-                assert_eq!(counts != counts_before, allocate);
-                let inode = fs.read_inode(&cx, ino).unwrap();
-                let physical = fs
-                    .resolve_extent(&cx, &RequestScope::empty(), &inode, u32::from(allocate))
-                    .unwrap()
-                    .unwrap()
-                    .0;
-                // Barrier 1 is the store's data sync; barrier 2 follows the
-                // derived GDT/SB writes. Only the latter exposes the old eager
-                // cursor publication. Allocation makes its stale accounting
-                // observable even though the first barrier persisted file data.
-                let failing_sync = dev.sync_count() + barrier;
-                dev.arm_sync_failure(failing_sync);
-                let error = fs.flush_mvcc_to_device(&cx).unwrap_err();
-                assert!(matches!(error, FfsError::Io(_)), "{error:?}");
-                assert_eq!(dev.sync_count(), failing_sync);
-                assert!(!fs.is_writable());
-                assert_eq!(*fs.mvcc_flushed_through.lock(), cursor);
-                let failed_durable = dev.durable_bytes();
-                if barrier == 1 {
-                    assert_eq!(failed_durable, durable_before);
-                } else {
-                    assert_ne!(failed_durable, durable_before);
-                    let start = usize::try_from(physical * u64::from(bs)).unwrap();
-                    assert_eq!(&failed_durable[start..start + bs as usize], payload);
-                    if allocate {
-                        assert_ne!(
-                            failed_durable,
-                            *dev.volatile.lock(),
-                            "summaries still need sync"
-                        );
+            for sync_all in [false, true] {
+                for (allocate, barrier) in [(false, 1), (false, 2), (true, 2)] {
+                    let (mut fs, dev, tmp) = open_writable_ext4_mkfs_with_crash_device(16)
+                        .expect("flush retry regression requires mkfs.ext4");
+                    fs.mvcc_store = Arc::new(if single_store {
+                        FsMvccStore::single()
+                    } else {
+                        FsMvccStore::sharded()
+                    });
+                    fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
+                    let cx = Cx::for_testing();
+                    let root = InodeNumber(2);
+                    let ino = fs
+                        .create(&cx, root, OsStr::new("accepted"), 0o644, 0, 0)
+                        .unwrap()
+                        .ino;
+                    let bs = fs.block_size();
+                    let old = vec![0x21; bs as usize];
+                    fs.write(&cx, ino, 0, &old).unwrap();
+                    fs.flush_mvcc_to_device(&cx).unwrap();
+                    let cursor = *fs.mvcc_flushed_through.lock();
+                    let durable_before = dev.durable_bytes();
+                    let counts_before = fs.statfs(&cx, root).unwrap();
+                    let payload = vec![0x42; bs as usize];
+                    let offset = if allocate { u64::from(bs) } else { 0 };
+                    fs.write(&cx, ino, offset, &payload).unwrap();
+                    let expected = if allocate {
+                        [old.as_slice(), payload.as_slice()].concat()
+                    } else {
+                        payload.clone()
+                    };
+                    let accepted = fs.current_snapshot();
+                    assert!(accepted.high > cursor);
+                    let counts = fs.statfs(&cx, root).unwrap();
+                    assert_eq!(counts != counts_before, allocate);
+                    let inode = fs.read_inode(&cx, ino).unwrap();
+                    let physical = fs
+                        .resolve_extent(&cx, &RequestScope::empty(), &inode, u32::from(allocate))
+                        .unwrap()
+                        .unwrap()
+                        .0;
+                    // Barrier 1 is the store's data sync; barrier 2 follows the
+                    // derived GDT/SB writes. Only the latter exposes the old eager
+                    // cursor publication. Allocation makes its stale accounting
+                    // observable even though the first barrier persisted file data.
+                    let failing_sync = dev.sync_count() + barrier;
+                    dev.arm_sync_failure(failing_sync);
+                    let error = if sync_all {
+                        fs.sync_all_to_device(&cx)
+                    } else {
+                        fs.flush_mvcc_to_device(&cx).map(|_| ())
                     }
+                    .unwrap_err();
+                    assert!(matches!(error, FfsError::Io(_)), "{error:?}");
+                    assert_eq!(dev.sync_count(), failing_sync);
+                    assert!(!fs.is_writable());
+                    assert_eq!(*fs.mvcc_flushed_through.lock(), cursor);
+                    let failed_durable = dev.durable_bytes();
+                    if barrier == 1 {
+                        assert_eq!(failed_durable, durable_before);
+                    } else {
+                        assert_ne!(failed_durable, durable_before);
+                        let start = usize::try_from(physical * u64::from(bs)).unwrap();
+                        assert_eq!(&failed_durable[start..start + bs as usize], payload);
+                        if allocate {
+                            assert_ne!(
+                                failed_durable,
+                                *dev.volatile.lock(),
+                                "summaries still need sync"
+                            );
+                        }
+                    }
+                    assert_eq!(fs.read(&cx, ino, 0, 2 * bs).unwrap(), expected);
+                    dev.disarm();
+                    fs.flush_on_destroy(&cx).unwrap();
+                    assert_eq!(*fs.mvcc_flushed_through.lock(), accepted.high);
+                    assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                    let bytes = dev.durable_bytes();
+                    assert_ne!(bytes, durable_before);
+                    assert_eq!(dev.volatile.lock().as_slice(), bytes);
+                    let image = tmp.path().join("retried-abort.ext4");
+                    native_parity_fsck(&TestDevice::from_vec(bytes.clone()), &image);
+                    assert_eq!(std::fs::read(&image).unwrap(), bytes);
+                    let reopened = OpenFs::from_device(
+                        &cx,
+                        Box::new(TestDevice::from_vec(bytes)),
+                        &OpenOptions::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(reopened.read(&cx, ino, 0, 2 * bs).unwrap(), expected);
+                    assert_eq!(reopened.statfs(&cx, root).unwrap(), counts);
                 }
-                assert_eq!(fs.read(&cx, ino, 0, 2 * bs).unwrap(), expected);
-                dev.disarm();
-                fs.flush_on_destroy(&cx).unwrap();
-                assert_eq!(*fs.mvcc_flushed_through.lock(), accepted.high);
-                assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
-                let bytes = dev.durable_bytes();
-                assert_ne!(bytes, durable_before);
-                assert_eq!(dev.volatile.lock().as_slice(), bytes);
-                let image = tmp.path().join("retried-abort.ext4");
-                native_parity_fsck(&TestDevice::from_vec(bytes.clone()), &image);
-                assert_eq!(std::fs::read(&image).unwrap(), bytes);
-                let reopened = OpenFs::from_device(
-                    &cx,
-                    Box::new(TestDevice::from_vec(bytes)),
-                    &OpenOptions::default(),
-                )
-                .unwrap();
-                assert_eq!(reopened.read(&cx, ino, 0, 2 * bs).unwrap(), expected);
-                assert_eq!(reopened.statfs(&cx, root).unwrap(), counts);
             }
         }
     }
