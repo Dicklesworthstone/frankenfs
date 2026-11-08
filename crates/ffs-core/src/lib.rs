@@ -79368,7 +79368,10 @@ mod tests {
                 });
             }
         });
-        let counts_after = fs.statfs(&cx, root).expect("completed storm accounting");
+        let counts_after = fs
+            .as_ref()
+            .statfs(&cx, root)
+            .expect("completed storm accounting");
         assert_eq!(counts_after.blocks_free, counts_before.blocks_free);
         assert_eq!(counts_after.files_free, counts_before.files_free);
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
@@ -104606,7 +104609,7 @@ mod tests {
         *notification.fs.lock().unwrap() = Some(Arc::downgrade(&fs));
         let before = fs.current_snapshot();
         let payload = [0xC9; 17];
-        let error = fs.write(&cx, ino, 0, &payload).unwrap_err();
+        let error = fs.as_ref().write(&cx, ino, 0, &payload).unwrap_err();
         assert!(
             matches!(error, FfsError::RepairFailed(ref detail)
             if detail.contains("already committed")),
@@ -104614,7 +104617,7 @@ mod tests {
         );
         assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
         assert_eq!(notification.calls.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(fs.read(&cx, ino, 0, 64).unwrap(), payload);
+        assert_eq!(fs.as_ref().read(&cx, ino, 0, 64).unwrap(), payload);
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
         assert!(fs.try_close_mutation_gate().is_some());
     }
