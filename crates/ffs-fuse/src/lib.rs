@@ -7565,7 +7565,16 @@ impl Filesystem for FrankenFuse {
         reply: ReplyIoctl,
     ) {
         self.record_ioctl_probe(ino, cmd, in_data.len(), out_size);
-        match self.dispatch_ioctl(req.pid(), ino, fh, cmd, in_data, out_size) {
+        match self.dispatch_ioctl(
+            req.pid(),
+            req.uid(),
+            req.gid(),
+            ino,
+            fh,
+            cmd,
+            in_data,
+            out_size,
+        ) {
             IoctlResult::Data(data) => {
                 // A flags change moves ctime, and the kernel keeps the inode's
                 // attributes cached across a FUSE ioctl: drop them, or stat
@@ -15179,6 +15188,7 @@ mod tests {
         BtrfsLimitQgroup(BtrfsQgroupLimitRequest),
         BtrfsRemoveDeviceV2(Vec<u8>),
         BtrfsSnapDestroyV2(Vec<u8>),
+        BtrfsSubvolCreate(InodeNumber, u16, u32, u32, Vec<u8>),
         BtrfsAddDevice(Vec<u8>),
         BtrfsRemoveDevice(Vec<u8>),
         BtrfsForgetDevice(Vec<u8>),
@@ -15210,6 +15220,7 @@ mod tests {
         flags: u32,
         generation: u32,
         attr_kind: FfsFileType,
+        attr_perm: u16,
         attr_size: u64,
         blksize: u32,
         move_ext_result: Option<u64>,
@@ -15234,6 +15245,7 @@ mod tests {
                 flags,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: None,
@@ -15258,6 +15270,7 @@ mod tests {
                 flags,
                 generation,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: None,
@@ -15285,6 +15298,7 @@ mod tests {
                 flags: 0,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: None,
@@ -15309,6 +15323,7 @@ mod tests {
                 flags: 0,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: None,
@@ -15333,6 +15348,7 @@ mod tests {
                 flags: EXT4_EXTENTS_FL,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: Some(moved_len),
@@ -15375,6 +15391,7 @@ mod tests {
                 flags: EXT4_EXTENTS_FL,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize,
                 move_ext_result: Some(1),
@@ -15404,6 +15421,7 @@ mod tests {
                 flags,
                 generation: 0,
                 attr_kind: kind,
+                attr_perm: 0o644,
                 attr_size: size,
                 blksize: 4096,
                 move_ext_result: Some(1),
@@ -15432,6 +15450,7 @@ mod tests {
                 flags: 0,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: None,
@@ -15456,6 +15475,7 @@ mod tests {
                 flags: 0,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: None,
@@ -15480,6 +15500,7 @@ mod tests {
                 flags: 0,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: None,
@@ -15504,6 +15525,7 @@ mod tests {
                 flags: 0,
                 generation: 0,
                 attr_kind: FfsFileType::RegularFile,
+                attr_perm: 0o644,
                 attr_size: 64 * 1024,
                 blksize: 4096,
                 move_ext_result: None,
@@ -15552,7 +15574,7 @@ mod tests {
         in_data: &[u8],
         out_size: u32,
     ) -> IoctlResult {
-        fuse.dispatch_ioctl(std::process::id(), ino, fh, cmd, in_data, out_size)
+        fuse.dispatch_ioctl(std::process::id(), 0, 0, ino, fh, cmd, in_data, out_size)
     }
 
     impl FsOps for IoctlRecordingFs {
@@ -15575,7 +15597,7 @@ mod tests {
                 ctime: SystemTime::UNIX_EPOCH,
                 crtime: SystemTime::UNIX_EPOCH,
                 kind: self.attr_kind,
-                perm: 0o644,
+                perm: self.attr_perm,
                 nlink: 1,
                 uid: 0,
                 gid: 0,
@@ -16103,6 +16125,29 @@ mod tests {
                 .lock()
                 .expect("lock ioctl calls")
                 .push(IoctlCall::BtrfsSnapDestroyV2(vol_args.to_vec()));
+            Ok(())
+        }
+
+        fn btrfs_subvol_create(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            umask: u16,
+            uid: u32,
+            gid: u32,
+            vol_args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.calls
+                .lock()
+                .expect("lock ioctl calls")
+                .push(IoctlCall::BtrfsSubvolCreate(
+                    parent,
+                    umask,
+                    uid,
+                    gid,
+                    vol_args.to_vec(),
+                ));
             Ok(())
         }
 
@@ -17923,6 +17968,248 @@ mod tests {
         let response = dispatch_ioctl_for_testing(&fuse, 1, 0, BTRFS_IOC_QGROUP_LIMIT, &input, 0);
         assert_eq!(response, IoctlResult::Error(libc::EROFS));
         assert!(calls.lock().expect("lock ioctl calls").is_empty());
+    }
+
+    fn subvol_create_test_caller() -> (u32, u32, u32, u16) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let fs_id = |label: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(label))
+                .unwrap()
+                .split_whitespace()
+                .nth(3)
+                .unwrap()
+                .parse::<u32>()
+                .unwrap()
+        };
+        let uid = fs_id("Uid:");
+        let gid = fs_id("Gid:");
+        let (umask, _) = FrankenFuse::subvol_create_caller_state(&status, uid, gid).unwrap();
+        (std::process::id(), uid, gid, umask)
+    }
+
+    #[test]
+    fn subvol_create_caller_state_requires_matching_fs_credentials_and_valid_umask() {
+        let status =
+            "Name:\tcaller\nUmask:\t0077\nUid:\t10 11 12 13\nGid:\t20 21 22 23\nGroups:\t7 23 42\n";
+        assert_eq!(
+            FrankenFuse::subvol_create_caller_state(status, 13, 23),
+            Some((0o077, vec![7, 23, 42]))
+        );
+        for (uid, gid) in [(10, 23), (11, 23), (13, 20), (13, 21), (99, 99)] {
+            assert_eq!(
+                FrankenFuse::subvol_create_caller_state(status, uid, gid),
+                None,
+                "real/effective or unrelated credentials must not substitute for fsuid/fsgid"
+            );
+        }
+        for malformed in [
+            "Umask: 0077\nUid: 10 11 12\nGid: 20 21 22 23\nGroups: 42\n",
+            "Umask: 0077\nUid: 10 11 12 13\nGid: 20 21 22 23\n",
+            "Umask: 0077\nUid: 10 11 12 13\nGid: 20 21 22 23\nGroups: 42 invalid\n",
+            "Uid: 10 11 12 13\nGid: 20 21 22 23\nGroups: 42\n",
+            "Umask: 0899\nUid: 10 11 12 13\nGid: 20 21 22 23\nGroups: 42\n",
+            "Umask: 1000\nUid: 10 11 12 13\nGid: 20 21 22 23\nGroups: 42\n",
+            "Umask: 77777777777\nUid: 10 11 12 13\nGid: 20 21 22 23\nGroups: 42\n",
+        ] {
+            assert_eq!(
+                FrankenFuse::subvol_create_caller_state(malformed, 13, 23),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_ioctl_btrfs_subvol_create_routes_parent_credentials_and_invalidates_name() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = IoctlRecordingFs::new(0, Arc::clone(&calls));
+        backend.attr_kind = FfsFileType::Directory;
+        backend.attr_perm = 0o777;
+        // Exercise the Arc<FsOps> forwarding layer used by real mounts too.
+        let fuse = FrankenFuse::with_options(
+            Box::new(Arc::new(backend)),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        );
+        let (notifier, mut receiver) = KernelNotifyQueue::for_test();
+        *fuse.inner.kernel_notifier.lock().unwrap() = Some(notifier);
+        let mut input = vec![0_u8; BTRFS_VOL_ARGS_SIZE as usize];
+        input[56..61].copy_from_slice(b"child");
+
+        let (pid, uid, gid, umask) = subvol_create_test_caller();
+        let response =
+            fuse.dispatch_ioctl(pid, uid, gid, 42, 0, BTRFS_IOC_SUBVOL_CREATE_V2, &input, 0);
+        assert_eq!(response, IoctlResult::Data(Vec::new()));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                IoctlCall::Begin(RequestOp::IoctlWrite),
+                IoctlCall::Getattr(InodeNumber(42)),
+                IoctlCall::BtrfsSubvolCreate(InodeNumber(42), umask, uid, gid, input),
+                IoctlCall::Commit,
+                IoctlCall::End(RequestOp::IoctlWrite),
+            ]
+        );
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(KernelNotification::Entry { parent: 42, name }) if name == OsStr::new("child")
+            ),
+            "ioctl success has no entry reply to evict a cached negative dentry"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(KernelNotification::Inode { ino: 42 })
+        ));
+    }
+
+    #[test]
+    fn dispatch_ioctl_btrfs_subvol_create_refuses_short_readonly_and_non_directory_requests() {
+        for (read_only, input_len, kind, expected) in [
+            (false, 4095, FfsFileType::Directory, libc::EINVAL),
+            (true, 4096, FfsFileType::Directory, libc::EROFS),
+            (false, 4096, FfsFileType::RegularFile, libc::ENOTDIR),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = IoctlRecordingFs::new(0, Arc::clone(&calls));
+            backend.attr_kind = kind;
+            let fuse = FrankenFuse::with_options(
+                Box::new(backend),
+                &MountOptions {
+                    read_only,
+                    ..MountOptions::default()
+                },
+            );
+            let response = dispatch_ioctl_for_testing(
+                &fuse,
+                42,
+                0,
+                BTRFS_IOC_SUBVOL_CREATE_V2,
+                &vec![0; input_len],
+                0,
+            );
+            assert_eq!(response, IoctlResult::Error(expected));
+            assert!(
+                !calls.lock().unwrap().iter().any(|call| matches!(
+                    call,
+                    IoctlCall::BtrfsSubvolCreate(..) | IoctlCall::Commit
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn subvol_create_access_enforces_write_search_and_group_precedence() {
+        let backend = IoctlRecordingFs::new(0, Arc::new(Mutex::new(Vec::new())));
+        let mut attr = backend
+            .getattr(
+                &Cx::for_testing(),
+                &mut RequestScope::empty(),
+                InodeNumber(42),
+            )
+            .unwrap();
+        attr.uid = 100;
+        attr.gid = 200;
+        for (perm, uid, gid, groups, allowed) in [
+            (0o300, 100, 999, vec![], true),
+            (0o033, 100, 999, vec![200], false),
+            (0o030, 101, 200, vec![], true),
+            (0o030, 101, 999, vec![200], true),
+            (0o003, 101, 999, vec![], true),
+            (0o003, 101, 200, vec![], false),
+            (0o003, 101, 999, vec![200], false),
+            (0o222, 101, 999, vec![], false),
+            (0o111, 101, 999, vec![], false),
+            (0o777, 101, 999, vec![200], true),
+        ] {
+            attr.perm = perm;
+            assert_eq!(
+                FrankenFuse::subvol_create_access(&attr, uid, gid, &groups),
+                allowed,
+                "mode {perm:o}, uid {uid}, gid {gid}, groups {groups:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_ioctl_btrfs_subvol_create_refuses_unavailable_or_mismatched_caller_state() {
+        let (pid, uid, gid, _) = subvol_create_test_caller();
+        for (pid, uid, gid) in [
+            (u32::MAX, uid, gid),
+            (pid, uid ^ 1, gid),
+            (pid, uid, gid ^ 1),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = IoctlRecordingFs::new(0, Arc::clone(&calls));
+            backend.attr_kind = FfsFileType::Directory;
+            backend.attr_perm = 0o777;
+            let fuse = FrankenFuse::with_options(
+                Box::new(backend),
+                &MountOptions {
+                    read_only: false,
+                    ..MountOptions::default()
+                },
+            );
+            let response = fuse.dispatch_ioctl(
+                pid,
+                uid,
+                gid,
+                42,
+                0,
+                BTRFS_IOC_SUBVOL_CREATE_V2,
+                &[0; 4096],
+                0,
+            );
+            assert_eq!(
+                response,
+                IoctlResult::Error(libc::EACCES),
+                "cannot replace a missing or mismatched caller mask with the daemon's mask"
+            );
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                &[
+                    IoctlCall::Begin(RequestOp::IoctlWrite),
+                    IoctlCall::Getattr(InodeNumber(42)),
+                    IoctlCall::End(RequestOp::IoctlWrite),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_ioctl_btrfs_subvol_create_commit_error_does_not_acknowledge_or_notify() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = IoctlRecordingFs::new(0, Arc::clone(&calls));
+        backend.attr_kind = FfsFileType::Directory;
+        backend.attr_perm = 0o777;
+        backend.commit_errno = Some(libc::EIO);
+        let fuse = FrankenFuse::with_options(
+            Box::new(backend),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        );
+        let (notifier, mut receiver) = KernelNotifyQueue::for_test();
+        *fuse.inner.kernel_notifier.lock().unwrap() = Some(notifier);
+        let mut input = vec![0; 4096];
+        input[56..61].copy_from_slice(b"child");
+        let (pid, uid, gid, _) = subvol_create_test_caller();
+        assert_eq!(
+            fuse.dispatch_ioctl(pid, uid, gid, 42, 0, BTRFS_IOC_SUBVOL_CREATE_V2, &input, 0),
+            IoctlResult::Error(libc::EIO)
+        );
+        assert_eq!(
+            calls.lock().unwrap().last(),
+            Some(&IoctlCall::End(RequestOp::IoctlWrite))
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(asupersync::channel::mpsc::RecvError::Empty)
+        ));
     }
 
     #[test]

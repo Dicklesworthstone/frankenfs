@@ -2330,12 +2330,24 @@ pub trait FsOps: Send + Sync {
 
     /// Create a subvolume for `BTRFS_IOC_SUBVOL_CREATE_V2`.
     ///
-    /// Takes raw vol_args_v2 struct bytes containing flags and name.
+    /// `parent` is the directory on which the ioctl was issued; `uid`,
+    /// `gid`, and `umask` are the caller's credentials and creation mask, not
+    /// the mount daemon's identity or mask.
+    /// Takes the native-endian `btrfs_ioctl_vol_args_v2` bytes. The transport
+    /// must authorize write/search access to `parent` before calling this.
+    /// Unlike the staged native `OpenFs::create_subvolume` operation, success
+    /// waits for the new tree to commit so it is immediately traversable.
+    /// A failed device commit can leave pending creation debt for a sync retry.
     /// Non-btrfs backends must return `FfsError::UnsupportedFeature`.
+    #[allow(clippy::too_many_arguments)]
     fn btrfs_subvol_create(
         &self,
         _cx: &Cx,
         _scope: &mut RequestScope,
+        _parent: InodeNumber,
+        _umask: u16,
+        _uid: u32,
+        _gid: u32,
         _vol_args: &[u8],
     ) -> ffs_error::Result<()> {
         Err(FfsError::UnsupportedFeature(
@@ -3592,6 +3604,20 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         args: &[u8],
     ) -> ffs_error::Result<Vec<u8>> {
         self.as_ref().btrfs_file_extent_same(cx, scope, ino, args)
+    }
+
+    fn btrfs_subvol_create(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        umask: u16,
+        uid: u32,
+        gid: u32,
+        vol_args: &[u8],
+    ) -> ffs_error::Result<()> {
+        self.as_ref()
+            .btrfs_subvol_create(cx, scope, parent, umask, uid, gid, vol_args)
     }
 
     fn get_quota_info(&self, cx: &Cx, scope: &mut RequestScope) -> ffs_error::Result<QuotaInfo> {

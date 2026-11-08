@@ -2092,6 +2092,8 @@ fn assert_direct_fscrypt_legacy_policy(golden: &Value, image_path: &Path) {
     let policy = fuse
         .dispatch_ioctl_for_fuzzing(
             std::process::id(),
+            0,
+            0,
             11,
             0,
             FS_IOC_GET_ENCRYPTION_POLICY_CMD,

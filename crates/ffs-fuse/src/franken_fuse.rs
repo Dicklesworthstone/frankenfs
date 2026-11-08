@@ -183,7 +183,10 @@ impl FrankenFuse {
     }
 
     fn retire_kernel_notifier(&self) {
-        let queue = self.inner.kernel_notifier.lock()
+        let queue = self
+            .inner
+            .kernel_notifier
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         // Dispatch has retired. Drain callbacks without the slot mutex and
@@ -291,16 +294,21 @@ impl FrankenFuse {
     /// successful commands yield the raw reply payload, failed commands yield
     /// the errno that would be sent back through FUSE.
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_ioctl_for_fuzzing(
         &self,
         caller_pid: u32,
+        caller_uid: u32,
+        caller_gid: u32,
         ino: u64,
         fh: u64,
         cmd: u32,
         in_data: &[u8],
         out_size: u32,
     ) -> std::result::Result<Vec<u8>, c_int> {
-        match self.dispatch_ioctl(caller_pid, ino, fh, cmd, in_data, out_size) {
+        match self.dispatch_ioctl(
+            caller_pid, caller_uid, caller_gid, ino, fh, cmd, in_data, out_size,
+        ) {
             IoctlResult::Data(data) => Ok(data),
             IoctlResult::Error(errno) => Err(errno),
         }
@@ -1557,7 +1565,8 @@ impl FrankenFuse {
         {
             return IoctlResult::Error(libc::EIO);
         }
-        let total = u64::from_le_bytes(data[8..16].try_into().expect("validated space-info header"));
+        let total =
+            u64::from_le_bytes(data[8..16].try_into().expect("validated space-info header"));
         let records = slots.min(total);
         let expected_size = records
             .checked_mul(u64::from(BTRFS_SPACE_INFO_RECORD_SIZE))
@@ -1568,10 +1577,92 @@ impl FrankenFuse {
         IoctlResult::Data(data)
     }
 
-    #[allow(clippy::too_many_lines)]
+    fn subvol_create_caller_state(status: &str, uid: u32, gid: u32) -> Option<(u16, Vec<u32>)> {
+        let fs_id = |label: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(label))
+                .and_then(|ids| ids.split_whitespace().nth(3))
+                .and_then(|id| id.parse::<u32>().ok())
+        };
+        // FUSE carries fsuid/fsgid. A changed identity or mismatched procfs
+        // namespace must not lend another caller's supplementary groups to it.
+        if fs_id("Uid:") != Some(uid) || fs_id("Gid:") != Some(gid) {
+            return None;
+        }
+        let umask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:"))?;
+        let umask = u16::from_str_radix(umask.trim(), 8).ok()?;
+        if umask & !0o777 != 0 {
+            return None;
+        }
+        let groups = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))?;
+        let groups = groups
+            .split_whitespace()
+            .map(|group| group.parse::<u32>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        Some((umask, groups))
+    }
+
+    fn subvol_create_access(attr: &InodeAttr, uid: u32, gid: u32, groups: &[u32]) -> bool {
+        let permission_gid = if groups.contains(&attr.gid) {
+            attr.gid
+        } else {
+            gid
+        };
+        check_access_permission(
+            attr.perm,
+            attr.uid,
+            attr.gid,
+            uid,
+            permission_gid,
+            libc::W_OK | libc::X_OK,
+        )
+    }
+
+    /// Creating a subvolume through an ioctl does not run the kernel's mkdir
+    /// permission check. Authorize the actual caller before forwarding it.
+    /// ACL-bearing parents are refused by the backend until their inheritance
+    /// is supported; mode bits alone must never silently bypass an ACL.
+    fn authorize_subvol_create(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        caller: (u32, u32, u32),
+    ) -> ffs_error::Result<u16> {
+        let (pid, uid, gid) = caller;
+        let attr = self.inner.ops.getattr(cx, scope, parent)?;
+        if attr.kind != FfsFileType::Directory {
+            return Err(FfsError::NotDirectory);
+        }
+        let denied = || FfsError::RequestRejected {
+            errno: libc::EACCES,
+            detail: "subvolume creation requires write and search access to its parent".into(),
+        };
+        // FUSE_IOCTL carries no umask. Read it from the same verified caller
+        // snapshot as supplementary groups; substituting the daemon's mask or
+        // a default 022 could expose a directory the caller intended as 0700.
+        // Missing status or Umask is a refusal, even for a permissive parent.
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).map_err(|_| denied())?;
+        let (umask, groups) =
+            Self::subvol_create_caller_state(&status, uid, gid).ok_or_else(denied)?;
+        if !Self::subvol_create_access(&attr, uid, gid, &groups) {
+            return Err(denied());
+        }
+        Ok(umask)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn dispatch_ioctl(
         &self,
         caller_pid: u32,
+        caller_uid: u32,
+        caller_gid: u32,
         ino: u64,
         fh: u64,
         cmd: u32,
@@ -2491,8 +2582,8 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let space_slots = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
-                let capacity = (encoded_size - BTRFS_SPACE_ARGS_HEADER_SIZE)
-                    / BTRFS_SPACE_INFO_RECORD_SIZE;
+                let capacity =
+                    (encoded_size - BTRFS_SPACE_ARGS_HEADER_SIZE) / BTRFS_SPACE_INFO_RECORD_SIZE;
                 if space_slots > u64::from(capacity) {
                     return IoctlResult::Error(libc::EOVERFLOW);
                 }
@@ -2917,11 +3008,50 @@ impl FrankenFuse {
                 if in_data.len() < BTRFS_VOL_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
+                if self.inner.read_only {
+                    return IoctlResult::Error(libc::EROFS);
+                }
                 let cx = Self::cx_for_request();
-                match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
-                    self.inner.ops.btrfs_subvol_create(cx, scope, in_data)
+                if let Some(errno) = self.backpressure_errno(&cx, RequestOp::IoctlWrite) {
+                    return IoctlResult::Error(errno);
+                }
+                let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(ino)]);
+                match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
+                    let umask = self.authorize_subvol_create(
+                        cx,
+                        scope,
+                        InodeNumber(ino),
+                        (caller_pid, caller_uid, caller_gid),
+                    )?;
+                    self.inner.ops.btrfs_subvol_create(
+                        cx,
+                        scope,
+                        InodeNumber(ino),
+                        umask,
+                        caller_uid,
+                        caller_gid,
+                        in_data,
+                    )?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
+                    Ok(())
                 }) {
-                    Ok(()) => IoctlResult::Data(Vec::new()),
+                    Ok(()) => {
+                        // An ioctl reply carries no FUSE entry, so it cannot
+                        // replace a cached negative lookup as CREATE does.
+                        let name = in_data[56..BTRFS_VOL_ARGS_SIZE as usize]
+                            .split(|byte| *byte == 0)
+                            .next()
+                            .expect("ioctl name field");
+                        #[cfg(unix)]
+                        let name = OsStr::from_bytes(name);
+                        #[cfg(not(unix))]
+                        let owned_name = OsString::from(String::from_utf8_lossy(name).into_owned());
+                        #[cfg(not(unix))]
+                        let name = owned_name.as_os_str();
+                        self.notify_entry_invalidation(ino, name);
+                        self.notify_parent_invalidation(ino);
+                        IoctlResult::Data(Vec::new())
+                    }
                     Err(error) => IoctlResult::Error(error.to_errno()),
                 }
             }

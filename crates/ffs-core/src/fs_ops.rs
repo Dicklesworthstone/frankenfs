@@ -3601,27 +3601,70 @@ impl FsOps for OpenFs {
 
     fn btrfs_subvol_create(
         &self,
-        _cx: &Cx,
-        _scope: &mut RequestScope,
-        _vol_args: &[u8],
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        umask: u16,
+        uid: u32,
+        gid: u32,
+        vol_args: &[u8],
     ) -> ffs_error::Result<()> {
-        match &self.flavor {
-            FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
+        if !self.is_btrfs() {
+            return Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_SUBVOL_CREATE_V2 is not supported on ext4 filesystems".to_owned(),
-            )),
-            FsFlavor::Btrfs(_) => {
-                // bd-tmwe8: OpenFs::create_subvolume exists but is not wired to
-                // this ioctl yet; EROFS only when the mount is read-only.
-                if self.is_writable() {
-                    Err(FfsError::UnsupportedFeature(
-                        "BTRFS_IOC_SUBVOL_CREATE_V2 is not implemented on FrankenFS btrfs mounts"
-                            .to_owned(),
-                    ))
-                } else {
-                    Err(FfsError::ReadOnly)
-                }
-            }
+            ));
         }
+        self.require_btrfs_rw_allowed("subvol_create_v2")?;
+
+        // Linux UAPI btrfs_ioctl_vol_args_v2: fd(8), transid(8), flags(8),
+        // unused/qgroup union(32), name(4040). fd and transid are ignored for
+        // creation. A qgroup pointer belongs to the caller's address space and
+        // must never be dereferenced by this userspace filesystem.
+        const ARGS_SIZE: usize = 4096;
+        const NAME_OFFSET: usize = 56;
+        const SUBVOL_RDONLY: u64 = 1 << 1;
+        const SUBVOL_QGROUP_INHERIT: u64 = 1 << 2;
+        let invalid = |detail: &str| FfsError::RequestRejected {
+            errno: libc::EINVAL,
+            detail: detail.to_owned(),
+        };
+        if umask & !0o777 != 0 {
+            return Err(invalid("invalid subvolume creation umask"));
+        }
+        let args = vol_args
+            .get(..ARGS_SIZE)
+            .ok_or_else(|| invalid("short BTRFS_IOC_SUBVOL_CREATE_V2 request"))?;
+        let flags = u64::from_ne_bytes(args[16..24].try_into().expect("checked ioctl size"));
+        if flags & !(SUBVOL_RDONLY | SUBVOL_QGROUP_INHERIT) != 0 {
+            return Err(invalid("unknown BTRFS_IOC_SUBVOL_CREATE_V2 flags"));
+        }
+        if flags != 0 {
+            return Err(FfsError::UnsupportedFeature(
+                "subvolume creation with readonly or qgroup inheritance flags is not supported"
+                    .to_owned(),
+            ));
+        }
+        let name_bytes = &args[NAME_OFFSET..];
+        let name_end = name_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| invalid("subvolume name is not NUL terminated"))?;
+        let name = &name_bytes[..name_end];
+        Self::validate_single_path_component(name)?;
+
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
+        let _view = self.btrfs_semantic_view_guard()?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        self.reject_dir_entry_change(cx, scope, parent, false)?;
+        self.btrfs_create_subvolume(cx, parent, name, 0o777 & !umask, uid, gid)?;
+        // Nested-subvolume reads open the committed root tree. A staged root
+        // has bytenr=0 and would otherwise appear as a root-owned placeholder
+        // until some unrelated fsync. Only acknowledge the ioctl once its real
+        // tree is published and immediately traversable. On commit failure the
+        // existing rollback path retains the extra-tree debt for a sync retry;
+        // propagate the error instead of reporting a successful creation.
+        self.btrfs_full_transaction_commit(cx, "subvol-create-v2")?;
+        Ok(())
     }
 
     fn btrfs_rm_dev_v2(

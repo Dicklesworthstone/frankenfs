@@ -42019,6 +42019,25 @@ impl OpenFs {
             .next())
     }
 
+    /// The shared inode cursor is rebuilt from the mounted fs-tree on reopen,
+    /// independently of roots already present in the root tree. Both new
+    /// subvolumes and snapshots must reserve an unused root identity across
+    /// every ROOT_ITEM offset before changing any shared extent references.
+    /// The caller holds allocator-write exclusion and advances the cursor only
+    /// after registration succeeds.
+    fn btrfs_next_unused_root_id(alloc: &BtrfsAllocState) -> Result<u64, FfsError> {
+        let mut candidate = alloc.next_objectid.max(BTRFS_FIRST_FREE_OBJECTID);
+        loop {
+            if candidate > BTRFS_LAST_FREE_OBJECTID {
+                return Err(FfsError::NoSpace);
+            }
+            if Self::btrfs_find_root_item(&alloc.root_tree, candidate)?.is_none() {
+                return Ok(candidate);
+            }
+            candidate += 1;
+        }
+    }
+
     // ── Btrfs durable writeback (bd-jdo53) ───────────────────────────────
 
     /// Fixpoint iteration cap for the extent tree's self-description pass in
@@ -42258,6 +42277,16 @@ impl OpenFs {
         if purge_fs_tree_by_filter {
             purged_roots.push(fs_root);
         }
+        // A failed superblock write/final sync retains these complete trees
+        // for retry, together with the allocation state that may already be
+        // published. Rewriting them below must retire the previous attempt's
+        // metadata too, or its root-owned extent items become unreachable.
+        // Only pending extra roots are included: their metadata was allocated
+        // exclusively for these copied/new trees, never shared with another
+        // root. The existing retirement pass pins before deleting, so even a
+        // fully persisted but unacknowledged superblock remains readable until
+        // its replacement's final sync succeeds. Unrelated subvolumes stay put.
+        purged_roots.extend(subvol_trees.iter().map(|(root, _)| *root));
         alloc
             .extent_alloc
             .remove_metadata_items_owned_by_roots(&purged_roots)
@@ -44890,6 +44919,9 @@ impl OpenFs {
     /// `UnsupportedFeature` on a non-btrfs filesystem. Returns the new
     /// subvolume's root objectid. See [`Self::btrfs_create_subvolume`] for the
     /// btrfs implementation (bd-tm48j).
+    /// This native API stages a root with mode `0755`; sync it before reopening
+    /// or traversing it. The ioctl API instead applies the caller's umask and
+    /// commits the new tree before reporting success.
     pub fn create_subvolume(
         &self,
         cx: &Cx,
@@ -44905,7 +44937,7 @@ impl OpenFs {
                 "subvolume creation is only supported on btrfs".into(),
             ));
         }
-        self.btrfs_create_subvolume(cx, parent, name, uid, gid)
+        self.btrfs_create_subvolume(cx, parent, name, 0o755, uid, gid)
     }
 
     /// Create a snapshot of the default subvolume named `name` under `parent`
@@ -44961,97 +44993,124 @@ impl OpenFs {
         secs: u64,
         nanos: u32,
     ) -> ffs_error::Result<()> {
-        let root_dir_oid = BTRFS_FIRST_FREE_OBJECTID;
+        // Registration spans two trees and the directory's index/log state.
+        // An insertion failure must not leave a ROOT_ITEM, dangling name, or
+        // consumed index behind for a later transaction to publish.
+        let root_checkpoint = alloc.root_tree.checkpoint();
+        let fs_checkpoint = alloc.fs_tree.checkpoint();
+        let old_dir_counter = alloc.dir_index_counters.get(&parent_oid).copied();
+        let old_logged_keys = alloc.btrfs_logged_dir_keys.clone();
+        let old_extra_trees_len = alloc.extra_subvol_trees.len();
+        let result = (|| {
+            let root_dir_oid = BTRFS_FIRST_FREE_OBJECTID;
 
-        // ROOT_ITEM. bytenr/level are placeholders the commit repoints (via
-        // patch_root_commit) to the just-written tree root. A deterministic
-        // non-zero uuid (generation == generation_v2 from to_bytes) keeps it
-        // parseable; parent_uuid marks a snapshot (non-zero) vs a plain subvol.
-        let mut uuid = [0_u8; 16];
-        uuid[0..8].copy_from_slice(&subvol_id.to_le_bytes());
-        uuid[8..16].copy_from_slice(&alloc.generation.to_le_bytes());
-        let root_item = BtrfsRootItem {
-            bytenr: 0,
-            level: 0,
-            generation: alloc.generation,
-            last_snapshot: 0,
-            root_dirid: root_dir_oid,
-            flags: 0,
-            refs: 1,
-            uuid,
-            parent_uuid,
-        };
-        alloc
-            .root_tree
-            .insert(
-                BtrfsKey {
-                    objectid: subvol_id,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                },
-                &root_item.to_bytes(),
-            )
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            // ROOT_ITEM. bytenr/level are placeholders the commit repoints (via
+            // patch_root_commit) to the just-written tree root. A deterministic
+            // non-zero uuid (generation == generation_v2 from to_bytes) keeps it
+            // parseable; parent_uuid marks a snapshot (non-zero) vs a plain subvol.
+            let mut uuid = [0_u8; 16];
+            uuid[0..8].copy_from_slice(&subvol_id.to_le_bytes());
+            uuid[8..16].copy_from_slice(&alloc.generation.to_le_bytes());
+            let root_item = BtrfsRootItem {
+                bytenr: 0,
+                level: 0,
+                generation: alloc.generation,
+                last_snapshot: 0,
+                root_dirid: root_dir_oid,
+                flags: 0,
+                refs: 1,
+                uuid,
+                parent_uuid,
+            };
+            alloc
+                .root_tree
+                .insert(
+                    BtrfsKey {
+                        objectid: subvol_id,
+                        item_type: BTRFS_ITEM_ROOT_ITEM,
+                        offset: 0,
+                    },
+                    &root_item.to_bytes(),
+                )
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-        // Name linkage: the parent dir entry points at the subvolume's ROOT_ITEM
-        // (child_key_type = ROOT_ITEM; readdir emits it as a directory named
-        // `name`). No INODE_REF — a subvolume is not an inode in the parent tree;
-        // the back-link is the ROOT_BACKREF.
-        let parent_root_objectid = alloc.fs_root_objectid;
-        let dir_item = BtrfsDirItem {
-            child_objectid: subvol_id,
-            child_key_type: BTRFS_ITEM_ROOT_ITEM,
-            child_key_offset: u64::MAX,
-            file_type: BTRFS_FT_DIR,
-            name: name.to_vec(),
-        };
-        let dir_index_seq = self.btrfs_insert_dir_entry(alloc, parent_oid, &dir_item)?;
+            // Name linkage: the parent dir entry points at the subvolume's ROOT_ITEM
+            // (child_key_type = ROOT_ITEM; readdir emits it as a directory named
+            // `name`). No INODE_REF — a subvolume is not an inode in the parent tree;
+            // the back-link is the ROOT_BACKREF.
+            let parent_root_objectid = alloc.fs_root_objectid;
+            let dir_item = BtrfsDirItem {
+                child_objectid: subvol_id,
+                child_key_type: BTRFS_ITEM_ROOT_ITEM,
+                child_key_offset: u64::MAX,
+                file_type: BTRFS_FT_DIR,
+                name: name.to_vec(),
+            };
+            let dir_index_seq = self.btrfs_insert_dir_entry(alloc, parent_oid, &dir_item)?;
 
-        // ROOT_REF (parent_root, ROOT_REF, subvol_id) + the inverse ROOT_BACKREF.
-        // On-disk btrfs_root_ref: dirid(8) + sequence(8) + name_len(2) + name.
-        let name_len = u16::try_from(name.len())
-            .map_err(|_| FfsError::Format("subvolume name exceeds u16 length".into()))?;
-        let mut root_ref_bytes = Vec::with_capacity(18 + name.len());
-        root_ref_bytes.extend_from_slice(&parent_oid.to_le_bytes());
-        root_ref_bytes.extend_from_slice(&dir_index_seq.to_le_bytes());
-        root_ref_bytes.extend_from_slice(&name_len.to_le_bytes());
-        root_ref_bytes.extend_from_slice(name);
-        alloc
-            .root_tree
-            .insert(
-                BtrfsKey {
-                    objectid: parent_root_objectid,
-                    item_type: ffs_btrfs::BTRFS_ITEM_ROOT_REF,
-                    offset: subvol_id,
-                },
-                &root_ref_bytes,
-            )
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        alloc
-            .root_tree
-            .insert(
-                BtrfsKey {
-                    objectid: subvol_id,
-                    item_type: ffs_btrfs::BTRFS_ITEM_ROOT_BACKREF,
-                    offset: parent_root_objectid,
-                },
-                &root_ref_bytes,
-            )
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            // ROOT_REF (parent_root, ROOT_REF, subvol_id) + the inverse ROOT_BACKREF.
+            // On-disk btrfs_root_ref: dirid(8) + sequence(8) + name_len(2) + name.
+            let name_len = u16::try_from(name.len())
+                .map_err(|_| FfsError::Format("subvolume name exceeds u16 length".into()))?;
+            let mut root_ref_bytes = Vec::with_capacity(18 + name.len());
+            root_ref_bytes.extend_from_slice(&parent_oid.to_le_bytes());
+            root_ref_bytes.extend_from_slice(&dir_index_seq.to_le_bytes());
+            root_ref_bytes.extend_from_slice(&name_len.to_le_bytes());
+            root_ref_bytes.extend_from_slice(name);
+            alloc
+                .root_tree
+                .insert(
+                    BtrfsKey {
+                        objectid: parent_root_objectid,
+                        item_type: ffs_btrfs::BTRFS_ITEM_ROOT_REF,
+                        offset: subvol_id,
+                    },
+                    &root_ref_bytes,
+                )
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            alloc
+                .root_tree
+                .insert(
+                    BtrfsKey {
+                        objectid: subvol_id,
+                        item_type: ffs_btrfs::BTRFS_ITEM_ROOT_BACKREF,
+                        offset: parent_root_objectid,
+                    },
+                    &root_ref_bytes,
+                )
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-        alloc.extra_subvol_trees.push((subvol_id, subvol_tree));
-        self.btrfs_touch_inode_times(alloc, parent_oid, secs, nanos)?;
-        Ok(())
+            alloc.extra_subvol_trees.push((subvol_id, subvol_tree));
+            self.btrfs_touch_inode_times(alloc, parent_oid, secs, nanos)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            alloc.root_tree.rollback_to(root_checkpoint);
+            alloc.fs_tree.rollback_to(fs_checkpoint);
+            if let Some(counter) = old_dir_counter {
+                alloc.dir_index_counters.insert(parent_oid, counter);
+            } else {
+                alloc.dir_index_counters.remove(&parent_oid);
+            }
+            alloc.btrfs_logged_dir_keys = old_logged_keys;
+            alloc.extra_subvol_trees.truncate(old_extra_trees_len);
+        } else {
+            alloc.root_tree.release_checkpoint();
+            alloc.fs_tree.release_checkpoint();
+        }
+        result
     }
 
     fn btrfs_create_subvolume(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         parent: InodeNumber,
         name: &[u8],
+        mode: u16,
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<u64> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         self.require_btrfs_rw_allowed("create_subvolume")?;
         let alloc_mutex = self.require_btrfs_alloc_state()?;
         let parent_oid = self.btrfs_canonical_inode(parent)?;
@@ -45059,15 +45118,42 @@ impl OpenFs {
 
         Self::validate_single_path_component(name)?;
 
+        let _namespace = self.begin_namespace_mutation();
+        clear_readdir_snapshot(&self.readdir_snapshot);
         let mut alloc = alloc_mutex.write();
-        self.btrfs_require_directory_inode(&alloc, parent_oid)?;
-        if Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name).is_ok() {
-            return Err(FfsError::Exists);
+        let parent_inode = self.btrfs_require_directory_inode(&alloc, parent_oid)?;
+        if parent_inode.flags & BTRFS_INODE_IMMUTABLE != 0 {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EPERM,
+                detail: "immutable directory cannot contain a new subvolume".into(),
+            });
         }
+        // Subvolume roots live in their own tree, so the ordinary mkdir ACL
+        // inheritance helper cannot safely target them. Refuse explicitly
+        // instead of silently creating a root with different permissions.
+        for acl_name in [POSIX_ACL_ACCESS_XATTR, POSIX_ACL_DEFAULT_XATTR] {
+            let key = BtrfsKey {
+                objectid: parent_oid,
+                item_type: BTRFS_ITEM_XATTR_ITEM,
+                offset: u64::from(ffs_btrfs::btrfs_name_hash(acl_name.as_bytes())),
+            };
+            if let Some((_, data)) = alloc
+                .fs_tree
+                .range(&key, &key)
+                .map_err(|error| btrfs_mutation_to_ffs(&error))?
+                .first()
+                && find_xattr_item_value(data, acl_name.as_bytes())
+                    .map_err(|error| parse_to_ffs_error(&error))?
+                    .is_some()
+            {
+                return Err(FfsError::UnsupportedFeature(
+                    "subvolume creation beneath an ACL-bearing directory is not supported".into(),
+                ));
+            }
+        }
+        Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
-        // Allocate the new subvolume's root objectid from the shared id pool.
-        let subvol_id = alloc.next_objectid;
-        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+        let subvol_id = Self::btrfs_next_unused_root_id(&alloc)?;
 
         // Build the subvolume's own fs-tree: its root directory (inode 256).
         let max_items = ((alloc.nodesize as usize).saturating_sub(101) / 25).max(3);
@@ -45080,8 +45166,10 @@ impl OpenFs {
             nbytes: 0,
             nlink: 1,
             uid,
+            // Linux subvolume roots use the caller's gid and masked mode,
+            // without inheriting a parent's setgid bit or owning group.
             gid,
-            mode: 0o040_755, // S_IFDIR | 0755
+            mode: 0o040_000 | u32::from(mode),
             rdev: 0,
             flags: 0,
             atime_sec: secs,
@@ -45133,6 +45221,7 @@ impl OpenFs {
             secs,
             nanos,
         )?;
+        alloc.next_objectid = subvol_id + 1;
         drop(alloc);
 
         Ok(subvol_id)
@@ -45164,6 +45253,7 @@ impl OpenFs {
         if Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name).is_ok() {
             return Err(FfsError::Exists);
         }
+        let snapshot_id = Self::btrfs_next_unused_root_id(&alloc)?;
 
         // Source is the mounted subvolume. Its uuid (ROOT_ITEM bytes offset
         // 247, 16 bytes) becomes the snapshot's parent_uuid.
@@ -45211,9 +45301,6 @@ impl OpenFs {
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         }
 
-        let snapshot_id = alloc.next_objectid;
-        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
-
         // Add one reference, owned by the snapshot root, to every shared data
         // extent the copied tree now references. The snapshot's EXTENT_DATA_REF
         // is keyed (snapshot_id, inode, file_offset - extent_offset) — distinct
@@ -45259,6 +45346,7 @@ impl OpenFs {
             secs,
             nanos,
         )?;
+        alloc.next_objectid = snapshot_id + 1;
         drop(alloc);
 
         Ok(snapshot_id)
@@ -113061,6 +113149,526 @@ mod tests {
         );
     }
 
+    fn btrfs_subvol_create_ioctl_args(name: &[u8]) -> Vec<u8> {
+        let mut args = vec![0; 4096];
+        args[56..56 + name.len()].copy_from_slice(name);
+        args
+    }
+
+    #[test]
+    fn btrfs_subvol_create_ioctl_rejects_malformed_and_unsupported_requests_without_mutation() {
+        let (fs, cx) = open_writable_btrfs();
+        let fs = Arc::new(fs);
+        let parent = InodeNumber(1);
+        let low = BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        };
+        let high = BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        };
+        let snapshot = || {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            (
+                alloc.root_tree.range(&low, &high).unwrap(),
+                alloc.fs_tree.range(&low, &high).unwrap(),
+                alloc.next_objectid,
+                alloc.extra_subvol_trees.len(),
+            )
+        };
+        let before = snapshot();
+        let mut cases = Vec::new();
+        for len in [0, 55, 4095] {
+            cases.push((vec![0; len], libc::EINVAL));
+        }
+        for name in [b"".as_slice(), b".", b"..", b"parent/child"] {
+            cases.push((btrfs_subvol_create_ioctl_args(name), libc::EINVAL));
+        }
+        cases.push((
+            btrfs_subvol_create_ioctl_args(&[b'a'; 256]),
+            libc::ENAMETOOLONG,
+        ));
+        let mut unterminated = btrfs_subvol_create_ioctl_args(b"child");
+        unterminated[56..].fill(b'a');
+        cases.push((unterminated, libc::EINVAL));
+        for flags in [1_u64, 1 << 3, 1 << 4, 1 << 63] {
+            let mut args = btrfs_subvol_create_ioctl_args(b"child");
+            args[16..24].copy_from_slice(&flags.to_ne_bytes());
+            cases.push((args, libc::EINVAL));
+        }
+        for flags in [2_u64, 4, 6] {
+            let mut args = btrfs_subvol_create_ioctl_args(b"child");
+            args[16..24].copy_from_slice(&flags.to_ne_bytes());
+            // An adversarial caller pointer is refused, never dereferenced.
+            args[32..40].copy_from_slice(&u64::MAX.to_ne_bytes());
+            cases.push((args, libc::EOPNOTSUPP));
+        }
+        for (args, errno) in cases {
+            let error = FsOps::btrfs_subvol_create(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                parent,
+                0o022,
+                1000,
+                1001,
+                &args,
+            )
+            .expect_err("invalid or unsupported creation must fail");
+            assert_eq!(error.to_errno(), errno, "{error}");
+            assert_eq!(
+                snapshot(),
+                before,
+                "refusal must not change either tree or consume an id"
+            );
+        }
+        for umask in [0o1000, u16::MAX] {
+            let error = FsOps::btrfs_subvol_create(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                parent,
+                umask,
+                1000,
+                1001,
+                &btrfs_subvol_create_ioctl_args(b"child"),
+            )
+            .expect_err("invalid caller umask must not become permission bits");
+            assert_eq!(error.to_errno(), libc::EINVAL);
+            assert_eq!(snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn btrfs_subvol_create_ioctl_refuses_readonly_non_directory_immutable_and_acl_parents() {
+        let (fs, cx, dev) = open_writable_btrfs_with_device();
+        let args = btrfs_subvol_create_ioctl_args(b"child");
+        let ro = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert_eq!(
+            FsOps::btrfs_subvol_create(
+                &ro,
+                &cx,
+                &mut RequestScope::empty(),
+                InodeNumber(1),
+                0o022,
+                0,
+                0,
+                &args,
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EROFS
+        );
+        let file = fs
+            .create(&cx, InodeNumber(1), OsStr::new("file"), 0o644, 0, 0)
+            .unwrap();
+        assert_eq!(
+            FsOps::btrfs_subvol_create(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                file.ino,
+                0o022,
+                0,
+                0,
+                &args,
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::ENOTDIR
+        );
+        let dir = fs
+            .mkdir(&cx, InodeNumber(1), OsStr::new("acl-parent"), 0o755, 0, 0)
+            .unwrap();
+        let acl = ext4_setattr_test_acl(7, 5, 0);
+        fs.setxattr(
+            &cx,
+            dir.ino,
+            POSIX_ACL_DEFAULT_XATTR,
+            &acl,
+            XattrSetMode::Set,
+        )
+        .unwrap();
+        assert_eq!(
+            FsOps::btrfs_subvol_create(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                dir.ino,
+                0o022,
+                0,
+                0,
+                &args,
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EOPNOTSUPP
+        );
+        FsOps::set_inode_flags(
+            &fs,
+            &cx,
+            &mut RequestScope::empty(),
+            InodeNumber(1),
+            ffs_types::EXT4_IMMUTABLE_FL,
+        )
+        .unwrap();
+        assert_eq!(
+            FsOps::btrfs_subvol_create(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                InodeNumber(1),
+                0o022,
+                0,
+                0,
+                &args,
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EPERM
+        );
+        assert!(
+            fs.require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .extra_subvol_trees
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn btrfs_create_subvolume_registration_failure_rolls_back_both_trees_and_retry_state() {
+        let (fs, cx) = open_writable_btrfs();
+        let parent = InodeNumber(1);
+        fs.create(&cx, parent, OsStr::new("existing"), 0o644, 0, 0)
+            .unwrap();
+        let canonical = fs.btrfs_canonical_inode(parent).unwrap();
+        let low = BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        };
+        let high = BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        };
+        let snapshot = |alloc: &BtrfsAllocState| {
+            (
+                alloc.root_tree.range(&low, &high).unwrap(),
+                alloc.fs_tree.range(&low, &high).unwrap(),
+                alloc.next_objectid,
+                alloc.dir_index_counters.clone(),
+                alloc.btrfs_logged_dir_keys.clone(),
+                alloc.extra_subvol_trees.len(),
+            )
+        };
+        let (before, next_index) = {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            let next = alloc.dir_index_counters[&canonical];
+            // Force a DIR_INDEX collision after ROOT_ITEM and DIR_ITEM have
+            // already been inserted. This exercises a partial registration,
+            // unlike an ordinary duplicate-name preflight rejection.
+            alloc.dir_index_counters.insert(canonical, next - 1);
+            (snapshot(&alloc), next)
+        };
+        let error = fs
+            .create_subvolume(&cx, parent, b"retry", 123, 456)
+            .unwrap_err();
+        assert_eq!(error.to_errno(), libc::EEXIST);
+        {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            assert_eq!(snapshot(&alloc), before);
+            alloc.dir_index_counters.insert(canonical, next_index);
+        }
+        let id = fs
+            .create_subvolume(&cx, parent, b"retry", 123, 456)
+            .expect("retry after rollback");
+        assert_eq!(
+            id, before.2,
+            "failed registration must not consume the root id"
+        );
+        assert_eq!(
+            fs.lookup(&cx, parent, OsStr::new("existing")).unwrap().kind,
+            FileType::RegularFile
+        );
+        assert_eq!(
+            fs.lookup(&cx, parent, OsStr::new("retry")).unwrap().kind,
+            FileType::Directory
+        );
+    }
+
+    #[test]
+    fn btrfs_subvol_create_ioctl_is_immediately_traversable_and_survives_sync_reopen() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(128) else {
+            oracle_unavailable("btrfs image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let fs = Arc::new(fs);
+        let parent = fs
+            .mkdir(
+                &cx,
+                InodeNumber(1),
+                OsStr::new("container"),
+                0o2775,
+                1000,
+                2000,
+            )
+            .unwrap();
+        assert!(
+            !fs.readdir(&cx, parent.ino, 0)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == b"child")
+        );
+        let mut args = btrfs_subvol_create_ioctl_args(b"child");
+        // The UAPI explicitly ignores these fields for subvolume creation.
+        args[..8].copy_from_slice(&(-1_i64).to_ne_bytes());
+        args[8..16].copy_from_slice(&u64::MAX.to_ne_bytes());
+        let epoch = fs.mutation_epoch.load(Ordering::Acquire);
+        let mut scope = FsOps::begin_request_scope(&fs, &cx, RequestOp::IoctlWrite).unwrap();
+        FsOps::btrfs_subvol_create(&fs, &cx, &mut scope, parent.ino, 0o077, 1234, 5678, &args)
+            .unwrap();
+        FsOps::commit_request_scope(&fs, &cx, &mut scope).unwrap();
+        FsOps::end_request_scope(&fs, &cx, RequestOp::IoctlWrite, scope).unwrap();
+        assert!(fs.mutation_epoch.load(Ordering::Acquire) > epoch);
+
+        // No additional sync occurs before lookup/getattr/readdir: ioctl
+        // success must expose the real committed root, never a placeholder.
+        let child = fs.lookup(&cx, parent.ino, OsStr::new("child")).unwrap();
+        assert_eq!(
+            (child.uid, child.gid, child.perm),
+            (1234, 5678, 0o700),
+            "caller umask controls privacy; native subvolumes do not inherit parent SGID or gid"
+        );
+        assert_eq!(
+            FsOps::getattr(&fs, &cx, &mut RequestScope::empty(), child.ino)
+                .unwrap()
+                .uid,
+            1234
+        );
+        let rows = fs.readdir(&cx, child.ino, 0).unwrap();
+        assert!(
+            rows.iter()
+                .all(|entry| entry.name == b"." || entry.name == b"..")
+        );
+        assert_eq!(
+            rows.iter().find(|entry| entry.name == b"..").unwrap().ino,
+            parent.ino
+        );
+        assert!(
+            fs.readdir(&cx, parent.ino, 0)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == b"child")
+        );
+        let (first_id, next_id) = {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(
+                alloc.extra_subvol_trees.is_empty(),
+                "ioctl must commit the new tree"
+            );
+            (
+                OpenFs::btrfs_lookup_dir_entry(&alloc, parent.ino.0, b"child")
+                    .unwrap()
+                    .child_objectid,
+                alloc.next_objectid,
+            )
+        };
+        assert_eq!(
+            FsOps::btrfs_subvol_create(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                parent.ino,
+                0o077,
+                1234,
+                5678,
+                &args,
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EEXIST
+        );
+        assert_eq!(
+            fs.require_btrfs_alloc_state().unwrap().read().next_objectid,
+            next_id
+        );
+        fs.sync_all_to_device(&cx).unwrap();
+        assert_eq!(
+            fs.committed_mutation_epoch.load(Ordering::Acquire),
+            fs.mutation_epoch.load(Ordering::Acquire)
+        );
+        drop(fs);
+
+        let mut reopened =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        reopened.enable_writes(&cx).unwrap();
+        let parent = reopened
+            .lookup(&cx, InodeNumber(1), OsStr::new("container"))
+            .unwrap();
+        let child = reopened
+            .lookup(&cx, parent.ino, OsStr::new("child"))
+            .unwrap();
+        assert_eq!((child.uid, child.gid, child.perm), (1234, 5678, 0o700));
+        // The inode pool resets independently of the root tree on reopen.
+        assert_eq!(
+            reopened
+                .require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .next_objectid,
+            first_id
+        );
+        let longest = [b'z'; 255];
+        FsOps::btrfs_subvol_create(
+            &reopened,
+            &cx,
+            &mut RequestScope::empty(),
+            parent.ino,
+            0,
+            4321,
+            8765,
+            &btrfs_subvol_create_ioctl_args(&longest),
+        )
+        .expect("255-byte name and an already occupied root objectid");
+        let second = reopened
+            .lookup(&cx, parent.ino, OsStr::from_bytes(&longest))
+            .unwrap();
+        assert_eq!((second.uid, second.gid, second.perm), (4321, 8765, 0o777));
+        let alloc = reopened.require_btrfs_alloc_state().unwrap().read();
+        let second_id = OpenFs::btrfs_lookup_dir_entry(&alloc, parent.ino.0, &longest)
+            .unwrap()
+            .child_objectid;
+        assert_ne!(
+            second_id, first_id,
+            "reopen must not reuse an existing subvolume id"
+        );
+        drop(alloc);
+        reopened.sync_all_to_device(&cx).unwrap();
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        let Some((clean, output)) = run_btrfs_check(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "btrfs check must accept both ioctl-created subvolumes:\n{output}"
+        );
+    }
+
+    #[test]
+    fn btrfs_subvol_create_ioctl_commit_failure_is_reported_and_pending_tree_can_sync() {
+        #[derive(Debug)]
+        struct RefuseWrites {
+            inner: TestDevice,
+            armed: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl ByteDevice for RefuseWrites {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                if self.armed.load(Ordering::Acquire) {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+                }
+                self.inner.write_all_at(cx, offset, buf)
+            }
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+        let Some((seed, dev, _tmp, image)) = open_writable_btrfs_mkfs(128) else {
+            oracle_unavailable("btrfs image formatter");
+            return;
+        };
+        drop(seed);
+        let cx = Cx::for_testing();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(RefuseWrites {
+                inner: dev.clone(),
+                armed: Arc::clone(&armed),
+            }),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        fs.enable_writes(&cx).unwrap();
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let mut before = [0; ffs_types::BTRFS_SUPER_INFO_SIZE];
+        dev.read_exact_at(&cx, ByteOffset(BTRFS_SUPER_INFO_OFFSET as u64), &mut before)
+            .unwrap();
+        armed.store(true, Ordering::Release);
+        let error = FsOps::btrfs_subvol_create(
+            &fs,
+            &cx,
+            &mut RequestScope::empty(),
+            InodeNumber(1),
+            0o027,
+            123,
+            456,
+            &btrfs_subvol_create_ioctl_args(b"retry-after-io"),
+        )
+        .expect_err("an ioctl cannot acknowledge a failed native commit");
+        assert_eq!(error.to_errno(), libc::EIO);
+        let mut after = [0; ffs_types::BTRFS_SUPER_INFO_SIZE];
+        dev.read_exact_at(&cx, ByteOffset(BTRFS_SUPER_INFO_OFFSET as u64), &mut after)
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "the failed write must not advance the superblock"
+        );
+        assert_eq!(
+            fs.require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .extra_subvol_trees
+                .len(),
+            1,
+            "commit failure must retain the staged root for retry, unlike registration failure"
+        );
+
+        armed.store(false, Ordering::Release);
+        fs.sync_all_to_device(&cx)
+            .expect("retry the pending creation at an explicit sync");
+        assert!(
+            fs.require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .extra_subvol_trees
+                .is_empty()
+        );
+        let child = fs
+            .lookup(&cx, InodeNumber(1), OsStr::new("retry-after-io"))
+            .unwrap();
+        assert_eq!((child.uid, child.gid, child.perm), (123, 456, 0o750));
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        let Some((clean, output)) = run_btrfs_check(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "btrfs check must accept the retried creation:\n{output}"
+        );
+    }
+
     /// bd-34blv: with default settings a btrfs RW mount grows data chunks on
     /// demand, so filling most of a 256 MiB image succeeds where the formatter's
     /// small initial data chunk used to return ENOSPC after ~8 MiB. The result
@@ -113213,10 +113821,23 @@ mod tests {
             <Arc<OpenFs> as FsOps>::btrfs_balance_progress(&fs, &cx, &mut scope),
             Err(FfsError::Io(ref e)) if e.raw_os_error() == Some(libc::ENOTCONN)
         ));
-        assert!(matches!(
-            <Arc<OpenFs> as FsOps>::btrfs_subvol_create(&fs, &cx, &mut scope, &[0_u8; 4096]),
-            Err(FfsError::UnsupportedFeature(_))
-        ));
+        // Creation is now implemented, but an empty request must still never
+        // report a successful operation that did no work (the original guard).
+        assert_eq!(
+            <Arc<OpenFs> as FsOps>::btrfs_subvol_create(
+                &fs,
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                0o022,
+                0,
+                0,
+                &[0_u8; 4096],
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EINVAL,
+        );
     }
 
     /// bd-dj725: on btrfs the periodic commit keys off mutating request scopes
@@ -113699,6 +114320,358 @@ mod tests {
             if let Some((ok, output)) = run_btrfs_check(&image) {
                 assert!(ok, "sync failure {cut} retry image: {output}");
             }
+        }
+    }
+
+    #[test]
+    fn btrfs_new_root_ids_preserve_existing_generations_after_inode_pool_reopen() {
+        let Some((seed_fs, seed_dev, _tmp, image)) = open_writable_btrfs_mkfs(128) else {
+            oracle_unavailable("btrfs image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let parent = InodeNumber(1);
+        seed_fs.set_btrfs_dirty_bytes_threshold(0);
+        let generation_id = seed_fs
+            .create_snapshot(&cx, parent, b"existing-generation")
+            .unwrap();
+        let zero_id = seed_fs
+            .create_subvolume(&cx, parent, b"existing-zero", 77, 88)
+            .unwrap();
+        let source_id = seed_fs
+            .create_subvolume(&cx, parent, b"source", 123, 456)
+            .unwrap();
+        seed_fs
+            .btrfs_full_transaction_commit(&cx, "root-id-collision-seed")
+            .unwrap();
+        {
+            let mut alloc = seed_fs.require_btrfs_alloc_state().unwrap().write();
+            // ROOT_ITEM identities include generation offsets; an exact
+            // `(id, ROOT_ITEM, 0)` check must not miss this existing root.
+            let old_key = BtrfsKey {
+                objectid: generation_id,
+                item_type: BTRFS_ITEM_ROOT_ITEM,
+                offset: 0,
+            };
+            let bytes = alloc.root_tree.get(&old_key).unwrap();
+            let generation_key = BtrfsKey {
+                offset: alloc.generation,
+                ..old_key
+            };
+            alloc.root_tree.delete(&old_key).unwrap();
+            alloc.root_tree.insert(generation_key, &bytes).unwrap();
+        }
+        seed_fs
+            .btrfs_full_transaction_commit(&cx, "root-id-generation-key-seed")
+            .unwrap();
+        let seed = seed_dev.snapshot_bytes();
+        drop(seed_fs);
+        drop(seed_dev);
+
+        for snapshot in [false, true] {
+            let device = TestDevice::from_vec(seed.clone());
+            let options = OpenOptions {
+                btrfs_mount_selection: BtrfsMountSelection::SubvolumeId(source_id),
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::from_device(&cx, Box::new(device.clone()), &options).unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            assert_eq!(
+                fs.require_btrfs_alloc_state().unwrap().read().next_objectid,
+                generation_id,
+                "the selected empty fs-tree resets the inode pool onto an existing root ID"
+            );
+            let existing_roots = || {
+                let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+                [generation_id, zero_id]
+                    .into_iter()
+                    .flat_map(|id| {
+                        let key = BtrfsKey {
+                            objectid: id,
+                            item_type: BTRFS_ITEM_ROOT_ITEM,
+                            offset: 0,
+                        };
+                        alloc
+                            .root_tree
+                            .range(
+                                &key,
+                                &BtrfsKey {
+                                    offset: u64::MAX,
+                                    ..key
+                                },
+                            )
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = existing_roots();
+            assert_eq!(before.len(), 2);
+            assert_ne!(before[0].0.offset, 0);
+            assert_eq!(before[1].0.offset, 0);
+            let create = |name: &[u8]| {
+                if snapshot {
+                    fs.create_snapshot(&cx, parent, name)
+                } else {
+                    fs.create_subvolume(&cx, parent, name, 123, 456)
+                }
+            };
+            let id = create(b"fresh-root").unwrap();
+            assert_eq!(id, source_id + 1, "skip every existing root identity");
+            assert_eq!(existing_roots(), before);
+            assert_eq!(
+                fs.require_btrfs_alloc_state().unwrap().read().next_objectid,
+                id + 1
+            );
+            fs.btrfs_full_transaction_commit(&cx, "root-id-collision-commit")
+                .unwrap();
+            assert_eq!(
+                existing_roots(),
+                before,
+                "the commit must preserve prior roots"
+            );
+
+            // Fail registration after ROOT_ITEM insertion. Neither constructor
+            // may consume a candidate that never became a registered root.
+            let (next_id, next_index) = {
+                let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+                let next_index = alloc.dir_index_counters[&BTRFS_FIRST_FREE_OBJECTID];
+                alloc
+                    .dir_index_counters
+                    .insert(BTRFS_FIRST_FREE_OBJECTID, next_index - 1);
+                (alloc.next_objectid, next_index)
+            };
+            let error = create(b"registration-fails").unwrap_err();
+            assert_eq!(error.to_errno(), libc::EEXIST);
+            {
+                let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+                assert_eq!(alloc.next_objectid, next_id);
+                assert!(
+                    OpenFs::btrfs_find_root_item(&alloc.root_tree, next_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(alloc.extra_subvol_trees.is_empty());
+                alloc
+                    .dir_index_counters
+                    .insert(BTRFS_FIRST_FREE_OBJECTID, next_index);
+            }
+            assert_eq!(existing_roots(), before);
+            let reopened =
+                OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default())
+                    .unwrap();
+            for (key, data) in &before {
+                let old_root = ffs_btrfs::parse_root_item(data).unwrap();
+                assert_eq!(
+                    reopened
+                        .btrfs_fs_tree_root_bytenr(&cx, key.objectid)
+                        .unwrap(),
+                    old_root.bytenr
+                );
+            }
+            std::fs::write(&image, device.snapshot_bytes()).unwrap();
+            if let Some((clean, output)) = run_btrfs_check(&image) {
+                assert!(
+                    clean,
+                    "root-id collision avoidance, snapshot={snapshot}: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_extra_subvolume_final_sync_retry_retires_only_superseded_metadata() {
+        let Some((seed_fs, seed_dev, _tmp, image)) = open_writable_btrfs_mkfs(128) else {
+            oracle_unavailable("btrfs image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(1);
+        seed_fs.set_btrfs_dirty_bytes_threshold(0);
+        let kept_id = seed_fs
+            .create_subvolume(&cx, root, b"kept-before-retry", 77, 88)
+            .unwrap();
+        seed_fs
+            .btrfs_full_transaction_commit(&cx, "extra-subvol-retry-seed")
+            .unwrap();
+        let seed = seed_dev.snapshot_bytes();
+        drop(seed_fs);
+        drop(seed_dev);
+
+        let open = |device: &CrashDevice| {
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default())
+                    .unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            fs
+        };
+        let stage = |fs: &OpenFs| {
+            ["retry-left", "retry-right"].map(|name| {
+                fs.create_subvolume(&cx, root, name.as_bytes(), 123, 456)
+                    .unwrap()
+            })
+        };
+        let root_item = |fs: &OpenFs, id: u64| {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            let (_, data) = OpenFs::btrfs_find_root_item(&alloc.root_tree, id)
+                .unwrap()
+                .unwrap();
+            ffs_btrfs::parse_root_item(&data).unwrap()
+        };
+
+        // Measure the actual last flush; the FST policy can change how many
+        // pre-superblock barriers a native commit needs.
+        let sync_span = {
+            let device = CrashDevice::from_vec(seed.clone());
+            let fs = open(&device);
+            stage(&fs);
+            let before = device.sync_count();
+            fs.btrfs_full_transaction_commit(&cx, "extra-subvol-retry-control")
+                .unwrap();
+            device.sync_count() - before
+        };
+        assert!(sync_span >= 2, "separate tree and superblock flushes");
+
+        let device = CrashDevice::from_vec(seed);
+        let fs = open(&device);
+        let kept_root = root_item(&fs, kept_id);
+        let ids = stage(&fs);
+        let generation = fs.require_btrfs_alloc_state().unwrap().read().generation;
+        let failed_at = device.sync_count() + sync_span;
+        device.arm_sync_failure(failed_at);
+        let error = fs
+            .btrfs_full_transaction_commit(&cx, "extra-subvol-final-sync-failure")
+            .expect_err("fail the final superblock durability flush");
+        assert!(
+            error.to_string().contains("injected sync failure"),
+            "{error}"
+        );
+        assert_eq!(device.sync_count(), failed_at);
+        let previous_roots = ids.map(|id| root_item(&fs, id));
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(alloc.generation > generation, "failure follows publication");
+            assert_eq!(alloc.extra_subvol_trees.len(), ids.len());
+            for previous in &previous_roots {
+                assert_ne!(previous.bytenr, 0);
+                let key = BtrfsKey {
+                    objectid: previous.bytenr,
+                    item_type: ffs_btrfs::BTRFS_ITEM_METADATA_ITEM,
+                    offset: u64::from(previous.level),
+                };
+                assert!(alloc.extent_alloc.extent_tree().get(&key).is_some());
+            }
+        }
+
+        // A failed flush can have persisted its complete write set. Model
+        // that allowed outcome without acknowledging the pending trees to
+        // OpenFs, then force another failure before replacement publication.
+        device.disarm();
+        device.sync(&cx).unwrap();
+        let chunks = fs.btrfs_live_chunks().unwrap();
+        let nodesize = usize::try_from(fs.btrfs_context().unwrap().nodesize).unwrap();
+        let mut protected = Vec::new();
+        for previous in previous_roots.iter().chain(std::iter::once(&kept_root)) {
+            let mapping = ffs_ondisk::map_logical_to_stripes(&chunks, previous.bytenr)
+                .unwrap()
+                .unwrap();
+            for stripe in mapping.stripes {
+                let mut bytes = vec![0; nodesize];
+                let offset = ByteOffset(stripe.physical);
+                device.read_exact_at(&cx, offset, &mut bytes).unwrap();
+                protected.push((offset, bytes));
+            }
+        }
+        let mut superblock = vec![0; ffs_types::BTRFS_SUPER_INFO_SIZE];
+        let superblock_offset = ByteOffset(BTRFS_SUPER_INFO_OFFSET as u64);
+        device
+            .read_exact_at(&cx, superblock_offset, &mut superblock)
+            .unwrap();
+        protected.push((superblock_offset, superblock));
+
+        device.arm_sync_failure(device.sync_count() + 1);
+        let error = fs
+            .btrfs_full_transaction_commit(&cx, "extra-subvol-replacement-prepublication-failure")
+            .expect_err("fail the replacement before it can publish");
+        assert!(
+            error.to_string().contains("injected sync failure"),
+            "{error}"
+        );
+        for (offset, before) in protected {
+            let mut after = vec![0; before.len()];
+            device.read_exact_at(&cx, offset, &mut after).unwrap();
+            assert_eq!(
+                after, before,
+                "published tree/SB at {offset:?} was overwritten"
+            );
+        }
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert_eq!(alloc.extra_subvol_trees.len(), ids.len());
+            for previous in &previous_roots {
+                let key = BtrfsKey {
+                    objectid: previous.bytenr,
+                    item_type: ffs_btrfs::BTRFS_ITEM_METADATA_ITEM,
+                    offset: u64::from(previous.level),
+                };
+                assert!(
+                    alloc.extent_alloc.extent_tree().get(&key).is_some(),
+                    "failed retirement must restore the prior extent item"
+                );
+            }
+        }
+
+        device.disarm();
+        fs.btrfs_full_transaction_commit(&cx, "extra-subvol-final-sync-retry")
+            .unwrap();
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(alloc.extra_subvol_trees.is_empty());
+            for previous in &previous_roots {
+                let key = BtrfsKey {
+                    objectid: previous.bytenr,
+                    item_type: ffs_btrfs::BTRFS_ITEM_METADATA_ITEM,
+                    offset: u64::from(previous.level),
+                };
+                assert!(
+                    alloc.extent_alloc.extent_tree().get(&key).is_none(),
+                    "successful replacement must not retain an unreachable extra-tree extent"
+                );
+                assert!(!alloc.extent_alloc.is_pinned(previous.bytenr));
+            }
+        }
+        assert_eq!(root_item(&fs, kept_id).bytenr, kept_root.bytenr);
+        for (id, previous) in ids.into_iter().zip(previous_roots) {
+            assert_ne!(root_item(&fs, id).bytenr, previous.bytenr);
+        }
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        drop(fs);
+
+        let durable = device.durable_bytes();
+        std::fs::write(&image, &durable).unwrap();
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(durable)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        for name in ["retry-left", "retry-right"] {
+            let attr = reopened.lookup(&cx, root, OsStr::new(name)).unwrap();
+            assert_eq!(
+                (attr.kind, attr.uid, attr.gid),
+                (FileType::Directory, 123, 456)
+            );
+        }
+        let kept = reopened
+            .lookup(&cx, root, OsStr::new("kept-before-retry"))
+            .unwrap();
+        assert_eq!((kept.uid, kept.gid), (77, 88));
+        if let Some((clean, output)) = run_btrfs_check(&image) {
+            assert!(
+                clean,
+                "extra-subvolume final-sync retry native check: {output}"
+            );
         }
     }
 

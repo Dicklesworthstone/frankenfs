@@ -1246,7 +1246,51 @@ Metadata validates copies before caching; checksummed file reads validate each s
 
 `BTRFS_IOC_INO_LOOKUP` follows the requested `treeid` contract: `treeid=0` reports the mounted subvolume objectid; explicit tree IDs walk their matching `ROOT_ITEM` fs tree; root-object lookups return a NUL-terminated empty path. `--subvol NAME` and `--snapshot NAME` select named trees through the mount open path, including FUSE E2E coverage for root scoping and `NotFound` errors.
 
-Subvolumes nested in the mounted tree are entered as the kernel enters them. A directory entry that links a subvolume is that subvolume's root directory, read from its own tree. This works for any depth of nesting: a subvolume inside a nested subvolume gets its own tree too. Each nested subvolume is served by a read-only instance opened on first use, and its inodes appear as `slot << 48 | objectid`. The `..` of a nested root is the directory holding the link. Nested trees are read-only through the mount: create, write, unlink and the like inside them return `EROFS`. Unlike the kernel, a nested subvolume has no `st_dev` of its own, because FUSE gives a mount one device number. A subvolume created on the same writable mount shows as an empty directory until it is committed. Tests: `btrfs_nested_subvolumes_present_their_own_trees_bd_2ryx9` (btrfs-progs `--subvol` image, read-only and writable instances) and the kernel-oracle FUSE test `btrfs_nested_subvolumes_read_like_the_kernel_bd_2ryx9`.
+Subvolumes nested in the mounted tree are entered as the kernel enters them. A directory entry that links a subvolume is that subvolume's root directory, read from its own tree. This works for any depth of nesting: a subvolume inside a nested subvolume gets its own tree too. Each nested subvolume is served by a read-only instance opened on first use, and its inodes appear as `slot << 48 | objectid`. The `..` of a nested root is the directory holding the link. Nested trees are read-only through the mount: create, write, unlink and the like inside them return `EROFS`. Unlike the kernel, a nested subvolume has no `st_dev` of its own, because FUSE gives a mount one device number. The direct `OpenFs::create_subvolume` API stages a subvolume until a full native commit; its entry appears as an empty placeholder in that interval. Tests: `btrfs_nested_subvolumes_present_their_own_trees_bd_2ryx9` (btrfs-progs `--subvol` image, read-only and writable instances) and the kernel-oracle FUSE test `btrfs_nested_subvolumes_read_like_the_kernel_bd_2ryx9`.
+
+### Creating a subvolume through FUSE
+
+`BTRFS_IOC_SUBVOL_CREATE_V2` now connects the FUSE request to native subvolume
+creation on the mounted writable btrfs tree. The zero-flags request used by
+ordinary `btrfs subvolume create MOUNT/name` creates a separate root tree, its
+root references, and the parent directory entry. The ioctl completes a full
+native transaction before reporting success, so immediate lookup, attributes
+and directory traversal use the published root. A caller does not need an
+additional fsync to replace the staged placeholder.
+
+The request checks write and search permission on the parent, including
+supplementary groups when necessary, and creates the root with the caller's
+uid/gid and `0777 & ~umask` permissions. It follows Linux's subvolume-specific
+ownership rule: a parent's setgid bit and group are not inherited. FUSE ioctl
+requests do not carry the umask, so dispatch requires a readable `/proc/PID/status`
+snapshot whose filesystem uid/gid match the request. Missing or inconsistent
+caller information is refused. See Linux's
+[`btrfs_new_subvol_inode`](https://codebrowser.dev/linux/linux/fs/btrfs/inode.c.html#btrfs_new_subvol_inode)
+for the native ownership contract.
+
+Successful dispatch invalidates the parent attributes and new name. Both
+subvolume and snapshot creation skip existing root IDs after reopen, including
+nonzero ROOT_ITEM generation keys; failed namespace registration restores both
+affected trees. A native commit failure is reported to the caller and retains
+the existing pending-commit state for a later sync retry; it is not a promise
+that no device write occurred.
+
+This supports a plain new subvolume with a single-component name. Read-only
+mounts, immutable parents, ACL-bearing parents whose inheritance is not
+implemented, readonly/qgroup creation flags and malformed requests are refused.
+Nested subvolumes retain the read-only routing described above; select the new
+subvolume as the mounted root to modify its contents. Snapshot creation,
+subvolume deletion and qgroup inheritance are outside this ioctl increment.
+
+The accompanying core and FUSE regressions cover immediate traversal,
+permissions and umask, malformed requests, registration rollback, reopen ID
+collisions, failed writes, and retry after the final superblock flush fails.
+That last path retires superseded metadata for pending extra roots while pinning
+the previous blocks until replacement succeeds; unrelated subvolumes retain
+their roots. These new Rust tests have not executed in this environment:
+dependency compilation was killed under memory pressure. Native fixture
+preparation alone is not proof of these paths, and no live mounted ioctl result
+is claimed (`/dev/fuse` is unavailable).
 
 ### Send/receive parsing
 

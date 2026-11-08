@@ -6,7 +6,7 @@ use ffs_core::{
 };
 use ffs_error::FfsError;
 use ffs_fuse::{FrankenFuse, MountOptions};
-use ffs_types::{crc32c, InodeNumber};
+use ffs_types::{InodeNumber, crc32c};
 use libfuzzer_sys::fuzz_target;
 use std::ffi::OsStr;
 use std::time::SystemTime;
@@ -888,7 +888,7 @@ fn classify_ioctl(data: &[u8]) -> IoctlOutcome {
     let fuse = FrankenFuse::with_options(Box::new(fs), &options);
     let (cmd, in_data, out_size) = build_ioctl_request(kind, &mut cursor);
 
-    match fuse.dispatch_ioctl_for_fuzzing(caller_pid, ino, fh, cmd, &in_data, out_size) {
+    match fuse.dispatch_ioctl_for_fuzzing(caller_pid, 0, 0, ino, fh, cmd, &in_data, out_size) {
         Ok(payload) => IoctlOutcome::Data {
             len: payload.len(),
             crc32c: crc32c(&payload),
