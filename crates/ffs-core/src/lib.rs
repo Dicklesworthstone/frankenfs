@@ -83752,7 +83752,10 @@ mod tests {
                 let (mut fs, dev, _tmp, image) = open_ext4_mke2fs_features_args(
                     8,
                     "extent,metadata_csum,^fast_commit",
-                    &["-g", "2048", "-J", "size=1", "-N", "256"],
+                    // Keep the journal near the beginning: mke2fs' default
+                    // placement can consume group 2, the only non-backup,
+                    // non-final group eligible for a lazy block bitmap here.
+                    &["-g", "2048", "-J", "size=1,location=0", "-N", "256"],
                 )
                 .expect("repeated enable regression requires native mke2fs");
                 fs.mvcc_store = Arc::new(if single_store {
