@@ -26123,6 +26123,10 @@ impl OpenFs {
         scope: &mut RequestScope,
         alloc: &mut Ext4AllocState,
     ) -> Result<CommitSeq, FfsError> {
+        // Write authority can be revoked after the caller obtained alloc or
+        // while it waited for this guard. Recheck before publishing staged data;
+        // require_alloc_state only checks authority and does not take the lock.
+        self.require_alloc_state()?;
         if scope.ext4_block_deltas.is_empty() && scope.ext4_initialized_bitmaps.is_empty() {
             return scope.commit_if_write(&self.mvcc_store);
         }
@@ -104561,6 +104565,76 @@ mod tests {
             );
             assert!(matches!(
                 fs.write(&cx, source, 0, b"changed"),
+                Err(FfsError::ReadOnly)
+            ));
+        }
+    }
+
+    #[test]
+    fn ext4_sdk_write_rechecks_abort_before_locked_publication() {
+        for allocate in [false, true] {
+            let (mut fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("SDK publication authority regression requires mkfs.ext4");
+            fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let ino = fs
+                .create(&cx, root, OsStr::new("abort-before-commit"), 0o644, 0, 0)
+                .unwrap()
+                .ino;
+            let payload = vec![0x7C; fs.block_size() as usize];
+            assert_eq!(fs.write(&cx, ino, 0, &payload).unwrap(), fs.block_size());
+            let before = fs.current_snapshot();
+            let inode = fs.read_inode(&cx, ino).unwrap();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let backing = dev.snapshot_bytes();
+            {
+                let _gate = fs.mutation_gate_guard();
+                let mut alloc = fs.require_alloc_state().unwrap().write();
+                let groups = format!("{:?}", alloc.groups);
+                let base = fs.block_device_adapter();
+                let (tx, pin) = RegisteredSnapshotBlockAdapter::begin(&base, &fs.mvcc_store);
+                let mut scope = RequestScope::with_transaction(tx);
+                let offset = if allocate {
+                    u64::from(fs.block_size())
+                } else {
+                    0
+                };
+                assert_eq!(
+                    fs.ext4_write_locked(&cx, &mut scope, &mut alloc, ino, offset, b"staged")
+                        .unwrap(),
+                    6
+                );
+                assert!(scope.pending_write_count() > 0);
+                assert_eq!(scope.ext4_block_deltas.is_empty(), !allocate);
+                // A component schedule: invoke the real Abort handler after
+                // staging, before the SDK's publication helper. This is a
+                // planted I/O failure, not mounted concurrent execution.
+                let error = fs
+                    .handle_ext4_write_result::<()>(
+                        "write",
+                        Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO))),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.to_errno(), libc::EIO);
+                assert!(!fs.is_writable());
+                assert!(matches!(
+                    fs.commit_scope_with_ext4_block_counts_locked(&mut scope, &mut alloc),
+                    Err(FfsError::ReadOnly)
+                ));
+                assert_eq!(format!("{:?}", alloc.groups), groups);
+                drop(scope);
+                drop(pin);
+            }
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), inode);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(fs.read(&cx, ino, 0, fs.block_size()).unwrap(), payload);
+            assert_eq!(dev.snapshot_bytes(), backing);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+            assert!(matches!(
+                fs.write(&cx, ino, 0, b"denied"),
                 Err(FfsError::ReadOnly)
             ));
         }
