@@ -4978,6 +4978,13 @@ impl FsOps for OpenFs {
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             self.reject_btrfs_unsupported_mutation()?;
         }
+        // Gate admission must precede the semantic-view lock, matching raw
+        // publishers and ordinary requests. Deferred scopes left their gate.
+        let publication = if scope.pending_write_count() != 0 {
+            self.publication_guard(true)?
+        } else {
+            None
+        };
         let tx_id = scope.tx.as_ref().map(ffs_mvcc::Transaction::id);
         // Only the repair-flush lifecycle consumes write_blocks; when it is not
         // attached (normal operation) skip the per-commit Vec allocation of every
@@ -5001,6 +5008,7 @@ impl FsOps for OpenFs {
             **stale = true;
         }
         drop(view);
+        drop(publication);
         if let Ok(commit_seq) = &result {
             self.prune_mvcc_after_commit_if_due(*commit_seq);
             if let Some(tx_id) = tx_id {
@@ -5013,6 +5021,15 @@ impl FsOps for OpenFs {
     fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {
         let _view = self.btrfs_semantic_view_guard()?;
         if !self.is_writable() {
+            if self.is_ext4()
+                && self
+                    .ext4_forced_read_only
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // Abort revokes new publications, not durability for writes
+                // already accepted before teardown.
+                self.flush_revoked_ext4_commits(cx)?;
+            }
             return Ok(());
         }
 
@@ -5042,7 +5059,7 @@ impl FsOps for OpenFs {
         if flushed > 0 {
             info!(flushed_blocks = flushed, "flush_on_destroy");
         }
-        self.checkpoint_metadata_log()?;
+        self.checkpoint_metadata_log(*self.mvcc_flushed_through.lock())?;
 
         // btrfs commit-on-destroy: flush dirty COW trees to disk so
         // mutations performed through the mounted FUSE path survive

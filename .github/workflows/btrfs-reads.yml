@@ -9,6 +9,7 @@ on:
       - 'crates/ffs-btrfs/**'
       - 'crates/ffs-ondisk/**'
       - 'crates/ffs-block/**'
+      - 'crates/ffs-mvcc/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -62,6 +63,10 @@ jobs:
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_eager_concurrent_storm_is_consistent_bd_hyysq -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc writer_snapshot_reads_reject_newer_ancestors_and_preserve_staged_bytes -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_sharded_birth_cross_group_fallback_passes_native_checker -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_managed_publication_refuses_abort_for_data_and_namespace -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_revoked_flush_preserves_committed_allocation_and_retries_sync -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::ext4_flush_sync_failure_retains_cursor_and_teardown_retries_after_abort -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::ext4_revoked_metadata_log_checkpoints_and_resumes_without_stale_replay -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::acl_stored_corruption_preserves_error_origin_and_aborts_metadata_mutation -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::ext4_exchange_rechecks_protected_parents_and_inodes -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::ext4_exchange_batch_preserves_staged_entries_when_moving_their_directory -- --exact --nocapture

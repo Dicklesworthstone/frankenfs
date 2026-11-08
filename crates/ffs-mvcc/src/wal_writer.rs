@@ -383,7 +383,11 @@ impl WalWriter {
     /// appends or Manual sync. Publish the new cursor and counters only after
     /// that barrier succeeds. Any uncertain storage failure seals this writer;
     /// it is not safe to resume appending after merely clearing the I/O error.
-    pub(crate) fn truncate_after_checkpoint(
+    ///
+    /// # Errors
+    /// Returns an error for an invalid checkpoint horizon, an externally changed
+    /// file length, or a storage failure. Ambiguous storage failures seal the writer.
+    pub fn truncate_after_checkpoint(
         &mut self,
         checkpoint_commit_seq: u64,
     ) -> std::result::Result<u64, WalWriteError> {
