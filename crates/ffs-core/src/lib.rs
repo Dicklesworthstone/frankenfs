@@ -13361,6 +13361,7 @@ impl OpenFs {
     /// background home-location compactor.
     fn flush_ext4_metadata_log(&self, cx: &Cx) -> Result<usize, FfsError> {
         self.reject_ext4_revoked_publication(true)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         // Keep the captured bitmap/inode versions and derived counts at one
         // head whenever this caller can quiesce requests. Gated O_SYNC callers
         // retain the existing reentrant path. Gate admission precedes the WAL.
@@ -13397,6 +13398,9 @@ impl OpenFs {
             txn_id: ffs_types::TxnId(durable_through.0),
             writes,
         };
+        // Capture can be entirely in memory, including its no-op sync. Do not
+        // append to the real WAL if cancellation arrived during that capture.
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let append = log.writer.append_commit(&commit).map_err(FfsError::from)?;
 
         // WAL durability precedes both index publication and compaction enqueue.
@@ -13496,7 +13500,15 @@ impl OpenFs {
         let epoch_dirty = epoch != self.committed_mutation_epoch.load(Ordering::Acquire);
         let mvcc_dirty = match &self.flavor {
             FsFlavor::Ext4(_) => {
-                self.mvcc_store.current_snapshot().high > *self.mvcc_flushed_through.lock()
+                // WAL fsync acknowledges durability before home compaction.
+                // Comparing with the home cursor would keep an idle logged
+                // writer perpetually dirty until a full physical checkpoint.
+                let durable_through = if let Some(log) = &self.metadata_log {
+                    log.lock().logged_through
+                } else {
+                    *self.mvcc_flushed_through.lock()
+                };
+                self.mvcc_store.current_snapshot().high > durable_through
             }
             FsFlavor::Btrfs(_) => self.btrfs_pending_dirty_bytes() != 0,
         };
@@ -103814,90 +103826,234 @@ mod tests {
     #[test]
     fn append_only_metadata_log_replays_then_checkpoints_clean() {
         let _flocks = wal_flock_holder();
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let image = tmp.path().join("metadata-log.ext4");
-        let wal = tmp.path().join("metadata-log.wal");
-        let file = std::fs::File::create(&image).expect("create image");
-        file.set_len(16 * 1024 * 1024).expect("size image");
-        drop(file);
-        let mkfs = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "4096", image.to_str().expect("UTF-8 path")])
-            .output();
-        let Ok(mkfs) = mkfs else {
-            return;
-        };
-        if !mkfs.status.success() {
-            return;
-        }
-        let _ = std::process::Command::new("debugfs")
-            .args([
-                "-w",
-                "-R",
-                "set_inode_field / mode 040777",
-                image.to_str().expect("UTF-8 path"),
-            ])
-            .output();
+        for single_store in [false, true] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let image = tmp.path().join("metadata-log.ext4");
+            let wal = tmp.path().join("metadata-log.wal");
+            let file = std::fs::File::create(&image).expect("create image");
+            file.set_len(16 * 1024 * 1024).expect("size image");
+            drop(file);
+            let mkfs = std::process::Command::new("mkfs.ext4")
+                .args(["-F", "-b", "4096", image.to_str().expect("UTF-8 path")])
+                .output()
+                .expect("native WAL regression requires mkfs.ext4");
+            assert!(
+                mkfs.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&mkfs.stdout),
+                String::from_utf8_lossy(&mkfs.stderr)
+            );
+            let debugfs = std::process::Command::new("debugfs")
+                .args([
+                    "-w",
+                    "-R",
+                    "set_inode_field / mode 040777",
+                    image.to_str().expect("UTF-8 path"),
+                ])
+                .output()
+                .expect("native WAL regression requires debugfs");
+            assert!(
+                debugfs.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&debugfs.stdout),
+                String::from_utf8_lossy(&debugfs.stderr)
+            );
 
-        let cx = Cx::for_testing();
-        let options = OpenOptions {
-            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
-            mvcc_wal_path: Some(wal.clone()),
-            metadata_log_enabled: true,
-            ..OpenOptions::default()
-        };
-        let mut fs = OpenFs::open_read_write(&cx, &image, &options).expect("open logged ext4");
-        fs.enable_writes(&cx).expect("enable writes");
-        let created = fs
-            .create(&cx, InodeNumber(2), OsStr::new("logged.txt"), 0o644, 0, 0)
-            .expect("create logged file");
-        fs.write(&cx, created.ino, 0, b"durable-through-wal")
-            .expect("write logged file");
-        fs.fsync(&cx, created.ino, 0, false).expect("WAL fsync");
-        assert!(
-            std::fs::metadata(&wal).expect("WAL metadata").len()
-                > u64::try_from(ffs_mvcc::wal::HEADER_SIZE).expect("header size"),
-            "fsync must append a non-empty WAL record"
-        );
+            let cx = Cx::for_testing();
+            let options = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                mvcc_wal_path: Some(wal.clone()),
+                metadata_log_enabled: true,
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::open_read_write(&cx, &image, &options).expect("open logged ext4");
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            fs.enable_writes(&cx).expect("enable writes");
+            let created = fs
+                .create(&cx, InodeNumber(2), OsStr::new("logged.txt"), 0o644, 0, 0)
+                .expect("create logged file");
+            fs.write(&cx, created.ino, 0, b"durable-through-wal")
+                .expect("write logged file");
+            fs.fsync(&cx, created.ino, 0, false).expect("WAL fsync");
+            assert!(
+                std::fs::metadata(&wal).expect("WAL metadata").len()
+                    > u64::try_from(ffs_mvcc::wal::HEADER_SIZE).expect("header size"),
+                "fsync must append a non-empty WAL record"
+            );
 
-        // Simulate a process crash: stop the optional compactor, but deliberately
-        // do not call flush_on_destroy (the base image is not the authority).
-        fs.shutdown_metadata_compactor();
-        drop(fs);
+            // The WAL, rather than the still-old home cursor, is the active
+            // durability boundary. The first tick acknowledges the mutation epoch
+            // left by ordinary fsync; later idle ticks must report no new work.
+            let home_cursor = *fs.mvcc_flushed_through.lock();
+            let logged = fs.metadata_log.as_ref().unwrap().lock().logged_through;
+            assert_eq!(logged, fs.current_snapshot().high);
+            assert!(logged > home_cursor);
+            let wal_len = std::fs::metadata(&wal).unwrap().len();
+            assert!(fs.periodic_commit(&cx).unwrap());
+            for _ in 0..2 {
+                assert!(!fs.periodic_commit(&cx).unwrap());
+                assert_eq!(std::fs::metadata(&wal).unwrap().len(), wal_len);
+                assert_eq!(*fs.mvcc_flushed_through.lock(), home_cursor);
+            }
 
-        let mut recovered =
-            OpenFs::open_read_write(&cx, &image, &options).expect("replay metadata WAL");
-        let report = recovered
-            .mvcc_wal_recovery()
-            .expect("recovery report after WAL fsync");
-        assert_eq!(report.commits_replayed, 1);
-        assert!(report.versions_replayed > 0);
-        recovered.enable_writes(&cx).expect("enable after replay");
-        let attr = recovered
-            .lookup(&cx, InodeNumber(2), OsStr::new("logged.txt"))
-            .expect("replayed name is visible");
-        assert_eq!(
+            // Join the optional compactor so the following work is recoverable
+            // only from the same WAL, not from a later background home write.
+            fs.shutdown_metadata_compactor();
+            let second = fs
+                .create(&cx, InodeNumber(2), OsStr::new("second.txt"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            let bs = fs.block_size();
+            fs.write(&cx, second, 0, &vec![0x63; bs as usize]).unwrap();
+            let pending = fs.current_snapshot();
+            let acknowledged_epoch = fs.committed_mutation_epoch.load(Ordering::Acquire);
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            for periodic in [false, true] {
+                let result = if periodic {
+                    fs.periodic_commit(&cancelled).map(|_| ())
+                } else {
+                    fs.fsync(&cancelled, second, 0, false)
+                };
+                assert!(matches!(result, Err(FfsError::Cancelled)), "{result:?}");
+                assert_eq!(fs.current_snapshot(), pending);
+                assert_eq!(std::fs::metadata(&wal).unwrap().len(), wal_len);
+                assert_eq!(
+                    fs.metadata_log.as_ref().unwrap().lock().logged_through,
+                    logged
+                );
+                assert_eq!(*fs.mvcc_flushed_through.lock(), home_cursor);
+                assert_eq!(
+                    fs.committed_mutation_epoch.load(Ordering::Acquire),
+                    acknowledged_epoch
+                );
+                assert!(fs.is_writable());
+            }
+            // Pass the entry checkpoint, then cancel while waiting for WAL
+            // append exclusion. Release that exclusion before any join/assert
+            // so the negative control cannot strand its worker on a failure.
+            let late_cancel = Cx::for_testing();
+            assert_eq!(fs.mutation_gate.lock().closing, 0);
+            let log = fs.metadata_log.as_ref().unwrap().lock();
+            let (admitted, result) = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| fs.fsync(&late_cancel, second, 0, false));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let admitted = loop {
+                    if fs.mutation_gate.lock().closing > 0 {
+                        break true;
+                    }
+                    if worker.is_finished() || Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                };
+                late_cancel.set_cancel_requested(true);
+                drop(log);
+                (admitted, worker.join().expect("join cancelled WAL fsync"))
+            });
+            assert!(admitted, "fsync must pass entry before the cancellation");
+            assert!(matches!(result, Err(FfsError::Cancelled)), "{result:?}");
+            assert_eq!(std::fs::metadata(&wal).unwrap().len(), wal_len);
+            assert_eq!(
+                fs.metadata_log.as_ref().unwrap().lock().logged_through,
+                logged
+            );
+            assert_eq!(*fs.mvcc_flushed_through.lock(), home_cursor);
+            assert_eq!(
+                fs.committed_mutation_epoch.load(Ordering::Acquire),
+                acknowledged_epoch
+            );
+            assert_eq!(fs.current_snapshot(), pending);
+            assert!(fs.is_writable());
+            assert!(fs.periodic_commit(&cx).unwrap());
+            assert!(!fs.periodic_commit(&cx).unwrap());
+            assert!(std::fs::metadata(&wal).unwrap().len() > wal_len);
+
+            // Public raw publication must also make the next tick log new bytes.
+            // The first file's original WAL payload stays untouched as a replay
+            // control; overwrite only the second file's existing physical block.
+            let inode = fs.read_inode(&cx, second).unwrap();
+            let block = fs
+                .resolve_extent(&cx, &RequestScope::empty(), &inode, 0)
+                .unwrap()
+                .unwrap()
+                .0;
+            let mut tx = fs.begin_transaction();
+            tx.stage_write(BlockNumber(block), vec![0x6B; bs as usize]);
+            fs.commit_transaction(&cx, tx).unwrap();
+            assert!(fs.periodic_commit(&cx).unwrap());
+            assert!(!fs.periodic_commit(&cx).unwrap());
+            assert_eq!(
+                fs.metadata_log.as_ref().unwrap().lock().logged_through,
+                fs.current_snapshot().high
+            );
+            assert_eq!(*fs.mvcc_flushed_through.lock(), home_cursor);
+            let base_only = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(std::fs::read(&image).unwrap())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                base_only.lookup(&cx, InodeNumber(2), OsStr::new("second.txt")),
+                Err(FfsError::NotFound(_))
+            ));
+            drop(base_only);
+
+            // Simulate a process crash: stop the optional compactor, but deliberately
+            // do not call flush_on_destroy (the base image is not the authority).
+            fs.shutdown_metadata_compactor();
+            drop(fs);
+
+            let mut recovered =
+                OpenFs::open_read_write(&cx, &image, &options).expect("replay metadata WAL");
+            let report = recovered
+                .mvcc_wal_recovery()
+                .expect("recovery report after WAL fsync");
+            assert_eq!(report.commits_replayed, 3);
+            assert!(report.versions_replayed > 0);
+            recovered.enable_writes(&cx).expect("enable after replay");
+            let attr = recovered
+                .lookup(&cx, InodeNumber(2), OsStr::new("logged.txt"))
+                .expect("replayed name is visible");
+            assert_eq!(
+                recovered
+                    .read(&cx, attr.ino, 0, 64)
+                    .expect("read replayed file"),
+                b"durable-through-wal"
+            );
+            assert_eq!(
+                recovered
+                    .lookup(&cx, InodeNumber(2), OsStr::new("second.txt"))
+                    .unwrap()
+                    .ino,
+                second
+            );
+            assert_eq!(
+                recovered.read(&cx, second, 0, bs).unwrap(),
+                vec![0x6B; bs as usize]
+            );
+
             recovered
-                .read(&cx, attr.ino, 0, 64)
-                .expect("read replayed file"),
-            b"durable-through-wal"
-        );
-
-        recovered
-            .flush_on_destroy(&cx)
-            .expect("compact and checkpoint WAL");
-        drop(recovered);
-        assert_eq!(
-            std::fs::metadata(&wal).expect("checkpointed WAL").len(),
-            u64::try_from(ffs_mvcc::wal::HEADER_SIZE).expect("header size"),
-            "clean checkpoint must retire the WAL tail"
-        );
-        let Some((clean, output)) = run_e2fsck(&image) else {
-            return;
-        };
-        assert!(
-            clean,
-            "e2fsck must accept the checkpointed image:\n{output}"
-        );
+                .flush_on_destroy(&cx)
+                .expect("compact and checkpoint WAL");
+            drop(recovered);
+            assert_eq!(
+                std::fs::metadata(&wal).expect("checkpointed WAL").len(),
+                u64::try_from(ffs_mvcc::wal::HEADER_SIZE).expect("header size"),
+                "clean checkpoint must retire the WAL tail"
+            );
+            let (clean, output) =
+                run_e2fsck(&image).expect("native WAL regression requires e2fsck");
+            assert!(
+                clean,
+                "e2fsck must accept the checkpointed image:\n{output}"
+            );
+        }
     }
 
     /// A COMPOUND ext4 data-op churn — extent growth, a sparse gap, in-place
