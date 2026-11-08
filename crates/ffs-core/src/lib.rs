@@ -22294,17 +22294,33 @@ impl OpenFs {
         scope: &RequestScope,
         inode: &Ext4Inode,
     ) -> Result<Arc<[Ext4Extent]>, FfsError> {
+        let snapshot = match (scope.uses_fixed_snapshot(), scope.snapshot) {
+            (true, Some(snapshot)) => Some(snapshot),
+            (true, None) => {
+                return Err(FfsError::Format(
+                    "fixed extent scope has no snapshot".into(),
+                ));
+            }
+            (false, _) => None,
+        };
         // An indirect block map grows inside its pointer blocks without
         // changing `i_block`, so the root-keyed snapshot cannot tell its
-        // versions apart: always re-walk it.
-        if self.ext4_inode_block_map_is_indirect(inode) || scope.uses_fixed_snapshot() {
+        // versions apart: always re-walk it. Staged metadata must also bypass
+        // the committed cache. An unfixed walk cannot prove that every leaf
+        // came from one sequence, so it must never populate this shared cache.
+        if self.ext4_inode_block_map_is_indirect(inode) || scope.pending_write_count() != 0 {
             return Ok(Arc::from(
                 self.collect_extents_with_scope(cx, scope, inode)?,
             ));
         }
+        let Some(snapshot) = snapshot else {
+            return Ok(Arc::from(
+                self.collect_extents_with_scope(cx, scope, inode)?,
+            ));
+        };
         let namespace = extent_cache_namespace(inode);
         let root_namespace = extent_root_namespace(inode);
-        let commit_seq = self.latest_snapshot().high;
+        let commit_seq = snapshot.high;
 
         let cached_extents = {
             let snapshot = self.ext4_write_extent_snapshot.lock();
@@ -29012,6 +29028,9 @@ impl OpenFs {
         if !matches!(self.flavor, FsFlavor::Ext4(_)) {
             return Ok(());
         }
+        if self.require_alloc_state().is_err() {
+            return Ok(()); // revoked write authority must not publish summaries
+        }
         let Some((total_free_blocks, total_free_inodes)) = self.ext4_live_free_totals() else {
             return Ok(()); // read-only fs — nothing to sync
         };
@@ -29031,8 +29050,9 @@ impl OpenFs {
         self.ext4_write_superblock_free_totals(cx, block_dev, total_free_blocks, total_free_inodes)
     }
 
-    /// Current `(free_blocks, free_inodes)` of a writable ext4 mount (`None`
-    /// when read-only), from whichever allocator state is live: the
+    /// Current `(free_blocks, free_inodes)` of an ext4 mount that enabled writes
+    /// (`None` without allocator state), including after write authority is
+    /// revoked by Abort. Read queries still need the committed live totals: the
     /// reconciled sharded records plus single-lock movement when the sharded
     /// path is active, else the single-lock array. Backs both the persisted
     /// superblock totals and `statfs`, so `df` reports what the next boundary
@@ -29040,7 +29060,7 @@ impl OpenFs {
     /// single-lock array, so `statfs` summing it alone missed every mounted
     /// create and delete).
     fn ext4_live_free_totals(&self) -> Option<(u64, u64)> {
-        let alloc_mutex = self.require_alloc_state().ok()?;
+        let alloc_mutex = self.ext4_alloc_state.as_ref()?;
         #[cfg(feature = "bhh0i_sharded_alloc")]
         if self.bhh0i_sharded_ops_active() {
             let live = self.ext4_single_lock_group_counts();
@@ -49843,6 +49863,10 @@ impl OpenFs {
             .map_err(|_| FfsError::Format("source inode exceeds u32".into()))?;
         let dst_ino = u32::try_from(u64::from(dst_entry.inode))
             .map_err(|_| FfsError::Format("destination inode exceeds u32".into()))?;
+        let parent_ino = u32::try_from(parent.0)
+            .map_err(|_| FfsError::Format("source parent inode exceeds u32".into()))?;
+        let new_parent_ino = u32::try_from(new_parent.0)
+            .map_err(|_| FfsError::Format("destination parent inode exceeds u32".into()))?;
         let src_inode = self.read_inode_with_scope(cx, scope, InodeNumber(u64::from(src_ino)))?;
         let dst_inode = self.read_inode_with_scope(cx, scope, InodeNumber(u64::from(dst_ino)))?;
         // Swapping two hard links of the same inode is a true no-op. Keep this
@@ -49935,6 +49959,7 @@ impl OpenFs {
                     dst_file_type,
                     reserved_tail,
                 )? {
+                    self.stamp_ext4_dir_block(&mut data, parent_ino, parent_inode.generation);
                     Self::write_block_with_scope(cx, scope, &block_dev, block, &data)?;
                     src_swapped = true;
                     break 'src;
@@ -49975,6 +50000,11 @@ impl OpenFs {
                     src_file_type,
                     reserved_tail,
                 )? {
+                    self.stamp_ext4_dir_block(
+                        &mut data,
+                        new_parent_ino,
+                        new_parent_inode.generation,
+                    );
                     Self::write_block_with_scope(cx, scope, &block_dev, block, &data)?;
                     dst_swapped = true;
                     break 'dst;
@@ -49997,6 +50027,7 @@ impl OpenFs {
                         src_file_type,
                         reserved_tail,
                     )? {
+                        self.stamp_ext4_dir_block(&mut data, parent_ino, parent_inode.generation);
                         Self::write_block_with_scope(cx, scope, &block_dev, block, &data)?;
                         break 'undo;
                     }
@@ -89886,6 +89917,121 @@ mod tests {
     }
 
     #[test]
+    fn ext4_write_extent_cache_obeys_pristine_snapshot_and_staged_mappings() {
+        for single_store in [false, true] {
+            let (mut fs, _dev, _tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("extent cache snapshot regression requires mkfs.ext4");
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            let cx = Cx::for_testing();
+            let ino = fs
+                .create(
+                    &cx,
+                    InodeNumber(2),
+                    OsStr::new("snapshot-extents"),
+                    0o644,
+                    0,
+                    0,
+                )
+                .unwrap()
+                .ino;
+            let bs = fs.block_size();
+            let payload = vec![0x6B; bs as usize];
+            for index in 0..8_u64 {
+                fs.write(&cx, ino, index * 2 * u64::from(bs), &payload)
+                    .unwrap();
+            }
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+            let inode = fs.read_inode_with_scope(&cx, &scope, ino).unwrap();
+            let original = fs
+                .ext4_write_extents_with_scope(&cx, &scope, &inode)
+                .unwrap();
+            let cached = fs
+                .ext4_write_extents_with_scope(&cx, &scope, &inode)
+                .unwrap();
+            assert!(
+                Arc::ptr_eq(&original, &cached),
+                "pristine snapshot cache hit"
+            );
+
+            let current_offset = 32 * u64::from(bs);
+            fs.write(&cx, ino, current_offset, &payload).unwrap();
+            let current_inode = fs.read_inode(&cx, ino).unwrap();
+            assert_eq!(
+                current_inode.extent_bytes, inode.extent_bytes,
+                "external leaf changes must keep the inode root equal in this probe"
+            );
+            let base = fs.block_device_adapter();
+            let (current_tx, current_pin) =
+                RegisteredSnapshotBlockAdapter::begin(&base, &fs.mvcc_store);
+            let current_scope = RequestScope::with_transaction(current_tx);
+            let current = fs
+                .ext4_write_extents_with_scope(&cx, &current_scope, &current_inode)
+                .unwrap();
+            assert_ne!(current.as_ref(), original.as_ref());
+            drop(current_scope);
+            drop(current_pin);
+            let retained = fs
+                .ext4_write_extents_with_scope(&cx, &scope, &inode)
+                .unwrap();
+            assert_eq!(retained.as_ref(), original.as_ref());
+            assert!(!Arc::ptr_eq(&retained, &current));
+            // An unfixed live walk must not replace a proven retained entry.
+            fs.ext4_write_extents_with_scope(&cx, &RequestScope::empty(), &current_inode)
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &fs.ext4_write_extent_snapshot
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .extents,
+                &retained
+            ));
+
+            let before = fs.current_snapshot();
+            let counts = fs.statfs(&cx, InodeNumber(2)).unwrap();
+            let staged_offset = 24 * u64::from(bs);
+            FsOps::write(&fs, &cx, &mut scope, ino, staged_offset, &payload).unwrap();
+            let staged_inode = fs.read_inode_with_scope(&cx, &scope, ino).unwrap();
+            assert_eq!(staged_inode.extent_bytes, inode.extent_bytes);
+            // Plant a matching baseline cache after real staged leaf changes:
+            // only the staged-write bypass can prevent this old mapping winning.
+            *fs.ext4_write_extent_snapshot.lock() = Some(Ext4WriteExtentSnapshot {
+                namespace: extent_cache_namespace(&inode),
+                root_namespace: extent_root_namespace(&inode),
+                commit_seq: scope.snapshot.unwrap().high,
+                extents: Arc::clone(&original),
+            });
+            let staged = fs
+                .ext4_write_extents_with_scope(&cx, &scope, &staged_inode)
+                .unwrap();
+            assert!(staged.iter().any(|extent| extent.logical_block == 24));
+            assert!(!staged.iter().any(|extent| extent.logical_block == 32));
+            assert!(Arc::ptr_eq(
+                &fs.ext4_write_extent_snapshot
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .extents,
+                &original
+            ));
+            fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.statfs(&cx, InodeNumber(2)).unwrap(), counts);
+            assert_eq!(
+                fs.read(&cx, ino, staged_offset, bs).unwrap(),
+                vec![0; bs as usize]
+            );
+            assert_eq!(fs.read(&cx, ino, current_offset, bs).unwrap(), payload);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+        }
+    }
+
+    #[test]
     fn ext4_write_cross_call_extent_snapshot_golden_bd_pqzev() {
         use sha2::{Digest, Sha256};
 
@@ -103097,23 +103243,39 @@ mod tests {
 
     #[test]
     fn write_fallocate_punch_hole_without_keep_size_returns_einval() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some(mut fs) = open_writable_ext4() else {
             return;
         };
+        fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
         let attr = fs
             .create(&cx, root, OsStr::new("falloc_ph_noks.bin"), 0o644, 0, 0)
             .expect("create");
         fs.write(&cx, attr.ino, 0, &[0xAB; 8192]).expect("write");
+        let before = fs.current_snapshot();
+        let inode = fs.read_inode(&cx, attr.ino).unwrap();
+        let counts = fs.statfs(&cx, root).unwrap();
         // PUNCH_HOLE (0x02) without KEEP_SIZE (0x01) is invalid per POSIX
         let err = fs
             .fallocate(&cx, attr.ino, 0, 4096, libc::FALLOC_FL_PUNCH_HOLE)
             .expect_err("punch without keep_size");
         assert!(
-            matches!(err, FfsError::Io(_)),
-            "expected Io(EINVAL), got {err:?}"
+            matches!(&err, FfsError::RequestRejected { .. }),
+            "expected a deliberate request rejection, got {err:?}"
         );
+        assert_eq!(err.to_errno(), libc::EINVAL);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(fs.read_inode(&cx, attr.ino).unwrap(), inode);
+        assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+        assert_eq!(fs.read(&cx, attr.ino, 0, 8192).unwrap(), [0xAB; 8192]);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        assert!(fs.try_close_mutation_gate().is_some());
+        assert!(fs.is_writable(), "invalid requests must not trigger Abort");
+        assert_eq!(fs.write(&cx, attr.ino, 0, b"ok").unwrap(), 2);
+        let mut expected = [0xAB; 8192];
+        expected[..2].copy_from_slice(b"ok");
+        assert_eq!(fs.read(&cx, attr.ino, 0, 8192).unwrap(), expected);
     }
 
     #[test]
@@ -104630,6 +104792,7 @@ mod tests {
             assert_eq!(fs.read_inode(&cx, ino).unwrap(), inode);
             assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
             assert_eq!(fs.read(&cx, ino, 0, fs.block_size()).unwrap(), payload);
+            fs.ext4_sync_superblock_free_totals(&cx).unwrap();
             assert_eq!(dev.snapshot_bytes(), backing);
             assert_eq!(fs.mvcc_active_snapshot_count(), 0);
             assert!(fs.try_close_mutation_gate().is_some());

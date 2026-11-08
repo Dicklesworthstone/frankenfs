@@ -62,6 +62,11 @@ jobs:
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc ext4_eager_concurrent_storm_is_consistent_bd_hyysq -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc writer_snapshot_reads_reject_newer_ancestors_and_preserve_staged_bytes -- --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_sharded_birth_cross_group_fallback_passes_native_checker -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::acl_stored_corruption_preserves_error_origin_and_aborts_metadata_mutation -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::ext4_exchange_rechecks_protected_parents_and_inodes -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::ext4_write_extent_cache_obeys_pristine_snapshot_and_staged_mappings -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::ext4_write_cross_call_extent_snapshot_golden_bd_pqzev -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::write_fallocate_punch_hole_without_keep_size_returns_einval -- --exact --nocapture
           cargo test -p ffs-core --locked --lib
       - name: Core Clippy
         run: cargo clippy -p ffs-core --locked --all-targets -- -D warnings
