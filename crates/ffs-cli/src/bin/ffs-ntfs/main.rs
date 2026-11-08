@@ -136,7 +136,7 @@ struct RecordArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Cross-check allocated FILE mappings against native bitmaps without repair.
+    /// Cross-check native allocation, with optional record and namespace validation.
     CheckAllocation {
         #[command(flatten)]
         options: allocation_commands::AllocationArgs,

@@ -397,6 +397,15 @@ coverage leaves owner-absence conclusions unknown. This does not grant repair
 or native write authority. Eight library and three CLI/report regressions are
 authored but unexecuted here. See the [record ownership profile](docs/NTFS_RECORD_OWNERSHIP.md).
 
+Add `--verify-namespace` to reconcile native directory indexes and FILE_NAME
+catalogs in both directions, validate record/parent sequences and allocation,
+and check root reachability. It detects missing names even when physical
+allocation balances. `--max-namespace-entries` bounds the retained name graph;
+`--max-metadata-bytes` independently bounds each selected structural pass.
+Incomplete inspection produces an unknown result and a nonzero exit. See the
+[namespace-check contract](docs/NTFS_ALLOCATION_CHECK.md#namespace-and-directory-index-verification)
+for the exact scope and JSON fields.
+
 ### Resolve a path through its native index branches
 
 `read`, `readlink` and `ls` accept `--indexed-lookup` to locate a path without

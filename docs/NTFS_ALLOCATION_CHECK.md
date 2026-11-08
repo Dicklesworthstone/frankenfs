@@ -95,6 +95,68 @@ The library API is `NtfsVolume::check_allocations(cx, AllocationLimits)` with
 public report/issue types under `ffs_ntfs::reader::allocation`; it adds no
 serialization dependency to the native library.
 
+## Namespace and directory-index verification
+
+Add `--verify-namespace` to reconcile allocated base FILE records with their
+native `$I30` directory indexes. This complements physical allocation and the
+separate `--verify-record-ownership` check: a volume can account for every cluster
+while a file's name is absent from its parent directory.
+
+```sh
+ffs-ntfs check-allocation volume.img --offline-image --verify-namespace
+ffs-ntfs check-allocation disk.img --offline-image \
+  --offset 1048576 --length 67108864 \
+  --verify-record-ownership --verify-namespace \
+  --max-records 1048576 --max-namespace-entries 1048576 \
+  --max-metadata-bytes 1073741824
+```
+
+The pass assembles each base record's validated attribute catalog, including
+extension records, and retains native record sequences and exact UTF-16 name
+identities. It walks each directory's resident root and allocated INDX children,
+checks update-sequence protection, child geometry and allocation, and verifies
+the order using the volume's own `$UpCase` table. An allocated but unreachable
+index block is a discrepancy. Ordinary file contents and reparse targets are
+not followed. Reparse directories and unsupported transformed or sparse index
+storage leave the namespace check incomplete.
+
+After complete inspection, it compares both directions: every indexed name must
+identify an allocated, sequence-matching base FILE with that name in its catalog,
+and every non-root FILE_NAME must have its corresponding parent index entry.
+The parent must itself be an allocated, sequence-matching directory. Root
+reachability is derived from verified links, with reserved unnamed system slots
+kept separate from ordinary user records. Duplicate names and invalid directory
+hierarchies are reported without selecting an owner or changing the image.
+
+The library API is `NtfsVolume::check_namespace(cx, NamespaceLimits)`. Its types
+are exported from `ffs_ntfs::reader::allocation`. The defaults are 1,048,576 MFT
+slots, 1,048,576 combined FILE_NAME/index identities and one GiB of metadata work.
+The entry ceiling is 16,777,216. FILE, ATTRIBUTE_LIST, bitmap, index and UpCase
+bytes are charged before their reads, including repeated metadata and resident
+values. This is a work budget rather than a unique-byte or resident-memory
+measurement; the retained identity graph also consumes memory. Reader bootstrap
+occurs before the checker and retains its own bounds.
+
+`--max-metadata-bytes` applies independently to each requested structural check.
+Selecting both ownership and namespace checking grants each that amount; it is
+not a combined cap, and it does not change the physical allocation scan's bounds.
+`--max-namespace-entries` requires `--verify-namespace`. All selected checks retain
+the original offline, immutable-source and no-recovery-overlay requirements.
+
+JSON includes a separate `namespace` object and `requested_checks_consistent`.
+`allocation_consistent` keeps its original physical-run meaning. An unreadable
+record/index, unsupported metadata or exhausted budget prevents namespace
+success. Incomplete coverage leaves `missing_index_entries` and
+`unreachable_records` null, not zero. Cancellation fails the call. A failure in
+the MFT bitmap or UpCase authority also fails the call. Diagnostics retain
+bounded issue details and omitted counts; `reclaimable_records` remains null.
+
+This verifies the selected native namespace structure. It does not validate the
+FILE header's hard-link count/DOS-alias pairing policy, unallocated FILE headers,
+security descriptors, non-I30 secondary indexes, payloads or the journal. Full
+NTFS checking, formatting, resize and native mutation remain open under
+`bd-h7cme` and the related writer work.
+
 ## Evidence and remaining qualification
 
 Ten library regressions and four CLI/report controls are authored. They cover
@@ -106,12 +168,20 @@ work bounds, unchanged bytes/no payload reads and pre-open source-policy refusal
 Test devices panic on writes and flushes. They are constructed native-byte tests,
 not images generated or checked by Windows.
 
-These Rust tests have **not been executed in this implementation environment**.
-RCH, Cargo, rustc and rustfmt are unavailable; attempted test/check/lint/format
-commands could not start (exit 127). Exact baseline and uploaded blob comparisons
-and Git whitespace checks passed. An independent Python accounting model passed
-4,900 layouts and 19,600 comparisons; it did not execute this Rust implementation.
-No native NTFS3/NTFS-3G/Windows, full-workspace or runtime pass is claimed.
+The namespace increment adds thirteen parameterized library tests and three CLI
+controls. They cover resident and multilevel indexes, extension-backed names,
+hard links and DOS aliases, stale/free references, missing reverse entries,
+conflicting names, directory cycles, invalid root identities, malformed indexes,
+cancellation and pre-I/O global budgets. Read-recording fixtures exclude ordinary
+payload access and verify that incomplete scans retain unknown absence counts.
+
+Runtime qualification is still pending. In the current environment, the pinned
+nightly toolchain is available and the changed NTFS/CLI Rust files pass rustfmt.
+Focused all-target checks and a single-job retry were terminated by SIGKILL
+while compiling the `asupersync` dependency under memory pressure; they did not
+reach the new checker or execute its tests. No full-workspace, native checker or
+Windows pass is claimed. The earlier independent Python allocation model's
+4,900 layouts and 19,600 comparisons did not execute this Rust implementation.
 
 Required validation remains:
 

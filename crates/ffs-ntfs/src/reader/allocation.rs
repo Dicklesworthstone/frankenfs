@@ -1,13 +1,17 @@
-//! Read-only physical-allocation accounting for the initialized native MFT.
+//! Bounded read-only allocation, catalog-ownership and namespace checking.
 //!
-//! Scan each $MFT::$BITMAP-allocated FILE record once, including extension
-//! records, then compare every nonresident run with $Bitmap. This deliberately
-//! does not walk directory names, follow hard links, read file data, or turn an
-//! unexplained allocation into authority to free it. It is not journal replay
-//! or a complete NTFS consistency checker.
+//! `check_allocations` scans each $MFT::$BITMAP-allocated FILE record once,
+//! including extension records, and compares every nonresident run with $Bitmap.
+//! The separately requested `check_record_ownership` and `check_namespace`
+//! helpers reconcile complete attribute catalogs and native directory links.
+//! These checks do not read ordinary file data, replay journals, or turn an
+//! unexplained allocation or unreachable record into authority to free it.
+//! Their combined results are not a complete NTFS consistency checker.
 
 mod ownership;
 pub use ownership::{RecordOwnershipLimits, RecordOwnershipReport};
+mod namespace;
+pub use namespace::{NamespaceLimits, NamespaceReport};
 
 use super::{
     Cx, FfsError, NtfsValue, NtfsVolume, Result, Storage, Stream, buffer, checkpoint, corrupt,

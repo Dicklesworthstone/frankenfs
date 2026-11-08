@@ -600,6 +600,17 @@ Begin with externally formatted fixtures; later add a native formatter with the
 required metadata files, journal, allocation, collation, and security defaults.
 Offline resize precedes any online extension/shrink claim.
 
+The bounded namespace-checking increment is exposed through
+`NtfsVolume::check_namespace` and `ffs-ntfs check-allocation --verify-namespace`.
+It reconciles allocated FILE_NAME catalogs and native `$I30` indexes, checks
+sequence-bound parents and targets, and derives root reachability only after
+complete inspection. Metadata and identity budgets must produce incomplete
+coverage, never a false absence or reclamation decision. This complements the
+existing physical-allocation and base/extension ownership checks; link-count
+policy, security/secondary indexes, journal validation, formatting, resize and
+native mutation remain required. See `docs/NTFS_ALLOCATION_CHECK.md` for the
+implemented scope and executed qualification.
+
 ### 10.7 NTFS completion gate
 
 Required evidence spans Microsoft-created volumes and files, Linux NTFS3 and

@@ -1,5 +1,7 @@
 use super::*;
 
+mod check;
+
 const NAMESPACE_LENGTH: usize = 1024 * 512;
 const INDEX_START: usize = BASE + 220 * 512;
 
