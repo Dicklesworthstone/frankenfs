@@ -57,6 +57,9 @@ fn open_with_barriers(
     sync_file: impl FnOnce(&File) -> io::Result<()>,
     mut sync_directory: impl FnMut(&File) -> io::Result<()>,
 ) -> Result<File> {
+    // Refuse an unreadable requested directory before creating a new name.
+    // The actual barriers still run only after exclusive inode admission.
+    let requested_directory = File::open(parent_path(path))?;
     // Never O_TRUNC: discovering another owner must not erase its log.
     let file = OpenOptions::new()
         .read(true)
@@ -76,13 +79,12 @@ fn open_with_barriers(
         std::fs::TryLockError::Error(error) => error,
     })?;
 
-    // Resolve AFTER ownership. For a final-component symlink in another
-    // directory, syncing only the alias directory would miss a newly created
+    // Resolve the owned file's target after admission. For a final-component
+    // symlink in another directory, syncing only the alias would miss a newly created
     // target. Conversely, syncing only the target would miss the alias name.
     let resolved = path.canonicalize()?;
     verify_name(&resolved, &owned)?;
     let target_directory = File::open(parent_path(&resolved))?;
-    let requested_directory = File::open(parent_path(path))?;
     let target_meta = target_directory.metadata()?;
     let requested_meta = requested_directory.metadata()?;
     if !target_meta.is_dir() || !requested_meta.is_dir() {

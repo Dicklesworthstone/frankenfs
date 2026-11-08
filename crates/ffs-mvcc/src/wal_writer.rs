@@ -46,7 +46,7 @@ const WAL_VERIFY_CHUNK_BYTES: usize = 64 * 1024;
 
 #[path = "wal_writer/namespace.rs"]
 mod namespace;
-pub(crate) use namespace::open_owned_wal;
+pub use namespace::open_owned_wal;
 #[path = "wal_writer/stream.rs"]
 mod stream;
 
@@ -321,8 +321,17 @@ impl WalWriter {
     /// ownership. A competing owner produces an I/O `WouldBlock` error without
     /// modifying its log. Dropping the last descriptor releases ownership.
     pub fn create(path: &Path, config: WalWriterConfig) -> Result<Self> {
-        let mut file = open_owned_wal(path)?;
+        Self::create_owned(open_owned_wal(path)?, config)
+    }
+
+    /// Initialize a fresh header on an exclusively owned descriptor.
+    ///
+    /// The caller must admit the file with [`open_owned_wal`] before recovery
+    /// or mutation, and transfer that same locked descriptor here. Existing
+    /// contents are discarded. Ownership is retained without relocking.
+    pub fn create_owned(mut file: File, config: WalWriterConfig) -> Result<Self> {
         file.set_len(0)?;
+        std::io::Seek::rewind(&mut file)?;
 
         let header = WalHeader::default();
         let header_bytes = wal::encode_header(&header);

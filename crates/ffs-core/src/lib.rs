@@ -76,7 +76,7 @@ use ffs_journal::{
 use ffs_mvcc::persist::WalRecoveryReport;
 use ffs_mvcc::wal::{WalCommit, WalWrite};
 use ffs_mvcc::wal_replay::{ReplayOutcome as MvccReplayOutcome, TailPolicy, WalReplayEngine};
-use ffs_mvcc::wal_writer::{SyncPolicy, WalWriter, WalWriterConfig};
+use ffs_mvcc::wal_writer::{SyncPolicy, WalWriter, WalWriterConfig, open_owned_wal};
 use ffs_mvcc::{
     BlockVersionStats, CommitError, EbrVersionStats, MergeProof, MvccStore, Transaction,
     TransactionOutcomeStats,
@@ -100,7 +100,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::io::IoSliceMut;
+use std::io::{IoSliceMut, Read, Seek};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -2972,6 +2972,9 @@ pub struct OpenFs {
     /// write-back cache; above it memory would otherwise grow with every block
     /// the mount ever wrote.
     mvcc_resident_block_cap: std::sync::atomic::AtomicUsize,
+    /// Fields drop in declaration order: drain old home writes before releasing
+    /// the WAL's exclusive ownership, including a plain drop without checkpoint.
+    metadata_compactor: Mutex<Option<MetadataCompactor>>,
     /// Optional append-only metadata durability path.
     ///
     /// A sync batches every block newer than `logged_through`, adds the derived
@@ -2980,7 +2983,6 @@ pub struct OpenFs {
     /// owned compactor materializes WAL batches at home locations in parallel;
     /// clean unmount joins it, writes a final checkpoint, then truncates the WAL.
     metadata_log: Option<Mutex<MetadataLog>>,
-    metadata_compactor: Mutex<Option<MetadataCompactor>>,
     /// Optional JBD2 writer for ext4 compatibility-mode write path.
     ///
     /// When present, `commit_transaction_journaled` journals writes to the
@@ -8198,28 +8200,21 @@ impl OpenFs {
             }
         };
 
-        let (mvcc_store, mvcc_wal_recovery) = Self::init_mvcc_store(options)?;
+        let (mvcc_store, mvcc_wal_recovery, metadata_log) = if options.metadata_log_enabled
+            && matches!(flavor, FsFlavor::Ext4(_))
+            && options.mvcc_wal_path.is_some()
+        {
+            let (store, recovery, log) = Self::open_metadata_log(options)?;
+            (store, recovery, Some(Mutex::new(log)))
+        } else {
+            let (store, recovery) = Self::init_mvcc_store(options, None)?;
+            (store, recovery, None)
+        };
         // The format context above was read from the backing image, before WAL
         // recovery. Recovered raw versions cannot share that semantic view.
         let btrfs_semantic_view_stale = Arc::new(RwLock::new(
             matches!(flavor, FsFlavor::Btrfs(_)) && mvcc_store.version_count() != 0,
         ));
-        let metadata_log = if options.metadata_log_enabled && matches!(flavor, FsFlavor::Ext4(_)) {
-            options
-                .mvcc_wal_path
-                .as_deref()
-                .map(|path| {
-                    Self::open_metadata_log(
-                        path,
-                        mvcc_store.current_snapshot().high,
-                        mvcc_wal_recovery.as_ref(),
-                    )
-                    .map(Mutex::new)
-                })
-                .transpose()?
-        } else {
-            None
-        };
         trace!(
             target: "ffs::mvcc",
             has_wal = mvcc_wal_recovery.is_some(),
@@ -8305,8 +8300,8 @@ impl OpenFs {
             mvcc_resident_block_cap: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_MVCC_RESIDENT_BLOCK_CAP,
             ),
-            metadata_log,
             metadata_compactor: Mutex::new(None),
+            metadata_log,
             jbd2_writer: None,
             ext4_alloc_state: None,
             #[cfg(feature = "bhh0i_sharded_alloc")]
@@ -8581,15 +8576,18 @@ impl OpenFs {
     /// replayed into a fresh `MvccStore` using the configured `TailPolicy`.
     /// If the WAL does not exist or is empty, a fresh store is returned.
     /// If replay fails under [`TailPolicy::FailFast`], the error is logged
-    /// and an empty store is returned (read-only fallback).
+    /// and an empty store is returned (read-only fallback). An active metadata
+    /// writer supplies its admitted descriptor; invalid headers are fatal and
+    /// a failed replay cannot authorize its later tail repair or publication.
     fn init_mvcc_store(
         options: &OpenOptions,
+        wal_file: Option<&mut std::fs::File>,
     ) -> Result<(Arc<FsMvccStore>, Option<WalRecoveryReport>), FfsError> {
         let Some(wal_path) = &options.mvcc_wal_path else {
             return Ok((Arc::new(FsMvccStore::sharded()), None));
         };
 
-        if !wal_path.exists() {
+        if wal_file.is_none() && !wal_path.exists() {
             info!(
                 wal_path = %wal_path.display(),
                 "mvcc_wal_not_found"
@@ -8602,7 +8600,12 @@ impl OpenFs {
             return Ok((Arc::new(store), None));
         }
 
-        let wal_size = std::fs::metadata(wal_path).map_or(0, |m| m.len());
+        let owned = wal_file.is_some();
+        let wal_size = if let Some(file) = wal_file.as_ref() {
+            file.metadata()?.len()
+        } else {
+            std::fs::metadata(wal_path).map_or(0, |m| m.len())
+        };
         if wal_size == 0 {
             info!(
                 wal_path = %wal_path.display(),
@@ -8624,9 +8627,26 @@ impl OpenFs {
         );
 
         // Read WAL file: header + data.
-        let wal_bytes = std::fs::read(wal_path)?;
+        let wal_bytes = if let Some(file) = wal_file {
+            file.rewind()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            if u64::try_from(bytes.len()).ok() != Some(wal_size) {
+                return Err(FfsError::Io(std::io::Error::other(
+                    "WAL length changed during owned recovery",
+                )));
+            }
+            bytes
+        } else {
+            std::fs::read(wal_path)?
+        };
         let header_size = ffs_mvcc::wal::HEADER_SIZE;
         if wal_bytes.len() < header_size {
+            if owned {
+                return Err(FfsError::Format(
+                    "active metadata WAL has a short header".to_owned(),
+                ));
+            }
             warn!(
                 wal_path = %wal_path.display(),
                 size = wal_bytes.len(),
@@ -8637,6 +8657,9 @@ impl OpenFs {
 
         // Validate header.
         if let Err(e) = ffs_mvcc::wal::decode_header(&wal_bytes[..header_size]) {
+            if owned {
+                return Err(e);
+            }
             warn!(
                 wal_path = %wal_path.display(),
                 error = %e,
@@ -8700,28 +8723,30 @@ impl OpenFs {
     }
 
     fn open_metadata_log(
-        path: &Path,
-        latest_commit: CommitSeq,
-        recovery: Option<&WalRecoveryReport>,
-    ) -> Result<MetadataLog, FfsError> {
-        let existed = path.exists();
-        let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        options: &OpenOptions,
+    ) -> Result<(Arc<FsMvccStore>, Option<WalRecoveryReport>, MetadataLog), FfsError> {
+        let path = options
+            .mvcc_wal_path
+            .as_deref()
+            .ok_or_else(|| FfsError::Format("metadata WAL requires a path".to_owned()))?;
+        // Admission includes the file and both target/requested directory
+        // barriers. Keep this exact owned inode through replay and tail repair;
+        // reopening the pathname would discard ownership and race replacement.
+        let mut file = open_owned_wal(path)?;
+        let size = file.metadata()?.len();
+        let (store, recovery) = Self::init_mvcc_store(options, Some(&mut file))?;
+        let latest_commit = store.current_snapshot().high;
         let config = WalWriterConfig {
             sync_policy: SyncPolicy::Immediate,
             verify_writes: false,
             backpressure_threshold_bytes: 0,
         };
-        let mut writer = if !existed || size == 0 {
-            let writer = WalWriter::create(path, config)?;
-            if !existed
-                && let Some(parent) = path.parent()
-                && let Ok(directory) = std::fs::File::open(parent)
-            {
-                directory.sync_all()?;
-            }
-            writer
+        let mut writer = if size == 0 {
+            WalWriter::create_owned(file, config)?
         } else {
-            let valid_bytes = recovery.map_or(size, |report| report.wal_valid_bytes);
+            let valid_bytes = recovery
+                .as_ref()
+                .map_or(size, |report| report.wal_valid_bytes);
             let header_size = u64::try_from(ffs_mvcc::wal::HEADER_SIZE)
                 .map_err(|_| FfsError::Format("WAL header size does not fit u64".to_owned()))?;
             if valid_bytes < header_size {
@@ -8730,10 +8755,11 @@ impl OpenFs {
                     path.display()
                 )));
             }
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)?;
+            if valid_bytes > size || file.metadata()?.len() != size {
+                return Err(FfsError::Format(
+                    "metadata WAL recovery boundary changed".to_owned(),
+                ));
+            }
             if valid_bytes < size {
                 file.set_len(valid_bytes)?;
                 file.sync_all()?;
@@ -8748,11 +8774,15 @@ impl OpenFs {
             wal_bytes = writer.size(),
             "append-only metadata log enabled"
         );
-        Ok(MetadataLog {
-            writer,
-            logged_through: latest_commit,
-            index: BTreeMap::new(),
-        })
+        Ok((
+            store,
+            recovery,
+            MetadataLog {
+                writer,
+                logged_through: latest_commit,
+                index: BTreeMap::new(),
+            },
+        ))
     }
 
     fn rebuild_metadata_log_index(&self, cx: &Cx) -> Result<(), FfsError> {
@@ -103625,8 +103655,13 @@ mod tests {
         }
 
         let _flocks = wal_flock_holder();
-        for mode in ["flush", "sync_all", "reentrant"] {
-            for fail_sync in [false, true] {
+        for mode in ["flush", "sync_all", "reentrant", "drop"] {
+            let failure_cases: &[bool] = if mode == "drop" {
+                &[false]
+            } else {
+                &[false, true]
+            };
+            for &fail_sync in failure_cases {
                 let (seed, dev, tmp) = open_writable_ext4_mkfs_with_crash_device(16)
                     .expect("metadata checkpoint regression requires mkfs.ext4");
                 let cx = Cx::for_testing();
@@ -103683,6 +103718,76 @@ mod tests {
                     assert!(!log.index.is_empty());
                     (log.logged_through, log.index.clone(), log.writer.size())
                 };
+                if mode == "drop" {
+                    let sender = fs
+                        .metadata_compactor
+                        .lock()
+                        .as_ref()
+                        .unwrap()
+                        .sender
+                        .clone();
+                    assert_eq!(sender.telemetry_snapshot(0).queued_messages, 0);
+                    let before = std::fs::read(&wal).unwrap();
+                    let (entered, contender, after, premature) = std::thread::scope(|threads| {
+                        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+                        let worker = threads.spawn(move || {
+                            drop(fs);
+                            done_tx.send(()).unwrap();
+                        });
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        // The paused worker cannot consume Shutdown. Its actual
+                        // queued command witnesses destructor drain admission.
+                        while sender.telemetry_snapshot(0).queued_messages == 0
+                            && !worker.is_finished()
+                            && Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                        let entered = sender.telemetry_snapshot(0).queued_messages != 0;
+                        let contender =
+                            OpenFs::from_device(&cx, Box::new(dev.clone()), &options).map(drop);
+                        let after = std::fs::read(&wal);
+                        let premature = done_rx.try_recv();
+                        // Always unblock old I/O before joining or asserting.
+                        let released = resume_tx.send(());
+                        let joined = worker.join();
+                        released.unwrap();
+                        joined.unwrap();
+                        (entered, contender, after.unwrap(), premature)
+                    });
+                    assert!(entered, "drop must begin draining the paused compactor");
+                    assert!(
+                        matches!(contender, Err(FfsError::Io(ref io)) if io.kind() == std::io::ErrorKind::WouldBlock),
+                        "{contender:?}"
+                    );
+                    assert_eq!(after, before);
+                    assert!(matches!(
+                        premature,
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ));
+                    assert_eq!(std::fs::metadata(&wal).unwrap().len(), old_wal_size);
+                    let mut reopened =
+                        OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+                    assert_eq!(reopened.mvcc_wal_recovery().unwrap().commits_replayed, 1);
+                    reopened.enable_writes(&cx).unwrap();
+                    assert_eq!(reopened.read(&cx, ino, 0, bs).unwrap(), old_payload);
+                    reopened.write(&cx, ino, 0, b"after-drop").unwrap();
+                    reopened.fsync(&cx, ino, 0, false).unwrap();
+                    reopened.flush_on_destroy(&cx).unwrap();
+                    drop(reopened);
+                    let home = OpenFs::from_device(
+                        &cx,
+                        Box::new(TestDevice::from_vec(dev.durable_bytes())),
+                        &OpenOptions::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(home.read(&cx, ino, 0, 10).unwrap(), b"after-drop");
+                    native_parity_fsck(
+                        &TestDevice::from_vec(dev.durable_bytes()),
+                        &tmp.path().join("drop-drain.ext4"),
+                    );
+                    continue;
+                }
                 let mut payload = vec![0x33; (2 * bs + 17) as usize];
                 fs.write(&cx, ino, 0, &payload).unwrap();
                 let accepted = fs.current_snapshot();
@@ -103823,6 +103928,230 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn metadata_log_requires_owned_durable_admission() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt;
+
+        const CHILD_CASE: &str = "FFS_METADATA_LOG_DIRECTORY_CHILD";
+        if let Some(case) = std::env::var_os(CHILD_CASE) {
+            let path = Path::new("metadata.wal");
+            let mut options = OpenOptions {
+                mvcc_wal_path: Some(path.to_path_buf()),
+                metadata_log_enabled: true,
+                mvcc_replay_policy: TailPolicy::TruncateToLastGood,
+                ..OpenOptions::default()
+            };
+            match case.to_str().expect("child case") {
+                "healthy" => {
+                    use std::io::Write;
+                    let (_, _, mut log) = OpenFs::open_metadata_log(&options).unwrap();
+                    let commit = WalCommit {
+                        commit_seq: CommitSeq(1),
+                        txn_id: ffs_types::TxnId(1),
+                        writes: vec![WalWrite {
+                            block: BlockNumber(7),
+                            data: vec![0xA5; 4096],
+                        }],
+                    };
+                    log.writer.append_commit(&commit).unwrap();
+                    let bytes = std::fs::read(path).unwrap();
+                    match ffs_mvcc::wal::decode_commit(&bytes[ffs_mvcc::wal::HEADER_SIZE..]) {
+                        ffs_mvcc::wal::DecodeResult::Commit(decoded) => {
+                            assert_eq!(decoded, commit);
+                        }
+                        other => panic!("expected the real WAL record, got {other:?}"),
+                    }
+                    // A contender must not replay or repair a live owner's
+                    // incomplete tail. Only the next admitted owner may trim it.
+                    let next_commit = WalCommit {
+                        commit_seq: CommitSeq(2),
+                        txn_id: ffs_types::TxnId(2),
+                        writes: vec![WalWrite {
+                            block: BlockNumber(7),
+                            data: vec![0x6B; 4096],
+                        }],
+                    };
+                    let tail = ffs_mvcc::wal::encode_commit(&next_commit).unwrap();
+                    let mut append = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                    append.write_all(&tail[..tail.len() / 2]).unwrap();
+                    append.sync_all().unwrap();
+                    drop(append);
+                    let torn = std::fs::read(path).unwrap();
+                    let error = OpenFs::open_metadata_log(&options)
+                        .err()
+                        .expect("an active metadata WAL owner must exclude a contender");
+                    assert!(
+                        matches!(error, FfsError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock),
+                        "{error:?}"
+                    );
+                    assert_eq!(std::fs::read(path).unwrap(), torn);
+                    drop(log);
+                    let (store, recovery, mut reopened) =
+                        OpenFs::open_metadata_log(&options).unwrap();
+                    let recovery = recovery.unwrap();
+                    assert_eq!(recovery.commits_replayed, 1);
+                    assert_eq!(recovery.records_discarded, 1);
+                    assert_eq!(
+                        store.read_visible(BlockNumber(7), store.current_snapshot()),
+                        Some(vec![0xA5; 4096])
+                    );
+                    assert_eq!(reopened.logged_through, CommitSeq(1));
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                    reopened.writer.append_commit(&next_commit).unwrap();
+                    drop(reopened);
+                    let continued = std::fs::read(path).unwrap();
+                    assert_eq!(&continued[..bytes.len()], bytes);
+                    match ffs_mvcc::wal::decode_commit(&continued[bytes.len()..]) {
+                        ffs_mvcc::wal::DecodeResult::Commit(decoded) => {
+                            assert_eq!(decoded, next_commit);
+                        }
+                        other => panic!("expected the post-recovery WAL record, got {other:?}"),
+                    }
+                }
+                "deny-new" | "deny-existing" => {
+                    assert_eq!(
+                        std::fs::File::open(".").unwrap_err().kind(),
+                        std::io::ErrorKind::PermissionDenied
+                    );
+                    let existing = case == "deny-existing";
+                    let target = if existing { path } else { Path::new("new.wal") };
+                    let before = if existing {
+                        // Prove the refusal is the directory admission, rather
+                        // than a WAL file permission or ownership failure.
+                        drop(
+                            std::fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .open(target)
+                                .expect("WAL itself remains readable and writable"),
+                        );
+                        Some(std::fs::read(target).unwrap())
+                    } else {
+                        assert!(!target.exists());
+                        None
+                    };
+                    options.mvcc_wal_path = Some(target.to_path_buf());
+                    let error = OpenFs::open_metadata_log(&options)
+                        .err()
+                        .expect("directory-open failure must reject WAL admission");
+                    assert!(
+                        matches!(error, FfsError::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied),
+                        "{error:?}"
+                    );
+                    if let Some(before) = before {
+                        assert_eq!(std::fs::read(target).unwrap(), before);
+                    } else {
+                        assert!(!target.exists(), "refused open must not create a WAL");
+                    }
+                }
+                "bad-header" | "short-header" => {
+                    let invalid = if case == "bad-header" {
+                        vec![0; ffs_mvcc::wal::HEADER_SIZE]
+                    } else {
+                        vec![0xFF; 3]
+                    };
+                    let corrupt = Path::new("corrupt.wal");
+                    std::fs::write(corrupt, &invalid).unwrap();
+                    options.mvcc_wal_path = Some(corrupt.to_path_buf());
+                    let error = OpenFs::open_metadata_log(&options)
+                        .err()
+                        .expect("active metadata WAL must reject an invalid header");
+                    assert!(matches!(error, FfsError::Format(_)), "{error:?}");
+                    assert_eq!(std::fs::read(corrupt).unwrap(), invalid);
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(corrupt)
+                        .unwrap();
+                    file.try_lock()
+                        .expect("failed admission releases ownership");
+                }
+                other => panic!("unknown directory durability case: {other}"),
+            }
+            println!("WAL_DIRECTORY_CASE_PASS|{}", case.to_string_lossy());
+            return;
+        }
+
+        // CWD belongs to the child, so parallel tests never observe a global
+        // directory change. Root must run the permission negatives unprivileged.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::metadata(tmp.path()).unwrap().uid() == 0;
+        let tmp = if root {
+            tempfile::Builder::new()
+                .prefix("ffs-wal-directory-")
+                .tempdir_in("/tmp")
+                .unwrap()
+        } else {
+            tmp
+        };
+        let executable = std::env::current_exe().unwrap();
+        let child_executable = if root {
+            // The original binary may live below a root-only Cargo directory.
+            let accessible = tmp.path().join("child-test");
+            std::fs::copy(&executable, &accessible).unwrap();
+            std::fs::set_permissions(&accessible, std::fs::Permissions::from_mode(0o755)).unwrap();
+            accessible
+        } else {
+            executable
+        };
+        for case in [
+            "healthy",
+            "deny-new",
+            "deny-existing",
+            "bad-header",
+            "short-header",
+        ] {
+            let deny_directory = case.starts_with("deny-");
+            if deny_directory {
+                std::fs::set_permissions(
+                    tmp.path().join("metadata.wal"),
+                    std::fs::Permissions::from_mode(0o666),
+                )
+                .unwrap();
+                std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o333))
+                    .unwrap();
+            }
+            let mut child = std::process::Command::new(&child_executable);
+            child
+                .args([
+                    "--exact",
+                    "tests::metadata_log_requires_owned_durable_admission",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(tmp.path())
+                .env(CHILD_CASE, case)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if root && deny_directory {
+                child.gid(65534).uid(65534);
+            }
+            let spawned = {
+                let _no_flock_holders = TEST_CHILD_SPAWN_GATE
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                child.spawn()
+            };
+            let output = spawned.and_then(std::process::Child::wait_with_output);
+            // Restore access before assertions, including a failed spawn/wait.
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let output = output.expect("run directory durability child");
+            assert!(
+                output.status.success(),
+                "{case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("WAL_DIRECTORY_CASE_PASS|{case}")),
+                "child must execute the exact selected durability case: {case}"
+            );
+        }
+    }
+
     #[test]
     fn append_only_metadata_log_replays_then_checkpoints_clean() {
         let _flocks = wal_flock_holder();
@@ -103903,6 +104232,15 @@ mod tests {
             // Join the optional compactor so the following work is recoverable
             // only from the same WAL, not from a later background home write.
             fs.shutdown_metadata_compactor();
+            let before_contender = std::fs::read(&wal).unwrap();
+            let error = OpenFs::open_read_write(&cx, &image, &options)
+                .err()
+                .expect("public open must exclude the live metadata WAL owner");
+            assert!(
+                matches!(error, FfsError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock),
+                "{error:?}"
+            );
+            assert_eq!(std::fs::read(&wal).unwrap(), before_contender);
             let second = fs
                 .create(&cx, InodeNumber(2), OsStr::new("second.txt"), 0o600, 0, 0)
                 .unwrap()
