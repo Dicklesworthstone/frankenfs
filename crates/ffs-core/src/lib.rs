@@ -26113,6 +26113,24 @@ impl OpenFs {
         // mvcc_flushed_through here: a boundary may hold it while draining us.
         let _gate = self.mutation_gate_guard();
         let mut alloc = self.require_alloc_state()?.write();
+        self.commit_scope_with_ext4_block_counts_locked(scope, &mut alloc)
+    }
+
+    /// The caller holds allocator exclusion through bitmap/count publication.
+    /// This also serves an SDK write that began its transaction under that lock.
+    fn commit_scope_with_ext4_block_counts_locked(
+        &self,
+        scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
+    ) -> Result<CommitSeq, FfsError> {
+        if scope.ext4_block_deltas.is_empty() && scope.ext4_initialized_bitmaps.is_empty() {
+            return scope.commit_if_write(&self.mvcc_store);
+        }
+        if scope.tx.is_none() {
+            return Err(FfsError::Format(
+                "scoped block accounting has no transaction".into(),
+            ));
+        }
         #[cfg(feature = "bhh0i_sharded_alloc")]
         let sharded = self
             .ext4_sharded_alloc
@@ -26143,7 +26161,6 @@ impl OpenFs {
             }
             alloc.groups = updated;
         }
-        drop(alloc);
         scope.ext4_block_deltas.clear();
         scope.ext4_initialized_bitmaps.clear();
         result
@@ -34407,11 +34424,7 @@ impl OpenFs {
     }
 
     /// Write data to an ext4 file.
-    #[allow(
-        clippy::too_many_lines,
-        clippy::significant_drop_tightening,
-        clippy::single_match_else
-    )]
+    #[allow(clippy::significant_drop_tightening)]
     fn ext4_write(
         &self,
         cx: &Cx,
@@ -34424,38 +34437,68 @@ impl OpenFs {
             return Ok(0);
         }
 
-        if scope.tx.is_none() {
-            // The direct SDK supplies a snapshot-only scope. Without an owned
-            // transaction, allocation and data blocks publish individually;
-            // ENOSPC can leave mappings published before the final inode update.
-            // Pin the ancestor until publication or error, including unwind.
-            const MAX_ATTEMPTS: u32 = 16;
-            let mut attempt = 0;
-            loop {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let alloc_mutex = self.require_alloc_state()?;
+        let mut alloc = alloc_mutex.write();
+        if scope.tx.is_some() {
+            // Caller-owned scopes keep their original snapshot and publication.
+            return self.ext4_write_locked(cx, scope, &mut alloc, ino, offset, data);
+        }
+
+        // An operation-owned SDK transaction must share the allocator's entire
+        // exclusion, including begin and publication. Eager GDT writes cover a
+        // descriptor slot: releasing this guard between stage and commit lets
+        // a concurrent namespace operation invalidate it on every retry.
+        const MAX_ATTEMPTS: u32 = 16;
+        for attempt in 1..=MAX_ATTEMPTS {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let base = self.block_device_adapter();
+            let (tx, snapshot_pin) = RegisteredSnapshotBlockAdapter::begin(&base, &self.mvcc_store);
+            let tx_id = tx.id();
+            let mut write_scope = RequestScope::with_transaction(tx);
+            let staged =
+                self.ext4_write_locked(cx, &mut write_scope, &mut alloc, ino, offset, data);
+            let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                write_scope
+                    .tx
+                    .as_ref()
+                    .map_or_else(Vec::new, |tx| tx.write_set().keys().copied().collect())
+            } else {
+                Vec::new()
+            };
+            let result = staged.and_then(|written| {
                 cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-                attempt += 1;
-                let base = self.block_device_adapter();
-                let (tx, _snapshot_pin) =
-                    RegisteredSnapshotBlockAdapter::begin(&base, &self.mvcc_store);
-                let mut write_scope = RequestScope::with_transaction(tx);
-                let result = self
-                    .ext4_write(cx, &mut write_scope, ino, offset, data)
-                    .and_then(|written| {
-                        self.commit_request_scope(cx, &mut write_scope)?;
-                        Ok(written)
-                    });
-                match result {
-                    // Allocations or shared inode-table blocks can conflict
-                    // with another writer. A fresh attempt owns no published
-                    // bytes. Postcommit notification errors are RepairFailed,
-                    // so they must never reach this retry arm.
-                    Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => {}
-                    result => return result,
+                self.commit_scope_with_ext4_block_counts_locked(&mut write_scope, &mut alloc)
+                    .map(|seq| (written, seq))
+            });
+            match result {
+                Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => {}
+                Err(error) => return Err(error),
+                Ok((written, seq)) => {
+                    drop(snapshot_pin);
+                    drop(alloc);
+                    self.prune_mvcc_after_commit_if_due(seq);
+                    // Publication has succeeded. Notification errors must not
+                    // enter the unpublished-conflict retry loop above.
+                    self.notify_repair_flush_lifecycle_with_cx(cx, tx_id, &write_blocks)?;
+                    return Ok(written);
                 }
             }
         }
+        unreachable!("the final SDK write attempt returns its result")
+    }
 
-        let alloc_mutex = self.require_alloc_state()?;
+    /// Stage one write using the caller's allocator exclusion and transaction.
+    #[allow(clippy::too_many_lines, clippy::single_match_else)]
+    fn ext4_write_locked(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        offset: u64,
+        data: &[u8],
+    ) -> ffs_error::Result<u32> {
         let mut block_dev = self.block_device_adapter();
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
 
@@ -34540,7 +34583,7 @@ impl OpenFs {
                 &mut inode,
                 offset,
                 data,
-                alloc_mutex,
+                alloc,
                 block_size,
                 csum_seed,
                 tstamp_secs,
@@ -34556,11 +34599,10 @@ impl OpenFs {
         if (inode.flags & ffs_types::EXT4_EXTENTS_FL) == 0 {
             // Legacy files resolve existing block pointers and allocate missing
             // data and indirect-metadata blocks through the same request scope.
-            return self.ext4_write_indirect(cx, scope, ino, inode, offset, data);
+            return self.ext4_write_indirect(cx, scope, alloc, ino, inode, (offset, data));
         }
 
-        let mut alloc = alloc_mutex.write();
-        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, alloc, |scope, alloc| {
             // Snapshot extent-tree metadata blocks before any tree mutation in this
             // write so growth (and any later coalescing-driven shrink) is charged to
             // i_blocks at the end, regardless of which internal path changed the
@@ -34966,12 +35008,12 @@ impl OpenFs {
         &self,
         cx: &Cx,
         scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
         ino: InodeNumber,
         mut inode: Ext4Inode,
-        offset: u64,
-        data: &[u8],
+        write: (u64, &[u8]),
     ) -> ffs_error::Result<u32> {
-        let alloc_mutex = self.require_alloc_state()?;
+        let (offset, data) = write;
         let mut block_dev = self.block_device_adapter();
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
         let sb = self
@@ -34988,8 +35030,7 @@ impl OpenFs {
             .checked_add(write_len)
             .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
 
-        let mut alloc = alloc_mutex.write();
-        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, alloc, |scope, alloc| {
             // i_blocks counts 512-byte sectors per fs block (or 1 unit/block for
             // huge_file inodes). Each newly mapped logical block costs one data
             // block plus any indirect-metadata blocks write_block_ptr allocates.
@@ -35480,7 +35521,7 @@ impl OpenFs {
         inode: &mut Ext4Inode,
         offset: u64,
         data: &[u8],
-        alloc_mutex: &RwLock<Ext4AllocState>,
+        alloc: &mut Ext4AllocState,
         block_size: u32,
         csum_seed: u32,
         tstamp_secs: u64,
@@ -35509,9 +35550,7 @@ impl OpenFs {
         let mut pending_frees = Vec::new();
         let mut pending_new_blocks = Vec::new();
 
-        let scoped = scope.tx.is_some();
-        let mut alloc = alloc_mutex.write();
-        let result = Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, alloc, |scope, alloc| {
             let write_result = (|| -> Result<u32, FfsError> {
                 // Process data cluster-by-cluster.
                 let mut pos = offset;
@@ -35692,12 +35731,7 @@ impl OpenFs {
             );
 
             write_result
-        });
-        drop(alloc);
-        if !scoped {
-            let _ = self.ext4_flush_group_descriptors(cx);
-        }
-        result
+        })
     }
 
     /// Read a directory's mapping from the supplied operation view, including
@@ -79285,7 +79319,7 @@ mod tests {
         let _restore = GdtModeRestore;
         ffs_alloc::set_gdt_persistence_deferred_for_test(Some(false));
 
-        let Some((fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
             return; // format tool unavailable
         };
         let cx = Cx::for_testing();
@@ -79300,6 +79334,7 @@ mod tests {
                 .expect("create worker subdirectory");
             dirs.push(attr.ino);
         }
+        let counts_before = fs.statfs(&cx, root).expect("initial storm accounting");
 
         let fs = std::sync::Arc::new(fs);
         std::thread::scope(|scope| {
@@ -79317,14 +79352,27 @@ mod tests {
                         let attr = fs
                             .create(&cx, dir, OsStr::new(&name), 0o644, 0, 0)
                             .expect("concurrent create");
-                        fs.write(&cx, attr.ino, 0, &[0xAB_u8; 4096])
-                            .expect("concurrent write");
+                        assert_eq!(
+                            fs.write(&cx, attr.ino, 0, &[0xAB_u8; 4096])
+                                .expect("concurrent write"),
+                            4096
+                        );
+                        assert_eq!(
+                            fs.read(&cx, attr.ino, 0, 4096)
+                                .expect("concurrent readback"),
+                            [0xAB_u8; 4096]
+                        );
                         fs.unlink(&cx, dir, OsStr::new(&name))
                             .expect("concurrent unlink");
                     }
                 });
             }
         });
+        let counts_after = fs.statfs(&cx, root).expect("completed storm accounting");
+        assert_eq!(counts_after.blocks_free, counts_before.blocks_free);
+        assert_eq!(counts_after.files_free, counts_before.files_free);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        assert!(fs.try_close_mutation_gate().is_some());
 
         // Stop where the defective code stopped: versions only, no boundary flush.
         let base_dev = fs.direct_block_device_adapter();
@@ -79345,6 +79393,31 @@ mod tests {
              reproduced it and no serial test could. Do NOT weaken this assertion.",
             mismatches.len()
         );
+        // Keep the version-only eager descriptor assertion above. A separate
+        // durability boundary must then produce a native-clean, reopenable image.
+        fs.flush_mvcc_to_device(&cx).expect("flush completed storm");
+        let bytes = dev.snapshot_bytes();
+        let image = tmp.path().join("eager-concurrent-storm.ext4");
+        native_parity_fsck(&dev, &image);
+        assert_eq!(std::fs::read(&image).unwrap(), bytes);
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions::default(),
+        )
+        .expect("reopen concurrent storm image");
+        let reopened_counts = reopened.statfs(&cx, root).unwrap();
+        assert_eq!(reopened_counts.blocks_free, counts_before.blocks_free);
+        assert_eq!(reopened_counts.files_free, counts_before.files_free);
+        for (worker, &dir) in dirs.iter().enumerate() {
+            assert_eq!(
+                reopened
+                    .lookup(&cx, root, OsStr::new(&format!("hyysq_conc_{worker}")))
+                    .unwrap()
+                    .ino,
+                dir
+            );
+        }
     }
 
     /// Resolve a mkfs-created image's INTERNAL journal to a single contiguous
@@ -104492,14 +104565,30 @@ mod tests {
 
     #[test]
     fn ext4_sdk_write_does_not_retry_a_postcommit_notification_conflict() {
-        #[derive(Debug)]
-        struct ConflictingNotification;
+        #[derive(Debug, Default)]
+        struct ConflictingNotification {
+            fs: Mutex<Option<std::sync::Weak<OpenFs>>>,
+            calls: AtomicUsize,
+        }
         impl RepairFlushLifecycle for ConflictingNotification {
             fn on_flush_committed(
                 &self,
                 _cx: &Cx,
                 _blocks: &[BlockNumber],
             ) -> ffs_error::Result<()> {
+                let fs = self
+                    .fs
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .expect("notification owner remains live");
+                assert!(
+                    fs.require_alloc_state().unwrap().try_write().is_some(),
+                    "postcommit notification must not retain allocator exclusion"
+                );
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 Err(FfsError::MvccConflict { tx: 0, block: 0 })
             }
         }
@@ -104511,7 +104600,10 @@ mod tests {
             .create(&cx, InodeNumber(2), OsStr::new("notify-write"), 0o644, 0, 0)
             .unwrap()
             .ino;
-        fs.attach_repair_flush_lifecycle(Arc::new(ConflictingNotification));
+        let notification = Arc::new(ConflictingNotification::default());
+        fs.attach_repair_flush_lifecycle(notification.clone());
+        let fs = Arc::new(fs);
+        *notification.fs.lock().unwrap() = Some(Arc::downgrade(&fs));
         let before = fs.current_snapshot();
         let payload = [0xC9; 17];
         let error = fs.write(&cx, ino, 0, &payload).unwrap_err();
@@ -104521,6 +104613,7 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+        assert_eq!(notification.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(fs.read(&cx, ino, 0, 64).unwrap(), payload);
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
         assert!(fs.try_close_mutation_gate().is_some());

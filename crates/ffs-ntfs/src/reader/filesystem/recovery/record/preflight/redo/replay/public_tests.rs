@@ -422,7 +422,7 @@ fn recovered_fsops_expose_complete_redo_undo_without_backing_writes() {
                     fs.read(&cx, &mut scope, file.ino, 2, 3).unwrap(),
                     &expected[2..5]
                 );
-                assert!(fs.read(&cx, &mut scope, file.ino, 8, 1).unwrap().is_empty());
+                assert_eq!(fs.read(&cx, &mut scope, file.ino, 8, 1).unwrap(), b"");
                 assert!(matches!(
                     fs.write(&cx, &mut scope, file.ino, 0, b"change"),
                     Err(FfsError::ReadOnly)
