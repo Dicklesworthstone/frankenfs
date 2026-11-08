@@ -13949,6 +13949,16 @@ impl OpenFs {
                             .into(),
                     ));
                 }
+                // Pending COW trees and extent reservations are authoritative
+                // once installed. Reloading physical roots here loses accepted
+                // edits and resets the mount-lifetime hard-refusal latch.
+                if let Some(alloc) = &self.btrfs_alloc_state {
+                    return if alloc.read().commit_refused {
+                        Err(FfsError::ReadOnly)
+                    } else {
+                        Ok(())
+                    };
+                }
                 let mut alloc_state = self.load_btrfs_alloc_state(cx)?;
                 self.btrfs_materialize_tree_log(cx, &mut alloc_state)?;
                 if let Some(old_root) = shared_fs_root {
@@ -118623,6 +118633,218 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_repeated_enable_preserves_pending_cow_and_reservations_native() {
+        for single_store in [false, true] {
+            let (mut fs, dev, _tmp, image) = open_writable_btrfs_mkfs(128)
+                .expect("repeated btrfs enable regression requires native btrfs-progs");
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            let cx = Cx::for_testing();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let dir = fs
+                .mkdir(&cx, root, OsStr::new("live-dir"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let file = fs
+                .create(&cx, dir, OsStr::new("before"), 0o640, 0, 0)
+                .unwrap()
+                .ino;
+            let bs = fs.block_size();
+            let payload = vec![0x95; (3 * bs + 17) as usize];
+            fs.write(&cx, file, 0, &payload).unwrap();
+            fs.setxattr(&cx, file, "user.pending", b"metadata", XattrSetMode::Set)
+                .unwrap();
+            fs.rename(&cx, dir, OsStr::new("before"), dir, OsStr::new("kept"))
+                .unwrap();
+            let reserved = fs
+                .create(&cx, dir, OsStr::new("reserved"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            fs.fallocate(
+                &cx,
+                reserved,
+                0,
+                2 * u64::from(bs),
+                libc::FALLOC_FL_KEEP_SIZE,
+            )
+            .unwrap();
+            let retired = fs
+                .create(&cx, dir, OsStr::new("retired"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            fs.unlink(&cx, dir, OsStr::new("retired")).unwrap();
+            let head = fs.current_snapshot();
+            let cursor = *fs.mvcc_flushed_through.lock();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let mappings = fs
+                .fiemap(&cx, &mut RequestScope::empty(), reserved, 0, u64::MAX)
+                .unwrap();
+            assert!(!mappings.is_empty(), "real KEEP_SIZE reservation required");
+            let backing = blake3::hash(&dev.snapshot_bytes());
+            let physical = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                physical.lookup(&cx, root, OsStr::new("live-dir")),
+                Err(FfsError::NotFound(_))
+            ));
+            drop(physical);
+
+            let state = |fs: &OpenFs| {
+                let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                let lo = BtrfsKey {
+                    objectid: 0,
+                    item_type: 0,
+                    offset: 0,
+                };
+                let hi = BtrfsKey {
+                    objectid: u64::MAX,
+                    item_type: u8::MAX,
+                    offset: u64::MAX,
+                };
+                (
+                    alloc.root_tree.range(&lo, &hi).unwrap(),
+                    alloc.fs_tree.range(&lo, &hi).unwrap(),
+                    alloc.csum_tree.range(&lo, &hi).unwrap(),
+                    alloc.extent_alloc.extent_tree().range(&lo, &hi).unwrap(),
+                    alloc.extent_alloc.space_info(),
+                    alloc.extent_alloc.pinned_extent_count(),
+                    alloc.next_objectid,
+                    alloc.generation,
+                    alloc.dir_index_counters.clone(),
+                    alloc.btrfs_logged_inodes.clone(),
+                    alloc.fs_tree_released_at_enable,
+                    alloc.commit_refused,
+                )
+            };
+            let pending = state(&fs);
+            assert!(
+                !pending.2.is_empty(),
+                "non-inline payload must populate the checksum tree"
+            );
+            {
+                let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                assert!(
+                    OpenFs::btrfs_extent_data_items(
+                        &alloc,
+                        fs.btrfs_canonical_inode(file).unwrap()
+                    )
+                    .unwrap()
+                    .iter()
+                    .any(|(_, extent)| matches!(extent, BtrfsExtentData::Regular { .. }))
+                );
+            }
+            let attrs = [file, reserved].map(|ino| fs.getattr(&cx, ino).unwrap());
+            for _ in 0..2 {
+                fs.enable_writes(&cx).unwrap();
+                assert_eq!(state(&fs), pending);
+                assert_eq!(fs.current_snapshot(), head);
+                assert_eq!(*fs.mvcc_flushed_through.lock(), cursor);
+                assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                assert_eq!(blake3::hash(&dev.snapshot_bytes()), backing);
+                assert_eq!(
+                    fs.lookup(&cx, root, OsStr::new("live-dir")).unwrap().ino,
+                    dir
+                );
+                assert_eq!(fs.lookup(&cx, dir, OsStr::new("kept")).unwrap().ino, file);
+                assert_eq!(
+                    [file, reserved].map(|ino| fs.getattr(&cx, ino).unwrap()),
+                    attrs
+                );
+                assert_eq!(fs.read(&cx, file, 0, 4 * bs).unwrap(), payload);
+                assert_eq!(
+                    fs.getxattr(&cx, file, "user.pending").unwrap(),
+                    Some(b"metadata".to_vec())
+                );
+                assert_eq!(
+                    fs.fiemap(&cx, &mut RequestScope::empty(), reserved, 0, u64::MAX)
+                        .unwrap(),
+                    mappings
+                );
+                assert_eq!(fs.getattr(&cx, reserved).unwrap().size, 0);
+            }
+
+            let later = fs
+                .create(&cx, dir, OsStr::new("later"), 0o600, 0, 0)
+                .unwrap()
+                .ino;
+            assert!(
+                fs.btrfs_canonical_inode(later).unwrap()
+                    > fs.btrfs_canonical_inode(retired).unwrap()
+            );
+            assert!(![dir, file, reserved, retired].contains(&later));
+            fs.write(&cx, later, 0, b"later-data").unwrap();
+            let reserved_payload = vec![0x4D; bs as usize];
+            fs.write(&cx, reserved, 0, &reserved_payload).unwrap();
+            assert_eq!(fs.read(&cx, reserved, 0, 2 * bs).unwrap(), reserved_payload);
+            let committed_mappings = fs
+                .fiemap(&cx, &mut RequestScope::empty(), reserved, 0, u64::MAX)
+                .unwrap();
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            fs.btrfs_full_transaction_commit(&cx, "repeated-enable-native")
+                .unwrap();
+            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+            let persisted = blake3::hash(&std::fs::read(&image).unwrap());
+            let (clean, output) = run_btrfs_check(&image).expect("actual native checker required");
+            assert!(
+                clean,
+                "repeated enable changed btrfs ownership/accounting: {output}"
+            );
+            assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), persisted);
+            drop(fs);
+            let reopened = OpenFs::open(&cx, &image).unwrap();
+            assert_eq!(
+                reopened
+                    .lookup(&cx, root, OsStr::new("live-dir"))
+                    .unwrap()
+                    .ino,
+                dir
+            );
+            assert_eq!(
+                reopened.lookup(&cx, dir, OsStr::new("kept")).unwrap().ino,
+                file
+            );
+            assert_eq!(
+                reopened
+                    .lookup(&cx, dir, OsStr::new("reserved"))
+                    .unwrap()
+                    .ino,
+                reserved
+            );
+            assert_eq!(
+                reopened.lookup(&cx, dir, OsStr::new("later")).unwrap().ino,
+                later
+            );
+            assert!(matches!(
+                reopened.lookup(&cx, dir, OsStr::new("retired")),
+                Err(FfsError::NotFound(_))
+            ));
+            assert_eq!(reopened.read(&cx, file, 0, 4 * bs).unwrap(), payload);
+            assert_eq!(
+                reopened.getxattr(&cx, file, "user.pending").unwrap(),
+                Some(b"metadata".to_vec())
+            );
+            assert_eq!(
+                reopened.read(&cx, reserved, 0, 2 * bs).unwrap(),
+                reserved_payload
+            );
+            assert_eq!(reopened.read(&cx, later, 0, bs).unwrap(), b"later-data");
+            assert_eq!(
+                reopened
+                    .fiemap(&cx, &mut RequestScope::empty(), reserved, 0, u64::MAX)
+                    .unwrap(),
+                committed_mappings
+            );
+        }
+    }
+
+    #[test]
     fn btrfs_clone_file_data_shares_extent_and_sets_size() {
         // The inode-level reflink core (bd-vh8p9 increment 3): sharing src's
         // data extent into dst must bump the extent refcount 1->2, point dst's
@@ -119231,7 +119453,7 @@ mod tests {
 
     #[test]
     fn btrfs_latched_enospc_allows_reuse_but_preserves_allocation_refusals() {
-        let (fs, cx) = open_writable_btrfs();
+        let (mut fs, cx, dev) = open_writable_btrfs_with_device();
         let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
         const BS: usize = 4096;
         let create = |name: &str| {
@@ -119281,6 +119503,14 @@ mod tests {
         }
         assert_eq!(fs.read(&cx, regular, 0, BS as u32).unwrap(), [0x33; BS]);
 
+        // A retryable space refusal is not a hard commit refusal. Repeated
+        // admission preserves pending state and still allows reservation reuse.
+        let soft_head = fs.current_snapshot();
+        fs.enable_writes(&cx).unwrap();
+        assert_eq!(fs.current_snapshot(), soft_head);
+        assert!(fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+        assert_eq!(fs.statfs(&cx, root).unwrap().blocks_free, free_before);
+        assert_eq!(fs.read(&cx, regular, 0, BS as u32).unwrap(), [0x33; BS]);
         fs.write(&cx, reserved, 0, &[0x31; BS]).unwrap();
         fs.clone_file(&cx, &mut RequestScope::empty(), empty, regular)
             .unwrap();
@@ -119295,6 +119525,40 @@ mod tests {
             .unwrap()
             .write()
             .commit_refused = true;
+        // This is an explicitly planted component refusal. Re-enabling this
+        // same mount must never clear it or discard accepted COW metadata.
+        let lo = BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        };
+        let before = fs
+            .btrfs_alloc_state
+            .as_ref()
+            .unwrap()
+            .read()
+            .fs_tree
+            .range(&lo, &hi)
+            .unwrap();
+        let head = fs.current_snapshot();
+        let counts = fs.statfs(&cx, root).unwrap();
+        let backing = dev.snapshot_bytes();
+        for _ in 0..2 {
+            assert!(matches!(fs.enable_writes(&cx), Err(FfsError::ReadOnly)));
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            assert!(alloc.commit_refused);
+            assert_eq!(alloc.fs_tree.range(&lo, &hi).unwrap(), before);
+            drop(alloc);
+            assert!(fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+            assert_eq!(fs.current_snapshot(), head);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(dev.snapshot_bytes(), backing);
+        }
         assert!(matches!(
             fs.write(&cx, reserved, BS as u64, &[0x72; BS]),
             Err(FfsError::ReadOnly)
