@@ -497,6 +497,9 @@ After flushing, the caller must reopen to rebuild and validate the chunk map,
 roots, tree-log overlay, allocator and caches. This is refusal safety, not
 transparent cache refresh. Normal Btrfs operations maintain their own COW state
 and do not invalidate the view merely for committing or flushing data.
+The public `sync_all_to_device` boundary uses the same full Btrfs transaction
+commit as filesystem-wide `sync_fs`, even when per-file fsync uses ephemeral
+tree logging. Draining MVCC data alone cannot persist the separate COW trees.
 Btrfs boundary eviction closes the request-mutation gate only when already
 quiescent. Otherwise it retains the durable MVCC chains for a later boundary:
 waiting while holding a semantic read guard could deadlock a request publishing

@@ -49349,13 +49349,13 @@ impl OpenFs {
         )
     }
 
-    /// Flush ALL committed MVCC block versions to the underlying image device,
-    /// making everything written this session durable on disk — the persist step
-    /// a real mount performs at sync/umount. Without this, writes and creates
-    /// committed to the in-memory MVCC overlay are lost on close (a re-open or
-    /// kernel mount sees nothing), so a benchmark/tool that needs a PERSISTED,
-    /// kernel-comparable result must call it after its mutations. Read-only
-    /// mounts return `ReadOnly`.
+    /// Persist all committed filesystem mutations to the underlying image.
+    /// Ext4 checkpoints MVCC blocks and allocation summaries; btrfs commits its
+    /// COW trees as well as file data, even in per-file ephemeral fsync mode.
+    /// This is the persist step a real mount performs at sync/umount. Without
+    /// a durability boundary, in-memory writes and creates are lost on close.
+    /// Tools needing a persisted, kernel-comparable result must call this after
+    /// their mutations. Read-only mounts return `ReadOnly`.
     pub fn sync_all_to_device(&self, cx: &Cx) -> ffs_error::Result<()> {
         let _view = self.btrfs_semantic_view_guard()?;
         if !self.is_writable() {
@@ -49364,9 +49364,10 @@ impl OpenFs {
         if self.is_ext4() {
             return self.flush_mvcc_to_device(cx).map(|_| ());
         }
-        let base_dev = self.direct_block_device_adapter();
-        self.flush_mvcc_versions_to_device(cx, &base_dev)?;
-        Ok(())
+        // Btrfs namespace and extent metadata live in COW trees outside MVCC.
+        // Use the complete filesystem-sync boundary, including on an ephemeral
+        // mount, and acknowledge its mutation epoch only after the full commit.
+        <Self as FsOps>::sync_fs(self, cx, &mut RequestScope::empty())
     }
 
     pub fn flush(
@@ -113771,6 +113772,7 @@ mod tests {
             let mut scope = RequestScope::empty();
             match operation {
                 "sync" => FsOps::sync_fs(fs, cx, &mut scope),
+                "sync-all" => fs.sync_all_to_device(cx),
                 "start" => FsOps::btrfs_start_sync(fs, cx, &mut scope).map(|token| {
                     assert_eq!(
                         token,
@@ -113789,7 +113791,7 @@ mod tests {
             fs.enable_writes(&cx).unwrap();
             fs.btrfs_rw_ephemeral_ok = ephemeral;
             fs.set_btrfs_dirty_bytes_threshold(0);
-            for operation in ["sync", "start", "wait"] {
+            for operation in ["sync", "start", "wait", "sync-all"] {
                 let name = format!("ioctl-{operation}");
                 let file = fs
                     .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
@@ -115648,9 +115650,8 @@ mod tests {
     /// ⚠️ SCOPE: this pins the ABSENT direction only. The PRESENT direction — an xattr
     /// that exists must still be found — is verified end to end through a real FUSE
     /// mount (set on a RW mount, read back correctly after a RO remount) and is
-    /// deliberately NOT pinned here: this crate's in-process btrfs fixture does not
-    /// survive `sync_all_to_device` + reopen (the file itself returns `NotFound`), so
-    /// such a test would assert on the fixture rather than on the code.
+    /// pinned separately by the native repeated-enable test, which checks the
+    /// exact xattr value after public `sync_all_to_device` and a read-only reopen.
     #[test]
     fn btrfs_readonly_getxattr_absent_name_is_not_served_from_a_neighbour_bd_yu6jz() {
         let image = build_btrfs_fsops_image();
@@ -118637,9 +118638,13 @@ mod tests {
 
     #[test]
     fn btrfs_repeated_enable_preserves_pending_cow_and_reservations_native() {
-        for single_store in [false, true] {
+        for (single_store, ephemeral) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let (mut fs, dev, _tmp, image) = open_writable_btrfs_mkfs(128)
                 .expect("repeated btrfs enable regression requires native btrfs-progs");
+            fs.btrfs_rw_ephemeral_ok = ephemeral;
+            fs.set_btrfs_dirty_bytes_threshold(0);
             fs.mvcc_store = Arc::new(if single_store {
                 FsMvccStore::single()
             } else {
@@ -118789,61 +118794,103 @@ mod tests {
             let committed_mappings = fs
                 .fiemap(&cx, &mut RequestScope::empty(), reserved, 0, u64::MAX)
                 .unwrap();
-            fs.flush_mvcc_to_device(&cx).unwrap();
-            fs.btrfs_full_transaction_commit(&cx, "repeated-enable-native")
-                .unwrap();
-            std::fs::write(&image, dev.snapshot_bytes()).unwrap();
-            let persisted = blake3::hash(&std::fs::read(&image).unwrap());
-            let (clean, output) = run_btrfs_check(&image).expect("actual native checker required");
+            // The public whole-session sync must publish COW metadata too.
+            // Exceed the historical ~20-entry overflow case with enough bytes
+            // for multiple actual leaves; no fsync/private commit may rescue it.
+            let siblings: Vec<_> = (0..512)
+                .map(|index| {
+                    let name = format!("native-sync-sibling-{index:04}-with-a-long-name");
+                    let ino = fs
+                        .create(&cx, dir, OsStr::new(&name), 0o600, 0, 0)
+                        .unwrap()
+                        .ino;
+                    (name, ino)
+                })
+                .collect();
             assert!(
-                clean,
-                "repeated enable changed btrfs ownership/accounting: {output}"
-            );
-            assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), persisted);
-            drop(fs);
-            let reopened = OpenFs::open(&cx, &image).unwrap();
-            assert_eq!(
-                reopened
-                    .lookup(&cx, root, OsStr::new("live-dir"))
+                fs.btrfs_alloc_state
+                    .as_ref()
                     .unwrap()
-                    .ino,
-                dir
+                    .read()
+                    .fs_tree
+                    .root_level()
+                    > 0
             );
-            assert_eq!(
-                reopened.lookup(&cx, dir, OsStr::new("kept")).unwrap().ino,
-                file
-            );
-            assert_eq!(
-                reopened
-                    .lookup(&cx, dir, OsStr::new("reserved"))
-                    .unwrap()
-                    .ino,
-                reserved
-            );
-            assert_eq!(
-                reopened.lookup(&cx, dir, OsStr::new("later")).unwrap().ino,
-                later
-            );
-            assert!(matches!(
-                reopened.lookup(&cx, dir, OsStr::new("retired")),
-                Err(FfsError::NotFound(_))
-            ));
-            assert_eq!(reopened.read(&cx, file, 0, 4 * bs).unwrap(), payload);
-            assert_eq!(
-                reopened.getxattr(&cx, file, "user.pending").unwrap(),
-                Some(b"metadata".to_vec())
-            );
-            assert_eq!(
-                reopened.read(&cx, reserved, 0, 2 * bs).unwrap(),
-                reserved_payload
-            );
-            assert_eq!(reopened.read(&cx, later, 0, bs).unwrap(), b"later-data");
-            assert_eq!(
-                reopened
-                    .fiemap(&cx, &mut RequestScope::empty(), reserved, 0, u64::MAX)
-                    .unwrap(),
-                committed_mappings
-            );
+            fs.sync_all_to_device(&cx).unwrap();
+            assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+            assert!(!fs.periodic_commit(&cx).unwrap());
+            let first_generation = fs.btrfs_alloc_state.as_ref().unwrap().read().generation;
+            for teardown in [false, true] {
+                if teardown {
+                    // Verify the first sync via an independent reopen BEFORE
+                    // a repeat sync or the real teardown can repair its output.
+                    fs.sync_all_to_device(&cx).unwrap();
+                    fs.flush_on_destroy(&cx).unwrap();
+                    assert!(
+                        fs.btrfs_alloc_state.as_ref().unwrap().read().generation
+                            >= first_generation
+                    );
+                }
+                std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+                let persisted = blake3::hash(&std::fs::read(&image).unwrap());
+                let (clean, output) =
+                    run_btrfs_check(&image).expect("actual native checker required");
+                assert!(
+                    clean,
+                    "repeated enable changed btrfs ownership/accounting: {output}"
+                );
+                assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), persisted);
+                let reopened = OpenFs::open(&cx, &image).unwrap();
+                assert_eq!(
+                    reopened
+                        .lookup(&cx, root, OsStr::new("live-dir"))
+                        .unwrap()
+                        .ino,
+                    dir
+                );
+                assert_eq!(
+                    reopened.lookup(&cx, dir, OsStr::new("kept")).unwrap().ino,
+                    file
+                );
+                assert_eq!(
+                    reopened
+                        .lookup(&cx, dir, OsStr::new("reserved"))
+                        .unwrap()
+                        .ino,
+                    reserved
+                );
+                assert_eq!(
+                    reopened.lookup(&cx, dir, OsStr::new("later")).unwrap().ino,
+                    later
+                );
+                assert!(matches!(
+                    reopened.lookup(&cx, dir, OsStr::new("retired")),
+                    Err(FfsError::NotFound(_))
+                ));
+                assert_eq!(reopened.read(&cx, file, 0, 4 * bs).unwrap(), payload);
+                assert_eq!(
+                    reopened.getxattr(&cx, file, "user.pending").unwrap(),
+                    Some(b"metadata".to_vec())
+                );
+                assert_eq!(
+                    reopened.read(&cx, reserved, 0, 2 * bs).unwrap(),
+                    reserved_payload
+                );
+                assert_eq!(reopened.read(&cx, later, 0, bs).unwrap(), b"later-data");
+                assert_eq!(
+                    reopened
+                        .fiemap(&cx, &mut RequestScope::empty(), reserved, 0, u64::MAX)
+                        .unwrap(),
+                    committed_mappings
+                );
+                for (name, ino) in &siblings {
+                    assert_eq!(
+                        reopened.lookup(&cx, dir, OsStr::new(name)).unwrap().ino,
+                        *ino,
+                        "single_store={single_store} ephemeral={ephemeral} teardown={teardown}: {name}"
+                    );
+                }
+            }
         }
     }
 

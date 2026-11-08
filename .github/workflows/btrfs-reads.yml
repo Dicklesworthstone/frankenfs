@@ -65,6 +65,7 @@ jobs:
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_sharded_birth_cross_group_fallback_passes_native_checker -- --exact --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_repeated_enable_preserves_live_allocators_and_deferred_scope -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::btrfs_repeated_enable_preserves_pending_cow_and_reservations_native -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::btrfs_sync_ioctls_publish_full_boundaries_bd_8u2a5 -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::btrfs_latched_enospc_allows_reuse_but_preserves_allocation_refusals -- --exact --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_managed_publication_refuses_abort_for_data_and_namespace -- --exact --nocapture
           cargo test -p ffs-core --locked --lib --features bhh0i_sharded_alloc tests::ext4_revoked_flush_preserves_committed_allocation_and_retries_sync -- --exact --nocapture

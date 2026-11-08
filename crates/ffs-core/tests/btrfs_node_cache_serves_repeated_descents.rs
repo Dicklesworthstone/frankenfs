@@ -94,10 +94,9 @@ fn seeded_image(dir: &Path, entries: usize, name: &str) -> Option<PathBuf> {
     let cx = Cx::for_testing();
     let device = ffs_block::FileByteDevice::open(&image).expect("open image");
     // Durable (default) mode, NOT ephemeral: btrfs persistence here comes from a
-    // full transaction commit at the fsync below. `sync_all_to_device` is the
-    // ext4/MVCC durability boundary and does not commit the btrfs trees, which is
-    // what an earlier version of this fixture used — the reopen then found no
-    // files at all.
+    // full transaction commit at the fsync below. The public whole-session
+    // `sync_all_to_device` boundary also commits the btrfs trees; its native
+    // reopen and failure-retry coverage lives in the core unit tests.
     let mut fs =
         OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default()).expect("open btrfs");
     fs.enable_writes(&cx).expect("enable writes");
