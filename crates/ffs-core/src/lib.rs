@@ -23273,7 +23273,24 @@ impl OpenFs {
         name: &[u8],
     ) -> Result<Option<Ext4DirEntry>, FfsError> {
         Self::ext4_reject_inline_data_dir(dir_inode)?;
-        // Negative fast path (bd-f8rd8), checked FIRST: an authoritative per-dir
+        // Dots live in logical block zero, including an indexed directory's
+        // dx root. Neither the current-view name index nor a hashed leaf miss
+        // can decide their presence. Keep the mapping and bytes in this scope.
+        if name == b"." || name == b".." {
+            let block = match self.resolve_extent(cx, scope, dir_inode, 0)? {
+                Some((physical, false)) => BlockNumber(physical),
+                _ => {
+                    return Err(FfsError::Corruption {
+                        block: 0,
+                        detail: "directory is missing its dot-entry block".into(),
+                    });
+                }
+            };
+            let data = self.read_block_with_scope(cx, scope, block)?;
+            return lookup_in_dir_block(&data, self.block_size(), name)
+                .map_err(|error| parse_to_ffs_error(&error));
+        }
+        // Negative fast path (bd-f8rd8), before ordinary-name descent: a per-dir
         // name index answers a name-ABSENT lookup (the create existence check) in
         // O(1) — a hash-set membership test under one shard lock — which is
         // strictly cheaper than the htree descent + hash-target-leaf scan below.
@@ -49639,6 +49656,7 @@ impl OpenFs {
     fn ext4_directory_is_descendant_of(
         &self,
         cx: &Cx,
+        scope: &RequestScope,
         candidate: InodeNumber,
         ancestor: InodeNumber,
     ) -> ffs_error::Result<bool> {
@@ -49662,22 +49680,22 @@ impl OpenFs {
             }
             visited.push(current);
 
-            let inode = self.read_inode(cx, current)?;
+            let inode = self.read_inode_with_scope(cx, scope, current)?;
             if !inode.is_dir() {
                 return Err(FfsError::Corruption {
                     block: 0,
                     detail: format!("inode {} in '..' chain is not a directory", current.0),
                 });
             }
-            let dotdot =
-                self.lookup_name(cx, &inode, b"..")?
-                    .ok_or_else(|| FfsError::Corruption {
-                        block: 0,
-                        detail: format!(
-                            "directory {} missing '..' while checking ancestry",
-                            current.0
-                        ),
-                    })?;
+            let dotdot = self
+                .lookup_name_with_scope(cx, scope, &inode, b"..")?
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: format!(
+                        "directory {} missing '..' while checking ancestry",
+                        current.0
+                    ),
+                })?;
             current = InodeNumber(u64::from(dotdot.inode));
         }
 
@@ -49690,6 +49708,7 @@ impl OpenFs {
     fn ext4_prepare_dotdot_update(
         &self,
         cx: &Cx,
+        scope: &RequestScope,
         dir_inode: &Ext4Inode,
         dir_ino_u32: u32,
         new_parent: InodeNumber,
@@ -49700,12 +49719,10 @@ impl OpenFs {
         // the logical-0 extent. `resolve_extent(0)` returns (physical, unwritten)
         // for block 0, matching the old `find(logical_block == 0 && !is_unwritten)`
         // exactly: a present, written block 0 -> Some((phys, false)); an unwritten
-        // (true) or absent (None) block 0 -> the same corruption error. Indirect-
-        // mapped dirs keep the legacy path (see the ext4_rename sibling): their
-        // non-extent i_block errors in `collect_extents`, and preserving that error
-        // keeps this byte-identical rather than a behaviour change.
+        // (true) or absent (None) block 0 -> the same corruption error. Indirect
+        // maps use the shared scoped collection path, including staged pointers.
         let dot_dot_block = if dir_inode.flags & EXT4_EXTENTS_FL != 0 {
-            match self.resolve_extent(cx, &RequestScope::empty(), dir_inode, 0)? {
+            match self.resolve_extent(cx, scope, dir_inode, 0)? {
                 Some((phys, false)) => BlockNumber(phys),
                 _ => {
                     return Err(FfsError::Corruption {
@@ -49716,7 +49733,7 @@ impl OpenFs {
                 }
             }
         } else {
-            let child_extents = self.collect_extents(cx, dir_inode)?;
+            let child_extents = self.collect_extents_with_scope(cx, scope, dir_inode)?;
             let first_ext = child_extents
                 .iter()
                 .find(|ext| ext.logical_block == 0 && !ext.is_unwritten())
@@ -49726,7 +49743,7 @@ impl OpenFs {
                 })?;
             BlockNumber(first_ext.physical_start)
         };
-        let mut data = self.read_block_vec(cx, dot_dot_block)?;
+        let mut data = self.read_block_with_scope(cx, scope, dot_dot_block)?;
         let parent_ino_u32 = u32::try_from(new_parent.0)
             .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
         // Repoint '..' at its fixed offset (12) rather than a linear scan: an
@@ -49770,19 +49787,9 @@ impl OpenFs {
                 .ext4_rename2_exchange_staged(cx, scope, parent, name, new_parent, new_name);
         }
 
-        let txn = self.mvcc_store.begin();
-        let snapshot = txn.snapshot();
-
-        let mut local_scope = RequestScope {
-            snapshot: Some(snapshot),
-            tx: Some(txn),
-            read_snapshot_pinned: false,
-            commit_mode: RequestCommitMode::PerRequest,
-            skip_readdir_prefetch: false,
-            ext4_block_deltas: BTreeMap::new(),
-            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
-            ext4_accounting_active: false,
-        };
+        let base = self.block_device_adapter();
+        let (txn, _snapshot_pin) = RegisteredSnapshotBlockAdapter::begin(&base, &self.mvcc_store);
+        let mut local_scope = RequestScope::with_transaction(txn);
         match self.ext4_rename2_exchange_staged(
             cx,
             &mut local_scope,
@@ -49887,12 +49894,18 @@ impl OpenFs {
             && src_is_dir
             && self.ext4_directory_is_descendant_of(
                 cx,
+                scope,
                 new_parent,
                 InodeNumber(u64::from(src_ino)),
             )?;
         let dst_would_move_under_self = cross_parent
             && dst_is_dir
-            && self.ext4_directory_is_descendant_of(cx, parent, InodeNumber(u64::from(dst_ino)))?;
+            && self.ext4_directory_is_descendant_of(
+                cx,
+                scope,
+                parent,
+                InodeNumber(u64::from(dst_ino)),
+            )?;
         if src_would_move_under_self || dst_would_move_under_self {
             return Err(FfsError::RequestRejected {
                 errno: libc::EINVAL,
@@ -49905,12 +49918,12 @@ impl OpenFs {
         // remains stable while inode and file_type stay consistent.
         let reserved_tail = self.ext4_dir_reserved_tail();
         let src_dotdot_update = if cross_parent && src_is_dir {
-            Some(self.ext4_prepare_dotdot_update(cx, &src_inode, src_ino, new_parent)?)
+            Some(self.ext4_prepare_dotdot_update(cx, scope, &src_inode, src_ino, new_parent)?)
         } else {
             None
         };
         let dst_dotdot_update = if cross_parent && dst_is_dir {
-            Some(self.ext4_prepare_dotdot_update(cx, &dst_inode, dst_ino, parent)?)
+            Some(self.ext4_prepare_dotdot_update(cx, scope, &dst_inode, dst_ino, parent)?)
         } else {
             None
         };
@@ -49939,7 +49952,7 @@ impl OpenFs {
         }
         let alloc = alloc_mutex.read();
 
-        let parent_extents = self.collect_extents(cx, &parent_inode)?;
+        let parent_extents = self.collect_extents_with_scope(cx, scope, &parent_inode)?;
         // For an htree dir, logical block 0 is the dx_root: it holds no file
         // entries, and its '..' rec_len spans past the reserved tail so a linear
         // retarget_entry scan rejects it as corrupt (same reason the remove /
@@ -49979,7 +49992,7 @@ impl OpenFs {
         let new_parent_extents = if parent == new_parent {
             parent_extents.clone()
         } else {
-            self.collect_extents(cx, &new_parent_inode)?
+            self.collect_extents_with_scope(cx, scope, &new_parent_inode)?
         };
         let new_parent_dx_root_phys = if parent == new_parent {
             parent_dx_root_phys
@@ -96730,6 +96743,297 @@ mod tests {
     }
 
     #[test]
+    fn ext4_exchange_batch_preserves_staged_entries_when_moving_their_directory() {
+        for single_store in [false, true] {
+            let (mut fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("batched exchange regression requires mkfs.ext4");
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let left = fs
+                .mkdir(&cx, root, OsStr::new("left"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let right = fs
+                .mkdir(&cx, root, OsStr::new("right"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let child = fs
+                .mkdir(&cx, left, OsStr::new("child"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let outside = fs
+                .create(&cx, left, OsStr::new("outside"), 0o644, 0, 0)
+                .unwrap()
+                .ino;
+            let inside = fs
+                .create(&cx, child, OsStr::new("inside"), 0o644, 0, 0)
+                .unwrap()
+                .ino;
+            let other = fs
+                .create(&cx, right, OsStr::new("other"), 0o644, 0, 0)
+                .unwrap()
+                .ino;
+            for (ino, payload) in [
+                (outside, b"outside".as_slice()),
+                (inside, b"inside"),
+                (other, b"other"),
+            ] {
+                fs.write(&cx, ino, 0, payload).unwrap();
+            }
+            let before = fs.current_snapshot();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+            FsOps::rename2(
+                &fs,
+                &cx,
+                &mut scope,
+                left,
+                OsStr::new("outside"),
+                child,
+                OsStr::new("inside"),
+                libc::RENAME_EXCHANGE,
+            )
+            .unwrap();
+            FsOps::rename2(
+                &fs,
+                &cx,
+                &mut scope,
+                left,
+                OsStr::new("child"),
+                right,
+                OsStr::new("other"),
+                libc::RENAME_EXCHANGE,
+            )
+            .unwrap();
+            // The second exchange changes this child's '..'. It must retain
+            // the first exchange's staged entry in that very same data block.
+            let staged_inside = FsOps::lookup(&fs, &cx, &mut scope, child, OsStr::new("inside"))
+                .unwrap()
+                .ino;
+            let staged_outside = FsOps::lookup(&fs, &cx, &mut scope, left, OsStr::new("outside"))
+                .unwrap()
+                .ino;
+            let staged_dotdot = FsOps::lookup(&fs, &cx, &mut scope, child, OsStr::new(".."))
+                .unwrap()
+                .ino;
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(
+                fs.lookup(&cx, child, OsStr::new("inside")).unwrap().ino,
+                inside
+            );
+            assert_eq!(
+                fs.lookup(&cx, left, OsStr::new("child")).unwrap().ino,
+                child
+            );
+            fs.commit_request_scope(&cx, &mut scope).unwrap();
+            fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+            assert_eq!(staged_inside, outside);
+            assert_eq!(staged_outside, inside);
+            assert_eq!(staged_dotdot, right);
+            assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(
+                fs.lookup(&cx, child, OsStr::new("inside")).unwrap().ino,
+                outside
+            );
+            assert_eq!(
+                fs.lookup(&cx, left, OsStr::new("outside")).unwrap().ino,
+                inside
+            );
+            assert_eq!(
+                fs.lookup(&cx, left, OsStr::new("child")).unwrap().ino,
+                other
+            );
+            assert_eq!(
+                fs.lookup(&cx, right, OsStr::new("other")).unwrap().ino,
+                child
+            );
+            assert_eq!(fs.getattr(&cx, left).unwrap().nlink, 2);
+            assert_eq!(fs.getattr(&cx, right).unwrap().nlink, 3);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let bytes = dev.snapshot_bytes();
+            let image = tmp.path().join("batched-exchange.ext4");
+            native_parity_fsck(&dev, &image);
+            assert_eq!(std::fs::read(&image).unwrap(), bytes);
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(bytes)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                reopened
+                    .lookup(&cx, child, OsStr::new("inside"))
+                    .unwrap()
+                    .ino,
+                outside
+            );
+            assert_eq!(
+                reopened
+                    .lookup(&cx, left, OsStr::new("outside"))
+                    .unwrap()
+                    .ino,
+                inside
+            );
+            assert_eq!(
+                reopened.lookup(&cx, left, OsStr::new("child")).unwrap().ino,
+                other
+            );
+            assert_eq!(
+                reopened
+                    .lookup(&cx, right, OsStr::new("other"))
+                    .unwrap()
+                    .ino,
+                child
+            );
+            assert_eq!(
+                reopened.lookup(&cx, child, OsStr::new("..")).unwrap().ino,
+                right
+            );
+            for (ino, payload) in [
+                (outside, b"outside".as_slice()),
+                (inside, b"inside"),
+                (other, b"other"),
+            ] {
+                assert_eq!(reopened.read(&cx, ino, 0, 16).unwrap(), payload);
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_exchange_batch_rejects_a_cycle_through_staged_indexed_dotdot() {
+        for single_store in [false, true] {
+            let (mut fs, dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("staged exchange cycle regression requires mkfs.ext4");
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            fs.ext4_data_err_policy = Ext4DataErrPolicy::Abort;
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let left = fs
+                .mkdir(&cx, root, OsStr::new("left"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let right = fs
+                .mkdir(&cx, root, OsStr::new("right"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let left_child = fs
+                .mkdir(&cx, left, OsStr::new("child"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let right_child = fs
+                .mkdir(&cx, right, OsStr::new("child"), 0o755, 0, 0)
+                .unwrap()
+                .ino;
+            let file = fs
+                .create(&cx, right_child, OsStr::new("file"), 0o644, 0, 0)
+                .unwrap()
+                .ino;
+            fs.write(&cx, file, 0, b"kept").unwrap();
+            // Real namespace growth makes '..' live in a dx root rather than
+            // a hashed leaf. A hashed absence must not decide ancestry.
+            for index in 0..32 {
+                let name = format!("index-{index:02}-{}", "x".repeat(180));
+                fs.create(&cx, right_child, OsStr::new(&name), 0o644, 0, 0)
+                    .unwrap();
+            }
+            assert!(fs.read_inode(&cx, right_child).unwrap().has_htree_index());
+            let before = fs.current_snapshot();
+            let counts = fs.statfs(&cx, root).unwrap();
+            let backing = dev.snapshot_bytes();
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+            FsOps::rename2(
+                &fs,
+                &cx,
+                &mut scope,
+                left,
+                OsStr::new("child"),
+                right,
+                OsStr::new("child"),
+                libc::RENAME_EXCHANGE,
+            )
+            .unwrap();
+            let staged = scope.tx.clone();
+            assert!(scope.pending_write_count() > 0);
+            let result = FsOps::rename2(
+                &fs,
+                &cx,
+                &mut scope,
+                root,
+                OsStr::new("left"),
+                right_child,
+                OsStr::new("file"),
+                libc::RENAME_EXCHANGE,
+            );
+            let after_rejection = scope.tx.clone();
+            // Release even on old-code failure before examining the result.
+            fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+            let error = result.expect_err("left cannot move under its newly staged child");
+            assert!(
+                matches!(&error, FfsError::RequestRejected { .. }),
+                "{error:?}"
+            );
+            assert_eq!(error.to_errno(), libc::EINVAL);
+            assert_eq!(
+                after_rejection, staged,
+                "rejection must preserve every staged byte and proof"
+            );
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+            assert_eq!(dev.snapshot_bytes(), backing);
+            assert_eq!(
+                fs.lookup(&cx, left, OsStr::new("child")).unwrap().ino,
+                left_child
+            );
+            assert_eq!(
+                fs.lookup(&cx, right, OsStr::new("child")).unwrap().ino,
+                right_child
+            );
+            assert_eq!(
+                fs.lookup(&cx, right_child, OsStr::new("..")).unwrap().ino,
+                right
+            );
+            assert_eq!(fs.read(&cx, file, 0, 4).unwrap(), b"kept");
+            assert!(
+                fs.is_writable(),
+                "an ancestry rejection must not trigger Abort"
+            );
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert!(fs.try_close_mutation_gate().is_some());
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let bytes = dev.snapshot_bytes();
+            let image = tmp.path().join("aborted-exchange-cycle.ext4");
+            native_parity_fsck(&dev, &image);
+            assert_eq!(std::fs::read(&image).unwrap(), bytes);
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(bytes)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                reopened
+                    .lookup(&cx, right_child, OsStr::new(".."))
+                    .unwrap()
+                    .ino,
+                right
+            );
+            assert_eq!(reopened.read(&cx, file, 0, 4).unwrap(), b"kept");
+        }
+    }
+
+    #[test]
     fn ext4_directory_is_descendant_of_walks_multiple_levels() {
         let Some(fs) = open_writable_ext4() else {
             return;
@@ -96749,27 +97053,27 @@ mod tests {
 
         // deep -> mid -> a: a descendant across multiple '..' levels.
         assert!(
-            fs.ext4_directory_is_descendant_of(&cx, deep.ino, a.ino)
+            fs.ext4_directory_is_descendant_of(&cx, &RequestScope::empty(), deep.ino, a.ino)
                 .unwrap()
         );
         // mid -> a: one level.
         assert!(
-            fs.ext4_directory_is_descendant_of(&cx, mid.ino, a.ino)
+            fs.ext4_directory_is_descendant_of(&cx, &RequestScope::empty(), mid.ino, a.ino)
                 .unwrap()
         );
         // The inverse direction is false: a is not under deep.
         assert!(
-            !fs.ext4_directory_is_descendant_of(&cx, a.ino, deep.ino)
+            !fs.ext4_directory_is_descendant_of(&cx, &RequestScope::empty(), a.ino, deep.ino)
                 .unwrap()
         );
         // A sibling subtree is not a descendant.
         assert!(
-            !fs.ext4_directory_is_descendant_of(&cx, other.ino, a.ino)
+            !fs.ext4_directory_is_descendant_of(&cx, &RequestScope::empty(), other.ino, a.ino)
                 .unwrap()
         );
         // A directory is reported as a descendant of itself (rename rejects mv a a).
         assert!(
-            fs.ext4_directory_is_descendant_of(&cx, a.ino, a.ino)
+            fs.ext4_directory_is_descendant_of(&cx, &RequestScope::empty(), a.ino, a.ino)
                 .unwrap()
         );
     }
