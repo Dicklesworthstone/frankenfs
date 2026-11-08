@@ -13812,28 +13812,32 @@ impl OpenFs {
                          state — repair it offline (e2fsck) first"
                     )));
                 }
-                if self.ext4_forced_read_only.load(Ordering::SeqCst) {
+                let revoked = self.ext4_forced_read_only.load(Ordering::SeqCst);
+                if revoked {
                     // Preserve accepted writes and reset the WAL before an
                     // explicit recovery request rebuilds mutable state.
                     self.flush_ext4_checkpoint(cx, false)?;
                 }
-                let alloc_state = self.load_ext4_alloc_state(cx)?;
-                // Index all descriptor-owned metadata by physical group before
-                // splitting the allocator. FLEX_BG permits metadata outside its
-                // owner's flex neighborhood; one range-distribution pass avoids
-                // an all-descriptor scan for every group's first allocation.
-                ffs_alloc::populate_reserved_block_caches(&alloc_state.geo, &alloc_state.groups);
-                // Mirror the per-group records into the default-off sharded
-                // structure (clone leaves the single-lock path's initial state
-                // identical). Unused until the sharded alloc path is wired.
-                #[cfg(feature = "bhh0i_sharded_alloc")]
-                let sharded = crate::sharded_alloc::PerGroupAlloc::from_group_stats(
-                    alloc_state.groups.clone(),
-                );
-                self.ext4_alloc_state = Some(RwLock::new(alloc_state));
-                #[cfg(feature = "bhh0i_sharded_alloc")]
-                {
-                    self.ext4_sharded_alloc = Some(sharded);
+                // Deferred descriptors can lag committed allocation counters
+                // and initialized bitmaps. Re-enabling an active writer must
+                // preserve both live families and their common seed; only cold
+                // initialization or a checkpointed Abort may rebuild them.
+                if self.ext4_alloc_state.is_none() || revoked {
+                    let alloc_state = self.load_ext4_alloc_state(cx)?;
+                    // FLEX_BG metadata can live outside its owner's group.
+                    ffs_alloc::populate_reserved_block_caches(
+                        &alloc_state.geo,
+                        &alloc_state.groups,
+                    );
+                    #[cfg(feature = "bhh0i_sharded_alloc")]
+                    let sharded = crate::sharded_alloc::PerGroupAlloc::from_group_stats(
+                        alloc_state.groups.clone(),
+                    );
+                    self.ext4_alloc_state = Some(RwLock::new(alloc_state));
+                    #[cfg(feature = "bhh0i_sharded_alloc")]
+                    {
+                        self.ext4_sharded_alloc = Some(sharded);
+                    }
                 }
                 let restart_compactor =
                     self.metadata_log.is_some() && self.metadata_compactor.lock().is_none();
@@ -83724,6 +83728,171 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ext4_repeated_enable_preserves_live_allocators_and_deferred_scope() {
+        let _mode = GdtModeRestore;
+        ffs_alloc::set_gdt_persistence_deferred_for_test(Some(true));
+        assert!(ffs_alloc::gdt_persistence_deferred());
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let modes = [false, true];
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let modes = [false];
+        for single_store in [false, true] {
+            for sharded in modes {
+                let (mut fs, dev, _tmp, image) = open_ext4_mke2fs_features_args(
+                    8,
+                    "extent,metadata_csum,^fast_commit",
+                    &["-g", "2048", "-J", "size=1", "-N", "256"],
+                )
+                .expect("repeated enable regression requires native mke2fs");
+                fs.mvcc_store = Arc::new(if single_store {
+                    FsMvccStore::single()
+                } else {
+                    FsMvccStore::sharded()
+                });
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                {
+                    fs.set_bhh0i_sharded_ops(sharded);
+                    assert_eq!(fs.bhh0i_sharded_ops_active(), sharded);
+                }
+                let cx = Cx::for_testing();
+                let root = InodeNumber(2);
+                let initial_groups = fs.ext4_alloc_state.as_ref().unwrap().read().groups.clone();
+                assert_eq!(initial_groups.len(), 4);
+                assert!(initial_groups.iter().any(GroupStats::block_bitmap_uninit));
+                let ino = fs
+                    .create(&cx, root, OsStr::new("pending"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino;
+                let bs = fs.block_size();
+                // More than the combined capacity of the root+journal groups
+                // forces a real lazy bitmap to be initialized as well.
+                let mut payload = vec![0x7D; (3500 * bs + 17) as usize];
+                fs.write(&cx, ino, 0, &payload).unwrap();
+                let live = fs.statfs(&cx, root).unwrap();
+                let groups = fs.ext4_alloc_state.as_ref().unwrap().read().groups.clone();
+                assert!(initial_groups.iter().zip(&groups).any(|(before, after)| {
+                    before.block_bitmap_uninit() && !after.block_bitmap_uninit()
+                }));
+                let descriptors: Vec<_> = (0..groups.len())
+                    .map(|group| fs.read_group_desc(&cx, GroupNumber(group as u32)).unwrap())
+                    .collect();
+                assert!(
+                    descriptors
+                        .iter()
+                        .map(|gd| u64::from(gd.free_blocks_count))
+                        .sum::<u64>()
+                        > live.blocks_free,
+                    "real deferred descriptor bytes must lag committed allocations"
+                );
+                assert!(
+                    descriptors
+                        .iter()
+                        .map(|gd| u64::from(gd.free_inodes_count))
+                        .sum::<u64>()
+                        > live.files_free
+                );
+
+                let mut private = fs.begin_writeback_batch_scope(&cx).unwrap();
+                let offset = (u64::try_from(payload.len()).unwrap() + u64::from(bs))
+                    .next_multiple_of(u64::from(bs));
+                FsOps::write(&fs, &cx, &mut private, ino, offset, b"private").unwrap();
+                assert!(private.pending_write_count() > 0);
+                let private_delta = private.ext4_block_deltas.values().sum::<i64>();
+                assert!(private_delta < 0);
+                let staged = private.tx.clone();
+                let staged_counts = private.ext4_block_deltas.clone();
+                let staged_initializations = private.ext4_initialized_bitmaps.clone();
+                let head = fs.current_snapshot();
+                let inode = fs.read_inode(&cx, ino).unwrap();
+                let backing = dev.snapshot_bytes();
+                let groups_at_enable = fs.ext4_alloc_state.as_ref().unwrap().read().groups.clone();
+                let single_state = format!("{groups_at_enable:?}");
+                #[cfg(feature = "bhh0i_sharded_alloc")]
+                let sharded_state = fs.ext4_sharded_alloc.as_ref().map(|state| {
+                    (
+                        format!("{:?}", state.snapshot_group_stats()),
+                        format!("{:?}", state.birth_group_stats(&groups_at_enable).unwrap()),
+                    )
+                });
+                assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+                for _ in 0..2 {
+                    fs.enable_writes(&cx).unwrap();
+                    assert!(fs.is_writable());
+                    assert_eq!(fs.current_snapshot(), head);
+                    assert_eq!(fs.statfs(&cx, root).unwrap(), live);
+                    assert_eq!(fs.read_inode(&cx, ino).unwrap(), inode);
+                    assert_eq!(fs.read(&cx, ino, 0, 4000 * bs).unwrap(), payload);
+                    assert_eq!(dev.snapshot_bytes(), backing);
+                    assert_eq!(
+                        format!("{:?}", fs.ext4_alloc_state.as_ref().unwrap().read().groups),
+                        single_state
+                    );
+                    #[cfg(feature = "bhh0i_sharded_alloc")]
+                    assert_eq!(
+                        fs.ext4_sharded_alloc.as_ref().map(|state| {
+                            let alloc = fs.ext4_alloc_state.as_ref().unwrap().read();
+                            (
+                                format!("{:?}", state.snapshot_group_stats()),
+                                format!("{:?}", state.birth_group_stats(&alloc.groups).unwrap()),
+                            )
+                        }),
+                        sharded_state
+                    );
+                    assert_eq!(private.tx, staged);
+                    assert_eq!(private.ext4_block_deltas, staged_counts);
+                    assert_eq!(private.ext4_initialized_bitmaps, staged_initializations);
+                    assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+                }
+                assert_eq!(
+                    fs.commit_writeback_batch_scope(&cx, private).unwrap().0,
+                    head.high.0 + 1
+                );
+                payload.resize(usize::try_from(offset).unwrap(), 0);
+                payload.extend_from_slice(b"private");
+                let committed = fs.statfs(&cx, root).unwrap();
+                assert_eq!(
+                    committed.blocks_free,
+                    live.blocks_free.checked_add_signed(private_delta).unwrap()
+                );
+                assert_eq!(committed.files_free, live.files_free);
+                assert_eq!(fs.read(&cx, ino, 0, 4000 * bs).unwrap(), payload);
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+
+                let later = fs
+                    .create(&cx, root, OsStr::new("later"), 0o600, 0, 0)
+                    .unwrap()
+                    .ino;
+                fs.write(&cx, later, 0, &vec![0x2A; (bs + 3) as usize])
+                    .unwrap();
+                assert!(fs.statfs(&cx, root).unwrap().blocks_free < committed.blocks_free);
+                fs.unlink(&cx, root, OsStr::new("later")).unwrap();
+                assert_eq!(fs.statfs(&cx, root).unwrap(), committed);
+                assert!(fs.try_close_mutation_gate().is_some());
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                let bytes = dev.snapshot_bytes();
+                native_parity_fsck(&dev, &image);
+                assert_eq!(std::fs::read(&image).unwrap(), bytes);
+                let reopened = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(bytes)),
+                    &OpenOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened
+                        .lookup(&cx, root, OsStr::new("pending"))
+                        .unwrap()
+                        .ino,
+                    ino
+                );
+                assert_eq!(reopened.read(&cx, ino, 0, 4000 * bs).unwrap(), payload);
+                assert_eq!(reopened.statfs(&cx, root).unwrap(), committed);
+                println!("repeated enable: single_store={single_store} sharded_alloc={sharded}");
+            }
+        }
+    }
+
     /// META_BG layout (kernel `descriptor_loc`, `ext4_bg_num_gdb`). With 1 KiB
     /// blocks and 64-byte descriptors, 16 groups share a descriptor block, so a
     /// 300 MiB `meta_bg` image spans three metagroups, each holding its own
@@ -103473,6 +103642,11 @@ mod tests {
                     assert!(fs.metadata_compactor.lock().is_none());
                     assert!(fs.is_writable());
                     dev.disarm();
+                    fs.enable_writes(&cx).unwrap();
+                    assert!(fs.metadata_compactor.lock().is_some());
+                    assert_eq!(*fs.mvcc_flushed_through.lock(), cursor);
+                    assert_eq!(fs.statfs(&cx, root).unwrap(), counts);
+                    assert_eq!(fs.read(&cx, ino, 0, 3 * bs).unwrap(), payload);
                     checkpoint(&fs).unwrap();
                 } else {
                     result.unwrap();
