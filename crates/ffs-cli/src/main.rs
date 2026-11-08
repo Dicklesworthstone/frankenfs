@@ -979,17 +979,16 @@ enum Command {
         /// Number of files to create.
         #[arg(long, default_value_t = 20_000)]
         count: usize,
-        /// Parallel writer threads (each creates count/threads files in its
-        /// own subdir, isolating the MVCC commit-lock contention). 1 = serial.
+        /// Parallel writer threads sharing the exact file count, each in its
+        /// own subdirectory. 1 = serial.
         #[arg(long, default_value_t = 1)]
         threads: usize,
         /// Repeat the create phase `rounds` times in ONE process against ONE
         /// image, timing each round's creates SEPARATELY and flushing once at
         /// the end.
         ///
-        /// `--rounds 1` (the default) is byte-identical to the historical
-        /// behaviour, flush inside the timer and all, so every previously
-        /// published create-bench number stays comparable.
+        /// `--rounds 1` (the default) includes the final flush in the timer.
+        /// Parallel workers create exactly `count` files, sharing any remainder.
         ///
         /// `--rounds N > 1` exists because the historical shape cannot decide a
         /// small effect: it needs a fresh 2 GiB image copy per run (thread
@@ -3056,13 +3055,8 @@ gate_metric=read_wall_us",
     Ok(())
 }
 
-/// Random-read benchmark (no FUSE): open once, resolve `file_path`, then issue
-/// `count` random page-aligned reads of `size` bytes each via the positioned
-/// read engine (`read_into`). Reports the engine time (excluding open/resolve),
-/// throughput and IOPS as a JSON-able `info!` line, for a head-to-head against
-/// a kernel random `pread` loop. Random access does one extent-map lookup per
-/// read (sequential `read` coalesces runs), so this exercises the per-lookup
-/// path (e.g. the `ffs-extent` cache) that sequential reads hide (bd-7f6yr).
+/// Create the requested files through the public filesystem API and persist
+/// them to the image before returning a successful benchmark result.
 fn createbench_cmd(
     path: &PathBuf,
     dir_path: &str,
@@ -3092,14 +3086,13 @@ fn createbench_cmd(
             .with_context(|| format!("failed to resolve {dir_path} at component {comp:?}"))?;
         parent = attr.ino;
     }
-    // Low-variance mode (`--rounds N > 1`). Everything below the historical
-    // single-round paths, so `--rounds 1` reaches them untouched.
+    // Repeated rounds exclude the final flush from their per-round timer.
     if rounds > 1 {
         return createbench_rounds(&cx, &open_fs, parent, count, threads, rounds);
     }
 
-    // Parallel mode: each thread creates in its own subdir, so the only shared
-    // contention is the MVCC commit lock — isolating whether writes scale.
+    // Each worker gets its own directory and a balanced share of the exact
+    // requested file count, including a count smaller than the worker count.
     if threads > 1 {
         let mut tdirs: Vec<InodeNumber> = Vec::with_capacity(threads);
         for t in 0..threads {
@@ -3116,14 +3109,16 @@ fn createbench_cmd(
             tdirs.push(attr.ino);
         }
         let per = count / threads;
+        let extra = count % threads;
         let started = Instant::now();
         std::thread::scope(|s| {
             let mut workers = Vec::with_capacity(tdirs.len());
             for (t, &tdir) in tdirs.iter().enumerate() {
                 let fs = &open_fs;
                 let cxr = &cx;
+                let worker_count = per + usize::from(t < extra);
                 workers.push(s.spawn(move || -> Result<()> {
-                    for i in 0..per {
+                    for i in 0..worker_count {
                         let name = format!("cb_{t}_{i:08}");
                         fs.create(cxr, tdir, std::ffi::OsStr::new(&name), 0o644, 0, 0)
                             .with_context(|| format!("failed to create {name}"))?;
@@ -3137,11 +3132,10 @@ fn createbench_cmd(
             .sync_all_to_device(&cx)
             .with_context(|| "failed to flush creates".to_string())?;
         let elapsed = started.elapsed();
-        let total = (per * threads) as f64;
+        let total = count as f64;
         let cps = total / elapsed.as_secs_f64().max(1e-9);
         eprintln!(
-            "createbench: {} creates / {threads} threads in {} us = {} creates/s",
-            per * threads,
+            "createbench: {count} creates / {threads} threads in {} us = {} creates/s",
             elapsed.as_micros(),
             truncated_rate(cps)
         );
@@ -3388,6 +3382,7 @@ fn createbench_one_round(
 ) -> Result<Duration> {
     let per = if threads > 1 { count / threads } else { count };
     let elapsed = if threads > 1 {
+        let extra = count % threads;
         let mut tdirs: Vec<InodeNumber> = Vec::with_capacity(threads);
         for t in 0..threads {
             let attr = open_fs
@@ -3407,8 +3402,9 @@ fn createbench_one_round(
             let mut workers = Vec::with_capacity(tdirs.len());
             for (t, &tdir) in tdirs.iter().enumerate() {
                 let fs = &*open_fs;
+                let worker_count = per + usize::from(t < extra);
                 workers.push(s.spawn(move || -> Result<()> {
-                    for i in 0..per {
+                    for i in 0..worker_count {
                         let name = format!("cb_{t}_{i:08}");
                         fs.create(cx, tdir, std::ffi::OsStr::new(&name), 0o644, 0, 0)
                             .with_context(|| format!("failed to create {name}"))?;
@@ -3449,16 +3445,14 @@ fn createbench_rounds(
         Ok(sha) => println!("bench_evidence,binary_sha256={sha}"),
         Err(err) => println!("bench_evidence,binary_sha256=unavailable,error={err}"),
     }
-    let per = if threads > 1 { count / threads } else { count };
-    let per_round_total = per * threads.max(1);
     for round in 0..rounds {
         let create_us = createbench_one_round(cx, open_fs, parent, count, threads, round)?;
         let secs = create_us.as_secs_f64().max(1e-9);
         println!(
-            "createbench_round,round={round},threads={threads},count={per_round_total},\
+            "createbench_round,round={round},threads={threads},count={count},\
 create_us={},creates_per_s={}",
             create_us.as_micros(),
-            truncated_rate(per_round_total as f64 / secs)
+            truncated_rate(count as f64 / secs)
         );
     }
     // One flush for the whole run, timed and reported separately so it can be
@@ -10848,34 +10842,49 @@ mod tests {
 
     #[test]
     fn createbench_command_parallel_creates_survive_reopen() {
-        let image = preserved_createbench_test_image();
-        super::createbench_cmd(&image, "/", 8, 2, 1)
-            .expect("parallel create command must complete and flush");
+        for (count, expected) in [
+            (8, vec![4, 4]),
+            (7, vec![3, 2, 2]),
+            (1, vec![1, 0, 0]),
+            (0, vec![0, 0, 0]),
+        ] {
+            let image = preserved_createbench_test_image();
+            super::createbench_cmd(&image, "/", count, expected.len(), 1)
+                .expect("parallel create command must complete and flush");
 
-        let cx = Cx::for_testing();
-        let reopened = OpenFs::open(&cx, &image).expect("reopen persisted benchmark output");
-        let mut inodes = std::collections::BTreeSet::new();
-        for worker in 0..2 {
-            let directory = reopened
-                .lookup(
-                    &cx,
-                    ffs_types::InodeNumber(2),
-                    std::ffi::OsStr::new(&format!("t{worker}")),
-                )
-                .expect("worker directory must persist");
-            for index in 0..4 {
-                let file = reopened
+            let cx = Cx::for_testing();
+            let reopened = OpenFs::open(&cx, &image).expect("reopen persisted benchmark output");
+            let mut inodes = std::collections::BTreeSet::new();
+            for (worker, &worker_count) in expected.iter().enumerate() {
+                let directory = reopened
                     .lookup(
                         &cx,
-                        directory.ino,
-                        std::ffi::OsStr::new(&format!("cb_{worker}_{index:08}")),
+                        ffs_types::InodeNumber(2),
+                        std::ffi::OsStr::new(&format!("t{worker}")),
                     )
-                    .expect("every requested create must persist");
-                assert_eq!(file.size, 0);
-                assert!(inodes.insert(file.ino));
+                    .expect("worker directory must persist");
+                let entries = reopened.readdir(&cx, directory.ino, 0).unwrap();
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.name != b"." && entry.name != b"..")
+                        .count(),
+                    worker_count
+                );
+                for index in 0..worker_count {
+                    let file = reopened
+                        .lookup(
+                            &cx,
+                            directory.ino,
+                            std::ffi::OsStr::new(&format!("cb_{worker}_{index:08}")),
+                        )
+                        .expect("every requested create must persist");
+                    assert_eq!(file.size, 0);
+                    assert!(inodes.insert(file.ino));
+                }
             }
+            assert_eq!(inodes.len(), count);
         }
-        assert_eq!(inodes.len(), 8);
     }
 
     #[test]

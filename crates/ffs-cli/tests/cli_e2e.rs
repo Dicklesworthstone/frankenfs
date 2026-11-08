@@ -2667,6 +2667,140 @@ fn cli_repair_truncated_image_returns_error() {
     }
 }
 
+#[test]
+fn cli_create_bench_exact_counts_persist_on_native_images() {
+    let retained = tempfile::Builder::new()
+        .prefix("ffs-create-bench-native-")
+        .tempdir()
+        .expect("create native benchmark regression directory")
+        .keep();
+    eprintln!("retained create-bench images: {}", retained.display());
+    for format in ["ext4", "btrfs"] {
+        for (count, rounds, per_worker) in [
+            (301_usize, 1_usize, [101_usize, 100, 100]),
+            (1, 2, [1, 0, 0]),
+        ] {
+            let directory = retained.join(format!("{format}-{count}-{rounds}"));
+            fs::create_dir(&directory).unwrap();
+            let image = if format == "btrfs" {
+                create_minimal_btrfs_image(&directory, 128)
+            } else {
+                create_minimal_ext4_image(&directory, 16)
+            };
+            let count_arg = count.to_string();
+            let rounds_arg = rounds.to_string();
+            let output = run_ffs_cli(&[
+                "create-bench",
+                image.to_str().unwrap(),
+                "/",
+                "--count",
+                &count_arg,
+                "--threads",
+                "3",
+                "--rounds",
+                &rounds_arg,
+            ]);
+            assert!(
+                output.status.success(),
+                "{format} count={count} rounds={rounds}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if rounds == 1 {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains(&format!("createbench: {count} creates / 3 threads"))
+                );
+            } else {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let rows: Vec<_> = stdout
+                    .lines()
+                    .filter(|line| line.starts_with("createbench_round,"))
+                    .collect();
+                assert_eq!(rows.len(), rounds);
+                for (round, row) in rows.iter().enumerate() {
+                    assert!(row.contains(&format!(",round={round},")), "{row}");
+                    assert!(row.contains(&format!(",count={count},")), "{row}");
+                }
+            }
+
+            // This opens the actual CLI-written file after the child has exited.
+            // No fsync, teardown call or retained in-memory writer can rescue it.
+            let cx = asupersync::Cx::for_testing();
+            let reopened = ffs_core::OpenFs::open(&cx, &image).unwrap();
+            let mut inodes = std::collections::BTreeSet::new();
+            for round in 0..rounds {
+                for (worker, &worker_count) in per_worker.iter().enumerate() {
+                    let name = if rounds == 1 {
+                        format!("t{worker}")
+                    } else {
+                        format!("t{worker}_r{round}")
+                    };
+                    let directory = reopened
+                        .lookup(&cx, ffs_types::InodeNumber(1), std::ffi::OsStr::new(&name))
+                        .unwrap();
+                    let mut actual: Vec<_> = reopened
+                        .readdir(&cx, directory.ino, 0)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|entry| entry.name != b"." && entry.name != b"..")
+                        .map(|entry| entry.name)
+                        .collect();
+                    actual.sort();
+                    let expected: Vec<_> = (0..worker_count)
+                        .map(|index| format!("cb_{worker}_{index:08}").into_bytes())
+                        .collect();
+                    assert_eq!(actual, expected, "{format}: {name}");
+                    for name in &expected {
+                        let file = reopened
+                            .lookup(
+                                &cx,
+                                directory.ino,
+                                std::ffi::OsStr::new(std::str::from_utf8(name).unwrap()),
+                            )
+                            .unwrap();
+                        assert_eq!(file.size, 0);
+                        assert!(
+                            inodes.insert(file.ino),
+                            "distinct files must have distinct inodes"
+                        );
+                    }
+                }
+            }
+            assert_eq!(inodes.len(), count * rounds);
+            drop(reopened);
+
+            let before_check = sha256_file(&image);
+            let check = if format == "btrfs" {
+                Command::new("btrfs").arg("check").arg(&image).output()
+            } else {
+                Command::new("e2fsck").arg("-fn").arg(&image).output()
+            }
+            .expect("native filesystem checker must execute");
+            eprintln!(
+                "native {format} checker count={count} rounds={rounds}: {}\n{}\n{}",
+                check.status,
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            );
+            assert!(
+                check.status.success(),
+                "native {format} image is inconsistent"
+            );
+            assert_eq!(
+                sha256_file(&image),
+                before_check,
+                "checker must not repair the image"
+            );
+        }
+    }
+    emit_scenario_result(
+        "cli_create_bench_exact_count_native",
+        "PASS",
+        Some("formats=ext4,btrfs;counts=301,1;threads=3;rounds=1,2"),
+    );
+}
+
 // ── Btrfs CLI E2E Tests ─────────────────────────────────────────────────────
 
 #[test]
