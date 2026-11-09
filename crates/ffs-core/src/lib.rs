@@ -13533,11 +13533,10 @@ impl OpenFs {
                 // WAL fsync acknowledges durability before home compaction.
                 // Comparing with the home cursor would keep an idle logged
                 // writer perpetually dirty until a full physical checkpoint.
-                let durable_through = if let Some(log) = &self.metadata_log {
-                    log.lock().logged_through
-                } else {
-                    *self.mvcc_flushed_through.lock()
-                };
+                let durable_through = self.metadata_log.as_ref().map_or_else(
+                    || *self.mvcc_flushed_through.lock(),
+                    |log| log.lock().logged_through,
+                );
                 self.mvcc_store.current_snapshot().high > durable_through
             }
             FsFlavor::Btrfs(_) => self.btrfs_pending_dirty_bytes() != 0,
@@ -113904,6 +113903,7 @@ mod tests {
         let cx = Cx::for_testing();
         let fs = Arc::new(fs);
         let parent = fs
+            .as_ref()
             .mkdir(
                 &cx,
                 InodeNumber(1),
@@ -113914,7 +113914,8 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !fs.readdir(&cx, parent.ino, 0)
+            !fs.as_ref()
+                .readdir(&cx, parent.ino, 0)
                 .unwrap()
                 .iter()
                 .any(|entry| entry.name == b"child")
@@ -113933,7 +113934,10 @@ mod tests {
 
         // No additional sync occurs before lookup/getattr/readdir: ioctl
         // success must expose the real committed root, never a placeholder.
-        let child = fs.lookup(&cx, parent.ino, OsStr::new("child")).unwrap();
+        let child = fs
+            .as_ref()
+            .lookup(&cx, parent.ino, OsStr::new("child"))
+            .unwrap();
         assert_eq!(
             (child.uid, child.gid, child.perm),
             (1234, 5678, 0o700),
@@ -113945,7 +113949,7 @@ mod tests {
                 .uid,
             1234
         );
-        let rows = fs.readdir(&cx, child.ino, 0).unwrap();
+        let rows = fs.as_ref().readdir(&cx, child.ino, 0).unwrap();
         assert!(
             rows.iter()
                 .all(|entry| entry.name == b"." || entry.name == b"..")
@@ -113955,7 +113959,8 @@ mod tests {
             parent.ino
         );
         assert!(
-            fs.readdir(&cx, parent.ino, 0)
+            fs.as_ref()
+                .readdir(&cx, parent.ino, 0)
                 .unwrap()
                 .iter()
                 .any(|entry| entry.name == b"child")
