@@ -103670,6 +103670,48 @@ mod tests {
 
     #[test]
     fn metadata_log_checkpoint_fences_old_compaction_and_resumes_after_retry() {
+        const CHILD_ENV: &str = "FFS_METADATA_CHECKPOINT_ISOLATED_CHILD";
+        const PASS_MARKER: &str = "METADATA_CHECKPOINT_ALL_CASES_PASS";
+        if std::env::var_os(CHILD_ENV).as_deref() != Some(OsStr::new("1")) {
+            // Unrelated native-tool launches in the parent test harness can
+            // inherit a flock until exec. Give these ownership-retirement
+            // scenarios their own process while retaining every scoped worker
+            // and contender below. Spawn before acquiring any WAL/holder guard.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tests::metadata_log_checkpoint_fences_old_compaction_and_resumes_after_retry",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let spawned = {
+                let _no_flock_holders = TEST_CHILD_SPAWN_GATE
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                child
+                    .spawn()
+                    .expect("spawn isolated metadata checkpoint test")
+            };
+            let output = spawned.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "isolated metadata checkpoint test failed: {stdout}{stderr}"
+            );
+            assert!(
+                stdout.lines().any(|line| line.trim() == PASS_MARKER),
+                "isolated metadata checkpoint scenarios did not all execute: {stdout}{stderr}"
+            );
+            print!("{stdout}");
+            eprint!("{stderr}");
+            return;
+        }
+
         struct ReleaseOldWrite(std::sync::mpsc::SyncSender<()>);
         impl Drop for ReleaseOldWrite {
             fn drop(&mut self) {
@@ -103999,6 +104041,7 @@ mod tests {
                 assert_eq!(std::fs::metadata(&wal).unwrap().len(), header_size);
             }
         }
+        println!("\n{PASS_MARKER}");
     }
 
     #[cfg(unix)]
