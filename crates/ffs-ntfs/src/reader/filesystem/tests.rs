@@ -546,7 +546,7 @@ fn filesystem_link_count_includes_names_from_extension_records() {
             resident(0x30, 4, "", &filename(27, "link.txt", 1)),
         ],
     );
-    extension[32..40].copy_from_slice(&((u64::from(SEQUENCE) << 48) | 24).to_le_bytes());
+    extension[32..40].copy_from_slice(&((u64::from(SEQUENCE) << 48) | 0x0018).to_le_bytes());
     put(&mut bytes, 39, &extension);
     let reads: Reads = Arc::default();
     let fs = open(bytes, Arc::clone(&reads), None).unwrap();

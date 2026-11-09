@@ -147,7 +147,7 @@ fn namespace_check_rejects_free_and_stale_index_targets_without_trusting_header_
 
     let mut image = fixture(false);
     let mut keys = root_keys();
-    keys[0][..8].copy_from_slice(&((8_u64 << 48) | 24).to_le_bytes());
+    keys[0][..8].copy_from_slice(&((8_u64 << 48) | 0x0018).to_le_bytes());
     root(&mut image, &keys);
     let report = check(image);
     assert!(has(&report, "invalid_index_target"));

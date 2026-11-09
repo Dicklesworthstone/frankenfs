@@ -417,10 +417,10 @@ impl Scan {
                     "the same exact directory name refers to different native file identities",
                 );
             }
-            if !self
+            if self
                 .records
                 .get(&key.record)
-                .is_some_and(|record| record.sequence == key.sequence)
+                .is_none_or(|record| record.sequence != key.sequence)
             {
                 self.report.issue(
                     key.record,
@@ -543,10 +543,10 @@ impl Index<'_> {
                 let block = offset / u64::from(self.block_bytes);
                 if !offset.is_multiple_of(u64::from(self.block_bytes))
                     || block >= MAX_BLOCKS
-                    || !self
+                    || self
                         .bitmap
                         .get((block / 8) as usize)
-                        .is_some_and(|value| value & (1 << (block % 8)) != 0)
+                        .is_none_or(|value| value & (1 << (block % 8)) == 0)
                     || !self.visited.insert(block)
                 {
                     return Err(corrupt(
