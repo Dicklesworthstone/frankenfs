@@ -104240,8 +104240,7 @@ mod tests {
             fs.shutdown_metadata_compactor();
             let before_contender = std::fs::read(&wal).unwrap();
             let error = OpenFs::open_read_write(&cx, &image, &options)
-                .err()
-                .expect("public open must exclude the live metadata WAL owner");
+                .expect_err("public open must exclude the live metadata WAL owner");
             assert!(
                 matches!(error, FfsError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock),
                 "{error:?}"

@@ -297,9 +297,9 @@ impl FrankenFuse {
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_ioctl_for_fuzzing(
         &self,
-        caller_pid: u32,
-        caller_uid: u32,
-        caller_gid: u32,
+        process_id: u32,
+        user_id: u32,
+        group_id: u32,
         ino: u64,
         fh: u64,
         cmd: u32,
@@ -307,7 +307,7 @@ impl FrankenFuse {
         out_size: u32,
     ) -> std::result::Result<Vec<u8>, c_int> {
         match self.dispatch_ioctl(
-            caller_pid, caller_uid, caller_gid, ino, fh, cmd, in_data, out_size,
+            process_id, user_id, group_id, ino, fh, cmd, in_data, out_size,
         ) {
             IoctlResult::Data(data) => Ok(data),
             IoctlResult::Error(errno) => Err(errno),
@@ -1660,9 +1660,9 @@ impl FrankenFuse {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn dispatch_ioctl(
         &self,
-        caller_pid: u32,
-        caller_uid: u32,
-        caller_gid: u32,
+        process_id: u32,
+        user_id: u32,
+        group_id: u32,
         ino: u64,
         fh: u64,
         cmd: u32,
@@ -2090,7 +2090,7 @@ impl FrankenFuse {
                         .map_err(|errno| FfsError::Io(std::io::Error::from_raw_os_error(errno)))?;
                     Self::validate_move_ext_range(attr.blksize, orig_start, donor_start, len)
                         .map_err(|_| FfsError::InvalidGeometry("invalid move_ext range".into()))?;
-                    let resolved_donor = self.resolve_move_ext_donor(caller_pid, donor_fd)?;
+                    let resolved_donor = self.resolve_move_ext_donor(process_id, donor_fd)?;
                     donor_ino = Some(resolved_donor);
                     self.inner
                         .ops
@@ -2963,7 +2963,7 @@ impl FrankenFuse {
                 }
                 let cx = Self::cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
-                    self.inner.ops.btrfs_send(cx, scope, in_data, caller_pid)
+                    self.inner.ops.btrfs_send(cx, scope, in_data, process_id)
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
                     Err(error) => IoctlResult::Error(error.to_errno()),
@@ -3021,15 +3021,15 @@ impl FrankenFuse {
                         cx,
                         scope,
                         InodeNumber(ino),
-                        (caller_pid, caller_uid, caller_gid),
+                        (process_id, user_id, group_id),
                     )?;
                     self.inner.ops.btrfs_subvol_create(
                         cx,
                         scope,
                         InodeNumber(ino),
                         umask,
-                        caller_uid,
-                        caller_gid,
+                        user_id,
+                        group_id,
                         in_data,
                     )?;
                     self.inner.ops.commit_request_scope(cx, scope)?;
@@ -3121,7 +3121,7 @@ impl FrankenFuse {
                 // the move_ext donor resolver), then share its extents into the
                 // ioctl target (`ino`). bd-vh8p9.
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
-                    let src_ino = self.resolve_move_ext_donor(caller_pid, src_fd)?;
+                    let src_ino = self.resolve_move_ext_donor(process_id, src_fd)?;
                     self.inner
                         .ops
                         .clone_file(cx, scope, InodeNumber(ino), src_ino)?;
@@ -3150,7 +3150,7 @@ impl FrankenFuse {
                 };
                 let cx = Self::cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
-                    let src_ino = self.resolve_move_ext_donor(caller_pid, src_fd)?;
+                    let src_ino = self.resolve_move_ext_donor(process_id, src_fd)?;
                     self.inner.ops.clone_file_range(
                         cx,
                         scope,
