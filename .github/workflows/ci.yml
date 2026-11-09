@@ -355,6 +355,8 @@ jobs:
       - name: Build test binaries
         id: native_build
         run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          test -w "$CARGO_TARGET_DIR"
           cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount
           cargo build --release -p ffs-repair --bin ffs-image-repair
           cargo test -p ffs-harness --no-run
@@ -450,13 +452,112 @@ jobs:
         run: ./scripts/e2e/ffs_ext4_rw_smoke.sh
 
       - name: Native btrfs written-image differential
+        id: btrfs_differential
         if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         env:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
           FFS_USE_RCH: "0"
           FFS_SKIP_BUILD: "1"
-        run: ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
+        run: |
+          set -o pipefail
+          ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh | tee "$RUNNER_TEMP/btrfs-differential-positive.log"
+
+      - name: Btrfs differential failure controls
+        if: ${{ !cancelled() && steps.btrfs_differential.conclusion == 'success' }}
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
+          FFS_USE_RCH: "0"
+          FFS_SKIP_BUILD: "1"
+        run: |
+          controls=$(mktemp -d "$RUNNER_TEMP/btrfs-differential-controls.XXXXXX")
+          mkdir "$controls/bin"
+          exec > >(tee "$controls/controller.log") 2>&1
+          FFS_GATE_REAL_CARGO=$(command -v cargo)
+          export FFS_GATE_REAL_CARGO
+          # Only the negative invocations use this shim. Zero selection runs
+          # real libtest; the final-command case deliberately exits 73.
+          cat > "$controls/bin/cargo" <<'CARGO'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          case "${FFS_GATE_NEGATIVE_MODE:-}:$1" in
+            zero:test)
+              echo 'PLANTED_NEGATIVE_ZERO_SELECTION' >&2
+              exec "$FFS_GATE_REAL_CARGO" test -p ffs-btrfs --lib -- --exact __ffs_differential_must_select_zero_tests__
+              ;;
+            final:clippy)
+              echo 'PLANTED_NEGATIVE_FINAL_COMMAND_FAILURE exit=73' >&2
+              exit 73
+              ;;
+          esac
+          exec "$FFS_GATE_REAL_CARGO" "$@"
+          CARGO
+          chmod +x "$controls/bin/cargo"
+
+          expect_failure() {
+            local name="$1" expected="$2"
+            shift 2
+            local log="$controls/$name.log" code=0
+            "$@" > "$log" 2>&1 || code=$?
+            cat "$log"
+            printf 'PLANTED_NEGATIVE_RESULT|case=%s|exit=%s\n' "$name" "$code"
+            test "$code" -ne 0
+            python3 - "$RUNNER_TEMP/btrfs-differential-positive.log" "$log" "$name" "$expected" "$denied" <<'PY'
+          import pathlib, re, sys
+          baseline_path, log_path, name, expected_csv, denied_target = sys.argv[1:]
+          pattern = re.compile(r'^SCENARIO_RESULT\|scenario_id=([^|]+)\|outcome=([^|]+)\|', re.M)
+          def scenarios(text):
+              result = {}
+              for key, outcome in pattern.findall(text):
+                  assert result.setdefault(key, outcome) == outcome, (key, result, outcome)
+              assert result, 'no scenario results executed'
+              return result
+          baseline = scenarios(pathlib.Path(baseline_path).read_text())
+          assert all(value == 'PASS' for value in baseline.values()), baseline
+          required = {'ffs_mount_rw', 'ffs_mutations_reopened', 'ffs_written_btrfs_check',
+                      'writeback_unit_tests', 'crash_consistency_tests', 'clippy_clean',
+                      'btrfs_progs_differential_overall'}
+          assert required <= baseline.keys(), baseline
+          text = pathlib.Path(log_path).read_text()
+          actual = scenarios(text)
+          expected = set(expected_csv.split(','))
+          assert actual.keys() == (expected if name == 'oracle' else baseline.keys()), actual
+          assert {key for key, value in actual.items() if value != 'PASS'} == expected, actual
+          assert all(actual[key] == 'FAIL' for key in expected), actual
+          directory = pathlib.Path(re.search(r'^Log directory: (.+)$', text, re.M)[1])
+          if name == 'target':
+              for file in ['writeback_tests.log', 'crash_consistency_tests.log', 'clippy.log']:
+                  raw = (directory / file).read_text()
+                  assert denied_target and denied_target in raw and 'Permission denied' in raw, file
+          elif name == 'zero':
+              for file in ['writeback_tests.log', 'crash_consistency_tests.log']:
+                  raw = (directory / file).read_text()
+                  assert 'PLANTED_NEGATIVE_ZERO_SELECTION' in raw, file
+                  assert 'test result: ok. 0 passed; 0 failed;' in raw, file
+          elif name == 'final':
+              assert 'PLANTED_NEGATIVE_FINAL_COMMAND_FAILURE exit=73' in (directory / 'clippy.log').read_text()
+          elif name == 'oracle':
+              assert 'mkfs.btrfs not found' in text
+          print(f'DIFFERENTIAL_NEGATIVE_PASS|case={name}|rejected={sorted(expected)}')
+          PY
+          }
+
+          denied=$(mktemp -d "$RUNNER_TEMP/btrfs-denied-target.XXXXXX")
+          chmod 0555 "$denied"
+          test ! -w "$denied"
+          expect_failure target writeback_unit_tests,crash_consistency_tests,clippy_clean,btrfs_progs_differential_overall \
+            env CARGO_TARGET_DIR="$denied" ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
+          expect_failure zero writeback_unit_tests,crash_consistency_tests,btrfs_progs_differential_overall \
+            env PATH="$controls/bin:$PATH" FFS_GATE_NEGATIVE_MODE=zero ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
+          expect_failure final clippy_clean,btrfs_progs_differential_overall \
+            env PATH="$controls/bin:$PATH" FFS_GATE_NEGATIVE_MODE=final ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
+          if PATH=/usr/bin:/bin command -v mkfs.btrfs; then
+            echo 'missing-oracle control requires mkfs.btrfs outside /usr/bin:/bin' >&2
+            exit 1
+          fi
+          expect_failure oracle btrfs_progs_capability_check \
+            env PATH=/usr/bin:/bin ./scripts/e2e/ffs_btrfs_progs_differential_e2e.sh
 
       - name: Collect FUSE helper diagnostics on failure
         if: failure()
@@ -476,8 +577,8 @@ jobs:
             cat artifacts/e2e/fuse-helper-diagnostics/apparmor.log
           fi
 
-      - name: Upload E2E artifacts on failure
-        if: failure()
+      - name: Retain E2E and differential control evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuse-e2e-diagnostics
@@ -485,6 +586,8 @@ jobs:
           path: |
             artifacts/e2e/**/*.log
             artifacts/e2e/**/*.json
+            ${{ runner.temp }}/btrfs-differential-positive.log
+            ${{ runner.temp }}/btrfs-differential-controls.*/*.log
             /tmp/ffs-live-tui-*/*.log
             /tmp/ffs-live-tui-*/*-profile.stdout
             /tmp/ffs-live-tui-*/*-profile.stderr
