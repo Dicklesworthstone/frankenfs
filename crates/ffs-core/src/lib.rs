@@ -13358,12 +13358,14 @@ impl OpenFs {
                 || self.btrfs_alloc_state.is_some())
     }
 
-    /// Not-yet-writable or revoked views can still expose a WAL overlay.
+    /// Raw publication authority precedes allocator activation; not-yet-writable
+    /// or revoked views can also expose a WAL overlay.
     /// Those versions must be visible before allocator initialization as well
     /// as after a forced read-only transition. Only a view without either
     /// mutable state or recovery can assume the base device is authoritative.
     fn has_mutable_view(&self) -> bool {
-        self.ext4_alloc_state.is_some()
+        self.write_authority
+            || self.ext4_alloc_state.is_some()
             || self.btrfs_alloc_state.is_some()
             || self.metadata_log.is_some()
             || self
@@ -48992,8 +48994,9 @@ impl OpenFs {
     /// mount never commits, so `current_snapshot()` is invariant: resolve it
     /// once under the store `RwLock`, then cache it in `ro_snapshot` and return
     /// the cached copy (a `OnceLock` atomic load — no `RwLock`) on every later
-    /// read. A mount that enabled writes always re-reads the live snapshot,
-    /// including after a forced read-only transition.
+    /// read. A view with raw publication authority always re-reads the live
+    /// snapshot, even before allocator activation or after a forced read-only
+    /// transition.
     #[inline]
     fn latest_snapshot(&self) -> Snapshot {
         if self.has_mutable_view() {
@@ -61620,7 +61623,15 @@ mod tests {
         let dev = CountingDevice::new(TestDevice::from_vec(image), ByteOffset(4 * 4096));
         let cx = Cx::for_testing();
 
-        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let fs = OpenFs::from_devices(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions::default(),
+            VolumeAccess::ReadOnly,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         dev.reset_count();
 
         let first = fs.read_inode(&cx, InodeNumber(2)).unwrap();
@@ -62113,7 +62124,15 @@ mod tests {
         let image = build_ext4_image_with_multiblock_index_extent();
         let dev = CountingDevice::new(TestDevice::from_vec(image), ByteOffset(14 * 4096));
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let fs = OpenFs::from_devices(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions::default(),
+            VolumeAccess::ReadOnly,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
         let scope = RequestScope::empty();
         dev.reset_count();
@@ -62226,7 +62245,15 @@ mod tests {
         let image = build_ext4_image_with_shared_index_block();
         let dev = CountingDevice::new(TestDevice::from_vec(image), ByteOffset(15 * 4096));
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let fs = OpenFs::from_devices(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions::default(),
+            VolumeAccess::ReadOnly,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
         let scope = RequestScope::empty();
         dev.reset_count();
@@ -64344,7 +64371,15 @@ mod tests {
         let dev = CountingDevice::new(TestDevice::from_vec(image), ByteOffset(13 * 4096));
         let cx = Cx::for_testing();
 
-        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let fs = OpenFs::from_devices(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions::default(),
+            VolumeAccess::ReadOnly,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         dev.reset_count();
 
         let first = fs
@@ -64375,7 +64410,15 @@ mod tests {
         let image = build_ext4_image_with_multiblock_index_extent();
         let dev = CountingDevice::new(TestDevice::from_vec(image), ByteOffset(15 * 4096));
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let fs = OpenFs::from_devices(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions::default(),
+            VolumeAccess::ReadOnly,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
         dev.reset_count();
 
@@ -64428,7 +64471,15 @@ mod tests {
         let image = build_ext4_image_with_dir();
         let dev = CountingDevice::new(TestDevice::from_vec(image), ByteOffset(10 * 4096));
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let fs = OpenFs::from_devices(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions::default(),
+            VolumeAccess::ReadOnly,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let root = fs.read_inode(&cx, InodeNumber(2)).unwrap();
         dev.reset_count();
 
@@ -75435,8 +75486,9 @@ mod tests {
         let root = InodeNumber(2);
         let mut fs =
             OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
-        // Populate immutable snapshot, inode/parent and directory caches using
-        // actual public reads before enabling writes on this same instance.
+        // Exercise public reads before allocator activation on this same
+        // instance. Raw publication authority already excludes immutable-view
+        // cache fills; a later Abort must retain that exclusion.
         fs.getattr(&cx, root).unwrap();
         fs.readdir(&cx, root, 0).unwrap();
         fs.lookup(&cx, root, OsStr::new("lost+found")).unwrap();
@@ -105947,16 +105999,22 @@ mod tests {
 
     #[test]
     fn read_request_scope_carries_snapshot_without_pinning_gc() {
-        // A read scope carries a snapshot VALUE (for cacheability existence checks)
-        // but does NOT pin it in `active_snapshots` — a read op never reads a pinned
-        // overlay version (overlay reads are gated on `scope.tx`; block reads use the
-        // live/base adapter), so pinning was two global `active_snapshots` write-lock
-        // ops per read with no effect on read results. Consistent with the sibling
-        // `writable_current_adapter_does_not_pin_gc_watermark_bd_mvccgc`.
+        // An immutable view carries a snapshot value for cache checks without
+        // pinning it. Raw-capable views must pin reads even before allocator
+        // activation because another admitted transaction may publish versions.
         let image = build_ext4_image_with_state(EXT4_VALID_FS);
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let fs = OpenFs::from_devices(
+            &cx,
+            Box::new(dev),
+            &OpenOptions::default(),
+            VolumeAccess::ReadOnly,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!fs.write_authority);
 
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
 
@@ -105966,6 +106024,7 @@ mod tests {
         let snapshot = scope
             .snapshot
             .expect("read scope should carry a snapshot value");
+        assert_eq!(snapshot, fs.current_snapshot());
         assert!(scope.tx.is_none(), "request scope should not allocate txn");
         assert_eq!(
             fs.mvcc_active_snapshot_count(),
@@ -105973,21 +106032,8 @@ mod tests {
             "read scope must not pin the GC watermark"
         );
 
-        fs.end_request_scope(
-            &cx,
-            RequestOp::Read,
-            RequestScope {
-                snapshot: Some(snapshot),
-                tx: None,
-                read_snapshot_pinned: false,
-                commit_mode: RequestCommitMode::PerRequest,
-                skip_readdir_prefetch: false,
-                ext4_block_deltas: BTreeMap::new(),
-                ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
-                ext4_accounting_active: false,
-            },
-        )
-        .expect("end request scope");
+        fs.end_request_scope(&cx, RequestOp::Read, scope)
+            .expect("end request scope");
         assert_eq!(fs.mvcc_active_snapshot_count(), 0);
     }
 
@@ -107877,16 +107923,33 @@ mod tests {
         let image = build_ext4_image_with_state(EXT4_VALID_FS);
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let fs = OpenFs::from_devices(
+            &cx,
+            Box::new(dev),
+            &OpenOptions::default(),
+            VolumeAccess::ReadOnly,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!fs.write_authority);
 
         let scope = fs
             .begin_request_scope(&cx, RequestOp::IoctlRead)
             .expect("begin request scope");
-        assert!(scope.snapshot.is_some(), "read ioctl should pin a snapshot");
+        assert!(
+            scope.snapshot.is_some(),
+            "read ioctl should carry a snapshot value"
+        );
         assert!(
             scope.tx.is_none(),
             "read ioctl should not allocate a transaction"
         );
+        assert!(!scope.read_snapshot_pinned);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        fs.end_request_scope(&cx, RequestOp::IoctlRead, scope)
+            .unwrap();
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
     }
 
     #[test]
@@ -109699,27 +109762,89 @@ mod tests {
 
     #[test]
     fn open_fs_mvcc_stage_block_write_and_commit() {
-        let image = build_ext4_image(2); // 4K blocks
-        let dev = TestDevice::from_vec(image);
-        let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        for single_store in [false, true] {
+            let image = build_ext4_image(2); // 4K blocks
+            let dev = TestDevice::from_vec(image);
+            let cx = Cx::for_testing();
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            assert!(!fs.is_writable());
+            assert!(fs.ext4_alloc_state.is_none());
 
-        let block = BlockNumber(5);
-        let bs = fs.block_size() as usize;
+            let block = BlockNumber(5);
+            let bs = fs.block_size() as usize;
+            // Warm both the latest-snapshot and base-device paths before any
+            // raw publication. Neither may become a permanently frozen view.
+            let initial = fs.latest_snapshot();
+            let before = fs.block_device_adapter().read_block(&cx, block).unwrap();
+            assert_ne!(before.as_slice(), vec![0xCC; bs]);
+            let initial_scope = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            assert!(initial_scope.read_snapshot_pinned);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+            fs.end_request_scope(&cx, RequestOp::Read, initial_scope)
+                .unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
 
-        // Stage a write via the OpenFs wrapper method.
-        let mut txn = fs.begin_transaction();
-        fs.stage_block_write(&mut txn, block, vec![0xCC; bs]);
+            // Stage a write via the OpenFs wrapper method.
+            let mut txn = fs.begin_transaction();
+            fs.stage_block_write(&mut txn, block, vec![0xCC; bs]);
 
-        // Commit and verify.
-        let seq = fs.commit_transaction(&cx, txn).expect("commit");
-        assert!(seq.0 > 0);
+            // Commit and verify.
+            let seq = fs.commit_transaction(&cx, txn).expect("commit");
+            assert!(seq.0 > 0);
+            assert!(seq > initial.high);
+            assert_eq!(fs.latest_snapshot().high, seq);
+            assert!(!fs.is_writable());
 
-        // Read back via snapshot.
-        let data = fs
-            .read_block_at_snapshot(&cx, block, fs.current_snapshot())
-            .expect("read after commit");
-        assert_eq!(data, vec![0xCC; bs]);
+            // Retain the explicit snapshot control and verify the actual
+            // current-view adapters used by metadata and allocator loading.
+            let data = fs
+                .read_block_at_snapshot(&cx, block, fs.current_snapshot())
+                .expect("read after commit");
+            assert_eq!(data, vec![0xCC; bs]);
+            assert_eq!(
+                fs.block_device_adapter()
+                    .read_block(&cx, block)
+                    .unwrap()
+                    .as_slice(),
+                vec![0xCC; bs]
+            );
+            assert_eq!(
+                fs.with_block_bytes(&cx, &RequestScope::empty(), block, <[u8]>::to_vec)
+                    .unwrap(),
+                vec![0xCC; bs]
+            );
+            assert_eq!(
+                fs.read_contiguous_blocks_with_scope(&cx, &RequestScope::empty(), block, 1)
+                    .unwrap(),
+                vec![vec![0xCC; bs]]
+            );
+
+            let scope = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            assert!(scope.read_snapshot_pinned);
+            let mut newer = fs.begin_transaction();
+            fs.stage_block_write(&mut newer, block, vec![0xDD; bs]);
+            let next = fs.commit_transaction(&cx, newer).unwrap();
+            fs.prune_mvcc_versions();
+            assert_eq!(
+                fs.read_block_with_scope(&cx, &scope, block).unwrap(),
+                vec![0xCC; bs]
+            );
+            assert_eq!(fs.latest_snapshot().high, next);
+            assert_eq!(
+                fs.block_device_adapter()
+                    .read_block(&cx, block)
+                    .unwrap()
+                    .as_slice(),
+                vec![0xDD; bs]
+            );
+            fs.end_request_scope(&cx, RequestOp::Read, scope).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
     }
 
     #[test]

@@ -79,6 +79,8 @@ jobs:
           test -x "$wal_admission_test"
           sudo -- "$wal_admission_test" --exact tests::metadata_log_requires_owned_durable_admission --nocapture --test-threads=1
           cargo test -p ffs-core --locked --lib tests::append_only_metadata_log_replays_then_checkpoints_clean -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::open_fs_mvcc_stage_block_write_and_commit -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::btrfs_subvol_create_ioctl_commit_failure_is_reported_and_pending_tree_can_sync -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::acl_stored_corruption_preserves_error_origin_and_aborts_metadata_mutation -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::ext4_exchange_rechecks_protected_parents_and_inodes -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::ext4_exchange_batch_preserves_staged_entries_when_moving_their_directory -- --exact --nocapture
