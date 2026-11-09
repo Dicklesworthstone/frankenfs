@@ -1,14 +1,15 @@
 //! Bounded, read-only reconciliation of native FILE_NAME and $I30 identities.
 //!
-//! Cluster ownership, security indexes, link-count/DOS-pair accounting and native
+//! Cluster ownership, security indexes, DOS-pair accounting and native
 //! journal recovery remain separate checks. A report never authorizes mutation.
 
 use super::ownership::{Work, catalog};
 use super::{
-    AllocationIssue, Cx, FfsError, MAX_ISSUES, MAX_RECORDS, NtfsValue, NtfsVolume, Result, Storage,
-    Stream, bit, checkpoint, corrupt, parse, read_bitmap, unsupported,
+    AllocationIssue, Cx, FfsError, MAX_ISSUES, MAX_RECORDS, NtfsVolume, Result, Storage, Stream,
+    bit, checkpoint, corrupt, parse, read_bitmap, unsupported,
 };
 use crate::reader::attributes::AttributeSet;
+use crate::reader::namespace::parse_file_name;
 use crate::reader::{DATA, NtfsFileRecord, NtfsReference, REPARSE_POINT};
 use ffs_ondisk::ntfs::index::{NtfsFileName, NtfsIndexEntry, NtfsIndexRoot, parse_index_block};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -204,16 +205,11 @@ impl Scan {
         cx: &Cx,
     ) -> Result<bool> {
         let mut named = false;
+        let first_name = self.report.file_names_examined;
         for attr in attrs.all()?.iter().filter(|attr| attr.kind == 0x30) {
             checkpoint(cx)?;
             self.entry(false)?;
-            if attr.flags != 0 || !attr.name.is_empty() {
-                return Err(corrupt(0, "invalid FILE_NAME flags or attribute name"));
-            }
-            let NtfsValue::Resident(value) = &attr.value else {
-                return Err(corrupt(0, "nonresident FILE_NAME"));
-            };
-            let name = NtfsFileName::parse(value).map_err(|error| parse(&error))?;
+            let name = parse_file_name(attr)?;
             let identity = Identity::new(
                 NtfsReference {
                     record: u64::from(record.number),
@@ -236,6 +232,20 @@ impl Scan {
                     "base catalog repeats a FILE_NAME identity",
                 );
             }
+        }
+        // This comparison requires the complete validated catalog, including
+        // extension names and DOS aliases. A partial parse or exhausted budget
+        // returns above without claiming that an unobserved name is absent.
+        let native_names = self.report.file_names_examined - first_name;
+        if native_names != u64::from(record.hard_links) {
+            self.report.issue(
+                u64::from(record.number),
+                "link_count_mismatch",
+                &format!(
+                    "FILE header declares {} links but its complete catalog contains {native_names} FILE_NAME attributes (including DOS aliases)",
+                    record.hard_links
+                ),
+            );
         }
         Ok(named)
     }

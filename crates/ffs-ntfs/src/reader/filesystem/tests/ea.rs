@@ -32,7 +32,7 @@ fn put_file_eas(image: &mut [u8], info: &[u8], value: &[u8]) {
         &record(
             24,
             false,
-            2,
+            3,
             &[
                 standard(),
                 resident(DATA, 0, "", b"hello"),

@@ -14,6 +14,50 @@ const I30: &[u16] = &[36, 73, 51, 48];
 const MAX_ENTRIES: usize = 65_536;
 const MAX_BLOCKS: usize = 16_384;
 
+pub(super) fn parse_file_name(attribute: &NtfsAttribute<'_>) -> Result<NtfsFileName> {
+    if attribute.kind != 0x30 || attribute.flags != 0 || !attribute.name.is_empty() {
+        return Err(corrupt(0, "invalid FILE_NAME storage or attribute name"));
+    }
+    let NtfsValue::Resident(value) = &attribute.value else {
+        return Err(corrupt(0, "nonresident FILE_NAME"));
+    };
+    NtfsFileName::parse(value).map_err(|error| parse(&error))
+}
+
+/// Count host-visible hard links from a complete base/extension catalog.
+/// Native FILE headers count every FILE_NAME, including separate DOS aliases;
+/// POSIX nlink excludes namespace 2 but includes combined Win32/DOS namespace 3.
+pub(super) fn host_link_count(cx: &Cx, attributes: &[NtfsAttribute<'_>]) -> Result<u32> {
+    checkpoint(cx)?;
+    let mut names = BTreeSet::new();
+    let mut links = 0;
+    for attribute in attributes.iter().filter(|attribute| attribute.kind == 0x30) {
+        checkpoint(cx)?;
+        let name = parse_file_name(attribute)?;
+        let visible = name.namespace != 2;
+        if !names.insert((
+            name.parent.record,
+            name.parent.sequence,
+            name.namespace,
+            name.name,
+        )) {
+            return Err(corrupt(0, "duplicate FILE_NAME identity in link catalog"));
+        }
+        if names.len() > usize::from(u16::MAX) {
+            return Err(corrupt(
+                0,
+                "FILE_NAME count exceeds native link-count range",
+            ));
+        }
+        links += u32::from(visible);
+    }
+    if links == 0 {
+        return Err(corrupt(0, "live NTFS base record has no non-DOS file name"));
+    }
+    checkpoint(cx)?;
+    Ok(links)
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectoryEntry {
     pub reference: NtfsReference,
@@ -167,13 +211,7 @@ impl NtfsVolume {
         let mut matched = false;
         for attr in attributes.iter().filter(|attr| attr.kind == 0x30) {
             checkpoint(cx)?;
-            if attr.flags != 0 || !attr.name.is_empty() {
-                return Err(corrupt(0, "invalid FILE_NAME storage or attribute name"));
-            }
-            let NtfsValue::Resident(value) = &attr.value else {
-                return Err(corrupt(0, "nonresident FILE_NAME"));
-            };
-            let actual = NtfsFileName::parse(value).map_err(|error| parse(&error))?;
+            let actual = parse_file_name(attr)?;
             matched |= actual == filename;
             unmatched.remove(&(
                 actual.parent.record,

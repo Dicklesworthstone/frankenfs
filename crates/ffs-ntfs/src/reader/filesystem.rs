@@ -330,6 +330,7 @@ impl NtfsFs {
         let record = self.record(cx, ino)?;
         let catalog = self.volume.attributes(cx, &record)?;
         let all = catalog.all()?;
+        let nlink = super::namespace::host_link_count(cx, &all)?;
         let reparse = self.volume.reparse_from_catalog(cx, &catalog)?;
         let standard = catalog.select(&self.volume.geometry, 0x10, &[])?;
         if !standard.resident() || !matches!(standard.size, 48 | 72) {
@@ -419,7 +420,7 @@ impl NtfsFs {
                 FileType::Symlink => 0o777,
                 _ => 0o444,
             },
-            nlink: u32::from(record.hard_links),
+            nlink,
             uid: self.uid,
             gid: self.gid,
             rdev: 0,

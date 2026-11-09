@@ -459,6 +459,15 @@ native root (MFT record 5); other nodes encode the record number and sequence.
 DOS aliases and hard links share one inode. Stale or noncanonical references,
 directory cycles and inconsistent native parents are errors, not alternate roots.
 
+The mounted `nlink` comes from the complete base/extension FILE_NAME catalog:
+POSIX, Win32 and combined Win32/DOS names count once, while a separate DOS alias
+does not add a hard link. Native FILE headers instead count all FILE_NAME
+attributes; `check-allocation --verify-namespace` reports disagreements with that
+native count. The mount does not rewrite either form of metadata. Duplicate or
+malformed identities and catalogs without any non-DOS name fail before an inode
+attribute is cached. Directory counts retain this native-name projection; no
+additional Unix child-directory count is manufactured.
+
 The adapter provides lookup, getattr, paginated readdir, regular-file reads,
 relative-link readlink, read-only open admission, statfs and non-writing
 synchronization. Unnamed DATA

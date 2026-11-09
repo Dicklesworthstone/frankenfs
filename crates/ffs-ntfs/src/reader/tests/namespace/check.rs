@@ -11,13 +11,15 @@ fn bitmap(image: &mut Image, records: &[usize]) {
     for &number in records {
         bits[number / 8] |= 1 << (number % 8);
     }
-    let mft = file_record(
+    let mut mft = file_record(
         0,
         &[
             mapped(&[0x11, 16, 4, 0x11, 48, 36, 0], 64, 32 * 1024, 32 * 1024, 0),
             resident(0xB0, 1, "", &bits),
         ],
     );
+    // This constructed MFT has no FILE_NAME, unlike a full native system file.
+    mft[18..20].copy_from_slice(&0_u16.to_le_bytes());
     image.put_record(0, &mft);
     image.bytes[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&mft);
 }
@@ -25,14 +27,19 @@ fn bitmap(image: &mut Image, records: &[usize]) {
 fn fixture(external: bool) -> Image {
     let mut image = namespace_image(external);
     bitmap(&mut image, ALLOCATED);
+    for number in [3, 5, 10] {
+        let at = Image::record_offset(number);
+        image.bytes[at + 18..at + 20].copy_from_slice(&0_u16.to_le_bytes());
+    }
+    let at = Image::record_offset(24);
+    image.bytes[at + 18..at + 20].copy_from_slice(&2_u16.to_le_bytes());
     image
 }
 
 fn root(image: &mut Image, keys: &[Vec<u8>]) {
-    image.put_record(
-        5,
-        &directory_record(5, &[resident(0x90, 0, "$I30", &index_root(keys, false))]),
-    );
+    let mut record = directory_record(5, &[resident(0x90, 0, "$I30", &index_root(keys, false))]);
+    record[18..20].copy_from_slice(&0_u16.to_le_bytes());
+    image.put_record(5, &record);
 }
 
 fn check(image: Image) -> NamespaceReport {
@@ -44,6 +51,24 @@ fn check(image: Image) -> NamespaceReport {
 
 fn has(report: &NamespaceReport, category: &str) -> bool {
     report.issues.iter().any(|issue| issue.category == category)
+}
+
+#[test]
+fn namespace_check_native_link_count_includes_dos_aliases() {
+    for links in [0_u16, 1, 3, u16::MAX] {
+        let mut image = fixture(false);
+        let at = Image::record_offset(24);
+        image.bytes[at + 18..at + 20].copy_from_slice(&links.to_le_bytes());
+        let report = check(image);
+        assert!(report.complete, "{report:?}");
+        assert!(!report.is_consistent(), "{report:?}");
+        assert!(
+            report.issues.iter().any(|issue| {
+                issue.category == "link_count_mismatch" && issue.record == Some(24)
+            }),
+            "native header {links} must disagree with two FILE_NAME attributes, including the DOS alias: {report:?}"
+        );
+    }
 }
 
 #[test]
@@ -206,6 +231,8 @@ fn extension_fixture(nonresident_list: bool, allocate_extension: bool) -> Image 
             &[resident(0x30, 3, "", &name_value(5, "A~1.TXT", 2))],
         ),
     );
+    let at = Image::record_offset(24);
+    image.bytes[at + 18..at + 20].copy_from_slice(&2_u16.to_le_bytes());
     image
 }
 
@@ -283,10 +310,51 @@ fn namespace_check_accepts_file_hard_links_and_directory_dos_aliases() {
     let mut keys = root_keys();
     keys.insert(4, key(27, 5, "SUBDIR~1", 2, None));
     root(&mut image, &keys);
+    for (number, links) in [(24, 3_u16), (27, 2)] {
+        let at = Image::record_offset(number);
+        image.bytes[at + 18..at + 20].copy_from_slice(&links.to_le_bytes());
+    }
     let report = check(image);
     assert!(report.is_consistent(), "{report:?}");
     assert_eq!(report.file_names_examined, 8);
     assert_eq!(report.index_entries_examined, 8);
+}
+
+#[test]
+fn namespace_check_does_not_compare_partial_catalog_link_counts() {
+    for nonresident in [false, true] {
+        let mut image = extension_fixture(nonresident, true);
+        let at = Image::record_offset(26);
+        image.bytes[at + 510] ^= 1;
+        let report = check(image);
+        assert!(!report.complete && !report.is_consistent(), "{report:?}");
+        assert_eq!(report.missing_index_entries, None);
+        assert_eq!(report.unreachable_records, None);
+        assert!(
+            !report.issues.iter().any(|issue| {
+                issue.category == "link_count_mismatch" && issue.record == Some(24)
+            })
+        );
+    }
+}
+
+#[test]
+fn namespace_check_retains_known_link_damage_when_later_records_are_unreadable() {
+    let mut image = fixture(false);
+    let at = Image::record_offset(24);
+    image.bytes[at + 18..at + 20].copy_from_slice(&1_u16.to_le_bytes());
+    let at = Image::record_offset(29);
+    image.bytes[at + 510] ^= 1;
+    let report = check(image);
+    assert!(!report.complete && !report.is_consistent(), "{report:?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| { issue.category == "link_count_mismatch" && issue.record == Some(24) })
+    );
+    assert_eq!(report.missing_index_entries, None);
+    assert_eq!(report.unreachable_records, None);
 }
 
 #[test]

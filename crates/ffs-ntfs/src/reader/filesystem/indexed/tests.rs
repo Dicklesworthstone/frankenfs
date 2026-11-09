@@ -289,6 +289,7 @@ fn image(external: bool) -> Vec<u8> {
                 true,
                 &[
                     standard(0),
+                    resident(0x30, 501, "", &filename(5, ".", 3)),
                     root(&[key(26, 5, "middle", 0, Some(0)), terminal(Some(8))], true),
                     mapped(0xA0, 41, "$I30", 700, 16),
                     resident(0xB0, 42, "$I30", &[3]),
@@ -306,7 +307,15 @@ fn image(external: bool) -> Vec<u8> {
         put(
             &mut bytes,
             5,
-            &file(5, true, &[standard(0), root(&left, false)]),
+            &file(
+                5,
+                true,
+                &[
+                    standard(0),
+                    resident(0x30, 501, "", &filename(5, ".", 3)),
+                    root(&left, false),
+                ],
+            ),
         );
     }
     put(

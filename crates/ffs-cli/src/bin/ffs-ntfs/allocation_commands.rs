@@ -209,8 +209,7 @@ fn combined_json(
     let namespace_json = namespace.map_or_else(
         || Value::Null,
         |report| {
-            output["not_checked"][2] =
-                "native link-count policy and non-I30 secondary indexes".into();
+            output["not_checked"][2] = "DOS alias pairing and non-I30 secondary indexes".into();
             let issues: Vec<_> = report
                 .issues
                 .iter()

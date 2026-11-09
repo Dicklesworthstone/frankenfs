@@ -225,6 +225,7 @@ fn image() -> Vec<u8> {
             1,
             &[
                 standard(),
+                resident(0x30, 501, "", &filename(5, ".", 3)),
                 index(
                     &[
                         (24, "hello.txt", 1),
@@ -274,7 +275,7 @@ fn image() -> Vec<u8> {
         &record(
             24,
             false,
-            2,
+            3,
             &[
                 standard(),
                 resident(DATA, 0, "", b"hello"),
@@ -462,6 +463,169 @@ fn root_alias_hard_link_native_names_parent_and_metadata() {
     );
     assert!(fs.getattr(&cx, &mut scope, InodeNumber(0)).is_err());
     assert!(fs.getattr(&cx, &mut scope, InodeNumber(u64::MAX)).is_err());
+}
+
+#[test]
+fn filesystem_link_count_excludes_a_dos_alias_without_losing_real_hard_links() {
+    let cx = Cx::for_testing();
+    for separate_hard_link in [false, true] {
+        let mut bytes = image();
+        let mut attrs = vec![
+            standard(),
+            resident(DATA, 0, "", b"hello"),
+            resident(0x30, 2, "", &filename(5, "hello.txt", 1)),
+            resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
+        ];
+        if separate_hard_link {
+            attrs.push(resident(0x30, 4, "", &filename(27, "link.txt", 1)));
+        }
+        put(
+            &mut bytes,
+            24,
+            &record(24, false, if separate_hard_link { 3 } else { 2 }, &attrs),
+        );
+        let fs = open(bytes, Arc::default(), None).unwrap();
+        let mut scope = RequestScope::empty();
+        let file = fs
+            .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+            .unwrap();
+        assert_eq!(file.nlink, if separate_hard_link { 2 } else { 1 });
+        let alias = fs
+            .lookup(&cx, &mut scope, ROOT, OsStr::new("hello~1.txt"))
+            .unwrap();
+        assert_eq!((alias.ino, alias.nlink), (file.ino, file.nlink));
+        assert_eq!(
+            fs.getattr(&cx, &mut scope, file.ino).unwrap().nlink,
+            file.nlink
+        );
+    }
+}
+
+#[test]
+fn filesystem_link_count_includes_names_from_extension_records() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    let mut list = Vec::new();
+    for (kind, number, id) in [
+        (0x10_u32, 24_u64, 500_u16),
+        (0x30, 24, 2),
+        (0x30, 39, 3),
+        (0x30, 39, 4),
+        (DATA, 24, 0),
+    ] {
+        let mut entry = [0; 32];
+        entry[..4].copy_from_slice(&kind.to_le_bytes());
+        entry[4..6].copy_from_slice(&32_u16.to_le_bytes());
+        entry[7] = 26;
+        entry[16..24].copy_from_slice(&((u64::from(SEQUENCE) << 48) | number).to_le_bytes());
+        entry[24..26].copy_from_slice(&id.to_le_bytes());
+        list.extend(entry);
+    }
+    put(
+        &mut bytes,
+        24,
+        &record(
+            24,
+            false,
+            3,
+            &[
+                standard(),
+                resident(0x20, 10, "", &list),
+                resident(DATA, 0, "", b"hello"),
+                resident(0x30, 2, "", &filename(5, "hello.txt", 1)),
+            ],
+        ),
+    );
+    // Slot 39 is allocated in the fixture's MFT bitmap and otherwise unused.
+    let mut extension = record(
+        39,
+        false,
+        0,
+        &[
+            resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
+            resident(0x30, 4, "", &filename(27, "link.txt", 1)),
+        ],
+    );
+    extension[32..40].copy_from_slice(&((u64::from(SEQUENCE) << 48) | 24).to_le_bytes());
+    put(&mut bytes, 39, &extension);
+    let reads: Reads = Arc::default();
+    let fs = open(bytes, Arc::clone(&reads), None).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+        .unwrap();
+    assert_eq!(file.nlink, 2);
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello~1.txt"))
+            .unwrap()
+            .ino,
+        file.ino
+    );
+    let parent = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir"))
+        .unwrap();
+    let link = fs
+        .lookup(&cx, &mut scope, parent.ino, OsStr::new("link.txt"))
+        .unwrap();
+    assert_eq!((link.ino, link.nlink), (file.ino, 2));
+    assert!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(at, _)| { *at == (BASE + 4 * 512 + 39 * 1024) as u64 })
+    );
+}
+
+#[test]
+fn filesystem_link_count_validates_every_name_before_returning_a_count() {
+    use crate::reader::namespace::host_link_count;
+
+    let cx = Cx::for_testing();
+    let first = resident(0x30, 2, "", &filename(5, "hello.txt", 1));
+    for case in 0..5 {
+        let mut last = match case {
+            0 => resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 4)),
+            1 => resident(0x30, 3, "invalid", &filename(5, "HELLO~1.TXT", 2)),
+            2 => first.clone(),
+            _ => resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
+        };
+        if case == 2 {
+            last[14..16].copy_from_slice(&3_u16.to_le_bytes());
+        } else if case == 3 {
+            last[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        } else if case == 4 {
+            last = mapped(&[0x11, 1, 20, 0], 1, 512, false);
+            last[..4].copy_from_slice(&0x30_u32.to_le_bytes());
+        }
+        let raw = record(24, false, 2, &[first.clone(), last]);
+        let parsed = NtfsFileRecord::parse(&raw).unwrap();
+        assert!(
+            host_link_count(&cx, &parsed.attributes().unwrap()).is_err(),
+            "case {case}"
+        );
+    }
+    for namespace in [0, 1, 3] {
+        let raw = record(
+            24,
+            false,
+            1,
+            &[resident(0x30, 2, "", &filename(5, "VALID", namespace))],
+        );
+        let parsed = NtfsFileRecord::parse(&raw).unwrap();
+        assert_eq!(
+            host_link_count(&cx, &parsed.attributes().unwrap()).unwrap(),
+            1
+        );
+    }
+    let raw = record(
+        24,
+        false,
+        1,
+        &[resident(0x30, 2, "", &filename(5, "ALIAS~1", 2))],
+    );
+    let parsed = NtfsFileRecord::parse(&raw).unwrap();
+    assert!(host_link_count(&cx, &parsed.attributes().unwrap()).is_err());
 }
 
 #[test]
@@ -1106,6 +1270,7 @@ fn directory_encryption_defaults_preserve_mounts_without_admitting_efs_data() {
                 1,
                 &[
                     standard_with_flags(root_flags),
+                    resident(0x30, 501, "", &filename(5, ".", 3)),
                     index(
                         &[
                             (24, "hello.txt", 1),
@@ -1234,7 +1399,7 @@ fn wof_image(
         &record(
             24,
             false,
-            2,
+            3,
             &[
                 standard_with_flags(0x600),
                 placeholder(expected.len(), initialized.unwrap_or(expected.len())),

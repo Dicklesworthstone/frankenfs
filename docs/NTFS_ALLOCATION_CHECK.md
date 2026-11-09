@@ -128,6 +128,17 @@ reachability is derived from verified links, with reserved unnamed system slots
 kept separate from ordinary user records. Duplicate names and invalid directory
 hierarchies are reported without selecting an owner or changing the image.
 
+Each completely parsed base catalog also checks the native FILE header's link
+count. Every FILE_NAME attribute counts, including separate DOS aliases and names
+held in validated extension records. A combined Win32/DOS name counts once.
+Disagreements produce a `link_count_mismatch` issue naming the base record and
+both counts; the source remains unchanged. An unreadable extension, malformed
+name or exhausted budget prevents this comparison for that base record, while a
+previously established mismatch remains reportable if another record later fails.
+This is native attribute accounting, distinct from the mounted POSIX `nlink`,
+which excludes separate DOS aliases. The distinction follows the independent
+[Linux v6.19 NTFS3 inode reader](https://github.com/torvalds/linux/blob/v6.19/fs/ntfs3/inode.c).
+
 The library API is `NtfsVolume::check_namespace(cx, NamespaceLimits)`. Its types
 are exported from `ffs_ntfs::reader::allocation`. The defaults are 1,048,576 MFT
 slots, 1,048,576 combined FILE_NAME/index identities and one GiB of metadata work.
@@ -151,8 +162,8 @@ success. Incomplete coverage leaves `missing_index_entries` and
 the MFT bitmap or UpCase authority also fails the call. Diagnostics retain
 bounded issue details and omitted counts; `reclaimable_records` remains null.
 
-This verifies the selected native namespace structure. It does not validate the
-FILE header's hard-link count/DOS-alias pairing policy, unallocated FILE headers,
+This verifies the selected native namespace structure. It does not validate
+DOS-to-Win32 alias pairing, unallocated FILE headers,
 security descriptors, non-I30 secondary indexes, payloads or the journal. Full
 NTFS checking, formatting, resize and native mutation remain open under
 `bd-h7cme` and the related writer work.
