@@ -710,7 +710,11 @@ fn indexed_fsops_checks_the_selected_native_spelling_not_only_the_request() {
             &file(
                 5,
                 true,
-                &[standard(0), root(&[entry, terminal(None)], false)],
+                &[
+                    standard(0),
+                    resident(0x30, 501, "", &filename(5, ".", 3)),
+                    root(&[entry, terminal(None)], false),
+                ],
             ),
         );
         put(

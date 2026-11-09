@@ -1219,7 +1219,11 @@ fn stream_eviction_keeps_the_limit_and_reloads_exact_data() {
                 number,
                 false,
                 1,
-                &[standard(), resident(DATA, 0, "", &number.to_le_bytes())],
+                &[
+                    standard(),
+                    resident(DATA, 0, "", &number.to_le_bytes()),
+                    resident(0x30, 1, "", &filename(5, &format!("file{number}"), 1)),
+                ],
             ),
         );
     }

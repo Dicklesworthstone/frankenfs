@@ -354,8 +354,19 @@ fn mountable_image(bank: bool, decision: u16) -> Vec<u8> {
             .copy_from_slice(&116_444_736_000_000_000_u64.to_le_bytes());
     }
     let standard = resident(0x10, 0, &standard);
-    let mut root = file(5, &[standard.clone(), mount_index()]);
+    let mut root_name = mount_filename(".");
+    root_name[40..56].fill(0);
+    root_name[65] = 3;
+    let mut root = file(
+        5,
+        &[
+            standard.clone(),
+            resident(0x30, 2, &root_name),
+            mount_index(),
+        ],
+    );
     root[22..24].copy_from_slice(&3_u16.to_le_bytes());
+    root[40..42].copy_from_slice(&3_u16.to_le_bytes());
     let upcase = file(10, &[mapped(1024, 256)]);
     for (number, record) in [(5, root), (10, upcase)] {
         let at = BASE + 128 * 512 + number * 1024;
