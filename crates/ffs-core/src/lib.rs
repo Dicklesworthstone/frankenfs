@@ -42821,6 +42821,16 @@ impl OpenFs {
         // stripe leaves the second copy at an older generation, so any fallback
         // read (kernel or ours) of that copy sees a stale, transid-mismatched
         // node and DUP redundancy silently disappears.
+        // The executor callback accepts only BtrfsMutationError. Retain an
+        // actual device failure separately so that boundary does not erase its
+        // errno or cancellation origin. Planner/serialization failures still
+        // use the ordinary mutation-error mapping.
+        let device_write_error = std::cell::Cell::new(None);
+        let map_writeback_error = |error: BtrfsMutationError| {
+            device_write_error
+                .take()
+                .unwrap_or_else(|| btrfs_mutation_to_ffs(&error))
+        };
         let write_mirrored = |logical: u64, bytes: &[u8]| -> Result<(), BtrfsMutationError> {
             let mapping = ffs_ondisk::map_logical_to_stripes(&chunks_for_writeback, logical)
                 .map_err(|_| {
@@ -42840,7 +42850,10 @@ impl OpenFs {
             for stripe in &mapping.stripes {
                 self.dev
                     .write_all_at(cx, ByteOffset(stripe.physical), bytes)
-                    .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+                    .map_err(|error| {
+                        device_write_error.set(Some(error));
+                        BtrfsMutationError::InvalidConfig("disk write failed")
+                    })?;
             }
             Ok(())
         };
@@ -42878,7 +42891,7 @@ impl OpenFs {
             Ok(())
         });
 
-        flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        flush_result.map_err(map_writeback_error)?;
         // bd-rsjvf: attribute the per-commit write set BY TREE. Without this the
         // only available number is the total, and `btrfs inspect-internal
         // dump-tree` cannot recover the split (the newest on-disk generation does
@@ -43024,7 +43037,7 @@ impl OpenFs {
                 nodes_written = nodes_written.saturating_add(1);
                 Ok(())
             });
-            csum_flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            csum_flush_result.map_err(map_writeback_error)?;
             csum_nodes_written = nodes_written.saturating_sub(csum_nodes_before);
 
             // Create (or update) the CSUM_TREE ROOT_ITEM in root_tree pointing
@@ -43136,7 +43149,7 @@ impl OpenFs {
                 nodes_written = nodes_written.saturating_add(1);
                 Ok(())
             });
-            subvol_flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            subvol_flush_result.map_err(map_writeback_error)?;
 
             // Wire the just-written subvol tree into its ROOT_ITEM in root_tree.
             // The create path inserts the ROOT_ITEM (and ROOT_REF/BACKREF); here
@@ -43351,7 +43364,7 @@ impl OpenFs {
                         nodes_written = nodes_written.saturating_add(1);
                         Ok(())
                     })
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                    .map_err(map_writeback_error)?;
 
                 let dev_root_key = BtrfsKey {
                     objectid: BTRFS_DEV_TREE_OBJECTID,
@@ -43435,7 +43448,7 @@ impl OpenFs {
                         nodes_written = nodes_written.saturating_add(1);
                         Ok(())
                     })
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                    .map_err(map_writeback_error)?;
 
                 new_chunk_root = Some((
                     chunk_disk_ctx.block_to_bytenr(alloc.chunk_tree.root_block()),
@@ -43631,7 +43644,7 @@ impl OpenFs {
             nodes_written = nodes_written.saturating_add(1);
             Ok(())
         });
-        extent_flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        extent_flush_result.map_err(map_writeback_error)?;
         let extent_nodes_written = nodes_written.saturating_sub(extent_nodes_before);
 
         // Update ROOT_ITEM for EXTENT_TREE in root_tree.
@@ -43725,7 +43738,7 @@ impl OpenFs {
             nodes_written = nodes_written.saturating_add(1);
             Ok(())
         });
-        root_flush_result.map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        root_flush_result.map_err(map_writeback_error)?;
         let root_nodes_written = nodes_written.saturating_sub(root_nodes_before);
         debug!(
             target: "ffs::btrfs::writeback",
@@ -43821,9 +43834,11 @@ impl OpenFs {
                 let node_bytes = serialized.len() as u64;
                 let logical = fst_ctx.block_to_bytenr(block);
                 write_mirrored(logical, &serialized).map_err(|e| {
-                    FfsError::Io(std::io::Error::other(format!(
-                        "free-space tree write failed: {e}"
-                    )))
+                    device_write_error.take().unwrap_or_else(|| {
+                        FfsError::Io(std::io::Error::other(format!(
+                            "free-space tree write failed: {e}"
+                        )))
+                    })
                 })?;
                 bytes_written = bytes_written.saturating_add(node_bytes);
                 nodes_written = nodes_written.saturating_add(1);
