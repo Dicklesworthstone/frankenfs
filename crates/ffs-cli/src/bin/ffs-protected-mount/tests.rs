@@ -1061,7 +1061,8 @@ fn protected_mount_ntfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
     let sidecar_path = dir.path().join("image.ffs-rq");
     let cx = Cx::for_testing();
 
-    // Build a valid 1 MiB NTFS 3.1 image with 512-byte sectors/clusters and a 16 KiB non-resident file
+    // Construct a 1 MiB NTFS 3.1 fixture with 512-byte sectors/clusters and a
+    // 12 KiB non-resident file.
     let length = 1024 * 1024_usize;
     let mut image = vec![0_u8; length];
     let boot = &mut image[..512];
@@ -1220,7 +1221,12 @@ fn protected_mount_ntfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
             5,
             true,
             1,
-            &[standard.clone(), resident(0x90, 40, "$I30", &root_idx)],
+            &[
+                standard.clone(),
+                // Native root name: self-reference in the Win32/DOS namespace.
+                resident(0x30, 501, "", &filename(5, ".", 3)),
+                resident(0x90, 40, "$I30", &root_idx),
+            ],
         ),
     );
     put(
