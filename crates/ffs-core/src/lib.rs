@@ -13358,11 +13358,18 @@ impl OpenFs {
                 || self.btrfs_alloc_state.is_some())
     }
 
-    /// A forced read-only transition revokes writes but retains committed
-    /// overlay state. Only an image that never enabled writes can use caches
-    /// and adapters that assume the base device is the whole current view.
+    /// Not-yet-writable or revoked views can still expose a WAL overlay.
+    /// Those versions must be visible before allocator initialization as well
+    /// as after a forced read-only transition. Only a view without either
+    /// mutable state or recovery can assume the base device is authoritative.
     fn has_mutable_view(&self) -> bool {
-        self.ext4_alloc_state.is_some() || self.btrfs_alloc_state.is_some()
+        self.ext4_alloc_state.is_some()
+            || self.btrfs_alloc_state.is_some()
+            || self.metadata_log.is_some()
+            || self
+                .mvcc_wal_recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.versions_replayed != 0)
     }
 
     /// Incrementally checkpoint MVCC versions to this filesystem's base device.
@@ -104329,6 +104336,7 @@ mod tests {
                 fs.current_snapshot().high
             );
             assert_eq!(*fs.mvcc_flushed_through.lock(), home_cursor);
+            let expected_counts = fs.statfs(&cx, InodeNumber(2)).unwrap();
             let base_only = OpenFs::from_device(
                 &cx,
                 Box::new(TestDevice::from_vec(std::fs::read(&image).unwrap())),
@@ -104339,12 +104347,53 @@ mod tests {
                 base_only.lookup(&cx, InodeNumber(2), OsStr::new("second.txt")),
                 Err(FfsError::NotFound(_))
             ));
+            let physical_counts = base_only.statfs(&cx, InodeNumber(2)).unwrap();
+            assert!(physical_counts.blocks_free > expected_counts.blocks_free);
+            assert!(physical_counts.files_free > expected_counts.files_free);
             drop(base_only);
 
             // Simulate a process crash: stop the optional compactor, but deliberately
             // do not call flush_on_destroy (the base image is not the authority).
             fs.shutdown_metadata_compactor();
             drop(fs);
+
+            let home_hash = blake3::hash(&std::fs::read(&image).unwrap());
+            // The path-based read-only API still refuses WAL authority. An
+            // explicitly supplied device may expose replayed versions before
+            // allocator initialization, without an active metadata writer.
+            let reader_options = OpenOptions {
+                mvcc_wal_path: Some(wal.clone()),
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            assert!(matches!(
+                OpenFs::open_with_options(&cx, &image, &reader_options),
+                Err(FfsError::ReadOnly)
+            ));
+            let reader = OpenFs::from_device(
+                &cx,
+                Box::new(FileByteDevice::open_read_only(&image).unwrap()),
+                &reader_options,
+            )
+            .unwrap();
+            assert!(!reader.is_writable());
+            assert_eq!(reader.statfs(&cx, InodeNumber(2)).unwrap(), expected_counts);
+            assert_eq!(
+                reader
+                    .lookup(&cx, InodeNumber(2), OsStr::new("second.txt"))
+                    .unwrap()
+                    .ino,
+                second
+            );
+            assert_eq!(
+                reader.read(&cx, second, 0, bs).unwrap(),
+                vec![0x6B; bs as usize]
+            );
+            assert!(matches!(
+                reader.create(&cx, InodeNumber(2), OsStr::new("denied.txt"), 0o600, 0, 0),
+                Err(FfsError::ReadOnly)
+            ));
+            drop(reader);
 
             let mut recovered =
                 OpenFs::open_read_write(&cx, &image, &options).expect("replay metadata WAL");
@@ -104353,7 +104402,33 @@ mod tests {
                 .expect("recovery report after WAL fsync");
             assert_eq!(report.commits_replayed, 3);
             assert!(report.versions_replayed > 0);
+            assert!(!recovered.is_writable());
+            assert_eq!(
+                recovered.statfs(&cx, InodeNumber(2)).unwrap(),
+                expected_counts
+            );
+            assert_eq!(
+                u64::from(
+                    recovered
+                        .count_free_blocks_in_group(&cx, GroupNumber(0))
+                        .unwrap()
+                ),
+                expected_counts.blocks_free
+            );
+            assert_eq!(
+                u64::from(
+                    recovered
+                        .count_free_inodes_in_group(&cx, GroupNumber(0))
+                        .unwrap()
+                ),
+                expected_counts.files_free
+            );
             recovered.enable_writes(&cx).expect("enable after replay");
+            assert_eq!(
+                recovered.statfs(&cx, InodeNumber(2)).unwrap(),
+                expected_counts
+            );
+            assert_eq!(blake3::hash(&std::fs::read(&image).unwrap()), home_hash);
             let attr = recovered
                 .lookup(&cx, InodeNumber(2), OsStr::new("logged.txt"))
                 .expect("replayed name is visible");
@@ -104384,11 +104459,16 @@ mod tests {
                 u64::try_from(ffs_mvcc::wal::HEADER_SIZE).expect("header size"),
                 "clean checkpoint must retire the WAL tail"
             );
+            let checkpoint_hash = blake3::hash(&std::fs::read(&image).unwrap());
             let (clean, output) =
                 run_e2fsck(&image).expect("native WAL regression requires e2fsck");
+            assert_eq!(
+                blake3::hash(&std::fs::read(&image).unwrap()),
+                checkpoint_hash
+            );
             assert!(
                 clean,
-                "e2fsck must accept the checkpointed image:\n{output}"
+                "e2fsck must accept the checkpointed image (single_store={single_store}):\n{output}"
             );
         }
     }
