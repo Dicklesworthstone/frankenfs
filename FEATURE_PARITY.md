@@ -2063,6 +2063,23 @@
 > This proves explicit single-image sidecar mounts, not default self-healing,
 > native ownership, multi-device repair or recovery from an unfinished epoch.
 >
+> **Protected companion mounts (`bd-q19uk`, verified 2026-11-10):** the
+> [hosted mounted-repair step](https://github.com/Dicklesworthstone/frankenfs/actions/runs/42843276029/job/129923865266)
+> at `d158a7450f2b3888dad90a701fca78b410c18950` passed all three FAT32,
+> NTFS and ZFS cases with no failures or ignores. Each uses the production
+> `ffs-protected-mount` and kernel reads to repair two physical 4 KiB blocks
+> damaged after mount admission, checking exact application and restored disk
+> bytes. FAT32 also verifies a fresh image/archive capture after fsync while
+> the writer descriptor remains open, reads its acknowledged data independently
+> through `ffs-fat`, and checks a fresh read-only remount. Seven real FAT CLI
+> operations (format, mkdir, create, replace, rename, unlink and rmdir) refresh
+> protection; native `fsck.fat -n` checks pass for FAT32 and formatted FAT16.
+> The lane uses declared ordinary external unmounts, verifies CLI exit and
+> observed helper retirement, and retains its inputs and captures. NTFS/ZFS
+> inputs are constructed supported-profile images; this does not establish
+> native Windows/OpenZFS interchange. Automatic-unmount cleanup remains a
+> separate failing live-telemetry gate; no host-policy relaxation is included.
+>
 > **Repair-tail safety (`bd-plamw`, verified 2026-10-11):** complete requested
 > symbol/descriptor plans now fail closed before their first write. Explicit
 > rebuild admission precedes journal/superblock recovery; unsafe mounted repair
