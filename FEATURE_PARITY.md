@@ -3131,3 +3131,31 @@ The new CLI/engine regressions remain unexecuted: a further CLI compile retry
 again received SIGKILL while building `asupersync`. Workspace formatting reports
 13 unchanged files, and UBS could not execute its launcher. Native OpenZFS pool
 and kernel FUSE execution remain unverified. See `docs/ZFS_READ_PROFILE.md`.
+
+### NTFS complete mirror and indexed security-store checks (2026-11-10)
+
+`ffs-ntfs check-allocation --verify-mft-mirror` compares every record in the
+initialized native mirror, validates independent physical storage and required
+bootstrap allocation, and distinguishes required-prefix agreement from later
+differences. The pass compares used metadata after fixups, preserving valid
+differences in unused slack and USA transport bytes. It never chooses a repair
+source. Native NTFS-3G images with 512-byte, 4 KiB and 64 KiB clusters are prepared;
+raw inspection confirms all 64 records of the large-cluster mirror agree.
+
+`ffs-ntfs check-security` traverses both complete `$SII` and `$SDH` trees with
+native unsigned hash/ID collation, reconciles all header identities and verifies
+every indexed primary/duplicate SDS descriptor pair. Shared metadata-work bounds,
+tree reachability, descriptor overlap, corruption, I/O and cancellation fail the
+whole security check instead of certifying a prefix. This does not check
+unindexed SDS data, every file's security reference, host access decisions,
+allocation/recovery state or native write admission.
+
+All 958 on-disk tests pass, including the new SDH parser regressions; strict
+all-targets on-disk Clippy and workspace formatting pass. Nine mirror library
+tests, eight security-audit library tests and five CLI controls are authored and
+independently reviewed. Their execution is still pending: larger builds stop in
+the existing `asupersync` dependency with kernel-confirmed OOM kills on the shared
+host. Native byte inspection is not Rust checker execution or Windows
+qualification. The full NTFS-07/`bd-h7cme` goals remain open, with no tracked V1
+parity or performance credit added. See `docs/NTFS_ALLOCATION_CHECK.md` and
+`docs/NTFS_READ_PROFILE.md` for commands and precise scope.

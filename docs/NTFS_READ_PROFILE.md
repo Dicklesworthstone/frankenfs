@@ -604,6 +604,64 @@ Descriptor and ACE framing also follows Microsoft's MS-DTYP
 and [callback ACE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/c9579cf4-0f4a-44f1-9444-422dfb10557a)
 specifications. These define native structure, not a host access policy.
 
+## Complete native security-store checking
+
+`ffs-ntfs check-security IMAGE --offline-image` checks both complete native
+`$Secure` indexes and every descriptor they reference, including descriptors
+unrelated to a selected file:
+
+```bash
+ffs-ntfs check-security volume.img --offline-image
+ffs-ntfs check-security disk.img --offline-image --offset 1048576 --length 67108864 \
+  --max-entries 65536 --max-metadata-bytes 536870912
+```
+
+The library entry point is `NtfsVolume::check_security(cx, SecurityCheckLimits)`.
+It walks `$SII` and `$SDH` once each, checks native collation, parent ranges,
+INDX fixups, allocation-bitmaps and complete reachability, then reconciles the
+entire `(hash, security ID, SDS offset, length)` tuple in both directions.
+`$SDH` orders unsigned native hashes first and security IDs second; legitimate
+hash collisions remain distinct. Its native trailing `II` padding is outside
+the 20-byte data header and is not required to be zero.
+
+Every indexed SDS primary range must be disjoint. Every primary and duplicate
+is then checked for initialized physical coverage, byte equality, native hash,
+header identity and bounded SID/ACL structure. A corrupt last entry fails the
+whole check even when ordinary inspection of a different file would succeed.
+No descriptor is selected as a repair source.
+
+The entry cap applies independently to each complete index. One shared work
+budget covers FILE records, ATTRIBUTE_LIST values and extensions, resident
+roots, bitmaps, external index blocks and both copies of every descriptor.
+Charges precede reads; reaching a limit, cancellation, I/O failure or invalid
+metadata returns an error instead of certifying a prefix. Default limits are
+65,536 keys per index and 512 MiB of total metadata work, with the existing
+32-level, 16,384-block and 64 MiB per-index limits also retained.
+
+The command requires the original clean-flag image and refuses sidecars and
+volatile recovery overlays. Successful JSON reports the exact checked scope,
+native `$Secure` record sequence, key/block counts and charged bytes. It does
+not scan unindexed SDS records or padding, reconcile every file's security ID,
+validate cluster allocation or recovery state, evaluate access, project host
+ACLs, repair data or grant native write authority. Those remaining obligations
+stay open under `bd-h7cme`.
+
+Parser regressions cover native hash/ID ordering, collisions, data/key overlap,
+torn sectors and truncated entries. Reader controls cover both resident and
+multilevel indexes, missing/mismatched keys, overlapping descriptors, late
+payload corruption, global budget exhaustion, I/O errors, cancellation and
+unchanged bounded-image sentinels. The complete on-disk suite passes 958 tests,
+and strict all-targets on-disk Clippy and workspace formatting pass. The new
+reader and CLI tests remain pending: compilation of the existing `asupersync`
+dependency was killed by the host OOM killer before reaching those crates.
+Native NTFS-3G image inspection confirms the index layouts and duplicate SDS
+bytes, but does not execute this checker or qualify Windows interchange.
+Native format definitions are
+[Linux NTFS3 security-index records](https://github.com/torvalds/linux/blob/v6.19/fs/ntfs3/ntfs.h)
+and [its unsigned hash/ID comparator](https://github.com/torvalds/linux/blob/v6.19/fs/ntfs3/index.c).
+These implementation and test surfaces do not by themselves establish full
+Windows filesystem checking or write interoperability.
+
 ## Native extended attributes
 
 `ea` reads the native EA_INFORMATION (`0xD0`) and EA (`0xE0`) attributes through

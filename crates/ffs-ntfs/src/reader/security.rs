@@ -1,21 +1,87 @@
 //! Exact native security metadata through validated file and $Secure catalogs.
 //! No SID mapping, access decision, descriptor repair or backing mutation.
 
+use super::attributes::{AttributeSet, read_list, resolve_catalog};
 use super::{
     Cx, DATA, NtfsFileRecord, NtfsGeometry, NtfsReference, NtfsValue, NtfsVolume, Result, Storage,
     Stream, checkpoint, corrupt, data_read_admission, parse, standard_flags, unsupported,
 };
 use ffs_ondisk::ntfs_security::{
     MAX_SECURITY_DESCRIPTOR_BYTES, NtfsSecurityDescriptor, NtfsSecurityHeader,
-    NtfsSecurityIndexEntry, NtfsSecurityIndexRoot, SDS_COPY_DISTANCE, parse_security_index_block,
+    NtfsSecurityIndexEntry, NtfsSecurityIndexKind, NtfsSecurityIndexRoot, SDS_COPY_DISTANCE,
+    parse_security_index_block_with_kind,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SII: &[u16] = &[36, 83, 73, 73];
+const SDH: &[u16] = &[36, 83, 68, 72];
 const SDS: &[u16] = &[36, 83, 68, 83];
 const MAX_INDEX_BLOCKS: usize = 16_384;
 const MAX_INDEX_KEYS: usize = 65_536;
 const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bounds for a complete $Secure audit, not permission to certify a prefix.
+#[derive(Debug, Clone, Copy)]
+pub struct SecurityCheckLimits {
+    /// Maximum entries in each of the two native indexes.
+    pub entries: usize,
+    /// Total FILE, attribute-list, index, bitmap and paired-descriptor bytes.
+    /// Resident metadata counts as work too. Charged before the corresponding read.
+    pub metadata_bytes: u64,
+}
+
+impl Default for SecurityCheckLimits {
+    fn default() -> Self {
+        Self {
+            entries: MAX_INDEX_KEYS,
+            metadata_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+impl SecurityCheckLimits {
+    pub fn validate(self) -> Result<()> {
+        if !(1..=MAX_INDEX_KEYS).contains(&self.entries)
+            || !(1..=(1_u64 << 40)).contains(&self.metadata_bytes)
+        {
+            return Err(super::FfsError::Format(
+                "security checking requires 1..=65536 entries and 1..=1099511627776 metadata bytes"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Returned only after both entire indexes and every indexed SDS pair validate.
+/// This does not check unindexed SDS bytes or the security references of files,
+/// evaluate access, repair descriptors, or grant writable admission.
+#[derive(Debug)]
+pub struct SecurityCheckReport {
+    pub secure_reference: NtfsReference,
+    pub security_ids: usize,
+    pub hash_entries: usize,
+    pub index_blocks: usize,
+    pub descriptor_bytes: u64,
+    pub metadata_bytes: u64,
+}
+
+struct SecurityBudget {
+    limits: SecurityCheckLimits,
+    used: u64,
+}
+
+impl SecurityBudget {
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        if bytes > self.limits.metadata_bytes - self.used {
+            return Err(unsupported(
+                "security checking exceeds its metadata-work budget",
+            ));
+        }
+        self.used += bytes;
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct SecurityDescriptorInfo {
@@ -114,111 +180,26 @@ impl NtfsVolume {
         let catalog = self.attributes(cx, &secure)?;
         let attributes = catalog.all()?;
         data_read_admission(&secure, &attributes)?;
-        // Sparse SDS gaps are legal; descriptor ranges themselves must have
-        // physical initialized storage. INDEX_ROOT/ALLOCATION/BITMAP do not
-        // admit transformed values in this read profile.
-        for attribute in &attributes {
-            let index = matches!(attribute.kind, 0x90 | 0xA0 | 0xB0) && attribute.name == SII;
-            let sds = attribute.kind == DATA && attribute.name == SDS;
-            if (index && attribute.flags != 0) || (sds && attribute.flags & !super::SPARSE != 0) {
-                return Err(unsupported(
-                    "transformed NTFS security metadata is not admitted",
-                ));
-            }
-            if index && attribute.kind == 0x90 && !matches!(attribute.value, NtfsValue::Resident(_))
-            {
-                return Err(corrupt(0, "$SII INDEX_ROOT is nonresident"));
-            }
-        }
-        let root = catalog.select(&self.geometry, 0x90, SII)?;
-        if !root.resident() {
-            return Err(corrupt(0, "$SII INDEX_ROOT is nonresident"));
-        }
-        let bytes = self.read(cx, &root, 0, 65_536)?;
-        let root = NtfsSecurityIndexRoot::parse(&bytes, self.geometry.cluster_bytes())
-            .map_err(|error| parse(&error))?;
-        if root.block_bytes != self.geometry.index_bytes() {
-            return Err(unsupported(
-                "$SII index geometry differs from the boot profile",
-            ));
-        }
-        let external = root.entries.iter().any(|entry| entry.child_vcn.is_some())
-            || attributes
-                .iter()
-                .any(|attribute| matches!(attribute.kind, 0xA0 | 0xB0) && attribute.name == SII);
-        let (allocation, bitmap) = if external {
-            let allocation = catalog.select(&self.geometry, 0xA0, SII)?;
-            let bitmap = catalog.select(&self.geometry, 0xB0, SII)?;
-            if allocation.resident()
-                || allocation.initialized != allocation.size
-                || !allocation.size.is_multiple_of(u64::from(root.block_bytes))
-                || allocation.size / u64::from(root.block_bytes) > MAX_INDEX_BLOCKS as u64
-                || bitmap.size > MAX_INDEX_BLOCKS.div_ceil(8) as u64
-            {
-                return Err(unsupported(
-                    "$SII allocation or bitmap exceeds the read profile",
-                ));
-            }
-            if bitmap.size * 8 < allocation.size / u64::from(root.block_bytes) {
-                return Err(corrupt(
-                    0,
-                    "$SII bitmap does not cover its allocation blocks",
-                ));
-            }
-            metadata_range(&self.geometry, &allocation, 0, allocation.size)?;
-            metadata_range(&self.geometry, &bitmap, 0, bitmap.size)?;
-            let bitmap = self.read(cx, &bitmap, 0, bitmap.size as usize)?;
-            (Some(allocation), bitmap)
-        } else {
-            (None, Vec::new())
+        let stream = self.security_sds(&catalog)?;
+        let mut budget = SecurityBudget {
+            limits: SecurityCheckLimits::default(),
+            used: 0,
         };
-        let mut walker = SecurityWalker {
-            volume: self,
+        let mut found = None;
+        self.security_index(
             cx,
-            block_bytes: root.block_bytes,
-            vcn_bytes: root.vcn_bytes,
-            allocation,
-            bitmap,
-            visited: BTreeSet::new(),
-            keys: 0,
-            bytes_read: 0,
-            wanted: security_id,
-            found: None,
-        };
-        walker.visit(root.entries)?;
-        for (index, &byte) in walker.bitmap.iter().enumerate() {
-            for bit in 0..8 {
-                if byte & (1 << bit) != 0 && !walker.visited.contains(&(index as u64 * 8 + bit)) {
-                    return Err(corrupt(0, "$SII bitmap has an unreachable allocated block"));
+            &catalog,
+            NtfsSecurityIndexKind::SecurityId,
+            &mut budget,
+            |header| {
+                if header.security_id == security_id && found.replace(header).is_some() {
+                    return Err(corrupt(0, "duplicate $SII security ID"));
                 }
-            }
-        }
-        let header = walker
-            .found
-            .ok_or_else(|| corrupt(0, "file security ID is missing from $SII"))?;
-        let stream = catalog.select(&self.geometry, DATA, SDS)?;
-        if stream.resident() {
-            return Err(corrupt(0, "$Secure:$SDS must be nonresident"));
-        }
-        let length = u64::from(header.length);
-        let duplicate = header
-            .offset
-            .checked_add(SDS_COPY_DISTANCE)
-            .ok_or_else(|| corrupt(0, "SDS duplicate offset overflow"))?;
-        // Validate both ranges before issuing either payload read.
-        metadata_range(&self.geometry, &stream, header.offset, length)?;
-        metadata_range(&self.geometry, &stream, duplicate, length)?;
-        let primary = self.read(cx, &stream, header.offset, header.length as usize)?;
-        let copy = self.read(cx, &stream, duplicate, header.length as usize)?;
-        if primary != copy {
-            return Err(corrupt(header.offset, "SDS primary and duplicate disagree"));
-        }
-        let bytes = header
-            .descriptor(&primary)
-            .map_err(|error| parse(&error))?
-            .to_vec();
-        let descriptor = NtfsSecurityDescriptor::parse(&bytes).map_err(|error| parse(&error))?;
-        checkpoint(cx)?;
+                Ok(())
+            },
+        )?;
+        let header = found.ok_or_else(|| corrupt(0, "file security ID is missing from $SII"))?;
+        let (bytes, descriptor) = self.security_pair(cx, &stream, header, &mut budget)?;
         Ok(SecurityDescriptorInfo {
             source: "secure_sds",
             security_id: Some(security_id),
@@ -234,6 +215,264 @@ impl NtfsVolume {
             descriptor,
         })
     }
+
+    /// Audit both native $Secure indexes once, reconcile every complete header,
+    /// and validate every referenced primary/duplicate SDS descriptor pair.
+    /// Any corruption, unsupported metadata, I/O error, cancellation or exhausted
+    /// budget fails the entire call; no partial scan is returned as consistent.
+    pub fn check_security(
+        &self,
+        cx: &Cx,
+        limits: SecurityCheckLimits,
+    ) -> Result<SecurityCheckReport> {
+        checkpoint(cx)?;
+        limits.validate()?;
+        if self.volume_flags != 0
+            || self.logfile_recovery.is_some()
+            || !self.source.overlay.is_empty()
+        {
+            return Err(unsupported(
+                "security checking requires original clean-flag bytes without a recovery overlay",
+            ));
+        }
+        let mut budget = SecurityBudget { limits, used: 0 };
+        budget.charge(u64::from(self.geometry.record_bytes()))?;
+        let secure = self.record(cx, 9, None)?;
+        if secure.is_directory() {
+            return Err(corrupt(0, "NTFS $Secure is a directory"));
+        }
+        let catalog = security_catalog(self, cx, &secure, &mut budget)?;
+        data_read_admission(&secure, &catalog.all()?)?;
+        let stream = self.security_sds(&catalog)?;
+        let mut headers = BTreeMap::new();
+        let (security_ids, sii_blocks) = self.security_index(
+            cx,
+            &catalog,
+            NtfsSecurityIndexKind::SecurityId,
+            &mut budget,
+            |header| {
+                if headers.insert(header.security_id, header).is_some() {
+                    return Err(corrupt(0, "duplicate $SII security ID"));
+                }
+                Ok(())
+            },
+        )?;
+        let mut hashed = BTreeSet::new();
+        let (hash_entries, sdh_blocks) = self.security_index(
+            cx,
+            &catalog,
+            NtfsSecurityIndexKind::SecurityHash,
+            &mut budget,
+            |header| {
+                if headers.get(&header.security_id) != Some(&header)
+                    || !hashed.insert(header.security_id)
+                {
+                    return Err(corrupt(
+                        0,
+                        "$SDH entry disagrees with $SII or repeats an ID",
+                    ));
+                }
+                Ok(())
+            },
+        )?;
+        if hashed.len() != headers.len() {
+            return Err(corrupt(0, "$SII security ID is missing from $SDH"));
+        }
+        // Index order is not SDS-offset order. Check all physical descriptor
+        // extents before reading any payload; two IDs cannot own overlapping
+        // bytes, even if one carefully crafted header could parse inside another.
+        let mut ordered: Vec<_> = headers.values().copied().collect();
+        ordered.sort_unstable_by_key(|header| header.offset);
+        let mut end = 0;
+        for header in &ordered {
+            checkpoint(cx)?;
+            if header.offset < end {
+                return Err(corrupt(header.offset, "indexed SDS descriptors overlap"));
+            }
+            end = header.offset + u64::from(header.length);
+        }
+        let mut descriptor_bytes = 0;
+        for header in ordered {
+            let (bytes, _) = self.security_pair(cx, &stream, header, &mut budget)?;
+            descriptor_bytes += bytes.len() as u64;
+        }
+        checkpoint(cx)?;
+        Ok(SecurityCheckReport {
+            secure_reference: NtfsReference {
+                record: 9,
+                sequence: secure.sequence,
+            },
+            security_ids,
+            hash_entries,
+            index_blocks: sii_blocks + sdh_blocks,
+            descriptor_bytes,
+            metadata_bytes: budget.used,
+        })
+    }
+
+    fn security_sds(&self, catalog: &AttributeSet<'_>) -> Result<Stream> {
+        // Sparse gaps are legal, but each indexed descriptor must have physical
+        // initialized storage. Compression/encryption is never metadata here.
+        if catalog.all()?.iter().any(|attribute| {
+            attribute.kind == DATA && attribute.name == SDS && attribute.flags & !super::SPARSE != 0
+        }) {
+            return Err(unsupported(
+                "transformed NTFS security metadata is not admitted",
+            ));
+        }
+        let stream = catalog.select(&self.geometry, DATA, SDS)?;
+        if stream.resident() {
+            return Err(corrupt(0, "$Secure:$SDS must be nonresident"));
+        }
+        Ok(stream)
+    }
+
+    fn security_pair(
+        &self,
+        cx: &Cx,
+        stream: &Stream,
+        header: NtfsSecurityHeader,
+        budget: &mut SecurityBudget,
+    ) -> Result<(Vec<u8>, NtfsSecurityDescriptor)> {
+        checkpoint(cx)?;
+        let length = u64::from(header.length);
+        let duplicate = header.offset + SDS_COPY_DISTANCE;
+        // Parsed headers guarantee addition bounds. Validate and charge both
+        // copies before either read, including ranges crossing mapped runs.
+        metadata_range(&self.geometry, stream, header.offset, length)?;
+        metadata_range(&self.geometry, stream, duplicate, length)?;
+        budget.charge(2 * length)?;
+        let primary = self.read(cx, stream, header.offset, header.length as usize)?;
+        let copy = self.read(cx, stream, duplicate, header.length as usize)?;
+        if primary != copy {
+            return Err(corrupt(header.offset, "SDS primary and duplicate disagree"));
+        }
+        let bytes = header
+            .descriptor(&primary)
+            .map_err(|error| parse(&error))?
+            .to_vec();
+        let descriptor = NtfsSecurityDescriptor::parse(&bytes).map_err(|error| parse(&error))?;
+        checkpoint(cx)?;
+        Ok((bytes, descriptor))
+    }
+
+    fn security_index(
+        &self,
+        cx: &Cx,
+        catalog: &AttributeSet<'_>,
+        kind: NtfsSecurityIndexKind,
+        budget: &mut SecurityBudget,
+        visit: impl FnMut(NtfsSecurityHeader) -> Result<()>,
+    ) -> Result<(usize, usize)> {
+        let name = match kind {
+            NtfsSecurityIndexKind::SecurityId => SII,
+            NtfsSecurityIndexKind::SecurityHash => SDH,
+        };
+        let attributes = catalog.all()?;
+        for attribute in &attributes {
+            let index = matches!(attribute.kind, 0x90 | 0xA0 | 0xB0) && attribute.name == name;
+            if index && attribute.flags != 0 {
+                return Err(unsupported(
+                    "transformed NTFS security index is not admitted",
+                ));
+            }
+        }
+        let root = catalog.select(&self.geometry, 0x90, name)?;
+        if !root.resident() {
+            return Err(corrupt(0, "security INDEX_ROOT is nonresident"));
+        }
+        if root.size > 65_536 {
+            return Err(unsupported("security INDEX_ROOT exceeds 65536 bytes"));
+        }
+        budget.charge(root.size)?;
+        let bytes = self.read(cx, &root, 0, root.size as usize)?;
+        let root =
+            NtfsSecurityIndexRoot::parse_with_kind(&bytes, self.geometry.cluster_bytes(), kind)
+                .map_err(|error| parse(&error))?;
+        if root.block_bytes != self.geometry.index_bytes() {
+            return Err(unsupported(
+                "security index geometry differs from the boot profile",
+            ));
+        }
+        let external = root.entries.iter().any(|entry| entry.child_vcn.is_some())
+            || attributes
+                .iter()
+                .any(|attribute| matches!(attribute.kind, 0xA0 | 0xB0) && attribute.name == name);
+        let (allocation, bitmap) = if external {
+            let allocation = catalog.select(&self.geometry, 0xA0, name)?;
+            let bitmap = catalog.select(&self.geometry, 0xB0, name)?;
+            if allocation.resident()
+                || allocation.initialized != allocation.size
+                || !allocation.size.is_multiple_of(u64::from(root.block_bytes))
+                || allocation.size / u64::from(root.block_bytes) > MAX_INDEX_BLOCKS as u64
+                || bitmap.size > MAX_INDEX_BLOCKS.div_ceil(8) as u64
+            {
+                return Err(unsupported(
+                    "security index allocation or bitmap exceeds the read profile",
+                ));
+            }
+            if bitmap.size * 8 < allocation.size / u64::from(root.block_bytes) {
+                return Err(corrupt(
+                    0,
+                    "security index bitmap does not cover its allocation blocks",
+                ));
+            }
+            metadata_range(&self.geometry, &allocation, 0, allocation.size)?;
+            metadata_range(&self.geometry, &bitmap, 0, bitmap.size)?;
+            budget.charge(bitmap.size)?;
+            let bitmap = self.read(cx, &bitmap, 0, bitmap.size as usize)?;
+            (Some(allocation), bitmap)
+        } else {
+            (None, Vec::new())
+        };
+        let mut walker = SecurityWalker {
+            volume: self,
+            cx,
+            kind,
+            budget,
+            block_bytes: root.block_bytes,
+            vcn_bytes: root.vcn_bytes,
+            allocation,
+            bitmap,
+            visited: BTreeSet::new(),
+            keys: 0,
+            bytes_read: 0,
+        };
+        walker.visit(root.entries, visit)?;
+        for (index, &byte) in walker.bitmap.iter().enumerate() {
+            for bit in 0..8 {
+                if byte & (1 << bit) != 0 && !walker.visited.contains(&(index as u64 * 8 + bit)) {
+                    return Err(corrupt(
+                        0,
+                        "security index bitmap has an unreachable allocated block",
+                    ));
+                }
+            }
+        }
+        Ok((walker.keys, walker.visited.len()))
+    }
+}
+
+fn security_catalog<'a>(
+    volume: &NtfsVolume,
+    cx: &Cx,
+    base: &'a NtfsFileRecord,
+    budget: &mut SecurityBudget,
+) -> Result<AttributeSet<'a>> {
+    for attribute in base.attributes().map_err(|error| parse(&error))? {
+        if attribute.kind == super::ATTRIBUTE_LIST {
+            let length = match attribute.value {
+                NtfsValue::Resident(value) => value.len() as u64,
+                NtfsValue::NonResident(value) => value.data_bytes,
+            };
+            budget.charge(length)?;
+        }
+    }
+    let list = read_list(&volume.source, &volume.geometry, cx, base)?;
+    resolve_catalog(cx, &volume.geometry, base, list.as_deref(), |reference| {
+        budget.charge(u64::from(volume.geometry.record_bytes()))?;
+        volume.record(cx, reference.record, Some(reference.sequence))
+    })
 }
 
 /// Security metadata never acquires apparently valid zeroes from VDL tails,
@@ -278,6 +517,8 @@ fn metadata_range(
 struct SecurityWalker<'a> {
     volume: &'a NtfsVolume,
     cx: &'a Cx,
+    kind: NtfsSecurityIndexKind,
+    budget: &'a mut SecurityBudget,
     block_bytes: u32,
     vcn_bytes: u32,
     allocation: Option<Stream>,
@@ -285,19 +526,21 @@ struct SecurityWalker<'a> {
     visited: BTreeSet<u64>,
     keys: usize,
     bytes_read: u64,
-    wanted: u32,
-    found: Option<NtfsSecurityHeader>,
 }
 
 struct SecurityFrame {
     entries: std::vec::IntoIter<NtfsSecurityIndexEntry>,
     depth: usize,
-    lower: Option<u32>,
-    upper: Option<u32>,
+    lower: Option<(u32, u32)>,
+    upper: Option<(u32, u32)>,
 }
 
 impl SecurityWalker<'_> {
-    fn visit(&mut self, entries: Vec<NtfsSecurityIndexEntry>) -> Result<()> {
+    fn visit(
+        &mut self,
+        entries: Vec<NtfsSecurityIndexEntry>,
+        mut visit: impl FnMut(NtfsSecurityHeader) -> Result<()>,
+    ) -> Result<()> {
         let mut stack = vec![SecurityFrame {
             entries: entries.into_iter(),
             depth: 0,
@@ -313,32 +556,27 @@ impl SecurityWalker<'_> {
                 continue;
             };
             let previous = frame.lower;
-            let next = entry.header.map(|header| header.security_id);
+            let next = entry.header.map(|header| self.kind.key(header));
             if let Some(id) = next {
                 self.keys += 1;
-                if self.keys > MAX_INDEX_KEYS {
-                    return Err(unsupported("$SII index exceeds 65,536 keys"));
+                if self.keys > self.budget.limits.entries {
+                    return Err(unsupported("security index exceeds its entry budget"));
                 }
                 if previous.is_some_and(|bound| id <= bound)
                     || frame.upper.is_some_and(|bound| id >= bound)
                 {
-                    return Err(corrupt(0, "$SII key violates its parent bounds"));
+                    return Err(corrupt(0, "security index key violates its parent bounds"));
                 }
             }
             if let Some(header) = entry.header {
-                if header.security_id == self.wanted {
-                    if self.found.is_some() {
-                        return Err(corrupt(0, "duplicate $SII security ID"));
-                    }
-                    self.found = Some(header);
-                }
-                frame.lower = Some(header.security_id);
+                visit(header)?;
+                frame.lower = next;
             }
             if let Some(vcn) = entry.child_vcn {
                 let depth = frame.depth + 1;
                 let upper = next.or(frame.upper);
                 if depth > 32 {
-                    return Err(unsupported("$SII index exceeds 32 child levels"));
+                    return Err(unsupported("security index exceeds 32 child levels"));
                 }
                 let child = self.child(vcn)?;
                 stack.push(SecurityFrame {
@@ -356,9 +594,12 @@ impl SecurityWalker<'_> {
         checkpoint(self.cx)?;
         let offset = vcn
             .checked_mul(u64::from(self.vcn_bytes))
-            .ok_or_else(|| corrupt(0, "$SII child offset overflow"))?;
+            .ok_or_else(|| corrupt(0, "security index child offset overflow"))?;
         if !offset.is_multiple_of(u64::from(self.block_bytes)) {
-            return Err(corrupt(offset, "$SII child is not index-block aligned"));
+            return Err(corrupt(
+                offset,
+                "security index child is not index-block aligned",
+            ));
         }
         let number = offset / u64::from(self.block_bytes);
         let byte = usize::try_from(number / 8)
@@ -372,26 +613,27 @@ impl SecurityWalker<'_> {
         {
             return Err(corrupt(
                 offset,
-                "$SII child is free, repeated or over budget",
+                "security index child is free, repeated or over budget",
             ));
         }
         self.bytes_read += u64::from(self.block_bytes);
         if self.bytes_read > MAX_INDEX_BYTES {
-            return Err(unsupported("$SII traversal exceeds 64 MiB"));
+            return Err(unsupported("security index traversal exceeds 64 MiB"));
         }
         let stream = self
             .allocation
             .as_ref()
-            .ok_or_else(|| corrupt(offset, "$SII child has no INDEX_ALLOCATION"))?;
+            .ok_or_else(|| corrupt(offset, "security index child has no INDEX_ALLOCATION"))?;
         metadata_range(
             &self.volume.geometry,
             stream,
             offset,
             u64::from(self.block_bytes),
         )?;
+        self.budget.charge(u64::from(self.block_bytes))?;
         let raw = self
             .volume
             .read(self.cx, stream, offset, self.block_bytes as usize)?;
-        parse_security_index_block(&raw, vcn).map_err(|error| parse(&error))
+        parse_security_index_block_with_kind(&raw, vcn, self.kind).map_err(|error| parse(&error))
     }
 }

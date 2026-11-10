@@ -444,6 +444,15 @@ crashes during the corresponding metadata updates.
 **Own:** `ffs-ntfs` maintenance modules and existing CLI integration.
 **Depends:** NTFS-05 plus the feature obligations of the target maintenance profile.
 
+The read-only checker now includes complete declared `$MFTMirr` comparison
+(`check-allocation --verify-mft-mirror`) and complete `$SII`/`$SDH` reconciliation
+with every indexed SDS primary/duplicate pair (`check-security`). Both expose
+bounded work and explicit incomplete/error outcomes without selecting a repair
+source. These are structural-checker increments under `bd-h7cme`; they do not
+complete this workpackage's native repair, formatting, resize or Windows
+interchange obligations. Commands, exact coverage and execution limits are in
+`docs/NTFS_ALLOCATION_CHECK.md` and `docs/NTFS_READ_PROFILE.md`.
+
 Cross-check records, references, links, cluster ownership, native indexes, and
 metadata-file invariants without writing. Keep damage, unsupported state, and
 missing external checker distinct. Implement bounded explicitly authorized repair

@@ -136,6 +136,17 @@ struct RecordArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Reconcile both $Secure indexes and verify every indexed security descriptor pair.
+    CheckSecurity {
+        #[command(flatten)]
+        image: ImageArgs,
+        /// Maximum entries in each native index; a limit never certifies a prefix.
+        #[arg(long, default_value_t = 65_536, value_parser = clap::value_parser!(u64).range(1..=65_536))]
+        max_entries: u64,
+        /// Total metadata work cap, including both copies of every indexed descriptor.
+        #[arg(long, default_value_t = 536_870_912, value_parser = clap::value_parser!(u64).range(1..=1_099_511_627_776))]
+        max_metadata_bytes: u64,
+    },
     /// Cross-check native allocation, with optional record and namespace validation.
     CheckAllocation {
         #[command(flatten)]
@@ -405,6 +416,55 @@ fn ea_json(catalog: &reader::ea::EaCatalog, selected: Option<&[u8]>) -> Result<s
     }))
 }
 
+fn security_check_limits(
+    image: &ImageArgs,
+    entries: u64,
+    metadata_bytes: u64,
+) -> Result<reader::security::SecurityCheckLimits> {
+    if image.sidecar.is_some() || image.recover_logfile {
+        bail!(
+            "security checking requires original image bytes without a sidecar or recovery overlay"
+        );
+    }
+    let limits = reader::security::SecurityCheckLimits {
+        entries: usize::try_from(entries)?,
+        metadata_bytes,
+    };
+    limits.validate()?;
+    Ok(limits)
+}
+
+fn security_check_json(
+    report: &reader::security::SecurityCheckReport,
+    offset: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "format": "NTFS",
+        "operation": "check_security",
+        "scope": "complete_sii_sdh_indexes_and_indexed_sds_pairs",
+        "read_only": true,
+        "backing_writes": false,
+        "repair_performed": false,
+        "replay_performed": false,
+        "volume_offset": offset,
+        "complete": true,
+        "consistent": true,
+        "secure_record": report.secure_reference.record,
+        "secure_sequence": report.secure_reference.sequence,
+        "security_ids": report.security_ids,
+        "hash_entries": report.hash_entries,
+        "index_blocks": report.index_blocks,
+        "descriptor_bytes": report.descriptor_bytes,
+        "metadata_bytes": report.metadata_bytes,
+        "not_checked": [
+            "unindexed SDS records, gaps and padding",
+            "file STANDARD_INFORMATION security IDs and legacy SECURITY_DESCRIPTOR attributes",
+            "cluster allocation ownership, namespace, journal state and native recovery",
+            "access decisions, host ACL projection and writable admission"
+        ]
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -413,6 +473,18 @@ fn main() -> Result<()> {
         .map_err(|err| anyhow::anyhow!("failed to build ffs-ntfs runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     match cli.command {
+        Command::CheckSecurity {
+            image,
+            max_entries,
+            max_metadata_bytes,
+        } => {
+            let limits = security_check_limits(&image, max_entries, max_metadata_bytes)?;
+            let volume = image.open(&cx)?;
+            let report = volume
+                .check_security(&cx, limits)
+                .context("checking complete native NTFS security indexes and descriptor pairs")?;
+            json(&security_check_json(&report, image.offset))?;
+        }
         Command::CheckAllocation { options } => allocation_commands::run(&cx, &options)?,
         Command::Inspect { image } => {
             let volume = image.open(&cx)?;
@@ -685,6 +757,83 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_security_check_enforces_bounds_original_bytes_and_explicit_offline_image() {
+        assert!(Cli::try_parse_from(["ffs-ntfs", "check-security", "disk.img"]).is_err());
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "check-security",
+            "disk.img",
+            "--offline-image",
+            "--offset",
+            "1024",
+            "--length",
+            "65536",
+            "--max-entries",
+            "3",
+            "--max-metadata-bytes",
+            "4096",
+        ])
+        .unwrap();
+        let Command::CheckSecurity {
+            mut image,
+            max_entries,
+            max_metadata_bytes,
+        } = cli.command
+        else {
+            panic!("check-security");
+        };
+        let limits = security_check_limits(&image, max_entries, max_metadata_bytes).unwrap();
+        assert_eq!((limits.entries, limits.metadata_bytes), (3, 4096));
+        assert_eq!((image.offset, image.length), (1024, Some(65536)));
+        image.recover_logfile = true;
+        assert!(security_check_limits(&image, max_entries, max_metadata_bytes).is_err());
+        image.recover_logfile = false;
+        image.sidecar = Some(PathBuf::from("disk.rq"));
+        assert!(security_check_limits(&image, max_entries, max_metadata_bytes).is_err());
+        for (flag, value) in [
+            ("--max-entries", "0"),
+            ("--max-entries", "65537"),
+            ("--max-metadata-bytes", "0"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "ffs-ntfs",
+                    "check-security",
+                    "disk.img",
+                    "--offline-image",
+                    flag,
+                    value
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn security_check_report_names_its_scope_without_claiming_volume_consistency() {
+        let report = reader::security::SecurityCheckReport {
+            secure_reference: ffs_ondisk::ntfs::NtfsReference {
+                record: 9,
+                sequence: 17,
+            },
+            security_ids: 3,
+            hash_entries: 3,
+            index_blocks: 4,
+            descriptor_bytes: 288,
+            metadata_bytes: 18000,
+        };
+        let json = security_check_json(&report, 1024);
+        assert_eq!(json["secure_sequence"], 17);
+        assert_eq!(json["hash_entries"], 3);
+        assert_eq!(
+            json["scope"],
+            "complete_sii_sdh_indexes_and_indexed_sds_pairs"
+        );
+        assert_eq!(json["backing_writes"], false);
+        assert_eq!(json["not_checked"].as_array().unwrap().len(), 4);
+    }
 
     #[test]
     fn protected_read_only_admission_coexists_with_a_retained_reader() {
