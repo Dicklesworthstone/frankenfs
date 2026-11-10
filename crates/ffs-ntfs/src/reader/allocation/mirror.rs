@@ -47,7 +47,7 @@ impl MftMirrorReport {
             && self.record_pairs_examined == self.declared_records
     }
 
-    fn issue(&mut self, number: u64, category: &'static str, detail: String) {
+    fn issue(&mut self, number: u64, category: &'static str, detail: &str) {
         if category == "unsupported" {
             self.unsupported += 1;
         } else if category != "extended_mirror_difference" {
@@ -79,7 +79,7 @@ impl MftMirrorReport {
             FfsError::Io(_) => "io",
             _ => "mirror_metadata",
         };
-        self.issue(number, category, error.to_string());
+        self.issue(number, category, &error.to_string());
         Ok(())
     }
 
@@ -293,7 +293,7 @@ impl NtfsVolume {
                             report.extended_record_differences += 1;
                             "extended_mirror_difference"
                         };
-                        report.issue(number, category, format!(
+                        report.issue(number, category, &format!(
                             "MFT and $MFTMirr record {number} have different used metadata; neither copy is selected for recovery"
                         ));
                     }
