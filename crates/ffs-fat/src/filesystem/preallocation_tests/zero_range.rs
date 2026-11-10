@@ -269,9 +269,35 @@ fn invalid_zero_requests_preserve_bytes_and_leave_the_mount_usable() {
 
 #[test]
 fn every_zero_write_and_sync_cut_quarantines_without_a_clean_partial_success() {
+    const INITIAL_MTIME: u64 = 946_684_800;
+    let fault_target = |kind, active| {
+        assert!(
+            now_unix_secs() > INITIAL_MTIME + 1,
+            "fault fixture requires a wall clock later than its fixed FAT timestamp"
+        );
+        let (image, fs, ino) = target(kind, 512, active, b"ABCDEFGH");
+        // KEEP_SIZE can leave the complete directory record unchanged when
+        // create/write and ZERO_RANGE share the same two-second FAT timestamp.
+        // Force its metadata publication in both the baseline and every trial.
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(INITIAL_MTIME);
+        let attr = fs
+            .setattr(
+                &Cx::for_testing(),
+                &mut RequestScope::empty(),
+                ino,
+                &SetAttrRequest {
+                    mtime: Some(mtime),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(attr.mtime, mtime);
+        image.device.disk.lock().unwrap().attempts = 0;
+        (image, fs, ino)
+    };
     for (kind, active) in profiles() {
         for mode in [ZERO, ZERO | KEEP] {
-            let (baseline, fs, ino) = target(kind, 512, active, b"ABCDEFGH");
+            let (baseline, fs, ino) = fault_target(kind, active);
             fs.fallocate(
                 &Cx::for_testing(),
                 &mut RequestScope::empty(),
@@ -285,22 +311,30 @@ fn every_zero_write_and_sync_cut_quarantines_without_a_clean_partial_success() {
             assert!(count > 8);
             for fail in 1..=count {
                 for tear in [0, 17, 511] {
-                    let (image, fs, ino) = target(kind, 512, active, b"ABCDEFGH");
+                    let (image, fs, ino) = fault_target(kind, active);
                     {
                         let mut disk = image.device.disk.lock().unwrap();
                         disk.fail_at = Some(fail);
                         disk.tear = tear;
                     }
+                    let result = fs.fallocate(
+                        &Cx::for_testing(),
+                        &mut RequestScope::empty(),
+                        ino,
+                        2,
+                        1600,
+                        mode,
+                    );
+                    let (attempts, fault_reached) = {
+                        let disk = image.device.disk.lock().unwrap();
+                        (disk.attempts, disk.fault_reached)
+                    };
                     assert!(
-                        fs.fallocate(
-                            &Cx::for_testing(),
-                            &mut RequestScope::empty(),
-                            ino,
-                            2,
-                            1600,
-                            mode
-                        )
-                        .is_err(),
+                        fault_reached,
+                        "selected cut did not execute: {kind:?} mode={mode} fail={fail} tear={tear} baseline={count} attempts={attempts}"
+                    );
+                    assert!(
+                        result.is_err(),
                         "{kind:?} mode={mode} fail={fail} tear={tear}"
                     );
                     stopped(&fs, &image, ino);

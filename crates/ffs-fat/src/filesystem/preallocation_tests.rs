@@ -17,6 +17,7 @@ struct Disk {
     reads: usize,
     attempts: usize,
     fail_at: Option<usize>,
+    fault_reached: bool,
     tear: usize,
     drop_write_at: Option<u64>,
     cancel_after_clean: bool,
@@ -93,6 +94,7 @@ impl ByteDevice for Device {
             return Ok(());
         }
         if disk.fail_at == Some(disk.attempts) {
+            disk.fault_reached = true;
             let count = disk.tear.min(bytes.len());
             disk.put(at.0, &bytes[..count]);
             return Err(std::io::Error::other("injected preallocation write failure").into());
@@ -106,6 +108,7 @@ impl ByteDevice for Device {
         let mut disk = self.disk.lock().unwrap();
         disk.attempts += 1;
         if disk.fail_at == Some(disk.attempts) {
+            disk.fault_reached = true;
             return Err(std::io::Error::other("injected preallocation sync failure").into());
         }
         disk.persist();
