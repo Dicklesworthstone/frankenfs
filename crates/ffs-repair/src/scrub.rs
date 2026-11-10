@@ -908,14 +908,15 @@ impl Ext4MetadataValidator {
                 out.push((block, kind));
             }
         };
-        for (raw, logical) in inode.extent_bytes.chunks_exact(4).take(12).zip(0_u64..) {
+        let (inode_pointers, _) = inode.extent_bytes.as_chunks::<4>();
+        for (raw, logical) in inode_pointers.iter().take(12).zip(0_u64..) {
             record_directory(read_pointer(raw), logical);
         }
 
         let pointers_per_block = u64::from(sb.block_size / 4);
         let mut stack = Vec::new();
         let mut logical_start = 12_u64;
-        for (raw, depth) in inode.extent_bytes.chunks_exact(4).skip(12).zip(1_u32..=3) {
+        for (raw, depth) in inode_pointers.iter().skip(12).zip(1_u32..=3) {
             let block = read_pointer(raw);
             if logical_start < logical_blocks && valid_pointer(block) {
                 stack.push((block, depth, logical_start));
@@ -944,7 +945,8 @@ impl Ext4MetadataValidator {
                 Err(_) => continue, // The scrub scan reports unreadable blocks.
             };
             let child_span = pointers_per_block.pow(depth - 1);
-            for (raw, index) in bytes.as_slice().chunks_exact(4).zip(0..pointers_per_block) {
+            let (pointers, _) = bytes.as_slice().as_chunks::<4>();
+            for (raw, index) in pointers.iter().zip(0..pointers_per_block) {
                 let logical = logical_start + index * child_span;
                 if logical >= logical_blocks {
                     break;
@@ -3476,7 +3478,8 @@ mod tests {
             inode.extent_bytes[slot * 4..slot * 4 + 4].copy_from_slice(&block.to_le_bytes());
         }
         let mut cyclic = vec![0; 4096];
-        for pointer in cyclic.chunks_exact_mut(4) {
+        let (pointers, _) = cyclic.as_chunks_mut::<4>();
+        for pointer in pointers {
             pointer.copy_from_slice(&6_u32.to_le_bytes());
         }
         dev.write(BlockNumber(6), cyclic);
@@ -3510,7 +3513,7 @@ mod tests {
             &cx, &dev, &sb, &inode, 2, false, &mut owned,
         )
         .expect("filesystem bound");
-        assert!(owned.is_empty());
+        assert_eq!(owned, Vec::<(u64, Ext4OwnedBlock)>::new());
         assert_eq!(dev.scalar_read_count(), 1);
 
         // Inline directory bytes are not an indirect block map.
@@ -3520,7 +3523,7 @@ mod tests {
             &cx, &dev, &sb, &inode, 2, false, &mut owned,
         )
         .expect("inline directory");
-        assert!(owned.is_empty());
+        assert_eq!(owned, Vec::<(u64, Ext4OwnedBlock)>::new());
         assert_eq!(dev.scalar_read_count(), 1);
     }
 
