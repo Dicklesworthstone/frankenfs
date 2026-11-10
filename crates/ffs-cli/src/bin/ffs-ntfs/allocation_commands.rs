@@ -3,14 +3,14 @@
 use super::{Cx, ImageArgs, Result, bail, json};
 use clap::Args;
 use ffs_ntfs::reader::allocation::{
-    AllocationLimits, AllocationReport, NamespaceLimits, NamespaceReport, RecordOwnershipLimits,
-    RecordOwnershipReport,
+    AllocationLimits, AllocationReport, MftMirrorReport, NamespaceLimits, NamespaceReport,
+    RecordOwnershipLimits, RecordOwnershipReport,
 };
 use serde_json::{Value, json as value};
 
 #[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("structural_check")
-    .args(["verify_record_ownership", "verify_namespace"])
+    .args(["verify_record_ownership", "verify_namespace", "verify_mft_mirror"])
     .multiple(true)))]
 pub struct AllocationArgs {
     #[command(flatten)]
@@ -30,6 +30,9 @@ pub struct AllocationArgs {
     /// Also reconcile FILE_NAME links with native directory indexes and root reachability.
     #[arg(long)]
     verify_namespace: bool,
+    /// Also compare the complete declared MFT mirror with the corresponding primary records.
+    #[arg(long)]
+    verify_mft_mirror: bool,
     /// Maximum FILE_NAME and directory-index identities for namespace checking.
     #[arg(long, requires = "verify_namespace", value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
     max_namespace_entries: Option<u64>,
@@ -48,8 +51,9 @@ impl AllocationArgs {
         if self.max_metadata_bytes.is_some()
             && !self.verify_record_ownership
             && !self.verify_namespace
+            && !self.verify_mft_mirror
         {
-            bail!("--max-metadata-bytes requires --verify-record-ownership or --verify-namespace");
+            bail!("--max-metadata-bytes requires a selected structural check");
         }
         if self.max_namespace_entries.is_some() && !self.verify_namespace {
             bail!("--max-namespace-entries requires --verify-namespace");
@@ -86,6 +90,20 @@ impl AllocationArgs {
             records: self.max_records,
             metadata_bytes: self.max_metadata_bytes.unwrap_or(defaults.metadata_bytes),
             entries: self.max_namespace_entries.unwrap_or(defaults.entries),
+        };
+        limits.validate()?;
+        Ok(Some(limits))
+    }
+
+    fn mirror_limits(&self) -> Result<Option<RecordOwnershipLimits>> {
+        if !self.verify_mft_mirror {
+            return Ok(None);
+        }
+        let limits = RecordOwnershipLimits {
+            records: self.max_records,
+            metadata_bytes: self
+                .max_metadata_bytes
+                .unwrap_or_else(|| RecordOwnershipLimits::default().metadata_bytes),
         };
         limits.validate()?;
         Ok(Some(limits))
@@ -268,12 +286,66 @@ fn namespace_outcome(report: Option<&NamespaceReport>) -> Result<()> {
     Ok(())
 }
 
+fn add_mirror_json(output: &mut Value, mirror: Option<&MftMirrorReport>) {
+    output["requested_checks_consistent"] = (output["requested_checks_consistent"]
+        .as_bool()
+        .unwrap_or(false)
+        && mirror.is_none_or(MftMirrorReport::is_consistent))
+    .into();
+    let Some(report) = mirror else {
+        output["mft_mirror"] = Value::Null;
+        return;
+    };
+    output["not_checked"][5] = "security descriptors and secondary indexes".into();
+    let issues: Vec<_> = report
+        .issues
+        .iter()
+        .map(|issue| {
+            value!({
+                "category": issue.category,
+                "record": issue.record,
+                "detail": issue.detail,
+            })
+        })
+        .collect();
+    output["mft_mirror"] = value!({
+        "scope": "mftmirr_declared_record_prefix",
+        "consistent": report.is_consistent(),
+        "complete": report.complete,
+        "limit_reached": report.limit_reached,
+        "declared_records": report.declared_records,
+        "record_pairs_examined": report.record_pairs_examined,
+        "matching_records": report.matching_records,
+        "different_records": report.different_records,
+        "required_prefix_records": 4,
+        "required_prefix_matches": report.required_prefix_matches,
+        "extended_record_differences": report.extended_record_differences,
+        "extended_tail_policy": "differences beyond record 3 do not alone establish corruption on Windows big-cluster volumes",
+        "metadata_bytes_attempted": report.metadata_bytes_attempted,
+        "errors": report.errors,
+        "unsupported": report.unsupported,
+        "issues": issues,
+        "omitted_issues": report.omitted_issues,
+        "repair_source": null,
+    });
+}
+
+fn mirror_outcome(report: Option<&MftMirrorReport>) -> Result<()> {
+    if report.is_some_and(|report| !report.is_consistent()) {
+        bail!(
+            "NTFS MFT mirror differences or incomplete coverage; see the JSON report; neither copy selected for repair"
+        );
+    }
+    Ok(())
+}
+
 pub fn run(cx: &Cx, args: &AllocationArgs) -> Result<()> {
     cx.checkpoint()
         .map_err(|_| ffs_error::FfsError::Cancelled)?;
     let limits = args.preflight()?;
     let ownership_limits = args.ownership_limits()?;
     let namespace_limits = args.namespace_limits()?;
+    let mirror_limits = args.mirror_limits()?;
     let volume = args.image.open(cx)?;
     let report = volume.check_allocations(cx, limits)?;
     let ownership = ownership_limits
@@ -282,17 +354,23 @@ pub fn run(cx: &Cx, args: &AllocationArgs) -> Result<()> {
     let namespace = namespace_limits
         .map(|limits| volume.check_namespace(cx, limits))
         .transpose()?;
+    let mirror = mirror_limits
+        .map(|limits| volume.check_mft_mirror(cx, limits))
+        .transpose()?;
     cx.checkpoint()
         .map_err(|_| ffs_error::FfsError::Cancelled)?;
-    json(&combined_json(
+    let mut output = combined_json(
         &report,
         ownership.as_ref(),
         namespace.as_ref(),
         args.image.offset,
-    ))?;
+    );
+    add_mirror_json(&mut output, mirror.as_ref());
+    json(&output)?;
     outcome(&report)?;
     ownership_outcome(ownership.as_ref())?;
-    namespace_outcome(namespace.as_ref())
+    namespace_outcome(namespace.as_ref())?;
+    mirror_outcome(mirror.as_ref())
 }
 
 #[cfg(test)]
@@ -301,6 +379,111 @@ mod tests {
     use crate::{Cli, Command};
     use clap::Parser;
     use ffs_ntfs::reader::allocation::AllocationIssue;
+
+    #[test]
+    fn mirror_cli_selects_independent_bounded_work_and_can_combine_checks() {
+        for others in [false, true] {
+            let mut args = vec![
+                "ffs-ntfs",
+                "check-allocation",
+                "unopened.img",
+                "--offline-image",
+                "--verify-mft-mirror",
+                "--max-records",
+                "4096",
+                "--max-metadata-bytes",
+                "8388608",
+            ];
+            if others {
+                args.extend(["--verify-namespace", "--verify-record-ownership"]);
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::CheckAllocation { options } = cli.command else {
+                panic!("allocation");
+            };
+            options.preflight().unwrap();
+            let limits = options.mirror_limits().unwrap().unwrap();
+            assert_eq!((limits.records, limits.metadata_bytes), (4096, 8_388_608));
+            assert_eq!(options.ownership_limits().unwrap().is_some(), others);
+            assert_eq!(options.namespace_limits().unwrap().is_some(), others);
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "check-allocation",
+                "unopened.img",
+                "--offline-image",
+                "--verify-mft-mirror",
+                "--max-metadata-bytes",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mirror_cli_refuses_sidecars_and_recovery_before_opening() {
+        for extra in [vec!["--recover-logfile"], vec!["--sidecar", "unopened.rq"]] {
+            let cli = Cli::try_parse_from(
+                [
+                    "ffs-ntfs",
+                    "check-allocation",
+                    "unopened.img",
+                    "--offline-image",
+                    "--verify-mft-mirror",
+                ]
+                .into_iter()
+                .chain(extra),
+            )
+            .unwrap();
+            let Command::CheckAllocation { options } = cli.command else {
+                panic!("allocation");
+            };
+            assert!(
+                run(&Cx::for_testing(), &options)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("without a sidecar or recovery overlay")
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_report_never_conflates_a_required_prefix_with_full_equivalence_or_repair() {
+        let allocation = AllocationReport {
+            complete: true,
+            allocated_without_reference: Some(0),
+            ..AllocationReport::default()
+        };
+        let mut output = combined_json(&allocation, None, None, 1024);
+        add_mirror_json(&mut output, None);
+        assert!(output["mft_mirror"].is_null());
+        assert!(mirror_outcome(None).is_ok());
+        let mut report = MftMirrorReport::default();
+        add_mirror_json(&mut output, Some(&report));
+        assert_eq!(output["requested_checks_consistent"], false);
+        assert!(output["mft_mirror"]["required_prefix_matches"].is_null());
+        assert!(mirror_outcome(Some(&report)).is_err());
+        report.complete = true;
+        report.declared_records = 8;
+        report.record_pairs_examined = 8;
+        report.matching_records = 8;
+        report.required_prefix_matches = Some(true);
+        let mut output = combined_json(&allocation, None, None, 1024);
+        add_mirror_json(&mut output, Some(&report));
+        assert_eq!(output["requested_checks_consistent"], true);
+        assert!(mirror_outcome(Some(&report)).is_ok());
+        report.matching_records = 7;
+        report.different_records = 1;
+        report.extended_record_differences = 1;
+        add_mirror_json(&mut output, Some(&report));
+        assert_eq!(output["requested_checks_consistent"], false);
+        assert_eq!(output["mft_mirror"]["required_prefix_matches"], true);
+        assert_eq!(output["mft_mirror"]["extended_record_differences"], 1);
+        assert_eq!(output["mft_mirror"]["errors"], 0);
+        assert!(output["mft_mirror"]["repair_source"].is_null());
+        assert!(mirror_outcome(Some(&report)).is_err());
+    }
 
     #[test]
     fn namespace_cli_selects_bounded_work_independently_or_with_record_ownership() {

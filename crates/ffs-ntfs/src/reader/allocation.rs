@@ -12,6 +12,8 @@ mod ownership;
 pub use ownership::{RecordOwnershipLimits, RecordOwnershipReport};
 mod namespace;
 pub use namespace::{NamespaceLimits, NamespaceReport};
+mod mirror;
+pub use mirror::MftMirrorReport;
 
 use super::{
     Cx, FfsError, NtfsValue, NtfsVolume, Result, Storage, Stream, buffer, checkpoint, corrupt,

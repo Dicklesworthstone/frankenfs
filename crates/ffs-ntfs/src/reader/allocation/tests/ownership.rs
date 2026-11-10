@@ -35,7 +35,7 @@ fn replace_list(image: &mut Image, list: Option<&[u8]>) {
     image.put(24, &record(24, &attrs, 0));
 }
 
-fn clear_mft_bit(image: &mut Image, number: usize) {
+pub(super) fn clear_mft_bit(image: &mut Image, number: usize) {
     let at = image.offset(0);
     let mut raw = image.bytes[at..at + 1024].to_vec();
     let data_length = u32::from_le_bytes(raw[60..64].try_into().unwrap()) as usize;

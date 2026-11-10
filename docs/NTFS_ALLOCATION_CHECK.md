@@ -168,6 +168,59 @@ security descriptors, non-I30 secondary indexes, payloads or the journal. Full
 NTFS checking, formatting, resize and native mutation remain open under
 `bd-h7cme` and the related writer work.
 
+## Complete MFT mirror comparison
+
+`--verify-mft-mirror` compares the complete initialized unnamed DATA stream of
+`$MFTMirr` with the corresponding primary MFT records. Opening the reader
+already checks bootstrap record zero; this pass also detects disagreements in
+the mirror's `$MFTMirr`, `$LogFile` and `$Volume` records and any larger declared
+mirror prefix. It does not choose which copy is authoritative or repair either
+copy. An image whose record-zero bootstrap is already unreadable or inconsistent
+remains refused by the normal reader.
+
+```sh
+ffs-ntfs check-allocation volume.img --offline-image --verify-mft-mirror
+ffs-ntfs check-allocation volume.img --offline-image \
+  --verify-mft-mirror --verify-record-ownership --verify-namespace \
+  --max-records 1048576 --max-metadata-bytes 1073741824
+```
+
+The pass validates the native record-1 catalog, MFT allocation bits for the four
+bootstrap records, initialized record boundaries, plain nonsparse mirror
+storage and agreement with the boot-sector mirror location. Mirror extents
+cannot overlap themselves or any primary MFT extent: equality between two views
+of the same physical allocation would not establish a separate recovery copy.
+Each record is parsed with update-sequence and attribute bounds checks before
+its used metadata is compared. Unused record slack and the validated USA array
+do not affect logical equality; restored sector trailers within used metadata
+still participate in the comparison.
+
+The JSON `mft_mirror` result separates `required_prefix_matches` for records 0–3
+from `extended_record_differences`. This matters because NTFS-3G documents that
+Windows versions since 2017 can leave later mirror records different on
+large-cluster volumes ([native comparator source](https://github.com/tuxera/ntfs-3g/blob/edge/ntfsprogs/ntfsfix.c)).
+Such a difference is reported without calling it proof of corruption. The full
+comparison still returns a failing status when the declared copies differ;
+`consistent: true` means all inspected used metadata agrees. No result supplies
+a `repair_source`, a native recovery decision, or general filesystem cleanliness.
+
+`--max-records` retains its whole-MFT slot bound. `--max-metadata-bytes` applies
+independently to this pass, charging FILE/catalog/bitmap work and both copies
+before each pair is read. A limit, unreadable record or unsupported storage
+leaves `complete: false`; a required-prefix comparison that could not finish is
+null. Already established differences remain visible. Cancellation returns an
+error, not a partial successful report. The same original-image, offline,
+no-sidecar and no-recovery-overlay requirements apply, and the pass never writes
+or synchronizes the backing device.
+
+Nine library controls and three CLI controls are authored for this increment.
+They cover 512-byte and 4 KiB cluster fixtures, four- and eight-record mirrors,
+used-data versus slack/USA distinctions, required and extended differences,
+torn/stale records, boot mapping and self-aliasing, invalid initialized ranges,
+MFT bitmap disagreement, pre-I/O work limits, I/O errors, cancellation and
+unchanged backing bytes. These constructed records are not native Windows
+qualification; executed results are recorded separately when available.
+
 ## Evidence and remaining qualification
 
 Ten library regressions and four CLI/report controls are authored. They cover

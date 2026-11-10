@@ -1,5 +1,6 @@
 //! Constructed native records and allocation models, not Windows qualification.
 
+mod mirror;
 mod ownership;
 
 use super::*;
