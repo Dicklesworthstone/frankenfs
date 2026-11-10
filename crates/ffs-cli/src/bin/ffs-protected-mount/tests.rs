@@ -224,6 +224,369 @@ impl Fixture {
     }
 }
 
+// This additional lane uses the production CLI and the kernel. The ordinary
+// owning suite keeps its direct FsOps checks; CI explicitly requires all three
+// mounted results. Fixtures and logs are retained even if a mount cannot retire.
+const MOUNTED_REPAIR: &str = r"
+import hashlib, json, os, pathlib, shutil, signal, subprocess, sys, time
+
+binary, source, directory, filesystem, first, second = sys.argv[1:]
+directory = pathlib.Path(directory)
+image, archive = directory / 'image', directory / 'sidecar'
+mount = directory / 'mount'
+expected = (directory / 'expected').read_bytes()
+blocks = [int(first), int(second)]
+assert len(set(blocks)) == 2
+assert pathlib.Path(binary).is_file() and os.access(binary, os.X_OK)
+assert source and pathlib.Path('/dev/fuse').exists()
+assert shutil.which('fusermount3') and shutil.which('timeout')
+binary_hash = hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest()
+escapes = {9: b'\\011', 10: b'\\012', 32: b'\\040', 92: b'\\134'}
+mount_key = b''.join(escapes.get(b, bytes([b])) for b in os.fsencode(mount))
+
+def mount_id():
+    records = pathlib.Path('/proc/self/mountinfo').read_bytes()
+    assert records.strip(), 'empty mount table'
+    matches = []
+    for line in records.split(b'\n'):
+        if not line:
+            continue
+        fields = line.split(b' ')
+        assert len(fields) >= 10 and b'-' in fields[6:], 'invalid mount table'
+        if fields[4] == mount_key:
+            split = fields.index(b'-', 6)
+            assert fields[split + 1] == b'fuse.ffs', fields
+            matches.append(int(fields[0]))
+    assert len(matches) <= 1, 'stacked mounts are not owned by this test'
+    return matches[0] if matches else None
+
+def identity(pid):
+    try:
+        fields = pathlib.Path('/proc', str(pid), 'stat').read_text().rsplit(') ', 1)[1].split()
+        return fields[19]
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+def helpers(process):
+    found = {}
+    for task in pathlib.Path('/proc', str(process.pid), 'task').iterdir():
+        try:
+            children = (task / 'children').read_text().split()
+        except FileNotFoundError:
+            continue
+        for pid in children:
+            try:
+                name = pathlib.Path('/proc', pid, 'comm').read_text().strip()
+                start = identity(pid)
+            except FileNotFoundError:
+                continue
+            if name in ('fusermount', 'fusermount3') and start is not None:
+                found[int(pid)] = start
+    assert found, 'automatic-unmount helper was not observed'
+    return found
+
+client_number = 0
+def run(arguments):
+    global client_number
+    client_number += 1
+    stdout = directory / ('client-' + str(client_number) + '.stdout')
+    stderr = directory / ('client-' + str(client_number) + '.stderr')
+    # Files avoid waiting for pipe EOF if a stuck FUSE client outlives timeout.
+    with stdout.open('xb') as out, stderr.open('xb') as err:
+        result = subprocess.run(['timeout', '--kill-after=5s', '30s', *map(str, arguments)],
+                                stdout=out, stderr=err, timeout=40)
+    errors = stderr.read_bytes()
+    assert result.returncode == 0, (arguments, result.returncode, errors)
+    assert not errors, (arguments, errors)
+    return stdout.read_bytes()
+
+def cycle(phase, writable, action):
+    assert mount_id() is None
+    logfile = directory / (phase + '.log')
+    with logfile.open('wb') as output:
+        args = [binary, str(image), str(archive), str(mount), '--exclusive-image', '--allow-repair']
+        if writable:
+            args += ['--rw', '--commit-interval-secs', '0']
+        process = subprocess.Popen(args, stdout=output, stderr=output)
+        owned = None
+        observed = {}
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                assert process.poll() is None, logfile.read_text()
+                statuses = []
+                for line in logfile.read_text().splitlines():
+                    try:
+                        statuses.append(json.loads(line))
+                    except ValueError:
+                        pass
+                owned = mount_id()
+                if owned is not None and any(s.get('event') == 'mounted' and
+                        s.get('filesystem') == filesystem and s.get('read_only') == (not writable)
+                        for s in statuses):
+                    break
+                assert time.monotonic() < deadline, ('mount startup timed out', logfile.read_text())
+                time.sleep(0.02)
+            observed = helpers(process)
+            action()
+        finally:
+            try:
+                # External unmount is the declared shutdown for this lane,
+                # including assertion failures. Never rescue a failed automatic
+                # cleanup, lazy-detach, or operate on a replacement mount.
+                current = mount_id()
+                if current is not None:
+                    assert owned is not None and current == owned, 'mount identity changed'
+                    run(['fusermount3', '-u', mount])
+                elif process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                assert process.wait(timeout=60) == 0, logfile.read_text()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+            assert mount_id() is None, 'owned mount remains attached'
+            deadline = time.monotonic() + 10
+            while any(identity(pid) == start for pid, start in observed.items()):
+                assert time.monotonic() < deadline, ('helper remains', observed)
+                time.sleep(0.02)
+        print('PROTECTED_MOUNT_PHASE|' + filesystem + '|' + phase + '|PASS|' +
+              json.dumps({'source': source, 'binary_sha256': binary_hash,
+                          'mount_id': owned, 'observed_helpers': observed}), flush=True)
+
+def repair():
+    with image.open('r+b', buffering=0) as raw:
+        original = [os.pread(raw.fileno(), 4096, block * 4096) for block in blocks]
+        assert all(len(block) == 4096 for block in original)
+        for block, before in zip(blocks, original):
+            assert os.pwrite(raw.fileno(), bytes([0xE7]) * 4096, block * 4096) == 4096
+            assert os.pread(raw.fileno(), 4096, block * 4096) != before
+        os.fsync(raw.fileno())
+        assert run(['cat', mount / 'payload.bin']) == expected
+        assert [os.pread(raw.fileno(), 4096, block * 4096) for block in blocks] == original
+        os.fsync(raw.fileno())
+        print('PROTECTED_MOUNT_REPAIR|' + json.dumps({
+            'filesystem': filesystem, 'blocks': blocks,
+            'restored_block_sha256': [hashlib.sha256(block).hexdigest() for block in original],
+            'application_sha256': hashlib.sha256(expected).hexdigest()}), flush=True)
+
+cycle('read-repair', False, repair)
+if filesystem == 'fat32':
+    written = bytes([0xA3]) * 16385
+    (directory / 'new-payload').write_bytes(written)
+    def write_and_capture():
+        # Keep the client descriptor open through capture: neither close/flush
+        # nor CLI finalization may rescue a missing fsync publication.
+        client = '''
+import hashlib, json, os, pathlib, shutil, sys
+directory, mount = map(pathlib.Path, sys.argv[1:])
+data = (directory / 'new-payload').read_bytes()
+with (mount / 'kernel-written.bin').open('wb') as target:
+    assert target.write(data) == len(data)
+    target.flush()
+    os.fsync(target.fileno())
+    paths = [directory / 'image', directory / 'sidecar']
+    before = [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
+    for path, name in zip(paths, ['fsync.image', 'fsync.sidecar']):
+        shutil.copyfile(path, directory / name)
+    assert [hashlib.sha256((directory / name).read_bytes()).hexdigest()
+            for name in ['fsync.image', 'fsync.sidecar']] == before
+    assert [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths] == before
+    print('PROTECTED_MOUNT_FSYNC_CAPTURE|' + json.dumps(before), flush=True)
+'''
+        print(run(['python3', '-c', client, directory, mount]).decode(), end='', flush=True)
+        assert run(['cat', mount / 'kernel-written.bin']) == written
+    cycle('write-fsync', True, write_and_capture)
+    def reopen():
+        assert run(['cat', mount / 'kernel-written.bin']) == written
+        assert run(['cat', mount / 'payload.bin']) == expected
+    cycle('fresh-reopen', False, reopen)
+";
+
+fn assert_mounted_repair(fixture: &Fixture, filesystem: &str, blocks: [u64; 2]) {
+    if std::env::var_os("FFS_PROTECTED_MOUNT_E2E").as_deref() != Some(OsStr::new("1")) {
+        return;
+    }
+    let binary = std::env::var_os("FFS_PROTECTED_MOUNT_BIN")
+        .expect("mounted repair requires the source-bound production CLI");
+    let source = std::env::var("FFS_CLI_SOURCE_STAMP")
+        .expect("mounted repair requires the production CLI source identity");
+    let artifacts = std::env::var_os("FFS_CLI_ARTIFACT_DIR")
+        .expect("mounted repair requires a retained artifact directory");
+    let directory = tempfile::Builder::new()
+        .prefix("ffs-protected-mount-")
+        .tempdir_in(artifacts)
+        .unwrap()
+        .keep();
+    println!("PROTECTED_MOUNT_ARTIFACTS|{}", directory.display());
+    let image = directory.join("image");
+    let archive = directory.join("sidecar");
+    // The owning test has finished and verified this pair. Copy both inputs;
+    // the new CLI independently admits them without inheriting warmed caches.
+    std::fs::copy(&fixture.image, &image).unwrap();
+    std::fs::copy(&fixture.sidecar, &archive).unwrap();
+    std::fs::write(directory.join("expected"), &fixture.payload).unwrap();
+    std::fs::create_dir(directory.join("mount")).unwrap();
+    let cx = Cx::for_testing();
+    let output = command(
+        Command::new("python3")
+            .args(["-c", MOUNTED_REPAIR])
+            .arg(&binary)
+            .arg(&source)
+            .arg(&directory)
+            .arg(filesystem)
+            .arg(blocks[0].to_string())
+            .arg(blocks[1].to_string()),
+    );
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(verify(&cx, &image, &archive).unwrap().is_healthy());
+    if filesystem == "fat32" {
+        assert!(
+            verify(
+                &cx,
+                &directory.join("fsync.image"),
+                &directory.join("fsync.sidecar"),
+            )
+            .unwrap()
+            .is_healthy(),
+            "the capture before CLI shutdown must already have current protection"
+        );
+        assert_fat_cli_refresh(&directory, &binary, &source);
+    }
+    println!("PROTECTED_MOUNT_RESULT|{filesystem}|PASS");
+}
+
+fn assert_fat_cli_refresh(directory: &Path, protected: &OsStr, source: &str) {
+    use sha2::{Digest, Sha256};
+
+    let binary = std::env::var_os("FFS_FAT_BIN")
+        .expect("FAT refresh requires the source-bound production CLI");
+    let binary_hash = format!("{:x}", Sha256::digest(std::fs::read(&binary).unwrap()));
+    let image = directory.join("image");
+    let archive = directory.join("sidecar");
+    let cx = Cx::for_testing();
+    // A healthy old image/archive pair is insufficient. Independently read the
+    // pre-shutdown capture to prove it contains the acknowledged kernel write.
+    for (path, expected) in [
+        ("kernel-written.bin", vec![0xA3; 16_385]),
+        (
+            "payload.bin",
+            std::fs::read(directory.join("expected")).unwrap(),
+        ),
+    ] {
+        let output = command(
+            Command::new(&binary)
+                .arg("cat")
+                .arg(directory.join("fsync.image"))
+                .arg(path)
+                .arg("--sidecar")
+                .arg(directory.join("fsync.sidecar")),
+        );
+        assert_eq!(output.stdout, expected);
+    }
+    let mutate = |label: &str, operation: &str, paths: &[&str], input: Option<&str>, create| {
+        let mut cmd = Command::new(&binary);
+        cmd.arg(operation)
+            .arg(&image)
+            .args(paths)
+            .arg("--offline-image")
+            .arg("--sidecar")
+            .arg(&archive);
+        if let Some(input) = input {
+            cmd.arg("--source").arg(directory.join(input));
+        }
+        if create {
+            cmd.arg("--create");
+        }
+        let output = command(&mut cmd);
+        std::fs::write(directory.join(format!("cli-{label}.json")), &output.stdout).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["sidecar_refreshed"], true);
+        assert!(verify(&cx, &image, &archive).unwrap().is_healthy());
+        println!("PROTECTED_FAT_CLI_RESULT|{label}|PASS|source={source}|sha256={binary_hash}");
+    };
+    let read = |path: &str| {
+        command(
+            Command::new(&binary)
+                .arg("cat")
+                .arg(&image)
+                .arg(path)
+                .arg("--sidecar")
+                .arg(&archive),
+        )
+        .stdout
+    };
+    mutate("mkdir", "mkdir", &["/cli-dir"], None, false);
+    mutate(
+        "create",
+        "replace",
+        &["/cli-dir/created.bin"],
+        Some("new-payload"),
+        true,
+    );
+    assert_eq!(read("/cli-dir/created.bin"), vec![0xA3; 16_385]);
+    mutate(
+        "replace",
+        "replace",
+        &["/cli-dir/created.bin"],
+        Some("expected"),
+        false,
+    );
+    let expected = std::fs::read(directory.join("expected")).unwrap();
+    assert_eq!(read("/cli-dir/created.bin"), expected);
+    mutate(
+        "rename",
+        "rename",
+        &["/cli-dir/created.bin", "/cli-renamed.bin"],
+        None,
+        false,
+    );
+    assert_eq!(read("/cli-renamed.bin"), expected);
+    mutate("unlink", "unlink", &["/cli-renamed.bin"], None, false);
+    mutate("rmdir", "rmdir", &["/cli-dir"], None, false);
+    let volume = fat::reader::FatVolume::open(&cx, &image, 0, None).unwrap();
+    for path in ["/cli-dir", "/cli-renamed.bin"] {
+        assert!(volume.resolve(&cx, path).unwrap().is_none());
+    }
+    drop(volume);
+    let checked = command(Command::new("fsck.fat").arg("-n").arg(&image));
+    std::fs::write(directory.join("native-fat32.stdout"), &checked.stdout).unwrap();
+    std::fs::write(directory.join("native-fat32.stderr"), &checked.stderr).unwrap();
+
+    let formatted = directory.join("formatted.fat16");
+    let formatted_archive = directory.join("formatted.sidecar");
+    let output = command(
+        Command::new(&binary)
+            .arg("format")
+            .arg(&formatted)
+            .args(["--kind", "fat16", "--size-mib", "8", "--sidecar"])
+            .arg(&formatted_archive),
+    );
+    std::fs::write(directory.join("cli-format.json"), &output.stdout).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["sidecar_refreshed"], true);
+    assert!(
+        verify(&cx, &formatted, &formatted_archive)
+            .unwrap()
+            .is_healthy()
+    );
+    let checked = command(Command::new("fsck.fat").arg("-n").arg(&formatted));
+    std::fs::write(directory.join("native-fat16.stdout"), &checked.stdout).unwrap();
+    std::fs::write(directory.join("native-fat16.stderr"), &checked.stderr).unwrap();
+    let output = command(
+        Command::new(protected)
+            .arg(&formatted)
+            .arg(&formatted_archive)
+            .args(["--check", "--exclusive-image", "--allow-repair"]),
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["event"], "checked_not_mounted");
+    assert_eq!(status["filesystem"], "fat16");
+    assert_eq!(status["read_only"], true);
+    println!("PROTECTED_FAT_CLI_RESULT|format|PASS|source={source}|sha256={binary_hash}");
+}
+
 #[test]
 fn command_requires_authority_and_a_single_execution_mode() {
     let base = ["ffs-protected-mount", "image", "archive", "--check"];
@@ -1021,7 +1384,7 @@ fn protected_mount_fat32_repairs_multi_block_corruption_and_refreshes_on_rw_bd_q
             .is_healthy()
     );
 
-    // Now mount writable (--rw), write a new file, and verify sidecar refreshes on finish
+    // Enable writable FsOps, write a new file, and verify protection on finish.
     let rw_prepared = prepare(&cx, &fixture.writable_args()).expect("admit writable fat32");
     assert!(rw_prepared.fs.is_writable());
     let new_data = vec![0xA7_u8; 12_288];
@@ -1052,6 +1415,7 @@ fn protected_mount_fat32_repairs_multi_block_corruption_and_refreshes_on_rw_bd_q
             .unwrap()
             .is_healthy()
     );
+    assert_mounted_repair(&fixture, "fat32", [data_block_0, data_block_1]);
 }
 
 #[test]
@@ -1347,6 +1711,7 @@ fn protected_mount_ntfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
             .unwrap()
             .is_healthy()
     );
+    assert_mounted_repair(&fixture, "ntfs", [80, 81]);
 }
 
 #[test]
@@ -1681,4 +2046,5 @@ fn protected_mount_zfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
             .unwrap()
             .is_healthy()
     );
+    assert_mounted_repair(&fixture, "zfs", [blk_a, blk_b]);
 }

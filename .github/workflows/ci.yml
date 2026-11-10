@@ -340,7 +340,7 @@ jobs:
       - name: Install FUSE and ext4 prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs attr
+          sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs dosfstools attr
           # fusermount3 needs this for fuser's automatic-unmount helper.
           if ! grep -qxF user_allow_other /etc/fuse.conf; then
             printf '%s\n' user_allow_other | sudo tee -a /etc/fuse.conf
@@ -357,17 +357,18 @@ jobs:
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           test -w "$CARGO_TARGET_DIR"
-          cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount
+          cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount --bin ffs-fat
           cargo build --release -p ffs-repair --bin ffs-image-repair
           cargo test -p ffs-harness --no-run
           mkdir -p "$RUNNER_TEMP/ffs-cli-proof/bin" "$RUNNER_TEMP/ffs-cli-proof/artifacts"
-          cp target/release/ffs-cli target/release/ffs-protected-mount target/release/ffs-image-repair "$RUNNER_TEMP/ffs-cli-proof/bin/"
+          cp target/release/ffs-cli target/release/ffs-protected-mount target/release/ffs-fat target/release/ffs-image-repair "$RUNNER_TEMP/ffs-cli-proof/bin/"
           printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/ffs-cli-proof/source-revision.txt"
           rustc --version --verbose > "$RUNNER_TEMP/ffs-cli-proof/toolchain.txt"
           (cd "$RUNNER_TEMP/ffs-cli-proof" && sha256sum bin/*) > "$RUNNER_TEMP/ffs-cli-proof/sha256sums.txt"
           {
             echo "FFS_CLI_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-cli"
             echo "FFS_PROTECTED_MOUNT_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-protected-mount"
+            echo "FFS_FAT_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-fat"
             echo "FFS_IMAGE_REPAIR_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-image-repair"
             echo "FFS_CLI_SOURCE_STAMP=$GITHUB_SHA"
             echo "FFS_CLI_ARTIFACT_DIR=$RUNNER_TEMP/ffs-cli-proof/artifacts"
@@ -423,6 +424,23 @@ jobs:
           FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
         run: cargo test -p ffs-cli --test cli_e2e cli_live_tui_one_process_observes_real_mounts_and_cleans_up -- --exact --nocapture --test-threads=1
+
+      - name: Protected FAT32 NTFS and ZFS mounted repair
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
+        timeout-minutes: 20
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
+          FFS_PROTECTED_MOUNT_E2E: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p ffs-cli --bin ffs-protected-mount -- bd_q19uk --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/protected-mount-repair.log"
+          for filesystem in fat32 ntfs zfs; do
+            grep -qxF "PROTECTED_MOUNT_RESULT|$filesystem|PASS" "$RUNNER_TEMP/protected-mount-repair.log"
+          done
+          for operation in format mkdir create replace rename unlink rmdir; do
+            grep -qF "PROTECTED_FAT_CLI_RESULT|$operation|PASS|" "$RUNNER_TEMP/protected-mount-repair.log"
+          done
 
       # bd-53dub: a mounted test that cannot mount fails here instead of
       # passing vacuously (FUSE, fuse3, e2fsprogs and btrfs-progs are installed
@@ -588,6 +606,19 @@ jobs:
             artifacts/e2e/**/*.json
             ${{ runner.temp }}/btrfs-differential-positive.log
             ${{ runner.temp }}/btrfs-differential-controls.*/*.log
+            ${{ runner.temp }}/protected-mount-repair.log
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/*.log
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/*.json
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/*.stdout
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/*.stderr
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/expected
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/new-payload
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/image
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/sidecar
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/fsync.image
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/fsync.sidecar
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/formatted.fat16
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/formatted.sidecar
             /tmp/ffs-live-tui-*/*.log
             /tmp/ffs-live-tui-*/*-profile.stdout
             /tmp/ffs-live-tui-*/*-profile.stderr
