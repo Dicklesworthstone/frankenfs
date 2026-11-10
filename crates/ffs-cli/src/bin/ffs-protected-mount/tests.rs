@@ -547,7 +547,11 @@ fn assert_fat_cli_refresh(directory: &Path, protected: &OsStr, source: &str) {
     mutate("rmdir", "rmdir", &["/cli-dir"], None, false);
     let volume = fat::reader::FatVolume::open(&cx, &image, 0, None).unwrap();
     for path in ["/cli-dir", "/cli-renamed.bin"] {
-        assert!(volume.resolve(&cx, path).unwrap().is_none());
+        assert!(
+            matches!(volume.resolve(&cx, path), Err(FfsError::NotFound(name))
+                if name == path.trim_start_matches('/')),
+            "removed FAT path must report its exact missing name: {path}"
+        );
     }
     drop(volume);
     let checked = command(Command::new("fsck.fat").arg("-n").arg(&image));
