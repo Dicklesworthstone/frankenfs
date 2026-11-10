@@ -812,16 +812,22 @@ impl Ext4MetadataValidator {
                     if inode.mode == 0 {
                         continue;
                     }
-                    let inode_csum_ok =
-                        ffs_ondisk::ext4::verify_inode_checksum(raw, seed, ino, sb.inode_size)
-                            .is_ok();
-                    if inode_csum_ok && inode.file_acl != 0 && inode.file_acl < sb.blocks_count {
+                    // Do not let a damaged inode redirect metadata ownership
+                    // onto unrelated blocks. Its table block is already a scrub
+                    // target; a decoded-view rebuild can discover its children
+                    // after the inode itself has been recovered.
+                    if ffs_ondisk::ext4::verify_inode_checksum(raw, seed, ino, sb.inode_size)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if inode.file_acl != 0 && inode.file_acl < sb.blocks_count {
                         owned.push((inode.file_acl, Ext4OwnedBlock::Xattr));
                     }
+                    let is_journal = has_journal && ino == sb.journal_inum;
                     if inode.flags & ffs_types::EXT4_EXTENTS_FL != 0 {
                         let is_dir = inode.is_dir();
                         let indexed = inode.has_htree_index();
-                        let is_journal = has_journal && ino == sb.journal_inum;
                         Self::collect_ext4_inode_owned_from_tree(
                             cx,
                             device,
@@ -835,12 +841,126 @@ impl Ext4MetadataValidator {
                             0,
                             &mut owned,
                         );
+                    } else {
+                        Self::collect_ext4_legacy_inode_owned(
+                            cx, device, sb, &inode, ino, is_journal, &mut owned,
+                        )?;
                     }
                 }
             }
         }
         validator.add_owned_blocks(owned);
         Ok(validator)
+    }
+
+    /// Legacy ext2/ext3-style block maps remain valid on metadata_csum ext4.
+    /// Their pointer blocks have no checksum, but their directory blocks and
+    /// journal superblock do. Discover those targets from the supplied device
+    /// (including a decoded overlay), without depending on an `OpenFs` walk.
+    fn collect_ext4_legacy_inode_owned(
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        sb: &Ext4Superblock,
+        inode: &ffs_ondisk::Ext4Inode,
+        ino: u32,
+        is_journal: bool,
+        out: &mut Vec<(u64, Ext4OwnedBlock)>,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if inode.flags & ffs_types::EXT4_INLINE_DATA_FL != 0 || (!inode.is_dir() && !is_journal) {
+            return Ok(());
+        }
+        let block_count = sb.blocks_count.min(device.block_count());
+        let logical_blocks = inode.size.div_ceil(u64::from(sb.block_size));
+        let read_pointer =
+            |raw: &[u8]| u64::from(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+        let valid_pointer = |block: u64| block != 0 && block < block_count;
+
+        // Logical journal block zero is always the first direct pointer.
+        // Its remaining log blocks require transaction-aware validation, not
+        // directory checksums or speculative magic-number recognition.
+        if is_journal {
+            if logical_blocks != 0
+                && let Some(raw) = inode.extent_bytes.get(..4)
+            {
+                let block = read_pointer(raw);
+                if valid_pointer(block) {
+                    out.push((block, Ext4OwnedBlock::Jbd2Superblock));
+                }
+            }
+            return Ok(());
+        }
+
+        let mut seen_data = std::collections::HashSet::new();
+        let mut record_directory = |block, logical| {
+            if valid_pointer(block) && logical < logical_blocks && seen_data.insert(block) {
+                let kind = if logical == 0 && inode.has_htree_index() {
+                    Ext4OwnedBlock::DxRoot {
+                        ino,
+                        generation: inode.generation,
+                    }
+                } else {
+                    Ext4OwnedBlock::DirLeaf {
+                        ino,
+                        generation: inode.generation,
+                    }
+                };
+                out.push((block, kind));
+            }
+        };
+        for (raw, logical) in inode.extent_bytes.chunks_exact(4).take(12).zip(0_u64..) {
+            record_directory(read_pointer(raw), logical);
+        }
+
+        let pointers_per_block = u64::from(sb.block_size / 4);
+        let mut stack = Vec::new();
+        let mut logical_start = 12_u64;
+        for (raw, depth) in inode.extent_bytes.chunks_exact(4).skip(12).zip(1_u32..=3) {
+            let block = read_pointer(raw);
+            if logical_start < logical_blocks && valid_pointer(block) {
+                stack.push((block, depth, logical_start));
+            }
+            let span = pointers_per_block.checked_pow(depth).ok_or_else(|| {
+                FfsError::Format("ext4 indirect block-map span overflows".to_owned())
+            })?;
+            logical_start = logical_start.checked_add(span).ok_or_else(|| {
+                FfsError::Format("ext4 indirect block-map offset overflows".to_owned())
+            })?;
+        }
+
+        // At most three pointer levels, and each physical pointer block is
+        // read once. Corrupt cycles/repeated references cannot multiply the
+        // walk's I/O or memory use. Holes keep their logical span, and pointers
+        // past EOF or either the filesystem/device end are never followed.
+        let mut visited = std::collections::HashSet::new();
+        while let Some((block, depth, logical_start)) = stack.pop() {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if !visited.insert(block) {
+                continue;
+            }
+            let bytes = match device.read_block(cx, BlockNumber(block)) {
+                Ok(bytes) => bytes,
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(_) => continue, // The scrub scan reports unreadable blocks.
+            };
+            let child_span = pointers_per_block.pow(depth - 1);
+            for (raw, index) in bytes.as_slice().chunks_exact(4).zip(0..pointers_per_block) {
+                let logical = logical_start + index * child_span;
+                if logical >= logical_blocks {
+                    break;
+                }
+                let child = read_pointer(raw);
+                if !valid_pointer(child) {
+                    continue;
+                }
+                if depth == 1 {
+                    record_directory(child, logical);
+                } else {
+                    stack.push((child, depth - 1, logical));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -3127,7 +3247,7 @@ mod tests {
             iblock[20..22].copy_from_slice(&0_u16.to_le_bytes()); // ei_leaf_hi = 0
             ffs_ondisk::ext4::stamp_inode_checksum(slot, seed, 11, 256).expect("stamp ino 11");
         }
-        dev.write(BlockNumber(4), itab);
+        dev.write(BlockNumber(4), itab.clone());
 
         // Block 5: valid directory leaf block for ino 2 (gen 7).
         let mut dir_block = vec![0_u8; 4096];
@@ -3174,31 +3294,341 @@ mod tests {
         ffs_ondisk::ext4::stamp_extent_block_checksum(&mut extent_block, seed, 11, 9);
         dev.write(BlockNumber(8), extent_block.clone());
 
-        // Build validator purely from `device` (no `add_owned_blocks` call!).
-        let validator = Ext4MetadataValidator::from_device(&cx, &dev, &sb)
-            .expect("from_device must build validator");
-        let clean_report = Scrubber::new(&dev, &validator)
-            .scrub_all(&cx)
-            .expect("clean scrub");
-        assert!(
-            clean_report.is_clean(),
-            "all valid blocks must scrub clean: {:?}",
-            clean_report.findings
+        // Both extent and legacy block maps must be discovered purely from
+        // `device` (no `add_owned_blocks` call), including when the device is a
+        // decoded overlay used to validate a pending repair.
+        for legacy in [false, true] {
+            if legacy {
+                for (slot_index, ino, block) in [(1, 2, 5_u32), (7, 8, 7_u32)] {
+                    let slot = &mut itab[slot_index * 256..(slot_index + 1) * 256];
+                    slot[0x20..0x24].fill(0); // no EXT4_EXTENTS_FL
+                    slot[0x28..0x64].fill(0);
+                    slot[0x28..0x2C].copy_from_slice(&block.to_le_bytes());
+                    ffs_ondisk::ext4::stamp_inode_checksum(slot, seed, ino, 256)
+                        .expect("stamp legacy inode");
+                }
+                dev.write(BlockNumber(4), itab.clone());
+            }
+            let validator = Ext4MetadataValidator::from_device(&cx, &dev, &sb)
+                .expect("from_device must build validator");
+            let clean_report = Scrubber::new(&dev, &validator)
+                .scrub_all(&cx)
+                .expect("clean scrub");
+            assert!(
+                clean_report.is_clean(),
+                "all valid blocks must scrub clean (legacy={legacy}): {:?}",
+                clean_report.findings
+            );
+
+            // Flip 1 byte in each discovered inode-owned / JBD2 block.
+            for (blk_no, mut raw, flip_off, label) in [
+                (5_u64, dir_block.clone(), 24_usize, "DirLeaf"),
+                (6_u64, xattr_block.clone(), 64_usize, "Xattr"),
+                (7_u64, jbd2_sb.clone(), 28_usize, "Jbd2Superblock"),
+                (8_u64, extent_block.clone(), 16_usize, "ExtentNode"),
+            ] {
+                raw[flip_off] ^= 0x01;
+                let verdict = validator.validate(BlockNumber(blk_no), &BlockBuf::new(raw));
+                assert!(
+                    matches!(verdict, BlockVerdict::Corrupt(_)),
+                    "from_device validator must reject corrupted {label} at block {blk_no} \
+                     (legacy={legacy}), got {verdict:?}"
+                );
+            }
+        }
+
+        // Invalid owner checksums must not redirect either legacy or extent
+        // discovery. The inode-table block still reports the corruption.
+        for slot_index in [1, 7, 10] {
+            itab[slot_index * 256 + 0x28] ^= 0x01;
+        }
+        dev.write(BlockNumber(4), itab);
+        let validator = Ext4MetadataValidator::from_device(&cx, &dev, &sb).expect("damaged owners");
+        assert!(matches!(
+            validator.validate(
+                BlockNumber(4),
+                &dev.read_block(&cx, BlockNumber(4)).unwrap()
+            ),
+            BlockVerdict::Corrupt(_)
+        ));
+        for block in 5..=8 {
+            assert!(
+                matches!(
+                    validator.validate(
+                        BlockNumber(block),
+                        &dev.read_block(&cx, BlockNumber(block)).unwrap()
+                    ),
+                    BlockVerdict::Skip
+                ),
+                "a corrupt owner must not assign checksum authority to block {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_legacy_scrub_discovers_direct_and_three_indirect_levels_bd_jufod() {
+        let cx = test_cx();
+        let dev = BatchCountingBlockDevice::new(4096, 32);
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_ext4_superblock_region())
+            .expect("superblock");
+        let mut inode = ffs_ondisk::Ext4Inode::parse_from_bytes(&[0; 256]).expect("inode");
+        inode.mode = ffs_types::S_IFDIR | 0o755;
+        inode.flags = ffs_types::EXT4_INDEX_FL;
+        inode.generation = 7;
+        // Include one block at the start of the triple-indirect range; holes
+        // must retain their full logical span when classifying the dx_root.
+        let pointers = 1024_u64;
+        inode.size = (12 + pointers + pointers * pointers + 1) * 4096;
+        for (slot, block) in [(0, 5_u32), (2, 6), (12, 7), (13, 9), (14, 12)] {
+            inode.extent_bytes[slot * 4..slot * 4 + 4].copy_from_slice(&block.to_le_bytes());
+        }
+        for (block, slot, child) in [
+            (7, 3, 8_u32), // single indirect: logical 15
+            (9, 2, 10),
+            (10, 4, 11), // double indirect: logical 3088
+            (12, 0, 13),
+            (13, 0, 14),
+            (14, 0, 15), // triple indirect: logical 1049612
+        ] {
+            let mut bytes = vec![0; 4096];
+            bytes[slot * 4..slot * 4 + 4].copy_from_slice(&child.to_le_bytes());
+            dev.write(BlockNumber(block), bytes);
+        }
+        let mut owned = Vec::new();
+        Ext4MetadataValidator::collect_ext4_legacy_inode_owned(
+            &cx, &dev, &sb, &inode, 2, false, &mut owned,
+        )
+        .expect("legacy walk");
+        owned.sort_by_key(|(block, _)| *block);
+        assert_eq!(
+            owned,
+            vec![
+                (
+                    5,
+                    Ext4OwnedBlock::DxRoot {
+                        ino: 2,
+                        generation: 7
+                    }
+                ),
+                (
+                    6,
+                    Ext4OwnedBlock::DirLeaf {
+                        ino: 2,
+                        generation: 7
+                    }
+                ),
+                (
+                    8,
+                    Ext4OwnedBlock::DirLeaf {
+                        ino: 2,
+                        generation: 7
+                    }
+                ),
+                (
+                    11,
+                    Ext4OwnedBlock::DirLeaf {
+                        ino: 2,
+                        generation: 7
+                    }
+                ),
+                (
+                    15,
+                    Ext4OwnedBlock::DirLeaf {
+                        ino: 2,
+                        generation: 7
+                    }
+                ),
+            ]
+        );
+        assert_eq!(dev.scalar_read_count(), 6, "read each pointer block once");
+        // Pointer blocks are not checksummed by legacy ext4 and must never be
+        // presented as checksum-verified metadata.
+        let mut validator = Ext4MetadataValidator::new(&sb, &[]);
+        validator.add_owned_blocks(owned);
+        for block in [7, 9, 10, 12, 13, 14] {
+            assert!(matches!(
+                validator.validate(
+                    BlockNumber(block),
+                    &dev.read_block(&cx, BlockNumber(block)).unwrap()
+                ),
+                BlockVerdict::Skip
+            ));
+        }
+    }
+
+    #[test]
+    fn ext4_legacy_scrub_bounds_cycles_eof_device_and_inline_data_bd_jufod() {
+        let cx = test_cx();
+        let dev = BatchCountingBlockDevice::new(4096, 32);
+        let mut sb = Ext4Superblock::parse_superblock_region(&make_valid_ext4_superblock_region())
+            .expect("superblock");
+        let mut inode = ffs_ondisk::Ext4Inode::parse_from_bytes(&[0; 256]).expect("inode");
+        inode.mode = ffs_types::S_IFDIR | 0o755;
+        inode.size = u64::MAX;
+        for (slot, block) in [
+            (0, 5_u32),
+            (1, 32),
+            (2, u32::MAX),
+            (12, 6),
+            (13, 6),
+            (14, 6),
+        ] {
+            inode.extent_bytes[slot * 4..slot * 4 + 4].copy_from_slice(&block.to_le_bytes());
+        }
+        let mut cyclic = vec![0; 4096];
+        for pointer in cyclic.chunks_exact_mut(4) {
+            pointer.copy_from_slice(&6_u32.to_le_bytes());
+        }
+        dev.write(BlockNumber(6), cyclic);
+        let mut owned = Vec::new();
+        Ext4MetadataValidator::collect_ext4_legacy_inode_owned(
+            &cx, &dev, &sb, &inode, 2, false, &mut owned,
+        )
+        .expect("bounded cyclic walk");
+        assert_eq!(
+            dev.scalar_read_count(),
+            1,
+            "a repeated cyclic block is read once"
+        );
+        assert_eq!(
+            owned,
+            vec![(
+                5,
+                Ext4OwnedBlock::DirLeaf {
+                    ino: 2,
+                    generation: 0
+                }
+            )]
         );
 
-        // Flip 1 byte in each discovered inode-owned / JBD2 block and verify rejection.
-        for (blk_no, mut raw, flip_off, label) in [
-            (5_u64, dir_block, 24_usize, "DirLeaf"),
-            (6_u64, xattr_block, 64_usize, "Xattr"),
-            (7_u64, jbd2_sb, 28_usize, "Jbd2Superblock"),
-            (8_u64, extent_block, 16_usize, "ExtentNode"),
-        ] {
-            raw[flip_off] ^= 0x01;
-            let verdict = validator.validate(BlockNumber(blk_no), &BlockBuf::new(raw));
+        // A valid pointer beyond EOF must not be registered or read, and the
+        // filesystem bound also applies when the backing device is longer.
+        inode.size = 4096;
+        sb.blocks_count = 5;
+        owned.clear();
+        Ext4MetadataValidator::collect_ext4_legacy_inode_owned(
+            &cx, &dev, &sb, &inode, 2, false, &mut owned,
+        )
+        .expect("filesystem bound");
+        assert!(owned.is_empty());
+        assert_eq!(dev.scalar_read_count(), 1);
+
+        // Inline directory bytes are not an indirect block map.
+        sb.blocks_count = 32;
+        inode.flags = ffs_types::EXT4_INLINE_DATA_FL;
+        Ext4MetadataValidator::collect_ext4_legacy_inode_owned(
+            &cx, &dev, &sb, &inode, 2, false, &mut owned,
+        )
+        .expect("inline directory");
+        assert!(owned.is_empty());
+        assert_eq!(dev.scalar_read_count(), 1);
+    }
+
+    #[test]
+    fn ext4_metadata_legacy_scrub_checks_native_mke2fs_images_bd_jufod() {
+        use ffs_block::{ByteBlockDevice, ByteDevice, FileByteDevice};
+        use ffs_types::{ByteOffset, GroupNumber, InodeNumber};
+
+        let cx = test_cx();
+        for block_size in [1024, 4096] {
+            let dir = tempfile::tempdir().expect("temporary image directory");
+            let path = dir.path().join("legacy.ext4");
+            std::fs::File::create(&path)
+                .and_then(|file| file.set_len(32 * 1024 * 1024))
+                .expect("create image");
+            let formatted = std::process::Command::new("mke2fs")
+                .args([
+                    "-q",
+                    "-F",
+                    "-t",
+                    "ext4",
+                    "-O",
+                    "metadata_csum,^extent,^64bit",
+                    "-b",
+                    &block_size.to_string(),
+                ])
+                .arg(&path)
+                .output();
+            let formatted = match formatted {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|value| value != "1"),
+                        "FFS_REQUIRE_ORACLES=1 but mke2fs is unavailable"
+                    );
+                    eprintln!("SKIP bd-jufod legacy ext4 images: mke2fs unavailable");
+                    return;
+                }
+                Err(error) => panic!("run mke2fs: {error}"),
+            };
             assert!(
-                matches!(verdict, BlockVerdict::Corrupt(_)),
-                "from_device validator must reject corrupted {label} at block {blk_no}, got {verdict:?}"
+                formatted.status.success(),
+                "mke2fs failed: {}",
+                String::from_utf8_lossy(&formatted.stderr)
             );
+
+            let byte_dev = FileByteDevice::open_read_only(&path).expect("read-only image");
+            let raw_sb = ffs_block::read_ext4_superblock_region(&cx, &byte_dev).expect("read sb");
+            let sb = Ext4Superblock::parse_superblock_region(&raw_sb).expect("parse sb");
+            let mut raw_gd = vec![0; usize::from(sb.group_desc_size())];
+            byte_dev
+                .read_exact_at(
+                    &cx,
+                    ByteOffset(sb.group_desc_offset(GroupNumber(0)).expect("group zero")),
+                    &mut raw_gd,
+                )
+                .expect("read group descriptor");
+            let gd = ffs_ondisk::Ext4GroupDesc::parse_from_bytes(&raw_gd, sb.group_desc_size())
+                .expect("group descriptor");
+            assert_ne!(sb.journal_inum, 0, "fixture must contain a journal");
+            let mut targets = Vec::new();
+            for (ino, label) in [
+                (2, "root directory"),
+                (sb.journal_inum, "journal superblock"),
+            ] {
+                let (group, _, offset) = sb.inode_table_offset(InodeNumber(u64::from(ino)));
+                assert_eq!(group, GroupNumber(0));
+                let mut raw_inode = vec![0; usize::from(sb.inode_size)];
+                byte_dev
+                    .read_exact_at(
+                        &cx,
+                        ByteOffset(gd.inode_table * u64::from(sb.block_size) + offset),
+                        &mut raw_inode,
+                    )
+                    .expect("read inode");
+                let inode = ffs_ondisk::Ext4Inode::parse_from_bytes(&raw_inode).expect("inode");
+                assert_eq!(inode.flags & ffs_types::EXT4_EXTENTS_FL, 0, "{label}");
+                let first = &inode.extent_bytes[..4];
+                let block = u64::from(u32::from_le_bytes([first[0], first[1], first[2], first[3]]));
+                assert_ne!(block, 0, "{label} must have a first direct block");
+                targets.push((BlockNumber(block), label));
+            }
+            let dev = ByteBlockDevice::new(byte_dev, sb.block_size).expect("block device");
+            let validator = Ext4MetadataValidator::from_device(&cx, &dev, &sb).expect("validator");
+            let report = Scrubber::new(&dev, &validator)
+                .scrub_all(&cx)
+                .expect("scrub");
+            assert!(
+                report.is_clean(),
+                "native image must be clean: {:?}",
+                report.findings
+            );
+            for (block, label) in targets {
+                let clean = dev.read_block(&cx, block).expect("target block");
+                assert!(
+                    matches!(validator.validate(block, &clean), BlockVerdict::Clean),
+                    "{label} must be verified, not skipped (block size {block_size})"
+                );
+                let mut corrupt = clean.into_inner();
+                corrupt[0] ^= 0x01;
+                assert!(
+                    matches!(
+                        validator.validate(block, &BlockBuf::new(corrupt)),
+                        BlockVerdict::Corrupt(_)
+                    ),
+                    "damaged {label} must be detected (block size {block_size})"
+                );
+            }
         }
     }
 }
