@@ -533,7 +533,7 @@ fn growth_publication_torn_eof_never_exposes_uninitialized_preallocation() {
             )
             .unwrap();
             let writes = publications(&success);
-            assert!(!writes.is_empty());
+            assert_ne!(writes, Vec::<(usize, Vec<u8>)>::new());
             for (attempt, _) in writes {
                 // Exercise each possible prefix and suffix through the four
                 // EOF bytes, retaining or discarding unflushed bytes on restart.
@@ -637,7 +637,7 @@ fn growth_publication_torn_first_head_never_exposes_an_unrelated_chain() {
         )
         .unwrap();
         let writes = publications(&success);
-        assert!(!writes.is_empty());
+        assert_ne!(writes, Vec::<(usize, Vec<u8>)>::new());
         for (attempt, _) in writes {
             for within in [0, 20, 21, 22, 26, 27, 28, 29, 30, 31, 32] {
                 for suffix in [true, false] {

@@ -459,10 +459,15 @@ fn assert_mounted_repair(fixture: &Fixture, filesystem: &str, blocks: [u64; 2]) 
 
 fn assert_fat_cli_refresh(directory: &Path, protected: &OsStr, source: &str) {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     let binary = std::env::var_os("FFS_FAT_BIN")
         .expect("FAT refresh requires the source-bound production CLI");
-    let binary_hash = format!("{:x}", Sha256::digest(std::fs::read(&binary).unwrap()));
+    let digest = Sha256::digest(std::fs::read(&binary).unwrap());
+    let mut binary_hash = String::with_capacity(64);
+    for byte in &digest[..] {
+        write!(&mut binary_hash, "{byte:02x}").unwrap();
+    }
     let image = directory.join("image");
     let archive = directory.join("sidecar");
     let cx = Cx::for_testing();
