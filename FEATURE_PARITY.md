@@ -82,6 +82,22 @@
 > The seed and binaries remain unchanged, with default chunk growth and a
 > private mount namespace. Full harness/benchmark qualification remains in
 > progress; no test relaxation, percentage change or P0 closure is claimed.
+>
+> **Refreshed native EOF evidence (2026-11-10):** hosted source
+> `d158a7450f2b3888dad90a701fca78b410c18950` now passes four matched
+> kernel/FrankenFS cases on full, shared and unshared 100 MiB native images.
+> Both implementations shrink successfully, preserve observed inode state and physical
+> DATA allocation on refused growth, then expose a zero tail after reclaim.
+> Eleven native checks including data checksums and eight kernel readbacks
+> pass; full-image checks run before reclaim. Peer bytes and the three original
+> compressed files remain intact. FrankenFS images report a stale v1 space-cache
+> generation warning; native checking still exits zero. This uses a verified
+> prebuilt upstream image, ordinary owned external unmounts and no host-policy
+> changes. Raw execution and the retained image/log archive are under
+> `artifacts/implementation/20261105_live_tui_O6utU4/review36-native-eof*`.
+> The original P0 remains open for the separately reviewed correction and
+> execution of its randomized-growth property, including the valid 14-operation
+> ENOSPC case; the passing 48 sampled cases do not settle that condition.
 
 > **Btrfs differential daemon ordering (bd-53dub, 2026-11-03):** hosted
 >58acc82d5 passes full shell and journaled ext4 smoke, then fails btrfs reopen.
