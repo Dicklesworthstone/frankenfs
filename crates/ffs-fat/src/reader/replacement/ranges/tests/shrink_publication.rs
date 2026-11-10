@@ -18,6 +18,7 @@ type Pages = BTreeMap<u64, [u8; PAGE]>;
 #[derive(Clone, Copy)]
 enum Fault {
     Tear(usize),
+    TearSuffix(usize),
     Drop,
     Cancel,
 }
@@ -134,6 +135,11 @@ impl ByteDevice for Device {
             Some(Fault::Tear(prefix)) => {
                 storage.put(at.0, &bytes[..prefix.min(bytes.len())]);
                 return Err(std::io::Error::other("injected prefix-torn shrink write").into());
+            }
+            Some(Fault::TearSuffix(start)) => {
+                let start = start.min(bytes.len());
+                storage.put(at.0 + start as u64, &bytes[start..]);
+                return Err(std::io::Error::other("injected suffix-torn native write").into());
             }
             Some(Fault::Cancel) => {
                 storage.put(at.0, bytes);

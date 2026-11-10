@@ -11,6 +11,7 @@ mod insert;
 mod zero;
 
 use super::super::super::{Entry, FatTable, FatVolume, FileChain, MAX_CHAIN_CLUSTERS};
+use super::super::publication::EntryPublication;
 use super::super::{
     EXPECT_END, HASH_BYTES, allocate, change_fat, checkpoint, modified_timestamp, reserve_clusters,
     set_dirty, set_hints, write_volume,
@@ -339,19 +340,12 @@ fn apply_update(
         updated[24..26].copy_from_slice(&date.to_le_bytes());
         updated[11] |= 0x20;
     }
-    let sector_bytes = u64::from(volume.geometry.sector_bytes());
-    let sector_start = entry.offset / sector_bytes * sector_bytes;
-    let within = (entry.offset - sector_start) as usize;
     // Reserve scratch before dirty publication; neither payload nor gap size
     // affects memory use. Allocation/checker storage remains explicitly bounded.
-    let mut sector = allocate(sector_bytes as usize)?;
-    let mut sector_readback = allocate(sector_bytes as usize)?;
+    let mut publication = EntryPublication::new(volume, entry.offset)?;
     let mut bytes = allocate(HASH_BYTES)?;
     let mut readback = allocate(HASH_BYTES)?;
-    volume.read_exact(cx, sector_start, &mut sector)?;
-    if sector[within..within + 32] != original {
-        bail!("native range directory entry changed before mutation");
-    }
+    publication.verify_current(cx, volume, &original)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
@@ -464,17 +458,7 @@ fn apply_update(
         }
 
         phase = "publishing native length and metadata";
-        volume.read_exact(cx, sector_start, &mut sector)?;
-        if sector[within..within + 32] != original {
-            bail!("native range directory entry changed before publication");
-        }
-        sector[within..within + 32].copy_from_slice(&updated);
-        write_volume(cx, volume, sector_start, &sector)?;
-        volume.device.sync(cx)?;
-        volume.read_exact(cx, sector_start, &mut sector_readback)?;
-        if sector_readback != sector {
-            bail!("native range directory sector failed readback");
-        }
+        publication.publish_growth(cx, volume, &original, &updated)?;
 
         set_hints(cx, volume, free_hint)?;
         volume.device.sync(cx)?;

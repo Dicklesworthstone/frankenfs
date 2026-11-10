@@ -4,7 +4,8 @@
 //! FAT cache. The caller retains exclusive writer ownership through publication.
 
 use super::{
-    EXPECT_END, FatEntry, FatTable, FatVolume, Replacement, allocate, checkpoint, write_volume,
+    EXPECT_END, FatEntry, FatKind, FatTable, FatVolume, Replacement, allocate, checkpoint,
+    write_volume,
 };
 use anyhow::{Result, bail};
 use asupersync::Cx;
@@ -120,6 +121,20 @@ impl EntryPublication {
         })
     }
 
+    pub(super) fn verify_current(
+        &mut self,
+        cx: &Cx,
+        volume: &FatVolume,
+        expected: &[u8; 32],
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        volume.read_exact(cx, self.start, &mut self.sector)?;
+        if self.sector[self.within..self.within + 32] != *expected {
+            bail!("directory entry changed before replacement publication");
+        }
+        Ok(())
+    }
+
     fn publish(
         &mut self,
         cx: &Cx,
@@ -127,17 +142,62 @@ impl EntryPublication {
         expected: &[u8; 32],
         updated: &[u8; 32],
     ) -> Result<()> {
-        checkpoint(cx)?;
-        volume.read_exact(cx, self.start, &mut self.sector)?;
-        if self.sector[self.within..self.within + 32] != *expected {
-            bail!("directory entry changed before replacement publication");
-        }
+        self.verify_current(cx, volume, expected)?;
         self.sector[self.within..self.within + 32].copy_from_slice(updated);
         write_volume(cx, volume, self.start, &self.sector)?;
         volume.device.sync(cx)?;
         volume.read_exact(cx, self.start, &mut self.readback)?;
         if self.readback != self.sector {
             bail!("replacement directory sector failed readback; old allocation retained");
+        }
+        checkpoint(cx)?;
+        Ok(())
+    }
+
+    /// Publish an initialized extension while retaining the complete old chain.
+    /// Each size transition changes bits in only one direction, so a torn
+    /// mixture of its old/new bytes cannot expose bytes past initialized EOF.
+    /// An interrupted transition can leave a shorter file and dirty allocation;
+    /// this is ordered publication, not a rollback or atomicity guarantee.
+    pub(super) fn publish_growth(
+        &mut self,
+        cx: &Cx,
+        volume: &FatVolume,
+        original: &[u8; 32],
+        updated: &[u8; 32],
+    ) -> Result<()> {
+        let old_size = u32::from_le_bytes([original[28], original[29], original[30], original[31]]);
+        let size = u32::from_le_bytes([updated[28], updated[29], updated[30], updated[31]]);
+        if size < old_size {
+            bail!("growth publication must retain the verified shrink path");
+        }
+        let head_changed = original[26..28] != updated[26..28]
+            || (volume.geometry.kind() == FatKind::Fat32 && original[20..22] != updated[20..22]);
+        let mut previous = *original;
+        if head_changed {
+            if old_size != 0 {
+                bail!("incremental growth must retain a nonempty file's head");
+            }
+            // First allocation can change both FAT32 head words. Persist and
+            // verify that head with EOF still zero before exposing any data.
+            let mut ready = *updated;
+            ready[28..32].fill(0);
+            self.publish(cx, volume, &previous, &ready)?;
+            previous = ready;
+        } else {
+            // 0x0000ffff -> 0x00010000 can tear into 0x0001ffff and expose
+            // uninitialized retained preallocation. Intersecting the lengths
+            // bounds the first transition by old EOF and the second by new EOF.
+            let guard = old_size & size;
+            if guard != old_size {
+                let mut guarded = previous;
+                guarded[28..32].copy_from_slice(&guard.to_le_bytes());
+                self.publish(cx, volume, &previous, &guarded)?;
+                previous = guarded;
+            }
+        }
+        if previous != *updated {
+            self.publish(cx, volume, &previous, updated)?;
         }
         checkpoint(cx)?;
         Ok(())

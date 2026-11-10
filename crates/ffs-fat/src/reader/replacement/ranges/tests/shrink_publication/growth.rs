@@ -499,3 +499,294 @@ fn mounted_growth_link_failure_keeps_native_eof_and_quarantines_cached_access() 
         libc::EIO
     );
 }
+
+fn restart_image(image: &Image) -> Image {
+    Image {
+        device: image.device.restart(false),
+        geometry: image.geometry.clone(),
+        sector_start: image.sector_start,
+        entry: image.entry,
+        chain: image.chain.clone(),
+        payload: image.payload.clone(),
+    }
+}
+
+#[test]
+fn growth_publication_torn_eof_never_exposes_uninitialized_preallocation() {
+    // A suffix tear of 0x0000ffff -> 0x00010000 used to publish 0x0001ffff.
+    // This fixture owns enough retained, poisoned allocation that such an EOF
+    // exposes stale bytes rather than merely failing a short-chain check.
+    const OLD: u32 = 65_535;
+    const NEW: u64 = 65_536;
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let pristine = fixture(kind, 512, false, OLD);
+        for action in ACTIONS {
+            if matches!(action, Action::Reserve) {
+                continue;
+            }
+            let success = restart_image(&pristine);
+            execute(
+                &Cx::for_testing(),
+                &success.device.open().unwrap(),
+                action,
+                NEW,
+            )
+            .unwrap();
+            let writes = publications(&success);
+            assert!(!writes.is_empty());
+            for (attempt, _) in writes {
+                // Exercise each possible prefix and suffix through the four
+                // EOF bytes, retaining or discarding unflushed bytes on restart.
+                for within in 28..=32 {
+                    for suffix in [true, false] {
+                        let image = restart_image(&pristine);
+                        let volume = image.device.open().unwrap();
+                        let old_allocation = allocation(&image);
+                        let cut = (image.entry - image.sector_start) as usize + within;
+                        image.device.storage.lock().unwrap().fault = Some((
+                            attempt,
+                            if suffix {
+                                Fault::TearSuffix(cut)
+                            } else {
+                                Fault::Tear(cut)
+                            },
+                        ));
+                        assert!(
+                            execute(&Cx::for_testing(), &volume, action, NEW).is_err(),
+                            "{kind:?} {action:?} cut {attempt}/{within}, suffix={suffix}"
+                        );
+                        assert_old_allocation(&image, &old_allocation);
+                        for retain in [false, true] {
+                            let restarted = image.device.restart(retain);
+                            let length = u32::from_le_bytes(
+                                restarted.bytes(image.entry + 28, 4).try_into().unwrap(),
+                            );
+                            assert!(
+                                u64::from(length) <= NEW,
+                                "{kind:?} {action:?} cut {attempt}/{within}, suffix={suffix}, retain={retain}: native EOF {length} exposes bytes past initialized EOF {NEW}"
+                            );
+                            assert_eq!(
+                                restarted.bytes(image.entry + 20, 2),
+                                success.device.bytes(success.entry + 20, 2)
+                            );
+                            assert_eq!(
+                                restarted.bytes(image.entry + 26, 2),
+                                success.device.bytes(success.entry + 26, 2)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn empty_high_head_fixture(sector: u32) -> Image {
+    let mut image = fixture(FatKind::Fat32, sector, false, 768);
+    let mut record = image.device.bytes(image.entry, 32);
+    record[20..22].copy_from_slice(&0xC000_u16.to_le_bytes());
+    record[26..32].fill(0);
+    {
+        let mut storage = image.device.storage.lock().unwrap();
+        // Force the first new head to 0x00010002. A torn low-word publication
+        // can otherwise point the file at root cluster 2 with a nonzero EOF.
+        // Native bad-cluster markers reserve the intervening storage without
+        // fabricating unowned allocation or weakening the checker.
+        for copy in 0..image.geometry.fat_count() {
+            let high = (10 + u32::from(copy)) << 28;
+            for cluster in 3..65_538 {
+                if cluster != 4 {
+                    storage.put(
+                        BASE + image.geometry.entry_offset(copy, cluster).unwrap(),
+                        &(high | 0x0FFF_FFF7_u32).to_le_bytes(),
+                    );
+                }
+            }
+            storage.put(
+                BASE + image.geometry.entry_offset(copy, 65_538).unwrap(),
+                &high.to_le_bytes(),
+            );
+        }
+        storage.put(image.entry, &record);
+        storage.persist();
+    }
+    image.chain.clear();
+    image.payload.clear();
+    assert!(
+        image
+            .device
+            .open()
+            .unwrap()
+            .check(&Cx::for_testing())
+            .unwrap()
+            .clean
+    );
+    image
+}
+
+#[test]
+fn growth_publication_torn_first_head_never_exposes_an_unrelated_chain() {
+    for sector in [512, 4096] {
+        let pristine = empty_high_head_fixture(sector);
+        let success = restart_image(&pristine);
+        execute(
+            &Cx::for_testing(),
+            &success.device.open().unwrap(),
+            Action::Write,
+            4,
+        )
+        .unwrap();
+        let writes = publications(&success);
+        assert!(!writes.is_empty());
+        for (attempt, _) in writes {
+            for within in [0, 20, 21, 22, 26, 27, 28, 29, 30, 31, 32] {
+                for suffix in [true, false] {
+                    let image = restart_image(&pristine);
+                    let volume = image.device.open().unwrap();
+                    let neighbors = image.device.bytes(image.sector_start, sector as usize - 32);
+                    let cut = (image.entry - image.sector_start) as usize + within;
+                    image.device.storage.lock().unwrap().fault = Some((
+                        attempt,
+                        if suffix {
+                            Fault::TearSuffix(cut)
+                        } else {
+                            Fault::Tear(cut)
+                        },
+                    ));
+                    assert!(execute(&Cx::for_testing(), &volume, Action::Write, 4).is_err());
+                    for retain in [false, true] {
+                        let restarted = image.device.restart(retain);
+                        let record = restarted.bytes(image.entry, 32);
+                        let high = u16::from_le_bytes(record[20..22].try_into().unwrap());
+                        let low = u16::from_le_bytes(record[26..28].try_into().unwrap());
+                        let first = (u32::from(high & 0x0FFF) << 16) | u32::from(low);
+                        let length = u32::from_le_bytes(record[28..32].try_into().unwrap());
+                        assert!(length <= 4);
+                        assert!(
+                            length == 0 || first == 65_538,
+                            "sector={sector} cut {attempt}/{within}, suffix={suffix}, retain={retain}: nonzero EOF {length} exposes mixed cluster head {first}"
+                        );
+                        assert_eq!(high & 0xF000, 0xC000);
+                        assert_eq!(
+                            restarted.bytes(image.sector_start, sector as usize - 32),
+                            neighbors
+                        );
+                        assert_eq!(
+                            restarted.bytes(BASE + image.geometry.cluster_offset(4).unwrap(), 4),
+                            b"SAFE"
+                        );
+                        assert_eq!(restarted.bytes(0, PAGE), [0xA7; PAGE]);
+                        assert_eq!(
+                            restarted.bytes(BASE + image.geometry.volume_bytes(), PAGE),
+                            [0xB9; PAGE]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PublicationFailure {
+    Drop,
+    Sync,
+    Readback,
+    Cancel,
+}
+
+#[test]
+fn growth_publication_barrier_failures_stop_visibility_and_quarantine_the_mount() {
+    for first_head in [false, true] {
+        let pristine = if first_head {
+            empty_high_head_fixture(512)
+        } else {
+            fixture(FatKind::Fat16, 512, false, 65_535)
+        };
+        let end = if first_head { 4 } else { 65_536 };
+        let success = restart_image(&pristine);
+        execute(
+            &Cx::for_testing(),
+            &success.device.open().unwrap(),
+            Action::Write,
+            end,
+        )
+        .unwrap();
+        let writes = publications(&success);
+        assert_eq!(writes.len(), 2, "head/EOF requires a verified guard");
+        let attempt = writes[0].0;
+        for failure in [
+            PublicationFailure::Drop,
+            PublicationFailure::Sync,
+            PublicationFailure::Readback,
+            PublicationFailure::Cancel,
+        ] {
+            let image = restart_image(&pristine);
+            let old_size = entry_size(&image);
+            let cx = Cx::for_testing();
+            let fs = crate::filesystem::FatFs::new_with_mode(
+                &cx,
+                image.device.open().unwrap(),
+                0,
+                0,
+                true,
+            )
+            .unwrap();
+            let mut scope = RequestScope::empty();
+            let ino = fs
+                .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("TARGET.BIN"))
+                .unwrap()
+                .ino;
+            fs.getattr(&cx, &mut scope, ino).unwrap();
+            fs.statfs(&cx, &mut scope, ino).unwrap();
+            {
+                let mut storage = image.device.storage.lock().unwrap();
+                match failure {
+                    PublicationFailure::Drop => {
+                        storage.fault = Some((attempt, Fault::Drop));
+                    }
+                    PublicationFailure::Sync => {
+                        storage.fault = Some((attempt + 1, Fault::Tear(0)));
+                    }
+                    PublicationFailure::Readback => {
+                        storage.read_failure = Some((attempt + 1, image.entry));
+                    }
+                    PublicationFailure::Cancel => {
+                        storage.fault = Some((attempt, Fault::Cancel));
+                    }
+                }
+            }
+            assert!(
+                fs.write(&cx, &mut scope, ino, end - 4, b"TAIL").is_err(),
+                "first_head={first_head} failure={failure:?}"
+            );
+            assert_eq!(publications(&image).len(), 1);
+            assert!(entry_size(&image) <= old_size);
+            let attempts = image.device.storage.lock().unwrap().attempts;
+            let next_cx = Cx::for_testing();
+            assert_eq!(
+                fs.getattr(&next_cx, &mut scope, ino)
+                    .unwrap_err()
+                    .to_errno(),
+                libc::EIO
+            );
+            assert_eq!(
+                fs.read(&next_cx, &mut scope, ino, 0, 1)
+                    .unwrap_err()
+                    .to_errno(),
+                libc::EIO
+            );
+            assert_eq!(
+                fs.statfs(&next_cx, &mut scope, ino).unwrap_err().to_errno(),
+                libc::EIO
+            );
+            assert_eq!(
+                fs.write(&next_cx, &mut scope, ino, 0, b"X")
+                    .unwrap_err()
+                    .to_errno(),
+                libc::EIO
+            );
+            assert_eq!(image.device.storage.lock().unwrap().attempts, attempts);
+        }
+    }
+}
