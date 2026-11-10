@@ -84,6 +84,86 @@ fn block(vcn: u64, entries: &[Vec<u8>]) -> Vec<u8> {
     value
 }
 
+fn hash_entry(hash: u32, id: u32, offset: u64, child: Option<u64>) -> Vec<u8> {
+    let length = if child.is_some() { 56 } else { 48 };
+    let mut value = vec![0; length];
+    value[..2].copy_from_slice(&24_u16.to_le_bytes());
+    value[2..4].copy_from_slice(&20_u16.to_le_bytes());
+    value[8..10].copy_from_slice(&(length as u16).to_le_bytes());
+    value[10..12].copy_from_slice(&8_u16.to_le_bytes());
+    value[12..14].copy_from_slice(&u16::from(child.is_some()).to_le_bytes());
+    value[16..20].copy_from_slice(&hash.to_le_bytes());
+    value[20..24].copy_from_slice(&id.to_le_bytes());
+    value[24..44].copy_from_slice(&header(id, offset));
+    value[24..28].copy_from_slice(&hash.to_le_bytes());
+    // Native $SDH includes padding outside data_length.
+    value[44..48].copy_from_slice(&0x0049_0049_u32.to_le_bytes());
+    if let Some(child) = child {
+        value[48..56].copy_from_slice(&child.to_le_bytes());
+    }
+    value
+}
+
+#[test]
+fn sdh_parser_uses_native_hash_then_security_id_order_with_collisions() {
+    let entries = [
+        hash_entry(1, 0xFFFF, 0, None),
+        hash_entry(0x100, 0x100, 128, None),
+        hash_entry(0x100, 0x200, 256, None),
+        terminal(None),
+    ];
+    let mut value = root(&entries, false);
+    value[4..8].copy_from_slice(&0x12_u32.to_le_bytes());
+    let kind = NtfsSecurityIndexKind::SecurityHash;
+    let parsed = NtfsSecurityIndexRoot::parse_with_kind(&value, 512, kind).unwrap();
+    assert_eq!(parsed.entries.len(), 4);
+    assert_eq!(parsed.entries[0].header.unwrap().security_id, 0xFFFF);
+    assert_eq!(parsed.entries[2].header.unwrap().hash, 0x100);
+    assert!(NtfsSecurityIndexRoot::parse(&value, 512).is_err());
+    let raw = block(8, &entries);
+    let parsed = parse_security_index_block_with_kind(&raw, 8, kind).unwrap();
+    assert_eq!(parsed[2].header.unwrap().security_id, 0x200);
+    assert!(parse_security_index_block(&raw, 8).is_err());
+    let mut torn = raw;
+    torn[4094] ^= 1;
+    assert!(parse_security_index_block_with_kind(&torn, 8, kind).is_err());
+
+    // A collision is ordered by ID; a lower hash cannot follow a higher one,
+    // even when bytewise or ID-only comparison would accept it.
+    for keys in [
+        vec![hash_entry(0x100, 2, 0, None), hash_entry(1, 3, 128, None)],
+        vec![hash_entry(1, 3, 0, None), hash_entry(1, 2, 128, None)],
+        vec![hash_entry(1, 2, 0, None), hash_entry(1, 2, 128, None)],
+    ] {
+        let mut keys = keys;
+        keys.push(terminal(None));
+        let mut value = root(&keys, false);
+        value[4..8].copy_from_slice(&0x12_u32.to_le_bytes());
+        assert!(NtfsSecurityIndexRoot::parse_with_kind(&value, 512, kind).is_err());
+    }
+}
+
+#[test]
+fn sdh_parser_binds_both_key_words_and_rejects_overlapping_key_data_or_child() {
+    let kind = NtfsSecurityIndexKind::SecurityHash;
+    let mut value = root(
+        &[hash_entry(0x1234, 0x100, 0, Some(8)), terminal(Some(16))],
+        true,
+    );
+    value[4..8].copy_from_slice(&0x12_u32.to_le_bytes());
+    let parsed = NtfsSecurityIndexRoot::parse_with_kind(&value, 512, kind).unwrap();
+    assert_eq!(parsed.entries[0].child_vcn, Some(8));
+    assert_eq!(parsed.entries[1].child_vcn, Some(16));
+    for (at, byte) in [(32, 20), (34, 24), (42, 4), (48, 0x35), (52, 1)] {
+        let mut damaged = value.clone();
+        damaged[at] = byte;
+        assert!(NtfsSecurityIndexRoot::parse_with_kind(&damaged, 512, kind).is_err());
+    }
+    for length in 0..value.len() {
+        assert!(NtfsSecurityIndexRoot::parse_with_kind(&value[..length], 512, kind).is_err());
+    }
+}
+
 #[test]
 fn native_descriptor_preserves_owner_group_acl_and_hash() {
     let descriptor = NtfsSecurityDescriptor::parse(&DESCRIPTOR).unwrap();

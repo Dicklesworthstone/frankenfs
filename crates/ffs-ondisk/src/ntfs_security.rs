@@ -1,4 +1,4 @@
-//! Native NTFS security descriptors, $SII index records and $SDS headers.
+//! Native NTFS security descriptors, $SII/$SDH index records and $SDS headers.
 //!
 //! Layout: Microsoft MS-DTYP self-relative security descriptors; NTFS 3.1
 //! security indexes as documented by NTFS-3G 2022.10.3 and Linux NTFS3 v6.19.
@@ -363,10 +363,40 @@ pub struct NtfsSecurityIndexRoot {
     pub entries: Vec<NtfsSecurityIndexEntry>,
 }
 
+/// Native security-index collation. Hash collisions are ordered by security ID,
+/// not treated as duplicate descriptors or compared as little-endian bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtfsSecurityIndexKind {
+    SecurityId,
+    SecurityHash,
+}
+
+impl NtfsSecurityIndexKind {
+    #[must_use]
+    pub fn key(self, header: NtfsSecurityHeader) -> (u32, u32) {
+        match self {
+            Self::SecurityId => (header.security_id, 0),
+            Self::SecurityHash => (header.hash, header.security_id),
+        }
+    }
+}
+
 impl NtfsSecurityIndexRoot {
     pub fn parse(value: &[u8], cluster_bytes: u32) -> Result<Self, ParseError> {
-        if value.len() < 32 || le32(value, 0)? != 0 || le32(value, 4)? != 0x10 {
-            return Err(invalid("security index is not ULONG-collated $SII"));
+        Self::parse_with_kind(value, cluster_bytes, NtfsSecurityIndexKind::SecurityId)
+    }
+
+    pub fn parse_with_kind(
+        value: &[u8],
+        cluster_bytes: u32,
+        kind: NtfsSecurityIndexKind,
+    ) -> Result<Self, ParseError> {
+        let collation = match kind {
+            NtfsSecurityIndexKind::SecurityId => 0x10,
+            NtfsSecurityIndexKind::SecurityHash => 0x12,
+        };
+        if value.len() < 32 || le32(value, 0)? != 0 || le32(value, 4)? != collation {
+            return Err(invalid("security index has the wrong native collation"));
         }
         let block_bytes = le32(value, 8)?;
         if !(512..=65_536).contains(&block_bytes)
@@ -387,7 +417,7 @@ impl NtfsSecurityIndexRoot {
         Ok(Self {
             block_bytes,
             vcn_bytes,
-            entries: index_entries(value, 16, 32)?,
+            entries: index_entries(value, 16, 32, kind)?,
         })
     }
 }
@@ -396,19 +426,28 @@ pub fn parse_security_index_block(
     raw: &[u8],
     expected_vcn: u64,
 ) -> Result<Vec<NtfsSecurityIndexEntry>, ParseError> {
+    parse_security_index_block_with_kind(raw, expected_vcn, NtfsSecurityIndexKind::SecurityId)
+}
+
+pub fn parse_security_index_block_with_kind(
+    raw: &[u8],
+    expected_vcn: u64,
+    kind: NtfsSecurityIndexKind,
+) -> Result<Vec<NtfsSecurityIndexEntry>, ParseError> {
     let value = restore_record(raw, b"INDX")?;
     let usa = usize::from(le16(&value, 4)?);
     let usa_end = usa + usize::from(le16(&value, 6)?) * 2;
     if usa < 40 || le64(&value, 16)? != expected_vcn {
         return Err(invalid("invalid security INDX fixup position or VBN"));
     }
-    index_entries(&value, 24, usa_end)
+    index_entries(&value, 24, usa_end, kind)
 }
 
 fn index_entries(
     value: &[u8],
     header: usize,
     minimum_entry: usize,
+    kind: NtfsSecurityIndexKind,
 ) -> Result<Vec<NtfsSecurityIndexEntry>, ParseError> {
     let offset = usize::try_from(le32(value, header)?)
         .map_err(|_| invalid("security index offset overflow"))?;
@@ -467,23 +506,31 @@ fn index_entries(
         } else {
             let data_offset = usize::from(le16(value, at)?);
             let data_length = usize::from(le16(value, at + 2)?);
-            if key_length != 4
-                || data_offset < 20
+            let expected_key_length = match kind {
+                NtfsSecurityIndexKind::SecurityId => 4,
+                NtfsSecurityIndexKind::SecurityHash => 8,
+            };
+            if key_length != expected_key_length
+                || data_offset < 16 + expected_key_length
                 || data_length != SDS_HEADER_BYTES
                 || data_offset + data_length > length - child_bytes
                 || le32(value, at + 4)? != 0
             {
-                return Err(invalid("invalid $SII key or data boundaries"));
+                return Err(invalid("invalid security-index key or data boundaries"));
             }
             let security = NtfsSecurityHeader::parse(
                 &value[at + data_offset..at + data_offset + data_length],
             )?;
-            if le32(value, at + 16)? != security.security_id
-                || previous.is_some_and(|old| old >= security.security_id)
-            {
-                return Err(invalid("mismatched or unordered $SII security identity"));
+            let key = match kind {
+                NtfsSecurityIndexKind::SecurityId => (le32(value, at + 16)?, 0),
+                NtfsSecurityIndexKind::SecurityHash => {
+                    (le32(value, at + 16)?, le32(value, at + 20)?)
+                }
+            };
+            if key != kind.key(security) || previous.is_some_and(|old| old >= key) {
+                return Err(invalid("mismatched or unordered security-index identity"));
             }
-            previous = Some(security.security_id);
+            previous = Some(key);
             Some(security)
         };
         result.push(NtfsSecurityIndexEntry {
