@@ -224,6 +224,27 @@ impl Fixture {
             .collect();
         Pool::from_leaves(leaves).unwrap()
     }
+    fn survivors(
+        self,
+        cx: &Cx,
+        supplied: &[usize],
+        missing: Vec<u64>,
+        faults: &[Fault],
+    ) -> Result<Pool> {
+        let leaves = supplied
+            .iter()
+            .map(|&index| {
+                open_bytes(
+                    self.images[index].clone(),
+                    BASE,
+                    self.lengths[index],
+                    Arc::clone(&self.logs[index]),
+                    faults[index],
+                )
+            })
+            .collect();
+        Pool::from_mirror_survivors(cx, leaves, missing)
+    }
     fn no_payload(logs: &[Reads]) {
         for log in logs {
             assert!(log.lock().unwrap().iter().all(|(offset, _)| {
@@ -570,6 +591,285 @@ fn striped_mirror_automatic_selection_preserves_explicit_config_and_replica_read
     let mut objects = pool.import_objects(&cx, Some(123)).unwrap();
     drop(pool);
     assert_eq!(objects.read(&cx, 1, 0, 512).unwrap(), vec![0xA5; 512]);
+}
+
+#[test]
+fn missing_striped_mirrors_preserve_native_routes_and_retained_cold_owners() {
+    let cx = Cx::for_testing();
+    for (widths, supplied) in [
+        ([2, 2], vec![3, 1]),
+        ([3, 2], vec![4, 2, 1]),
+        ([1, 2], vec![2, 0]),
+        ([2, 1], vec![2, 1]),
+    ] {
+        for order in [Endian::Little, Endian::Big] {
+            let fixture = Fixture::new(widths, [9, 12], order);
+            let missing: Vec<_> = fixture
+                .guids
+                .iter()
+                .enumerate()
+                .filter_map(|(index, guid)| (!supplied.contains(&index)).then_some(*guid))
+                .collect();
+            let count = fixture.images.len();
+            let guid_sum = order.u64(&fixture.ubs[0], 24).unwrap();
+            let root_guid = fixture.guids[*fixture.groups[1]
+                .iter()
+                .find(|member| supplied.contains(member))
+                .unwrap()];
+            let expected = fixture.root.clone();
+            let logs = fixture.logs.clone();
+            let pool = fixture
+                .survivors(&cx, &supplied, missing, &vec![Fault::None; count])
+                .unwrap();
+            assert_eq!(pool.leaves().len(), supplied.len());
+            assert!(pool.standalone_leaf().is_none());
+            Fixture::no_payload(&logs);
+            let owner = pool.clone();
+            drop(pool);
+            let root = owner.root(&cx, 0, 2, 123).unwrap();
+            assert_eq!(root.data, expected);
+            assert_eq!(root.member_guid, root_guid);
+            assert_eq!(root.uberblock.guid_sum, guid_sum);
+            assert_eq!(root.config.total_data_bytes(), capacity(0) + capacity(1));
+            assert_eq!(root.config.raidz_members.as_ref().unwrap().members.len(), 2);
+            let mut objects = owner.objects(&cx, 0, 2, 123).unwrap();
+            drop(owner);
+            assert_eq!(objects.read(&cx, 1, 7, 400).unwrap(), vec![0xA5; 400]);
+            let mut cold = objects.clone_mos();
+            drop(objects);
+            assert_eq!(cold.read(&cx, 1, 0, 512).unwrap(), vec![0xA5; 512]);
+            for (index, log) in logs.iter().enumerate() {
+                let reads = log.lock().unwrap();
+                if !supplied.contains(&index) {
+                    assert!(reads.is_empty(), "missing member acquired a physical route");
+                }
+                assert!(reads.iter().all(|(offset, size)| {
+                    *offset >= BASE as u64 && *offset + *size as u64 <= (BASE + LENGTH) as u64
+                }));
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_striped_mirrors_require_the_exact_complement_and_a_survivor_per_vdev() {
+    let cx = Cx::for_testing();
+    for (widths, supplied, missing) in [
+        ([2, 2], vec![0, 2], vec![]),
+        ([2, 2], vec![0, 2], vec![0, 1017]),
+        ([2, 2], vec![0, 2], vec![1001, 1001]),
+        ([2, 2], vec![0, 2], vec![1000, 1017]),
+        ([2, 2], vec![0, 2], vec![9999, 1017]),
+        ([2, 2], vec![0, 2], vec![1001]),
+        ([2, 2], vec![0, 0, 2], vec![1001, 1017]),
+        ([2, 2], vec![0, 1], vec![1016, 1017]),
+        ([2, 2], vec![2, 3], vec![1000, 1001]),
+        ([1, 2], vec![1], vec![500, 1017]),
+        ([2, 1], vec![0], vec![1001, 501]),
+    ] {
+        let fixture = Fixture::new(widths, [9, 12], Endian::Little);
+        let count = fixture.images.len();
+        let logs = fixture.logs.clone();
+        assert!(
+            fixture
+                .survivors(&cx, &supplied, missing.clone(), &vec![Fault::None; count])
+                .is_err(),
+            "widths={widths:?}, supplied={supplied:?}, missing={missing:?}"
+        );
+        Fixture::no_payload(&logs);
+    }
+}
+
+#[test]
+fn missing_striped_mirrors_refuse_invalid_labels_topologies_and_geometry_before_payload() {
+    let cx = Cx::for_testing();
+    for case in 0..8 {
+        let mut fixture = Fixture::new([3, 2], [9, 12], Endian::Little);
+        let original = fixture.images[1].clone();
+        match case {
+            0 => {
+                for cfg in &mut fixture.configs {
+                    cfg.fields.insert("state".into(), Value::Unsigned(0));
+                }
+            }
+            1 => {
+                tree(&mut fixture.configs[1])
+                    .fields
+                    .insert("asize".into(), Value::Unsigned(capacity(0) - 512));
+            }
+            2 => {
+                fixture.configs[4]
+                    .fields
+                    .insert("pool_guid".into(), Value::Unsigned(124));
+            }
+            3 => {
+                fixture.configs[4]
+                    .fields
+                    .insert("top_guid".into(), Value::Unsigned(500));
+                tree(&mut fixture.configs[4])
+                    .fields
+                    .insert("guid".into(), Value::Unsigned(500));
+            }
+            4 => {
+                let Value::Lists(children) = tree(&mut fixture.configs[4])
+                    .fields
+                    .get_mut("children")
+                    .unwrap()
+                else {
+                    panic!("children");
+                };
+                children[1].fields.insert("id".into(), Value::Unsigned(7));
+            }
+            5 => fixture.lengths[1] -= LABEL_BYTES,
+            6 => {
+                fixture.configs[1]
+                    .fields
+                    .insert("txg".into(), Value::Unsigned(39));
+            }
+            _ => {}
+        }
+        fixture.labels();
+        if case == 6 {
+            // A checksum-valid outlier label must not be decided by majority vote.
+            // Label zero agrees on every survivor, so only examining that
+            // first copy would miss the conflict in the second label.
+            let start = BASE + LABEL_BYTES as usize;
+            let end = start + LABEL_BYTES as usize;
+            let changed = fixture.images[1][start..end].to_vec();
+            fixture.images[1] = original;
+            fixture.images[1][start..end].copy_from_slice(&changed);
+        } else if case == 7 {
+            fixture.images[1][BASE + ffs_ondisk::zfs::LABEL_CONFIG_OFFSET as usize] ^= 1;
+        }
+        let logs = fixture.logs.clone();
+        assert!(
+            fixture
+                .survivors(&cx, &[4, 2, 1], vec![1000, 1016], &[Fault::None; 5])
+                .is_err(),
+            "case {case}"
+        );
+        Fixture::no_payload(&logs);
+    }
+}
+
+#[test]
+fn missing_striped_mirrors_verify_complete_guid_sums_and_coherent_candidates_before_payload() {
+    let cx = Cx::for_testing();
+    for case in 0..4 {
+        let mut fixture = Fixture::new([2, 2], [9, 12], Endian::Big);
+        match case {
+            0 => {
+                for ub in &mut fixture.ubs {
+                    let sum = fixture.order.u64(ub, 24).unwrap();
+                    word(ub, 24, sum - 1000 - 1016, fixture.order);
+                }
+            }
+            1 => word(&mut fixture.ubs[3], 32, 101, fixture.order),
+            2 => {
+                for ub in &mut fixture.ubs {
+                    word(ub, 16, 39, fixture.order);
+                }
+            }
+            _ => {
+                // A healthy first DVA cannot authorize an undeclared second vdev.
+                for ub in &mut fixture.ubs {
+                    word(ub, 56, (7_u64 << 32) | 2, fixture.order);
+                    word(ub, 64, OTHER / 512, fixture.order);
+                }
+            }
+        }
+        fixture.labels();
+        let logs = fixture.logs.clone();
+        let pool = fixture
+            .survivors(&cx, &[3, 1], vec![1000, 1016], &[Fault::None; 4])
+            .unwrap();
+        assert!(pool.root(&cx, 0, 2, 123).is_err(), "case {case}");
+        Fixture::no_payload(&logs);
+    }
+}
+
+#[test]
+fn missing_striped_mirror_fallback_stays_within_its_vdev_and_cancellation_is_terminal() {
+    let cx = Cx::for_testing();
+    for case in 0..3 {
+        let mut fixture = Fixture::new([2, 3], [9, 12], Endian::Little);
+        fixture.poison(2, DATA);
+        if case == 1 {
+            fixture.poison(4, DATA);
+        }
+        // Valid bytes on the surviving unrelated vdev are never a mirror copy.
+        fixture.store(0, DATA, &[0xA5; 512]);
+        let logs = fixture.logs.clone();
+        let mut faults = [Fault::None; 5];
+        if case == 2 {
+            faults[2] = Fault::Cancel(at(DATA) as u64);
+        }
+        let pool = fixture
+            .survivors(&cx, &[4, 1, 2], vec![1000, 1017], &faults)
+            .unwrap();
+        let result = pool.objects(&cx, 0, 2, 123).unwrap().read(&cx, 1, 0, 512);
+        match case {
+            0 => assert_eq!(result.unwrap(), vec![0xA5; 512]),
+            1 => assert!(result.is_err()),
+            _ => assert!(matches!(result, Err(FfsError::Cancelled))),
+        }
+        for (index, log) in logs.iter().enumerate() {
+            let data_reads = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(offset, _)| *offset == at(DATA) as u64)
+                .count();
+            let expected = usize::from(index == 2 || (index == 4 && case != 2));
+            assert_eq!(data_reads, expected, "case {case}, member {index}");
+            if index == 0 || index == 3 {
+                assert!(log.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_striped_mirror_scrub_reports_absence_and_forbids_automatic_and_log_recovery() {
+    let cx = Cx::for_testing();
+    let fixture = Fixture::new([3, 2], [9, 12], Endian::Little);
+    let logs = fixture.logs.clone();
+    let pool = fixture
+        .survivors(&cx, &[4, 2, 1], vec![1000, 1016], &[Fault::None; 5])
+        .unwrap();
+    assert!(pool.root_with_mode(&cx, 0, 2, 123, true).is_err());
+    assert!(pool.import_active(&cx, Some(123)).is_err());
+    assert!(pool.import_objects(&cx, Some(123)).is_err());
+    Fixture::no_payload(&logs);
+    let mut objects = pool.objects(&cx, 0, 2, 123).unwrap();
+    drop(pool);
+    assert_eq!(objects.read(&cx, 1, 0, 512).unwrap(), vec![0xA5; 512]);
+    assert!(
+        objects
+            .scrub(&cx, ScrubLimits::default())
+            .unwrap()
+            .is_clean()
+    );
+    let report = objects
+        .scrub(
+            &cx,
+            ScrubLimits {
+                copy_bytes: Some(1 << 30),
+                ..ScrubLimits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(report.missing_native_members, 2);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.verified_blocks, 2);
+    assert_eq!(report.copies_examined, 3);
+    assert!(!report.is_clean());
+    for log in &logs {
+        log.lock().unwrap().clear();
+    }
+    let error = objects.intent_log(&cx, &[]).unwrap_err();
+    assert!(error.to_string().contains("complete native member set"));
+    assert!(logs.iter().all(|log| log.lock().unwrap().is_empty()));
 }
 
 pub(in crate::reader) fn log_fixture(

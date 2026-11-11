@@ -24,7 +24,7 @@ const MAX_MEMBERS: usize = 8;
 #[derive(Clone)]
 pub struct Pool {
     members: Vec<Leaf>,
-    // An exact, operator-declared complement of an exported mirror's children.
+    // An exact, operator-declared complement of exported mirrors' children.
     // Empty keeps complete-member admission; never infer missing devices.
     missing_mirror_guids: Vec<u64>,
     missing_raidz_guids: Vec<u64>,
@@ -228,9 +228,9 @@ impl Pool {
         }
         let first_label = self.members[0].label(cx, label_index)?;
         if integer(&first_label.config, "vdev_children").unwrap_or(1) > 1 {
-            if self.has_missing_members() {
+            if !self.missing_raidz_guids.is_empty() {
                 return Err(unsupported(
-                    "missing-member extraction requires one ordinary mirror or RAIDZ group",
+                    "missing RAIDZ extraction requires one ordinary RAIDZ group",
                 ));
             }
             return self.striped_root_with_mode(
@@ -347,7 +347,9 @@ impl Pool {
     ) -> Result<RootBlock> {
         let count = self.members.len();
         let first_label = self.members[0].label(cx, label_index)?;
-        if integer(&first_label.config, "vdev_children")? != count as u64 {
+        if !self.missing_mirror_guids.is_empty()
+            || integer(&first_label.config, "vdev_children")? != count as u64
+        {
             return self.mirror_stripe_root(cx, label_index, slot, pool_guid, allow_active_state);
         }
         let first_cfg = first_label.striped_leaf_config(pool_guid, count, allow_active_state)?;

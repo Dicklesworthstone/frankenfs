@@ -1,8 +1,8 @@
-# Explicit read-only extraction from a mirror with absent members
+# Explicit read-only extraction from mirrors with absent members
 
 `ffs-zfs` now admits a bounded missing-member profile through the repeatable
 `--missing-mirror-member GUID` option. This is **committed-view extraction from
-an explicitly selected exported mirror**, not automatic degraded pool import,
+explicitly selected exported mirrors**, not automatic degraded pool import,
 latest-state selection, log recovery, resilvering or writable pool operation.
 Keep every supplied image offline and immutable for the lifetime of the view.
 
@@ -31,6 +31,12 @@ ffs-zfs mount survivor.img /mnt/recovery --dataset data --snapshot before \
 # Three-child mirror: two actual images plus one declared absent child.
 ffs-zfs read first.img /important.bin --member second.img --offline-image \
   --pool-guid 123 --label 0 --slot 2 --missing-mirror-member 1003
+
+# Two top-level mirrors: one surviving image from each, two absent children.
+ffs-zfs read mirror_a_survivor.img /important.bin \
+  --member mirror_b_survivor.img --offline-image \
+  --pool-guid 123 --label 0 --slot 2 \
+  --missing-mirror-member 1002 --missing-mirror-member 1018
 ```
 
 The mountpoint must already exist and be empty, and cannot hide a backing
@@ -41,9 +47,13 @@ streamed prefix on stdout; it does not turn partial extraction into success.
 
 ## Native admission and read behavior
 
-The complete configuration must describe one ordinary mirror with two through
-eight file/disk children. Every surviving member must have four valid, agreeing
-labels identifying that same exported configuration. Repeated supplied GUIDs,
+The complete configuration must describe ordinary mirrors, optionally striped
+with other ordinary mirrors or standalone file/disk vdevs. At most eight physical
+children, including absent children, are admitted. Each top-level vdev requires
+at least one supplied physical member; every standalone vdev must be present.
+Every surviving member must have four valid, agreeing labels identifying its
+exported top-level subtree. Surviving members of the same mirror must agree on
+that entire subtree. Repeated supplied GUIDs,
 unknown missing GUIDs, overlapping present/missing sets, zero/duplicate GUIDs,
 and an unaccounted child are refused. A supplied image with damaged metadata
 is not silently relabeled as absent. Normal operation without the new option
@@ -51,8 +61,8 @@ continues to require the complete configured member set.
 
 Each survivor must contain the same explicitly selected uberblock candidate.
 Its native GUID sum continues to include **all configured children**, including
-absent ones. Neither this option nor a surviving checksum proves that an absent
-member has no newer or divergent state. There is no automatic rewind or
+absent ones and every top-level identity. Neither this option nor a surviving
+checksum proves that an absent member has no newer or divergent state. There is no automatic rewind or
 selection of a conveniently readable transaction group in this profile.
 
 The existing block-pointer bounds, feature admission, checksums, transforms,
@@ -65,19 +75,38 @@ replaced by this path.
 Even one remaining mirror disk keeps the mirror-aware pool owner. It is not
 reinterpreted as a standalone leaf. Head and named-snapshot readers retain
 separate roots and caches, including after the original pool handle is dropped.
+A block's vdev ID selects only that vdev's surviving children, in native child
+order. Another vdev is considered only when a separate declared block-pointer
+copy selects it. Capacity is counted once per top-level vdev. Redundancy scrub
+reports the missing physical members and cannot declare intact redundancy even
+when all requested bytes are readable.
 A successful read says nothing about the unread part of the pool or the ability
 to restore native redundancy.
 
 ## Refused combinations
 
 Missing-member selection is incompatible with `--auto-import`, `--replay-zil`,
-active pool state, missing RAIDZ columns, striped top-level vdevs, nested or
-changing topologies, missing log/special storage, and writable operation. The
+active pool state, missing RAIDZ columns, an entirely absent top-level vdev,
+nested or changing topologies, missing log/special storage, and writable operation. The
 separate `zil-inspect` and `zil-read` commands also refuse this option before
-opening images. Existing feature, device-state and ownership exclusions are
-not bypassed. This increment does not add native pool import/export or repair.
+opening images. The public library's `Objects::intent_log` rejects incomplete
+member sets before reading dataset or log metadata, which also prevents ZPL
+replay through the same library owner. Existing feature, device-state and
+ownership exclusions are not bypassed. This increment does not add native pool
+import/export or repair.
 
 ## Evidence
+
+The multi-vdev extension adds six constructed-image regressions covering both
+byte orders, mixed leaves/mirrors, retained cold DMU owners, exact GUID
+complements and sums, label/geometry/candidate failures before payload I/O,
+same-vdev checksum fallback, terminal cancellation, missing-member scrub and
+automatic-selection/ZIL refusal. Backing devices reject writes and flushes.
+In the 2026-11-11 implementation session, workspace formatting and Git whitespace
+checks pass; local compilation is killed in dependencies before these tests can
+execute. These are authored controls, not executed Rust or native OpenZFS proof.
+
+The following records the earlier single-mirror implementation session:
 
 Ten authored Rust controls cover two/three/eight-child mirrors, either byte
 order, one or multiple survivors, exact GUID membership and native GUID sums,

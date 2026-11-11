@@ -533,6 +533,15 @@ feature refusal without mutating the pool.
 **Own:** `ffs-zfs` vdev mapping, mirror, RAIDZ, and later advanced-layout modules.
 **Depends:** ZFS-02; integrate dataset evidence through ZFS-03.
 
+The existing explicit missing-mirror reader now accepts exported multi-mirror
+and mixed leaf/mirror pools when each top-level vdev has a survivor and the
+declared absent GUIDs exactly complement its native children. Per-vdev physical
+routes, complete GUID sums and explicit candidate agreement are retained;
+automatic selection and ZIL inspection/replay remain unavailable for incomplete
+sets. This is a bounded read-path increment under `bd-i6em8`, not completion of
+the native topology/lifecycle obligations below. See
+`docs/ZFS_MISSING_MIRROR_PROFILE.md` for admission and evidence limits.
+
 Implement mirrors, RAIDZ1/2/3, mapping/asize/padding, checksum-aware alternative
 reads, and correct erasure reconstruction. A successful physical read with a bad
 checksum is an invalid copy, not a reason to suppress retries. Missing and

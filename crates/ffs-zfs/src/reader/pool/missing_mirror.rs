@@ -8,6 +8,7 @@ use super::{
     BTreeSet, Cx, GroupConfig, Leaf, MAX_MEMBERS, Pool, Result, checkpoint, corrupt, integer,
     unsupported,
 };
+use std::sync::Arc;
 
 impl Pool {
     /// Validate only the bounded request shape, before the CLI opens any image.
@@ -21,7 +22,7 @@ impl Pool {
                 .is_none_or(|total| total > MAX_MEMBERS)
         {
             return Err(unsupported(
-                "missing-member extraction needs one or more survivors and at most eight total mirror children",
+                "missing-member extraction needs survivors and at most eight total physical children",
             ));
         }
         let mut seen = BTreeSet::new();
@@ -35,17 +36,18 @@ impl Pool {
         Ok(())
     }
 
-    /// Retain an explicitly incomplete mirror for read-only candidate extraction.
+    /// Retain explicitly incomplete mirrors for read-only candidate extraction.
     ///
-    /// The complete four-label configuration of every survivor must agree on
-    /// one exported ordinary mirror. Supplied and explicitly missing GUIDs must
-    /// partition its children exactly. The caller still selects a pool GUID,
+    /// Every survivor's four labels must agree on its exported ordinary mirror
+    /// or standalone top-level leaf. Each top-level vdev needs a survivor, and
+    /// standalone leaves must be present. Supplied and explicitly missing GUIDs
+    /// must partition the complete physical child set. The caller selects a pool GUID,
     /// label and uberblock slot through `root` or `objects`; this constructor
     /// neither selects a TXG nor certifies that absent members lack newer state.
     pub fn from_mirror_survivors(cx: &Cx, members: Vec<Leaf>, missing: Vec<u64>) -> Result<Self> {
         checkpoint(cx)?;
         Self::check_mirror_survivors(members.len(), &missing)?;
-        let pool = Self {
+        let mut pool = Self {
             members,
             missing_mirror_guids: missing,
             missing_raidz_guids: Vec::new(),
@@ -53,6 +55,11 @@ impl Pool {
         };
         let first = pool.members[0].label(cx, 0)?;
         let pool_guid = integer(&first.config, "pool_guid")?;
+        if integer(&first.config, "vdev_children")? > 1 {
+            let topology = pool.admit_striped_mirrors(cx, pool_guid, false)?;
+            pool.top_levels = Some(Arc::new(topology));
+            return Ok(pool);
+        }
         let (selected, _) = first.group_config_with_mode(pool_guid, false)?;
         let mut supplied = Vec::with_capacity(pool.members.len());
         for member in &pool.members {

@@ -406,6 +406,11 @@ impl Objects {
     /// view, with a dedicated ZIL verifier for replicas and RAIDZ reconstruction.
     pub fn intent_log(&mut self, cx: &Cx, components: &[Vec<u8>]) -> Result<IntentLog> {
         checkpoint(cx)?;
+        if self.pool.missing_member_count() != 0 {
+            return Err(unsupported(
+                "ZIL inspection and recovery require the complete native member set",
+            ));
+        }
         let dataset = self
             .datasets(cx)?
             .into_iter()

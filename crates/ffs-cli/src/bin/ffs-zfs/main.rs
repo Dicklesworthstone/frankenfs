@@ -124,8 +124,8 @@ struct CandidateArgs {
         value_name = "IMAGE"
     )]
     members: Vec<PathBuf>,
-    /// Explicitly absent child GUID of one exported mirror; repeat for every missing disk.
-    /// Requires an explicit candidate and never enables import, replay or healing.
+    /// Explicitly absent mirror child GUID; repeat for every missing disk in the exported pool.
+    /// Every top-level vdev needs a survivor. Never enables import, replay or healing.
     #[arg(
         long = "missing-mirror-member",
         value_name = "GUID",

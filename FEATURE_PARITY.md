@@ -1,5 +1,21 @@
 # FEATURE_PARITY
 
+> **ZFS survivor extraction across mirror vdevs (2026-11-11 UTC):**
+> `Pool::from_mirror_survivors` and the existing CLI missing-mirror option now
+> admit exported multi-mirror and mixed leaf/mirror pools with a survivor in
+> every top-level vdev. Explicit missing GUIDs must exactly complement native
+> children; all four labels, full GUID sums, candidate agreement and physical
+> geometry remain mandatory. Retained DMU readers preserve per-vdev routes even
+> with one survivor per mirror. Redundancy scrub still reports absent members,
+> and the public ZIL entry point refuses incomplete sets before log I/O.
+> Six constructed-image regressions cover routing, retained owners, malformed
+> metadata, fallback, cancellation, scrub and forbidden selection/replay modes.
+> Workspace formatting and Git whitespace checks pass. Local compilation is
+> blocked by dependency rustc SIGKILLs before the changed crates; these tests
+> are authored, not executed evidence. Native OpenZFS interchange and mounted
+> recovery remain unqualified. This advances `bd-i6em8` / ZFS-04 without closing
+> their broader topology/lifecycle scope or changing the parity denominator.
+
 > **Mounted btrfs block-group query verified (bd-k3hon, 2026-11-04):**
 > The existing allocator records are connected through an explicitly sized
 > Linux/FUSE SPACE_INFO command and the public `scripts/ffs_space_info.py`

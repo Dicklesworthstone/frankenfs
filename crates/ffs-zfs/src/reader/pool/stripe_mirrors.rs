@@ -1,4 +1,4 @@
-//! Complete, immutable stripes of ordinary mirrors and/or standalone leaves.
+//! Immutable stripes of ordinary mirrors and/or standalone leaves.
 //!
 //! Labels describe their own top-level subtree, not every disk in the pool.
 //! Join those subtrees by native ID/GUID before admitting a payload address.
@@ -97,13 +97,13 @@ fn top(label: &Label, pool_guid: u64, count: usize, active: bool) -> Result<(Top
 }
 
 impl Pool {
-    fn admit_striped_mirrors(&self, cx: &Cx, pool_guid: u64, active: bool) -> Result<Topology> {
+    pub(super) fn admit_striped_mirrors(
+        &self,
+        cx: &Cx,
+        pool_guid: u64,
+        active: bool,
+    ) -> Result<Topology> {
         checkpoint(cx)?;
-        if self.has_missing_members() {
-            return Err(unsupported(
-                "multi-vdev extraction requires every configured physical child",
-            ));
-        }
         // Explicit candidate selection retains its strict four-label contract.
         // Only automatic selection may discard an unreadable/bad-checksum copy.
         let labels = self
@@ -132,10 +132,13 @@ impl Pool {
         active: bool,
     ) -> Result<Topology> {
         checkpoint(cx)?;
-        if self.has_missing_members() {
+        if !self.missing_raidz_guids.is_empty() || (active && self.has_missing_members()) {
             return Err(unsupported(
-                "multi-vdev extraction requires every configured physical child",
+                "incomplete multi-vdev extraction requires exported ordinary mirrors",
             ));
+        }
+        if !self.missing_mirror_guids.is_empty() {
+            Self::check_mirror_survivors(self.members.len(), &self.missing_mirror_guids)?;
         }
         if labels.len() != self.members.len()
             || labels
@@ -152,7 +155,7 @@ impl Pool {
             .map_err(|_| corrupt("top-level vdev count overflows"))?;
         if !(2..=MAX_MEMBERS).contains(&count) || count > self.members.len() {
             return Err(unsupported(
-                "supply every top-level vdev and all of its mirror children",
+                "supply at least one physical member of every top-level vdev",
             ));
         }
         let mut tops: Vec<Option<Top>> = vec![None; count];
@@ -213,6 +216,7 @@ impl Pool {
         let mut config = first.config.clone();
         let mut identities = BTreeSet::from([pool_guid]);
         let mut assigned = BTreeSet::new();
+        let mut missing: BTreeSet<_> = self.missing_mirror_guids.iter().copied().collect();
         let mut guid_sum = pool_guid;
         let mut sources = Vec::with_capacity(count);
         let mut routes = Vec::with_capacity(count);
@@ -240,12 +244,21 @@ impl Pool {
                     }
                     guid_sum = guid_sum.wrapping_add(guid);
                 }
-                let index = supplied_guids
-                    .iter()
-                    .position(|supplied| *supplied == guid)
-                    .ok_or_else(|| {
-                        unsupported("every configured mirror child must be explicitly supplied")
-                    })?;
+                let Some(index) = supplied_guids.iter().position(|supplied| *supplied == guid)
+                else {
+                    // Missing leaves have no physical route. Retain their
+                    // identities in the full GUID sum without fabricating a
+                    // reader or borrowing a replica from a different vdev.
+                    if selected.tree.text("type") == Some("mirror") && missing.remove(&guid) {
+                        continue;
+                    }
+                    return Err(unsupported(
+                        "every absent mirror child must be explicitly identified by GUID",
+                    ));
+                };
+                if missing.contains(&guid) {
+                    return Err(corrupt("present and missing mirror GUIDs overlap"));
+                }
                 if !assigned.insert(index) {
                     return Err(corrupt(
                         "one physical member belongs to multiple top-level vdevs",
@@ -253,8 +266,11 @@ impl Pool {
                 }
                 indices.push(index);
             }
+            let supplied_index = *indices.first().ok_or_else(|| {
+                unsupported("every top-level vdev requires a surviving physical member")
+            })?;
             routes.push(RaidzMember {
-                supplied_index: indices[0],
+                supplied_index,
                 guid: cfg.top_guid,
                 ashift: cfg.ashift,
                 allocated_bytes: cfg.allocated_bytes,
@@ -263,6 +279,11 @@ impl Pool {
         }
         if assigned.len() != self.members.len() {
             return Err(corrupt("a supplied member has no unique configured owner"));
+        }
+        if !missing.is_empty() {
+            return Err(corrupt(
+                "a missing GUID is not an absent child of an admitted mirror",
+            ));
         }
         config.raidz_members = Some(RaidzGroup {
             parity: 0,
@@ -340,21 +361,28 @@ impl Pool {
         cx: &Cx,
         config: &VdevConfig,
     ) -> Result<Self> {
-        if config
-            .raidz_members
-            .as_ref()
-            .is_some_and(|group| group.parity == 0 && group.members.len() != self.members.len())
-        {
+        if config.raidz_members.as_ref().is_some_and(|group| {
+            group.parity == 0
+                && (group.members.len() != self.members.len()
+                    || !self.missing_mirror_guids.is_empty())
+        }) {
             // Automatic import may have selected a healthy ring beside a bad
             // config copy. Reopening that view must not revert to label zero or
             // lose mirror children before MOS feature and dataset reads.
             // Explicit selection already checked all four copies at its entry.
-            let labels = self
-                .members
-                .iter()
-                .map(|member| super::import::verified_labels(cx, member))
-                .collect::<Result<Vec<_>>>()?;
-            let topology = self.admit_striped_labels(cx, &labels, config.pool_guid, true)?;
+            let topology = if self.has_missing_members() {
+                // Explicit survivor views retain their strict, exported,
+                // four-label admission even when one survivor per vdev makes
+                // the physical count equal the top-level count.
+                self.admit_striped_mirrors(cx, config.pool_guid, false)?
+            } else {
+                let labels = self
+                    .members
+                    .iter()
+                    .map(|member| super::import::verified_labels(cx, member))
+                    .collect::<Result<Vec<_>>>()?;
+                self.admit_striped_labels(cx, &labels, config.pool_guid, true)?
+            };
             if topology.config != *config {
                 return Err(corrupt(
                     "selected root lost its native striped-mirror mapping",

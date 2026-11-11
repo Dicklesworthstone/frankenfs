@@ -26,7 +26,8 @@ ffs-zfs scrub first.img \
 Each label describes its own top-level subtree. The engine joins these subtrees
 by their native vdev IDs, not argument order. Two through eight top-level vdevs
 and at most eight total physical members are admitted. Every mirror has two
-through eight ordinary file/disk children; all configured children are required.
+through eight ordinary file/disk children. Complete-member mode requires every
+configured child. Explicit survivor extraction is described below.
 
 Explicit selection requires all four labels on each member to agree on its
 entire subtree and physical identity. Automatic selection uses all surviving
@@ -112,19 +113,51 @@ log copies are charged before log I/O. Existing ZIL inspection/recovery scope
 and limits are unchanged; no replay or backing mutation happens merely by
 opening this topology.
 
+## Explicit extraction with absent mirror children
+
+`--missing-mirror-member GUID` also admits exported multi-mirror and mixed
+leaf/mirror pools. Identify every absent mirror child and supply at least one
+survivor from each top-level vdev; standalone leaves must all be supplied.
+The combined present/absent physical count remains bounded by eight. These
+declarations must be the exact complement of the native child arrays, and the
+selected candidate's GUID sum still includes the absent children.
+
+This path uses the same label validation and physical reader as complete
+topologies. It retains surviving routes after opening a DMU view, including the
+one-survivor-per-vdev case, and checks every present member's geometry. A declared
+absent child has no synthetic device or borrowed route. Wrong, overlapping,
+duplicate or omitted GUIDs, missing entire vdevs and conflicting configurations
+are refused before payload I/O. Native capacities still count once per vdev.
+
+Only an explicitly selected committed view of an exported pool is admitted.
+Automatic root selection, active pools and ZIL inspection/replay remain refused
+for incomplete sets, including at the public library log entry point. Redundancy
+scrub reports missing members even when surviving data verifies. See the
+[missing-mirror profile](ZFS_MISSING_MIRROR_PROFILE.md) for command examples.
+
 ## Explicit limits
 
 Native writable import, pool ownership, DTL reconciliation, newest-state authority,
 resilver/heal, device attach/replace, allocation/TXG writing and native replay
 remain separate obligations. The images must remain offline and immutable.
 
-Missing-member options remain limited to their existing single-group profiles;
-this new topology requires the complete member set. Multiple RAIDZ groups,
+Missing RAIDZ members remain limited to the existing single-group profile.
+Multiple RAIDZ groups,
 mixtures involving RAIDZ, nested/replacing/spare vdevs, log/special allocation
 classes, removed/indirect vdevs, expanded RAIDZ and dRAID remain unsupported.
 A readable selected root is not permission to discard any of these components.
 
 ## Evidence and qualification
+
+The explicit survivor extension adds six constructed-image regressions for
+multi-mirror and mixed topologies, exact present/absent membership, retained cold
+views, full candidate identity, pre-I/O metadata/geometry refusal, bounded
+same-vdev fallback, cancellation, missing-member scrub and ZIL refusal. Workspace
+formatting and Git whitespace checks pass in the 2026-11-11 session. Local
+compilation is killed in dependency rustc processes before the changed crates;
+the new tests remain unexecuted and native OpenZFS qualification remains open.
+
+The following records the earlier complete-member implementation sessions:
 
 Ten new Rust regression tests are authored: eight native-layout/DMU/scrub tests
 and two ZIL storage tests. They cover both byte orders, 512/4096/65536-byte sectors,
