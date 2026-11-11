@@ -270,6 +270,7 @@ fn invalid_zero_requests_preserve_bytes_and_leave_the_mount_usable() {
 #[test]
 fn every_zero_write_and_sync_cut_quarantines_without_a_clean_partial_success() {
     const INITIAL_MTIME: u64 = 946_684_800;
+    const RECORDED_CUT: usize = 23;
     let fault_target = |kind, active| {
         assert!(
             now_unix_secs() > INITIAL_MTIME + 1,
@@ -309,6 +310,10 @@ fn every_zero_write_and_sync_cut_quarantines_without_a_clean_partial_success() {
             .unwrap();
             let count = baseline.device.disk.lock().unwrap().attempts;
             assert!(count > 8);
+            eprintln!("ZERO_FAULT_BASELINE|kind={kind:?}|active={active}|mode={mode}|attempts={count}");
+            if kind == FatKind::Fat32 && mode == (ZERO | KEEP) {
+                assert!(count >= RECORDED_CUT, "matrix must reach the recorded FAT32 cut");
+            }
             for fail in 1..=count {
                 for tear in [0, 17, 511] {
                     let (image, fs, ino) = fault_target(kind, active);
@@ -329,6 +334,13 @@ fn every_zero_write_and_sync_cut_quarantines_without_a_clean_partial_success() {
                         let disk = image.device.disk.lock().unwrap();
                         (disk.attempts, disk.fault_reached)
                     };
+                    if kind == FatKind::Fat32
+                        && mode == (ZERO | KEEP)
+                        && fail == RECORDED_CUT
+                        && tear == 0
+                    {
+                        eprintln!("ZERO_FAULT_RECORDED_CUT|kind={kind:?}|active={active}|mode={mode}|fail={fail}|tear={tear}|baseline={count}|attempts={attempts}|fault_reached={fault_reached}|returned_error={}", result.is_err());
+                    }
                     assert!(
                         fault_reached,
                         "selected cut did not execute: {kind:?} mode={mode} fail={fail} tear={tear} baseline={count} attempts={attempts}"
