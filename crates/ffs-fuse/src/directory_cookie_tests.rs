@@ -166,7 +166,7 @@ impl Wire {
         body[..8].copy_from_slice(&self.handle.to_ne_bytes());
         let response = self.request(29, &body);
         assert_eq!(response.error, 0);
-        assert!(response.body.is_empty());
+        assert_eq!(response.body.as_slice(), b"");
     }
 }
 
@@ -251,13 +251,13 @@ fn wire_directory_overflow_returns_errno_without_fabricated_entries_or_reference
                 for _ in 0..2 {
                     let response = wire.readdir(opcode, 0, 4096);
                     assert_eq!(response.error, -libc::EOVERFLOW);
-                    assert!(response.body.is_empty());
+                    assert_eq!(response.body.as_slice(), b"");
                     assert_eq!(lookups.count(2), 0);
                 }
                 assert_eq!(*offsets.lock().unwrap(), vec![0, 0]);
                 let negative = wire.readdir(opcode, -1, 4096);
                 assert_eq!(negative.error, -libc::EINVAL);
-                assert!(negative.body.is_empty());
+                assert_eq!(negative.body.as_slice(), b"");
                 assert_eq!(*offsets.lock().unwrap(), vec![0, 0]);
             });
         }
@@ -287,7 +287,7 @@ fn wire_directory_valid_prefix_preserves_cookies_and_lookups_before_overflow() {
                     for _ in 0..2 {
                         let response = wire.readdir(opcode, i64::MAX, size);
                         assert_eq!(response.error, -libc::EOVERFLOW);
-                        assert!(response.body.is_empty());
+                        assert_eq!(response.body.as_slice(), b"");
                         assert_eq!(lookups.count(4), 0);
                         assert_eq!(lookups.count(5), 0);
                     }
@@ -316,7 +316,7 @@ fn wire_directory_maximum_signed_cookie_round_trips_to_real_eof() {
             );
             let eof = wire.readdir(opcode, i64::MAX, 4096);
             assert_eq!(eof.error, 0);
-            assert!(eof.body.is_empty());
+            assert_eq!(eof.body.as_slice(), b"");
             assert_eq!(*offsets.lock().unwrap(), vec![0, LAST_COOKIE]);
             for ino in [2, 3] {
                 assert_eq!(lookups.count(ino), u64::from(opcode == READDIRPLUS));
