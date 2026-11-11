@@ -487,6 +487,118 @@ impl RequestOp {
     }
 }
 
+/// Isolation level used when committing an MVCC request scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MvccIsolationMode {
+    /// Snapshot Isolation with First-Committer-Wins / proof-carrying merge (default).
+    #[default]
+    Snapshot,
+    /// Cahill Serializable Snapshot Isolation (`rw`-antidependency pivot abort).
+    Serializable,
+}
+
+/// Shared read-set accumulator for an SSI-enabled [`RequestScope`], allowing
+/// `&RequestScope` read paths to record `(block, observed_seq)` without `&mut`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SsiReadTracker(
+    Arc<parking_lot::Mutex<BTreeMap<ffs_types::BlockNumber, CommitSeq>>>,
+);
+
+impl PartialEq for SsiReadTracker {
+    fn eq(&self, other: &Self) -> bool {
+        *self.0.lock() == *other.0.lock()
+    }
+}
+
+impl Eq for SsiReadTracker {}
+
+impl SsiReadTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn record(&self, block: ffs_types::BlockNumber, seq: CommitSeq) {
+        self.0
+            .lock()
+            .entry(block)
+            .and_modify(|prev| {
+                if seq > *prev {
+                    *prev = seq;
+                }
+            })
+            .or_insert(seq);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.lock().is_empty()
+    }
+
+    pub(crate) fn fold_into(&self, tx: &mut ffs_mvcc::Transaction) {
+        for (&block, &seq) in &*self.0.lock() {
+            tx.record_read(block, seq);
+        }
+    }
+}
+
+/// Staged per-group ext4 allocator/inode/checksum deltas owned by a [`RequestScope`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Ext4StagedGroupDelta {
+    pub(crate) free_inodes_delta: i64,
+    pub(crate) used_dirs_delta: i64,
+    pub(crate) inode_bitmap_initialized: bool,
+    pub(crate) block_bitmap_csum_xor: u32,
+    pub(crate) inode_bitmap_csum_xor: u32,
+    pub(crate) inode_search_start: Option<u32>,
+}
+
+impl Ext4StagedGroupDelta {
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.free_inodes_delta == 0
+            && self.used_dirs_delta == 0
+            && !self.inode_bitmap_initialized
+            && self.block_bitmap_csum_xor == 0
+            && self.inode_bitmap_csum_xor == 0
+            && self.inode_search_start.is_none()
+    }
+}
+
+/// Staged ext4 runtime metadata effects deferred until [`RequestScope`] commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Ext4StagedScopeState {
+    pub(crate) group_deltas: BTreeMap<usize, Ext4StagedGroupDelta>,
+    pub(crate) orphan_head: Option<u32>,
+    pub(crate) pending_orphans_add: std::collections::BTreeSet<u64>,
+    pub(crate) pending_orphans_remove: std::collections::BTreeSet<u64>,
+    pub(crate) forget_inodes: Vec<InodeNumber>,
+    pub(crate) extent_invalidate_inodes: Vec<ffs_ondisk::Ext4Inode>,
+    pub(crate) xattr_invalidate_inodes: Vec<InodeNumber>,
+    pub(crate) xattr_refresh_inodes: Vec<(InodeNumber, ffs_ondisk::Ext4Inode)>,
+}
+
+impl Ext4StagedScopeState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.group_deltas.is_empty()
+            && self.orphan_head.is_none()
+            && self.pending_orphans_add.is_empty()
+            && self.pending_orphans_remove.is_empty()
+            && self.forget_inodes.is_empty()
+            && self.extent_invalidate_inodes.is_empty()
+            && self.xattr_invalidate_inodes.is_empty()
+            && self.xattr_refresh_inodes.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.group_deltas.clear();
+        self.orphan_head = None;
+        self.pending_orphans_add.clear();
+        self.pending_orphans_remove.clear();
+        self.forget_inodes.clear();
+        self.extent_invalidate_inodes.clear();
+        self.xattr_invalidate_inodes.clear();
+        self.xattr_refresh_inodes.clear();
+    }
+}
+
 /// Commit boundary policy carried by an MVCC request scope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestCommitMode {
@@ -514,6 +626,19 @@ pub struct RequestScope {
     pub(crate) read_snapshot_pinned: bool,
     #[serde(default)]
     pub commit_mode: RequestCommitMode,
+    #[serde(default)]
+    pub isolation_mode: MvccIsolationMode,
+    /// Operation that opened this managed request scope, if any.
+    #[serde(skip)]
+    pub(crate) origin_op: Option<RequestOp>,
+    /// Whether multiple VFS operations are intentionally composed into this
+    /// scope before `commit_request_scope` (e.g. `RENAME_WHITEOUT` or SDK
+    /// multi-operation transactions).
+    #[serde(skip)]
+    pub(crate) composite: bool,
+    /// Read-set tracker populated when `isolation_mode == Serializable`.
+    #[serde(skip)]
+    pub(crate) ssi_reads: Option<SsiReadTracker>,
     /// Set by callers (e.g. `readdirplus`) that immediately `getattr` every
     /// returned entry themselves, so the readdir-internal inode-table prefetch
     /// fan-out is pure duplicate work (a second parallel pass over the same
@@ -529,6 +654,9 @@ pub struct RequestScope {
     /// Groups whose previously undefined bitmap was initialized in this scope.
     #[serde(default)]
     pub(crate) ext4_initialized_bitmaps: std::collections::BTreeSet<usize>,
+    /// Additional ext4 allocator/orphan/cache mutations staged in this scope.
+    #[serde(skip)]
+    pub(crate) ext4_staged: Ext4StagedScopeState,
     /// Nested mapping helpers already operate on the outer private allocator.
     #[serde(skip)]
     pub(crate) ext4_accounting_active: bool,
@@ -541,19 +669,44 @@ impl RequestScope {
         self.read_snapshot_pinned || (self.tx.is_some() && self.snapshot.is_some())
     }
 
+    pub(crate) fn has_ext4_staged_effects(&self) -> bool {
+        !self.ext4_block_deltas.is_empty()
+            || !self.ext4_initialized_bitmaps.is_empty()
+            || !self.ext4_staged.is_empty()
+    }
+
+    pub(crate) fn record_ssi_read(&self, block: ffs_types::BlockNumber, seq: CommitSeq) {
+        if let Some(tracker) = &self.ssi_reads {
+            tracker.record(block, seq);
+        }
+    }
+
+    /// Mark this request scope as composing multiple VFS mutations into a
+    /// single atomic `commit_request_scope` publication.
+    pub fn mark_composite(&mut self) {
+        self.composite = true;
+    }
+
+    /// Whether an ext4 namespace/inode mutation should stage into `self.tx`
+    /// and defer publication until `commit_request_scope` rather than running
+    /// a standalone single-operation publication under `alloc_mutex`.
+    pub(crate) fn defers_ext4_op_to_scope_commit(&self) -> bool {
+        self.tx.is_some()
+            && (self.is_deferred_until_flush()
+                || self.composite
+                || self.origin_op.is_none()
+                || self.pending_write_count() > 0
+                || self.has_ext4_staged_effects()
+                || self
+                    .ssi_reads
+                    .as_ref()
+                    .is_some_and(|reads| !reads.is_empty()))
+    }
+
     /// Create a scope with no snapshot or transaction attached.
     #[must_use]
     pub fn empty() -> Self {
-        Self {
-            snapshot: None,
-            tx: None,
-            read_snapshot_pinned: false,
-            commit_mode: RequestCommitMode::PerRequest,
-            skip_readdir_prefetch: false,
-            ext4_block_deltas: BTreeMap::new(),
-            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
-            ext4_accounting_active: false,
-        }
+        Self::default()
     }
 
     /// Create a scope tied to a specific MVCC snapshot.
@@ -561,13 +714,7 @@ impl RequestScope {
     pub fn with_snapshot(snapshot: Snapshot) -> Self {
         Self {
             snapshot: Some(snapshot),
-            tx: None,
-            read_snapshot_pinned: false,
-            commit_mode: RequestCommitMode::PerRequest,
-            skip_readdir_prefetch: false,
-            ext4_block_deltas: BTreeMap::new(),
-            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
-            ext4_accounting_active: false,
+            ..Self::default()
         }
     }
 
@@ -577,12 +724,7 @@ impl RequestScope {
         Self {
             snapshot: Some(tx.snapshot()),
             tx: Some(tx),
-            read_snapshot_pinned: false,
-            commit_mode: RequestCommitMode::PerRequest,
-            skip_readdir_prefetch: false,
-            ext4_block_deltas: BTreeMap::new(),
-            ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
-            ext4_accounting_active: false,
+            ..Self::default()
         }
     }
 
@@ -613,9 +755,20 @@ impl RequestScope {
         &mut self,
         mvcc_store: &FsMvccStore,
     ) -> ffs_error::Result<CommitSeq> {
-        self.tx.take().map_or(Ok(CommitSeq(0)), |tx| {
+        let use_ssi =
+            self.isolation_mode == MvccIsolationMode::Serializable || mvcc_store.is_ssi_enabled();
+        let ssi_reads = self.ssi_reads.take();
+        self.tx.take().map_or(Ok(CommitSeq(0)), |mut tx| {
+            if let Some(tracker) = ssi_reads {
+                tracker.fold_into(&mut tx);
+            }
             let tx_id = tx.id().0;
-            mvcc_store.commit(tx).map_err(|error| match error {
+            let commit_res = if use_ssi {
+                mvcc_store.commit_ssi(tx)
+            } else {
+                mvcc_store.commit(tx)
+            };
+            commit_res.map_err(|error| match error {
                 ffs_mvcc::CommitError::Conflict { block, .. }
                 | ffs_mvcc::CommitError::ChainBackpressure { block, .. } => {
                     ffs_error::FfsError::MvccConflict {
@@ -1185,7 +1338,8 @@ pub trait FsOps: Send + Sync {
     ///   exists. The check + rename must be atomic under the parent
     ///   directory locks held by the caller.
     /// - `RENAME_EXCHANGE` (2) — atomically swap two existing entries.
-    /// - `RENAME_WHITEOUT` (4) — used by overlayfs; not currently supported.
+    /// - `RENAME_WHITEOUT` (4) — atomically move source and leave a `0:0`
+    ///   character-device whiteout node at the source path (ext4 supported).
     ///
     /// The default implementation delegates to [`Self::rename`] when
     /// `flags == 0` and returns `EINVAL` for any non-zero flags so that

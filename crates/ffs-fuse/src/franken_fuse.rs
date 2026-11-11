@@ -3715,6 +3715,9 @@ impl FrankenFuse {
             let _inode_guards =
                 self.acquire_mutation_inode_guards(&[InodeNumber(parent), InodeNumber(newparent)]);
             self.with_request_scope(&cx, RequestOp::Rename, |cx, scope| {
+                if whiteout {
+                    scope.mark_composite();
+                }
                 self.inner.ops.rename2(
                     cx,
                     scope,

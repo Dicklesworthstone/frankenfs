@@ -211,6 +211,11 @@ impl PerGroupAlloc {
             if live.block_bitmap_initialized {
                 stats.mark_block_bitmap_initialized();
             }
+            if live.inode_bitmap_initialized {
+                stats.mark_inode_bitmap_initialized();
+            }
+            stats.block_bitmap_csum ^= live.block_bitmap_csum ^ seed.block_bitmap_csum;
+            stats.inode_bitmap_csum ^= live.inode_bitmap_csum ^ seed.inode_bitmap_csum;
         }
         out
     }
@@ -232,6 +237,11 @@ impl PerGroupAlloc {
             if !live.block_bitmap_uninit() {
                 stats.mark_block_bitmap_initialized();
             }
+            if !live.inode_bitmap_uninit() {
+                stats.mark_inode_bitmap_initialized();
+            }
+            stats.block_bitmap_csum ^= live.block_bitmap_csum ^ seed.block_bitmap_csum;
+            stats.inode_bitmap_csum ^= live.inode_bitmap_csum ^ seed.inode_bitmap_csum;
             // Either family may have changed the free runs since the other
             // cached its hint. A stale upper bound is harmless; a lower one
             // could cause a false ENOSPC in the complete fallback.
@@ -270,11 +280,19 @@ impl PerGroupAlloc {
             let dirs = split_count(next.used_dirs, shard.used_dirs, seed.used_dirs);
             sharded_moved |= blocks.1 != shard.free_blocks
                 || inodes.1 != shard.free_inodes
-                || dirs.1 != shard.used_dirs;
+                || dirs.1 != shard.used_dirs
+                || next.flags != shard.flags
+                || next.block_bitmap_csum != shard.block_bitmap_csum
+                || next.inode_bitmap_csum != shard.inode_bitmap_csum;
             *shard = next.clone();
             (next.free_blocks, shard.free_blocks) = blocks;
             (next.free_inodes, shard.free_inodes) = inodes;
             (next.used_dirs, shard.used_dirs) = dirs;
+            // `shard` carries the full post-publication checksum state; reset
+            // `next` (`single`) back to `seed` so `shard ^ (single ^ seed)`
+            // evaluates to `actual` instead of double-XORing on later reconciles.
+            next.block_bitmap_csum = seed.block_bitmap_csum;
+            next.inode_bitmap_csum = seed.inode_bitmap_csum;
         }
         Ok(ReconciledPublication {
             single: next_single,
@@ -634,6 +652,16 @@ pub struct SeedCounts {
     /// it or an allocated-into BLOCK_UNINIT group would keep the flag on disk
     /// over real allocations.
     pub(crate) block_bitmap_initialized: bool,
+    /// Mirrors `block_bitmap_initialized` for `INODE_UNINIT` clearing on
+    /// single-lock / request-scoped inode births.
+    pub(crate) inode_bitmap_initialized: bool,
+    /// Tracks single-lock / request-scoped block-bitmap checksum XOR movement
+    /// so `ext4_gdt_skip_unchanged` never skips a group whose free count is
+    /// net-zero (e.g. free block X + alloc block Y in one scope) while its
+    /// bitmap bits changed.
+    pub(crate) block_bitmap_csum: u32,
+    /// Tracks single-lock / request-scoped inode-bitmap checksum XOR movement.
+    pub(crate) inode_bitmap_csum: u32,
 }
 
 impl SeedCounts {
@@ -643,6 +671,9 @@ impl SeedCounts {
             free_inodes: stats.free_inodes,
             used_dirs: stats.used_dirs,
             block_bitmap_initialized: !stats.block_bitmap_uninit(),
+            inode_bitmap_initialized: !stats.inode_bitmap_uninit(),
+            block_bitmap_csum: stats.block_bitmap_csum,
+            inode_bitmap_csum: stats.inode_bitmap_csum,
         }
     }
 
@@ -1491,5 +1522,40 @@ mod tests {
         stats[2].used_dirs = 9;
         let sharded = PerGroupAlloc::from_group_stats(stats);
         assert_eq!(sharded.choose_dir_group(), Some(GroupNumber(1)));
+    }
+
+    #[test]
+    fn birth_publication_preserves_bitmap_csum_and_inode_uninit_without_double_xor() {
+        let mut seed = sample_group(0, 100, 40);
+        seed.flags = 0x0003; // INODE_UNINIT | BLOCK_UNINIT
+        seed.block_bitmap_csum = 0x1122_3344;
+        seed.inode_bitmap_csum = 0xAABB_CCDD;
+        let single = vec![seed];
+        let sharded = PerGroupAlloc::from_group_stats(single.clone());
+
+        let mut actual = sharded.birth_group_stats(&single).expect("initial birth");
+        // Simulate net-zero free-inode movement (free one inode + allocate a
+        // different inode in the same composite scope): only flags + csum move.
+        actual[0].mark_inode_bitmap_initialized();
+        actual[0].inode_bitmap_csum = 0x5566_7788;
+        actual[0].block_bitmap_csum = 0x99AA_BBCC;
+
+        let plan = sharded
+            .prepare_birth_publication(&single, actual)
+            .expect("prepare publication");
+        assert!(plan.moves_sharded_counts());
+        let published = sharded.publish_birth(plan);
+
+        let live = SeedCounts::snapshot(&published);
+        let reconciled = sharded.reconciled_group_stats(&live);
+        assert!(!reconciled[0].inode_bitmap_uninit());
+        assert_eq!(reconciled[0].inode_bitmap_csum, 0x5566_7788);
+        assert_eq!(reconciled[0].block_bitmap_csum, 0x99AA_BBCC);
+
+        let second_birth = sharded
+            .birth_group_stats(&published)
+            .expect("second birth must not double-XOR csum");
+        assert_eq!(second_birth[0].inode_bitmap_csum, 0x5566_7788);
+        assert_eq!(second_birth[0].block_bitmap_csum, 0x99AA_BBCC);
     }
 }

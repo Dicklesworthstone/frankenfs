@@ -312,9 +312,10 @@ impl MergeByteRange {
 
 /// Byte-level merge algorithm selected by a [`MergeProof`].
 ///
-/// The public proof labels are semantic/diagnostic labels. They intentionally
-/// collapse to two same-block merge mechanisms plus one non-merge outcome:
-/// append-only concatenation, range overlay, or FCW fallback.
+/// The public proof labels are semantic/diagnostic labels. They collapse to
+/// four same-block merge mechanisms plus one non-merge outcome:
+/// append-only concatenation, byte-range overlay, monotone bitmap OR,
+/// bidirectional bitmap XOR-delta, or FCW fallback (`NoSameBlockMerge`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MergeProofMechanism {
     /// No same-block merge is attempted; FCW remains the decision boundary.
@@ -1413,6 +1414,7 @@ impl SsiDangerousStructure {
     pub(crate) fn emit_logs(self, pivot_txn: TxnId) {
         debug!(
             target: "ffs::ssi",
+            event = "ssi_pivot_detected",
             txn_id = pivot_txn.0,
             incoming_reader_txn = self.incoming.reader_txn.0,
             incoming_block = self.incoming.block.0,
@@ -1435,11 +1437,15 @@ impl SsiDangerousStructure {
         );
         warn!(
             target: "ffs::ssi",
+            event = "ssi_pivot_detected",
             txn_id = pivot_txn.0,
+            pivot_tx = pivot_txn.0,
             incoming_reader_txn = self.incoming.reader_txn.0,
+            in_tx = self.incoming.reader_txn.0,
             incoming_block = self.incoming.block.0,
             incoming_reader_snapshot_high = self.incoming.reader_snapshot_high.0,
             outgoing_writer_txn = self.outgoing.writer_txn.0,
+            out_tx = self.outgoing.writer_txn.0,
             outgoing_block = self.outgoing.block.0,
             outgoing_reader_snapshot_high = self.outgoing.reader_snapshot_high.0,
             conflict_type = "two_edge_dangerous_structure",
@@ -11429,5 +11435,104 @@ mod tests {
             watchdog_join_elapsed < watchdog_join_limit,
             "watchdog should return within {watchdog_join_limit:?} after worker completion; join elapsed={watchdog_join_elapsed:?}"
         );
+    }
+
+    #[test]
+    fn single_store_fcw_and_ssi_merge_unversioned_block_via_staged_base() {
+        for use_ssi in [false, true] {
+            let mut store = MvccStore::new();
+            let block = BlockNumber(42);
+            let base = vec![0x11_u8; 4096];
+
+            let mut t1 = store.begin();
+            let mut t2 = store.begin();
+
+            let mut b1 = base.clone();
+            b1[0..256].fill(0xAA);
+            t1.stage_write_with_proof_and_base(
+                block,
+                b1,
+                MergeProof::independent_keys(&[(0, 256)]),
+                Some(base.clone()),
+            );
+
+            let mut b2 = base.clone();
+            b2[256..512].fill(0xBB);
+            t2.stage_write_with_proof_and_base(
+                block,
+                b2,
+                MergeProof::independent_keys(&[(256, 256)]),
+                Some(base.clone()),
+            );
+
+            if use_ssi {
+                store.commit_ssi(t1).expect("t1 ssi commit");
+                store
+                    .commit_ssi(t2)
+                    .expect("t2 ssi commit must merge disjoint slots via staged_base");
+            } else {
+                store.commit(t1).expect("t1 fcw commit");
+                store
+                    .commit(t2)
+                    .expect("t2 fcw commit must merge disjoint slots via staged_base");
+            }
+
+            let snap = store.current_snapshot();
+            let merged = store.read_visible(block, snap).expect("merged block");
+            assert!(merged[0..256].iter().all(|&b| b == 0xAA));
+            assert!(merged[256..512].iter().all(|&b| b == 0xBB));
+            assert!(merged[512..].iter().all(|&b| b == 0x11));
+        }
+    }
+
+    #[test]
+    fn read_visible_block_buf_with_seq_reports_exact_version_seq_single_and_sharded() {
+        let block = BlockNumber(9);
+        let mut single = MvccStore::new();
+        assert!(
+            single
+                .read_visible_block_buf_with_seq(block, single.current_snapshot())
+                .is_none()
+        );
+        let mut tx1 = single.begin();
+        tx1.stage_write(block, vec![1_u8; 64]);
+        let seq1 = single.commit(tx1).expect("seq1");
+
+        let mut tx2 = single.begin();
+        tx2.stage_write(BlockNumber(10), vec![9_u8; 64]);
+        let _seq2 = single.commit(tx2).expect("seq2");
+        let snap2 = single.current_snapshot();
+
+        let (buf1, got_seq1) = single
+            .read_visible_block_buf_with_seq(block, snap2)
+            .expect("visible at snap2");
+        assert_eq!(got_seq1, seq1);
+        assert_eq!(buf1.as_slice(), &[1_u8; 64]);
+
+        let sharded = sharded::ShardedMvccStore::new(4);
+        assert!(
+            sharded
+                .read_visible_block_buf_with_seq(block, sharded.current_snapshot())
+                .is_none()
+        );
+        let mut sharded_tx_a = sharded.begin();
+        sharded_tx_a.stage_write(block, vec![2_u8; 64]);
+        let sharded_commit_a = sharded.commit(sharded_tx_a).expect("sharded seq1");
+        let sharded_snap_a = sharded.current_snapshot();
+        let mut sharded_tx_b = sharded.begin();
+        sharded_tx_b.stage_write(block, vec![3_u8; 64]);
+        let sharded_commit_b = sharded.commit(sharded_tx_b).expect("sharded seq2");
+
+        let (sharded_bytes_a, observed_sharded_a) = sharded
+            .read_visible_block_buf_with_seq(block, sharded_snap_a)
+            .expect("sharded visible at sharded_commit_a");
+        assert_eq!(observed_sharded_a, sharded_commit_a);
+        assert_eq!(sharded_bytes_a.as_slice(), &[2_u8; 64]);
+
+        let (sharded_bytes_b, observed_sharded_b) = sharded
+            .read_visible_block_buf_with_seq(block, sharded.current_snapshot())
+            .expect("sharded visible at head");
+        assert_eq!(observed_sharded_b, sharded_commit_b);
+        assert_eq!(sharded_bytes_b.as_slice(), &[3_u8; 64]);
     }
 }

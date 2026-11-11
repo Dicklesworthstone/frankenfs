@@ -1778,6 +1778,19 @@ impl ShardedMvccStore {
         block: BlockNumber,
         snapshot: Snapshot,
     ) -> Option<ffs_block::BlockBuf> {
+        self.read_visible_block_buf_with_seq(block, snapshot)
+            .map(|(buf, _)| buf)
+    }
+
+    /// Read the visible version of `block` at `snapshot` together with the
+    /// exact [`CommitSeq`] that produced those bytes (used by SSI read-set
+    /// tracking on `OpenFs` without a second shard lock acquisition).
+    #[must_use]
+    pub fn read_visible_block_buf_with_seq(
+        &self,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Option<(ffs_block::BlockBuf, CommitSeq)> {
         // Mirror `read_visible`'s empty-store fast path (bd-cc-mvccempty): with no
         // version ever installed (read-only mount), skip the shard hash + read-lock
         // + empty-map probe — the result is `None` either way (no map holds `block`).
@@ -1788,7 +1801,8 @@ impl ShardedMvccStore {
         let shard = self.shards[shard_idx].read();
         shard.versions.get(&block).and_then(|versions| {
             let idx = crate::newest_visible_index(versions, snapshot.high)?;
-            compression::resolve_block_buf_with(versions, idx, |version| &version.data)
+            let buf = compression::resolve_block_buf_with(versions, idx, |version| &version.data)?;
+            Some((buf, versions[idx].commit_seq))
         })
     }
 

@@ -24,13 +24,11 @@ use asupersync::raptorq::decoder::{
 use asupersync::raptorq::gf256::{Gf256, gf256_add_slice, gf256_addmul_slice, gf256_mul_slice};
 use asupersync::raptorq::rfc6330::{next_prime_ge, try_tuple};
 use asupersync::raptorq::systematic::{EmittedSymbol, SystematicEncoder, SystematicParams};
-#[cfg(any(test, feature = "bench-instrumentation"))]
-use ffs_block::BlockBuf;
-use ffs_block::BlockDevice;
+use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use std::collections::VecDeque;
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::symbol::repair_seed;
@@ -39,6 +37,16 @@ const RQ_DECODE_WAVEFRONT_BATCH: usize = 4;
 const DIRECT_SMALL_ERASURE_MAX_CORRUPT: usize = 2;
 const DIRECT_SMALL_ERASURE_MAX_SOURCE_BLOCKS: usize = 64;
 const SOURCE_COEFFICIENT_ENCODER_CACHE_CAPACITY: usize = 8;
+const PROJECTED_REPAIR_BATCH_SYMBOLS: usize = 8;
+const PROJECTED_SOURCE_TILE_BLOCKS: usize = 8;
+
+/// Default RFC 6330 §4.3 sub-block (stripe) source symbol count for large
+/// (`128 MiB` = `32,768 × 4 KiB`) block groups.
+///
+/// Sizing each stripe at `64` blocks (`256 KiB`) keeps the entire stripe hot in
+/// L2 cache during SIMD `GF(256)` projection AND ensures 1–2 erasures per
+/// stripe hit [`try_direct_small_erasure_decode`] (`DIRECT_SMALL_ERASURE_MAX_SOURCE_BLOCKS = 64`).
+pub const DEFAULT_MAX_STRIPE_SOURCE_BLOCKS: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourceCoefficientEncoderKey {
@@ -483,6 +491,70 @@ fn emit_projected_repair_symbols(
     repair_count: usize,
     group: GroupNumber,
 ) -> Result<Vec<EmittedSymbol>> {
+    let refs: Vec<&[u8]> = source_symbols.iter().map(Vec::as_slice).collect();
+    emit_projected_repair_symbols_refs(&refs, block_size, seed, repair_count, group, true)
+}
+
+fn emit_projected_repair_batch(
+    source_symbols: &[&[u8]],
+    block_size: usize,
+    coefficient_encoder: &SystematicEncoder,
+    params: &SystematicParams,
+    start_esi: u32,
+    batch_offset: usize,
+    batch_len: usize,
+) -> Vec<EmittedSymbol> {
+    let source_count = source_symbols.len();
+    let mut coeff_rows = vec![vec![0_u8; source_count]; batch_len];
+    let mut esis = Vec::with_capacity(batch_len);
+    for (slot, row) in coeff_rows.iter_mut().enumerate() {
+        let esi = start_esi + u32::try_from(batch_offset + slot).unwrap_or(u32::MAX);
+        coefficient_encoder.repair_symbol_into(esi, row);
+        esis.push(esi);
+    }
+
+    let mut outputs = vec![vec![0_u8; block_size]; batch_len];
+    for tile_start in (0..source_count).step_by(PROJECTED_SOURCE_TILE_BLOCKS) {
+        let tile_end = (tile_start + PROJECTED_SOURCE_TILE_BLOCKS).min(source_count);
+        for (src_idx, &source_symbol) in source_symbols[tile_start..tile_end]
+            .iter()
+            .enumerate()
+            .map(|(off, sym)| (tile_start + off, sym))
+        {
+            for (out_idx, output) in outputs.iter_mut().enumerate() {
+                let coefficient = Gf256::new(coeff_rows[out_idx][src_idx]);
+                if coefficient.is_zero() {
+                    continue;
+                }
+                if coefficient == Gf256::ONE {
+                    gf256_add_slice(output, source_symbol);
+                } else {
+                    gf256_addmul_slice(output, source_symbol, coefficient);
+                }
+            }
+        }
+    }
+
+    outputs
+        .into_iter()
+        .zip(esis)
+        .map(|(data, esi)| EmittedSymbol {
+            esi,
+            data,
+            is_source: false,
+            degree: raptorq_repair_symbol_degree(params, esi),
+        })
+        .collect()
+}
+
+fn emit_projected_repair_symbols_refs(
+    source_symbols: &[&[u8]],
+    block_size: usize,
+    seed: u64,
+    repair_count: usize,
+    group: GroupNumber,
+    parallel_batches: bool,
+) -> Result<Vec<EmittedSymbol>> {
     let source_count = source_symbols.len();
     let coefficient_encoder =
         build_source_coefficient_encoder(source_count, seed).ok_or_else(|| {
@@ -494,52 +566,640 @@ fn emit_projected_repair_symbols(
 
     let start_esi = coefficient_encoder.next_repair_esi();
     let params = coefficient_encoder.params();
-
-    // Each repair symbol is an independent GF256 linear combination of the K
-    // source symbols (own coefficients + data buffers; the encoder is shared
-    // read-only via the Arc), so compute the R of them in parallel across cores
-    // — mirroring the already-parallel LRC global-parity loop (lrc.rs) (bd-blr6r).
-    //
-    // The serial version `break`s on the first esi that would overflow u32; since
-    // esi = start_esi + i is monotonic, that valid set is a prefix, so cap the
-    // index range at `valid_count` and let rayon's ordered `collect` reproduce
-    // the exact emission order and symbols.
     let valid_count = repair_count.min(
         usize::try_from(u32::MAX - start_esi)
             .unwrap_or(usize::MAX)
             .saturating_add(1),
     );
-    let repair_symbols: Vec<EmittedSymbol> = (0..valid_count)
+    if valid_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let batch_count = valid_count.div_ceil(PROJECTED_REPAIR_BATCH_SYMBOLS);
+    if parallel_batches && batch_count > 1 {
+        let symbols = (0..batch_count)
+            .into_par_iter()
+            .flat_map_iter(|batch_idx| {
+                let batch_offset = batch_idx * PROJECTED_REPAIR_BATCH_SYMBOLS;
+                let batch_len = (valid_count - batch_offset).min(PROJECTED_REPAIR_BATCH_SYMBOLS);
+                emit_projected_repair_batch(
+                    source_symbols,
+                    block_size,
+                    &coefficient_encoder,
+                    params,
+                    start_esi,
+                    batch_offset,
+                    batch_len,
+                )
+            })
+            .collect();
+        Ok(symbols)
+    } else {
+        let mut symbols = Vec::with_capacity(valid_count);
+        for batch_idx in 0..batch_count {
+            let batch_offset = batch_idx * PROJECTED_REPAIR_BATCH_SYMBOLS;
+            let batch_len = (valid_count - batch_offset).min(PROJECTED_REPAIR_BATCH_SYMBOLS);
+            symbols.extend(emit_projected_repair_batch(
+                source_symbols,
+                block_size,
+                &coefficient_encoder,
+                params,
+                start_esi,
+                batch_offset,
+                batch_len,
+            ));
+        }
+        Ok(symbols)
+    }
+}
+
+/// One modified source block for incremental `GF(256)` parity refresh.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockDelta<'a> {
+    /// Zero-based index of the modified source block within the encoded group.
+    pub source_index: u32,
+    /// Previous bytes of the source block before mutation.
+    pub old_block: &'a [u8],
+    /// Updated bytes of the source block after mutation.
+    pub new_block: &'a [u8],
+}
+
+/// Incrementally update `encoded`'s repair symbols in place for sparse block
+/// mutations using systematic RaptorQ's `GF(256)` linearity:
+/// `R_new[esi] = R_old[esi] ^ sum_i G[esi, idx_i] * (old_i ^ new_i)`.
+///
+/// The resulting repair symbols are bit-for-bit identical to running a full
+/// [`encode_group`] over the post-mutation block group, while doing `O(|deltas| * R)`
+/// SIMD slice operations instead of `O(K * R)`.
+///
+/// # Errors
+///
+/// Returns [`FfsError::RepairFailed`] if any delta index is out of bounds, block
+/// lengths do not match `encoded.symbol_size`, or the systematic coefficient
+/// matrix cannot be constructed.
+pub fn update_encoded_group_delta(
+    encoded: &mut EncodedGroup,
+    deltas: &[BlockDelta<'_>],
+) -> Result<()> {
+    let symbol_size = usize::try_from(encoded.symbol_size)
+        .map_err(|_| FfsError::RepairFailed("encoded symbol_size exceeds usize".to_owned()))?;
+    let source_count = usize::try_from(encoded.source_block_count)
+        .map_err(|_| FfsError::RepairFailed("encoded source count exceeds usize".to_owned()))?;
+
+    if deltas.is_empty() || encoded.repair_symbols.is_empty() {
+        for delta in deltas {
+            if delta.source_index >= encoded.source_block_count {
+                return Err(FfsError::RepairFailed(format!(
+                    "delta source_index {} out of range for K={}",
+                    delta.source_index, encoded.source_block_count
+                )));
+            }
+            if delta.old_block.len() != symbol_size || delta.new_block.len() != symbol_size {
+                return Err(FfsError::RepairFailed(format!(
+                    "delta block length mismatch: expected {symbol_size}, got old={} new={}",
+                    delta.old_block.len(),
+                    delta.new_block.len()
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    let mut coalesced: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    for delta in deltas {
+        if delta.source_index >= encoded.source_block_count {
+            return Err(FfsError::RepairFailed(format!(
+                "delta source_index {} out of range for K={}",
+                delta.source_index, encoded.source_block_count
+            )));
+        }
+        if delta.old_block.len() != symbol_size || delta.new_block.len() != symbol_size {
+            return Err(FfsError::RepairFailed(format!(
+                "delta block length mismatch: expected {symbol_size}, got old={} new={}",
+                delta.old_block.len(),
+                delta.new_block.len()
+            )));
+        }
+        let idx = usize::try_from(delta.source_index)
+            .map_err(|_| FfsError::RepairFailed("delta source_index exceeds usize".to_owned()))?;
+        let acc = coalesced
+            .entry(idx)
+            .or_insert_with(|| vec![0_u8; symbol_size]);
+        gf256_add_slice(acc, delta.old_block);
+        gf256_add_slice(acc, delta.new_block);
+    }
+
+    let active_diffs: Vec<(usize, Vec<u8>)> = coalesced
+        .into_iter()
+        .filter(|(_, diff)| diff.iter().any(|&byte| byte != 0))
+        .collect();
+    if active_diffs.is_empty() {
+        return Ok(());
+    }
+
+    let coefficient_encoder = build_source_coefficient_encoder(source_count, encoded.seed)
+        .ok_or_else(|| {
+            FfsError::RepairFailed(format!(
+                "constraint matrix singular for group {} (K={source_count})",
+                encoded.group.0
+            ))
+        })?;
+
+    let apply_to_symbol = |symbol: &mut EmittedSymbol| {
+        let mut coefficients = vec![0_u8; source_count];
+        coefficient_encoder.repair_symbol_into(symbol.esi, &mut coefficients);
+        for &(src_idx, ref diff) in &active_diffs {
+            let coefficient = Gf256::new(coefficients[src_idx]);
+            if coefficient.is_zero() {
+                continue;
+            }
+            if coefficient == Gf256::ONE {
+                gf256_add_slice(&mut symbol.data, diff);
+            } else {
+                gf256_addmul_slice(&mut symbol.data, diff, coefficient);
+            }
+        }
+    };
+
+    if encoded.repair_symbols.len() >= 16 {
+        encoded
+            .repair_symbols
+            .par_iter_mut()
+            .for_each(apply_to_symbol);
+    } else {
+        encoded.repair_symbols.iter_mut().for_each(apply_to_symbol);
+    }
+    Ok(())
+}
+
+/// Configuration for RFC 6330 §4.3 block-interleaved striped RaptorQ encoding of
+/// full `128 MiB` (`32,768 × 4 KiB`) filesystem block groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StripedGroupConfig {
+    /// Maximum source blocks per stripe (`K_stripe`, default `64`).
+    pub max_stripe_blocks: u32,
+    /// Number of repair symbols emitted per stripe (`R_stripe`, default `4`).
+    pub repair_blocks_per_stripe: u32,
+}
+
+impl Default for StripedGroupConfig {
+    fn default() -> Self {
+        Self {
+            max_stripe_blocks: DEFAULT_MAX_STRIPE_SOURCE_BLOCKS,
+            repair_blocks_per_stripe: 4,
+        }
+    }
+}
+
+impl StripedGroupConfig {
+    /// Build a striped configuration targeting at least `overhead_pct` percent
+    /// parity redundancy per stripe.
+    #[must_use]
+    pub const fn for_overhead_pct(max_stripe_blocks: u32, overhead_pct: u32) -> Self {
+        let numerator = (max_stripe_blocks as u64) * (overhead_pct as u64);
+        let repair_u64 = numerator.div_ceil(100);
+        let repair = if repair_u64 == 0 {
+            1
+        } else if repair_u64 > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            repair_u64 as u32
+        };
+        Self {
+            max_stripe_blocks,
+            repair_blocks_per_stripe: repair,
+        }
+    }
+}
+
+/// Encoded repair state for a single interleaved sub-block stripe.
+#[derive(Debug, Clone)]
+pub struct StripedRepairStripe {
+    /// Stripe index `s` in `0..stripe_count` (owns offsets `s + slot * stripe_count`).
+    pub stripe_index: u32,
+    /// Number of source blocks mapped into this stripe (`K_s`).
+    pub source_block_count: u32,
+    /// Deterministic RaptorQ seed for this stripe.
+    pub seed: u64,
+    /// Emitted repair symbols for this stripe (`ESI >= K_s`).
+    pub repair_symbols: Vec<EmittedSymbol>,
+}
+
+/// Encoded RFC 6330 §4.3 block-interleaved striped repair state for an entire
+/// block group (such as a `128 MiB` = `32,768 × 4 KiB` ext4 block group).
+#[derive(Debug, Clone)]
+pub struct StripedEncodedGroup {
+    /// Block group identifier.
+    pub group: GroupNumber,
+    /// First physical block covered by this group.
+    pub first_block: BlockNumber,
+    /// Total source blocks across all stripes (`K_total`).
+    pub total_source_blocks: u32,
+    /// Number of interleaved stripes (`Z`).
+    pub stripe_count: u32,
+    /// Block size in bytes.
+    pub symbol_size: u32,
+    /// Per-stripe repair symbol sets in `0..stripe_count` order.
+    pub stripes: Vec<StripedRepairStripe>,
+}
+
+impl StripedEncodedGroup {
+    /// Total repair symbols emitted across all stripes.
+    #[must_use]
+    pub fn total_repair_symbols(&self) -> usize {
+        self.stripes.iter().map(|s| s.repair_symbols.len()).sum()
+    }
+}
+
+enum GroupSourceStorage {
+    Contiguous { bytes: Vec<u8>, block_size: usize },
+    Blocks(Vec<BlockBuf>),
+}
+
+impl GroupSourceStorage {
+    #[inline]
+    fn block_slice(&self, index: usize) -> &[u8] {
+        match self {
+            Self::Contiguous { bytes, block_size } => {
+                let start = index * *block_size;
+                &bytes[start..start + *block_size]
+            }
+            Self::Blocks(blocks) => blocks[index].as_slice(),
+        }
+    }
+}
+
+fn read_group_blocks_fast(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    first_block: BlockNumber,
+    source_block_count: u32,
+) -> Result<GroupSourceStorage> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    let count_u64 = u64::from(source_block_count);
+    if count_u64 == 0 {
+        return Ok(GroupSourceStorage::Blocks(Vec::new()));
+    }
+    let last_block = first_block.0.checked_add(count_u64 - 1).ok_or_else(|| {
+        FfsError::RepairFailed(format!(
+            "encode_group_striped: block address overflow at first_block={} + count={source_block_count}",
+            first_block.0
+        ))
+    })?;
+    let block_size = usize::try_from(device.block_size()).map_err(|_| {
+        FfsError::Format("encode_group_striped: block size exceeds usize".to_owned())
+    })?;
+    let source_count = usize::try_from(source_block_count).map_err(|_| {
+        FfsError::Format("encode_group_striped: source count exceeds usize".to_owned())
+    })?;
+
+    if count_u64 > 1
+        && device.supports_contiguous_reads()
+        && last_block < device.block_count()
+        && block_size > 0
+    {
+        let total_bytes = source_count.checked_mul(block_size).ok_or_else(|| {
+            FfsError::Format("encode_group_striped: group byte length overflows usize".to_owned())
+        })?;
+        let mut bytes = vec![0_u8; total_bytes];
+        device.read_contiguous_into(cx, first_block, &mut bytes)?;
+        return Ok(GroupSourceStorage::Contiguous { bytes, block_size });
+    }
+
+    let mut blocks = Vec::with_capacity(source_count);
+    for idx in 0..count_u64 {
+        if idx.trailing_zeros() >= 6 {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        }
+        blocks.push(device.read_block(cx, BlockNumber(first_block.0 + idx))?);
+    }
+    Ok(GroupSourceStorage::Blocks(blocks))
+}
+
+/// Encode an entire block group (including full `128 MiB` = `32,768 × 4 KiB`
+/// groups) using RFC 6330 §4.3 stride-interleaved sub-blocking.
+///
+/// Block offset `off` (`0..source_block_count`) maps to stripe `off % Z` at
+/// intra-stripe slot `off / Z`, dispersing contiguous physical burst erasures
+/// evenly across all `Z` stripes while sharing cached systematic generator
+/// matrices across Rayon worker threads.
+///
+/// # Errors
+///
+/// Returns an error if `config` has zero counts, block reads fail, `cx` is
+/// cancelled, or any stripe's systematic matrix is singular.
+pub fn encode_group_striped(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    fs_uuid: &[u8; 16],
+    group: GroupNumber,
+    first_block: BlockNumber,
+    source_block_count: u32,
+    config: StripedGroupConfig,
+) -> Result<StripedEncodedGroup> {
+    if source_block_count == 0
+        || config.max_stripe_blocks == 0
+        || config.repair_blocks_per_stripe == 0
+    {
+        return Err(FfsError::RepairFailed(
+            "encode_group_striped requires nonzero source, stripe, and repair counts".to_owned(),
+        ));
+    }
+    let block_size = device.block_size();
+    let block_size_usize = usize::try_from(block_size)
+        .map_err(|_| FfsError::RepairFailed("block_size exceeds usize".to_owned()))?;
+    let repair_per_stripe = usize::try_from(config.repair_blocks_per_stripe)
+        .map_err(|_| FfsError::RepairFailed("repair_blocks_per_stripe exceeds usize".to_owned()))?;
+
+    let raw_blocks = read_group_blocks_fast(cx, device, first_block, source_block_count)?;
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+
+    let stripe_count = source_block_count.div_ceil(config.max_stripe_blocks);
+    let stripe_count_usize = usize::try_from(stripe_count)
+        .map_err(|_| FfsError::RepairFailed("stripe_count exceeds usize".to_owned()))?;
+    let base_k = usize::try_from(source_block_count / stripe_count)
+        .map_err(|_| FfsError::RepairFailed("stripe base K exceeds usize".to_owned()))?;
+    let remainder = source_block_count % stripe_count;
+    let base_seed = repair_seed(fs_uuid, group);
+
+    // Pre-warm the (at most two) distinct stripe matrix sizes once before
+    // spawning parallel stripe tasks so worker threads hit the LRU cache.
+    if base_k > 0 {
+        let _ = build_source_coefficient_encoder(base_k, base_seed).ok_or_else(|| {
+            FfsError::RepairFailed(format!(
+                "striped constraint matrix singular for group {} (stripe_k={base_k})",
+                group.0
+            ))
+        })?;
+    }
+    if remainder > 0 {
+        let larger_k = base_k + 1;
+        let _ = build_source_coefficient_encoder(larger_k, base_seed).ok_or_else(|| {
+            FfsError::RepairFailed(format!(
+                "striped constraint matrix singular for group {} (stripe_k={larger_k})",
+                group.0
+            ))
+        })?;
+    }
+
+    let parallel_inner = stripe_count < 8;
+    let stripes: Result<Vec<StripedRepairStripe>> = (0..stripe_count)
         .into_par_iter()
-        .map(|i| {
-            // i < valid_count guarantees i fits u32 and start_esi + i ≤ u32::MAX.
-            let esi = start_esi + u32::try_from(i).unwrap_or(u32::MAX);
-            let mut coefficients = vec![0_u8; source_count];
-            coefficient_encoder.repair_symbol_into(esi, &mut coefficients);
-
-            let mut data = vec![0_u8; block_size];
-            for (&coefficient, source_symbol) in coefficients.iter().zip(source_symbols) {
-                let coefficient = Gf256::new(coefficient);
-                if coefficient.is_zero() {
-                    continue;
-                }
-                if coefficient == Gf256::ONE {
-                    gf256_add_slice(&mut data, source_symbol);
-                } else {
-                    gf256_addmul_slice(&mut data, source_symbol, coefficient);
-                }
+        .map(|stripe_idx| {
+            let stripe_k_u32 =
+                (source_block_count / stripe_count) + u32::from(stripe_idx < remainder);
+            let stripe_k = usize::try_from(stripe_k_u32).expect("u32 fits usize");
+            let stripe_usize = usize::try_from(stripe_idx).expect("u32 fits usize");
+            let mut stripe_refs = Vec::with_capacity(stripe_k);
+            for slot in 0..stripe_k {
+                let offset = stripe_usize + slot * stripe_count_usize;
+                stripe_refs.push(raw_blocks.block_slice(offset));
             }
-
-            EmittedSymbol {
-                esi,
-                data,
-                is_source: false,
-                degree: raptorq_repair_symbol_degree(params, esi),
-            }
+            let repair_symbols = emit_projected_repair_symbols_refs(
+                &stripe_refs,
+                block_size_usize,
+                base_seed,
+                repair_per_stripe,
+                group,
+                parallel_inner,
+            )?;
+            Ok(StripedRepairStripe {
+                stripe_index: stripe_idx,
+                source_block_count: stripe_k_u32,
+                seed: base_seed,
+                repair_symbols,
+            })
         })
         .collect();
 
-    Ok(repair_symbols)
+    Ok(StripedEncodedGroup {
+        group,
+        first_block,
+        total_source_blocks: source_block_count,
+        stripe_count,
+        symbol_size: block_size,
+        stripes: stripes?,
+    })
+}
+
+/// Incrementally update a [`StripedEncodedGroup`] in place for sparse 4 KiB
+/// block mutations in `O(|deltas| * R_stripe)` time.
+///
+/// # Errors
+///
+/// Returns [`FfsError::RepairFailed`] if any delta index or block size is invalid.
+pub fn update_striped_group_delta(
+    encoded: &mut StripedEncodedGroup,
+    deltas: &[BlockDelta<'_>],
+) -> Result<()> {
+    if encoded.stripe_count == 0 || encoded.stripes.len() != encoded.stripe_count as usize {
+        return Err(FfsError::RepairFailed(
+            "invalid striped group geometry".to_owned(),
+        ));
+    }
+    let symbol_size = usize::try_from(encoded.symbol_size)
+        .map_err(|_| FfsError::RepairFailed("encoded symbol_size exceeds usize".to_owned()))?;
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    let mut per_stripe: BTreeMap<usize, Vec<BlockDelta<'_>>> = BTreeMap::new();
+    for delta in deltas {
+        if delta.source_index >= encoded.total_source_blocks {
+            return Err(FfsError::RepairFailed(format!(
+                "striped delta source_index {} out of range for total_source_blocks={}",
+                delta.source_index, encoded.total_source_blocks
+            )));
+        }
+        if delta.old_block.len() != symbol_size || delta.new_block.len() != symbol_size {
+            return Err(FfsError::RepairFailed(format!(
+                "striped delta block length mismatch: expected {symbol_size}, got old={} new={}",
+                delta.old_block.len(),
+                delta.new_block.len()
+            )));
+        }
+        let stripe_idx = (delta.source_index % encoded.stripe_count) as usize;
+        let slot = delta.source_index / encoded.stripe_count;
+        per_stripe.entry(stripe_idx).or_default().push(BlockDelta {
+            source_index: slot,
+            old_block: delta.old_block,
+            new_block: delta.new_block,
+        });
+    }
+
+    for (stripe_idx, stripe_deltas) in per_stripe {
+        let stripe = &mut encoded.stripes[stripe_idx];
+        let mut temp = EncodedGroup {
+            group: encoded.group,
+            source_block_count: stripe.source_block_count,
+            symbol_size: encoded.symbol_size,
+            seed: stripe.seed,
+            repair_symbols: std::mem::take(&mut stripe.repair_symbols),
+        };
+        let res = update_encoded_group_delta(&mut temp, &stripe_deltas);
+        stripe.repair_symbols = temp.repair_symbols;
+        res?;
+    }
+    Ok(())
+}
+
+struct StripeSliceDevice {
+    blocks: Vec<BlockBuf>,
+    block_size: u32,
+}
+
+impl BlockDevice for StripeSliceDevice {
+    fn read_block(&self, _cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+        let idx = usize::try_from(block.0)
+            .map_err(|_| FfsError::RepairFailed("stripe block index exceeds usize".to_owned()))?;
+        self.blocks
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| FfsError::RepairFailed(format!("stripe block index {idx} out of range")))
+    }
+
+    fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<()> {
+        Err(FfsError::UnsupportedFeature(
+            "StripeSliceDevice is read-only".to_owned(),
+        ))
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn block_count(&self) -> u64 {
+        u64::try_from(self.blocks.len()).unwrap_or(u64::MAX)
+    }
+
+    fn sync(&self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Reconstruct corrupt blocks in a block-interleaved [`StripedEncodedGroup`].
+///
+/// Only stripes containing at least one corrupt block perform device reads or
+/// erasure solving; stripes with 1–2 erasures and `K_s <= 64` automatically hit
+/// the direct O(`K_s`) solver.
+///
+/// # Errors
+///
+/// Returns an error if `corrupt_offsets` contains an out-of-range index, device
+/// reads fail, or any affected stripe has insufficient repair symbols.
+pub fn decode_group_striped(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    fs_uuid: &[u8; 16],
+    encoded: &StripedEncodedGroup,
+    corrupt_offsets: &[u32],
+) -> Result<DecodeOutcome> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    if encoded.stripe_count == 0 || encoded.stripes.len() != encoded.stripe_count as usize {
+        return Err(FfsError::RepairFailed(
+            "decode_group_striped: invalid striped group geometry".to_owned(),
+        ));
+    }
+    if corrupt_offsets.is_empty() {
+        return Ok(DecodeOutcome {
+            recovered: Vec::new(),
+            stats: asupersync::raptorq::decoder::DecodeStats::default(),
+            complete: true,
+        });
+    }
+
+    let mut per_stripe: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for &offset in corrupt_offsets {
+        if offset >= encoded.total_source_blocks {
+            return Err(FfsError::RepairFailed(format!(
+                "decode_group_striped: corrupt offset {offset} out of range for total_source_blocks={}",
+                encoded.total_source_blocks
+            )));
+        }
+        let stripe_idx = offset % encoded.stripe_count;
+        let slot = offset / encoded.stripe_count;
+        let slots = per_stripe.entry(stripe_idx).or_default();
+        if !slots.contains(&slot) {
+            slots.push(slot);
+        }
+    }
+
+    let block_size_usize = usize::try_from(encoded.symbol_size)
+        .map_err(|_| FfsError::RepairFailed("symbol_size exceeds usize".to_owned()))?;
+    let mut recovered_by_offset: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    let mut agg_stats = asupersync::raptorq::decoder::DecodeStats::default();
+
+    for (stripe_idx, corrupt_slots) in per_stripe {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let stripe = &encoded.stripes[stripe_idx as usize];
+        let stripe_k = stripe.source_block_count;
+        let mut stripe_blocks = Vec::with_capacity(stripe_k as usize);
+        for slot in 0..stripe_k {
+            if corrupt_slots.contains(&slot) {
+                stripe_blocks.push(BlockBuf::zeroed(block_size_usize));
+            } else {
+                let offset =
+                    u64::from(stripe_idx) + u64::from(slot) * u64::from(encoded.stripe_count);
+                let phys =
+                    BlockNumber(encoded.first_block.0.checked_add(offset).ok_or_else(|| {
+                        FfsError::RepairFailed(
+                            "decode_group_striped: physical block overflow".to_owned(),
+                        )
+                    })?);
+                stripe_blocks.push(device.read_block(cx, phys)?);
+            }
+        }
+        let stripe_dev = StripeSliceDevice {
+            blocks: stripe_blocks,
+            block_size: encoded.symbol_size,
+        };
+        let repair_pairs: Vec<(u32, Vec<u8>)> = stripe
+            .repair_symbols
+            .iter()
+            .map(|sym| (sym.esi, sym.data.clone()))
+            .collect();
+        let outcome = decode_group(
+            cx,
+            &stripe_dev,
+            fs_uuid,
+            encoded.group,
+            BlockNumber(0),
+            stripe_k,
+            &corrupt_slots,
+            &repair_pairs,
+        )?;
+        agg_stats.peeled += outcome.stats.peeled;
+        agg_stats.inactivated += outcome.stats.inactivated;
+        agg_stats.gauss_ops += outcome.stats.gauss_ops;
+        for rec in outcome.recovered {
+            let slot = u32::try_from(rec.block.0)
+                .map_err(|_| FfsError::RepairFailed("recovered slot exceeds u32".to_owned()))?;
+            let offset = stripe_idx + slot * encoded.stripe_count;
+            recovered_by_offset.insert(offset, rec.data);
+        }
+    }
+
+    let mut recovered = Vec::with_capacity(corrupt_offsets.len());
+    for &offset in corrupt_offsets {
+        let data = recovered_by_offset
+            .get(&offset)
+            .cloned()
+            .ok_or_else(|| FfsError::RepairFailed(format!("missing recovered offset {offset}")))?;
+        let phys = BlockNumber(
+            encoded
+                .first_block
+                .0
+                .checked_add(u64::from(offset))
+                .ok_or_else(|| FfsError::RepairFailed("recovered block overflow".to_owned()))?,
+        );
+        recovered.push(RecoveredBlock { block: phys, data });
+    }
+
+    Ok(DecodeOutcome {
+        complete: recovered.len() == corrupt_offsets.len(),
+        recovered,
+        stats: agg_stats,
+    })
 }
 
 fn raptorq_repair_symbol_degree(params: &SystematicParams, esi: u32) -> usize {
@@ -3369,5 +4029,261 @@ mod tests {
             &small_repair,
         );
         assert!(result.is_err(), "4 corrupt with 1 repair should fail");
+    }
+
+    #[test]
+    fn tiled_projection_matches_direct_systematic_encoder_bit_for_bit() {
+        let cx = Cx::for_testing();
+        let uuid = test_uuid();
+        let group = GroupNumber(3);
+        for (k, r, block_size) in [(17_u32, 9_u32, 256_u32), (64_u32, 19_u32, 4096_u32)] {
+            let device = setup_device(k, block_size);
+            let tiled = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, r)
+                .expect("tiled encode_group");
+            let direct = encode_group_direct(
+                &cx,
+                &device,
+                &uuid,
+                DirectEncodeRequest {
+                    group,
+                    first_block: BlockNumber(0),
+                    source_block_count: k,
+                    repair_count: r,
+                    max_working_bytes: 256 * 1024 * 1024,
+                },
+            )
+            .expect("direct encode_group");
+            assert_eq!(tiled.repair_symbols.len(), direct.repair_symbols.len());
+            for (lhs, rhs) in tiled.repair_symbols.iter().zip(&direct.repair_symbols) {
+                assert_eq!(lhs.esi, rhs.esi);
+                assert_eq!(lhs.degree, rhs.degree);
+                assert_eq!(lhs.data, rhs.data);
+            }
+        }
+    }
+
+    #[test]
+    fn update_encoded_group_delta_matches_full_reencode_and_rejects_bad_bounds() {
+        let cx = Cx::for_testing();
+        let uuid = test_uuid();
+        let group = GroupNumber(11);
+        let k = 32_u32;
+        let r = 8_u32;
+        let block_size = 512_u32;
+        let device = setup_device(k, block_size);
+        let mut encoded =
+            encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, r).expect("initial encode");
+
+        let old_5 = device.read_block(&cx, BlockNumber(5)).unwrap().into_inner();
+        let old_21 = device
+            .read_block(&cx, BlockNumber(21))
+            .unwrap()
+            .into_inner();
+        let mid_5: Vec<u8> = (0..block_size as usize)
+            .map(|i| u8::try_from((i * 7 + 3) & 0xFF).unwrap())
+            .collect();
+        let new_5: Vec<u8> = (0..block_size as usize)
+            .map(|i| u8::try_from((i * 13 + 91) & 0xFF).unwrap())
+            .collect();
+        let new_21: Vec<u8> = (0..block_size as usize)
+            .map(|i| u8::try_from((i * 29 + 17) & 0xFF).unwrap())
+            .collect();
+
+        device.write_block(&cx, BlockNumber(5), &new_5).unwrap();
+        device.write_block(&cx, BlockNumber(21), &new_21).unwrap();
+
+        // Exercise chained updates on the same source_index (5: old -> mid -> new)
+        // plus an independent update on source_index 21.
+        update_encoded_group_delta(
+            &mut encoded,
+            &[
+                BlockDelta {
+                    source_index: 5,
+                    old_block: &old_5,
+                    new_block: &mid_5,
+                },
+                BlockDelta {
+                    source_index: 5,
+                    old_block: &mid_5,
+                    new_block: &new_5,
+                },
+                BlockDelta {
+                    source_index: 21,
+                    old_block: &old_21,
+                    new_block: &new_21,
+                },
+            ],
+        )
+        .expect("delta update must succeed");
+
+        let fresh = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, r)
+            .expect("fresh re-encode");
+        for (inc, full) in encoded.repair_symbols.iter().zip(&fresh.repair_symbols) {
+            assert_eq!(inc.esi, full.esi);
+            assert_eq!(inc.data, full.data);
+        }
+
+        // Negative cases: out-of-range source_index and mismatched block size.
+        assert!(
+            update_encoded_group_delta(
+                &mut encoded,
+                &[BlockDelta {
+                    source_index: k,
+                    old_block: &old_5,
+                    new_block: &new_5,
+                }],
+            )
+            .is_err()
+        );
+        assert!(
+            update_encoded_group_delta(
+                &mut encoded,
+                &[BlockDelta {
+                    source_index: 0,
+                    old_block: &old_5[..16],
+                    new_block: &new_5,
+                }],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn striped_group_recovers_contiguous_burst_erasure_and_incremental_delta() {
+        let cx = Cx::for_testing();
+        let uuid = test_uuid();
+        let group = GroupNumber(2);
+        let k_total = 520_u32; // intentionally non-multiple of 64 (9 stripes: 8x58 + 1x56)
+        let block_size = 512_u32;
+        let device = setup_device(k_total, block_size);
+        let config = StripedGroupConfig {
+            max_stripe_blocks: 64,
+            repair_blocks_per_stripe: 4,
+        };
+
+        let mut striped =
+            encode_group_striped(&cx, &device, &uuid, group, BlockNumber(0), k_total, config)
+                .expect("striped encode");
+
+        // Apply sparse delta on 3 blocks across different stripes and verify parity matches fresh encode.
+        let mut deltas_owned = Vec::new();
+        for &idx in &[0_u32, 259_u32, 519_u32] {
+            let old_b = device
+                .read_block(&cx, BlockNumber(u64::from(idx)))
+                .unwrap()
+                .into_inner();
+            let new_b: Vec<u8> = old_b
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b ^ u8::try_from((i + idx as usize + 1) & 0xFF).unwrap())
+                .collect();
+            device
+                .write_block(&cx, BlockNumber(u64::from(idx)), &new_b)
+                .unwrap();
+            deltas_owned.push((idx, old_b, new_b));
+        }
+        let delta_refs: Vec<BlockDelta<'_>> = deltas_owned
+            .iter()
+            .map(|(idx, old_b, new_b)| BlockDelta {
+                source_index: *idx,
+                old_block: old_b,
+                new_block: new_b,
+            })
+            .collect();
+        update_striped_group_delta(&mut striped, &delta_refs).expect("striped delta update");
+
+        let fresh_striped =
+            encode_group_striped(&cx, &device, &uuid, group, BlockNumber(0), k_total, config)
+                .expect("fresh striped encode");
+        for (lhs_s, rhs_s) in striped.stripes.iter().zip(&fresh_striped.stripes) {
+            for (lhs_sym, rhs_sym) in lhs_s.repair_symbols.iter().zip(&rhs_s.repair_symbols) {
+                assert_eq!(lhs_sym.data, rhs_sym.data);
+            }
+        }
+
+        // Wipe a contiguous 27-block burst (3 erasures in each of the 9 stripes)
+        // and verify bit-identical recovery of all 27 blocks!
+        let burst_start = 100_u32;
+        let burst_len = 27_u32;
+        let mut expected = Vec::new();
+        let mut corrupt_offsets = Vec::new();
+        let zeroes = vec![0_u8; block_size as usize];
+        for off in burst_start..burst_start + burst_len {
+            expected.push(
+                device
+                    .read_block(&cx, BlockNumber(u64::from(off)))
+                    .unwrap()
+                    .into_inner(),
+            );
+            device
+                .write_block(&cx, BlockNumber(u64::from(off)), &zeroes)
+                .unwrap();
+            corrupt_offsets.push(off);
+        }
+
+        let decoded = decode_group_striped(&cx, &device, &uuid, &striped, &corrupt_offsets)
+            .expect("striped burst decode must succeed");
+        assert!(decoded.complete);
+        assert_eq!(decoded.recovered.len(), burst_len as usize);
+        for (rec, exp) in decoded.recovered.iter().zip(&expected) {
+            assert_eq!(&rec.data, exp);
+        }
+    }
+
+    mod delta_proptests {
+        use super::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(24))]
+
+            #[test]
+            fn prop_sparse_delta_parity_bit_identical_to_full_encode(
+                k in 8_u32..=40,
+                r in 1_u32..=8,
+                mutations in prop::collection::vec((0_usize..40, any::<u8>()), 1..=6),
+            ) {
+                let cx = Cx::for_testing();
+                let uuid = test_uuid();
+                let group = GroupNumber(5);
+                let block_size = 128_u32;
+                let device = setup_device(k, block_size);
+                let mut encoded = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, r)
+                    .expect("encode_group");
+
+                let mut owned = Vec::new();
+                for (raw_idx, mask) in mutations {
+                    let idx = u32::try_from(raw_idx % (k as usize)).unwrap();
+                    let old_bytes = device
+                        .read_block(&cx, BlockNumber(u64::from(idx)))
+                        .unwrap()
+                        .into_inner();
+                    let new_bytes: Vec<u8> = old_bytes
+                        .iter()
+                        .enumerate()
+                        .map(|(pos, &b)| b ^ mask.wrapping_add(u8::try_from(pos & 0xFF).unwrap()))
+                        .collect();
+                    device
+                        .write_block(&cx, BlockNumber(u64::from(idx)), &new_bytes)
+                        .unwrap();
+                    owned.push((idx, old_bytes, new_bytes));
+                }
+                let refs: Vec<BlockDelta<'_>> = owned
+                    .iter()
+                    .map(|(idx, old_b, new_b)| BlockDelta {
+                        source_index: *idx,
+                        old_block: old_b,
+                        new_block: new_b,
+                    })
+                    .collect();
+                update_encoded_group_delta(&mut encoded, &refs).expect("delta update");
+
+                let full = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, r)
+                    .expect("full encode");
+                for (lhs, rhs) in encoded.repair_symbols.iter().zip(&full.repair_symbols) {
+                    prop_assert_eq!(lhs.esi, rhs.esi);
+                    prop_assert_eq!(&lhs.data, &rhs.data);
+                }
+            }
+        }
     }
 }

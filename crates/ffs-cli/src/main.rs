@@ -101,8 +101,8 @@ use ffs_btrfs::{BTRFS_FS_TREE_OBJECTID, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_I
 use ffs_core::degradation::DegradationLevel;
 use ffs_core::{
     BackpressureGate, BtrfsMountSelection, CrashRecoveryOutcome, DegradationFsm, Ext4DataErrPolicy,
-    Ext4JournalReplayMode, FsFlavor, FsOps, OpenFs, OpenOptions, RepairWritebackBlock,
-    detect_filesystem_at_path,
+    Ext4JournalReplayMode, FsFlavor, FsOps, MvccIsolationMode, OpenFs, OpenOptions,
+    RepairWritebackBlock, detect_filesystem_at_path,
 };
 use ffs_fuse::{
     AtimePolicy, MountConfig, MountOptions, PerCoreTransportMetrics, WritebackCacheMode,
@@ -614,14 +614,38 @@ enum MvccPolicyArg {
     SafeMerge,
     /// Choose Strict or SafeMerge per commit from observed contention.
     Adaptive,
+    /// Serializable Snapshot Isolation (`commit_ssi`) with SafeMerge block conflict resolution.
+    Ssi,
 }
 
 impl MvccPolicyArg {
     const fn policy(self) -> ffs_mvcc::ConflictPolicy {
         match self {
             Self::Strict => ffs_mvcc::ConflictPolicy::Strict,
-            Self::SafeMerge => ffs_mvcc::ConflictPolicy::SafeMerge,
+            Self::SafeMerge | Self::Ssi => ffs_mvcc::ConflictPolicy::SafeMerge,
             Self::Adaptive => ffs_mvcc::ConflictPolicy::Adaptive,
+        }
+    }
+
+    const fn implies_ssi(self) -> bool {
+        matches!(self, Self::Ssi)
+    }
+}
+
+/// `--mvcc-isolation` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MvccIsolationArg {
+    /// Snapshot Isolation with First-Committer-Wins / SafeMerge conflict checks (default).
+    Snapshot,
+    /// Serializable Snapshot Isolation (`commit_ssi`) tracking read sets to prevent write skew.
+    Ssi,
+}
+
+impl MvccIsolationArg {
+    const fn mode(self) -> MvccIsolationMode {
+        match self {
+            Self::Snapshot => MvccIsolationMode::Snapshot,
+            Self::Ssi => MvccIsolationMode::Serializable,
         }
     }
 }
@@ -673,6 +697,8 @@ struct MountCmdOptions {
     commit_interval_secs: Option<u64>,
     /// MVCC conflict policy override (bd-7ssc7); `None` = SafeMerge.
     mvcc_policy: Option<MvccPolicyArg>,
+    /// MVCC isolation level override; `None` = Snapshot (unless `mvcc_policy == Some(Ssi)`).
+    mvcc_isolation: Option<MvccIsolationArg>,
     /// MVCC evidence ledger path (bd-7ssc7); `None` = disabled.
     mvcc_evidence_ledger: Option<PathBuf>,
     runtime: MountRuntimeConfig,
@@ -681,6 +707,20 @@ struct MountCmdOptions {
     background_scrub: MountBackgroundScrubConfig,
     writeback_cache: MountWritebackCacheConfig,
     console: MountConsoleConfig,
+}
+
+impl MountCmdOptions {
+    const fn resolved_mvcc_isolation(&self) -> MvccIsolationMode {
+        if let Some(isolation) = self.mvcc_isolation {
+            return isolation.mode();
+        }
+        if let Some(policy) = self.mvcc_policy
+            && policy.implies_ssi()
+        {
+            return MvccIsolationMode::Serializable;
+        }
+        MvccIsolationMode::Snapshot
+    }
 }
 
 fn default_env_filter() -> EnvFilter {
@@ -1493,9 +1533,14 @@ enum Command {
         /// MVCC conflict policy for commits (bd-7ssc7): `strict` aborts on any
         /// same-block conflict, `safe-merge` (default) merges when a valid
         /// merge proof exists, `adaptive` chooses per commit from observed
-        /// contention via the expected-loss model.
+        /// contention via the expected-loss model, `ssi` enables Serializable
+        /// Snapshot Isolation (`commit_ssi`) with `safe-merge`.
         #[arg(long = "mvcc-policy", value_enum)]
         mvcc_policy: Option<MvccPolicyArg>,
+        /// MVCC isolation level: `snapshot` (default) or `ssi` (Serializable
+        /// Snapshot Isolation tracking read sets to prevent write skew).
+        #[arg(long = "mvcc-isolation", value_enum)]
+        mvcc_isolation: Option<MvccIsolationArg>,
         /// Append-only evidence ledger for MVCC commits and aborts (bd-7ssc7).
         /// Emits `transaction_commit` and `txn_aborted` records as JSONL.
         #[arg(long = "mvcc-evidence-ledger", value_name = "PATH")]
@@ -2760,8 +2805,14 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
             btrfs_device_paths,
             commit_interval_secs,
             mvcc_policy,
+            mvcc_isolation,
             mvcc_evidence_ledger,
         } => {
+            if matches!(mvcc_policy, Some(MvccPolicyArg::Ssi))
+                && matches!(mvcc_isolation, Some(MvccIsolationArg::Snapshot))
+            {
+                bail!("--mvcc-policy ssi conflicts with --mvcc-isolation snapshot");
+            }
             let btrfs_mount_selection = parse_btrfs_mount_selection(subvol, snapshot)?;
             let background_scrub = MountBackgroundScrubConfig::resolve(
                 MountBackgroundScrubRequest::new(
@@ -2810,6 +2861,7 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
                     btrfs_verify_data_on_read,
                     commit_interval_secs,
                     mvcc_policy,
+                    mvcc_isolation,
                     mvcc_evidence_ledger,
                     runtime: MountRuntimeConfig {
                         mode: runtime_mode,
@@ -8933,6 +8985,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     if let Some(policy) = options.mvcc_policy {
         open_fs.set_mvcc_conflict_policy(policy.policy());
     }
+    open_fs.set_mvcc_isolation_mode(options.resolved_mvcc_isolation());
     if let Some(ref path) = options.mvcc_evidence_ledger {
         open_fs.enable_mvcc_evidence_ledger(path).with_context(|| {
             format!("failed to open MVCC evidence ledger at {}", path.display())
@@ -9148,6 +9201,7 @@ fn build_mount_open_options(options: &MountCmdOptions) -> OpenOptions {
         ext4_data_err_policy: options.ext4_data_err_policy,
         ext4_verify_journal_checksums: options.ext4_verify_journal_checksums,
         mount_mode: options.mount_mode,
+        mvcc_isolation: options.resolved_mvcc_isolation(),
         native_repair_max_working_bytes: options.native_repair_max_working_bytes,
         btrfs_mount_selection: options.btrfs_mount_selection.clone(),
         btrfs_device_paths: options.btrfs_device_paths.clone(),
@@ -11043,6 +11097,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_isolation: None,
             mvcc_evidence_ledger: None,
             runtime: MountRuntimeConfig {
                 mode: MountRuntimeMode::Standard,
@@ -16042,6 +16097,7 @@ mod tests {
                         btrfs_verify_data_on_read: false,
                         commit_interval_secs: None,
                         mvcc_policy: None,
+                        mvcc_isolation: None,
                         mvcc_evidence_ledger: None,
                         mount_mode: MountMode::Compat,
                         native_repair_max_working_bytes: None,
@@ -16129,6 +16185,7 @@ mod tests {
                 btrfs_verify_data_on_read: false,
                 commit_interval_secs: None,
                 mvcc_policy: None,
+                mvcc_isolation: None,
                 mvcc_evidence_ledger: None,
                 mount_mode: MountMode::Compat,
                 native_repair_max_working_bytes: None,
@@ -16176,6 +16233,7 @@ mod tests {
                 btrfs_verify_data_on_read: false,
                 commit_interval_secs: None,
                 mvcc_policy: None,
+                mvcc_isolation: None,
                 mvcc_evidence_ledger: None,
                 mount_mode: MountMode::Compat,
                 native_repair_max_working_bytes: None,
@@ -16323,6 +16381,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_isolation: None,
             mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
             native_repair_max_working_bytes: None,
@@ -16421,6 +16480,7 @@ mod tests {
             btrfs_verify_data_on_read: verify,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_isolation: None,
             mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
             native_repair_max_working_bytes: None,
@@ -16468,6 +16528,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_isolation: None,
             mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
             native_repair_max_working_bytes: None,
@@ -16510,6 +16571,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_isolation: None,
             mvcc_evidence_ledger: None,
             mount_mode: MountMode::Native,
             native_repair_max_working_bytes: None,
@@ -16556,6 +16618,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
                     mvcc_policy: None,
+                    mvcc_isolation: None,
                     mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
                     native_repair_max_working_bytes: None,
@@ -16611,6 +16674,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
                     mvcc_policy: None,
+                    mvcc_isolation: None,
                     mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
                     native_repair_max_working_bytes: None,
@@ -16667,6 +16731,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
                     mvcc_policy: None,
+                    mvcc_isolation: None,
                     mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
                     native_repair_max_working_bytes: None,
@@ -16740,6 +16805,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
                     mvcc_policy: None,
+                    mvcc_isolation: None,
                     mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
                     native_repair_max_working_bytes: None,
@@ -17047,10 +17113,12 @@ mod tests {
         match default_cli.command {
             Command::Mount {
                 mvcc_policy,
+                mvcc_isolation,
                 mvcc_evidence_ledger,
                 ..
             } => {
                 assert_eq!(mvcc_policy, None);
+                assert_eq!(mvcc_isolation, None);
                 assert_eq!(mvcc_evidence_ledger, None);
             }
             other => assert!(
@@ -17058,6 +17126,61 @@ mod tests {
                 "expected mount command"
             ),
         }
+    }
+
+    #[test]
+    fn cli_parses_mount_mvcc_isolation_and_ssi_policy() {
+        let ssi_isolation =
+            Cli::try_parse_from(["ffs", "mount", "--mvcc-isolation", "ssi", "/img", "/mnt"])
+                .expect("mount --mvcc-isolation ssi should parse");
+        let Command::Mount {
+            mvcc_policy,
+            mvcc_isolation,
+            ..
+        } = ssi_isolation.command
+        else {
+            panic!("expected mount command");
+        };
+        assert_eq!(mvcc_policy, None);
+        assert_eq!(mvcc_isolation, Some(super::MvccIsolationArg::Ssi));
+
+        let mut opts = test_mount_cmd_options(true, MountWritebackCacheConfig::disabled());
+        opts.mvcc_isolation = mvcc_isolation;
+        assert_eq!(
+            build_mount_open_options(&opts).mvcc_isolation,
+            super::MvccIsolationMode::Serializable
+        );
+
+        let ssi_policy =
+            Cli::try_parse_from(["ffs", "mount", "--mvcc-policy", "ssi", "/img", "/mnt"])
+                .expect("mount --mvcc-policy ssi should parse");
+        let Command::Mount {
+            mvcc_policy,
+            mvcc_isolation,
+            ..
+        } = ssi_policy.command
+        else {
+            panic!("expected mount command");
+        };
+        assert_eq!(mvcc_policy, Some(super::MvccPolicyArg::Ssi));
+        assert_eq!(mvcc_isolation, None);
+        assert_eq!(
+            super::MvccPolicyArg::Ssi.policy(),
+            ffs_mvcc::ConflictPolicy::SafeMerge
+        );
+
+        let mut policy_opts = test_mount_cmd_options(true, MountWritebackCacheConfig::disabled());
+        policy_opts.mvcc_policy = mvcc_policy;
+        assert_eq!(
+            build_mount_open_options(&policy_opts).mvcc_isolation,
+            super::MvccIsolationMode::Serializable
+        );
+
+        let default_opts = test_mount_cmd_options(true, MountWritebackCacheConfig::disabled());
+        assert_eq!(
+            build_mount_open_options(&default_opts).mvcc_isolation,
+            super::MvccIsolationMode::Snapshot
+        );
     }
 
     #[test]

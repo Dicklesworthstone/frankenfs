@@ -348,7 +348,13 @@ impl OpenFs {
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
         if matches!(&self.flavor, FsFlavor::Ext4(_)) {
-            return self.ext4_set_access_acl(cx, Self::ext4_canonical_inode(ino), value, mode);
+            return self.ext4_set_access_acl(
+                cx,
+                scope,
+                Self::ext4_canonical_inode(ino),
+                value,
+                mode,
+            );
         }
         let entries = super::posix_acl_parse_input(value)?;
         let (bits, equivalent) = super::posix_acl_equiv_mode(&entries);
@@ -1684,6 +1690,7 @@ impl FsOps for OpenFs {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_rename(
                 cx,
+                scope,
                 Self::ext4_canonical_inode(parent),
                 name.as_encoded_bytes(),
                 Self::ext4_canonical_inode(new_parent),
@@ -1721,7 +1728,6 @@ impl FsOps for OpenFs {
         const RENAME_NOREPLACE: u32 = libc::RENAME_NOREPLACE;
         const RENAME_EXCHANGE: u32 = libc::RENAME_EXCHANGE;
         const RENAME_WHITEOUT: u32 = libc::RENAME_WHITEOUT;
-        const SUPPORTED: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE;
         const KNOWN: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
         if flags & !KNOWN != 0 {
             return Err(FfsError::RequestRejected {
@@ -1736,15 +1742,87 @@ impl FsOps for OpenFs {
                 detail: "RENAME_NOREPLACE and RENAME_EXCHANGE are mutually exclusive".into(),
             });
         }
-        if flags & !SUPPORTED != 0 {
-            // RENAME_WHITEOUT still needs a fresh char-device inode from
-            // the unused-inode pool. Return EINVAL until it lands so the
-            // kernel surfaces a real error rather than degrading to
-            // overwrite.
+        if flags & RENAME_WHITEOUT != 0 && flags & RENAME_EXCHANGE != 0 {
             return Err(FfsError::RequestRejected {
                 errno: libc::EINVAL,
-                detail: "RENAME_WHITEOUT is not supported".into(),
+                detail: "RENAME_WHITEOUT and RENAME_EXCHANGE are mutually exclusive".into(),
             });
+        }
+        if flags & RENAME_WHITEOUT != 0 {
+            if !self.is_ext4() {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EINVAL,
+                    detail: "RENAME_WHITEOUT is not supported".into(),
+                });
+            }
+            let no_replace = flags & RENAME_NOREPLACE != 0;
+            let _namespace = self.begin_namespace_mutation();
+            clear_readdir_snapshot(&self.readdir_snapshot);
+            let canon_parent = Self::ext4_canonical_inode(parent);
+            let canon_new_parent = Self::ext4_canonical_inode(new_parent);
+            #[allow(clippy::cast_possible_truncation)]
+            let whiteout_mode = libc::S_IFCHR as u16;
+            if scope.tx.is_some() {
+                scope.mark_composite();
+                self.ext4_rename(
+                    cx,
+                    scope,
+                    canon_parent,
+                    name.as_encoded_bytes(),
+                    canon_new_parent,
+                    new_name.as_encoded_bytes(),
+                    no_replace,
+                )?;
+                self.ext4_mknod(
+                    cx,
+                    scope,
+                    canon_parent,
+                    name.as_encoded_bytes(),
+                    whiteout_mode,
+                    0,
+                    0,
+                    0,
+                )?;
+                return Ok(());
+            }
+            const MAX_ATTEMPTS: u32 = 16;
+            for attempt in 1..=MAX_ATTEMPTS {
+                let mut local = <Self as FsOps>::begin_request_scope(self, cx, RequestOp::Rename)?;
+                local.mark_composite();
+                let staged = self
+                    .ext4_rename(
+                        cx,
+                        &mut local,
+                        canon_parent,
+                        name.as_encoded_bytes(),
+                        canon_new_parent,
+                        new_name.as_encoded_bytes(),
+                        no_replace,
+                    )
+                    .and_then(|()| {
+                        self.ext4_mknod(
+                            cx,
+                            &mut local,
+                            canon_parent,
+                            name.as_encoded_bytes(),
+                            whiteout_mode,
+                            0,
+                            0,
+                            0,
+                        )
+                        .map(|_| ())
+                    })
+                    .and_then(|()| {
+                        <Self as FsOps>::commit_request_scope(self, cx, &mut local).map(|_| ())
+                    });
+                let end = <Self as FsOps>::end_request_scope(self, cx, RequestOp::Rename, local);
+                match (staged, end) {
+                    (Ok(()), Ok(())) => return Ok(()),
+                    (Err(FfsError::MvccConflict { .. }), Ok(())) if attempt < MAX_ATTEMPTS => {}
+                    (Ok(()), Err(err)) | (Err(err), _) => return Err(err),
+                }
+            }
+            unreachable!("final RENAME_WHITEOUT attempt returns its result");
         }
 
         if flags & RENAME_NOREPLACE != 0 {
@@ -1756,6 +1834,7 @@ impl FsOps for OpenFs {
                 clear_readdir_snapshot(&self.readdir_snapshot);
                 return self.ext4_rename(
                     cx,
+                    scope,
                     Self::ext4_canonical_inode(parent),
                     name.as_encoded_bytes(),
                     Self::ext4_canonical_inode(new_parent),
@@ -1889,6 +1968,7 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => self
                 .ext4_symlink(
                     cx,
+                    scope,
                     Self::ext4_canonical_inode(parent),
                     name.as_encoded_bytes(),
                     target,
@@ -4920,7 +5000,7 @@ impl FsOps for OpenFs {
         // could miss an ACL installed after that probe but before chmod.
         if attrs.mode.is_some() && matches!(&self.flavor, FsFlavor::Ext4(_)) {
             return self
-                .ext4_setattr_with_acl(cx, Self::ext4_canonical_inode(ino), attrs)
+                .ext4_setattr_with_acl(cx, scope, Self::ext4_canonical_inode(ino), attrs)
                 .map(Self::ext4_present_attr);
         }
         // Preserve the existing Btrfs ACL dispatch; its semantic mutation view
@@ -5117,14 +5197,24 @@ impl FsOps for OpenFs {
             (Some(snapshot), None)
         };
 
+        let isolation_mode = self.mvcc_isolation_mode();
+        let ssi_reads = (isolation_mode == crate::vfs::MvccIsolationMode::Serializable
+            && (op.is_write() || read_snapshot_pinned))
+            .then(crate::vfs::SsiReadTracker::new);
+
         Ok(RequestScope {
             snapshot,
             tx,
             read_snapshot_pinned,
             commit_mode: RequestCommitMode::PerRequest,
+            isolation_mode,
+            origin_op: Some(op),
+            composite: false,
+            ssi_reads,
             skip_readdir_prefetch: false,
             ext4_block_deltas: std::collections::BTreeMap::new(),
             ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
+            ext4_staged: crate::vfs::Ext4StagedScopeState::default(),
             ext4_accounting_active: false,
         })
     }
@@ -5241,7 +5331,7 @@ impl FsOps for OpenFs {
         }
         // Gate admission must precede the semantic-view lock, matching raw
         // publishers and ordinary requests. Deferred scopes left their gate.
-        let publication = if scope.pending_write_count() != 0 {
+        let publication = if scope.pending_write_count() != 0 || scope.has_ext4_staged_effects() {
             self.publication_guard(true)?
         } else {
             None
@@ -5262,7 +5352,7 @@ impl FsOps for OpenFs {
         // caller-supplied scope writes are raw block publication, just like
         // the public FCW/SSI transaction API, and invalidate captured state.
         let mut view = self.btrfs_raw_publication_guard(scope.pending_write_count());
-        let result = self.commit_scope_with_ext4_block_counts(scope);
+        let result = self.commit_scope_with_ext4_block_counts(cx, scope);
         if result.is_ok()
             && let Some(stale) = view.as_mut()
         {

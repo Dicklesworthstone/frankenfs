@@ -15,9 +15,27 @@ use ffs_mvcc::{
 };
 use ffs_types::{BlockNumber, CommitSeq, Snapshot};
 use parking_lot::RwLock;
+use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MVCC_COMMIT_PRUNE_INTERVAL: u64 = 256;
+
+std::thread_local! {
+    static LAST_SSI_READ: Cell<Option<(BlockNumber, CommitSeq)>> = const { Cell::new(None) };
+}
+
+pub fn record_ssi_read(block: BlockNumber, seq: CommitSeq) {
+    LAST_SSI_READ.with(|slot| slot.set(Some((block, seq))));
+}
+
+pub fn clear_last_ssi_read() {
+    LAST_SSI_READ.with(|slot| slot.set(None));
+}
+
+pub fn take_last_ssi_read() -> Option<(BlockNumber, CommitSeq)> {
+    LAST_SSI_READ.with(Cell::take)
+}
 
 /// Convert a commit failure into an `FfsError`, PRESERVING a first-committer-wins
 /// conflict as the typed [`FfsError::MvccConflict`] instead of flattening it into
@@ -35,6 +53,10 @@ fn commit_error_to_ffs(error: &CommitError) -> FfsError {
             tx: 0,
             block: block.0,
         },
+        CommitError::SsiConflict { pivot_block, .. } => FfsError::MvccConflict {
+            tx: 0,
+            block: pivot_block.0,
+        },
         other => FfsError::Format(other.to_string()),
     }
 }
@@ -46,14 +68,27 @@ fn commit_error_to_ffs(error: &CommitError) -> FfsError {
 #[allow(clippy::large_enum_variant)]
 pub enum FsMvccStore {
     /// Single store behind a `RwLock`: legacy, JBD2, and MVCC-WAL configured path.
-    Single(RwLock<MvccStore>),
+    Single {
+        lock: RwLock<MvccStore>,
+        ssi_enabled: AtomicBool,
+    },
     /// Sharded store: default in-memory parallel-write path.
-    Sharded { store: ShardedMvccStore },
+    Sharded {
+        store: ShardedMvccStore,
+        ssi_enabled: AtomicBool,
+    },
 }
 
 impl FsMvccStore {
     pub(super) fn single() -> Self {
-        Self::Single(RwLock::new(MvccStore::new()))
+        Self::from_single(MvccStore::new())
+    }
+
+    pub(super) const fn from_single(store: MvccStore) -> Self {
+        Self::Single {
+            lock: RwLock::new(store),
+            ssi_enabled: AtomicBool::new(false),
+        }
     }
 
     pub(super) fn sharded() -> Self {
@@ -67,6 +102,7 @@ impl FsMvccStore {
         // lock, not shard count (docs/NEGATIVE_EVIDENCE.md).
         Self::Sharded {
             store: ShardedMvccStore::for_host_parallelism(),
+            ssi_enabled: AtomicBool::new(false),
         }
     }
 
@@ -76,11 +112,29 @@ impl FsMvccStore {
                 ShardedMvccStore::host_parallelism_shard_count(),
                 mode,
             ),
+            ssi_enabled: AtomicBool::new(false),
         }
     }
 
     pub(super) const fn is_sharded(&self) -> bool {
         matches!(self, Self::Sharded { .. })
+    }
+
+    pub(crate) fn set_ssi_enabled(&self, enabled: bool) {
+        match self {
+            Self::Single { ssi_enabled, .. } | Self::Sharded { ssi_enabled, .. } => {
+                ssi_enabled.store(enabled, Ordering::Release);
+            }
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_ssi_enabled(&self) -> bool {
+        match self {
+            Self::Single { ssi_enabled, .. } | Self::Sharded { ssi_enabled, .. } => {
+                ssi_enabled.load(Ordering::Acquire)
+            }
+        }
     }
 
     /// Enable append-only evidence recording to a JSONL ledger path (bd-7ssc7).
@@ -89,16 +143,16 @@ impl FsMvccStore {
         path: impl AsRef<std::path::Path>,
     ) -> FfsResult<()> {
         match self {
-            Self::Single(lock) => lock.write().enable_evidence_ledger(path),
-            Self::Sharded { store } => store.enable_evidence_ledger(path),
+            Self::Single { lock, .. } => lock.write().enable_evidence_ledger(path),
+            Self::Sharded { store, .. } => store.enable_evidence_ledger(path),
         }
     }
 
     /// Disable evidence recording.
     pub(super) fn disable_evidence_ledger(&self) {
         match self {
-            Self::Single(lock) => lock.write().disable_evidence_ledger(),
-            Self::Sharded { store } => store.disable_evidence_ledger(),
+            Self::Single { lock, .. } => lock.write().disable_evidence_ledger(),
+            Self::Sharded { store, .. } => store.disable_evidence_ledger(),
         }
     }
 
@@ -106,8 +160,8 @@ impl FsMvccStore {
     #[must_use]
     pub(super) fn has_evidence_ledger(&self) -> bool {
         match self {
-            Self::Single(lock) => lock.read().has_evidence_ledger(),
-            Self::Sharded { store } => store.has_evidence_ledger(),
+            Self::Single { lock, .. } => lock.read().has_evidence_ledger(),
+            Self::Sharded { store, .. } => store.has_evidence_ledger(),
         }
     }
 
@@ -115,7 +169,7 @@ impl FsMvccStore {
     /// (bd-7ssc7).
     pub(super) fn set_conflict_policy(&self, policy: ffs_mvcc::ConflictPolicy) {
         match self {
-            Self::Single(lock) => lock.write().set_conflict_policy(policy),
+            Self::Single { lock, .. } => lock.write().set_conflict_policy(policy),
             Self::Sharded { store, .. } => store.set_conflict_policy(policy),
         }
     }
@@ -123,7 +177,7 @@ impl FsMvccStore {
     /// The live store's conflict policy (bd-7ssc7).
     pub(super) fn conflict_policy(&self) -> ffs_mvcc::ConflictPolicy {
         match self {
-            Self::Single(lock) => lock.read().conflict_policy(),
+            Self::Single { lock, .. } => lock.read().conflict_policy(),
             Self::Sharded { store, .. } => store.conflict_policy(),
         }
     }
@@ -132,7 +186,7 @@ impl FsMvccStore {
     #[cfg(test)]
     pub(super) fn effective_policy(&self) -> ffs_mvcc::ConflictPolicy {
         match self {
-            Self::Single(lock) => lock.read().effective_policy(),
+            Self::Single { lock, .. } => lock.read().effective_policy(),
             Self::Sharded { store, .. } => store.effective_policy(),
         }
     }
@@ -141,14 +195,14 @@ impl FsMvccStore {
     #[cfg(test)]
     pub(super) fn contention_metrics(&self) -> ffs_mvcc::ContentionMetrics {
         match self {
-            Self::Single(lock) => *lock.read().contention_metrics(),
+            Self::Single { lock, .. } => *lock.read().contention_metrics(),
             Self::Sharded { store, .. } => store.contention_metrics(),
         }
     }
 
     pub(super) fn begin(&self) -> Transaction {
         match self {
-            Self::Single(lock) => lock.write().begin(),
+            Self::Single { lock, .. } => lock.write().begin(),
             Self::Sharded { store, .. } => store.begin(),
         }
     }
@@ -156,40 +210,43 @@ impl FsMvccStore {
     /// Begin and pin a writer's snapshot without leaving a GC registration gap.
     pub(super) fn begin_registered(&self) -> Transaction {
         match self {
-            Self::Single(lock) => {
+            Self::Single { lock, .. } => {
                 let mut store = lock.write();
                 let txn = store.begin();
                 store.register_snapshot(txn.snapshot());
                 txn
             }
-            Self::Sharded { store } => store.begin_registered(),
+            Self::Sharded { store, .. } => store.begin_registered(),
         }
     }
 
     pub(super) fn commit(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+        if self.is_ssi_enabled() {
+            return self.commit_ssi(txn);
+        }
         match self {
-            Self::Single(lock) => lock.write().commit(txn),
-            Self::Sharded { store } => store.commit(txn).map_err(|(error, _txn)| error),
+            Self::Single { lock, .. } => lock.write().commit(txn),
+            Self::Sharded { store, .. } => store.commit(txn).map_err(|(error, _txn)| error),
         }
     }
 
     pub(super) fn commit_ssi(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         match self {
-            Self::Single(lock) => lock.write().commit_ssi(txn),
-            Self::Sharded { store } => store.commit_ssi(txn).map_err(|(error, _txn)| error),
+            Self::Single { lock, .. } => lock.write().commit_ssi(txn),
+            Self::Sharded { store, .. } => store.commit_ssi(txn).map_err(|(error, _txn)| error),
         }
     }
 
     pub(super) fn abort(&self, txn: Transaction, reason: TxnAbortReason, detail: Option<String>) {
         match self {
-            Self::Single(lock) => lock.write().abort(txn, reason, detail),
-            Self::Sharded { store } => store.abort(txn, reason, detail),
+            Self::Single { lock, .. } => lock.write().abort(txn, reason, detail),
+            Self::Sharded { store, .. } => store.abort(txn, reason, detail),
         }
     }
 
     pub(super) fn read_visible(&self, block: BlockNumber, snapshot: Snapshot) -> Option<Vec<u8>> {
         match self {
-            Self::Single(lock) => lock
+            Self::Single { lock, .. } => lock
                 .read()
                 .read_visible(block, snapshot)
                 .map(std::borrow::Cow::into_owned),
@@ -203,54 +260,67 @@ impl FsMvccStore {
         snapshot: Snapshot,
     ) -> Option<BlockBuf> {
         match self {
-            Self::Single(lock) => lock.read().read_visible_block_buf(block, snapshot),
+            Self::Single { lock, .. } => lock.read().read_visible_block_buf(block, snapshot),
             Self::Sharded { store, .. } => store.read_visible_block_buf(block, snapshot),
+        }
+    }
+
+    pub(super) fn read_visible_block_buf_with_seq(
+        &self,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Option<(BlockBuf, CommitSeq)> {
+        match self {
+            Self::Single { lock, .. } => {
+                lock.read().read_visible_block_buf_with_seq(block, snapshot)
+            }
+            Self::Sharded { store, .. } => store.read_visible_block_buf_with_seq(block, snapshot),
         }
     }
 
     pub(super) fn current_snapshot(&self) -> Snapshot {
         match self {
-            Self::Single(lock) => lock.read().current_snapshot(),
+            Self::Single { lock, .. } => lock.read().current_snapshot(),
             Self::Sharded { store, .. } => store.current_snapshot(),
         }
     }
 
     pub(super) fn register_snapshot(&self, snapshot: Snapshot) {
         match self {
-            Self::Single(lock) => lock.write().register_snapshot(snapshot),
+            Self::Single { lock, .. } => lock.write().register_snapshot(snapshot),
             Self::Sharded { store, .. } => store.register_snapshot(snapshot),
         }
     }
 
     pub(super) fn register_current_snapshot(&self) -> Snapshot {
         match self {
-            Self::Single(lock) => {
+            Self::Single { lock, .. } => {
                 let mut store = lock.write();
                 let snapshot = store.current_snapshot();
                 store.register_snapshot(snapshot);
                 snapshot
             }
-            Self::Sharded { store } => store.register_current_snapshot(),
+            Self::Sharded { store, .. } => store.register_current_snapshot(),
         }
     }
 
     pub(super) fn release_snapshot(&self, snapshot: Snapshot) -> bool {
         match self {
-            Self::Single(lock) => lock.write().release_snapshot(snapshot),
+            Self::Single { lock, .. } => lock.write().release_snapshot(snapshot),
             Self::Sharded { store, .. } => store.release_snapshot(snapshot),
         }
     }
 
     pub(super) fn watermark(&self) -> Option<CommitSeq> {
         match self {
-            Self::Single(lock) => lock.read().watermark(),
+            Self::Single { lock, .. } => lock.read().watermark(),
             Self::Sharded { store, .. } => store.watermark(),
         }
     }
 
     pub(super) fn latest_commit_seq(&self, block: BlockNumber) -> CommitSeq {
         match self {
-            Self::Single(lock) => lock.read().latest_commit_seq(block),
+            Self::Single { lock, .. } => lock.read().latest_commit_seq(block),
             Self::Sharded { store, .. } => store.latest_commit_seq(block),
         }
     }
@@ -286,7 +356,15 @@ impl FsMvccStore {
 
     pub(super) fn prune_safe(&self) -> CommitSeq {
         match self {
-            Self::Single(lock) => lock.write().prune_safe(),
+            Self::Single { lock, .. } => {
+                let mut store = lock.write();
+                let pruned = store.prune_safe();
+                let ssi_horizon = store
+                    .watermark()
+                    .unwrap_or_else(|| store.current_snapshot().high);
+                store.prune_ssi_log(ssi_horizon);
+                pruned
+            }
             Self::Sharded { store, .. } => store.prune_safe(),
         }
     }
@@ -344,12 +422,18 @@ impl FsMvccStore {
         // inode-table block). Recording the base makes the merge independent of
         // pruning (bd-bhh0i BUG-4 inode-table pruning race). The extra block-sized
         // clone is only consumed on a same-block conflict.
-        let (mut data, base) = if let Some(bytes) = self.read_visible(block, snapshot) {
-            (bytes.clone(), Some(bytes))
+        let (mut data, base, observed_seq) = if let Some((buf, seq)) =
+            self.read_visible_block_buf_with_seq(block, snapshot)
+        {
+            let bytes = buf.into_inner();
+            (bytes.clone(), Some(bytes), seq)
         } else {
             let device_base = self.read_unversioned_base_at_snapshot(block, snapshot, read_base)?;
-            (device_base.clone(), Some(device_base))
+            (device_base.clone(), Some(device_base), CommitSeq(0))
         };
+        if self.is_ssi_enabled() {
+            txn.record_read(block, observed_seq);
+        }
         patch(&mut data)?;
         txn.stage_write_with_proof_and_base(block, data, proof, base);
         let commit_seq = self
@@ -366,9 +450,10 @@ impl FsMvccStore {
         flushed_through: CommitSeq,
     ) -> FfsResult<(usize, CommitSeq)> {
         match self {
-            Self::Single(lock) => lock
-                .read()
-                .flush_to_device_after(cx, device, flushed_through),
+            Self::Single { lock, .. } => {
+                lock.read()
+                    .flush_to_device_after(cx, device, flushed_through)
+            }
             Self::Sharded { store, .. } => store.flush_to_device_after(cx, device, flushed_through),
         }
     }
@@ -378,7 +463,7 @@ impl FsMvccStore {
     /// acknowledge a captured count only under the format's commit exclusion.
     pub(super) fn committed_block_writes(&self) -> u64 {
         match self {
-            Self::Single(lock) => lock.read().committed_block_writes(),
+            Self::Single { lock, .. } => lock.read().committed_block_writes(),
             Self::Sharded { store, .. } => store.committed_block_writes(),
         }
     }
@@ -386,7 +471,7 @@ impl FsMvccStore {
     /// Blocks with a resident version (O(1) single store, O(shards) sharded).
     pub(super) fn tracked_block_count(&self) -> usize {
         match self {
-            Self::Single(lock) => lock.read().tracked_block_count(),
+            Self::Single { lock, .. } => lock.read().tracked_block_count(),
             Self::Sharded { store, .. } => store.block_count_versioned(),
         }
     }
@@ -399,49 +484,51 @@ impl FsMvccStore {
         on_evict: impl FnMut(BlockNumber),
     ) -> usize {
         match self {
-            Self::Single(lock) => lock.write().evict_durable_chains(durable_through, on_evict),
+            Self::Single { lock, .. } => {
+                lock.write().evict_durable_chains(durable_through, on_evict)
+            }
             Self::Sharded { store, .. } => store.evict_durable_chains(durable_through, on_evict),
         }
     }
 
     pub(super) fn version_count(&self) -> usize {
         match self {
-            Self::Single(lock) => lock.read().version_count(),
+            Self::Single { lock, .. } => lock.read().version_count(),
             Self::Sharded { store, .. } => store.version_count(),
         }
     }
 
     pub(super) fn active_snapshot_count(&self) -> usize {
         match self {
-            Self::Single(lock) => lock.read().active_snapshot_count(),
+            Self::Single { lock, .. } => lock.read().active_snapshot_count(),
             Self::Sharded { store, .. } => store.active_snapshot_count(),
         }
     }
 
     pub(super) fn block_version_stats(&self) -> BlockVersionStats {
         match self {
-            Self::Single(lock) => lock.read().block_version_stats(),
+            Self::Single { lock, .. } => lock.read().block_version_stats(),
             Self::Sharded { store, .. } => store.block_version_stats(),
         }
     }
 
     pub(super) fn ebr_stats(&self) -> EbrVersionStats {
         match self {
-            Self::Single(lock) => lock.read().ebr_stats(),
+            Self::Single { lock, .. } => lock.read().ebr_stats(),
             Self::Sharded { store, .. } => store.ebr_stats(),
         }
     }
 
     pub(super) fn transaction_outcome_stats(&self) -> TransactionOutcomeStats {
         match self {
-            Self::Single(lock) => lock.read().transaction_outcome_stats(),
+            Self::Single { lock, .. } => lock.read().transaction_outcome_stats(),
             Self::Sharded { store, .. } => store.transaction_outcome_stats(),
         }
     }
 
     pub(super) fn as_single(&self) -> Option<&RwLock<MvccStore>> {
         match self {
-            Self::Single(lock) => Some(lock),
+            Self::Single { lock, .. } => Some(lock),
             Self::Sharded { .. } => None,
         }
     }
@@ -587,6 +674,31 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
         Ok(())
     }
 
+    fn read_merge_ancestor_with_seq_at_snapshot(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> FfsResult<(BlockBuf, Option<Vec<u8>>, CommitSeq)> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        self.validate_range(block, 1)?;
+        let (buf, observed_seq) =
+            if let Some((buf, seq)) = self.store.read_visible_block_buf_with_seq(block, snapshot) {
+                (buf, seq)
+            } else {
+                let buf = self
+                    .store
+                    .read_unversioned_base_at_snapshot(block, snapshot, || {
+                        self.base.read_block(cx, block)
+                    })?;
+                (buf, CommitSeq(0))
+            };
+        self.validate_read_buf(block, &buf)?;
+        let base = buf.as_slice().to_vec();
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        Ok((buf, Some(base), observed_seq))
+    }
+
     fn rmw_with_proof(
         &self,
         cx: &Cx,
@@ -599,7 +711,11 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
         // another writer commits and prunes while the callback runs. All three
         // RMW variants use this gate so bitmap updates cannot bypass it.
         let mut txn = self.store.begin();
-        let (buf, base) = self.read_merge_ancestor_at_snapshot(cx, block, txn.snapshot())?;
+        let (buf, base, observed_seq) =
+            self.read_merge_ancestor_with_seq_at_snapshot(cx, block, txn.snapshot())?;
+        if self.store.is_ssi_enabled() {
+            txn.record_read(block, observed_seq);
+        }
         let mut data = buf.into_inner();
         patch(&mut data)?;
         // A callback can resize the Vec or request cancellation. Neither may
@@ -844,8 +960,6 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         block: BlockNumber,
         snapshot: Snapshot,
     ) -> FfsResult<(BlockBuf, Option<Vec<u8>>)> {
-        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        self.validate_range(block, 1)?;
         // Resolve the ancestor at the CALLER's snapshot, independent of this
         // device's own read-your-writes view. Retain the exact before-image even
         // when it came from MVCC: the caller can stage a batched transaction and
@@ -854,18 +968,12 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         // has the same owned-base contract as the auto-commit RMW paths above;
         // retaining bytes does not authorize overlapping changes or pin a read
         // snapshot that the caller has not registered.
-        let buf = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot) {
-            buf
-        } else {
-            self.store
-                .read_unversioned_base_at_snapshot(block, snapshot, || {
-                    self.base.read_block(cx, block)
-                })?
-        };
-        self.validate_read_buf(block, &buf)?;
-        let base = buf.as_slice().to_vec();
-        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        Ok((buf, Some(base)))
+        let (buf, base, observed_seq) =
+            self.read_merge_ancestor_with_seq_at_snapshot(cx, block, snapshot)?;
+        if self.store.is_ssi_enabled() {
+            record_ssi_read(block, observed_seq);
+        }
+        Ok((buf, base))
     }
 
     fn block_size(&self) -> u32 {

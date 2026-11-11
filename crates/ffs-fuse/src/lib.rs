@@ -24195,7 +24195,9 @@ mod tests {
             ..MountOptions::default()
         };
         let fuse = FrankenFuse::with_options(
-            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
+            Box::new(MutationRecordingFs::with_scope_recording(Arc::clone(
+                &calls,
+            ))),
             &options,
         );
         fuse.dispatch_rename(
@@ -24212,6 +24214,9 @@ mod tests {
         assert_eq!(
             calls.lock().expect("lock calls").as_slice(),
             &[
+                MutationCall::Begin {
+                    op: RequestOp::Rename,
+                },
                 MutationCall::Rename {
                     parent: InodeNumber(8),
                     name: "old".to_owned(),
@@ -24225,6 +24230,10 @@ mod tests {
                     rdev: 0,
                     uid: 1000,
                     gid: 1001,
+                },
+                MutationCall::Commit,
+                MutationCall::End {
+                    op: RequestOp::Rename,
                 },
             ]
         );

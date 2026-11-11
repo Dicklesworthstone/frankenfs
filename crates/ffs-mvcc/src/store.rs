@@ -1216,6 +1216,7 @@ impl MvccStore {
 
             let base = self
                 .version_bytes_at(block, snapshot_high)
+                .or_else(|| staged.base.as_deref().map(std::borrow::Cow::Borrowed))
                 .unwrap_or_default();
             let latest = self.version_bytes_at(block, observed).unwrap_or_default();
             match staged
@@ -1335,6 +1336,7 @@ impl MvccStore {
 
             let base = self
                 .version_bytes_at(block, snapshot_high)
+                .or_else(|| staged.base.as_deref().map(std::borrow::Cow::Borrowed))
                 .unwrap_or_default();
             let latest = self.version_bytes_at(block, observed).unwrap_or_default();
             let Some(merged) = staged
@@ -1842,9 +1844,22 @@ impl MvccStore {
         block: BlockNumber,
         snapshot: Snapshot,
     ) -> Option<BlockBuf> {
+        self.read_visible_block_buf_with_seq(block, snapshot)
+            .map(|(buf, _)| buf)
+    }
+
+    /// Read the visible version of `block` at `snapshot` together with the
+    /// exact [`CommitSeq`] that produced those bytes.
+    #[must_use]
+    pub fn read_visible_block_buf_with_seq(
+        &self,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Option<(BlockBuf, CommitSeq)> {
         self.versions.get(&block).and_then(|versions| {
             let idx = newest_visible_index(versions, snapshot.high)?;
-            compression::resolve_block_buf_with(versions, idx, |v| &v.data)
+            let buf = compression::resolve_block_buf_with(versions, idx, |v| &v.data)?;
+            Some((buf, versions[idx].commit_seq))
         })
     }
 

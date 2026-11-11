@@ -107,3 +107,7 @@ harness = false
 [[bench]]
 name = "queued_refresh_lookup"
 harness = false
+
+[[bench]]
+name = "raptorq_128mib_group"
+harness = false

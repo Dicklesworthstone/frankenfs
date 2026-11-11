@@ -124,7 +124,10 @@ nix = { version = "0.29", features = ["fs", "uio"] }
 xattr = "1.6.1"
 
 # Sibling project dependencies (crates.io; local path overrides via [patch] if needed)
-asupersync = { version = "0.5.0" }
+# `simd-intrinsics` activates asupersync's runtime-detected AVX2/NEON GF(256)
+# RaptorQ kernel (~8x faster parity encode/decode) with automatic scalar fallback
+# and zero additional external crate dependencies.
+asupersync = { version = "0.5.0", features = ["simd-intrinsics"] }
 ftui = "0.3.1"
 
 # Workspace crate cross-references

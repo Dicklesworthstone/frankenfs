@@ -144,25 +144,29 @@ pub fn write_inode_at(
     };
     serialize_inode_with_checksum(inode, inode_size, ino, csum_seed, raw);
 
-    // Read the block, patch the inode bytes IN PLACE, write back. `make_mut` is
-    // COW (`Arc::make_mut`): when the freshly-read block is uniquely owned it hands
-    // back the existing buffer with no copy — eliminating the per-inode-write 4 KiB
-    // heap alloc + memcpy the old `buf.as_slice().to_vec()` always paid; when the
-    // buffer is shared (cached) it clones once, exactly as `to_vec` did. Pareto and
-    // byte-identical: the same patched block is written either way.
-    let mut buf = dev.read_block(cx, loc.block)?;
-    if loc.byte_offset + inode_size > buf.as_slice().len() {
-        return Err(FfsError::Corruption {
-            block: loc.block.0,
-            detail: "inode extends beyond block boundary".into(),
-        });
-    }
-    // `make_mut()`'s borrow ends at this statement, so the immutable `as_slice()`
-    // below is a fresh borrow (no overlap).
-    buf.make_mut()[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(raw);
-    dev.write_block(cx, loc.block, buf.as_slice())?;
-
-    Ok(())
+    // Route through `rmw_block` declaring this inode's exact `[byte_offset,
+    // byte_offset + inode_size)` slot range so MVCC transactional adapters
+    // stage `MergeProof::IndependentKeys` (`RangeOverlay`) instead of an
+    // opaque whole-block `MergeProof::Unsafe`. Concurrent writers touching
+    // disjoint inode slots in the same 4 KiB inode-table block therefore
+    // commute cleanly at commit, while non-MVCC devices execute their normal
+    // single-block read-modify-write.
+    let slot: &[u8] = raw;
+    dev.rmw_block(
+        cx,
+        loc.block,
+        &[(loc.byte_offset, inode_size)],
+        &mut |block_data| {
+            if loc.byte_offset.saturating_add(inode_size) > block_data.len() {
+                return Err(FfsError::Corruption {
+                    block: loc.block.0,
+                    detail: "inode extends beyond block boundary".into(),
+                });
+            }
+            block_data[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(slot);
+            Ok(())
+        },
+    )
 }
 
 /// Serialize `inode` into `buf` AND stamp its CRC32C checksum, with NO device I/O.
@@ -6557,5 +6561,132 @@ mod tests {
             inode.version, 100,
             "version should be bumped by touch_ctime"
         );
+    }
+
+    #[test]
+    fn write_inode_at_declares_exact_slot_rmw_range_and_rejects_overflow() {
+        struct RecordingRmwDevice {
+            block: std::sync::Mutex<Vec<u8>>,
+            recorded_ranges: std::sync::Mutex<Vec<Vec<(usize, usize)>>>,
+            direct_write_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl BlockDevice for RecordingRmwDevice {
+            fn read_block(&self, _cx: &Cx, _block: BlockNumber) -> Result<ffs_block::BlockBuf> {
+                Ok(ffs_block::BlockBuf::new(self.block.lock().unwrap().clone()))
+            }
+
+            fn write_block(&self, _cx: &Cx, _block: BlockNumber, data: &[u8]) -> Result<()> {
+                self.direct_write_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *self.block.lock().unwrap() = data.to_vec();
+                Ok(())
+            }
+
+            fn rmw_block(
+                &self,
+                _cx: &Cx,
+                _block: BlockNumber,
+                disjoint_ranges: &[(usize, usize)],
+                patch: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>,
+            ) -> Result<()> {
+                self.recorded_ranges
+                    .lock()
+                    .unwrap()
+                    .push(disjoint_ranges.to_vec());
+                let mut buf = self.block.lock().unwrap().clone();
+                patch(&mut buf)?;
+                *self.block.lock().unwrap() = buf;
+                Ok(())
+            }
+
+            fn block_size(&self) -> u32 {
+                4096
+            }
+
+            fn block_count(&self) -> u64 {
+                16
+            }
+
+            fn sync(&self, _cx: &Cx) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let dev = RecordingRmwDevice {
+            block: std::sync::Mutex::new(vec![0xA5_u8; 4096]),
+            recorded_ranges: std::sync::Mutex::new(Vec::new()),
+            direct_write_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let inode = Ext4Inode {
+            mode: 0o100_644,
+            uid: 1000,
+            gid: 1000,
+            size: 1234,
+            links_count: 1,
+            blocks: 8,
+            flags: EXT4_EXTENTS_FL,
+            version: 7,
+            generation: 3,
+            file_acl: 0,
+            atime: 10,
+            ctime: 20,
+            mtime: 30,
+            dtime: 0,
+            atime_extra: 0,
+            ctime_extra: 0,
+            mtime_extra: 0,
+            crtime: 5,
+            crtime_extra: 0,
+            extra_isize: 32,
+            checksum: 0,
+            version_hi: 0,
+            projid: 0,
+            extent_bytes: vec![0; 60].into(),
+            xattr_ibody: Vec::new(),
+            number: 12,
+        };
+        let loc = InodeLocation {
+            block: BlockNumber(7),
+            byte_offset: 512,
+        };
+        write_inode_at(&cx, &dev, loc, 256, InodeNumber(12), &inode, 0xDEAD_BEEF)
+            .expect("slot-scoped write_inode_at must succeed");
+
+        assert_eq!(
+            dev.direct_write_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "write_inode_at must route through rmw_block rather than whole-block write_block"
+        );
+        assert_eq!(
+            *dev.recorded_ranges.lock().unwrap(),
+            vec![vec![(512, 256)]],
+            "write_inode_at must declare the exact [byte_offset, byte_offset + inode_size) slot"
+        );
+        let written = dev.block.lock().unwrap().clone();
+        assert!(written[..512].iter().all(|&b| b == 0xA5));
+        assert!(written[768..].iter().all(|&b| b == 0xA5));
+        let parsed =
+            Ext4Inode::parse_from_bytes(&written[512..768]).expect("written slot must parse");
+        assert_eq!(parsed.size, 1234);
+        assert_eq!(parsed.uid, 1000);
+
+        let bad_loc = InodeLocation {
+            block: BlockNumber(7),
+            byte_offset: 4000,
+        };
+        let err = write_inode_at(
+            &cx,
+            &dev,
+            bad_loc,
+            256,
+            InodeNumber(12),
+            &inode,
+            0xDEAD_BEEF,
+        )
+        .expect_err("slot extending past block boundary must fail");
+        assert!(matches!(err, FfsError::Corruption { block: 7, .. }));
     }
 }
