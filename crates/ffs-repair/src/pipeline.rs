@@ -33,8 +33,8 @@ use crate::evidence::{
     SymbolRefreshDetail,
 };
 use crate::recovery::{
-    DirectDeviceRecoveryWriteback, GroupRecoveryOrchestrator, RecoveryAttemptResult,
-    RecoveryDecoderStats, RecoveryOutcome, RecoveryWriteback,
+    DecodedViewValidatorFactory, DirectDeviceRecoveryWriteback, GroupRecoveryOrchestrator,
+    RecoveryAttemptResult, RecoveryDecoderStats, RecoveryOutcome, RecoveryWriteback,
 };
 use crate::scrub::{BlockValidator, ScrubReport, Scrubber, Severity};
 use crate::storage::{RepairGroupLayout, RepairGroupStorage};
@@ -828,6 +828,8 @@ pub struct ScrubDaemon<'a, W: Write> {
 pub struct ScrubWithRecovery<'a, W: Write> {
     device: &'a dyn BlockDevice,
     validator: &'a dyn BlockValidator,
+    /// Rebuild cross-block metadata checks for each scan and decoded image.
+    view_validator_factory: Option<DecodedViewValidatorFactory<'a>>,
     fs_uuid: [u8; 16],
     groups: Vec<GroupConfig>,
     ledger: EvidenceLedger<W>,
@@ -896,6 +898,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         Self {
             device,
             validator,
+            view_validator_factory: None,
             fs_uuid,
             groups,
             ledger: EvidenceLedger::new(ledger_writer),
@@ -920,6 +923,24 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     #[must_use]
     pub fn with_decoded_block_verification(mut self, enabled: bool) -> Self {
         self.verify_decoded_blocks = enabled;
+        self
+    }
+
+    /// Build validation from the device at the start of every full or group
+    /// scrub, and from the reconstructed device view before every writeback.
+    ///
+    /// Use this for checks whose authority lives in other blocks, such as ext4
+    /// bitmap checksums and inode-owned metadata. Repairs can restore that
+    /// authority, so neither later scans nor decoded-block validation may reuse
+    /// a metadata map captured from the damaged image. The caller must exclude
+    /// concurrent client mutations while these views are constructed and used.
+    ///
+    /// This always verifies decoded blocks with the rebuilt view, independently
+    /// of [`Self::with_decoded_block_verification`], which controls the fallback
+    /// validator only. Factory errors never fall back to stale validation.
+    #[must_use]
+    pub fn with_device_view_validator(mut self, factory: DecodedViewValidatorFactory<'a>) -> Self {
+        self.view_validator_factory = Some(factory);
         self
     }
 
@@ -1191,7 +1212,8 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     /// 4. Optionally refresh repair symbols after successful recovery.
     /// 5. Return a [`RecoveryReport`] with per-block outcomes.
     pub fn scrub_and_recover(&mut self, cx: &Cx) -> Result<RecoveryReport> {
-        let scrubber = Scrubber::new(self.device, self.validator);
+        let rebuilt = self.rebuild_scan_validator(cx)?;
+        let scrubber = Scrubber::new(self.device, rebuilt.as_deref().unwrap_or(self.validator));
 
         // Scrub the entire device.
         info!("scrub_and_recover: starting full device scrub");
@@ -1289,6 +1311,16 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
 
     // ── Internal helpers ──────────────────────────────────────────────
 
+    fn rebuild_scan_validator(&self, cx: &Cx) -> Result<Option<Box<dyn BlockValidator>>> {
+        let Some(factory) = self.view_validator_factory else {
+            return Ok(None);
+        };
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let validator = factory(cx, self.device)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        Ok(Some(validator))
+    }
+
     fn corrupt_blocks_from_report(report: &ScrubReport) -> Vec<BlockNumber> {
         let mut blocks: Vec<BlockNumber> = report
             .findings
@@ -1307,7 +1339,8 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         group_cfg: GroupConfig,
     ) -> Result<(ScrubReport, Option<GroupRecoverySummary>)> {
         let group = group_cfg.layout.group;
-        let scrubber = Scrubber::new(self.device, self.validator);
+        let rebuilt = self.rebuild_scan_validator(cx)?;
+        let scrubber = Scrubber::new(self.device, rebuilt.as_deref().unwrap_or(self.validator));
         let report = scrubber.scrub_range(
             cx,
             group_cfg.source_first_block,
@@ -2041,7 +2074,9 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             }
         };
 
-        let orchestrator = if self.verify_decoded_blocks {
+        let orchestrator = if let Some(factory) = self.view_validator_factory {
+            orchestrator.with_decoded_view_validator(factory)
+        } else if self.verify_decoded_blocks {
             orchestrator.with_decoded_block_validator(self.validator)
         } else {
             orchestrator
@@ -2556,10 +2591,12 @@ mod tests {
     use crate::autopilot::DurabilityAutopilot;
     use crate::codec::encode_group;
     use crate::evidence::{EvidenceEventType, EvidenceRecord};
-    use crate::scrub::{BlockVerdict, CorruptionKind, Ext4SuperblockValidator, Severity};
+    use crate::scrub::{
+        BlockVerdict, CorruptionKind, Ext4MetadataValidator, Ext4SuperblockValidator, Severity,
+    };
     use crate::symbol::RepairGroupDescExt;
     use ffs_block::{ArcCache, ArcWritePolicy, BlockBuf, RepairFlushLifecycle};
-    use ffs_ondisk::{Ext4IncompatFeatures, Ext4RoCompatFeatures};
+    use ffs_ondisk::{Ext4IncompatFeatures, Ext4RoCompatFeatures, Ext4Superblock};
     use ffs_types::{
         EXT4_SB_CHECKSUM_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
     };
@@ -2797,6 +2834,150 @@ mod tests {
         sb[EXT4_SB_CHECKSUM_OFFSET..EXT4_SB_CHECKSUM_OFFSET + 4]
             .copy_from_slice(&checksum.to_le_bytes());
         sb
+    }
+
+    /// Checksummed ext4 metadata in one source region, with actual repair
+    /// symbols stored separately in its tail. This is a memory-device fixture,
+    /// not a native mounted filesystem or allocation-reservation proof.
+    struct Ext4RecoveryFixture {
+        device: MemBlockDevice,
+        sb: Ext4Superblock,
+        group: GroupConfig,
+    }
+
+    impl Ext4RecoveryFixture {
+        fn new(cx: &Cx) -> Self {
+            let device = MemBlockDevice::new(4096, 64);
+            let mut superblock = make_valid_ext4_superblock_region();
+            superblock[0x00..0x04].copy_from_slice(&16_u32.to_le_bytes());
+            superblock[0x04..0x08].copy_from_slice(&64_u32.to_le_bytes());
+            superblock[0x20..0x24].copy_from_slice(&64_u32.to_le_bytes());
+            superblock[0x24..0x28].copy_from_slice(&64_u32.to_le_bytes());
+            superblock[0x28..0x2C].copy_from_slice(&16_u32.to_le_bytes());
+            superblock[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes());
+            superblock[0x68..0x78].copy_from_slice(&test_uuid());
+            let checksum = ffs_ondisk::ext4_chksum(!0, &superblock[..EXT4_SB_CHECKSUM_OFFSET]);
+            superblock[EXT4_SB_CHECKSUM_OFFSET..EXT4_SB_CHECKSUM_OFFSET + 4]
+                .copy_from_slice(&checksum.to_le_bytes());
+            let sb = Ext4Superblock::parse_superblock_region(&superblock).expect("superblock");
+            let mut block = vec![0; 4096];
+            block[1024..2048].copy_from_slice(&superblock);
+            device
+                .write_block(cx, BlockNumber(0), &block)
+                .expect("superblock");
+
+            let block_bitmap = vec![0xFF; 4096];
+            let mut inode_bitmap = vec![0; 4096];
+            inode_bitmap[0] = 1 << 1; // root inode 2
+            inode_bitmap[1] = 1 << 2; // regular inode 11
+            device
+                .write_block(cx, BlockNumber(2), &block_bitmap)
+                .expect("block bitmap");
+            device
+                .write_block(cx, BlockNumber(3), &inode_bitmap)
+                .expect("inode bitmap");
+            let desc_size = sb.group_desc_size();
+            let mut descriptor = vec![0; usize::from(desc_size)];
+            descriptor[0..4].copy_from_slice(&2_u32.to_le_bytes());
+            descriptor[4..8].copy_from_slice(&3_u32.to_le_bytes());
+            descriptor[8..12].copy_from_slice(&4_u32.to_le_bytes());
+            let mut gd = ffs_ondisk::Ext4GroupDesc::parse_from_bytes(&descriptor, desc_size)
+                .expect("descriptor");
+            ffs_ondisk::ext4::stamp_block_bitmap_checksum(
+                &block_bitmap,
+                sb.csum_seed(),
+                sb.clusters_per_group,
+                &mut gd,
+                desc_size,
+            );
+            ffs_ondisk::ext4::stamp_inode_bitmap_checksum(
+                &inode_bitmap,
+                sb.csum_seed(),
+                sb.inodes_per_group,
+                &mut gd,
+                desc_size,
+            );
+            gd.write_to_bytes(&mut descriptor, desc_size)
+                .expect("descriptor bytes");
+            ffs_ondisk::ext4::stamp_group_desc_checksum(
+                &mut descriptor,
+                &sb.uuid,
+                sb.csum_seed(),
+                0,
+                desc_size,
+                sb.group_desc_checksum_kind(),
+            );
+            let mut gdt = vec![0; 4096];
+            gdt[..descriptor.len()].copy_from_slice(&descriptor);
+            device.write_block(cx, BlockNumber(1), &gdt).expect("GDT");
+
+            let mut table = vec![0; 4096];
+            for (slot, ino, mode, generation) in [(1, 2, 0x41ED_u16, 7_u32), (10, 11, 0x81A4, 3)] {
+                let inode = &mut table[slot * 256..(slot + 1) * 256];
+                inode[0..2].copy_from_slice(&mode.to_le_bytes());
+                inode[0x1A..0x1C].copy_from_slice(&1_u16.to_le_bytes());
+                inode[0x20..0x24].copy_from_slice(&ffs_types::EXT4_EXTENTS_FL.to_le_bytes());
+                inode[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
+                inode[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+                inode[0x28..0x2A].copy_from_slice(&0xF30A_u16.to_le_bytes());
+                inode[0x2C..0x2E].copy_from_slice(&4_u16.to_le_bytes());
+                if ino == 2 {
+                    inode[4..8].copy_from_slice(&4096_u32.to_le_bytes());
+                    inode[0x2A..0x2C].copy_from_slice(&1_u16.to_le_bytes());
+                    inode[0x38..0x3A].copy_from_slice(&1_u16.to_le_bytes());
+                    inode[0x3C..0x40].copy_from_slice(&5_u32.to_le_bytes());
+                }
+                ffs_ondisk::ext4::stamp_inode_checksum(inode, sb.csum_seed(), ino, 256)
+                    .expect("inode checksum");
+            }
+            device
+                .write_block(cx, BlockNumber(4), &table)
+                .expect("inode table");
+            let mut directory = vec![0; 4096];
+            directory[0..4].copy_from_slice(&2_u32.to_le_bytes());
+            directory[4..6].copy_from_slice(&4084_u16.to_le_bytes());
+            directory[6] = 1;
+            directory[7] = 2;
+            directory[8] = b'.';
+            directory[4088..4090].copy_from_slice(&12_u16.to_le_bytes());
+            directory[4091] = 0xDE;
+            ffs_ondisk::ext4::stamp_dir_block_checksum(&mut directory, sb.csum_seed(), 2, 7);
+            device
+                .write_block(cx, BlockNumber(5), &directory)
+                .expect("directory");
+            let validator =
+                Ext4MetadataValidator::from_device(cx, &device, &sb).expect("validator");
+            let report = Scrubber::new(&device, &validator)
+                .scrub_all(cx)
+                .expect("clean fixture");
+            assert!(report.is_clean(), "{:?}", report.findings);
+            Self {
+                device,
+                sb,
+                group: GroupConfig {
+                    layout: RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 8)
+                        .expect("repair layout"),
+                    source_first_block: BlockNumber(0),
+                    source_block_count: 8,
+                },
+            }
+        }
+
+        fn encode(&self, cx: &Cx) {
+            bootstrap_storage(cx, &self.device, self.group.layout, BlockNumber(0), 8, 8);
+        }
+
+        fn flip(&self, cx: &Cx, block: u64, offset: usize) {
+            let mut bytes = self
+                .device
+                .read_block(cx, BlockNumber(block))
+                .expect("read")
+                .into_inner();
+            bytes[offset] ^= 1;
+            self.device
+                .write_block(cx, BlockNumber(block), &bytes)
+                .expect("plant corruption");
+        }
     }
 
     fn write_source_blocks(
@@ -3431,6 +3612,361 @@ mod tests {
                     originals[3].as_slice(),
                     "control: without verification the stale decode is written"
                 );
+            }
+        }
+    }
+
+    fn ext4_recovery_pass(
+        daemon: &mut ScrubDaemon<'_, Vec<u8>>,
+        cx: &Cx,
+        group_scan: bool,
+    ) -> Result<(usize, usize, usize)> {
+        if group_scan {
+            let step = daemon.run_once(cx)?;
+            Ok((
+                step.corrupt_count,
+                step.recovered_count,
+                step.unrecoverable_count,
+            ))
+        } else {
+            let report = daemon.pipeline.scrub_and_recover(cx)?;
+            Ok((
+                report.total_corrupt,
+                report.total_recovered,
+                report.total_unrecoverable,
+            ))
+        }
+    }
+
+    #[test]
+    fn ext4_pipeline_rebuilds_descriptor_bitmap_authority_before_writeback_bd_jufod() {
+        for group_scan in [false, true] {
+            for rebuild in [false, true] {
+                let cx = Cx::for_testing();
+                let fixture = Ext4RecoveryFixture::new(&cx);
+                fixture.encode(&cx);
+                let original = fixture.device.blocks.lock().expect("image").clone();
+                fixture.flip(&cx, 1, 0x18); // corrupt expected block-bitmap checksum
+                fixture.flip(&cx, 2, 0);
+                let damaged = fixture.device.blocks.lock().expect("image").clone();
+                let startup = Ext4MetadataValidator::from_device(&cx, &fixture.device, &fixture.sb)
+                    .expect("startup metadata");
+                let from_view =
+                    |cx: &Cx, view: &dyn BlockDevice| -> Result<Box<dyn BlockValidator>> {
+                        Ok(Box::new(Ext4MetadataValidator::from_device(
+                            cx,
+                            view,
+                            &fixture.sb,
+                        )?))
+                    };
+                let mut pipeline = ScrubWithRecovery::new(
+                    &fixture.device,
+                    &startup,
+                    test_uuid(),
+                    vec![fixture.group],
+                    Vec::new(),
+                    0,
+                )
+                .with_decoded_block_verification(true);
+                if rebuild {
+                    pipeline = pipeline.with_device_view_validator(&from_view);
+                }
+                let mut daemon = ScrubDaemon::new(pipeline, ScrubDaemonConfig::default());
+                let result = ext4_recovery_pass(&mut daemon, &cx, group_scan).expect("scrub");
+                let expected = if rebuild { (2, 2, 0) } else { (2, 0, 2) };
+                assert_eq!(
+                    result, expected,
+                    "group_scan={group_scan}, rebuild={rebuild}"
+                );
+                assert_eq!(
+                    *fixture.device.blocks.lock().expect("image"),
+                    if rebuild { original } else { damaged },
+                    "a recovered bitmap must use the recovered descriptor checksum"
+                );
+                let records =
+                    crate::evidence::parse_evidence_ledger(&daemon.into_pipeline().into_ledger());
+                assert_eq!(count_event(&records, EvidenceEventType::RepairAttempted), 1);
+                assert_eq!(
+                    count_event(&records, EvidenceEventType::RepairSucceeded),
+                    usize::from(rebuild)
+                );
+                assert_eq!(
+                    count_event(&records, EvidenceEventType::RepairFailed),
+                    usize::from(!rebuild)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_pipeline_rejects_decoded_children_that_disagree_with_recovered_owner_bd_jufod() {
+        for rebuild in [false, true] {
+            let cx = Cx::for_testing();
+            let fixture = Ext4RecoveryFixture::new(&cx);
+            // Plant a complete, integrity-valid symbol generation whose child
+            // checksum belongs to a different inode generation. Decoder success
+            // alone cannot establish cross-block metadata consistency.
+            let mut directory = fixture
+                .device
+                .read_block(&cx, BlockNumber(5))
+                .expect("directory")
+                .into_inner();
+            ffs_ondisk::ext4::stamp_dir_block_checksum(
+                &mut directory,
+                fixture.sb.csum_seed(),
+                2,
+                9,
+            );
+            fixture
+                .device
+                .write_block(&cx, BlockNumber(5), &directory)
+                .expect("different child generation");
+            fixture.encode(&cx);
+
+            // The damaged current table exposes owner generation 9, but another
+            // live inode in this table fails its checksum. Both the table and
+            // directory are consequently selected by an ordinary metadata scan.
+            let mut table = fixture
+                .device
+                .read_block(&cx, BlockNumber(4))
+                .expect("table")
+                .into_inner();
+            let root = &mut table[256..512];
+            root[0x64..0x68].copy_from_slice(&9_u32.to_le_bytes());
+            ffs_ondisk::ext4::stamp_inode_checksum(root, fixture.sb.csum_seed(), 2, 256)
+                .expect("root checksum");
+            table[10 * 256 + 8] ^= 1;
+            fixture
+                .device
+                .write_block(&cx, BlockNumber(4), &table)
+                .expect("damaged table");
+            fixture.flip(&cx, 5, 24);
+            let damaged = fixture.device.blocks.lock().expect("image").clone();
+            let startup = Ext4MetadataValidator::from_device(&cx, &fixture.device, &fixture.sb)
+                .expect("startup");
+            let from_view = |cx: &Cx, view: &dyn BlockDevice| -> Result<Box<dyn BlockValidator>> {
+                Ok(Box::new(Ext4MetadataValidator::from_device(
+                    cx,
+                    view,
+                    &fixture.sb,
+                )?))
+            };
+            let mut pipeline = ScrubWithRecovery::new(
+                &fixture.device,
+                &startup,
+                test_uuid(),
+                vec![fixture.group],
+                Vec::new(),
+                0,
+            )
+            .with_decoded_block_verification(true);
+            if rebuild {
+                pipeline = pipeline.with_device_view_validator(&from_view);
+            }
+            let report = pipeline.scrub_and_recover(&cx).expect("pipeline");
+            assert_eq!(report.total_corrupt, 2);
+            if rebuild {
+                assert_eq!(report.total_recovered, 0);
+                assert_eq!(report.total_unrecoverable, 2);
+                assert_eq!(
+                    *fixture.device.blocks.lock().expect("image"),
+                    damaged,
+                    "reject every source and parity write"
+                );
+            } else {
+                assert_eq!(
+                    report.total_recovered, 2,
+                    "control: cached owner accepts the wrong child generation"
+                );
+                let current = Ext4MetadataValidator::from_device(&cx, &fixture.device, &fixture.sb)
+                    .expect("recovered metadata");
+                assert!(
+                    matches!(
+                        current.validate(
+                            BlockNumber(5),
+                            &fixture
+                                .device
+                                .read_block(&cx, BlockNumber(5))
+                                .expect("directory")
+                        ),
+                        BlockVerdict::Corrupt(_)
+                    ),
+                    "control must expose the cross-block inconsistency after writeback"
+                );
+            }
+            let records = crate::evidence::parse_evidence_ledger(&pipeline.into_ledger());
+            assert_eq!(
+                count_event(&records, EvidenceEventType::RepairSucceeded),
+                usize::from(!rebuild)
+            );
+            assert_eq!(
+                count_event(&records, EvidenceEventType::RepairFailed),
+                usize::from(rebuild)
+            );
+            if rebuild {
+                assert!(
+                    records
+                        .iter()
+                        .filter_map(|record| record.repair.as_ref())
+                        .filter_map(|detail| detail.reason.as_deref())
+                        .any(|reason| reason.contains("decoded block 5 fails validation"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_pipeline_rediscovers_inode_owned_metadata_after_prior_repair_bd_jufod() {
+        for group_scan in [false, true] {
+            for rebuild in [false, true] {
+                let cx = Cx::for_testing();
+                let fixture = Ext4RecoveryFixture::new(&cx);
+                fixture.encode(&cx);
+                let original = fixture.device.blocks.lock().expect("image").clone();
+                fixture.flip(&cx, 4, 256 + 8); // root inode checksum
+                let startup = Ext4MetadataValidator::from_device(&cx, &fixture.device, &fixture.sb)
+                    .expect("startup");
+                assert!(
+                    matches!(
+                        startup.validate(
+                            BlockNumber(5),
+                            &fixture
+                                .device
+                                .read_block(&cx, BlockNumber(5))
+                                .expect("directory")
+                        ),
+                        BlockVerdict::Skip
+                    ),
+                    "a corrupt owner must not assign child checksum authority"
+                );
+                let from_view =
+                    |cx: &Cx, view: &dyn BlockDevice| -> Result<Box<dyn BlockValidator>> {
+                        Ok(Box::new(Ext4MetadataValidator::from_device(
+                            cx,
+                            view,
+                            &fixture.sb,
+                        )?))
+                    };
+                let mut pipeline = ScrubWithRecovery::new(
+                    &fixture.device,
+                    &startup,
+                    test_uuid(),
+                    vec![fixture.group],
+                    Vec::new(),
+                    0,
+                )
+                .with_decoded_block_verification(true);
+                if rebuild {
+                    pipeline = pipeline.with_device_view_validator(&from_view);
+                }
+                let mut daemon = ScrubDaemon::new(pipeline, ScrubDaemonConfig::default());
+                assert_eq!(
+                    ext4_recovery_pass(&mut daemon, &cx, group_scan).expect("owner repair"),
+                    (1, 1, 0)
+                );
+                fixture.flip(&cx, 5, 24); // new corruption after owner restoration
+                let result = ext4_recovery_pass(&mut daemon, &cx, group_scan).expect("next pass");
+                assert_eq!(result, if rebuild { (1, 1, 0) } else { (0, 0, 0) });
+                if rebuild {
+                    assert_eq!(*fixture.device.blocks.lock().expect("image"), original);
+                } else {
+                    assert_ne!(
+                        *fixture.device.blocks.lock().expect("image"),
+                        original,
+                        "control: the stale metadata map silently misses the damaged child"
+                    );
+                }
+                let records =
+                    crate::evidence::parse_evidence_ledger(&daemon.into_pipeline().into_ledger());
+                assert_eq!(
+                    count_event(&records, EvidenceEventType::CorruptionDetected),
+                    if rebuild { 2 } else { 1 }
+                );
+                assert_eq!(
+                    count_event(&records, EvidenceEventType::RepairSucceeded),
+                    if rebuild { 2 } else { 1 }
+                );
+                assert_eq!(count_event(&records, EvidenceEventType::RepairFailed), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_view_factory_errors_and_cancellation_never_write_sources_bd_jufod() {
+        for fail_on_call in [0, 1] {
+            // scan admission, then decoded-overlay admission
+            for cancelled in [false, true] {
+                let cx = Cx::for_testing();
+                let fixture = Ext4RecoveryFixture::new(&cx);
+                fixture.encode(&cx);
+                fixture.flip(&cx, 2, 0);
+                let damaged = fixture.device.blocks.lock().expect("image").clone();
+                let startup = Ext4MetadataValidator::from_device(&cx, &fixture.device, &fixture.sb)
+                    .expect("startup");
+                let calls = AtomicU64::new(0);
+                let from_view = |cx: &Cx,
+                                 view: &dyn BlockDevice|
+                 -> Result<Box<dyn BlockValidator>> {
+                    if calls.fetch_add(1, Ordering::Relaxed) == fail_on_call {
+                        return if cancelled {
+                            cx.set_cancel_requested(true);
+                            Err(FfsError::Cancelled)
+                        } else {
+                            Err(std::io::Error::other("planted metadata-view I/O failure").into())
+                        };
+                    }
+                    Ok(Box::new(Ext4MetadataValidator::from_device(
+                        cx,
+                        view,
+                        &fixture.sb,
+                    )?))
+                };
+                let mut pipeline = ScrubWithRecovery::new(
+                    &fixture.device,
+                    &startup,
+                    test_uuid(),
+                    vec![fixture.group],
+                    Vec::new(),
+                    0,
+                )
+                .with_device_view_validator(&from_view);
+                let result = pipeline.scrub_and_recover(&cx);
+                if fail_on_call == 0 {
+                    let error = result.expect_err("scan authority failure must propagate");
+                    if cancelled {
+                        assert!(matches!(error, FfsError::Cancelled));
+                    } else {
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("planted metadata-view I/O failure")
+                        );
+                    }
+                } else {
+                    let report = result.expect("failed recovery is reported");
+                    assert_eq!(
+                        (
+                            report.total_corrupt,
+                            report.total_recovered,
+                            report.total_unrecoverable
+                        ),
+                        (1, 0, 1)
+                    );
+                }
+                assert_eq!(calls.load(Ordering::Relaxed), fail_on_call + 1);
+                assert_eq!(*fixture.device.blocks.lock().expect("image"), damaged);
+                let records = crate::evidence::parse_evidence_ledger(&pipeline.into_ledger());
+                assert_eq!(count_event(&records, EvidenceEventType::RepairSucceeded), 0);
+                assert_eq!(
+                    count_event(&records, EvidenceEventType::RepairFailed),
+                    usize::from(fail_on_call != 0)
+                );
+                if cancelled {
+                    assert!(
+                        cx.checkpoint().is_err(),
+                        "cancellation must remain terminal"
+                    );
+                }
             }
         }
     }

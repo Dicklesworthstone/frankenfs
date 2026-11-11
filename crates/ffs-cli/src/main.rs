@@ -8428,28 +8428,18 @@ fn run_mount_background_scrub_daemon(
             plan.block_size
         )
     })?;
-    let validator = match &plan.flavor {
-        FsFlavor::Ext4(sb) if plan.static_metadata => {
-            let mut validator =
-                ffs_repair::scrub::Ext4MetadataValidator::from_device(cx, &block_dev, sb)
-                    .context("failed to read ext4 group descriptors for background scrub")?;
-            if let Some(ref open_fs) = config.mounted_repair_writeback {
-                validator.add_owned_blocks(ext4_inode_owned_blocks(cx, open_fs));
-            } else if let Ok(fs) = OpenFs::open_with_options(
-                cx,
-                image_path,
-                &OpenOptions {
-                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
-                    skip_validation: true,
-                    ..OpenOptions::default()
-                },
-            ) {
-                validator.add_owned_blocks(ext4_inode_owned_blocks(cx, &fs));
+    let validator_from_view =
+        |cx: &Cx, view: &dyn BlockDevice| -> ffs_error::Result<Box<dyn BlockValidator>> {
+            match &plan.flavor {
+                FsFlavor::Ext4(sb) if plan.static_metadata => Ok(Box::new(
+                    ffs_repair::scrub::Ext4MetadataValidator::from_device(cx, view, sb)?,
+                )),
+                _ => Ok(scrub_validator(&plan.flavor, plan.block_size)),
             }
-            Box::new(validator) as Box<dyn BlockValidator>
-        }
-        _ => scrub_validator(&plan.flavor, plan.block_size),
-    };
+        };
+    let validator = validator_from_view(cx, &block_dev)
+        .context("failed to construct metadata validation for background scrub")?;
+    let rebuild_ext4_metadata = plan.static_metadata && matches!(&plan.flavor, FsFlavor::Ext4(_));
     let ledger = open_mount_background_scrub_ledger(config.ledger_path)?;
     let repair_symbol_count =
         mount_background_repair_symbol_count(&plan.groups, repair_writes_enabled);
@@ -8466,6 +8456,12 @@ fn run_mount_background_scrub_daemon(
     // decoded block it rejects (stale or damaged symbols) is never written.
     .with_decoded_block_verification(true)
     .with_metrics(config.pipeline_metrics);
+    if rebuild_ext4_metadata {
+        // Use the supplied physical/decoded view for both fixed metadata and
+        // inode-owned discovery. A cached OpenFs or startup descriptor map can
+        // describe corrupt owners, even after an earlier pass repairs them.
+        pipeline = pipeline.with_device_view_validator(&validator_from_view);
+    }
     if let Some(open_fs) = config.mounted_repair_writeback {
         pipeline = pipeline.with_recovery_writeback(Arc::new(MountedRecoveryWriteback { open_fs }));
     }
