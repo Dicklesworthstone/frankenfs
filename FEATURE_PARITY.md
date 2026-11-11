@@ -96,11 +96,15 @@
 > changes. Raw execution and the retained image/log archive are under
 > `artifacts/implementation/20261105_live_tui_O6utU4/review38-native-eof*`;
 > the earlier D158 comparison remains under `review36-native-eof*`.
-> The original P0 remains open. Its published growth model fails a fixture
-> precondition on both x86 and ARM; the native comparison does not qualify that
-> test oracle. The corrected precondition, exact 14-operation refusal, required
-> positive growth controls, full suites and benchmark checks still need their
-> own executed evidence. No parity percentage or automatic-cleanup claim changes.
+> The original P0 remains open. The `59fc07b94` growth model failed a fixture
+> precondition on both x86 and ARM; that earlier failure remains retained.
+> Corrected source `0a603b869` now passes the complete ARM recovery job:
+> exact 14-operation refusal, required positive growth controls, original
+> property, full core library (1,646 passed, zero failed, 24 existing ignores),
+> strict core Clippy and formatting. Its executed log is
+> `review38-0a603-recovery-arm.raw.log` under the same retained evidence directory.
+> The x86 run, workspace/harness qualification and actual harness benchmark
+> remain pending. No parity percentage or automatic-cleanup claim changes.
 
 > **Chunk-growth authority review (bd-a136s, reopened 2026-11-11 UTC):**
 > the write-time DATA-growth helper omitted the complete-tree prerequisite

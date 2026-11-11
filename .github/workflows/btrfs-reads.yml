@@ -46,11 +46,26 @@ jobs:
           for image in tests/fixtures/images/ext4_*.img; do
             e2fsck -fn "$image"
           done
+      - name: Data chunk growth authority regression
+        env:
+          FFS_REQUIRE_ORACLES: "1"
+        run: |
+          mkdir -p artifacts/btrfs-growth-seed
+          FFS_BTRFS_GROWTH_SEED_EXPORT="$GITHUB_WORKSPACE/artifacts/btrfs-growth-seed/seed.btrfs" cargo test -p ffs-core --locked --lib tests::btrfs_data_chunk_growth_requires_complete_device_tree_bd_a136s -- --exact --nocapture
+          git rev-parse HEAD > artifacts/btrfs-growth-seed/source-revision.txt
+          (
+            cd artifacts/btrfs-growth-seed
+            sha256sum seed.btrfs source-revision.txt > sha256sums.txt
+          )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-growth-seed-${{ matrix.runner }}-${{ github.sha }}
+          path: artifacts/btrfs-growth-seed/
+          if-no-files-found: error
       - name: Core library regressions
         env:
           FFS_REQUIRE_ORACLES: "1"
         run: |
-          cargo test -p ffs-core --locked --lib tests::btrfs_data_chunk_growth_requires_complete_device_tree_bd_a136s -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::btrfs_truncate_recorded_full_sequence_succeeds_bd_wcbvk -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::btrfs_growth_model_requires_hole_zero_tail_and_spare_space_success_bd_wcbvk -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::btrfs_reflink_random_matches_reference_model -- --exact --nocapture

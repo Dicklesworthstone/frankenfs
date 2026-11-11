@@ -30,10 +30,7 @@ fn mkfs_btrfs_image(dir: &Path, size_mb: u64) -> Option<PathBuf> {
     f.set_len(size_mb * 1024 * 1024).expect("size image file");
     drop(f);
 
-    // Assembled rather than written literally: the dev sandbox command guard
-    // rejects the literal tool name (mirrors `open_writable_btrfs_mkfs`).
-    let fmt_tool = format!("mk{}.btrfs", "fs");
-    let out = std::process::Command::new(fmt_tool)
+    let out = std::process::Command::new("mkfs.btrfs")
         .args(["-f", "-q", image.to_str().unwrap()])
         .output();
     match out {

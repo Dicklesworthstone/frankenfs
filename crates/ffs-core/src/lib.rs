@@ -94007,8 +94007,7 @@ mod tests {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(size_mb * 1024 * 1024))
             .expect("create image");
-        // Tool name assembled: the dev sandbox's command guard rejects the literal.
-        let made = std::process::Command::new(format!("mk{}.btrfs", "fs"))
+        let made = std::process::Command::new("mkfs.btrfs")
             .args(["-q", "-f"])
             .arg(&image)
             .status()
@@ -94042,8 +94041,7 @@ mod tests {
                     .and_then(|f| f.set_len(256 << 20))
                     .expect("create image");
             }
-            // Tool name assembled: the dev sandbox's command guard rejects the literal.
-            let formatted = std::process::Command::new(format!("mk{}.btrfs", "fs"))
+            let formatted = std::process::Command::new("mkfs.btrfs")
                 .args(["-q", "-f", "-d", profile, "-m", profile])
                 .args(&images)
                 .status()
@@ -114548,6 +114546,23 @@ mod tests {
             return;
         };
         assert!(clean, "the full-DATA seed must be valid: {output}");
+        // Retain the already-checked input for the separate kernel acceptance
+        // gate. The caller owns its export directory; never replace a file.
+        if let Some(path) = std::env::var_os("FFS_BTRFS_GROWTH_SEED_EXPORT") {
+            let mut exported = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create fresh growth seed export");
+            std::io::Write::write_all(&mut exported, &original).unwrap();
+            exported.sync_all().unwrap();
+            eprintln!(
+                "CHUNK_AUTHORITY_SEED_EXPORT|path={}|bytes={}|blake3={}",
+                std::path::Path::new(&path).display(),
+                original.len(),
+                blake3::hash(&original)
+            );
+        }
         drop(seed);
         drop(device);
 
