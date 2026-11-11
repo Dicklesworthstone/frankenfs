@@ -8222,6 +8222,16 @@ impl BtrfsExtentAllocator {
         self.pinned.len()
     }
 
+    /// Exact pinned ranges and whether each survives the next successful commit.
+    ///
+    /// Diagnostic view only: ranges may overlap live extents already charged to
+    /// block-group accounting, so callers must use their union when measuring space.
+    pub fn pinned_extents(&self) -> impl Iterator<Item = (u64, u64, bool)> + '_ {
+        self.pinned
+            .iter()
+            .map(|(&start, pin)| (start, pin.num_bytes, pin.live_after_commit))
+    }
+
     /// Whether `bytenr` is currently held out of allocation. Test accessor.
     #[must_use]
     pub fn is_pinned(&self, bytenr: u64) -> bool {

@@ -137641,98 +137641,38 @@ mod tests {
 
     #[test]
     fn btrfs_truncate_recorded_full_sequence_succeeds_bd_wcbvk() {
-        let (fs, cx) = open_writable_btrfs();
-        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
-        let mut inos = Vec::new();
-        let mut model = vec![Vec::new(); 3];
-        for index in 0..3 {
-            inos.push(
-                fs.create(
-                    &cx,
-                    root,
-                    OsStr::new(&format!("rl{index}.bin")),
-                    0o644,
-                    0,
-                    0,
-                )
-                .unwrap()
-                .ino,
-            );
-        }
-        // Exact writes preceding the hosted shrunk failure, not a new random
-        // sample. Failed writes leave the byte model unchanged, as in the
-        // original property; every file is checked after every operation.
-        let writes = [
-            (0, 11_674, 37_479, 0),
-            (0, 61_112, 37_193, 0),
-            (0, 12_627, 20_142, 91),
-            (2, 109_901, 27_228, 148),
-            (2, 42_983, 25_463, 121),
-            (1, 185_206, 18_549, 226),
-            (2, 124_511, 33_316, 203),
-            (2, 109_989, 6_878, 247),
-            (0, 50_722, 36_429, 192),
-            (2, 164_069, 13_811, 60),
-            (2, 61_140, 39_196, 13),
-            (0, 39_498, 38_835, 176),
+        let mut model = BtrfsReflinkModel::new();
+        // Exact hosted sequence, including unused tuple fields, followed by a
+        // legal fourteenth operation. Both use the original property's runner.
+        let ops = [
+            (0, 0, 0, 11_674, 0, 37_479, 0),
+            (0, 0, 0, 61_112, 0, 37_193, 0),
+            (0, 0, 0, 12_627, 115_426, 20_142, 91),
+            (0, 2, 0, 109_901, 133_756, 27_228, 148),
+            (0, 2, 1, 42_983, 187_417, 25_463, 121),
+            (0, 1, 2, 185_206, 169_519, 18_549, 226),
+            (0, 2, 2, 124_511, 105_713, 33_316, 203),
+            (0, 2, 0, 109_989, 92_855, 6_878, 247),
+            (0, 0, 2, 50_722, 143_466, 36_429, 192),
+            (0, 2, 1, 164_069, 87_166, 13_811, 60),
+            (0, 2, 0, 61_140, 148_736, 39_196, 13),
+            (0, 0, 1, 39_498, 53_332, 38_835, 176),
+            (1, 0, 1, 47_198, 142_099, 3_412, 154),
         ];
-        let verify_files = |model: &[Vec<u8>]| {
-            for (&ino, expected) in inos.iter().zip(model) {
-                assert_eq!(fs.getattr(&cx, ino).unwrap().size, expected.len() as u64);
-                let got = fs
-                    .read(&cx, ino, 0, u32::try_from(expected.len()).unwrap())
-                    .unwrap();
-                assert_eq!(got.len(), expected.len());
-                assert!(
-                    got == *expected,
-                    "inode {ino:?} changed at byte {:?}; all files must match the operation model",
-                    got.iter().zip(expected).position(|(a, b)| a != b)
-                );
-            }
-        };
-        for (file, offset, len, byte) in writes {
-            let data = vec![byte; len];
-            match fs.write(&cx, inos[file], offset as u64, &data) {
-                Ok(written) => {
-                    assert_eq!(written as usize, len);
-                    let new_len = model[file].len().max(offset + len);
-                    model[file].resize(new_len, 0);
-                    model[file][offset..offset + len].copy_from_slice(&data);
-                }
-                Err(error) => assert_eq!(error.to_errno(), libc::ENOSPC),
-            }
-            {
-                let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
-                eprintln!(
-                    "RECORDED_EOF_WRITE|file={file}|offset={offset}|len={len}|data_free={}|data_allocatable={}|pinned={}|commit_out_of_space={}",
-                    alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA),
-                    alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
-                    alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
-                    fs.btrfs_commit_out_of_space.load(Ordering::Acquire)
-                );
-            }
-            verify_files(&model);
-        }
-        let free_before = fs
+        model.run(&ops[..12]).unwrap();
+        let free_before = model
+            .fs
             .btrfs_alloc_state
             .as_ref()
             .unwrap()
             .read()
             .extent_alloc
             .total_free(BTRFS_BLOCK_GROUP_DATA);
-        fs.setattr(
-            &cx,
-            inos[0],
-            &SetAttrRequest {
-                size: Some(47_198),
-                ..SetAttrRequest::default()
-            },
-        )
-        .expect("the recorded regular-extent shrink must not allocate DATA");
-        model[0].resize(47_198, 0);
-        verify_files(&model);
+        assert_eq!(model.run(&ops[12..]).unwrap(), 0, "shrink must succeed");
         assert!(
-            fs.btrfs_alloc_state
+            model
+                .fs
+                .btrfs_alloc_state
                 .as_ref()
                 .unwrap()
                 .read()
@@ -137740,77 +137680,77 @@ mod tests {
                 .total_free(BTRFS_BLOCK_GROUP_DATA)
                 >= free_before
         );
-
-        // The original property also permits a growth immediately after this
-        // shrink. Observe its real space requirement without weakening that
-        // property's expectation: an admitted growth must expose a zero byte;
-        // a full-DATA refusal must preserve the complete checkpointed state.
-        // Freed bytes pinned by the previous transaction are not allocatable
-        // until a superblock commit; total_free alone includes those bytes.
-        let snapshot = || {
-            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
-            let lo = BtrfsKey {
-                objectid: 0,
-                item_type: 0,
-                offset: 0,
-            };
-            let hi = BtrfsKey {
-                objectid: u64::MAX,
-                item_type: u8::MAX,
-                offset: u64::MAX,
-            };
-            (
-                alloc.fs_tree.range(&lo, &hi).unwrap(),
-                alloc.csum_tree.range(&lo, &hi).unwrap(),
-                alloc.extent_alloc.extent_tree().range(&lo, &hi).unwrap(),
-                alloc.extent_alloc.space_info(),
-                alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
-                alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA),
-            )
-        };
-        let before_growth = snapshot();
-        eprintln!(
-            "RECORDED_EOF_GROWTH_PREFLIGHT|data_free={}|data_pinned={}|data_allocatable={}|commit_out_of_space={}|spaces={:?}",
-            before_growth.5,
-            before_growth.4,
-            fs.btrfs_alloc_state
-                .as_ref()
-                .unwrap()
-                .read()
-                .extent_alloc
-                .allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
-            fs.btrfs_commit_out_of_space.load(Ordering::Acquire),
-            before_growth.3
+        assert!(model.permits_growth_enospc(0, 47_199));
+        assert_eq!(
+            model.run(&[(1, 0, 0, 47_199, 0, 1, 0)]).unwrap(),
+            1,
+            "exercise the exact refusal branch, not merely a random sample"
         );
-        match fs.setattr(
-            &cx,
-            inos[0],
-            &SetAttrRequest {
-                size: Some(47_199),
-                ..SetAttrRequest::default()
-            },
-        ) {
-            Ok(_) => {
-                model[0].resize(47_199, 0);
-                eprintln!(
-                    "RECORDED_EOF_GROWTH|outcome=success|free_before={}",
-                    before_growth.5
-                );
+    }
+
+    #[test]
+    fn btrfs_growth_model_requires_hole_zero_tail_and_spare_space_success_bd_wcbvk() {
+        const BS: usize = BtrfsReflinkModel::SECTOR;
+        for scenario in ["hole", "zero_tail", "spare_sector"] {
+            let mut model = BtrfsReflinkModel::new();
+            if scenario != "hole" {
+                model.run(&[(0, 0, 0, 0, 0, BS, 0x69)]).unwrap();
+                if scenario == "zero_tail" {
+                    model
+                        .fs
+                        .write(&model.cx, model.inos[0], (BS - 1) as u64, &[0])
+                        .unwrap();
+                    model.files[0][BS - 1] = 0;
+                }
             }
-            Err(error) => {
-                assert_eq!(error.to_errno(), libc::ENOSPC);
+            model.run(&[(1, 0, 0, BS - 1, 0, 1, 0)]).unwrap();
+            if scenario != "spare_sector" {
+                // Fill real DATA sectors using both other model files. Stop
+                // only on ENOSPC; no allocator/accounting mutation plants fullness.
+                let mut exhausted = false;
+                for file in [1, 2] {
+                    for _ in 0..64 {
+                        let off = model.files[file].len();
+                        match model
+                            .fs
+                            .write(&model.cx, model.inos[file], off as u64, &[0x7A; BS])
+                        {
+                            Ok(n) => {
+                                assert_eq!(n as usize, BS);
+                                model.files[file].extend_from_slice(&[0x7A; BS]);
+                            }
+                            Err(e) => {
+                                assert_eq!(e.to_errno(), libc::ENOSPC);
+                                exhausted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if exhausted {
+                        break;
+                    }
+                }
+                assert!(exhausted);
                 assert!(
-                    before_growth.5.saturating_sub(before_growth.4) < 4096,
-                    "an unpinned DATA sector must allow growth"
+                    model.no_usable_data_sector(),
+                    "{scenario} needs actual full DATA"
                 );
-                assert_eq!(snapshot(), before_growth, "refused growth must be atomic");
-                eprintln!(
-                    "RECORDED_EOF_GROWTH|outcome=ENOSPC|free_before={}",
-                    before_growth.5
-                );
+                assert!(!model.retained_tail_requires_cow(0, BS));
+            } else {
+                assert!(model.retained_tail_requires_cow(0, BS));
+                assert!(!model.no_usable_data_sector());
             }
+            assert!(
+                !model.permits_growth_enospc(0, BS),
+                "{scenario} must reject the exemption"
+            );
+            assert_eq!(
+                model.run(&[(1, 0, 0, BS, 0, 1, 0)]).unwrap(),
+                0,
+                "{scenario} must grow successfully and expose zeros"
+            );
+            model.verify_files(usize::MAX).unwrap();
         }
-        verify_files(&model);
     }
 
     #[test]
@@ -138003,6 +137943,464 @@ mod tests {
         }
     }
 
+    // Keep the original tiny fixture and strategy. A growth refusal needs raw
+    // retained-tail and physical-space evidence, not free-minus-pinned totals.
+    type BtrfsReflinkOp = (u8, usize, usize, usize, usize, usize, u8);
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct BtrfsReflinkCheckpoint {
+        trees: Vec<Vec<(BtrfsKey, Vec<u8>)>>,
+        spaces: Vec<(u64, u64, u64)>,
+        pins: Vec<(u64, u64, bool)>,
+        refs: Vec<(ffs_btrfs::ExtentKey, u64, Vec<ffs_btrfs::DelayedRef>)>,
+        generation: u64,
+        commit_refused: bool,
+        mvcc_snapshot: Snapshot,
+        physical_blocks: Vec<[u8; 32]>,
+        attrs: Vec<InodeAttr>,
+    }
+
+    struct BtrfsReflinkModel {
+        fs: OpenFs,
+        cx: Cx,
+        device: TestDevice,
+        inos: Vec<InodeNumber>,
+        files: Vec<Vec<u8>>,
+    }
+
+    impl BtrfsReflinkModel {
+        const SECTOR: usize = 4096;
+        const IMAGE: usize = 512 * 1024;
+        const RESERVED: usize = 128 * 1024;
+
+        fn new() -> Self {
+            let (fs, cx, device) = open_writable_btrfs_with_device();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let inos = (0..3)
+                .map(|i| {
+                    fs.create(&cx, root, OsStr::new(&format!("rl{i}.bin")), 0o644, 0, 0)
+                        .expect("create")
+                        .ino
+                })
+                .collect();
+            Self {
+                fs,
+                cx,
+                device,
+                inos,
+                files: vec![Vec::new(); 3],
+            }
+        }
+
+        fn tree_items(tree: &InMemoryCowBtrfsTree) -> Vec<(BtrfsKey, Vec<u8>)> {
+            tree.range(
+                &BtrfsKey {
+                    objectid: 0,
+                    item_type: 0,
+                    offset: 0,
+                },
+                &BtrfsKey {
+                    objectid: u64::MAX,
+                    item_type: u8::MAX,
+                    offset: u64::MAX,
+                },
+            )
+            .expect("complete model tree")
+        }
+
+        fn checkpoint(&self) -> (BtrfsReflinkCheckpoint, Vec<[u8; 32]>) {
+            let alloc = self.fs.btrfs_alloc_state.as_ref().unwrap().read();
+            // Include freed extents absent from the live tree by enumerating
+            // every valid aligned extent key in this fixed 512 KiB image.
+            let mut refs = Vec::new();
+            let mut pending = 0;
+            for start in (0..Self::IMAGE).step_by(Self::SECTOR) {
+                for len in (Self::SECTOR..=Self::IMAGE - start).step_by(Self::SECTOR) {
+                    let key = ffs_btrfs::ExtentKey {
+                        bytenr: start as u64,
+                        num_bytes: len as u64,
+                    };
+                    let count = alloc.extent_alloc.extent_refcount(key);
+                    let queued = alloc.extent_alloc.pending_for(&key);
+                    pending += queued.len();
+                    if count != 0 || !queued.is_empty() {
+                        refs.push((key, count, queued.to_vec()));
+                    }
+                }
+            }
+            assert_eq!(pending, alloc.extent_alloc.delayed_ref_count());
+            let mvcc_snapshot = self.fs.mvcc_store.current_snapshot();
+            let base = self.device.snapshot_bytes();
+            assert_eq!(base.len(), Self::IMAGE);
+            let (base_sectors, remainder) = base.as_chunks::<{ Self::SECTOR }>();
+            assert!(remainder.is_empty());
+            let base_hashes = base_sectors
+                .iter()
+                .map(|bytes| *blake3::hash(bytes).as_bytes())
+                .collect();
+            let checkpoint = BtrfsReflinkCheckpoint {
+                trees: [
+                    &alloc.root_tree,
+                    &alloc.fs_tree,
+                    &alloc.csum_tree,
+                    &alloc.chunk_tree,
+                    &alloc.dev_tree,
+                    alloc.extent_alloc.extent_tree(),
+                ]
+                .into_iter()
+                .map(Self::tree_items)
+                .collect(),
+                spaces: alloc.extent_alloc.space_info(),
+                pins: alloc.extent_alloc.pinned_extents().collect(),
+                refs,
+                generation: alloc.generation,
+                commit_refused: alloc.commit_refused,
+                mvcc_snapshot,
+                physical_blocks: (0..Self::IMAGE / Self::SECTOR)
+                    .map(|block| {
+                        let visible = self
+                            .fs
+                            .mvcc_store
+                            .read_visible(BlockNumber(block as u64), mvcc_snapshot);
+                        *blake3::hash(visible.as_deref().unwrap_or(&base_sectors[block][..]))
+                            .as_bytes()
+                    })
+                    .collect(),
+                attrs: Vec::new(),
+            };
+            drop(alloc);
+            (
+                BtrfsReflinkCheckpoint {
+                    attrs: self
+                        .inos
+                        .iter()
+                        .map(|&ino| self.fs.getattr(&self.cx, ino).unwrap())
+                        .collect(),
+                    ..checkpoint
+                },
+                base_hashes,
+            )
+        }
+
+        fn verify_refusal(
+            &self,
+            before: (BtrfsReflinkCheckpoint, Vec<[u8; 32]>),
+        ) -> proptest::test_runner::TestCaseResult {
+            let (after, base_after) = self.checkpoint();
+            let (before, base_before) = before;
+            // The unpin retry can drain PREVIOUSLY acknowledged MVCC data,
+            // even without publishing new metadata. That durability progress
+            // is legal: each base block must stay old or equal its pre-call
+            // visible value. No new publication or effective byte may change.
+            for block in 0..base_after.len() {
+                proptest::prop_assert!(
+                    base_after[block] == base_before[block]
+                        || base_after[block] == before.physical_blocks[block],
+                    "refused growth wrote new physical contents at block {}",
+                    block
+                );
+            }
+            proptest::prop_assert_eq!(after, before, "refused growth changed observable state");
+            Ok(())
+        }
+
+        fn retained_tail_requires_cow(&self, file: usize, new_size: usize) -> bool {
+            let old_size = self.files[file].len();
+            if new_size <= old_size || old_size.is_multiple_of(Self::SECTOR) {
+                return false;
+            }
+            let floor = old_size / Self::SECTOR * Self::SECTOR;
+            let canonical = self.fs.btrfs_canonical_inode(self.inos[file]).unwrap();
+            let alloc = self.fs.btrfs_alloc_state.as_ref().unwrap().read();
+            for (key, bytes) in Self::tree_items(&alloc.fs_tree) {
+                if key.objectid != canonical || key.item_type != BTRFS_ITEM_EXTENT_DATA {
+                    continue;
+                }
+                let BtrfsExtentData::Regular {
+                    compression: 0,
+                    extent_type: BTRFS_FILE_EXTENT_REG,
+                    disk_bytenr,
+                    disk_num_bytes,
+                    extent_offset,
+                    num_bytes,
+                    ..
+                } = parse_extent_data(&bytes).expect("model extent")
+                else {
+                    continue;
+                };
+                if disk_bytenr == 0
+                    || key.offset > floor as u64
+                    || key.offset + num_bytes < (floor + Self::SECTOR) as u64
+                {
+                    continue;
+                }
+                let offset = extent_offset + floor as u64 - key.offset;
+                assert!(offset + Self::SECTOR as u64 <= disk_num_bytes);
+                // Read the physical sector at the current MVCC head, separately
+                // from the production EOF-gap/file-range materializer. Ephemeral
+                // writes are overlay versions, not yet in the base TestDevice.
+                let physical = disk_bytenr + offset;
+                assert!(physical.is_multiple_of(Self::SECTOR as u64));
+                let sector = self
+                    .fs
+                    .block_device_adapter()
+                    .read_block(&self.cx, BlockNumber(physical / Self::SECTOR as u64))
+                    .expect("MVCC-visible physical EOF sector");
+                let sector = sector.as_slice();
+                assert_eq!(sector.len(), Self::SECTOR);
+                let start = old_size - floor;
+                let stop = new_size.min(floor + Self::SECTOR) - floor;
+                assert_eq!(&sector[..start], &self.files[file][floor..old_size]);
+                return sector[..start].iter().any(|&b| b != 0)
+                    && sector[start..stop].iter().any(|&b| b != 0);
+            }
+            false
+        }
+
+        fn no_usable_data_sector(&self) -> bool {
+            let alloc = self.fs.btrfs_alloc_state.as_ref().unwrap().read();
+            assert_eq!(self.device.len_bytes(), Self::IMAGE as u64);
+            assert_eq!(alloc.sectorsize as usize, Self::SECTOR);
+            assert_eq!(alloc.nodesize as usize, Self::SECTOR);
+            assert!(
+                !alloc.chunk_trees_authoritative,
+                "cannot waive growable images"
+            );
+            let FsFlavor::Btrfs(sb) = &self.fs.flavor else {
+                panic!("Btrfs fixture")
+            };
+            assert_eq!(
+                sb.chunk_root, 0,
+                "no on-disk chunk tree can grow this fixture"
+            );
+            let ctx = self.fs.btrfs_context().unwrap();
+            assert_eq!(ctx.chunks.len(), 1);
+            assert_eq!(ctx.chunks[0].key.offset, 0);
+            assert_eq!(ctx.chunks[0].length, Self::IMAGE as u64);
+            assert_eq!(ctx.chunks[0].chunk_type, BTRFS_BLOCK_GROUP_DATA);
+            assert_eq!(ctx.chunks[0].stripes.len(), 1);
+            assert_eq!(ctx.chunks[0].stripes[0].offset, 0);
+
+            let mut occupied = [false; Self::IMAGE / Self::SECTOR];
+            occupied[..Self::RESERVED / Self::SECTOR].fill(true);
+            let mut references = std::collections::BTreeMap::<ffs_btrfs::ExtentKey, u64>::new();
+            for (key, bytes) in Self::tree_items(&alloc.fs_tree) {
+                if key.item_type != BTRFS_ITEM_EXTENT_DATA {
+                    continue;
+                }
+                if let BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    disk_num_bytes,
+                    ..
+                } = parse_extent_data(&bytes).unwrap()
+                    && disk_bytenr >= Self::RESERVED as u64
+                {
+                    *references
+                        .entry(ffs_btrfs::ExtentKey {
+                            bytenr: disk_bytenr,
+                            num_bytes: disk_num_bytes,
+                        })
+                        .or_default() += 1;
+                }
+            }
+            let mut used = Self::RESERVED as u64;
+            for (key, bytes) in Self::tree_items(alloc.extent_alloc.extent_tree()) {
+                if key.item_type != ffs_btrfs::BTRFS_ITEM_EXTENT_ITEM {
+                    continue;
+                }
+                assert!(bytes.len() >= 24);
+                assert_eq!(
+                    u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+                    1,
+                    "DATA only"
+                );
+                let range = ffs_btrfs::ExtentKey {
+                    bytenr: key.objectid,
+                    num_bytes: key.offset,
+                };
+                assert_eq!(
+                    references.remove(&range),
+                    Some(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
+                    "every live allocation needs exactly its file-mapping refs"
+                );
+                let start = usize::try_from(key.objectid).unwrap();
+                let len = usize::try_from(key.offset).unwrap();
+                assert!(start >= Self::RESERVED && len != 0);
+                assert!(start.is_multiple_of(Self::SECTOR) && len.is_multiple_of(Self::SECTOR));
+                assert!(start + len <= Self::IMAGE);
+                let sectors = &mut occupied[start / Self::SECTOR..(start + len) / Self::SECTOR];
+                assert!(sectors.iter().all(|&b| !b), "live DATA extents overlap");
+                sectors.fill(true);
+                used += key.offset;
+            }
+            assert!(
+                references.is_empty(),
+                "file mappings need allocation records"
+            );
+            assert_eq!(
+                alloc.extent_alloc.space_info(),
+                vec![(BTRFS_BLOCK_GROUP_DATA, Self::IMAGE as u64, used)],
+                "accounting must match live allocations plus the reserved prefix"
+            );
+            // Pins can overlap live allocations or the reserved prefix. OR the
+            // sectors instead of subtracting pin lengths from free bytes.
+            for (start, len, _) in alloc.extent_alloc.pinned_extents() {
+                let (start, len) = (
+                    usize::try_from(start).unwrap(),
+                    usize::try_from(len).unwrap(),
+                );
+                assert!(len != 0 && start + len <= Self::IMAGE);
+                assert!(start.is_multiple_of(Self::SECTOR) && len.is_multiple_of(Self::SECTOR));
+                occupied[start / Self::SECTOR..(start + len) / Self::SECTOR].fill(true);
+            }
+            occupied.iter().all(|&b| b)
+        }
+
+        fn permits_growth_enospc(&self, file: usize, new_size: usize) -> bool {
+            self.retained_tail_requires_cow(file, new_size) && self.no_usable_data_sector()
+        }
+
+        fn verify_files(&self, step: usize) -> proptest::test_runner::TestCaseResult {
+            for (file, (&ino, expected)) in self.inos.iter().zip(&self.files).enumerate() {
+                let attr = self.fs.getattr(&self.cx, ino).expect("getattr");
+                proptest::prop_assert_eq!(
+                    attr.size,
+                    expected.len() as u64,
+                    "size f{} step {}",
+                    file,
+                    step
+                );
+                let got = self
+                    .fs
+                    .read(&self.cx, ino, 0, u32::try_from(expected.len()).unwrap())
+                    .expect("read");
+                proptest::prop_assert_eq!(
+                    got.len(),
+                    expected.len(),
+                    "read length f{} step {}",
+                    file,
+                    step
+                );
+                proptest::prop_assert!(
+                    got == *expected,
+                    "content f{} step {} first difference {:?}",
+                    file,
+                    step,
+                    got.iter().zip(expected).position(|(a, b)| a != b)
+                );
+            }
+            Ok(())
+        }
+
+        fn run(
+            &mut self,
+            ops: &[BtrfsReflinkOp],
+        ) -> Result<usize, proptest::test_runner::TestCaseError> {
+            const CAP: usize = 256 * 1024;
+            let align_down = |x: usize| x & !(Self::SECTOR - 1);
+            let mut refused_growths = 0;
+            for (step, &(kind, fa, fb, raw_a, raw_b, raw_len, val)) in ops.iter().enumerate() {
+                match kind {
+                    0 => {
+                        let off = raw_a.min(CAP - 1);
+                        let len = raw_len.min(CAP - off).max(1);
+                        let buf = vec![val; len];
+                        match self.fs.write(&self.cx, self.inos[fa], off as u64, &buf) {
+                            Ok(written) => {
+                                proptest::prop_assert_eq!(
+                                    written as usize,
+                                    len,
+                                    "partial write step {}",
+                                    step
+                                );
+                                let size = self.files[fa].len().max(off + len);
+                                self.files[fa].resize(size, 0);
+                                self.files[fa][off..off + len].copy_from_slice(&buf);
+                            }
+                            Err(e) if e.to_errno() == libc::ENOSPC => {}
+                            Err(e) => proptest::prop_assert!(false, "write step {}: {}", step, e),
+                        }
+                    }
+                    1 => {
+                        let size_new = raw_a % (CAP + 1);
+                        let can_refuse = self.permits_growth_enospc(fa, size_new);
+                        let before = can_refuse.then(|| self.checkpoint());
+                        let latch_before =
+                            self.fs.btrfs_commit_out_of_space.load(Ordering::Acquire);
+                        match self.fs.setattr(
+                            &self.cx,
+                            self.inos[fa],
+                            &SetAttrRequest {
+                                size: Some(size_new as u64),
+                                ..Default::default()
+                            },
+                        ) {
+                            Ok(_) => self.files[fa].resize(size_new, 0),
+                            Err(e) => {
+                                proptest::prop_assert!(
+                                    can_refuse && e.to_errno() == libc::ENOSPC,
+                                    "truncate step {}: {} (no independently proved full-DATA tail COW)",
+                                    step,
+                                    e
+                                );
+                                // Reclaim may fail and set the soft space latch,
+                                // or a no-dirty-node commit may clear it. These
+                                // retry bookkeeping changes are not file/data
+                                // publication; dedicated latch tests cover them.
+                                eprintln!(
+                                    "BTRFS_MODEL_REFUSED_GROWTH|step={step}|file={fa}|new_size={size_new}|latch_before={latch_before}|latch_after={}",
+                                    self.fs.btrfs_commit_out_of_space.load(Ordering::Acquire)
+                                );
+                                self.verify_refusal(before.unwrap())?;
+                                refused_growths += 1;
+                            }
+                        }
+                    }
+                    _ if fa != fb && self.files[fa].len() >= Self::SECTOR => {
+                        let src_size = self.files[fa].len();
+                        let src_off = align_down(raw_a % src_size);
+                        let maxlen = align_down(src_size - src_off);
+                        if maxlen >= Self::SECTOR {
+                            let len = Self::SECTOR * (1 + raw_len % (maxlen / Self::SECTOR));
+                            let dst_off = align_down(raw_b % CAP);
+                            if dst_off + len <= CAP {
+                                match self.fs.clone_file_range(
+                                    &self.cx,
+                                    &mut RequestScope::empty(),
+                                    self.inos[fb],
+                                    self.inos[fa],
+                                    src_off as u64,
+                                    len as u64,
+                                    dst_off as u64,
+                                ) {
+                                    Ok(()) => {
+                                        let size = self.files[fb].len().max(dst_off + len);
+                                        self.files[fb].resize(size, 0);
+                                        let chunk = self.files[fa][src_off..src_off + len].to_vec();
+                                        self.files[fb][dst_off..dst_off + len]
+                                            .copy_from_slice(&chunk);
+                                    }
+                                    Err(e)
+                                        if [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSPC]
+                                            .contains(&e.to_errno()) => {}
+                                    Err(e) => proptest::prop_assert!(
+                                        false,
+                                        "unexpected clone error step {}: {}",
+                                        step,
+                                        e
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.verify_files(step)?;
+            }
+            Ok(refused_growths)
+        }
+    }
+
     // Property-based metamorphic check of the btrfs REFLINK surface
     // (clone_file_range) interleaved with writes and truncates across three
     // files, against a byte-exact per-file model. Reflink shares EXTENT_DATA
@@ -138020,123 +138418,7 @@ mod tests {
                 1..40,
             ),
         ) {
-            let (fs, cx) = open_writable_btrfs();
-            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
-            let mut inos = Vec::new();
-            let mut model: Vec<Vec<u8>> = Vec::new();
-            for i in 0..3 {
-                let a = fs
-                    .create(&cx, root, OsStr::new(&format!("rl{i}.bin")), 0o644, 0, 0)
-                    .expect("create");
-                inos.push(a.ino);
-                model.push(Vec::new());
-            }
-            const BS: usize = 4096;
-            const CAP: usize = 256 * 1024;
-            let align_down = |x: usize| x & !(BS - 1);
-
-            for (step, (kind, fa, fb, raw_a, raw_b, raw_len, val)) in ops.into_iter().enumerate() {
-                match kind {
-                    0 => {
-                        // write file fa
-                        let off = raw_a.min(CAP - 1);
-                        let len = raw_len.min(CAP - off).max(1);
-                        let buf = vec![val; len];
-                        match fs.write(&cx, inos[fa], off as u64, &buf) {
-                            Ok(_) => {
-                                if off + len > model[fa].len() {
-                                    model[fa].resize(off + len, 0);
-                                }
-                                model[fa][off..off + len].copy_from_slice(&buf);
-                            }
-                            // The image is intentionally tiny (512 KiB), so three
-                            // files churning up to 256 KiB each can legitimately
-                            // exhaust it. ENOSPC is a valid filesystem response
-                            // (it now maps correctly, bd-70hzk), so skip the op in
-                            // lockstep without touching the model — the per-file
-                            // content assertions below still verify the file was
-                            // not left partially modified (bd-lf4fa).
-                            Err(ref e) if e.to_errno() == libc::ENOSPC => {}
-                            Err(e) => {
-                                proptest::prop_assert!(false, "write step {}: {}", step, e);
-                            }
-                        }
-                    }
-                    1 => {
-                        // truncate file fa (may drop shared extents -> refcount--)
-                        let size_new = raw_a % (CAP + 1);
-                        fs.setattr(
-                            &cx,
-                            inos[fa],
-                            &SetAttrRequest { size: Some(size_new as u64), ..Default::default() },
-                        )
-                        .expect("truncate");
-                        model[fa].resize(size_new, 0);
-                    }
-                    _ if fa != fb && model[fa].len() >= BS => {
-                        // clone_file_range src=fa -> dst=fb (block-aligned, within src).
-                        let src_size = model[fa].len();
-                        let src_off = align_down(raw_a % src_size);
-                        let maxlen = align_down(src_size - src_off);
-                        if maxlen >= BS {
-                            let len = BS * (1 + raw_len % (maxlen / BS));
-                            let dst_off = align_down(raw_b % CAP);
-                            if dst_off + len <= CAP {
-                                match fs.clone_file_range(
-                                    &cx,
-                                    &mut RequestScope::empty(),
-                                    inos[fb],
-                                    inos[fa],
-                                    src_off as u64,
-                                    len as u64,
-                                    dst_off as u64,
-                                ) {
-                                    Ok(()) => {
-                                        if dst_off + len > model[fb].len() {
-                                            model[fb].resize(dst_off + len, 0);
-                                        }
-                                        let chunk = model[fa][src_off..src_off + len].to_vec();
-                                        model[fb][dst_off..dst_off + len].copy_from_slice(&chunk);
-                                    }
-                                    Err(e)
-                                        if e.to_errno() == libc::EINVAL
-                                            || e.to_errno() == libc::EOPNOTSUPP
-                                            || e.to_errno() == libc::ENOSPC => {}
-                                    Err(e) => {
-                                        proptest::prop_assert!(
-                                            false,
-                                            "unexpected clone error step {}: {}",
-                                            step,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
-                // Every file's full content must match its model.
-                for (fi, ino) in inos.iter().enumerate() {
-                    let n = model[fi].len();
-                    let attr_now = fs.getattr(&cx, *ino).expect("getattr");
-                    proptest::prop_assert_eq!(attr_now.size, n as u64, "size mismatch f{} step {}", fi, step);
-                    if n == 0 {
-                        continue;
-                    }
-                    let got = fs.read(&cx, *ino, 0, u32::try_from(n).expect("fits u32")).expect("read");
-                    let ndiff = (0..n).filter(|&i| got[i] != model[fi][i]).count();
-                    proptest::prop_assert!(
-                        ndiff == 0,
-                        "f{} content diverged step {}: {} bytes differ (first at {})",
-                        fi,
-                        step,
-                        ndiff,
-                        (0..n).find(|&i| got[i] != model[fi][i]).unwrap_or(0)
-                    );
-                }
-            }
+            BtrfsReflinkModel::new().run(&ops)?;
         }
     }
 
