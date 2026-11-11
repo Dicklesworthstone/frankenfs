@@ -34,7 +34,7 @@ const FAT16_MAX_CLUSTERS: u64 = 65_518;
 const FAT32_MIN_CLUSTERS: u64 = 65_525;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum FormatKind {
+pub enum FormatKind {
     Fat16,
     Fat32,
 }
@@ -67,30 +67,30 @@ pub struct FormatArgs {
     /// New regular image file. Existing files, symlinks and devices are refused.
     /// Keep the destination parent's identity/path stable until format completes.
     #[arg(value_name = "NEW_IMAGE")]
-    image: PathBuf,
+    pub image: PathBuf,
     /// Native dialect; geometry must fit this dialect and the checker budget.
     #[arg(long, value_enum)]
-    kind: FormatKind,
+    pub kind: FormatKind,
     /// Exact logical image size in MiB (1048576 bytes); storage may be sparse.
     #[arg(long, value_name = "MIB")]
-    size_mib: u64,
+    pub size_mib: u64,
     /// Power of two from 1 to 128; defaults to the smallest admitted cluster.
     /// Clusters above 32 KiB have limited compatibility with native FAT tools.
     #[arg(long, value_name = "SECTORS")]
-    sectors_per_cluster: Option<u8>,
+    pub sectors_per_cluster: Option<u8>,
     /// 1..11 legal ASCII label bytes, uppercased; no leading or trailing space.
     #[arg(long)]
-    label: Option<String>,
+    pub label: Option<String>,
     /// 32-bit serial in decimal or 0x-prefixed hex; defaults to a time-derived ID.
     #[arg(long, value_name = "U32", value_parser = parse_serial)]
-    serial: Option<u32>,
+    pub serial: Option<u32>,
     /// Copy an immutable tree of regular files/directories into the new image.
     /// No symlinks/special files; destination must be outside the source tree.
     #[arg(long, value_name = "DIRECTORY")]
-    source_dir: Option<PathBuf>,
+    pub source_dir: Option<PathBuf>,
     /// Optional RaptorQ sidecar archive to create after formatting completes.
     #[arg(long)]
-    sidecar: Option<PathBuf>,
+    pub sidecar: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

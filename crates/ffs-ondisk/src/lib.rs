@@ -15,6 +15,7 @@ pub mod lznt1;
 pub mod lzx;
 pub mod ntfs;
 pub mod ntfs_security;
+pub mod partition;
 pub mod xpress;
 pub mod zfs;
 pub mod zfs_dmu;

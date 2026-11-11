@@ -1073,3 +1073,248 @@ fn native_producer_interchange_reads_and_refuses_mutation_through_public_facade(
         );
     }
 }
+
+#[test]
+fn partition_byte_device_rejects_out_of_bounds_reads_and_writes_before_inner_device_io() {
+    use ffs_ondisk::partition::PartitionScheme;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingDevice {
+        bytes: Vec<u8>,
+        io_calls: Arc<AtomicUsize>,
+    }
+
+    impl ByteDevice for CountingDevice {
+        fn len_bytes(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_exact_at(&self, _cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+            self.io_calls.fetch_add(1, Ordering::SeqCst);
+            let start = usize::try_from(offset.0).unwrap();
+            buf.copy_from_slice(&self.bytes[start..start + buf.len()]);
+            Ok(())
+        }
+
+        fn write_all_at(&self, _cx: &Cx, _offset: ByteOffset, _buf: &[u8]) -> Result<()> {
+            self.io_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn sync(&self, _cx: &Cx) -> Result<()> {
+            self.io_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let cx = Cx::for_testing();
+    let io_calls = Arc::new(AtomicUsize::new(0));
+    let mut backing = vec![0xEE_u8; 16 * 512];
+    backing[4 * 512..12 * 512].fill(0x42);
+    let inner: Arc<dyn ByteDevice> = Arc::new(CountingDevice {
+        bytes: backing,
+        io_calls: Arc::clone(&io_calls),
+    });
+
+    let entry = PartitionEntry {
+        index: 1,
+        scheme: PartitionScheme::Gpt,
+        start_lba: 4,
+        end_lba_inclusive: 11,
+        start_byte: 4 * 512,
+        byte_len: 8 * 512,
+        mbr_type: None,
+        mbr_bootable: false,
+        type_guid: None,
+        part_uuid: None,
+        label: Some("BOUNDED".to_owned()),
+        attributes: 0,
+    };
+
+    let rw_part =
+        PartitionByteDevice::new(Arc::clone(&inner), entry.clone(), VolumeAccess::ReadWrite)
+            .expect("construct RW partition window");
+    let partition_len = rw_part.len_bytes();
+    assert_eq!(partition_len, 4096);
+
+    // Out-of-bounds reads and writes at partition_len (including 1-byte, 0-byte,
+    // and straddling [partition_len - 4..partition_len + 4)) MUST fail before
+    // any inner ByteDevice call occurs!
+    let mut one_byte = [0_u8; 1];
+    let mut empty = [];
+    let mut eight = [0_u8; 8];
+    assert!(rw_part
+        .read_exact_at(&cx, ByteOffset(partition_len), &mut one_byte)
+        .is_err());
+    assert!(rw_part
+        .read_exact_at(&cx, ByteOffset(partition_len), &mut empty)
+        .is_err());
+    assert!(rw_part
+        .read_exact_at(&cx, ByteOffset(partition_len - 4), &mut eight)
+        .is_err());
+    assert!(rw_part
+        .write_all_at(&cx, ByteOffset(partition_len), &[0x99])
+        .is_err());
+    assert!(rw_part
+        .write_all_at(&cx, ByteOffset(partition_len), &[])
+        .is_err());
+    assert!(rw_part
+        .write_all_at(&cx, ByteOffset(partition_len - 4), &[0x99; 8])
+        .is_err());
+    assert_eq!(
+        io_calls.load(Ordering::SeqCst),
+        0,
+        "out-of-bounds requests must be rejected before touching inner ByteDevice"
+    );
+
+    // Valid in-bounds read at the last byte succeeds and touches inner once.
+    rw_part
+        .read_exact_at(&cx, ByteOffset(partition_len - 1), &mut one_byte)
+        .expect("last byte inside partition is readable");
+    assert_eq!(one_byte, [0x42]);
+    assert_eq!(io_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gpt_multi_filesystem_disk_opens_ext4_and_fat16_partitions_by_index_uuid_and_label() {
+    use ffs_ondisk::partition::{
+        PartUuid, PartitionParseOptions, PartitionSelector, SyntheticGptPartitionSpec,
+        write_gpt_partition_table,
+    };
+    use std::str::FromStr;
+
+    let cx = Cx::for_testing();
+    let dir = tempfile::tempdir().unwrap();
+    let fat16_path = fat_image(&cx, dir.path(), "fat16");
+    let fat16_bytes = fs::read(&fat16_path).unwrap();
+    let ext4_bytes = ext4_image();
+
+    let p1_lba = 64_u64;
+    let p1_sectors = (ext4_bytes.len() / 512) as u64;
+    let p2_lba = p1_lba + p1_sectors + 8;
+    let p2_sectors = (fat16_bytes.len() / 512) as u64;
+    let total_lbas = p2_lba + p2_sectors + 64;
+    let mut disk = vec![0_u8; (total_lbas as usize) * 512];
+
+    let linux_guid = PartUuid::from_str("0fc63daf-8483-4772-8e79-3d69d8477de4").unwrap();
+    let efi_data_guid = PartUuid::from_str("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7").unwrap();
+    let disk_guid = PartUuid::from_str("12345678-1111-2222-3333-444455556666").unwrap();
+    let p1_uuid = PartUuid::from_str("aaaaaaaa-0000-4000-8000-000000000001").unwrap();
+    let p2_uuid = PartUuid::from_str("aaaaaaaa-0000-4000-8000-000000000002").unwrap();
+
+    write_gpt_partition_table(
+        &mut disk,
+        disk_guid,
+        &[
+            SyntheticGptPartitionSpec {
+                type_guid: linux_guid,
+                part_uuid: p1_uuid,
+                start_lba: p1_lba,
+                end_lba_inclusive: p1_lba + p1_sectors - 1,
+                label: "ROOT_EXT4".to_owned(),
+                attributes: 0,
+            },
+            SyntheticGptPartitionSpec {
+                type_guid: efi_data_guid,
+                part_uuid: p2_uuid,
+                start_lba: p2_lba,
+                end_lba_inclusive: p2_lba + p2_sectors - 1,
+                label: "DATA_FAT16".to_owned(),
+                attributes: 0,
+            },
+        ],
+    )
+    .expect("write synthetic multi-format GPT table");
+
+    let p1_start = (p1_lba as usize) * 512;
+    disk[p1_start..p1_start + ext4_bytes.len()].copy_from_slice(&ext4_bytes);
+    let p2_start = (p2_lba as usize) * 512;
+    disk[p2_start..p2_start + fat16_bytes.len()].copy_from_slice(&fat16_bytes);
+
+    let disk_path = dir.path().join("multi.gpt.img");
+    fs::write(&disk_path, &disk).unwrap();
+
+    let table = discover_partitions(&cx, &disk_path, &PartitionParseOptions::default())
+        .expect("discover GPT partitions");
+    assert_eq!(table.partitions.len(), 2);
+
+    // 1. Open partition 1 (ext4) by PARTUUID.
+    let ext4_opened = open_read_only(
+        &cx,
+        &disk_path,
+        &ReadOnlyOpenOptions {
+            partition: Some(PartitionSelector::PartUuid(p1_uuid)),
+            ..ReadOnlyOpenOptions::default()
+        },
+    )
+    .expect("open ext4 GPT partition");
+    assert_eq!(ext4_opened.format, FsFormatKind::Ext4);
+    assert_eq!(
+        ext4_opened.partition.as_ref().map(|p| p.index),
+        Some(1)
+    );
+    let root = ext4_opened
+        .filesystem
+        .getattr(&cx, &mut RequestScope::empty(), InodeNumber(1))
+        .unwrap();
+    assert_eq!(root.kind, FileType::Directory);
+
+    // 2. Open partition 2 (FAT16) by GPT label and read `/hello.txt`.
+    let fat_opened = open_read_only(
+        &cx,
+        &disk_path,
+        &ReadOnlyOpenOptions {
+            partition: Some(PartitionSelector::from_str("label:DATA_FAT16").unwrap()),
+            uid: 1000,
+            gid: 1000,
+            ..ReadOnlyOpenOptions::default()
+        },
+    )
+    .expect("open fat16 GPT partition");
+    assert_eq!(fat_opened.format, FsFormatKind::Fat16);
+    let mut scope = RequestScope::empty();
+    let hello = fat_opened
+        .filesystem
+        .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("hello.txt"))
+        .unwrap();
+    assert_eq!(
+        fat_opened
+            .filesystem
+            .read(&cx, &mut scope, hello.ino, 0, 128)
+            .unwrap(),
+        b"native facade payload\0"
+    );
+    assert_eq!(fs::read(&disk_path).unwrap(), disk);
+
+    // 3. Corrupt primary GPT header -> fails closed unless allow_backup_gpt=true.
+    drop(ext4_opened);
+    drop(fat_opened);
+    let mut damaged = disk.clone();
+    damaged[512 + 24] ^= 0xFF;
+    let damaged_path = dir.path().join("damaged.gpt.img");
+    fs::write(&damaged_path, &damaged).unwrap();
+
+    assert!(open_read_only(
+        &cx,
+        &damaged_path,
+        &ReadOnlyOpenOptions {
+            partition: Some(PartitionSelector::Index(2)),
+            allow_backup_gpt: false,
+            ..ReadOnlyOpenOptions::default()
+        },
+    )
+    .is_err());
+
+    let recovered = open_read_only(
+        &cx,
+        &damaged_path,
+        &ReadOnlyOpenOptions {
+            partition: Some(PartitionSelector::Index(2)),
+            allow_backup_gpt: true,
+            ..ReadOnlyOpenOptions::default()
+        },
+    )
+    .expect("backup GPT fallback opens partition 2 when explicitly permitted");
+    assert_eq!(recovered.format, FsFormatKind::Fat16);
+    assert_eq!(fs::read(&damaged_path).unwrap(), damaged);
+}

@@ -17,6 +17,7 @@ clap = { workspace = true }
 crc32c = { workspace = true }
 ctrlc = { workspace = true }
 rayon = { workspace = true }
+ffs = { workspace = true }
 ffs-error = { workspace = true }
 ffs-block = { workspace = true }
 ffs-btrfs = { workspace = true }

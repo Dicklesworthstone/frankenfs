@@ -9,7 +9,11 @@ use ffs_core::{
 };
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::fat::FatOemCodePage;
+use ffs_ondisk::partition::{
+    PartitionEntry, PartitionParseError, PartitionParseOptions, PartitionSelector, PartitionTable,
+};
 use ffs_types::ByteOffset;
+use std::io::IoSliceMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -96,16 +100,246 @@ pub struct ZfsReadOptions {
 pub struct ReadOnlyOpenOptions {
     pub offset: u64,
     pub length: Option<u64>,
+    /// Optional MBR or GPT partition selector (`1`, `<partuuid>`, `label:<name>`).
+    /// Mutually exclusive with manual `offset` / `length`.
+    pub partition: Option<PartitionSelector>,
+    /// Permit falling back to the backup GPT header when the primary GPT is corrupt.
+    pub allow_backup_gpt: bool,
     /// Synthetic ownership for FAT/NTFS/ZFS, as in their existing mount adapters.
     pub uid: u32,
     pub gid: u32,
     pub backend: ReadOnlyBackend,
 }
 
+/// Zero-copy, range-clamped [`ByteDevice`] window bound to a validated MBR or GPT
+/// [`PartitionEntry`].
+///
+/// Any read, write, or discard whose start offset `>= entry.byte_len` or whose end
+/// offset `> entry.byte_len` is rejected before forwarding to the inner device.
+#[derive(Clone, Debug)]
+pub struct PartitionByteDevice {
+    volume: VolumeDevice,
+    entry: PartitionEntry,
+}
+
+impl PartitionByteDevice {
+    /// Construct a range-clamped partition window over `[entry.start_byte, entry.end_byte())`.
+    pub fn new(
+        inner: Arc<dyn ByteDevice>,
+        entry: PartitionEntry,
+        access: VolumeAccess,
+    ) -> Result<Self> {
+        if entry.byte_len == 0 {
+            return Err(FfsError::InvalidGeometry(
+                "partition byte_len must be non-zero".to_owned(),
+            ));
+        }
+        let volume = VolumeDevice::new(inner, ByteOffset(entry.start_byte), entry.byte_len, access)?;
+        Ok(Self { volume, entry })
+    }
+
+    /// Return the validated partition metadata for this slice.
+    #[must_use]
+    pub const fn entry(&self) -> &PartitionEntry {
+        &self.entry
+    }
+
+    /// Return the underlying [`VolumeAccess`] policy (`ReadOnly` or `ReadWrite`).
+    #[must_use]
+    pub fn access(&self) -> VolumeAccess {
+        self.volume.access()
+    }
+
+    fn check_bounds(&self, cx: &Cx, offset: ByteOffset, count: u64) -> Result<()> {
+        checkpoint(cx)?;
+        let end = offset.0.checked_add(count).ok_or_else(|| {
+            FfsError::InvalidGeometry("partition-relative request overflows u64".to_owned())
+        })?;
+        if offset.0 >= self.entry.byte_len || end > self.entry.byte_len {
+            return Err(FfsError::InvalidGeometry(format!(
+                "partition #{} I/O out of bounds: offset={} len={count} partition_len={}",
+                self.entry.index, offset.0, self.entry.byte_len
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl ByteDevice for PartitionByteDevice {
+    fn len_bytes(&self) -> u64 {
+        self.entry.byte_len
+    }
+
+    fn supports_vectored_reads(&self) -> bool {
+        self.volume.supports_vectored_reads()
+    }
+
+    fn preserves_read_exact_at_destination_on_error(&self) -> bool {
+        self.volume.preserves_read_exact_at_destination_on_error()
+    }
+
+    fn preserves_read_vectored_destinations_on_error(&self) -> bool {
+        self.volume.preserves_read_vectored_destinations_on_error()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        let count = u64::try_from(buf.len())
+            .map_err(|_| FfsError::InvalidGeometry("partition buffer overflows u64".to_owned()))?;
+        self.check_bounds(cx, offset, count)?;
+        self.volume.read_exact_at(cx, offset, buf)
+    }
+
+    fn read_exact_at_volatile(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        let count = u64::try_from(buf.len())
+            .map_err(|_| FfsError::InvalidGeometry("partition buffer overflows u64".to_owned()))?;
+        self.check_bounds(cx, offset, count)?;
+        self.volume.read_exact_at_volatile(cx, offset, buf)
+    }
+
+    fn read_vectored_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Result<()> {
+        let mut count = 0_u64;
+        for buf in bufs.iter() {
+            let len = u64::try_from(buf.len()).map_err(|_| {
+                FfsError::InvalidGeometry("partition vectored buffer overflows u64".to_owned())
+            })?;
+            count = count.checked_add(len).ok_or_else(|| {
+                FfsError::InvalidGeometry("partition vectored read overflows u64".to_owned())
+            })?;
+        }
+        self.check_bounds(cx, offset, count)?;
+        self.volume.read_vectored_exact_at(cx, offset, bufs)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        let count = u64::try_from(buf.len())
+            .map_err(|_| FfsError::InvalidGeometry("partition buffer overflows u64".to_owned()))?;
+        self.check_bounds(cx, offset, count)?;
+        self.volume.write_all_at(cx, offset, buf)
+    }
+
+    fn write_vectored_all_at(&self, cx: &Cx, offset: ByteOffset, bufs: &[&[u8]]) -> Result<()> {
+        let mut count = 0_u64;
+        for buf in bufs {
+            let len = u64::try_from(buf.len()).map_err(|_| {
+                FfsError::InvalidGeometry("partition vectored buffer overflows u64".to_owned())
+            })?;
+            count = count.checked_add(len).ok_or_else(|| {
+                FfsError::InvalidGeometry("partition vectored write overflows u64".to_owned())
+            })?;
+        }
+        self.check_bounds(cx, offset, count)?;
+        self.volume.write_vectored_all_at(cx, offset, bufs)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        self.volume.sync(cx)
+    }
+
+    fn supports_discard(&self) -> bool {
+        self.volume.supports_discard()
+    }
+
+    fn discard(&self, cx: &Cx, offset: ByteOffset, length: u64) -> Result<()> {
+        self.check_bounds(cx, offset, length)?;
+        self.volume.discard(cx, offset, length)
+    }
+}
+
+fn map_partition_error(err: PartitionParseError) -> FfsError {
+    match err {
+        PartitionParseError::Io(msg) => FfsError::Io(std::io::Error::other(msg)),
+        PartitionParseError::InvalidOptions(_)
+        | PartitionParseError::InvalidGeometry(_)
+        | PartitionParseError::OverlappingPartitions { .. }
+        | PartitionParseError::NestedPartitionTable { .. } => {
+            FfsError::InvalidGeometry(err.to_string())
+        }
+        PartitionParseError::PartitionNotFound(_) => FfsError::NotFound(err.to_string()),
+        PartitionParseError::PrimaryGptCorrupt { .. }
+        | PartitionParseError::BackupGptCorrupt { .. } => FfsError::Corruption {
+            block: 1,
+            detail: err.to_string(),
+        },
+        PartitionParseError::NotAPartitionTable(_) | PartitionParseError::AmbiguousLabel(_) => {
+            FfsError::Format(err.to_string())
+        }
+    }
+}
+
+/// Discover and validate the outer MBR or GPT partition table on a [`ByteDevice`].
+pub fn discover_partitions_on_device(
+    cx: &Cx,
+    device: &dyn ByteDevice,
+    options: &PartitionParseOptions,
+) -> Result<PartitionTable> {
+    checkpoint(cx)?;
+    PartitionTable::parse_with_reader(device.len_bytes(), options, |offset, buf| {
+        device
+            .read_exact_at(cx, ByteOffset(offset), buf)
+            .map_err(|err| err.to_string())
+    })
+    .map_err(map_partition_error)
+}
+
+/// Discover and validate the outer MBR or GPT partition table of a regular disk image file.
+pub fn discover_partitions(
+    cx: &Cx,
+    path: impl AsRef<Path>,
+    options: &PartitionParseOptions,
+) -> Result<PartitionTable> {
+    let device = open_image(cx, path.as_ref(), 0, None)?;
+    discover_partitions_on_device(cx, &device, options)
+}
+
+/// Validate the outer partition table, resolve `selector`, reject nested partition-table
+/// bombs inside the selected slice, and return a range-clamped [`PartitionByteDevice`].
+pub fn select_partition_device(
+    cx: &Cx,
+    inner: Arc<dyn ByteDevice>,
+    selector: &PartitionSelector,
+    options: &PartitionParseOptions,
+    access: VolumeAccess,
+) -> Result<(PartitionTable, PartitionByteDevice)> {
+    let table = discover_partitions_on_device(cx, inner.as_ref(), options)?;
+    let entry = table.select(selector).map_err(map_partition_error)?.clone();
+    let partition_dev = PartitionByteDevice::new(inner, entry.clone(), access)?;
+    PartitionTable::ensure_slice_not_nested_partition_table(
+        entry.index,
+        entry.byte_len,
+        table.logical_block_bytes,
+        |offset, buf| {
+            partition_dev
+                .read_exact_at(cx, ByteOffset(offset), buf)
+                .map_err(|err| err.to_string())
+        },
+    )
+    .map_err(map_partition_error)?;
+    Ok((table, partition_dev))
+}
+
+/// Open a regular disk image read-only and return the range-clamped [`PartitionByteDevice`]
+/// selected by `selector` (retaining the shared file lock on the underlying descriptor).
+pub fn open_partition_read_only(
+    cx: &Cx,
+    path: impl AsRef<Path>,
+    selector: &PartitionSelector,
+    options: &PartitionParseOptions,
+) -> Result<(PartitionTable, PartitionByteDevice)> {
+    let outer = open_image(cx, path.as_ref(), 0, None)?;
+    select_partition_device(cx, Arc::new(outer), selector, options, VolumeAccess::ReadOnly)
+}
+
 /// An admitted native reader, ready for direct VFS use or a read-only FUSE mount.
 /// The trait object exposes no format-specific write-enablement operation.
 pub struct ReadOnlyFs {
     pub format: FsFormatKind,
+    pub partition: Option<PartitionEntry>,
     pub filesystem: Box<dyn FsOps>,
     ntfs: Option<Arc<ffs_ntfs::NtfsFs>>,
 }
@@ -243,7 +477,37 @@ pub fn open_read_only(
 ) -> Result<ReadOnlyFs> {
     checkpoint(cx)?;
     validate_selection(&options.backend)?;
-    let device = open_image(cx, path.as_ref(), options.offset, options.length)?;
+    let (device, resolved_partition) = if let Some(selector) = &options.partition {
+        if options.offset != 0 || options.length.is_some() {
+            return Err(FfsError::InvalidGeometry(
+                "partition selector cannot be combined with manual byte offset/length".to_owned(),
+            ));
+        }
+        let parse_opts = PartitionParseOptions {
+            allow_backup_gpt_fallback: options.allow_backup_gpt,
+            ..PartitionParseOptions::default()
+        };
+        let (_table, part_dev) = open_partition_read_only(cx, path.as_ref(), selector, &parse_opts)?;
+        let entry = part_dev.entry().clone();
+        let vol = VolumeDevice::new(
+            Arc::new(part_dev),
+            ByteOffset(0),
+            entry.byte_len,
+            VolumeAccess::ReadOnly,
+        )?;
+        (vol, Some(entry))
+    } else {
+        (
+            open_image(cx, path.as_ref(), options.offset, options.length)?,
+            None,
+        )
+    };
+    let effective_offset = resolved_partition
+        .as_ref()
+        .map_or(options.offset, |entry| entry.start_byte);
+    let partition_id = resolved_partition
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), PartitionEntry::canonical_id);
     let detected = detect_all_filesystems_on_device(cx, &device).map_err(|error| match error {
         DetectionError::Io(error) => error,
         other => FfsError::Format(other.to_string()),
@@ -258,7 +522,8 @@ pub fn open_read_only(
         target: "ffs::native",
         operation = "open_read_only",
         %format,
-        offset = options.offset,
+        partition_id = %partition_id,
+        offset = effective_offset,
         length = device.len_bytes(),
         "opening bounded native read-only view"
     );
@@ -413,6 +678,7 @@ pub fn open_read_only(
     checkpoint(cx)?;
     Ok(ReadOnlyFs {
         format,
+        partition: resolved_partition,
         filesystem,
         ntfs,
     })
