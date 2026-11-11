@@ -641,10 +641,58 @@ metadata returns an error instead of certifying a prefix. Default limits are
 The command requires the original clean-flag image and refuses sidecars and
 volatile recovery overlays. Successful JSON reports the exact checked scope,
 native `$Secure` record sequence, key/block counts and charged bytes. It does
-not scan unindexed SDS records or padding, reconcile every file's security ID,
-validate cluster allocation or recovery state, evaluate access, project host
+not scan unindexed SDS records or padding or, without the option below,
+reconcile every file's security ID, validate cluster allocation or recovery
+state, evaluate access, project host
 ACLs, repair data or grant native write authority. Those remaining obligations
 stay open under `bd-h7cme`.
+
+### Allocated-file security references
+
+Add `--verify-file-references` to connect that complete store check to every
+allocated MFT record. The library entry point is
+`NtfsVolume::check_security_references(cx, SecurityCheckLimits, max_records)`.
+
+```bash
+ffs-ntfs check-security volume.img --offline-image --verify-file-references
+ffs-ntfs check-security disk.img --offline-image --offset 1048576 --length 67108864 \
+  --verify-file-references --max-records 1048576 --max-metadata-bytes 536870912
+```
+
+The scan uses `$MFT::$BITMAP`, initialized record bounds, sequence-validated
+FILE records and complete base/extension ATTRIBUTE_LIST catalogs. The bitmap
+must allocate record zero and `$Secure`; a catalog may not obtain security
+metadata from an extension marked free. Allocated extensions must belong to a
+validated base catalog. Every base file needs valid STANDARD_INFORMATION.
+Nonzero security IDs must occur in the exact verified `$SII`/`$SDH` store;
+a coexisting legacy descriptor cannot mask a dangling ID. Legacy 48-byte
+STANDARD_INFORMATION and zero IDs use an unnamed SECURITY_DESCRIPTOR when
+present. Absence leaves security coverage incomplete and unsupported; it is
+not classified as proven corruption or replaced with a fabricated descriptor.
+NTFS-3G describes such descriptor-less native files in
+[its security reader](https://github.com/tuxera/ntfs-3g/blob/2022.10.3/libntfs-3g/security.c),
+including cases that `chkdsk` leaves unchanged.
+Every present legacy descriptor is validated, including one coexisting with a
+valid nonzero shared ID. File DATA is not read, even for encrypted or reparse
+files; checking security metadata does not admit their contents.
+
+One metadata-work budget covers both the store and file passes, including
+repeated record/catalog reads and legacy values. The default record cap is
+1,048,576 logical slots; `--max-records` requires the explicit reference option
+and permits 1 through 16,777,216. The shared store is validated once regardless
+of how many files use its IDs. Unused indexed descriptors remain valid store
+entries and are not declared reclaimable.
+
+Failures in shared-store or bitmap authority fail the operation. Per-file
+metadata and I/O failures produce bounded diagnostics with `complete: false`;
+budgets cannot certify a scanned prefix. A known dangling ID yields an
+inconsistent result even after complete inspection.
+Cancellation propagates as cancellation. Unowned-extension absence remains
+unknown unless every allocated record and catalog was inspected. JSON includes
+the file/reference/legacy counts, defect witnesses, total charged bytes and
+limit reason. Inconsistent or incomplete JSON is followed by a nonzero exit.
+Successful store-only checking is unchanged. Neither mode evaluates access,
+repairs metadata, establishes Windows `chkdsk` parity or grants write authority.
 
 Parser regressions cover native hash/ID ordering, collisions, data/key overlap,
 torn sectors and truncated entries. Reader controls cover both resident and

@@ -8,7 +8,7 @@
 //! unexplained allocation or unreachable record into authority to free it.
 //! Their combined results are not a complete NTFS consistency checker.
 
-mod ownership;
+pub(super) mod ownership;
 pub use ownership::{RecordOwnershipLimits, RecordOwnershipReport};
 mod namespace;
 pub use namespace::{NamespaceLimits, NamespaceReport};
@@ -160,11 +160,16 @@ struct Claim {
     attribute: u16,
 }
 
-fn bit(bytes: &[u8], index: u64) -> bool {
+pub(super) fn bit(bytes: &[u8], index: u64) -> bool {
     bytes[index as usize / 8] & (1 << (index % 8)) != 0
 }
 
-fn read_bitmap(cx: &Cx, volume: &NtfsVolume, stream: &Stream, bits: u64) -> Result<Vec<u8>> {
+pub(super) fn read_bitmap(
+    cx: &Cx,
+    volume: &NtfsVolume,
+    stream: &Stream,
+    bits: u64,
+) -> Result<Vec<u8>> {
     let length = bits.div_ceil(8);
     if stream.size < length || stream.initialized != stream.size {
         return Err(corrupt(

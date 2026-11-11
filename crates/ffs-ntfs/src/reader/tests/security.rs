@@ -269,8 +269,7 @@ fn hash_root(entries: &[Vec<u8>], internal: bool) -> Vec<u8> {
 
 const HASH_LCN: usize = 1550;
 
-fn audit_image(external: bool) -> Image {
-    let mut image = security_image(external);
+fn audit_attributes(external: bool) -> Vec<Vec<u8>> {
     let mut attributes = secure_attributes(external, 3);
     let keys = if external {
         vec![hash_key(0x200, 592, Some(0)), terminal(Some(8))]
@@ -294,14 +293,360 @@ fn audit_image(external: bool) -> Image {
             false,
         ));
         attributes.push(resident(0xB0, 6, "$SDH", &[3]));
+    }
+    attributes
+}
+
+fn audit_image(external: bool) -> Image {
+    let mut image = security_image(external);
+    if external {
         for (number, vcn, id, offset) in [(0, 0, 0x100, 464), (1, 8, 0x300, 720)] {
             let block = index_block(vcn, &[hash_key(id, offset, None), terminal(None)], false);
             let at = BASE + HASH_LCN * 512 + number * 4096;
             image.bytes[at..at + 4096].copy_from_slice(&block);
         }
     }
-    image.put_record(9, &file_record(9, &attributes));
+    image.put_record(9, &file_record(9, &audit_attributes(external)));
     image
+}
+
+fn reference_bitmap(image: &mut Image, allocated: &[u64]) {
+    let mut bits = [0_u8; 4];
+    for &number in allocated {
+        bits[number as usize / 8] |= 1 << (number % 8);
+    }
+    let mft = file_record(
+        0,
+        &[
+            mapped(&[0x11, 16, 4, 0x11, 48, 36, 0], 64, 32768, 32768, 0),
+            resident(0x10, 1, "", &standard(0x100, 0)),
+            resident(0xB0, 2, "", &bits),
+        ],
+    );
+    image.put_record(0, &mft);
+    image.bytes[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&mft);
+}
+
+fn reference_image(external: bool) -> Image {
+    let mut image = audit_image(external);
+    reference_bitmap(&mut image, &[0, 3, 9, 24, 25]);
+    let mut info = [0; 12];
+    info[8..10].copy_from_slice(&[3, 1]);
+    image.put_record(
+        3,
+        &file_record(
+            3,
+            &[
+                resident(VOLUME_INFORMATION, 0, "", &info),
+                resident(0x10, 1, "", &standard(0, 0)[..48]),
+                resident(0x50, 2, "", &DESCRIPTOR),
+            ],
+        ),
+    );
+    let mut attrs = audit_attributes(external);
+    attrs.push(resident(0x10, 7, "", &standard(0x200, 0)));
+    image.put_record(9, &file_record(9, &attrs));
+    image.put_record(
+        25,
+        &file_record(
+            25,
+            &[
+                resident(0x10, 0, "", &standard(0, 0)),
+                resident(0x50, 1, "", &DESCRIPTOR),
+            ],
+        ),
+    );
+    image
+}
+
+#[test]
+fn security_references_validate_every_allocated_base_and_legacy_descriptor_without_payload_io() {
+    use super::super::security::SecurityCheckLimits;
+    let cx = Cx::for_testing();
+    for external in [false, true] {
+        let reads: Reads = Arc::default();
+        let volume = open_security(reference_image(external), Arc::clone(&reads), None).unwrap();
+        reads.lock().unwrap().clear();
+        let report = volume
+            .check_security_references(&cx, SecurityCheckLimits::default(), 32)
+            .unwrap();
+        assert!(report.is_consistent(), "{:?}", report.issues);
+        assert_eq!(
+            (report.logical_records, report.record_slots_examined),
+            (32, 32)
+        );
+        assert_eq!(report.base_records_examined, 5);
+        assert_eq!(report.shared_references_examined, 3);
+        assert_eq!(report.legacy_descriptors_checked, 2);
+        assert_eq!(report.missing_shared_references, 0);
+        assert_eq!(report.extensions_without_owner, Some(0));
+        assert_eq!(report.store.security_ids, 3);
+        let trace = reads.lock().unwrap();
+        assert!(
+            trace
+                .iter()
+                .all(|(at, _)| *at != (BASE + 1700 * 512) as u64)
+        );
+        // Each shared descriptor pair is checked once, irrespective of how many
+        // files refer to its ID. The unused third ID must still be validated.
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|(at, _)| *at == sds_physical(720) as u64)
+                .count(),
+            1
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|(at, _)| *at == sds_physical(COPY_DISTANCE + 720) as u64)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn security_references_find_a_dangling_final_id_even_with_a_valid_legacy_descriptor() {
+    use super::super::security::SecurityCheckLimits;
+    let cx = Cx::for_testing();
+    let mut image = reference_image(false);
+    reference_bitmap(&mut image, &[0, 3, 9, 24, 25, 31]);
+    image.put_record(
+        31,
+        &file_record(
+            31,
+            &[
+                resident(0x10, 0, "", &standard(0x400, 0)),
+                resident(0x50, 1, "", &DESCRIPTOR),
+            ],
+        ),
+    );
+    let volume = open_security(image, Arc::default(), None).unwrap();
+    assert_eq!(
+        volume
+            .check_security(&cx, SecurityCheckLimits::default())
+            .unwrap()
+            .security_ids,
+        3
+    );
+    let report = volume
+        .check_security_references(&cx, SecurityCheckLimits::default(), 32)
+        .unwrap();
+    assert!(report.complete);
+    assert!(!report.is_consistent());
+    assert_eq!(report.record_slots_examined, 32);
+    assert_eq!((report.errors, report.missing_shared_references), (1, 1));
+    assert_eq!(report.legacy_descriptors_checked, 3);
+    assert_eq!(report.issues[0].record, 31);
+    assert_eq!(report.issues[0].security_id, Some(0x400));
+    assert_eq!(report.issues[0].category, "missing_security_id");
+}
+
+fn reference_extension_image(legacy: bool) -> Image {
+    let mut image = reference_image(false);
+    reference_bitmap(&mut image, &[0, 3, 9, 24, 25, 27]);
+    let mut list = list_entry(0x10, if legacy { 24 } else { 27 }, 1, 0, "");
+    if legacy {
+        list.extend(list_entry(0x50, 27, 2, 0, ""));
+    }
+    list.extend(list_entry(DATA, 24, 0, 0, ""));
+    let mut attrs = vec![
+        resident(ATTRIBUTE_LIST, 3, "", &list),
+        resident(DATA, 0, "", b"no data read"),
+    ];
+    if legacy {
+        attrs.push(resident(0x10, 1, "", &standard(0, 0)));
+    }
+    image.put_record(24, &file_record(24, &attrs));
+    let attr = if legacy {
+        resident(0x50, 2, "", &DESCRIPTOR)
+    } else {
+        resident(0x10, 1, "", &standard(0x300, 0))
+    };
+    image.put_record(27, &extension(27, 24, &[attr]));
+    image
+}
+
+#[test]
+fn security_references_resolve_standard_and_legacy_metadata_in_owned_extensions() {
+    use super::super::security::SecurityCheckLimits;
+    for legacy in [false, true] {
+        let volume =
+            open_security(reference_extension_image(legacy), Arc::default(), None).unwrap();
+        let report = volume
+            .check_security_references(&Cx::for_testing(), SecurityCheckLimits::default(), 32)
+            .unwrap();
+        assert!(report.is_consistent(), "{:?}", report.issues);
+        assert_eq!(report.extension_records_examined, 1);
+        assert_eq!(report.base_records_examined, 5);
+        assert_eq!(report.extensions_without_owner, Some(0));
+        assert_eq!(
+            report.legacy_descriptors_checked,
+            if legacy { 3 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn security_references_refuse_free_or_stale_extensions_and_report_orphan_contexts() {
+    use super::super::security::SecurityCheckLimits;
+    for case in 0..3 {
+        let mut image = reference_extension_image(false);
+        match case {
+            0 => reference_bitmap(&mut image, &[0, 3, 9, 24, 25]),
+            1 => {
+                let offset = Image::record_offset(27);
+                image.bytes[offset + 16..offset + 18].copy_from_slice(&8_u16.to_le_bytes());
+            }
+            _ => image.put_record(
+                24,
+                &file_record(24, &[resident(0x10, 0, "", &standard(0x100, 0))]),
+            ),
+        }
+        let volume = open_security(image, Arc::default(), None).unwrap();
+        let report = volume
+            .check_security_references(&Cx::for_testing(), SecurityCheckLimits::default(), 32)
+            .unwrap();
+        assert!(!report.is_consistent(), "case {case}");
+        if case == 2 {
+            assert!(report.complete);
+            assert_eq!(report.extensions_without_owner, Some(1));
+            assert_eq!(report.issues[0].category, "extension_without_owner");
+            assert_eq!(report.issues[0].record, 27);
+        } else {
+            assert!(!report.complete);
+            assert_eq!(report.extensions_without_owner, None);
+            assert!(report.issues.iter().any(|issue| issue.record == 24));
+        }
+    }
+}
+
+#[test]
+fn security_references_validate_coexisting_legacy_and_report_missing_context_as_incomplete() {
+    use super::super::security::SecurityCheckLimits;
+    for case in 0..4 {
+        let mut image = reference_image(false);
+        let id = if case == 0 { 0x100 } else { 0 };
+        let value = standard(id, 0);
+        let standard = if case == 3 { &value[..48] } else { &value[..] };
+        let mut attrs = vec![resident(0x10, 0, "", standard)];
+        if case <= 1 {
+            let mut bad = DESCRIPTOR;
+            bad[0] = 2;
+            attrs.push(resident(0x50, 1, "", &bad));
+        }
+        image.put_record(25, &file_record(25, &attrs));
+        let volume = open_security(image, Arc::default(), None).unwrap();
+        let report = volume
+            .check_security_references(&Cx::for_testing(), SecurityCheckLimits::default(), 32)
+            .unwrap();
+        assert!(!report.is_consistent(), "case {case}");
+        assert!(!report.complete);
+        assert_eq!(report.extensions_without_owner, None);
+        assert_eq!(report.errors, u64::from(case <= 1));
+        assert_eq!(report.unsupported, u64::from(case > 1));
+        assert_eq!(report.issues[0].record, 25);
+        assert_eq!(
+            report.issues[0].category,
+            if case <= 1 {
+                "security_metadata"
+            } else {
+                "unsupported"
+            }
+        );
+    }
+}
+
+#[test]
+fn security_reference_budgets_cover_both_passes_and_never_certify_a_prefix() {
+    use super::super::security::SecurityCheckLimits;
+    let cx = Cx::for_testing();
+    let reads: Reads = Arc::default();
+    let volume = open_security(reference_image(false), Arc::clone(&reads), None).unwrap();
+    let complete = volume
+        .check_security_references(&cx, SecurityCheckLimits::default(), 32)
+        .unwrap();
+    assert!(complete.is_consistent());
+    for bytes in [complete.store.metadata_bytes, complete.metadata_bytes - 1] {
+        let report = volume
+            .check_security_references(
+                &cx,
+                SecurityCheckLimits {
+                    metadata_bytes: bytes,
+                    ..SecurityCheckLimits::default()
+                },
+                32,
+            )
+            .unwrap();
+        assert!(!report.complete);
+        assert!(!report.is_consistent());
+        assert_eq!(report.extensions_without_owner, None);
+        assert_eq!(report.limit_reached, Some("metadata work budget"));
+        assert!(report.metadata_bytes <= bytes);
+    }
+    assert!(
+        volume
+            .check_security_references(
+                &cx,
+                SecurityCheckLimits {
+                    metadata_bytes: complete.metadata_bytes,
+                    ..SecurityCheckLimits::default()
+                },
+                32
+            )
+            .unwrap()
+            .is_consistent()
+    );
+    let limited = volume
+        .check_security_references(&cx, SecurityCheckLimits::default(), 31)
+        .unwrap();
+    assert!(!limited.is_consistent());
+    assert_eq!(limited.record_slots_examined, 0);
+    assert_eq!(limited.limit_reached, Some("MFT record budget"));
+    for records in [0, 16_777_217] {
+        reads.lock().unwrap().clear();
+        assert!(matches!(
+            volume.check_security_references(&cx, SecurityCheckLimits::default(), records),
+            Err(FfsError::Format(_))
+        ));
+        assert!(reads.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn security_reference_bitmap_authority_and_final_record_failures_are_not_success() {
+    use super::super::security::SecurityCheckLimits;
+    let cx = Cx::for_testing();
+    for allocated in [&[0, 3, 24, 25][..], &[3, 9, 24, 25][..]] {
+        let mut image = reference_image(false);
+        reference_bitmap(&mut image, allocated);
+        let volume = open_security(image, Arc::default(), None).unwrap();
+        assert!(matches!(
+            volume.check_security_references(&cx, SecurityCheckLimits::default(), 32),
+            Err(FfsError::Corruption { .. })
+        ));
+    }
+    let mut image = reference_image(false);
+    image.bytes[Image::record_offset(25) + 510] ^= 1;
+    let volume = open_security(image, Arc::default(), None).unwrap();
+    let report = volume
+        .check_security_references(&cx, SecurityCheckLimits::default(), 32)
+        .unwrap();
+    assert!(!report.complete);
+    assert!(!report.is_consistent());
+    assert_eq!(report.extensions_without_owner, None);
+    assert_eq!(report.issues[0].record, 25);
+    let volume = open_security(
+        reference_image(false),
+        Arc::default(),
+        Some(Image::record_offset(25) as u64),
+    )
+    .unwrap();
+    assert!(matches!(
+        volume.check_security_references(&cx, SecurityCheckLimits::default(), 32),
+        Err(FfsError::Cancelled)
+    ));
 }
 
 #[test]

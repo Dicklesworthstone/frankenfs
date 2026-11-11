@@ -1,5 +1,20 @@
 # FEATURE_PARITY
 
+> **NTFS allocated-file security references (2026-11-11 UTC):**
+> `check-security --verify-file-references` connects the existing complete
+> `$SII`/`$SDH`/indexed `$SDS` check to allocated `$MFT` records and validated
+> base/extension catalogs. Nonzero STANDARD_INFORMATION IDs must resolve in
+> that checked store; every present legacy descriptor is validated. Missing
+> legacy coverage is reported as incomplete/unsupported rather than proven
+> corruption. One bounded work budget covers both passes, and incomplete
+> catalogs cannot certify extension ownership. The CLI exposes bounded counts,
+> witnesses and nonzero exits for inconsistent or incomplete results.
+> Seven library and two CLI regressions are authored; formatting and Git
+> whitespace checks pass. Local compilation is blocked by dependency rustc
+> SIGKILLs, so execution and native Windows comparison remain pending. This
+> advances `bd-h7cme` / NTFS-07 without closing native repair, formatting,
+> resize, security-policy or writer obligations or changing parity credit.
+
 > **ZFS survivor extraction across mirror vdevs (2026-11-11 UTC):**
 > `Pool::from_mirror_survivors` and the existing CLI missing-mirror option now
 > admit exported multi-mirror and mixed leaf/mirror pools with a survivor in

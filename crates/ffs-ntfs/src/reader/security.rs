@@ -1,10 +1,12 @@
 //! Exact native security metadata through validated file and $Secure catalogs.
 //! No SID mapping, access decision, descriptor repair or backing mutation.
 
+use super::allocation::ownership::{Work, catalog as allocated_catalog};
+use super::allocation::{RecordOwnershipLimits, bit, read_bitmap};
 use super::attributes::{AttributeSet, read_list, resolve_catalog};
 use super::{
     Cx, DATA, NtfsFileRecord, NtfsGeometry, NtfsReference, NtfsValue, NtfsVolume, Result, Storage,
-    Stream, checkpoint, corrupt, data_read_admission, parse, standard_flags, unsupported,
+    Stream, buffer, checkpoint, corrupt, data_read_admission, parse, standard_flags, unsupported,
 };
 use ffs_ondisk::ntfs_security::{
     MAX_SECURITY_DESCRIPTOR_BYTES, NtfsSecurityDescriptor, NtfsSecurityHeader,
@@ -66,20 +68,119 @@ pub struct SecurityCheckReport {
     pub metadata_bytes: u64,
 }
 
+/// One observed defect or coverage limit. Details contain native identities,
+/// never descriptor contents or a suggestion to replace security metadata.
+#[derive(Debug)]
+pub struct SecurityReferenceIssue {
+    pub record: u64,
+    pub category: &'static str,
+    pub security_id: Option<u32>,
+    pub detail: String,
+}
+
+/// Whole-store verification followed by a bounded scan of every allocated MFT
+/// record. A partial catalog, unreadable record or exhausted budget makes the
+/// reference result incomplete; the verified store alone cannot certify it.
+#[derive(Debug)]
+pub struct SecurityReferenceReport {
+    pub store: SecurityCheckReport,
+    pub logical_records: u64,
+    pub initialized_records: u64,
+    pub record_slots_examined: u64,
+    pub base_records_examined: u64,
+    pub extension_records_examined: u64,
+    pub shared_references_examined: u64,
+    pub missing_shared_references: u64,
+    pub legacy_descriptors_checked: u64,
+    /// None unless all allocated records and their catalogs were inspected.
+    /// Orphan extensions are defects, never authority to reclaim their bytes.
+    pub extensions_without_owner: Option<u64>,
+    /// Includes the complete store pass, repeated catalogs and legacy values.
+    pub metadata_bytes: u64,
+    pub complete: bool,
+    pub limit_reached: Option<&'static str>,
+    pub errors: u64,
+    pub unsupported: u64,
+    pub issues: Vec<SecurityReferenceIssue>,
+    pub omitted_issues: u64,
+}
+
+impl SecurityReferenceReport {
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.complete
+            && self.limit_reached.is_none()
+            && self.errors == 0
+            && self.unsupported == 0
+            && self.missing_shared_references == 0
+            && self.extensions_without_owner == Some(0)
+    }
+
+    fn stop(&mut self, reason: &'static str) {
+        self.complete = false;
+        self.limit_reached = Some(reason);
+    }
+
+    fn issue(
+        &mut self,
+        record: u64,
+        category: &'static str,
+        security_id: Option<u32>,
+        detail: &str,
+    ) {
+        if category == "unsupported" {
+            self.unsupported += 1;
+        } else {
+            self.errors += 1;
+        }
+        if self.issues.len() == 128 {
+            self.omitted_issues += 1;
+            return;
+        }
+        self.issues.push(SecurityReferenceIssue {
+            record,
+            category,
+            security_id,
+            detail: detail.chars().take(512).collect(),
+        });
+    }
+
+    fn failed_record(&mut self, number: u64, error: super::FfsError) -> Result<()> {
+        if matches!(error, super::FfsError::Cancelled) {
+            return Err(error);
+        }
+        self.complete = false;
+        let category = match &error {
+            super::FfsError::UnsupportedFeature(_) => "unsupported",
+            super::FfsError::Io(_) => "io",
+            _ => "security_metadata",
+        };
+        self.issue(number, category, None, &error.to_string());
+        Ok(())
+    }
+}
+
 struct SecurityBudget {
     limits: SecurityCheckLimits,
-    used: u64,
+    work: Work,
 }
 
 impl SecurityBudget {
-    fn charge(&mut self, bytes: u64) -> Result<()> {
-        if bytes > self.limits.metadata_bytes - self.used {
-            return Err(unsupported(
-                "security checking exceeds its metadata-work budget",
-            ));
+    fn new(limits: SecurityCheckLimits) -> Self {
+        Self {
+            limits,
+            work: Work {
+                used: 0,
+                limit: limits.metadata_bytes,
+                stopped: false,
+            },
         }
-        self.used += bytes;
-        Ok(())
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        self.work
+            .reserve(bytes)
+            .map_err(|_| unsupported("security checking exceeds its metadata-work budget"))
     }
 }
 
@@ -181,10 +282,7 @@ impl NtfsVolume {
         let attributes = catalog.all()?;
         data_read_admission(&secure, &attributes)?;
         let stream = self.security_sds(&catalog)?;
-        let mut budget = SecurityBudget {
-            limits: SecurityCheckLimits::default(),
-            used: 0,
-        };
+        let mut budget = SecurityBudget::new(SecurityCheckLimits::default());
         let mut found = None;
         self.security_index(
             cx,
@@ -225,8 +323,231 @@ impl NtfsVolume {
         cx: &Cx,
         limits: SecurityCheckLimits,
     ) -> Result<SecurityCheckReport> {
+        let mut budget = SecurityBudget::new(limits);
+        self.security_store(cx, &mut budget)
+            .map(|(report, _)| report)
+    }
+
+    /// Verify the complete shared security store and every allocated base file's
+    /// security identity, including metadata held in validated extension records.
+    /// Nonzero IDs must exist in that exact store. Zero/legacy identities use
+    /// a valid unnamed SECURITY_DESCRIPTOR; absence leaves coverage incomplete.
+    /// Coexisting legacy descriptors are checked too. The shared metadata budget
+    /// covers both passes.
+    ///
+    /// This does not infer permissions, reclaim unused IDs, replay a log or
+    /// mutate the backing. Store/bitmap authority errors fail the call; bounded
+    /// per-file failures return an explicitly incomplete, inconsistent report.
+    pub fn check_security_references(
+        &self,
+        cx: &Cx,
+        limits: SecurityCheckLimits,
+        max_records: u64,
+    ) -> Result<SecurityReferenceReport> {
         checkpoint(cx)?;
         limits.validate()?;
+        RecordOwnershipLimits {
+            records: max_records,
+            metadata_bytes: limits.metadata_bytes,
+        }
+        .validate()?;
+        let mut budget = SecurityBudget::new(limits);
+        let (store, headers) = self.security_store(cx, &mut budget)?;
+        let record_bytes = u64::from(self.geometry.record_bytes());
+        let records = self.mft.size / record_bytes;
+        let mut report = SecurityReferenceReport {
+            store,
+            logical_records: records,
+            initialized_records: self.record_count(),
+            record_slots_examined: 0,
+            base_records_examined: 0,
+            extension_records_examined: 0,
+            shared_references_examined: 0,
+            missing_shared_references: 0,
+            legacy_descriptors_checked: 0,
+            extensions_without_owner: None,
+            metadata_bytes: budget.work.used,
+            complete: true,
+            limit_reached: None,
+            errors: 0,
+            unsupported: 0,
+            issues: Vec::new(),
+            omitted_issues: 0,
+        };
+        if records > max_records {
+            report.stop("MFT record budget");
+            return Ok(report);
+        }
+        let allocated = (|| -> Result<Vec<u8>> {
+            budget.charge(record_bytes)?;
+            let mft = self.record(cx, 0, None)?;
+            let attrs = allocated_catalog(self, cx, &mft, &mut budget.work, None, records)?;
+            let bitmap = attrs.select(&self.geometry, 0xB0, &[])?;
+            budget.charge(records.div_ceil(8))?;
+            let bits = read_bitmap(cx, self, &bitmap, records)?;
+            if records <= 9 || !bit(&bits, 0) || !bit(&bits, 9) {
+                return Err(corrupt(
+                    0,
+                    "$MFT bitmap must allocate its own base record and $Secure",
+                ));
+            }
+            Ok(bits)
+        })();
+        let allocated = match allocated {
+            Ok(bits) => bits,
+            Err(_) if budget.work.stopped => {
+                report.stop("metadata work budget");
+                report.metadata_bytes = budget.work.used;
+                checkpoint(cx)?;
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut extensions = buffer(allocated.len())?;
+        let mut owned = buffer(allocated.len())?;
+        for number in 0..records {
+            checkpoint(cx)?;
+            report.record_slots_examined += 1;
+            if !bit(&allocated, number) {
+                continue;
+            }
+            let result = (|| -> Result<()> {
+                if number >= report.initialized_records {
+                    return Err(corrupt(0, "allocated FILE is beyond initialized MFT data"));
+                }
+                budget.charge(record_bytes)?;
+                let record = self.record(cx, number, None)?;
+                if record.base.record != 0 || record.base.sequence != 0 {
+                    report.extension_records_examined += 1;
+                    extensions[number as usize / 8] |= 1 << (number % 8);
+                    record.attributes().map_err(|error| parse(&error))?;
+                    return Ok(());
+                }
+                report.base_records_examined += 1;
+                let attrs = allocated_catalog(
+                    self,
+                    cx,
+                    &record,
+                    &mut budget.work,
+                    Some(&allocated),
+                    records,
+                )?;
+                for extension in attrs.extension_numbers() {
+                    checkpoint(cx)?;
+                    owned[extension as usize / 8] |= 1 << (extension % 8);
+                }
+                self.check_file_security(cx, number, &attrs, &headers, &mut budget, &mut report)
+            })();
+            match result {
+                Ok(()) => {}
+                Err(_) if budget.work.stopped => {
+                    report.stop("metadata work budget");
+                    break;
+                }
+                Err(error) => report.failed_record(number, error)?,
+            }
+        }
+        report.metadata_bytes = budget.work.used;
+        if report.complete {
+            let mut unowned = 0;
+            for number in 0..records {
+                checkpoint(cx)?;
+                if bit(&extensions, number) && !bit(&owned, number) {
+                    unowned += 1;
+                    report.issue(
+                        number,
+                        "extension_without_owner",
+                        None,
+                        "allocated extension belongs to no validated base catalog; its security context is unknown",
+                    );
+                }
+            }
+            report.extensions_without_owner = Some(unowned);
+        }
+        checkpoint(cx)?;
+        Ok(report)
+    }
+
+    fn check_file_security(
+        &self,
+        cx: &Cx,
+        number: u64,
+        catalog: &AttributeSet<'_>,
+        headers: &BTreeMap<u32, NtfsSecurityHeader>,
+        budget: &mut SecurityBudget,
+        report: &mut SecurityReferenceReport,
+    ) -> Result<()> {
+        let attributes = catalog.all()?;
+        if standard_flags(&attributes)?.is_none() {
+            return Err(corrupt(
+                0,
+                "allocated base FILE has no STANDARD_INFORMATION",
+            ));
+        }
+        let standard = catalog.select(&self.geometry, 0x10, &[])?;
+        budget.charge(standard.size)?;
+        let value = self.read(cx, &standard, 0, 72)?;
+        let id = if value.len() == 72 {
+            u32::from_le_bytes(
+                value[52..56]
+                    .try_into()
+                    .map_err(|_| corrupt(0, "short security ID"))?,
+            )
+        } else {
+            0
+        };
+        if id != 0 {
+            report.shared_references_examined += 1;
+            if !headers.contains_key(&id) {
+                report.missing_shared_references += 1;
+                report.issue(number, "missing_security_id", Some(id),
+                    "STANDARD_INFORMATION security ID is absent from the complete verified $Secure store; legacy metadata is not fallback authority");
+            }
+        }
+        let mut legacy = false;
+        for attr in &attributes {
+            checkpoint(cx)?;
+            if attr.kind == 0x50 {
+                if attr.flags != 0 || !attr.name.is_empty() {
+                    return Err(corrupt(
+                        0,
+                        "named or transformed SECURITY_DESCRIPTOR attribute",
+                    ));
+                }
+                legacy = true;
+            }
+        }
+        if legacy {
+            let stream = catalog.select(&self.geometry, 0x50, &[])?;
+            if !(20..=MAX_SECURITY_DESCRIPTOR_BYTES as u64).contains(&stream.size) {
+                return Err(unsupported(
+                    "legacy security descriptor exceeds the read profile",
+                ));
+            }
+            metadata_range(&self.geometry, &stream, 0, stream.size)?;
+            budget.charge(stream.size)?;
+            let bytes = self.read(cx, &stream, 0, stream.size as usize)?;
+            NtfsSecurityDescriptor::parse(&bytes).map_err(|error| parse(&error))?;
+            report.legacy_descriptors_checked += 1;
+        } else if id == 0 {
+            // Native readers encounter descriptor-less legacy/zero-ID files
+            // that chkdsk can leave unchanged. Do not invent a descriptor or
+            // classify that state as proven corruption; its security context
+            // is outside the coverage this checker can certify.
+            return Err(unsupported(
+                "legacy or zero-ID STANDARD_INFORMATION has no SECURITY_DESCRIPTOR; native security context cannot be certified",
+            ));
+        }
+        checkpoint(cx)
+    }
+
+    fn security_store(
+        &self,
+        cx: &Cx,
+        budget: &mut SecurityBudget,
+    ) -> Result<(SecurityCheckReport, BTreeMap<u32, NtfsSecurityHeader>)> {
+        checkpoint(cx)?;
+        budget.limits.validate()?;
         if self.volume_flags != 0
             || self.logfile_recovery.is_some()
             || !self.source.overlay.is_empty()
@@ -235,13 +556,12 @@ impl NtfsVolume {
                 "security checking requires original clean-flag bytes without a recovery overlay",
             ));
         }
-        let mut budget = SecurityBudget { limits, used: 0 };
         budget.charge(u64::from(self.geometry.record_bytes()))?;
         let secure = self.record(cx, 9, None)?;
         if secure.is_directory() {
             return Err(corrupt(0, "NTFS $Secure is a directory"));
         }
-        let catalog = security_catalog(self, cx, &secure, &mut budget)?;
+        let catalog = security_catalog(self, cx, &secure, budget)?;
         data_read_admission(&secure, &catalog.all()?)?;
         let stream = self.security_sds(&catalog)?;
         let mut headers = BTreeMap::new();
@@ -249,7 +569,7 @@ impl NtfsVolume {
             cx,
             &catalog,
             NtfsSecurityIndexKind::SecurityId,
-            &mut budget,
+            budget,
             |header| {
                 if headers.insert(header.security_id, header).is_some() {
                     return Err(corrupt(0, "duplicate $SII security ID"));
@@ -262,7 +582,7 @@ impl NtfsVolume {
             cx,
             &catalog,
             NtfsSecurityIndexKind::SecurityHash,
-            &mut budget,
+            budget,
             |header| {
                 if headers.get(&header.security_id) != Some(&header)
                     || !hashed.insert(header.security_id)
@@ -293,21 +613,24 @@ impl NtfsVolume {
         }
         let mut descriptor_bytes = 0;
         for header in ordered {
-            let (bytes, _) = self.security_pair(cx, &stream, header, &mut budget)?;
+            let (bytes, _) = self.security_pair(cx, &stream, header, budget)?;
             descriptor_bytes += bytes.len() as u64;
         }
         checkpoint(cx)?;
-        Ok(SecurityCheckReport {
-            secure_reference: NtfsReference {
-                record: 9,
-                sequence: secure.sequence,
+        Ok((
+            SecurityCheckReport {
+                secure_reference: NtfsReference {
+                    record: 9,
+                    sequence: secure.sequence,
+                },
+                security_ids,
+                hash_entries,
+                index_blocks: sii_blocks + sdh_blocks,
+                descriptor_bytes,
+                metadata_bytes: budget.work.used,
             },
-            security_ids,
-            hash_entries,
-            index_blocks: sii_blocks + sdh_blocks,
-            descriptor_bytes,
-            metadata_bytes: budget.used,
-        })
+            headers,
+        ))
     }
 
     fn security_sds(&self, catalog: &AttributeSet<'_>) -> Result<Stream> {

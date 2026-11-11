@@ -146,6 +146,12 @@ enum Command {
         /// Total metadata work cap, including both copies of every indexed descriptor.
         #[arg(long, default_value_t = 536_870_912, value_parser = clap::value_parser!(u64).range(1..=1_099_511_627_776))]
         max_metadata_bytes: u64,
+        /// Also validate every allocated file's security ID or legacy descriptor.
+        #[arg(long)]
+        verify_file_references: bool,
+        /// Maximum logical MFT slots for the reference pass (default: 1048576).
+        #[arg(long, requires = "verify_file_references", value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
+        max_records: Option<u64>,
     },
     /// Cross-check native allocation, with optional record and namespace validation.
     CheckAllocation {
@@ -465,6 +471,44 @@ fn security_check_json(
     })
 }
 
+fn security_reference_check_json(
+    report: &reader::security::SecurityReferenceReport,
+    offset: u64,
+) -> serde_json::Value {
+    let mut output = security_check_json(&report.store, offset);
+    output["scope"] = "sii_sdh_indexed_sds_and_allocated_file_security".into();
+    output["complete"] = report.complete.into();
+    output["consistent"] = report.is_consistent().into();
+    output["metadata_bytes"] = report.metadata_bytes.into();
+    output["file_references"] = serde_json::json!({
+        "logical_records": report.logical_records,
+        "initialized_records": report.initialized_records,
+        "record_slots_examined": report.record_slots_examined,
+        "base_records_examined": report.base_records_examined,
+        "extension_records_examined": report.extension_records_examined,
+        "shared_references_examined": report.shared_references_examined,
+        "missing_shared_references": report.missing_shared_references,
+        "legacy_descriptors_checked": report.legacy_descriptors_checked,
+        "extensions_without_owner": report.extensions_without_owner,
+        "limit_reached": report.limit_reached,
+        "errors": report.errors,
+        "unsupported": report.unsupported,
+        "omitted_issues": report.omitted_issues,
+        "issues": report.issues.iter().map(|issue| serde_json::json!({
+            "record": issue.record,
+            "category": issue.category,
+            "security_id": issue.security_id,
+            "detail": issue.detail,
+        })).collect::<Vec<_>>(),
+    });
+    output["not_checked"] = serde_json::json!([
+        "unindexed SDS records, gaps and padding",
+        "cluster allocation ownership, namespace, journal state and native recovery",
+        "access decisions, host ACL projection and writable admission"
+    ]);
+    output
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -477,13 +521,25 @@ fn main() -> Result<()> {
             image,
             max_entries,
             max_metadata_bytes,
+            verify_file_references,
+            max_records,
         } => {
             let limits = security_check_limits(&image, max_entries, max_metadata_bytes)?;
             let volume = image.open(&cx)?;
-            let report = volume
-                .check_security(&cx, limits)
-                .context("checking complete native NTFS security indexes and descriptor pairs")?;
-            json(&security_check_json(&report, image.offset))?;
+            if verify_file_references {
+                let report = volume
+                    .check_security_references(&cx, limits, max_records.unwrap_or(1_048_576))
+                    .context("checking native NTFS security store and allocated file references")?;
+                json(&security_reference_check_json(&report, image.offset))?;
+                if !report.is_consistent() {
+                    bail!("NTFS file security reference checking is inconsistent or incomplete");
+                }
+            } else {
+                let report = volume.check_security(&cx, limits).context(
+                    "checking complete native NTFS security indexes and descriptor pairs",
+                )?;
+                json(&security_check_json(&report, image.offset))?;
+            }
         }
         Command::CheckAllocation { options } => allocation_commands::run(&cx, &options)?,
         Command::Inspect { image } => {
@@ -780,11 +836,15 @@ mod tests {
             mut image,
             max_entries,
             max_metadata_bytes,
+            verify_file_references,
+            max_records,
         } = cli.command
         else {
             panic!("check-security");
         };
         let limits = security_check_limits(&image, max_entries, max_metadata_bytes).unwrap();
+        assert!(!verify_file_references);
+        assert_eq!(max_records, None);
         assert_eq!((limits.entries, limits.metadata_bytes), (3, 4096));
         assert_eq!((image.offset, image.length), (1024, Some(65536)));
         image.recover_logfile = true;
@@ -833,6 +893,114 @@ mod tests {
         );
         assert_eq!(json["backing_writes"], false);
         assert_eq!(json["not_checked"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn file_security_reference_check_is_explicit_and_record_bounded() {
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "check-security",
+                "image.img",
+                "--offline-image",
+                "--max-records",
+                "32",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "check-security",
+            "image.img",
+            "--offline-image",
+            "--verify-file-references",
+            "--max-records",
+            "32",
+        ])
+        .unwrap();
+        let Command::CheckSecurity {
+            verify_file_references,
+            max_records,
+            ..
+        } = cli.command
+        else {
+            panic!("check-security");
+        };
+        assert!(verify_file_references);
+        assert_eq!(max_records, Some(32));
+        for value in ["0", "16777217"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ffs-ntfs",
+                    "check-security",
+                    "image.img",
+                    "--offline-image",
+                    "--verify-file-references",
+                    "--max-records",
+                    value,
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn file_reference_report_never_promotes_a_verified_store_over_missing_or_partial_files() {
+        let mut report = reader::security::SecurityReferenceReport {
+            store: reader::security::SecurityCheckReport {
+                secure_reference: ffs_ondisk::ntfs::NtfsReference {
+                    record: 9,
+                    sequence: 7,
+                },
+                security_ids: 3,
+                hash_entries: 3,
+                index_blocks: 0,
+                descriptor_bytes: 288,
+                metadata_bytes: 2000,
+            },
+            logical_records: 32,
+            initialized_records: 32,
+            record_slots_examined: 32,
+            base_records_examined: 5,
+            extension_records_examined: 0,
+            shared_references_examined: 3,
+            missing_shared_references: 1,
+            legacy_descriptors_checked: 2,
+            extensions_without_owner: Some(0),
+            metadata_bytes: 9000,
+            complete: true,
+            limit_reached: None,
+            errors: 1,
+            unsupported: 0,
+            issues: vec![reader::security::SecurityReferenceIssue {
+                record: 31,
+                category: "missing_security_id",
+                security_id: Some(1024),
+                detail: "missing from complete native store".into(),
+            }],
+            omitted_issues: 0,
+        };
+        let json = security_reference_check_json(&report, 1024);
+        assert_eq!(json["consistent"], false);
+        assert_eq!(json["complete"], true);
+        assert_eq!(json["metadata_bytes"], 9000);
+        assert_eq!(json["file_references"]["issues"][0]["security_id"], 1024);
+        assert_eq!(json["backing_writes"], false);
+        assert_eq!(json["not_checked"].as_array().unwrap().len(), 3);
+        report.complete = false;
+        report.errors = 0;
+        report.missing_shared_references = 0;
+        report.extensions_without_owner = None;
+        report.limit_reached = Some("metadata work budget");
+        report.issues.clear();
+        let json = security_reference_check_json(&report, 1024);
+        assert_eq!(json["complete"], false);
+        assert_eq!(json["consistent"], false);
+        assert!(json["file_references"]["extensions_without_owner"].is_null());
+        assert_eq!(
+            json["file_references"]["limit_reached"],
+            "metadata work budget"
+        );
     }
 
     #[test]

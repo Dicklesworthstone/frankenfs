@@ -117,14 +117,14 @@ impl RecordOwnershipReport {
     }
 }
 
-pub(super) struct Work {
-    pub(super) used: u64,
-    pub(super) limit: u64,
-    pub(super) stopped: bool,
+pub(in crate::reader) struct Work {
+    pub(in crate::reader) used: u64,
+    pub(in crate::reader) limit: u64,
+    pub(in crate::reader) stopped: bool,
 }
 
 impl Work {
-    pub(super) fn reserve(&mut self, bytes: u64) -> Result<()> {
+    pub(in crate::reader) fn reserve(&mut self, bytes: u64) -> Result<()> {
         if bytes > self.limit - self.used {
             self.stopped = true;
             return Err(unsupported(
@@ -141,7 +141,7 @@ impl Work {
 /// During bitmap bootstrap, native sequence/bounds are checked but the bitmap
 /// cannot validate itself. Record zero is rechecked with bitmap authority in
 /// the scan; that bootstrap exception never certifies a free extension.
-pub(super) fn catalog<'a>(
+pub(in crate::reader) fn catalog<'a>(
     volume: &NtfsVolume,
     cx: &Cx,
     base: &'a NtfsFileRecord,
