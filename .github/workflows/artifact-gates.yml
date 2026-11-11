@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -14,6 +17,7 @@ env:
   COVERAGE_MIN_PCT: "60"
   COVERAGE_MAX_DROP_PCT: "5"
   P99_FAIL_THRESHOLD_PCT: "20"
+  P99_HETEROGENEOUS_RUNNER_FAIL_THRESHOLD_PCT: "200"
 
 jobs:
   # ── Binary Size Gate ─────────────────────────────────────────────
@@ -31,61 +35,87 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release --bin ffs-cli 2>&1
+      - name: Build release binaries
+        run: cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount
 
-      - name: Measure binary size
-        id: size
-        run: |
-          BIN="target/release/ffs-cli"
-          if [ ! -f "$BIN" ]; then
-            echo "::warning::ffs-cli binary not found, skipping size gate"
-            echo "current_bytes=0" >> "$GITHUB_OUTPUT"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CURRENT=$(stat -c%s "$BIN")
-          echo "current_bytes=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "Binary size: $CURRENT bytes ($(numfmt --to=iec $CURRENT))"
-
-      - name: Compare against baseline
-        if: steps.size.outputs.skip != 'true'
+      - name: Measure and compare release binary sizes against baseline
         run: |
           set -euo pipefail
           BASELINE_FILE="benchmarks/baselines/binary_size.txt"
-          CURRENT="${{ steps.size.outputs.current_bytes }}"
-          MAX_GROWTH="${{ env.BINARY_SIZE_MAX_GROWTH_PCT }}"
+          BASELINE_JSON="benchmarks/baselines/binary_sizes.json"
+          CLI_BIN="target/release/ffs-cli"
+          PROTECTED_BIN="target/release/ffs-protected-mount"
+          MAX_GROWTH="${BINARY_SIZE_MAX_GROWTH_PCT}"
 
-          if [ ! -f "$BASELINE_FILE" ]; then
-            echo "No baseline found — recording current size as baseline"
-            mkdir -p "$(dirname "$BASELINE_FILE")"
-            echo "$CURRENT" > "$BASELINE_FILE"
-            exit 0
-          fi
-
-          BASELINE=$(cat "$BASELINE_FILE")
-          if [ "$BASELINE" -eq 0 ] 2>/dev/null; then
-            echo "Baseline is 0, recording new baseline"
-            echo "$CURRENT" > "$BASELINE_FILE"
-            exit 0
-          fi
-
-          DELTA_PCT=$(( (CURRENT - BASELINE) * 100 / BASELINE ))
-          echo "Baseline: $BASELINE bytes, Current: $CURRENT bytes, Delta: ${DELTA_PCT}%"
-
-          if [ "$DELTA_PCT" -gt "$MAX_GROWTH" ]; then
-            echo "::error::Binary size grew ${DELTA_PCT}% (threshold: ${MAX_GROWTH}%). Add BINARY_SIZE_OVERRIDE=true to commit message to bypass."
-            # Allow override via commit message
-            if git log -1 --pretty=%B | grep -q "BINARY_SIZE_OVERRIDE=true"; then
-              echo "::warning::Override detected — updating baseline"
-              echo "$CURRENT" > "$BASELINE_FILE"
-            else
+          for required_bin in "$CLI_BIN" "$PROTECTED_BIN"; do
+            if [ ! -f "$required_bin" ]; then
+              echo "::error::Required release binary missing after build: $required_bin"
               exit 1
             fi
-          else
-            echo "Binary size within threshold (${DELTA_PCT}% <= ${MAX_GROWTH}%)"
+          done
+
+          for required_baseline in "$BASELINE_FILE" "$BASELINE_JSON"; do
+            if [ ! -s "$required_baseline" ]; then
+              echo "::error::Required binary-size baseline missing or empty: $required_baseline"
+              exit 1
+            fi
+          done
+
+          CURRENT_CLI="$(stat -c%s "$CLI_BIN")"
+          CURRENT_PROTECTED="$(stat -c%s "$PROTECTED_BIN")"
+          if [ "$CURRENT_CLI" -le 0 ] || [ "$CURRENT_PROTECTED" -le 0 ]; then
+            echo "::error::Measured release binary size is non-positive (ffs-cli=$CURRENT_CLI, ffs-protected-mount=$CURRENT_PROTECTED)"
+            exit 1
           fi
+
+          BASELINE_CLI_TXT="$(tr -d '[:space:]' < "$BASELINE_FILE")"
+          BASELINE_CLI_JSON="$(jq -er '.binaries["ffs-cli"].size_bytes' "$BASELINE_JSON")"
+          BASELINE_PROTECTED_JSON="$(jq -er '.binaries["ffs-protected-mount"].size_bytes' "$BASELINE_JSON")"
+
+          if [ "$BASELINE_CLI_TXT" -le 0 ] || [ "$BASELINE_PROTECTED_JSON" -le 0 ]; then
+            echo "::error::Baseline binary size must be positive (ffs-cli=$BASELINE_CLI_TXT, ffs-protected-mount=$BASELINE_PROTECTED_JSON)"
+            exit 1
+          fi
+          if [ "$BASELINE_CLI_TXT" -ne "$BASELINE_CLI_JSON" ]; then
+            echo "::error::binary_size.txt ($BASELINE_CLI_TXT) disagrees with binary_sizes.json ($BASELINE_CLI_JSON)"
+            exit 1
+          fi
+
+          mkdir -p artifacts/binary-size
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --argjson cli_baseline "$BASELINE_CLI_TXT" \
+            --argjson cli_current "$CURRENT_CLI" \
+            --argjson protected_baseline "$BASELINE_PROTECTED_JSON" \
+            --argjson protected_current "$CURRENT_PROTECTED" \
+            --argjson max_growth_pct "$MAX_GROWTH" \
+            '{
+              commit: $commit,
+              max_growth_pct: $max_growth_pct,
+              binaries: {
+                "ffs-cli": { baseline_bytes: $cli_baseline, current_bytes: $cli_current },
+                "ffs-protected-mount": { baseline_bytes: $protected_baseline, current_bytes: $protected_current }
+              }
+            }' > artifacts/binary-size/report.json
+
+          check_binary_growth() {
+            local name="$1"
+            local baseline="$2"
+            local current="$3"
+            local delta_pct=$(( (current - baseline) * 100 / baseline ))
+            echo "$name: baseline=$baseline bytes, current=$current bytes ($(numfmt --to=iec "$current")), delta=${delta_pct}%"
+            if [ "$delta_pct" -gt "$MAX_GROWTH" ]; then
+              if git log -1 --pretty=%B | grep -q "BINARY_SIZE_OVERRIDE=true"; then
+                echo "::warning::$name grew ${delta_pct}% (> ${MAX_GROWTH}%), permitted by BINARY_SIZE_OVERRIDE=true"
+              else
+                echo "::error::$name binary size grew ${delta_pct}% (threshold: ${MAX_GROWTH}%). Update baseline intentionally or add BINARY_SIZE_OVERRIDE=true to commit message."
+                return 1
+              fi
+            fi
+          }
+
+          check_binary_growth "ffs-cli" "$BASELINE_CLI_TXT" "$CURRENT_CLI"
+          check_binary_growth "ffs-protected-mount" "$BASELINE_PROTECTED_JSON" "$CURRENT_PROTECTED"
 
       - name: Upload size artifact
         if: always()
@@ -94,6 +124,8 @@ jobs:
           name: binary-size
           path: |
             benchmarks/baselines/binary_size.txt
+            benchmarks/baselines/binary_sizes.json
+            artifacts/binary-size/report.json
           if-no-files-found: warn
 
   # ── Benchmark Regression Gate ────────────────────────────────────
@@ -111,36 +143,56 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install benchmark tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y hyperfine jq
+
       - name: Run benchmark regression check
         run: |
           set -euo pipefail
-          BASELINE_JSON="artifacts/baselines/perf_baseline.json"
-          THRESHOLD="${{ env.P99_FAIL_THRESHOLD_PCT }}"
+          BASELINE_JSON="benchmarks/baselines/perf_baseline.json"
+          LATEST_JSON="benchmarks/baselines/latest.json"
+          THRESHOLDS_TOML="benchmarks/thresholds.toml"
 
-          if [ ! -f "$BASELINE_JSON" ]; then
-            echo "::warning::No performance baseline found — skipping regression gate"
-            echo "Run scripts/benchmark_record.sh to generate a baseline"
-            exit 0
-          fi
-
-          echo "Performance baseline found: $BASELINE_JSON"
-          echo "Fail threshold: ${THRESHOLD}%"
-
-          # Build harness for parity check (lightweight)
-          cargo build --release --bin ffs-harness 2>&1 || {
-            echo "::warning::ffs-harness build failed — skipping benchmark regression"
-            exit 0
-          }
-
-          # Run comparison if benchmark_record.sh supports it
-          if [ -x scripts/benchmark_record.sh ]; then
-            scripts/benchmark_record.sh --compare --p99-fail-threshold "$THRESHOLD" || {
-              echo "::error::Benchmark regression detected (p99 > ${THRESHOLD}% threshold)"
+          for required_file in "$BASELINE_JSON" "$LATEST_JSON" "$THRESHOLDS_TOML"; do
+            if [ ! -s "$required_file" ]; then
+              echo "::error::Required performance baseline file missing or empty: $required_file"
               exit 1
-            }
-          else
-            echo "::warning::benchmark_record.sh not executable — skipping regression check"
+            fi
+          done
+
+          jq -e '([.measurements[] | select(.status == "measured" and .p99_us > 0)] | length) >= 25' "$BASELINE_JSON" >/dev/null
+
+          if [ ! -x scripts/benchmark_record.sh ]; then
+            echo "::error::scripts/benchmark_record.sh missing or not executable"
+            exit 1
           fi
+
+          cargo test -p ffs-harness --lib perf_regression -- --nocapture
+          cargo test -p ffs-harness --lib perf_comparison -- --nocapture
+
+          cargo build --release -p ffs-cli --bin ffs-cli
+          cargo build --release -p ffs-harness --bin ffs-harness
+
+          HOST_CPU="$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo unknown)"
+          BASELINE_CPU="$(jq -r '.environment.cpu_model // "unknown"' "$BASELINE_JSON")"
+          if [ "$HOST_CPU" = "$BASELINE_CPU" ]; then
+            EFFECTIVE_THRESHOLD="${P99_FAIL_THRESHOLD_PCT}"
+          else
+            EFFECTIVE_THRESHOLD="${P99_HETEROGENEOUS_RUNNER_FAIL_THRESHOLD_PCT}"
+            echo "Heterogeneous CI runner CPU ('$HOST_CPU' vs baseline '$BASELINE_CPU'); using fail ceiling ${EFFECTIVE_THRESHOLD}%"
+          fi
+
+          FFS_USE_RCH=0 ./scripts/benchmark_record.sh \
+            --compare \
+            --skip-verify-golden \
+            --profile release \
+            --warmup 2 \
+            --runs 5 \
+            --op fixture_validation \
+            --p99-fail-threshold "$EFFECTIVE_THRESHOLD" \
+            --out-json artifacts/baselines/perf_baseline.json
 
       - name: Upload benchmark artifacts
         if: always()
@@ -148,6 +200,7 @@ jobs:
         with:
           name: benchmark-results
           path: |
+            benchmarks/baselines/perf_baseline.json
             artifacts/baselines/perf_baseline.json
             baselines/baseline-*.md
           if-no-files-found: warn
@@ -170,25 +223,25 @@ jobs:
       - name: Verify fixture checksums
         run: |
           set -euo pipefail
-          if [ -f conformance/fixtures/checksums.sha256 ]; then
-            cd conformance/fixtures && sha256sum -c checksums.sha256
-          else
-            echo "::warning::No fixture checksums found"
+          if [ ! -s conformance/fixtures/checksums.sha256 ]; then
+            echo "::error::conformance/fixtures/checksums.sha256 missing or empty"
+            exit 1
           fi
+          (cd conformance/fixtures && sha256sum -c checksums.sha256)
 
       - name: Verify golden checksums
         run: |
           set -euo pipefail
-          if [ -f conformance/golden/checksums.sha256 ]; then
-            cd conformance/golden && sha256sum -c checksums.sha256
-          else
-            echo "::warning::No golden checksums found"
+          if [ ! -s conformance/golden/checksums.sha256 ]; then
+            echo "::error::conformance/golden/checksums.sha256 missing or empty"
+            exit 1
           fi
+          (cd conformance/golden && sha256sum -c checksums.sha256)
 
       - name: Verify parity evidence consumer
         run: |
           set -euo pipefail
-          # Check the evidence consumer; this does not certify filesystem parity.
+          # Check the evidence consumer; whole-project parity runs in ci.yml with --strict-all-suites.
           cargo run -p ffs-harness -- parity --verify parity-honesty --local 2>&1
 
       - name: Upload golden artifacts

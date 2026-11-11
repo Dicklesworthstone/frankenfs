@@ -38,5 +38,9 @@ harness = false
 name = "extent_cache_touch_cost"
 harness = false
 
+[[bench]]
+name = "extent_cache_shard"
+harness = false
+
 [lints]
 workspace = true

@@ -9,12 +9,12 @@ set -euo pipefail
 # Note: We intentionally don't set IFS to avoid command parsing issues
 
 # Colors (if terminal supports them)
-if [[ -t 1 ]] && command -v tput &>/dev/null; then
-    RED=$(tput setaf 1)
-    GREEN=$(tput setaf 2)
-    YELLOW=$(tput setaf 3)
-    BLUE=$(tput setaf 4)
-    RESET=$(tput sgr0)
+if [[ -t 1 ]] && command -v tput &>/dev/null && [[ "${TERM:-dumb}" != "dumb" ]]; then
+    RED=$(tput setaf 1 2>/dev/null || true)
+    GREEN=$(tput setaf 2 2>/dev/null || true)
+    YELLOW=$(tput setaf 3 2>/dev/null || true)
+    BLUE=$(tput setaf 4 2>/dev/null || true)
+    RESET=$(tput sgr0 2>/dev/null || true)
 else
     RED="" GREEN="" YELLOW="" BLUE="" RESET=""
 fi

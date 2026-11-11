@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "profile": "release",
+  "opt_level": "z",
+  "lto": true,
+  "strip": true,
+  "recorded_at_commit": "2639f4508e95783a9b5bf67331b705c5a7e80518",
+  "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+  "max_growth_percent": 10,
+  "binaries": {
+    "ffs-cli": {
+      "package": "ffs-cli",
+      "size_bytes": 9595360
+    },
+    "ffs-protected-mount": {
+      "package": "ffs-cli",
+      "size_bytes": 8627768
+    }
+  }
+}

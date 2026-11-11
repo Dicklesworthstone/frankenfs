@@ -2,10 +2,73 @@
 # ffs_v12_program_gate_e2e.sh - V1.2 program acceptance rollup (bd-ckivp).
 #
 # Writes structured per-scenario JSONL plus a program gate manifest under
-# artifacts/release_gate/v12/. Cargo-bearing checks are always routed through
-# rch; this script never invokes cargo directly.
+# artifacts/release_gate/v12/. Cargo-bearing checks route through `rch` when
+# `FFS_GATE_EXECUTOR` resolves to `rch`, or through portable local `cargo`
+# execution on GitHub-hosted runners when `FFS_GATE_EXECUTOR=local`.
 
 set -euo pipefail
+
+GATE_EXECUTOR="${FFS_GATE_EXECUTOR:-auto}"
+SMOKE_MODE="${FFS_V12_PROGRAM_GATE_SMOKE:-0}"
+RCH_SELF_CHECK="${FFS_V12_PROGRAM_GATE_RCH_SELF_CHECK:-0}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --local)
+            GATE_EXECUTOR="local"
+            shift
+            ;;
+        --rch)
+            GATE_EXECUTOR="rch"
+            shift
+            ;;
+        --executor)
+            [[ $# -ge 2 ]] || { echo "missing value for --executor" >&2; exit 2; }
+            GATE_EXECUTOR="$2"
+            shift 2
+            ;;
+        --smoke)
+            SMOKE_MODE="1"
+            shift
+            ;;
+        --rch-self-check)
+            RCH_SELF_CHECK="1"
+            shift
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+case "$GATE_EXECUTOR" in
+    auto)
+        if command -v "${RCH_BIN:-rch}" >/dev/null 2>&1; then
+            RESOLVED_GATE_EXECUTOR="rch"
+        else
+            RESOLVED_GATE_EXECUTOR="local"
+        fi
+        ;;
+    rch)
+        if [[ "$RCH_SELF_CHECK" != "1" ]] && ! command -v "${RCH_BIN:-rch}" >/dev/null 2>&1; then
+            echo "FFS_GATE_EXECUTOR=rch requested, but rch is not installed in PATH" >&2
+            exit 2
+        fi
+        RESOLVED_GATE_EXECUTOR="rch"
+        ;;
+    local)
+        RESOLVED_GATE_EXECUTOR="local"
+        ;;
+    *)
+        echo "invalid FFS_GATE_EXECUTOR='${GATE_EXECUTOR}'; expected auto, rch, or local" >&2
+        exit 2
+        ;;
+esac
+export FFS_GATE_EXECUTOR="$RESOLVED_GATE_EXECUTOR"
+if [[ "$RESOLVED_GATE_EXECUTOR" == "local" ]]; then
+    export FFS_USE_RCH="${FFS_USE_RCH:-0}"
+fi
 
 cd "$(dirname "$0")/../.."
 REPO_ROOT="$(pwd)"
@@ -16,8 +79,12 @@ source "$REPO_ROOT/scripts/e2e/lib.sh"
 
 export RUST_LOG="${RUST_LOG:-info}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/projects/.cargo-target-frankenfs-v12-program-gate}"
-e2e_rch_add_env_allowlist CARGO_TARGET_DIR RUST_LOG RUST_BACKTRACE
+if [[ "$RESOLVED_GATE_EXECUTOR" == "rch" ]]; then
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/projects/.cargo-target-frankenfs-v12-program-gate}"
+    e2e_rch_add_env_allowlist CARGO_TARGET_DIR RUST_LOG RUST_BACKTRACE
+else
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${RUNNER_TEMP:-/tmp}/cargo-target-frankenfs-v12-program-gate}"
+fi
 RCH_COMMAND_TIMEOUT_SECS="${RCH_COMMAND_TIMEOUT_SECS:-900}"
 RCH_ARTIFACT_RETRIEVAL_GRACE_SECS="${RCH_ARTIFACT_RETRIEVAL_GRACE_SECS:-8}"
 
@@ -26,8 +93,6 @@ SCENARIO_DIR="$ARTIFACT_DIR/scenarios"
 MANIFEST_JSON="$ARTIFACT_DIR/program_gate_manifest.json"
 COMMAND_LOG="$ARTIFACT_DIR/command_transcript.tsv"
 DEFAULT_BUDGET_SECS="${FFS_V12_PROGRAM_GATE_SCENARIO_TIMEOUT_SECS:-300}"
-SMOKE_MODE="${FFS_V12_PROGRAM_GATE_SMOKE:-0}"
-RCH_SELF_CHECK="${FFS_V12_PROGRAM_GATE_RCH_SELF_CHECK:-0}"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -218,6 +283,11 @@ run_scenario_command() {
 }
 
 run_rch_scenario_command() {
+    if [[ "$RESOLVED_GATE_EXECUTOR" == "local" ]]; then
+        run_scenario_command "$@"
+        return
+    fi
+
     local number="$1"
     local name="$2"
     local child_gate_bead="$3"
@@ -460,8 +530,9 @@ PY
     package_version="$(sed -n 's/^version = \"\\(.*\\)\"/\\1/p' crates/ffs-harness/Cargo.toml | head -1)"
 
     python3 - "$MANIFEST_JSON" "$records_json" "$recommendation" "$reason" "$git_head" \
-        "$kernel" "$rustc" "$cargo_version" "$package_version" "$COMMAND_LOG" "$waiver_path" \
-        "$active_waiver_count" "$PASS_COUNT" "$FAIL_COUNT" "$TIMEOUT_COUNT" "$SKIP_COUNT" "$TOTAL" <<'PY'
+        "$kernel" "$rustc" "$cargo_version" "$package_version" "$RESOLVED_GATE_EXECUTOR" \
+        "$COMMAND_LOG" "$waiver_path" "$active_waiver_count" "$PASS_COUNT" "$FAIL_COUNT" \
+        "$TIMEOUT_COUNT" "$SKIP_COUNT" "$TOTAL" <<'PY'
 from __future__ import annotations
 
 import json
@@ -479,6 +550,7 @@ from datetime import datetime, timezone
     rustc,
     cargo_version,
     package_version,
+    executor_mode,
     command_log,
     waiver_path,
     active_waiver_count,
@@ -500,6 +572,7 @@ payload = {
         "rustc": rustc,
         "cargo": cargo_version,
         "ffs_harness_version": package_version,
+        "executor_mode": executor_mode,
     },
     "scenario_count": int(total),
     "pass_count": int(pass_count),

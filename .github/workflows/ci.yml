@@ -108,11 +108,40 @@ jobs:
       - name: Install ext4/btrfs oracle tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs btrfs-progs fuse3
+          sudo apt-get install -y \
+            e2fsprogs btrfs-progs fuse3 \
+            build-essential autoconf automake pkg-config \
+            uuid-dev libblkid-dev zlib1g-dev liblzo2-dev libzstd-dev libudev-dev
           # The unignored live TUI test uses fuser's auto-unmount helper.
           if ! grep -qxF user_allow_other /etc/fuse.conf; then
             printf '%s\n' user_allow_other | sudo tee -a /etc/fuse.conf
           fi
+
+      - name: Cache btrfs-progs v6.16 golden anchor
+        id: btrfs-progs-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/btrfs-progs-v6.16
+          key: btrfs-progs-v6.16-${{ runner.os }}-v1
+
+      - name: Build btrfs-progs v6.16 golden anchor
+        if: steps.btrfs-progs-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v6.16 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/kdave/btrfs-progs.git ~/btrfs-progs-v6.16
+          cd ~/btrfs-progs-v6.16
+          ./autogen.sh
+          ./configure --disable-documentation --disable-python --disable-udev --disable-zoned
+          make -j"$(nproc)" mkfs.btrfs btrfs
+
+      - name: Activate btrfs-progs v6.16 golden anchor
+        run: |
+          set -euo pipefail
+          test -x "$HOME/btrfs-progs-v6.16/mkfs.btrfs"
+          test -x "$HOME/btrfs-progs-v6.16/btrfs"
+          echo "$HOME/btrfs-progs-v6.16" >> "$GITHUB_PATH"
+          "$HOME/btrfs-progs-v6.16/btrfs" --version | grep -F "v6.16"
 
       # The mounted comparator's scratch-root guard only accepts paths under
       # /data/tmp (the offload hosts' scratch volume), and its unit tests
@@ -149,31 +178,16 @@ jobs:
           FFS_REQUIRE_ORACLES: "1"
         run: cargo test --workspace --no-fail-fast -- --nocapture
 
-      # The ext4 reference and kernel-differential suites compare against
-      # mkfs.ext4/debugfs output. Without e2fsprogs those tests report a skip
-      # marker, which the evidence model classifies as Skipped rather than
-      # Passed, so the step fails closed instead of passing vacuously.
-      # btrfs-reference is deliberately not selected here: it additionally pins
-      # btrfs-progs to the golden's anchor version.
+      # The ext4/btrfs reference and kernel-differential suites compare against
+      # mkfs.ext4/debugfs and pinned btrfs-progs v6.16 output. `--strict-all-suites`
+      # executes all 17 PARITY_SUITES and all 7 canonical §22 gates, failing
+      # closed if any suite, capability contract, or canonical gate is omitted,
+      # skipped, or unverified (`readiness_verified` must be true).
       - name: Executed parity contracts
+        env:
+          FFS_REQUIRE_ORACLES: "1"
         run: |
-          cargo run -p ffs-harness -- parity \
-            --verify ext4-journal \
-            --verify ext4-reference \
-            --verify ext4-kernel-differential \
-            --verify mvcc-lib \
-            --verify repair-lib \
-            --verify journal-lib \
-            --verify ondisk-lib \
-            --verify fuse-lib \
-            --verify cli-e2e \
-            --verify cli-bins \
-            --verify core-lib \
-            --verify btrfs-lib \
-            --verify conformance \
-            --verify profile-artifacts \
-            --verify parity-honesty \
-            --local
+          cargo run -p ffs-harness -- parity --strict-all-suites --local
 
       # §22.1 names seven gate commands. This executes them and fails the job when
       # a gate that HAS tests does not pass. A filter that selects zero tests is
@@ -357,11 +371,18 @@ jobs:
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           test -w "$CARGO_TARGET_DIR"
-          cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount --bin ffs-fat
+          cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount --bin ffs-fat --bin ffs-ntfs --bin ffs-zfs
           cargo build --release -p ffs-repair --bin ffs-image-repair
           cargo test -p ffs-harness --no-run
           mkdir -p "$RUNNER_TEMP/ffs-cli-proof/bin" "$RUNNER_TEMP/ffs-cli-proof/artifacts"
-          cp target/release/ffs-cli target/release/ffs-protected-mount target/release/ffs-fat target/release/ffs-image-repair "$RUNNER_TEMP/ffs-cli-proof/bin/"
+          cp \
+            target/release/ffs-cli \
+            target/release/ffs-protected-mount \
+            target/release/ffs-fat \
+            target/release/ffs-ntfs \
+            target/release/ffs-zfs \
+            target/release/ffs-image-repair \
+            "$RUNNER_TEMP/ffs-cli-proof/bin/"
           printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/ffs-cli-proof/source-revision.txt"
           rustc --version --verbose > "$RUNNER_TEMP/ffs-cli-proof/toolchain.txt"
           (cd "$RUNNER_TEMP/ffs-cli-proof" && sha256sum bin/*) > "$RUNNER_TEMP/ffs-cli-proof/sha256sums.txt"
@@ -369,6 +390,8 @@ jobs:
             echo "FFS_CLI_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-cli"
             echo "FFS_PROTECTED_MOUNT_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-protected-mount"
             echo "FFS_FAT_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-fat"
+            echo "FFS_NTFS_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-ntfs"
+            echo "FFS_ZFS_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-zfs"
             echo "FFS_IMAGE_REPAIR_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-image-repair"
             echo "FFS_CLI_SOURCE_STAMP=$GITHUB_SHA"
             echo "FFS_CLI_ARTIFACT_DIR=$RUNNER_TEMP/ffs-cli-proof/artifacts"

@@ -1746,57 +1746,81 @@ write_perf_baseline_json
 COMPARE_STATUS=0
 COMPARE_SUMMARY=""
 if [ "$COMPARE" -eq 1 ]; then
-    if [ -d "baselines/hyperfine" ]; then
-        previous_tag="$(find baselines/hyperfine -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | grep -v "^${DATE_TAG}\$" | tail -n1 || true)"
-    else
-        previous_tag=""
-    fi
+    compared_count=0
+    fallback_baseline_json=""
+    for candidate_baseline_json in "benchmarks/baselines/perf_baseline.json" "$BENCHMARK_BASELINE_LATEST_PATH"; do
+        if [ -s "$candidate_baseline_json" ]; then
+            fallback_baseline_json="$candidate_baseline_json"
+            break
+        fi
+    done
 
-    if [ -n "$previous_tag" ]; then
-        previous_dir="baselines/hyperfine/${previous_tag}"
-        COMPARE_SUMMARY+="## Regression Check (vs ${previous_tag})"$'\n\n'
-        COMPARE_SUMMARY+="Threshold defaults: warn if p99 regresses >${P99_WARN_THRESHOLD}%; fail if >${P99_FAIL_THRESHOLD}%."$'\n\n'
-        COMPARE_SUMMARY+="| Command | Baseline p99 (ms) | Current p99 (ms) | Delta % | Warn % | Fail % | Status |"$'\n'
-        COMPARE_SUMMARY+="|---|---:|---:|---:|---:|---:|---|"$'\n'
+    COMPARE_SUMMARY+="## Regression Check"$'\n\n'
+    COMPARE_SUMMARY+="Threshold defaults: warn if p99 regresses >${P99_WARN_THRESHOLD}%; fail if >${P99_FAIL_THRESHOLD}%."$'\n\n'
+    COMPARE_SUMMARY+="| Command | Source | Baseline p99 (ms) | Current p99 (ms) | Delta % | Warn % | Fail % | Status |"$'\n'
+    COMPARE_SUMMARY+="|---|---|---:|---:|---:|---:|---:|---|"$'\n'
 
-        for i in "${!BENCH_LABELS[@]}"; do
-            cur_json="${OUT_DIR}/${BENCH_FILES[$i]}"
-            prev_json="${previous_dir}/${BENCH_FILES[$i]}"
-            op="${BENCH_OPERATIONS[$i]}"
-            warn_threshold="${OP_WARN_THRESHOLDS[$op]:-$P99_WARN_THRESHOLD}"
-            fail_threshold="${OP_FAIL_THRESHOLDS[$op]:-$P99_FAIL_THRESHOLD}"
-            if [ ! -f "$prev_json" ]; then
-                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | ${warn_threshold} | ${fail_threshold} | SKIP (no prior file) |"$'\n'
-                continue
+    for i in "${!BENCH_LABELS[@]}"; do
+        cur_json="${OUT_DIR}/${BENCH_FILES[$i]}"
+        op="${BENCH_OPERATIONS[$i]}"
+        warn_threshold="${OP_WARN_THRESHOLDS[$op]:-$P99_WARN_THRESHOLD}"
+        fail_threshold="${OP_FAIL_THRESHOLDS[$op]:-$P99_FAIL_THRESHOLD}"
+        prev_p99_s=""
+        prev_source=""
+
+        if [ -d "baselines/hyperfine" ]; then
+            while IFS= read -r candidate_tag; do
+                [ -n "$candidate_tag" ] || continue
+                candidate_file="baselines/hyperfine/${candidate_tag}/${BENCH_FILES[$i]}"
+                if [ -f "$candidate_file" ]; then
+                    prev_p99_s="$(json_p99 "$candidate_file" 2>/dev/null || true)"
+                    prev_source="hyperfine/${candidate_tag}"
+                    break
+                fi
+            done < <(find baselines/hyperfine -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r | grep -v "^${DATE_TAG}\$" || true)
+        fi
+
+        if { [ -z "$prev_p99_s" ] || ! valid_number "$prev_p99_s"; } && [ -n "$fallback_baseline_json" ]; then
+            prev_p99_s="$(
+                jq -r --arg op "$op" '
+                    ([.measurements[]? | select(.operation == $op and .status == "measured" and (.p99_us // 0) > 0) | (.p99_us / 1000000.0)] | first) // empty
+                ' "$fallback_baseline_json" 2>/dev/null || true
+            )"
+            if [ -n "$prev_p99_s" ]; then
+                prev_source="$fallback_baseline_json"
             fi
+        fi
 
-            cur_p99_s="$(json_p99 "$cur_json" 2>/dev/null || true)"
-            prev_p99_s="$(json_p99 "$prev_json" 2>/dev/null || true)"
-            if [ -z "$cur_p99_s" ] || [ -z "$prev_p99_s" ] || ! valid_number "$cur_p99_s" || ! valid_number "$prev_p99_s"; then
-                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | ${warn_threshold} | ${fail_threshold} | SKIP (invalid benchmark JSON) |"$'\n'
-                continue
-            fi
-            if awk -v base="$prev_p99_s" 'BEGIN { exit !(base <= 0.0) }'; then
-                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | ${warn_threshold} | ${fail_threshold} | SKIP (baseline p99 <= 0) |"$'\n'
-                continue
-            fi
+        cur_p99_s="$(json_p99 "$cur_json" 2>/dev/null || true)"
+        if [ -z "$cur_p99_s" ] || [ -z "$prev_p99_s" ] || ! valid_number "$cur_p99_s" || ! valid_number "$prev_p99_s"; then
+            COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | n/a | ${warn_threshold} | ${fail_threshold} | FAIL (missing or invalid baseline) |"$'\n'
+            COMPARE_STATUS=1
+            continue
+        fi
+        if awk -v base="$prev_p99_s" 'BEGIN { exit !(base <= 0.0) }'; then
+            COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | ${prev_source} | n/a | n/a | n/a | ${warn_threshold} | ${fail_threshold} | FAIL (baseline p99 <= 0) |"$'\n'
+            COMPARE_STATUS=1
+            continue
+        fi
 
-            cur_p99_ms="$(sec_to_ms "$cur_p99_s")"
-            prev_p99_ms="$(sec_to_ms "$prev_p99_s")"
-            delta_pct="$(pct_change "$prev_p99_s" "$cur_p99_s")"
+        compared_count=$((compared_count + 1))
+        cur_p99_ms="$(sec_to_ms "$cur_p99_s")"
+        prev_p99_ms="$(sec_to_ms "$prev_p99_s")"
+        delta_pct="$(pct_change "$prev_p99_s" "$cur_p99_s")"
 
-            status="OK"
-            if awk -v d="$delta_pct" -v threshold="$fail_threshold" 'BEGIN { exit !(d > threshold) }'; then
-                status="FAIL"
-                COMPARE_STATUS=1
-            elif awk -v d="$delta_pct" -v threshold="$warn_threshold" 'BEGIN { exit !(d > threshold) }'; then
-                status="WARN"
-            fi
-            COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | ${prev_p99_ms} | ${cur_p99_ms} | ${delta_pct}% | ${warn_threshold} | ${fail_threshold} | ${status} |"$'\n'
-        done
-    else
-        COMPARE_SUMMARY+="## Regression Check"$'\n\n'
-        COMPARE_SUMMARY+="No prior baseline directory found under \`baselines/hyperfine/\`; compare skipped."$'\n'
+        status="OK"
+        if awk -v d="$delta_pct" -v threshold="$fail_threshold" 'BEGIN { exit !(d > threshold) }'; then
+            status="FAIL"
+            COMPARE_STATUS=1
+        elif awk -v d="$delta_pct" -v threshold="$warn_threshold" 'BEGIN { exit !(d > threshold) }'; then
+            status="WARN"
+        fi
+        COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | \`${prev_source}\` | ${prev_p99_ms} | ${cur_p99_ms} | ${delta_pct}% | ${warn_threshold} | ${fail_threshold} | ${status} |"$'\n'
+    done
+
+    if [ "$compared_count" -eq 0 ]; then
+        COMPARE_SUMMARY+=$'\n'"ERROR: zero operations were compared against a committed baseline."$'\n'
+        COMPARE_STATUS=1
     fi
 
     {

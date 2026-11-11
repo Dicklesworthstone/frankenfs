@@ -724,21 +724,43 @@ fn parity_cmd(args: &[String]) -> Result<()> {
     let mut suites = Vec::new();
     let mut gates = Vec::new();
     let mut executor = ParityExecutor::Rch;
+    let mut strict = false;
+    let mut strict_all_suites = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--verify" => suites.push(args.next().context("--verify requires a suite")?.clone()),
             "--gate" => gates.push(args.next().context("--gate requires a gate id")?.clone()),
             "--local" => executor = ParityExecutor::Cargo,
+            "--strict" => strict = true,
+            "--strict-all-suites" => {
+                strict = true;
+                strict_all_suites = true;
+            }
             _ => bail!("unknown parity argument: {arg}"),
         }
     }
-    if executor == ParityExecutor::Cargo && suites.is_empty() && gates.is_empty() {
-        bail!("--local requires --verify or --gate");
+    if strict_all_suites {
+        if suites.is_empty() {
+            suites = ffs_harness::parity_suite_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+        }
+        if gates.is_empty() {
+            gates.push(ffs_harness::canonical_gates::ALL_GATES_ARG.to_owned());
+        }
+    }
+    if executor == ParityExecutor::Cargo && suites.is_empty() && gates.is_empty() && !strict {
+        bail!("--local requires --verify, --gate, --strict, or --strict-all-suites");
     }
     let report = ExecutionGatedParityReport::run_with_gates(&suites, &gates, executor)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
-    if !suites.is_empty() || !gates.is_empty() {
+    if strict {
+        report
+            .require_evidence_strict()
+            .map_err(anyhow::Error::msg)?;
+    } else if !suites.is_empty() || !gates.is_empty() {
         report.require_evidence().map_err(anyhow::Error::msg)?;
     }
     Ok(())
@@ -9683,7 +9705,9 @@ fn print_usage() {
 
 #[allow(clippy::too_many_lines)]
 fn print_usage_core_commands() {
-    println!("  ffs-harness parity");
+    println!(
+        "  ffs-harness parity [--verify SUITE ...] [--gate ID|all ...] [--strict|--strict-all-suites] [--local]"
+    );
     println!("  ffs-harness gates [--gate ID|all] [--local] [--out FILE]");
     println!("  ffs-harness check-fixtures");
     println!(

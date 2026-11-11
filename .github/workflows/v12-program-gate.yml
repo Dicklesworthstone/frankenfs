@@ -6,9 +6,13 @@ on:
     tags:
       - "v1.2.*"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  CARGO_TARGET_DIR: /data/projects/.cargo-target-frankenfs-github-v12-program-gate
+  FFS_GATE_EXECUTOR: auto
+  FFS_USE_RCH: "0"
   RCH_ENV_ALLOWLIST: CARGO_TARGET_DIR,RUST_LOG,RUST_BACKTRACE
   RUST_BACKTRACE: "1"
   RUST_LOG: info
@@ -17,6 +21,8 @@ jobs:
   v12-program-gate:
     name: V1.2 Program Gate
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-v12-program-gate
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,14 +32,30 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Verify rch availability
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install program-gate prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs btrfs-progs fuse3 libfuse3-dev jq hyperfine python3
+          sudo mkdir -p /data/tmp
+          sudo chmod 1777 /data/tmp
+          ./scripts/fixtures/make_ext4_fixtures.sh --images-only
+
+      - name: Select execution mode
         run: |
           set -euo pipefail
-          command -v rch
-          rch check
+          if command -v rch >/dev/null 2>&1; then
+            rch check
+            echo "FFS_GATE_EXECUTOR=rch" >> "$GITHUB_ENV"
+          else
+            echo "rch not installed on hosted runner; using portable local cargo execution"
+            echo "FFS_GATE_EXECUTOR=local" >> "$GITHUB_ENV"
+          fi
 
       - name: Run V1.2 program gate
-        run: ./scripts/e2e/ffs_v12_program_gate_e2e.sh
+        run: ./scripts/e2e/ffs_v12_program_gate_e2e.sh --executor "$FFS_GATE_EXECUTOR"
 
       - name: Upload V1.2 program gate artifacts
         if: always()

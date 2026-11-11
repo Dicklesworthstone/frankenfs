@@ -1744,6 +1744,24 @@ pub enum ParityExecutor {
     Cargo,
 }
 
+/// Every registered parity suite id in canonical declaration order.
+#[must_use]
+pub fn parity_suite_ids() -> Vec<&'static str> {
+    PARITY_SUITES.iter().map(|suite| suite.id).collect()
+}
+
+/// Structured failure diagnostics emitted by [`ExecutionGatedParityReport::require_evidence_strict`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrictParityFailureDiagnostic {
+    pub error: String,
+    pub readiness_verified: bool,
+    pub missing_suites: Vec<String>,
+    pub missing_gates: Vec<String>,
+    pub missing_evidence_rows: Vec<String>,
+    pub evidence_backed_rows: usize,
+    pub total_rows: usize,
+}
+
 impl ExecutionGatedParityReport {
     /// Run the selected known suites. No paths, shell commands, JSON reports or
     /// caller-supplied pass/fail maps are accepted as parity evidence.
@@ -1935,6 +1953,67 @@ impl ExecutionGatedParityReport {
             }
         }
         Ok(())
+    }
+
+    /// Strict whole-project parity and canonical-gate readiness enforcement.
+    ///
+    /// Unlike [`Self::require_evidence`], which validates only the subset of suites
+    /// selected by the caller, `require_evidence_strict` fails closed whenever any
+    /// registered parity suite was not executed, any capability contract lacks
+    /// verified executed evidence, any canonical §22 gate was omitted or is not
+    /// `Passed`, or `readiness_verified` is `false`.
+    pub fn require_evidence_strict(&self) -> Result<(), String> {
+        let base_error = self.require_evidence().err();
+        let selected_set: std::collections::BTreeSet<&str> =
+            self.selected_suites.iter().map(String::as_str).collect();
+        let mut missing_suites: Vec<String> = PARITY_SUITES
+            .iter()
+            .filter(|suite| !selected_set.contains(suite.id))
+            .map(|suite| suite.id.to_owned())
+            .collect();
+        for contract in &self.contracts {
+            if !contract.verified
+                && !missing_suites
+                    .iter()
+                    .any(|existing| existing == contract.suite)
+            {
+                missing_suites.push(contract.suite.to_owned());
+            }
+        }
+
+        let passed_gates: std::collections::BTreeSet<&str> = self
+            .canonical_gates
+            .gates
+            .iter()
+            .filter(|gate| gate.status == canonical_gates::CanonicalGateStatus::Passed)
+            .map(|gate| gate.gate_id)
+            .collect();
+        let missing_gates: Vec<String> = canonical_gates::canonical_gate_ids()
+            .into_iter()
+            .filter(|gate_id| !passed_gates.contains(gate_id))
+            .map(str::to_owned)
+            .collect();
+
+        if base_error.is_none()
+            && missing_suites.is_empty()
+            && missing_gates.is_empty()
+            && self.missing_evidence_rows.is_empty()
+            && self.readiness_verified
+        {
+            return Ok(());
+        }
+
+        let diagnostic = StrictParityFailureDiagnostic {
+            error: base_error.unwrap_or_else(|| "incomplete_parity_or_gate_execution".to_owned()),
+            readiness_verified: self.readiness_verified,
+            missing_suites,
+            missing_gates,
+            missing_evidence_rows: self.missing_evidence_rows.clone(),
+            evidence_backed_rows: self.evidence_backed_rows,
+            total_rows: self.total_rows,
+        };
+        Err(serde_json::to_string(&diagnostic)
+            .unwrap_or_else(|_| format!("strict parity check failed: {diagnostic:?}")))
     }
 }
 
