@@ -9,13 +9,14 @@ use super::super::super::tail;
 use super::super::{
     LogRecord, analyze, checkpoint, corrupt, read_record, targets, u16_at, u64_at, unsupported,
 };
-use super::{Candidate, Plan, ReplayInput, ReplaySummary, build};
+use super::{Candidate, Plan, ReplayInput, ReplaySummary, build, index_replay};
 use ffs_ondisk::ntfs::recovery::{
     FileEdit, FileEditResult, FileOperation, IndexOperation, RecoveryPass, apply_file_edit,
 };
 use ffs_ondisk::ntfs::{
     DATA, NtfsFileRecord, NtfsLogFilePlan, NtfsLogOp, NtfsLogRestartArea, NtfsRecoveryAction,
 };
+use reader::recovery_apply::{self, PreparedRecovery};
 use reader::{Cx, NtfsVolume, Result, Storage, Stream, parse};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -565,24 +566,17 @@ impl ExportBudget {
     }
 }
 
-/// Export exactly the history already checked by native checkpoint Analysis
-/// and private MFT execution. The public publisher separately limits edits to
-/// allocation-preserving resident metadata; no raw physical fallback exists.
+/// Retain the typed INDX stage before exporting diagnostic actions, whose wire
+/// shape cannot identify an INDEX_ALLOCATION owner. FILE and INDX effects must
+/// both succeed before either becomes a visible recovered view.
 fn export(
     cx: &Cx,
     volume: &NtfsVolume,
     restart: &journal::Restart,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
-) -> Result<NtfsLogFilePlan> {
+) -> Result<PreparedRecovery> {
     let tail_record = read_record(cx, restart, restart.file_size, restart.current_lsn, read)?;
-    let analyzed = analyze(
-        cx,
-        restart,
-        restart.file_size,
-        &tail_record,
-        read,
-        Some(volume),
-    )?;
+    let analyzed = analyze(cx, restart, restart.file_size, &tail_record, read, None)?;
     let targets = analyzed.targets.as_ref().ok_or_else(|| {
         unsupported("public NTFS recovery requires a native checkpoint target table")
     })?;
@@ -592,15 +586,36 @@ fn export(
         ));
     }
     let candidates = build(cx, targets, &analyzed.history)?;
+    let indexes = index_replay::stage_publication(
+        cx,
+        &candidates,
+        ReplayInput {
+            volume,
+            restart,
+            targets,
+            history: &analyzed.history,
+            undo: &analyzed.report,
+        },
+        read,
+    )?;
     let mut budget = ExportBudget::default();
     let mut plan = empty_plan(restart)?;
+    let mut files = empty_plan(restart)?;
+    let mut directories: BTreeSet<_> = indexes
+        .directories
+        .into_iter()
+        .map(|reference| (reference.record, reference.sequence))
+        .collect();
     plan.records_parsed = analyzed.history.len();
     // Report live endpoint identities, not an invented historical commit list.
     (plan.committed_transactions, plan.aborted_transactions) = analyzed.state.transaction_ids();
     for candidate in &candidates.candidates {
         checkpoint(cx)?;
-        plan.redo_actions
-            .push(budget.action(candidate.record, false, candidate.lcns.clone())?);
+        let action = budget.action(candidate.record, false, candidate.lcns.clone())?;
+        if candidate.attribute.kind != 0xA0 {
+            files.redo_actions.push(action.clone());
+        }
+        plan.redo_actions.push(action);
     }
     for &(lsn, owner, opcode) in &analyzed.report.undo {
         checkpoint(cx)?;
@@ -612,15 +627,11 @@ fn export(
             ));
         }
         let slot = u32::from(u16_at(&record.data, 12)?);
-        if targets
+        let attribute = targets
             .attributes
             .get(&slot)
-            .is_none_or(|attribute| attribute.opened > lsn)
-        {
-            return Err(unsupported(
-                "native undo target incarnation no longer survives",
-            ));
-        }
+            .filter(|attribute| attribute.opened <= lsn)
+            .ok_or_else(|| unsupported("native undo target incarnation no longer survives"))?;
         let count = usize::from(u16_at(&record.data, 14)?);
         let first = u64_at(&record.data, 24)?;
         let mut lcns = Vec::with_capacity(count);
@@ -637,7 +648,11 @@ fn export(
                 .ok_or_else(|| unsupported("native undo export spans retired allocation"))?;
             lcns.push(lcn);
         }
-        plan.undo_actions.push(budget.action(&record, true, lcns)?);
+        let action = budget.action(&record, true, lcns)?;
+        if attribute.kind != 0xA0 {
+            files.undo_actions.push(action.clone());
+        }
+        plan.undo_actions.push(action);
     }
     plan.dirty_lcns = plan
         .redo_actions
@@ -647,14 +662,40 @@ fn export(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    // The public FILE executor intentionally has a stricter contract than
+    // diagnostic preflight: it rejects mapping, bitmap and allocation edits.
+    let mut overlay = recovery_apply::stage(cx, volume, &files)?;
+    for reference in recovery_apply::directories(cx, volume, &files)? {
+        checkpoint(cx)?;
+        directories.insert((reference.record, reference.sequence));
+    }
+    for (sector, bytes) in indexes.overlay {
+        checkpoint(cx)?;
+        if overlay.insert(sector, bytes).is_some() {
+            return Err(corrupt(
+                0,
+                "FILE and INDX recovery targets overlap in the combined view",
+            ));
+        }
+    }
     checkpoint(cx)?;
-    Ok(plan)
+    Ok(PreparedRecovery {
+        plan,
+        overlay,
+        directories: directories
+            .into_iter()
+            .map(|(record, sequence)| reader::NtfsReference { record, sequence })
+            .collect(),
+    })
 }
 
 impl NtfsVolume {
     /// None means the complete initialized journal was verified erased. Errors
     /// never become an empty plan, stale-checkpoint fallback or raw memcpy.
-    pub(crate) fn native_recovery_plan(&self, cx: &Cx) -> Result<Option<NtfsLogFilePlan>> {
+    pub(in crate::reader) fn native_recovery_stage(
+        &self,
+        cx: &Cx,
+    ) -> Result<Option<PreparedRecovery>> {
         checkpoint(cx)?;
         let record = self.record(cx, 2, None)?;
         let stream = self.data_stream(cx, &record, &[])?;
@@ -695,7 +736,11 @@ impl NtfsVolume {
         }
         if selected.clean {
             checkpoint(cx)?;
-            return empty_plan(selected).map(Some);
+            return Ok(Some(PreparedRecovery {
+                plan: empty_plan(selected)?,
+                overlay: BTreeMap::new(),
+                directories: Vec::new(),
+            }));
         }
         tail::with_latest(cx, selected, length, &mut source, |boundary, view| {
             let mut read = |offset, size| view(offset, size);

@@ -786,3 +786,455 @@ fn checkpoint_only_loser_exports_undo_and_redo_before_the_analysis_start() {
     assert_eq!(backing, original[BASE..BASE + VOLUME_BYTES]);
     assert_eq!(trace.lock().unwrap().writes, 0);
 }
+
+// A native checkpoint plus OpenNonresidentAttribute binds the external edits
+// to directory 42's $I30 stream. These bytes are encoded independently of the
+// production FILE/INDX editors and are not a native Windows recovery capture.
+const INDEX_LCN: u16 = 1536;
+
+fn named_resident(kind: u32, id: u16, value: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0; (32 + value.len()).next_multiple_of(8)];
+    let length = bytes.len() as u32;
+    bytes[..4].copy_from_slice(&kind.to_le_bytes());
+    bytes[4..8].copy_from_slice(&length.to_le_bytes());
+    bytes[9] = 4;
+    bytes[10..12].copy_from_slice(&24_u16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&id.to_le_bytes());
+    bytes[16..20].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    bytes[20..22].copy_from_slice(&32_u16.to_le_bytes());
+    bytes[24..32].copy_from_slice(&[b'$', 0, b'I', 0, b'3', 0, b'0', 0]);
+    bytes[32..32 + value.len()].copy_from_slice(value);
+    bytes
+}
+
+fn directory_name(parent: u64, name: &str, directory: bool) -> Vec<u8> {
+    let mut value = mount_filename(name);
+    value[..8].copy_from_slice(&((7_u64 << 48) | parent).to_le_bytes());
+    if directory {
+        value[40..56].fill(0);
+        value[56..60].copy_from_slice(&0x1000_0000_u32.to_le_bytes());
+    }
+    value
+}
+
+fn directory_entry(number: u64, name: &[u8]) -> Vec<u8> {
+    let mut entry = vec![0; (16 + name.len()).next_multiple_of(8)];
+    let length = entry.len() as u16;
+    entry[..8].copy_from_slice(&((7_u64 << 48) | number).to_le_bytes());
+    entry[8..10].copy_from_slice(&length.to_le_bytes());
+    entry[10..12].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    entry[16..16 + name.len()].copy_from_slice(name);
+    entry
+}
+
+fn directory_root(entries: &[Vec<u8>], external: bool) -> Vec<u8> {
+    let mut value = vec![0; 32];
+    value[..4].copy_from_slice(&0x30_u32.to_le_bytes());
+    value[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    value[8..12].copy_from_slice(&(PAGE as u32).to_le_bytes());
+    value[12] = 8;
+    value[16..20].copy_from_slice(&16_u32.to_le_bytes());
+    value[28] = u8::from(external);
+    for entry in entries {
+        value.extend(entry);
+    }
+    let mut terminal = vec![0; if external { 24 } else { 16 }];
+    terminal[8] = terminal.len() as u8;
+    terminal[12] = if external { 3 } else { 2 };
+    value.extend(terminal);
+    let used = value.len() as u32 - 16;
+    value[20..24].copy_from_slice(&used.to_le_bytes());
+    value[24..28].copy_from_slice(&used.to_le_bytes());
+    named_resident(0x90, 2, &value)
+}
+
+fn directory_block() -> Vec<u8> {
+    let mut bytes = vec![0; PAGE];
+    bytes[..4].copy_from_slice(b"INDX");
+    bytes[24..28].copy_from_slice(&40_u32.to_le_bytes());
+    bytes[32..36].copy_from_slice(&((PAGE - 24) as u32).to_le_bytes());
+    let entry = directory_entry(43, &directory_name(42, "alpha", false));
+    let end = 64 + entry.len();
+    bytes[64..end].copy_from_slice(&entry);
+    bytes[end + 8..end + 10].copy_from_slice(&16_u16.to_le_bytes());
+    bytes[end + 12..end + 14].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[28..32].copy_from_slice(&((end + 16 - 24) as u32).to_le_bytes());
+    protected(bytes, 40, 0xA5A5)
+}
+
+fn external_change(number: u64, name: &str, offset: u16) -> Vec<u8> {
+    let entry = directory_entry(number, &directory_name(42, name, false));
+    let mut data = vec![0; 96 + entry.len()];
+    data[..2].copy_from_slice(&0x0E_u16.to_le_bytes());
+    data[2..4].copy_from_slice(&0x0F_u16.to_le_bytes());
+    data[4..6].copy_from_slice(&96_u16.to_le_bytes());
+    data[6..8].copy_from_slice(&(entry.len() as u16).to_le_bytes());
+    data[8..10].copy_from_slice(&((96 + entry.len()) as u16).to_le_bytes());
+    data[12..14].copy_from_slice(&64_u16.to_le_bytes());
+    data[14..16].copy_from_slice(&8_u16.to_le_bytes());
+    data[18..20].copy_from_slice(&offset.to_le_bytes());
+    for index in 0..8 {
+        data[32 + index * 8..40 + index * 8]
+            .copy_from_slice(&(u64::from(INDEX_LCN) + index as u64).to_le_bytes());
+    }
+    data[96..].copy_from_slice(&entry);
+    data
+}
+
+fn directory_journal(data_offset: u16, loser: bool) -> Vec<u8> {
+    let mut attribute = [0; 40];
+    attribute[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    attribute[8..12].copy_from_slice(&DATA.to_le_bytes());
+    attribute[16..24].copy_from_slice(&(7_u64 << 48).to_le_bytes());
+    let mut checkpoint = vec![0; 64];
+    checkpoint[..4].copy_from_slice(&1_u32.to_le_bytes());
+    checkpoint[8..16].copy_from_slice(&lsn(1).to_le_bytes());
+    checkpoint[16..24].copy_from_slice(&lsn(0).to_le_bytes());
+    checkpoint[48..52].copy_from_slice(&64_u32.to_le_bytes());
+    let mut opened = vec![0; 88];
+    opened[..2].copy_from_slice(&0x1C_u16.to_le_bytes());
+    opened[4..6].copy_from_slice(&40_u16.to_le_bytes());
+    opened[6..8].copy_from_slice(&40_u16.to_le_bytes());
+    opened[8..10].copy_from_slice(&80_u16.to_le_bytes());
+    opened[10..12].copy_from_slice(&8_u16.to_le_bytes());
+    opened[12..14].copy_from_slice(&64_u16.to_le_bytes());
+    opened[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+    opened[44..48].copy_from_slice(&(PAGE as u32).to_le_bytes());
+    opened[48..52].copy_from_slice(&0xA0_u32.to_le_bytes());
+    opened[56..64].copy_from_slice(&((7_u64 << 48) | 42).to_le_bytes());
+    opened[80..88].copy_from_slice(&[b'$', 0, b'I', 0, b'3', 0, b'0', 0]);
+    let mut data = change(43, b"winner!!", b"original");
+    data[16..18].copy_from_slice(&data_offset.to_le_bytes());
+    let mut commit = vec![0; 40];
+    commit[..2].copy_from_slice(&0x1A_u16.to_le_bytes());
+    let mut payloads = vec![
+        table_dump(0x1D, &attribute),
+        checkpoint,
+        opened,
+        data,
+        external_change(44, "beta", 160),
+        commit,
+    ];
+    if loser {
+        payloads.push(external_change(45, "gamma", 256));
+    }
+    let mut next = 64;
+    let positions: Vec<_> = payloads
+        .iter()
+        .map(|data| {
+            let at = next;
+            next += (48 + data.len()).next_multiple_of(8);
+            at
+        })
+        .collect();
+    let lsns: Vec<_> = positions
+        .iter()
+        .map(|at| (1_u64 << 15) | ((RING + at) as u64 / 8))
+        .collect();
+    assert_eq!((lsns[0], lsns[1]), (lsn(0), lsn(1)));
+    let mut page = vec![0; PAGE];
+    page[..4].copy_from_slice(b"RCRD");
+    for at in [8, 32] {
+        page[at..at + 8].copy_from_slice(&lsns.last().unwrap().to_le_bytes());
+    }
+    page[16..20].copy_from_slice(&1_u32.to_le_bytes());
+    page[20..22].copy_from_slice(&1_u16.to_le_bytes());
+    page[22..24].copy_from_slice(&1_u16.to_le_bytes());
+    page[24..26].copy_from_slice(&(next as u16).to_le_bytes());
+    for (index, data) in payloads.iter().enumerate() {
+        let at = positions[index];
+        page[at..at + 8].copy_from_slice(&lsns[index].to_le_bytes());
+        if (3..=5).contains(&index) {
+            for link in [8, 16] {
+                page[at + link..at + link + 8].copy_from_slice(&lsns[index - 1].to_le_bytes());
+            }
+        }
+        page[at + 24..at + 28].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        page[at + 28..at + 30].copy_from_slice(&9_u16.to_le_bytes());
+        let kind = if index == 1 { 2_u32 } else { 1 };
+        page[at + 32..at + 36].copy_from_slice(&kind.to_le_bytes());
+        let owner = if index == 1 {
+            0_u32
+        } else if index == 6 {
+            64
+        } else {
+            24
+        };
+        page[at + 36..at + 40].copy_from_slice(&owner.to_le_bytes());
+        page[at + 48..at + 48 + data.len()].copy_from_slice(data);
+    }
+    protected(page, 40, 0xBCDE)
+}
+
+fn directory_image(loser: bool) -> Vec<u8> {
+    let mut bytes = mountable_image(false, 0x1A);
+    let mut standard = [0; 72];
+    for field in 0..4 {
+        standard[field * 8..field * 8 + 8]
+            .copy_from_slice(&116_444_736_000_000_000_u64.to_le_bytes());
+    }
+    let standard = resident(0x10, 0, &standard);
+    let mut allocation = vec![0; 80];
+    allocation[..64].copy_from_slice(&mapped(INDEX_LCN, 8)[..64]);
+    allocation[..4].copy_from_slice(&0xA0_u32.to_le_bytes());
+    allocation[4..8].copy_from_slice(&80_u32.to_le_bytes());
+    allocation[9] = 4;
+    allocation[10..12].copy_from_slice(&64_u16.to_le_bytes());
+    allocation[14..16].copy_from_slice(&3_u16.to_le_bytes());
+    allocation[32..34].copy_from_slice(&72_u16.to_le_bytes());
+    allocation[64..72].copy_from_slice(&[b'$', 0, b'I', 0, b'3', 0, b'0', 0]);
+    allocation[72..80].copy_from_slice(&mapped(INDEX_LCN, 8)[64..72]);
+    let tree_name = directory_name(5, "tree", true);
+    let mut root = file(
+        5,
+        &[
+            standard.clone(),
+            resident(0x30, 1, &directory_name(5, ".", true)),
+            directory_root(&[directory_entry(42, &tree_name)], false),
+        ],
+    );
+    root[22..24].copy_from_slice(&3_u16.to_le_bytes());
+    root[40..42].copy_from_slice(&3_u16.to_le_bytes());
+    let mut directory = file(
+        42,
+        &[
+            standard.clone(),
+            resident(0x30, 1, &tree_name),
+            directory_root(&[], true),
+            allocation,
+            named_resident(0xB0, 4, &[1]),
+        ],
+    );
+    directory[22..24].copy_from_slice(&3_u16.to_le_bytes());
+    directory[40..42].copy_from_slice(&5_u16.to_le_bytes());
+    for (number, record) in [(5, root), (42, directory)] {
+        let at = BASE + 128 * 512 + number * 1024;
+        bytes[at..at + 1024].copy_from_slice(&record);
+    }
+    let mut data_offset = 0;
+    for (number, name) in [(43, "alpha"), (44, "beta"), (45, "gamma")] {
+        let filename = resident(0x30, 1, &directory_name(42, name, false));
+        if number == 43 {
+            data_offset = (64 + standard.len() + filename.len()) as u16;
+        }
+        let mut record = file(
+            number,
+            &[standard.clone(), filename, resident(DATA, 2, b"original")],
+        );
+        record[40..42].copy_from_slice(&3_u16.to_le_bytes());
+        let at = BASE + 128 * 512 + number as usize * 1024;
+        bytes[at..at + 1024].copy_from_slice(&record);
+    }
+    let at = BASE + usize::from(INDEX_LCN) * 512;
+    bytes[at..at + PAGE].copy_from_slice(&directory_block());
+    let at = BASE + LOG_LCN * 512 + RING;
+    bytes[at..at + PAGE].copy_from_slice(&directory_journal(data_offset, loser));
+    bytes
+}
+
+#[test]
+fn dirty_external_directory_and_file_replay_publish_one_read_only_fsops_view() {
+    use crate::NtfsFs;
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    for loser in [false, true] {
+        for indexed in [false, true] {
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            let original = directory_image(loser);
+            assert!(matches!(
+                NtfsVolume::from_device(
+                    &cx,
+                    Box::new(Memory {
+                        bytes: original.clone(),
+                        trace: Arc::clone(&trace)
+                    }),
+                    BASE as u64,
+                    VOLUME_BYTES as u64,
+                ),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+            let volume = open(original.clone(), &trace).unwrap();
+            let plan = volume.logfile_recovery.as_ref().unwrap();
+            assert_eq!(plan.redo_actions.len(), if loser { 3 } else { 2 });
+            assert_eq!(plan.undo_actions.len(), usize::from(loser));
+            assert_eq!(plan.redo_actions[1].op, NtfsLogOp::AddIndexEntryAllocation);
+            let fs = if indexed {
+                NtfsFs::new_recovered_indexed(&cx, volume, 123, 456)
+            } else {
+                NtfsFs::new_recovered(&cx, volume, 123, 456)
+            }
+            .unwrap();
+            let mut scope = RequestScope::empty();
+            let directory = fs
+                .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("TREE"))
+                .unwrap();
+            let entries = fs.readdir(&cx, &mut scope, directory.ino, 0).unwrap();
+            assert!(entries.iter().any(|entry| entry.name == b"alpha"));
+            assert!(entries.iter().any(|entry| entry.name == b"beta"));
+            assert!(!entries.iter().any(|entry| entry.name == b"gamma"));
+            for (name, expected) in [("ALPHA", b"winner!!"), ("BETA", b"original")] {
+                let file = fs
+                    .lookup(&cx, &mut scope, directory.ino, OsStr::new(name))
+                    .unwrap();
+                assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(), expected);
+                assert!(matches!(
+                    fs.write(&cx, &mut scope, file.ino, 0, b"x"),
+                    Err(FfsError::ReadOnly)
+                ));
+            }
+            assert!(matches!(
+                fs.lookup(&cx, &mut scope, directory.ino, OsStr::new("gamma")),
+                Err(FfsError::NotFound(_))
+            ));
+            assert_eq!(fs.volume().volume_flags, 1);
+            let mut backing = vec![0; VOLUME_BYTES];
+            fs.volume()
+                .source
+                .device
+                .read_exact_at(&cx, ByteOffset(0), &mut backing)
+                .unwrap();
+            assert_eq!(backing, original[BASE..BASE + VOLUME_BYTES]);
+            assert_eq!(trace.lock().unwrap().writes, 0);
+        }
+    }
+}
+
+#[test]
+fn combined_file_and_external_index_redo_is_idempotent() {
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let mut bytes = directory_image(false);
+    let first = open(bytes.clone(), &trace).unwrap();
+    for (&sector, data) in &first.source.overlay {
+        let at = BASE + sector as usize * 512;
+        bytes[at..at + 512].copy_from_slice(data);
+    }
+    let second = open(bytes, &trace).unwrap();
+    assert_eq!(first.source.overlay, second.source.overlay);
+    assert_eq!(value(&second, 43), b"winner!!");
+    let cx = Cx::for_testing();
+    let directory = second.record(&cx, 42, Some(7)).unwrap();
+    let entries = second.list_directory(&cx, &directory).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(trace.lock().unwrap().writes, 0);
+}
+
+#[test]
+fn final_directory_identity_or_io_failure_restores_the_previous_complete_view() {
+    let cx = Cx::for_testing();
+    for fault in 0..5 {
+        let cancellation = fault == 4;
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let mut bytes = directory_image(false);
+        // Open without replay to inspect the publication boundary itself.
+        let flags = BASE + 128 * 512 + 3 * 1024 + 64 + 24 + 10;
+        bytes[flags..flags + 2].fill(0);
+        let target = BASE + 128 * 512 + 44 * 1024;
+        match fault {
+            0 => {
+                // The inserted INDX key remains "beta"; its untouched target's
+                // FILE_NAME becomes "zeta". Node replay alone cannot see it.
+                let name = target + 64 + 96 + 24 + 66;
+                bytes[name..name + 2].copy_from_slice(&u16::from(b'z').to_le_bytes());
+            }
+            1 => bytes[target + 16..target + 18].copy_from_slice(&8_u16.to_le_bytes()),
+            2 => {
+                // The only reachable block is zero. Local replay has no reason
+                // to visit the second allocated-but-unreachable bitmap bit.
+                bytes[BASE + 128 * 512 + 42 * 1024 + 464] = 3;
+            }
+            3 => {
+                // Both names match their FILEs and each node parses, but the
+                // final in-order sequence is zebra,beta instead of beta,zebra.
+                for (index, unit) in "zebra".encode_utf16().enumerate() {
+                    let file = BASE + 128 * 512 + 43 * 1024 + 64 + 96 + 24 + 66 + index * 2;
+                    let key = BASE + usize::from(INDEX_LCN) * 512 + 64 + 16 + 66 + index * 2;
+                    bytes[file..file + 2].copy_from_slice(&unit.to_le_bytes());
+                    bytes[key..key + 2].copy_from_slice(&unit.to_le_bytes());
+                }
+            }
+            _ => {}
+        }
+        let mut volume = NtfsVolume::from_device(
+            &cx,
+            Box::new(Memory {
+                bytes,
+                trace: Arc::clone(&trace),
+            }),
+            BASE as u64,
+            VOLUME_BYTES as u64,
+        )
+        .unwrap();
+        let prepared = volume.native_recovery_stage(&cx).unwrap().unwrap();
+        assert!(!prepared.overlay.is_empty());
+        volume.source.overlay.insert(0, [0xA1; 512]);
+        let previous = volume.source.overlay.clone();
+        if cancellation {
+            trace.lock().unwrap().fail_at = Some(target as u64);
+        }
+        let result = recovery_apply::publish_recovered(&cx, &mut volume, prepared);
+        assert!(if cancellation {
+            matches!(result, Err(FfsError::Cancelled))
+        } else {
+            matches!(result, Err(FfsError::Corruption { .. }))
+        });
+        assert_eq!(volume.source.overlay, previous);
+        assert!(volume.logfile_recovery.is_none());
+        assert_eq!(value(&volume, 43), b"original");
+        assert_eq!(trace.lock().unwrap().writes, 0);
+    }
+}
+
+#[test]
+fn external_public_recovery_refuses_stale_mapping_allocation_and_torn_targets() {
+    for fault in 0..6 {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let mut bytes = directory_image(false);
+        let journal = BASE + LOG_LCN * 512 + RING;
+        match fault {
+            0 => {
+                // Native open-attribute slot names a stale directory sequence.
+                let at = journal + 328 + 48 + 56;
+                bytes[at..at + 8].copy_from_slice(&((8_u64 << 48) | 42).to_le_bytes());
+            }
+            1 => {
+                // A log claim cannot redirect the export to an arbitrary LCN.
+                let at = journal + 576 + 48 + 32;
+                bytes[at..at + 8].copy_from_slice(&1600_u64.to_le_bytes());
+            }
+            2 => bytes[BASE + 400 * 512 + usize::from(INDEX_LCN) / 8] &= !1,
+            3 => bytes[BASE + 128 * 512 + 42 * 1024 + 464] = 0,
+            4 => bytes[BASE + usize::from(INDEX_LCN) * 512 + 511] ^= 1,
+            _ => bytes[BASE + 128 * 512 + 43 * 1024 + 1023] ^= 1,
+        }
+        assert!(
+            open(bytes, &trace).is_err(),
+            "invalid external replay case {fault}"
+        );
+        assert_eq!(trace.lock().unwrap().writes, 0);
+    }
+}
+
+#[test]
+fn final_directory_validation_shares_one_budget_across_all_directory_walks() {
+    let cx = Cx::for_testing();
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let volume = open(directory_image(false), &trace).unwrap();
+    // Repeated valid walks exercise the aggregate budget without building a
+    // giant fixture. Public preparation deduplicates these native references.
+    let references = vec![
+        reader::NtfsReference {
+            record: 42,
+            sequence: 7
+        };
+        16_385
+    ];
+    assert!(matches!(
+        volume.validate_recovered_directories(&cx, &references),
+        Err(FfsError::UnsupportedFeature(detail)) if detail.contains("64 MiB")
+    ));
+    assert_eq!(value(&volume, 43), b"winner!!");
+    assert_eq!(trace.lock().unwrap().writes, 0);
+}

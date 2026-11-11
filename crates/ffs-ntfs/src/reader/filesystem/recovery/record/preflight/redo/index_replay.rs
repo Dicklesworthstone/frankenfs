@@ -2,8 +2,10 @@
 //!
 //! Resolve checkpoint identities against the directory's real INDEX_ROOT,
 //! INDEX_ALLOCATION and BITMAP before interpreting an operation. All buffers
-//! are private. Allocation changes, tree-wide collation/reachability, system
-//! directories and recovered-view publication are separate obligations.
+//! are private. Publication retains exact directory identities and exports
+//! sectors through the checked INDEX_ALLOCATION runlist. The combined FILE/INDX
+//! view must pass final tree validation before the opening volume is returned.
+//! Allocation changes and system directories remain outside this profile.
 //! Native addressing follows Linux v6.17 fs/ntfs3/fslog.c, do_action.
 
 use super::super::super::super::super::super as reader;
@@ -427,6 +429,55 @@ struct Staged {
     summary: ReplaySummary,
 }
 
+#[derive(Default)]
+pub(super) struct Publication {
+    pub(super) overlay: reader::recovery_apply::Overlay,
+    pub(super) directories: Vec<ffs_ondisk::ntfs::NtfsReference>,
+}
+
+fn export(cx: &Cx, input: &impl Input, staged: &Staged) -> Result<Publication> {
+    let geometry = input.geometry();
+    let mut result = Publication::default();
+    let mut directories = BTreeSet::new();
+    for (&(reference, offset), raw) in &staged.blocks {
+        checkpoint(cx)?;
+        directories.insert(reference);
+        let (sectors, suffix) = raw.as_chunks::<512>();
+        if !suffix.is_empty() {
+            return Err(corrupt(offset, "INDX publication ends inside a sector"));
+        }
+        for (index, sector) in sectors.iter().enumerate() {
+            checkpoint(cx)?;
+            let logical = offset
+                .checked_add(index as u64 * SECTOR)
+                .ok_or_else(|| corrupt(offset, "INDX sector address overflows"))?;
+            let vcn = logical / geometry.cluster_bytes;
+            let lcn = input.mapped_lcn(reference, vcn)?;
+            if lcn == 0 || lcn >= geometry.clusters {
+                return Err(corrupt(offset, "INDX publication exceeds volume geometry"));
+            }
+            let physical = lcn
+                .checked_mul(geometry.cluster_bytes)
+                .and_then(|at| at.checked_add(logical % geometry.cluster_bytes))
+                .ok_or_else(|| corrupt(offset, "INDX physical address overflows"))?;
+            if !physical.is_multiple_of(SECTOR)
+                || result.overlay.insert(physical / SECTOR, *sector).is_some()
+            {
+                return Err(corrupt(
+                    physical,
+                    "INDX publication has unaligned or overlapping sectors",
+                ));
+            }
+        }
+    }
+    result.directories = directories
+        .into_iter()
+        .map(ffs_ondisk::ntfs::NtfsReference::decode)
+        .collect();
+    checkpoint(cx)?;
+    Ok(result)
+}
+
 fn execute(cx: &Cx, input: &mut impl Input, actions: &[Action<'_>]) -> Result<Staged> {
     checkpoint(cx)?;
     let geometry = input.geometry();
@@ -588,6 +639,25 @@ pub(super) fn stage(
     input: ReplayInput<'_>,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
 ) -> Result<ReplaySummary> {
+    stage_with_publication(cx, plan, input, read, false).map(|(summary, _)| summary)
+}
+
+pub(super) fn stage_publication(
+    cx: &Cx,
+    plan: &Plan<'_>,
+    input: ReplayInput<'_>,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<Publication> {
+    stage_with_publication(cx, plan, input, read, true).map(|(_, publication)| publication)
+}
+
+fn stage_with_publication(
+    cx: &Cx,
+    plan: &Plan<'_>,
+    input: ReplayInput<'_>,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    publish: bool,
+) -> Result<(ReplaySummary, Publication)> {
     let has_index = plan
         .candidates
         .iter()
@@ -598,7 +668,8 @@ pub(super) fn stage(
             .iter()
             .any(|&(_, _, opcode)| matches!(opcode, 0x0E..=0x10 | 0x12 | 0x14));
     if !has_index {
-        return replay::stage(cx, plan, input, read);
+        return replay::stage(cx, plan, input, read)
+            .map(|summary| (summary, Publication::default()));
     }
     checkpoint(cx)?;
     if input.undo.prepared != 0 || input.undo.undo.len() > MAX_RECORDS {
@@ -744,13 +815,21 @@ pub(super) fn stage(
     };
     let mut native = Native::new(cx, input.volume, input.restart.current_lsn)?;
     let indexes = execute(cx, &mut native, &actions)?;
+    let publication = if publish {
+        export(cx, &native, &indexes)?
+    } else {
+        Publication::default()
+    };
     checkpoint(cx)?;
-    Ok(ReplaySummary {
-        records: file_summary.records + indexes.summary.records,
-        redo: file_summary.redo + indexes.summary.redo,
-        undo: file_summary.undo + indexes.summary.undo,
-        skipped: file_summary.skipped + indexes.summary.skipped,
-    })
+    Ok((
+        ReplaySummary {
+            records: file_summary.records + indexes.summary.records,
+            redo: file_summary.redo + indexes.summary.redo,
+            undo: file_summary.undo + indexes.summary.undo,
+            skipped: file_summary.skipped + indexes.summary.skipped,
+        },
+        publication,
+    ))
 }
 
 #[cfg(test)]

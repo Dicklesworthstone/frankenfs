@@ -138,6 +138,42 @@ DATA access. `readlink` follows intermediate supported links and retains the
 final link's own record; it emits the relative substitute target with native
 backslash separators converted to `/`.
 
+## Volatile FILE and external directory recovery
+
+The existing explicit `--recover-logfile` option can combine supported resident
+FILE changes with changes to already allocated external `$I30` directory index
+blocks. For example, `ffs-ntfs ls volume.img /nested --offline-image
+--recover-logfile` and the corresponding `read` and `mount` commands consume one
+recovered view. Library callers open with recovery enabled and then use
+`NtfsFs::new_recovered` or `NtfsFs::new_recovered_indexed`. Ordinary clean-only
+constructors retain their dirty-log refusal.
+
+Recovery reconstructs native checkpoint/open-attribute identities, selects the
+validated tail, repeats supported history and undoes admitted loser operations.
+External Add/DeleteIndexEntry, WriteEndOfIndexBuffer, SetIndexEntryVcn and
+UpdateFileName operations retain their exact directory `$I30` identity through
+staging. Every target sector follows the directory's actual INDEX_ALLOCATION
+mapping, including fragmented runs. Stale directory sequences, unallocated
+records/blocks/clusters, forged mappings and conflicting physical sectors fail
+the complete open. System-directory recovery and changes to mappings,
+ATTRIBUTE_LIST indirections or allocation bitmaps remain outside this profile.
+
+FILE and INDX changes become visible together only after complete affected
+directory trees have passed graph/reachability checks, native UpCase ordering
+and sequence-bound FILE_NAME matching against the combined view. Final
+validation shares a 64 MiB metadata-read budget, a 65,536-entry limit and a
+16,384-block limit across directories, including attribute-list extension reads.
+A late error or cancellation restores the previous overlay. Diagnostic plans
+alone do not authorize publication or a recovered mount.
+
+This is an in-memory, read-only recovery view. The backing image, native dirty
+flags and journal remain unchanged; no CLR, checkpoint or durable recovery
+record is written. This does not implement native writable transactions or
+establish Windows crash/recovery qualification. Independently encoded test
+fixtures cover combined FILE/index redo, external loser undo, repeated redo,
+both recovered FsOps constructors and late validation failures. Those fixtures
+are source-level regression coverage, not native-producer interchange evidence.
+
 ## Complete DATA stream catalog
 
 `streams` enumerates logical DATA streams through the selected base file's

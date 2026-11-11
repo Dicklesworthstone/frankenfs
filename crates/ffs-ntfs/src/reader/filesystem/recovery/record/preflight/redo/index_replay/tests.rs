@@ -217,6 +217,38 @@ fn repeated_redo_is_idempotent_but_still_checks_live_allocation() {
 }
 
 #[test]
+fn index_publication_exports_fragmented_native_sectors_and_refuses_aliases() {
+    let cx = Cx::for_testing();
+    let attribute = attribute();
+    let update = record(20, 0x0E, 0x0F, 152, &entry(98), &[]);
+    let mut source = Memory::new();
+    let staged = execute(&cx, &mut source, &[action(&update, &attribute, false)]).unwrap();
+    let published = export(&cx, &source, &staged).unwrap();
+    assert_eq!(
+        published.overlay.keys().copied().collect::<Vec<_>>(),
+        [50, 102]
+    );
+    assert_eq!(
+        published.directories,
+        [ffs_ondisk::ntfs::NtfsReference::decode(OWNER)]
+    );
+    let raw = &staged.blocks[&(OWNER, 1024)];
+    assert_eq!(published.overlay[&102], raw[..512]);
+    assert_eq!(published.overlay[&50], raw[512..]);
+    assert_eq!(names(&source.blocks[&1024]), [vec![97]]);
+    source.mappings.insert(3, 102);
+    assert!(matches!(
+        export(&cx, &source, &staged),
+        Err(FfsError::Corruption { .. })
+    ));
+    source.mappings.insert(3, source.geometry.clusters);
+    assert!(matches!(
+        export(&cx, &source, &staged),
+        Err(FfsError::Corruption { .. })
+    ));
+}
+
+#[test]
 fn every_claim_and_all_three_allocation_domains_are_required_before_payload_io() {
     let cx = Cx::for_testing();
     let attribute = attribute();

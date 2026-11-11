@@ -3,12 +3,14 @@
 //! The flat journal planner is not an ownership oracle. Bind every physical
 //! claim to the current MFT, check allocation, and use the same FILE editor as
 //! checkpoint-aware preflight. Never reinterpret unsupported opcodes as memcpy.
-//! Only resident/INDEX_ROOT changes are published here: nonresident attributes
-//! must survive byte-for-byte until allocation and bootstrap reconstruction are
-//! integrated. This does not establish an authoritative durable journal tail.
+//! Nonresident mappings, attribute lists and allocation bitmaps must survive
+//! byte-for-byte. Typed external $I30 effects are staged by the checkpoint-aware
+//! INDX executor and merged before a single validated volatile publication.
+//! This does not establish an authoritative durable journal tail.
 
 use super::{
-    Cx, NtfsVolume, Result, Source, Storage, Stream, checkpoint, corrupt, parse, unsupported,
+    Cx, NtfsReference, NtfsVolume, Result, Source, Storage, Stream, checkpoint, corrupt, parse,
+    unsupported,
 };
 use ffs_ondisk::ntfs::recovery::{
     FileEdit, FileEditResult, FileOperation, IndexOperation, RecoveryPass, apply_file_edit,
@@ -23,7 +25,16 @@ const MAX_BYTES: usize = 16 * 1024 * 1024;
 const IO_BUDGET: u64 = 64 * 1024 * 1024;
 const SECTOR: u64 = 512;
 
-type Overlay = BTreeMap<u64, [u8; 512]>;
+pub(super) type Overlay = BTreeMap<u64, [u8; 512]>;
+
+/// A private stage retains the native directory identities that the diagnostic
+/// action format cannot express. Possessing a diagnostic plan is not authority
+/// to publish an external-index update.
+pub(super) struct PreparedRecovery {
+    pub(super) plan: NtfsLogFilePlan,
+    pub(super) overlay: Overlay,
+    pub(super) directories: Vec<NtfsReference>,
+}
 
 #[derive(Clone, Copy)]
 struct Layout {
@@ -203,9 +214,9 @@ fn target(layout: Layout, action: &NtfsRecoveryAction) -> Result<u32> {
     Ok(number)
 }
 
-/// Preserve direct mappings AND resident ATTRIBUTE_LIST indirections until
-/// allocation/ownership reconciliation is integrated. Compare attribute bytes,
-/// not their containing offsets: a resident resize can move an unchanged map.
+/// Preserve direct mappings, resident ATTRIBUTE_LIST indirections AND resident
+/// index bitmaps. Compare attribute bytes, not their containing offsets: a
+/// resident resize can move unchanged storage metadata.
 fn storage_metadata(record: &NtfsFileRecord) -> Result<BTreeMap<u16, Vec<u8>>> {
     let bytes = record.used_bytes();
     let mut at = usize::from(u16::from_le_bytes([bytes[20], bytes[21]]));
@@ -220,7 +231,7 @@ fn storage_metadata(record: &NtfsFileRecord) -> Result<BTreeMap<u16, Vec<u8>>> {
             .checked_add(length)
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| corrupt(0, "FILE attribute exceeds its restored record"))?;
-        if attr.kind == ffs_ondisk::ntfs::ATTRIBUTE_LIST
+        if matches!(attr.kind, ffs_ondisk::ntfs::ATTRIBUTE_LIST | 0xB0)
             || matches!(attr.value, ffs_ondisk::ntfs::NtfsValue::NonResident(_))
         {
             result.insert(attr.id, bytes[at..end].to_vec());
@@ -458,6 +469,89 @@ pub(super) fn stage(cx: &Cx, volume: &NtfsVolume, plan: &NtfsLogFilePlan) -> Res
         operation(action)?;
     }
     execute(cx, &mut Native::new(cx, volume)?, plan)
+}
+
+/// Directory FILE actions address the containing FILE through $MFT DATA.
+/// Include general resident edits as well as INDEX_ROOT-specific opcodes so
+/// every changed directory is checked in the final combined view.
+pub(super) fn directories(
+    cx: &Cx,
+    volume: &NtfsVolume,
+    plan: &NtfsLogFilePlan,
+) -> Result<Vec<NtfsReference>> {
+    let layout = Layout {
+        cluster_bytes: u64::from(volume.geometry.cluster_bytes()),
+        clusters: volume.geometry.cluster_count(),
+        record_bytes: volume.geometry.record_bytes() as usize,
+        mft_initialized: volume.mft.initialized,
+        volume_bytes: volume.geometry.volume_bytes(),
+    };
+    let mut targets = BTreeMap::new();
+    for action in plan.redo_actions.iter().chain(&plan.undo_actions) {
+        checkpoint(cx)?;
+        let root_operation = matches!(
+            action.op,
+            NtfsLogOp::AddIndexEntryRoot
+                | NtfsLogOp::DeleteIndexEntryRoot
+                | NtfsLogOp::SetIndexEntryVcnRoot
+                | NtfsLogOp::UpdateFileNameRoot
+        );
+        *targets.entry(target(layout, action)?).or_insert(false) |= root_operation;
+    }
+    if targets
+        .len()
+        .checked_mul(layout.record_bytes)
+        .is_none_or(|bytes| bytes > MAX_BYTES)
+    {
+        return Err(unsupported(
+            "directory FILE identities exceed 16 MiB of reads",
+        ));
+    }
+    let mut result = Vec::new();
+    for (number, root_operation) in targets {
+        checkpoint(cx)?;
+        let record = volume.record(cx, u64::from(number), None)?;
+        let has_root = record
+            .attributes()
+            .map_err(|error| parse(&error))?
+            .iter()
+            .any(|attribute| attribute.kind == 0x90 && attribute.name == [36, 73, 51, 48]);
+        if record.is_directory() || has_root {
+            result.push(if record.base.record != 0 || record.base.sequence != 0 {
+                record.base
+            } else {
+                NtfsReference {
+                    record: u64::from(number),
+                    sequence: record.sequence,
+                }
+            });
+        } else if root_operation {
+            return Err(corrupt(0, "INDEX_ROOT recovery target is not a directory"));
+        }
+    }
+    Ok(result)
+}
+
+/// Validate the final FILE/index combination while it is still private to the
+/// opening volume. Any error restores the previous view, including failures in
+/// the last directory and cancellation after the last recovered sector.
+pub(super) fn publish_recovered(
+    cx: &Cx,
+    volume: &mut NtfsVolume,
+    prepared: PreparedRecovery,
+) -> Result<NtfsLogFilePlan> {
+    checkpoint(cx)?;
+    let previous = std::mem::take(&mut volume.source.overlay);
+    let result = (|| {
+        publish(cx, &mut volume.source, prepared.overlay)?;
+        volume.validate_recovered_directories(cx, &prepared.directories)?;
+        checkpoint(cx)
+    })();
+    if let Err(error) = result {
+        volume.source.overlay = previous;
+        return Err(error);
+    }
+    Ok(prepared.plan)
 }
 
 /// Reuse Source's range and capacity guards, retaining its old snapshot until

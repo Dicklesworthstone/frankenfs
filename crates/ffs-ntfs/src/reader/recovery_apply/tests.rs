@@ -459,3 +459,35 @@ fn resident_attribute_lists_cannot_bypass_nonresident_storage_admission() {
     ));
     assert_eq!(input.backing, before);
 }
+
+#[test]
+fn resident_allocation_bitmaps_cannot_be_created_changed_or_deleted() {
+    for edit in 0..3 {
+        let mut input = Memory::new();
+        let mut action = update(20, 24, b"changed!");
+        action.record_offset = 96;
+        if edit == 0 {
+            let mut bitmap = resident(3, &[1]);
+            bitmap[..4].copy_from_slice(&0xB0_u32.to_le_bytes());
+            action.op = NtfsLogOp::CreateAttribute;
+            action.attribute_offset = 0;
+            action.data = bitmap;
+        } else {
+            input.backing[96..100].copy_from_slice(&0xB0_u32.to_le_bytes());
+            if edit == 2 {
+                action.op = NtfsLogOp::DeleteAttribute;
+                action.attribute_offset = 0;
+                action.data.clear();
+            }
+        }
+        let before = input.backing.clone();
+        assert!(
+            matches!(
+                execute(&Cx::for_testing(), &mut input, &plan(vec![action], vec![])),
+                Err(FfsError::UnsupportedFeature(_))
+            ),
+            "allocation bitmap edit {edit} was not refused"
+        );
+        assert_eq!(input.backing, before);
+    }
+}

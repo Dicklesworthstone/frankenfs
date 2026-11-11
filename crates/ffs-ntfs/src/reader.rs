@@ -373,15 +373,13 @@ impl NtfsVolume {
         // Use the same protected tail and checkpoint-aware Analysis as native
         // preflight. Never fall back to a flat scan after a newer commit, table
         // or target cannot be read. None is a completely verified erased log.
-        let Some(plan) = self.native_recovery_plan(cx)? else {
+        let Some(prepared) = self.native_recovery_stage(cx)? else {
             return Ok(());
         };
-        let overlay = recovery_apply::stage(cx, self, &plan)?;
-        checkpoint(cx)?;
-        // System records and changes to nonresident attributes are refused by
-        // this executor. The admitted MFT bootstrap therefore remains valid.
-        // No fallible work after publishing the complete volatile view.
-        recovery_apply::publish(cx, &mut self.source, overlay)?;
+        // Mapping/bitmap changes remain refused, preserving the admitted MFT
+        // bootstrap. Validate complete affected directory trees against the
+        // combined private FILE/INDX view before admitting a recovered mount.
+        let plan = recovery_apply::publish_recovered(cx, self, prepared)?;
         self.logfile_recovery = Some(plan);
         Ok(())
     }
@@ -532,7 +530,7 @@ impl NtfsVolume {
     }
 }
 
-/// Validate the immutable MFT bootstrap. The public resident-only recovery
+/// Validate the immutable MFT bootstrap. The public allocation-preserving recovery
 /// profile cannot change this map or silently retain a stale rebuilt view.
 fn validate_mft_stream(mft: &Stream, geometry: &NtfsGeometry) -> Result<()> {
     let Storage::Mapped(runs) = &mft.storage else {

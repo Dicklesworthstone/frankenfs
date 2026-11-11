@@ -14,6 +14,57 @@ const I30: &[u16] = &[36, 73, 51, 48];
 const MAX_ENTRIES: usize = 65_536;
 const MAX_BLOCKS: usize = 16_384;
 
+/// Shared across all affected directories, including extension catalogs and
+/// target FILE_NAME verification. A large recovered namespace must not turn
+/// each individually bounded walk into unbounded aggregate recovery work.
+struct RecoveryBudget {
+    bytes: u64,
+    entries: usize,
+    blocks: usize,
+}
+
+impl RecoveryBudget {
+    fn new() -> Self {
+        Self {
+            bytes: 64 * 1024 * 1024,
+            entries: MAX_ENTRIES,
+            blocks: MAX_BLOCKS,
+        }
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| unsupported("recovered directory validation exceeds 64 MiB of reads"))?;
+        Ok(())
+    }
+}
+
+fn catalog<'a>(
+    volume: &NtfsVolume,
+    cx: &Cx,
+    record: &'a NtfsFileRecord,
+    budget: Option<&mut RecoveryBudget>,
+) -> Result<super::attributes::AttributeSet<'a>> {
+    let Some(budget) = budget else {
+        return volume.attributes(cx, record);
+    };
+    // Charge the list before read_list performs any list-stream I/O. Its own
+    // parser still validates unique storage, initialization and the 4 MiB cap.
+    for attribute in record.attributes().map_err(|error| parse(&error))? {
+        if attribute.kind == super::ATTRIBUTE_LIST {
+            let stream = Stream::from_attribute(&volume.geometry, &attribute)?;
+            budget.charge(stream.size)?;
+        }
+    }
+    let list = super::attributes::read_list(&volume.source, &volume.geometry, cx, record)?;
+    super::attributes::resolve_catalog(cx, &volume.geometry, record, list.as_deref(), |reference| {
+        budget.charge(u64::from(volume.geometry.record_bytes()))?;
+        volume.record(cx, reference.record, Some(reference.sequence))
+    })
+}
+
 pub(super) fn parse_file_name(attribute: &NtfsAttribute<'_>) -> Result<NtfsFileName> {
     if attribute.kind != 0x30 || attribute.flags != 0 || !attribute.name.is_empty() {
         return Err(corrupt(0, "invalid FILE_NAME storage or attribute name"));
@@ -73,11 +124,20 @@ impl NtfsVolume {
         cx: &'a Cx,
         record: &NtfsFileRecord,
     ) -> Result<(Walker<'a>, Vec<NtfsIndexEntry>)> {
+        self.directory_index_with_budget(cx, record, None)
+    }
+
+    fn directory_index_with_budget<'a>(
+        &'a self,
+        cx: &'a Cx,
+        record: &NtfsFileRecord,
+        mut budget: Option<&mut RecoveryBudget>,
+    ) -> Result<(Walker<'a>, Vec<NtfsIndexEntry>)> {
         checkpoint(cx)?;
         if !record.is_directory() {
             return Err(FfsError::NotDirectory);
         }
-        let catalog = self.attributes(cx, record)?;
+        let catalog = catalog(self, cx, record, budget.as_deref_mut())?;
         let attributes = catalog.all()?;
         reject_reparse(&attributes)?;
         let root = catalog.select(&self.geometry, 0x90, I30)?;
@@ -118,6 +178,9 @@ impl NtfsVolume {
                     "directory INDEX_ALLOCATION contains sparse holes",
                 ));
             }
+            if let Some(budget) = &mut budget {
+                budget.charge(bitmap.size)?;
+            }
             let bitmap = self.read(cx, &bitmap, 0, bitmap.size as usize)?;
             (Some(allocation), bitmap)
         } else {
@@ -140,26 +203,25 @@ impl NtfsVolume {
     /// Every link is checked against its target record's FILE_NAME identity.
     pub fn list_directory(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<Vec<DirectoryEntry>> {
         let (mut walker, entries) = self.directory_index(cx, record)?;
-        walker.visit(entries, 0)?;
-        for (byte_index, byte) in walker.bitmap.iter().enumerate() {
-            for bit in 0..8 {
-                if byte & (1 << bit) != 0
-                    && !walker.visited.contains(&(byte_index as u64 * 8 + bit))
-                {
-                    return Err(corrupt(
-                        0,
-                        "directory bitmap contains an unreachable allocated index block",
-                    ));
-                }
-            }
-        }
+        walker.visit(entries, 0, None)?;
+        walker.complete()?;
+        self.directory_entries(cx, record, walker.keys, None)
+    }
+
+    fn directory_entries(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+        keys: Vec<(NtfsReference, NtfsFileName)>,
+        mut budget: Option<&mut RecoveryBudget>,
+    ) -> Result<Vec<DirectoryEntry>> {
         let parent = NtfsReference {
             record: u64::from(record.number),
             sequence: record.sequence,
         };
         let mut names = BTreeMap::new();
-        let mut result = Vec::with_capacity(walker.keys.len());
-        for (reference, filename) in walker.keys {
+        let mut result = Vec::with_capacity(keys.len());
+        for (reference, filename) in keys {
             checkpoint(cx)?;
             if filename.parent != parent {
                 return Err(corrupt(0, "directory index has the wrong parent reference"));
@@ -179,10 +241,53 @@ impl NtfsVolume {
                     "duplicate directory name points at different file records",
                 ));
             }
-            result.push(self.verify_directory_entry(cx, reference, filename, &[])?);
+            result.push(self.verify_directory_entry_with_budget(
+                cx,
+                reference,
+                filename,
+                &[],
+                budget.as_deref_mut(),
+            )?);
         }
         checkpoint(cx)?;
         Ok(result)
+    }
+
+    /// Certify the complete affected tree in the combined private recovered
+    /// view, including untouched branches, native collation and target names.
+    pub(in crate::reader) fn validate_recovered_directories(
+        &self,
+        cx: &Cx,
+        references: &[NtfsReference],
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        if references.is_empty() {
+            return Ok(());
+        }
+        let mut budget = RecoveryBudget::new();
+        let table = self.upcase_with_budget(cx, Some(&mut budget))?;
+        for reference in references {
+            checkpoint(cx)?;
+            budget.charge(u64::from(self.geometry.record_bytes()))?;
+            let record = self.record(cx, reference.record, Some(reference.sequence))?;
+            let (mut walker, entries) =
+                self.directory_index_with_budget(cx, &record, Some(&mut budget))?;
+            walker.visit(entries, 0, Some(&mut budget))?;
+            walker.complete()?;
+            for pair in walker.keys.windows(2) {
+                checkpoint(cx)?;
+                let left = pair[0].1.name.iter().map(|unit| table[usize::from(*unit)]);
+                let right = pair[1].1.name.iter().map(|unit| table[usize::from(*unit)]);
+                if left.cmp(right).is_gt() {
+                    return Err(corrupt(
+                        0,
+                        "recovered directory violates native UpCase tree order",
+                    ));
+                }
+            }
+            self.directory_entries(cx, &record, walker.keys, Some(&mut budget))?;
+        }
+        checkpoint(cx)
     }
 
     fn verify_directory_entry(
@@ -192,8 +297,22 @@ impl NtfsVolume {
         filename: NtfsFileName,
         other_names: &[NtfsFileName],
     ) -> Result<DirectoryEntry> {
+        self.verify_directory_entry_with_budget(cx, reference, filename, other_names, None)
+    }
+
+    fn verify_directory_entry_with_budget(
+        &self,
+        cx: &Cx,
+        reference: NtfsReference,
+        filename: NtfsFileName,
+        other_names: &[NtfsFileName],
+        mut budget: Option<&mut RecoveryBudget>,
+    ) -> Result<DirectoryEntry> {
+        if let Some(budget) = &mut budget {
+            budget.charge(u64::from(self.geometry.record_bytes()))?;
+        }
         let target = self.record(cx, reference.record, Some(reference.sequence))?;
-        let target_catalog = self.attributes(cx, &target)?;
+        let target_catalog = catalog(self, cx, &target, budget.as_deref_mut())?;
         let attributes = target_catalog.all()?;
         // Deduplicate additional selected identities before the single FILE_NAME
         // pass. Repeated index keys must not multiply FILE reads or turn this
@@ -225,6 +344,14 @@ impl NtfsVolume {
                 0,
                 "directory index does not match target FILE_NAME",
             ));
+        }
+        if let Some(budget) = &mut budget
+            && attributes
+                .iter()
+                .any(|attribute| attribute.kind == REPARSE_POINT)
+        {
+            let stream = target_catalog.select(&self.geometry, REPARSE_POINT, &[])?;
+            budget.charge(stream.size)?;
         }
         Ok(DirectoryEntry {
             reference,
@@ -433,13 +560,42 @@ impl NtfsVolume {
     }
 
     fn upcase(&self, cx: &Cx) -> Result<Vec<u16>> {
+        self.upcase_with_budget(cx, None)
+    }
+
+    fn upcase_with_budget(
+        &self,
+        cx: &Cx,
+        mut budget: Option<&mut RecoveryBudget>,
+    ) -> Result<Vec<u16>> {
+        if let Some(budget) = &mut budget {
+            budget.charge(u64::from(self.geometry.record_bytes()))?;
+        }
         let record = self.record(cx, 10, None)?;
-        let stream = self.data_stream(cx, &record, &[])?;
+        let stream = if budget.is_some() {
+            let catalog = catalog(self, cx, &record, budget.as_deref_mut())?;
+            super::data_read_admission(&record, &catalog.all()?)?;
+            if record.is_directory() {
+                return Err(FfsError::IsDirectory);
+            }
+            catalog.select(&self.geometry, super::DATA, &[])?
+        } else {
+            self.data_stream(cx, &record, &[])?
+        };
+        if budget.is_some() && !matches!(&stream.storage, Storage::Resident(_) | Storage::Mapped(_))
+        {
+            return Err(unsupported(
+                "recovered directory validation needs plain native UpCase",
+            ));
+        }
         if stream.size != 131_072 || stream.initialized != stream.size {
             return Err(corrupt(
                 0,
                 "invalid NTFS UpCase table size or initialized boundary",
             ));
+        }
+        if let Some(budget) = &mut budget {
+            budget.charge(stream.size)?;
         }
         let bytes = self.read(cx, &stream, 0, 131_072)?;
         let table: Vec<_> = bytes
@@ -539,7 +695,12 @@ impl Walker<'_> {
         parse_index_block(&raw, vcn).map_err(|error| parse(&error))
     }
 
-    fn visit(&mut self, entries: Vec<NtfsIndexEntry>, depth: usize) -> Result<()> {
+    fn visit(
+        &mut self,
+        entries: Vec<NtfsIndexEntry>,
+        depth: usize,
+        mut budget: Option<&mut RecoveryBudget>,
+    ) -> Result<()> {
         checkpoint(self.cx)?;
         if depth > 32 {
             return Err(unsupported("NTFS index tree depth exceeds 32"));
@@ -547,16 +708,43 @@ impl Walker<'_> {
         for entry in entries {
             checkpoint(self.cx)?;
             if let Some(vcn) = entry.child_vcn {
+                if let Some(budget) = &mut budget {
+                    budget.blocks = budget.blocks.checked_sub(1).ok_or_else(|| {
+                        unsupported("recovered directories exceed 16384 index blocks")
+                    })?;
+                    budget.charge(u64::from(self.block_bytes))?;
+                }
                 let children = self.read_child(vcn)?;
-                self.visit(children, depth + 1)?;
+                self.visit(children, depth + 1, budget.as_deref_mut())?;
             }
             if let Some(key) = entry.key {
                 if self.keys.len() == MAX_ENTRIES {
                     return Err(unsupported("NTFS directory exceeds 65536 entries"));
                 }
+                if let Some(budget) = &mut budget {
+                    budget.entries = budget.entries.checked_sub(1).ok_or_else(|| {
+                        unsupported("recovered directories exceed 65536 total entries")
+                    })?;
+                }
                 self.keys.push(key);
             }
         }
         Ok(())
+    }
+
+    fn complete(&self) -> Result<()> {
+        for (byte_index, byte) in self.bitmap.iter().enumerate() {
+            checkpoint(self.cx)?;
+            for bit in 0..8 {
+                if byte & (1 << bit) != 0 && !self.visited.contains(&(byte_index as u64 * 8 + bit))
+                {
+                    return Err(corrupt(
+                        0,
+                        "directory bitmap contains an unreachable allocated index block",
+                    ));
+                }
+            }
+        }
+        checkpoint(self.cx)
     }
 }
