@@ -182,7 +182,7 @@ fn mft_mirror_checks_boot_location_physical_independence_and_initialized_geometr
                     8,
                     4096,
                     false,
-                )
+                );
             }
             3 => attr[48..56].copy_from_slice(&3072_u64.to_le_bytes()),
             4 => attr[56..64].copy_from_slice(&3072_u64.to_le_bytes()),
