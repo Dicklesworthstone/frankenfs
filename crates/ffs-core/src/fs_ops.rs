@@ -1,12 +1,12 @@
 //! VFS operation dispatch for [`OpenFs`].
 
 use super::{
-    Arc, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_INO_LOOKUP_USER_ARGS_SIZE,
-    BTRFS_INO_LOOKUP_USER_NAME_OFFSET, BTRFS_INO_LOOKUP_USER_NAME_SIZE,
-    BTRFS_INO_LOOKUP_USER_PATH_OFFSET, BTRFS_INO_LOOKUP_USER_PATH_SIZE,
-    BTRFS_INO_PATHS_MAX_BYTES_U64, BTRFS_INODE_APPEND, BTRFS_INODE_IMMUTABLE,
-    BTRFS_INODE_NODATASUM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM,
-    BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM, BTRFS_MAX_ROOTREF_BUFFER_NUM,
+    Arc, BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID,
+    BTRFS_INO_LOOKUP_USER_ARGS_SIZE, BTRFS_INO_LOOKUP_USER_NAME_OFFSET,
+    BTRFS_INO_LOOKUP_USER_NAME_SIZE, BTRFS_INO_LOOKUP_USER_PATH_OFFSET,
+    BTRFS_INO_LOOKUP_USER_PATH_SIZE, BTRFS_INO_PATHS_MAX_BYTES_U64, BTRFS_INODE_APPEND,
+    BTRFS_INODE_IMMUTABLE, BTRFS_INODE_NODATASUM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
+    BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM, BTRFS_MAX_ROOTREF_BUFFER_NUM,
     BTRFS_ROOT_SUBVOL_RDONLY, BTRFS_ROOTREF_ENTRY_SIZE, BTRFS_SUBVOL_ROOTREF_ARGS_SIZE,
     BTRFS_SUBVOL_ROOTREF_NUM_ITEMS_OFFSET, BTRFS_SUPER_INFO_OFFSET, BTRFS_TREE_SEARCH_KEY_SIZE,
     BTRFS_TREE_SEARCH_V2_HEADER_SIZE, BTRFS_USER_SETTABLE_FSFLAGS, BTRFS_USER_SETTABLE_XFLAGS,
@@ -42,7 +42,187 @@ use crate::vfs::XattrPresence;
 /// suppression they never had.
 const XATTR_SCAN_INODE_LIMIT: u32 = 262_144;
 
+const BTRFS_SUBVOL_RDONLY: u64 = 1 << 1;
+const BTRFS_DEV_STATS_RESET: u64 = 1 << 0;
+const BTRFS_DEV_REPLACE_CMD_START: u64 = 0;
+const BTRFS_DEV_REPLACE_CMD_STATUS: u64 = 1;
+const BTRFS_DEV_REPLACE_CMD_CANCEL: u64 = 2;
+const BTRFS_DEV_REPLACE_ARGS_LEN: usize = 2600;
+const BTRFS_BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
+
 impl OpenFs {
+    fn ext4_apply_and_write_inode_flags_and_projid(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        flags: u32,
+        new_projid: Option<u32>,
+    ) -> ffs_error::Result<()> {
+        let canonical = Self::ext4_canonical_inode(ino);
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let mut inode = self.read_inode_with_scope(cx, scope, canonical)?;
+        let requested_user_flags = flags & Self::EXT4_USER_SETTABLE_FLAGS;
+        let wants_compression = requested_user_flags & ffs_types::EXT4_COMPR_FL != 0;
+        if wants_compression && !sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::COMPRESSION) {
+            return Err(FfsError::UnsupportedFeature(
+                "EXT4_COMPR_FL requires the ext4 COMPRESSION incompat feature".into(),
+            ));
+        }
+        let enabling_compression = wants_compression && inode.flags & ffs_types::EXT4_COMPR_FL == 0;
+        if enabling_compression {
+            if !inode.is_regular() {
+                return Err(FfsError::ModeViolation(
+                    "EXT4_COMPR_FL can only be enabled on regular files".into(),
+                ));
+            }
+            if inode.size != 0 {
+                return Err(FfsError::UnsupportedFeature(
+                    "EXT4_COMPR_FL can only be enabled on empty files".into(),
+                ));
+            }
+        }
+
+        let mut new_flags = (inode.flags & !Self::EXT4_USER_SETTABLE_FLAGS) | requested_user_flags;
+        if enabling_compression {
+            inode.flags = new_flags;
+            Self::seed_e2compr_defaults_for_inode(&mut inode);
+            new_flags = inode.flags;
+        }
+        inode.flags = new_flags;
+        if let Some(projid) = new_projid {
+            inode.projid = projid;
+        }
+        let (secs, nanos) = Self::now_timestamp();
+        ffs_inode::touch_ctime(&mut inode, secs, nanos);
+
+        if let Some(tx) = &mut scope.tx {
+            let tx_dev = TransactionBlockAdapter {
+                base: &block_dev,
+                tx: Mutex::new(tx),
+            };
+            let alloc = alloc_mutex.read();
+            ffs_inode::write_inode(
+                cx,
+                &tx_dev,
+                &alloc.geo,
+                &alloc.groups,
+                canonical,
+                &inode,
+                csum_seed,
+            )?;
+        } else {
+            let alloc = alloc_mutex.read();
+            ffs_inode::write_inode(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &alloc.groups,
+                canonical,
+                &inode,
+                csum_seed,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn btrfs_readonly_space_info(&self, cx: &Cx) -> ffs_error::Result<Vec<(u64, u64, u64)>> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let sb = self
+            .btrfs_superblock()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        let ctx = self
+            .btrfs_context()
+            .ok_or_else(|| FfsError::Format("btrfs context not available".into()))?;
+
+        // `groups`: start -> (flags, total_bytes, used_bytes)
+        let mut groups: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
+        for chunk in &ctx.chunks {
+            let alloc_flags = Self::btrfs_block_group_alloc_flags(chunk.chunk_type);
+            let synthetic_used = if chunk.key.offset == 0 {
+                chunk.length.min(131_072)
+            } else {
+                0
+            };
+            groups.insert(
+                chunk.key.offset,
+                (alloc_flags | chunk.chunk_type, chunk.length, synthetic_used),
+            );
+        }
+
+        let mut explicit_bg_starts: BTreeSet<u64> = BTreeSet::new();
+        let mut extent_spans: Vec<(u64, u64)> = Vec::new();
+        if let Ok(root_items) = self.walk_btrfs_root_tree(cx) {
+            for tree_oid in [BTRFS_EXTENT_TREE_OBJECTID, BTRFS_BLOCK_GROUP_TREE_OBJECTID] {
+                let Some(entry) = root_items.iter().find(|e| {
+                    e.key.objectid == tree_oid && e.key.item_type == BTRFS_ITEM_ROOT_ITEM
+                }) else {
+                    continue;
+                };
+                let Ok(root_item) = parse_root_item(&entry.data) else {
+                    continue;
+                };
+                if root_item.bytenr == 0 {
+                    continue;
+                }
+                let Ok(items) = self.walk_btrfs_tree(cx, root_item.bytenr) else {
+                    continue;
+                };
+                for item in items {
+                    match item.key.item_type {
+                        ffs_btrfs::BTRFS_ITEM_BLOCK_GROUP_ITEM if item.data.len() >= 24 => {
+                            let used = u64::from_le_bytes(item.data[0..8].try_into().unwrap());
+                            let bg_flags =
+                                u64::from_le_bytes(item.data[16..24].try_into().unwrap());
+                            let flags = Self::btrfs_block_group_alloc_flags(bg_flags) | bg_flags;
+                            groups.insert(item.key.objectid, (flags, item.key.offset, used));
+                            explicit_bg_starts.insert(item.key.objectid);
+                        }
+                        ffs_btrfs::BTRFS_ITEM_EXTENT_ITEM => {
+                            extent_spans.push((item.key.objectid, item.key.offset));
+                        }
+                        ffs_btrfs::BTRFS_ITEM_METADATA_ITEM => {
+                            extent_spans.push((item.key.objectid, u64::from(sb.nodesize)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if !extent_spans.is_empty() {
+            for (&start, entry) in &mut groups {
+                if explicit_bg_starts.contains(&start) {
+                    continue;
+                }
+                let end = start.saturating_add(entry.1);
+                let used = extent_spans
+                    .iter()
+                    .filter(|&&(ext_start, _)| ext_start >= start && ext_start < end)
+                    .fold(0_u64, |acc, &(_, len)| acc.saturating_add(len));
+                entry.2 = used;
+            }
+        }
+
+        let mut aggregated: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        for &(flags, total_bytes, used_bytes) in groups.values() {
+            let slot = aggregated.entry(flags).or_insert((0, 0));
+            slot.0 = slot.0.saturating_add(total_bytes);
+            slot.1 = slot.1.saturating_add(used_bytes);
+        }
+        Ok(aggregated
+            .into_iter()
+            .map(|(flags, (total, used))| (flags, total, used))
+            .collect())
+    }
+
     /// Walk the inode table and decide whether ANY inode carries an xattr.
     ///
     /// Every exit that is not a completed clean walk returns
@@ -437,6 +617,10 @@ impl OpenFs {
             for ptr in ptrs {
                 let actual = self.btrfs_tree_block_generation(cx, ptr.blockptr)?;
                 if actual != ptr.generation {
+                    self.record_btrfs_dev_stat(
+                        self.btrfs_devid_for_logical(ptr.blockptr),
+                        crate::BTRFS_DEV_STAT_GENERATION_ERRS,
+                    );
                     found.push(BtrfsTransidMismatch {
                         logical: ptr.blockptr,
                         wanted: ptr.generation,
@@ -487,6 +671,10 @@ impl OpenFs {
                 };
                 let actual = self.btrfs_tree_block_generation(cx, root_item.bytenr)?;
                 if actual != root_item.generation {
+                    self.record_btrfs_dev_stat(
+                        self.btrfs_devid_for_logical(root_item.bytenr),
+                        crate::BTRFS_DEV_STAT_GENERATION_ERRS,
+                    );
                     found.push(BtrfsTransidMismatch {
                         logical: root_item.bytenr,
                         wanted: root_item.generation,
@@ -2004,37 +2192,23 @@ impl FsOps for OpenFs {
                 let canonical = Self::ext4_canonical_inode(ino);
                 let current = self.read_inode_with_scope(cx, scope, canonical)?;
                 let new_flags = xflags_to_ext4_flags(fsx.xflags, current.flags)?;
-
-                // Reuse the existing user-flag pipeline so the
-                // EXT4_USER_SETTABLE_FLAGS gate, EXT4_COMPR_FL feature
-                // check, and journal-aware write path all stay in one
-                // place. set_inode_flags only touches the user-settable
-                // subset, so PROJINHERIT etc. round-trip cleanly.
-                <Self as FsOps>::set_inode_flags(self, cx, scope, ino, new_flags)?;
-
-                // Project-ID is a separate field — apply it directly
-                // unless it matches what's already on disk.
-                if fsx.projid != current.projid {
-                    let mut updated = self.read_inode_with_scope(cx, scope, canonical)?;
-                    updated.projid = fsx.projid;
-                    let alloc_mutex = self.require_alloc_state()?;
-                    let block_dev = self.block_device_adapter();
-                    let sb = self
-                        .ext4_superblock()
-                        .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-                    let csum_seed = sb.csum_seed();
-                    let alloc = alloc_mutex.read();
-                    ffs_inode::write_inode(
-                        cx,
-                        &block_dev,
-                        &alloc.geo,
-                        &alloc.groups,
-                        canonical,
-                        &updated,
-                        csum_seed,
-                    )?;
-                }
-                Ok(())
+                let projid_override = (fsx.projid != current.projid).then_some(fsx.projid);
+                tracing::debug!(
+                    target: "ffs::core::ioctl",
+                    ioctl = "FS_IOC_FSSETXATTR",
+                    fs = "ext4",
+                    ino = canonical.0,
+                    xflags = fsx.xflags,
+                    projid = fsx.projid,
+                    "staging ext4 inode flags and projid in single request scope write"
+                );
+                self.ext4_apply_and_write_inode_flags_and_projid(
+                    cx,
+                    scope,
+                    ino,
+                    new_flags,
+                    projid_override,
+                )
             }
             FsFlavor::Btrfs(_) => {
                 self.require_btrfs_rw_allowed("setfsxattr")?;
@@ -2681,7 +2855,7 @@ impl FsOps for OpenFs {
 
     fn get_btrfs_space_info(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         _scope: &mut RequestScope,
         space_slots: u64,
     ) -> ffs_error::Result<Vec<u8>> {
@@ -2691,11 +2865,19 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_SPACE_INFO is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                let space_infos = self
-                    .require_btrfs_alloc_state()?
-                    .read()
-                    .extent_alloc
-                    .space_info();
+                let space_infos = if let Some(alloc_mutex) = &self.btrfs_alloc_state {
+                    alloc_mutex.read().extent_alloc.space_info()
+                } else {
+                    self.btrfs_readonly_space_info(cx)?
+                };
+                tracing::debug!(
+                    target: "ffs::core::ioctl",
+                    ioctl = "BTRFS_IOC_SPACE_INFO",
+                    writable = self.is_writable(),
+                    space_slots,
+                    total_spaces = space_infos.len(),
+                    "encoded btrfs space_info response"
+                );
                 let total_spaces = u64::try_from(space_infos.len()).map_err(|_| {
                     FfsError::Format("BTRFS_IOC_SPACE_INFO entry count exceeds u64".to_owned())
                 })?;
@@ -3344,23 +3526,48 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         args: &[u8],
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_DEV_REPLACE is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                // Return status indicating no replacement in progress
+                if args.len() < BTRFS_DEV_REPLACE_ARGS_LEN {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::EINVAL,
+                    )));
+                }
                 // cmd field at offset 0: 0=start, 1=status, 2=cancel
-                let cmd = if args.len() >= 8 {
-                    u64::from_le_bytes(args[0..8].try_into().unwrap_or([0; 8]))
-                } else {
-                    1 // default to status query
-                };
-                let mut out = vec![0u8; 2600];
-                out[0..8].copy_from_slice(&cmd.to_le_bytes());
-                // result at offset 8: 0 = no error
-                // status.replace_state at offset 16: 0 = not started
-                Ok(out)
+                let cmd = u64::from_le_bytes(args[0..8].try_into().expect("checked >= 2600"));
+                tracing::debug!(
+                    target: "ffs::core::ioctl",
+                    ioctl = "BTRFS_IOC_DEV_REPLACE",
+                    cmd,
+                    writable = self.is_writable(),
+                    "dispatching btrfs_dev_replace"
+                );
+                match cmd {
+                    BTRFS_DEV_REPLACE_CMD_STATUS => {
+                        let mut out = vec![0_u8; BTRFS_DEV_REPLACE_ARGS_LEN];
+                        out[0..8].copy_from_slice(&cmd.to_le_bytes());
+                        // result at offset 8: 0 = BTRFS_IOCTL_DEV_REPLACE_RESULT_NO_ERROR
+                        // status.replace_state at offset 24: 0 = BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED
+                        Ok(out)
+                    }
+                    BTRFS_DEV_REPLACE_CMD_START | BTRFS_DEV_REPLACE_CMD_CANCEL => {
+                        if self.is_writable() {
+                            Err(FfsError::UnsupportedFeature(
+                                "BTRFS_IOC_DEV_REPLACE start/cancel is not implemented on FrankenFS btrfs mounts"
+                                    .to_owned(),
+                            ))
+                        } else {
+                            Err(FfsError::ReadOnly)
+                        }
+                    }
+                    _ => Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::EINVAL,
+                    ))),
+                }
             }
         }
     }
@@ -3783,21 +3990,54 @@ impl FsOps for OpenFs {
 
     fn btrfs_get_dev_stats(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         _scope: &mut RequestScope,
         devid: u64,
+        flags: u64,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_GET_DEV_STATS is not supported on ext4 filesystems".to_owned(),
             )),
-            FsFlavor::Btrfs(_) => {
-                // Return zeroed stats struct - FrankenFS is read-only and doesn't track device errors
+            FsFlavor::Btrfs(sb) => {
+                if flags & !BTRFS_DEV_STATS_RESET != 0 {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::EINVAL,
+                    )));
+                }
+                let reset = flags & BTRFS_DEV_STATS_RESET != 0;
+                if reset && !self.is_writable() {
+                    return Err(FfsError::ReadOnly);
+                }
+                if !self.btrfs_has_device_id(cx, sb, devid)? {
+                    return Err(btrfs_dev_info_enodev());
+                }
+                let values = {
+                    let mut stats_map = self.btrfs_dev_stats.lock();
+                    let current = stats_map.get(&devid).copied().unwrap_or([0; 5]);
+                    if reset {
+                        stats_map.insert(devid, [0; 5]);
+                    }
+                    current
+                };
+                tracing::debug!(
+                    target: "ffs::core::ioctl",
+                    ioctl = "BTRFS_IOC_GET_DEV_STATS",
+                    devid,
+                    reset,
+                    values = ?values,
+                    "returning btrfs per-device error counters"
+                );
                 // struct btrfs_ioctl_get_dev_stats = 1032 bytes
-                // Layout: devid(8) + nr_items(8) + flags(8) + values[5](40) + unused[121..](968)
-                let mut out = vec![0u8; 1032];
+                // Layout: devid(8) + nr_items(8) + flags(8) + values[5](40) + unused[121](968)
+                let mut out = vec![0_u8; 1032];
                 out[0..8].copy_from_slice(&devid.to_le_bytes());
-                out[8..16].copy_from_slice(&5u64.to_le_bytes()); // nr_items = 5 counters
+                out[8..16].copy_from_slice(&5_u64.to_le_bytes());
+                for (idx, val) in values.iter().enumerate() {
+                    let off = 24 + idx * 8;
+                    out[off..off + 8].copy_from_slice(&val.to_le_bytes());
+                }
                 Ok(out)
             }
         }
@@ -4179,7 +4419,7 @@ impl FsOps for OpenFs {
         &self,
         cx: &Cx,
         _scope: &mut RequestScope,
-        _ino: InodeNumber,
+        ino: InodeNumber,
     ) -> ffs_error::Result<u64> {
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
@@ -4187,24 +4427,56 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_SUBVOL_GETFLAGS is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
+                if let Some((_slot, nested, inner_ino)) = self.btrfs_nested_route(ino)? {
+                    return <Self as FsOps>::get_subvol_flags(
+                        &nested,
+                        cx,
+                        &mut RequestScope::empty(),
+                        inner_ino,
+                    );
+                }
                 let subvol_id = self
                     .btrfs_context
                     .as_ref()
                     .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid);
-                let root_items = self.walk_btrfs_root_tree(cx)?;
-                let fs_tree_root = root_items
-                    .iter()
-                    .find(|item| {
-                        item.key.objectid == subvol_id && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
-                    })
-                    .ok_or_else(|| {
-                        FfsError::NotFound(format!(
-                            "btrfs ROOT_ITEM for subvolume objectid {subvol_id}"
-                        ))
-                    })?;
-                let root_item =
-                    parse_root_item(&fs_tree_root.data).map_err(|e| parse_to_ffs_error(&e))?;
-                Ok(root_item.flags)
+                let root_item = if let Some(alloc_mutex) = &self.btrfs_alloc_state {
+                    let alloc = alloc_mutex.read();
+                    let (_key, data) = Self::btrfs_find_root_item(&alloc.root_tree, subvol_id)?
+                        .ok_or_else(|| {
+                            FfsError::NotFound(format!(
+                                "btrfs ROOT_ITEM for subvolume objectid {subvol_id}"
+                            ))
+                        })?;
+                    parse_root_item(&data).map_err(|e| parse_to_ffs_error(&e))?
+                } else {
+                    let root_items = self.walk_btrfs_root_tree(cx)?;
+                    let fs_tree_root = root_items
+                        .iter()
+                        .find(|item| {
+                            item.key.objectid == subvol_id
+                                && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
+                        })
+                        .ok_or_else(|| {
+                            FfsError::NotFound(format!(
+                                "btrfs ROOT_ITEM for subvolume objectid {subvol_id}"
+                            ))
+                        })?;
+                    parse_root_item(&fs_tree_root.data).map_err(|e| parse_to_ffs_error(&e))?
+                };
+                let uapi_flags = if root_item.flags & BTRFS_ROOT_SUBVOL_RDONLY != 0 {
+                    BTRFS_SUBVOL_RDONLY
+                } else {
+                    0
+                };
+                tracing::debug!(
+                    target: "ffs::core::ioctl",
+                    ioctl = "BTRFS_IOC_SUBVOL_GETFLAGS",
+                    subvol_id,
+                    ondisk_flags = root_item.flags,
+                    uapi_flags,
+                    "read btrfs subvolume flags"
+                );
+                Ok(uapi_flags)
             }
         }
     }
@@ -4213,7 +4485,7 @@ impl FsOps for OpenFs {
         &self,
         cx: &Cx,
         _scope: &mut RequestScope,
-        _ino: InodeNumber,
+        ino: InodeNumber,
         flags: u64,
     ) -> ffs_error::Result<()> {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
@@ -4225,35 +4497,46 @@ impl FsOps for OpenFs {
             FsFlavor::Btrfs(_) => {
                 self.require_btrfs_rw_allowed("subvol_setflags")?;
 
-                // Only BTRFS_ROOT_SUBVOL_RDONLY (bit 0) is user-settable
-                if flags & !BTRFS_ROOT_SUBVOL_RDONLY != 0 {
-                    return Err(FfsError::UnsupportedFeature(format!(
-                        "invalid subvol flags 0x{flags:x}: only RDONLY (0x1) is settable"
+                // Linux UAPI <linux/btrfs.h> BTRFS_SUBVOL_RDONLY = 1 << 1 (0x2);
+                // on-disk btrfs_root_item.flags uses BTRFS_ROOT_SUBVOL_RDONLY = 1 << 0 (0x1).
+                if flags & !BTRFS_SUBVOL_RDONLY != 0 {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::EINVAL,
                     )));
                 }
 
-                let subvol_id = self
-                    .btrfs_context
-                    .as_ref()
-                    .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid);
-
-                let root_key = BtrfsKey {
-                    objectid: subvol_id,
-                    item_type: BTRFS_ITEM_ROOT_ITEM,
-                    offset: 0,
-                };
+                let subvol_id =
+                    if let Some((_slot, nested, _inner_ino)) = self.btrfs_nested_route(ino)? {
+                        nested
+                            .btrfs_context
+                            .as_ref()
+                            .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid)
+                    } else {
+                        self.btrfs_context
+                            .as_ref()
+                            .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid)
+                    };
 
                 let alloc_mutex = self.require_btrfs_alloc_state()?;
                 {
                     let mut alloc = alloc_mutex.write();
+                    let (root_key, mut root_item_data) =
+                        Self::btrfs_find_root_item(&alloc.root_tree, subvol_id)?.ok_or_else(
+                            || {
+                                FfsError::NotFound(format!(
+                                    "btrfs ROOT_ITEM for subvolume objectid {subvol_id}"
+                                ))
+                            },
+                        )?;
+                    let parsed =
+                        parse_root_item(&root_item_data).map_err(|e| parse_to_ffs_error(&e))?;
+                    let ondisk_flags = if flags & BTRFS_SUBVOL_RDONLY != 0 {
+                        parsed.flags | BTRFS_ROOT_SUBVOL_RDONLY
+                    } else {
+                        parsed.flags & !BTRFS_ROOT_SUBVOL_RDONLY
+                    };
 
-                    let mut root_item_data = alloc.root_tree.get(&root_key).ok_or_else(|| {
-                        FfsError::NotFound(format!(
-                            "btrfs ROOT_ITEM for subvolume objectid {subvol_id}"
-                        ))
-                    })?;
-
-                    BtrfsRootItem::patch_flags(&mut root_item_data, flags).map_err(|e| {
+                    BtrfsRootItem::patch_flags(&mut root_item_data, ondisk_flags).map_err(|e| {
                         FfsError::Parse(format!("ROOT_ITEM flags patch failed: {e}"))
                     })?;
 
@@ -4261,6 +4544,14 @@ impl FsOps for OpenFs {
                         .root_tree
                         .update(&root_key, &root_item_data)
                         .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                    tracing::debug!(
+                        target: "ffs::core::ioctl",
+                        ioctl = "BTRFS_IOC_SUBVOL_SETFLAGS",
+                        subvol_id,
+                        uapi_flags = flags,
+                        ondisk_flags,
+                        "updated btrfs subvolume flags in root_tree"
+                    );
                 }
 
                 Ok(())
@@ -4402,80 +4693,7 @@ impl FsOps for OpenFs {
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let canonical = Self::ext4_canonical_inode(ino);
-                let alloc_mutex = self.require_alloc_state()?;
-                let block_dev = self.block_device_adapter();
-                let sb = self
-                    .ext4_superblock()
-                    .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-                let csum_seed = sb.csum_seed();
-
-                let mut inode = self.read_inode_with_scope(cx, scope, canonical)?;
-                let requested_user_flags = flags & Self::EXT4_USER_SETTABLE_FLAGS;
-                let wants_compression = requested_user_flags & ffs_types::EXT4_COMPR_FL != 0;
-                if wants_compression
-                    && !sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::COMPRESSION)
-                {
-                    return Err(FfsError::UnsupportedFeature(
-                        "EXT4_COMPR_FL requires the ext4 COMPRESSION incompat feature".into(),
-                    ));
-                }
-                let enabling_compression =
-                    wants_compression && inode.flags & ffs_types::EXT4_COMPR_FL == 0;
-                if enabling_compression {
-                    if !inode.is_regular() {
-                        return Err(FfsError::ModeViolation(
-                            "EXT4_COMPR_FL can only be enabled on regular files".into(),
-                        ));
-                    }
-                    if inode.size != 0 {
-                        return Err(FfsError::UnsupportedFeature(
-                            "EXT4_COMPR_FL can only be enabled on empty files".into(),
-                        ));
-                    }
-                }
-
-                let mut new_flags =
-                    (inode.flags & !Self::EXT4_USER_SETTABLE_FLAGS) | requested_user_flags;
-                if enabling_compression {
-                    inode.flags = new_flags;
-                    Self::seed_e2compr_defaults_for_inode(&mut inode);
-                    new_flags = inode.flags;
-                }
-                inode.flags = new_flags;
-                // ext4_ioctl_setflags stamps ctime on every successful call
-                // (xfstests generic/277), as btrfs below does.
-                let (secs, nanos) = Self::now_timestamp();
-                ffs_inode::touch_ctime(&mut inode, secs, nanos);
-
-                if let Some(tx) = &mut scope.tx {
-                    let tx_dev = TransactionBlockAdapter {
-                        base: &block_dev,
-                        tx: Mutex::new(tx),
-                    };
-                    let alloc = alloc_mutex.read();
-                    ffs_inode::write_inode(
-                        cx,
-                        &tx_dev,
-                        &alloc.geo,
-                        &alloc.groups,
-                        canonical,
-                        &inode,
-                        csum_seed,
-                    )?;
-                } else {
-                    let alloc = alloc_mutex.read();
-                    ffs_inode::write_inode(
-                        cx,
-                        &block_dev,
-                        &alloc.geo,
-                        &alloc.groups,
-                        canonical,
-                        &inode,
-                        csum_seed,
-                    )?;
-                }
-                Ok(())
+                self.ext4_apply_and_write_inode_flags_and_projid(cx, scope, ino, flags, None)
             }
             FsFlavor::Btrfs(_) => {
                 self.require_btrfs_rw_allowed("setflags")?;

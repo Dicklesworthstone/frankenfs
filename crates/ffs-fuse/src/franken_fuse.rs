@@ -2903,15 +2903,23 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_DEV_REPLACE => {
-                // Input: 2600-byte dev_replace_args with cmd + status
+                // Input: 2600-byte dev_replace_args with cmd + status.
+                // cmd == 1 (BTRFS_IOCTL_DEV_REPLACE_CMD_STATUS) is valid on
+                // read-only mounts; START (0) and CANCEL (2) require RW.
                 if in_data.len() < BTRFS_DEV_REPLACE_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                if self.inner.read_only {
+                let cmd = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
+                if self.inner.read_only && cmd != 1 {
                     return IoctlResult::Error(libc::EROFS);
                 }
+                let scope_op = if self.inner.read_only {
+                    RequestOp::IoctlRead
+                } else {
+                    RequestOp::IoctlWrite
+                };
                 let cx = Self::cx_for_request();
-                match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
+                match self.with_request_scope(&cx, scope_op, |cx, scope| {
                     self.inner.ops.btrfs_dev_replace(cx, scope, in_data)
                 }) {
                     Ok(data) => IoctlResult::Data(data),
@@ -3204,14 +3212,27 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_GET_DEV_STATS => {
-                // Input: 1032-byte struct with devid
+                // Input: 1032-byte struct with devid(0..8), nr_items(8..16), flags(16..24)
                 if in_data.len() < BTRFS_DEV_STATS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let devid = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
+                let flags = u64::from_le_bytes(in_data[16..24].try_into().unwrap_or([0; 8]));
+                if flags & !BTRFS_DEV_STATS_RESET != 0 {
+                    return IoctlResult::Error(libc::EINVAL);
+                }
+                let reset = flags & BTRFS_DEV_STATS_RESET != 0;
+                if self.inner.read_only && reset {
+                    return IoctlResult::Error(libc::EROFS);
+                }
+                let scope_op = if reset {
+                    RequestOp::IoctlWrite
+                } else {
+                    RequestOp::IoctlRead
+                };
                 let cx = Self::cx_for_request();
-                match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
-                    self.inner.ops.btrfs_get_dev_stats(cx, scope, devid)
+                match self.with_request_scope(&cx, scope_op, |cx, scope| {
+                    self.inner.ops.btrfs_get_dev_stats(cx, scope, devid, flags)
                 }) {
                     Ok(mut data) => {
                         data.resize(BTRFS_DEV_STATS_SIZE as usize, 0);

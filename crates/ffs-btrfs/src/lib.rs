@@ -968,12 +968,13 @@ impl BtrfsRootItem {
     /// Update the flags field in a ROOT_ITEM blob in-place.
     ///
     /// # Arguments
-    /// * `data` - Mutable ROOT_ITEM data (must be at least 279 bytes)
+    /// * `data` - Mutable ROOT_ITEM data (must be at least 239 bytes, covering both
+    ///   legacy v0 239-byte and full 439-byte `btrfs_root_item` records)
     /// * `flags` - New flags value
     pub fn patch_flags(data: &mut [u8], flags: u64) -> Result<(), ParseError> {
-        if data.len() < BTRFS_ROOT_ITEM_SIZE {
+        if data.len() < BTRFS_ROOT_ITEM_LEGACY_SIZE {
             return Err(ParseError::InsufficientData {
-                needed: BTRFS_ROOT_ITEM_SIZE,
+                needed: BTRFS_ROOT_ITEM_LEGACY_SIZE,
                 offset: 0,
                 actual: data.len(),
             });
@@ -18460,6 +18461,14 @@ mod tests {
         BtrfsRootItem::patch_flags(&mut data, 0).expect("patch");
         let cleared = parse_root_item(&data).expect("parse cleared");
         assert_eq!(cleared.flags, 0);
+
+        // Legacy 239-byte ROOT_ITEM also supports in-place flags patching
+        let mut legacy = data[..BTRFS_ROOT_ITEM_LEGACY_SIZE].to_vec();
+        BtrfsRootItem::patch_flags(&mut legacy, BTRFS_ROOT_SUBVOL_RDONLY)
+            .expect("patch legacy 239-byte ROOT_ITEM");
+        let parsed_legacy = parse_root_item(&legacy).expect("parse legacy");
+        assert_eq!(parsed_legacy.flags, BTRFS_ROOT_SUBVOL_RDONLY);
+        assert!(BtrfsRootItem::patch_flags(&mut legacy[..238], 0).is_err());
     }
 
     #[test]

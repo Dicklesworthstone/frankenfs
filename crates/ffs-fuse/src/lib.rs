@@ -2094,6 +2094,7 @@ const BTRFS_FSLABEL_SIZE: u32 = 256;
 /// Get device error statistics (1032 bytes).
 const BTRFS_IOC_GET_DEV_STATS: u32 = 0xC408_9434;
 const BTRFS_DEV_STATS_SIZE: u32 = 1032;
+const BTRFS_DEV_STATS_RESET: u64 = 1 << 0;
 /// `BTRFS_IOC_GET_SUBVOL_INFO` = `_IOR(0x94, 60, struct btrfs_ioctl_get_subvol_info_args)`.
 /// Get subvolume info for the mounted subvol or specified inode.
 const BTRFS_IOC_GET_SUBVOL_INFO: u32 = 0x81F8_943C;
@@ -15222,6 +15223,7 @@ mod tests {
         BtrfsForgetDevice(Vec<u8>),
         BtrfsResize(Vec<u8>),
         BtrfsDevReplace(Vec<u8>),
+        BtrfsGetDevStats(u64, u64),
         Getattr(InodeNumber),
         Statfs(InodeNumber),
         GetVersion(InodeNumber),
@@ -16242,6 +16244,23 @@ mod tests {
                 .expect("lock ioctl calls")
                 .push(IoctlCall::BtrfsDevReplace(args.to_vec()));
             Ok(vec![0_u8; BTRFS_DEV_REPLACE_ARGS_SIZE as usize])
+        }
+
+        fn btrfs_get_dev_stats(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            devid: u64,
+            flags: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.calls
+                .lock()
+                .expect("lock ioctl calls")
+                .push(IoctlCall::BtrfsGetDevStats(devid, flags));
+            let mut out = vec![0_u8; BTRFS_DEV_STATS_SIZE as usize];
+            out[0..8].copy_from_slice(&devid.to_le_bytes());
+            out[8..16].copy_from_slice(&5_u64.to_le_bytes());
+            Ok(out)
         }
 
         fn get_btrfs_dev_info(
@@ -18658,6 +18677,96 @@ mod tests {
         let response = dispatch_ioctl_for_testing(&fuse, 1, 0, BTRFS_IOC_DEV_REPLACE, &input, 0);
         assert_eq!(response, IoctlResult::Error(libc::EROFS));
         assert!(calls.lock().expect("lock ioctl calls").is_empty());
+    }
+
+    #[test]
+    fn dispatch_ioctl_btrfs_dev_replace_status_allowed_on_read_only() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fuse = FrankenFuse::new(Box::new(IoctlRecordingFs::new(0, Arc::clone(&calls))));
+        let mut input = vec![0_u8; BTRFS_DEV_REPLACE_ARGS_SIZE as usize];
+        input[0..8].copy_from_slice(&1_u64.to_le_bytes());
+
+        let response = dispatch_ioctl_for_testing(&fuse, 1, 0, BTRFS_IOC_DEV_REPLACE, &input, 0);
+        assert_eq!(
+            response,
+            IoctlResult::Data(vec![0_u8; BTRFS_DEV_REPLACE_ARGS_SIZE as usize])
+        );
+        assert_eq!(
+            calls.lock().expect("lock ioctl calls").as_slice(),
+            &[
+                IoctlCall::Begin(RequestOp::IoctlRead),
+                IoctlCall::BtrfsDevReplace(input),
+                IoctlCall::End(RequestOp::IoctlRead),
+            ]
+        );
+    }
+
+    #[test]
+    fn dispatch_ioctl_btrfs_get_dev_stats_validates_flags_and_reset_permissions() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let readonly_fuse =
+            FrankenFuse::new(Box::new(IoctlRecordingFs::new(0, Arc::clone(&calls))));
+
+        // Read on RO mount uses IoctlRead scope.
+        let mut read_in = vec![0_u8; BTRFS_DEV_STATS_SIZE as usize];
+        read_in[0..8].copy_from_slice(&1_u64.to_le_bytes());
+        let read_resp =
+            dispatch_ioctl_for_testing(&readonly_fuse, 1, 0, BTRFS_IOC_GET_DEV_STATS, &read_in, 0);
+        assert!(matches!(read_resp, IoctlResult::Data(ref b) if b.len() == 1032));
+
+        // Unknown flag bit returns EINVAL before touching FsOps.
+        let mut bad_flags = vec![0_u8; BTRFS_DEV_STATS_SIZE as usize];
+        bad_flags[0..8].copy_from_slice(&1_u64.to_le_bytes());
+        bad_flags[16..24].copy_from_slice(&2_u64.to_le_bytes());
+        assert_eq!(
+            dispatch_ioctl_for_testing(
+                &readonly_fuse,
+                1,
+                0,
+                BTRFS_IOC_GET_DEV_STATS,
+                &bad_flags,
+                0
+            ),
+            IoctlResult::Error(libc::EINVAL)
+        );
+
+        // RESET flag on RO mount returns EROFS before touching FsOps.
+        let mut reset_in = vec![0_u8; BTRFS_DEV_STATS_SIZE as usize];
+        reset_in[0..8].copy_from_slice(&1_u64.to_le_bytes());
+        reset_in[16..24].copy_from_slice(&BTRFS_DEV_STATS_RESET.to_le_bytes());
+        assert_eq!(
+            dispatch_ioctl_for_testing(&readonly_fuse, 1, 0, BTRFS_IOC_GET_DEV_STATS, &reset_in, 0),
+            IoctlResult::Error(libc::EROFS)
+        );
+        assert_eq!(
+            calls.lock().expect("lock ioctl calls").as_slice(),
+            &[
+                IoctlCall::Begin(RequestOp::IoctlRead),
+                IoctlCall::BtrfsGetDevStats(1, 0),
+                IoctlCall::End(RequestOp::IoctlRead),
+            ]
+        );
+
+        // RESET flag on RW mount uses IoctlWrite scope and forwards flags=1.
+        let writable_calls = Arc::new(Mutex::new(Vec::new()));
+        let writable_fuse = FrankenFuse::with_options(
+            Box::new(IoctlRecordingFs::new(0, Arc::clone(&writable_calls))),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        );
+        let reset_resp =
+            dispatch_ioctl_for_testing(&writable_fuse, 1, 0, BTRFS_IOC_GET_DEV_STATS, &reset_in, 0);
+        assert!(matches!(reset_resp, IoctlResult::Data(ref b) if b.len() == 1032));
+        assert_eq!(
+            writable_calls.lock().expect("lock ioctl calls").as_slice(),
+            &[
+                IoctlCall::Begin(RequestOp::IoctlWrite),
+                IoctlCall::BtrfsGetDevStats(1, BTRFS_DEV_STATS_RESET),
+                IoctlCall::End(RequestOp::IoctlWrite),
+            ]
+        );
     }
 
     #[test]

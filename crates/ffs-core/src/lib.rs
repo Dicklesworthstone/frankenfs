@@ -3508,7 +3508,17 @@ pub struct OpenFs {
     /// caches, preserving its bounded memory. Bounded by
     /// `BTRFS_DECOMPRESSED_EXTENT_CACHE_LIMIT`.
     btrfs_decompressed_extent_cache: ShardedCache<u64, Arc<Vec<u8>>>,
+    /// Per-device runtime I/O and corruption counters surfaced by
+    /// `BTRFS_IOC_GET_DEV_STATS` (`[write_errs, read_errs, flush_errs,
+    /// corruption_errs, generation_errs]`).
+    btrfs_dev_stats: Mutex<std::collections::BTreeMap<u64, [u64; 5]>>,
 }
+
+pub(crate) const BTRFS_DEV_STAT_WRITE_ERRS: usize = 0;
+pub(crate) const BTRFS_DEV_STAT_READ_ERRS: usize = 1;
+pub(crate) const BTRFS_DEV_STAT_FLUSH_ERRS: usize = 2;
+pub(crate) const BTRFS_DEV_STAT_CORRUPTION_ERRS: usize = 3;
+pub(crate) const BTRFS_DEV_STAT_GENERATION_ERRS: usize = 4;
 
 /// Parsed read-only btrfs inode entry shared by the sharded extent cache and
 /// the lock-free hot-inode slot: the INODE_ITEM plus its full
@@ -8391,6 +8401,7 @@ impl OpenFs {
             btrfs_floor_memo_suppressions: std::sync::atomic::AtomicU64::new(0),
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
+            btrfs_dev_stats: Mutex::new(std::collections::BTreeMap::new()),
         };
 
         // Install physical write fencing before journal/fast-commit/orphan
@@ -14929,6 +14940,85 @@ impl OpenFs {
         Ok(devices)
     }
 
+    pub(crate) fn btrfs_primary_devid(&self) -> u64 {
+        self.btrfs_context()
+            .and_then(|ctx| ctx.chunks.first())
+            .and_then(|chunk| chunk.stripes.first())
+            .map_or(1, |stripe| stripe.devid)
+    }
+
+    pub(crate) fn btrfs_devid_for_logical(&self, logical: u64) -> u64 {
+        self.btrfs_context()
+            .and_then(|ctx| {
+                ffs_ondisk::map_logical_to_physical(&ctx.chunks, logical)
+                    .ok()
+                    .flatten()
+            })
+            .or_else(|| {
+                self.btrfs_live_chunks().and_then(|live| {
+                    ffs_ondisk::map_logical_to_physical(&live, logical)
+                        .ok()
+                        .flatten()
+                })
+            })
+            .map_or_else(|| self.btrfs_primary_devid(), |m| m.devid)
+    }
+
+    pub(crate) fn btrfs_has_device_id(
+        &self,
+        cx: &Cx,
+        sb: &BtrfsSuperblock,
+        devid: u64,
+    ) -> Result<bool, FfsError> {
+        match self.current_btrfs_device_items(cx, sb) {
+            Ok(devices) => Ok(devices.contains_key(&devid)),
+            Err(FfsError::UnsupportedFeature(_)) => {
+                let backing = read_btrfs_backing_device_item(cx, self.dev.as_ref(), sb)?;
+                let lo = BtrfsKey {
+                    objectid: ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+                    item_type: ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
+                    offset: 0,
+                };
+                let hi = BtrfsKey {
+                    item_type: lo.item_type + 1,
+                    ..lo
+                };
+                if let Ok(entries) = self.walk_btrfs_tree_range(cx, sb.chunk_root, lo, hi)
+                    && let Ok(devices) = parse_btrfs_device_inventory(
+                        sb,
+                        &backing,
+                        entries
+                            .iter()
+                            .map(|entry| (entry.key, entry.data.as_slice())),
+                        self.btrfs_devices.as_deref(),
+                    )
+                    && u64::try_from(devices.len()).ok() == Some(sb.num_devices)
+                {
+                    return Ok(devices.contains_key(&devid));
+                }
+                if backing.devid == devid {
+                    return Ok(true);
+                }
+                if let Some(attached) = self.btrfs_devices.as_deref()
+                    && attached.identities.contains_key(&devid)
+                {
+                    return Ok(true);
+                }
+                if let Some(ctx) = self.btrfs_context()
+                    && ctx
+                        .chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.stripes.iter())
+                        .any(|stripe| stripe.devid == devid)
+                {
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Map a JBD2 commit error to an `FfsError` with context.
     fn map_journal_commit_error(
         txn_id: u64,
@@ -15617,19 +15707,24 @@ impl OpenFs {
                 reason: "not a btrfs filesystem",
             })?
             .fsid;
-        let read_copy = |physical: u64| -> Result<_, ParseError> {
+        let read_copy = |devid: u64, physical: u64| -> Result<_, ParseError> {
             cx.checkpoint().map_err(|_| ParseError::InvalidField {
                 field: "btrfs_device_read",
                 reason: "metadata read cancelled",
             })?;
             let mut buf = vec![0_u8; ns];
-            self.dev
+            if self
+                .dev
                 .read_exact_at(cx, ByteOffset(physical), &mut buf)
-                .map_err(|_| ParseError::InsufficientData {
+                .is_err()
+            {
+                self.record_btrfs_dev_stat(devid, BTRFS_DEV_STAT_READ_ERRS);
+                return Err(ParseError::InsufficientData {
                     needed: ns,
                     offset: 0,
                     actual: 0,
-                })?;
+                });
+            }
             cx.checkpoint().map_err(|_| ParseError::InvalidField {
                 field: "btrfs_device_read",
                 reason: "metadata read cancelled",
@@ -15637,8 +15732,13 @@ impl OpenFs {
             // Verify + parse ONCE, before the node enters the cache, so every
             // cached node is already-verified — a hit never skips a checksum
             // that was not already checked.
-            let header = validate_btrfs_tree_fsid(&buf, fsid)?;
-            let node = parse_btrfs_tree_node_owned(buf, ctx.csum_type, logical, nodesize)?;
+            let header = validate_btrfs_tree_fsid(&buf, fsid).inspect_err(|_| {
+                self.record_btrfs_dev_stat(devid, BTRFS_DEV_STAT_CORRUPTION_ERRS);
+            })?;
+            let node = parse_btrfs_tree_node_owned(buf, ctx.csum_type, logical, nodesize)
+                .inspect_err(|_| {
+                    self.record_btrfs_dev_stat(devid, BTRFS_DEV_STAT_CORRUPTION_ERRS);
+                })?;
             Ok((
                 node,
                 BtrfsNodeMetadata {
@@ -15647,7 +15747,7 @@ impl OpenFs {
                 },
             ))
         };
-        let node = match read_copy(mapping.physical) {
+        let node = match read_copy(mapping.devid, mapping.physical) {
             Ok(node) => node,
             Err(primary_err) => {
                 // bd-0mcvt: a DUP chunk keeps a second copy on the same device.
@@ -15664,7 +15764,7 @@ impl OpenFs {
                     .iter()
                     .filter(|s| s.devid == mapping.devid && s.physical != mapping.physical)
                 {
-                    if let Ok(node) = read_copy(stripe.physical) {
+                    if let Ok(node) = read_copy(stripe.devid, stripe.physical) {
                         warn!(
                             target: "ffs::btrfs::read",
                             logical,
@@ -15681,6 +15781,18 @@ impl OpenFs {
             }
         };
         Ok((Arc::new(node.0), node.1))
+    }
+
+    pub(crate) fn record_btrfs_dev_stat(&self, devid: u64, stat_idx: usize) {
+        if let Some(slot) = self
+            .btrfs_dev_stats
+            .lock()
+            .entry(devid)
+            .or_insert([0; 5])
+            .get_mut(stat_idx)
+        {
+            *slot = slot.saturating_add(1);
+        }
     }
 
     /// Test-only: drop the read-only tree-node cache so a following operation
@@ -17659,20 +17771,29 @@ impl OpenFs {
 
                     if block_offset == 0 && chunk_in_block == bs_usize {
                         // Full block overwrite.
-                        block_dev.write_block(
-                            cx,
-                            block_num,
-                            &data_remaining[pos..pos + bs_usize],
-                        )?;
+                        block_dev
+                            .write_block(cx, block_num, &data_remaining[pos..pos + bs_usize])
+                            .inspect_err(|_| {
+                                self.record_btrfs_dev_stat(stripe.devid, BTRFS_DEV_STAT_WRITE_ERRS);
+                            })?;
                     } else {
                         // Partial block overwrite: read-modify-write. The read buffer
                         // is owned and sole-referenced here, so move its Vec out
                         // (into_inner -> Arc::try_unwrap, O(1)) instead of copying the
                         // whole block before patching the changed bytes.
-                        let mut block_data = block_dev.read_block(cx, block_num)?.into_inner();
+                        let mut block_data = block_dev
+                            .read_block(cx, block_num)
+                            .inspect_err(|_| {
+                                self.record_btrfs_dev_stat(stripe.devid, BTRFS_DEV_STAT_READ_ERRS);
+                            })?
+                            .into_inner();
                         block_data[block_offset..block_offset + chunk_in_block]
                             .copy_from_slice(&data_remaining[pos..pos + chunk_in_block]);
-                        block_dev.write_block(cx, block_num, &block_data)?;
+                        block_dev
+                            .write_block(cx, block_num, &block_data)
+                            .inspect_err(|_| {
+                                self.record_btrfs_dev_stat(stripe.devid, BTRFS_DEV_STAT_WRITE_ERRS);
+                            })?;
                     }
                     pos += chunk_in_block;
                 }
@@ -17767,11 +17888,21 @@ impl OpenFs {
                 {
                     let full_blocks = remaining / bs_usize;
                     let span = full_blocks * bs_usize;
-                    block_dev.read_contiguous_into(cx, block_num, &mut out[pos..pos + span])?;
+                    block_dev
+                        .read_contiguous_into(cx, block_num, &mut out[pos..pos + span])
+                        .inspect_err(|err| {
+                            if !matches!(err, FfsError::Cancelled) {
+                                self.record_btrfs_dev_stat(mapping.devid, BTRFS_DEV_STAT_READ_ERRS);
+                            }
+                        })?;
                     pos += span;
                 } else {
                     let chunk_in_block = remaining.min(bs_usize - block_offset);
-                    let block_data = block_dev.read_block(cx, block_num)?;
+                    let block_data = block_dev.read_block(cx, block_num).inspect_err(|err| {
+                        if !matches!(err, FfsError::Cancelled) {
+                            self.record_btrfs_dev_stat(mapping.devid, BTRFS_DEV_STAT_READ_ERRS);
+                        }
+                    })?;
                     out[pos..pos + chunk_in_block].copy_from_slice(
                         &block_data.as_slice()[block_offset..block_offset + chunk_in_block],
                     );
@@ -18371,6 +18502,7 @@ impl OpenFs {
                     Ok(bytes) => bytes,
                     Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => return Err(FfsError::Cancelled),
                     Err(error) => {
+                        self.record_btrfs_dev_stat(stripe.devid, BTRFS_DEV_STAT_READ_ERRS);
                         if matches!(
                             mapping.profile,
                             ffs_ondisk::BtrfsRaidProfile::Raid5
@@ -18387,6 +18519,7 @@ impl OpenFs {
                     verified = Some(bytes);
                     break;
                 }
+                self.record_btrfs_dev_stat(stripe.devid, BTRFS_DEV_STAT_CORRUPTION_ERRS);
                 corruption = Some(FfsError::Corruption {
                     block: sector_start,
                     detail: format!(
@@ -18486,6 +18619,15 @@ impl OpenFs {
             };
             self.btrfs_read_checksummed_into(cx, csum_items, sectorsize, bytenr, &mut sector)?;
             if !ffs_btrfs::btrfs_data_csum_matches(csum_type, &sector, expected) {
+                let devid = self
+                    .btrfs_context()
+                    .and_then(|ctx| map_logical_to_physical(&ctx.chunks, bytenr).ok().flatten())
+                    .or_else(|| {
+                        self.btrfs_live_chunks()
+                            .and_then(|live| map_logical_to_physical(&live, bytenr).ok().flatten())
+                    })
+                    .map_or(1, |m| m.devid);
+                self.record_btrfs_dev_stat(devid, BTRFS_DEV_STAT_CORRUPTION_ERRS);
                 let actual = ffs_btrfs::btrfs_data_csum(csum_type, &sector).unwrap_or_default();
                 return Err(FfsError::Corruption {
                     block: bytenr,
@@ -42010,6 +42152,7 @@ impl OpenFs {
                 Ok(())
             }
             Err(err) => {
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
                 warn!(
                     target: "ffs::btrfs::rw",
                     operation_id = %operation_id,
@@ -42858,6 +43001,7 @@ impl OpenFs {
                 self.dev
                     .write_all_at(cx, ByteOffset(stripe.physical), bytes)
                     .map_err(|error| {
+                        self.record_btrfs_dev_stat(stripe.devid, BTRFS_DEV_STAT_WRITE_ERRS);
                         device_write_error.set(Some(error));
                         BtrfsMutationError::InvalidConfig("disk write failed")
                     })?;
@@ -44129,6 +44273,7 @@ impl OpenFs {
         self.dev
             .write_all_at(cx, ByteOffset(BTRFS_SUPER_INFO_OFFSET as u64), &sb_bytes)
             .map_err(|e| {
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_WRITE_ERRS);
                 FfsError::Io(std::io::Error::other(format!(
                     "superblock write failed: {e}"
                 )))
@@ -44136,7 +44281,9 @@ impl OpenFs {
         bytes_written = bytes_written.saturating_add(sb_bytes.len() as u64);
 
         // Final fsync to ensure superblock is durable
-        self.dev.sync(cx)?;
+        self.dev.sync(cx).inspect_err(|_| {
+            self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
+        })?;
 
         alloc.reset_pending_metadata();
         self.btrfs_block_writes_at_boundary
@@ -95057,6 +95204,451 @@ mod tests {
         assert_eq!(
             after_off.xflags, 0,
             "xflags must be empty after clearing (no HASATTR either)"
+        );
+    }
+
+    // ── bd-fix-fsops-arc-forwarding-and-ioctl-bugs-wugmo ────────────────────
+
+    #[test]
+    fn arc_openfs_matches_direct_openfs_for_all_15_newly_forwarded_methods_on_ext4_and_btrfs() {
+        fn collect_15_outcomes(
+            ops: &dyn FsOps,
+            cx: &Cx,
+            ino: InodeNumber,
+        ) -> Vec<Result<Vec<u8>, i32>> {
+            let mut s = RequestScope::empty();
+            let norm = |r: ffs_error::Result<Vec<u8>>| r.map_err(|e| e.to_errno());
+            let norm_u =
+                |r: ffs_error::Result<()>| r.map(|()| Vec::new()).map_err(|e| e.to_errno());
+            vec![
+                ops.get_subvol_flags(cx, &mut s, ino)
+                    .map(|f| f.to_le_bytes().to_vec())
+                    .map_err(|e| e.to_errno()),
+                norm_u(ops.set_subvol_flags(cx, &mut s, ino, 2)),
+                norm(ops.btrfs_scrub_start(cx, &mut s, 1)),
+                norm_u(ops.btrfs_scrub_cancel(cx, &mut s)),
+                norm_u(ops.btrfs_defrag_range(cx, &mut s, 0, 0, 4096)),
+                norm_u(ops.btrfs_snap_create(cx, &mut s, &[0; 64])),
+                norm_u(ops.btrfs_snap_destroy(cx, &mut s, &[0; 64])),
+                ops.btrfs_encoded_write(cx, &mut s, 0, &[0; 64])
+                    .map(|n| n.to_le_bytes().to_vec())
+                    .map_err(|e| e.to_errno()),
+                norm_u(ops.btrfs_defrag(cx, &mut s, ino.0)),
+                norm_u(ops.btrfs_scan_dev(cx, &mut s, &[0; 64])),
+                // Negative send_fd (-1) hits OpenFs::btrfs_send validation (EBADF on btrfs,
+                // EOPNOTSUPP on ext4) without touching real /proc fds, proving Arc<OpenFs>
+                // forwards into OpenFs::btrfs_send rather than FsOps default EOPNOTSUPP!
+                {
+                    let mut send_args = [0_u8; 72];
+                    send_args[0..8].copy_from_slice(&(-1_i64).to_le_bytes());
+                    norm_u(ops.btrfs_send(cx, &mut s, &send_args, std::process::id()))
+                },
+                norm(ops.btrfs_set_received_subvol(cx, &mut s, &[0; 64])),
+                norm(ops.btrfs_balance_start(cx, &mut s, &[0; 64])),
+                norm_u(ops.btrfs_balance_ctl(cx, &mut s, 1)),
+                norm(ops.btrfs_get_fslabel(cx, &mut s)),
+            ]
+        }
+
+        // Btrfs RO + RW equivalence
+        let cx = Cx::for_testing();
+        let ro_dev = TestDevice::from_vec(build_btrfs_csum_image());
+        let ro_btrfs = Arc::new(
+            OpenFs::from_device(&cx, Box::new(ro_dev), &OpenOptions::default())
+                .expect("open ro btrfs"),
+        );
+        let direct_ro = collect_15_outcomes(ro_btrfs.as_ref(), &cx, InodeNumber(256));
+        let arc_ro_dyn: &dyn FsOps = &ro_btrfs;
+        let wrapped_ro = collect_15_outcomes(arc_ro_dyn, &cx, InodeNumber(256));
+        assert_eq!(
+            wrapped_ro, direct_ro,
+            "Arc<OpenFs> RO btrfs outcomes must match OpenFs"
+        );
+        // Specifically prove key positive discriminators that previously failed with EOPNOTSUPP:
+        assert_eq!(wrapped_ro[0], Ok(0_u64.to_le_bytes().to_vec())); // get_subvol_flags
+        assert_eq!(wrapped_ro[10], Err(libc::EBADF)); // btrfs_send reached OpenFs (-1 fd -> EBADF, NOT EOPNOTSUPP!)
+        assert!(wrapped_ro[14].is_ok()); // btrfs_get_fslabel succeeded!
+
+        let (rw_btrfs_inner, cx_rw) = open_writable_btrfs();
+        let rw_btrfs = Arc::new(rw_btrfs_inner);
+        let arc_rw_dyn: &dyn FsOps = &rw_btrfs;
+        // set_subvol_flags mutates state, so compare get_subvol_flags + set_subvol_flags + get_subvol_flags via Arc<OpenFs>:
+        let mut s = RequestScope::empty();
+        assert_eq!(
+            arc_rw_dyn
+                .get_subvol_flags(&cx_rw, &mut s, InodeNumber(256))
+                .unwrap(),
+            0
+        );
+        arc_rw_dyn
+            .set_subvol_flags(&cx_rw, &mut s, InodeNumber(256), 0x2)
+            .expect("Arc<OpenFs>::set_subvol_flags(0x2) must forward to OpenFs");
+        assert_eq!(
+            arc_rw_dyn
+                .get_subvol_flags(&cx_rw, &mut s, InodeNumber(256))
+                .unwrap(),
+            0x2
+        );
+        // Reset back to 0 so direct vs wrapped comparison starts from identical state.
+        arc_rw_dyn
+            .set_subvol_flags(&cx_rw, &mut s, InodeNumber(256), 0)
+            .expect("clear RDONLY");
+
+        if let Some(ext4_inner) = open_writable_ext4() {
+            let ext4 = Arc::new(ext4_inner);
+            let direct_ext4 = collect_15_outcomes(ext4.as_ref(), &cx, InodeNumber(2));
+            let arc_ext4_dyn: &dyn FsOps = &ext4;
+            let wrapped_ext4 = collect_15_outcomes(arc_ext4_dyn, &cx, InodeNumber(2));
+            assert_eq!(
+                wrapped_ext4, direct_ext4,
+                "Arc<OpenFs> ext4 outcomes must match OpenFs"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_space_info_works_on_readonly_and_rw_mounts() {
+        let cx = Cx::for_testing();
+        let image = build_btrfs_csum_image();
+
+        let ro_fs = Arc::new(
+            OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image.clone())),
+                &OpenOptions::default(),
+            )
+            .expect("open ro btrfs"),
+        );
+        assert!(!ro_fs.is_writable());
+
+        let mut rw_inner = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions {
+                btrfs_rw_ephemeral_ok: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open rw btrfs");
+        rw_inner.enable_writes(&cx).expect("enable btrfs writes");
+        let rw_fs = Arc::new(rw_inner);
+
+        let mut scope = RequestScope::empty();
+        let ro_hdr = <Arc<OpenFs> as FsOps>::get_btrfs_space_info(&ro_fs, &cx, &mut scope, 0)
+            .expect("RO BTRFS_IOC_SPACE_INFO slot discovery must succeed");
+        assert_eq!(ro_hdr.len(), 16);
+        let ro_total_spaces = u64::from_le_bytes(ro_hdr[8..16].try_into().unwrap());
+        assert!(
+            ro_total_spaces >= 1,
+            "RO space_info must report >= 1 space profile"
+        );
+
+        let ro_full = <Arc<OpenFs> as FsOps>::get_btrfs_space_info(&ro_fs, &cx, &mut scope, 16)
+            .expect("RO BTRFS_IOC_SPACE_INFO full query must succeed");
+        let rw_full = <Arc<OpenFs> as FsOps>::get_btrfs_space_info(&rw_fs, &cx, &mut scope, 16)
+            .expect("RW BTRFS_IOC_SPACE_INFO full query must succeed");
+        assert_eq!(
+            ro_full, rw_full,
+            "RO and RW BTRFS_IOC_SPACE_INFO payloads must match on identical image"
+        );
+        let first_total = u64::from_le_bytes(ro_full[24..32].try_into().unwrap());
+        assert!(
+            first_total > 0,
+            "reported block group total_bytes must be > 0"
+        );
+    }
+
+    #[test]
+    fn btrfs_dev_replace_honors_cmd_size_and_ro_rw_contracts() {
+        let cx = Cx::for_testing();
+        let image = build_btrfs_csum_image();
+        let ro_fs = Arc::new(
+            OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .expect("open ro btrfs"),
+        );
+        let (rw_inner, cx_rw) = open_writable_btrfs();
+        let rw_fs = Arc::new(rw_inner);
+        let mut scope = RequestScope::empty();
+
+        // < 2600 bytes -> EINVAL
+        let short_err =
+            <Arc<OpenFs> as FsOps>::btrfs_dev_replace(&ro_fs, &cx, &mut scope, &[0; 64])
+                .expect_err("short dev_replace buffer must fail");
+        assert_eq!(short_err.to_errno(), libc::EINVAL);
+
+        // cmd == 1 (STATUS) -> 2600-byte NEVER_STARTED on both RO and RW
+        let mut status_req = vec![0_u8; 2600];
+        status_req[0..8].copy_from_slice(&1_u64.to_le_bytes());
+        let ro_status =
+            <Arc<OpenFs> as FsOps>::btrfs_dev_replace(&ro_fs, &cx, &mut scope, &status_req)
+                .expect("STATUS on RO must succeed");
+        let rw_status =
+            <Arc<OpenFs> as FsOps>::btrfs_dev_replace(&rw_fs, &cx_rw, &mut scope, &status_req)
+                .expect("STATUS on RW must succeed");
+        assert_eq!(ro_status.len(), 2600);
+        assert_eq!(ro_status, rw_status);
+        assert_eq!(u64::from_le_bytes(ro_status[8..16].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(ro_status[24..32].try_into().unwrap()), 0);
+
+        // cmd == 0 (START) and cmd == 2 (CANCEL) -> EROFS on RO, EOPNOTSUPP on RW
+        for cmd in [0_u64, 2_u64] {
+            let mut req = vec![0_u8; 2600];
+            req[0..8].copy_from_slice(&cmd.to_le_bytes());
+            let ro_err = <Arc<OpenFs> as FsOps>::btrfs_dev_replace(&ro_fs, &cx, &mut scope, &req)
+                .expect_err("START/CANCEL on RO must fail");
+            assert_eq!(ro_err.to_errno(), libc::EROFS, "cmd={cmd} on RO");
+            let rw_err =
+                <Arc<OpenFs> as FsOps>::btrfs_dev_replace(&rw_fs, &cx_rw, &mut scope, &req)
+                    .expect_err("START/CANCEL on RW must fail");
+            assert_eq!(rw_err.to_errno(), libc::EOPNOTSUPP, "cmd={cmd} on RW");
+        }
+
+        // cmd > 2 -> EINVAL
+        let mut invalid_cmd = vec![0_u8; 2600];
+        invalid_cmd[0..8].copy_from_slice(&3_u64.to_le_bytes());
+        let bad_err =
+            <Arc<OpenFs> as FsOps>::btrfs_dev_replace(&rw_fs, &cx_rw, &mut scope, &invalid_cmd)
+                .expect_err("cmd=3 must fail");
+        assert_eq!(bad_err.to_errno(), libc::EINVAL);
+    }
+
+    #[test]
+    fn btrfs_get_dev_stats_validates_devid_flags_and_tracks_csum_corruption_and_reset() {
+        let cx = Cx::for_testing();
+        let mut corrupt_image = build_btrfs_csum_image();
+        // Flip one byte in datasum file 257's extent at BTRFS_TEST_FILE_DATA_LOGICAL.
+        corrupt_image[BTRFS_TEST_FILE_DATA_LOGICAL] ^= 0xFF;
+
+        let ro_fs = Arc::new(
+            OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(corrupt_image.clone())),
+                &OpenOptions::default(),
+            )
+            .expect("open ro btrfs"),
+        );
+        let mut scope = RequestScope::empty();
+
+        // Unknown devids (0, 99) -> ENODEV
+        for bad_devid in [0_u64, 99_u64] {
+            let err =
+                <Arc<OpenFs> as FsOps>::btrfs_get_dev_stats(&ro_fs, &cx, &mut scope, bad_devid, 0)
+                    .expect_err("unknown devid must return ENODEV");
+            assert_eq!(err.to_errno(), libc::ENODEV);
+        }
+
+        // Unknown flags -> EINVAL; RESET on RO -> EROFS
+        assert_eq!(
+            <Arc<OpenFs> as FsOps>::btrfs_get_dev_stats(&ro_fs, &cx, &mut scope, 1, 0x2)
+                .unwrap_err()
+                .to_errno(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            <Arc<OpenFs> as FsOps>::btrfs_get_dev_stats(&ro_fs, &cx, &mut scope, 1, 0x1)
+                .unwrap_err()
+                .to_errno(),
+            libc::EROFS
+        );
+
+        // Initial stats for devid 1 are all zero.
+        let initial = <Arc<OpenFs> as FsOps>::btrfs_get_dev_stats(&ro_fs, &cx, &mut scope, 1, 0)
+            .expect("devid 1 stats");
+        assert_eq!(initial.len(), 1032);
+        assert_eq!(u64::from_le_bytes(initial[8..16].try_into().unwrap()), 5);
+        assert_eq!(&initial[24..64], &[0_u8; 40]);
+
+        // Reading corrupted datasum inode 257 fails with EIO and increments CORRUPTION_ERRS (idx 3).
+        let read_err =
+            <Arc<OpenFs> as FsOps>::read(&ro_fs, &cx, &mut scope, InodeNumber(257), 0, 4096)
+                .expect_err("corrupted datasum read must fail");
+        assert_eq!(read_err.to_errno(), libc::EIO);
+
+        let after_ro = <Arc<OpenFs> as FsOps>::btrfs_get_dev_stats(&ro_fs, &cx, &mut scope, 1, 0)
+            .expect("devid 1 stats after csum mismatch");
+        let ro_corruption_errs =
+            u64::from_le_bytes(after_ro[24 + 3 * 8..24 + 4 * 8].try_into().unwrap());
+        assert_eq!(ro_corruption_errs, 1);
+
+        // Now verify RW mount: corrupt read increments CORRUPTION_ERRS, RESET returns 1 and zeroes!
+        let mut rw_inner = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(corrupt_image)),
+            &OpenOptions {
+                btrfs_rw_ephemeral_ok: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open rw btrfs");
+        rw_inner.enable_writes(&cx).expect("enable writes");
+        let rw_fs = Arc::new(rw_inner);
+
+        let _ = <Arc<OpenFs> as FsOps>::read(&rw_fs, &cx, &mut scope, InodeNumber(257), 0, 4096)
+            .expect_err("corrupted RW datasum read must fail");
+        let reset_out =
+            <Arc<OpenFs> as FsOps>::btrfs_get_dev_stats(&rw_fs, &cx, &mut scope, 1, 0x1)
+                .expect("RW BTRFS_DEV_STATS_RESET must succeed");
+        assert_eq!(
+            u64::from_le_bytes(reset_out[24 + 3 * 8..24 + 4 * 8].try_into().unwrap()),
+            1,
+            "RESET returns pre-reset counter value"
+        );
+        let post_reset = <Arc<OpenFs> as FsOps>::btrfs_get_dev_stats(&rw_fs, &cx, &mut scope, 1, 0)
+            .expect("post-reset stats");
+        assert_eq!(
+            u64::from_le_bytes(post_reset[24 + 3 * 8..24 + 4 * 8].try_into().unwrap()),
+            0,
+            "post-reset counter must be 0"
+        );
+    }
+
+    #[test]
+    fn btrfs_subvol_flags_translates_uapi_rdonly_and_persists_across_reopen() {
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(build_btrfs_csum_image());
+        let mut rw_inner = OpenFs::from_device(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions {
+                btrfs_rw_ephemeral_ok: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open rw btrfs");
+        rw_inner.enable_writes(&cx).expect("enable writes");
+        let rw_fs = Arc::new(rw_inner);
+        let mut scope = RequestScope::empty();
+
+        assert_eq!(
+            <Arc<OpenFs> as FsOps>::get_subvol_flags(&rw_fs, &cx, &mut scope, InodeNumber(256))
+                .unwrap(),
+            0
+        );
+        // Raw on-disk bit 0x1 is NOT a valid UAPI flag -> EINVAL.
+        let bad =
+            <Arc<OpenFs> as FsOps>::set_subvol_flags(&rw_fs, &cx, &mut scope, InodeNumber(256), 1)
+                .expect_err("0x1 must be rejected as invalid UAPI subvol flag");
+        assert_eq!(bad.to_errno(), libc::EINVAL);
+
+        // UAPI BTRFS_SUBVOL_RDONLY = 0x2 succeeds and is immediately visible via live root_tree.
+        <Arc<OpenFs> as FsOps>::set_subvol_flags(&rw_fs, &cx, &mut scope, InodeNumber(256), 0x2)
+            .expect("set BTRFS_SUBVOL_RDONLY (0x2)");
+        assert_eq!(
+            <Arc<OpenFs> as FsOps>::get_subvol_flags(&rw_fs, &cx, &mut scope, InodeNumber(256))
+                .unwrap(),
+            0x2
+        );
+
+        // Commit via flush_on_destroy and reopen RO from the underlying device.
+        <Arc<OpenFs> as FsOps>::flush_on_destroy(&rw_fs, &cx).expect("flush_on_destroy");
+        drop(rw_fs);
+
+        let reopened_ro = Arc::new(
+            OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+                .expect("reopen btrfs after subvol_setflags commit"),
+        );
+        assert_eq!(
+            <Arc<OpenFs> as FsOps>::get_subvol_flags(
+                &reopened_ro,
+                &cx,
+                &mut scope,
+                InodeNumber(256),
+            )
+            .expect("persisted get_subvol_flags"),
+            0x2
+        );
+    }
+
+    #[test]
+    fn ext4_set_inode_fsxattr_commits_in_single_request_scope_tx_and_rolls_back_on_abort() {
+        let Some(inner) = open_writable_ext4() else {
+            return;
+        };
+        let fs = Arc::new(inner);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let attr = OpenFs::create(&fs, &cx, root, OsStr::new("fsx_tx_atomic.bin"), 0o644, 0, 0)
+            .expect("create");
+
+        let seq_before = fs.mvcc_store.current_snapshot().high.0;
+        let mut scope =
+            <Arc<OpenFs> as FsOps>::begin_request_scope(&fs, &cx, RequestOp::IoctlWrite)
+                .expect("begin IoctlWrite scope");
+        assert!(
+            scope.tx.is_some(),
+            "ext4 IoctlWrite RequestScope must carry a live MVCC transaction"
+        );
+
+        let committed_want = FsxattrInfo {
+            xflags: xflags::FS_XFLAG_IMMUTABLE | xflags::FS_XFLAG_NOATIME,
+            extsize: 0,
+            nextents: 0,
+            projid: 0x1234_5678,
+            cowextsize: 0,
+        };
+        <Arc<OpenFs> as FsOps>::set_inode_fsxattr(&fs, &cx, &mut scope, attr.ino, committed_want)
+            .expect("staging xflags + projid in scope.tx must succeed");
+        assert_eq!(
+            fs.mvcc_store.current_snapshot().high.0,
+            seq_before,
+            "set_inode_fsxattr must not side-channel commit before commit_request_scope"
+        );
+        <Arc<OpenFs> as FsOps>::commit_request_scope(&fs, &cx, &mut scope)
+            .expect("commit_request_scope must succeed without self-conflict");
+        let seq_after = fs.mvcc_store.current_snapshot().high.0;
+        assert_eq!(
+            seq_after,
+            seq_before + 1,
+            "single FS_IOC_FSSETXATTR must advance commit_seq by exactly 1"
+        );
+
+        let mut read_scope = RequestScope::empty();
+        let got = <Arc<OpenFs> as FsOps>::get_inode_fsxattr(&fs, &cx, &mut read_scope, attr.ino)
+            .expect("get committed fsxattr");
+        assert_eq!(
+            got.xflags & !xflags::FS_XFLAG_HASATTR,
+            committed_want.xflags
+        );
+        assert_eq!(got.projid, 0x1234_5678);
+
+        // Now stage a conflicting update in a new IoctlWrite scope and abort (drop without commit):
+        // neither xflags nor projid may leak to committed state!
+        {
+            let mut aborted_scope =
+                <Arc<OpenFs> as FsOps>::begin_request_scope(&fs, &cx, RequestOp::IoctlWrite)
+                    .expect("begin second IoctlWrite scope");
+            let aborted_want = FsxattrInfo {
+                xflags: xflags::FS_XFLAG_APPEND,
+                extsize: 0,
+                nextents: 0,
+                projid: 0xDEAD_BEEF,
+                cowextsize: 0,
+            };
+            <Arc<OpenFs> as FsOps>::set_inode_fsxattr(
+                &fs,
+                &cx,
+                &mut aborted_scope,
+                attr.ino,
+                aborted_want,
+            )
+            .expect("stage aborted fsxattr");
+        }
+        assert_eq!(fs.mvcc_store.current_snapshot().high.0, seq_after);
+        let after_abort =
+            <Arc<OpenFs> as FsOps>::get_inode_fsxattr(&fs, &cx, &mut read_scope, attr.ino)
+                .expect("get after abort");
+        assert_eq!(
+            after_abort.xflags & !xflags::FS_XFLAG_HASATTR,
+            committed_want.xflags,
+            "aborted scope must roll back xflags"
+        );
+        assert_eq!(
+            after_abort.projid, 0x1234_5678,
+            "aborted scope must roll back projid"
         );
     }
 

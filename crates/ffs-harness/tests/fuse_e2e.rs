@@ -23327,3 +23327,402 @@ fn gdt_eager_mounted_forensics_bd_d2hdc() {
         }
     }
 }
+
+#[test]
+fn btrfs_fuse_arc_forwarded_ioctls_and_contracts_via_mounted_path() {
+    if !btrfs_fuse_available() || !command_available("python3") {
+        eprintln!("btrfs FUSE or python3 prerequisites not met, skipping");
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_btrfs_test_image(tmp.path());
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+
+    // 1. Mount READ-ONLY wrapped in Arc<OpenFs> (exact ffs-cli production mount path).
+    {
+        let cx = Cx::for_testing();
+        let ro_fs = OpenFs::open_with_options(&cx, &image, &OpenOptions::default())
+            .expect("open btrfs image RO");
+        let ro_opts = MountOptions {
+            read_only: true,
+            auto_unmount: false,
+            ..MountOptions::default()
+        };
+        let session = match mount_background(Box::new(std::sync::Arc::new(ro_fs)), &mnt, &ro_opts) {
+            Ok(s) => {
+                wait_for_fuse_mount_ready(&mnt);
+                ffs_harness::stale_mounts::MountGuard::new(s, &mnt)
+            }
+            Err(e) => {
+                require_fuse_or_skip(&format!("btrfs RO Arc<OpenFs> mount failed: {e}"));
+                return;
+            }
+        };
+
+        let ro_script = format!(
+            r#"
+import errno, fcntl, os, struct
+
+mnt = {mnt:?}
+fd = os.open(mnt, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    # A. BTRFS_IOC_SPACE_INFO on read-only mount (slot count + full payload)
+    BTRFS_IOC_SPACE_INFO = 0xc0109414
+    hdr = bytearray(16)
+    struct.pack_into('<QQ', hdr, 0, 0, 0)
+    fcntl.ioctl(fd, BTRFS_IOC_SPACE_INFO, hdr, True)
+    _, total_spaces = struct.unpack_from('<QQ', hdr, 0)
+    assert total_spaces >= 1, "RO SPACE_INFO must report >= 1 profile, got %d" % total_spaces
+    full_len = 16 + total_spaces * 24
+    space_cmd = (3 << 30) | (full_len << 16) | (0x94 << 8) | 20
+    full_buf = bytearray(full_len)
+    struct.pack_into('<Q', full_buf, 0, total_spaces)
+    fcntl.ioctl(fd, space_cmd, full_buf, True)
+    flags0, total0, used0 = struct.unpack_from('<QQQ', full_buf, 16)
+    assert total0 > 0, "RO SPACE_INFO first group total_bytes must be > 0"
+
+    # B. BTRFS_IOC_GET_FSLABEL via Arc<OpenFs>
+    BTRFS_IOC_GET_FSLABEL = 0x81009431
+    label_buf = bytearray(256)
+    fcntl.ioctl(fd, BTRFS_IOC_GET_FSLABEL, label_buf, True)
+
+    # C. BTRFS_IOC_SUBVOL_GETFLAGS via Arc<OpenFs>
+    BTRFS_IOC_SUBVOL_GETFLAGS = 0x80089419
+    subvol_flags_buf = bytearray(8)
+    fcntl.ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, subvol_flags_buf, True)
+    subvol_flags, = struct.unpack_from('<Q', subvol_flags_buf, 0)
+    assert subvol_flags == 0, "initial subvol flags must be 0, got 0x%x" % subvol_flags
+
+    # D. BTRFS_IOC_SEND via Arc<OpenFs> (verify Linux BTRFS_SEND_STREAM_MAGIC "btrfs-stream\0" + v1!)
+    BTRFS_IOC_SEND = 0x40489426
+    r_fd, w_fd = os.pipe()
+    try:
+        send_args = bytearray(72)
+        struct.pack_into('<q', send_args, 0, w_fd)
+        fcntl.ioctl(fd, BTRFS_IOC_SEND, send_args, True)
+        os.close(w_fd)
+        w_fd = -1
+        stream_head = os.read(r_fd, 64)
+        assert stream_head.startswith(b"btrfs-stream\x00\x01\x00\x00"), "unexpected send magic: %r" % (stream_head[:17],)
+    finally:
+        if w_fd >= 0:
+            os.close(w_fd)
+        os.close(r_fd)
+
+    # E. BTRFS_IOC_DEV_REPLACE on RO mount: STATUS(1) -> NEVER_STARTED(0); START(0)/CANCEL(2) -> EROFS
+    BTRFS_IOC_DEV_REPLACE = 0xca289435
+    status_buf = bytearray(2600)
+    struct.pack_into('<Q', status_buf, 0, 1)
+    fcntl.ioctl(fd, BTRFS_IOC_DEV_REPLACE, status_buf, True)
+    _, rep_res, rep_state = struct.unpack_from('<QQQ', status_buf, 0)
+    assert rep_res == 0 and rep_state == 0, "unexpected RO replace status: res=%d state=%d" % (rep_res, rep_state)
+    for mut_cmd in (0, 2):
+        req = bytearray(2600)
+        struct.pack_into('<Q', req, 0, mut_cmd)
+        try:
+            fcntl.ioctl(fd, BTRFS_IOC_DEV_REPLACE, req, True)
+        except OSError as exc:
+            assert exc.errno == errno.EROFS, "cmd=%d on RO expected EROFS, got %d" % (mut_cmd, exc.errno)
+        else:
+            raise AssertionError("cmd=%d unexpectedly succeeded on RO mount" % mut_cmd)
+
+    # F. BTRFS_IOC_GET_DEV_STATS on RO mount
+    BTRFS_IOC_GET_DEV_STATS = 0xc4089434
+    stats = bytearray(1032)
+    struct.pack_into('<Q', stats, 0, 1)
+    fcntl.ioctl(fd, BTRFS_IOC_GET_DEV_STATS, stats, True)
+    got_devid, nr_items, out_flags = struct.unpack_from('<QQQ', stats, 0)
+    assert got_devid == 1 and nr_items == 5 and out_flags == 0
+
+    missing = bytearray(1032)
+    struct.pack_into('<Q', missing, 0, 99)
+    try:
+        fcntl.ioctl(fd, BTRFS_IOC_GET_DEV_STATS, missing, True)
+    except OSError as exc:
+        assert exc.errno == errno.ENODEV, "unknown devid expected ENODEV, got %d" % exc.errno
+    else:
+        raise AssertionError("unknown devid unexpectedly succeeded")
+
+    bad_flags = bytearray(1032)
+    struct.pack_into('<QQQ', bad_flags, 0, 1, 5, 2)
+    try:
+        fcntl.ioctl(fd, BTRFS_IOC_GET_DEV_STATS, bad_flags, True)
+    except OSError as exc:
+        assert exc.errno == errno.EINVAL, "bad flags expected EINVAL, got %d" % exc.errno
+    else:
+        raise AssertionError("bad flags unexpectedly succeeded")
+
+    ro_reset = bytearray(1032)
+    struct.pack_into('<QQQ', ro_reset, 0, 1, 5, 1)
+    try:
+        fcntl.ioctl(fd, BTRFS_IOC_GET_DEV_STATS, ro_reset, True)
+    except OSError as exc:
+        assert exc.errno == errno.EROFS, "RESET on RO expected EROFS, got %d" % exc.errno
+    else:
+        raise AssertionError("RESET on RO unexpectedly succeeded")
+
+    print("RO_ARC_IOCTL_PASS")
+finally:
+    os.close(fd)
+"#,
+            mnt = mnt.to_str().unwrap()
+        );
+        let out = python_command(&ro_script)
+            .output()
+            .expect("run RO Arc<OpenFs> ioctl script");
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("RO_ARC_IOCTL_PASS"),
+            "RO Arc<OpenFs> ioctl test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        session.unmount_and_join();
+        wait_for_fuse_mount_released(&mnt);
+    }
+
+    // 2. Mount READ-WRITE wrapped in Arc<OpenFs>: test DEV_REPLACE RW EOPNOTSUPP + SUBVOL_SETFLAGS persistence!
+    {
+        let cx = Cx::for_testing();
+        let mut rw_fs =
+            OpenFs::open_read_write(&cx, &image, &OpenOptions::default()).expect("open btrfs RW");
+        if let Err(e) = rw_fs.enable_writes(&cx) {
+            require_fuse_or_skip(&format!("btrfs enable_writes failed: {e}"));
+            return;
+        }
+        let rw_opts = MountOptions {
+            read_only: false,
+            auto_unmount: false,
+            ..MountOptions::default()
+        };
+        let session = match mount_background(Box::new(std::sync::Arc::new(rw_fs)), &mnt, &rw_opts) {
+            Ok(s) => {
+                wait_for_fuse_mount_ready(&mnt);
+                ffs_harness::stale_mounts::MountGuard::new(s, &mnt)
+            }
+            Err(e) => {
+                require_fuse_or_skip(&format!("btrfs RW Arc<OpenFs> mount failed: {e}"));
+                return;
+            }
+        };
+
+        let rw_script = format!(
+            r#"
+import errno, fcntl, os, struct
+
+mnt = {mnt:?}
+fd = os.open(mnt, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    BTRFS_IOC_DEV_REPLACE = 0xca289435
+    for mut_cmd in (0, 2):
+        req = bytearray(2600)
+        struct.pack_into('<Q', req, 0, mut_cmd)
+        try:
+            fcntl.ioctl(fd, BTRFS_IOC_DEV_REPLACE, req, True)
+        except OSError as exc:
+            assert exc.errno == errno.EOPNOTSUPP, "cmd=%d on RW expected EOPNOTSUPP, got %d" % (mut_cmd, exc.errno)
+        else:
+            raise AssertionError("cmd=%d unexpectedly succeeded on RW" % mut_cmd)
+
+    bad_cmd = bytearray(2600)
+    struct.pack_into('<Q', bad_cmd, 0, 3)
+    try:
+        fcntl.ioctl(fd, BTRFS_IOC_DEV_REPLACE, bad_cmd, True)
+    except OSError as exc:
+        assert exc.errno == errno.EINVAL, "cmd=3 expected EINVAL, got %d" % exc.errno
+    else:
+        raise AssertionError("cmd=3 unexpectedly succeeded")
+
+    # SUBVOL_SETFLAGS / SUBVOL_GETFLAGS via Arc<OpenFs>
+    BTRFS_IOC_SUBVOL_GETFLAGS = 0x80089419
+    BTRFS_IOC_SUBVOL_SETFLAGS = 0x4008941a
+    bad_subvol = bytearray(struct.pack('<Q', 1))
+    try:
+        fcntl.ioctl(fd, BTRFS_IOC_SUBVOL_SETFLAGS, bad_subvol, True)
+    except OSError as exc:
+        assert exc.errno == errno.EINVAL, "0x1 subvol flag expected EINVAL, got %d" % exc.errno
+    else:
+        raise AssertionError("0x1 subvol flag unexpectedly succeeded")
+
+    rdonly_subvol = bytearray(struct.pack('<Q', 2))
+    fcntl.ioctl(fd, BTRFS_IOC_SUBVOL_SETFLAGS, rdonly_subvol, True)
+    got_buf = bytearray(8)
+    fcntl.ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, got_buf, True)
+    got_flags, = struct.unpack_from('<Q', got_buf, 0)
+    assert got_flags == 2, "live SUBVOL_GETFLAGS expected 0x2, got 0x%x" % got_flags
+    print("RW_ARC_IOCTL_PASS")
+finally:
+    os.close(fd)
+"#,
+            mnt = mnt.to_str().unwrap()
+        );
+        let out = python_command(&rw_script)
+            .output()
+            .expect("run RW Arc<OpenFs> ioctl script");
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("RW_ARC_IOCTL_PASS"),
+            "RW Arc<OpenFs> ioctl test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        session.unmount_and_join();
+        wait_for_fuse_mount_released(&mnt);
+    }
+
+    // 3. Remount RO via Arc<OpenFs> and verify SUBVOL_SETFLAGS(0x2) persisted across destroy commit!
+    {
+        let cx = Cx::for_testing();
+        let ro_fs = OpenFs::open_with_options(&cx, &image, &OpenOptions::default())
+            .expect("reopen btrfs RO");
+        let ro_opts = MountOptions {
+            read_only: true,
+            auto_unmount: false,
+            ..MountOptions::default()
+        };
+        let session = match mount_background(Box::new(std::sync::Arc::new(ro_fs)), &mnt, &ro_opts) {
+            Ok(s) => {
+                wait_for_fuse_mount_ready(&mnt);
+                ffs_harness::stale_mounts::MountGuard::new(s, &mnt)
+            }
+            Err(e) => {
+                require_fuse_or_skip(&format!("btrfs RO remount failed: {e}"));
+                return;
+            }
+        };
+        let verify_script = format!(
+            r#"
+import fcntl, os, struct
+fd = os.open({mnt:?}, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    buf = bytearray(8)
+    fcntl.ioctl(fd, 0x80089419, buf, True)
+    flags, = struct.unpack_from('<Q', buf, 0)
+    assert flags == 2, "persisted SUBVOL_GETFLAGS expected 0x2, got 0x%x" % flags
+    print("REMOUNT_SUBVOL_PASS")
+finally:
+    os.close(fd)
+"#,
+            mnt = mnt.to_str().unwrap()
+        );
+        let out = python_command(&verify_script)
+            .output()
+            .expect("run remount verify script");
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("REMOUNT_SUBVOL_PASS"),
+            "remount SUBVOL_GETFLAGS verification failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        session.unmount_and_join();
+        wait_for_fuse_mount_released(&mnt);
+    }
+
+    emit_scenario_result(
+        "btrfs_arc_forwarded_ioctls_and_contracts",
+        "PASS",
+        Some("space_info_ro+send+subvol_flags+dev_replace+dev_stats"),
+    );
+}
+
+#[test]
+fn ext4_fuse_arc_fssetxattr_xflags_and_projid_atomic_commit_and_e2fsck() {
+    if !fuse_available() || !command_available("python3") || !command_available("e2fsck") {
+        eprintln!("FUSE, python3, or e2fsck not available, skipping");
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_empty_ext4_test_image_with_size(tmp.path(), 32 * 1024 * 1024);
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+
+    let cx = Cx::for_testing();
+    let opts = OpenOptions {
+        skip_validation: false,
+        ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+        mvcc_wal_path: Some(image.with_extension("wal")),
+        ..OpenOptions::default()
+    };
+    let mut fs = OpenFs::open_read_write(&cx, &image, &opts).expect("open ext4 RW");
+    fs.enable_writes(&cx).expect("enable ext4 writes");
+    let mount_opts = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    let session = match mount_background(Box::new(std::sync::Arc::new(fs)), &mnt, &mount_opts) {
+        Ok(s) => {
+            wait_for_fuse_mount_ready(&mnt);
+            ffs_harness::stale_mounts::MountGuard::new(s, &mnt)
+        }
+        Err(e) => {
+            require_fuse_or_skip(&format!("ext4 RW Arc<OpenFs> mount failed: {e}"));
+            return;
+        }
+    };
+
+    let target = mnt.join("proj_noatime.bin");
+    fs::write(&target, b"atomic-fsxattr-payload\n").expect("write target file");
+
+    let script = format!(
+        r#"
+import fcntl, os, struct
+
+FS_IOC_FSGETXATTR = 0x801c581f
+FS_IOC_FSSETXATTR = 0x401c5820
+FS_XFLAG_NOATIME = 0x00000040
+FS_XFLAG_HASATTR = 0x80000000
+
+fd = os.open({path:?}, os.O_RDONLY)
+try:
+    # Set BOTH xflags and non-zero projid in one FS_IOC_FSSETXATTR call over FUSE!
+    # struct fsxattr (28 bytes): xflags(u32), extsize(u32), nextents(u32), projid(u32), cowextsize(u32), pad(8)
+    req = bytearray(struct.pack('<IIIII8s', FS_XFLAG_NOATIME, 0, 0, 0x13572468, 0, b'\x00' * 8))
+    fcntl.ioctl(fd, FS_IOC_FSSETXATTR, req, True)
+
+    got = bytearray(28)
+    fcntl.ioctl(fd, FS_IOC_FSGETXATTR, got, True)
+    xflags, extsize, nextents, projid, cowextsize = struct.unpack_from('<IIIII', got, 0)
+    assert (xflags & ~FS_XFLAG_HASATTR) == FS_XFLAG_NOATIME, "unexpected xflags 0x%x" % xflags
+    assert projid == 0x13572468, "unexpected projid 0x%x" % projid
+    print("EXT4_FSSETXATTR_PASS")
+finally:
+    os.close(fd)
+"#,
+        path = target.to_str().unwrap()
+    );
+    let out = python_command(&script)
+        .output()
+        .expect("run ext4 FS_IOC_FSSETXATTR script");
+    assert!(
+        out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("EXT4_FSSETXATTR_PASS"),
+        "ext4 FS_IOC_FSSETXATTR via FUSE failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    session.unmount_and_join();
+    wait_for_fuse_mount_released(&mnt);
+
+    let fsck = Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(&image)
+        .output()
+        .expect("run e2fsck -fn");
+    assert!(
+        fsck.status.success(),
+        "e2fsck -fn failed after FS_IOC_FSSETXATTR:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    emit_scenario_result(
+        "ext4_arc_fssetxattr_atomic_commit_and_e2fsck",
+        "PASS",
+        Some("xflags_plus_projid_single_tx"),
+    );
+}

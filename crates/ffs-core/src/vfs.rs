@@ -2456,12 +2456,14 @@ pub trait FsOps: Send + Sync {
 
     /// Get device statistics for `BTRFS_IOC_GET_DEV_STATS`.
     ///
+    /// `flags` carries caller flags such as `BTRFS_DEV_STATS_RESET` (`0x1`).
     /// Returns `btrfs_ioctl_get_dev_stats` struct bytes (1032 bytes).
     fn btrfs_get_dev_stats(
         &self,
         _cx: &Cx,
         _scope: &mut RequestScope,
         _devid: u64,
+        _flags: u64,
     ) -> ffs_error::Result<Vec<u8>> {
         Err(FfsError::UnsupportedFeature(
             "btrfs_get_dev_stats is not supported by this backend".to_owned(),
@@ -3458,13 +3460,33 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
             .get_btrfs_dev_info(cx, scope, devid_in, uuid_in)
     }
 
+    fn get_subvol_flags(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<u64> {
+        self.as_ref().get_subvol_flags(cx, scope, ino)
+    }
+
+    fn set_subvol_flags(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        flags: u64,
+    ) -> ffs_error::Result<()> {
+        self.as_ref().set_subvol_flags(cx, scope, ino, flags)
+    }
+
     fn btrfs_get_dev_stats(
         &self,
         cx: &Cx,
         scope: &mut RequestScope,
         devid: u64,
+        flags: u64,
     ) -> ffs_error::Result<Vec<u8>> {
-        self.as_ref().btrfs_get_dev_stats(cx, scope, devid)
+        self.as_ref().btrfs_get_dev_stats(cx, scope, devid, flags)
     }
 
     fn btrfs_get_subvol_info(
@@ -3523,6 +3545,19 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         self.as_ref().btrfs_get_subvol_rootref(cx, scope, args)
     }
 
+    fn btrfs_scrub_start(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        devid: u64,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_scrub_start(cx, scope, devid)
+    }
+
+    fn btrfs_scrub_cancel(&self, cx: &Cx, scope: &mut RequestScope) -> ffs_error::Result<()> {
+        self.as_ref().btrfs_scrub_cancel(cx, scope)
+    }
+
     fn btrfs_scrub_progress(
         &self,
         cx: &Cx,
@@ -3532,12 +3567,105 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         self.as_ref().btrfs_scrub_progress(cx, scope, devid)
     }
 
+    fn btrfs_defrag_range(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        fh: u64,
+        start: u64,
+        len: u64,
+    ) -> ffs_error::Result<()> {
+        self.as_ref().btrfs_defrag_range(cx, scope, fh, start, len)
+    }
+
+    fn btrfs_snap_create(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        vol_args: &[u8],
+    ) -> ffs_error::Result<()> {
+        self.as_ref().btrfs_snap_create(cx, scope, vol_args)
+    }
+
+    fn btrfs_snap_destroy(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        vol_args: &[u8],
+    ) -> ffs_error::Result<()> {
+        self.as_ref().btrfs_snap_destroy(cx, scope, vol_args)
+    }
+
+    fn btrfs_encoded_write(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: u64,
+        args: &[u8],
+    ) -> ffs_error::Result<usize> {
+        self.as_ref().btrfs_encoded_write(cx, scope, ino, args)
+    }
+
+    fn btrfs_defrag(&self, cx: &Cx, scope: &mut RequestScope, ino: u64) -> ffs_error::Result<()> {
+        self.as_ref().btrfs_defrag(cx, scope, ino)
+    }
+
+    fn btrfs_scan_dev(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        args: &[u8],
+    ) -> ffs_error::Result<()> {
+        self.as_ref().btrfs_scan_dev(cx, scope, args)
+    }
+
+    fn btrfs_send(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        args: &[u8],
+        caller_pid: u32,
+    ) -> ffs_error::Result<()> {
+        self.as_ref().btrfs_send(cx, scope, args, caller_pid)
+    }
+
+    fn btrfs_set_received_subvol(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        args: &[u8],
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_set_received_subvol(cx, scope, args)
+    }
+
+    fn btrfs_balance_start(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        args: &[u8],
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_balance_start(cx, scope, args)
+    }
+
+    fn btrfs_balance_ctl(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        cmd: i32,
+    ) -> ffs_error::Result<()> {
+        self.as_ref().btrfs_balance_ctl(cx, scope, cmd)
+    }
+
     fn btrfs_balance_progress(
         &self,
         cx: &Cx,
         scope: &mut RequestScope,
     ) -> ffs_error::Result<Vec<u8>> {
         self.as_ref().btrfs_balance_progress(cx, scope)
+    }
+
+    fn btrfs_get_fslabel(&self, cx: &Cx, scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_get_fslabel(cx, scope)
     }
 
     fn get_btrfs_logical_ino_v2(
@@ -3988,6 +4116,1275 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
     fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {
         self.as_ref().flush_on_destroy(cx)
     }
+}
+
+#[doc(hidden)]
+pub mod __delegate_support {
+    pub use super::{
+        BtrfsQgroupLimitRequest, BtrfsTreeSearchKey, FiemapExtent, FsStat, FsxattrInfo, InodeAttr,
+        OpenHandleOracle, QuotaInfo, ReaddirPage, ReleaseRequest, RequestOp, RequestScope,
+        SeekWhence, SetAttrRequest, XattrPresence, XattrSetMode,
+    };
+    pub use asupersync::Cx;
+    pub use ffs_error::Result;
+    pub use ffs_types::{CommitSeq, InodeNumber};
+    pub use std::ffi::OsStr;
+    pub use std::path::Path;
+    pub use std::time::SystemTime;
+}
+
+/// Forward every [`FsOps`] method from a wrapper type to `$target` so manual
+/// delegating wrappers (such as `ProtectedFs`) cannot silently omit trait
+/// methods and fall through to [`FsOps`] defaults.
+#[macro_export]
+macro_rules! delegate_fs_ops {
+    ($self:ident, $target:expr) => {
+        fn getattr_batch(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            inos: &[$crate::vfs::__delegate_support::InodeNumber],
+        ) -> ::std::vec::Vec<$crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr>> {
+            ($target).getattr_batch(cx, scope, inos)
+        }
+
+        fn xattr_presence(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+        ) -> $crate::vfs::__delegate_support::XattrPresence {
+            ($target).xattr_presence(cx)
+        }
+
+        fn install_open_handle_oracle(
+            &$self,
+            oracle: $crate::vfs::__delegate_support::OpenHandleOracle,
+        ) {
+            ($target).install_open_handle_oracle(oracle);
+        }
+
+        fn finalize_unlinked_inode(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<bool> {
+            ($target).finalize_unlinked_inode(cx, scope, ino)
+        }
+
+        fn getattr(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).getattr(cx, scope, ino)
+        }
+
+        fn lookup(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).lookup(cx, scope, parent, name)
+        }
+
+        fn readdir(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            offset: u64,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::ReaddirPage> {
+            ($target).readdir(cx, scope, ino, offset)
+        }
+
+        fn read(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            offset: u64,
+            size: u32,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).read(cx, scope, ino, offset, size)
+        }
+
+        fn open(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            flags: i32,
+        ) -> $crate::vfs::__delegate_support::Result<(u64, u32)> {
+            ($target).open(cx, scope, ino, flags)
+        }
+
+        fn readlink(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).readlink(cx, scope, ino)
+        }
+
+        fn statfs(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::FsStat> {
+            ($target).statfs(cx, scope, ino)
+        }
+
+        fn listxattr(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<::std::string::String>> {
+            ($target).listxattr(cx, ino)
+        }
+
+        fn getxattr(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            name: &str,
+        ) -> $crate::vfs::__delegate_support::Result<::std::option::Option<::std::vec::Vec<u8>>> {
+            ($target).getxattr(cx, ino, name)
+        }
+
+        fn setxattr(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            name: &str,
+            value: &[u8],
+            mode: $crate::vfs::__delegate_support::XattrSetMode,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).setxattr(cx, scope, ino, name, value, mode)
+        }
+
+        fn removexattr(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            name: &str,
+        ) -> $crate::vfs::__delegate_support::Result<bool> {
+            ($target).removexattr(cx, scope, ino, name)
+        }
+
+        fn create(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+            mode: u16,
+            uid: u32,
+            gid: u32,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).create(cx, scope, parent, name, mode, uid, gid)
+        }
+
+        fn tmpfile(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            mode: u16,
+            uid: u32,
+            gid: u32,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).tmpfile(cx, scope, parent, mode, uid, gid)
+        }
+
+        fn touch_atime(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            now: $crate::vfs::__delegate_support::SystemTime,
+            strict: bool,
+        ) -> $crate::vfs::__delegate_support::Result<bool> {
+            ($target).touch_atime(cx, scope, ino, now, strict)
+        }
+
+        fn mkdir(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+            mode: u16,
+            uid: u32,
+            gid: u32,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).mkdir(cx, scope, parent, name, mode, uid, gid)
+        }
+
+        fn unlink(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).unlink(cx, scope, parent, name)
+        }
+
+        fn rmdir(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).rmdir(cx, scope, parent, name)
+        }
+
+        fn rename(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+            new_parent: $crate::vfs::__delegate_support::InodeNumber,
+            new_name: &$crate::vfs::__delegate_support::OsStr,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).rename(cx, scope, parent, name, new_parent, new_name)
+        }
+
+        fn rename2(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+            new_parent: $crate::vfs::__delegate_support::InodeNumber,
+            new_name: &$crate::vfs::__delegate_support::OsStr,
+            flags: u32,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).rename2(cx, scope, parent, name, new_parent, new_name, flags)
+        }
+
+        fn write(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            offset: u64,
+            data: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<u32> {
+            ($target).write(cx, scope, ino, offset, data)
+        }
+
+        fn copy_file_range(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino_in: $crate::vfs::__delegate_support::InodeNumber,
+            offset_in: u64,
+            ino_out: $crate::vfs::__delegate_support::InodeNumber,
+            offset_out: u64,
+            len: u64,
+        ) -> $crate::vfs::__delegate_support::Result<u64> {
+            ($target).copy_file_range(cx, scope, ino_in, offset_in, ino_out, offset_out, len)
+        }
+
+        fn link(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            new_parent: $crate::vfs::__delegate_support::InodeNumber,
+            new_name: &$crate::vfs::__delegate_support::OsStr,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).link(cx, scope, ino, new_parent, new_name)
+        }
+
+        fn symlink(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+            target: &$crate::vfs::__delegate_support::Path,
+            uid: u32,
+            gid: u32,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).symlink(cx, scope, parent, name, target, uid, gid)
+        }
+
+        fn fallocate(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            offset: u64,
+            length: u64,
+            mode: i32,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).fallocate(cx, scope, ino, offset, length, mode)
+        }
+
+        fn fiemap(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            start: u64,
+            length: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<$crate::vfs::__delegate_support::FiemapExtent>> {
+            ($target).fiemap(cx, scope, ino, start, length)
+        }
+
+        fn lseek(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            offset: u64,
+            whence: $crate::vfs::__delegate_support::SeekWhence,
+        ) -> $crate::vfs::__delegate_support::Result<u64> {
+            ($target).lseek(cx, scope, ino, offset, whence)
+        }
+
+        fn get_inode_fsxattr(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::FsxattrInfo> {
+            ($target).get_inode_fsxattr(cx, scope, ino)
+        }
+
+        fn set_inode_fsxattr(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            fsxattr: $crate::vfs::__delegate_support::FsxattrInfo,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).set_inode_fsxattr(cx, scope, ino, fsxattr)
+        }
+
+        fn get_inode_flags(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<u32> {
+            ($target).get_inode_flags(cx, scope, ino)
+        }
+
+        fn get_inode_state(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<u32> {
+            ($target).get_inode_state(cx, scope, ino)
+        }
+
+        fn precache_extents(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).precache_extents(cx, scope, ino)
+        }
+
+        fn clear_extent_status_cache(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).clear_extent_status_cache(cx, scope, ino)
+        }
+
+        fn get_inode_generation(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<u32> {
+            ($target).get_inode_generation(cx, scope, ino)
+        }
+
+        fn set_inode_generation(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            generation: u32,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).set_inode_generation(cx, scope, ino, generation)
+        }
+
+        fn get_encryption_policy_v1(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<[u8; 12]> {
+            ($target).get_encryption_policy_v1(cx, scope, ino)
+        }
+
+        fn get_encryption_policy_ex(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<(u8, ::std::vec::Vec<u8>)> {
+            ($target).get_encryption_policy_ex(cx, scope, ino)
+        }
+
+        fn get_fs_label(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_fs_label(cx, scope)
+        }
+
+        fn set_fs_label(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            label: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).set_fs_label(cx, scope, label)
+        }
+
+        fn fs_uuid(&$self) -> $crate::vfs::__delegate_support::Result<[u8; 16]> {
+            ($target).fs_uuid()
+        }
+
+        fn fs_sysfs_path(&$self) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).fs_sysfs_path()
+        }
+
+        fn get_btrfs_fs_info(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_btrfs_fs_info(cx, scope)
+        }
+
+        fn get_btrfs_features(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_btrfs_features(cx, scope)
+        }
+
+        fn get_btrfs_supported_features(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_btrfs_supported_features(cx, scope)
+        }
+
+        fn get_btrfs_space_info(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            space_slots: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_btrfs_space_info(cx, scope, space_slots)
+        }
+
+        fn set_btrfs_features(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            feature_flags: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).set_btrfs_features(cx, scope, feature_flags)
+        }
+
+        fn sync_fs(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).sync_fs(cx, scope)
+        }
+
+        fn btrfs_start_sync(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<u64> {
+            ($target).btrfs_start_sync(cx, scope)
+        }
+
+        fn btrfs_wait_sync(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            transid: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_wait_sync(cx, scope, transid)
+        }
+
+        fn btrfs_set_default_subvol(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            treeid: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_set_default_subvol(cx, scope, treeid)
+        }
+
+        fn btrfs_start_transaction(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_start_transaction(cx, scope)
+        }
+
+        fn btrfs_end_transaction(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_end_transaction(cx, scope)
+        }
+
+        fn btrfs_ino_lookup(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            treeid: u64,
+            objectid: u64,
+        ) -> $crate::vfs::__delegate_support::Result<(u64, ::std::vec::Vec<u8>)> {
+            ($target).btrfs_ino_lookup(cx, scope, treeid, objectid)
+        }
+
+        fn get_btrfs_dev_info(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            devid_in: u64,
+            uuid_in: [u8; 16],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_btrfs_dev_info(cx, scope, devid_in, uuid_in)
+        }
+
+        fn get_subvol_flags(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<u64> {
+            ($target).get_subvol_flags(cx, scope, ino)
+        }
+
+        fn set_subvol_flags(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            flags: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).set_subvol_flags(cx, scope, ino, flags)
+        }
+
+        fn btrfs_get_dev_stats(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            devid: u64,
+            flags: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_get_dev_stats(cx, scope, devid, flags)
+        }
+
+        fn btrfs_get_subvol_info(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_get_subvol_info(cx, scope, ino)
+        }
+
+        fn btrfs_tree_search(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            key: $crate::vfs::__delegate_support::BtrfsTreeSearchKey,
+        ) -> $crate::vfs::__delegate_support::Result<(u32, ::std::vec::Vec<u8>)> {
+            ($target).btrfs_tree_search(cx, scope, key)
+        }
+
+        fn btrfs_tree_search_v2(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_tree_search_v2(cx, scope, args)
+        }
+
+        fn get_btrfs_ino_paths(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            inum: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_btrfs_ino_paths(cx, scope, inum)
+        }
+
+        fn btrfs_ino_lookup_user(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            treeid: u64,
+            dirid: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_ino_lookup_user(cx, scope, treeid, dirid)
+        }
+
+        fn btrfs_get_subvol_rootref(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_get_subvol_rootref(cx, scope, args)
+        }
+
+        fn btrfs_scrub_start(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            devid: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_scrub_start(cx, scope, devid)
+        }
+
+        fn btrfs_scrub_cancel(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_scrub_cancel(cx, scope)
+        }
+
+        fn btrfs_scrub_progress(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            devid: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_scrub_progress(cx, scope, devid)
+        }
+
+        fn btrfs_defrag_range(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            fh: u64,
+            start: u64,
+            len: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_defrag_range(cx, scope, fh, start, len)
+        }
+
+        fn btrfs_snap_create(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            vol_args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_snap_create(cx, scope, vol_args)
+        }
+
+        fn btrfs_snap_destroy(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            vol_args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_snap_destroy(cx, scope, vol_args)
+        }
+
+        fn btrfs_encoded_write(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: u64,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<usize> {
+            ($target).btrfs_encoded_write(cx, scope, ino, args)
+        }
+
+        fn btrfs_defrag(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_defrag(cx, scope, ino)
+        }
+
+        fn btrfs_scan_dev(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_scan_dev(cx, scope, args)
+        }
+
+        fn btrfs_send(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+            caller_pid: u32,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_send(cx, scope, args, caller_pid)
+        }
+
+        fn btrfs_set_received_subvol(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_set_received_subvol(cx, scope, args)
+        }
+
+        fn btrfs_balance_start(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_balance_start(cx, scope, args)
+        }
+
+        fn btrfs_balance_ctl(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            cmd: i32,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_balance_ctl(cx, scope, cmd)
+        }
+
+        fn btrfs_balance_progress(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_balance_progress(cx, scope)
+        }
+
+        fn btrfs_get_fslabel(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_get_fslabel(cx, scope)
+        }
+
+        fn get_btrfs_logical_ino_v2(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            logical: u64,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_btrfs_logical_ino_v2(cx, scope, logical, args)
+        }
+
+        fn get_btrfs_logical_ino(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            logical: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).get_btrfs_logical_ino(cx, scope, logical)
+        }
+
+        fn btrfs_resize(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_resize(cx, scope, args)
+        }
+
+        fn btrfs_dev_replace(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_dev_replace(cx, scope, args)
+        }
+
+        fn btrfs_forget_dev(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_forget_dev(cx, scope, args)
+        }
+
+        fn btrfs_set_fslabel(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_set_fslabel(cx, scope, args)
+        }
+
+        fn btrfs_file_extent_same(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: u64,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_file_extent_same(cx, scope, ino, args)
+        }
+
+        fn btrfs_subvol_create(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            umask: u16,
+            uid: u32,
+            gid: u32,
+            vol_args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_subvol_create(cx, scope, parent, umask, uid, gid, vol_args)
+        }
+
+        fn get_quota_info(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::QuotaInfo> {
+            ($target).get_quota_info(cx, scope)
+        }
+
+        fn btrfs_wait_quota_rescan(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_wait_quota_rescan(cx, scope)
+        }
+
+        fn btrfs_quota_rescan_status(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_quota_rescan_status(cx, scope)
+        }
+
+        fn btrfs_start_quota_rescan(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            flags: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_start_quota_rescan(cx, scope, flags)
+        }
+
+        fn btrfs_quota_control(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            cmd: u64,
+            status: u64,
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_quota_control(cx, scope, cmd, status)
+        }
+
+        fn btrfs_assign_qgroup(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            assign: u64,
+            src: u64,
+            dst: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_assign_qgroup(cx, scope, assign, src, dst)
+        }
+
+        fn btrfs_create_qgroup(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            create: u64,
+            qgroupid: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_create_qgroup(cx, scope, create, qgroupid)
+        }
+
+        fn btrfs_limit_qgroup(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            limit: $crate::vfs::__delegate_support::BtrfsQgroupLimitRequest,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_limit_qgroup(cx, scope, limit)
+        }
+
+        fn btrfs_rm_dev_v2(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            vol_args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_rm_dev_v2(cx, scope, vol_args)
+        }
+
+        fn btrfs_snap_destroy_v2(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            vol_args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_snap_destroy_v2(cx, scope, vol_args)
+        }
+
+        fn btrfs_encoded_read(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: u64,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<::std::vec::Vec<u8>> {
+            ($target).btrfs_encoded_read(cx, scope, ino, args)
+        }
+
+        fn btrfs_add_dev(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            vol_args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_add_dev(cx, scope, vol_args)
+        }
+
+        fn btrfs_rm_dev(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            vol_args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).btrfs_rm_dev(cx, scope, vol_args)
+        }
+
+        fn set_inode_flags(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            flags: u32,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).set_inode_flags(cx, scope, ino, flags)
+        }
+
+        fn trim_range(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            start: u64,
+            len: u64,
+            min_len: u64,
+        ) -> $crate::vfs::__delegate_support::Result<u64> {
+            ($target).trim_range(cx, scope, start, len, min_len)
+        }
+
+        fn mknod(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+            mode: u16,
+            rdev: u32,
+            uid: u32,
+            gid: u32,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).mknod(cx, scope, parent, name, mode, rdev, uid, gid)
+        }
+
+        fn move_ext(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            donor_fd: u32,
+            orig_start: u64,
+            donor_start: u64,
+            len: u64,
+        ) -> $crate::vfs::__delegate_support::Result<u64> {
+            ($target).move_ext(cx, scope, ino, donor_fd, orig_start, donor_start, len)
+        }
+
+        fn clone_file(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            dest_ino: $crate::vfs::__delegate_support::InodeNumber,
+            src_ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).clone_file(cx, scope, dest_ino, src_ino)
+        }
+
+        fn clone_file_range(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            dest_ino: $crate::vfs::__delegate_support::InodeNumber,
+            src_ino: $crate::vfs::__delegate_support::InodeNumber,
+            src_offset: u64,
+            src_length: u64,
+            dest_offset: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).clone_file_range(
+                cx,
+                scope,
+                dest_ino,
+                src_ino,
+                src_offset,
+                src_length,
+                dest_offset,
+            )
+        }
+
+        fn register_move_ext_donor_fd(
+            &$self,
+            donor_fd: u32,
+            donor_ino: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).register_move_ext_donor_fd(donor_fd, donor_ino)
+        }
+
+        fn unregister_move_ext_donor_fd(&$self, donor_fd: u32) {
+            ($target).unregister_move_ext_donor_fd(donor_fd);
+        }
+
+        fn ext4_group_extend(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).ext4_group_extend(cx, scope, args)
+        }
+
+        fn ext4_resize_fs(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).ext4_resize_fs(cx, scope, args)
+        }
+
+        fn ext4_group_add(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            args: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).ext4_group_add(cx, scope, args)
+        }
+
+        fn ext4_alloc_da_blks(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).ext4_alloc_da_blks(cx, scope, ino)
+        }
+
+        fn ext4_migrate(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).ext4_migrate(cx, scope, ino)
+        }
+
+        fn ext4_swap_boot(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).ext4_swap_boot(cx, scope, ino)
+        }
+
+        fn fs_shutdown(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            flags: &[u8],
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).fs_shutdown(cx, scope, flags)
+        }
+
+        fn fs_freeze(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<i32> {
+            ($target).fs_freeze(cx, scope)
+        }
+
+        fn fs_thaw(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).fs_thaw(cx, scope)
+        }
+
+        fn get_block_size(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<u32> {
+            ($target).get_block_size(cx, scope)
+        }
+
+        fn setattr(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            attrs: &$crate::vfs::__delegate_support::SetAttrRequest,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
+            ($target).setattr(cx, scope, ino, attrs)
+        }
+
+        fn flush(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            fh: u64,
+            lock_owner: u64,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).flush(cx, scope, ino, fh, lock_owner)
+        }
+
+        fn release(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            request: $crate::vfs::__delegate_support::ReleaseRequest,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).release(cx, scope, request)
+        }
+
+        fn fsync(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            fh: u64,
+            datasync: bool,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).fsync(cx, scope, ino, fh, datasync)
+        }
+
+        fn fsyncdir(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            ino: $crate::vfs::__delegate_support::InodeNumber,
+            fh: u64,
+            datasync: bool,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).fsyncdir(cx, scope, ino, fh, datasync)
+        }
+
+        fn begin_request_scope(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            op: $crate::vfs::__delegate_support::RequestOp,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::RequestScope> {
+            ($target).begin_request_scope(cx, op)
+        }
+
+        fn end_request_scope(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            op: $crate::vfs::__delegate_support::RequestOp,
+            scope: $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).end_request_scope(cx, op, scope)
+        }
+
+        fn commit_request_scope(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::CommitSeq> {
+            ($target).commit_request_scope(cx, scope)
+        }
+
+        fn begin_writeback_batch_scope(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::RequestScope> {
+            ($target).begin_writeback_batch_scope(cx)
+        }
+
+        fn commit_writeback_batch_scope(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::CommitSeq> {
+            ($target).commit_writeback_batch_scope(cx, scope)
+        }
+
+        fn abort_writeback_batch_scope(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: $crate::vfs::__delegate_support::RequestScope,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).abort_writeback_batch_scope(cx, scope)
+        }
+
+        fn flush_on_destroy(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).flush_on_destroy(cx)
+        }
+    };
 }
 
 #[cfg(test)]
@@ -4553,5 +5950,1552 @@ mod getattr_batch_tests {
         );
         assert_eq!(fs.oracles.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(fs.finalizes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_lines)]
+mod fs_ops_wrapper_completeness_pins {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    fn extract_fn_names(block: &str, indent: &str) -> BTreeSet<String> {
+        let prefix = format!("\n{indent}fn ");
+        let mut names = BTreeSet::new();
+        let mut rest = block;
+        while let Some(pos) = rest.find(&prefix) {
+            let after = &rest[pos + prefix.len()..];
+            let end = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(after.len());
+            let method_name = &after[..end];
+            assert!(
+                !method_name.is_empty(),
+                "empty fn identifier in {prefix:?} scan"
+            );
+            assert!(
+                names.insert(method_name.to_owned()),
+                "duplicate FsOps method `{method_name}` in scanned block"
+            );
+            rest = &after[end..];
+        }
+        names
+    }
+
+    #[test]
+    fn arc_and_delegate_macro_forward_every_single_fsops_method() {
+        let source = include_str!("vfs.rs");
+        let trait_start = source
+            .find("\npub trait FsOps: Send + Sync {\n")
+            .expect("pub trait FsOps header must exist");
+        let trait_tail = &source[trait_start + 1..];
+        let trait_end = trait_tail
+            .find("\n}\n")
+            .expect("pub trait FsOps closing brace must exist");
+        let trait_block = &trait_tail[..trait_end];
+
+        let arc_start = source
+            .find("\nimpl<T: FsOps + ?Sized> FsOps for Arc<T> {\n")
+            .expect("impl FsOps for Arc<T> header must exist");
+        let arc_tail = &source[arc_start + 1..];
+        let arc_end = arc_tail
+            .find("\n}\n")
+            .expect("impl FsOps for Arc<T> closing brace must exist");
+        let arc_block = &arc_tail[..arc_end];
+
+        let macro_start = source
+            .find("\nmacro_rules! delegate_fs_ops {\n")
+            .expect("macro_rules! delegate_fs_ops header must exist");
+        let macro_tail = &source[macro_start + 1..];
+        let macro_end = macro_tail
+            .find("\n}\n")
+            .expect("macro_rules! delegate_fs_ops closing brace must exist");
+        let macro_block = &macro_tail[..macro_end];
+
+        let trait_methods = extract_fn_names(trait_block, "    ");
+        let arc_methods = extract_fn_names(arc_block, "    ");
+        let macro_methods = extract_fn_names(macro_block, "        ");
+
+        assert!(
+            trait_methods.len() >= 132,
+            "expected at least 132 FsOps trait methods, found {}",
+            trait_methods.len()
+        );
+
+        let missing_arc: Vec<_> = trait_methods.difference(&arc_methods).cloned().collect();
+        let extra_arc: Vec<_> = arc_methods.difference(&trait_methods).cloned().collect();
+        assert!(
+            missing_arc.is_empty() && extra_arc.is_empty(),
+            "impl FsOps for Arc<T> drifted from trait FsOps! \
+             missing_from_arc={missing_arc:?}, extra_in_arc={extra_arc:?}"
+        );
+
+        let missing_macro: Vec<_> = trait_methods.difference(&macro_methods).cloned().collect();
+        let extra_macro: Vec<_> = macro_methods.difference(&trait_methods).cloned().collect();
+        assert!(
+            missing_macro.is_empty() && extra_macro.is_empty(),
+            "delegate_fs_ops! drifted from trait FsOps! \
+             missing_from_macro={missing_macro:?}, extra_in_macro={extra_macro:?}"
+        );
+
+        let protected_mount = include_str!("../../ffs-cli/src/bin/ffs-protected-mount/main.rs");
+        assert!(
+            protected_mount.contains("impl FsOps for ProtectedFs {\n    ffs_core::delegate_fs_ops!(self, self.as_ops());\n}"),
+            "ProtectedFs must delegate all FsOps methods via ffs_core::delegate_fs_ops!"
+        );
+    }
+
+    #[derive(Default)]
+    struct SpyFsOps {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl SpyFsOps {
+        fn record(&self, name: &'static str) {
+            self.calls.lock().expect("spy mutex").push(name);
+        }
+
+        fn dummy_attr(ino: InodeNumber) -> InodeAttr {
+            InodeAttr {
+                ino,
+                size: 64,
+                blocks: 1,
+                atime: SystemTime::UNIX_EPOCH,
+                mtime: SystemTime::UNIX_EPOCH,
+                ctime: SystemTime::UNIX_EPOCH,
+                crtime: SystemTime::UNIX_EPOCH,
+                kind: FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 4096,
+                generation: 1,
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    impl FsOps for SpyFsOps {
+        fn getattr_batch(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            inos: &[InodeNumber],
+        ) -> Vec<ffs_error::Result<InodeAttr>> {
+            self.record("getattr_batch");
+            inos.iter()
+                .copied()
+                .map(|i| Ok(Self::dummy_attr(i)))
+                .collect()
+        }
+        fn xattr_presence(&self, _cx: &Cx) -> XattrPresence {
+            self.record("xattr_presence");
+            XattrPresence::ProvenAbsent
+        }
+        fn install_open_handle_oracle(&self, _oracle: OpenHandleOracle) {
+            self.record("install_open_handle_oracle");
+        }
+        fn finalize_unlinked_inode(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<bool> {
+            self.record("finalize_unlinked_inode");
+            Ok(true)
+        }
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("getattr");
+            Ok(Self::dummy_attr(ino))
+        }
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("lookup");
+            Ok(Self::dummy_attr(parent))
+        }
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            self.record("readdir");
+            Ok(ReaddirPage::new(Vec::new()))
+        }
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("read");
+            Ok(vec![0xAB])
+        }
+        fn open(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _flags: i32,
+        ) -> ffs_error::Result<(u64, u32)> {
+            self.record("open");
+            Ok((7, 3))
+        }
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("readlink");
+            Ok(b"target".to_vec())
+        }
+        fn statfs(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<FsStat> {
+            self.record("statfs");
+            Ok(FsStat {
+                blocks: 10,
+                blocks_free: 5,
+                blocks_available: 5,
+                files: 10,
+                files_free: 5,
+                block_size: 4096,
+                name_max: 255,
+                fragment_size: 4096,
+            })
+        }
+        fn listxattr(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+            self.record("listxattr");
+            Ok(vec!["user.spy".to_owned()])
+        }
+        fn getxattr(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _name: &str,
+        ) -> ffs_error::Result<Option<Vec<u8>>> {
+            self.record("getxattr");
+            Ok(Some(b"v".to_vec()))
+        }
+        fn setxattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _name: &str,
+            _value: &[u8],
+            _mode: XattrSetMode,
+        ) -> ffs_error::Result<()> {
+            self.record("setxattr");
+            Ok(())
+        }
+        fn removexattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _name: &str,
+        ) -> ffs_error::Result<bool> {
+            self.record("removexattr");
+            Ok(true)
+        }
+        fn create(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            _name: &OsStr,
+            _mode: u16,
+            _uid: u32,
+            _gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("create");
+            Ok(Self::dummy_attr(parent))
+        }
+        fn tmpfile(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            _mode: u16,
+            _uid: u32,
+            _gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("tmpfile");
+            Ok(Self::dummy_attr(parent))
+        }
+        fn touch_atime(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _now: SystemTime,
+            _strict: bool,
+        ) -> ffs_error::Result<bool> {
+            self.record("touch_atime");
+            Ok(true)
+        }
+        fn mkdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            _name: &OsStr,
+            _mode: u16,
+            _uid: u32,
+            _gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("mkdir");
+            Ok(Self::dummy_attr(parent))
+        }
+        fn unlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<()> {
+            self.record("unlink");
+            Ok(())
+        }
+        fn rmdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<()> {
+            self.record("rmdir");
+            Ok(())
+        }
+        fn rename(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+            _new_parent: InodeNumber,
+            _new_name: &OsStr,
+        ) -> ffs_error::Result<()> {
+            self.record("rename");
+            Ok(())
+        }
+        fn rename2(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+            _new_parent: InodeNumber,
+            _new_name: &OsStr,
+            _flags: u32,
+        ) -> ffs_error::Result<()> {
+            self.record("rename2");
+            Ok(())
+        }
+        fn write(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            data: &[u8],
+        ) -> ffs_error::Result<u32> {
+            self.record("write");
+            Ok(u32::try_from(data.len()).unwrap_or(0))
+        }
+        fn copy_file_range(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino_in: InodeNumber,
+            _offset_in: u64,
+            _ino_out: InodeNumber,
+            _offset_out: u64,
+            len: u64,
+        ) -> ffs_error::Result<u64> {
+            self.record("copy_file_range");
+            Ok(len)
+        }
+        fn link(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            ino: InodeNumber,
+            _new_parent: InodeNumber,
+            _new_name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("link");
+            Ok(Self::dummy_attr(ino))
+        }
+        fn symlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            _name: &OsStr,
+            _target: &Path,
+            _uid: u32,
+            _gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("symlink");
+            Ok(Self::dummy_attr(parent))
+        }
+        fn fallocate(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _length: u64,
+            _mode: i32,
+        ) -> ffs_error::Result<()> {
+            self.record("fallocate");
+            Ok(())
+        }
+        fn fiemap(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _start: u64,
+            _length: u64,
+        ) -> ffs_error::Result<Vec<FiemapExtent>> {
+            self.record("fiemap");
+            Ok(Vec::new())
+        }
+        fn lseek(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            offset: u64,
+            _whence: SeekWhence,
+        ) -> ffs_error::Result<u64> {
+            self.record("lseek");
+            Ok(offset)
+        }
+        fn get_inode_fsxattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<FsxattrInfo> {
+            self.record("get_inode_fsxattr");
+            Ok(FsxattrInfo::default())
+        }
+        fn set_inode_fsxattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _fsxattr: FsxattrInfo,
+        ) -> ffs_error::Result<()> {
+            self.record("set_inode_fsxattr");
+            Ok(())
+        }
+        fn get_inode_flags(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<u32> {
+            self.record("get_inode_flags");
+            Ok(0)
+        }
+        fn get_inode_state(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<u32> {
+            self.record("get_inode_state");
+            Ok(1)
+        }
+        fn precache_extents(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<()> {
+            self.record("precache_extents");
+            Ok(())
+        }
+        fn clear_extent_status_cache(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<()> {
+            self.record("clear_extent_status_cache");
+            Ok(())
+        }
+        fn get_inode_generation(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<u32> {
+            self.record("get_inode_generation");
+            Ok(42)
+        }
+        fn set_inode_generation(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _generation: u32,
+        ) -> ffs_error::Result<()> {
+            self.record("set_inode_generation");
+            Ok(())
+        }
+        fn get_encryption_policy_v1(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<[u8; 12]> {
+            self.record("get_encryption_policy_v1");
+            Ok([0; 12])
+        }
+        fn get_encryption_policy_ex(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<(u8, Vec<u8>)> {
+            self.record("get_encryption_policy_ex");
+            Ok((2, vec![0; 24]))
+        }
+        fn get_fs_label(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_fs_label");
+            Ok(b"lbl".to_vec())
+        }
+        fn set_fs_label(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _label: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("set_fs_label");
+            Ok(())
+        }
+        fn fs_uuid(&self) -> ffs_error::Result<[u8; 16]> {
+            self.record("fs_uuid");
+            Ok([1; 16])
+        }
+        fn fs_sysfs_path(&self) -> ffs_error::Result<Vec<u8>> {
+            self.record("fs_sysfs_path");
+            Ok(b"/sys/fs".to_vec())
+        }
+        fn get_btrfs_fs_info(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_btrfs_fs_info");
+            Ok(vec![0; 1024])
+        }
+        fn get_btrfs_features(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_btrfs_features");
+            Ok(vec![0; 24])
+        }
+        fn get_btrfs_supported_features(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_btrfs_supported_features");
+            Ok(vec![0; 72])
+        }
+        fn get_btrfs_space_info(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _space_slots: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_btrfs_space_info");
+            Ok(vec![0; 16])
+        }
+        fn set_btrfs_features(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _feature_flags: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("set_btrfs_features");
+            Ok(())
+        }
+        fn sync_fs(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
+            self.record("sync_fs");
+            Ok(())
+        }
+        fn btrfs_start_sync(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<u64> {
+            self.record("btrfs_start_sync");
+            Ok(1)
+        }
+        fn btrfs_wait_sync(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _transid: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_wait_sync");
+            Ok(())
+        }
+        fn btrfs_set_default_subvol(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _treeid: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_set_default_subvol");
+            Ok(())
+        }
+        fn btrfs_start_transaction(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_start_transaction");
+            Ok(())
+        }
+        fn btrfs_end_transaction(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_end_transaction");
+            Ok(())
+        }
+        fn btrfs_ino_lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            treeid: u64,
+            _objectid: u64,
+        ) -> ffs_error::Result<(u64, Vec<u8>)> {
+            self.record("btrfs_ino_lookup");
+            Ok((treeid, Vec::new()))
+        }
+        fn get_btrfs_dev_info(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _devid_in: u64,
+            _uuid_in: [u8; 16],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_btrfs_dev_info");
+            Ok(vec![0; 4096])
+        }
+        fn get_subvol_flags(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<u64> {
+            self.record("get_subvol_flags");
+            Ok(2)
+        }
+        fn set_subvol_flags(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _flags: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("set_subvol_flags");
+            Ok(())
+        }
+        fn btrfs_get_dev_stats(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _devid: u64,
+            _flags: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_get_dev_stats");
+            Ok(vec![0; 1032])
+        }
+        fn btrfs_get_subvol_info(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_get_subvol_info");
+            Ok(vec![0; 504])
+        }
+        fn btrfs_tree_search(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _key: BtrfsTreeSearchKey,
+        ) -> ffs_error::Result<(u32, Vec<u8>)> {
+            self.record("btrfs_tree_search");
+            Ok((0, Vec::new()))
+        }
+        fn btrfs_tree_search_v2(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_tree_search_v2");
+            Ok(Vec::new())
+        }
+        fn get_btrfs_ino_paths(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _inum: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_btrfs_ino_paths");
+            Ok(Vec::new())
+        }
+        fn btrfs_ino_lookup_user(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _treeid: u64,
+            _dirid: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_ino_lookup_user");
+            Ok(Vec::new())
+        }
+        fn btrfs_get_subvol_rootref(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_get_subvol_rootref");
+            Ok(Vec::new())
+        }
+        fn btrfs_scrub_start(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _devid: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_scrub_start");
+            Ok(vec![0; 1024])
+        }
+        fn btrfs_scrub_cancel(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
+            self.record("btrfs_scrub_cancel");
+            Ok(())
+        }
+        fn btrfs_scrub_progress(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _devid: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_scrub_progress");
+            Ok(vec![0; 1024])
+        }
+        fn btrfs_defrag_range(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _fh: u64,
+            _start: u64,
+            _len: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_defrag_range");
+            Ok(())
+        }
+        fn btrfs_snap_create(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _vol_args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_snap_create");
+            Ok(())
+        }
+        fn btrfs_snap_destroy(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _vol_args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_snap_destroy");
+            Ok(())
+        }
+        fn btrfs_encoded_write(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: u64,
+            _args: &[u8],
+        ) -> ffs_error::Result<usize> {
+            self.record("btrfs_encoded_write");
+            Ok(0)
+        }
+        fn btrfs_defrag(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_defrag");
+            Ok(())
+        }
+        fn btrfs_scan_dev(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_scan_dev");
+            Ok(())
+        }
+        fn btrfs_send(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+            _caller_pid: u32,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_send");
+            Ok(())
+        }
+        fn btrfs_set_received_subvol(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_set_received_subvol");
+            Ok(Vec::new())
+        }
+        fn btrfs_balance_start(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_balance_start");
+            Ok(Vec::new())
+        }
+        fn btrfs_balance_ctl(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _cmd: i32,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_balance_ctl");
+            Ok(())
+        }
+        fn btrfs_balance_progress(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_balance_progress");
+            Ok(Vec::new())
+        }
+        fn btrfs_get_fslabel(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_get_fslabel");
+            Ok(b"btrfs-lbl".to_vec())
+        }
+        fn get_btrfs_logical_ino_v2(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _logical: u64,
+            _args: &[u8],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_btrfs_logical_ino_v2");
+            Ok(Vec::new())
+        }
+        fn get_btrfs_logical_ino(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _logical: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("get_btrfs_logical_ino");
+            Ok(Vec::new())
+        }
+        fn btrfs_resize(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_resize");
+            Ok(())
+        }
+        fn btrfs_dev_replace(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_dev_replace");
+            Ok(vec![0; 2600])
+        }
+        fn btrfs_forget_dev(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_forget_dev");
+            Ok(())
+        }
+        fn btrfs_set_fslabel(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_set_fslabel");
+            Ok(())
+        }
+        fn btrfs_file_extent_same(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: u64,
+            _args: &[u8],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_file_extent_same");
+            Ok(Vec::new())
+        }
+        fn btrfs_subvol_create(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _umask: u16,
+            _uid: u32,
+            _gid: u32,
+            _vol_args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_subvol_create");
+            Ok(())
+        }
+        fn get_quota_info(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<QuotaInfo> {
+            self.record("get_quota_info");
+            Ok(QuotaInfo {
+                user_quota_enabled: false,
+                user_quota_inum: None,
+                group_quota_enabled: false,
+                group_quota_inum: None,
+                project_quota_enabled: false,
+                project_quota_inum: None,
+            })
+        }
+        fn btrfs_wait_quota_rescan(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_wait_quota_rescan");
+            Ok(())
+        }
+        fn btrfs_quota_rescan_status(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_quota_rescan_status");
+            Ok(Vec::new())
+        }
+        fn btrfs_start_quota_rescan(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _flags: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_start_quota_rescan");
+            Ok(())
+        }
+        fn btrfs_quota_control(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _cmd: u64,
+            _status: u64,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_quota_control");
+            Ok(Vec::new())
+        }
+        fn btrfs_assign_qgroup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _assign: u64,
+            _src: u64,
+            _dst: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_assign_qgroup");
+            Ok(())
+        }
+        fn btrfs_create_qgroup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _create: u64,
+            _qgroupid: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_create_qgroup");
+            Ok(())
+        }
+        fn btrfs_limit_qgroup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _limit: BtrfsQgroupLimitRequest,
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_limit_qgroup");
+            Ok(())
+        }
+        fn btrfs_rm_dev_v2(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _vol_args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_rm_dev_v2");
+            Ok(())
+        }
+        fn btrfs_snap_destroy_v2(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _vol_args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_snap_destroy_v2");
+            Ok(())
+        }
+        fn btrfs_encoded_read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: u64,
+            _args: &[u8],
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.record("btrfs_encoded_read");
+            Ok(Vec::new())
+        }
+        fn btrfs_add_dev(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _vol_args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_add_dev");
+            Ok(())
+        }
+        fn btrfs_rm_dev(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _vol_args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("btrfs_rm_dev");
+            Ok(())
+        }
+        fn set_inode_flags(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _flags: u32,
+        ) -> ffs_error::Result<()> {
+            self.record("set_inode_flags");
+            Ok(())
+        }
+        fn trim_range(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _start: u64,
+            _len: u64,
+            _min_len: u64,
+        ) -> ffs_error::Result<u64> {
+            self.record("trim_range");
+            Ok(0)
+        }
+        fn mknod(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            _name: &OsStr,
+            _mode: u16,
+            _rdev: u32,
+            _uid: u32,
+            _gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("mknod");
+            Ok(Self::dummy_attr(parent))
+        }
+        fn move_ext(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _donor_fd: u32,
+            _orig_start: u64,
+            _donor_start: u64,
+            len: u64,
+        ) -> ffs_error::Result<u64> {
+            self.record("move_ext");
+            Ok(len)
+        }
+        fn clone_file(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _dest_ino: InodeNumber,
+            _src_ino: InodeNumber,
+        ) -> ffs_error::Result<()> {
+            self.record("clone_file");
+            Ok(())
+        }
+        fn clone_file_range(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _dest_ino: InodeNumber,
+            _src_ino: InodeNumber,
+            _src_offset: u64,
+            _src_length: u64,
+            _dest_offset: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("clone_file_range");
+            Ok(())
+        }
+        fn register_move_ext_donor_fd(
+            &self,
+            _donor_fd: u32,
+            _donor_ino: InodeNumber,
+        ) -> ffs_error::Result<()> {
+            self.record("register_move_ext_donor_fd");
+            Ok(())
+        }
+        fn unregister_move_ext_donor_fd(&self, _donor_fd: u32) {
+            self.record("unregister_move_ext_donor_fd");
+        }
+        fn ext4_group_extend(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("ext4_group_extend");
+            Ok(())
+        }
+        fn ext4_resize_fs(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("ext4_resize_fs");
+            Ok(())
+        }
+        fn ext4_group_add(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _args: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("ext4_group_add");
+            Ok(())
+        }
+        fn ext4_alloc_da_blks(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("ext4_alloc_da_blks");
+            Ok(())
+        }
+        fn ext4_migrate(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("ext4_migrate");
+            Ok(())
+        }
+        fn ext4_swap_boot(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("ext4_swap_boot");
+            Ok(())
+        }
+        fn fs_shutdown(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _flags: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.record("fs_shutdown");
+            Ok(())
+        }
+        fn fs_freeze(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<i32> {
+            self.record("fs_freeze");
+            Ok(1)
+        }
+        fn fs_thaw(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
+            self.record("fs_thaw");
+            Ok(())
+        }
+        fn get_block_size(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<u32> {
+            self.record("get_block_size");
+            Ok(4096)
+        }
+        fn setattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            ino: InodeNumber,
+            _attrs: &SetAttrRequest,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.record("setattr");
+            Ok(Self::dummy_attr(ino))
+        }
+        fn flush(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _fh: u64,
+            _lock_owner: u64,
+        ) -> ffs_error::Result<()> {
+            self.record("flush");
+            Ok(())
+        }
+        fn release(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _request: ReleaseRequest,
+        ) -> ffs_error::Result<()> {
+            self.record("release");
+            Ok(())
+        }
+        fn fsync(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _fh: u64,
+            _datasync: bool,
+        ) -> ffs_error::Result<()> {
+            self.record("fsync");
+            Ok(())
+        }
+        fn fsyncdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _fh: u64,
+            _datasync: bool,
+        ) -> ffs_error::Result<()> {
+            self.record("fsyncdir");
+            Ok(())
+        }
+        fn begin_request_scope(&self, _cx: &Cx, _op: RequestOp) -> ffs_error::Result<RequestScope> {
+            self.record("begin_request_scope");
+            Ok(RequestScope::empty())
+        }
+        fn end_request_scope(
+            &self,
+            _cx: &Cx,
+            _op: RequestOp,
+            _scope: RequestScope,
+        ) -> ffs_error::Result<()> {
+            self.record("end_request_scope");
+            Ok(())
+        }
+        fn commit_request_scope(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<CommitSeq> {
+            self.record("commit_request_scope");
+            Ok(CommitSeq(1))
+        }
+        fn begin_writeback_batch_scope(&self, _cx: &Cx) -> ffs_error::Result<RequestScope> {
+            self.record("begin_writeback_batch_scope");
+            Ok(RequestScope::empty())
+        }
+        fn commit_writeback_batch_scope(
+            &self,
+            _cx: &Cx,
+            _scope: RequestScope,
+        ) -> ffs_error::Result<CommitSeq> {
+            self.record("commit_writeback_batch_scope");
+            Ok(CommitSeq(2))
+        }
+        fn abort_writeback_batch_scope(
+            &self,
+            _cx: &Cx,
+            _scope: RequestScope,
+        ) -> ffs_error::Result<()> {
+            self.record("abort_writeback_batch_scope");
+            Ok(())
+        }
+        fn flush_on_destroy(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            self.record("flush_on_destroy");
+            Ok(())
+        }
+    }
+
+    struct DelegatedSpyFsOps {
+        inner: SpyFsOps,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    impl FsOps for DelegatedSpyFsOps {
+        crate::delegate_fs_ops!(self, &self.inner);
+    }
+
+    fn invoke_all_132_methods(ops: &dyn FsOps) {
+        let cx = Cx::for_testing();
+        let mut s = RequestScope::empty();
+        let ino = InodeNumber(2);
+        let name = OsStr::new("entry");
+        let path = Path::new("target");
+
+        let _ = ops.getattr_batch(&cx, &mut s, &[ino]);
+        let _ = ops.xattr_presence(&cx);
+        ops.install_open_handle_oracle(Arc::new(|_| 0));
+        let _ = ops.finalize_unlinked_inode(&cx, &mut s, ino);
+        let _ = ops.getattr(&cx, &mut s, ino);
+        let _ = ops.lookup(&cx, &mut s, ino, name);
+        let _ = ops.readdir(&cx, &mut s, ino, 0);
+        let _ = ops.read(&cx, &mut s, ino, 0, 16);
+        let _ = ops.open(&cx, &mut s, ino, 0);
+        let _ = ops.readlink(&cx, &mut s, ino);
+        let _ = ops.statfs(&cx, &mut s, ino);
+        let _ = ops.listxattr(&cx, ino);
+        let _ = ops.getxattr(&cx, ino, "user.k");
+        let _ = ops.setxattr(&cx, &mut s, ino, "user.k", b"v", XattrSetMode::Set);
+        let _ = ops.removexattr(&cx, &mut s, ino, "user.k");
+        let _ = ops.create(&cx, &mut s, ino, name, 0o644, 0, 0);
+        let _ = ops.tmpfile(&cx, &mut s, ino, 0o600, 0, 0);
+        let _ = ops.touch_atime(&cx, &mut s, ino, SystemTime::UNIX_EPOCH, false);
+        let _ = ops.mkdir(&cx, &mut s, ino, name, 0o755, 0, 0);
+        let _ = ops.unlink(&cx, &mut s, ino, name);
+        let _ = ops.rmdir(&cx, &mut s, ino, name);
+        let _ = ops.rename(&cx, &mut s, ino, name, ino, name);
+        let _ = ops.rename2(&cx, &mut s, ino, name, ino, name, 0);
+        let _ = ops.write(&cx, &mut s, ino, 0, b"x");
+        let _ = ops.copy_file_range(&cx, &mut s, ino, 0, ino, 0, 1);
+        let _ = ops.link(&cx, &mut s, ino, ino, name);
+        let _ = ops.symlink(&cx, &mut s, ino, name, path, 0, 0);
+        let _ = ops.fallocate(&cx, &mut s, ino, 0, 4096, 0);
+        let _ = ops.fiemap(&cx, &mut s, ino, 0, 4096);
+        let _ = ops.lseek(&cx, &mut s, ino, 0, SeekWhence::Data);
+        let _ = ops.get_inode_fsxattr(&cx, &mut s, ino);
+        let _ = ops.set_inode_fsxattr(&cx, &mut s, ino, FsxattrInfo::default());
+        let _ = ops.get_inode_flags(&cx, &mut s, ino);
+        let _ = ops.get_inode_state(&cx, &mut s, ino);
+        let _ = ops.precache_extents(&cx, &mut s, ino);
+        let _ = ops.clear_extent_status_cache(&cx, &mut s, ino);
+        let _ = ops.get_inode_generation(&cx, &mut s, ino);
+        let _ = ops.set_inode_generation(&cx, &mut s, ino, 1);
+        let _ = ops.get_encryption_policy_v1(&cx, &mut s, ino);
+        let _ = ops.get_encryption_policy_ex(&cx, &mut s, ino);
+        let _ = ops.get_fs_label(&cx, &mut s);
+        let _ = ops.set_fs_label(&cx, &mut s, b"lbl");
+        let _ = ops.fs_uuid();
+        let _ = ops.fs_sysfs_path();
+        let _ = ops.get_btrfs_fs_info(&cx, &mut s);
+        let _ = ops.get_btrfs_features(&cx, &mut s);
+        let _ = ops.get_btrfs_supported_features(&cx, &mut s);
+        let _ = ops.get_btrfs_space_info(&cx, &mut s, 8);
+        let _ = ops.set_btrfs_features(&cx, &mut s, &[0; 48]);
+        let _ = ops.sync_fs(&cx, &mut s);
+        let _ = ops.btrfs_start_sync(&cx, &mut s);
+        let _ = ops.btrfs_wait_sync(&cx, &mut s, 1);
+        let _ = ops.btrfs_set_default_subvol(&cx, &mut s, 5);
+        let _ = ops.btrfs_start_transaction(&cx, &mut s);
+        let _ = ops.btrfs_end_transaction(&cx, &mut s);
+        let _ = ops.btrfs_ino_lookup(&cx, &mut s, 5, 256);
+        let _ = ops.get_btrfs_dev_info(&cx, &mut s, 1, [0; 16]);
+        let _ = ops.get_subvol_flags(&cx, &mut s, ino);
+        let _ = ops.set_subvol_flags(&cx, &mut s, ino, 2);
+        let _ = ops.btrfs_get_dev_stats(&cx, &mut s, 1, 0);
+        let _ = ops.btrfs_get_subvol_info(&cx, &mut s, ino);
+        let _ = ops.btrfs_tree_search(&cx, &mut s, BtrfsTreeSearchKey::default());
+        let _ = ops.btrfs_tree_search_v2(&cx, &mut s, &[0; 112]);
+        let _ = ops.get_btrfs_ino_paths(&cx, &mut s, 256);
+        let _ = ops.btrfs_ino_lookup_user(&cx, &mut s, 5, 256);
+        let _ = ops.btrfs_get_subvol_rootref(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_scrub_start(&cx, &mut s, 1);
+        let _ = ops.btrfs_scrub_cancel(&cx, &mut s);
+        let _ = ops.btrfs_scrub_progress(&cx, &mut s, 1);
+        let _ = ops.btrfs_defrag_range(&cx, &mut s, 0, 0, 4096);
+        let _ = ops.btrfs_snap_create(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_snap_destroy(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_encoded_write(&cx, &mut s, 256, &[0; 64]);
+        let _ = ops.btrfs_defrag(&cx, &mut s, 256);
+        let _ = ops.btrfs_scan_dev(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_send(&cx, &mut s, &[0; 72], 1);
+        let _ = ops.btrfs_set_received_subvol(&cx, &mut s, &[0; 200]);
+        let _ = ops.btrfs_balance_start(&cx, &mut s, &[0; 1024]);
+        let _ = ops.btrfs_balance_ctl(&cx, &mut s, 1);
+        let _ = ops.btrfs_balance_progress(&cx, &mut s);
+        let _ = ops.btrfs_get_fslabel(&cx, &mut s);
+        let _ = ops.get_btrfs_logical_ino_v2(&cx, &mut s, 0, &[0; 56]);
+        let _ = ops.get_btrfs_logical_ino(&cx, &mut s, 0);
+        let _ = ops.btrfs_resize(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_dev_replace(&cx, &mut s, &[0; 2600]);
+        let _ = ops.btrfs_forget_dev(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_set_fslabel(&cx, &mut s, b"lbl");
+        let _ = ops.btrfs_file_extent_same(&cx, &mut s, 256, &[0; 64]);
+        let _ = ops.btrfs_subvol_create(&cx, &mut s, ino, 0o022, 0, 0, &[0; 4096]);
+        let _ = ops.get_quota_info(&cx, &mut s);
+        let _ = ops.btrfs_wait_quota_rescan(&cx, &mut s);
+        let _ = ops.btrfs_quota_rescan_status(&cx, &mut s);
+        let _ = ops.btrfs_start_quota_rescan(&cx, &mut s, 0);
+        let _ = ops.btrfs_quota_control(&cx, &mut s, 1, 0);
+        let _ = ops.btrfs_assign_qgroup(&cx, &mut s, 1, 5, 256);
+        let _ = ops.btrfs_create_qgroup(&cx, &mut s, 1, 256);
+        let _ = ops.btrfs_limit_qgroup(&cx, &mut s, BtrfsQgroupLimitRequest::default());
+        let _ = ops.btrfs_rm_dev_v2(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_snap_destroy_v2(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_encoded_read(&cx, &mut s, 256, &[0; 64]);
+        let _ = ops.btrfs_add_dev(&cx, &mut s, &[0; 4096]);
+        let _ = ops.btrfs_rm_dev(&cx, &mut s, &[0; 4096]);
+        let _ = ops.set_inode_flags(&cx, &mut s, ino, 0);
+        let _ = ops.trim_range(&cx, &mut s, 0, 4096, 0);
+        let _ = ops.mknod(&cx, &mut s, ino, name, 0o010_644, 0, 0, 0);
+        let _ = ops.move_ext(&cx, &mut s, ino, 3, 0, 0, 1);
+        let _ = ops.clone_file(&cx, &mut s, ino, ino);
+        let _ = ops.clone_file_range(&cx, &mut s, ino, ino, 0, 4096, 0);
+        let _ = ops.register_move_ext_donor_fd(3, ino);
+        ops.unregister_move_ext_donor_fd(3);
+        let _ = ops.ext4_group_extend(&cx, &mut s, &[0; 8]);
+        let _ = ops.ext4_resize_fs(&cx, &mut s, &[0; 8]);
+        let _ = ops.ext4_group_add(&cx, &mut s, &[0; 16]);
+        let _ = ops.ext4_alloc_da_blks(&cx, &mut s, 2);
+        let _ = ops.ext4_migrate(&cx, &mut s, 2);
+        let _ = ops.ext4_swap_boot(&cx, &mut s, 2);
+        let _ = ops.fs_shutdown(&cx, &mut s, &[0; 4]);
+        let _ = ops.fs_freeze(&cx, &mut s);
+        let _ = ops.fs_thaw(&cx, &mut s);
+        let _ = ops.get_block_size(&cx, &mut s);
+        let _ = ops.setattr(&cx, &mut s, ino, &SetAttrRequest::default());
+        let _ = ops.flush(&cx, &mut s, ino, 1, 0);
+        let _ = ops.release(
+            &cx,
+            &mut s,
+            ReleaseRequest {
+                ino,
+                fh: 1,
+                flags: 0,
+                lock_owner: None,
+                flush: false,
+            },
+        );
+        let _ = ops.fsync(&cx, &mut s, ino, 1, false);
+        let _ = ops.fsyncdir(&cx, &mut s, ino, 1, false);
+        let _ = ops.begin_request_scope(&cx, RequestOp::Getattr);
+        let _ = ops.end_request_scope(&cx, RequestOp::Getattr, RequestScope::empty());
+        let _ = ops.commit_request_scope(&cx, &mut s);
+        let _ = ops.begin_writeback_batch_scope(&cx);
+        let _ = ops.commit_writeback_batch_scope(&cx, RequestScope::empty());
+        let _ = ops.abort_writeback_batch_scope(&cx, RequestScope::empty());
+        let _ = ops.flush_on_destroy(&cx);
+    }
+
+    #[test]
+    fn arc_and_delegate_macro_invoke_implementor_for_all_132_methods_at_runtime() {
+        let source = include_str!("vfs.rs");
+        let trait_start = source.find("\npub trait FsOps: Send + Sync {\n").unwrap();
+        let trait_tail = &source[trait_start + 1..];
+        let trait_end = trait_tail.find("\n}\n").unwrap();
+        let expected = extract_fn_names(&trait_tail[..trait_end], "    ");
+
+        // 1. Box<Arc<SpyFsOps>> behind &dyn FsOps (exact production mount topology)
+        let spy = Arc::new(SpyFsOps::default());
+        let boxed_arc: Box<dyn FsOps> = Box::new(Arc::clone(&spy));
+        invoke_all_132_methods(boxed_arc.as_ref());
+        let recorded_arc: BTreeSet<String> = spy
+            .calls
+            .lock()
+            .expect("spy mutex")
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect();
+        let missing_arc_runtime: Vec<_> = expected.difference(&recorded_arc).cloned().collect();
+        assert!(
+            missing_arc_runtime.is_empty(),
+            "Box<Arc<SpyFsOps>> fell through to FsOps trait default for: {missing_arc_runtime:?}"
+        );
+        assert_eq!(spy.calls.lock().expect("spy mutex").len(), expected.len());
+
+        // 2. DelegatedSpyFsOps (delegate_fs_ops! used by ProtectedFs) behind &dyn FsOps
+        let delegated = DelegatedSpyFsOps {
+            inner: SpyFsOps::default(),
+        };
+        invoke_all_132_methods(&delegated);
+        let recorded_delegated: BTreeSet<String> = delegated
+            .inner
+            .calls
+            .lock()
+            .expect("spy mutex")
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect();
+        let missing_delegated_runtime: Vec<_> =
+            expected.difference(&recorded_delegated).cloned().collect();
+        assert!(
+            missing_delegated_runtime.is_empty(),
+            "delegate_fs_ops! fell through to FsOps trait default for: {missing_delegated_runtime:?}"
+        );
+        assert_eq!(
+            delegated.inner.calls.lock().expect("spy mutex").len(),
+            expected.len()
+        );
     }
 }
