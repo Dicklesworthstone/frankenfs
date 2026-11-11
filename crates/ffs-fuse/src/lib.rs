@@ -8,6 +8,8 @@
 //! See [`per_core::PerCoreDispatcher`] for thread-per-core dispatch routing.
 
 pub mod crossings;
+#[cfg(all(test, target_os = "linux"))]
+mod directory_cookie_tests;
 pub mod per_core;
 
 use asupersync::Cx;
@@ -6643,7 +6645,19 @@ impl Filesystem for FrankenFuse {
         }) {
             Ok(entries) => {
                 let visible = self.inner.dir_handles.visible_len(fh, fs_offset, &entries);
+                let mut has_entries = false;
                 for entry in entries.iter().take(visible) {
+                    let Ok(next_offset) = i64::try_from(entry.offset) else {
+                        warn!(ino, cookie = entry.offset, "readdir: cookie overflow");
+                        // Preserve a valid prefix; the next request fails at
+                        // this entry. Saturation aliases distinct cookies and
+                        // can make directory iteration repeat indefinitely.
+                        if !has_entries {
+                            reply.error(libc::EOVERFLOW);
+                            return;
+                        }
+                        break;
+                    };
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
@@ -6655,13 +6669,14 @@ impl Filesystem for FrankenFuse {
                         crossings::ReplyTimer::start(crossings::CrossingOp::Readdirplus);
                     let full = reply.add(
                         entry.ino.0,
-                        i64::try_from(entry.offset).unwrap_or(i64::MAX),
+                        next_offset,
                         to_fuser_file_type(entry.kind),
                         name,
                     );
                     if full {
                         break;
                     }
+                    has_entries = true;
                 }
                 // bd-xfe7z: the census must be emitted from BOTH directory
                 // handlers, and leaving it out of this one is what made the
@@ -6737,6 +6752,7 @@ impl Filesystem for FrankenFuse {
                 drop(phase_timer);
 
                 let mut emitted: usize = 0;
+                let mut has_entries = false;
                 // bd-xfe7z census, accumulated LOCALLY across this reply's emit
                 // loop and folded into the process counters once below, so the
                 // cost is per REPLY rather than per directory entry.
@@ -6751,6 +6767,17 @@ impl Filesystem for FrankenFuse {
                     // fetch and the `break` on a full reply buffer.
                     let _loop_timer =
                         crossings::LoopTimer::start(crossings::CrossingOp::Readdirplus);
+                    let Ok(next_offset) = i64::try_from(entry.offset) else {
+                        warn!(ino, cookie = entry.offset, "readdirplus: cookie overflow");
+                        // A successful prefix already owns lookup references.
+                        // Send it unchanged and report overflow when the caller
+                        // resumes, without fabricating a continuation cookie.
+                        if !has_entries {
+                            reply.error(libc::EOVERFLOW);
+                            return;
+                        }
+                        break;
+                    };
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
@@ -6785,7 +6812,7 @@ impl Filesystem for FrankenFuse {
 
                     let full = reply.add(
                         entry.ino.0,
-                        i64::try_from(entry.offset).unwrap_or(i64::MAX),
+                        next_offset,
                         name,
                         &ATTR_TTL,
                         &attr,
@@ -6811,6 +6838,7 @@ impl Filesystem for FrankenFuse {
                     if full {
                         break;
                     }
+                    has_entries = true;
                     // An entry the reply carried takes a kernel lookup
                     // reference, except "." and ".." (bd-90aey).
                     if entry.name != b"." && entry.name != b".." {

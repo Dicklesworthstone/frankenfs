@@ -1,5 +1,17 @@
 # FEATURE_PARITY
 
+> **FUSE directory-cookie overflow (2026-11-11 UTC):** READDIR and READDIRPLUS
+> now reject native continuation cookies above `i64::MAX` with `EOVERFLOW`
+> instead of mapping different values onto the same signed limit. A valid
+> buffered prefix is returned with its exact cookies and READDIRPLUS lookup
+> references; continuation then reports the unrepresentable entry. Three socket
+> transport regressions drive real fuser INIT, OPENDIR, directory requests and
+> RELEASEDIR, covering tiny/full reply buffers, repeated errors, reference
+> accounting and genuine EOF at the maximum representable cookie. Formatting
+> and whitespace checks pass; local dependency compilation prevents test
+> execution. This is a separate defect from the unresolved `bd-uu90b`
+> generic/310 concurrency hang, which is neither reproduced nor closed here.
+
 > **NTFS allocated-file security references (2026-11-11 UTC):**
 > `check-security --verify-file-references` connects the existing complete
 > `$SII`/`$SDH`/indexed `$SDS` check to allocated `$MFT` records and validated
