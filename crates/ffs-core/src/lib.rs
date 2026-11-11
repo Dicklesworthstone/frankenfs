@@ -2615,6 +2615,11 @@ impl BtrfsAllocState {
         fsid: &[u8; 16],
         published: &arc_swap::ArcSwapOption<Vec<BtrfsChunkEntry>>,
     ) -> bool {
+        // A failed load is not an empty device tree. Match commit-time growth:
+        // never allocate or serialize new chunks from an incomplete view.
+        if !self.chunk_trees_authoritative {
+            return false;
+        }
         let Ok(chunks) = ffs_btrfs::chunk_entries_from_chunk_tree(&self.chunk_tree) else {
             return false;
         };
@@ -114428,6 +114433,332 @@ mod tests {
             clean,
             "btrfs check must accept the retried creation:\n{output}"
         );
+    }
+
+    /// bd-a136s: a failed DEV_TREE load must disable write-time growth even
+    /// when the CHUNK_TREE describes genuine unallocated device space. The
+    /// healthy arm starts from identical bytes and must still grow normally.
+    #[test]
+    fn btrfs_data_chunk_growth_requires_complete_device_tree_bd_a136s() {
+        struct DevTreeReadFault {
+            inner: TestDevice,
+            ranges: Vec<(u64, u64)>,
+            armed: Arc<AtomicBool>,
+            failures: Arc<AtomicUsize>,
+        }
+        impl ByteDevice for DevTreeReadFault {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                let end = offset.0.checked_add(buf.len() as u64).unwrap();
+                if self.armed.load(Ordering::Acquire)
+                    && self
+                        .ranges
+                        .iter()
+                        .any(|&(start, stop)| offset.0 < stop && end > start)
+                {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                }
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.write_all_at(cx, offset, buf)
+            }
+
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        let Some((seed, device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(256, &["-m", "single", "-d", "single"])
+        else {
+            oracle_unavailable("btrfs image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        seed.set_btrfs_grow_chunks(false);
+        seed.set_btrfs_dirty_bytes_threshold(0);
+        let root = InodeNumber(1);
+        let file = seed
+            .create(&cx, root, OsStr::new("growth"), 0o644, 0, 0)
+            .unwrap();
+        let inline = seed
+            .create(&cx, root, OsStr::new("inline"), 0o644, 0, 0)
+            .unwrap();
+        let initial_free = seed
+            .require_btrfs_alloc_state()
+            .unwrap()
+            .read()
+            .extent_alloc
+            .allocatable_bytes(BTRFS_BLOCK_GROUP_DATA);
+        let sector = u64::from(seed.btrfs_superblock().unwrap().sectorsize);
+        assert!(initial_free >= sector && initial_free < 64 * 1024 * 1024);
+        assert!(initial_free.is_multiple_of(sector));
+        let payload = vec![0xA7; usize::try_from(initial_free).unwrap()];
+        assert_eq!(
+            seed.write(&cx, file.ino, 0, &payload).unwrap(),
+            u32::try_from(initial_free).unwrap()
+        );
+        seed.btrfs_full_transaction_commit(&cx, "authority-seed")
+            .unwrap();
+        let ctx = seed.btrfs_context().unwrap();
+        let dev_root = {
+            let alloc = seed.require_btrfs_alloc_state().unwrap().read();
+            assert!(alloc.chunk_trees_authoritative);
+            assert_eq!(
+                alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+                0,
+                "fill only the initial DATA group, without invoking growth"
+            );
+            let (_, bytes) =
+                OpenFs::btrfs_find_root_item(&alloc.root_tree, BTRFS_DEV_TREE_OBJECTID)
+                    .unwrap()
+                    .unwrap();
+            parse_root_item(&bytes).unwrap().bytenr
+        };
+        let ranges: Vec<_> = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, dev_root)
+            .unwrap()
+            .unwrap()
+            .stripes
+            .into_iter()
+            .map(|stripe| {
+                assert_eq!(stripe.devid, 1);
+                (stripe.physical, stripe.physical + u64::from(ctx.nodesize))
+            })
+            .collect();
+        assert!(!ranges.is_empty());
+        let original = device.snapshot_bytes();
+        std::fs::write(&image, &original).unwrap();
+        let Some((clean, output)) = run_btrfs_check(&image) else {
+            return;
+        };
+        assert!(clean, "the full-DATA seed must be valid: {output}");
+        drop(seed);
+        drop(device);
+
+        for fail_dev_load in [true, false] {
+            let device = TestDevice::from_vec(original.clone());
+            let armed = Arc::new(AtomicBool::new(false));
+            let failures = Arc::new(AtomicUsize::new(0));
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(DevTreeReadFault {
+                    inner: device.clone(),
+                    ranges: ranges.clone(),
+                    armed: Arc::clone(&armed),
+                    failures: Arc::clone(&failures),
+                }),
+                &OpenOptions {
+                    btrfs_rw_ephemeral_ok: true,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            fs.btrfs_test_clear_node_cache();
+            armed.store(fail_dev_load, Ordering::Release);
+            fs.enable_writes(&cx)
+                .expect("an unreadable device tree disables growth, not existing-space writes");
+            armed.store(false, Ordering::Release);
+            assert_eq!(failures.load(Ordering::Relaxed) > 0, fail_dev_load);
+            fs.set_btrfs_grow_chunks(true);
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            let inline_payload = b"existing-space writes remain available";
+            fs.write(&cx, inline.ino, 0, inline_payload).unwrap();
+            let all = |tree: &InMemoryCowBtrfsTree| {
+                tree.range(
+                    &BtrfsKey {
+                        objectid: 0,
+                        item_type: 0,
+                        offset: 0,
+                    },
+                    &BtrfsKey {
+                        objectid: u64::MAX,
+                        item_type: u8::MAX,
+                        offset: u64::MAX,
+                    },
+                )
+                .unwrap()
+            };
+            let state = || {
+                let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+                let refs: Vec<_> = all(alloc.extent_alloc.extent_tree())
+                    .into_iter()
+                    .filter(|(key, _)| key.item_type == ffs_btrfs::BTRFS_ITEM_EXTENT_ITEM)
+                    .map(|(key, _)| {
+                        let extent = ffs_btrfs::ExtentKey {
+                            bytenr: key.objectid,
+                            num_bytes: key.offset,
+                        };
+                        (
+                            extent,
+                            alloc.extent_alloc.extent_refcount(extent),
+                            alloc.extent_alloc.pending_for(&extent).to_vec(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    refs.iter()
+                        .map(|(_, _, pending)| pending.len())
+                        .sum::<usize>(),
+                    alloc.extent_alloc.delayed_ref_count(),
+                    "the refusal snapshot must account for every queued reference"
+                );
+                (
+                    [
+                        &alloc.root_tree,
+                        &alloc.fs_tree,
+                        &alloc.csum_tree,
+                        &alloc.chunk_tree,
+                        &alloc.dev_tree,
+                        alloc.extent_alloc.extent_tree(),
+                    ]
+                    .into_iter()
+                    .map(all)
+                    .collect::<Vec<_>>(),
+                    (
+                        alloc.extent_alloc.space_info(),
+                        alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+                        alloc.extent_alloc.pinned_extents().collect::<Vec<_>>(),
+                        alloc.extent_alloc.delayed_ref_count(),
+                        alloc.generation,
+                        alloc.chunk_trees_dirty,
+                        alloc.commit_refused,
+                    ),
+                    refs,
+                    fs.btrfs_grown_chunks.load_full(),
+                    (fs.current_snapshot(), fs.mvcc_version_count()),
+                )
+            };
+            let old_chunks = {
+                let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+                assert_eq!(alloc.chunk_trees_authoritative, !fail_dev_load);
+                assert_eq!(all(&alloc.dev_tree).is_empty(), fail_dev_load);
+                assert_eq!(
+                    alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+                    0
+                );
+                assert_eq!(
+                    alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                    0
+                );
+                let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap();
+                let growth_device = ffs_btrfs::GrowthDevice::from_chunk_tree(
+                    &alloc.chunk_tree,
+                    fs.btrfs_superblock().unwrap().fsid,
+                )
+                .unwrap();
+                let plan = ffs_btrfs::plan_growth_for_shortfall(
+                    &chunks,
+                    ffs_btrfs::ChunkKind::Data,
+                    sector,
+                    &growth_device,
+                    &ffs_btrfs::ChunkSizePolicy::default(),
+                )
+                .unwrap()
+                .expect("refusal must be about authority, not a physically full device");
+                assert!(
+                    ffs_btrfs::unallocated_device_runs(&chunks, &growth_device)
+                        .unwrap()
+                        .iter()
+                        .any(|&(start, len)| start <= plan.dev_extent_key.offset
+                            && start + len >= plan.dev_extent_key.offset + plan.chunk.length)
+                );
+                chunks.len()
+            };
+            let before = state();
+            let attrs = [
+                fs.getattr(&cx, file.ino).unwrap(),
+                fs.getattr(&cx, inline.ino).unwrap(),
+            ];
+            let disk_hash = blake3::hash(&device.snapshot_bytes());
+            let tail = vec![0xBC; usize::try_from(sector).unwrap()];
+            let result = fs.write(&cx, file.ino, initial_free, &tail);
+            if fail_dev_load {
+                assert_eq!(result.unwrap_err().to_errno(), libc::ENOSPC);
+                assert_eq!(
+                    state(),
+                    before,
+                    "refusal changed trees, space, pins or publication"
+                );
+                assert_eq!(blake3::hash(&device.snapshot_bytes()), disk_hash);
+                assert_eq!(
+                    [
+                        fs.getattr(&cx, file.ino).unwrap(),
+                        fs.getattr(&cx, inline.ino).unwrap(),
+                    ],
+                    attrs
+                );
+                assert_eq!(
+                    fs.read(
+                        &cx,
+                        file.ino,
+                        0,
+                        u32::try_from(initial_free + sector).unwrap()
+                    )
+                    .unwrap(),
+                    payload
+                );
+                assert_eq!(fs.read(&cx, inline.ino, 0, 4096).unwrap(), inline_payload);
+                eprintln!(
+                    "CHUNK_AUTHORITY|load_fault=true|injected={}|write=ENOSPC|state=unchanged",
+                    failures.load(Ordering::Relaxed)
+                );
+                continue;
+            }
+            assert_eq!(result.unwrap(), u32::try_from(sector).unwrap());
+            assert!(fs.btrfs_grown_chunks.load_full().unwrap().len() > old_chunks);
+            fs.btrfs_full_transaction_commit(&cx, "authority-positive-growth")
+                .unwrap();
+            std::fs::write(&image, device.snapshot_bytes()).unwrap();
+            let Some((clean, output)) = run_btrfs_check(&image) else {
+                return;
+            };
+            assert!(clean, "authoritative growth must remain valid: {output}");
+            drop(fs);
+            let reopened =
+                OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default()).unwrap();
+            let grown = reopened.lookup(&cx, root, OsStr::new("growth")).unwrap();
+            let mut expected = payload.clone();
+            expected.extend_from_slice(&tail);
+            assert_eq!(grown.size, expected.len() as u64);
+            assert_eq!(
+                reopened
+                    .read(
+                        &cx,
+                        grown.ino,
+                        0,
+                        u32::try_from(expected.len() + 1).unwrap()
+                    )
+                    .unwrap(),
+                expected
+            );
+            let small = reopened.lookup(&cx, root, OsStr::new("inline")).unwrap();
+            assert_eq!(
+                reopened.read(&cx, small.ino, 0, 4096).unwrap(),
+                inline_payload
+            );
+            reopened
+                .btrfs_verify_file_data_csums(&cx, grown.ino)
+                .unwrap();
+            eprintln!(
+                "CHUNK_AUTHORITY|load_fault=false|write=success|new_chunk=true|native_check=clean|reopen=exact"
+            );
+        }
     }
 
     /// bd-34blv: with default settings a btrfs RW mount grows data chunks on

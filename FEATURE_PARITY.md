@@ -102,6 +102,17 @@
 > positive growth controls, full suites and benchmark checks still need their
 > own executed evidence. No parity percentage or automatic-cleanup claim changes.
 
+> **Chunk-growth authority review (bd-a136s, reopened 2026-11-11 UTC):**
+> the write-time DATA-growth helper omitted the complete-tree prerequisite
+> already enforced at commit time. The candidate now refuses growth before
+> planning when CHUNK/DEV loading was incomplete. Its paired native-image test
+> injects an observed DEV_TREE read failure, requires unchanged-state ENOSPC
+> despite physical spare space, and requires healthy growth plus native checking
+> and exact SDK reopen from identical input. Compilation and execution of this
+> new regression remain pending, as does fresh kernel readback for the original
+> growth acceptance. Source review alone does not demonstrate corruption or
+> qualify the fix; the original task remains open.
+
 > **Btrfs differential daemon ordering (bd-53dub, 2026-11-03):** hosted
 >58acc82d5 passes full shell and journaled ext4 smoke, then fails btrfs reopen.
 > Actual process controls show immediate post-unmount SIGTERM loses a created

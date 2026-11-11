@@ -50,6 +50,7 @@ jobs:
         env:
           FFS_REQUIRE_ORACLES: "1"
         run: |
+          cargo test -p ffs-core --locked --lib tests::btrfs_data_chunk_growth_requires_complete_device_tree_bd_a136s -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::btrfs_truncate_recorded_full_sequence_succeeds_bd_wcbvk -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::btrfs_growth_model_requires_hole_zero_tail_and_spare_space_success_bd_wcbvk -- --exact --nocapture
           cargo test -p ffs-core --locked --lib tests::btrfs_reflink_random_matches_reference_model -- --exact --nocapture
