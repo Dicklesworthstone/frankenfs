@@ -138170,8 +138170,16 @@ mod tests {
                 panic!("Btrfs fixture")
             };
             assert_eq!(
-                sb.chunk_root, 0,
-                "no on-disk chunk tree can grow this fixture"
+                sb.chunk_root, 0xA000,
+                "fixture device-identity helper installs this chunk tree"
+            );
+            assert_eq!(sb.num_devices, 1);
+            assert!(Self::tree_items(&alloc.dev_tree).is_empty());
+            assert!(
+                Self::tree_items(&alloc.root_tree).iter().all(|(key, _)| {
+                    key.objectid != BTRFS_DEV_TREE_OBJECTID || key.item_type != BTRFS_ITEM_ROOT_ITEM
+                }),
+                "fixture has no device-tree authority for chunk growth"
             );
             let ctx = self.fs.btrfs_context().unwrap();
             assert_eq!(ctx.chunks.len(), 1);
@@ -138179,7 +138187,10 @@ mod tests {
             assert_eq!(ctx.chunks[0].length, Self::IMAGE as u64);
             assert_eq!(ctx.chunks[0].chunk_type, BTRFS_BLOCK_GROUP_DATA);
             assert_eq!(ctx.chunks[0].stripes.len(), 1);
+            assert_eq!(ctx.chunks[0].stripes[0].devid, 1);
             assert_eq!(ctx.chunks[0].stripes[0].offset, 0);
+            // This sole identity chunk covers the entire backing device, so
+            // even a complete chunk/device tree could not add physical space.
 
             let mut occupied = [false; Self::IMAGE / Self::SECTOR];
             occupied[..Self::RESERVED / Self::SECTOR].fill(true);

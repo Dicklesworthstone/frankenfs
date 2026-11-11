@@ -50,6 +50,9 @@ jobs:
         env:
           FFS_REQUIRE_ORACLES: "1"
         run: |
+          cargo test -p ffs-core --locked --lib tests::btrfs_truncate_recorded_full_sequence_succeeds_bd_wcbvk -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::btrfs_growth_model_requires_hole_zero_tail_and_spare_space_success_bd_wcbvk -- --exact --nocapture
+          cargo test -p ffs-core --locked --lib tests::btrfs_reflink_random_matches_reference_model -- --exact --nocapture
           cargo test -p ffs-alloc --locked --lib
           cargo test -p ffs-error --locked --lib
           cargo test -p ffs-alloc --locked --lib --features bhh0i_sharded_alloc
