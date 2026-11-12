@@ -92,10 +92,125 @@ impl AutoUnmountHelper {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountedIdentity {
+    mount_id: Vec<u8>,
+    major_minor: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+fn sole_process_file_description(device: &File) -> bool {
+    const KCMP_FILE: libc::c_int = 0;
+    let target_fd = device.as_raw_fd();
+    let pid = unsafe { libc::getpid() };
+    let self_cmp = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            pid,
+            pid,
+            KCMP_FILE,
+            target_fd as libc::c_ulong,
+            target_fd as libc::c_ulong,
+        )
+    };
+    if self_cmp != 0 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            return false;
+        };
+        let Ok(candidate_fd) = name.parse::<libc::c_int>() else {
+            return false;
+        };
+        if candidate_fd == target_fd {
+            continue;
+        }
+        let cmp = unsafe {
+            libc::syscall(
+                libc::SYS_kcmp,
+                pid,
+                pid,
+                KCMP_FILE,
+                target_fd as libc::c_ulong,
+                candidate_fd as libc::c_ulong,
+            )
+        };
+        if cmp == 0 {
+            return false;
+        }
+        if cmp < 0 && Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_mountinfo_mounts(
+    records: &[u8],
+    encoded_path: &[u8],
+) -> io::Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
+    if records.is_empty() || records.iter().all(|byte| *byte == b'\n') {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "empty mountinfo after auto-unmount",
+        ));
+    }
+    let mut at_path = Vec::new();
+    let mut parent_ids = Vec::new();
+    for record in records
+        .split(|byte| *byte == b'\n')
+        .filter(|record| !record.is_empty())
+    {
+        let fields: Vec<_> = record.split(|byte| *byte == b' ').collect();
+        if fields.len() < 10 || !fields[4].starts_with(b"/") {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "invalid mountinfo after auto-unmount",
+            ));
+        }
+        parent_ids.push(fields[1].to_vec());
+        if fields[4] == encoded_path {
+            at_path.push((fields[0].to_vec(), fields[2].to_vec()));
+        }
+    }
+    Ok((at_path, parent_ids))
+}
+
+fn is_unobscured_owned_mount(
+    records: &[u8],
+    encoded_path: &[u8],
+    expected_mount_id: &[u8],
+    expected_major_minor: &[u8],
+) -> io::Result<bool> {
+    let (at_path, parent_ids) = parse_mountinfo_mounts(records, encoded_path)?;
+    if at_path.len() != 1 {
+        return Ok(false);
+    }
+    let (mount_id, major_minor) = &at_path[0];
+    if mount_id.as_slice() != expected_mount_id || major_minor.as_slice() != expected_major_minor {
+        return Ok(false);
+    }
+    if parent_ids
+        .iter()
+        .any(|parent| parent.as_slice() == expected_mount_id)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 #[derive(Debug)]
 struct ReadOnlyUnmountView {
     mountinfo: File,
     encoded_path: Vec<u8>,
+    mounted_identity: Option<MountedIdentity>,
 }
 
 impl ReadOnlyUnmountView {
@@ -113,37 +228,106 @@ impl ReadOnlyUnmountView {
         Ok(Self {
             mountinfo: File::open("/proc/thread-self/mountinfo")?,
             encoded_path,
+            mounted_identity: None,
         })
     }
 
-    fn confirm_detached(&mut self, helper_pid: u32) -> io::Result<()> {
+    fn read_records(&mut self) -> io::Result<Vec<u8>> {
         self.mountinfo.seek(SeekFrom::Start(0))?;
         let mut records = Vec::new();
         self.mountinfo.read_to_end(&mut records)?;
-        if records.iter().all(|byte| *byte == b'\n') {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "empty mountinfo after auto-unmount",
-            ));
-        }
-        for record in records
-            .split(|byte| *byte == b'\n')
-            .filter(|record| !record.is_empty())
-        {
-            let fields: Vec<_> = record.split(|byte| *byte == b' ').collect();
-            if fields.len() < 10 || !fields[4].starts_with(b"/") {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "invalid mountinfo after auto-unmount",
-                ));
-            }
-            if fields[4] == self.encoded_path.as_slice() {
-                return Err(Error::other(format!(
-                    "auto-unmount helper exited but mountpoint remains mounted (helper pid={helper_pid})"
-                )));
+        Ok(records)
+    }
+
+    fn capture_mounted_identity(&mut self) -> io::Result<()> {
+        let records = self.read_records()?;
+        let (at_path, _) = parse_mountinfo_mounts(&records, &self.encoded_path)?;
+        if let Some((mount_id, major_minor)) = at_path.last() {
+            let is_anonymous_fuse = major_minor
+                .strip_prefix(b"0:")
+                .is_some_and(|minor| !minor.is_empty() && minor.iter().all(u8::is_ascii_digit));
+            if is_anonymous_fuse {
+                self.mounted_identity = Some(MountedIdentity {
+                    mount_id: mount_id.clone(),
+                    major_minor: major_minor.clone(),
+                });
             }
         }
         Ok(())
+    }
+
+    fn confirm_detached(&mut self, helper_pid: u32) -> io::Result<()> {
+        let records = self.read_records()?;
+        let (at_path, _) = parse_mountinfo_mounts(&records, &self.encoded_path)?;
+        if !at_path.is_empty() {
+            return Err(Error::other(format!(
+                "auto-unmount helper exited but mountpoint remains mounted (helper pid={helper_pid})"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn admit_aborted_owner_fallback(&mut self, mountpoint: &CStr) -> io::Result<bool> {
+        let Some(identity) = self.mounted_identity.clone() else {
+            return Ok(false);
+        };
+        let records = self.read_records()?;
+        if !is_unobscured_owned_mount(
+            &records,
+            &self.encoded_path,
+            &identity.mount_id,
+            &identity.major_minor,
+        )? {
+            return Ok(false);
+        }
+        let probe_fd = unsafe {
+            libc::open(
+                mountpoint.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if probe_fd >= 0 {
+            unsafe {
+                libc::close(probe_fd);
+            }
+            return Ok(false);
+        }
+        Ok(Error::last_os_error().raw_os_error() == Some(libc::ENOTCONN))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_aborted_owned_mount(mountpoint: &CStr, timeout: Duration) -> io::Result<bool> {
+    match super::libc_umount(mountpoint) {
+        Ok(()) => return Ok(true),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {}
+        Err(_) => return Ok(false),
+    }
+    let started = Instant::now();
+    let mut child = Command::new(detect_fusermount_bin())
+        .args(["-u", "-q", "--"])
+        .arg(OsStr::from_bytes(mountpoint.to_bytes()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status.success()),
+            None => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::new(
+                        ErrorKind::TimedOut,
+                        "aborted read-only fusermount -u fallback timed out",
+                    ));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
     }
 }
 
@@ -159,12 +343,15 @@ impl Mount {
         let mountpoint = mountpoint.canonicalize()?;
         // Capture only the namespace/root view, before creating the mount.
         // This holds no reference to the mounted FUSE root.
-        let read_only_view = if read_only_auto_unmount(options) {
+        let mut read_only_view = if read_only_auto_unmount(options) {
             Some(ReadOnlyUnmountView::new(&mountpoint)?)
         } else {
             None
         };
         let (file, sock) = fuse_mount_pure(mountpoint.as_os_str(), options)?;
+        if let Some(view) = read_only_view.as_mut() {
+            view.capture_mounted_identity()?;
+        }
         let file = Arc::new(file);
         Ok((
             file.clone(),
@@ -195,8 +382,12 @@ impl Mount {
             .fuse_device
             .take()
             .ok_or_else(|| Error::other("FUSE device already released"))?;
-        match Arc::try_unwrap(device) {
-            Ok(device) => drop(device),
+        let sole_device_fd = match Arc::try_unwrap(device) {
+            Ok(device) => {
+                let sole = sole_process_file_description(&device);
+                drop(device);
+                sole
+            }
             Err(device) => {
                 drop(device);
                 if let Some(mut helper) = self.auto_unmount_socket.take() {
@@ -207,16 +398,32 @@ impl Mount {
                     "FUSE device still has external reply or notifier owners",
                 ));
             }
-        }
+        };
         // Last device close ends this proven read-only connection. Only then
         // may the existing crash helper inspect ENOTCONN and detach its mount.
         let mut helper = self.auto_unmount_socket.take().unwrap();
         let helper_pid = helper.child.id();
         helper.finish(timeout.saturating_sub(started.elapsed()))?;
-        self.read_only_view
-            .as_mut()
-            .unwrap()
-            .confirm_detached(helper_pid)
+        let view = self.read_only_view.as_mut().unwrap();
+        let Err(detach_err) = view.confirm_detached(helper_pid) else {
+            return Ok(());
+        };
+        // On hosts where AppArmor confines fusermount3's auto_unmount check_is_mount
+        // namespace helper (e.g. Ubuntu 24.04/26.04 denying `mount("", "/", MS_SLAVE)`),
+        // fusermount3 exits 0 on _FUSE_COMMFD EOF without detaching the ENOTCONN mount.
+        // Fall back to `fusermount3 -u` ONLY when kcmp proved no duplicate OS descriptor
+        // existed for `/dev/fuse`, mountinfo proves our exact `(mount_id, major:minor)`
+        // is still unobscured at `mountpoint`, and opening `mountpoint` returns ENOTCONN.
+        if sole_device_fd
+            && view.admit_aborted_owner_fallback(&self.mountpoint)?
+            && unmount_aborted_owned_mount(
+                &self.mountpoint,
+                timeout.saturating_sub(started.elapsed()),
+            )?
+        {
+            return view.confirm_detached(helper_pid);
+        }
+        Err(detach_err)
     }
 }
 
@@ -896,5 +1103,71 @@ mod block_mount_tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn owned_mount_fallback_requires_exact_unobscured_mount_identity() {
+        let owned_mountinfo = b"\
+29 1 0:25 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+814 29 0:97 / /tmp/ffs\\040ro ro,nosuid,nodev,relatime shared:412 - fuse.ffs frankenfs ro,user_id=1000,group_id=1000\n";
+        assert!(
+            is_unobscured_owned_mount(owned_mountinfo, b"/tmp/ffs\\040ro", b"814", b"0:97")
+                .unwrap()
+        );
+        // Replacement mount_id or major:minor at the same path must be rejected.
+        assert!(
+            !is_unobscured_owned_mount(owned_mountinfo, b"/tmp/ffs\\040ro", b"815", b"0:97")
+                .unwrap()
+        );
+        assert!(
+            !is_unobscured_owned_mount(owned_mountinfo, b"/tmp/ffs\\040ro", b"814", b"0:98")
+                .unwrap()
+        );
+        // Missing mount at path must return false.
+        assert!(
+            !is_unobscured_owned_mount(owned_mountinfo, b"/tmp/other", b"814", b"0:97").unwrap()
+        );
+
+        // Stacked overmount at the same mountpoint must be rejected.
+        let stacked_mountinfo = b"\
+29 1 0:25 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+814 29 0:97 / /tmp/ffs ro,nosuid,nodev - fuse.ffs frankenfs ro\n\
+815 814 0:98 / /tmp/ffs rw,nosuid,nodev - tmpfs replacement rw\n";
+        assert!(
+            !is_unobscured_owned_mount(stacked_mountinfo, b"/tmp/ffs", b"814", b"0:97").unwrap()
+        );
+
+        // Submount whose parent_id is our mount_id must be rejected even at a child path.
+        let child_mountinfo = b"\
+29 1 0:25 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+814 29 0:97 / /tmp/ffs ro,nosuid,nodev - fuse.ffs frankenfs ro\n\
+815 814 0:98 / /tmp/ffs/sub rw,nosuid,nodev - tmpfs submount rw\n";
+        assert!(!is_unobscured_owned_mount(child_mountinfo, b"/tmp/ffs", b"814", b"0:97").unwrap());
+
+        // Empty or malformed mountinfo must fail closed with InvalidData.
+        assert_eq!(
+            is_unobscured_owned_mount(b"", b"/tmp/ffs", b"814", b"0:97")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            is_unobscured_owned_mount(b"814 29 0:97 / broken\n", b"/tmp/ffs", b"814", b"0:97")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn sole_process_file_description_detects_duplicate_descriptors() {
+        let file = File::open("/dev/null").unwrap();
+        let unrelated = File::open("/dev/null").unwrap();
+        assert!(sole_process_file_description(&file));
+        let duplicate = file.try_clone().unwrap();
+        assert!(!sole_process_file_description(&file));
+        drop(duplicate);
+        assert!(sole_process_file_description(&file));
+        drop(unrelated);
     }
 }

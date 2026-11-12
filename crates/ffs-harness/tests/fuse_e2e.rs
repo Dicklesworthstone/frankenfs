@@ -23734,10 +23734,12 @@ fn concurrent_shared_dirfd_read_lseek_readdir_and_sigpipe_bd_uu90b() {
         return;
     }
 
-    // 1. Discriminating SIGPIPE inheritance proof (Rust test runner itself enters with SIGPIPE=SIG_IGN,
-    // reproducing sudo-rs / actions-runner inheritance into non-interactive bash).
+    // 1. Discriminating SIGPIPE inheritance proof (sudo-rs / actions-runner enter non-interactive
+    // bash with SIGPIPE=SIG_IGN without resetting signals before execve).
     let sigpipe_probe = r#"
 import os, signal, subprocess, time
+
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 def sig_ign_mask(pid="self"):
     for line in open(f"/proc/{pid}/status", encoding="utf-8"):
@@ -23748,7 +23750,8 @@ def sig_ign_mask(pid="self"):
 # Negative control: non-interactive bash inherits SIG_IGN and even `trap - PIPE` cannot clear it.
 neg = subprocess.Popen(
     ["bash", "-c", "trap - PIPE; while :; do sleep 0.05; done"],
-     start_new_session=True,
+    start_new_session=True,
+    restore_signals=False,
 )
 try:
     time.sleep(0.1)
@@ -23771,6 +23774,7 @@ pos = subprocess.Popen(
         "while :; do sleep 0.05; done",
     ],
     start_new_session=True,
+    restore_signals=False,
 )
 try:
     deadline = time.monotonic() + 3.0
@@ -23923,8 +23927,11 @@ print("GENERIC_310_WORKLOAD_PASS")
     };
 
     // 2. Execute on mounted ext4 (RW Arc<OpenFs>).
+    // Place FUSE mountpoints under `/tmp` when available so RCH's workspace
+    // output-root disk monitor never sees an unmonitored FUSE mount inside `.rch-tmp`.
+    let mount_tempdir = || TempDir::new_in("/tmp").or_else(|_| TempDir::new());
     {
-        let tmp = TempDir::new().expect("ext4 tmpdir");
+        let tmp = mount_tempdir().expect("ext4 tmpdir");
         let image = create_empty_ext4_test_image_with_size(tmp.path(), 64 * 1024 * 1024);
         let mnt = tmp.path().join("mnt_ext4");
         fs::create_dir_all(&mnt).expect("mkdir mnt_ext4");
@@ -23959,7 +23966,7 @@ print("GENERIC_310_WORKLOAD_PASS")
 
     // 3. Execute on mounted btrfs (RW Arc<OpenFs>) when mkfs.btrfs is available.
     if command_available("mkfs.btrfs") {
-        let tmp = TempDir::new().expect("btrfs tmpdir");
+        let tmp = mount_tempdir().expect("btrfs tmpdir");
         let image = create_btrfs_test_image(tmp.path());
         let mnt = tmp.path().join("mnt_btrfs");
         fs::create_dir_all(&mnt).expect("mkdir mnt_btrfs");
