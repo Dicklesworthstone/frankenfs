@@ -545,6 +545,8 @@ impl SsiReadTracker {
 pub(crate) struct Ext4StagedGroupDelta {
     pub(crate) free_inodes_delta: i64,
     pub(crate) used_dirs_delta: i64,
+    pub(crate) retired_inodes: u32,
+    pub(crate) retired_dirs: u32,
     pub(crate) inode_bitmap_initialized: bool,
     pub(crate) block_bitmap_csum_xor: u32,
     pub(crate) inode_bitmap_csum_xor: u32,
@@ -555,6 +557,8 @@ impl Ext4StagedGroupDelta {
     pub(crate) const fn is_empty(&self) -> bool {
         self.free_inodes_delta == 0
             && self.used_dirs_delta == 0
+            && self.retired_inodes == 0
+            && self.retired_dirs == 0
             && !self.inode_bitmap_initialized
             && self.block_bitmap_csum_xor == 0
             && self.inode_bitmap_csum_xor == 0

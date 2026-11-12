@@ -223,6 +223,20 @@ fn workflows_have_tracked_nonempty_baselines_and_zero_vacuous_patterns() {
             "ci.yml fuse-e2e must build companion binary `{required_bin}`"
         );
     }
+    for required_sandbox_token in [
+        "bubblewrap",
+        "ntfs-3g",
+        "test_ffs_inspect_sandbox.py",
+        "ffs_inspect_sandbox_native_e2e.sh",
+        "FFS_REQUIRE_SANDBOX: \"1\"",
+        "FFS_REQUIRE_CGROUP: \"1\"",
+        "FFS_REQUIRE_NTFS_TOOLS: \"1\"",
+    ] {
+        assert!(
+            ci_yml.contains(required_sandbox_token),
+            "ci.yml fuse-e2e must qualify isolated sandbox readers (`{required_sandbox_token}`)"
+        );
+    }
 
     // Every required baseline referenced by workflows must exist on disk, be non-empty,
     // and not be ignored by git (`git check-ignore -q` must exit non-zero).

@@ -5586,3 +5586,133 @@ fn cli_mount_ext4_background_scrub_repairs_meta_and_data_refuses_tampered_parity
         Some("ro_5_block_heal_forged_parity_refused_and_rw_live_scrub"),
     );
 }
+
+#[test]
+fn cli_inspect_sandbox_native_readers_and_cgroup_quotas_bd_qx2om() {
+    let require = std::env::var("FFS_REQUIRE_SANDBOX").as_deref() == Ok("1");
+    if nix::unistd::Uid::current().is_root() {
+        assert!(
+            !require,
+            "FFS_REQUIRE_SANDBOX=1 but ffs_inspect_sandbox.py refuses root execution"
+        );
+        emit_scenario_result(
+            "cli_inspect_sandbox_native_readers_bd_qx2om",
+            "SKIP",
+            Some("sandbox_refuses_root"),
+        );
+        return;
+    }
+
+    let bwrap_ok = Path::new("/usr/bin/bwrap").is_file()
+        && Command::new("/usr/bin/bwrap")
+            .args([
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "--",
+                "/usr/bin/true",
+            ])
+            .output()
+            .is_ok_and(|out| out.status.success());
+    if !bwrap_ok {
+        assert!(
+            !require,
+            "FFS_REQUIRE_SANDBOX=1 but /usr/bin/bwrap user-namespace containment is unavailable"
+        );
+        emit_scenario_result(
+            "cli_inspect_sandbox_native_readers_bd_qx2om",
+            "SKIP",
+            Some("bwrap_userns_unavailable"),
+        );
+        return;
+    }
+
+    let path_with_sbin = format!(
+        "{}:/usr/sbin:/sbin",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    for tool in ["mke2fs", "mkfs.btrfs", "fsck.fat"] {
+        let found = Command::new("bash")
+            .args(["-c", &format!("command -v {tool} >/dev/null 2>&1")])
+            .env("PATH", &path_with_sbin)
+            .status()
+            .is_ok_and(|st| st.success());
+        if !found {
+            assert!(
+                !require,
+                "FFS_REQUIRE_SANDBOX=1 but required image builder/oracle `{tool}` is unavailable"
+            );
+            emit_scenario_result(
+                "cli_inspect_sandbox_native_readers_bd_qx2om",
+                "SKIP",
+                Some(&format!("missing_{tool}")),
+            );
+            return;
+        }
+    }
+
+    let staging = tempfile::tempdir().expect("create sandbox staging tempdir");
+    let bin_dir = staging.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create staged bin dir");
+    for (name, built) in [
+        ("ffs-cli", env!("CARGO_BIN_EXE_ffs-cli")),
+        ("ffs-fat", env!("CARGO_BIN_EXE_ffs-fat")),
+        ("ffs-ntfs", env!("CARGO_BIN_EXE_ffs-ntfs")),
+        ("ffs-zfs", env!("CARGO_BIN_EXE_ffs-zfs")),
+    ] {
+        let src = Path::new(built);
+        let dst = bin_dir.join(name);
+        fs::hard_link(src, &dst)
+            .or_else(|_| fs::copy(src, &dst).map(|_| ()))
+            .unwrap_or_else(|err| {
+                panic!("stage reader binary {name} from {}: {err}", src.display())
+            });
+    }
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let script = repo_root.join("scripts/e2e/ffs_inspect_sandbox_native_e2e.sh");
+    let output = Command::new("bash")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env("FFS_BIN_DIR", &bin_dir)
+        .env("REPO_ROOT", staging.path())
+        .env("FFS_REQUIRE_SANDBOX", "1")
+        .env("TMPDIR", "/tmp")
+        .output()
+        .expect("execute ffs_inspect_sandbox_native_e2e.sh");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "ffs_inspect_sandbox_native_e2e.sh failed: status={:?}\n{combined}",
+        output.status
+    );
+    for expected_marker in [
+        "SCENARIO_RESULT|scenario_id=ext4_read_matches_source|outcome=PASS",
+        "SCENARIO_RESULT|scenario_id=btrfs_read_matches_source|outcome=PASS",
+        "SCENARIO_RESULT|scenario_id=fat32_cat_matches_source|outcome=PASS",
+        "SCENARIO_RESULT|scenario_id=ntfs_read_matches_source|outcome=PASS",
+        "SCENARIO_RESULT|scenario_id=zfs_read_matches_source|outcome=PASS",
+        "SCENARIO_RESULT|scenario_id=gpt_p4_zfs_matches_source|outcome=PASS",
+        "SCENARIO_RESULT|scenario_id=truncated_ntfs_refused|outcome=PASS",
+        "SCENARIO_RESULT|scenario_id=corrupted_zfs_refused|outcome=PASS",
+        "SCENARIO_RESULT|scenario_id=evidence_records_policy|outcome=PASS",
+    ] {
+        assert!(
+            combined.contains(expected_marker),
+            "missing expected sandbox E2E scenario marker `{expected_marker}` in output:\n{combined}"
+        );
+    }
+
+    emit_scenario_result(
+        "cli_inspect_sandbox_native_readers_bd_qx2om",
+        "PASS",
+        Some("all_six_formats_gpt_hostile_and_cgroup_verified"),
+    );
+}

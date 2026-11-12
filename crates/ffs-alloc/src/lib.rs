@@ -4355,6 +4355,16 @@ pub fn free_inode_persist(
     bitmap_clear(&mut bitmap, bit_idx);
     let inode_bitmap_override =
         BitmapOverride::from_flipped_bit_range(&bitmap, bit_idx, 1, pctx.inodes_per_group);
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    if groups[gidx].inode_bitmap_uninit() {
+        dev.write_block(cx, bitmap_block, &bitmap)?;
+    } else {
+        dev.rmw_block_bitmap_delta(cx, bitmap_block, &mut |base_bitmap| {
+            bitmap_clear(base_bitmap, bit_idx);
+            Ok(())
+        })?;
+    }
+    #[cfg(not(feature = "bhh0i_sharded_alloc"))]
     dev.write_block(cx, bitmap_block, &bitmap)?;
     let previous_used_dirs = groups[gidx].used_dirs;
     let previous_inode_bitmap_csum = groups[gidx].inode_bitmap_csum;

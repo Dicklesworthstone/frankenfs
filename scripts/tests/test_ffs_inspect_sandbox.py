@@ -102,6 +102,60 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(sandbox.Refusal):
                 dataclasses.replace(sandbox.Limits(), **{name: 0}).validate()
 
+    def test_real_native_tool_subcommands_are_admitted_and_nonexistent_or_mutating_refused(self):
+        for cmd in ("read", "listxattr", "getxattr", "scrub", "allocation", "properties",
+                    "zil-inspect", "zil-read"):
+            self.assertIn(cmd, sandbox.TOOLS["ffs-zfs"])
+        for bad in ("cat", "xattr", "mount"):
+            self.assertNotIn(bad, sandbox.TOOLS["ffs-zfs"])
+        for cmd in ("check-security", "check-allocation", "read", "streams"):
+            self.assertIn(cmd, sandbox.TOOLS["ffs-ntfs"])
+        self.assertNotIn("mount", sandbox.TOOLS["ffs-ntfs"])
+        for cmd in ("ls", "scrub", "partitions", "streams", "pool", "dataset"):
+            self.assertIn(cmd, sandbox.TOOLS["ffs-cli"])
+        for bad in ("mount", "format", "mkfs", "repair", "fsck", "check"):
+            self.assertNotIn(bad, sandbox.TOOLS["ffs-cli"])
+
+    def test_cgroup_limits_validation_and_systemd_wrapper_argv(self):
+        disabled = sandbox.CgroupLimits()
+        self.assertFalse(disabled.enabled)
+        disabled.validate()
+        with self.assertRaises(sandbox.Refusal):
+            sandbox.cgroup_argv("ffs-test.scope", disabled, ["/usr/bin/bwrap"])
+        for bad in [
+            sandbox.CgroupLimits(memory_bytes=0),
+            sandbox.CgroupLimits(memory_bytes=63 * sandbox.MIB),
+            sandbox.CgroupLimits(memory_bytes=True),
+            sandbox.CgroupLimits(pids_max=3),
+            sandbox.CgroupLimits(pids_max=False),
+            sandbox.CgroupLimits(cpu_quota_pct=0),
+            sandbox.CgroupLimits(cpu_quota_pct=10_001),
+            sandbox.CgroupLimits(cpu_quota_pct=True),
+        ]:
+            with self.assertRaises(sandbox.Refusal):
+                bad.validate()
+        active = sandbox.CgroupLimits(
+            memory_bytes=128 * sandbox.MIB, pids_max=16, cpu_quota_pct=150
+        )
+        self.assertTrue(active.enabled)
+        active.validate()
+        wrapped = sandbox.cgroup_argv("ffs-inspect-unit.scope", active, ["/proc/self/fd/3", "--"])
+        self.assertEqual(
+            wrapped,
+            [
+                "systemd-run", "--user", "--scope", "--quiet", "--collect",
+                "--unit=ffs-inspect-unit.scope",
+                "-p", f"MemoryMax={128 * sandbox.MIB}",
+                "-p", "MemorySwapMax=0",
+                "-p", "TasksMax=16",
+                "-p", "CPUQuota=150%",
+                "--", "/proc/self/fd/3", "--",
+            ],
+        )
+        for bad_unit in ("ffs-inspect-unit", "nested/ffs.scope"):
+            with self.assertRaises(sandbox.Refusal):
+                sandbox.cgroup_argv(bad_unit, active, ["/proc/self/fd/3"])
+
 
 SECCOMP_DATA = struct.Struct("=iIQ6Q")  # struct seccomp_data
 RET_KILL, RET_ALLOW, RET_EPERM = 0x80000000, 0x7FFF0000, 0x00050000 | errno.EPERM
@@ -326,6 +380,85 @@ class FileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "process limit"):
                 inner.restrict_processes(value)
 
+    def test_inner_verifies_cgroup_scope_membership_when_configured(self):
+        namespaces = {name: -1 for name in ("mnt", "user", "pid", "net", "ipc", "uts")}
+        good_status = "NoNewPrivs:\t1\nCapEff:\t0\nCapPrm:\t0\nCapAmb:\t0\nCapBnd:\t0\nSeccomp:\t2\n"
+
+        def fake_open_for(cgroup_text: str):
+            def _open(path, *args, **kwargs):
+                if path == "/proc/self/status":
+                    return io.StringIO(good_status)
+                if path == "/proc/self/cgroup":
+                    return io.StringIO(cgroup_text)
+                raise AssertionError(f"unexpected path {path}")
+            return _open
+
+        with mock.patch("builtins.open", side_effect=fake_open_for("0::/user.slice/ffs-ok.scope\n")):
+            inner.verify_containment(namespaces, "ffs-ok.scope")
+        for bad_cgroup in ("0::/user.slice/other.scope\n", "1:name=systemd:/ffs-ok.scope\n", ""):
+            with mock.patch("builtins.open", side_effect=fake_open_for(bad_cgroup)), \
+                 self.assertRaisesRegex(ValueError, "cgroup v2 scope"):
+                inner.verify_containment(namespaces, "ffs-ok.scope")
+        for bad_unit in ("ffs-ok", "sub/ffs-ok.scope", 123):
+            with mock.patch("builtins.open", side_effect=fake_open_for("0::/user.slice/ffs-ok.scope\n")), \
+                 self.assertRaisesRegex(ValueError, "cgroup scope unit"):
+                inner.verify_containment(namespaces, bad_unit)
+
+    def test_cgroup_preflight_refuses_missing_hierarchy_controller_bus_or_systemd_run_without_creating_output(self):
+        active = sandbox.CgroupLimits(memory_bytes=128 * sandbox.MIB, pids_max=16, cpu_quota_pct=100)
+        fake_cg = self.directory / "fake-cgroup"
+        fake_cg.mkdir()
+        output = self.directory / "never-created"
+        fake_bwrap = self.directory / "fake-bwrap"
+        fake_bwrap.write_bytes(b"\x7fELF")
+        fake_bwrap.chmod(0o755)
+        fake_systemd_run = self.directory / "fake-systemd-run"
+        fake_systemd_run.write_bytes(b"\x7fELF")
+        fake_systemd_run.chmod(0o755)
+
+        # 1. Missing cgroup.controllers -> fail closed before output.mkdir
+        with mock.patch.object(sandbox.os, "geteuid", return_value=1000), \
+             mock.patch.object(sandbox.os, "getuid", return_value=1000), \
+             self.assertRaisesRegex(sandbox.Refusal, "cgroup v2 unified hierarchy"):
+            sandbox.execute(Path(sys.executable), "ffs-fat", [("disk", self.input)],
+                            ["inspect", "@disk"], output, sandbox.Limits(), fake_bwrap,
+                            cgroup=active, systemd_run=fake_systemd_run, cgroup_root=fake_cg)
+        self.assertFalse(output.exists())
+
+        # 2. Missing required controller ("memory") -> fail closed
+        (fake_cg / "cgroup.controllers").write_text("cpu pids\n", encoding="ascii")
+        with mock.patch.object(sandbox.os, "geteuid", return_value=1000), \
+             mock.patch.object(sandbox.os, "getuid", return_value=1000), \
+             self.assertRaisesRegex(sandbox.Refusal, "memory"):
+            sandbox.execute(Path(sys.executable), "ffs-fat", [("disk", self.input)],
+                            ["inspect", "@disk"], output, sandbox.Limits(), fake_bwrap,
+                            cgroup=active, systemd_run=fake_systemd_run, cgroup_root=fake_cg)
+        self.assertFalse(output.exists())
+
+        # 3. Missing user bus socket -> fail closed
+        (fake_cg / "cgroup.controllers").write_text("cpu memory pids\n", encoding="ascii")
+        empty_rt = self.directory / "empty-run-user"
+        empty_rt.mkdir()
+        with mock.patch.object(sandbox.os, "geteuid", return_value=1000), \
+             mock.patch.object(sandbox.os, "getuid", return_value=1000), \
+             mock.patch.object(sandbox, "_user_runtime_dir", return_value=empty_rt), \
+             self.assertRaisesRegex(sandbox.Refusal, "user manager bus"):
+            sandbox.execute(Path(sys.executable), "ffs-fat", [("disk", self.input)],
+                            ["inspect", "@disk"], output, sandbox.Limits(), fake_bwrap,
+                            cgroup=active, systemd_run=fake_systemd_run, cgroup_root=fake_cg)
+        self.assertFalse(output.exists())
+
+        # 4. Bus is a regular file instead of socket, or missing systemd-run -> fail closed
+        (empty_rt / "bus").write_bytes(b"not a socket")
+        with mock.patch.object(sandbox.os, "geteuid", return_value=1000), \
+             mock.patch.object(sandbox.os, "getuid", return_value=1000), \
+             mock.patch.object(sandbox, "_user_runtime_dir", return_value=empty_rt), \
+             self.assertRaisesRegex(sandbox.Refusal, "not a user-owned socket"):
+            sandbox.execute(Path(sys.executable), "ffs-fat", [("disk", self.input)],
+                            ["inspect", "@disk"], output, sandbox.Limits(), fake_bwrap,
+                            cgroup=active, systemd_run=fake_systemd_run, cgroup_root=fake_cg)
+        self.assertFalse(output.exists())
+
 
 class SupervisorTests(unittest.TestCase):
     def run_child(self, program, *, timeout=3, cap=8192):
@@ -474,6 +607,35 @@ def live_sandbox_unavailable() -> str | None:
     return reason
 
 
+def live_cgroup_unavailable() -> str | None:
+    """Why live systemd-run --user --scope cgroup v2 tests cannot run; FFS_REQUIRE_CGROUP=1 makes it fatal."""
+    reason = live_sandbox_unavailable()
+    systemd_run = Path("/usr/bin/systemd-run")
+    uid = os.getuid()
+    bus = Path(f"/run/user/{uid}/bus")
+    if reason is None:
+        if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+            reason = "cgroup v2 unified hierarchy is not mounted at /sys/fs/cgroup"
+        elif not systemd_run.is_file():
+            reason = "systemd-run is not installed at /usr/bin/systemd-run"
+        elif not bus.exists() or not stat.S_ISSOCK(bus.lstat().st_mode):
+            reason = f"systemd user manager bus is unavailable at {bus}"
+        else:
+            probe = subprocess.run(
+                [str(systemd_run), "--user", "--scope", "--quiet", "--collect",
+                 "-p", "MemoryMax=67108864", "-p", "MemorySwapMax=0",
+                 "-p", "TasksMax=16", "-p", "CPUQuota=100%", "--", "/usr/bin/true"],
+                env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+                     "XDG_RUNTIME_DIR": f"/run/user/{uid}"},
+                capture_output=True, check=False, timeout=30,
+            )
+            if probe.returncode != 0:
+                reason = f"systemd-run --user --scope failed: {probe.stderr[-200:]!r}"
+    if reason and os.environ.get("FFS_REQUIRE_CGROUP") == "1":
+        raise AssertionError(f"FFS_REQUIRE_CGROUP=1 but {reason}")
+    return reason
+
+
 def plain_true_executable() -> Path | None:
     # Multicall coreutils dispatch on argv[0], which the launcher sets to /app/reader.
     for candidate in (Path("/usr/bin/gnutrue"), Path("/usr/bin/true"), Path("/bin/true")):
@@ -557,9 +719,144 @@ class LiveSandboxTests(unittest.TestCase):
         self.assertTrue(result["reader_and_inputs_unchanged"])
         self.assertEqual(result["inputs"][0]["sha256_after"], hashlib.sha256(self.content).hexdigest())
         self.assertEqual(request["policy"], sandbox.POLICY)
+        self.assertFalse(request["cgroup"]["enabled"])
         program = sandbox.seccomp_filter(os.uname().machine)
         self.assertEqual(request["seccomp"]["sha256"], hashlib.sha256(program).hexdigest())
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+
+    def test_live_cgroup_scope_enforces_kernel_memory_swap_pids_and_cpu_quotas(self):
+        reason = live_cgroup_unavailable()
+        if reason:
+            self.skipTest(reason)
+        reader = plain_true_executable()
+        if reader is None:
+            if os.environ.get("FFS_REQUIRE_SANDBOX") == "1" or os.environ.get("FFS_REQUIRE_CGROUP") == "1":
+                self.fail("no single-purpose ELF true is installed")
+            self.skipTest("no single-purpose ELF true to stand in for a reader")
+
+        # 1. Inspect actual kernel cgroup v2 files while a live systemd-run + bwrap scope is active.
+        python = Path("/usr/bin/python3").resolve()
+        systemd_run = Path("/usr/bin/systemd-run").resolve()
+        cg = sandbox.CgroupLimits(memory_bytes=96 * sandbox.MIB, pids_max=16, cpu_quota_pct=150)
+        scope_unit = f"ffs-inspect-live-{os.getpid()}-{time.monotonic_ns():x}.scope"
+        hold_r, hold_w = os.pipe()
+        try:
+            with contextlib.ExitStack() as stack:
+                systemd_fd = sandbox.pin_file(stack, systemd_run, executable=True)
+                bwrap_fd = sandbox.pin_file(stack, Path("/usr/bin/bwrap").resolve(), executable=True)
+                binary_fd = sandbox.pin_file(stack, python, executable=True)
+                python_fd = sandbox.pin_file(stack, python, executable=True)
+                disk_fd = sandbox.pin_file(stack, self.input)
+                inner_fd = sandbox.sealed_data(stack, SOURCE.with_name("ffs_inspect_sandbox_inner.py").read_bytes())
+                config_fd = sandbox.sealed_data(stack, b"{}")
+                seccomp_fd = sandbox.sealed_data(stack, sandbox.seccomp_filter(os.uname().machine))
+                status = os.pipe2(os.O_CLOEXEC)
+                stack.callback(lambda: [contextlib.suppress(OSError).__enter__() or os.close(fd) for fd in status])
+                bwrap_argv = sandbox.sandbox_argv(
+                    Path(f"/proc/self/fd/{bwrap_fd}"), binary_fd, [("disk", disk_fd)],
+                    ["inspect", "/inputs/disk"], sandbox.Limits(), status[1],
+                    python_fd, inner_fd, config_fd, seccomp_fd,
+                )
+                probe_code = (
+                    f"import os, sys; sys.stdout.write(open('/proc/self/cgroup').read()); "
+                    f"sys.stdout.flush(); os.read({hold_r}, 1)"
+                )
+                bwrap_argv = bwrap_argv[:bwrap_argv.index("--") + 1] + [
+                    "/app/python", "-I", "-S", "-c", probe_code
+                ]
+                argv = sandbox.cgroup_argv(scope_unit, cg, bwrap_argv)
+                proc = subprocess.Popen(
+                    argv,
+                    executable=f"/proc/self/fd/{systemd_fd}",
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    pass_fds=(systemd_fd, bwrap_fd, binary_fd, python_fd, disk_fd,
+                              inner_fd, config_fd, seccomp_fd, status[1], hold_r),
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+                         "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"},
+                )
+                os.close(hold_r)
+                hold_r = -1
+                cg_line = proc.stdout.readline().decode("ascii").strip()
+                self.assertTrue(cg_line.startswith("0::/"), cg_line)
+                self.assertTrue(cg_line.endswith(f"/{scope_unit}"), cg_line)
+                cg_dir = Path("/sys/fs/cgroup") / cg_line[4:]
+                self.assertEqual((cg_dir / "memory.max").read_text().strip(), str(96 * sandbox.MIB))
+                self.assertEqual((cg_dir / "memory.swap.max").read_text().strip(), "0")
+                self.assertEqual((cg_dir / "pids.max").read_text().strip(), "16")
+                self.assertEqual((cg_dir / "cpu.max").read_text().strip(), "150000 100000")
+                os.close(hold_w)
+                hold_w = -1
+                _, stderr_bytes = proc.communicate(timeout=30)
+                proc.stdout.close()
+                self.assertEqual(proc.returncode, 0, stderr_bytes[-1000:])
+        finally:
+            for fd in (hold_r, hold_w):
+                if fd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+
+        # 2. Hostile memory-hog child inside a 64 MiB MemoryMax (SwapMax=0) cgroup is killed by kernel OOM.
+        with contextlib.ExitStack() as stack:
+            systemd_fd = sandbox.pin_file(stack, systemd_run, executable=True)
+            bwrap_fd = sandbox.pin_file(stack, Path("/usr/bin/bwrap").resolve(), executable=True)
+            binary_fd = sandbox.pin_file(stack, python, executable=True)
+            python_fd = sandbox.pin_file(stack, python, executable=True)
+            disk_fd = sandbox.pin_file(stack, self.input)
+            inner_fd = sandbox.sealed_data(stack, SOURCE.with_name("ffs_inspect_sandbox_inner.py").read_bytes())
+            config_fd = sandbox.sealed_data(stack, b"{}")
+            seccomp_fd = sandbox.sealed_data(stack, sandbox.seccomp_filter(os.uname().machine))
+            status = os.pipe2(os.O_CLOEXEC)
+            oom_cg = sandbox.CgroupLimits(memory_bytes=64 * sandbox.MIB, pids_max=16)
+            oom_unit = f"ffs-inspect-oom-{os.getpid()}-{time.monotonic_ns():x}.scope"
+            bwrap_argv = sandbox.sandbox_argv(
+                Path(f"/proc/self/fd/{bwrap_fd}"), binary_fd, [("disk", disk_fd)],
+                ["inspect", "/inputs/disk"], sandbox.Limits(), status[1],
+                python_fd, inner_fd, config_fd, seccomp_fd,
+            )
+            hog = "buf = bytearray(160 * 1024 * 1024)\nfor i in range(0, len(buf), 4096): buf[i] = 1\n"
+            bwrap_argv = bwrap_argv[:bwrap_argv.index("--") + 1] + [
+                "/app/python", "-I", "-S", "-c", hog
+            ]
+            argv = sandbox.cgroup_argv(oom_unit, oom_cg, bwrap_argv)
+            out, err = io.BytesIO(), io.BytesIO()
+            oom_res = sandbox._supervise(
+                argv,
+                (systemd_fd, bwrap_fd, binary_fd, python_fd, disk_fd,
+                 inner_fd, config_fd, seccomp_fd, status[1]),
+                {"stdout": out, "stderr": err},
+                sandbox.Limits(),
+                time.monotonic() + 30,
+                status,
+                executable=f"/proc/self/fd/{systemd_fd}",
+                extra_env={"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"},
+            )
+        self.assertNotEqual(oom_res["exit_code"], 0)
+        self.assertEqual(self.input.read_bytes(), self.content)
+
+        # 3. End-to-end sandbox.execute with CgroupLimits verifies inner scope check + manifest fields.
+        output = self.directory / "evidence-cgroup"
+        code = sandbox.execute(
+            reader, "ffs-cli", [("disk", self.input)], ["inspect", "@disk"],
+            output, sandbox.Limits(), Path("/usr/bin/bwrap"),
+            cgroup=cg, systemd_run=systemd_run,
+        )
+        result = json.loads((output / "result.json").read_text())
+        request = json.loads((output / "request.json").read_text())
+        self.assertEqual(code, 0, result)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["execution_confirmed"])
+        self.assertTrue(result["reader_and_inputs_unchanged"])
+        self.assertTrue(request["cgroup"]["enabled"])
+        self.assertEqual(request["cgroup"]["memory_bytes"], 96 * sandbox.MIB)
+        self.assertEqual(request["cgroup"]["swap_max"], 0)
+        self.assertEqual(request["cgroup"]["pids_max"], 16)
+        self.assertEqual(request["cgroup"]["cpu_quota_pct"], 150)
+        self.assertTrue(request["cgroup"]["scope_unit"].endswith(".scope"))
+        self.assertEqual(len(request["cgroup"]["systemd_run_sha256"]), 64)
+        self.assertTrue(result["cgroup"]["enabled"])
+        self.assertEqual(result["cgroup"]["scope_unit"], request["cgroup"]["scope_unit"])
 
 
 if __name__ == "__main__":

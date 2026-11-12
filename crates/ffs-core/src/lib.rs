@@ -10048,6 +10048,12 @@ impl OpenFs {
                     is_dir,
                     &alloc.persist_ctx,
                 )?;
+                let group = ffs_types::inode_to_group(ino, alloc.geo.inodes_per_group).0 as usize;
+                let delta = scope.ext4_staged.group_deltas.entry(group).or_default();
+                delta.retired_inodes = delta.retired_inodes.saturating_add(1);
+                if is_dir {
+                    delta.retired_dirs = delta.retired_dirs.saturating_add(1);
+                }
             }
         }
         let loc = ffs_inode::locate_inode(ino, &alloc.geo, &alloc.groups).ok_or_else(|| {
@@ -27049,7 +27055,19 @@ impl OpenFs {
         Self::ext4_apply_scoped_block_counts(scope, &mut updated)?;
         #[cfg(feature = "bhh0i_sharded_alloc")]
         let publication = sharded
-            .map(|sharded| sharded.prepare_birth_publication(&alloc.groups, updated.clone()))
+            .map(|sharded| {
+                sharded.prepare_birth_publication_with_retirements(
+                    &alloc.groups,
+                    updated.clone(),
+                    Some(&|gidx| {
+                        scope
+                            .ext4_staged
+                            .group_deltas
+                            .get(&gidx)
+                            .map_or((0, 0), |d| (d.retired_inodes, d.retired_dirs))
+                    }),
+                )
+            })
             .transpose()?;
 
         // Serialize xattr cache invalidation across commit against concurrent
@@ -30161,6 +30179,14 @@ impl OpenFs {
              which structure holds the debit, and a later free would credit the \
              wrong one. Set the toggle before the first operation."
         );
+        if previous
+            && !enabled
+            && let (Some(sharded), Ok(alloc_mutex)) =
+                (&self.ext4_sharded_alloc, self.require_alloc_state())
+        {
+            let mut alloc = alloc_mutex.write();
+            sharded.sync_checksums_into_single(&mut alloc.groups);
+        }
         previous
     }
 

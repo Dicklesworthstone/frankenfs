@@ -78,9 +78,15 @@ therefore modify a dirty ext4 image they were asked only to read.
 - [x] Run actual bubblewrap namespace, filter and read-only-input tests, plus an
   end-to-end launcher run with a stand-in reader: 35 passed live with
   `FFS_REQUIRE_SANDBOX=1`, and four planted negatives were detected.
-- [ ] Run the native FrankenFS readers under the launcher against real images.
-- [ ] Qualify aggregate cgroup quotas and supported host/kernel configurations
-  before promoting this to a hostile-production security profile.
+- [x] Run the native FrankenFS readers (`ffs-cli`, `ffs-fat`, `ffs-ntfs`, `ffs-zfs`)
+  under the launcher against real ext4, btrfs, FAT16/FAT32, NTFS, ZFS, 4-slice GPT,
+  and corrupted hostile images (`scripts/e2e/ffs_inspect_sandbox_native_e2e.sh` +
+  `cli_inspect_sandbox_native_readers_and_cgroup_quotas_bd_qx2om`).
+- [x] Qualify fail-closed aggregate unified cgroup v2 quotas (`--cgroup-memory-mib`,
+  `--cgroup-pids-max`, `--cgroup-cpu-quota-pct` via `systemd-run --user --scope`,
+  verified inside `ffs_inspect_sandbox_inner.py` via `/proc/self/cgroup` and across
+  40 Python tests with `FFS_REQUIRE_SANDBOX=1 FFS_REQUIRE_CGROUP=1` plus Ubuntu 24.04
+  GitHub Actions CI with `mkntfs`, OpenZFS `zpool`, and AppArmor).
 
 Executed test command:
 

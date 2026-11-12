@@ -355,7 +355,9 @@ jobs:
       - name: Install FUSE and ext4 prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs dosfstools attr
+          sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs dosfstools attr bubblewrap ntfs-3g zfsutils-linux
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
           # fusermount3 needs this for fuser's automatic-unmount helper.
           if ! grep -qxF user_allow_other /etc/fuse.conf; then
             printf '%s\n' user_allow_other | sudo tee -a /etc/fuse.conf
@@ -415,6 +417,35 @@ jobs:
         # still prevent admission of every test step below.
         if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         run: cargo test -p ffs-ops -- --nocapture
+
+      - name: Qualify isolated inspection sandbox and six-format native readers
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
+        env:
+          FFS_REQUIRE_SANDBOX: "1"
+          FFS_REQUIRE_CGROUP: "1"
+          FFS_REQUIRE_NTFS_TOOLS: "1"
+          FFS_BIN_DIR: ${{ runner.temp }}/ffs-cli-proof/bin
+        run: |
+          set -euo pipefail
+          python3 -I -m unittest discover -s scripts/tests -p test_ffs_inspect_sandbox.py -v
+          zfs_dir="$(mktemp -d "$RUNNER_TEMP/ffs-sandbox-zpool.XXXXXX")"
+          head -c 131072 /dev/urandom > "$zfs_dir/payload.bin"
+          if sudo modprobe zfs 2>/dev/null && [ -e /dev/zfs ]; then
+            pool_name="ffs_sbx_$$"
+            truncate -s 128M "$zfs_dir/pool.img"
+            mkdir -p "$zfs_dir/mnt"
+            sudo zpool create -d -m none -o cachefile=none -o ashift=12 "$pool_name" "$zfs_dir/pool.img"
+            sudo zfs create -o version=5 -o atime=off -o compression=lzjb -o "mountpoint=$zfs_dir/mnt" "$pool_name/data"
+            sudo cp "$zfs_dir/payload.bin" "$zfs_dir/mnt/payload.bin"
+            sync
+            sudo zpool export "$pool_name"
+            sudo chmod 0644 "$zfs_dir/pool.img"
+            export FFS_ZFS_LIVE_POOL_IMAGE="$zfs_dir/pool.img"
+            export FFS_ZFS_LIVE_PAYLOAD="$zfs_dir/payload.bin"
+            export FFS_ZFS_LIVE_DATASET="data"
+            export FFS_REQUIRE_ZFS_TOOLS="1"
+          fi
+          ./scripts/e2e/ffs_inspect_sandbox_native_e2e.sh
 
       - name: FUSE shutdown ownership and final-flush controls
         if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}

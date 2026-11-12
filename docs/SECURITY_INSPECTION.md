@@ -35,8 +35,15 @@ python3 -I scripts/ffs_inspect_sandbox.py \
 
 python3 -I scripts/ffs_inspect_sandbox.py \
   --tool ffs-zfs --binary target/release/ffs-zfs \
-  --input leaf=/srv/images/zfs-leaf.img --output audit-zfs-inspect \
-  -- inspect @leaf --offline-image
+  --input leaf=/srv/images/zfs-leaf.img --output audit-zfs-read \
+  -- read @leaf /docs/report.txt --offline-image
+
+# With fail-closed unified cgroup v2 aggregate job quotas (MemoryMax, MemorySwapMax=0, TasksMax, CPUQuota):
+python3 -I scripts/ffs_inspect_sandbox.py \
+  --cgroup-memory-mib 512 --cgroup-pids-max 32 --cgroup-cpu-quota-pct 200 \
+  --tool ffs-cli --binary target/release/ffs-cli \
+  --input disk=/srv/images/gpt.img --output audit-gpt-p4 \
+  -- read @disk /docs/report.txt --partition 4
 ```
 
 `NAME=PATH` declares one regular input. `@NAME` (also `--option=@NAME`) is replaced
@@ -120,24 +127,31 @@ threads and children. Outside, `RLIMIT_NPROC` counts every task of the real UID;
 applied to bubblewrap itself it made namespace creation fail on any account
 already running more than 64 tasks.
 
-These are **not aggregate cgroup quotas**. Per-process memory/CPU limits and a
-per-sandbox task count do not establish an aggregate per-job memory/CPU
-guarantee. Run this profile under a dedicated account with externally enforced
-cgroup memory, process and CPU budgets on a host intended for hostile workloads.
-A stuck kernel I/O operation can delay process reaping; userspace deadlines are
-not kernel liveness proofs.
+When `--cgroup-memory-mib`, `--cgroup-pids-max`, or `--cgroup-cpu-quota-pct` are
+omitted, these `rlimit` budgets remain per-process/per-sandbox rather than
+aggregate cgroup quotas. When any `--cgroup-*` flag is supplied, the launcher
+enforces fail-closed unified cgroup v2 scope quotas (`MemoryMax`,
+`MemorySwapMax=0`, `TasksMax`, `CPUQuota`) via a pinned, descriptor-locked,
+SHA-256-hashed `systemd-run --user --scope --collect` wrapper (`--systemd-run`),
+refuses launch without creating the output directory if cgroup v2, required
+controllers (`memory`, `pids`, `cpu`), or the user-owned systemd bus socket are
+unavailable, and verifies inside `ffs_inspect_sandbox_inner.py` before `execve`
+that `/proc/self/cgroup` places the sandbox in the expected transient scope unit.
+Even with cgroup quotas active, a stuck kernel I/O operation can delay process
+reaping; userspace deadlines are not kernel liveness proofs.
 
 ## Evidence contract
 
 The new mode-0700 output directory contains mode-0600 files:
 
 - `request.json`: policy version, reader, bubblewrap, Python and bootstrap hashes, exact
-  mapped argv, resource limits, the syscall filter's SHA-256 and denylist, input
-  identities and initial SHA-256 values.
+  mapped argv, resource limits, optional `cgroup` scope policy and `systemd-run` SHA-256,
+  the syscall filter's SHA-256 and denylist, input identities and initial SHA-256 values.
 - `stdout.bin` and `stderr.bin`: bounded, untrusted output. A failed operation may
   leave a valid-looking prefix; do not consume it as a successful extraction.
 - `result.json`: child exit, limit termination, bubblewrap start/exit observations,
-  captured byte counts/hashes, post-run source hashes and the final success flag.
+  `cgroup` scope enforcement record, captured byte counts/hashes, post-run source
+  hashes and the final success flag.
 
 Success requires a zero child exit, bubblewrap execution confirmation, no exhausted
 supervision budget, and unchanged retained executable/input contents and
@@ -164,20 +178,24 @@ small extraction. No mounted FUSE operation is exercised by this launcher.
 Run the executable policy/file-descriptor/supervisor tests with:
 
 ```sh
-FFS_REQUIRE_SANDBOX=1 python3 -I -m unittest discover -s scripts/tests -p test_ffs_inspect_sandbox.py -v
+FFS_REQUIRE_SANDBOX=1 FFS_REQUIRE_CGROUP=1 python3 -I -m unittest discover -s scripts/tests -p test_ffs_inspect_sandbox.py -v
 ```
 
-`FFS_REQUIRE_SANDBOX=1` turns a missing or unusable bubblewrap into a failure
-instead of a skip, so a passing run proves the live tests executed.
+`FFS_REQUIRE_SANDBOX=1` and `FFS_REQUIRE_CGROUP=1` turn a missing or unusable
+bubblewrap or unified cgroup v2 scope runner into a failure instead of a skip,
+so a passing run proves both the live bubblewrap and live cgroup v2 enforcement
+tests executed.
 
 The unit tests use real child processes, descriptor permissions, locks,
 timeout/pipe inheritance, output overflow, environment isolation, sealed
-bootstrap memory, substituted mount refusal, descriptor closure and
-evidence-file refusal. They also check the filter's syscall numbers against
-kernel headers and interpret the filter program for both architectures.
+bootstrap memory, substituted mount refusal, descriptor closure, cgroup preflight
+refusal, inner `/proc/self/cgroup` scope verification, and evidence-file refusal.
+They also check the filter's syscall numbers against kernel headers and interpret
+the filter program for both architectures.
 
-Two live tests run real bubblewrap. The first uses the exact launcher policy,
-filter included, with a probe in place of the reader. It observes:
+Three live tests run real bubblewrap (and unified cgroup v2 scopes when enabled).
+The first uses the exact launcher policy, filter included, with a probe in place
+of the reader. It observes:
 
 - filter mode 2, no-new-privileges and empty capability sets;
 - `EPERM` from `socket(AF_UNIX)` and a `personality` query, both of which
@@ -187,10 +205,18 @@ filter included, with a probe in place of the reader. It observes:
 - only a loopback interface;
 - a task limit that admits 4 threads but caps 20.
 
-The second runs the complete launcher end to end with a stand-in ELF reader.
+The second runs the complete launcher end to end with a stand-in ELF reader, and
+the third verifies live kernel `memory.max`, `memory.swap.max=0`, `pids.max`, and
+`cpu.max` cgroup v2 scope limits plus a live 64 MiB OOM kill of a 160 MiB hog.
 
-On 2026-10-16 (kernel 7.0, bubblewrap 0.11.1, Python 3.14, an account running
-over 1,000 tasks), all 35 passed. Planted negatives confirmed that the live and
+On 2026-11-12 (kernel 7.0, bubblewrap 0.11.1, AppArmor `bwrap-userns-restrict`,
+Python 3.14, unified cgroup v2), all 40 passed. Real FrankenFS readers
+(`ffs-cli`, `ffs-fat`, `ffs-ntfs`, and `ffs-zfs`) are qualified end to end across
+ext4, btrfs, FAT16/FAT32, NTFS (synthesized + independent `mkntfs`), ZFS
+(synthesized + independent `zpool create -d`), 4-slice GPT images, and corrupted
+hostile images in `scripts/e2e/ffs_inspect_sandbox_native_e2e.sh` (wired into
+`.github/workflows/ci.yml` and `crates/ffs-cli/tests/cli_e2e.rs`). Planted
+negatives confirmed that the live and
 filter tests detect each of these: a dropped filter, a per-UID task limit, a
 verifier that no longer requires the filter, and an un-denied `socket`. Before
 the task-limit fix, the unmodified launcher could not start a sandbox on that

@@ -43,7 +43,8 @@ def verify_binding(binding: dict, *, require_read_only: bool = True) -> None:
         os.close(opened)
 
 
-def verify_containment(outer_namespaces: dict[str, int]) -> None:
+def verify_containment(outer_namespaces: dict[str, int],
+                       cgroup_scope_unit: str | None = None) -> None:
     for name in ("mnt", "user", "pid", "net", "ipc", "uts"):
         if os.stat(f"/proc/self/ns/{name}").st_ino == outer_namespaces[name]:
             raise ValueError(f"sandbox did not isolate the {name} namespace")
@@ -56,6 +57,14 @@ def verify_containment(outer_namespaces: dict[str, int]) -> None:
     # Mode 2 is SECCOMP_MODE_FILTER: the launcher's syscall filter is attached.
     if status.get("Seccomp", "").strip() != "2":
         raise ValueError("sandbox syscall filter is not active")
+    if cgroup_scope_unit is not None:
+        if (type(cgroup_scope_unit) is not str or not cgroup_scope_unit.endswith(".scope")
+                or "/" in cgroup_scope_unit):
+            raise ValueError("invalid sandbox cgroup scope unit")
+        with open("/proc/self/cgroup", encoding="ascii") as source:
+            unified = [line.rstrip()[3:] for line in source if line.startswith("0::")]
+        if len(unified) != 1 or not unified[0].endswith(f"/{cgroup_scope_unit}"):
+            raise ValueError("sandbox is not confined to the requested cgroup v2 scope")
 
 
 def restrict_processes(limit: int) -> None:
@@ -97,7 +106,7 @@ def main() -> int:
         if len(raw) > 65536:
             raise ValueError("sandbox bootstrap configuration exceeds its limit")
         config = json.loads(raw)
-        verify_containment(config["outer_namespaces"])
+        verify_containment(config["outer_namespaces"], config.get("cgroup_scope_unit"))
         for binding in config["bindings"]:
             verify_binding(binding)
         restrict_processes(config["process_limit"])
@@ -105,8 +114,21 @@ def main() -> int:
         if os.pread(executable, 4, 0) != b"\x7fELF":
             raise ValueError("reader must be a native ELF executable")
         close_inherited(executable)
-        os.execve(executable, ["/app/reader", *config["arguments"]],
-                  {"PATH": "/app", "LANG": "C", "LC_ALL": "C", "HOME": "/tmp", "TMPDIR": "/tmp"})
+        os.execve(
+            executable,
+            ["/app/reader", *config["arguments"]],
+            {
+                "PATH": "/app",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "HOME": "/tmp",
+                "TMPDIR": "/tmp",
+                "RAYON_NUM_THREADS": "2",
+                "FFS_READ_PARALLELISM": "2",
+                "FFS_STREAM_CHUNK_MB": "8",
+                "_RJEM_MALLOC_CONF": "narenas:2,tcache:false",
+            },
+        )
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({"bootstrap_refused": str(error)}, ensure_ascii=True), file=sys.stderr)
         return 125

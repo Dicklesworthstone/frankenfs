@@ -170,9 +170,10 @@ fuzz_target!(|data: &[u8]| {
         &parse_opts,
         VolumeAccess::ReadOnly,
     ) {
-        if part_dev.entry().index == 1 && must_reject_partition_1 {
-            panic!("nested GPT partition bomb inside Partition #1 must never be selected");
-        }
+        assert!(
+            !(part_dev.entry().index == 1 && must_reject_partition_1),
+            "nested GPT partition bomb inside Partition #1 must never be selected"
+        );
         // Out-of-bounds read at partition_len must always be rejected!
         let mut oob = [0_u8; 1];
         assert!(

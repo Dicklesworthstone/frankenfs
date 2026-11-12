@@ -257,6 +257,18 @@ impl PerGroupAlloc {
         single: &[GroupStats],
         actual: Vec<GroupStats>,
     ) -> Result<ReconciledPublication, ffs_error::FfsError> {
+        self.prepare_birth_publication_with_retirements(single, actual, None)
+    }
+
+    /// Like [`Self::prepare_birth_publication`], additionally routing explicit
+    /// inode/directory retirement credits (`(retired_inodes, retired_dirs)` per
+    /// group) into the sharded counter ledger when sharded allocation is active.
+    pub(crate) fn prepare_birth_publication_with_retirements(
+        &self,
+        single: &[GroupStats],
+        actual: Vec<GroupStats>,
+        retired_inodes_and_dirs: Option<&dyn Fn(usize) -> (u32, u32)>,
+    ) -> Result<ReconciledPublication, ffs_error::FfsError> {
         let mut sharded = self.snapshot_group_stats();
         if single.len() != actual.len()
             || sharded.len() != actual.len()
@@ -266,24 +278,28 @@ impl PerGroupAlloc {
         }
         let mut next_single = actual;
         let mut sharded_moved = false;
-        for (((next, shard), live), seed) in next_single
+        for (gidx, (((next, shard), live), seed)) in next_single
             .iter_mut()
             .zip(&mut sharded)
             .zip(single)
             .zip(&self.seed)
+            .enumerate()
         {
             exact_count(live.free_blocks, shard.free_blocks, seed.free_blocks)?;
             exact_count(live.free_inodes, shard.free_inodes, seed.free_inodes)?;
             exact_count(live.used_dirs, shard.used_dirs, seed.used_dirs)?;
+            let (retired_inodes, retired_dirs) =
+                retired_inodes_and_dirs.map_or((0, 0), |lookup| lookup(gidx));
+            let old_sharded_inodes = shard.free_inodes.saturating_add(retired_inodes);
+            let old_sharded_dirs = shard.used_dirs.saturating_sub(retired_dirs);
             let blocks = split_count(next.free_blocks, shard.free_blocks, seed.free_blocks);
-            let inodes = split_count(next.free_inodes, shard.free_inodes, seed.free_inodes);
-            let dirs = split_count(next.used_dirs, shard.used_dirs, seed.used_dirs);
-            sharded_moved |= blocks.1 != shard.free_blocks
+            let inodes = split_count(next.free_inodes, old_sharded_inodes, seed.free_inodes);
+            let dirs = split_count(next.used_dirs, old_sharded_dirs, seed.used_dirs);
+            sharded_moved |= retired_inodes > 0
+                || retired_dirs > 0
+                || blocks.1 != shard.free_blocks
                 || inodes.1 != shard.free_inodes
-                || dirs.1 != shard.used_dirs
-                || next.flags != shard.flags
-                || next.block_bitmap_csum != shard.block_bitmap_csum
-                || next.inode_bitmap_csum != shard.inode_bitmap_csum;
+                || dirs.1 != shard.used_dirs;
             *shard = next.clone();
             (next.free_blocks, shard.free_blocks) = blocks;
             (next.free_inodes, shard.free_inodes) = inodes;
@@ -299,6 +315,27 @@ impl PerGroupAlloc {
             sharded,
             sharded_moved,
         })
+    }
+
+    /// Reconcile bitmap checksums and UNINIT flags back into `single` when a test
+    /// disables the sharded toggle before any sharded count movement occurred.
+    pub(crate) fn sync_checksums_into_single(&self, single: &mut [GroupStats]) {
+        for (gidx, live) in single.iter_mut().enumerate() {
+            let (Some(seed), Some(group)) = (self.seed.get(gidx), self.groups.get(gidx)) else {
+                continue;
+            };
+            let shard = group.stats.lock();
+            if !shard.block_bitmap_uninit() {
+                live.mark_block_bitmap_initialized();
+            }
+            if !shard.inode_bitmap_uninit() {
+                live.mark_inode_bitmap_initialized();
+            }
+            live.block_bitmap_csum =
+                shard.block_bitmap_csum ^ live.block_bitmap_csum ^ seed.block_bitmap_csum;
+            live.inode_bitmap_csum =
+                shard.inode_bitmap_csum ^ live.inode_bitmap_csum ^ seed.inode_bitmap_csum;
+        }
     }
 
     /// Publish only after the transaction commits, while exclusive allocation
@@ -1534,8 +1571,9 @@ mod tests {
         let sharded = PerGroupAlloc::from_group_stats(single.clone());
 
         let mut actual = sharded.birth_group_stats(&single).expect("initial birth");
-        // Simulate net-zero free-inode movement (free one inode + allocate a
-        // different inode in the same composite scope): only flags + csum move.
+        // Case A: pure single-lock flag + csum movement (e.g. non-sharded mknod)
+        // must NOT claim sharded count movement, yet still preserve flags + csum
+        // without double-XORing on subsequent reconciles.
         actual[0].mark_inode_bitmap_initialized();
         actual[0].inode_bitmap_csum = 0x5566_7788;
         actual[0].block_bitmap_csum = 0x99AA_BBCC;
@@ -1543,7 +1581,7 @@ mod tests {
         let plan = sharded
             .prepare_birth_publication(&single, actual)
             .expect("prepare publication");
-        assert!(plan.moves_sharded_counts());
+        assert!(!plan.moves_sharded_counts());
         let published = sharded.publish_birth(plan);
 
         let live = SeedCounts::snapshot(&published);
@@ -1552,10 +1590,26 @@ mod tests {
         assert_eq!(reconciled[0].inode_bitmap_csum, 0x5566_7788);
         assert_eq!(reconciled[0].block_bitmap_csum, 0x99AA_BBCC);
 
-        let second_birth = sharded
+        let mut second_birth = sharded
             .birth_group_stats(&published)
             .expect("second birth must not double-XOR csum");
         assert_eq!(second_birth[0].inode_bitmap_csum, 0x5566_7788);
         assert_eq!(second_birth[0].block_bitmap_csum, 0x99AA_BBCC);
+
+        // Case B: composite scope retiring 1 inode + allocating 1 replacement
+        // inode (net-zero free_inodes delta) DOES move sharded counts and
+        // preserves updated checksums without double-XOR.
+        second_birth[0].inode_bitmap_csum = 0xDEAD_BEEF;
+        let plan2 = sharded
+            .prepare_birth_publication_with_retirements(&published, second_birth, Some(&|_| (1, 0)))
+            .expect("prepare composite retire+birth publication");
+        assert!(plan2.moves_sharded_counts());
+        let published2 = sharded.publish_birth(plan2);
+        let third_birth = sharded
+            .birth_group_stats(&published2)
+            .expect("third birth must not double-XOR csum");
+        assert_eq!(third_birth[0].free_inodes, 40);
+        assert_eq!(third_birth[0].inode_bitmap_csum, 0xDEAD_BEEF);
+        assert_eq!(third_birth[0].block_bitmap_csum, 0x99AA_BBCC);
     }
 }

@@ -27,10 +27,15 @@ import time
 from typing import BinaryIO
 
 TOOLS = {
-    "ffs-cli": frozenset({"inspect", "info", "dump", "read", "walk"}),
+    "ffs-cli": frozenset({"inspect", "info", "dump", "read", "walk", "ls", "scrub",
+                          "partitions", "streams", "pool", "dataset"}),
     "ffs-fat": frozenset({"inspect", "check", "ls", "cat", "catalog", "extract"}),
-    "ffs-ntfs": frozenset({"inspect", "ls", "read", "readlink", "streams", "security", "ea", "record", "cat"}),
-    "ffs-zfs": frozenset({"inspect", "root", "object", "object-read", "zap", "datasets", "ls", "stat", "cat", "readlink", "xattr", "snapshots", "zvol-info", "zvol-read", "zvol-seek"}),
+    "ffs-ntfs": frozenset({"inspect", "ls", "read", "readlink", "streams", "security",
+                           "ea", "record", "cat", "check-security", "check-allocation"}),
+    "ffs-zfs": frozenset({"inspect", "root", "object", "object-read", "zap", "datasets",
+                          "ls", "stat", "read", "readlink", "listxattr", "getxattr",
+                          "snapshots", "scrub", "allocation", "properties",
+                          "zvol-info", "zvol-read", "zvol-seek", "zil-inspect", "zil-read"}),
 }
 FORBIDDEN = frozenset({"--rw", "--allow-repair", "--reclaim-lost", "--salvage-to"})
 MIB = 1024 * 1024
@@ -97,6 +102,67 @@ class Limits:
             raise Refusal("all resource limits must be positive")
         if self.descriptors < 32 or self.processes < 4 or self.address_bytes < 64 * MIB:
             raise Refusal("limits are too small to start the isolated reader")
+
+
+@dataclasses.dataclass(frozen=True)
+class CgroupLimits:
+    memory_bytes: int | None = None
+    pids_max: int | None = None
+    cpu_quota_pct: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return (self.memory_bytes is not None or self.pids_max is not None
+                or self.cpu_quota_pct is not None)
+
+    def validate(self) -> None:
+        if self.memory_bytes is not None:
+            if type(self.memory_bytes) is not int or self.memory_bytes < 64 * MIB:
+                raise Refusal("cgroup memory limit must be an integer >= 64 MiB")
+        if self.pids_max is not None:
+            if type(self.pids_max) is not int or self.pids_max < 4:
+                raise Refusal("cgroup pids limit must be an integer >= 4")
+        if self.cpu_quota_pct is not None:
+            if type(self.cpu_quota_pct) is not int or not 1 <= self.cpu_quota_pct <= 10_000:
+                raise Refusal("cgroup CPU quota percent must be an integer in 1..=10000")
+
+    def required_controllers(self) -> set[str]:
+        needed: set[str] = set()
+        if self.memory_bytes is not None:
+            needed.add("memory")
+        if self.pids_max is not None:
+            needed.add("pids")
+        if self.cpu_quota_pct is not None:
+            needed.add("cpu")
+        return needed
+
+    def systemd_properties(self) -> list[str]:
+        props: list[str] = []
+        if self.memory_bytes is not None:
+            props += ["-p", f"MemoryMax={self.memory_bytes}", "-p", "MemorySwapMax=0"]
+        if self.pids_max is not None:
+            props += ["-p", f"TasksMax={self.pids_max}"]
+        if self.cpu_quota_pct is not None:
+            props += ["-p", f"CPUQuota={self.cpu_quota_pct}%"]
+        return props
+
+    def manifest_record(self, *, scope_unit: str | None = None,
+                        systemd_run: Path | None = None,
+                        systemd_run_sha256: str | None = None,
+                        systemd_run_identity: dict[str, int] | None = None) -> dict:
+        record = {
+            "enabled": self.enabled,
+            "memory_bytes": self.memory_bytes,
+            "swap_max": 0 if self.memory_bytes is not None else None,
+            "pids_max": self.pids_max,
+            "cpu_quota_pct": self.cpu_quota_pct,
+            "scope_unit": scope_unit,
+        }
+        if systemd_run is not None:
+            record["systemd_run"] = str(systemd_run)
+            record["systemd_run_sha256"] = systemd_run_sha256
+            record["systemd_run_identity"] = systemd_run_identity
+        return record
 
 
 def stamp(fd: int) -> dict[str, int]:
@@ -256,6 +322,47 @@ def sandbox_argv(bwrap: Path, binary_fd: int, inputs: list[tuple[str, int]],
     return argv
 
 
+def cgroup_argv(scope_unit: str, cgroup: CgroupLimits, bwrap_argv: list[str]) -> list[str]:
+    if not cgroup.enabled:
+        raise Refusal("cgroup wrapper requested without any cgroup limit")
+    if not scope_unit.endswith(".scope") or "/" in scope_unit:
+        raise Refusal("invalid cgroup scope unit name")
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+            f"--unit={scope_unit}", *cgroup.systemd_properties(), "--", *bwrap_argv]
+
+
+def _user_runtime_dir(uid: int) -> Path:
+    return Path(f"/run/user/{uid}")
+
+
+def _preflight_cgroup(cgroup: CgroupLimits, systemd_run: Path,
+                      cgroup_root: Path, uid: int) -> Path:
+    controllers_path = cgroup_root / "cgroup.controllers"
+    if not controllers_path.is_file():
+        raise Refusal("cgroup v2 unified hierarchy is unavailable; refusing uncapped execution")
+    try:
+        controllers = set(controllers_path.read_text(encoding="ascii").split())
+    except OSError as error:
+        raise Refusal("cannot read cgroup v2 controllers; refusing uncapped execution") from error
+    missing = sorted(cgroup.required_controllers() - controllers)
+    if missing:
+        raise Refusal(
+            f"required cgroup v2 controllers unavailable ({', '.join(missing)}); "
+            "refusing uncapped execution"
+        )
+    runtime_dir = _user_runtime_dir(uid)
+    bus_path = runtime_dir / "bus"
+    try:
+        bus_stat = bus_path.lstat()
+    except OSError as error:
+        raise Refusal("systemd user manager bus is unavailable; refusing uncapped execution") from error
+    if not stat.S_ISSOCK(bus_stat.st_mode) or bus_stat.st_uid != uid:
+        raise Refusal("systemd user manager bus is not a user-owned socket; refusing uncapped execution")
+    if not systemd_run.is_file() or not os.access(systemd_run, os.X_OK):
+        raise Refusal("systemd-run is unavailable; refusing uncapped execution")
+    return runtime_dir
+
+
 def sealed_data(stack: contextlib.ExitStack, data: bytes) -> int:
     if len(data) > CHUNK:
         raise Refusal("trusted bootstrap data exceeds 64 KiB")
@@ -288,18 +395,24 @@ def _child_limits(limits: Limits) -> None:
 
 
 def _supervise(argv: list[str], pass_fds: tuple[int, ...], outputs: dict[str, BinaryIO],
-               limits: Limits, deadline: float, status_pipe: tuple[int, int] | None = None) -> dict:
+               limits: Limits, deadline: float, status_pipe: tuple[int, int] | None = None,
+               *, executable: str | None = None,
+               extra_env: dict[str, str] | None = None) -> dict:
     """Single-threaded CLI supervisor. Private test seam is not a public bypass mode."""
     counts = {"stdout": 0, "stderr": 0, "status": 0}
     hashes = {name: hashlib.sha256() for name in ("stdout", "stderr")}
     reason = None
     status = bytearray()
     process = None
+    child_env = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    if extra_env:
+        child_env.update(extra_env)
     with selectors.DefaultSelector() as selected:
         try:
-            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            process = subprocess.Popen(argv, executable=executable,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, pass_fds=pass_fds,
-                                       env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                                       env=child_env,
                                        start_new_session=True, preexec_fn=lambda: _child_limits(limits))
             if status_pipe is not None:
                 os.close(status_pipe[1])
@@ -382,8 +495,12 @@ def status_confirms_execution(text: str, exit_code: int) -> bool:
 
 
 def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[str],
-            output: Path, limits: Limits, bwrap: Path) -> int:
+            output: Path, limits: Limits, bwrap: Path,
+            cgroup: CgroupLimits = CgroupLimits(),
+            systemd_run: Path = Path("/usr/bin/systemd-run"),
+            cgroup_root: Path = Path("/sys/fs/cgroup")) -> int:
     limits.validate()
+    cgroup.validate()
     if (sys.platform != "linux" or os.geteuid() == 0 or os.getuid() != os.geteuid()
             or os.getgid() != os.getegid()):
         raise Refusal("run as an ordinary non-root Linux user; no privilege escalation is supported")
@@ -393,22 +510,30 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
     command = reader_arguments(tool, args, set(names))
     if not bwrap.is_file() or not os.access(bwrap, os.X_OK):
         raise Refusal("bubblewrap is unavailable; refusing unsandboxed execution")
+    runtime_dir = (_preflight_cgroup(cgroup, systemd_run, cgroup_root, os.getuid())
+                   if cgroup.enabled else None)
     machine = os.uname().machine
     filter_program = seccomp_filter(machine)
     # Resolve only trusted executables. Never resolve untrusted input symlinks.
     binary, bwrap = binary.resolve(strict=True), bwrap.resolve(strict=True)
+    if cgroup.enabled:
+        systemd_run = systemd_run.resolve(strict=True)
     deadline = time.monotonic() + limits.wall_seconds
     with contextlib.ExitStack() as stack:
         binary_fd = pin_file(stack, binary, executable=True)
         bwrap_fd = pin_file(stack, bwrap, executable=True)
         python_fd = pin_file(stack, Path("/usr/bin/python3").resolve(strict=True), executable=True)
-        for fd in (binary_fd, bwrap_fd, python_fd):
+        systemd_run_fd = pin_file(stack, systemd_run, executable=True) if cgroup.enabled else None
+        trusted_fds = [binary_fd, bwrap_fd, python_fd]
+        if systemd_run_fd is not None:
+            trusted_fds.append(systemd_run_fd)
+        for fd in trusted_fds:
             if os.pread(fd, 4, 0) != b"\x7fELF":
-                raise Refusal("reader, bubblewrap and system Python must be native ELF executables")
+                raise Refusal("reader, bubblewrap, systemd-run and system Python must be native ELF executables")
         pinned = [(name, pin_file(stack, path)) for name, path in inputs]
         identities = [stamp(fd) for _, fd in pinned]
         distinct = {(s["device"], s["inode"]) for s in identities}
-        executables = {(stamp(fd)["device"], stamp(fd)["inode"]) for fd in (binary_fd, bwrap_fd, python_fd)}
+        executables = {(stamp(fd)["device"], stamp(fd)["inode"]) for fd in trusted_fds}
         if len(distinct) != len(identities) or distinct & executables:
             raise Refusal("input aliases another input or a trusted executable")
         if sum(s["bytes"] for s in identities) > limits.input_bytes:
@@ -419,6 +544,9 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
         bwrap_hash = digest(bwrap_fd, bwrap_before["bytes"], deadline)
         python_before = stamp(python_fd)
         python_hash = digest(python_fd, python_before["bytes"], deadline)
+        systemd_run_before = stamp(systemd_run_fd) if systemd_run_fd is not None else None
+        systemd_run_hash = (digest(systemd_run_fd, systemd_run_before["bytes"], deadline)
+                            if systemd_run_fd is not None and systemd_run_before is not None else None)
         evidence = []
         for (name, fd), before in zip(pinned, identities):
             sha = digest(fd, before["bytes"], deadline)
@@ -436,7 +564,10 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
             raise Refusal("trusted bootstrap source changed during capture")
         inner_fd = sealed_data(stack, inner_code)
         seccomp_fd = sealed_data(stack, filter_program)
+        scope_unit = (f"ffs-inspect-{os.getpid()}-{time.monotonic_ns():x}.scope"
+                      if cgroup.enabled else None)
         config = {"binary_fd": binary_fd, "arguments": command, "process_limit": limits.processes,
+                  "cgroup_scope_unit": scope_unit,
                   "outer_namespaces": {name: os.stat(f"/proc/self/ns/{name}").st_ino
                                        for name in ("mnt", "user", "pid", "net", "ipc", "uts")},
                   "bindings": [{"fd": binary_fd, "path": "/app/reader", "identity": binary_before},
@@ -447,20 +578,36 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
         # Existing directories are never reused or overwritten.
         output = output.absolute()
         output.mkdir(mode=0o700)
+        scope_text = (
+            "read-only contents; advisory locks do not exclude external writers; "
+            "aggregate cgroup v2 scope quotas enforced alongside per-process rlimits "
+            "and per-userns task cap"
+            if cgroup.enabled else
+            "read-only contents; advisory locks do not exclude external writers; "
+            "rlimits are per process except the task limit, which applies per "
+            "sandbox user namespace"
+        )
+        cgroup_request = cgroup.manifest_record(
+            scope_unit=scope_unit,
+            systemd_run=systemd_run if cgroup.enabled else None,
+            systemd_run_sha256=systemd_run_hash,
+            systemd_run_identity=systemd_run_before,
+        )
         request = {"schema_version": 2, "policy": POLICY, "tool": tool,
                    "reader_sha256": binary_hash, "reader_identity": binary_before,
                    "bwrap": str(bwrap), "bwrap_sha256": bwrap_hash,
                    "bwrap_identity": bwrap_before, "arguments": command,
                    "bootstrap_sha256": hashlib.sha256(inner_code).hexdigest(),
                    "python_identity": python_before, "python_sha256": python_hash,
-                   "limits": dataclasses.asdict(limits), "inputs": evidence,
+                   "limits": dataclasses.asdict(limits), "cgroup": cgroup_request,
+                   "inputs": evidence,
                    "seccomp": seccomp_policy(machine, filter_program),
                    "status": "requested_not_completed", "authentication": "none",
-                   "scope": ("read-only contents; advisory locks do not exclude external writers; "
-                             "rlimits are per process except the task limit, which applies per "
-                             "sandbox user namespace")}
+                   "scope": scope_text}
         write_json(output / "request.json", request)
-        result = {"schema_version": 2, "success": False, "inputs": evidence}
+        result = {"schema_version": 2, "success": False,
+                  "cgroup": cgroup.manifest_record(scope_unit=scope_unit),
+                  "inputs": evidence}
         try:
             with private_output(output / "stdout.bin") as stdout, private_output(output / "stderr.bin") as stderr:
                 status_pipe = os.pipe2(os.O_CLOEXEC)
@@ -468,13 +615,22 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
                     argv = sandbox_argv(Path(f"/proc/self/fd/{bwrap_fd}"), binary_fd, pinned,
                                         command, limits, status_pipe[1], python_fd, inner_fd, config_fd,
                                         seccomp_fd)
+                    if cgroup.enabled and scope_unit is not None:
+                        argv = cgroup_argv(scope_unit, cgroup, argv)
                 except BaseException:
                     for fd in status_pipe:
                         os.close(fd)
                     raise
-                observed = _supervise(argv, (bwrap_fd, binary_fd, python_fd, inner_fd, config_fd,
-                                            seccomp_fd, *(fd for _, fd in pinned), status_pipe[1]),
-                                       {"stdout": stdout, "stderr": stderr}, limits, deadline, status_pipe)
+                inherited_fds = [bwrap_fd, binary_fd, python_fd, inner_fd, config_fd,
+                                 seccomp_fd, *(fd for _, fd in pinned), status_pipe[1]]
+                if systemd_run_fd is not None:
+                    inherited_fds.insert(0, systemd_run_fd)
+                observed = _supervise(
+                    argv, tuple(inherited_fds),
+                    {"stdout": stdout, "stderr": stderr}, limits, deadline, status_pipe,
+                    executable=f"/proc/self/fd/{systemd_run_fd}" if systemd_run_fd is not None else None,
+                    extra_env={"XDG_RUNTIME_DIR": str(runtime_dir)} if runtime_dir is not None else None,
+                )
                 for stream in (stdout, stderr):
                     stream.flush()
                     os.fsync(stream.fileno())
@@ -482,6 +638,9 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
             unchanged = stamp(binary_fd) == binary_before and digest(binary_fd, binary_before["bytes"], deadline) == binary_hash
             unchanged = unchanged and stamp(bwrap_fd) == bwrap_before and digest(bwrap_fd, bwrap_before["bytes"], deadline) == bwrap_hash
             unchanged = unchanged and stamp(python_fd) == python_before and digest(python_fd, python_before["bytes"], deadline) == python_hash
+            if systemd_run_fd is not None and systemd_run_before is not None and systemd_run_hash is not None:
+                unchanged = (unchanged and stamp(systemd_run_fd) == systemd_run_before
+                             and digest(systemd_run_fd, systemd_run_before["bytes"], deadline) == systemd_run_hash)
             for item, (_, fd) in zip(evidence, pinned):
                 item["sha256_after"] = digest(fd, item["identity"]["bytes"], deadline)
                 item["unchanged"] = (stamp(fd) == item["identity"] and item["sha256_after"] == item["sha256_before"])
@@ -509,18 +668,32 @@ def main() -> int:
     parser.add_argument("--input", action="append", type=input_spec, required=True, help="NAME=PATH; use @NAME in reader arguments")
     parser.add_argument("--output", type=Path, required=True, help="new private evidence directory; must not exist")
     parser.add_argument("--bwrap", type=Path, default=Path("/usr/bin/bwrap"), help="trusted bubblewrap executable")
+    parser.add_argument("--systemd-run", type=Path, default=Path("/usr/bin/systemd-run"),
+                        help="trusted systemd-run executable used when any --cgroup-* limit is set")
     parser.add_argument("--wall-seconds", type=int, default=120)
     parser.add_argument("--cpu-seconds", type=int, default=60)
     parser.add_argument("--memory-mib", type=int, default=2048, help="per-process virtual address limit, not an aggregate cgroup quota")
     parser.add_argument("--output-mib", type=int, default=64, help="combined stdout/stderr cap")
     parser.add_argument("--input-mib", type=int, default=16384, help="combined input size cap; every input is hashed twice")
+    parser.add_argument("--cgroup-memory-mib", type=int, default=None,
+                        help="aggregate cgroup v2 MemoryMax in MiB (with MemorySwapMax=0); refuses uncapped fallback")
+    parser.add_argument("--cgroup-pids-max", type=int, default=None,
+                        help="aggregate cgroup v2 TasksMax across the sandbox; refuses uncapped fallback")
+    parser.add_argument("--cgroup-cpu-quota-pct", type=int, default=None,
+                        help="aggregate cgroup v2 CPUQuota percentage (100 = 1 core); refuses uncapped fallback")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- READ_COMMAND @INPUT [reader options]")
     args = parser.parse_args()
     limits = Limits(wall_seconds=args.wall_seconds, cpu_seconds=args.cpu_seconds,
                     address_bytes=args.memory_mib * MIB, output_bytes=args.output_mib * MIB,
                     input_bytes=args.input_mib * MIB)
+    cgroup = CgroupLimits(
+        memory_bytes=args.cgroup_memory_mib * MIB if args.cgroup_memory_mib is not None else None,
+        pids_max=args.cgroup_pids_max,
+        cpu_quota_pct=args.cgroup_cpu_quota_pct,
+    )
     try:
-        return execute(args.binary, args.tool, args.input, args.command, args.output, limits, args.bwrap)
+        return execute(args.binary, args.tool, args.input, args.command, args.output,
+                       limits, args.bwrap, cgroup=cgroup, systemd_run=args.systemd_run)
     except (OSError, Refusal, KeyboardInterrupt) as error:
         # JSON escaping keeps hostile filenames from injecting terminal controls.
         print(json.dumps({"success": False, "error": str(error)}, ensure_ascii=True), file=sys.stderr)
