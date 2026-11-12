@@ -330,6 +330,28 @@ fn workflows_have_tracked_nonempty_baselines_and_zero_vacuous_patterns() {
             String::from_utf8_lossy(&lock_out.stderr)
         );
     }
+
+    // bd-uu90b: ffs_xfstests_e2e.sh must reset SIGPIPE to SIG_DFL before exec'ing ./check so
+    // runner/sudo-rs SIG_IGN inheritance never strands generic/310 (`_pkill -PIPE` + `wait`),
+    // and generic/310 must remain selected + regression-gated on both ext4 and btrfs.
+    let xfstests_e2e = fs::read_to_string(root.join("scripts/e2e/ffs_xfstests_e2e.sh"))
+        .expect("read ffs_xfstests_e2e.sh");
+    assert!(
+        xfstests_e2e.contains("signal.signal(signal.SIGPIPE, signal.SIG_DFL)"),
+        "ffs_xfstests_e2e.sh must restore SIGPIPE=SIG_DFL before exec'ing ./check (bd-uu90b)"
+    );
+    for xfstests_rel in [
+        "scripts/e2e/xfstests_generic.list",
+        "scripts/e2e/xfstests_allowlist.json",
+        "scripts/e2e/xfstests_baseline.json",
+        "scripts/e2e/xfstests_baseline_btrfs.json",
+    ] {
+        let text = fs::read_to_string(root.join(xfstests_rel)).expect("read xfstests config");
+        assert!(
+            text.contains("generic/310"),
+            "`{xfstests_rel}` must include `generic/310` (bd-uu90b)"
+        );
+    }
 }
 
 #[test]

@@ -5101,6 +5101,12 @@
           "category": "happy",
           "status": "active",
           "evidence": "junit.xml"
+        },
+        {
+          "id": "xfstests_sigpipe_dfl_exec_guard",
+          "category": "edge",
+          "status": "active",
+          "evidence": "signal.signal(signal.SIGPIPE, signal.SIG_DFL)"
         }
       ]
     },

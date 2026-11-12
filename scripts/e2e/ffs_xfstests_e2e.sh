@@ -2297,8 +2297,33 @@ run_xfstests_subset() {
     e2e_log "Running xfstests command from $XFSTESTS_DIR:"
     e2e_log "  ./check ${check_args[*]}"
 
+    local pre_sig_ign="unavailable"
+    if [[ -r /proc/self/status ]]; then
+        pre_sig_ign="$(awk '/^SigIgn:/ { print $2 }' /proc/self/status)"
+    fi
+    e2e_log "Pre-exec SigIgn mask: $pre_sig_ign (bit 12 / 0x1000 = SIGPIPE)"
+
+    # bd-uu90b: GitHub Actions runners (`actions/runner` / `systemd`
+    # `IgnoreSIGPIPE=yes`) and `sudo-rs` (Rust `libstd` pre-`main` runtime init)
+    # set `SIGPIPE = SIG_IGN`, which survives `execve(2)` and cannot be cleared
+    # by `trap - PIPE` in a non-interactive shell. Upstream `generic/310` stops
+    # `src/t_readdir_1` and `src/t_readdir_2` exclusively via `_pkill -PIPE` +
+    # `wait`, so an inherited `SIG_IGN` leaves both spinning in `while (1)`
+    # until the 60-minute job timeout cancels CI. Explicitly restore `SIG_DFL`
+    # via native `signal(2)` before exec'ing `./check`.
     local rc=0
-    (cd "$XFSTESTS_DIR" && ./check "${check_args[@]}") >"$ARTIFACT_DIR/stdout.log" 2>"$ARTIFACT_DIR/stderr.log" || rc=$?
+    if command -v python3 >/dev/null 2>&1; then
+        local post_sig_ign="unavailable"
+        post_sig_ign="$(python3 -c 'import signal; signal.signal(signal.SIGPIPE, signal.SIG_DFL); print(next((line.split()[1] for line in open("/proc/self/status") if line.startswith("SigIgn:")), "unavailable"))' 2>/dev/null || echo "unavailable")"
+        e2e_log "Post-reset SigIgn mask: $post_sig_ign"
+        (
+            cd "$XFSTESTS_DIR" && python3 -c \
+                'import os, signal, sys; signal.signal(signal.SIGPIPE, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' \
+                ./check "${check_args[@]}"
+        ) >"$ARTIFACT_DIR/stdout.log" 2>"$ARTIFACT_DIR/stderr.log" || rc=$?
+    else
+        (cd "$XFSTESTS_DIR" && ./check "${check_args[@]}") >"$ARTIFACT_DIR/stdout.log" 2>"$ARTIFACT_DIR/stderr.log" || rc=$?
+    fi
     {
         cat "$ARTIFACT_DIR/stdout.log"
         cat "$ARTIFACT_DIR/stderr.log"

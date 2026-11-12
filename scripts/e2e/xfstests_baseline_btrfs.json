@@ -116,5 +116,6 @@
   { "test_id": "generic/426", "expected_status": "passed" },
   { "test_id": "generic/467", "expected_status": "passed" },
   { "test_id": "generic/477", "expected_status": "passed" },
-  { "test_id": "generic/756", "expected_status": "passed" }
+  { "test_id": "generic/756", "expected_status": "passed" },
+  { "test_id": "generic/310", "expected_status": "passed" }
 ]

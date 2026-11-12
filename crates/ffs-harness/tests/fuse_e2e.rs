@@ -23726,3 +23726,265 @@ finally:
         Some("xflags_plus_projid_single_tx"),
     );
 }
+
+#[test]
+fn concurrent_shared_dirfd_read_lseek_readdir_and_sigpipe_bd_uu90b() {
+    if !fuse_available() || !command_available("python3") {
+        eprintln!("FUSE or python3 not available, skipping");
+        return;
+    }
+
+    // 1. Discriminating SIGPIPE inheritance proof (Rust test runner itself enters with SIGPIPE=SIG_IGN,
+    // reproducing sudo-rs / actions-runner inheritance into non-interactive bash).
+    let sigpipe_probe = r#"
+import os, signal, subprocess, time
+
+def sig_ign_mask(pid="self"):
+    for line in open(f"/proc/{pid}/status", encoding="utf-8"):
+        if line.startswith("SigIgn:"):
+            return int(line.split()[1], 16)
+    raise RuntimeError("SigIgn missing")
+
+# Negative control: non-interactive bash inherits SIG_IGN and even `trap - PIPE` cannot clear it.
+neg = subprocess.Popen(
+    ["bash", "-c", "trap - PIPE; while :; do sleep 0.05; done"],
+     start_new_session=True,
+)
+try:
+    time.sleep(0.1)
+    assert (sig_ign_mask(neg.pid) & 0x1000) != 0, "expected inherited SIGPIPE=SIG_IGN bit 0x1000"
+    os.killpg(neg.pid, signal.SIGPIPE)
+    time.sleep(0.15)
+    assert neg.poll() is None, "negative control: process with inherited SIG_IGN must ignore SIGPIPE"
+finally:
+    os.killpg(neg.pid, signal.SIGKILL)
+    neg.wait(timeout=5)
+
+# Positive proof: native signal(SIGPIPE, SIG_DFL) + execvp clears bit 0x1000 so _pkill -PIPE terminates cleanly.
+pos = subprocess.Popen(
+    [
+        "python3",
+        "-c",
+        "import os, signal, sys; signal.signal(signal.SIGPIPE, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])",
+        "bash",
+        "-c",
+        "while :; do sleep 0.05; done",
+    ],
+    start_new_session=True,
+)
+try:
+    deadline = time.monotonic() + 3.0
+    while (sig_ign_mask(pos.pid) & 0x1000) != 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert (sig_ign_mask(pos.pid) & 0x1000) == 0, "SIG_DFL wrapper must clear SigIgn bit 0x1000"
+    os.killpg(pos.pid, signal.SIGPIPE)
+    rc = pos.wait(timeout=5)
+    assert rc == -signal.SIGPIPE, f"expected -SIGPIPE (-13), got {rc}"
+finally:
+    if pos.poll() is None:
+        os.killpg(pos.pid, signal.SIGKILL)
+        pos.wait(timeout=5)
+print("SIGPIPE_CONTRACT_PASS")
+"#;
+    let probe_out = python_command(sigpipe_probe)
+        .output()
+        .expect("run sigpipe probe");
+    assert!(
+        probe_out.status.success()
+            && String::from_utf8_lossy(&probe_out.stdout).contains("SIGPIPE_CONTRACT_PASS"),
+        "SIGPIPE inheritance/reset contract probe failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&probe_out.stdout),
+        String::from_utf8_lossy(&probe_out.stderr)
+    );
+
+    let run_generic_310_on_mount = |mnt: &Path, label: &str| {
+        let dir_310 = mnt.join("dir_310");
+        let dir_sib = mnt.join("dir_sibling");
+        fs::create_dir_all(&dir_310).expect("mkdir dir_310");
+        fs::create_dir_all(&dir_sib).expect("mkdir dir_sibling");
+        for i in 0..4096_u32 {
+            fs::File::create(dir_310.join(i.to_string())).expect("create 310 entry");
+        }
+        for i in 0..600_u32 {
+            fs::File::create(dir_sib.join(format!("s_{i}"))).expect("create sibling entry");
+        }
+
+        // Exact generic/310 workload (src/t_readdir_1.c + src/t_readdir_2.c) sharing ONE open dir fd
+        // across fork(), terminated by SIGPIPE after racing read()/lseek()/readdir() + sibling listing.
+        let workload = format!(
+            r#"
+import ctypes, errno, os, signal, subprocess, sys, threading, time
+
+dir_310 = {dir_310:?}
+dir_sib = {dir_sib:?}
+
+worker_code = r'''
+import ctypes, ctypes.util, errno, os, signal, sys, threading
+
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+
+class Dirent64(ctypes.Structure):
+    _fields_ = [
+        ("d_ino", ctypes.c_uint64),
+        ("d_off", ctypes.c_int64),
+        ("d_reclen", ctypes.c_uint16),
+        ("d_type", ctypes.c_uint8),
+        ("d_name", ctypes.c_char * 256),
+    ]
+
+libc.opendir.argtypes = [ctypes.c_char_p]
+libc.opendir.restype = ctypes.c_void_p
+libc.dirfd.argtypes = [ctypes.c_void_p]
+libc.dirfd.restype = ctypes.c_int
+libc.readdir64.argtypes = [ctypes.c_void_p]
+libc.readdir64.restype = ctypes.POINTER(Dirent64)
+libc.closedir.argtypes = [ctypes.c_void_p]
+libc.closedir.restype = ctypes.c_int
+
+target = sys.argv[1].encode("utf-8")
+sib = sys.argv[2]
+mode = sys.argv[3]
+dirp = libc.opendir(target)
+assert dirp, "opendir failed"
+fd = libc.dirfd(dirp)
+assert fd >= 0, "dirfd failed"
+
+pid = os.fork()
+if pid == 0:
+    offsets = [0, 1, 2, 3, 1023, 1024, 1025, 4095, 4096, 4097, 0x7fffffff]
+    idx = 0
+    while True:
+        if mode == "read_lseek":
+            try:
+                os.read(fd, 100)
+            except OSError as exc:
+                if exc.errno != errno.EISDIR:
+                    os._exit(2)
+            else:
+                os._exit(3)
+            os.lseek(fd, 0, os.SEEK_CUR)
+        else:
+            os.lseek(fd, offsets[idx % len(offsets)], os.SEEK_SET)
+            os.lseek(fd, 1, os.SEEK_CUR)
+            idx += 1
+else:
+    def sib_loop():
+        while True:
+            entries = os.listdir(sib)
+            if len(entries) != 600:
+                os._exit(4)
+    t = threading.Thread(target=sib_loop, daemon=True)
+    t.start()
+    while True:
+        os.lseek(fd, 0, os.SEEK_SET)
+        ent = libc.readdir64(dirp)
+        if ent:
+            name = ent.contents.d_name.decode("utf-8", "surrogateescape")
+            if name not in (".", "..") and not (name.isdigit() and 0 <= int(name) < 4096):
+                os._exit(5)
+'''
+
+for mode in ("read_lseek", "lseek_storm"):
+    proc = subprocess.Popen(
+        ["python3", "-c", worker_code, dir_310, dir_sib, mode],
+        start_new_session=True,
+    )
+    try:
+        time.sleep(1.2)
+        assert proc.poll() is None, f"worker {{mode}} exited prematurely with {{proc.returncode}}"
+        os.killpg(proc.pid, signal.SIGPIPE)
+        rc = proc.wait(timeout=10)
+        assert rc == -signal.SIGPIPE, f"worker {{mode}} expected -SIGPIPE, got {{rc}}"
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+
+listed = sorted(os.listdir(dir_310), key=int)
+assert len(listed) == 4096 and listed[0] == "0" and listed[-1] == "4095", f"unexpected count={{len(listed)}}"
+assert len(os.listdir(dir_sib)) == 600
+print("GENERIC_310_WORKLOAD_PASS")
+"#,
+            dir_310 = dir_310.to_str().unwrap(),
+            dir_sib = dir_sib.to_str().unwrap(),
+        );
+
+        let out = python_command(&workload)
+            .output()
+            .unwrap_or_else(|e| panic!("run generic/310 workload on {label}: {e}"));
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("GENERIC_310_WORKLOAD_PASS"),
+            "generic/310 workload failed on {label}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // 2. Execute on mounted ext4 (RW Arc<OpenFs>).
+    {
+        let tmp = TempDir::new().expect("ext4 tmpdir");
+        let image = create_empty_ext4_test_image_with_size(tmp.path(), 64 * 1024 * 1024);
+        let mnt = tmp.path().join("mnt_ext4");
+        fs::create_dir_all(&mnt).expect("mkdir mnt_ext4");
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            skip_validation: false,
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            mvcc_wal_path: Some(image.with_extension("wal")),
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::open_read_write(&cx, &image, &opts).expect("open ext4 RW");
+        fs.enable_writes(&cx).expect("enable ext4 writes");
+        let mount_opts = MountOptions {
+            read_only: false,
+            auto_unmount: false,
+            ..MountOptions::default()
+        };
+        let session = match mount_background(Box::new(std::sync::Arc::new(fs)), &mnt, &mount_opts) {
+            Ok(s) => {
+                wait_for_fuse_mount_ready(&mnt);
+                ffs_harness::stale_mounts::MountGuard::new(s, &mnt)
+            }
+            Err(e) => {
+                require_fuse_or_skip(&format!("ext4 mount failed: {e}"));
+                return;
+            }
+        };
+        run_generic_310_on_mount(&mnt, "ext4");
+        session.unmount_and_join();
+        wait_for_fuse_mount_released(&mnt);
+    }
+
+    // 3. Execute on mounted btrfs (RW Arc<OpenFs>) when mkfs.btrfs is available.
+    if command_available("mkfs.btrfs") {
+        let tmp = TempDir::new().expect("btrfs tmpdir");
+        let image = create_btrfs_test_image(tmp.path());
+        let mnt = tmp.path().join("mnt_btrfs");
+        fs::create_dir_all(&mnt).expect("mkdir mnt_btrfs");
+        let cx = Cx::for_testing();
+        let mut rw_fs =
+            OpenFs::open_read_write(&cx, &image, &OpenOptions::default()).expect("open btrfs RW");
+        if rw_fs.enable_writes(&cx).is_ok() {
+            let rw_opts = MountOptions {
+                read_only: false,
+                auto_unmount: false,
+                ..MountOptions::default()
+            };
+            if let Ok(s) = mount_background(Box::new(std::sync::Arc::new(rw_fs)), &mnt, &rw_opts) {
+                wait_for_fuse_mount_ready(&mnt);
+                let session = ffs_harness::stale_mounts::MountGuard::new(s, &mnt);
+                run_generic_310_on_mount(&mnt, "btrfs");
+                session.unmount_and_join();
+                wait_for_fuse_mount_released(&mnt);
+            }
+        }
+    }
+
+    emit_scenario_result(
+        "concurrent_shared_dirfd_read_lseek_readdir_and_sigpipe_bd_uu90b",
+        "PASS",
+        Some("ext4_and_btrfs_4096_entries_plus_sigpipe_dfl"),
+    );
+}
