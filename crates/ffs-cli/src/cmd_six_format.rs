@@ -1565,12 +1565,27 @@ pub fn maybe_route_mount_cmd(
     options: &MountCmdOptions,
     six: &SixFormatCliArgs,
 ) -> Result<bool> {
+    if six.partition.is_none() && options.runtime.validate().is_err() {
+        return Ok(false);
+    }
     let cx = cli_cx();
-    let (kind, _detected, part_entry, _part_dev) = detect_target_format(&cx, image_path, six)?;
+    let (kind, _detected, part_entry, _part_dev) = match detect_target_format(&cx, image_path, six)
+    {
+        Ok(target) => target,
+        Err(_err) if six.partition.is_none() && !six.has_ntfs_flags() && !six.has_zfs_flags() => {
+            return Ok(false);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to open filesystem image: {}", image_path.display())
+            });
+        }
+    };
     six.validate_format_compatibility(kind)?;
     if part_entry.is_none() && matches!(kind, FsFormatKind::Ext4 | FsFormatKind::Btrfs) {
         return Ok(false);
     }
+    options.runtime.validate()?;
 
     if !six.offline_image && !matches!(kind, FsFormatKind::Ext4 | FsFormatKind::Btrfs) {
         bail!(

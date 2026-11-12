@@ -7974,6 +7974,35 @@
         {"id": "xfstests_executed_evidence_dispatch", "category": "happy", "status": "active", "evidence": "\"$SCRIPT_DIR/ffs_xfstests_e2e.sh\""},
         {"id": "xfstests_executed_evidence_missing_suite", "category": "error", "status": "active", "evidence": "SKIP: xfstests not available"}
       ]
+    },
+    {
+      "suite_id": "ffs_ci_workflow_hygiene",
+      "script": "scripts/e2e/ffs_ci_workflow_hygiene_e2e.sh",
+      "required_categories": ["happy", "edge"],
+      "scenarios": [
+        {"id": "v12_program_gate_portable_local_smoke", "category": "happy", "status": "active", "evidence": "record_check \"v12_program_gate_portable_local_smoke\" \"PASS\""},
+        {"id": "v12_program_gate_rch_self_check", "category": "edge", "status": "active", "evidence": "record_check \"v12_program_gate_rch_self_check\" \"PASS\""},
+        {"id": "ci_workflow_contracts_suite", "category": "happy", "status": "active", "evidence": "record_check \"ci_workflow_contracts_suite\" \"PASS\""}
+      ]
+    },
+    {
+      "suite_id": "ffs_unified_six_format_cli",
+      "script": "scripts/e2e/ffs_unified_six_format_cli_e2e.sh",
+      "required_categories": ["happy", "edge", "error"],
+      "scenarios": [
+        {"id": "synthesize_six_format_fixtures", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=synthesize_six_format_fixtures|outcome=PASS"},
+        {"id": "ntfs_requires_offline_image", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ntfs_requires_offline_image|outcome=PASS"},
+        {"id": "zfs_requires_offline_image", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=zfs_requires_offline_image|outcome=PASS"},
+        {"id": "format_ext4_requires_delegation_flag", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=format_ext4_requires_delegation_flag|outcome=PASS"},
+        {"id": "mkfs_requires_delegation_flag", "category": "error", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=mkfs_requires_delegation_flag|outcome=PASS"},
+        {"id_pattern": "^pure_rust_format_[a-z0-9]+$", "category": "happy", "status": "active", "evidence": "scenario_result \"pure_rust_format_${fat_kind}\" \"PASS\""},
+        {"id_pattern": "^unified_cli_workflow_[a-z0-9]+$", "category": "happy", "status": "active", "evidence": "scenario_result \"unified_cli_workflow_${fmt}\" \"PASS\""},
+        {"id": "ntfs_ads_streams_extraction", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=ntfs_ads_streams_extraction|outcome=PASS"},
+        {"id": "zfs_pool_dataset_snapshot_workflows", "category": "happy", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=zfs_pool_dataset_snapshot_workflows|outcome=PASS"},
+        {"id": "gpt_multi_partition_routing", "category": "edge", "status": "active", "evidence": "SCENARIO_RESULT|scenario_id=gpt_multi_partition_routing|outcome=PASS"},
+        {"id_pattern": "^ro_fuse_mount_[a-z0-9]+$", "category": "edge", "status": "active", "evidence": "scenario_result \"ro_fuse_mount_${fmt}\" \"PASS\""},
+        {"id_pattern": "^immutable_backing_[a-z0-9_]+$", "category": "edge", "status": "active", "evidence": "scenario_result \"immutable_backing_${img}\" \"PASS\""}
+      ]
     }
   ],
   "gate_minimums": [
