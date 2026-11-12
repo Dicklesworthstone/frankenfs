@@ -33,28 +33,28 @@ const TRANSFER: usize = 64 * 1024;
 #[derive(Debug, Args)]
 pub struct ResizeArgs {
     #[command(flatten)]
-    image: ImageArgs,
+    pub image: ImageArgs,
     /// New standalone volume image. Existing files, symlinks and devices are refused.
     #[arg(long)]
-    output: PathBuf,
+    pub output: PathBuf,
     /// Exact output length in MiB. Dialect and cluster size are retained.
     #[arg(long)]
-    size_mib: u64,
+    pub size_mib: u64,
     /// Move live tail clusters into free retained slots when shrinking.
     /// Only the new output is changed; bad tail clusters are still refused.
     #[arg(long)]
-    relocate: bool,
+    pub relocate: bool,
     /// Expand the FAT16 fixed root to this many native directory slots.
     /// Must be sector-aligned and no smaller than the source; FAT32 is refused.
     /// At unchanged output size this consumes data capacity; --relocate may be needed.
     #[arg(long, value_name = "SLOTS")]
-    root_entries: Option<u16>,
+    pub root_entries: Option<u16>,
     /// Confirm the source stays offline and immutable for the complete operation.
     #[arg(long, required = true)]
-    offline_image: bool,
+    pub offline_image: bool,
     /// Check source, geometry, shrink safety and planned namespace; create nothing.
     #[arg(long)]
-    dry_run: bool,
+    pub dry_run: bool,
 }
 
 fn invalid(detail: impl Into<String>) -> FfsError {
@@ -842,6 +842,105 @@ pub fn run(cx: &Cx, args: &ResizeArgs) -> Result<serde_json::Value> {
     result.with_context(|| format!(
         "resize failed; source was not written; output {} is retained and may be incomplete or already complete; no rollback claimed", path.display()
     ))?;
+    Ok(report)
+}
+
+/// Publish a validated offline resize directly into a zero-initialized `ByteDevice`
+/// (withholding the primary boot sector at byte offset `0` until full payload
+/// readback and structural verification pass).
+pub fn run_to_device(
+    cx: &Cx,
+    args: &ResizeArgs,
+    output: Arc<dyn ByteDevice>,
+) -> Result<serde_json::Value> {
+    checkpoint(cx)?;
+    if !args.offline_image {
+        bail!("--offline-image is required");
+    }
+    if args.image.sidecar.is_some() {
+        bail!(
+            "resize does not attach, repair or transfer sidecars; use native input without --sidecar"
+        );
+    }
+    let length = args
+        .size_mib
+        .checked_mul(1024 * 1024)
+        .filter(|length| *length != 0)
+        .context("resize length overflow or zero size")?;
+    if output.len_bytes() != length {
+        bail!(
+            "resize target device length ({}) must equal requested size_mib ({length} bytes)",
+            output.len_bytes()
+        );
+    }
+    let named = fs::symlink_metadata(&args.image.image)?;
+    if !named.is_file() || named.file_type().is_symlink() {
+        bail!("resize source must be a regular non-symlink image");
+    }
+    let input = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&args.image.image)?,
+    );
+    input
+        .try_lock_shared()
+        .map_err(|e| anyhow::anyhow!("cannot lock resize source: {e}"))?;
+    let stamp = Stamp::of(&named);
+    source_unchanged(&input, &args.image.image, stamp)?;
+    let selected = args
+        .image
+        .length
+        .unwrap_or_else(|| stamp.length.saturating_sub(args.image.offset));
+    if args
+        .image
+        .offset
+        .checked_add(selected)
+        .is_none_or(|end| end > stamp.length)
+    {
+        bail!("resize selected volume exceeds source");
+    }
+    let source = Slice {
+        inner: Arc::new(FileDevice {
+            file: Arc::clone(&input),
+            length: stamp.length,
+            writable: false,
+        }),
+        base: args.image.offset,
+        length: selected,
+    };
+    let (source, root_change) = if let Some(entries) = args.root_entries {
+        let (source, change) = root::prepare(cx, source, entries, args.image.oem_code_page)?;
+        (source, Some(change))
+    } else {
+        (source, None)
+    };
+    let (source, relocated) = if args.relocate {
+        relocation::prepare(cx, source, length, args.image.oem_code_page)?
+    } else {
+        (source, 0)
+    };
+    let plan = Plan::prepare(cx, source, length, args.image.oem_code_page)?;
+    source_unchanged(&input, &args.image.image, stamp)?;
+    let mut report = plan.report(args.dry_run);
+    report["relocation_requested"] = args.relocate.into();
+    report["relocated_clusters"] = relocated.into();
+    report["cluster_numbers_preserved"] = (relocated == 0).into();
+    if let Some(change) = root_change {
+        report["source_volume_bytes"] = change.source_bytes.into();
+        report["source_root_entries"] = change.before.into();
+        report["output_root_entries"] = change.after.into();
+        report["root_directory_expanded"] = (change.after != change.before).into();
+    }
+    checkpoint(cx)?;
+    if args.dry_run {
+        return Ok(report);
+    }
+    let digest = publish(cx, &plan, output, || {
+        source_unchanged(&input, &args.image.image, stamp)
+    })?;
+    report["sha256"] = digest.into();
+    report["durability"] = "verified_device_synced".into();
     Ok(report)
 }
 

@@ -34,36 +34,36 @@ use std::sync::Arc;
 #[derive(Debug, Args)]
 pub struct RecoverArgs {
     #[command(flatten)]
-    image: ImageArgs,
+    pub image: ImageArgs,
     /// Confirm exclusive offline ownership; no kernel mount or unrelated writer.
     #[arg(long, required = true)]
-    offline_image: bool,
+    pub offline_image: bool,
     /// Discard clusters proven unreachable. Their former contents may be lost.
     /// Never repairs ambiguous ownership; use --salvage-to to preserve raw data.
     #[arg(long, conflicts_with = "salvage_to")]
-    reclaim_lost: bool,
+    pub reclaim_lost: bool,
     /// Retire only long-name records proved to have no live short entry.
     /// Does not repair names attached to live files or authorize cluster loss.
     #[arg(long, conflicts_with = "salvage_to")]
-    discard_orphan_lfn: bool,
+    pub discard_orphan_lfn: bool,
     /// Reconcile mirrored allocation tables using this zero-based copy only.
     /// Conflicting allocation in other copies is discarded; payload integrity
     /// is not established. Inactive FAT32 tables are never repair candidates.
     #[arg(long, value_name = "COPY", conflicts_with_all = ["reclaim_lost", "discard_orphan_lfn", "salvage_to"])]
-    repair_mirrors_from: Option<u8>,
+    pub repair_mirrors_from: Option<u8>,
     /// Restore one FAT32 boot sector from an explicitly selected native copy.
     /// Zero selects primary -> backup; otherwise supply the volume-relative
     /// BYTE offset of the backup -> primary. Changed images remain dirty.
     #[arg(long, value_name = "BYTE_OFFSET", conflicts_with_all = ["reclaim_lost", "discard_orphan_lfn", "repair_mirrors_from", "salvage_to"])]
-    repair_boot_from: Option<u64>,
+    pub repair_boot_from: Option<u64>,
     /// Export unambiguous lost chains into a NEW private host directory.
     /// Leaves the image unchanged. Files include slack and may contain sensitive
     /// deleted data; original names and logical lengths cannot be inferred.
     #[arg(long, value_name = "DIRECTORY", conflicts_with = "reclaim_lost")]
-    salvage_to: Option<PathBuf>,
+    pub salvage_to: Option<PathBuf>,
     /// Perform every diagnosis and ownership preflight without writes or syncs.
     #[arg(long)]
-    dry_run: bool,
+    pub dry_run: bool,
 }
 
 struct Image {
