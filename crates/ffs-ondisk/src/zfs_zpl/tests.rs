@@ -423,3 +423,78 @@ fn dxattr_values_reject_wrong_native_types_duplicates_tails_and_bounds() {
             .is_err()
     );
 }
+
+#[test]
+fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve_extras() {
+    for order in [Endian::Little, Endian::Big] {
+        let dir_ref = encode_directory_reference(42, Kind::Directory).unwrap();
+        assert_eq!(
+            directory_reference(dir_ref).unwrap(),
+            (42, Some(Kind::Directory))
+        );
+        assert!(encode_directory_reference(0, Kind::Regular).is_err());
+        assert!(encode_directory_reference(1 << 48, Kind::Regular).is_err());
+
+        // Legacy v4 encode preserves zp_xattr (offset 104) while updating Metadata
+        let mut prev_legacy = legacy(order, 0o100_640, 17);
+        prev_legacy[104..112].copy_from_slice(&order.encode(777));
+        let mut meta = Metadata::legacy(&prev_legacy, order).unwrap();
+        meta.size = 4096;
+        meta.mode = 0o100_600;
+        let encoded_legacy = meta.encode_legacy(Some(&prev_legacy), order).unwrap();
+        assert_eq!(Metadata::legacy(&encoded_legacy, order).unwrap(), meta);
+        assert_eq!(XattrSources::legacy(&encoded_legacy, order).unwrap().directory, 777);
+
+        // SA v5 update + template creation with dynamic ZPL_PROJID, ZPL_DACL_COUNT, ZPL_DACL_ACES
+        let mut template_attrs = attributes(order, 0o040_755, 2);
+        template_attrs.push((20, order.encode(99).to_vec())); // ZPL_PROJID
+        template_attrs.push((21, order.encode(3).to_vec())); // ZPL_DACL_COUNT
+        template_attrs.push((22, vec![0x11; 24])); // ZPL_DACL_ACES (variable length)
+        let mut xattr_attrs = template_attrs.clone();
+        xattr_attrs.push((23, xdr_xattrs(&[("user.keep", b"val")])));
+
+        let registry = SaRegistry::from_zaps(
+            &[
+                registration("ZPL_PROJID", 20, 8, 0),
+                registration("ZPL_DACL_COUNT", 21, 8, 0),
+                registration("ZPL_DACL_ACES", 22, 0, 1),
+                registration("ZPL_DXATTR", 23, 0, 3),
+            ],
+            &[layout(2, &template_attrs), layout(3, &xattr_attrs)],
+        )
+        .unwrap();
+
+        let parent_with_xattr = packed(3, &xattr_attrs, &[22, 23], order);
+        let mut updated_parent_meta = registry
+            .decode(&parent_with_xattr, None)
+            .unwrap()
+            .metadata()
+            .unwrap();
+        updated_parent_meta.size = 5;
+        updated_parent_meta.links = 3;
+        let (reencoded_parent, spill) = registry
+            .encode_updated_bonus_and_spill(&parent_with_xattr, None, &updated_parent_meta)
+            .unwrap();
+        assert!(spill.is_none());
+        let decoded_parent = registry.decode(&reencoded_parent, None).unwrap();
+        assert_eq!(decoded_parent.metadata().unwrap(), updated_parent_meta);
+        assert_eq!(
+            decoded_parent.xattrs().unwrap().inline.get("user.keep").map(Vec::as_slice),
+            Some(b"val".as_slice())
+        );
+
+        // Creating a new child file from parent_with_xattr chooses layout 2 (without ZPL_DXATTR)
+        let mut child_meta = updated_parent_meta.clone();
+        child_meta.kind = Kind::Regular;
+        child_meta.mode = 0o100_644;
+        child_meta.size = 0;
+        child_meta.links = 1;
+        child_meta.parent = 3;
+        let child_bonus = registry
+            .encode_new_from_template(&parent_with_xattr, &child_meta)
+            .unwrap();
+        let decoded_child = registry.decode(&child_bonus, None).unwrap();
+        assert_eq!(decoded_child.metadata().unwrap(), child_meta);
+        assert!(decoded_child.xattrs().unwrap().inline.is_empty());
+    }
+}

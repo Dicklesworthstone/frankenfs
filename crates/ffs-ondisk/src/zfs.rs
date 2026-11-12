@@ -25,6 +25,7 @@ pub const MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 const EMBEDDED_PAYLOAD_BYTES: usize = 14 * 8;
 const ECK_MAGIC: u64 = 0x0210_da7a_b10c_7a11;
 const UBER_MAGIC: u64 = 0x00ba_b10c;
+pub const MMP_MAGIC: u64 = 0x0000_0000_a11c_ea11;
 
 fn invalid(reason: &'static str) -> ParseError {
     ParseError::InvalidField {
@@ -181,6 +182,28 @@ pub fn verify_label_checksum(bytes: &[u8], offset: u64) -> Result<Endian, ParseE
     Ok(order)
 }
 
+/// Stamp an offset-salted SHA-256 embedded checksum (`zio_eck_t`) onto the
+/// trailing 40 bytes of a vdev label configuration or uberblock slot.
+/// `offset` is relative to the selected vdev, not the host file/partition base.
+pub fn stamp_label_checksum(bytes: &mut [u8], offset: u64, order: Endian) -> Result<(), ParseError> {
+    if bytes.len() < 40 || bytes.len() > LABEL_CONFIG_BYTES {
+        return Err(invalid("invalid embedded-checksum span"));
+    }
+    let tail = bytes.len() - 40;
+    bytes[tail..tail + 8].copy_from_slice(&order.encode(ECK_MAGIC));
+    let mut hash = Sha256::new();
+    hash.update(&bytes[..tail + 8]);
+    hash.update(order.encode(offset));
+    hash.update([0_u8; 24]);
+    let digest = hash.finalize();
+    for index in 0..4 {
+        let word = u64::from_be_bytes(std::array::from_fn(|i| digest[index * 8 + i]));
+        let at = tail + 8 + index * 8;
+        bytes[at..at + 8].copy_from_slice(&order.encode(word));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dva {
     pub vdev: u32,
@@ -261,6 +284,115 @@ impl BlockPointer {
     #[must_use]
     pub const fn birth(&self) -> u64 {
         self.words[10]
+    }
+    #[must_use]
+    pub const fn fill(&self) -> u64 {
+        self.words[11]
+    }
+    #[must_use]
+    pub const fn checksum_words(&self) -> [u64; 4] {
+        [
+            self.words[12],
+            self.words[13],
+            self.words[14],
+            self.words[15],
+        ]
+    }
+    #[must_use]
+    pub const fn hole_pointer() -> Self {
+        Self { words: [0; 16] }
+    }
+    pub fn born_hole(
+        logical_bytes: usize,
+        object_type: u8,
+        level: u8,
+        birth: u64,
+    ) -> Result<Self, ParseError> {
+        if !(512..=MAX_BLOCK_BYTES).contains(&logical_bytes)
+            || !logical_bytes.is_multiple_of(512)
+            || level > 31
+            || birth == 0
+        {
+            return Err(invalid("invalid born-hole geometry, level or birth"));
+        }
+        let lsize_sectors = (logical_bytes / 512) as u64;
+        if lsize_sectors > 0x1_0000 {
+            return Err(invalid("born-hole logical size exceeds 16-bit sector span"));
+        }
+        let mut words = [0_u64; 16];
+        words[6] =
+            (lsize_sectors - 1) | (u64::from(object_type) << 48) | (u64::from(level) << 56);
+        words[10] = birth;
+        Ok(Self { words })
+    }
+    #[must_use]
+    pub fn encode(&self, order: Endian) -> [u8; 128] {
+        let mut raw = [0_u8; 128];
+        for (index, word) in self.words.iter().enumerate() {
+            raw[index * 8..index * 8 + 8].copy_from_slice(&order.encode(*word));
+        }
+        raw
+    }
+    pub fn new_regular(spec: &RegularBlockSpec<'_>) -> Result<Self, ParseError> {
+        if spec.dvas.is_empty() || spec.dvas.len() > 3 {
+            return Err(invalid("regular block requires one through three DVAs"));
+        }
+        if !(512..=MAX_BLOCK_BYTES).contains(&spec.logical_bytes)
+            || !spec.logical_bytes.is_multiple_of(512)
+            || spec.physical.len() < 512
+            || spec.physical.len() > spec.logical_bytes
+            || !spec.physical.len().is_multiple_of(512)
+        {
+            return Err(invalid("invalid regular block logical or physical size"));
+        }
+        let lsize_sectors = (spec.logical_bytes / 512) as u64;
+        let psize_sectors = (spec.physical.len() / 512) as u64;
+        if lsize_sectors > 0x1_0000 || psize_sectors > 0x1_0000 {
+            return Err(invalid(
+                "regular block exceeds standard 32 MiB blkptr sector field",
+            ));
+        }
+        if spec.compression == 2 && spec.physical.len() != spec.logical_bytes {
+            return Err(invalid("uncompressed block sizes disagree"));
+        }
+        if !matches!(spec.compression, 2 | 3 | 5..=16)
+            || !matches!(spec.checksum_type, 6..=8 | 11)
+            || spec.level > 31
+            || spec.birth == 0
+        {
+            return Err(invalid(
+                "unsupported block compression, checksum, level or zero birth",
+            ));
+        }
+        let mut words = [0_u64; 16];
+        for (index, dva) in spec.dvas.iter().enumerate() {
+            if dva.gang
+                || dva.vdev > 0x00ff_ffff
+                || dva.allocated_bytes < spec.physical.len() as u64
+                || !dva.allocated_bytes.is_multiple_of(512)
+                || (dva.allocated_bytes / 512) == 0
+                || (dva.allocated_bytes / 512) > 0x00ff_ffff
+                || !dva.offset.is_multiple_of(512)
+                || (dva.offset / 512) >> 63 != 0
+            {
+                return Err(invalid("invalid regular DVA geometry or alignment"));
+            }
+            words[index * 2] =
+                (u64::from(dva.vdev) << 32) | ((dva.allocated_bytes / 512) & 0x00ff_ffff);
+            words[index * 2 + 1] = (dva.offset / 512) & 0x7fff_ffff_ffff_ffff;
+        }
+        words[6] = (lsize_sectors - 1)
+            | ((psize_sectors - 1) << 16)
+            | ((u64::from(spec.compression) & 0x7f) << 32)
+            | (u64::from(spec.checksum_type) << 40)
+            | (u64::from(spec.object_type) << 48)
+            | ((u64::from(spec.level) & 0x1f) << 56)
+            | (u64::from(spec.payload_order == Endian::Little) << 63);
+        words[10] = spec.birth;
+        words[11] = spec.fill;
+        let cksum = checksum(spec.physical, spec.checksum_type, spec.payload_order)?;
+        words[12..16].copy_from_slice(&cksum);
+        Ok(Self { words })
     }
     #[must_use]
     pub const fn payload_order(&self) -> Endian {
@@ -378,6 +510,51 @@ impl BlockPointer {
 }
 
 #[derive(Debug, Clone)]
+pub struct RegularBlockSpec<'a> {
+    pub dvas: &'a [Dva],
+    pub logical_bytes: usize,
+    pub physical: &'a [u8],
+    pub compression: u8,
+    pub checksum_type: u8,
+    pub object_type: u8,
+    pub level: u8,
+    pub payload_order: Endian,
+    pub birth: u64,
+    pub fill: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UberblockMmpInfo {
+    pub software_version: u64,
+    pub mmp_magic: u64,
+    pub mmp_delay: u64,
+    pub mmp_config: u64,
+}
+
+impl UberblockMmpInfo {
+    pub fn parse(raw: &[u8], vdev_offset: u64) -> Result<Self, ParseError> {
+        if !matches!(raw.len(), 1024 | 2048 | 4096 | 8192) {
+            return Err(invalid("invalid uberblock slot size"));
+        }
+        let order = verify_label_checksum(raw, vdev_offset)?;
+        if order.u64(raw, 0)? != UBER_MAGIC {
+            return Err(invalid("invalid uberblock magic"));
+        }
+        Ok(Self {
+            software_version: order.u64(raw, 168)?,
+            mmp_magic: order.u64(raw, 176)?,
+            mmp_delay: order.u64(raw, 184)?,
+            mmp_config: order.u64(raw, 192)?,
+        })
+    }
+
+    #[must_use]
+    pub const fn has_active_mmp(&self) -> bool {
+        self.mmp_delay != 0 || (self.mmp_magic == MMP_MAGIC && (self.mmp_config & 0xffff) != 0)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Uberblock {
     pub order: Endian,
     pub version: u64,
@@ -424,6 +601,61 @@ impl Uberblock {
             timestamp: order.u64(raw, 32)?,
             root,
         })
+    }
+
+    pub fn encode(&self, slot_bytes: usize, vdev_offset: u64) -> Result<Vec<u8>, ParseError> {
+        let software_version = if self.version == 5000 {
+            5000
+        } else {
+            self.version
+        };
+        self.encode_with_meta(slot_bytes, vdev_offset, software_version, 0, 0)
+    }
+
+    pub fn encode_with_meta(
+        &self,
+        slot_bytes: usize,
+        vdev_offset: u64,
+        software_version: u64,
+        mmp_magic: u64,
+        mmp_config: u64,
+    ) -> Result<Vec<u8>, ParseError> {
+        if !matches!(slot_bytes, 1024 | 2048 | 4096 | 8192) {
+            return Err(invalid("invalid uberblock slot size"));
+        }
+        if !(1..=28).contains(&self.version) && self.version != 5000 {
+            return Err(invalid("unsupported pool version"));
+        }
+        if self.txg == 0
+            || self.root.hole()
+            || self.root.embedded()
+            || self.root.protected()
+            || self.root.object_type() != 11
+            || self.root.level() != 0
+            || self.root.birth() == 0
+            || self.root.birth() > self.txg
+        {
+            return Err(invalid(
+                "uberblock has an invalid TXG or MOS root pointer",
+            ));
+        }
+        if mmp_magic == MMP_MAGIC && (mmp_config & 0xffff) != 0 {
+            return Err(invalid("refusing to encode active MMP sequence in uberblock"));
+        }
+        let mut raw = vec![0_u8; slot_bytes];
+        raw[0..8].copy_from_slice(&self.order.encode(UBER_MAGIC));
+        raw[8..16].copy_from_slice(&self.order.encode(self.version));
+        raw[16..24].copy_from_slice(&self.order.encode(self.txg));
+        raw[24..32].copy_from_slice(&self.order.encode(self.guid_sum));
+        raw[32..40].copy_from_slice(&self.order.encode(self.timestamp));
+        raw[40..168].copy_from_slice(&self.root.encode(self.order));
+        raw[168..176].copy_from_slice(&self.order.encode(software_version));
+        raw[176..184].copy_from_slice(&self.order.encode(mmp_magic));
+        raw[184..192].copy_from_slice(&self.order.encode(0));
+        raw[192..200].copy_from_slice(&self.order.encode(mmp_config & !0xffff));
+        stamp_label_checksum(&mut raw, vdev_offset, self.order)?;
+        let _ = Self::parse(&raw, vdev_offset)?;
+        Ok(raw)
     }
 }
 
@@ -866,5 +1098,92 @@ mod embedded_tests {
                 .decode_embedded()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn regular_block_pointer_and_uberblock_encode_roundtrip_across_endians_and_checksums() {
+        let payload: Vec<u8> = (0..4096_u32).map(|i| (i * 37 + 11) as u8).collect();
+        let dvas = [
+            Dva {
+                vdev: 0,
+                offset: 65_536,
+                allocated_bytes: 4096,
+                gang: false,
+            },
+            Dva {
+                vdev: 0,
+                offset: 131_072,
+                allocated_bytes: 4096,
+                gang: false,
+            },
+        ];
+        for container in [Endian::Little, Endian::Big] {
+            for payload_order in [Endian::Little, Endian::Big] {
+                for cksum in [7_u8, 8_u8, 11_u8] {
+                    let bp = BlockPointer::new_regular(&RegularBlockSpec {
+                        dvas: &dvas,
+                        logical_bytes: 4096,
+                        physical: &payload,
+                        compression: 2,
+                        checksum_type: cksum,
+                        object_type: 11,
+                        level: 0,
+                        payload_order,
+                        birth: 77,
+                        fill: 14,
+                    })
+                    .unwrap();
+                    let encoded_bp = bp.encode(container);
+                    let decoded_bp = BlockPointer::parse(&encoded_bp, container).unwrap();
+                    assert_eq!(decoded_bp, bp);
+                    assert_eq!(decoded_bp.fill(), 14);
+                    assert_eq!(decoded_bp.birth(), 77);
+                    assert_eq!(decoded_bp.regular_dvas().unwrap(), dvas);
+                    assert_eq!(decoded_bp.decode(&payload).unwrap(), payload);
+
+                    let ub = Uberblock {
+                        order: container,
+                        version: 5000,
+                        txg: 78,
+                        guid_sum: 0x1234_5678_9abc_def0,
+                        timestamp: 1_731_000_000,
+                        root: bp.clone(),
+                    };
+                    let vdev_offset = UBERBLOCK_RING_OFFSET + 3 * 4096;
+                    let slot = ub
+                        .encode_with_meta(4096, vdev_offset, 5000, MMP_MAGIC, 0x0064_000a_0000)
+                        .unwrap();
+                    assert_eq!(verify_label_checksum(&slot, vdev_offset).unwrap(), container);
+                    assert!(verify_label_checksum(&slot, vdev_offset + 4096).is_err());
+                    let parsed_ub = Uberblock::parse(&slot, vdev_offset).unwrap();
+                    assert_eq!(parsed_ub.txg, 78);
+                    assert_eq!(parsed_ub.guid_sum, ub.guid_sum);
+                    assert_eq!(parsed_ub.root, bp);
+                    let mmp = UberblockMmpInfo::parse(&slot, vdev_offset).unwrap();
+                    assert!(!mmp.has_active_mmp());
+
+                    // Active MMP sequence must be refused on encode and detected on parse.
+                    assert!(
+                        ub.encode_with_meta(4096, vdev_offset, 5000, MMP_MAGIC, 1)
+                            .is_err()
+                    );
+                    let mut active_slot = slot;
+                    active_slot[184..192].copy_from_slice(&container.encode(100_000_000));
+                    stamp_label_checksum(&mut active_slot, vdev_offset, container).unwrap();
+                    assert!(
+                        UberblockMmpInfo::parse(&active_slot, vdev_offset)
+                            .unwrap()
+                            .has_active_mmp()
+                    );
+                }
+            }
+            let hole = BlockPointer::born_hole(16_384, 19, 1, 55).unwrap();
+            let parsed_hole = BlockPointer::parse(&hole.encode(container), container).unwrap();
+            assert!(parsed_hole.hole());
+            assert_eq!(parsed_hole.birth(), 55);
+            assert_eq!(parsed_hole.object_type(), 19);
+            assert_eq!(parsed_hole.level(), 1);
+            assert_eq!(parsed_hole.logical_bytes(), 16_384);
+        }
     }
 }

@@ -13,7 +13,15 @@ use std::collections::BTreeSet;
 pub const DNODE_BYTES: usize = 512;
 pub const DNODE_BLOCK_BYTES: usize = 16 * 1024;
 pub const DMU_OT_DNODE: u8 = 10;
+pub const DMU_OT_OBJSET: u8 = 11;
 pub const DMU_OT_OBJECT_DIRECTORY: u8 = 1;
+pub const DNODE_FLAG_USED_BYTES: u8 = 0x01;
+pub const DNODE_FLAG_USERUSED_ACCOUNTED: u8 = 0x02;
+pub const DNODE_FLAG_SPILL_BLKPTR: u8 = 0x04;
+pub const DNODE_FLAG_USEROBJUSED_ACCOUNTED: u8 = 0x08;
+pub const OBJSET_USERUSED_OFFSET: usize = 1024;
+pub const OBJSET_GROUPUSED_OFFSET: usize = 1536;
+pub const OBJSET_PROJECTUSED_OFFSET: usize = 2048;
 
 fn invalid(reason: &'static str) -> ParseError {
     ParseError::InvalidField {
@@ -34,12 +42,35 @@ fn u16_at(raw: &[u8], at: usize, order: Endian) -> Result<u16, ParseError> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct DnodeSpec {
+    pub object_type: u8,
+    pub bonus_type: u8,
+    pub checksum_type: u8,
+    pub compress_type: u8,
+    pub flags: u8,
+    pub order: Endian,
+    pub levels: u8,
+    pub indirect_shift: u8,
+    pub data_bytes: usize,
+    pub max_block: u64,
+    pub used_bytes: u64,
+    pub slots: usize,
+    pub pointers: Vec<BlockPointer>,
+    pub bonus: Vec<u8>,
+    pub spill: Option<BlockPointer>,
+}
+
 /// An allocated native dnode, including its exact bonus bytes and optional spill.
 /// Geometry fields are private: construction cannot bypass validation.
 #[derive(Debug, Clone)]
 pub struct Dnode {
     object_type: u8,
     bonus_type: u8,
+    checksum_type: u8,
+    compress_type: u8,
+    flags: u8,
+    max_slots: u8,
     order: Endian,
     levels: u8,
     indirect_shift: u8,
@@ -107,6 +138,10 @@ impl Dnode {
         let dnode = Self {
             object_type: raw[0],
             bonus_type: raw[4],
+            checksum_type: raw[5],
+            compress_type: raw[6],
+            flags: raw[7],
+            max_slots: raw[13],
             order,
             levels,
             indirect_shift,
@@ -122,6 +157,36 @@ impl Dnode {
         Ok(dnode)
     }
 
+    pub fn from_spec(spec: DnodeSpec) -> Result<Self, ParseError> {
+        let mut flags = spec.flags & 0x0B;
+        if spec.spill.is_some() {
+            flags |= 0x04;
+        }
+        if flags & 0x01 == 0 && !spec.used_bytes.is_multiple_of(512) {
+            flags |= 0x01;
+        }
+        let candidate = Self {
+            object_type: spec.object_type,
+            bonus_type: spec.bonus_type,
+            checksum_type: spec.checksum_type,
+            compress_type: spec.compress_type,
+            flags,
+            max_slots: 0,
+            order: spec.order,
+            levels: spec.levels,
+            indirect_shift: spec.indirect_shift,
+            data_bytes: spec.data_bytes,
+            max_block: spec.max_block,
+            used_bytes: spec.used_bytes,
+            slots: spec.slots,
+            pointers: spec.pointers,
+            bonus: spec.bonus,
+            spill: spec.spill,
+        };
+        let encoded = candidate.encode()?;
+        Self::parse(&encoded, spec.order)
+    }
+
     #[must_use]
     pub const fn object_type(&self) -> u8 {
         self.object_type
@@ -129,6 +194,22 @@ impl Dnode {
     #[must_use]
     pub const fn bonus_type(&self) -> u8 {
         self.bonus_type
+    }
+    #[must_use]
+    pub const fn checksum_type(&self) -> u8 {
+        self.checksum_type
+    }
+    #[must_use]
+    pub const fn compress_type(&self) -> u8 {
+        self.compress_type
+    }
+    #[must_use]
+    pub const fn flags(&self) -> u8 {
+        self.flags
+    }
+    #[must_use]
+    pub const fn indirect_shift(&self) -> u8 {
+        self.indirect_shift
     }
     #[must_use]
     pub const fn order(&self) -> Endian {
@@ -196,6 +277,257 @@ impl Dnode {
         }
         Ok(route)
     }
+
+    pub fn set_tree(
+        &mut self,
+        levels: u8,
+        indirect_shift: u8,
+        data_bytes: usize,
+        max_block: u64,
+        pointers: Vec<BlockPointer>,
+        used_bytes: u64,
+    ) -> Result<(), ParseError> {
+        let mut updated = self.clone();
+        updated.levels = levels;
+        updated.indirect_shift = indirect_shift;
+        updated.data_bytes = data_bytes;
+        updated.max_block = max_block;
+        updated.pointers = pointers;
+        updated.used_bytes = used_bytes;
+        if updated.flags & 0x01 == 0 && !used_bytes.is_multiple_of(512) {
+            updated.flags |= 0x01;
+        }
+        let raw = updated.encode()?;
+        *self = Self::parse(&raw, self.order)?;
+        Ok(())
+    }
+
+    pub fn set_bonus_and_spill(
+        &mut self,
+        bonus_type: u8,
+        bonus: Vec<u8>,
+        spill: Option<BlockPointer>,
+    ) -> Result<(), ParseError> {
+        let mut updated = self.clone();
+        updated.bonus_type = bonus_type;
+        updated.bonus = bonus;
+        updated.spill = spill;
+        if updated.spill.is_some() {
+            updated.flags |= 0x04;
+        } else {
+            updated.flags &= !0x04;
+        }
+        let raw = updated.encode()?;
+        *self = Self::parse(&raw, self.order)?;
+        Ok(())
+    }
+
+    pub fn set_used_bytes(&mut self, used_bytes: u64) -> Result<(), ParseError> {
+        let mut updated = self.clone();
+        updated.used_bytes = used_bytes;
+        if updated.flags & 0x01 == 0 && !used_bytes.is_multiple_of(512) {
+            updated.flags |= 0x01;
+        }
+        let raw = updated.encode()?;
+        *self = Self::parse(&raw, self.order)?;
+        Ok(())
+    }
+
+    pub fn set_flags(&mut self, flags: u8) -> Result<(), ParseError> {
+        let mut updated = self.clone();
+        updated.flags = (flags & 0x0B) | if updated.spill.is_some() { 0x04 } else { 0 };
+        let raw = updated.encode()?;
+        *self = Self::parse(&raw, self.order)?;
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ParseError> {
+        if self.object_type == 0 || !(1..=32).contains(&self.slots) {
+            return Err(invalid("invalid dnode object type or slot count"));
+        }
+        let size = self.slots * DNODE_BYTES;
+        if size > DNODE_BLOCK_BYTES {
+            return Err(invalid("dnode exceeds 16 KiB dnode block"));
+        }
+        if !(1..=12).contains(&self.levels) || !(1..=3).contains(&self.pointers.len()) {
+            return Err(invalid("unsupported dnode level or root-pointer count"));
+        }
+        if !((12..=17).contains(&self.indirect_shift)
+            || self.levels == 1 && self.indirect_shift == 0)
+        {
+            return Err(invalid("unsupported indirect block shift"));
+        }
+        if self.data_bytes == 0
+            || self.data_bytes > MAX_BLOCK_BYTES
+            || !self.data_bytes.is_multiple_of(512)
+            || (self.max_block != 0 && !self.data_bytes.is_power_of_two())
+        {
+            return Err(invalid("invalid dnode data-block geometry"));
+        }
+        let data_sectors =
+            u16::try_from(self.data_bytes / 512).map_err(|_| invalid("dnode block sectors overflow"))?;
+        let bonus_start = 64 + self.pointers.len() * 128;
+        let bonus_end = size - if self.spill.is_some() { 128 } else { 0 };
+        if bonus_start > bonus_end || self.bonus.len() > bonus_end - bonus_start {
+            return Err(invalid("bonus data overlaps pointers or spill"));
+        }
+        let bonus_len =
+            u16::try_from(self.bonus.len()).map_err(|_| invalid("dnode bonus length overflow"))?;
+        self.route(self.max_block)?;
+
+        let mut flags = (self.flags & 0x0B) | if self.spill.is_some() { 0x04 } else { 0 };
+        if flags & 0x01 == 0 && !self.used_bytes.is_multiple_of(512) {
+            flags |= 0x01;
+        }
+        let raw_used = if flags & 0x01 != 0 {
+            self.used_bytes
+        } else {
+            self.used_bytes / 512
+        };
+
+        let mut raw = vec![0_u8; size];
+        raw[0] = self.object_type;
+        raw[1] = self.indirect_shift;
+        raw[2] = self.levels;
+        raw[3] = self.pointers.len() as u8;
+        raw[4] = self.bonus_type;
+        raw[5] = self.checksum_type;
+        raw[6] = self.compress_type;
+        raw[7] = flags;
+        raw[8..10].copy_from_slice(&match self.order {
+            Endian::Little => data_sectors.to_le_bytes(),
+            Endian::Big => data_sectors.to_be_bytes(),
+        });
+        raw[10..12].copy_from_slice(&match self.order {
+            Endian::Little => bonus_len.to_le_bytes(),
+            Endian::Big => bonus_len.to_be_bytes(),
+        });
+        raw[12] = (self.slots - 1) as u8;
+        raw[13] = self.max_slots;
+        raw[16..24].copy_from_slice(&self.order.encode(self.max_block));
+        raw[24..32].copy_from_slice(&self.order.encode(raw_used));
+        for (index, bp) in self.pointers.iter().enumerate() {
+            let at = 64 + index * 128;
+            raw[at..at + 128].copy_from_slice(&bp.encode(self.order));
+        }
+        raw[bonus_start..bonus_start + self.bonus.len()].copy_from_slice(&self.bonus);
+        if let Some(spill) = &self.spill {
+            raw[size - 128..].copy_from_slice(&spill.encode(self.order));
+        }
+        Ok(raw)
+    }
+}
+
+/// Write an encoded dnode into a 16 KiB dnode block, ensuring no overlap with
+/// an interior slot of a multi-slot dnode or an adjacent allocated dnode.
+pub fn write_dnode_at(block: &mut [u8], slot: usize, dnode: &Dnode) -> Result<(), ParseError> {
+    let total_slots = DNODE_BLOCK_BYTES / DNODE_BYTES;
+    if block.len() != DNODE_BLOCK_BYTES || slot >= total_slots || slot + dnode.slots > total_slots {
+        return Err(invalid("dnode write exceeds 16 KiB dnode block"));
+    }
+    let existing = dnode_at(block, slot, dnode.order)?;
+    if let Some(prev) = &existing {
+        if prev.slots > dnode.slots {
+            let clear_start = (slot + dnode.slots) * DNODE_BYTES;
+            let clear_end = (slot + prev.slots) * DNODE_BYTES;
+            block[clear_start..clear_end].fill(0);
+        } else if prev.slots < dnode.slots {
+            for extra in (slot + prev.slots)..(slot + dnode.slots) {
+                if block[extra * DNODE_BYTES] != 0 {
+                    return Err(invalid("expanded dnode overlaps an allocated neighbor slot"));
+                }
+            }
+        }
+    } else {
+        for check in slot..(slot + dnode.slots) {
+            if block[check * DNODE_BYTES] != 0 {
+                return Err(invalid("new dnode overlaps an allocated neighbor slot"));
+            }
+        }
+    }
+    let encoded = dnode.encode()?;
+    let start = slot * DNODE_BYTES;
+    block[start..start + encoded.len()].copy_from_slice(&encoded);
+    Ok(())
+}
+
+/// Free (zero) a dnode slot (and any extra slots it owns) in a 16 KiB dnode block.
+pub fn clear_dnode_at(block: &mut [u8], slot: usize, order: Endian) -> Result<(), ParseError> {
+    let Some(existing) = dnode_at(block, slot, order)? else {
+        return Err(invalid("cannot clear an unallocated dnode slot"));
+    };
+    let start = slot * DNODE_BYTES;
+    let end = (slot + existing.slots) * DNODE_BYTES;
+    block[start..end].fill(0);
+    Ok(())
+}
+
+/// Find the first contiguous unallocated run of `needed_slots` starting at or
+/// after `min_slot` within a 16 KiB dnode block.
+pub fn find_free_dnode_slot(
+    block: &[u8],
+    min_slot: usize,
+    needed_slots: usize,
+) -> Result<Option<usize>, ParseError> {
+    let total_slots = DNODE_BLOCK_BYTES / DNODE_BYTES;
+    if block.len() != DNODE_BLOCK_BYTES || needed_slots == 0 || needed_slots > total_slots {
+        return Err(invalid("invalid dnode block or requested slot count"));
+    }
+    let mut current = 0;
+    let mut free_run_start: Option<usize> = None;
+    let mut free_run_len = 0;
+    while current < total_slots {
+        let at = current * DNODE_BYTES;
+        if block[at] == 0 {
+            if current >= min_slot {
+                if free_run_start.is_none() {
+                    free_run_start = Some(current);
+                    free_run_len = 0;
+                }
+                free_run_len += 1;
+                if free_run_len >= needed_slots {
+                    return Ok(free_run_start);
+                }
+            }
+            current += 1;
+        } else {
+            free_run_start = None;
+            free_run_len = 0;
+            let slots = usize::from(block[at + 12]) + 1;
+            if current + slots > total_slots {
+                return Err(invalid("large dnode crosses its containing block"));
+            }
+            current += slots;
+        }
+    }
+    Ok(None)
+}
+
+/// Count allocated `dnode_phys_t` objects in a 16 KiB `DMU_OT_DNODE` block
+/// (exact OpenZFS `blk_fill` definition for `DMU_OT_DNODE` level-0 blocks).
+pub fn count_allocated_dnodes(block: &[u8], order: Endian) -> Result<u64, ParseError> {
+    let total_slots = DNODE_BLOCK_BYTES / DNODE_BYTES;
+    if block.len() != DNODE_BLOCK_BYTES {
+        return Err(invalid("invalid dnode block size"));
+    }
+    let mut current = 0;
+    let mut fill = 0_u64;
+    while current < total_slots {
+        let at = current * DNODE_BYTES;
+        if block[at] == 0 {
+            current += 1;
+            continue;
+        }
+        let slots = usize::from(block[at + 12]) + 1;
+        let end = (current + slots) * DNODE_BYTES;
+        if end > block.len() {
+            return Err(invalid("large dnode crosses its containing block"));
+        }
+        let _ = Dnode::parse(&block[at..end], order)?;
+        fill += 1;
+        current += slots;
+    }
+    Ok(fill)
 }
 
 /// Find the start of an object in a native 16 KiB dnode block. Interior slots
@@ -238,6 +570,7 @@ pub struct ZilHeader {
     pub log: BlockPointer,
     pub claim_blk_seq: u64,
     pub flags: u64,
+    pub claim_lr_seq: u64,
 }
 
 impl ZilHeader {
@@ -250,13 +583,39 @@ impl ZilHeader {
         let log = BlockPointer::parse(&raw[16..144], order)?;
         let claim_blk_seq = order.u64(raw, 144)?;
         let flags = order.u64(raw, 152)?;
+        let claim_lr_seq = order.u64(raw, 160)?;
         Ok(Self {
             claim_txg,
             replay_seq,
             log,
             claim_blk_seq,
             flags,
+            claim_lr_seq,
         })
+    }
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            claim_txg: 0,
+            replay_seq: 0,
+            log: BlockPointer::hole_pointer(),
+            claim_blk_seq: 0,
+            flags: 0,
+            claim_lr_seq: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn encode(&self, order: Endian) -> [u8; 192] {
+        let mut raw = [0_u8; 192];
+        raw[0..8].copy_from_slice(&order.encode(self.claim_txg));
+        raw[8..16].copy_from_slice(&order.encode(self.replay_seq));
+        raw[16..144].copy_from_slice(&self.log.encode(order));
+        raw[144..152].copy_from_slice(&order.encode(self.claim_blk_seq));
+        raw[152..160].copy_from_slice(&order.encode(self.flags));
+        raw[160..168].copy_from_slice(&order.encode(self.claim_lr_seq));
+        raw
     }
 
     #[must_use]
@@ -600,6 +959,7 @@ pub struct ObjectSet {
     pub flags: u64,
     pub meta: Dnode,
     pub zil_header: ZilHeader,
+    tail_bytes: Vec<u8>,
 }
 
 impl ObjectSet {
@@ -621,12 +981,142 @@ impl ObjectSet {
             return Err(invalid("object set has an invalid meta-dnode"));
         }
         let zil_header = ZilHeader::parse(&raw[512..704], order)?;
-        Ok(Self {
+        let os = Self {
             kind,
             flags,
             meta,
             zil_header,
-        })
+            tail_bytes: raw[720..].to_vec(),
+        };
+        for slot_offset in [
+            OBJSET_USERUSED_OFFSET,
+            OBJSET_GROUPUSED_OFFSET,
+            OBJSET_PROJECTUSED_OFFSET,
+        ] {
+            let _ = os.embedded_dnode(slot_offset, order)?;
+        }
+        Ok(os)
+    }
+
+    pub fn new(
+        kind: u64,
+        flags: u64,
+        meta: Dnode,
+        zil_header: ZilHeader,
+        physical_bytes: usize,
+    ) -> Result<Self, ParseError> {
+        if !matches!(physical_bytes, 1024 | 2048 | 4096) {
+            return Err(invalid("unsupported object-set physical size"));
+        }
+        let order = meta.order();
+        let candidate = Self {
+            kind,
+            flags,
+            meta,
+            zil_header,
+            tail_bytes: vec![0_u8; physical_bytes - 720],
+        };
+        let raw = candidate.encode(order)?;
+        Self::parse(&raw, order)
+    }
+
+    #[must_use]
+    pub fn physical_bytes(&self) -> usize {
+        720 + self.tail_bytes.len()
+    }
+
+    /// Exact OpenZFS `rootbp_write` `blk_fill` for `DMU_OT_OBJSET`: sum of
+    /// `BP_GET_FILL(&os_meta_dnode.dn_blkptr[i])` across root pointers.
+    #[must_use]
+    pub fn meta_fill(&self) -> u64 {
+        self.meta
+            .pointers()
+            .iter()
+            .map(|bp| {
+                if bp.embedded() {
+                    1
+                } else if bp.hole() {
+                    0
+                } else {
+                    bp.fill()
+                }
+            })
+            .sum()
+    }
+
+    pub fn embedded_dnode(
+        &self,
+        slot_offset: usize,
+        order: Endian,
+    ) -> Result<Option<Dnode>, ParseError> {
+        if !matches!(
+            slot_offset,
+            OBJSET_USERUSED_OFFSET | OBJSET_GROUPUSED_OFFSET | OBJSET_PROJECTUSED_OFFSET
+        ) {
+            return Err(invalid("unsupported embedded object-set dnode offset"));
+        }
+        if slot_offset + DNODE_BYTES > self.physical_bytes() {
+            return Ok(None);
+        }
+        let rel = slot_offset - 720;
+        let slice = &self.tail_bytes[rel..rel + DNODE_BYTES];
+        if slice[0] == 0 {
+            Ok(None)
+        } else {
+            Dnode::parse(slice, order).map(Some)
+        }
+    }
+
+    pub fn set_embedded_dnode(
+        &mut self,
+        slot_offset: usize,
+        dnode: Option<&Dnode>,
+    ) -> Result<(), ParseError> {
+        if !matches!(
+            slot_offset,
+            OBJSET_USERUSED_OFFSET | OBJSET_GROUPUSED_OFFSET | OBJSET_PROJECTUSED_OFFSET
+        ) || slot_offset + DNODE_BYTES > self.physical_bytes()
+        {
+            return Err(invalid("embedded object-set dnode offset out of bounds"));
+        }
+        let rel = slot_offset - 720;
+        if let Some(dn) = dnode {
+            if dn.slots() != 1 {
+                return Err(invalid("embedded object-set dnode must occupy one 512B slot"));
+            }
+            let encoded = dn.encode()?;
+            self.tail_bytes[rel..rel + DNODE_BYTES].copy_from_slice(&encoded);
+        } else {
+            self.tail_bytes[rel..rel + DNODE_BYTES].fill(0);
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, order: Endian) -> Result<Vec<u8>, ParseError> {
+        let physical_bytes = self.physical_bytes();
+        if !matches!(physical_bytes, 1024 | 2048 | 4096) {
+            return Err(invalid("unsupported object-set physical size"));
+        }
+        if !(1..=4).contains(&self.kind) || self.flags & !7 != 0 {
+            return Err(invalid("unsupported object-set type or flags"));
+        }
+        if self.meta.slots() != 1
+            || self.meta.object_type() != DMU_OT_DNODE
+            || self.meta.data_bytes() != DNODE_BLOCK_BYTES
+            || !self.meta.bonus().is_empty()
+            || self.meta.spill().is_some()
+        {
+            return Err(invalid("object set has an invalid meta-dnode"));
+        }
+        let mut raw = vec![0_u8; physical_bytes];
+        let meta_bytes = self.meta.encode()?;
+        raw[..DNODE_BYTES].copy_from_slice(&meta_bytes);
+        raw[512..704].copy_from_slice(&self.zil_header.encode(order));
+        raw[704..712].copy_from_slice(&order.encode(self.kind));
+        raw[712..720].copy_from_slice(&order.encode(self.flags));
+        raw[720..].copy_from_slice(&self.tail_bytes);
+        let _ = Self::parse(&raw, order)?;
+        Ok(raw)
     }
 }
 
@@ -636,6 +1126,64 @@ pub struct ZapEntry {
     pub name: Vec<u8>,
     pub value: u64,
     pub collision: u32,
+}
+
+/// Encode a native unnormalized micro-ZAP (`ZBT_MICRO`) block with unique
+/// 28-bit CRC64 collision differentiators so OpenZFS `mzap_open` AVL insertion
+/// and `microzap()` agree byte-for-byte.
+pub fn encode_microzap(
+    entries: &[ZapEntry],
+    block_bytes: usize,
+    salt: u64,
+    order: Endian,
+) -> Result<Vec<u8>, ParseError> {
+    if !(512..=131_072).contains(&block_bytes) || !block_bytes.is_multiple_of(512) {
+        return Err(invalid("invalid micro-ZAP block size"));
+    }
+    let capacity = (block_bytes - 64) / 64;
+    if entries.len() > capacity {
+        return Err(invalid("micro-ZAP entry count exceeds block capacity"));
+    }
+    let effective_salt = if salt == 0 {
+        0x0123_4567_89ab_cdef
+    } else {
+        salt | 1
+    };
+    let mut raw = vec![0_u8; block_bytes];
+    raw[0..8].copy_from_slice(&order.encode((1_u64 << 63) + 3));
+    raw[8..16].copy_from_slice(&order.encode(effective_salt));
+
+    let mut seen_names = BTreeSet::new();
+    let mut bucket_cd = std::collections::BTreeMap::<u64, u32>::new();
+    for (index, item) in entries.iter().enumerate() {
+        if item.name.is_empty() || item.name.len() > 49 || item.name.contains(&0) {
+            return Err(invalid("micro-ZAP name empty, NUL-containing or > 49 bytes"));
+        }
+        if !seen_names.insert(item.name.clone()) {
+            return Err(invalid("duplicate micro-ZAP name"));
+        }
+        let hash = crate::zfs_zap::zap_name_hash(&item.name, effective_salt, 28);
+        let cd_slot = bucket_cd.entry(hash).or_insert(0);
+        let cd = *cd_slot;
+        *cd_slot = cd
+            .checked_add(1)
+            .ok_or_else(|| invalid("micro-ZAP collision differentiator overflow"))?;
+
+        let slot = &mut raw[64 + index * 64..64 + (index + 1) * 64];
+        slot[0..8].copy_from_slice(&order.encode(item.value));
+        slot[8..12].copy_from_slice(&match order {
+            Endian::Little => cd.to_le_bytes(),
+            Endian::Big => cd.to_be_bytes(),
+        });
+        slot[14..14 + item.name.len()].copy_from_slice(&item.name);
+        slot[14 + item.name.len()] = 0;
+    }
+
+    let decoded = microzap(&raw, order)?;
+    if decoded.len() != entries.len() {
+        return Err(invalid("encoded micro-ZAP entry count mismatch"));
+    }
+    Ok(raw)
 }
 
 /// Enumerate a complete micro-ZAP. Fat-ZAP needs its own leaf/array traversal;
@@ -834,6 +1382,168 @@ mod tests {
             assert!(microzap(&raw, order).is_err());
             raw[..8].copy_from_slice(&order.encode((1_u64 << 63) + 1));
             assert!(microzap(&raw, order).is_err());
+        }
+    }
+
+    #[test]
+    fn dnode_block_helpers_objectset_embedded_dnodes_and_microzap_encode_roundtrip() {
+        for order in [Endian::Little, Endian::Big] {
+            let mut block = vec![0_u8; DNODE_BLOCK_BYTES];
+            assert_eq!(count_allocated_dnodes(&block, order).unwrap(), 0);
+            assert_eq!(find_free_dnode_slot(&block, 1, 2).unwrap(), Some(1));
+
+            let dn1 = Dnode::from_spec(DnodeSpec {
+                object_type: 19,
+                bonus_type: 44,
+                checksum_type: 7,
+                compress_type: 2,
+                flags: DNODE_FLAG_USED_BYTES | DNODE_FLAG_USERUSED_ACCOUNTED,
+                order,
+                levels: 1,
+                indirect_shift: 17,
+                data_bytes: 4096,
+                max_block: 0,
+                used_bytes: 4096,
+                slots: 2,
+                pointers: vec![BlockPointer::hole_pointer()],
+                bonus: vec![0xAA; 168],
+                spill: None,
+            })
+            .unwrap();
+            write_dnode_at(&mut block, 1, &dn1).unwrap();
+            assert_eq!(count_allocated_dnodes(&block, order).unwrap(), 1);
+            // Slot 1..3 is occupied, so next free slot >= 1 for 1 slot is 3.
+            assert_eq!(find_free_dnode_slot(&block, 1, 1).unwrap(), Some(3));
+            // Writing a new dnode overlapping interior slot 2 must fail.
+            assert!(write_dnode_at(&mut block, 2, &dn1).is_err());
+            let parsed_dn1 = dnode_at(&block, 1, order).unwrap().unwrap();
+            assert_eq!(parsed_dn1.bonus(), vec![0xAA; 168]);
+            assert_eq!(parsed_dn1.slots(), 2);
+            clear_dnode_at(&mut block, 1, order).unwrap();
+            assert_eq!(count_allocated_dnodes(&block, order).unwrap(), 0);
+
+            // 4096B ObjectSet with embedded userused/groupused/projectused dnodes
+            let bp = BlockPointer::new_regular(&crate::zfs::RegularBlockSpec {
+                dvas: &[crate::zfs::Dva {
+                    vdev: 0,
+                    offset: 0x40_0000,
+                    allocated_bytes: 16_384,
+                    gang: false,
+                }],
+                physical: &block,
+                logical_bytes: 16_384,
+                compression: 2,
+                checksum_type: 7,
+                object_type: DMU_OT_DNODE,
+                level: 0,
+                payload_order: order,
+                birth: 7,
+                fill: 5,
+            })
+            .unwrap();
+            let meta = Dnode::from_spec(DnodeSpec {
+                object_type: DMU_OT_DNODE,
+                bonus_type: 0,
+                checksum_type: 0,
+                compress_type: 0,
+                flags: DNODE_FLAG_USED_BYTES,
+                order,
+                levels: 1,
+                indirect_shift: 17,
+                data_bytes: DNODE_BLOCK_BYTES,
+                max_block: 0,
+                used_bytes: 16_384,
+                slots: 1,
+                pointers: vec![bp, BlockPointer::hole_pointer(), BlockPointer::hole_pointer()],
+                bonus: Vec::new(),
+                spill: None,
+            })
+            .unwrap();
+            let mut os = ObjectSet::new(2, 3, meta, ZilHeader::empty(), 4096).unwrap();
+            assert_eq!(os.meta_fill(), 5);
+            let quota_dn = Dnode::from_spec(DnodeSpec {
+                object_type: 20,
+                bonus_type: 0,
+                checksum_type: 0,
+                compress_type: 0,
+                flags: DNODE_FLAG_USED_BYTES,
+                order,
+                levels: 1,
+                indirect_shift: 17,
+                data_bytes: 512,
+                max_block: 0,
+                used_bytes: 512,
+                slots: 1,
+                pointers: vec![BlockPointer::hole_pointer()],
+                bonus: Vec::new(),
+                spill: None,
+            })
+            .unwrap();
+            os.set_embedded_dnode(OBJSET_USERUSED_OFFSET, Some(&quota_dn))
+                .unwrap();
+            os.set_embedded_dnode(OBJSET_GROUPUSED_OFFSET, Some(&quota_dn))
+                .unwrap();
+            os.set_embedded_dnode(OBJSET_PROJECTUSED_OFFSET, Some(&quota_dn))
+                .unwrap();
+            // Embedded quota dnodes never inflate DMU_OT_OBJSET blk_fill.
+            assert_eq!(os.meta_fill(), 5);
+            let encoded_os = os.encode(order).unwrap();
+            assert_eq!(encoded_os.len(), 4096);
+            let decoded_os = ObjectSet::parse(&encoded_os, order).unwrap();
+            assert_eq!(decoded_os.physical_bytes(), 4096);
+            assert!(
+                decoded_os
+                    .embedded_dnode(OBJSET_PROJECTUSED_OFFSET, order)
+                    .unwrap()
+                    .is_some()
+            );
+
+            // Micro-ZAP encode roundtrip & negative checks
+            let entries = vec![
+                ZapEntry {
+                    name: b"alpha".to_vec(),
+                    value: 11,
+                    collision: 0,
+                },
+                ZapEntry {
+                    name: b"beta".to_vec(),
+                    value: 22,
+                    collision: 0,
+                },
+            ];
+            let mzap_raw = encode_microzap(&entries, 512, 0x99, order).unwrap();
+            let parsed_mzap = microzap(&mzap_raw, order).unwrap();
+            assert_eq!(parsed_mzap.len(), 2);
+            assert_eq!(parsed_mzap[0].name, b"alpha");
+            assert_eq!(parsed_mzap[0].value, 11);
+            assert_eq!(parsed_mzap[1].name, b"beta");
+            assert_eq!(parsed_mzap[1].value, 22);
+
+            // Duplicate name, >49B name, and over-capacity are rejected.
+            let mut dup = entries.clone();
+            dup.push(entries[0].clone());
+            assert!(encode_microzap(&dup, 512, 1, order).is_err());
+            assert!(
+                encode_microzap(
+                    &[ZapEntry {
+                        name: vec![b'z'; 50],
+                        value: 1,
+                        collision: 0,
+                    }],
+                    512,
+                    1,
+                    order,
+                )
+                .is_err()
+            );
+            let too_many: Vec<ZapEntry> = (0..8)
+                .map(|i| ZapEntry {
+                    name: format!("k{i}").into_bytes(),
+                    value: i,
+                    collision: 0,
+                })
+                .collect();
+            assert!(encode_microzap(&too_many, 512, 1, order).is_err());
         }
     }
 }

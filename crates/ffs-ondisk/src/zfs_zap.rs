@@ -210,6 +210,18 @@ impl FatHeader {
         self.entries
     }
     #[must_use]
+    pub const fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+    #[must_use]
+    pub const fn salt(&self) -> u64 {
+        self.salt
+    }
+    #[must_use]
+    pub const fn is_hash64(&self) -> bool {
+        self.hash_bits == 48
+    }
+    #[must_use]
     pub fn table_blocks(&self) -> Range<u64> {
         self.table_start..self.table_start + self.table_blocks
     }
@@ -494,11 +506,423 @@ const CRC_TABLE: [u64; 256] = {
     table
 };
 
+pub(crate) fn zap_name_hash(name: &[u8], salt: u64, bits: u32) -> u64 {
+    name_hash(name, salt, bits)
+}
+
 fn name_hash(name: &[u8], salt: u64, bits: u32) -> u64 {
     let hash = name.iter().fold(salt, |hash, byte| {
         (hash >> 8) ^ CRC_TABLE[((hash ^ u64::from(*byte)) & 255) as usize]
     });
     hash & (u64::MAX << (64 - bits))
+}
+
+fn put_u16(raw: &mut [u8], at: usize, value: u16, order: Endian) {
+    let bytes = match order {
+        Endian::Little => value.to_le_bytes(),
+        Endian::Big => value.to_be_bytes(),
+    };
+    raw[at..at + 2].copy_from_slice(&bytes);
+}
+
+fn put_u32(raw: &mut [u8], at: usize, value: u32, order: Endian) {
+    let bytes = match order {
+        Endian::Little => value.to_le_bytes(),
+        Endian::Big => value.to_be_bytes(),
+    };
+    raw[at..at + 4].copy_from_slice(&bytes);
+}
+
+fn put_u64(raw: &mut [u8], at: usize, value: u64, order: Endian) {
+    raw[at..at + 8].copy_from_slice(&order.encode(value));
+}
+
+#[derive(Clone)]
+struct PreparedZapEntry {
+    name_nul: Vec<u8>,
+    width: u8,
+    value_count: u16,
+    value_bytes: Vec<u8>,
+    hash: u64,
+    collision: u32,
+    chunks_needed: usize,
+}
+
+fn encode_leaf_block(
+    block_bytes: usize,
+    prefix: u64,
+    prefix_bits: u32,
+    items: &[PreparedZapEntry],
+    order: Endian,
+) -> Result<Vec<u8>, ParseError> {
+    let buckets = block_bytes / 32;
+    let start = 48 + buckets * 2;
+    let total_chunks = (block_bytes - start) / 24;
+    let total_needed: usize = items.iter().map(|e| e.chunks_needed).sum();
+    if total_needed > total_chunks || items.len() > usize::from(u16::MAX) {
+        return Err(invalid("ZAP leaf entries exceed chunk capacity"));
+    }
+
+    let mut raw = vec![0_u8; block_bytes];
+    put_u64(&mut raw, 0, 1_u64 << 63, order);
+    put_u64(&mut raw, 16, prefix, order);
+    put_u32(&mut raw, 24, 0x02ab_1eaf, order);
+    put_u16(
+        &mut raw,
+        30,
+        u16::try_from(items.len()).map_err(|_| invalid("ZAP leaf entry count overflow"))?,
+        order,
+    );
+    put_u16(
+        &mut raw,
+        32,
+        u16::try_from(prefix_bits).map_err(|_| invalid("ZAP leaf prefix bits overflow"))?,
+        order,
+    );
+    raw[48..start].fill(0xFF);
+
+    // Insert in reverse (hash, collision) order so each bucket chain walks in
+    // ascending (hash, collision) order on disk.
+    let mut ordered = items.to_vec();
+    ordered.sort_by(|a, b| (b.hash, b.collision).cmp(&(a.hash, a.collision)));
+
+    let mut next_chunk = 0_u16;
+    let alloc_array = |buf: &mut [u8], payload: &[u8], next: &mut u16| -> u16 {
+        if payload.is_empty() {
+            return CHAIN_END;
+        }
+        let first = *next;
+        let parts = payload.chunks(21);
+        let part_count = parts.len();
+        for (idx, part) in parts.enumerate() {
+            let at = start + usize::from(*next) * 24;
+            buf[at] = 251;
+            buf[at + 1..at + 1 + part.len()].copy_from_slice(part);
+            let chain_next = if idx + 1 == part_count {
+                CHAIN_END
+            } else {
+                *next + 1
+            };
+            put_u16(buf, at + 22, chain_next, order);
+            *next += 1;
+        }
+        first
+    };
+
+    for item in &ordered {
+        let entry_idx = next_chunk;
+        next_chunk += 1;
+        let name_first = alloc_array(&mut raw, &item.name_nul, &mut next_chunk);
+        let value_first = alloc_array(&mut raw, &item.value_bytes, &mut next_chunk);
+        let slot =
+            (item.hash >> (64 - prefix_bits - buckets.ilog2())) as usize & (buckets - 1);
+        let prev_head = u16_at(&raw, 48 + slot * 2, order)?;
+        let at = start + usize::from(entry_idx) * 24;
+        raw[at] = 252;
+        raw[at + 1] = item.width;
+        put_u16(&mut raw, at + 2, prev_head, order);
+        put_u16(&mut raw, at + 4, name_first, order);
+        put_u16(
+            &mut raw,
+            at + 6,
+            u16::try_from(item.name_nul.len()).map_err(|_| invalid("ZAP name length overflow"))?,
+            order,
+        );
+        put_u16(&mut raw, at + 8, value_first, order);
+        put_u16(&mut raw, at + 10, item.value_count, order);
+        put_u32(&mut raw, at + 12, item.collision, order);
+        put_u64(&mut raw, at + 16, item.hash, order);
+        put_u16(&mut raw, 48 + slot * 2, entry_idx, order);
+    }
+
+    let free_chunks = total_chunks
+        .checked_sub(usize::from(next_chunk))
+        .ok_or_else(|| invalid("ZAP leaf chunk allocation overflow"))?;
+    put_u16(
+        &mut raw,
+        28,
+        u16::try_from(free_chunks).map_err(|_| invalid("ZAP free chunk count overflow"))?,
+        order,
+    );
+    put_u16(
+        &mut raw,
+        34,
+        if usize::from(next_chunk) == total_chunks {
+            CHAIN_END
+        } else {
+            next_chunk
+        },
+        order,
+    );
+    let total_chunks_u16 =
+        u16::try_from(total_chunks).map_err(|_| invalid("ZAP chunk limit overflow"))?;
+    for free_idx in next_chunk..total_chunks_u16 {
+        let at = start + usize::from(free_idx) * 24;
+        raw[at] = 253;
+        put_u16(
+            &mut raw,
+            at + 22,
+            if free_idx + 1 == total_chunks_u16 {
+                CHAIN_END
+            } else {
+                free_idx + 1
+            },
+            order,
+        );
+    }
+    Ok(raw)
+}
+
+/// Encode a complete string-keyed Fat-ZAP (`ZBT_HEADER` at block 0, leaf blocks,
+/// and optional external pointer-table blocks) with automatic leaf splitting and
+/// self-verification through `FatHeader::parse`, `routes`, and `leaf`.
+pub fn encode_fatzap(
+    entries: &[Entry],
+    block_bytes: usize,
+    salt: u64,
+    order: Endian,
+) -> Result<Vec<Vec<u8>>, ParseError> {
+    encode_fatzap_with_flags(entries, block_bytes, salt, false, order)
+}
+
+pub fn encode_fatzap_with_flags(
+    entries: &[Entry],
+    block_bytes: usize,
+    salt: u64,
+    hash64: bool,
+    order: Endian,
+) -> Result<Vec<Vec<u8>>, ParseError> {
+    if !(512..=131_072).contains(&block_bytes) || !block_bytes.is_power_of_two() {
+        return Err(invalid("invalid fat-ZAP block size"));
+    }
+    if entries.len() > MAX_ENTRIES {
+        return Err(invalid("ZAP entry count exceeds budget"));
+    }
+    let effective_salt = if salt == 0 {
+        0x0123_4567_89ab_cdef
+    } else {
+        salt
+    };
+    let hash_bits = if hash64 { 48_u32 } else { 28_u32 };
+
+    let buckets = block_bytes / 32;
+    let chunk_area_start = 48 + buckets * 2;
+    let leaf_chunk_capacity = (block_bytes - chunk_area_start) / 24;
+
+    let mut seen_names = BTreeSet::new();
+    let mut hash_cd = BTreeMap::<u64, u32>::new();
+    let mut prepared = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.name.is_empty()
+            || entry.name.len() + 1 > MAX_NAME_BYTES
+            || entry.name.contains(&0)
+        {
+            return Err(invalid("invalid fat-ZAP key name"));
+        }
+        if !seen_names.insert(entry.name.clone()) {
+            return Err(invalid("duplicate fat-ZAP key name"));
+        }
+        if !matches!(entry.integer_bytes, 1 | 2 | 4 | 8) {
+            return Err(invalid("unsupported fat-ZAP integer width"));
+        }
+        let width = usize::from(entry.integer_bytes);
+        let val_byte_len = entry
+            .values
+            .len()
+            .checked_mul(width)
+            .ok_or_else(|| invalid("fat-ZAP value byte length overflow"))?;
+        if val_byte_len > MAX_VALUE_BYTES {
+            return Err(invalid("fat-ZAP value exceeds maximum byte length"));
+        }
+        let value_count = u16::try_from(entry.values.len())
+            .map_err(|_| invalid("fat-ZAP value array count overflow"))?;
+        let mut value_bytes = Vec::with_capacity(val_byte_len);
+        for &v in &entry.values {
+            match entry.integer_bytes {
+                1 => {
+                    let b = u8::try_from(v).map_err(|_| invalid("fat-ZAP u8 value overflow"))?;
+                    value_bytes.push(b);
+                }
+                2 => {
+                    let w = u16::try_from(v).map_err(|_| invalid("fat-ZAP u16 value overflow"))?;
+                    value_bytes.extend_from_slice(&w.to_be_bytes());
+                }
+                4 => {
+                    let d = u32::try_from(v).map_err(|_| invalid("fat-ZAP u32 value overflow"))?;
+                    value_bytes.extend_from_slice(&d.to_be_bytes());
+                }
+                8 => value_bytes.extend_from_slice(&v.to_be_bytes()),
+                _ => unreachable!(),
+            }
+        }
+        let mut name_nul = Vec::with_capacity(entry.name.len() + 1);
+        name_nul.extend_from_slice(&entry.name);
+        name_nul.push(0);
+
+        let hash = name_hash(&entry.name, effective_salt, hash_bits);
+        let cd_slot = hash_cd.entry(hash).or_insert(0);
+        let collision = *cd_slot;
+        if hash64 && collision >= u32::from(u16::MAX) {
+            return Err(invalid("fat-ZAP hash64 collision differentiator overflow"));
+        }
+        *cd_slot = collision
+            .checked_add(1)
+            .ok_or_else(|| invalid("fat-ZAP collision differentiator overflow"))?;
+
+        let chunks_needed = 1
+            + name_nul.len().div_ceil(21)
+            + if value_bytes.is_empty() {
+                0
+            } else {
+                value_bytes.len().div_ceil(21)
+            };
+        if chunks_needed > leaf_chunk_capacity {
+            return Err(invalid("single fat-ZAP entry exceeds leaf block capacity"));
+        }
+        prepared.push(PreparedZapEntry {
+            name_nul,
+            width: entry.integer_bytes,
+            value_count,
+            value_bytes,
+            hash,
+            collision,
+            chunks_needed,
+        });
+    }
+
+    // Recursively split leaves along hash prefix bits whenever a leaf overflows.
+    let max_table_shift = MAX_TABLE_ENTRIES.ilog2().min(hash_bits);
+    let mut leaves: Vec<(u64, u32, Vec<PreparedZapEntry>)> = Vec::new();
+    let mut work: Vec<(u64, u32, Vec<PreparedZapEntry>)> = vec![(0, 0, prepared)];
+    while let Some((prefix, prefix_bits, group)) = work.pop() {
+        let needed: usize = group.iter().map(|e| e.chunks_needed).sum();
+        if needed <= leaf_chunk_capacity {
+            leaves.push((prefix, prefix_bits, group));
+            if leaves.len() > MAX_LEAVES {
+                return Err(invalid("fat-ZAP leaf count exceeds budget"));
+            }
+            continue;
+        }
+        if prefix_bits >= max_table_shift {
+            return Err(invalid("fat-ZAP hash collision chain exceeds leaf capacity"));
+        }
+        let bit_pos = 63 - prefix_bits;
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for item in group {
+            if (item.hash >> bit_pos) & 1 == 0 {
+                left.push(item);
+            } else {
+                right.push(item);
+            }
+        }
+        // Push right first so pop() visits left (lower prefix) first!
+        work.push(((prefix << 1) | 1, prefix_bits + 1, right));
+        work.push((prefix << 1, prefix_bits + 1, left));
+    }
+
+    leaves.sort_by_key(|&(prefix, prefix_bits, _)| {
+        if prefix_bits == 0 {
+            0
+        } else {
+            prefix << (64 - prefix_bits)
+        }
+    });
+
+    let max_prefix_bits = leaves.iter().map(|&(_, bits, _)| bits).max().unwrap_or(0);
+    let embedded_shift = (block_bytes / 16).ilog2();
+    let external_min_shift = (block_bytes / 8).ilog2();
+    let (table_shift, external_table_blocks) = if max_prefix_bits <= embedded_shift {
+        (embedded_shift, 0_u64)
+    } else {
+        let shift = max_prefix_bits.max(external_min_shift);
+        let tbl_len = 1_usize << shift;
+        let per_blk = block_bytes / 8;
+        (shift, (tbl_len / per_blk) as u64)
+    };
+    let table_len = 1_usize << table_shift;
+
+    // Block layout:
+    // Block 0: Fat-ZAP header (with embedded table when external_table_blocks == 0)
+    // Blocks 1..=leaves.len(): Leaf blocks
+    // Blocks leaves.len()+1..: External pointer-table blocks (if any)
+    let mut blocks = Vec::with_capacity(1 + leaves.len() + external_table_blocks as usize);
+    blocks.push(vec![0_u8; block_bytes]);
+
+    let mut ptr_table = vec![0_u64; table_len];
+    for (leaf_idx, (prefix, prefix_bits, group)) in leaves.iter().enumerate() {
+        let blk_num = (leaf_idx + 1) as u64;
+        let leaf_raw = encode_leaf_block(block_bytes, *prefix, *prefix_bits, group, order)?;
+        blocks.push(leaf_raw);
+
+        let span = 1_usize << (table_shift - *prefix_bits);
+        let first = (*prefix as usize) * span;
+        for slot in &mut ptr_table[first..first + span] {
+            *slot = blk_num;
+        }
+    }
+
+    let table_start = if external_table_blocks == 0 {
+        0_u64
+    } else {
+        (leaves.len() + 1) as u64
+    };
+    if external_table_blocks > 0 {
+        let per_blk = block_bytes / 8;
+        for chunk in ptr_table.chunks_exact(per_blk) {
+            let mut tbl_blk = vec![0_u8; block_bytes];
+            for (i, &val) in chunk.iter().enumerate() {
+                put_u64(&mut tbl_blk, i * 8, val, order);
+            }
+            blocks.push(tbl_blk);
+        }
+    }
+
+    let free_block = blocks.len() as u64;
+    let hdr = &mut blocks[0];
+    put_u64(hdr, 0, FAT_TAG, order);
+    put_u64(hdr, 8, 0x0002_f52a_b2ab, order);
+    put_u64(hdr, 16, table_start, order);
+    put_u64(hdr, 24, external_table_blocks, order);
+    put_u64(hdr, 32, u64::from(table_shift), order);
+    put_u64(hdr, 40, 0, order);
+    put_u64(hdr, 48, 0, order);
+    put_u64(hdr, 56, free_block, order);
+    put_u64(hdr, 64, leaves.len() as u64, order);
+    put_u64(hdr, 72, entries.len() as u64, order);
+    put_u64(hdr, 80, effective_salt, order);
+    put_u64(hdr, 88, 0, order);
+    put_u64(hdr, 96, u64::from(hash64), order);
+    if external_table_blocks == 0 {
+        let base = block_bytes / 2;
+        for (i, &val) in ptr_table.iter().enumerate() {
+            put_u64(hdr, base + i * 8, val, order);
+        }
+    }
+
+    // Self-verify roundtrip against FatHeader + routes + leaf!
+    let max_block = free_block - 1;
+    let parsed_hdr = FatHeader::parse(&blocks[0], order, max_block)?;
+    let decoded_table = if external_table_blocks == 0 {
+        parsed_hdr.embedded_table(&blocks[0], order)?
+    } else {
+        let mut t = Vec::with_capacity(table_len);
+        for blk_id in parsed_hdr.table_blocks() {
+            t.extend(parsed_hdr.table_block(&blocks[blk_id as usize], order)?);
+        }
+        t
+    };
+    let routes = parsed_hdr.routes(&decoded_table, max_block)?;
+    let mut total_decoded = 0_usize;
+    for route in routes {
+        let leaf_entries = parsed_hdr.leaf(&blocks[route.block as usize], order, route)?;
+        total_decoded += leaf_entries.len();
+    }
+    if total_decoded != entries.len() {
+        return Err(invalid("encoded fat-ZAP roundtrip entry count mismatch"));
+    }
+
+    Ok(blocks)
 }
 
 #[cfg(test)]

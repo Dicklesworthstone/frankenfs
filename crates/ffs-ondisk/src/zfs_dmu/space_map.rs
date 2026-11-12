@@ -56,6 +56,36 @@ impl Header {
             histogram,
         })
     }
+
+    pub fn encode(
+        &self,
+        bonus_len: usize,
+        preserved_object: u64,
+        order: Endian,
+    ) -> Result<Vec<u8>, ParseError> {
+        if !matches!(bonus_len, 24 | 320) {
+            return Err(invalid("unsupported space-map bonus size"));
+        }
+        if !self.length.is_multiple_of(8) {
+            return Err(invalid("space-map length is not a whole number of words"));
+        }
+        if bonus_len == 24 && self.histogram.is_some() {
+            return Err(invalid("24-byte space-map bonus cannot carry a histogram"));
+        }
+        let mut raw = vec![0_u8; bonus_len];
+        raw[0..8].copy_from_slice(&order.encode(preserved_object));
+        raw[8..16].copy_from_slice(&order.encode(self.length));
+        raw[16..24].copy_from_slice(&order.encode(self.allocated.cast_unsigned()));
+        if bonus_len == 320 {
+            let buckets = self.histogram.unwrap_or([0_u64; 32]);
+            for (index, &bucket) in buckets.iter().enumerate() {
+                let at = 64 + index * 8;
+                raw[at..at + 8].copy_from_slice(&order.encode(bucket));
+            }
+        }
+        let _ = Self::parse(&raw, order)?;
+        Ok(raw)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +143,119 @@ pub enum Record {
         txg: u64,
         sync_pass: u16,
     },
+}
+
+impl Record {
+    #[must_use]
+    pub const fn padding_word() -> Self {
+        Self::Debug {
+            kind: MapType::Allocate,
+            txg: 0,
+            sync_pass: 0,
+        }
+    }
+
+    pub fn encode(self, order: Endian, allow_v2: bool) -> Result<Vec<u8>, ParseError> {
+        match self {
+            Self::Debug {
+                kind,
+                txg,
+                sync_pass,
+            } => {
+                if txg >= (1_u64 << 50)
+                    || sync_pass >= 1024
+                    || (txg == 0 && (kind != MapType::Allocate || sync_pass != 0))
+                {
+                    return Err(invalid("invalid space-map debug or padding record"));
+                }
+                let action = u64::from(kind == MapType::Free);
+                let word = (2_u64 << 62)
+                    | (action << 60)
+                    | (u64::from(sync_pass) << 50)
+                    | txg;
+                Ok(order.encode(word).to_vec())
+            }
+            Self::Extent(Extent {
+                kind,
+                vdev,
+                offset_units,
+                run_units,
+            }) => {
+                if run_units == 0 {
+                    return Err(invalid("space-map extent run cannot be zero"));
+                }
+                let action = u64::from(kind == MapType::Free);
+                if vdev.is_none() && offset_units < (1_u64 << 47) && run_units <= 32_768 {
+                    let word = (offset_units << 16) | (action << 15) | (run_units - 1);
+                    return Ok(order.encode(word).to_vec());
+                }
+                if !allow_v2 {
+                    return Err(invalid(
+                        "two-word space map requires space_map_v2 admission",
+                    ));
+                }
+                let vdev_id = u64::from(vdev.unwrap_or(0));
+                if vdev_id > 0x00ff_ffff
+                    || offset_units >= (1_u64 << 63)
+                    || run_units > (1_u64 << 36)
+                {
+                    return Err(invalid("two-word space-map extent exceeds native bounds"));
+                }
+                let first = (3_u64 << 62) | ((run_units - 1) << 24) | vdev_id;
+                let second = (action << 63) | offset_units;
+                let mut out = Vec::with_capacity(16);
+                out.extend_from_slice(&order.encode(first));
+                out.extend_from_slice(&order.encode(second));
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Convert a byte range inside a metaslab `[region_start, region_start + region_size)`
+/// into one or more `Record::Extent` items (splitting runs at 32,768 units so
+/// metaslab streams use universally valid single-word records whenever possible).
+pub fn extent_records_for_range(
+    kind: MapType,
+    range: Range<u64>,
+    region_start: u64,
+    region_size: u64,
+    shift: u8,
+) -> Result<Vec<Record>, ParseError> {
+    let unit = 1_u64
+        .checked_shl(u32::from(shift))
+        .ok_or_else(|| invalid("space-map unit shift overflow"))?;
+    let region_end = region_start
+        .checked_add(region_size)
+        .ok_or_else(|| invalid("space-map region overflow"))?;
+    if range.start >= range.end
+        || range.start < region_start
+        || range.end > region_end
+        || !range.start.is_multiple_of(unit)
+        || !range.end.is_multiple_of(unit)
+    {
+        return Err(invalid("extent range outside or misaligned with metaslab"));
+    }
+    let mut offset_units = (range.start - region_start) / unit;
+    let mut remaining_units = (range.end - range.start) / unit;
+    let max_chunk = if offset_units + remaining_units <= (1_u64 << 47) {
+        32_768_u64
+    } else {
+        1_u64 << 36
+    };
+    let mut out = Vec::new();
+    while remaining_units > 0 {
+        let take = remaining_units.min(max_chunk);
+        out.push(Record::Extent(Extent {
+            kind,
+            vdev: None,
+            offset_units,
+            run_units: take,
+        }));
+        offset_units += take;
+        remaining_units -= take;
+    }
+    Ok(out)
 }
 
 /// One authenticated DMU block's used prefix. Errors fuse the iterator; no
@@ -307,6 +450,16 @@ impl AllocationMap {
     }
 
     #[must_use]
+    pub const fn region(&self) -> &Range<u64> {
+        &self.region
+    }
+
+    #[must_use]
+    pub const fn unit_bytes(&self) -> u64 {
+        self.unit
+    }
+
+    #[must_use]
     pub const fn allocated_bytes(&self) -> u64 {
         self.allocated
     }
@@ -318,6 +471,92 @@ impl AllocationMap {
 
     pub fn ranges(&self) -> impl Iterator<Item = Range<u64>> + '_ {
         self.ranges.iter().map(|(&start, &end)| start..end)
+    }
+
+    /// Find the lowest-address free byte range of length `bytes` aligned to
+    /// `align.max(self.unit)`.
+    #[must_use]
+    pub fn find_free_extent(&self, bytes: u64, align: u64) -> Option<Range<u64>> {
+        if bytes == 0 || !bytes.is_multiple_of(self.unit) {
+            return None;
+        }
+        let step = align.max(self.unit);
+        if !step.is_multiple_of(self.unit) {
+            return None;
+        }
+        let align_up = |addr: u64| -> Option<u64> {
+            let rem = addr % step;
+            if rem == 0 {
+                Some(addr)
+            } else {
+                addr.checked_add(step - rem)
+            }
+        };
+
+        let mut cursor = self.region.start;
+        for (&alloc_start, &alloc_end) in &self.ranges {
+            if alloc_start > cursor
+                && let Some(candidate) = align_up(cursor)
+                && let Some(candidate_end) = candidate.checked_add(bytes)
+                && candidate_end <= alloc_start
+            {
+                return Some(candidate..candidate_end);
+            }
+            cursor = alloc_end;
+        }
+        if self.region.end > cursor
+            && let Some(candidate) = align_up(cursor)
+            && let Some(candidate_end) = candidate.checked_add(bytes)
+            && candidate_end <= self.region.end
+        {
+            return Some(candidate..candidate_end);
+        }
+        None
+    }
+
+    /// Compute the exact 32-bucket OpenZFS `smp_histogram` (`space_map_histogram_add`
+    /// + `zfs_range_tree_stat_incr`): each maximal free segment of length `L`
+    /// increments `hist[L.ilog2() - shift]`, clamping shifts `>= 31` into
+    /// `hist[31]` with `1 << (rel - 31)`.
+    pub fn free_histogram(&self, shift: u8) -> Result<[u64; 32], ParseError> {
+        let expected_unit = 1_u64
+            .checked_shl(u32::from(shift))
+            .ok_or_else(|| invalid("space-map histogram shift overflow"))?;
+        if expected_unit != self.unit {
+            return Err(invalid("space-map histogram shift disagrees with map unit"));
+        }
+        let mut hist = [0_u64; 32];
+        let mut record_free = |free_len: u64| -> Result<(), ParseError> {
+            if free_len == 0 {
+                return Ok(());
+            }
+            let bit = free_len.ilog2();
+            if bit < u32::from(shift) {
+                return Err(invalid("free segment smaller than space-map unit"));
+            }
+            let rel = (bit - u32::from(shift)) as usize;
+            if rel < 31 {
+                hist[rel] = hist[rel]
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("space-map histogram bucket overflow"))?;
+            } else {
+                let weight = 1_u64
+                    .checked_shl((rel - 31) as u32)
+                    .ok_or_else(|| invalid("space-map top histogram bucket overflow"))?;
+                hist[31] = hist[31]
+                    .checked_add(weight)
+                    .ok_or_else(|| invalid("space-map top histogram bucket overflow"))?;
+            }
+            Ok(())
+        };
+
+        let mut cursor = self.region.start;
+        for (&alloc_start, &alloc_end) in &self.ranges {
+            record_free(alloc_start - cursor)?;
+            cursor = alloc_end;
+        }
+        record_free(self.region.end - cursor)?;
+        Ok(hist)
     }
 }
 

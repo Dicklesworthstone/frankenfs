@@ -304,3 +304,69 @@ fn enormous_sparse_regions_cost_ranges_not_sectors() {
         [0..512, (1_u64 << 63) - 512..1_u64 << 63]
     );
 }
+
+#[test]
+fn header_record_histogram_and_free_extent_helpers_roundtrip_and_split_cleanly() {
+    for order in [Endian::Little, Endian::Big] {
+        let mut map = AllocationMap::new(0x40_0000, 16 * 4096, 12, 64).unwrap();
+        // Free initially: 64 KiB = 16 * 4096 -> ilog2(65536)=16, rel=4 -> hist[4]=1
+        let hist0 = map.free_histogram(12).unwrap();
+        assert_eq!(hist0[4], 1);
+        assert_eq!(hist0.iter().sum::<u64>(), 1);
+
+        let first = map.find_free_extent(3 * 4096, 4096).unwrap();
+        assert_eq!(first, 0x40_0000..0x40_3000);
+        map.apply(MapType::Allocate, first.clone()).unwrap();
+
+        // Next 8 KiB-aligned allocation skips 0x40_3000..0x40_4000 (4 KiB gap)
+        let second = map.find_free_extent(2 * 4096, 8192).unwrap();
+        assert_eq!(second, 0x40_4000..0x40_6000);
+        map.apply(MapType::Allocate, second.clone()).unwrap();
+
+        // Remaining free gaps:
+        // 1) 0x40_3000..0x40_4000 (4096B -> rel 0)
+        // 2) 0x40_6000..0x41_0000 (10 * 4096 = 40960B -> ilog2=15 -> rel 3)
+        let hist = map.free_histogram(12).unwrap();
+        assert_eq!(hist[0], 1);
+        assert_eq!(hist[3], 1);
+        assert_eq!(hist.iter().sum::<u64>(), 2);
+
+        let hdr = Header {
+            length: 40,
+            allocated: i64::try_from(map.allocated_bytes()).unwrap(),
+            histogram: Some(hist),
+        };
+        let raw_hdr = hdr.encode(320, 99, order).unwrap();
+        assert_eq!(Header::parse(&raw_hdr, order).unwrap(), hdr);
+        assert!(hdr.encode(24, 99, order).is_err());
+
+        // Splitting > 32768 units produces two 1-word records without needing v2
+        let split_recs = extent_records_for_range(
+            MapType::Allocate,
+            0x40_0000..(0x40_0000 + 40_000 * 512),
+            0x40_0000,
+            65_536 * 512,
+            9,
+        )
+        .unwrap();
+        assert_eq!(split_recs.len(), 2);
+        let mut stream = Record::Debug {
+            kind: MapType::Allocate,
+            txg: 7,
+            sync_pass: 1,
+        }
+        .encode(order, false)
+        .unwrap();
+        for rec in &split_recs {
+            stream.extend_from_slice(&rec.encode(order, false).unwrap());
+        }
+        stream.extend_from_slice(&Record::padding_word().encode(order, false).unwrap());
+        let decoded: Vec<Record> = Records::new(&stream, order, false)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded[1], split_recs[0]);
+        assert_eq!(decoded[2], split_recs[1]);
+    }
+}

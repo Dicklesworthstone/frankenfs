@@ -63,6 +63,29 @@ impl Kind {
             _ => Err(invalid("unknown ZPL file type")),
         }
     }
+
+    #[must_use]
+    pub const fn to_tag(self) -> u64 {
+        match self {
+            Self::Fifo => 1,
+            Self::CharDevice => 2,
+            Self::Directory => 4,
+            Self::BlockDevice => 6,
+            Self::Regular => 8,
+            Self::Symlink => 10,
+            Self::Socket => 12,
+        }
+    }
+}
+
+/// Encode a ZPL directory ZAP scalar entry (`(type_tag << 60) | object_id`).
+pub fn encode_directory_reference(object: u64, kind: Kind) -> Result<u64, ParseError> {
+    if object == 0 || object >= OBJECT_LIMIT {
+        return Err(invalid("invalid ZPL directory object reference"));
+    }
+    let encoded = (kind.to_tag() << 60) | object;
+    let _ = directory_reference(encoded)?;
+    Ok(encoded)
 }
 
 /// The middle twelve bits are not part of either native field. A zero type is
@@ -167,6 +190,51 @@ impl Metadata {
             inline_symlink,
         }
         .validate()
+    }
+
+    /// Encode a legacy ZPL v4 `znode_phys_t` (`264` bytes + optional inline symlink),
+    /// preserving unedited fields (`zp_xattr`, `zp_rdev`, `zp_pad`, `zp_acl`) when
+    /// `existing_bonus` is provided.
+    pub fn encode_legacy(
+        &self,
+        existing_bonus: Option<&[u8]>,
+        order: Endian,
+    ) -> Result<Vec<u8>, ParseError> {
+        let checked = self.clone().validate()?;
+        for ts in &checked.times {
+            if ts.nanos >= 1_000_000_000 {
+                return Err(invalid("invalid ZPL nanoseconds"));
+            }
+        }
+        let extra_len = checked.inline_symlink.as_ref().map_or(0, Vec::len);
+        if LEGACY_BYTES + extra_len > 16_384 {
+            return Err(invalid("oversized legacy znode bonus"));
+        }
+        let mut raw = vec![0_u8; LEGACY_BYTES + extra_len];
+        if let Some(prev) = existing_bonus {
+            if prev.len() < LEGACY_BYTES {
+                return Err(invalid("truncated existing legacy znode bonus"));
+            }
+            raw[..LEGACY_BYTES].copy_from_slice(&prev[..LEGACY_BYTES]);
+        }
+        for (idx, ts) in checked.times.iter().enumerate() {
+            let at = idx * 16;
+            raw[at..at + 8].copy_from_slice(&order.encode(ts.seconds.cast_unsigned()));
+            raw[at + 8..at + 16].copy_from_slice(&order.encode(u64::from(ts.nanos)));
+        }
+        raw[64..72].copy_from_slice(&order.encode(checked.generation));
+        raw[72..80].copy_from_slice(&order.encode(checked.mode));
+        raw[80..88].copy_from_slice(&order.encode(checked.size));
+        raw[88..96].copy_from_slice(&order.encode(checked.parent));
+        raw[96..104].copy_from_slice(&order.encode(checked.links));
+        raw[120..128].copy_from_slice(&order.encode(checked.flags));
+        raw[128..136].copy_from_slice(&order.encode(checked.uid));
+        raw[136..144].copy_from_slice(&order.encode(checked.gid));
+        if let Some(target) = &checked.inline_symlink {
+            raw[LEGACY_BYTES..LEGACY_BYTES + target.len()].copy_from_slice(target);
+        }
+        let _ = Self::legacy(&raw, order)?;
+        Ok(raw)
     }
 }
 
@@ -408,6 +476,339 @@ impl SaRegistry {
         }
         Ok(result)
     }
+
+    fn parse_buffer_header(&self, raw: &[u8]) -> Result<(Endian, u16), ParseError> {
+        if !(8..=SA_BYTES).contains(&raw.len()) {
+            return Err(invalid("invalid SA buffer length"));
+        }
+        let order = match &raw[..4] {
+            [0x5a, 0x50, 0x2f, 0] => Endian::Little,
+            [0, 0x2f, 0x50, 0x5a] => Endian::Big,
+            _ => return Err(invalid("invalid SA buffer magic")),
+        };
+        let info = word16(raw, 4, order)?;
+        let layout = match info & 1023 {
+            0 => 1,
+            id => id,
+        };
+        if !self.layouts.contains_key(&layout) {
+            return Err(invalid("unknown SA layout"));
+        }
+        Ok((order, layout))
+    }
+
+    fn pack_layout(
+        &self,
+        layout_id: u16,
+        values_by_name: &BTreeMap<Vec<u8>, Vec<u8>>,
+        order: Endian,
+    ) -> Result<Vec<u8>, ParseError> {
+        if !(2..=1023).contains(&layout_id) {
+            return Err(invalid("invalid SA layout ID for non-empty buffer"));
+        }
+        let ids = self
+            .layouts
+            .get(&layout_id)
+            .ok_or_else(|| invalid("unknown SA layout"))?;
+        let mut var_lengths = Vec::new();
+        let mut payload_chunks = Vec::with_capacity(ids.len());
+        for id in ids {
+            let reg = self
+                .attributes
+                .get(id)
+                .ok_or_else(|| invalid("SA layout references unregistered attribute"))?;
+            let bytes = values_by_name
+                .get(&reg.name)
+                .ok_or_else(|| invalid("missing value for SA layout attribute"))?;
+            if reg.length == 0 {
+                let len_u16 = u16::try_from(bytes.len())
+                    .map_err(|_| invalid("variable SA attribute exceeds u16 length"))?;
+                var_lengths.push(len_u16);
+            } else if bytes.len() != usize::from(reg.length) {
+                return Err(invalid("fixed SA attribute value has wrong byte length"));
+            }
+            let width = match reg.swap {
+                0 => 8,
+                1 => 4,
+                2 => 2,
+                _ => 1,
+            };
+            if !bytes.len().is_multiple_of(width) {
+                return Err(invalid("misaligned SA integer array"));
+            }
+            payload_chunks.push(bytes.as_slice());
+        }
+
+        let header_bytes = (6 + var_lengths.len() * 2).next_multiple_of(8);
+        let header_words = header_bytes / 8;
+        if header_words > 63 {
+            return Err(invalid("SA header exceeds 6-bit word-count field"));
+        }
+        let mut raw = vec![0_u8; header_bytes];
+        raw[..4].copy_from_slice(match order {
+            Endian::Little => &[0x5a, 0x50, 0x2f, 0],
+            Endian::Big => &[0, 0x2f, 0x50, 0x5a],
+        });
+        let info = layout_id | ((header_words as u16) << 10);
+        raw[4..6].copy_from_slice(&match order {
+            Endian::Little => info.to_le_bytes(),
+            Endian::Big => info.to_be_bytes(),
+        });
+        for (idx, len) in var_lengths.iter().enumerate() {
+            let at = 6 + idx * 2;
+            raw[at..at + 2].copy_from_slice(&match order {
+                Endian::Little => len.to_le_bytes(),
+                Endian::Big => len.to_be_bytes(),
+            });
+        }
+        for chunk in payload_chunks {
+            raw.extend_from_slice(chunk);
+            let padded = raw.len().next_multiple_of(8);
+            raw.resize(padded, 0);
+        }
+        if raw.len() > SA_BYTES {
+            return Err(invalid("encoded SA buffer exceeds maximum size"));
+        }
+        let mut check = Attributes {
+            values: BTreeMap::new(),
+        };
+        self.decode_into(&raw, &mut check)?;
+        Ok(raw)
+    }
+
+    fn apply_metadata_to_map(
+        map: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+        metadata: &Metadata,
+        order: Endian,
+        update_trivial_dacl: bool,
+    ) -> Result<(), ParseError> {
+        let checked = metadata.clone().validate()?;
+        let enc_ts = |ts: Timestamp| -> Result<Vec<u8>, ParseError> {
+            if ts.nanos >= 1_000_000_000 {
+                return Err(invalid("invalid ZPL nanoseconds"));
+            }
+            let mut b = Vec::with_capacity(16);
+            b.extend_from_slice(&order.encode(ts.seconds.cast_unsigned()));
+            b.extend_from_slice(&order.encode(u64::from(ts.nanos)));
+            Ok(b)
+        };
+        let core: [(&[u8], Vec<u8>); 12] = [
+            (b"ZPL_ATIME", enc_ts(checked.times[0])?),
+            (b"ZPL_MTIME", enc_ts(checked.times[1])?),
+            (b"ZPL_CTIME", enc_ts(checked.times[2])?),
+            (b"ZPL_CRTIME", enc_ts(checked.times[3])?),
+            (b"ZPL_GEN", order.encode(checked.generation).to_vec()),
+            (b"ZPL_MODE", order.encode(checked.mode).to_vec()),
+            (b"ZPL_SIZE", order.encode(checked.size).to_vec()),
+            (b"ZPL_PARENT", order.encode(checked.parent).to_vec()),
+            (b"ZPL_LINKS", order.encode(checked.links).to_vec()),
+            (b"ZPL_FLAGS", order.encode(checked.flags).to_vec()),
+            (b"ZPL_UID", order.encode(checked.uid).to_vec()),
+            (b"ZPL_GID", order.encode(checked.gid).to_vec()),
+        ];
+        for (name, val) in core {
+            map.insert(name.to_vec(), val);
+        }
+        if let Some(target) = &checked.inline_symlink {
+            map.insert(b"ZPL_SYMLINK".to_vec(), target.clone());
+        }
+        if update_trivial_dacl {
+            let aces = encode_trivial_nfsv4_aces(checked.mode, checked.kind == Kind::Directory, order);
+            map.insert(b"ZPL_DACL_COUNT".to_vec(), order.encode(3).to_vec());
+            map.insert(b"ZPL_DACL_ACES".to_vec(), aces);
+        }
+        Ok(())
+    }
+
+    /// Update core ZPL `Metadata` inside an existing SA bonus (and optional spill),
+    /// preserving its registered layout ID, byte order, and all non-core attributes
+    /// (ACLs, project IDs, xattrs, rdev, etc.).
+    pub fn encode_updated_bonus_and_spill(
+        &self,
+        existing_bonus: &[u8],
+        existing_spill: Option<&[u8]>,
+        metadata: &Metadata,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), ParseError> {
+        let (bonus_order, bonus_layout) = self.parse_buffer_header(existing_bonus)?;
+        let mut bonus_decoded = Attributes {
+            values: BTreeMap::new(),
+        };
+        self.decode_into(existing_bonus, &mut bonus_decoded)?;
+        let mut bonus_map: BTreeMap<Vec<u8>, Vec<u8>> = bonus_decoded
+            .values
+            .into_iter()
+            .map(|(k, v)| (k, v.bytes))
+            .collect();
+        Self::apply_metadata_to_map(&mut bonus_map, metadata, bonus_order, false)?;
+        let new_bonus = self.pack_layout(bonus_layout, &bonus_map, bonus_order)?;
+
+        let new_spill = if let Some(spill_raw) = existing_spill {
+            let (spill_order, spill_layout) = self.parse_buffer_header(spill_raw)?;
+            let mut spill_decoded = Attributes {
+                values: BTreeMap::new(),
+            };
+            self.decode_into(spill_raw, &mut spill_decoded)?;
+            let mut spill_map: BTreeMap<Vec<u8>, Vec<u8>> = spill_decoded
+                .values
+                .into_iter()
+                .map(|(k, v)| (k, v.bytes))
+                .collect();
+            Self::apply_metadata_to_map(&mut spill_map, metadata, spill_order, false)?;
+            Some(self.pack_layout(spill_layout, &spill_map, spill_order)?)
+        } else {
+            None
+        };
+
+        let verified = self.decode(&new_bonus, new_spill.as_deref())?;
+        let _ = verified.metadata()?;
+        Ok((new_bonus, new_spill))
+    }
+
+    /// Encode a fresh SA bonus for a newly created regular file or directory by
+    /// selecting a registered SA layout compatible with `template_bonus` (e.g.
+    /// the parent directory's SA bonus) without requiring new SA layout creation.
+    pub fn encode_new_from_template(
+        &self,
+        template_bonus: &[u8],
+        metadata: &Metadata,
+    ) -> Result<Vec<u8>, ParseError> {
+        if metadata.inline_symlink.is_some() {
+            return Err(invalid("inline symlink creation requires a symlink SA layout"));
+        }
+        let (order, template_layout) = self.parse_buffer_header(template_bonus)?;
+        let mut template_decoded = Attributes {
+            values: BTreeMap::new(),
+        };
+        self.decode_into(template_bonus, &mut template_decoded)?;
+
+        let required_core: [&[u8]; 12] = [
+            b"ZPL_ATIME",
+            b"ZPL_MTIME",
+            b"ZPL_CTIME",
+            b"ZPL_CRTIME",
+            b"ZPL_GEN",
+            b"ZPL_MODE",
+            b"ZPL_SIZE",
+            b"ZPL_PARENT",
+            b"ZPL_LINKS",
+            b"ZPL_FLAGS",
+            b"ZPL_UID",
+            b"ZPL_GID",
+        ];
+        let allowed_optional: [&[u8]; 6] = [
+            b"ZPL_PROJID",
+            b"ZPL_DACL_COUNT",
+            b"ZPL_DACL_ACES",
+            b"ZPL_ZNODE_ACL",
+            b"ZPL_RDEV",
+            b"ZPL_PAD",
+        ];
+
+        let layout_admissible = |layout_id: u16| -> bool {
+            let Some(ids) = self.layouts.get(&layout_id) else {
+                return false;
+            };
+            let names: BTreeSet<&[u8]> = ids
+                .iter()
+                .filter_map(|id| self.attributes.get(id).map(|r| r.name.as_slice()))
+                .collect();
+            required_core.iter().all(|req| names.contains(req))
+                && names.iter().all(|name| {
+                    required_core.contains(name) || allowed_optional.contains(name)
+                })
+        };
+
+        let chosen_layout = if layout_admissible(template_layout) {
+            template_layout
+        } else {
+            self.layouts
+                .keys()
+                .copied()
+                .find(|&id| id >= 2 && layout_admissible(id))
+                .ok_or_else(|| invalid("dataset has no registered base ZPL SA layout"))?
+        };
+
+        let mut map = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        // Seed optional defaults (and inherit ZPL_PROJID if present on template)
+        let projid_bytes = template_decoded
+            .values
+            .get(b"ZPL_PROJID".as_slice())
+            .filter(|a| a.bytes.len() == 8)
+            .map_or_else(|| order.encode(0).to_vec(), |a| a.bytes.clone());
+        map.insert(b"ZPL_PROJID".to_vec(), projid_bytes);
+        map.insert(b"ZPL_RDEV".to_vec(), order.encode(0).to_vec());
+        map.insert(b"ZPL_PAD".to_vec(), vec![0_u8; 32]);
+        let znode_acl = template_decoded
+            .values
+            .get(b"ZPL_ZNODE_ACL".as_slice())
+            .filter(|a| a.bytes.len() == 88)
+            .map_or_else(|| vec![0_u8; 88], |a| a.bytes.clone());
+        map.insert(b"ZPL_ZNODE_ACL".to_vec(), znode_acl);
+
+        Self::apply_metadata_to_map(&mut map, metadata, order, true)?;
+        let encoded = self.pack_layout(chosen_layout, &map, order)?;
+        let verified = self.decode(&encoded, None)?;
+        let _ = verified.metadata()?;
+        Ok(encoded)
+    }
+}
+
+fn encode_trivial_nfsv4_aces(mode: u64, is_dir: bool, order: Endian) -> Vec<u8> {
+    const ACE_READ_DATA: u32 = 0x0000_0001;
+    const ACE_WRITE_DATA: u32 = 0x0000_0002;
+    const ACE_APPEND_DATA: u32 = 0x0000_0004;
+    const ACE_READ_NAMED_ATTRS: u32 = 0x0000_0008;
+    const ACE_WRITE_NAMED_ATTRS: u32 = 0x0000_0010;
+    const ACE_EXECUTE: u32 = 0x0000_0020;
+    const ACE_DELETE_CHILD: u32 = 0x0000_0040;
+    const ACE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const ACE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const ACE_READ_ACL: u32 = 0x0002_0000;
+    const ACE_WRITE_ACL: u32 = 0x0004_0000;
+    const ACE_WRITE_OWNER: u32 = 0x0008_0000;
+    const ACE_SYNCHRONIZE: u32 = 0x0010_0000;
+
+    let perm_mask = |rwx: u64, is_owner: bool| -> u32 {
+        let mut m = ACE_READ_ACL | ACE_READ_ATTRIBUTES | ACE_READ_NAMED_ATTRS | ACE_SYNCHRONIZE;
+        if is_owner {
+            m |= ACE_WRITE_ACL | ACE_WRITE_OWNER | ACE_WRITE_ATTRIBUTES | ACE_WRITE_NAMED_ATTRS;
+        }
+        if rwx & 0o4 != 0 {
+            m |= ACE_READ_DATA;
+        }
+        if rwx & 0o2 != 0 {
+            m |= ACE_WRITE_DATA | ACE_APPEND_DATA;
+            if is_dir && (mode & 0o1000 == 0 || is_owner) {
+                m |= ACE_DELETE_CHILD;
+            }
+        }
+        if rwx & 0o1 != 0 {
+            m |= ACE_EXECUTE;
+        }
+        m
+    };
+
+    let aces: [(u16, u32); 3] = [
+        (0x1000, perm_mask((mode >> 6) & 7, true)),
+        (0x2040, perm_mask((mode >> 3) & 7, false)),
+        (0x4000, perm_mask(mode & 7, false)),
+    ];
+    let mut out = Vec::with_capacity(24);
+    for (flags, access_mask) in aces {
+        match order {
+            Endian::Little => {
+                out.extend_from_slice(&0_u16.to_le_bytes());
+                out.extend_from_slice(&flags.to_le_bytes());
+                out.extend_from_slice(&access_mask.to_le_bytes());
+            }
+            Endian::Big => {
+                out.extend_from_slice(&0_u16.to_be_bytes());
+                out.extend_from_slice(&flags.to_be_bytes());
+                out.extend_from_slice(&access_mask.to_be_bytes());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug)]

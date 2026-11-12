@@ -353,3 +353,55 @@ fn hash64_profile_retains_collision_identity_and_rejects_wrong_hash_width() {
     let wrong = leaf(order, 0, 0, &[(b"alpha", 8, &[0; 8], ALPHA)]);
     assert!(h.leaf(&wrong, order, route()).is_err());
 }
+
+#[test]
+fn encode_fatzap_splits_leaves_scales_to_external_tables_and_roundtrips_arrays() {
+    for order in [Endian::Little, Endian::Big] {
+        for hash64 in [false, true] {
+            // 180 entries in 512B blocks (18 chunks/leaf) forces deep leaf splits
+            // and external pointer-table blocks (prefix_bits > 5).
+            let mut entries = Vec::new();
+            for i in 0_u64..180 {
+                entries.push(Entry {
+                    name: format!("entry-{i:04}-long-key-payload").into_bytes(),
+                    integer_bytes: if i % 4 == 0 { 2 } else { 8 },
+                    values: if i % 4 == 0 {
+                        vec![i & 0xffff, (i + 7) & 0xffff, 0x1234]
+                    } else {
+                        vec![0x0102_0304_0000_0000 | i]
+                    },
+                    collision: 0,
+                });
+            }
+            let blocks =
+                encode_fatzap_with_flags(&entries, 512, SALT, hash64, order).unwrap();
+            assert!(blocks.len() > 16);
+            let max_block = (blocks.len() - 1) as u64;
+            let hdr = FatHeader::parse(&blocks[0], order, max_block).unwrap();
+            assert_eq!(hdr.entry_count(), entries.len());
+            assert_eq!(hdr.is_hash64(), hash64);
+            let tbl = if hdr.table_blocks().is_empty() {
+                hdr.embedded_table(&blocks[0], order).unwrap()
+            } else {
+                let mut t = Vec::new();
+                for blk in hdr.table_blocks() {
+                    t.extend(hdr.table_block(&blocks[blk as usize], order).unwrap());
+                }
+                t
+            };
+            let mut recovered = BTreeMap::new();
+            for r in hdr.routes(&tbl, max_block).unwrap() {
+                for item in hdr.leaf(&blocks[r.block as usize], order, r).unwrap() {
+                    recovered.insert(item.name.clone(), (item.integer_bytes, item.values));
+                }
+            }
+            assert_eq!(recovered.len(), entries.len());
+            for expected in &entries {
+                assert_eq!(
+                    recovered.get(&expected.name),
+                    Some(&(expected.integer_bytes, expected.values.clone()))
+                );
+            }
+        }
+    }
+}
