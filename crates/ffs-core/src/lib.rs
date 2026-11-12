@@ -76855,11 +76855,12 @@ mod tests {
             .open(&image)
             .unwrap();
         output.set_len(32 * 1024 * 1024).unwrap();
-        let made = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "1024", "-g", "1024"])
-            .arg(&image)
-            .output()
-            .expect("mkfs must execute");
+        let made = spawn_gated_output(
+            std::process::Command::new("mkfs.ext4")
+                .args(["-F", "-b", "1024", "-g", "1024"])
+                .arg(&image),
+        )
+        .expect("mkfs must execute");
         assert!(made.status.success(), "mkfs: {made:?}");
         let dev = TestDevice::from_vec(std::fs::read(&image).unwrap());
         let cx = Cx::for_testing();
@@ -76979,11 +76980,12 @@ mod tests {
             .open(&image)
             .unwrap();
         output.set_len(32 * 1024 * 1024).unwrap();
-        let made = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "1024", "-g", "1024"])
-            .arg(&image)
-            .output()
-            .expect("mkfs must execute");
+        let made = spawn_gated_output(
+            std::process::Command::new("mkfs.ext4")
+                .args(["-F", "-b", "1024", "-g", "1024"])
+                .arg(&image),
+        )
+        .expect("mkfs must execute");
         assert!(
             made.status.success(),
             "mkfs: {}{}",
@@ -77550,11 +77552,12 @@ mod tests {
             .unwrap();
         output.write_all(&bytes).unwrap();
         output.sync_all().unwrap();
-        let checked = std::process::Command::new("e2fsck")
-            .args(["-f", "-n"])
-            .arg(&image)
-            .output()
-            .expect("native checker must execute");
+        let checked = spawn_gated_output(
+            std::process::Command::new("e2fsck")
+                .args(["-f", "-n"])
+                .arg(&image),
+        )
+        .expect("native checker must execute");
         println!(
             "retained named-birth image: {}\n{}\n{}",
             image.display(),
@@ -77930,11 +77933,12 @@ mod tests {
             .open(&image)
             .unwrap();
         output.set_len(16 * 1024 * 1024).unwrap();
-        let made = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "4096", "-N", "64", "-O", "^has_journal"])
-            .arg(&image)
-            .output()
-            .expect("mkfs must execute");
+        let made = spawn_gated_output(
+            std::process::Command::new("mkfs.ext4")
+                .args(["-F", "-b", "4096", "-N", "64", "-O", "^has_journal"])
+                .arg(&image),
+        )
+        .expect("mkfs must execute");
         assert!(
             made.status.success(),
             "mkfs: {}{}",
@@ -77945,11 +77949,12 @@ mod tests {
         // producer fill that reserve too, then require its independent checker
         // and both FrankenFS free-space counts to agree on actual exhaustion.
         for command in ["write /dev/null /survivor", "write /dev/null /filler"] {
-            let made = std::process::Command::new("debugfs")
-                .args(["-w", "-R", command])
-                .arg(&image)
-                .output()
-                .expect("native fixture producer must execute");
+            let made = spawn_gated_output(
+                std::process::Command::new("debugfs")
+                    .args(["-w", "-R", command])
+                    .arg(&image),
+            )
+            .expect("native fixture producer must execute");
             assert!(
                 made.status.success(),
                 "debugfs: {}{}",
@@ -77960,11 +77965,12 @@ mod tests {
         let initial = std::fs::read(&image).unwrap();
         let free = Ext4ImageReader::new(&initial).unwrap().sb.free_blocks_count;
         assert!(free > 100);
-        let filled = std::process::Command::new("debugfs")
-            .args(["-w", "-R", &format!("fallocate /filler 0 {}", free - 1)])
-            .arg(&image)
-            .output()
-            .expect("native preallocation must execute");
+        let filled = spawn_gated_output(
+            std::process::Command::new("debugfs")
+                .args(["-w", "-R", &format!("fallocate /filler 0 {}", free - 1)])
+                .arg(&image),
+        )
+        .expect("native preallocation must execute");
         assert!(
             filled.status.success(),
             "debugfs fallocate: {}{}",
@@ -78621,21 +78627,22 @@ mod tests {
                         16 * 1024 * 1024
                     })
                     .unwrap();
-                let made = std::process::Command::new("mkfs.ext4")
-                    .args([
-                        "-F",
-                        "-b",
-                        &block_size.to_string(),
-                        "-O",
-                        if indirect {
-                            "^has_journal,^extent,^64bit"
-                        } else {
-                            "^has_journal"
-                        },
-                    ])
-                    .arg(&image)
-                    .output()
-                    .expect("native mkfs must execute");
+                let made = spawn_gated_output(
+                    std::process::Command::new("mkfs.ext4")
+                        .args([
+                            "-F",
+                            "-b",
+                            &block_size.to_string(),
+                            "-O",
+                            if indirect {
+                                "^has_journal,^extent,^64bit"
+                            } else {
+                                "^has_journal"
+                            },
+                        ])
+                        .arg(&image),
+                )
+                .expect("native mkfs must execute");
                 assert!(
                     made.status.success(),
                     "mkfs: {}{}",
@@ -78803,7 +78810,7 @@ mod tests {
             if !extents {
                 mkfs.args(["-O", "^extent,^64bit"]);
             }
-            let made = mkfs.arg(&image).output().expect("mkfs must execute");
+            let made = spawn_gated_output(mkfs.arg(&image)).expect("mkfs must execute");
             assert!(
                 made.status.success(),
                 "mkfs: {}{}",
@@ -79078,11 +79085,12 @@ mod tests {
         file.sync_all().unwrap();
         let bytes = std::fs::read(&image).unwrap();
         let digest = blake3::hash(&bytes);
-        let checked = std::process::Command::new("e2fsck")
-            .args(["-f", "-n"])
-            .arg(&image)
-            .output()
-            .expect("e2fsck must execute for this native checker test");
+        let checked = spawn_gated_output(
+            std::process::Command::new("e2fsck")
+                .args(["-f", "-n"])
+                .arg(&image),
+        )
+        .expect("e2fsck must execute for this native checker test");
         println!(
             "retained tmpfile image: {}\n{}\n{}",
             image.display(),
@@ -79221,10 +79229,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let path = tmp.path().join("crashed.ext4");
         std::fs::write(&path, dev.snapshot_bytes()).expect("write crashed image");
-        let replay = std::process::Command::new("e2fsck")
-            .args(["-E", "journal_only", "-y"])
-            .arg(&path)
-            .output();
+        let replay = spawn_gated_output(
+            std::process::Command::new("e2fsck")
+                .args(["-E", "journal_only", "-y"])
+                .arg(&path),
+        );
         let Ok(replay) = replay else {
             oracle_unavailable("e2fsck");
             return;
@@ -79351,7 +79360,7 @@ mod tests {
             image.to_str().unwrap(),
         ]);
         for (tool, mut command) in [("mkfs.ext4", formatter), ("debugfs", permissions)] {
-            let out = match command.output() {
+            let out = match spawn_gated_output(&mut command) {
                 Ok(out) => out,
                 Err(error) => {
                     eprintln!("ext4 fixture setup failed: tool={tool} error={error}");
@@ -79905,10 +79914,9 @@ mod tests {
 
     /// Run `e2fsck -fn` (force, read-only) on an image; returns (clean, output).
     fn run_e2fsck(image: &std::path::Path) -> Option<(bool, String)> {
-        let Ok(out) = std::process::Command::new("e2fsck")
-            .args(["-fn", image.to_str().unwrap()])
-            .output()
-        else {
+        let Ok(out) = spawn_gated_output(
+            std::process::Command::new("e2fsck").args(["-fn", image.to_str().unwrap()]),
+        ) else {
             oracle_unavailable("e2fsck");
             return None;
         };
@@ -79931,10 +79939,77 @@ mod tests {
     /// once the child has exec'd; tests that reopen a flocked WAL hold it shared.
     static TEST_CHILD_SPAWN_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-    fn wal_flock_holder() -> std::sync::RwLockReadGuard<'static, ()> {
-        TEST_CHILD_SPAWN_GATE
+    thread_local! {
+        static WAL_FLOCK_READ_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    struct WalFlockReadGuard {
+        _guard: std::sync::RwLockReadGuard<'static, ()>,
+    }
+
+    impl Drop for WalFlockReadGuard {
+        fn drop(&mut self) {
+            WAL_FLOCK_READ_DEPTH.with(|depth| {
+                depth.set(depth.get().saturating_sub(1));
+            });
+        }
+    }
+
+    fn wal_flock_holder() -> WalFlockReadGuard {
+        let guard = TEST_CHILD_SPAWN_GATE
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        WAL_FLOCK_READ_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_add(1));
+        });
+        WalFlockReadGuard { _guard: guard }
+    }
+
+    fn spawn_gated_child(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+        WAL_FLOCK_READ_DEPTH.with(|depth| {
+            assert_eq!(
+                depth.get(),
+                0,
+                "cannot spawn a child process on the same thread while holding wal_flock_holder()"
+            );
+        });
+        let _no_flock_holders = TEST_CHILD_SPAWN_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cmd.spawn()
+    }
+
+    fn spawn_gated_output(
+        cmd: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Output> {
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        spawn_gated_child(cmd)?.wait_with_output()
+    }
+
+    fn spawn_gated_status(
+        cmd: &mut std::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        spawn_gated_child(cmd)?.wait()
+    }
+
+    #[cfg(unix)]
+    fn count_in_process_wal_fds(wal_path: &std::path::Path) -> usize {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(target_meta) = std::fs::metadata(wal_path) else {
+            return 0;
+        };
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                std::fs::metadata(entry.path()).is_ok_and(|meta| {
+                    meta.dev() == target_meta.dev() && meta.ino() == target_meta.ino()
+                })
+            })
+            .count()
     }
 
     /// bd-53dub: the oracle contract must be able to FAIL. This test re-runs
@@ -79975,17 +80050,7 @@ mod tests {
             if require {
                 child.env("FFS_REQUIRE_ORACLES", "1");
             }
-            let spawned = {
-                let _no_flock_holders = TEST_CHILD_SPAWN_GATE
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                child
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .expect("spawn child test")
-            };
-            let out = spawned.wait_with_output().expect("run child test");
+            let out = spawn_gated_output(&mut child).expect("run child test");
             let text = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -83529,11 +83594,12 @@ mod tests {
             "home namespace must still precede the transaction"
         );
         std::fs::write(&image, dev.snapshot_bytes()).unwrap();
-        let repair = std::process::Command::new("e2fsck")
-            .args(["-fy"])
-            .arg(&image)
-            .output()
-            .expect("mandatory e2fsck oracle");
+        let repair = spawn_gated_output(
+            std::process::Command::new("e2fsck")
+                .args(["-fy"])
+                .arg(&image),
+        )
+        .expect("mandatory e2fsck oracle");
         let output = format!(
             "{}{}",
             String::from_utf8_lossy(&repair.stdout),
@@ -83985,10 +84051,9 @@ mod tests {
 
         let path = tmp.path().join("crashed.ext4");
         std::fs::write(&path, &crashed).expect("write crash image");
-        let Ok(fix) = std::process::Command::new("e2fsck")
-            .args(["-fy", path.to_str().expect("utf8 path")])
-            .output()
-        else {
+        let Ok(fix) = spawn_gated_output(
+            std::process::Command::new("e2fsck").args(["-fy", path.to_str().expect("utf8 path")]),
+        ) else {
             oracle_unavailable("e2fsck");
             return;
         };
@@ -84512,7 +84577,7 @@ mod tests {
         if let Some(features) = features {
             cmd.args(["-O", features]);
         }
-        if !matches!(cmd.arg(&image).output(), Ok(o) if o.status.success()) {
+        if !matches!(spawn_gated_output(cmd.arg(&image)), Ok(o) if o.status.success()) {
             oracle_unavailable("mke2fs (e2fsprogs)");
             return None;
         }
@@ -84675,10 +84740,11 @@ mod tests {
             std::fs::File::create(&image)
                 .and_then(|f| f.set_len(64 << 20))
                 .expect("create image");
-            let out = std::process::Command::new("mke2fs")
-                .args(["-q", "-t", "ext4", "-O", features, "-F"])
-                .arg(&image)
-                .output();
+            let out = spawn_gated_output(
+                std::process::Command::new("mke2fs")
+                    .args(["-q", "-t", "ext4", "-O", features, "-F"])
+                    .arg(&image),
+            );
             if !matches!(&out, Ok(o) if o.status.success()) {
                 oracle_unavailable("mke2fs (e2fsprogs)");
                 return;
@@ -85265,23 +85331,24 @@ mod tests {
         f.set_len(size_mb * 1024 * 1024).expect("set image size");
         drop(f);
 
-        let out = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "4096", image.to_str().unwrap()])
-            .output();
+        let out = spawn_gated_output(std::process::Command::new("mkfs.ext4").args([
+            "-F",
+            "-b",
+            "4096",
+            image.to_str().unwrap(),
+        ]));
         let out = match out {
             Ok(o) if o.status.success() => o,
             _ => return None,
         };
         let _ = out;
 
-        let _ = std::process::Command::new("debugfs")
-            .args([
-                "-w",
-                "-R",
-                "set_inode_field / mode 040777",
-                image.to_str().unwrap(),
-            ])
-            .output();
+        let _ = spawn_gated_output(std::process::Command::new("debugfs").args([
+            "-w",
+            "-R",
+            "set_inode_field / mode 040777",
+            image.to_str().unwrap(),
+        ]));
 
         let mut data = std::fs::read(&image).expect("read image");
         let sb_off = EXT4_SUPERBLOCK_OFFSET;
@@ -85323,23 +85390,24 @@ mod tests {
         f.set_len(size_mb * 1024 * 1024).expect("set image size");
         drop(f);
 
-        let out = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "4096", image.to_str().unwrap()])
-            .output();
+        let out = spawn_gated_output(std::process::Command::new("mkfs.ext4").args([
+            "-F",
+            "-b",
+            "4096",
+            image.to_str().unwrap(),
+        ]));
         let out = match out {
             Ok(o) if o.status.success() => o,
             _ => return None,
         };
         let _ = out;
 
-        let _ = std::process::Command::new("debugfs")
-            .args([
-                "-w",
-                "-R",
-                "set_inode_field / mode 040777",
-                image.to_str().unwrap(),
-            ])
-            .output();
+        let _ = spawn_gated_output(std::process::Command::new("debugfs").args([
+            "-w",
+            "-R",
+            "set_inode_field / mode 040777",
+            image.to_str().unwrap(),
+        ]));
 
         let cx = Cx::for_testing();
         let data = std::fs::read(&image).expect("read image");
@@ -85367,23 +85435,24 @@ mod tests {
         f.set_len(size_mb * 1024 * 1024).expect("set image size");
         drop(f);
 
-        let out = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "4096", image.to_str().unwrap()])
-            .output();
+        let out = spawn_gated_output(std::process::Command::new("mkfs.ext4").args([
+            "-F",
+            "-b",
+            "4096",
+            image.to_str().unwrap(),
+        ]));
         let out = match out {
             Ok(o) if o.status.success() => o,
             _ => return None,
         };
         let _ = out;
 
-        let _ = std::process::Command::new("debugfs")
-            .args([
-                "-w",
-                "-R",
-                "set_inode_field / mode 040777",
-                image.to_str().unwrap(),
-            ])
-            .output();
+        let _ = spawn_gated_output(std::process::Command::new("debugfs").args([
+            "-w",
+            "-R",
+            "set_inode_field / mode 040777",
+            image.to_str().unwrap(),
+        ]));
 
         let cx = Cx::for_testing();
         let data = std::fs::read(&image).expect("read image");
@@ -86736,12 +86805,13 @@ mod tests {
         let f = std::fs::File::create(&image).ok()?;
         f.set_len(512 * 1024 * 1024).ok()?;
         drop(f);
-        let out = std::process::Command::new("mkfs.btrfs")
-            .args(["-f", "-q", "--rootdir"])
-            .arg(&seed)
-            .arg(&image)
-            .output()
-            .ok()?;
+        let out = spawn_gated_output(
+            std::process::Command::new("mkfs.btrfs")
+                .args(["-f", "-q", "--rootdir"])
+                .arg(&seed)
+                .arg(&image),
+        )
+        .ok()?;
         if !out.status.success() {
             return None;
         }
@@ -87055,12 +87125,13 @@ mod tests {
         drop(f);
         // `--rootdir` bakes the seed tree in without a mount. Not every
         // btrfs-progs build has it; absence is a skip, not a failure.
-        let out = std::process::Command::new("mkfs.btrfs")
-            .args(["-f", "-q", "--rootdir"])
-            .arg(&seed)
-            .arg(&image)
-            .output()
-            .ok()?;
+        let out = spawn_gated_output(
+            std::process::Command::new("mkfs.btrfs")
+                .args(["-f", "-q", "--rootdir"])
+                .arg(&seed)
+                .arg(&image),
+        )
+        .ok()?;
         if !out.status.success() {
             return None;
         }
@@ -87105,9 +87176,12 @@ mod tests {
         let f = std::fs::File::create(&image).expect("create image");
         f.set_len(16 * 1024 * 1024).expect("size image");
         drop(f);
-        let out = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-b", "4096", image.to_str().unwrap()])
-            .output();
+        let out = spawn_gated_output(std::process::Command::new("mkfs.ext4").args([
+            "-F",
+            "-b",
+            "4096",
+            image.to_str().unwrap(),
+        ]));
         if !matches!(out, Ok(ref o) if o.status.success()) {
             return; // e2fsprogs unavailable
         }
@@ -88709,23 +88783,24 @@ mod tests {
     }
 
     fn run_dir_index_debugfs(image: &std::path::Path, cmd: &str) -> bool {
-        std::process::Command::new("debugfs")
-            .args(["-w", "-R", cmd])
-            .arg(image)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        spawn_gated_status(
+            std::process::Command::new("debugfs")
+                .args(["-w", "-R", cmd])
+                .arg(image)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .is_ok_and(|status| status.success())
     }
 
     fn run_dir_index_e2fsck(image: &std::path::Path) -> bool {
-        let Ok(status) = std::process::Command::new("e2fsck")
-            .args(["-fyD"])
-            .arg(image)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-        else {
+        let Ok(status) = spawn_gated_status(
+            std::process::Command::new("e2fsck")
+                .args(["-fyD"])
+                .arg(image)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        ) else {
             return false;
         };
         matches!(status.code().unwrap_or(-1), 0 | 1)
@@ -88739,21 +88814,21 @@ mod tests {
             .expect("set dir_index image size");
         drop(file);
 
-        let Ok(status) = std::process::Command::new("mkfs.ext4")
-            .args([
-                "-F",
-                "-L",
-                "ffs-runtime-dx",
-                "-b",
-                "4096",
-                "-q",
-                "-O",
-                "dir_index",
-            ])
-            .arg(&image)
-            .stderr(std::process::Stdio::null())
-            .status()
-        else {
+        let Ok(status) = spawn_gated_status(
+            std::process::Command::new("mkfs.ext4")
+                .args([
+                    "-F",
+                    "-L",
+                    "ffs-runtime-dx",
+                    "-b",
+                    "4096",
+                    "-q",
+                    "-O",
+                    "dir_index",
+                ])
+                .arg(&image)
+                .stderr(std::process::Stdio::null()),
+        ) else {
             return None;
         };
         if !status.success() {
@@ -94493,11 +94568,12 @@ mod tests {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(size_mb * 1024 * 1024))
             .expect("create image");
-        let made = std::process::Command::new("mkfs.ext4")
-            .args(["-q", "-F", "-b", "4096"])
-            .arg(&image)
-            .status()
-            .is_ok_and(|s| s.success());
+        let made = spawn_gated_status(
+            std::process::Command::new("mkfs.ext4")
+                .args(["-q", "-F", "-b", "4096"])
+                .arg(&image),
+        )
+        .is_ok_and(|s| s.success());
         if !made {
             return None;
         }
@@ -94782,11 +94858,12 @@ mod tests {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(size_mb * 1024 * 1024))
             .expect("create image");
-        let made = std::process::Command::new("mkfs.btrfs")
-            .args(["-q", "-f"])
-            .arg(&image)
-            .status()
-            .is_ok_and(|s| s.success());
+        let made = spawn_gated_status(
+            std::process::Command::new("mkfs.btrfs")
+                .args(["-q", "-f"])
+                .arg(&image),
+        )
+        .is_ok_and(|s| s.success());
         if !made {
             return None;
         }
@@ -94816,11 +94893,12 @@ mod tests {
                     .and_then(|f| f.set_len(256 << 20))
                     .expect("create image");
             }
-            let formatted = std::process::Command::new("mkfs.btrfs")
-                .args(["-q", "-f", "-d", profile, "-m", profile])
-                .args(&images)
-                .status()
-                .is_ok_and(|s| s.success());
+            let formatted = spawn_gated_status(
+                std::process::Command::new("mkfs.btrfs")
+                    .args(["-q", "-f", "-d", profile, "-m", profile])
+                    .args(&images),
+            )
+            .is_ok_and(|s| s.success());
             if !formatted {
                 oracle_unavailable("btrfs image formatter (btrfs-progs)");
                 return;
@@ -104912,14 +104990,8 @@ mod tests {
                 .env(CHILD_ENV, "1")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            let spawned = {
-                let _no_flock_holders = TEST_CHILD_SPAWN_GATE
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                child
-                    .spawn()
-                    .expect("spawn isolated metadata checkpoint test")
-            };
+            let spawned =
+                spawn_gated_child(&mut child).expect("spawn isolated metadata checkpoint test");
             let output = spawned.wait_with_output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -104993,7 +105065,6 @@ mod tests {
             }
         }
 
-        let _flocks = wal_flock_holder();
         for mode in ["flush", "sync_all", "reentrant", "drop"] {
             let failure_cases: &[bool] = if mode == "drop" {
                 &[false]
@@ -105019,6 +105090,7 @@ mod tests {
                     .unwrap()
                     .0;
                 drop(seed);
+                let _flocks = wal_flock_holder();
                 let wal = tmp.path().join("ordered-checkpoint.wal");
                 let options = OpenOptions {
                     metadata_log_enabled: true,
@@ -105114,6 +105186,7 @@ mod tests {
                     reopened.fsync(&cx, ino, 0, false).unwrap();
                     reopened.flush_on_destroy(&cx).unwrap();
                     drop(reopened);
+                    drop(_flocks);
                     let home = OpenFs::from_device(
                         &cx,
                         Box::new(TestDevice::from_vec(dev.durable_bytes())),
@@ -105219,6 +105292,7 @@ mod tests {
                 let bytes = dev.durable_bytes();
                 assert_eq!(dev.volatile.lock().as_slice(), bytes);
                 let image = tmp.path().join("ordered-checkpoint.ext4");
+                drop(_flocks);
                 native_parity_fsck(&TestDevice::from_vec(bytes.clone()), &image);
                 assert_eq!(std::fs::read(&image).unwrap(), bytes);
                 let home = OpenFs::from_device(
@@ -105237,6 +105311,7 @@ mod tests {
 
                 // A later real fsync must append and compact through the
                 // replacement, including after a failed checkpoint/retry.
+                let _flocks = wal_flock_holder();
                 payload[..7].copy_from_slice(b"resumed");
                 fs.write(&cx, ino, 0, b"resumed").unwrap();
                 let inode = fs.read_inode(&cx, ino).unwrap();
@@ -105263,6 +105338,8 @@ mod tests {
                 reopened.flush_on_destroy(&cx).unwrap();
                 assert!(reopened.metadata_compactor.lock().is_none());
                 assert_eq!(std::fs::metadata(&wal).unwrap().len(), header_size);
+                drop(reopened);
+                drop(_flocks);
             }
         }
         println!("\n{PASS_MARKER}");
@@ -105468,12 +105545,7 @@ mod tests {
             if root && deny_directory {
                 child.gid(65534).uid(65534);
             }
-            let spawned = {
-                let _no_flock_holders = TEST_CHILD_SPAWN_GATE
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                child.spawn()
-            };
+            let spawned = spawn_gated_child(&mut child);
             let output = spawned.and_then(std::process::Child::wait_with_output);
             // Restore access before assertions, including a failed spawn/wait.
             std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -105494,7 +105566,6 @@ mod tests {
 
     #[test]
     fn append_only_metadata_log_replays_then_checkpoints_clean() {
-        let _flocks = wal_flock_holder();
         for single_store in [false, true] {
             let tmp = tempfile::TempDir::new().expect("tempdir");
             let image = tmp.path().join("metadata-log.ext4");
@@ -105502,25 +105573,26 @@ mod tests {
             let file = std::fs::File::create(&image).expect("create image");
             file.set_len(16 * 1024 * 1024).expect("size image");
             drop(file);
-            let mkfs = std::process::Command::new("mkfs.ext4")
-                .args(["-F", "-b", "4096", image.to_str().expect("UTF-8 path")])
-                .output()
-                .expect("native WAL regression requires mkfs.ext4");
+            let mkfs = spawn_gated_output(std::process::Command::new("mkfs.ext4").args([
+                "-F",
+                "-b",
+                "4096",
+                image.to_str().expect("UTF-8 path"),
+            ]))
+            .expect("native WAL regression requires mkfs.ext4");
             assert!(
                 mkfs.status.success(),
                 "{}{}",
                 String::from_utf8_lossy(&mkfs.stdout),
                 String::from_utf8_lossy(&mkfs.stderr)
             );
-            let debugfs = std::process::Command::new("debugfs")
-                .args([
-                    "-w",
-                    "-R",
-                    "set_inode_field / mode 040777",
-                    image.to_str().expect("UTF-8 path"),
-                ])
-                .output()
-                .expect("native WAL regression requires debugfs");
+            let debugfs = spawn_gated_output(std::process::Command::new("debugfs").args([
+                "-w",
+                "-R",
+                "set_inode_field / mode 040777",
+                image.to_str().expect("UTF-8 path"),
+            ]))
+            .expect("native WAL regression requires debugfs");
             assert!(
                 debugfs.status.success(),
                 "{}{}",
@@ -105528,6 +105600,7 @@ mod tests {
                 String::from_utf8_lossy(&debugfs.stderr)
             );
 
+            let _flocks = wal_flock_holder();
             let cx = Cx::for_testing();
             let options = OpenOptions {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
@@ -105787,6 +105860,7 @@ mod tests {
                 .flush_on_destroy(&cx)
                 .expect("compact and checkpoint WAL");
             drop(recovered);
+            drop(_flocks);
             assert_eq!(
                 std::fs::metadata(&wal).expect("checkpointed WAL").len(),
                 u64::try_from(ffs_mvcc::wal::HEADER_SIZE).expect("header size"),
@@ -106301,19 +106375,20 @@ mod tests {
         let f = std::fs::File::create(&image).expect("create image");
         f.set_len(16 * 1024 * 1024).expect("set image size");
         drop(f);
-        let made = std::process::Command::new("mkfs.ext4")
-            .args([
-                "-F",
-                "-q",
-                "-b",
-                "1024",
-                "-g",
-                "1024",
-                "-E",
-                "root_owner=0:0",
-            ])
-            .arg(&image)
-            .status();
+        let made = spawn_gated_status(
+            std::process::Command::new("mkfs.ext4")
+                .args([
+                    "-F",
+                    "-q",
+                    "-b",
+                    "1024",
+                    "-g",
+                    "1024",
+                    "-E",
+                    "root_owner=0:0",
+                ])
+                .arg(&image),
+        );
         if !matches!(made, Ok(s) if s.success()) {
             return; // mkfs.ext4 unavailable on this host — skip like sibling tests.
         }
@@ -108098,10 +108173,10 @@ mod tests {
 
     #[test]
     fn ext4_revoked_metadata_log_checkpoints_and_resumes_without_stale_replay() {
-        let _flocks = wal_flock_holder();
         let (seed, dev, tmp) = open_writable_ext4_mkfs_with_crash_device(16)
             .expect("revoked WAL recovery regression requires mkfs.ext4");
         drop(seed);
+        let _flocks = wal_flock_holder();
         let cx = Cx::for_testing();
         let wal = tmp.path().join("revoked-metadata.wal");
         let options = OpenOptions {
@@ -108162,12 +108237,14 @@ mod tests {
         let bytes = dev.durable_bytes();
         assert_eq!(dev.volatile.lock().as_slice(), bytes);
         let image = tmp.path().join("revoked-wal-checkpoint.ext4");
+        drop(_flocks);
         native_parity_fsck(&TestDevice::from_vec(bytes.clone()), &image);
         assert_eq!(std::fs::read(&image).unwrap(), bytes);
 
         // Explicit recovery retains its existing same-instance API. The next
         // fsync must append immediately after the header, without a stale
         // writer offset or an older compaction batch overwriting this data.
+        let _flocks = wal_flock_holder();
         fs.enable_writes(&cx).unwrap();
         assert!(fs.is_writable());
         assert!(fs.metadata_compactor.lock().is_some());
@@ -108184,8 +108261,26 @@ mod tests {
             assert_eq!(log.writer.size(), std::fs::metadata(&wal).unwrap().len());
         }
         fs.shutdown_metadata_compactor();
+        #[cfg(unix)]
+        let fds_before_drop = count_in_process_wal_fds(&wal);
+        #[cfg(unix)]
+        assert_eq!(
+            fds_before_drop, 1,
+            "live OpenFs must own exactly one WAL descriptor before drop"
+        );
         // Do not flush_on_destroy: reopen and replay the very same retained WAL.
         drop(fs);
+        #[cfg(unix)]
+        {
+            let fds_after_drop = count_in_process_wal_fds(&wal);
+            assert_eq!(
+                fds_after_drop, 0,
+                "dropping OpenFs must close all in-process WAL descriptors"
+            );
+            eprintln!(
+                "WAL_REOPEN_EVIDENCE|test=ext4_revoked_metadata_log_checkpoints_and_resumes_without_stale_replay|fds_before_drop={fds_before_drop}|fds_after_drop={fds_after_drop}"
+            );
+        }
         let mut reopened = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
         let recovery = reopened.mvcc_wal_recovery().unwrap();
         assert_eq!(recovery.commits_replayed, 1);
@@ -108204,10 +108299,202 @@ mod tests {
         assert_eq!(reopened.statfs(&cx, root).unwrap(), counts);
         reopened.flush_on_destroy(&cx).unwrap();
         assert_eq!(std::fs::metadata(&wal).unwrap().len(), header_size);
+        drop(reopened);
+        drop(_flocks);
         let bytes = dev.durable_bytes();
         let image = tmp.path().join("resumed-wal-checkpoint.ext4");
         native_parity_fsck(&TestDevice::from_vec(bytes.clone()), &image);
         assert_eq!(std::fs::read(&image).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_reopen_under_concurrent_child_spawns_never_inherits_stale_flock_bd_kdo95() {
+        let (seed, dev, tmp) = open_writable_ext4_mkfs_with_crash_device(16)
+            .expect("bd-kdo95 regression requires mkfs.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let ino = seed
+            .create(&cx, root, OsStr::new("contended.bin"), 0o644, 0, 0)
+            .expect("create seed file")
+            .ino;
+        seed.write(&cx, ino, 0, b"seed-payload")
+            .expect("seed write");
+        seed.flush_mvcc_to_device(&cx).expect("seed flush");
+        drop(seed);
+
+        // Negative control 1: a genuinely live in-process owner MUST exclude a
+        // concurrent OpenFs::from_device with ErrorKind::WouldBlock without
+        // touching the WAL bytes.
+        {
+            let _flocks = wal_flock_holder();
+            let live_wal = tmp.path().join("live-owner.wal");
+            let live_opts = OpenOptions {
+                metadata_log_enabled: true,
+                mvcc_wal_path: Some(live_wal.clone()),
+                ..OpenOptions::default()
+            };
+            let mut live_fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &live_opts)
+                .expect("open live owner");
+            live_fs.enable_writes(&cx).expect("enable live writes");
+            live_fs
+                .write(&cx, ino, 0, b"live-owner-bytes")
+                .expect("write live bytes");
+            live_fs.fsync(&cx, ino, 0, false).expect("fsync live bytes");
+            let before_bytes = std::fs::read(&live_wal).expect("read live WAL");
+            let contender = OpenFs::from_device(&cx, Box::new(dev.clone()), &live_opts);
+            assert!(
+                matches!(
+                    contender,
+                    Err(FfsError::Io(ref err)) if err.kind() == std::io::ErrorKind::WouldBlock
+                ),
+                "live WAL owner must reject contender with WouldBlock, got {contender:?}"
+            );
+            assert_eq!(
+                std::fs::read(&live_wal).expect("read live WAL after contender"),
+                before_bytes
+            );
+            live_fs.flush_on_destroy(&cx).expect("flush live owner");
+        }
+
+        // Negative control 2: when a child process genuinely retains an
+        // inherited open file description for the WAL, even after the parent
+        // closes all of its own descriptors (`count_in_process_wal_fds == 0`),
+        // `OpenFs::from_device` MUST still reject admission with `WouldBlock`
+        // until the child exits and releases the open file description.
+        {
+            let inherited_wal = tmp.path().join("inherited-child.wal");
+            let inherited_opts = OpenOptions {
+                metadata_log_enabled: true,
+                mvcc_wal_path: Some(inherited_wal.clone()),
+                ..OpenOptions::default()
+            };
+            let mut owner = open_owned_wal(&inherited_wal).expect("admit owned WAL");
+            std::io::Write::write_all(
+                &mut owner,
+                &ffs_mvcc::wal::encode_header(&ffs_mvcc::wal::WalHeader::default()),
+            )
+            .expect("write valid WAL header");
+            owner.sync_all().expect("sync WAL header");
+            assert_eq!(count_in_process_wal_fds(&inherited_wal), 1);
+
+            let mut holder_cmd = std::process::Command::new("sh");
+            holder_cmd
+                .args(["-c", "sleep 0.25"])
+                .stdin(std::process::Stdio::from(owner))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut child =
+                spawn_gated_child(&mut holder_cmd).expect("spawn child retaining WAL file desc");
+            drop(holder_cmd);
+            assert_eq!(
+                count_in_process_wal_fds(&inherited_wal),
+                0,
+                "parent must have closed its own WAL descriptor after dropping Command"
+            );
+
+            let _flocks = wal_flock_holder();
+            let blocked = OpenFs::from_device(&cx, Box::new(dev.clone()), &inherited_opts);
+            assert!(
+                matches!(
+                    blocked,
+                    Err(FfsError::Io(ref err)) if err.kind() == std::io::ErrorKind::WouldBlock
+                ),
+                "inherited child open file description must reject OpenFs reopen with WouldBlock, got {blocked:?}"
+            );
+            let status = child.wait().expect("wait for WAL-holding child");
+            assert!(status.success(), "holder child exited cleanly");
+
+            let admitted = OpenFs::from_device(&cx, Box::new(dev.clone()), &inherited_opts)
+                .expect("OpenFs must admit WAL immediately once child releases open file desc");
+            admitted.flush_on_destroy(&cx).expect("clean up admitted");
+        }
+
+        // Positive contention stress: 4 sibling threads continuously fork+exec
+        // gated child processes while this thread performs 24 rapid
+        // write -> fsync -> shutdown_metadata_compactor -> drop -> immediate
+        // reopen cycles on the very same retained WAL. Zero WouldBlock failures
+        // are tolerated because every Command spawn serializes through
+        // TEST_CHILD_SPAWN_GATE until execve closes CLOEXEC descriptors.
+        let stop = Arc::new(AtomicBool::new(false));
+        let total_spawns = Arc::new(AtomicUsize::new(0));
+        let cycles = 24usize;
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let stop_ref = Arc::clone(&stop);
+                let spawns_ref = Arc::clone(&total_spawns);
+                scope.spawn(move || {
+                    while !stop_ref.load(Ordering::Relaxed) {
+                        let out =
+                            spawn_gated_output(std::process::Command::new("sh").args(["-c", ":"]));
+                        if let Ok(output) = out {
+                            assert!(output.status.success());
+                            spawns_ref.fetch_add(1, Ordering::Relaxed);
+                        }
+                        std::thread::yield_now();
+                    }
+                });
+            }
+
+            let wal = tmp.path().join("rapid-reopen.wal");
+            let options = OpenOptions {
+                metadata_log_enabled: true,
+                mvcc_wal_path: Some(wal.clone()),
+                ..OpenOptions::default()
+            };
+            for iter in 0..cycles {
+                let _flocks = wal_flock_holder();
+                let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options)
+                    .unwrap_or_else(|err| panic!("initial open iter {iter} failed: {err:?}"));
+                fs.enable_writes(&cx).expect("enable writes");
+                let msg = format!("cycle-{iter:03}-durable");
+                fs.write(&cx, ino, 0, msg.as_bytes()).expect("write cycle");
+                fs.fsync(&cx, ino, 0, false).expect("fsync cycle");
+                fs.shutdown_metadata_compactor();
+                assert_eq!(count_in_process_wal_fds(&wal), 1);
+                drop(fs);
+                assert_eq!(
+                    count_in_process_wal_fds(&wal),
+                    0,
+                    "all in-process WAL descriptors must close on drop (iter {iter})"
+                );
+
+                let mut reopened = OpenFs::from_device(&cx, Box::new(dev.clone()), &options)
+                    .unwrap_or_else(|err| {
+                        panic!("immediate WAL reopen iter {iter} raced with child spawn: {err:?}")
+                    });
+                let recovery = reopened
+                    .mvcc_wal_recovery()
+                    .expect("WAL recovery report on reopen");
+                assert_eq!(recovery.commits_replayed, 1, "iter {iter} replay");
+                reopened
+                    .enable_writes(&cx)
+                    .expect("enable writes after reopen");
+                assert_eq!(
+                    reopened
+                        .read(&cx, ino, 0, u32::try_from(msg.len()).unwrap())
+                        .expect("read replayed bytes"),
+                    msg.as_bytes()
+                );
+                reopened
+                    .flush_on_destroy(&cx)
+                    .expect("checkpoint before next cycle");
+                drop(reopened);
+                drop(_flocks);
+                std::thread::yield_now();
+            }
+
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        let spawned = total_spawns.load(Ordering::Relaxed);
+        assert!(
+            spawned > 0,
+            "background child spawners must execute during WAL reopen stress"
+        );
+        eprintln!(
+            "WAL_REOPEN_EVIDENCE|test=wal_reopen_under_concurrent_child_spawns_never_inherits_stale_flock_bd_kdo95|cycles={cycles}|concurrent_spawns={spawned}|would_block=0"
+        );
     }
 
     #[test]
@@ -109864,16 +110151,14 @@ mod tests {
         // Mirror scripts/fixtures/make_ext4_fixtures.sh's ext4_small recipe
         // (feature set + default geometry) so the generated image matches what
         // these E2E tests were validated against with the committed fixture.
-        let out = std::process::Command::new("mkfs.ext4")
-            .args([
-                "-F",
-                "-O",
-                "extent,filetype",
-                "-L",
-                "ffs_gen",
-                tmp.to_str().unwrap(),
-            ])
-            .output();
+        let out = spawn_gated_output(std::process::Command::new("mkfs.ext4").args([
+            "-F",
+            "-O",
+            "extent,filetype",
+            "-L",
+            "ffs_gen",
+            tmp.to_str().unwrap(),
+        ]));
         match out {
             Ok(o) if o.status.success() => {}
             _ => {
@@ -109885,14 +110170,12 @@ mod tests {
         // Make root writable so the E2E tests can mkdir/create under it,
         // mirroring open_writable_ext4_mkfs. Best-effort: a fresh mkfs root is
         // already owner-writable, so ignore failure if debugfs is absent.
-        let _ = std::process::Command::new("debugfs")
-            .args([
-                "-w",
-                "-R",
-                "set_inode_field / mode 040777",
-                tmp.to_str().unwrap(),
-            ])
-            .output();
+        let _ = spawn_gated_output(std::process::Command::new("debugfs").args([
+            "-w",
+            "-R",
+            "set_inode_field / mode 040777",
+            tmp.to_str().unwrap(),
+        ]));
 
         Some(tmp)
     }
@@ -113691,10 +113974,11 @@ mod tests {
         drop(f);
 
         // Format the new test image with the fixed btrfs userspace tool.
-        let out = std::process::Command::new("mkfs.btrfs")
-            .args(mkfs_args)
-            .args(["-f", image.to_str().unwrap()])
-            .output();
+        let out = spawn_gated_output(
+            std::process::Command::new("mkfs.btrfs")
+                .args(mkfs_args)
+                .args(["-f", image.to_str().unwrap()]),
+        );
         match out {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
@@ -113726,10 +114010,9 @@ mod tests {
 
     /// Run `btrfs check` on an image file; returns (success, combined output).
     fn run_btrfs_check(image: &std::path::Path) -> Option<(bool, String)> {
-        let Ok(out) = std::process::Command::new("btrfs")
-            .args(["check", image.to_str().unwrap()])
-            .output()
-        else {
+        let Ok(out) = spawn_gated_output(
+            std::process::Command::new("btrfs").args(["check", image.to_str().unwrap()]),
+        ) else {
             oracle_unavailable("btrfs check");
             return None;
         };
@@ -113765,19 +114048,20 @@ mod tests {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(256 * 1024 * 1024))
             .expect("size image");
-        let made = std::process::Command::new("mke2fs")
-            .args([
-                "-q",
-                "-t",
-                "ext4",
-                "-O",
-                "extent,fast_commit",
-                "-b",
-                "1024",
-                "-F",
-            ])
-            .arg(&image)
-            .output();
+        let made = spawn_gated_output(
+            std::process::Command::new("mke2fs")
+                .args([
+                    "-q",
+                    "-t",
+                    "ext4",
+                    "-O",
+                    "extent,fast_commit",
+                    "-b",
+                    "1024",
+                    "-F",
+                ])
+                .arg(&image),
+        );
         if !made.is_ok_and(|o| o.status.success()) {
             oracle_unavailable("mke2fs (e2fsprogs)");
             return;
@@ -113801,11 +114085,12 @@ mod tests {
         drop(probe);
         let script_path = tmp.path().join("lazy.debugfs");
         std::fs::write(&script_path, script).expect("write debugfs script");
-        let lazied = std::process::Command::new("debugfs")
-            .args(["-w", "-f"])
-            .arg(&script_path)
-            .arg(&image)
-            .output();
+        let lazied = spawn_gated_output(
+            std::process::Command::new("debugfs")
+                .args(["-w", "-f"])
+                .arg(&script_path)
+                .arg(&image),
+        );
         if !lazied.is_ok_and(|o| o.status.success()) {
             oracle_unavailable("debugfs");
             return;
@@ -113882,18 +114167,20 @@ mod tests {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(64 * 1024 * 1024))
             .expect("size image");
-        let made = std::process::Command::new("mke2fs")
-            .args(["-q", "-t", "ext4", "-b", "4096", "-F"])
-            .arg(&image)
-            .output();
+        let made = spawn_gated_output(
+            std::process::Command::new("mke2fs")
+                .args(["-q", "-t", "ext4", "-b", "4096", "-F"])
+                .arg(&image),
+        );
         if !made.is_ok_and(|o| o.status.success()) {
             oracle_unavailable("mke2fs (e2fsprogs)");
             return;
         }
-        let flagged = std::process::Command::new("debugfs")
-            .args(["-w", "-R", "ssv flags 2"])
-            .arg(&image)
-            .output();
+        let flagged = spawn_gated_output(
+            std::process::Command::new("debugfs")
+                .args(["-w", "-R", "ssv flags 2"])
+                .arg(&image),
+        );
         if !flagged.is_ok_and(|o| o.status.success()) {
             oracle_unavailable("debugfs");
             return;
@@ -114000,11 +114287,12 @@ mod tests {
         f.set_len(size_mb * 1024 * 1024).expect("set image size");
         drop(f);
 
-        let out = std::process::Command::new("mke2fs")
-            .args(["-q", "-t", "ext4", "-O", features, "-b", "1024", "-F"])
-            .args(formatter_args)
-            .arg(&image)
-            .output();
+        let out = spawn_gated_output(
+            std::process::Command::new("mke2fs")
+                .args(["-q", "-t", "ext4", "-O", features, "-b", "1024", "-F"])
+                .args(formatter_args)
+                .arg(&image),
+        );
         match out {
             Ok(o) if o.status.success() => {}
             _ => {
@@ -118424,12 +118712,13 @@ mod tests {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(256 * 1024 * 1024))
             .expect("create image");
-        let made = std::process::Command::new("mkfs.btrfs")
-            .args(["-q", "-f", "--rootdir"])
-            .arg(&tree)
-            .args(["--subvol", "rw:sv", "--subvol", "rw:sv/inner"])
-            .arg(&image)
-            .output();
+        let made = spawn_gated_output(
+            std::process::Command::new("mkfs.btrfs")
+                .args(["-q", "-f", "--rootdir"])
+                .arg(&tree)
+                .args(["--subvol", "rw:sv", "--subvol", "rw:sv/inner"])
+                .arg(&image),
+        );
         match made {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
@@ -121449,17 +121738,17 @@ mod tests {
             let mut full = vec!["inspect-internal", "dump-tree"];
             full.extend_from_slice(args);
             full.push(image.to_str().unwrap());
-            let out = std::process::Command::new("btrfs")
-                .args(&full)
-                .output()
+            let out = spawn_gated_output(std::process::Command::new("btrfs").args(&full))
                 .expect("btrfs dump-tree");
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
         // Superblock: compat_ro flags (FREE_SPACE_TREE / _VALID bits).
-        let super_out = std::process::Command::new("btrfs")
-            .args(["inspect-internal", "dump-super", image.to_str().unwrap()])
-            .output()
-            .expect("dump-super");
+        let super_out = spawn_gated_output(std::process::Command::new("btrfs").args([
+            "inspect-internal",
+            "dump-super",
+            image.to_str().unwrap(),
+        ]))
+        .expect("dump-super");
         eprintln!(
             "===== DUMP-SUPER =====\n{}",
             String::from_utf8_lossy(&super_out.stdout)
@@ -121473,10 +121762,13 @@ mod tests {
         let (_ok, check) = run_btrfs_check(&image).expect("btrfs check");
         eprintln!("===== BTRFS CHECK =====\n{check}");
         // lowmem mode gives precise per-node extent-tree diagnostics.
-        let lowmem = std::process::Command::new("btrfs")
-            .args(["check", "--mode", "lowmem", image.to_str().unwrap()])
-            .output()
-            .expect("btrfs check lowmem");
+        let lowmem = spawn_gated_output(std::process::Command::new("btrfs").args([
+            "check",
+            "--mode",
+            "lowmem",
+            image.to_str().unwrap(),
+        ]))
+        .expect("btrfs check lowmem");
         eprintln!(
             "===== BTRFS CHECK LOWMEM =====\n{}{}",
             String::from_utf8_lossy(&lowmem.stdout),
@@ -129422,12 +129714,13 @@ mod tests {
         let path = tmp.path().join(format!("{label}.btrfs"));
         std::fs::write(&path, image).ok()?;
         // The oracle must never mutate the artifact it is judging.
-        let out = std::process::Command::new("btrfs")
-            .arg("check")
-            .arg("--readonly")
-            .arg(&path)
-            .output()
-            .ok()?;
+        let out = spawn_gated_output(
+            std::process::Command::new("btrfs")
+                .arg("check")
+                .arg("--readonly")
+                .arg(&path),
+        )
+        .ok()?;
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         Some((out.status.success(), text))
