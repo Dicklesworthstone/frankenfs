@@ -521,3 +521,150 @@ fn rename_over_survives_a_crash_bd_jhuob() {
          pointing at the inode — a replayed log re-added the source name (bd-jhuob)"
     );
 }
+
+/// Count and order-check device barriers on `write(4 KiB) + fsync()` for BOTH
+/// tree-log mode (`ephemeral = true`) and full-commit mode (`ephemeral = false`).
+///
+/// Before the `NoSyncBlockDevice` barrier collapse, `mvcc_store.flush_to_device_after`
+/// issued an extra `ByteDevice::sync()` ahead of the tree-log/CoW pre-superblock
+/// barrier (`3` barriers/fsync vs kernel btrfs's `2`, explaining the `31.19 µs` vs
+/// `20.73 µs` / `600` vs `400` `flush_ios` gap in `bd-jhuob`).
+#[test]
+fn fsync_collapses_to_two_barriers_on_tree_log_and_full_commit_bd_jhuob() {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RecordedOp {
+        Write { offset: u64, len: usize },
+        Sync,
+    }
+
+    struct OrderCountingDevice {
+        inner: FileByteDevice,
+        ops: std::sync::Arc<std::sync::Mutex<Vec<RecordedOp>>>,
+    }
+
+    impl ffs_block::ByteDevice for OrderCountingDevice {
+        fn len_bytes(&self) -> u64 {
+            self.inner.len_bytes()
+        }
+
+        fn read_exact_at(
+            &self,
+            cx: &Cx,
+            offset: ffs_types::ByteOffset,
+            buf: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            self.inner.read_exact_at(cx, offset, buf)
+        }
+
+        fn write_all_at(
+            &self,
+            cx: &Cx,
+            offset: ffs_types::ByteOffset,
+            buf: &[u8],
+        ) -> ffs_error::Result<()> {
+            self.ops.lock().expect("ops mutex").push(RecordedOp::Write {
+                offset: offset.0,
+                len: buf.len(),
+            });
+            self.inner.write_all_at(cx, offset, buf)
+        }
+
+        fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+            self.ops.lock().expect("ops mutex").push(RecordedOp::Sync);
+            self.inner.sync(cx)
+        }
+    }
+
+    init_tracing();
+    let cx = Cx::for_testing();
+    let sb_offset = u64::try_from(ffs_types::BTRFS_SUPER_INFO_OFFSET).expect("sb offset");
+
+    for ephemeral in [true, false] {
+        let tmp = tempfile::TempDir::new().expect("temporary directory");
+        let label = if ephemeral {
+            "jhuob-two-barriers-treelog.btrfs"
+        } else {
+            "jhuob-two-barriers-fullcommit.btrfs"
+        };
+        let Some(image) = mkfs_btrfs_image(tmp.path(), label) else {
+            eprintln!("btrfs-progs unavailable; skipping bd-jhuob barrier count test");
+            return;
+        };
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dev = OrderCountingDevice {
+            inner: FileByteDevice::open(&image).expect("open image"),
+            ops: std::sync::Arc::clone(&ops),
+        };
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(dev),
+            &OpenOptions {
+                btrfs_rw_ephemeral_ok: ephemeral,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open btrfs");
+        fs.enable_writes(&cx).expect("enable writes");
+
+        let ino = fs
+            .create(&cx, BTRFS_ROOT_DIR, OsStr::new("barrier.bin"), 0o644, 0, 0)
+            .expect("create barrier.bin")
+            .ino;
+        let payload = [0x3C_u8; 4096];
+        ops.lock().expect("ops mutex").clear();
+
+        let written = fs.write(&cx, ino, 0, &payload).expect("write 4 KiB");
+        assert_eq!(written, 4096);
+        fs.fsync(&cx, ino, 0, false).expect("fsync barrier.bin");
+
+        let recorded = ops.lock().expect("ops mutex").clone();
+        let sync_positions: Vec<usize> = recorded
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| (*op == RecordedOp::Sync).then_some(idx))
+            .collect();
+        assert_eq!(
+            sync_positions.len(),
+            2,
+            "ephemeral={ephemeral}: expected exact 2 device barriers per write+fsync, got {}: {recorded:?}",
+            sync_positions.len()
+        );
+        let first_sync = sync_positions[0];
+        let second_sync = sync_positions[1];
+        assert!(
+            first_sync > 0,
+            "ephemeral={ephemeral}: data and tree/log blocks must be written before Sync #1: {recorded:?}"
+        );
+        for op in &recorded[..first_sync] {
+            if let RecordedOp::Write { offset, .. } = *op {
+                assert_ne!(
+                    offset, sb_offset,
+                    "ephemeral={ephemeral}: superblock must NEVER be written before Sync #1: {recorded:?}"
+                );
+            }
+        }
+        assert_eq!(
+            &recorded[first_sync + 1..second_sync],
+            &[RecordedOp::Write {
+                offset: sb_offset,
+                len: 4096
+            }],
+            "ephemeral={ephemeral}: only the 4 KiB primary superblock write may sit between Sync #1 and Sync #2: {recorded:?}"
+        );
+        assert_eq!(
+            second_sync + 1,
+            recorded.len(),
+            "ephemeral={ephemeral}: no trailing writes may follow Sync #2: {recorded:?}"
+        );
+        drop(fs);
+
+        let recovered = open_rw(&cx, &image, false).expect("recovery mount");
+        assert_eq!(
+            content_of(&recovered, &cx, "barrier.bin", payload.len()).as_deref(),
+            Some(payload.as_slice()),
+            "ephemeral={ephemeral}: 2-barrier fsync payload must survive crash recovery"
+        );
+        drop(recovered);
+    }
+}

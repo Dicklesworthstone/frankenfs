@@ -2725,6 +2725,135 @@ struct BtrfsTreeLogWriteStats {
     retired_log_blocks: Vec<(u64, u64, bool)>,
 }
 
+enum TreeLogPublishError {
+    NodeWrite(FfsError),
+    PreSuperblockSync(FfsError),
+    SuperblockWrite(FfsError),
+}
+
+impl TreeLogPublishError {
+    #[cfg(test)]
+    fn into_inner(self) -> FfsError {
+        match self {
+            Self::NodeWrite(err) | Self::PreSuperblockSync(err) | Self::SuperblockWrite(err) => err,
+        }
+    }
+}
+
+/// Forwarding [`BlockDevice`] wrapper whose [`BlockDevice::sync`] is a cancel-aware
+/// no-op, used when a caller's own explicit pre-superblock device barrier (`Sync #1`)
+/// flushes both staged MVCC data blocks and CoW metadata/tree-log nodes together in a
+/// single durability round-trip (`bd-jhuob`).
+///
+/// The caller MUST hold `mvcc_flushed_through.lock()` across both the staged MVCC
+/// write pass and the real `ByteDevice::sync()`, advancing `*flushed_through` only
+/// after that barrier succeeds.
+struct NoSyncBlockDevice<'a, D: BlockDevice + ?Sized>(&'a D);
+
+impl<D: BlockDevice + ?Sized> BlockDevice for NoSyncBlockDevice<'_, D> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> ffs_error::Result<BlockBuf> {
+        self.0.read_block(cx, block)
+    }
+
+    fn supports_contiguous_reads(&self) -> bool {
+        self.0.supports_contiguous_reads()
+    }
+
+    fn read_contiguous_blocks(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        bufs: &mut [BlockBuf],
+    ) -> ffs_error::Result<()> {
+        self.0.read_contiguous_blocks(cx, start, bufs)
+    }
+
+    fn read_contiguous_into(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        dst: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        self.0.read_contiguous_into(cx, start, dst)
+    }
+
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> ffs_error::Result<()> {
+        self.0.write_block(cx, block, data)
+    }
+
+    fn rmw_block(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        disjoint_ranges: &[(usize, usize)],
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> ffs_error::Result<()>,
+    ) -> ffs_error::Result<()> {
+        self.0.rmw_block(cx, block, disjoint_ranges, patch)
+    }
+
+    fn rmw_block_bitmap_or(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> ffs_error::Result<()>,
+    ) -> ffs_error::Result<()> {
+        self.0.rmw_block_bitmap_or(cx, block, patch)
+    }
+
+    fn rmw_block_bitmap_delta(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> ffs_error::Result<()>,
+    ) -> ffs_error::Result<()> {
+        self.0.rmw_block_bitmap_delta(cx, block, patch)
+    }
+
+    fn read_merge_ancestor_at_snapshot(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> ffs_error::Result<(BlockBuf, Option<Vec<u8>>)> {
+        self.0.read_merge_ancestor_at_snapshot(cx, block, snapshot)
+    }
+
+    fn supports_contiguous_writes(&self) -> bool {
+        self.0.supports_contiguous_writes()
+    }
+
+    fn write_contiguous_blocks(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        data: &[u8],
+    ) -> ffs_error::Result<()> {
+        self.0.write_contiguous_blocks(cx, start, data)
+    }
+
+    fn write_contiguous_blocks_vectored(
+        &self,
+        cx: &Cx,
+        start: BlockNumber,
+        chunks: &[&[u8]],
+    ) -> ffs_error::Result<()> {
+        self.0.write_contiguous_blocks_vectored(cx, start, chunks)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.0.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.0.block_count()
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        Ok(())
+    }
+}
+
 /// Rename execution context shared by the batched and per-op rename paths:
 /// the resolved parent/name pairs plus the source entry. Grouped so the
 /// extracted path helpers stay under the argument-count lint.
@@ -13501,6 +13630,7 @@ impl OpenFs {
     /// fsync callers: an older snapshot can never overwrite a newer durable
     /// snapshot after the newer watermark has been published. The watermark is
     /// advanced only on success, so a partial/failed write is retried in full.
+    #[cfg(test)]
     fn flush_mvcc_versions_to_device<D: BlockDevice>(
         &self,
         cx: &Cx,
@@ -30720,7 +30850,7 @@ impl OpenFs {
             && !scope.composite
             && scope.pending_write_count() == 0
             && !scope.has_ext4_staged_effects()
-            && matches!(scope.origin_op, Some(op) if op == expected_op)
+            && scope.origin_op.is_none_or(|op| op == expected_op)
             && scope.isolation_mode == MvccIsolationMode::Snapshot
             && !self.mvcc_store.is_ssi_enabled()
     }
@@ -42452,7 +42582,9 @@ impl OpenFs {
         &self,
         cx: &Cx,
         ino: InodeNumber,
-    ) -> Result<BtrfsTreeLogWriteStats, FfsError> {
+        operation_id: &str,
+    ) -> Result<(BtrfsTreeLogWriteStats, usize), FfsError> {
+        self.reject_btrfs_unsupported_mutation()?;
         let sb = self
             .btrfs_superblock()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?
@@ -42466,13 +42598,22 @@ impl OpenFs {
         // than rebuilding it — a rebuild zeroes dev_item and the kernel then refuses
         // the filesystem (bd-jhuob).
         let mut on_disk_sb = vec![0_u8; 4096];
-        self.dev.read_exact_at(
-            cx,
-            ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
-                FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
-            })?),
-            &mut on_disk_sb,
-        )?;
+        self.dev
+            .read_exact_at(
+                cx,
+                ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
+                    FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
+                })?),
+                &mut on_disk_sb,
+            )
+            .inspect_err(|_| {
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_READ_ERRS);
+            })?;
+        // Prepare and allocate the log blocks BEFORE taking `mvcc_flushed_through`.
+        // Dropping `alloc_mutex` here keeps `alloc_mutex` and `mvcc_flushed_through`
+        // completely non-overlapping on the tree-log path and allows an overflow
+        // (`UnsupportedFeature`) to fall back to `btrfs_full_transaction_commit`
+        // without touching the MVCC flush cursor (bd-jhuob).
         let (nodes, sb_bytes, stats) = {
             let mut alloc = alloc_mutex.write();
             Self::btrfs_prepare_tree_log_write(
@@ -42488,36 +42629,123 @@ impl OpenFs {
         // and a check that covered only one of them would be worse than none —
         // it would read as validated (bd-jhuob).
         let mut writes: Vec<(ByteOffset, &[u8])> = Vec::with_capacity(nodes.len());
-        for (logical, bytes) in &nodes {
-            let chunk_end = self.btrfs_logical_chunk_end(*logical)?;
-            let available_in_chunk = Self::btrfs_checked_chunk_available(chunk_end, *logical)?;
-            if available_in_chunk
-                < u64::try_from(bytes.len())
-                    .map_err(|_| FfsError::InvalidGeometry("tree-log node too large".into()))?
-            {
-                return Err(FfsError::Corruption {
-                    block: *logical,
-                    detail: "btrfs tree-log node crosses chunk boundary".into(),
-                });
+        let span_validation: Result<ByteOffset, FfsError> = (|| {
+            for (logical, bytes) in &nodes {
+                let chunk_end = self.btrfs_logical_chunk_end(*logical)?;
+                let available_in_chunk = Self::btrfs_checked_chunk_available(chunk_end, *logical)?;
+                if available_in_chunk
+                    < u64::try_from(bytes.len())
+                        .map_err(|_| FfsError::InvalidGeometry("tree-log node too large".into()))?
+                {
+                    return Err(FfsError::Corruption {
+                        block: *logical,
+                        detail: "btrfs tree-log node crosses chunk boundary".into(),
+                    });
+                }
+                // bd-0mcvt: publish the log node on every DUP copy.
+                let mapping = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, *logical)
+                    .map_err(|e| parse_to_ffs_error(&e))?
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: *logical,
+                        detail: "tree-log logical bytenr not covered by any btrfs chunk".into(),
+                    })?;
+                for stripe in &mapping.stripes {
+                    Self::btrfs_checked_physical_span(stripe.physical, bytes.len())?;
+                    writes.push((ByteOffset(stripe.physical), bytes.as_slice()));
+                }
             }
-            // bd-0mcvt: publish the log node on every DUP copy.
-            let mapping = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, *logical)
-                .map_err(|e| parse_to_ffs_error(&e))?
-                .ok_or_else(|| FfsError::Corruption {
-                    block: *logical,
-                    detail: "tree-log logical bytenr not covered by any btrfs chunk".into(),
-                })?;
-            for stripe in &mapping.stripes {
-                Self::btrfs_checked_physical_span(stripe.physical, bytes.len())?;
-                writes.push((ByteOffset(stripe.physical), bytes.as_slice()));
+            u64::try_from(BTRFS_SUPER_INFO_OFFSET)
+                .map(ByteOffset)
+                .map_err(|_| {
+                    FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
+                })
+        })();
+        let superblock_offset = match span_validation {
+            Ok(offset) => offset,
+            Err(err) => {
+                self.btrfs_rollback_unwritten_tree_log(&stats.retired_log_blocks, operation_id);
+                return Err(err);
+            }
+        };
+
+        // Collapse MVCC data flush + tree-log node publish onto ONE pre-superblock
+        // barrier (`[MVCC data + log_tree + log_root] -> Sync #1 -> [superblock]`,
+        // bd-jhuob). Holding `mvcc_flushed_through` through `Sync #1` guarantees
+        // concurrent sync callers stay serialized and that `*flushed_through`
+        // advances only after `Sync #1` has made the MVCC blocks durable.
+        let base_dev = self.direct_block_device_adapter();
+        let no_sync_dev = NoSyncBlockDevice(&base_dev);
+        let mut flushed_through = self.mvcc_flushed_through.lock();
+        let (flushed, durable_through) =
+            match self
+                .mvcc_store
+                .flush_to_device_after(cx, &no_sync_dev, *flushed_through)
+            {
+                Ok(pair) => pair,
+                Err(err) => {
+                    drop(flushed_through);
+                    self.record_btrfs_dev_stat(
+                        self.btrfs_primary_devid(),
+                        BTRFS_DEV_STAT_WRITE_ERRS,
+                    );
+                    self.btrfs_rollback_unwritten_tree_log(&stats.retired_log_blocks, operation_id);
+                    return Err(err);
+                }
+            };
+        self.clear_ext4_writable_group_desc_cache();
+
+        match Self::btrfs_publish_tree_log_checked(
+            self.dev.as_ref(),
+            cx,
+            &writes,
+            superblock_offset,
+            &sb_bytes,
+        ) {
+            Ok(()) => {
+                *flushed_through = (*flushed_through).max(durable_through);
+                drop(flushed_through);
+                Ok((stats, flushed))
+            }
+            Err(TreeLogPublishError::NodeWrite(err)) => {
+                drop(flushed_through);
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_WRITE_ERRS);
+                self.btrfs_rollback_unwritten_tree_log(&stats.retired_log_blocks, operation_id);
+                Err(err)
+            }
+            Err(TreeLogPublishError::PreSuperblockSync(err)) => {
+                drop(flushed_through);
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
+                self.btrfs_rollback_unwritten_tree_log(&stats.retired_log_blocks, operation_id);
+                Err(err)
+            }
+            Err(TreeLogPublishError::SuperblockWrite(err)) => {
+                *flushed_through = (*flushed_through).max(durable_through);
+                drop(flushed_through);
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_WRITE_ERRS);
+                self.btrfs_repin_retired_tree_log_blocks(&stats.retired_log_blocks);
+                Err(err)
             }
         }
-        let superblock_offset =
-            ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
-                FfsError::InvalidGeometry("btrfs superblock offset does not fit u64".into())
-            })?);
-        Self::btrfs_publish_tree_log(self.dev.as_ref(), cx, &writes, superblock_offset, &sb_bytes)?;
-        Ok(stats)
+    }
+
+    fn btrfs_publish_tree_log_checked(
+        dev: &dyn ByteDevice,
+        cx: &Cx,
+        nodes: &[(ByteOffset, &[u8])],
+        superblock_offset: ByteOffset,
+        sb_bytes: &[u8],
+    ) -> Result<(), TreeLogPublishError> {
+        for (offset, bytes) in nodes {
+            dev.write_all_at(cx, *offset, bytes)
+                .map_err(TreeLogPublishError::NodeWrite)?;
+        }
+        // THE LOAD-BEARING LINE. Without it the superblock below can reach disk
+        // first and address a log node (or MVCC data block) that does not exist.
+        dev.sync(cx)
+            .map_err(TreeLogPublishError::PreSuperblockSync)?;
+        dev.write_all_at(cx, superblock_offset, sb_bytes)
+            .map_err(TreeLogPublishError::SuperblockWrite)?;
+        Ok(())
     }
 
     /// Publish a tree log: make the LOG NODE durable, then point the superblock at
@@ -42548,6 +42776,7 @@ impl OpenFs {
     ///
     /// # Errors
     /// Returns any device write or sync error, unchanged.
+    #[cfg(test)]
     fn btrfs_publish_tree_log(
         dev: &dyn ByteDevice,
         cx: &Cx,
@@ -42555,26 +42784,8 @@ impl OpenFs {
         superblock_offset: ByteOffset,
         sb_bytes: &[u8],
     ) -> Result<(), FfsError> {
-        for (offset, bytes) in nodes {
-            dev.write_all_at(cx, *offset, bytes)?;
-        }
-        // THE LOAD-BEARING LINE. Without it the superblock below can reach disk
-        // first and address a log node that does not exist.
-        //
-        // ONE barrier after ALL nodes, not one per node, and that is correct
-        // rather than a shortcut: the requirement is that every node is durable
-        // BEFORE the superblock names any of them. Nothing requires the nodes to
-        // be ordered among themselves — no node points at another until the
-        // superblock points at the first — so a barrier between them would buy
-        // nothing and cost a flush per node on the fsync path.
-        //
-        // Takes a slice because the kernel's log shape needs TWO blocks per fsync,
-        // the log tree and the log root tree that points at it (bd-jhuob). Passing
-        // one is the shape today and is byte-identical to the previous single-node
-        // form.
-        dev.sync(cx)?;
-        dev.write_all_at(cx, superblock_offset, sb_bytes)?;
-        Ok(())
+        Self::btrfs_publish_tree_log_checked(dev, cx, nodes, superblock_offset, sb_bytes)
+            .map_err(TreeLogPublishError::into_inner)
     }
 
     fn btrfs_sync_with_logging(
@@ -42696,25 +42907,12 @@ impl OpenFs {
             "tree_log_fast_fsync"
         );
 
-        // Flush committed MVCC block versions to the underlying device.
-        let base_dev = self.direct_block_device_adapter();
-        let flushed = self.flush_mvcc_versions_to_device(cx, &base_dev)?;
-        self.clear_ext4_writable_group_desc_cache();
-        if flushed > 0 {
-            trace!(
-                target: "ffs::btrfs::rw",
-                operation_id = %operation_id,
-                flushed_blocks = flushed,
-                "mvcc_flush_before_sync"
-            );
-        }
-        // bd-dm01m: when the accumulated fsync set no longer fits one log leaf,
-        // fall back to a FULL COMMIT rather than failing the fsync or dropping
-        // items. A full commit supersedes the log and clears the accumulator, so
-        // the next fsync starts a fresh log — which is precisely what kernel
-        // btrfs does when its log cannot be used.
-        let tree_log = match self.btrfs_write_tree_log_for_sync(cx, ino) {
-            Ok(stats) => stats,
+        // bd-dm01m + bd-jhuob: prepare the tree log first so an overflow falls
+        // back cleanly to `btrfs_full_transaction_commit`, and otherwise stage
+        // MVCC data blocks + tree-log nodes ahead of ONE shared pre-superblock
+        // barrier (`2` barriers/fsync total instead of `3`).
+        let (tree_log, flushed) = match self.btrfs_write_tree_log_for_sync(cx, ino, operation_id) {
+            Ok(result) => result,
             Err(FfsError::UnsupportedFeature(_)) => {
                 info!(
                     target: "ffs::btrfs::rw",
@@ -42732,6 +42930,14 @@ impl OpenFs {
             }
             Err(other) => return Err(other),
         };
+        if flushed > 0 {
+            trace!(
+                target: "ffs::btrfs::rw",
+                operation_id = %operation_id,
+                flushed_blocks = flushed,
+                "mvcc_flush_before_sync"
+            );
+        }
 
         match self.dev.sync(cx) {
             Ok(()) => {
@@ -42763,6 +42969,10 @@ impl OpenFs {
             }
             Err(err) => {
                 self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
+                // The superblock write was issued before this failed sync, so
+                // either the old OR the new `log_root` may be on disk. Keep
+                // both sets pinned until a later fsync or full commit succeeds.
+                self.btrfs_repin_retired_tree_log_blocks(&tree_log.retired_log_blocks);
                 warn!(
                     target: "ffs::btrfs::rw",
                     operation_id = %operation_id,
@@ -42775,6 +42985,44 @@ impl OpenFs {
                     "btrfs_sync_rejected"
                 );
                 Err(err)
+            }
+        }
+    }
+
+    /// Restore `btrfs_live_log_blocks` to `retired_log_blocks` and free the
+    /// newly allocated tree-log blocks when publication fails BEFORE writing
+    /// the superblock (`bd-jhuob`).
+    fn btrfs_rollback_unwritten_tree_log(
+        &self,
+        retired_log_blocks: &[(u64, u64, bool)],
+        operation_id: &str,
+    ) {
+        let unwritten = self.require_btrfs_alloc_state().map_or_else(
+            |_| Vec::new(),
+            |alloc_mutex| {
+                let mut alloc = alloc_mutex.write();
+                std::mem::replace(
+                    &mut alloc.btrfs_live_log_blocks,
+                    retired_log_blocks.to_vec(),
+                )
+            },
+        );
+        self.btrfs_free_retired_log_blocks(&unwritten, operation_id);
+    }
+
+    /// Keep `retired_log_blocks` pinned alongside the newly published log blocks
+    /// when a superblock write or trailing sync fails, since either pointer may
+    /// reach stable storage before recovery (`bd-jhuob`).
+    fn btrfs_repin_retired_tree_log_blocks(&self, retired_log_blocks: &[(u64, u64, bool)]) {
+        if retired_log_blocks.is_empty() {
+            return;
+        }
+        if let Ok(alloc_mutex) = self.require_btrfs_alloc_state() {
+            let mut alloc = alloc_mutex.write();
+            for &entry in retired_log_blocks {
+                if !alloc.btrfs_live_log_blocks.contains(&entry) {
+                    alloc.btrfs_live_log_blocks.push(entry);
+                }
             }
         }
     }
@@ -43005,18 +43253,28 @@ impl OpenFs {
         };
 
         // File data is staged through the MVCC block adapter, whereas the CoW
-        // trees below are written directly. Drain the committed data while the
-        // allocator lock excludes further btrfs writes, before publishing any
-        // metadata that refers to it. The existing pre-superblock sync barrier
-        // then makes both data and tree nodes durable. A failed drain must leave
-        // the old generation and tree publication state intact.
+        // trees below are written directly. Stage the committed data without an
+        // extra device FLUSH while the allocator lock excludes further btrfs
+        // writes, before publishing any metadata that refers to it: the
+        // pre-superblock sync barrier below then makes both data and tree nodes
+        // durable in one flush (`2` barriers/commit instead of `3`, bd-jhuob).
+        // `*mvcc_flushed_guard` advances only after that barrier succeeds, so a
+        // failed commit retries the full MVCC data write set.
+        self.reject_btrfs_unsupported_mutation()?;
         let base_dev = self.direct_block_device_adapter();
+        let no_sync_dev = NoSyncBlockDevice(&base_dev);
         // The allocator excludes native data writers and the caller's semantic
         // read guard excludes raw publication. Capture BEFORE draining: sharded
         // installation precedes publication, so a later sample is not proof
         // that the flushed snapshot covered those writes.
         let data_writes_at_boundary = self.mvcc_store.committed_block_writes();
-        let flushed_data_blocks = self.flush_mvcc_versions_to_device(cx, &base_dev)?;
+        let mut mvcc_flushed_guard = self.mvcc_flushed_through.lock();
+        let (flushed_data_blocks, mvcc_durable_through) = self
+            .mvcc_store
+            .flush_to_device_after(cx, &no_sync_dev, *mvcc_flushed_guard)
+            .inspect_err(|_| {
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_WRITE_ERRS);
+            })?;
 
         let current_gen = alloc.generation;
         let new_gen = current_gen.saturating_add(1);
@@ -43107,8 +43365,15 @@ impl OpenFs {
         let node_count = dag.node_count();
         if node_count == 0 {
             if flushed_data_blocks > 0 {
-                self.dev.sync(cx)?;
+                self.dev.sync(cx).inspect_err(|_| {
+                    self.record_btrfs_dev_stat(
+                        self.btrfs_primary_devid(),
+                        BTRFS_DEV_STAT_FLUSH_ERRS,
+                    );
+                })?;
             }
+            *mvcc_flushed_guard = (*mvcc_flushed_guard).max(mvcc_durable_through);
+            drop(mvcc_flushed_guard);
             debug!(
                 target: "ffs::btrfs::writeback",
                 operation_id,
@@ -44535,7 +44800,9 @@ impl OpenFs {
         let mut commit_barrier_pending = if btrfs_commit_fst_early() {
             true
         } else {
-            self.dev.sync(cx)?;
+            self.dev.sync(cx).inspect_err(|_| {
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
+            })?;
             false
         };
 
@@ -44606,9 +44873,11 @@ impl OpenFs {
             }
             fst_committed = true;
             // Under `btrfs_commit_fst_early` this is the deferred barrier from
-            // above, now covering the tree nodes AND the FST nodes in one flush;
-            // otherwise it is the second of three.
-            self.dev.sync(cx)?;
+            // above, now covering MVCC data blocks, tree nodes, AND the FST
+            // nodes in one flush; otherwise it is the second of three.
+            self.dev.sync(cx).inspect_err(|_| {
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
+            })?;
             commit_barrier_pending = false;
         }
 
@@ -44618,7 +44887,9 @@ impl OpenFs {
         // FST, or one too large to rewrite) the deferred barrier fires here,
         // still ahead of both.
         if commit_barrier_pending {
-            self.dev.sync(cx)?;
+            self.dev.sync(cx).inspect_err(|_| {
+                self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
+            })?;
             commit_barrier_pending = false;
         }
         // A hard assert, not a `debug_assert`: reaching the superblock write with
@@ -44630,6 +44901,8 @@ impl OpenFs {
             !commit_barrier_pending,
             "btrfs commit reached the superblock with its write set unflushed"
         );
+        *mvcc_flushed_guard = (*mvcc_flushed_guard).max(mvcc_durable_through);
+        drop(mvcc_flushed_guard);
 
         // Every DEV_ITEM's bytes_used as this commit leaves the chunk tree; the
         // superblock's embedded copy of its own device item is patched from it
@@ -54358,6 +54631,13 @@ mod tests {
         /// The bytes a crash right now would leave on storage.
         fn durable_bytes(&self) -> Vec<u8> {
             self.durable.lock().clone()
+        }
+
+        /// Simulate page-cache / write-buffer discard of un-synced volatile writes
+        /// after a failed `ByteDevice::sync()`.
+        fn discard_unflushed_volatile(&self) {
+            let durable = self.durable.lock().clone();
+            *self.volatile.lock() = durable;
         }
     }
 
@@ -100711,6 +100991,158 @@ mod tests {
              log_root; without the intervening sync an fsync that returned success \
              can lose its data (bd-sv7ql, same shape as bd-73bi2)"
         );
+    }
+
+    #[test]
+    fn btrfs_fsync_collapses_mvcc_barrier_and_retries_on_failed_sync_bd_jhuob() {
+        for ephemeral in [true, false] {
+            let Some((seed_fs, seed_dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+                return;
+            };
+            let device = CrashDevice::from_vec(seed_dev.snapshot_bytes());
+            drop(seed_fs);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(device.clone()),
+                &OpenOptions {
+                    btrfs_rw_ephemeral_ok: ephemeral,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("open btrfs on CrashDevice");
+            fs.enable_writes(&cx).expect("enable writes");
+            fs.set_btrfs_dirty_bytes_threshold(0);
+
+            // Step 1: write(4 KiB) + fsync() must issue EXACTLY 2 barriers
+            // (`[MVCC data + metadata/log] -> Sync #1 -> [superblock] -> Sync #2`),
+            // down from 3 barriers before bd-jhuob.
+            let attr = fs
+                .create(&cx, root, OsStr::new("two-barrier.bin"), 0o644, 0, 0)
+                .expect("create file");
+            let payload_v1 = [0xA5_u8; 4096];
+            assert_eq!(
+                fs.write(&cx, attr.ino, 0, &payload_v1).expect("write v1"),
+                4096
+            );
+
+            let sync_before_v1 = device.sync_count();
+            fs.fsync(&cx, attr.ino, 0, false).expect("fsync v1");
+            assert_eq!(
+                device.sync_count() - sync_before_v1,
+                2,
+                "ephemeral={ephemeral}: write + fsync must issue exactly 2 device barriers"
+            );
+
+            // Step 2 (negative / fault-injection control): write v2, fail Sync #1,
+            // and discard un-synced volatile writes. `mvcc_flushed_through` MUST NOT
+            // have advanced before Sync #1 succeeded, `BTRFS_DEV_STAT_FLUSH_ERRS`
+            // must increment, `durable_bytes()` must still hold v1 cleanly, and a
+            // subsequent disarmed `fsync` must re-flush the MVCC data blocks and
+            // make v2 durable in 2 barriers!
+            let watermark_before_v2 = *fs.mvcc_flushed_through.lock();
+            let payload_v2 = [0x5A_u8; 4096];
+            assert_eq!(
+                fs.write(&cx, attr.ino, 0, &payload_v2).expect("write v2"),
+                4096
+            );
+
+            let failed_sync_target = device.sync_count() + 1;
+            device.arm_sync_failure(failed_sync_target);
+            let err = fs
+                .fsync(&cx, attr.ino, 0, false)
+                .expect_err("armed Sync #1 failure must fail fsync");
+            assert_eq!(err.to_errno(), libc::EIO);
+            assert_eq!(
+                device.sync_count(),
+                failed_sync_target,
+                "ephemeral={ephemeral}: fsync must stop at failed Sync #1 without writing superblock"
+            );
+            assert_eq!(
+                *fs.mvcc_flushed_through.lock(),
+                watermark_before_v2,
+                "ephemeral={ephemeral}: mvcc_flushed_through must not advance when Sync #1 fails"
+            );
+
+            let mut scope = RequestScope::empty();
+            let stats_raw = fs
+                .btrfs_get_dev_stats(&cx, &mut scope, fs.btrfs_primary_devid(), 0)
+                .expect("btrfs_get_dev_stats");
+            let flush_errs = u64::from_le_bytes(
+                stats_raw
+                    [24 + BTRFS_DEV_STAT_FLUSH_ERRS * 8..24 + (BTRFS_DEV_STAT_FLUSH_ERRS + 1) * 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(
+                flush_errs, 1,
+                "ephemeral={ephemeral}: failed Sync #1 must record BTRFS_DEV_STAT_FLUSH_ERRS"
+            );
+
+            // Crash-check durable bytes right at failed Sync #1: v1 must still be intact.
+            device.discard_unflushed_volatile();
+            let crashed_at_sync1 = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(device.durable_bytes())),
+                &OpenOptions::default(),
+            )
+            .expect("mount durable image after failed Sync #1");
+            let crashed_attr = crashed_at_sync1
+                .lookup(&cx, root, OsStr::new("two-barrier.bin"))
+                .expect("lookup v1 after failed Sync #1");
+            assert_eq!(
+                crashed_at_sync1
+                    .read(&cx, crashed_attr.ino, 0, 4096)
+                    .expect("read v1 after failed Sync #1"),
+                payload_v1,
+                "ephemeral={ephemeral}: failed Sync #1 must leave prior durable payload intact"
+            );
+            drop(crashed_at_sync1);
+
+            // Disarm and retry fsync after volatile buffer discard: must re-write v2's
+            // MVCC blocks and complete in 2 barriers.
+            device.disarm();
+            let sync_before_retry = device.sync_count();
+            fs.fsync(&cx, attr.ino, 0, false)
+                .expect("retry fsync after Sync #1 failure");
+            assert_eq!(
+                device.sync_count() - sync_before_retry,
+                2,
+                "ephemeral={ephemeral}: retry fsync must issue exactly 2 device barriers"
+            );
+            assert!(
+                *fs.mvcc_flushed_through.lock() > watermark_before_v2,
+                "ephemeral={ephemeral}: mvcc_flushed_through must advance once Sync #1 succeeds"
+            );
+
+            // Verify durable image after retry holds v2 and passes `btrfs check --readonly`.
+            let durable_after_retry = device.durable_bytes();
+            let recovered = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(durable_after_retry.clone())),
+                &OpenOptions::default(),
+            )
+            .expect("mount durable image after retry");
+            let recovered_attr = recovered
+                .lookup(&cx, root, OsStr::new("two-barrier.bin"))
+                .expect("lookup v2 after retry");
+            assert_eq!(
+                recovered
+                    .read(&cx, recovered_attr.ino, 0, 4096)
+                    .expect("read v2 after retry"),
+                payload_v2,
+                "ephemeral={ephemeral}: retry fsync must re-flush MVCC data blocks even after volatile discard"
+            );
+            drop(recovered);
+            drop(fs);
+
+            std::fs::write(&image, durable_after_retry)
+                .expect("write durable image for btrfs check");
+            if let Some((ok, output)) = run_btrfs_check(&image) {
+                assert!(ok, "ephemeral={ephemeral} btrfs check failed: {output}");
+            }
+        }
     }
 
     #[cfg(feature = "bhh0i_sharded_alloc")]

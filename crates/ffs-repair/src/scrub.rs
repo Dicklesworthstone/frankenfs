@@ -3539,19 +3539,28 @@ mod tests {
             std::fs::File::create(&path)
                 .and_then(|file| file.set_len(32 * 1024 * 1024))
                 .expect("create image");
-            let formatted = std::process::Command::new("mke2fs")
-                .args([
-                    "-q",
-                    "-F",
-                    "-t",
-                    "ext4",
-                    "-O",
-                    "metadata_csum,^extent,^64bit",
-                    "-b",
-                    &block_size.to_string(),
-                ])
-                .arg(&path)
-                .output();
+            let formatted = {
+                // Hold `TEST_CHILD_PROCESS_GATE` exclusively while spawning and
+                // running `mke2fs`: otherwise a forked child can transiently
+                // inherit a sibling `sidecar::live` test's flocked image/archive
+                // descriptor before `exec` and trigger `WouldBlock` on reopen.
+                let _no_flock_holders = crate::sidecar::TEST_CHILD_PROCESS_GATE
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::process::Command::new("mke2fs")
+                    .args([
+                        "-q",
+                        "-F",
+                        "-t",
+                        "ext4",
+                        "-O",
+                        "metadata_csum,^extent,^64bit",
+                        "-b",
+                        &block_size.to_string(),
+                    ])
+                    .arg(&path)
+                    .output()
+            };
             let formatted = match formatted {
                 Ok(output) => output,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
