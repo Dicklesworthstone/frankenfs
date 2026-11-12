@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, validation/btrfs-namespace-integrity-20261112]
   pull_request:
     branches: [main]
 
@@ -97,6 +97,9 @@ jobs:
 
       - name: Check
         run: cargo check --all-targets
+
+      - name: Btrfs namespace regressions
+        run: cargo test -p ffs-core --lib btrfs_rename2_exchange_ -- --nocapture
 
       - name: Harness LOC growth guard
         if: github.event_name == 'pull_request'
