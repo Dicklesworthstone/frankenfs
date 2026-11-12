@@ -12346,7 +12346,7 @@ bank (bd-avg6f) — the btrfs cell has the same exposure.
 `RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
 the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
 
-Same-invocation A/A null control `1.022209` bootstrap median CI `[1.007151, 1.068001]`, from 20000 resamples over the 32 paired per-round ratios. Counted mechanism: both FrankenFS
+Same-invocation A/A null control `1.022209` bootstrap median CI `[1.007151, 1.068001]`, from 20000 resamples over the 32 paired per-round ratios (within-invocation bounds only; no second same-ELF cross-window run is recorded, so quote against the campaign's cross-window spread floor). Counted mechanism: both FrankenFS
 arms issue `getxattr` 148,002 and `lookup` 148,001 over 37 batches, read off the daemon's
 unconditional crossing counter at the kernel boundary.
 
@@ -12583,7 +12583,7 @@ kernel_median_wall_ns=20018000 against fuse_median_wall_ns=32314000 on ext4.
 `RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
 the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
 Same-invocation A/A null control `1.003276` bootstrap median CI `[0.993546, 1.011545]` (kernel ext4) and same-invocation A/A null control `0.999186` bootstrap median CI `[0.993778, 1.006644]` (kernel btrfs),
-both from 20000 resamples over the 36 paired per-round ratios.
+both from 20000 resamples over the 36 paired per-round ratios (within-invocation bounds only; no second same-ELF cross-window run is recorded, so quote against the campaign's cross-window spread floor).
 
 **DAEMON PLACEMENT, back-filled 2026-09-01 from the repo rather than from recollection
 (bd-plt79, BlackThrush).** `--placement-audit` flagged this section as a mounted ratio that
@@ -12677,7 +12677,7 @@ not need its own attack: it is the same defect, sized at `88.97%` of a batch ins
 `RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
 the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
 Same-invocation A/A null control `1.003276` bootstrap median CI `[0.993546, 1.011545]` (kernel ext4) and same-invocation A/A null control `0.999186` bootstrap median CI `[0.993778, 1.006644]` (kernel btrfs),
-both from 20000 resamples over the 36 paired per-round ratios.
+both from 20000 resamples over the 36 paired per-round ratios (within-invocation bounds only; no second same-ELF cross-window run is recorded, so quote against the campaign's cross-window spread floor).
 
 The ext4 twin's attack was the `DispatchGate::exclusive()` barrier, whose measured ceiling
 was `1.90x` on the CREATE phase. On btrfs the create phase is `27.117` of `249.147 ms` =
@@ -13003,7 +13003,7 @@ both from 20000 resamples over the 48 paired per-round ratios.
 
 `RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
 the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
-Same-invocation A/A null control `0.994573` bootstrap median CI `[0.981302, 1.001391]` and same-invocation A/A null control `1.008096` bootstrap median CI `[0.992431, 1.027760]`, from 20000 resamples.
+Same-invocation A/A null control `0.994573` bootstrap median CI `[0.981302, 1.001391]` and same-invocation A/A null control `1.008096` bootstrap median CI `[0.992431, 1.027760]`, from 20000 resamples (within-invocation bounds only; no second same-ELF cross-window run is recorded, so quote against the campaign's cross-window spread floor).
 
 **1. The 3-vs-2 barrier law is BTRFS-SPECIFIC, and my cross-row inference is REFUTED.** On
 btrfs we issue `3.000` barriers where the kernel issues `2.000`. On ext4 we issue
@@ -13040,7 +13040,7 @@ the barriers and half the bytes, not with engineering.
 
 `RCH_WORKER=none`, `hostname=thinkstation1`. Executing ELF, self-reported in-process by
 the daemon at mount: `mount_bench_evidence,binary_sha256=1d157cf57e224e004e786f788fd959ba530901c30261dc35f1371f9c0880fea2`.
-Same-invocation A/A null control `0.994573` bootstrap median CI `[0.981302, 1.001391]` and same-invocation A/A null control `1.008096` bootstrap median CI `[0.992431, 1.027760]`, from 20000 resamples.
+Same-invocation A/A null control `0.994573` bootstrap median CI `[0.981302, 1.001391]` and same-invocation A/A null control `1.008096` bootstrap median CI `[0.992431, 1.027760]`, from 20000 resamples (within-invocation bounds only; no second same-ELF cross-window run is recorded, so quote against the campaign's cross-window spread floor).
 Counted mechanism: FLUSH requests 16 / 16 / 8 / 8 / 8 per 8-op batch across the five arms,
 read off `/sys/block/<dev>/stat`. Absolute arm medians: kernel_median_wall_ns=72594000
 (unjournalled) and kernel_median_wall_ns=146838000 (journalled) against
@@ -15663,7 +15663,7 @@ daemon at mount:
 `mount_bench_evidence,binary_sha256=588ff2b12b457611de1dbf0bd39268642668c7e631f358798536aeb6b16cdbd9`.
 Same-invocation A/A null control `0.989375` bootstrap median CI `[0.982531, 0.997341]` and
 same-invocation A/A null control `0.997422` bootstrap median CI `[0.991813, 1.000509]`, both
-from 20000 resamples over the 36 paired per-round ratios. Absolutes:
+from 20000 resamples over the 36 paired per-round ratios (within-invocation bounds only; no second same-ELF cross-window run is recorded, so quote against the campaign's cross-window spread floor). Absolutes:
 kernel_median_wall_ns=19429000 and kernel_median_wall_ns=19641000 against
 fuse_median_wall_ns=36839000 and fuse_median_wall_ns=36836000. Counted mechanism: the
 per-opcode `crossings_*` / `dispatch_ns_*` census below, read off the daemon's own counters.
@@ -15677,7 +15677,7 @@ per-opcode `crossings_*` / `dispatch_ns_*` census below, read off the daemon's o
 
 Absolutes: kernel_median_wall_ns=19429000 and kernel_median_wall_ns=19641000 against
 fuse_median_wall_ns=36839000 and fuse_median_wall_ns=36836000. All CIs are 20000-resample
-bootstrap medians over the 36 paired per-round ratios.
+bootstrap medians over the 36 paired per-round ratios (within-invocation bounds only; no second same-ELF cross-window run is recorded, so quote against the campaign's cross-window spread floor).
 
 **The row is a NET of two opposite phases, and the dio rig sharpens both:**
 
@@ -16762,7 +16762,7 @@ campaign — against a `7.8x` effect. Absolutes: kernel_median_wall_ns=8613000 a
 kernel_median_wall_ns=8566000 against fuse_median_wall_ns=65808000 /
 fuse_median_wall_ns=8332000 (forward) and fuse_median_wall_ns=67550000 /
 fuse_median_wall_ns=8366000 (mirrored). All CIs are 20000-resample bootstrap medians over the
-24 paired per-round ratios.
+24 paired per-round ratios (within-invocation bounds only; no second same-ELF cross-window run is recorded, so quote against the campaign's cross-window spread floor).
 
 ⇒ **With the probe gone, FrankenFS warm stat on btrfs BEATS kernel btrfs by `2.5%`.** The
 `7.724334x` is not filesystem work; it is one external round trip per stat.
