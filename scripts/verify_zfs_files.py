@@ -12,12 +12,12 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import secrets
 import shutil
 import subprocess
 import tempfile
-from typing import Callable
+from collections.abc import Callable
+from pathlib import Path
 
 
 def require(condition: bool, message: str) -> None:
@@ -508,7 +508,7 @@ def main() -> None:
                         "--dataset", "data", failure="Uberblock")
                 require(digest(defect_img) == defect_sha, "split-Uberblock refusal mutated defect image")
 
-                def run_tx(*sub_args: str | Path) -> dict:
+                def run_tx(*sub_args: str | Path, pool_guid_arg: str = tx_pool_guid) -> dict:
                     nonlocal cur_slot, cur_txg
                     out = json.loads(command(
                         binary,
@@ -516,7 +516,7 @@ def main() -> None:
                         "--offline-image",
                         "--allow-write",
                         "--pool-guid",
-                        tx_pool_guid,
+                        pool_guid_arg,
                         "--label",
                         "0",
                         "--slot",
@@ -594,10 +594,13 @@ def main() -> None:
                     "moved_alias": k_moved.read_bytes(),
                     "nested_hardlink": (tx_mount / "sub" / "nested.bin").read_bytes()[:65536],
                 }
-                verify_oracle_expectations(kernel_expectations, lambda key: kernel_lookup[key])
+                verify_oracle_expectations(
+                    kernel_expectations,
+                    lambda key, table=kernel_lookup: table[key],
+                )
                 neg_controls = run_negative_controls(
                     kernel_expectations,
-                    lambda key: kernel_lookup[key],
+                    lambda key, table=kernel_lookup: table[key],
                     binary,
                     directory,
                 )

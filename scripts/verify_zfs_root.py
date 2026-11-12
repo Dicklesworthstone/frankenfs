@@ -12,16 +12,14 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import shutil
 import struct
 import subprocess
 import tempfile
-
-
-from typing import Callable
+from collections.abc import Callable
+from pathlib import Path
 
 
 def require(condition: bool, detail: str) -> None:
@@ -534,10 +532,13 @@ def main() -> None:
                                                "--pool-guid", tx_guid, "--start", "509", "--bytes", "8192"),
                     "datasets_guid_set": ",".join(sorted(head_identities(tx_heads, tx_pool).values())).encode(),
                 }
-                verify_oracle_expectations(oracle_expectations, lambda key: oracle_lookup[key])
+                verify_oracle_expectations(
+                    oracle_expectations,
+                    lambda key, table=oracle_lookup: table[key],
+                )
                 neg_controls = run_negative_controls(
                     oracle_expectations,
-                    lambda key: oracle_lookup[key],
+                    lambda key, table=oracle_lookup: table[key],
                     binary,
                     directory,
                 )
