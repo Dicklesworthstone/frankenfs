@@ -58,7 +58,9 @@ e2e_init "ffs_tracker_source_hygiene"
 ISSUES_JSONL="${TRACKER_SOURCE_HYGIENE_ISSUES:-$REPO_ROOT/.beads/issues.jsonl}"
 REPORT_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_report.json"
 REPORT_CANONICAL_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_report.canonical.json"
+GOLDEN_CANONICAL_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_golden.canonical.json"
 REPORT_MISMATCH_GOLDEN_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_report.mismatched_golden.json"
+GOLDEN_CONTRACT_MATRIX_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_golden_contract_matrix.json"
 LOCAL_OPEN_JSONL="${E2E_LOG_DIR}/tracker_source_hygiene_local_open.jsonl"
 SOURCE_AWARE_READY_JSONL="${E2E_LOG_DIR}/tracker_source_hygiene_source_aware_ready.jsonl"
 LOCAL_NONCLAIMABLE_JSONL="${E2E_LOG_DIR}/tracker_source_hygiene_local_nonclaimable.jsonl"
@@ -138,6 +140,94 @@ if ! command -v jq >/dev/null 2>&1; then
     scenario_result "tracker_source_hygiene_jsonl_parses" "FAIL" "jq not found"
     e2e_fail "jq is required for tracker source hygiene reporting"
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+    scenario_result "tracker_source_hygiene_jsonl_parses" "FAIL" "python3 not found"
+    e2e_fail "python3 is required for strict duplicate-key-free JSON comparison"
+fi
+
+# Golden comparison contract (bd-ln2wr):
+# Enforce strict duplicate-key-free JSON structural equality:
+# - Reject any duplicate object key anywhere in either golden or actual JSON
+# - Reject non-standard JSON constants (NaN/Infinity)
+# - Preserve exact object key sets, exact array element ordering, and exact
+#   scalar types (int vs float vs bool vs string vs null; 1 != "1" != 1.0 != true)
+# - Admit non-semantic JSON whitespace/line-wrapping differences so compact
+#   checked-in golden arrays compare structurally against canonicalized reports
+#   without regenerating or relaxing tests/fixtures/tracker_source_hygiene_report.golden.json.
+canonicalize_tracker_report_json() {
+    local mode="$1"
+    local input_json="$2"
+    local output_json="$3"
+
+    python3 - "$mode" "$input_json" "$output_json" <<'PY'
+import json
+import pathlib
+import sys
+
+mode, input_path, output_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def reject_duplicate_keys(pairs):
+    seen = set()
+    obj = {}
+    for key, val in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        seen.add(key)
+        obj[key] = val
+    return obj
+
+def reject_constants(const_str):
+    raise ValueError(f"non-standard JSON constant rejected: {const_str!r}")
+
+raw = pathlib.Path(input_path).read_text(encoding="utf-8")
+doc = json.loads(
+    raw,
+    object_pairs_hook=reject_duplicate_keys,
+    parse_constant=reject_constants,
+)
+if not isinstance(doc, dict):
+    raise ValueError("top-level tracker hygiene JSON must be an object")
+
+if mode == "report":
+    # Mask volatile run-local paths/timestamps ONLY when present and string-typed;
+    # missing or wrong-typed fields remain unmasked so diff fails closed.
+    top_masks = {
+        "run_id": "[RUN_ID]",
+        "created_at": "[TIMESTAMP]",
+        "issues_path": "[ISSUES_JSONL]",
+    }
+    for field, token in top_masks.items():
+        if isinstance(doc.get(field), str):
+            doc[field] = token
+
+    exports = doc.get("local_graph_exports")
+    if isinstance(exports, dict):
+        export_masks = {
+            "local_open": ("[LOCAL_OPEN_JSONL]", "[LOCAL_OPEN_SHA256]"),
+            "source_aware_ready": ("[SOURCE_AWARE_READY_JSONL]", "[SOURCE_AWARE_READY_SHA256]"),
+            "local_nonclaimable": ("[LOCAL_NONCLAIMABLE_JSONL]", "[LOCAL_NONCLAIMABLE_SHA256]"),
+        }
+        for section, (path_tok, sha_tok) in export_masks.items():
+            entry = exports.get(section)
+            if isinstance(entry, dict):
+                if isinstance(entry.get("path"), str):
+                    entry["path"] = path_tok
+                if isinstance(entry.get("checksum_path"), str):
+                    entry["checksum_path"] = sha_tok
+elif mode != "golden":
+    raise ValueError(f"unsupported canonicalization mode: {mode!r}")
+
+def sort_keys_preserve_arrays(node):
+    if isinstance(node, dict):
+        return {k: sort_keys_preserve_arrays(node[k]) for k in sorted(node.keys())}
+    if isinstance(node, list):
+        return [sort_keys_preserve_arrays(item) for item in node]
+    return node
+
+canonical = json.dumps(sort_keys_preserve_arrays(doc), indent=2, ensure_ascii=False) + "\n"
+pathlib.Path(output_path).write_text(canonical, encoding="utf-8")
+PY
+}
 if [[ ! -f "$ISSUES_JSONL" ]]; then
     scenario_result "tracker_source_hygiene_jsonl_parses" "FAIL" "issues JSONL missing: $ISSUES_JSONL"
     e2e_fail "issues JSONL missing: $ISSUES_JSONL"
@@ -881,18 +971,9 @@ else
 fi
 
 if [[ -n "$EXPECTED_GOLDEN" ]]; then
-    if jq -S '
-        .run_id = "[RUN_ID]"
-        | .created_at = "[TIMESTAMP]"
-        | .issues_path = "[ISSUES_JSONL]"
-        | .local_graph_exports.local_open.path = "[LOCAL_OPEN_JSONL]"
-        | .local_graph_exports.local_open.checksum_path = "[LOCAL_OPEN_SHA256]"
-        | .local_graph_exports.source_aware_ready.path = "[SOURCE_AWARE_READY_JSONL]"
-        | .local_graph_exports.source_aware_ready.checksum_path = "[SOURCE_AWARE_READY_SHA256]"
-        | .local_graph_exports.local_nonclaimable.path = "[LOCAL_NONCLAIMABLE_JSONL]"
-        | .local_graph_exports.local_nonclaimable.checksum_path = "[LOCAL_NONCLAIMABLE_SHA256]"
-    ' "$REPORT_JSON" >"$REPORT_CANONICAL_JSON" \
-        && diff -u "$EXPECTED_GOLDEN" "$REPORT_CANONICAL_JSON" >"${REPORT_CANONICAL_JSON}.diff"; then
+    if canonicalize_tracker_report_json golden "$EXPECTED_GOLDEN" "$GOLDEN_CANONICAL_JSON" \
+        && canonicalize_tracker_report_json report "$REPORT_JSON" "$REPORT_CANONICAL_JSON" \
+        && diff -u "$GOLDEN_CANONICAL_JSON" "$REPORT_CANONICAL_JSON" >"${REPORT_CANONICAL_JSON}.diff"; then
         scenario_result "tracker_source_hygiene_golden_report_matches" "PASS" "golden=$EXPECTED_GOLDEN"
     else
         scenario_result "tracker_source_hygiene_golden_report_matches" "FAIL" "golden mismatch diff=${REPORT_CANONICAL_JSON}.diff"
@@ -900,12 +981,108 @@ if [[ -n "$EXPECTED_GOLDEN" ]]; then
 fi
 
 if [[ "$EXPECT_GOLDEN_MISMATCH" -eq 1 ]]; then
+    GOLDEN_CONTRACT_OK=1
     if jq '.source_aware_queue_state.verdict = "intentional-mismatch-for-fail-closed-test"' \
         "$EXPECTED_GOLDEN" >"$REPORT_MISMATCH_GOLDEN_JSON" \
-        && ! diff -u "$REPORT_MISMATCH_GOLDEN_JSON" "$REPORT_CANONICAL_JSON" >"${REPORT_MISMATCH_GOLDEN_JSON}.diff"; then
-        scenario_result "tracker_source_hygiene_golden_mismatch_fails_closed" "PASS" "diff=${REPORT_MISMATCH_GOLDEN_JSON}.diff"
+        && canonicalize_tracker_report_json golden "$REPORT_MISMATCH_GOLDEN_JSON" "${REPORT_MISMATCH_GOLDEN_JSON}.canonical" \
+        && ! diff -u "${REPORT_MISMATCH_GOLDEN_JSON}.canonical" "$REPORT_CANONICAL_JSON" >"${REPORT_MISMATCH_GOLDEN_JSON}.diff"; then
+        :
     else
-        scenario_result "tracker_source_hygiene_golden_mismatch_fails_closed" "FAIL" "mismatched golden was not rejected"
+        GOLDEN_CONTRACT_OK=0
+    fi
+
+    # Verify the full bd-ln2wr win/lose golden contract matrix:
+    # - WIN (admitted): whitespace-only formatting differences (compact arrays, minified JSON)
+    # - LOSE (rejected): claimability, counts, blocked/permissioned IDs, owners, array order,
+    #   scalar type (int->str, int->float, bool->str), missing fields, and duplicate keys.
+    if [[ "$GOLDEN_CONTRACT_OK" -eq 1 ]]; then
+        MATRIX_DIR="$E2E_TEMP_DIR/golden_contract_matrix"
+        mkdir -p "$MATRIX_DIR"
+
+        expect_golden_admitted() {
+            local case_name="$1"
+            local candidate_path="$2"
+            local out_canon="$MATRIX_DIR/${case_name}.canon.json"
+            canonicalize_tracker_report_json golden "$candidate_path" "$out_canon" \
+                && diff -u "$out_canon" "$REPORT_CANONICAL_JSON" >"$MATRIX_DIR/${case_name}.diff"
+        }
+
+        expect_golden_rejected() {
+            local case_name="$1"
+            local mode="$2"
+            local candidate_path="$3"
+            local out_canon="$MATRIX_DIR/${case_name}.canon.json"
+            if ! canonicalize_tracker_report_json "$mode" "$candidate_path" "$out_canon" 2>"$MATRIX_DIR/${case_name}.err"; then
+                return 0
+            fi
+            ! diff -u "$out_canon" "$REPORT_CANONICAL_JSON" >"$MATRIX_DIR/${case_name}.diff"
+        }
+
+        jq -c . "$EXPECTED_GOLDEN" >"$MATRIX_DIR/win_minified.json"
+        jq '.source_aware_queue_state.claimable_ids = ["bd-fixture-ready"]' "$EXPECTED_GOLDEN" >"$MATRIX_DIR/lose_claimability.json"
+        jq '.source_aware_queue_state.claimable_count += 1' "$EXPECTED_GOLDEN" >"$MATRIX_DIR/lose_count.json"
+        jq '.source_aware_queue_state.permission_gated_ids = [] | .source_aware_queue_state.blocked_local_ids = []' "$EXPECTED_GOLDEN" >"$MATRIX_DIR/lose_blocked_perm_ids.json"
+        jq '.foreign_group_summaries[0].owner_hints = ["unknown"]' "$EXPECTED_GOLDEN" >"$MATRIX_DIR/lose_owner.json"
+        jq '.source_aware_queue_state.claimable_ids |= reverse' "$EXPECTED_GOLDEN" >"$MATRIX_DIR/lose_array_order.json"
+        jq '.schema_version = "1"' "$EXPECTED_GOLDEN" >"$MATRIX_DIR/lose_type_int_str.json"
+        python3 -c 'import pathlib,sys; s=pathlib.Path(sys.argv[1]).read_text(); assert "\"schema_version\": 1" in s; pathlib.Path(sys.argv[2]).write_text(s.replace("\"schema_version\": 1", "\"schema_version\": 1.0", 1))' \
+            "$EXPECTED_GOLDEN" "$MATRIX_DIR/lose_type_int_float.json"
+        jq '.strict = "false"' "$EXPECTED_GOLDEN" >"$MATRIX_DIR/lose_type_bool_str.json"
+        jq 'del(.status)' "$EXPECTED_GOLDEN" >"$MATRIX_DIR/lose_missing_status.json"
+        jq 'del(.created_at)' "$REPORT_JSON" >"$MATRIX_DIR/lose_missing_report_created_at.json"
+        python3 -c 'import pathlib,sys; s=pathlib.Path(sys.argv[1]).read_text(); idx=s.find("{"); pathlib.Path(sys.argv[2]).write_text("{\"status\":\"fail\"," + s[idx+1:])' \
+            "$EXPECTED_GOLDEN" "$MATRIX_DIR/lose_dup_key_golden.json"
+        python3 -c 'import pathlib,sys; s=pathlib.Path(sys.argv[1]).read_text(); idx=s.find("{"); pathlib.Path(sys.argv[2]).write_text("{\"status\":\"fail\"," + s[idx+1:])' \
+            "$REPORT_JSON" "$MATRIX_DIR/lose_dup_key_report.json"
+
+        if expect_golden_admitted "win_unchanged_compact_golden" "$EXPECTED_GOLDEN" \
+            && expect_golden_admitted "win_minified" "$MATRIX_DIR/win_minified.json" \
+            && expect_golden_rejected "lose_claimability" golden "$MATRIX_DIR/lose_claimability.json" \
+            && expect_golden_rejected "lose_count" golden "$MATRIX_DIR/lose_count.json" \
+            && expect_golden_rejected "lose_blocked_perm_ids" golden "$MATRIX_DIR/lose_blocked_perm_ids.json" \
+            && expect_golden_rejected "lose_owner" golden "$MATRIX_DIR/lose_owner.json" \
+            && expect_golden_rejected "lose_array_order" golden "$MATRIX_DIR/lose_array_order.json" \
+            && expect_golden_rejected "lose_type_int_str" golden "$MATRIX_DIR/lose_type_int_str.json" \
+            && expect_golden_rejected "lose_type_int_float" golden "$MATRIX_DIR/lose_type_int_float.json" \
+            && expect_golden_rejected "lose_type_bool_str" golden "$MATRIX_DIR/lose_type_bool_str.json" \
+            && expect_golden_rejected "lose_missing_status" golden "$MATRIX_DIR/lose_missing_status.json" \
+            && expect_golden_rejected "lose_missing_report_created_at" report "$MATRIX_DIR/lose_missing_report_created_at.json" \
+            && expect_golden_rejected "lose_dup_key_golden" golden "$MATRIX_DIR/lose_dup_key_golden.json" \
+            && expect_golden_rejected "lose_dup_key_report" report "$MATRIX_DIR/lose_dup_key_report.json"; then
+            cat >"$GOLDEN_CONTRACT_MATRIX_JSON" <<'JSON'
+{
+  "admitted_count": 2,
+  "admitted_controls": [
+    "win_unchanged_compact_golden",
+    "win_minified"
+  ],
+  "rejected_count": 13,
+  "rejected_controls": [
+    "lose_verdict_mismatch",
+    "lose_claimability",
+    "lose_count",
+    "lose_blocked_perm_ids",
+    "lose_owner",
+    "lose_array_order",
+    "lose_type_int_str",
+    "lose_type_int_float",
+    "lose_type_bool_str",
+    "lose_missing_status",
+    "lose_missing_report_created_at",
+    "lose_dup_key_golden",
+    "lose_dup_key_report"
+  ]
+}
+JSON
+        else
+            GOLDEN_CONTRACT_OK=0
+        fi
+    fi
+
+    if [[ "$GOLDEN_CONTRACT_OK" -eq 1 ]]; then
+        scenario_result "tracker_source_hygiene_golden_mismatch_fails_closed" "PASS" "admitted=2/2 rejected=13/13 diff=${REPORT_MISMATCH_GOLDEN_JSON}.diff matrix=${GOLDEN_CONTRACT_MATRIX_JSON}"
+    else
+        scenario_result "tracker_source_hygiene_golden_mismatch_fails_closed" "FAIL" "mismatched golden or contract matrix control was not enforced"
     fi
 fi
 
