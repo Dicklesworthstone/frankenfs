@@ -1,0 +1,42 @@
+name: Filesystem integrity validation
+
+on:
+  push:
+    branches: [validation/ffs-integrity-20261112]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  CFLAGS: "-g0 -O2"
+
+jobs:
+  baseline-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Prove pre-fix committed-pivot regression
+        run: |
+          set +e
+          cargo test --locked -p ffs-mvcc --lib tests::ssi_rejects_cycle_through_committed_pivot -- --exact > ssi-before.log 2>&1
+          status=$?
+          set -e
+          cat ssi-before.log
+          test "$status" -eq 101
+          grep -Fx 'running 1 test' ssi-before.log
+          grep -Fx 'test tests::ssi_rejects_cycle_through_committed_pivot ... FAILED' ssi-before.log
+          grep -F 'test result: FAILED. 0 passed; 1 failed;' ssi-before.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ssi-baseline-regression
+          path: ssi-before.log

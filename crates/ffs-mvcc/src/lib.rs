@@ -10221,6 +10221,139 @@ mod tests {
             .expect("single incoming rw edge remains serializable");
     }
 
+    #[test]
+    fn ssi_rejects_cycle_through_committed_pivot() {
+        for read_only in [false, true] {
+            for prune_history in [false, true] {
+                let mut store = MvccStore::new();
+                let x = BlockNumber(10);
+                let y = BlockNumber(20);
+                let z = BlockNumber(30);
+                let mut seed = store.begin();
+                for block in [x, y, z] {
+                    seed.stage_write(block, vec![0]);
+                }
+                let initial = store.commit_ssi(seed).expect("seed");
+
+                // P overlaps both O and I. O commits before I begins, so I
+                // observes x=1 while its snapshot still contains y=0.
+                let mut pivot = store.begin();
+                pivot.record_read(x, initial);
+                pivot.stage_write(y, vec![1]);
+                let mut outgoing = store.begin();
+                outgoing.stage_write(x, vec![1]);
+                let outgoing_seq = store.commit_ssi(outgoing).expect("outgoing");
+
+                let mut incoming = store.begin();
+                let incoming_snapshot = incoming.snapshot();
+                assert_eq!(
+                    store.read_visible(x, incoming_snapshot).unwrap().as_ref(),
+                    &[1]
+                );
+                assert_eq!(
+                    store.read_visible(y, incoming_snapshot).unwrap().as_ref(),
+                    &[0]
+                );
+                incoming.record_read(x, outgoing_seq);
+                incoming.record_read(y, initial);
+                if !read_only {
+                    incoming.stage_write(z, vec![1]);
+                }
+                store
+                    .commit_ssi(pivot)
+                    .expect("one outgoing edge is allowed");
+
+                // The cycle is I -rw-> P -rw-> O -wr-> I. Checking only I as
+                // the pivot misses it. P must retain its outgoing witness
+                // after O's history passes the oldest active snapshot.
+                if prune_history {
+                    store.prune_ssi_log(incoming_snapshot.high);
+                    assert_eq!(store.ssi_log.len(), 1);
+                }
+                let before = store.current_snapshot();
+                let history_len = store.ssi_log.len();
+                let error = store
+                    .commit_ssi(incoming)
+                    .expect_err("committed pivot must prevent a serialization cycle");
+                assert!(matches!(error, CommitError::SsiConflict { .. }));
+                assert_eq!(store.current_snapshot(), before);
+                assert_eq!(store.ssi_log.len(), history_len);
+                assert_eq!(store.read_visible(z, before).unwrap().as_ref(), &[0]);
+                assert_eq!(store.read_visible(x, before).unwrap().as_ref(), &[1]);
+                assert_eq!(store.read_visible(y, before).unwrap().as_ref(), &[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn ssi_committed_pivot_allows_reader_before_outgoing_commit() {
+        for reader_commits_first in [false, true] {
+            let mut store = MvccStore::new();
+            let x = BlockNumber(10);
+            let y = BlockNumber(20);
+            let mut seed = store.begin();
+            seed.stage_write(x, vec![0]);
+            seed.stage_write(y, vec![0]);
+            let initial = store.commit_ssi(seed).expect("seed");
+
+            let mut pivot = store.begin();
+            pivot.record_read(x, initial);
+            pivot.stage_write(y, vec![1]);
+            let mut reader = store.begin();
+            reader.record_read(x, initial);
+            reader.record_read(y, initial);
+            let mut outgoing = store.begin();
+            outgoing.stage_write(x, vec![1]);
+            store.commit_ssi(outgoing).expect("outgoing");
+
+            // R -> P -> O is serializable: R saw neither writer. A read-only
+            // incoming transaction is unsafe only if O preceded its snapshot.
+            if reader_commits_first {
+                store.commit_ssi(reader).expect("safe read-only snapshot");
+                store.commit_ssi(pivot).expect("safe pivot");
+            } else {
+                store.commit_ssi(pivot).expect("pivot");
+                store.commit_ssi(reader).expect("safe read-only snapshot");
+            }
+        }
+    }
+
+    #[test]
+    fn ssi_committed_pivot_retains_earliest_outgoing_witness() {
+        let mut store = MvccStore::new();
+        let x = BlockNumber(10);
+        let y = BlockNumber(20);
+        let other = BlockNumber(30);
+        let mut seed = store.begin();
+        for block in [x, y, other] {
+            seed.stage_write(block, vec![0]);
+        }
+        let initial = store.commit_ssi(seed).expect("seed");
+
+        let mut pivot = store.begin();
+        pivot.record_read(x, initial);
+        pivot.record_read(other, initial);
+        pivot.stage_write(y, vec![1]);
+        let mut outgoing = store.begin();
+        outgoing.stage_write(x, vec![1]);
+        let first_outgoing = store.commit_ssi(outgoing).expect("first outgoing");
+        let mut reader = store.begin();
+        reader.record_read(x, first_outgoing);
+        reader.record_read(y, initial);
+        let mut later_outgoing = store.begin();
+        later_outgoing.stage_write(other, vec![1]);
+        store.commit_ssi(later_outgoing).expect("second outgoing");
+        store.commit_ssi(pivot).expect("pivot");
+        store.prune_ssi_log(reader.snapshot().high);
+
+        // Keeping only the most recent outgoing edge would incorrectly call
+        // this reader safe: the first outgoing preceded its snapshot.
+        assert!(matches!(
+            store.commit_ssi(reader),
+            Err(CommitError::SsiConflict { .. })
+        ));
+    }
+
     /// SSI: write-write conflict is caught by FCW layer before SSI check.
     #[test]
     fn ssi_fcw_conflict_takes_precedence_over_ssi() {
