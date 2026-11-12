@@ -290,7 +290,11 @@ pub fn run_docs_status_drift(config: &DocsStatusDriftConfig) -> Result<DocsStatu
         &feature_parity,
     ));
     if let Some(root) = config.feature_parity_markdown.parent() {
-        for rel in ["README.md", "README_EXT4_BTRFS.md", "PROPOSED_ARCHITECTURE.md"] {
+        for rel in [
+            "README.md",
+            "README_EXT4_BTRFS.md",
+            "PROPOSED_ARCHITECTURE.md",
+        ] {
             let candidate = root.join(rel);
             if let Ok(doc_text) = fs::read_to_string(&candidate) {
                 report
@@ -1698,7 +1702,8 @@ pub fn find_scorecard_verdict_drift(doc_name: &str, scorecard_markdown: &str) ->
             let active_head = active_scorecard_row_head(without_edges);
             let withdrawn_or_uncomparable = active_head.contains("THE WIN IS WITHDRAWN")
                 || active_head.contains("THE TIE IS SUPERSEDED")
-                || active_head.contains("NOT COMPARABLE — THE ARMS ARE IN DIFFERENT DURABILITY CLASSES")
+                || active_head
+                    .contains("NOT COMPARABLE — THE ARMS ARE IN DIFFERENT DURABILITY CLASSES")
                 || active_head.contains("verdict=HONEST_LOSS")
                 || has_unqualified_loss_ratio_above_threshold(active_head, 1.05);
             if withdrawn_or_uncomparable {
@@ -2300,8 +2305,7 @@ mod tests {
         let clean_doc = "Remaining qualification stays open in `bd-open-1`.\n";
         assert!(find_stale_open_bead_claims(issues, "README.md", clean_doc).is_empty());
 
-        let closed_claim =
-            "UBS tripwire review and publication remain open under `bd-closed-2`.\n";
+        let closed_claim = "UBS tripwire review and publication remain open under `bd-closed-2`.\n";
         let closed_errors = find_stale_open_bead_claims(issues, "README.md", closed_claim);
         assert_eq!(closed_errors.len(), 1);
         assert!(closed_errors[0].contains("bead=bd-closed-2 status=closed"));

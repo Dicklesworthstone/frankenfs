@@ -2381,10 +2381,20 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
         &[standard(), ntfs_resident_attr(0x70, 1, "", &vol_info)],
     );
 
-    // Root directory (record 5) indexes user entry "hello.txt" (record 24);
-    // system records 0, 1, 2, 3, 5, 6, 10 have links=0 and no FILE_NAME attribute.
+    // Root directory (record 5) carries its self-referencing "." FILE_NAME (links=1)
+    // and indexes user entry "hello.txt" (record 24); system records 0, 1, 2, 3, 6, 10
+    // have links=0 and no FILE_NAME attribute.
     let root_children = [(24_u32, "hello.txt", 1_u8)];
-    let rec5 = ntfs_record(5, true, 0, &[standard(), index_root(&root_children, 5)]);
+    let rec5 = ntfs_record(
+        5,
+        true,
+        1,
+        &[
+            standard(),
+            ntfs_resident_attr(0x30, 1, "", &filename(5, ".", 3)),
+            index_root(&root_children, 5),
+        ],
+    );
 
     // Volume $Bitmap: 1023 clusters -> 128 bytes.
     // Claimed cluster ranges:
