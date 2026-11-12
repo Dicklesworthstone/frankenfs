@@ -320,13 +320,15 @@ pub fn partition_id_label(entry: Option<&PartitionEntry>) -> String {
     entry.map_or_else(
         || "whole_image".to_owned(),
         |part| {
-            if let Some(label) = &part.label {
-                format!("p{}:{label}", part.index)
-            } else if let Some(uuid) = part.part_uuid {
-                format!("p{}:{uuid}", part.index)
-            } else {
-                format!("p{}", part.index)
-            }
+            part.label.as_ref().map_or_else(
+                || {
+                    part.part_uuid.map_or_else(
+                        || format!("p{}", part.index),
+                        |uuid| format!("p{}:{uuid}", part.index),
+                    )
+                },
+                |label| format!("p{}:{label}", part.index),
+            )
         },
     )
 }
@@ -533,7 +535,7 @@ pub fn partitions_cmd(path: &Path, json: bool, six: &SixFormatCliArgs) -> Result
 }
 
 pub fn inspect_partitioned_cmd(
-    path: &PathBuf,
+    path: &Path,
     json: bool,
     list_subvolumes: bool,
     list_snapshots: bool,
@@ -1079,15 +1081,16 @@ pub fn maybe_route_walk_cmd(
                 if entry.name == b"." || entry.name == b".." || entry.name == b".zfs" {
                     continue;
                 }
-                let mut file_size = 0_u64;
-                if !no_stat || read_data {
+                let file_size = if !no_stat || read_data {
                     let mut attr_scope = opened
                         .filesystem
                         .begin_request_scope(&cx, RequestOp::Getattr)?;
                     let attr = opened.filesystem.getattr(&cx, &mut attr_scope, entry.ino)?;
                     stats += 1;
-                    file_size = attr.size;
-                }
+                    attr.size
+                } else {
+                    0_u64
+                };
                 if entry.kind == FileType::Directory {
                     if visited_dirs.insert(entry.ino.0) {
                         dirs += 1;
@@ -1187,7 +1190,7 @@ fn open_zfs_pool_and_objects(
 }
 
 pub fn maybe_route_fsck_cmd(
-    path: &PathBuf,
+    path: &Path,
     options: FsckCommandOptions,
     six: &SixFormatCliArgs,
 ) -> Result<bool> {
@@ -1226,7 +1229,7 @@ pub fn maybe_route_fsck_cmd(
                 }
                 let rec_args = ffs_fat::reader::recovery::RecoverArgs {
                     image: ffs_fat::ImageArgs {
-                        image: path.clone(),
+                        image: path.to_path_buf(),
                         offset: 0,
                         length: None,
                         oem_code_page: FatOemCodePage::Ascii,
@@ -1248,7 +1251,7 @@ pub fn maybe_route_fsck_cmd(
                 )
             } else {
                 let img = ffs_fat::ImageArgs {
-                    image: path.clone(),
+                    image: path.to_path_buf(),
                     offset,
                     length,
                     oem_code_page: FatOemCodePage::Ascii,
@@ -1345,7 +1348,7 @@ pub fn maybe_route_fsck_cmd(
         }
     };
 
-    let exit_code = if clean { 0 } else { 1 };
+    let exit_code = i32::from(!clean);
     let out_doc = serde_json::json!({
         "filesystem": kind.as_str(),
         "partition": part_entry.as_ref().map(|p| p.index),
@@ -1376,7 +1379,7 @@ pub fn maybe_route_fsck_cmd(
     Ok(true)
 }
 
-pub fn maybe_route_scrub_cmd(path: &PathBuf, json: bool, six: &SixFormatCliArgs) -> Result<bool> {
+pub fn maybe_route_scrub_cmd(path: &Path, json: bool, six: &SixFormatCliArgs) -> Result<bool> {
     let cx = cli_cx();
     let (kind, detected, part_entry, part_dev) = detect_target_format(&cx, path, six)?;
     six.validate_format_compatibility(kind)?;
@@ -1421,7 +1424,7 @@ pub fn maybe_route_scrub_cmd(path: &PathBuf, json: bool, six: &SixFormatCliArgs)
         }
         FsFormatKind::Fat16 | FsFormatKind::Fat32 => {
             let img = ffs_fat::ImageArgs {
-                image: path.clone(),
+                image: path.to_path_buf(),
                 offset,
                 length,
                 oem_code_page: FatOemCodePage::Ascii,
@@ -1676,8 +1679,8 @@ pub fn maybe_route_mount_cmd(
 }
 
 #[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "CLI format subcommand forwards explicit boolean flags directly"
+    clippy::too_many_arguments,
+    reason = "CLI format subcommand forwards explicit format arguments directly"
 )]
 pub fn format_cmd(
     output: &Path,
@@ -1841,12 +1844,10 @@ pub fn streams_cmd(
             .parse()
             .with_context(|| format!("invalid MFT record number {target:?}"))?;
         volume.record(&cx, rec_no, None)?
+    } else if six.ntfs_indexed_lookup {
+        volume.resolve_indexed_no_follow(&cx, target)?
     } else {
-        if six.ntfs_indexed_lookup {
-            volume.resolve_indexed_no_follow(&cx, target)?
-        } else {
-            volume.resolve_no_follow(&cx, target)?
-        }
+        volume.resolve_no_follow(&cx, target)?
     };
 
     if let Some(stream_name) = stream {
@@ -2343,7 +2344,7 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
     for slot in [0_usize, 1, 2, 3, 5, 6, 10, 24] {
         mft_bitmap[slot / 8] |= 1_u8 << (slot % 8);
     }
-    let rec0 = ntfs_record(
+    let mft_rec = ntfs_record(
         0,
         false,
         0,
@@ -2353,7 +2354,7 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
             ntfs_resident_attr(0xB0, 2, "", &mft_bitmap),
         ],
     );
-    let rec1 = ntfs_record(
+    let mft_mirr_rec = ntfs_record(
         1,
         false,
         0,
@@ -2363,7 +2364,7 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
             ntfs_mapped_attr(DATA, 1, &[0x21, 8, 128, 0, 0], 8, 4096),
         ],
     );
-    let rec2 = ntfs_record(
+    let logfile_rec = ntfs_record(
         2,
         false,
         0,
@@ -2374,7 +2375,7 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
     );
     let mut vol_info = [0_u8; 12];
     vol_info[8..10].copy_from_slice(&[3, 1]);
-    let rec3 = ntfs_record(
+    let volume_rec = ntfs_record(
         3,
         false,
         0,
@@ -2385,7 +2386,7 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
     // and indexes user entry "hello.txt" (record 24); system records 0, 1, 2, 3, 6, 10
     // have links=0 and no FILE_NAME attribute.
     let root_children = [(24_u32, "hello.txt", 1_u8)];
-    let rec5 = ntfs_record(
+    let root_dir_rec = ntfs_record(
         5,
         true,
         1,
@@ -2406,13 +2407,13 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
     for c in (4..84).chain(128..136).chain(192..256).chain(300..556) {
         vol_bitmap[c / 8] |= 1_u8 << (c % 8);
     }
-    let rec6 = ntfs_record(
+    let bitmap_rec = ntfs_record(
         6,
         false,
         0,
         &[standard(), ntfs_resident_attr(DATA, 1, "", &vol_bitmap)],
     );
-    let rec10 = ntfs_record(
+    let upcase_rec = ntfs_record(
         10,
         false,
         0,
@@ -2423,7 +2424,7 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
     );
     // Record 24: /hello.txt with unnamed DATA + named ADS "note"!
     // Attributes in ascending (type, name) order: 0x10, 0x30, 0x80 (""), 0x80 ("note").
-    let rec24 = ntfs_record(
+    let hello_file_rec = ntfs_record(
         24,
         false,
         1,
@@ -2435,14 +2436,14 @@ pub fn build_synthetic_ntfs_image() -> Vec<u8> {
         ],
     );
 
-    put_rec(&mut image, 0, &rec0);
-    put_rec(&mut image, 1, &rec1);
-    put_rec(&mut image, 2, &rec2);
-    put_rec(&mut image, 3, &rec3);
-    put_rec(&mut image, 5, &rec5);
-    put_rec(&mut image, 6, &rec6);
-    put_rec(&mut image, 10, &rec10);
-    put_rec(&mut image, 24, &rec24);
+    put_rec(&mut image, 0, &mft_rec);
+    put_rec(&mut image, 1, &mft_mirr_rec);
+    put_rec(&mut image, 2, &logfile_rec);
+    put_rec(&mut image, 3, &volume_rec);
+    put_rec(&mut image, 5, &root_dir_rec);
+    put_rec(&mut image, 6, &bitmap_rec);
+    put_rec(&mut image, 10, &upcase_rec);
+    put_rec(&mut image, 24, &hello_file_rec);
 
     // Copy records 0..4 (4096 bytes) to $MFTMirr at LCN 128!
     let mft_head = image[4 * 512..4 * 512 + 4096].to_vec();

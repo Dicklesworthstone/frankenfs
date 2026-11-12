@@ -151,7 +151,7 @@ pub fn inspect(
     Ok(())
 }
 
-pub(crate) fn print_inspect_output(output: &InspectOutput) {
+pub fn print_inspect_output(output: &InspectOutput) {
     println!("FrankenFS Inspector");
     match output {
         InspectOutput::Ext4 {

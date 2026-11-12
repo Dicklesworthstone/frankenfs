@@ -99,7 +99,9 @@ fn injected_readme_merge_mechanism_count_drift_is_detected() -> Result<(), Strin
 #[test]
 fn workspace_docs_have_no_stale_open_bead_claims() -> Result<(), String> {
     let root = workspace_root()?;
-    let issues_jsonl = read_to_string(&root, ".beads/issues.jsonl")?;
+    let Some(issues_jsonl) = read_issues_jsonl(&root)? else {
+        return Ok(());
+    };
     let mut all_errors = Vec::new();
     for doc in [
         "README.md",
@@ -129,26 +131,35 @@ fn workspace_docs_have_no_stale_open_bead_claims() -> Result<(), String> {
 #[test]
 fn injected_stale_open_bead_claim_is_detected() -> Result<(), String> {
     let root = workspace_root()?;
-    let issues_jsonl = read_to_string(&root, ".beads/issues.jsonl")?;
-    let synthetic = "Follow-on items remain open under `bd-9rutw` and `bd-uzt72`.\n";
-    let errors = ffs_harness::docs_status_drift::find_stale_open_bead_claims(
-        &issues_jsonl,
-        "README.md",
-        synthetic,
+    let fixture_jsonl = concat!(
+        "{\"id\":\"bd-9rutw\",\"status\":\"closed\"}\n",
+        "{\"id\":\"bd-mf9z9\",\"status\":\"open\"}\n",
     );
-    let saw_closed = errors
-        .iter()
-        .any(|err| err.contains("bd-9rutw") && err.contains("status=closed"));
-    let saw_missing = errors
-        .iter()
-        .any(|err| err.contains("bd-uzt72") && err.contains("status=missing"));
-    if saw_closed && saw_missing {
-        Ok(())
-    } else {
-        Err(format!(
-            "injected stale/missing open-bead claims not detected: {errors:?}"
-        ))
+    let synthetic = "Follow-on items remain open under `bd-9rutw`, `bd-mf9z9`, and `bd-uzt72`.\n";
+    for (label, issues_jsonl) in std::iter::once(("fixture", fixture_jsonl.to_owned())).chain(
+        read_issues_jsonl(&root)?
+            .into_iter()
+            .map(|live| ("live_beads_jsonl", live)),
+    ) {
+        let errors = ffs_harness::docs_status_drift::find_stale_open_bead_claims(
+            &issues_jsonl,
+            "README.md",
+            synthetic,
+        );
+        let saw_closed = errors
+            .iter()
+            .any(|err| err.contains("bd-9rutw") && err.contains("status=closed"));
+        let saw_missing = errors
+            .iter()
+            .any(|err| err.contains("bd-uzt72") && err.contains("status=missing"));
+        let flagged_open = errors.iter().any(|err| err.contains("bd-mf9z9"));
+        if !saw_closed || !saw_missing || flagged_open {
+            return Err(format!(
+                "[{label}] injected stale/missing open-bead claims mismatch: {errors:?}"
+            ));
+        }
     }
+    Ok(())
 }
 
 #[test]
@@ -177,21 +188,28 @@ fn injected_scorecard_verdict_drift_is_detected() -> Result<(), String> {
     let root = workspace_root()?;
     let btrfs_scorecard = read_to_string(&root, "docs/MOUNTED_BTRFS_SCORECARD.md")?;
     let mutated = btrfs_scorecard.replacen(
-        "| **Multi-file parallel read** |",
-        "| **Multi-file parallel read** | `1.140683x` slower (`verdict=HONEST_LOSS`; THE WIN IS WITHDRAWN) | **WIN** |\n| **Shadow row** |",
+        "| **Multi-file parallel read**, ",
+        "| **Multi-file parallel read** | `1.140683x` slower (`verdict=HONEST_LOSS`; THE WIN IS WITHDRAWN) | `1.00x` | `1.00x` | 8 -> 8 | **WIN** |\n| **Shadow row**, ",
         1,
     );
+    if mutated == btrfs_scorecard {
+        return Err("failed to mutate docs/MOUNTED_BTRFS_SCORECARD.md row prefix".to_owned());
+    }
     let errors = ffs_harness::docs_status_drift::find_scorecard_verdict_drift(
         "docs/MOUNTED_BTRFS_SCORECARD.md",
         &mutated,
     );
-    if errors.iter().any(|err| {
-        err.contains("scorecard verdict drift") || err.contains("scorecard summary drift")
-    }) {
+    let saw_verdict = errors
+        .iter()
+        .any(|err| err.contains("scorecard verdict drift"));
+    let saw_summary = errors
+        .iter()
+        .any(|err| err.contains("scorecard summary drift"));
+    if saw_verdict && saw_summary {
         Ok(())
     } else {
         Err(format!(
-            "injected scorecard verdict drift not detected: {errors:?}"
+            "injected scorecard verdict+summary drift not detected: {errors:?}"
         ))
     }
 }
@@ -207,15 +225,15 @@ fn comprehensive_spec_trait_mapping_section_names_live_workspace_traits() -> Res
         ("crates/ffs-block/src/lib.rs", "pub trait ByteDevice"),
         ("crates/ffs-block/src/lib.rs", "pub trait BlockDevice"),
         ("crates/ffs-core/src/vfs.rs", "pub trait FsOps"),
-        (
-            "crates/ffs-repair/src/recovery.rs",
-            "pub trait BlockValidator",
-        ),
+        ("crates/ffs-repair/src/scrub.rs", "pub trait BlockValidator"),
         (
             "crates/ffs-repair/src/recovery.rs",
             "pub trait RecoveryWriteback",
         ),
-        ("crates/ffs-mvcc/src/persist.rs", "pub trait WalWriter"),
+        (
+            "crates/ffs-journal/src/wal_buffer.rs",
+            "pub trait WalWriter",
+        ),
     ] {
         let src = read_to_string(&root, rel_path)?;
         if !src.contains(needle) {
@@ -396,6 +414,32 @@ fn workspace_root() -> Result<PathBuf, String> {
 fn read_to_string(root: &Path, relative: &str) -> Result<String, String> {
     let path = root.join(relative);
     std::fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))
+}
+
+fn read_issues_jsonl(root: &Path) -> Result<Option<String>, String> {
+    let path = root.join(".beads/issues.jsonl");
+    if path.is_file() {
+        return std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|err| format!("read {}: {err}", path.display()));
+    }
+    if root.join(".git").exists() {
+        let output = Command::new("git")
+            .args(["show", "HEAD:.beads/issues.jsonl"])
+            .current_dir(root)
+            .output()
+            .map_err(|err| format!("run git show HEAD:.beads/issues.jsonl: {err}"))?;
+        if output.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+        }
+    }
+    if option_env!("RCH_BUILD_SOURCE").is_some() && !root.join(".git").exists() {
+        eprintln!(
+            "SKIP_REMOTE_RCH_PAIRED_CHECKOUT: .beads/issues.jsonl excluded from remote rch mirror"
+        );
+        return Ok(None);
+    }
+    Err(format!("missing {}", path.display()))
 }
 
 fn read_quantitative_readme(root: &Path) -> Result<String, String> {

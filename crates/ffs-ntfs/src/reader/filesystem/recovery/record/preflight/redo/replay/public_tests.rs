@@ -901,7 +901,7 @@ fn directory_journal(data_offset: u16, loser: bool) -> Vec<u8> {
     opened[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
     opened[44..48].copy_from_slice(&(PAGE as u32).to_le_bytes());
     opened[48..52].copy_from_slice(&0xA0_u32.to_le_bytes());
-    opened[56..64].copy_from_slice(&((7_u64 << 48) | 42).to_le_bytes());
+    opened[56..64].copy_from_slice(&((7_u64 << 48) | 0x002A).to_le_bytes());
     opened[80..88].copy_from_slice(&[b'$', 0, b'I', 0, b'3', 0, b'0', 0]);
     let mut data = change(43, b"winner!!", b"original");
     data[16..18].copy_from_slice(&data_offset.to_le_bytes());
@@ -1197,7 +1197,7 @@ fn external_public_recovery_refuses_stale_mapping_allocation_and_torn_targets() 
             0 => {
                 // Native open-attribute slot names a stale directory sequence.
                 let at = journal + 328 + 48 + 56;
-                bytes[at..at + 8].copy_from_slice(&((8_u64 << 48) | 42).to_le_bytes());
+                bytes[at..at + 8].copy_from_slice(&((8_u64 << 48) | 0x002A).to_le_bytes());
             }
             1 => {
                 // A log claim cannot redirect the export to an arbitrary LCN.

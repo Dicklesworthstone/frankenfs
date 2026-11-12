@@ -1131,9 +1131,8 @@ fn partition_byte_device_rejects_out_of_bounds_reads_and_writes_before_inner_dev
         attributes: 0,
     };
 
-    let rw_part =
-        PartitionByteDevice::new(Arc::clone(&inner), entry.clone(), VolumeAccess::ReadWrite)
-            .expect("construct RW partition window");
+    let rw_part = PartitionByteDevice::new(Arc::clone(&inner), entry, VolumeAccess::ReadWrite)
+        .expect("construct RW partition window");
     let partition_len = rw_part.len_bytes();
     assert_eq!(partition_len, 4096);
 

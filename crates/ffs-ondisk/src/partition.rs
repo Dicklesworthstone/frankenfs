@@ -1031,8 +1031,8 @@ fn decode_gpt_utf16le_name(
     slot_one_based: u32,
 ) -> Result<Option<String>, PartitionParseError> {
     let mut units = Vec::with_capacity(36);
-    for pair in raw_72_bytes.chunks_exact(2) {
-        let unit = u16::from_le_bytes([pair[0], pair[1]]);
+    for &pair in raw_72_bytes.as_chunks::<2>().0 {
+        let unit = u16::from_le_bytes(pair);
         if unit == 0 {
             break;
         }

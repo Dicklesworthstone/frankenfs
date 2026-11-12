@@ -1575,13 +1575,8 @@ pub fn find_stale_open_bead_claims(
         }
     }
 
-    let prefixes = [
-        "remain open under ",
-        "remains open under ",
-        "stay open in ",
-        "stays open in ",
-        "open under ",
-    ];
+    let prefixes = ["stay open in ", "stays open in ", "open under "];
+    let mut seen = BTreeSet::new();
     let mut errors = Vec::new();
     for (idx, raw_line) in doc_text.lines().enumerate() {
         let lower = raw_line.to_ascii_lowercase();
@@ -1592,6 +1587,9 @@ pub fn find_stale_open_bead_claims(
                 search_from = after;
                 let tail = &raw_line[after..];
                 for candidate in extract_leading_bead_ids(tail) {
+                    if !seen.insert((idx + 1, candidate.clone())) {
+                        continue;
+                    }
                     match statuses.get(&candidate).map(String::as_str) {
                         Some("closed") => errors.push(format!(
                             "stale open-bead claim doc={doc_name}:{} bead={candidate} status=closed",
@@ -1613,7 +1611,7 @@ pub fn find_stale_open_bead_claims(
 fn extract_leading_bead_ids(segment: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let window_end = segment
-        .find(['.', ';', '\n'])
+        .find(['.', ';', '(', ')', ':', '\n'])
         .unwrap_or_else(|| segment.len().min(96));
     let window = &segment[..window_end];
     let mut rest = window;
@@ -2303,7 +2301,10 @@ mod tests {
             "\n",
         );
         let clean_doc = "Remaining qualification stays open in `bd-open-1`.\n";
-        assert!(find_stale_open_bead_claims(issues, "README.md", clean_doc).is_empty());
+        assert_eq!(
+            find_stale_open_bead_claims(issues, "README.md", clean_doc),
+            Vec::<String>::new()
+        );
 
         let closed_claim = "UBS tripwire review and publication remain open under `bd-closed-2`.\n";
         let closed_errors = find_stale_open_bead_claims(issues, "README.md", closed_claim);
@@ -2328,8 +2329,9 @@ mod tests {
 | **Warm stat** | **`4.888392x` slower**, `verdict=HONEST_LOSS` | `0.999x` | **LOSE** |
 | **Parallel read** | ⛔⛔ **THE WIN IS WITHDRAWN — ADMITTED LOSS `1.085668x`**, `verdict=HONEST_LOSS` | `1.001x` | **LOSE** |
 ";
-        assert!(
-            find_scorecard_verdict_drift("MOUNTED_BTRFS_SCORECARD.md", honest_scorecard).is_empty()
+        assert_eq!(
+            find_scorecard_verdict_drift("MOUNTED_BTRFS_SCORECARD.md", honest_scorecard),
+            Vec::<String>::new()
         );
 
         let inflated_verdict = honest_scorecard.replace(
