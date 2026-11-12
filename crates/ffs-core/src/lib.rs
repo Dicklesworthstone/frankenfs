@@ -126769,6 +126769,163 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_rename2_exchange_missing_self_returns_enoent() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+        let root = InodeNumber(1);
+        let err = ops
+            .rename2(
+                &cx,
+                &mut RequestScope::empty(),
+                root,
+                OsStr::new("absent"),
+                root,
+                OsStr::new("absent"),
+                libc::RENAME_EXCHANGE,
+            )
+            .expect_err("both exchange names must exist, including a self exchange");
+        assert_eq!(err.to_errno(), libc::ENOENT);
+    }
+
+    #[test]
+    fn btrfs_rename2_exchange_protected_children_preserve_namespace() {
+        for cross_parent in [false, true] {
+            for directory in [false, true] {
+                for protect_source in [false, true] {
+                    for flag in [BTRFS_INODE_IMMUTABLE, BTRFS_INODE_APPEND] {
+                        let (fs, cx) = open_writable_btrfs();
+                        let ops: &dyn FsOps = &fs;
+                        let root = InodeNumber(1);
+                        let destination = if cross_parent {
+                            fs.mkdir(&cx, root, OsStr::new("destination"), 0o755, 0, 0)
+                                .unwrap()
+                                .ino
+                        } else {
+                            root
+                        };
+                        let make_child = |parent, name| {
+                            if directory {
+                                fs.mkdir(&cx, parent, OsStr::new(name), 0o755, 0, 0)
+                            } else {
+                                fs.create(&cx, parent, OsStr::new(name), 0o644, 0, 0)
+                            }
+                            .unwrap()
+                            .ino
+                        };
+                        let source = make_child(root, "source");
+                        let target = make_child(destination, "target");
+                        let protected = if protect_source { source } else { target };
+                        let low = BtrfsKey {
+                            objectid: 0,
+                            item_type: 0,
+                            offset: 0,
+                        };
+                        let high = BtrfsKey {
+                            objectid: u64::MAX,
+                            item_type: u8::MAX,
+                            offset: u64::MAX,
+                        };
+                        let state = || {
+                            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+                            (
+                                alloc.fs_tree.range(&low, &high).unwrap(),
+                                alloc.dir_index_counters.clone(),
+                                alloc.btrfs_logged_dir_keys.clone(),
+                                alloc.btrfs_tree_log_has_deletions,
+                            )
+                        };
+                        {
+                            let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
+                            let mut inode = fs
+                                .btrfs_read_inode_from_tree(&alloc, protected.0)
+                                .unwrap();
+                            inode.flags |= flag;
+                            let key = BtrfsKey {
+                                objectid: protected.0,
+                                item_type: BTRFS_ITEM_INODE_ITEM,
+                                offset: 0,
+                            };
+                            alloc.fs_tree.update(&key, &inode.to_bytes()).unwrap();
+                        }
+                        let before = state();
+                        let err = ops
+                            .rename2(
+                                &cx,
+                                &mut RequestScope::empty(),
+                                root,
+                                OsStr::new("source"),
+                                destination,
+                                OsStr::new("target"),
+                                libc::RENAME_EXCHANGE,
+                            )
+                            .expect_err("exchange must enforce both children's native flags");
+                        assert_eq!(err.to_errno(), libc::EPERM);
+                        assert_eq!(state(), before, "refusal must preserve every FS-tree item");
+                        assert_eq!(
+                            fs.lookup(&cx, root, OsStr::new("source")).unwrap().ino,
+                            source
+                        );
+                        assert_eq!(
+                            fs.lookup(&cx, destination, OsStr::new("target")).unwrap().ino,
+                            target
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_rename2_exchange_inode_alias_is_noop() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+        let root = InodeNumber(1);
+        let inode = fs
+            .create(&cx, root, OsStr::new("source"), 0o644, 0, 0)
+            .unwrap()
+            .ino;
+        fs.link(&cx, inode, root, OsStr::new("alias")).unwrap();
+        let low = BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        };
+        let high = BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        };
+        let before = {
+            let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
+            let mut item = fs.btrfs_read_inode_from_tree(&alloc, inode.0).unwrap();
+            item.flags |= BTRFS_INODE_IMMUTABLE;
+            item.ctime_sec = 1;
+            item.ctime_nsec = 0;
+            let key = BtrfsKey {
+                objectid: inode.0,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: 0,
+            };
+            alloc.fs_tree.update(&key, &item.to_bytes()).unwrap();
+            alloc.fs_tree.range(&low, &high).unwrap()
+        };
+        for name in ["source", "alias"] {
+            ops.rename2(
+                &cx,
+                &mut RequestScope::empty(),
+                root,
+                OsStr::new("source"),
+                root,
+                OsStr::new(name),
+                libc::RENAME_EXCHANGE,
+            )
+            .expect("exchanging two names of one inode is a no-op");
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            assert_eq!(alloc.fs_tree.range(&low, &high).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn btrfs_rename2_exchange_swaps_two_entries_in_same_parent() {
         let (fs, cx) = open_writable_btrfs();
         let ops: &dyn FsOps = &fs;
