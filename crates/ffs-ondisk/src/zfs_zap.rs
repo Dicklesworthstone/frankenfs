@@ -584,7 +584,7 @@ fn encode_leaf_block(
     // Insert in reverse (hash, collision) order so each bucket chain walks in
     // ascending (hash, collision) order on disk.
     let mut ordered = items.to_vec();
-    ordered.sort_by(|a, b| (b.hash, b.collision).cmp(&(a.hash, a.collision)));
+    ordered.sort_by_key(|a| std::cmp::Reverse((a.hash, a.collision)));
 
     let mut next_chunk = 0_u16;
     let alloc_array = |buf: &mut [u8], payload: &[u8], next: &mut u16| -> u16 {

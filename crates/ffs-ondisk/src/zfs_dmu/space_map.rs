@@ -515,7 +515,7 @@ impl AllocationMap {
     }
 
     /// Compute the exact 32-bucket OpenZFS `smp_histogram` (`space_map_histogram_add`
-    /// + `zfs_range_tree_stat_incr`): each maximal free segment of length `L`
+    /// and `zfs_range_tree_stat_incr`): each maximal free segment of length `L`
     /// increments `hist[L.ilog2() - shift]`, clamping shifts `>= 31` into
     /// `hist[31]` with `1 << (rel - 31)`.
     pub fn free_histogram(&self, shift: u8) -> Result<[u64; 32], ParseError> {

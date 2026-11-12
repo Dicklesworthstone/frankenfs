@@ -30,8 +30,14 @@ macro_rules! companion_bin_tests {
 
 pub mod filesystem;
 pub mod reader;
+pub mod transaction;
 
 pub use filesystem::ZfsFs;
 pub use reader::dmu::Objects;
 pub use reader::dmu::zpl::Zpl;
 pub use reader::{Label, Leaf, Pool, RootBlock};
+pub use transaction::{
+    ZfsAdmissionReport, ZfsDataChecksum, ZfsDurableToken, ZfsPersistenceEvent,
+    ZfsPersistenceStage, ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome,
+    ZfsWriteOptions,
+};

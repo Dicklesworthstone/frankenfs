@@ -81,10 +81,75 @@ impl Pool {
     }
 }
 
+pub(crate) type CheckedDmuBlock = (Arc<Vec<u8>>, Endian, u64);
+
 impl Objects {
     #[must_use]
     pub const fn pool_guid(&self) -> u64 {
         self.config.pool_guid
+    }
+
+    #[must_use]
+    pub(crate) const fn meta_dnode(&self) -> &Dnode {
+        &self.meta
+    }
+
+    #[must_use]
+    pub(crate) const fn root_birth_txg(&self) -> u64 {
+        self.root_birth
+    }
+
+    #[must_use]
+    pub(crate) fn open_objectset_view(
+        &self,
+        meta: Dnode,
+        root_birth: u64,
+        txg: u64,
+    ) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            config: self.config.clone(),
+            txg,
+            root_birth,
+            meta,
+            cache: VecDeque::new(),
+            cached_bytes: 0,
+        }
+    }
+
+    pub(crate) fn checked_raw(
+        &mut self,
+        cx: &Cx,
+        bp: &BlockPointer,
+        kind: u8,
+        level: u8,
+        size: usize,
+        ceiling: u64,
+    ) -> Result<Option<CheckedDmuBlock>> {
+        Ok(self
+            .checked(cx, bp, kind, level, size, ceiling)?
+            .map(|b| (b.bytes, b.order, b.birth)))
+    }
+
+    pub(crate) fn object_with_ceiling(&mut self, cx: &Cx, number: u64) -> Result<(Dnode, u64)> {
+        let obj = self.load(cx, number)?;
+        Ok((obj.node, obj.ceiling))
+    }
+
+    pub(crate) fn object_data_block(
+        &mut self,
+        cx: &Cx,
+        node: &Dnode,
+        ceiling: u64,
+        block_id: u64,
+    ) -> Result<Option<CheckedDmuBlock>> {
+        let obj = Object {
+            node: node.clone(),
+            ceiling,
+        };
+        Ok(self
+            .data_block(cx, &obj, block_id)?
+            .map(|b| (b.bytes, b.order, b.birth)))
     }
 
     pub(super) fn clone_mos(&self) -> Self {

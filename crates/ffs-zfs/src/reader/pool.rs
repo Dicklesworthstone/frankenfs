@@ -179,7 +179,7 @@ impl Pool {
         })
     }
 
-    pub(super) fn has_missing_members(&self) -> bool {
+    pub(crate) fn has_missing_members(&self) -> bool {
         !self.missing_mirror_guids.is_empty() || !self.missing_raidz_guids.is_empty()
     }
 
@@ -195,7 +195,7 @@ impl Pool {
 
     /// Immutable handles retained by the admitted native topology. Log blocks
     /// use their own checksum boundary rather than the ordinary DMU decoder.
-    pub(super) fn leaves(&self) -> &[Leaf] {
+    pub(crate) fn leaves(&self) -> &[Leaf] {
         &self.members
     }
 

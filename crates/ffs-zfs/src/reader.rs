@@ -18,8 +18,8 @@ use ffs_ondisk::zfs::{
     verify_label_checksum,
 };
 use ffs_types::ByteOffset;
-use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -64,6 +64,31 @@ impl ByteDevice for ReadOnlyImage {
     }
 }
 
+struct WritableImage {
+    file: File,
+    length: u64,
+}
+impl ByteDevice for WritableImage {
+    fn len_bytes(&self) -> u64 {
+        self.length
+    }
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> Result<()> {
+        checkpoint(cx)?;
+        self.file.read_exact_at(bytes, offset.0)?;
+        checkpoint(cx)
+    }
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> Result<()> {
+        checkpoint(cx)?;
+        self.file.write_all_at(bytes, offset.0)?;
+        checkpoint(cx)
+    }
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        self.file.sync_all()?;
+        checkpoint(cx)
+    }
+}
+
 #[derive(Clone)]
 pub struct Leaf {
     device: Arc<dyn ByteDevice>,
@@ -81,34 +106,34 @@ pub struct Label {
 
 /// Addressing and read features of the single admitted top-level data vdev.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct VdevConfig {
-    pool_guid: u64,
-    top_guid: u64,
-    version: u64,
-    txg: u64,
-    ashift: u8,
-    id: u32,
-    allocated_bytes: u64,
-    read_features: Vec<String>,
+pub(crate) struct VdevConfig {
+    pub(crate) pool_guid: u64,
+    pub(crate) top_guid: u64,
+    pub(crate) version: u64,
+    pub(crate) txg: u64,
+    pub(crate) ashift: u8,
+    pub(crate) id: u32,
+    pub(crate) allocated_bytes: u64,
+    pub(crate) read_features: Vec<String>,
     /// Native child-ID order, bound to supplied images after group admission.
     /// Absent for standalone leaves and ordinary mirrors.
-    raidz_members: Option<RaidzGroup>,
+    pub(crate) raidz_members: Option<RaidzGroup>,
 }
 
 /// Parity and child order are bound together by complete label agreement.
 /// When `parity == 0`, `members` describes top-level vdevs in a striped pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RaidzGroup {
-    parity: usize,
-    members: Vec<RaidzMember>,
+pub(crate) struct RaidzGroup {
+    pub(crate) parity: usize,
+    pub(crate) members: Vec<RaidzMember>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RaidzMember {
-    supplied_index: usize,
-    guid: u64,
-    ashift: u8,
-    allocated_bytes: u64,
+pub(crate) struct RaidzMember {
+    pub(crate) supplied_index: usize,
+    pub(crate) guid: u64,
+    pub(crate) ashift: u8,
+    pub(crate) allocated_bytes: u64,
 }
 
 impl VdevConfig {
@@ -370,7 +395,64 @@ pub struct RootBlock {
     config: VdevConfig,
 }
 
+impl RootBlock {
+    #[must_use]
+    pub(crate) const fn vdev_config(&self) -> &VdevConfig {
+        &self.config
+    }
+}
+
 impl Leaf {
+    pub(crate) fn open_writable(
+        cx: &Cx,
+        path: &Path,
+        base: u64,
+        length: Option<u64>,
+    ) -> Result<(Self, Option<(u64, u64)>)> {
+        checkpoint(cx)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(unsupported(
+                "ZFS native writer requires an offline regular image file",
+            ));
+        }
+        file.try_lock()
+            .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+        let size = metadata.len();
+        let dev_ino = Some((metadata.dev(), metadata.ino()));
+        let leaf = Self::from_device(
+            cx,
+            Box::new(WritableImage { file, length: size }),
+            base,
+            length.unwrap_or_else(|| size.saturating_sub(base)),
+        )?;
+        Ok((leaf, dev_ino))
+    }
+    pub(crate) fn read_raw(&self, cx: &Cx, offset: u64, size: usize) -> Result<Vec<u8>> {
+        self.read(cx, offset, size)
+    }
+    pub(crate) fn write_raw(&self, cx: &Cx, offset: u64, bytes: &[u8]) -> Result<()> {
+        checkpoint(cx)?;
+        if offset
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > self.length)
+        {
+            return Err(corrupt("ZFS write exceeds selected leaf"));
+        }
+        self.device
+            .write_all_at(cx, ByteOffset(self.base + offset), bytes)?;
+        checkpoint(cx)
+    }
+    pub(crate) fn sync_raw(&self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        self.device.sync(cx)?;
+        checkpoint(cx)
+    }
     pub fn open(cx: &Cx, path: &Path, base: u64, length: Option<u64>) -> Result<Self> {
         checkpoint(cx)?;
         let file = File::open(path)?;
