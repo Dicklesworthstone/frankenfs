@@ -4939,3 +4939,650 @@ fn gate7_full_conformance_and_tools() {
     cli_inspect_nonexistent_file_returns_error();
     parity_default_reports_declarations_without_execution_credit();
 }
+
+/// bd-jufod: Full mounted `/dev/fuse` E2E verification of ext4 background scrub & repair:
+///
+/// - RO `--background-repair`: corrupt 1 byte each in GDT, inode table, external extent block,
+///   directory block, and file data block -> asserts `corruption_detected` (`checksum_mismatch`)
+///   and `repair_succeeded` in the JSONL ledger, byte-identical restoration on disk, live FUSE
+///   readback match, and `e2fsck -fn` clean exit.
+/// - Adversarial forged parity (valid raw parity manifest from a twin image decoding wrong bytes
+///   for the corrupted data block) -> post-decode `FFSCDG01` `DecodedOverlay` verification
+///   rejects writeback, emits `repair_failed` (`verify_pass == false`), and leaves disk untouched.
+/// - RW `--rw --background-scrub`: concurrent live FUSE writes/fsyncs produce zero false
+///   positives while 1-byte bitrot on disk in untouched data + directory blocks is detected and
+///   recorded in the JSONL ledger.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cli_mount_ext4_background_scrub_repairs_meta_and_data_refuses_tampered_parity_and_scrubs_rw_bd_jufod()
+ {
+    use std::ffi::OsStr;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::time::{Duration, Instant};
+
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+    if !Path::new("/dev/fuse").exists()
+        || !["mkfs.ext4", "e2fsck", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool))
+    {
+        assert!(
+            !require,
+            "FFS_REQUIRE_FUSE=1 but mount prerequisites (/dev/fuse, mkfs.ext4, e2fsck, fusermount3) are missing"
+        );
+        emit_scenario_result(
+            "mounted_ext4_scrub_repair_bd_jufod",
+            "SKIP",
+            Some("fuse_or_e2fsprogs_unavailable"),
+        );
+        return;
+    }
+
+    let tmp_guard = tempfile::Builder::new()
+        .prefix("ffs-bd-jufod-")
+        .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("ffs-bd-jufod-").tempdir())
+        .expect("create tempdir");
+    let dir = tmp_guard.path();
+
+    // Format an 8 MiB (2 groups x 1024 4KiB blocks) metadata_csum ext4 image with
+    // initialized bitmaps/inode tables (`lazy_itable_init=0`) and caller-owned root.
+    let base_image = dir.join("base.ext4");
+    fs::File::create(&base_image)
+        .and_then(|f| f.set_len(8 * 1024 * 1024))
+        .expect("size base.ext4");
+    let me = fs::metadata(&base_image).expect("stat base.ext4");
+    let ext_opts = format!("lazy_itable_init=0,root_owner={}:{}", me.uid(), me.gid());
+    let mkfs = Command::new("mkfs.ext4")
+        .args([
+            "-F",
+            "-q",
+            "-O",
+            "metadata_csum,^has_journal,^flex_bg",
+            "-b",
+            "4096",
+            "-g",
+            "1024",
+            "-E",
+            &ext_opts,
+        ])
+        .arg(&base_image)
+        .output()
+        .expect("run mkfs.ext4");
+    assert!(
+        mkfs.status.success(),
+        "mkfs.ext4 failed: {}",
+        String::from_utf8_lossy(&mkfs.stderr)
+    );
+
+    // Populate target structures in group 0:
+    // - `/dir_target/entry.txt` (dedicated DirLeaf block)
+    // - `/payload.bin` (16 KiB patterned data blocks)
+    // - `/frag.bin` interleaved with `/spacer.bin` across 6 single-block appends so
+    //   `/frag.bin` splits its 4-slot root extent tree (`eh_depth >= 1`) into an external ExtentNode!
+    let payload_bytes: Vec<u8> = (0..16_384_usize)
+        .map(|i| ((i.wrapping_mul(131).wrapping_add(17)) & 0xFF) as u8)
+        .collect();
+    let dir_entry_bytes = b"verified directory child payload\n".to_vec();
+    let mut frag_expected = Vec::with_capacity(6 * 4096);
+    {
+        let cx = asupersync::Cx::for_testing();
+        let mut fs =
+            ffs_core::OpenFs::open_read_write(&cx, &base_image, &ffs_core::OpenOptions::default())
+                .expect("open base.ext4 rw");
+        fs.enable_writes(&cx).expect("enable writes");
+
+        let sub = fs
+            .mkdir(
+                &cx,
+                ffs_types::InodeNumber(2),
+                OsStr::new("dir_target"),
+                0o755,
+                me.uid(),
+                me.gid(),
+            )
+            .expect("mkdir dir_target");
+        let entry = fs
+            .create(
+                &cx,
+                sub.ino,
+                OsStr::new("entry.txt"),
+                0o644,
+                me.uid(),
+                me.gid(),
+            )
+            .expect("create entry.txt");
+        fs.write(&cx, entry.ino, 0, &dir_entry_bytes)
+            .expect("write entry.txt");
+        fs.fsync(&cx, entry.ino, 0, false).expect("fsync entry.txt");
+
+        let payload = fs
+            .create(
+                &cx,
+                ffs_types::InodeNumber(2),
+                OsStr::new("payload.bin"),
+                0o644,
+                me.uid(),
+                me.gid(),
+            )
+            .expect("create payload.bin");
+        fs.write(&cx, payload.ino, 0, &payload_bytes)
+            .expect("write payload.bin");
+        fs.fsync(&cx, payload.ino, 0, false)
+            .expect("fsync payload.bin");
+
+        let frag = fs
+            .create(
+                &cx,
+                ffs_types::InodeNumber(2),
+                OsStr::new("frag.bin"),
+                0o644,
+                me.uid(),
+                me.gid(),
+            )
+            .expect("create frag.bin");
+        let spacer = fs
+            .create(
+                &cx,
+                ffs_types::InodeNumber(2),
+                OsStr::new("spacer.bin"),
+                0o644,
+                me.uid(),
+                me.gid(),
+            )
+            .expect("create spacer.bin");
+        for idx in 0..6_u64 {
+            let blk = vec![u8::try_from(0x20 + idx).unwrap(); 4096];
+            let spc = vec![u8::try_from(0x90 + idx).unwrap(); 4096];
+            fs.write(&cx, frag.ino, idx * 4096, &blk)
+                .expect("write frag block");
+            fs.fsync(&cx, frag.ino, 0, false).expect("fsync frag");
+            fs.write(&cx, spacer.ino, idx * 4096, &spc)
+                .expect("write spacer block");
+            fs.fsync(&cx, spacer.ino, 0, false).expect("fsync spacer");
+            frag_expected.extend_from_slice(&blk);
+        }
+    }
+
+    // Inspect exact physical blocks for all 5 target classes in group 0.
+    let (
+        gdt_block,
+        gdt_corrupt_off,
+        inode_table_block,
+        inode_corrupt_off,
+        extent_node_block,
+        dir_leaf_block,
+        data_block,
+        repair_tail_start_block,
+    ) = {
+        let cx = asupersync::Cx::for_testing();
+        let raw = fs::read(&base_image).expect("read base.ext4");
+        let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&raw).expect("parse sb");
+        let desc_size = usize::from(sb.group_desc_size());
+        let gd0_off =
+            usize::try_from(sb.group_desc_offset(ffs_types::GroupNumber(0)).unwrap()).unwrap();
+        let gd1_off =
+            usize::try_from(sb.group_desc_offset(ffs_types::GroupNumber(1)).unwrap()).unwrap();
+        let gd0 = ffs_ondisk::Ext4GroupDesc::parse_from_bytes(
+            &raw[gd0_off..gd0_off + desc_size],
+            sb.group_desc_size(),
+        )
+        .expect("parse gd0");
+        assert_eq!(gd0_off / 4096, 1, "4KiB ext4 GDT must live in block 1");
+        assert_eq!(gd1_off / 4096, 1, "group 1 descriptor lives in block 1");
+
+        let fs = ffs_core::OpenFs::open(&cx, &base_image).expect("open ro");
+        let payload_attr = fs
+            .lookup(&cx, ffs_types::InodeNumber(2), OsStr::new("payload.bin"))
+            .expect("lookup payload.bin");
+        let (ino_grp, _, ino_byte_in_table) = sb.inode_table_offset(payload_attr.ino);
+        assert_eq!(ino_grp, ffs_types::GroupNumber(0));
+        let itable_blk = gd0.inode_table + ino_byte_in_table / 4096;
+        let itable_off =
+            usize::try_from(itable_blk * 4096 + (ino_byte_in_table % 4096) + 8).unwrap();
+
+        let frag_attr = fs
+            .lookup(&cx, ffs_types::InodeNumber(2), OsStr::new("frag.bin"))
+            .expect("lookup frag.bin");
+        let frag_ino = fs.read_inode(&cx, frag_attr.ino).expect("read frag inode");
+        let (_, frag_tree) = ffs_ondisk::ext4::parse_extent_tree(&frag_ino.extent_bytes)
+            .expect("parse frag root extent tree");
+        let ext_blk = match frag_tree {
+            ffs_ondisk::ext4::ExtentTree::Index(indices) => {
+                assert!(
+                    !indices.is_empty(),
+                    "frag.bin must have extent index entries"
+                );
+                indices[0].leaf_block
+            }
+            ffs_ondisk::ext4::ExtentTree::Leaf(extents) => {
+                panic!(
+                    "expected external ExtentNode (depth>=1) for fragmented file, got inline leaf len={}",
+                    extents.len()
+                );
+            }
+        };
+
+        let sub_attr = fs
+            .lookup(&cx, ffs_types::InodeNumber(2), OsStr::new("dir_target"))
+            .expect("lookup dir_target");
+        let sub_ino = fs
+            .read_inode(&cx, sub_attr.ino)
+            .expect("read dir_target inode");
+        let dir_blk = fs.collect_extents(&cx, &sub_ino).expect("dir extents")[0].physical_start;
+
+        let payload_ino = fs
+            .read_inode(&cx, payload_attr.ino)
+            .expect("read payload inode");
+        let dat_blk = fs
+            .collect_extents(&cx, &payload_ino)
+            .expect("payload extents")[0]
+            .physical_start;
+
+        // Compute group 0's repair_start_block: 1024 - 2 desc - ceil(1022 * 0.05) = 1024 - 2 - 52 = 970.
+        let budget = 1024_u32 - ffs_repair::storage::REPAIR_DESC_SLOT_COUNT;
+        let rep_cnt =
+            ffs_repair::symbol::RepairGroupDescExt::compute_repair_block_count(budget, 1.05);
+        let layout0 = ffs_repair::storage::RepairGroupLayout::new(
+            ffs_types::GroupNumber(0),
+            ffs_types::BlockNumber(0),
+            1024,
+            1,
+            rep_cnt,
+        )
+        .expect("layout0");
+        let source_limit = layout0.validation_start_block().0;
+        let distinct: std::collections::BTreeSet<u64> = [1, itable_blk, ext_blk, dir_blk, dat_blk]
+            .into_iter()
+            .collect();
+        assert_eq!(distinct.len(), 5, "all 5 target blocks must be distinct");
+        for &b in &distinct {
+            assert!(
+                b < source_limit,
+                "target block {b} must lie inside group 0 source range [0, {source_limit})"
+            );
+        }
+
+        (
+            1_u64,
+            gd1_off + 12,
+            itable_blk,
+            itable_off,
+            ext_blk,
+            dir_blk,
+            dat_blk,
+            layout0.repair_start_block().0,
+        )
+    };
+
+    // Build a twin image BEFORE symbol generation with forged bytes in `data_block`
+    // so its generation-1 parity symbols validly decode `data_block` to forged bytes.
+    let twin_image = dir.join("twin_forged.ext4");
+    fs::copy(&base_image, &twin_image).expect("copy twin_forged.ext4");
+    {
+        let mut twin_bytes = fs::read(&twin_image).expect("read twin");
+        let start = usize::try_from(data_block * 4096).unwrap();
+        twin_bytes[start..start + 4096].fill(0xA5);
+        fs::write(&twin_image, &twin_bytes).expect("write forged twin");
+    }
+
+    for img in [&base_image, &twin_image] {
+        let rebuild = run_ffs_cli(&[
+            "repair",
+            "--rebuild-symbols",
+            "--json",
+            img.to_str().unwrap(),
+        ]);
+        assert!(
+            rebuild.status.success(),
+            "ffs repair --rebuild-symbols failed on {}: {}",
+            img.display(),
+            String::from_utf8_lossy(&rebuild.stderr)
+        );
+    }
+    let clean_protected_bytes = fs::read(&base_image).expect("read clean protected image");
+
+    let unmount_cleanly = |mut child: std::process::Child, mnt: &Path, log: &Path| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let unmount = Command::new("fusermount3")
+            .arg("-u")
+            .arg(mnt)
+            .output()
+            .expect("run fusermount3 -u");
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("poll mount child") {
+                break s;
+            }
+            if Instant::now() >= deadline {
+                sigkill_cli_mount(&mut child, mnt);
+                panic!(
+                    "mount daemon did not exit within 15s: {}",
+                    fs::read_to_string(log).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(
+            unmount.status.success() && status.success(),
+            "clean unmount failed (unmount={:?}, daemon={status}): {}",
+            unmount.status,
+            fs::read_to_string(log).unwrap_or_default()
+        );
+    };
+
+    // ── Phase 1: Mounted RO `--background-repair` heals all 5 block classes ──
+    let ro_image = dir.join("ro_heal.ext4");
+    fs::copy(&base_image, &ro_image).expect("copy ro_heal.ext4");
+    let ro_mnt = dir.join("mnt_ro");
+    fs::create_dir(&ro_mnt).expect("mkdir mnt_ro");
+    let ro_log = dir.join("ro_mount.log");
+    let ro_ledger = dir.join("ro_ledger.jsonl");
+    let Some(ro_child) = spawn_cli_mount(
+        &ro_image,
+        &ro_mnt,
+        &ro_log,
+        &[
+            "--background-repair",
+            "--background-scrub-interval-secs",
+            "1",
+            "--background-scrub-ledger",
+            ro_ledger.to_str().unwrap(),
+        ],
+        &[("RUST_LOG", "info")],
+        "mounted_ext4_scrub_repair_bd_jufod",
+        require,
+    ) else {
+        return;
+    };
+
+    // Inject 1-byte bitrot into GDT, inode table, extent node, dir leaf, and file data block!
+    {
+        let mut img_bytes = fs::read(&ro_image).expect("read ro_image");
+        img_bytes[gdt_corrupt_off] ^= 0x01;
+        img_bytes[inode_corrupt_off] ^= 0x01;
+        img_bytes[usize::try_from(extent_node_block * 4096 + 24).unwrap()] ^= 0x01;
+        img_bytes[usize::try_from(dir_leaf_block * 4096 + 24).unwrap()] ^= 0x01;
+        img_bytes[usize::try_from(data_block * 4096 + 128).unwrap()] ^= 0x01;
+        fs::write(&ro_image, &img_bytes).expect("inject 5 corruptions into ro_image");
+    }
+
+    let parse_corrupt_blocks = |rec: &serde_json::Value| -> Option<Vec<u64>> {
+        let detail = rec["corruption"]["detail"].as_str()?;
+        let json_list = detail.strip_prefix("blocks: ")?;
+        serde_json::from_str::<Vec<u64>>(json_list).ok()
+    };
+
+    let mut expected_sorted = [
+        gdt_block,
+        inode_table_block,
+        extent_node_block,
+        dir_leaf_block,
+        data_block,
+    ];
+    expected_sorted.sort_unstable();
+    let expected_blocks = expected_sorted;
+    let heal_deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let lines = fs::read_to_string(&ro_ledger).unwrap_or_default();
+        let records: Vec<serde_json::Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let all_detected = records.iter().any(|rec| {
+            rec["event_type"] == "corruption_detected"
+                && rec["corruption"]["corruption_kind"] == "checksum_mismatch"
+                && rec["corruption"]["blocks_affected"] == 5
+                && parse_corrupt_blocks(rec).is_some_and(|mut bs| {
+                    bs.sort_unstable();
+                    bs == expected_blocks
+                })
+        });
+        let repair_ok = records.iter().any(|rec| {
+            rec["event_type"] == "repair_succeeded"
+                && rec["repair"]["corrupt_count"] == 5
+                && rec["repair"]["verify_pass"] == true
+        });
+        if all_detected && repair_ok {
+            break;
+        }
+        assert!(
+            Instant::now() < heal_deadline,
+            "timed out waiting for RO background repair of all 5 blocks; ledger:\n{lines}\nlog:\n{}",
+            fs::read_to_string(&ro_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Live FUSE readback after repair must match exact payload bytes!
+    assert_eq!(
+        fs::read(ro_mnt.join("payload.bin")).expect("read mounted payload.bin"),
+        payload_bytes
+    );
+    assert_eq!(
+        fs::read(ro_mnt.join("frag.bin")).expect("read mounted frag.bin"),
+        frag_expected
+    );
+    assert_eq!(
+        fs::read(ro_mnt.join("dir_target").join("entry.txt")).expect("read mounted entry.txt"),
+        dir_entry_bytes
+    );
+
+    unmount_cleanly(ro_child, &ro_mnt, &ro_log);
+
+    // Every repaired source block on disk must be byte-for-byte identical to clean_protected_bytes!
+    let healed_bytes = fs::read(&ro_image).expect("read healed ro_image");
+    for blk in expected_blocks {
+        let start = usize::try_from(blk * 4096).unwrap();
+        assert_eq!(
+            &healed_bytes[start..start + 4096],
+            &clean_protected_bytes[start..start + 4096],
+            "repaired block {blk} must match original bytes identically"
+        );
+    }
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(&ro_image)
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck -fn failed after RO background repair: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // ── Phase 2: Forged parity symbols -> post-decode verification refuses writeback ──
+    let tampered_image = dir.join("tampered_parity.ext4");
+    fs::copy(&base_image, &tampered_image).expect("copy tampered_parity.ext4");
+    let data_corrupt_off = usize::try_from(data_block * 4096 + 64).unwrap();
+    let expected_corrupt_data_block = {
+        let twin_bytes = fs::read(&twin_image).expect("read twin");
+        let mut tampered_bytes = fs::read(&tampered_image).expect("read tampered");
+        let tail_byte_start = usize::try_from(repair_tail_start_block * 4096).unwrap();
+        let group0_byte_end = 1024 * 4096;
+        // Transplant valid generation-1 parity + descriptor blocks from twin_forged,
+        // keeping base_image's intact FFSCDG01 validation block!
+        tampered_bytes[tail_byte_start..group0_byte_end]
+            .copy_from_slice(&twin_bytes[tail_byte_start..group0_byte_end]);
+        tampered_bytes[data_corrupt_off] ^= 0x01;
+        let data_start = usize::try_from(data_block * 4096).unwrap();
+        let snap = tampered_bytes[data_start..data_start + 4096].to_vec();
+        fs::write(&tampered_image, &tampered_bytes).expect("write tampered_parity.ext4");
+        snap
+    };
+
+    let tam_mnt = dir.join("mnt_tampered");
+    fs::create_dir(&tam_mnt).expect("mkdir mnt_tampered");
+    let tam_log = dir.join("tampered_mount.log");
+    let tam_ledger = dir.join("tampered_ledger.jsonl");
+    let Some(tam_child) = spawn_cli_mount(
+        &tampered_image,
+        &tam_mnt,
+        &tam_log,
+        &[
+            "--background-repair",
+            "--background-scrub-interval-secs",
+            "1",
+            "--background-scrub-ledger",
+            tam_ledger.to_str().unwrap(),
+        ],
+        &[("RUST_LOG", "info")],
+        "mounted_ext4_scrub_repair_bd_jufod",
+        require,
+    ) else {
+        return;
+    };
+
+    let tam_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let lines = fs::read_to_string(&tam_ledger).unwrap_or_default();
+        let records: Vec<serde_json::Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let failed = records.iter().any(|rec| {
+            rec["event_type"] == "repair_failed" && rec["repair"]["verify_pass"] == false
+        });
+        let succeeded = records
+            .iter()
+            .any(|rec| rec["event_type"] == "repair_succeeded");
+        assert!(
+            !succeeded,
+            "forged parity decode must NEVER emit repair_succeeded; ledger:\n{lines}"
+        );
+        if failed {
+            break;
+        }
+        assert!(
+            Instant::now() < tam_deadline,
+            "timed out waiting for repair_failed on forged parity; ledger:\n{lines}\nlog:\n{}",
+            fs::read_to_string(&tam_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unmount_cleanly(tam_child, &tam_mnt, &tam_log);
+
+    let after_tampered = fs::read(&tampered_image).expect("read tampered after unmount");
+    let data_start = usize::try_from(data_block * 4096).unwrap();
+    assert_eq!(
+        &after_tampered[data_start..data_start + 4096],
+        expected_corrupt_data_block.as_slice(),
+        "forged parity decode must NOT write back 0xA5 bytes to data_block"
+    );
+
+    // ── Phase 3: Mounted RW `--rw --background-scrub` detects untouched bitrot with 0 false positives ──
+    let writable_img = dir.join("rw_scrub.ext4");
+    fs::copy(&base_image, &writable_img).expect("copy rw_scrub.ext4");
+    let writable_mnt = dir.join("mnt_rw");
+    fs::create_dir(&writable_mnt).expect("mkdir mnt_rw");
+    let writable_log = dir.join("rw_mount.log");
+    let writable_ledger = dir.join("rw_ledger.jsonl");
+    let Some(writable_proc) = spawn_cli_mount(
+        &writable_img,
+        &writable_mnt,
+        &writable_log,
+        &[
+            "--rw",
+            "--background-scrub",
+            "--background-scrub-interval-secs",
+            "1",
+            "--background-scrub-ledger",
+            writable_ledger.to_str().unwrap(),
+        ],
+        &[("RUST_LOG", "info")],
+        "mounted_ext4_scrub_repair_bd_jufod",
+        require,
+    ) else {
+        return;
+    };
+
+    // Perform live RW mutations (both new file allocation + overwrite of existing spacer.bin).
+    let active_rw_path = writable_mnt.join("active_rw_mutation.bin");
+    fs::write(&active_rw_path, vec![0xCC_u8; 24_576]).expect("write active_rw_mutation.bin");
+    fs::File::open(&active_rw_path)
+        .and_then(|f| f.sync_all())
+        .expect("fsync active_rw_mutation.bin");
+    let spacer_rw_path = writable_mnt.join("spacer.bin");
+    fs::write(&spacer_rw_path, vec![0xDD_u8; 8_192]).expect("overwrite spacer.bin");
+    fs::File::open(&spacer_rw_path)
+        .and_then(|f| f.sync_all())
+        .expect("fsync spacer.bin");
+
+    // Inject on-disk 1-byte bitrot into UNTOUCHED `data_block` (payload.bin) and `dir_leaf_block` (dir_target).
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut disk = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&writable_img)
+            .expect("open writable_img for bitrot");
+        for off in [data_block * 4096 + 200, dir_leaf_block * 4096 + 24] {
+            let mut byte = [0_u8; 1];
+            disk.seek(SeekFrom::Start(off)).unwrap();
+            disk.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0x01;
+            disk.seek(SeekFrom::Start(off)).unwrap();
+            disk.write_all(&byte).unwrap();
+        }
+        disk.sync_all().unwrap();
+    }
+
+    let cycles_before = fs::read_to_string(&writable_ledger)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|r| r["event_type"] == "scrub_cycle_complete")
+        .count();
+
+    let mut rw_expected_pair = vec![data_block, dir_leaf_block];
+    rw_expected_pair.sort_unstable();
+    let rw_deadline = Instant::now() + Duration::from_secs(30);
+    let rw_records: Vec<serde_json::Value> = loop {
+        let lines = fs::read_to_string(&writable_ledger).unwrap_or_default();
+        let records: Vec<serde_json::Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let cycles_now = records
+            .iter()
+            .filter(|r| r["event_type"] == "scrub_cycle_complete")
+            .count();
+        let found_exact_pair = records.iter().any(|rec| {
+            rec["event_type"] == "corruption_detected"
+                && rec["corruption"]["corruption_kind"] == "checksum_mismatch"
+                && parse_corrupt_blocks(rec).is_some_and(|mut bs| {
+                    bs.sort_unstable();
+                    bs == rw_expected_pair
+                })
+        });
+        if cycles_now >= cycles_before + 2 && found_exact_pair {
+            break records;
+        }
+        assert!(
+            Instant::now() < rw_deadline,
+            "timed out waiting for RW background scrub to detect untouched bitrot; ledger:\n{lines}\nlog:\n{}",
+            fs::read_to_string(&writable_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Assert zero false-positive corruption events on any block other than the 2 injected blocks!
+    for rec in &rw_records {
+        if rec["event_type"] == "corruption_detected" {
+            let bs = parse_corrupt_blocks(rec).unwrap_or_default();
+            for b in bs {
+                assert!(
+                    b == data_block || b == dir_leaf_block,
+                    "unexpected false-positive RW scrub corruption finding on block {b}: {rec}"
+                );
+            }
+        }
+    }
+
+    unmount_cleanly(writable_proc, &writable_mnt, &writable_log);
+
+    emit_scenario_result(
+        "mounted_ext4_scrub_repair_bd_jufod",
+        "PASS",
+        Some("ro_5_block_heal_forged_parity_refused_and_rw_live_scrub"),
+    );
+}

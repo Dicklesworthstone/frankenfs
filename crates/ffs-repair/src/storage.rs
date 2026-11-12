@@ -33,6 +33,57 @@ pub const REPAIR_DESC_SLOT_COUNT: u32 = 2;
 const REPAIR_DESC_SLOT_COUNT_USIZE: usize = 2;
 type SymbolBatch = Vec<(u32, Vec<u8>)>;
 
+/// Durable generation-bound BLAKE3 source-block digest manifest (`bd-jufod`).
+///
+/// Stored in the per-group `validation_block_count` region immediately
+/// preceding `repair_start_block` so ext4 non-metadata source blocks (regular
+/// file data, symlink blocks, indirect pointer blocks, and free blocks) carry
+/// generation-bound BLAKE3 integrity protection alongside metadata CRC32C.
+///
+/// Binary layout:
+/// - `[0..8]`: `MAGIC` (`b"FFSCDG01"`)
+/// - `[8..12]`: `group: u32` (little-endian)
+/// - `[12..16]`: `source_block_count: u32` (little-endian)
+/// - `[16..24]`: `source_first_block: u64` (little-endian)
+/// - `[24..32]`: `repair_generation: u64` (little-endian)
+/// - `[32..64]`: `manifest_blake3: [u8; 32]` over
+///   `b"ffs-source-digest-manifest-v1" || header[0..32] || digests[0..32*N]`
+/// - `[64..64 + 32*N]`: `N = source_block_count` 32-byte BLAKE3 block digests
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceBlockDigestManifest {
+    pub group: GroupNumber,
+    pub source_first_block: BlockNumber,
+    pub source_block_count: u32,
+    pub repair_generation: u64,
+    pub digests: Vec<[u8; 32]>,
+}
+
+impl SourceBlockDigestManifest {
+    pub const MAGIC: &'static [u8; 8] = b"FFSCDG01";
+    pub const HEADER_SIZE: usize = 64;
+    const DOMAIN: &'static [u8] = b"ffs-source-digest-manifest-v1";
+
+    /// Number of validation blocks needed to store `max_source_blocks` digests.
+    #[must_use]
+    pub fn required_validation_blocks(max_source_blocks: u32, block_size: u32) -> u32 {
+        if max_source_blocks == 0 || block_size == 0 {
+            return 0;
+        }
+        let total_bytes = (Self::HEADER_SIZE as u64)
+            .saturating_add(u64::from(max_source_blocks).saturating_mul(32));
+        let blocks = total_bytes.div_ceil(u64::from(block_size));
+        u32::try_from(blocks).unwrap_or(u32::MAX)
+    }
+
+    fn compute_mac(header_prefix: &[u8; 32], digest_table: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(Self::DOMAIN);
+        hasher.update(header_prefix);
+        hasher.update(digest_table);
+        *hasher.finalize().as_bytes()
+    }
+}
+
 /// Deterministic per-group layout for validation/repair metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepairGroupLayout {
@@ -399,6 +450,207 @@ impl<'a> RepairGroupStorage<'a> {
         self.write_group_desc_ext(cx, &next)?;
         self.device.sync(cx)?;
         Ok(())
+    }
+
+    /// Persist a generation-bound [`SourceBlockDigestManifest`] (`FFSCDG01`)
+    /// into this group's `validation_block_count` region (`bd-jufod`).
+    ///
+    /// No-op when `layout.validation_block_count == 0`, `source_block_count == 0`,
+    /// or `repair_generation == 0`. Call before `write_repair_symbols(..., repair_generation)`
+    /// so the subsequent parity/descriptor sync seals both parity and digests.
+    pub fn write_source_digests(
+        &self,
+        cx: &Cx,
+        source_first_block: BlockNumber,
+        source_block_count: u32,
+        repair_generation: u64,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if self.layout.validation_block_count == 0
+            || source_block_count == 0
+            || repair_generation == 0
+        {
+            return Ok(());
+        }
+        let block_size_u32 = self.device.block_size();
+        let block_size = self.block_size_usize()?;
+        let needed_blocks = SourceBlockDigestManifest::required_validation_blocks(
+            source_block_count,
+            block_size_u32,
+        );
+        if needed_blocks == 0 || needed_blocks > self.layout.validation_block_count {
+            return Err(FfsError::RepairFailed(format!(
+                "validation block region too small for group {}: needed={} reserved={}",
+                self.layout.group.0, needed_blocks, self.layout.validation_block_count
+            )));
+        }
+        let source_end = source_first_block
+            .0
+            .checked_add(u64::from(source_block_count))
+            .ok_or_else(|| FfsError::RepairFailed("source digest range overflow".to_owned()))?;
+        if source_first_block.0 < self.layout.group_start.0
+            || source_end > self.layout.validation_start_block().0
+        {
+            return Err(FfsError::RepairFailed(format!(
+                "source digest range [{}, {}) outside group {} data region [{}, {})",
+                source_first_block.0,
+                source_end,
+                self.layout.group.0,
+                self.layout.group_start.0,
+                self.layout.validation_start_block().0
+            )));
+        }
+
+        let source_blocks: Vec<BlockNumber> = (0..source_block_count)
+            .map(|i| BlockNumber(source_first_block.0 + u64::from(i)))
+            .collect();
+        let reads = Self::read_blocks_parallel(self.device, cx, &source_blocks);
+        let count_usize = usize::try_from(source_block_count)
+            .map_err(|_| FfsError::RepairFailed("source_block_count exceeds usize".to_owned()))?;
+        let mut digest_table = Vec::with_capacity(count_usize.saturating_mul(32));
+        for read in reads {
+            let buf = read?;
+            digest_table.extend_from_slice(blake3::hash(buf.as_slice()).as_bytes());
+        }
+
+        let mut header_prefix = [0_u8; 32];
+        header_prefix[0..8].copy_from_slice(SourceBlockDigestManifest::MAGIC);
+        header_prefix[8..12].copy_from_slice(&self.layout.group.0.to_le_bytes());
+        header_prefix[12..16].copy_from_slice(&source_block_count.to_le_bytes());
+        header_prefix[16..24].copy_from_slice(&source_first_block.0.to_le_bytes());
+        header_prefix[24..32].copy_from_slice(&repair_generation.to_le_bytes());
+        let mac = SourceBlockDigestManifest::compute_mac(&header_prefix, &digest_table);
+
+        let val_blocks_usize =
+            usize::try_from(self.layout.validation_block_count).map_err(|_| {
+                FfsError::RepairFailed("validation_block_count exceeds usize".to_owned())
+            })?;
+        let total_capacity = val_blocks_usize.checked_mul(block_size).ok_or_else(|| {
+            FfsError::RepairFailed("validation byte capacity overflow".to_owned())
+        })?;
+        let mut raw = vec![0_u8; total_capacity];
+        raw[0..32].copy_from_slice(&header_prefix);
+        raw[32..64].copy_from_slice(&mac);
+        raw[64..64 + digest_table.len()].copy_from_slice(&digest_table);
+
+        let val_start = self.layout.validation_start_block().0;
+        for idx in 0..val_blocks_usize {
+            let start = idx * block_size;
+            let end = start + block_size;
+            self.device
+                .write_block(cx, BlockNumber(val_start + idx as u64), &raw[start..end])?;
+        }
+        Ok(())
+    }
+
+    /// Read the verified [`SourceBlockDigestManifest`] matching `expected_generation`.
+    ///
+    /// Returns `Ok(None)` when no validation blocks are reserved, the region is
+    /// unpopulated, the stored generation differs from `expected_generation`, or
+    /// the manifest MAC itself is unreadable/corrupt (allowing metadata-CRC scrub
+    /// and RaptorQ recovery to proceed rather than aborting validator construction).
+    pub fn read_source_digests_for_generation(
+        &self,
+        cx: &Cx,
+        expected_source_first: BlockNumber,
+        expected_source_count: u32,
+        expected_generation: u64,
+    ) -> Result<Option<Vec<[u8; 32]>>> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if self.layout.validation_block_count == 0
+            || expected_source_count == 0
+            || expected_generation == 0
+        {
+            return Ok(None);
+        }
+        let needed_blocks = SourceBlockDigestManifest::required_validation_blocks(
+            expected_source_count,
+            self.device.block_size(),
+        );
+        if needed_blocks == 0 || needed_blocks > self.layout.validation_block_count {
+            return Ok(None);
+        }
+        let block_size = self.block_size_usize()?;
+        let val_start = self.layout.validation_start_block();
+        let first_buf = match self.device.read_block(cx, val_start) {
+            Ok(buf) => buf,
+            Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+            Err(_) => return Ok(None),
+        };
+        let first_slice = first_buf.as_slice();
+        if first_slice.len() < SourceBlockDigestManifest::HEADER_SIZE
+            || &first_slice[0..8] != SourceBlockDigestManifest::MAGIC
+        {
+            return Ok(None);
+        }
+        let group = u32::from_le_bytes([
+            first_slice[8],
+            first_slice[9],
+            first_slice[10],
+            first_slice[11],
+        ]);
+        let count = u32::from_le_bytes([
+            first_slice[12],
+            first_slice[13],
+            first_slice[14],
+            first_slice[15],
+        ]);
+        let first_block = u64::from_le_bytes(
+            first_slice[16..24]
+                .try_into()
+                .expect("8-byte slice for source_first_block"),
+        );
+        let generation = u64::from_le_bytes(
+            first_slice[24..32]
+                .try_into()
+                .expect("8-byte slice for repair_generation"),
+        );
+        if group != self.layout.group.0
+            || count != expected_source_count
+            || first_block != expected_source_first.0
+            || generation != expected_generation
+        {
+            return Ok(None);
+        }
+        let Ok(needed_usize) = usize::try_from(needed_blocks) else {
+            return Ok(None);
+        };
+        let Ok(count_usize) = usize::try_from(expected_source_count) else {
+            return Ok(None);
+        };
+        let total_needed_bytes =
+            SourceBlockDigestManifest::HEADER_SIZE.saturating_add(count_usize.saturating_mul(32));
+        let Some(buf_cap) = needed_usize.checked_mul(block_size) else {
+            return Ok(None);
+        };
+        if total_needed_bytes > buf_cap {
+            return Ok(None);
+        }
+        let mut raw = Vec::with_capacity(buf_cap);
+        raw.extend_from_slice(first_slice);
+        if needed_usize > 1 {
+            let rest_blocks: Vec<BlockNumber> = (1..needed_usize)
+                .map(|idx| BlockNumber(val_start.0 + idx as u64))
+                .collect();
+            for read in Self::read_blocks_parallel(self.device, cx, &rest_blocks) {
+                match read {
+                    Ok(buf) => raw.extend_from_slice(buf.as_slice()),
+                    Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                    Err(_) => return Ok(None),
+                }
+            }
+        }
+        if raw.len() < total_needed_bytes {
+            return Ok(None);
+        }
+        let header_prefix: [u8; 32] = raw[0..32].try_into().expect("32-byte header prefix");
+        let stored_mac: [u8; 32] = raw[32..64].try_into().expect("32-byte manifest mac");
+        let digest_table = &raw[64..total_needed_bytes];
+        if SourceBlockDigestManifest::compute_mac(&header_prefix, digest_table) != stored_mac {
+            return Ok(None);
+        }
+        let (chunks, _) = digest_table.as_chunks::<32>();
+        Ok(Some(chunks.to_vec()))
     }
 
     fn read_descriptor_candidates(&self, cx: &Cx) -> Result<Vec<(usize, RepairGroupDescExt)>> {

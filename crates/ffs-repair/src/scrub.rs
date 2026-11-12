@@ -595,6 +595,18 @@ pub enum Ext4OwnedBlock {
     Xattr,
     /// Logical block 0 of the internal JBD2 journal inode (`s_journal_inum`).
     Jbd2Superblock,
+    /// Active JBD2 descriptor (`1`) or revoke (`5`) block (4-byte tail CRC32C).
+    Jbd2DescriptorOrRevoke { seed: u32 },
+    /// Active JBD2 commit (`2`) block (CRC32C at offset 16).
+    Jbd2Commit { seed: u32 },
+    /// Active JBD2 journaled data block with tag checksum (`CsumV2` 16-bit or `CsumV3` 32-bit).
+    Jbd2DataBlock {
+        seed: u32,
+        sequence: u32,
+        escaped: bool,
+        expected_csum: u32,
+        mask: u32,
+    },
 }
 
 /// What a fixed-location ext4 metadata block holds (bd-jufod).
@@ -617,21 +629,27 @@ enum Ext4MetaBlock {
     },
 }
 
-/// Checksum validator for ext4's fixed-location metadata (bd-jufod): the
-/// superblock, every group descriptor, and every initialized block/inode
-/// bitmap.
-///
-/// The previous ext4 scrub validated ONLY the superblock block; a flipped bit in
-/// a descriptor or bitmap — the structures allocation trusts — went unnoticed.
-/// The bitmap checksums live in the descriptors, which are snapshotted at
-/// construction, so this validator is only correct while the image is not being
-/// mutated: offline scrub and read-only mounts. A read-write mount defers
-/// descriptor persistence, so its at-rest checksums legitimately lag.
+/// Thread-safe live predicate reporting blocks modified by an active RW mount (`bd-jufod`).
+pub trait RwModifiedLookup: std::fmt::Debug + Send + Sync {
+    /// Returns `true` when `block` has been modified by the active RW mount.
+    fn is_modified(&self, block: u64) -> bool;
+}
+
+/// Checksum validator for ext4's metadata and generation-bound source digests (`bd-jufod`):
+/// superblock, group descriptors, initialized block/inode bitmaps, inode tables,
+/// inode-owned metadata (extent nodes, directories, htree roots, xattr blocks,
+/// JBD2 superblock + active JBD2 log-ring transactions), and optional `FFSCDG01`
+/// BLAKE3 source-block digests for non-metadata blocks.
 #[derive(Debug, Clone)]
 pub struct Ext4MetadataValidator {
     superblock: Ext4SuperblockValidator,
     sb: Ext4Superblock,
     blocks: std::collections::HashMap<u64, Ext4MetaBlock>,
+    data_digests: std::collections::HashMap<u64, [u8; 32]>,
+    journal_blocks: std::collections::HashSet<u64>,
+    rw_mode: bool,
+    rw_modified_blocks: std::collections::HashSet<u64>,
+    rw_modified_live: Option<std::sync::Arc<dyn RwModifiedLookup>>,
 }
 
 impl Ext4MetadataValidator {
@@ -671,6 +689,11 @@ impl Ext4MetadataValidator {
             superblock: Ext4SuperblockValidator::new(sb.block_size),
             sb: sb.clone(),
             blocks,
+            data_digests: std::collections::HashMap::new(),
+            journal_blocks: std::collections::HashSet::new(),
+            rw_mode: false,
+            rw_modified_blocks: std::collections::HashSet::new(),
+            rw_modified_live: None,
         }
     }
 
@@ -846,11 +869,648 @@ impl Ext4MetadataValidator {
                             cx, device, sb, &inode, ino, is_journal, &mut owned,
                         )?;
                     }
+                    if is_journal {
+                        Self::collect_ext4_journal_owned(
+                            cx,
+                            device,
+                            sb,
+                            &inode,
+                            &mut validator.journal_blocks,
+                            &mut owned,
+                        )?;
+                    }
                 }
             }
         }
         validator.add_owned_blocks(owned);
         Ok(validator)
+    }
+
+    /// Build an [`Ext4MetadataValidator`] from `device` and additionally load
+    /// generation-bound [`crate::storage::SourceBlockDigestManifest`] (`FFSCDG01`)
+    /// BLAKE3 digests for non-metadata source blocks in `groups` (`bd-jufod`).
+    ///
+    /// When `enforce_all_digests` is `false` (offline/RO scan pass), a group whose
+    /// own checksummed allocation/inode metadata (`BlockBitmap`, `InodeBitmap`, or
+    /// `InodeTable`) carries a valid ext4 CRC32C while differing from the stored
+    /// `FFSCDG01` digest was cleanly mutated by an uncoordinated external writer
+    /// after symbols were built, so stale data digests for that group are skipped.
+    /// When `enforce_all_digests` is `true` (post-decode `DecodedOverlay` check),
+    /// every committed `FFSCDG01` digest is enforced so stale or forged parity
+    /// decodes are refused before writeback.
+    pub fn from_device_with_group_layouts(
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        sb: &Ext4Superblock,
+        groups: &[(BlockNumber, u32, crate::storage::RepairGroupLayout)],
+        enforce_all_digests: bool,
+    ) -> Result<Self> {
+        Self::from_device_with_group_layouts_and_rw_live(
+            cx,
+            device,
+            sb,
+            groups,
+            enforce_all_digests,
+            None,
+        )
+    }
+
+    /// Like [`Self::from_device_with_group_layouts`], attaching `rw_live` before
+    /// evaluating per-group stale-digest suppression so live RW-mount writes
+    /// tracked by `rw_live` keep `FFSCDG01` digests armed on untouched blocks in
+    /// the same block group (`bd-jufod`).
+    pub fn from_device_with_group_layouts_and_rw_live(
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        sb: &Ext4Superblock,
+        groups: &[(BlockNumber, u32, crate::storage::RepairGroupLayout)],
+        enforce_all_digests: bool,
+        rw_live: Option<std::sync::Arc<dyn RwModifiedLookup>>,
+    ) -> Result<Self> {
+        let mut validator = Self::from_device(cx, device, sb)?;
+        if let Some(live) = rw_live {
+            validator = validator.with_rw_modified_live(live);
+        }
+        for &(source_first_block, source_block_count, layout) in groups {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if source_block_count == 0 || layout.validation_block_count == 0 {
+                continue;
+            }
+            let storage = crate::storage::RepairGroupStorage::new(device, layout);
+            let Ok(desc) = storage.read_group_desc_ext(cx) else {
+                continue;
+            };
+            if desc.repair_generation == 0 {
+                continue;
+            }
+            let Some(digests) = storage.read_source_digests_for_generation(
+                cx,
+                source_first_block,
+                source_block_count,
+                desc.repair_generation,
+            )?
+            else {
+                if enforce_all_digests {
+                    let first_val = device.read_block(cx, layout.validation_start_block())?;
+                    if first_val.as_slice().iter().any(|&b| b != 0) {
+                        return Err(FfsError::RepairFailed(format!(
+                            "group {} source digest manifest at block {} failed integrity check for generation {}",
+                            layout.group.0,
+                            layout.validation_start_block().0,
+                            desc.repair_generation
+                        )));
+                    }
+                }
+                continue;
+            };
+            if !enforce_all_digests
+                && validator.group_metadata_cleanly_advanced(
+                    cx,
+                    device,
+                    source_first_block,
+                    &digests,
+                )?
+            {
+                continue;
+            }
+            for (idx, digest) in digests.into_iter().enumerate() {
+                let block = source_first_block.0.saturating_add(idx as u64);
+                if validator.blocks.contains_key(&block) {
+                    continue;
+                }
+                let (sb_block, _) = validator.superblock.target_block_and_offset();
+                if block == sb_block {
+                    continue;
+                }
+                validator.data_digests.insert(block, digest);
+            }
+        }
+        Ok(validator)
+    }
+
+    /// Configure RW-mount exemptions (`bd-jufod`): exempts blocks modified by
+    /// the active RW mount (and active JBD2 ring blocks) from pre-mount
+    /// `FFSCDG01` digests and deferred-GDT bitmap checksum lag, while keeping
+    /// live CRC32C validation on superblock, GDT, inode tables, extent nodes,
+    /// directories, xattrs, JBD2 superblock, untouched bitmaps, and `FFSCDG01`
+    /// BLAKE3 digests on all untouched non-metadata blocks.
+    #[must_use]
+    pub fn with_rw_modified_blocks(mut self, mut modified: std::collections::HashSet<u64>) -> Self {
+        modified.extend(self.journal_blocks.iter().copied());
+        self.blocks.retain(|_, meta| {
+            !matches!(
+                meta,
+                Ext4MetaBlock::Owned(
+                    Ext4OwnedBlock::Jbd2DescriptorOrRevoke { .. }
+                        | Ext4OwnedBlock::Jbd2Commit { .. }
+                        | Ext4OwnedBlock::Jbd2DataBlock { .. }
+                )
+            )
+        });
+        self.rw_mode = true;
+        self.rw_modified_blocks = modified;
+        self
+    }
+
+    /// Configure live RW-mount modified-block lookup (`bd-jufod`).
+    #[must_use]
+    pub fn with_rw_modified_live(mut self, live: std::sync::Arc<dyn RwModifiedLookup>) -> Self {
+        self.blocks.retain(|_, meta| {
+            !matches!(
+                meta,
+                Ext4MetaBlock::Owned(
+                    Ext4OwnedBlock::Jbd2DescriptorOrRevoke { .. }
+                        | Ext4OwnedBlock::Jbd2Commit { .. }
+                        | Ext4OwnedBlock::Jbd2DataBlock { .. }
+                )
+            )
+        });
+        self.rw_mode = true;
+        self.rw_modified_live = Some(live);
+        self
+    }
+
+    fn is_rw_modified(&self, block: u64) -> bool {
+        self.rw_mode
+            && (self.rw_modified_blocks.contains(&block)
+                || self.journal_blocks.contains(&block)
+                || self
+                    .rw_modified_live
+                    .as_ref()
+                    .is_some_and(|live| live.is_modified(block)))
+    }
+
+    fn group_metadata_cleanly_advanced(
+        &self,
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        source_first_block: BlockNumber,
+        digests: &[[u8; 32]],
+    ) -> Result<bool> {
+        for (idx, expected_digest) in digests.iter().enumerate() {
+            let block = source_first_block.0.saturating_add(idx as u64);
+            if self.is_rw_modified(block) {
+                continue;
+            }
+            let is_per_group_meta = matches!(
+                self.blocks.get(&block),
+                Some(
+                    Ext4MetaBlock::BlockBitmap(_)
+                        | Ext4MetaBlock::InodeBitmap(_)
+                        | Ext4MetaBlock::InodeTable { .. }
+                )
+            );
+            if !is_per_group_meta {
+                continue;
+            }
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let buf = match device.read_block(cx, BlockNumber(block)) {
+                Ok(buf) => buf,
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(_) => continue,
+            };
+            if blake3::hash(buf.as_slice()).as_bytes() != expected_digest
+                && matches!(self.validate(BlockNumber(block), &buf), BlockVerdict::Clean)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn collect_ext4_journal_owned(
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        sb: &Ext4Superblock,
+        inode: &ffs_ondisk::Ext4Inode,
+        journal_blocks: &mut std::collections::HashSet<u64>,
+        out: &mut Vec<(u64, Ext4OwnedBlock)>,
+    ) -> Result<()> {
+        const JBD2_MAGIC: u32 = 0xC03B_3998;
+        const JBD2_BLOCKTYPE_DESCRIPTOR: u32 = 1;
+        const JBD2_BLOCKTYPE_COMMIT: u32 = 2;
+        const JBD2_BLOCKTYPE_SUPERBLOCK_V1: u32 = 3;
+        const JBD2_BLOCKTYPE_SUPERBLOCK_V2: u32 = 4;
+        const JBD2_BLOCKTYPE_REVOKE: u32 = 5;
+        const JBD2_COMPAT_CHECKSUM: u32 = 0x0000_0001;
+        const JBD2_INCOMPAT_64BIT: u32 = 0x0000_0002;
+        const JBD2_INCOMPAT_ASYNC_COMMIT: u32 = 0x0000_0004;
+        const JBD2_INCOMPAT_CSUM_V2: u32 = 0x0000_0008;
+        const JBD2_INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
+        const JBD2_INCOMPAT_FAST_COMMIT: u32 = 0x0000_0020;
+
+        let mut logical_map = std::collections::BTreeMap::new();
+        let block_count = sb.blocks_count.min(device.block_count());
+        let logical_limit = inode.size.div_ceil(u64::from(sb.block_size));
+        if inode.flags & ffs_types::EXT4_EXTENTS_FL != 0 {
+            Self::collect_ext4_journal_extent_map(
+                cx,
+                device,
+                &inode.extent_bytes,
+                0,
+                block_count,
+                logical_limit,
+                &mut logical_map,
+            )?;
+        } else {
+            Self::collect_ext4_journal_legacy_map(
+                cx,
+                device,
+                sb,
+                inode,
+                block_count,
+                logical_limit,
+                &mut logical_map,
+            )?;
+        }
+        journal_blocks.extend(logical_map.values().copied());
+        let Some(&jb0) = logical_map.get(&0) else {
+            return Ok(());
+        };
+        out.push((jb0, Ext4OwnedBlock::Jbd2Superblock));
+        let jb0_buf = match device.read_block(cx, BlockNumber(jb0)) {
+            Ok(buf) => buf,
+            Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+            Err(_) => return Ok(()),
+        };
+        let jb = jb0_buf.as_slice();
+        if jb.len() < 1024 {
+            return Ok(());
+        }
+        let be32 = |slice: &[u8], off: usize| -> Option<u32> {
+            let b = slice.get(off..off + 4)?;
+            Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let magic = be32(jb, 0).unwrap_or(0);
+        let block_type = be32(jb, 4).unwrap_or(0);
+        let jbd2_bs = be32(jb, 12).unwrap_or(0);
+        let max_len = be32(jb, 16).unwrap_or(0);
+        let first_log = be32(jb, 20).unwrap_or(1).max(1);
+        let start_seq = be32(jb, 24).unwrap_or(0);
+        let start_block = be32(jb, 28).unwrap_or(0);
+        let feat_compat = be32(jb, 36).unwrap_or(0);
+        let feat_incompat = be32(jb, 40).unwrap_or(0);
+        let num_fc_blocks = be32(jb, 84).unwrap_or(0);
+        if magic != JBD2_MAGIC
+            || (block_type != JBD2_BLOCKTYPE_SUPERBLOCK_V1
+                && block_type != JBD2_BLOCKTYPE_SUPERBLOCK_V2)
+            || jbd2_bs != sb.block_size
+            || max_len == 0
+            || start_block == 0
+        {
+            return Ok(());
+        }
+        let has_checksum = (feat_compat & JBD2_COMPAT_CHECKSUM) != 0
+            || (feat_incompat
+                & (JBD2_INCOMPAT_ASYNC_COMMIT | JBD2_INCOMPAT_CSUM_V2 | JBD2_INCOMPAT_CSUM_V3))
+                != 0;
+        if !has_checksum {
+            return Ok(());
+        }
+        let seed = if (feat_incompat & (JBD2_INCOMPAT_CSUM_V2 | JBD2_INCOMPAT_CSUM_V3)) != 0 {
+            !crc32c::crc32c_append(0, &jb[48..64])
+        } else {
+            0
+        };
+        let is_64bit = (feat_incompat & JBD2_INCOMPAT_64BIT) != 0;
+        let csum_v3 = (feat_incompat & JBD2_INCOMPAT_CSUM_V3) != 0;
+        let csum_v2 = !csum_v3 && (feat_incompat & JBD2_INCOMPAT_CSUM_V2) != 0;
+        let log_first = u64::from(first_log);
+        let mut log_last = u64::from(max_len).min(logical_limit);
+        if (feat_incompat & JBD2_INCOMPAT_FAST_COMMIT) != 0 && num_fc_blocks > 0 {
+            log_last = log_last.saturating_sub(u64::from(num_fc_blocks));
+        }
+        if log_first >= log_last || u64::from(start_block) < log_first {
+            return Ok(());
+        }
+        let span = log_last - log_first;
+        let wrap_idx = |raw: u64| -> u64 {
+            if raw < log_last {
+                raw
+            } else {
+                log_first + (raw - log_first) % span
+            }
+        };
+
+        let mut idx = u64::from(start_block);
+        let mut expected_seq = start_seq;
+        let mut scanned = 0_u64;
+        while scanned < span {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let cur_idx = wrap_idx(idx);
+            let Some(&phys) = logical_map.get(&cur_idx) else {
+                break;
+            };
+            let raw = match device.read_block(cx, BlockNumber(phys)) {
+                Ok(buf) => buf,
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(_) => break,
+            };
+            scanned = scanned.saturating_add(1);
+            let slice = raw.as_slice();
+            if be32(slice, 0) != Some(JBD2_MAGIC) {
+                break;
+            }
+            let Some(btype) = be32(slice, 4) else {
+                break;
+            };
+            let Some(seq) = be32(slice, 8) else {
+                break;
+            };
+            if seq != expected_seq {
+                break;
+            }
+            match btype {
+                JBD2_BLOCKTYPE_DESCRIPTOR => {
+                    out.push((phys, Ext4OwnedBlock::Jbd2DescriptorOrRevoke { seed }));
+                    if !Self::verify_jbd2_tail_checksum(slice, seed) {
+                        break;
+                    }
+                    let Some(tags) =
+                        Self::parse_jbd2_descriptor_tags(slice, is_64bit, csum_v2, csum_v3)
+                    else {
+                        break;
+                    };
+                    let tag_count = u64::try_from(tags.len()).unwrap_or(u64::MAX);
+                    if tag_count >= span {
+                        break;
+                    }
+                    for (tag_i, (flags, expected_csum, mask)) in tags.into_iter().enumerate() {
+                        if mask != 0 {
+                            let data_idx = wrap_idx(idx.saturating_add(1 + tag_i as u64));
+                            if let Some(&data_phys) = logical_map.get(&data_idx) {
+                                out.push((
+                                    data_phys,
+                                    Ext4OwnedBlock::Jbd2DataBlock {
+                                        seed,
+                                        sequence: seq,
+                                        escaped: (flags & 0x01) != 0,
+                                        expected_csum,
+                                        mask,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    idx = idx.saturating_add(1).saturating_add(tag_count);
+                    scanned = scanned.saturating_add(tag_count);
+                }
+                JBD2_BLOCKTYPE_REVOKE => {
+                    out.push((phys, Ext4OwnedBlock::Jbd2DescriptorOrRevoke { seed }));
+                    if !Self::verify_jbd2_tail_checksum(slice, seed) {
+                        break;
+                    }
+                    idx = idx.saturating_add(1);
+                }
+                JBD2_BLOCKTYPE_COMMIT => {
+                    out.push((phys, Ext4OwnedBlock::Jbd2Commit { seed }));
+                    if !Self::verify_jbd2_commit_checksum(slice, seed) {
+                        break;
+                    }
+                    expected_seq = expected_seq.wrapping_add(1);
+                    idx = idx.saturating_add(1);
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_ext4_journal_extent_map(
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        node: &[u8],
+        level: u32,
+        block_count: u64,
+        logical_limit: u64,
+        out: &mut std::collections::BTreeMap<u64, u64>,
+    ) -> Result<()> {
+        if level > 5 {
+            return Ok(());
+        }
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let Ok((_header, tree)) = ffs_ondisk::ext4::parse_extent_tree(node) else {
+            return Ok(());
+        };
+        match tree {
+            ffs_ondisk::ext4::ExtentTree::Leaf(extents) => {
+                for extent in extents {
+                    if extent.is_unwritten() {
+                        continue;
+                    }
+                    let len = u64::from(extent.actual_len());
+                    if len == 0
+                        || extent.physical_start == 0
+                        || extent.physical_start.saturating_add(len) > block_count
+                    {
+                        continue;
+                    }
+                    for n in 0..len {
+                        let logical = u64::from(extent.logical_block).saturating_add(n);
+                        if logical < logical_limit {
+                            out.insert(logical, extent.physical_start.saturating_add(n));
+                        }
+                    }
+                }
+            }
+            ffs_ondisk::ext4::ExtentTree::Index(indices) => {
+                for idx in indices {
+                    let child = idx.leaf_block;
+                    if child == 0 || child >= block_count {
+                        continue;
+                    }
+                    match device.read_block(cx, BlockNumber(child)) {
+                        Ok(buf) => {
+                            Self::collect_ext4_journal_extent_map(
+                                cx,
+                                device,
+                                buf.as_slice(),
+                                level + 1,
+                                block_count,
+                                logical_limit,
+                                out,
+                            )?;
+                        }
+                        Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_ext4_journal_legacy_map(
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        sb: &Ext4Superblock,
+        inode: &ffs_ondisk::Ext4Inode,
+        block_count: u64,
+        logical_limit: u64,
+        out: &mut std::collections::BTreeMap<u64, u64>,
+    ) -> Result<()> {
+        let read_pointer =
+            |raw: &[u8]| u64::from(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+        let valid_pointer = |block: u64| block != 0 && block < block_count;
+        let (inode_pointers, _) = inode.extent_bytes.as_chunks::<4>();
+        for (raw, logical) in inode_pointers.iter().take(12).zip(0_u64..) {
+            let block = read_pointer(raw);
+            if logical < logical_limit && valid_pointer(block) {
+                out.insert(logical, block);
+            }
+        }
+        let pointers_per_block = u64::from(sb.block_size / 4);
+        let mut stack = Vec::new();
+        let mut logical_start = 12_u64;
+        for (raw, depth) in inode_pointers.iter().skip(12).zip(1_u32..=3) {
+            let block = read_pointer(raw);
+            if logical_start < logical_limit && valid_pointer(block) {
+                stack.push((block, depth, logical_start));
+            }
+            let Some(span) = pointers_per_block.checked_pow(depth) else {
+                break;
+            };
+            let Some(next) = logical_start.checked_add(span) else {
+                break;
+            };
+            logical_start = next;
+        }
+        let mut visited = std::collections::HashSet::new();
+        while let Some((block, depth, logical_start)) = stack.pop() {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if !visited.insert(block) {
+                continue;
+            }
+            let bytes = match device.read_block(cx, BlockNumber(block)) {
+                Ok(bytes) => bytes,
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(_) => continue,
+            };
+            let child_span = pointers_per_block.pow(depth - 1);
+            let (pointers, _) = bytes.as_slice().as_chunks::<4>();
+            for (raw, index) in pointers.iter().zip(0..pointers_per_block) {
+                let logical = logical_start + index * child_span;
+                if logical >= logical_limit {
+                    break;
+                }
+                let child = read_pointer(raw);
+                if !valid_pointer(child) {
+                    continue;
+                }
+                if depth == 1 {
+                    out.insert(logical, child);
+                } else {
+                    stack.push((child, depth - 1, logical));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_jbd2_tail_checksum(block: &[u8], seed: u32) -> bool {
+        if block.len() < 16 {
+            return false;
+        }
+        let tail = block.len() - 4;
+        let stored = u32::from_be_bytes([
+            block[tail],
+            block[tail + 1],
+            block[tail + 2],
+            block[tail + 3],
+        ]);
+        let csum = crc32c::crc32c_append(!seed, &block[..tail]);
+        let computed = !crc32c::crc32c_append(csum, &[0; 4]);
+        stored == computed
+    }
+
+    fn verify_jbd2_commit_checksum(block: &[u8], seed: u32) -> bool {
+        if block.len() < 20 {
+            return false;
+        }
+        let stored = u32::from_be_bytes([block[16], block[17], block[18], block[19]]);
+        let csum = crc32c::crc32c_append(!seed, &block[..16]);
+        let csum = crc32c::crc32c_append(csum, &[0; 4]);
+        let computed = !crc32c::crc32c_append(csum, &block[20..]);
+        stored == computed
+    }
+
+    fn verify_jbd2_data_checksum(
+        block: &[u8],
+        seed: u32,
+        sequence: u32,
+        escaped: bool,
+        expected_csum: u32,
+        mask: u32,
+    ) -> bool {
+        if block.len() < 4 {
+            return false;
+        }
+        let seq_bytes = sequence.to_be_bytes();
+        let csum = crc32c::crc32c_append(!seed, &seq_bytes);
+        let computed = if escaped {
+            let csum = crc32c::crc32c_append(csum, &0xC03B_3998_u32.to_be_bytes());
+            !crc32c::crc32c_append(csum, &block[4..])
+        } else {
+            !crc32c::crc32c_append(csum, block)
+        };
+        (computed & mask) == (expected_csum & mask)
+    }
+
+    fn parse_jbd2_descriptor_tags(
+        block: &[u8],
+        is_64bit: bool,
+        csum_v2: bool,
+        csum_v3: bool,
+    ) -> Option<Vec<(u32, u32, u32)>> {
+        let base_size = if csum_v3 {
+            16_usize
+        } else if is_64bit {
+            12_usize
+        } else {
+            8_usize
+        };
+        let limit = block.len().checked_sub(4)?;
+        let mut offset = 12_usize;
+        let mut tags = Vec::new();
+        while offset.checked_add(base_size)? <= limit {
+            let (flags, csum, mask) = if csum_v3 {
+                let f = u32::from_be_bytes([
+                    block[offset + 4],
+                    block[offset + 5],
+                    block[offset + 6],
+                    block[offset + 7],
+                ]);
+                let c = u32::from_be_bytes([
+                    block[offset + 12],
+                    block[offset + 13],
+                    block[offset + 14],
+                    block[offset + 15],
+                ]);
+                (f, c, u32::MAX)
+            } else {
+                let f = u32::from(u16::from_be_bytes([block[offset + 6], block[offset + 7]]));
+                let c = if csum_v2 {
+                    u32::from(u16::from_be_bytes([block[offset + 4], block[offset + 5]]))
+                } else {
+                    0
+                };
+                (f, c, if csum_v2 { 0xFFFF } else { 0 })
+            };
+            let full_size = if (flags & 0x02) == 0 {
+                base_size.checked_add(16)?
+            } else {
+                base_size
+            };
+            if offset.checked_add(full_size)? > limit {
+                return None;
+            }
+            tags.push((flags, csum, mask));
+            if (flags & 0x08) != 0 {
+                return Some(tags);
+            }
+            offset = offset.checked_add(full_size)?;
+        }
+        None
     }
 
     /// Legacy ext2/ext3-style block maps remain valid on metadata_csum ext4.
@@ -1073,6 +1733,18 @@ impl BlockValidator for Ext4MetadataValidator {
     fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
         let sb_verdict = self.superblock.validate(block, data);
         let Some(kind) = self.blocks.get(&block.0) else {
+            if matches!(sb_verdict, BlockVerdict::Skip)
+                && let Some(expected_digest) = self.data_digests.get(&block.0)
+                && !self.is_rw_modified(block.0)
+            {
+                let actual = blake3::hash(data.as_slice());
+                if actual.as_bytes() != expected_digest {
+                    return Self::checksum_issue(format!(
+                        "ext4 source block BLAKE3 digest mismatch in block {block}"
+                    ));
+                }
+                return BlockVerdict::Clean;
+            }
             return sb_verdict;
         };
         let bytes = data.as_slice();
@@ -1108,17 +1780,21 @@ impl BlockValidator for Ext4MetadataValidator {
                 }
             }
             Ext4MetaBlock::BlockBitmap(gd) => {
-                match ffs_ondisk::ext4::verify_block_bitmap_checksum(
-                    bytes,
-                    seed,
-                    self.sb.clusters_per_group,
-                    gd,
-                    desc_size,
-                ) {
-                    Ok(()) => BlockVerdict::Clean,
-                    Err(_) => Self::checksum_issue(format!(
-                        "ext4 block bitmap checksum mismatch in block {block}"
-                    )),
+                if self.is_rw_modified(block.0) {
+                    BlockVerdict::Clean
+                } else {
+                    match ffs_ondisk::ext4::verify_block_bitmap_checksum(
+                        bytes,
+                        seed,
+                        self.sb.clusters_per_group,
+                        gd,
+                        desc_size,
+                    ) {
+                        Ok(()) => BlockVerdict::Clean,
+                        Err(_) => Self::checksum_issue(format!(
+                            "ext4 block bitmap checksum mismatch in block {block}"
+                        )),
+                    }
                 }
             }
             Ext4MetaBlock::InodeTable {
@@ -1309,18 +1985,70 @@ impl BlockValidator for Ext4MetadataValidator {
                     }
                 }
             }
-            Ext4MetaBlock::InodeBitmap(gd) => {
-                match ffs_ondisk::ext4::verify_inode_bitmap_checksum(
+            Ext4MetaBlock::Owned(Ext4OwnedBlock::Jbd2DescriptorOrRevoke { seed: j_seed }) => {
+                let magic_ok = bytes.get(..8).is_some_and(|h| {
+                    u32::from_be_bytes([h[0], h[1], h[2], h[3]]) == 0xC03B_3998
+                        && matches!(u32::from_be_bytes([h[4], h[5], h[6], h[7]]), 1 | 5)
+                });
+                if magic_ok && Self::verify_jbd2_tail_checksum(bytes, *j_seed) {
+                    BlockVerdict::Clean
+                } else {
+                    Self::checksum_issue(format!(
+                        "ext4 jbd2 descriptor/revoke checksum mismatch in block {block}"
+                    ))
+                }
+            }
+            Ext4MetaBlock::Owned(Ext4OwnedBlock::Jbd2Commit { seed: j_seed }) => {
+                let magic_ok = bytes.get(..8).is_some_and(|h| {
+                    u32::from_be_bytes([h[0], h[1], h[2], h[3]]) == 0xC03B_3998
+                        && u32::from_be_bytes([h[4], h[5], h[6], h[7]]) == 2
+                });
+                if magic_ok && Self::verify_jbd2_commit_checksum(bytes, *j_seed) {
+                    BlockVerdict::Clean
+                } else {
+                    Self::checksum_issue(format!(
+                        "ext4 jbd2 commit checksum mismatch in block {block}"
+                    ))
+                }
+            }
+            Ext4MetaBlock::Owned(Ext4OwnedBlock::Jbd2DataBlock {
+                seed: j_seed,
+                sequence,
+                escaped,
+                expected_csum,
+                mask,
+            }) => {
+                if Self::verify_jbd2_data_checksum(
                     bytes,
-                    seed,
-                    self.sb.inodes_per_group,
-                    gd,
-                    desc_size,
+                    *j_seed,
+                    *sequence,
+                    *escaped,
+                    *expected_csum,
+                    *mask,
                 ) {
-                    Ok(()) => BlockVerdict::Clean,
-                    Err(_) => Self::checksum_issue(format!(
-                        "ext4 inode bitmap checksum mismatch in block {block}"
-                    )),
+                    BlockVerdict::Clean
+                } else {
+                    Self::checksum_issue(format!(
+                        "ext4 jbd2 data block checksum mismatch in block {block} (seq {sequence})"
+                    ))
+                }
+            }
+            Ext4MetaBlock::InodeBitmap(gd) => {
+                if self.is_rw_modified(block.0) {
+                    BlockVerdict::Clean
+                } else {
+                    match ffs_ondisk::ext4::verify_inode_bitmap_checksum(
+                        bytes,
+                        seed,
+                        self.sb.inodes_per_group,
+                        gd,
+                        desc_size,
+                    ) {
+                        Ok(()) => BlockVerdict::Clean,
+                        Err(_) => Self::checksum_issue(format!(
+                            "ext4 inode bitmap checksum mismatch in block {block}"
+                        )),
+                    }
                 }
             }
         };
@@ -3642,5 +4370,293 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn source_block_digest_manifest_roundtrip_and_tamper_detection_bd_jufod() {
+        use crate::storage::{RepairGroupLayout, RepairGroupStorage, SourceBlockDigestManifest};
+        use crate::symbol::RepairGroupDescExt;
+
+        let cx = test_cx();
+        // 200 source blocks * 32B + 64B header = 6464B -> spans 2 validation blocks (4096B each).
+        let source_block_count = 200_u32;
+        let val_blocks =
+            SourceBlockDigestManifest::required_validation_blocks(source_block_count, 4096);
+        assert_eq!(val_blocks, 2);
+
+        let blocks_per_group = 220_u32;
+        let repair_blocks = 16_u32;
+        let dev = MemBlockDevice::new(4096, u64::from(blocks_per_group));
+        let sb_region = make_valid_ext4_superblock_region();
+        let mut block0 = vec![0_u8; 4096];
+        block0[ffs_types::EXT4_SUPERBLOCK_OFFSET
+            ..ffs_types::EXT4_SUPERBLOCK_OFFSET + sb_region.len()]
+            .copy_from_slice(&sb_region);
+        dev.write(BlockNumber(0), block0);
+        let sb = Ext4Superblock::parse_superblock_region(&sb_region).expect("parse sb");
+
+        for b in 1..source_block_count {
+            let mut payload = vec![0_u8; 4096];
+            payload[0..4].copy_from_slice(&b.to_le_bytes());
+            payload[100] = (b & 0xFF) as u8;
+            dev.write(BlockNumber(u64::from(b)), payload);
+        }
+
+        let layout = RepairGroupLayout::new(
+            ffs_types::GroupNumber(0),
+            BlockNumber(0),
+            blocks_per_group,
+            val_blocks,
+            repair_blocks,
+        )
+        .expect("layout");
+        let storage = RepairGroupStorage::new(&dev, layout);
+        let bootstrap = RepairGroupDescExt {
+            transfer_length: u64::from(source_block_count) * 4096,
+            symbol_size: 4096,
+            source_block_count: u16::try_from(source_block_count).expect("fits u16"),
+            sub_blocks: 1,
+            symbol_alignment: 4,
+            repair_start_block: layout.repair_start_block(),
+            repair_block_count: repair_blocks,
+            repair_generation: 0,
+            checksum: 0,
+        };
+        let dummy_symbols: Vec<(u32, Vec<u8>)> = (0..repair_blocks)
+            .map(|i| (source_block_count + i, vec![0x5A_u8; 4096]))
+            .collect();
+        storage
+            .write_source_digests(&cx, BlockNumber(0), source_block_count, 1)
+            .expect("write source digests");
+        storage
+            .initialize_raw_repair_symbols(&cx, &bootstrap, &dummy_symbols, 1)
+            .expect("init raw generation");
+
+        // 1. Round-trip verification across 2 validation blocks.
+        let read_back = storage
+            .read_source_digests_for_generation(&cx, BlockNumber(0), source_block_count, 1)
+            .expect("read digests")
+            .expect("manifest present");
+        assert_eq!(read_back.len(), source_block_count as usize);
+        assert!(
+            storage
+                .read_source_digests_for_generation(&cx, BlockNumber(0), source_block_count, 2)
+                .expect("wrong generation")
+                .is_none()
+        );
+
+        // 2. Validator detects 1-byte corruption in non-metadata source block 77.
+        let groups = vec![(BlockNumber(0), source_block_count, layout)];
+        let validator =
+            Ext4MetadataValidator::from_device_with_group_layouts(&cx, &dev, &sb, &groups, false)
+                .expect("validator with digests");
+        let clean_77 = dev.read_block(&cx, BlockNumber(77)).expect("read 77");
+        assert!(matches!(
+            validator.validate(BlockNumber(77), &clean_77),
+            BlockVerdict::Clean
+        ));
+        let mut bad_77 = clean_77.into_inner();
+        bad_77[512] ^= 0x80;
+        assert!(matches!(
+            validator.validate(BlockNumber(77), &BlockBuf::new(bad_77)),
+            BlockVerdict::Corrupt(_)
+        ));
+
+        // 3. Tampering with the second validation block fails MAC: scan mode skips,
+        // while enforce_all_digests (post-decode overlay) fails closed.
+        let val_second = BlockNumber(layout.validation_start_block().0 + 1);
+        let mut raw_val2 = dev
+            .read_block(&cx, val_second)
+            .expect("val block 2")
+            .into_inner();
+        raw_val2[16] ^= 0x01;
+        dev.write(val_second, raw_val2);
+        assert!(
+            storage
+                .read_source_digests_for_generation(&cx, BlockNumber(0), source_block_count, 1)
+                .expect("tampered scan read")
+                .is_none()
+        );
+        let overlay_err =
+            Ext4MetadataValidator::from_device_with_group_layouts(&cx, &dev, &sb, &groups, true)
+                .expect_err("tampered manifest must fail closed in post-decode overlay check");
+        assert!(
+            overlay_err.to_string().contains("source digest manifest"),
+            "unexpected error: {overlay_err}"
+        );
+    }
+
+    #[test]
+    fn ext4_jbd2_active_transaction_descriptor_commit_and_data_validation_bd_jufod() {
+        const JBD2_MAGIC: u32 = 0xC03B_3998;
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096, 64);
+        let sb_region = make_valid_ext4_superblock_region();
+        let sb = Ext4Superblock::parse_superblock_region(&sb_region).expect("superblock");
+
+        // Build journal inode mapping logical blocks 0..6 -> physical blocks 20..26.
+        let mut inode = ffs_ondisk::Ext4Inode::parse_from_bytes(&[0; 256]).expect("inode");
+        inode.mode = 0o100_600;
+        inode.flags = ffs_types::EXT4_EXTENTS_FL;
+        inode.size = 6 * 4096;
+        inode.extent_bytes[0..2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+        inode.extent_bytes[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        inode.extent_bytes[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        inode.extent_bytes[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        inode.extent_bytes[12..16].copy_from_slice(&0_u32.to_le_bytes());
+        inode.extent_bytes[16..18].copy_from_slice(&6_u16.to_le_bytes());
+        inode.extent_bytes[18..20].copy_from_slice(&0_u16.to_le_bytes());
+        inode.extent_bytes[20..24].copy_from_slice(&20_u32.to_le_bytes());
+
+        let j_uuid = [0xAB_u8; 16];
+        let j_seed = !crc32c::crc32c_append(0, &j_uuid);
+        let seq = 42_u32;
+
+        // Block 22: normal journaled data block.
+        let mut data_norm = vec![0x33_u8; 4096];
+        data_norm[0..4].copy_from_slice(&0x1122_3344_u32.to_be_bytes());
+        let csum_norm = {
+            let c = crc32c::crc32c_append(!j_seed, &seq.to_be_bytes());
+            !crc32c::crc32c_append(c, &data_norm)
+        };
+        dev.write(BlockNumber(22), data_norm);
+
+        // Block 23: escaped journaled data block (original started with JBD2_MAGIC,
+        // stored zeroed on disk at [0..4], checksummed over unescaped bytes).
+        let mut data_esc_orig = vec![0x77_u8; 4096];
+        data_esc_orig[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        let csum_esc = {
+            let c = crc32c::crc32c_append(!j_seed, &seq.to_be_bytes());
+            !crc32c::crc32c_append(c, &data_esc_orig)
+        };
+        let mut data_esc_disk = data_esc_orig;
+        data_esc_disk[0..4].fill(0);
+        dev.write(BlockNumber(23), data_esc_disk);
+
+        // Block 21 (ring slot 1): Descriptor block with 2 CsumV3 64-bit tags + tail CRC.
+        let mut desc = vec![0_u8; 4096];
+        desc[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        desc[4..8].copy_from_slice(&1_u32.to_be_bytes()); // DESCRIPTOR
+        desc[8..12].copy_from_slice(&seq.to_be_bytes());
+        // Tag 0 at offset 12 (32 bytes: 16B tag3 + 16B uuid): flags = 0
+        desc[12..16].copy_from_slice(&50_u32.to_be_bytes());
+        desc[16..20].copy_from_slice(&0_u32.to_be_bytes());
+        desc[24..28].copy_from_slice(&csum_norm.to_be_bytes());
+        desc[28..44].copy_from_slice(&j_uuid);
+        // Tag 1 at offset 44 (16 bytes: ESCAPED | SAME_UUID | LAST_TAG = 0x0B)
+        desc[44..48].copy_from_slice(&51_u32.to_be_bytes());
+        desc[48..52].copy_from_slice(&0x0B_u32.to_be_bytes());
+        desc[56..60].copy_from_slice(&csum_esc.to_be_bytes());
+        let desc_crc = !crc32c::crc32c_append(!j_seed, &desc[..4092]);
+        let desc_crc = !crc32c::crc32c_append(!desc_crc, &[0_u8; 4]);
+        desc[4092..4096].copy_from_slice(&desc_crc.to_be_bytes());
+        dev.write(BlockNumber(21), desc);
+
+        // Block 24 (ring slot 4): Revoke block (type 5) with tail CRC.
+        let mut revoke = vec![0_u8; 4096];
+        revoke[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        revoke[4..8].copy_from_slice(&5_u32.to_be_bytes()); // REVOKE
+        revoke[8..12].copy_from_slice(&seq.to_be_bytes());
+        revoke[12..16].copy_from_slice(&16_u32.to_be_bytes()); // r_count = header only
+        let rev_crc = !crc32c::crc32c_append(!j_seed, &revoke[..4092]);
+        let rev_crc = !crc32c::crc32c_append(!rev_crc, &[0_u8; 4]);
+        revoke[4092..4096].copy_from_slice(&rev_crc.to_be_bytes());
+        dev.write(BlockNumber(24), revoke);
+
+        // Block 25 (ring slot 5): Commit block (type 2) with commit CRC at [16..20].
+        let mut commit = vec![0_u8; 4096];
+        commit[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        commit[4..8].copy_from_slice(&2_u32.to_be_bytes()); // COMMIT
+        commit[8..12].copy_from_slice(&seq.to_be_bytes());
+        let com_crc = !crc32c::crc32c_append(!j_seed, &commit);
+        commit[16..20].copy_from_slice(&com_crc.to_be_bytes());
+        dev.write(BlockNumber(25), commit);
+
+        // Block 20 (logical 0): JBD2 superblock v2 with s_start = 1, CSUM_V3 | 64BIT.
+        let write_jsb = |s_start: u32| {
+            let mut jsb = vec![0_u8; 4096];
+            jsb[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+            jsb[4..8].copy_from_slice(&4_u32.to_be_bytes()); // SUPERBLOCK_V2
+            jsb[12..16].copy_from_slice(&4096_u32.to_be_bytes()); // s_blocksize
+            jsb[16..20].copy_from_slice(&6_u32.to_be_bytes()); // s_maxlen
+            jsb[20..24].copy_from_slice(&1_u32.to_be_bytes()); // s_first
+            jsb[24..28].copy_from_slice(&seq.to_be_bytes()); // s_sequence
+            jsb[28..32].copy_from_slice(&s_start.to_be_bytes()); // s_start
+            jsb[40..44].copy_from_slice(&(0x10_u32 | 0x02_u32).to_be_bytes()); // CSUM_V3 | 64BIT
+            jsb[48..64].copy_from_slice(&j_uuid);
+            jsb[0x50] = 4; // JBD2_CRC32C_CHKSUM
+            let csum = ffs_ondisk::ext4::ext4_chksum(!0, &jsb[..1024]);
+            jsb[0xFC..0x100].copy_from_slice(&csum.to_be_bytes());
+            dev.write(BlockNumber(20), jsb);
+        };
+        write_jsb(1);
+
+        let mut j_blocks = std::collections::HashSet::new();
+        let mut owned = Vec::new();
+        Ext4MetadataValidator::collect_ext4_journal_owned(
+            &cx,
+            &dev,
+            &sb,
+            &inode,
+            &mut j_blocks,
+            &mut owned,
+        )
+        .expect("collect journal owned");
+        assert_eq!(j_blocks.len(), 6);
+
+        let mut validator = Ext4MetadataValidator::new(&sb, &[]);
+        validator.add_owned_blocks([(20_u64, Ext4OwnedBlock::Jbd2Superblock)]);
+        validator.add_owned_blocks(owned);
+
+        for blk in 20..=25_u64 {
+            let clean = dev
+                .read_block(&cx, BlockNumber(blk))
+                .expect("read jbd2 block");
+            assert!(
+                matches!(
+                    validator.validate(BlockNumber(blk), &clean),
+                    BlockVerdict::Clean
+                ),
+                "healthy JBD2 block {blk} must validate Clean"
+            );
+            let mut damaged = clean.into_inner();
+            damaged[32] ^= 0x01;
+            assert!(
+                matches!(
+                    validator.validate(BlockNumber(blk), &BlockBuf::new(damaged)),
+                    BlockVerdict::Corrupt(_)
+                ),
+                "corrupted JBD2 block {blk} must be detected"
+            );
+        }
+
+        // Clean inactive journal (s_start = 0) must not flag stale ring blocks 21..=25.
+        write_jsb(0);
+        let mut bad_ring = dev
+            .read_block(&cx, BlockNumber(22))
+            .expect("read 22")
+            .into_inner();
+        bad_ring[10] ^= 0xFF;
+        dev.write(BlockNumber(22), bad_ring);
+        let mut inactive_owned = Vec::new();
+        let mut inactive_set = std::collections::HashSet::new();
+        Ext4MetadataValidator::collect_ext4_journal_owned(
+            &cx,
+            &dev,
+            &sb,
+            &inode,
+            &mut inactive_set,
+            &mut inactive_owned,
+        )
+        .expect("collect inactive journal");
+        assert_eq!(
+            inactive_owned.len(),
+            1,
+            "inactive ring (s_start=0) owns only Jbd2Superblock, no active tx blocks"
+        );
+        assert!(matches!(
+            inactive_owned[0],
+            (20, Ext4OwnedBlock::Jbd2Superblock)
+        ));
     }
 }

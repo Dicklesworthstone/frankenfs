@@ -8686,17 +8686,92 @@ fn mount_background_repair_symbol_count(
         .unwrap_or(0)
 }
 
+#[derive(Debug)]
+struct RwScrubWriteTracker {
+    shards: [std::sync::RwLock<std::collections::HashSet<u64>>; 64],
+}
+
+impl RwScrubWriteTracker {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| {
+                std::sync::RwLock::new(std::collections::HashSet::new())
+            }),
+        }
+    }
+
+    fn record_block(&self, block: u64) {
+        let shard = &self.shards[(block as usize) & 63];
+        {
+            let read_guard = shard
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if read_guard.contains(&block) {
+                return;
+            }
+        }
+        shard
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(block);
+    }
+}
+
+impl ffs_core::RepairFlushLifecycle for RwScrubWriteTracker {
+    fn on_flush_committed(&self, _cx: &Cx, write_blocks: &[BlockNumber]) -> ffs_error::Result<()> {
+        for block in write_blocks {
+            self.record_block(block.0);
+        }
+        Ok(())
+    }
+}
+
+impl ffs_repair::scrub::RwModifiedLookup for RwScrubWriteTracker {
+    fn is_modified(&self, block: u64) -> bool {
+        self.shards[(block as usize) & 63]
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&block)
+    }
+}
+
+struct SharedPinnedScrubDevice(Arc<ffs_core::PinnedMvccScrubDevice>);
+
+impl BlockDevice for SharedPinnedScrubDevice {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> ffs_error::Result<ffs_block::BlockBuf> {
+        self.0.read_block(cx, block)
+    }
+
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> ffs_error::Result<()> {
+        self.0.write_block(cx, block, data)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.0.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.0.block_count()
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        self.0.sync(cx)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MountBackgroundScrubThreadConfig<'a> {
     interval: Duration,
     ledger_path: Option<&'a Path>,
     repair_writes_enabled: bool,
     mounted_repair_writeback: Option<Arc<OpenFs>>,
+    mounted_rw_scrub: Option<(Arc<OpenFs>, Arc<RwScrubWriteTracker>)>,
     pipeline_metrics: ffs_repair::pipeline::RepairPipelineMetrics,
     operation_id: &'a str,
     scenario_id: &'a str,
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_mount_background_scrub_daemon(
     cx: &Cx,
     image_path: &Path,
@@ -8727,23 +8802,78 @@ fn run_mount_background_scrub_daemon(
             plan.block_size
         )
     })?;
-    let validator_from_view =
-        |cx: &Cx, view: &dyn BlockDevice| -> ffs_error::Result<Box<dyn BlockValidator>> {
-            match &plan.flavor {
-                FsFlavor::Ext4(sb) if plan.static_metadata => Ok(Box::new(
-                    ffs_repair::scrub::Ext4MetadataValidator::from_device(cx, view, sb)?,
-                )),
-                _ => Ok(scrub_validator(&plan.flavor, plan.block_size)),
-            }
+    type MountedRwScrubCtx = (
+        Arc<ffs_core::PinnedMvccScrubDevice>,
+        Arc<RwScrubWriteTracker>,
+    );
+    let (scan_dev, rw_scrub_ctx): (Box<dyn BlockDevice>, Option<MountedRwScrubCtx>) =
+        if let Some((open_fs, tracker)) = config.mounted_rw_scrub {
+            let tracker_cb = Arc::clone(&tracker);
+            let pinned = Arc::new(
+                open_fs
+                    .pinned_scrub_device(Box::new(block_dev))
+                    .with_mvcc_hit_callback(Arc::new(move |b| tracker_cb.record_block(b))),
+            );
+            (
+                Box::new(SharedPinnedScrubDevice(Arc::clone(&pinned))),
+                Some((pinned, tracker)),
+            )
+        } else {
+            (Box::new(block_dev), None)
         };
-    let validator = validator_from_view(cx, &block_dev)
+    let ext4_group_layouts: Vec<(BlockNumber, u32, ffs_repair::storage::RepairGroupLayout)> = plan
+        .groups
+        .iter()
+        .map(|g| (g.source_first_block, g.source_block_count, g.layout))
+        .collect();
+    let scan_dev_data_addr = std::ptr::from_ref::<dyn BlockDevice>(scan_dev.as_ref())
+        .cast::<()>()
+        .addr();
+    let validator_from_view = |cx: &Cx,
+                               view: &dyn BlockDevice|
+     -> ffs_error::Result<Box<dyn BlockValidator>> {
+        match &plan.flavor {
+            FsFlavor::Ext4(sb) if plan.static_metadata => {
+                let is_overlay = std::ptr::from_ref::<dyn BlockDevice>(view)
+                    .cast::<()>()
+                    .addr()
+                    != scan_dev_data_addr;
+                Ok(Box::new(
+                    ffs_repair::scrub::Ext4MetadataValidator::from_device_with_group_layouts(
+                        cx,
+                        view,
+                        sb,
+                        &ext4_group_layouts,
+                        is_overlay,
+                    )?,
+                ))
+            }
+            FsFlavor::Ext4(sb) if rw_scrub_ctx.is_some() => {
+                let (pinned, tracker) = rw_scrub_ctx.as_ref().expect("checked is_some");
+                pinned.rotate_snapshot();
+                Ok(Box::new(
+                        ffs_repair::scrub::Ext4MetadataValidator::from_device_with_group_layouts_and_rw_live(
+                            cx,
+                            view,
+                            sb,
+                            &ext4_group_layouts,
+                            false,
+                            Some(Arc::clone(tracker) as Arc<dyn ffs_repair::scrub::RwModifiedLookup>),
+                        )?,
+                    ))
+            }
+            _ => Ok(scrub_validator(&plan.flavor, plan.block_size)),
+        }
+    };
+    let validator = validator_from_view(cx, scan_dev.as_ref())
         .context("failed to construct metadata validation for background scrub")?;
-    let rebuild_ext4_metadata = plan.static_metadata && matches!(&plan.flavor, FsFlavor::Ext4(_));
+    let rebuild_ext4_metadata = matches!(&plan.flavor, FsFlavor::Ext4(_))
+        && (plan.static_metadata || rw_scrub_ctx.is_some());
     let ledger = open_mount_background_scrub_ledger(config.ledger_path)?;
     let repair_symbol_count =
         mount_background_repair_symbol_count(&plan.groups, repair_writes_enabled);
     let mut pipeline = ScrubWithRecovery::new(
-        &block_dev,
+        scan_dev.as_ref(),
         validator.as_ref(),
         plan.fs_uuid,
         plan.groups,
@@ -8784,6 +8914,7 @@ fn run_mount_background_scrub_daemon(
     daemon.run_until_cancelled(cx).map_err(anyhow::Error::new)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_mount_background_scrub(
     cx: &Cx,
     runtime: &Arc<asupersync::runtime::Runtime>,
@@ -8791,6 +8922,7 @@ fn start_mount_background_scrub(
     open_fs: &OpenFs,
     config: &MountBackgroundScrubConfig,
     mounted_repair_writeback: Option<Arc<OpenFs>>,
+    mounted_rw_scrub: Option<(Arc<OpenFs>, Arc<RwScrubWriteTracker>)>,
     (operation_id, scenario_id): (&str, &str),
 ) -> Result<Option<MountBackgroundScrubGuard>> {
     if !config.enabled {
@@ -8875,6 +9007,7 @@ fn start_mount_background_scrub(
                 ledger_path: ledger_path.as_deref(),
                 repair_writes_enabled,
                 mounted_repair_writeback,
+                mounted_rw_scrub,
                 pipeline_metrics: thread_pipeline_metrics,
                 operation_id: &thread_operation_id,
                 scenario_id: &thread_scenario_id,
@@ -9258,10 +9391,18 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             bail!("FFS_BTRFS_DIRTY_BYTES_THRESHOLD must be valid UTF-8");
         }
     }
+    let rw_scrub_tracker = (options.read_write && options.background_scrub.enabled).then(|| {
+        let tracker = Arc::new(RwScrubWriteTracker::new());
+        open_fs.attach_repair_flush_lifecycle(
+            Arc::clone(&tracker) as Arc<dyn ffs_core::RepairFlushLifecycle>
+        );
+        tracker
+    });
     let open_fs = Arc::new(open_fs);
     let mounted_repair_writeback = (options.read_write
         && options.background_scrub.repair_writes_enabled)
         .then(|| Arc::clone(&open_fs));
+    let mounted_rw_scrub = rw_scrub_tracker.map(|tracker| (Arc::clone(&open_fs), tracker));
 
     let background_runtime = mount_background_runtime()?;
     let background_cx = background_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
@@ -9272,6 +9413,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         open_fs.as_ref(),
         &options.background_scrub,
         mounted_repair_writeback,
+        mounted_rw_scrub,
         (&operation_id, scenario_id),
     )?;
     let mut periodic_commit_guard = options
@@ -9680,11 +9822,11 @@ fn collect_ext4_extent_nodes(
     }
 }
 
-/// The ext4 validator for an image nothing is mutating (`ffs scrub`, `ffs
-/// fsck`, `ffs repair`): descriptor and bitmap checksums are authoritative
-/// there, so everything the image checksums is verified, not just the
-/// superblock (bd-jufod).
-pub fn offline_ext4_scrub_validator(
+/// Metadata-only ext4 validator (`bd-jufod`): validates all ext4 metadata
+/// checksums (superblock, GDT, bitmaps, inode tables, extent nodes,
+/// directories, xattrs, JBD2) without enforcing prior-generation `FFSCDG01`
+/// file-data digests during explicit `--rebuild-symbols`.
+pub fn offline_ext4_metadata_only_validator(
     cx: &Cx,
     path: &Path,
     block_dev: &dyn BlockDevice,
@@ -9692,6 +9834,55 @@ pub fn offline_ext4_scrub_validator(
 ) -> Result<Box<dyn BlockValidator>> {
     let mut validator = ffs_repair::scrub::Ext4MetadataValidator::from_device(cx, block_dev, sb)
         .context("failed to read ext4 group descriptors for scrub")?;
+    // Inode-owned metadata needs an inode walk; an image that cannot be
+    // opened still gets the fixed-location checks.
+    if let Ok(fs) = OpenFs::open_with_options(
+        cx,
+        path,
+        &OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            skip_validation: true,
+            ..OpenOptions::default()
+        },
+    ) {
+        validator.add_owned_blocks(ext4_inode_owned_blocks(cx, &fs));
+    }
+    Ok(Box::new(validator))
+}
+
+/// The ext4 validator for an image nothing is mutating (`ffs scrub`, `ffs
+/// fsck`, `ffs repair`): descriptor, bitmap, inode-owned, JBD2, and
+/// generation-bound `FFSCDG01` source-block BLAKE3 digests are authoritative
+/// there, so both metadata and protected data blocks are verified (bd-jufod).
+pub fn offline_ext4_scrub_validator(
+    cx: &Cx,
+    path: &Path,
+    block_dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+) -> Result<Box<dyn BlockValidator>> {
+    let group_layouts: Vec<(BlockNumber, u32, ffs_repair::storage::RepairGroupLayout)> =
+        build_ext4_repair_group_specs(sb)
+            .map(|specs| {
+                specs
+                    .into_iter()
+                    .map(|spec| {
+                        (
+                            spec.source_first_block,
+                            spec.source_block_count,
+                            spec.layout,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    let mut validator = ffs_repair::scrub::Ext4MetadataValidator::from_device_with_group_layouts(
+        cx,
+        block_dev,
+        sb,
+        &group_layouts,
+        false,
+    )
+    .context("failed to read ext4 group descriptors for scrub")?;
     // Inode-owned metadata needs an inode walk; an image that cannot be
     // opened still gets the fixed-location checks.
     if let Ok(fs) = OpenFs::open_with_options(
@@ -15406,6 +15597,7 @@ mod tests {
                 &fs,
                 &config,
                 None,
+                None,
                 ("seed-write-admission", "bd-hk5w3"),
             )
             .err()
@@ -15776,6 +15968,7 @@ mod tests {
             &fs,
             &cfg,
             None,
+            None,
             ("unsafe-plan", "bd-plamw"),
         )
         .err()
@@ -15849,6 +16042,7 @@ mod tests {
                 open_fs.as_ref(),
                 &cfg,
                 Some(Arc::clone(&open_fs)),
+                None,
                 (
                     "mount-bg-repair-rw-test",
                     "cli_mount_background_repair_rw_refused",
@@ -16064,6 +16258,7 @@ mod tests {
                 &path,
                 &open_fs,
                 &cfg,
+                None,
                 None,
                 ("mount-bg-scrub-test", "cli_mount_background_scrub_ro"),
             )

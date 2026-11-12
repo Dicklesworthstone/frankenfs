@@ -2152,6 +2152,15 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             .collect();
         let symbols_generated = u32::try_from(symbols.len()).unwrap_or(u32::MAX);
 
+        // Refresh generation-bound BLAKE3 source-block digests (when validation
+        // blocks are reserved) before sealing parity + descriptor at `new_gen`.
+        storage.write_source_digests(
+            cx,
+            group_cfg.source_first_block,
+            group_cfg.source_block_count,
+            new_gen,
+        )?;
+
         // Storage publishes and syncs the descriptor together with the symbols.
         // A second descriptor write would introduce a new failure after that
         // durable boundary, incorrectly leaving a committed refresh dirty.

@@ -12,7 +12,9 @@ use ffs_repair::codec::{EncodedGroup, encode_group};
 use ffs_repair::ownership::{AcquireResult, OwnershipGuard, RepairOwnership};
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryOutcome};
 use ffs_repair::scrub::{BlockValidator, Ext4MetadataValidator, ScrubReport, Scrubber, Severity};
-use ffs_repair::storage::{REPAIR_DESC_SLOT_COUNT, RepairGroupLayout, RepairGroupStorage};
+use ffs_repair::storage::{
+    REPAIR_DESC_SLOT_COUNT, RepairGroupLayout, RepairGroupStorage, SourceBlockDigestManifest,
+};
 use ffs_repair::symbol::RepairGroupDescExt;
 use ffs_types::{
     BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset, GroupNumber, MountMode,
@@ -30,7 +32,7 @@ use crate::{
     RepairActionOutput, RepairCommandOptions, RepairFlags, RepairOutput, RepairScopeOutput,
     RepairScrubOutput, choose_btrfs_scrub_block_size, cli_cx, count_blocks_at_severity_or_higher,
     ext4_appears_clean_state, ext4_group_scrub_scope, ext4_recovery_detail, filesystem_name,
-    offline_ext4_scrub_validator,
+    offline_ext4_metadata_only_validator, offline_ext4_scrub_validator,
     repair_btrfs_parsers::{parse_btrfs_block_group_item, parse_btrfs_root_item_bytenr},
     run_ext4_mount_recovery, scrub_validator,
 };
@@ -1803,7 +1805,15 @@ pub fn build_ext4_repair_group_spec(
     let repair_block_count = desired_repair
         .min(source_and_repair_budget.saturating_sub(1))
         .max(1);
-    let source_block_count = source_and_repair_budget.saturating_sub(repair_block_count);
+    let remaining = source_and_repair_budget.saturating_sub(repair_block_count);
+    let desired_val =
+        SourceBlockDigestManifest::required_validation_blocks(remaining, sb.block_size);
+    let (validation_block_count, source_block_count) = if desired_val > 0 && desired_val < remaining
+    {
+        (desired_val, remaining - desired_val)
+    } else {
+        (DEFAULT_REPAIR_VALIDATION_BLOCK_COUNT, remaining)
+    };
     if source_block_count == 0 {
         bail!(
             "ext4 group {group} has no source payload blocks after reserving repair metadata \
@@ -1815,7 +1825,7 @@ pub fn build_ext4_repair_group_spec(
         GroupNumber(group),
         scrub_start,
         blocks_per_group,
-        DEFAULT_REPAIR_VALIDATION_BLOCK_COUNT,
+        validation_block_count,
         repair_block_count,
     )?;
 
@@ -2016,6 +2026,26 @@ pub fn scrub_ext4_groups_for_repair(
     max_threads: Option<u32>,
     limitations: &mut Vec<String>,
 ) -> Result<ScrubReport> {
+    scrub_ext4_groups_for_repair_with_mode(
+        path,
+        flavor,
+        specs,
+        groups,
+        max_threads,
+        false,
+        limitations,
+    )
+}
+
+fn scrub_ext4_groups_for_repair_with_mode(
+    path: &PathBuf,
+    flavor: &FsFlavor,
+    specs: &[Ext4RepairGroupSpec],
+    groups: &[u32],
+    max_threads: Option<u32>,
+    metadata_only: bool,
+    limitations: &mut Vec<String>,
+) -> Result<ScrubReport> {
     if groups.is_empty() {
         return Ok(ScrubReport {
             findings: Vec::new(),
@@ -2031,13 +2061,17 @@ pub fn scrub_ext4_groups_for_repair(
     let block_size = sb.block_size;
     // bd-jufod: repair detects with the same validator as `ffs scrub`, built
     // once per pass from the image as it is now (the post-repair verification
-    // pass calls this again and so sees the repaired descriptors).
+    // pass calls this again and so sees the repaired descriptors and digests).
     let validator = {
         let byte_dev = FileByteDevice::open_read_only(path)
             .with_context(|| format!("failed to open image: {}", path.display()))?;
         let block_dev = ByteBlockDevice::new(byte_dev, block_size)
             .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
-        offline_ext4_scrub_validator(&cli_cx(), path, &block_dev, sb)?
+        if metadata_only {
+            offline_ext4_metadata_only_validator(&cli_cx(), path, &block_dev, sb)?
+        } else {
+            offline_ext4_scrub_validator(&cli_cx(), path, &block_dev, sb)?
+        }
     };
 
     let mut reports = Vec::with_capacity(groups.len());
@@ -2152,13 +2186,32 @@ pub fn recover_ext4_corrupt_blocks(
     let block_size = sb.block_size;
     let cx = cli_cx();
     // bd-jufod: every decoded block must pass the image's own metadata
-    // checksums before it is written. The validator is built over the image
-    // as it would be after the writeback, so a repaired descriptor/inode-table
-    // block and the bitmaps or inode-owned blocks (extent/dir/xattr/JBD2) it
+    // checksums and generation-bound FFSCDG01 source digests before it is
+    // written. The validator is built over the image as it would be after the
+    // writeback, so a repaired descriptor/inode-table block and the bitmaps,
+    // inode-owned blocks (extent/dir/xattr/JBD2), or file data blocks it
     // describes are judged together.
+    let group_layouts: Vec<(BlockNumber, u32, RepairGroupLayout)> = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.source_first_block,
+                spec.source_block_count,
+                spec.layout,
+            )
+        })
+        .collect();
     let validator_over_view =
         |cx: &Cx, view: &dyn BlockDevice| -> ffs_error::Result<Box<dyn BlockValidator>> {
-            Ok(Box::new(Ext4MetadataValidator::from_device(cx, view, sb)?))
+            Ok(Box::new(
+                Ext4MetadataValidator::from_device_with_group_layouts(
+                    cx,
+                    view,
+                    sb,
+                    &group_layouts,
+                    true,
+                )?,
+            ))
         };
     let byte_dev = FileByteDevice::open_read_write(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
@@ -2621,11 +2674,13 @@ fn publish_rebuilt_symbols(
     if pristine {
         storage.write_group_desc_ext(cx, &bootstrap)?;
     }
+    let source_block_count = encoded.source_block_count;
     let symbols: Vec<_> = encoded
         .repair_symbols
         .into_iter()
         .map(|symbol| (symbol.esi, symbol.data))
         .collect();
+    storage.write_source_digests(cx, layout.group_start, source_block_count, next)?;
     storage.write_repair_symbols(cx, &symbols, next)?;
     Ok(())
 }
@@ -2734,7 +2789,7 @@ pub fn rebuild_ext4_repair_symbols(
     let sb = tail_fs
         .ext4_superblock()
         .context("ext4 repair rebuild requires an ext4 image")?;
-    let validator = offline_ext4_scrub_validator(&cx, path, &block_dev, sb)?;
+    let validator = offline_ext4_metadata_only_validator(&cx, path, &block_dev, sb)?;
     let mut rebuilt_groups = 0_u64;
     let mut failed_groups = 0_u64;
     for spec in admitted {
@@ -3061,12 +3116,13 @@ pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Res
                 .copied()
                 .filter(|spec| selected_set.contains(&spec.group))
                 .collect();
-            let mut report = scrub_ext4_groups_for_repair(
+            let mut report = scrub_ext4_groups_for_repair_with_mode(
                 path,
                 &flavor,
                 &specs,
                 &selected_groups,
                 options.max_threads,
+                rebuild_symbols_requested,
                 &mut limitations,
             )
             .context("failed to scrub ext4 image")?;

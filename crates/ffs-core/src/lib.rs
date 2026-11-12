@@ -6416,6 +6416,76 @@ impl BlockDevice for RegisteredSnapshotBlockAdapter<'_> {
     }
 }
 
+/// Registered MVCC snapshot view over an uncached disk `BlockDevice` for
+/// RW mounted background scrub (`bd-jufod`).
+///
+/// Serves blocks visible in `OpenFs`'s MVCC store at a registered atomic
+/// [`Snapshot`] (preventing chain eviction/pruning of the pinned view across
+/// validator discovery and block scanning) while reading untouched blocks
+/// directly from `disk_dev` (bypassing `ext4_base_block_cache` so on-disk
+/// bitrot is never masked by cached reads).
+pub struct PinnedMvccScrubDevice {
+    open_fs: Arc<OpenFs>,
+    disk_dev: Box<dyn BlockDevice>,
+    pinned_snapshot: Mutex<Snapshot>,
+    on_mvcc_hit: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+impl PinnedMvccScrubDevice {
+    /// Register a callback invoked whenever `read_block` resolves a block from
+    /// the in-memory MVCC store at the pinned snapshot (`bd-jufod`).
+    #[must_use]
+    pub fn with_mvcc_hit_callback(mut self, cb: Arc<dyn Fn(u64) + Send + Sync>) -> Self {
+        self.on_mvcc_hit = Some(cb);
+        self
+    }
+
+    /// Advance the pinned MVCC snapshot to `current_snapshot()`, releasing the
+    /// previously pinned snapshot after registering the new one.
+    pub fn rotate_snapshot(&self) {
+        let mut guard = self.pinned_snapshot.lock();
+        let next = self.open_fs.mvcc_store.register_current_snapshot();
+        let prev = std::mem::replace(&mut *guard, next);
+        let _ = self.open_fs.mvcc_store.release_snapshot(prev);
+    }
+}
+
+impl Drop for PinnedMvccScrubDevice {
+    fn drop(&mut self) {
+        let snap = *self.pinned_snapshot.lock();
+        let _ = self.open_fs.mvcc_store.release_snapshot(snap);
+    }
+}
+
+impl BlockDevice for PinnedMvccScrubDevice {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
+        let snap = *self.pinned_snapshot.lock();
+        if let Some(buf) = self.open_fs.mvcc_store.read_visible_block_buf(block, snap) {
+            if let Some(ref cb) = self.on_mvcc_hit {
+                cb(block.0);
+            }
+            return Ok(buf);
+        }
+        self.disk_dev.read_block(cx, block)
+    }
+
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<(), FfsError> {
+        self.disk_dev.write_block(cx, block, data)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.disk_dev.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.disk_dev.block_count()
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
+        self.disk_dev.sync(cx)
+    }
+}
+
 /// Runtime effects of an inode retirement, kept private until its namespace
 /// transaction commits. Dropping this value aborts the sharded counter update.
 struct Ext4StagedInodeRetirement<'a> {
@@ -12870,6 +12940,23 @@ impl OpenFs {
             "mvcc_snapshot_acquired"
         );
         snap
+    }
+
+    /// Construct a [`PinnedMvccScrubDevice`] reading MVCC-visible blocks at a
+    /// registered atomic snapshot and falling back to uncached `disk_dev`
+    /// (`bd-jufod`).
+    #[must_use]
+    pub fn pinned_scrub_device(
+        self: &Arc<Self>,
+        disk_dev: Box<dyn BlockDevice>,
+    ) -> PinnedMvccScrubDevice {
+        let snap = self.mvcc_store.register_current_snapshot();
+        PinnedMvccScrubDevice {
+            open_fs: Arc::clone(self),
+            disk_dev,
+            pinned_snapshot: Mutex::new(snap),
+            on_mvcc_hit: None,
+        }
     }
 
     /// Begin a new MVCC transaction.
