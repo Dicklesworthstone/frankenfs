@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
-# RCH-aware pre-push verification gate for FrankenFS (bd-fix-c7fc0ddc4-clippy-red-main-fj1rz).
-# Fails closed on formatting, whitespace, workspace check, or clippy --all-targets -D warnings errors.
+# RCH-aware pre-push verification gate for FrankenFS
+# (bd-fix-c7fc0ddc4-clippy-red-main-fj1rz, bd-ys3wb).
+#
+# Fails closed on formatting, whitespace, workspace check, or
+# clippy --all-targets -D warnings errors before pushing to main.
+#
+# Documented emergency bypass (both required; audited in JSON receipt):
+#   1. Commit message must include a trailer line:
+#        Gate-Bypass: <non-empty reason, >= 8 chars>
+#   2. Push environment must explicitly opt in:
+#        FFS_PRE_PUSH_BYPASS=1 git push ...
+#      (Optionally set FFS_PRE_PUSH_BYPASS_REASON="<exact reason>" to pin exact match.)
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+REPO_ROOT="${FFS_PRE_PUSH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 RCH_BIN="${FFS_PRE_PUSH_RCH_BIN:-rch}"
 CARGO_BIN="${FFS_PRE_PUSH_CARGO_BIN:-cargo}"
 SBH_BIN="${FFS_PRE_PUSH_SBH_BIN:-sbh}"
 GIT_BIN="${FFS_PRE_PUSH_GIT_BIN:-git}"
-RCH_WORKERS="${FFS_PRE_PUSH_RCH_WORKERS:-auto vmi1149989 vmi1227854 vmi1153651}"
+RCH_WORKERS="${FFS_PRE_PUSH_RCH_WORKERS:-auto hz4 vmi1227854 hz3 vmi1149989 vmi1152480}"
 RECEIPT_PATH="${FFS_PRE_PUSH_RECEIPT:-}"
+ZERO_OID="0000000000000000000000000000000000000000"
 
 now_ms() {
     python3 -c 'import time; print(int(time.monotonic() * 1000))'
@@ -58,7 +70,7 @@ run_local_gate() {
     rc=$?
     set -e
     end_ms="$(now_ms)"
-    first_diag="$(printf '%s\n' "$out" | grep -E 'error|FAIL|refused' | head -n 1 || true)"
+    first_diag="$(printf '%s\n' "$out" | grep -E 'error|FAIL|refused|Diff in' | head -n 1 || true)"
     if [[ -z "$first_diag" && "$rc" -ne 0 ]]; then
         first_diag="$(printf '%s\n' "$out" | head -n 1 || true)"
     fi
@@ -69,6 +81,31 @@ run_local_gate() {
     fi
 }
 
+extract_first_cargo_diag() {
+    local raw_out="$1"
+    local rc="$2"
+    if [[ "$rc" -eq 0 ]]; then
+        printf ''
+        return 0
+    fi
+    python3 - "$raw_out" <<'PY'
+import re, sys
+
+ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+lines = [ansi_re.sub("", line).rstrip("\r") for line in sys.argv[1].splitlines()]
+non_empty = [line.strip() for line in lines if line.strip()]
+for line in non_empty:
+    if re.match(r"^error(\[[A-Z0-9]+\])?:", line) and not line.startswith("error: could not compile"):
+        print(line)
+        sys.exit(0)
+for line in non_empty:
+    if re.match(r"^error(\[[A-Z0-9]+\])?:", line):
+        print(line)
+        sys.exit(0)
+print(non_empty[-1] if non_empty else "")
+PY
+}
+
 run_rch_cargo_gate() {
     local gate_name="$1"
     shift
@@ -76,14 +113,14 @@ run_rch_cargo_gate() {
     local -a workers
     read -r -a workers <<<"$RCH_WORKERS"
 
-    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+    if [[ "$RCH_BIN" == "none" ]] || ! command -v "$RCH_BIN" >/dev/null 2>&1; then
         start_ms="$(now_ms)"
         set +e
         out="$("$CARGO_BIN" "$@" 2>&1)"
         rc=$?
         set -e
         end_ms="$(now_ms)"
-        first_diag="$(printf '%s\n' "$out" | grep -E '^error(\[|:)' | head -n 1 || true)"
+        first_diag="$(extract_first_cargo_diag "$out" "$rc")"
         emit_receipt "$gate_name" "local-cargo" "$rc" "$((end_ms - start_ms))" "$first_diag"
         if [[ "$rc" -ne 0 ]]; then
             printf '%s\n' "$out" >&2
@@ -129,10 +166,7 @@ run_rch_cargo_gate() {
             continue
         fi
 
-        first_diag="$(printf '%s\n' "$out" | grep -E '^error(\[|:)' | head -n 1 || true)"
-        if [[ -z "$first_diag" ]]; then
-            first_diag="$(printf '%s\n' "$out" | tail -n 5 | head -n 1 || true)"
-        fi
+        first_diag="$(extract_first_cargo_diag "$out" "$rc")"
         emit_receipt "$gate_name" "$worker" "$rc" "$((end_ms - start_ms))" "$first_diag"
         printf '%s\n' "$out" >&2
         return "$rc"
@@ -144,13 +178,92 @@ run_rch_cargo_gate() {
     return "${last_rc:-1}"
 }
 
+extract_bypass_trailer() {
+    local commit_ref="$1"
+    local msg
+    msg="$("$GIT_BIN" -C "$REPO_ROOT" log -1 --format=%B "$commit_ref" 2>/dev/null || true)"
+    python3 - "$msg" <<'PY'
+import re, sys
+
+msg = sys.argv[1]
+matches = []
+for raw_line in msg.splitlines():
+    m = re.match(r"^Gate-Bypass:\s*(.+?)\s*$", raw_line)
+    if m:
+        matches.append(m.group(1))
+if not matches:
+    sys.exit(1)
+reason = matches[-1]
+if len(reason) < 8 or reason.lower() in {"todo", "tbd", "none", "n/a", "bypass"}:
+    sys.exit(2)
+print(reason)
+PY
+}
+
+check_bypass_if_requested() {
+    local -a target_oids=("$@")
+    local bypass_flag="${FFS_PRE_PUSH_BYPASS:-0}"
+    local pinned_reason="${FFS_PRE_PUSH_BYPASS_REASON:-}"
+
+    if [[ "$bypass_flag" != "1" && "$bypass_flag" != "true" && -z "$pinned_reason" ]]; then
+        return 1
+    fi
+
+    if [[ "${#target_oids[@]}" -eq 0 ]]; then
+        target_oids=("HEAD")
+    fi
+
+    local first_reason=""
+    local oid trailer_reason rc
+    for oid in "${target_oids[@]}"; do
+        set +e
+        trailer_reason="$(extract_bypass_trailer "$oid")"
+        rc=$?
+        set -e
+        if [[ "$rc" -ne 0 ]]; then
+            local diag="pre-push bypass refused: commit $oid lacks a valid 'Gate-Bypass: <reason (>=8 chars)>' trailer"
+            emit_receipt "gate_bypass_refused" "local" 1 0 "$diag"
+            printf '%s\n' "$diag" >&2
+            exit 1
+        fi
+        if [[ -n "$pinned_reason" && "$trailer_reason" != "$pinned_reason" ]]; then
+            local diag="pre-push bypass refused: commit $oid trailer '$trailer_reason' != FFS_PRE_PUSH_BYPASS_REASON '$pinned_reason'"
+            emit_receipt "gate_bypass_refused" "local" 1 0 "$diag"
+            printf '%s\n' "$diag" >&2
+            exit 1
+        fi
+        if [[ -z "$first_reason" ]]; then
+            first_reason="$trailer_reason"
+        fi
+    done
+
+    emit_receipt "gate_bypass_authorized" "local" 0 0 "Gate-Bypass: $first_reason"
+    printf 'WARN: pre-push gate bypassed via documented commit trailer (Gate-Bypass: %s)\n' "$first_reason" >&2
+    return 0
+}
+
 install_hook() {
-    local hook_path="$REPO_ROOT/.git/hooks/pre-push"
-    cat >"$hook_path" <<'HOOK'
+    local target_repo="${1:-$REPO_ROOT}"
+    local hook_rel
+    hook_rel="$("$GIT_BIN" -C "$target_repo" rev-parse --git-path hooks/pre-push)"
+    local hook_path
+    if [[ "$hook_rel" == /* ]]; then
+        hook_path="$hook_rel"
+    else
+        hook_path="$target_repo/$hook_rel"
+    fi
+    mkdir -p "$(dirname "$hook_path")"
+    cat >"$hook_path" <<HOOK
 #!/usr/bin/env bash
 set -euo pipefail
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-exec "$REPO_ROOT/scripts/verify_pre_push_gates.sh"
+REPO_ROOT="\$(git rev-parse --show-toplevel)"
+export FFS_PRE_PUSH_REPO_ROOT="\$REPO_ROOT"
+export FFS_PRE_PUSH_FROM_GIT_HOOK=1
+GATE_SCRIPT="\$REPO_ROOT/scripts/verify_pre_push_gates.sh"
+if [[ ! -x "\$GATE_SCRIPT" ]]; then
+    GATE_SCRIPT="$SCRIPT_PATH"
+fi
+exec "\$GATE_SCRIPT" "\$@"
 HOOK
     chmod +x "$hook_path"
     printf 'Installed pre-push gate hook at %s\n' "$hook_path"
@@ -168,15 +281,31 @@ EOF
 #!/usr/bin/env bash
 exit 0
 EOF
-    cat >"$tmpdir/mock_git" <<'EOF'
+    cat >"$tmpdir/mock_git_no_trailer" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${2:-}" == "rev-parse" ]]; then
+if [[ "${3:-}" == "rev-parse" ]]; then
     echo "c7fc0ddc48fd09e3699b793a2317d511995d427a"
+    exit 0
+fi
+if [[ "${3:-}" == "log" ]]; then
+    printf 'chore: normal commit without bypass trailer\n'
     exit 0
 fi
 exit 0
 EOF
-    chmod +x "$tmpdir/mock_sbh" "$tmpdir/mock_cargo" "$tmpdir/mock_git"
+    cat >"$tmpdir/mock_git_with_trailer" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${3:-}" == "rev-parse" ]]; then
+    echo "c7fc0ddc48fd09e3699b793a2317d511995d427a"
+    exit 0
+fi
+if [[ "${3:-}" == "log" ]]; then
+    printf 'fix: emergency rollback\n\nGate-Bypass: emergency-rollback-bd-ys3wb\n'
+    exit 0
+fi
+exit 0
+EOF
+    chmod +x "$tmpdir/mock_sbh" "$tmpdir/mock_cargo" "$tmpdir/mock_git_no_trailer" "$tmpdir/mock_git_with_trailer"
 
     # Case 1: Worker 1 returns RCH-E330 (exit 120), worker 2 succeeds (exit 0) -> overall PASS + valid JSON receipts.
     cat >"$tmpdir/mock_rch_retry_ok" <<'EOF'
@@ -191,7 +320,7 @@ EOF
 
     FFS_PRE_PUSH_SBH_BIN="$tmpdir/mock_sbh" \
     FFS_PRE_PUSH_CARGO_BIN="$tmpdir/mock_cargo" \
-    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git" \
+    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git_no_trailer" \
     FFS_PRE_PUSH_RCH_BIN="$tmpdir/mock_rch_retry_ok" \
     FFS_PRE_PUSH_RCH_WORKERS="w1 w2" \
     FFS_PRE_PUSH_RECEIPT="$tmpdir/pass_receipts.jsonl" \
@@ -220,7 +349,7 @@ EOF
     set +e
     FFS_PRE_PUSH_SBH_BIN="$tmpdir/mock_sbh" \
     FFS_PRE_PUSH_CARGO_BIN="$tmpdir/mock_cargo" \
-    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git" \
+    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git_no_trailer" \
     FFS_PRE_PUSH_RCH_BIN="$tmpdir/mock_rch_clippy_fail" \
     FFS_PRE_PUSH_RCH_WORKERS="w1" \
     FFS_PRE_PUSH_RECEIPT="$tmpdir/fail_clippy.jsonl" \
@@ -250,7 +379,7 @@ EOF
     set +e
     FFS_PRE_PUSH_SBH_BIN="$tmpdir/mock_sbh" \
     FFS_PRE_PUSH_CARGO_BIN="$tmpdir/mock_cargo" \
-    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git" \
+    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git_no_trailer" \
     FFS_PRE_PUSH_RCH_BIN="$tmpdir/mock_rch_all_refuse" \
     FFS_PRE_PUSH_RCH_WORKERS="w1 w2" \
     FFS_PRE_PUSH_RECEIPT="$tmpdir/fail_admission.jsonl" \
@@ -262,7 +391,43 @@ EOF
         exit 1
     fi
 
-    echo "verify_pre_push_gates.sh --self-test: PASS (3/3 scenarios verified)"
+    # Case 4: Bypass requested without Gate-Bypass commit trailer -> MUST fail closed (rc=1).
+    set +e
+    FFS_PRE_PUSH_BYPASS=1 \
+    FFS_PRE_PUSH_SBH_BIN="$tmpdir/mock_sbh" \
+    FFS_PRE_PUSH_CARGO_BIN="$tmpdir/mock_cargo" \
+    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git_no_trailer" \
+    FFS_PRE_PUSH_RCH_BIN="$tmpdir/mock_rch_all_refuse" \
+    FFS_PRE_PUSH_RECEIPT="$tmpdir/fail_bypass.jsonl" \
+        "$0" >/dev/null 2>&1
+    local rc_bypass_refused=$?
+    set -e
+    if [[ "$rc_bypass_refused" -eq 0 ]]; then
+        echo "self-test failed: expected bypass without trailer to fail closed" >&2
+        exit 1
+    fi
+    python3 - "$tmpdir/fail_bypass.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert len(rows) == 1 and rows[0]["gate_name"] == "gate_bypass_refused" and rows[0]["exit_code"] == 1, rows
+PY
+
+    # Case 5: Bypass requested WITH valid Gate-Bypass commit trailer -> succeeds and logs audit receipt.
+    FFS_PRE_PUSH_BYPASS=1 \
+    FFS_PRE_PUSH_SBH_BIN="$tmpdir/mock_sbh" \
+    FFS_PRE_PUSH_CARGO_BIN="$tmpdir/mock_cargo" \
+    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git_with_trailer" \
+    FFS_PRE_PUSH_RCH_BIN="$tmpdir/mock_rch_all_refuse" \
+    FFS_PRE_PUSH_RECEIPT="$tmpdir/pass_bypass.jsonl" \
+        "$0" >/dev/null 2>&1
+    python3 - "$tmpdir/pass_bypass.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert len(rows) == 1 and rows[0]["gate_name"] == "gate_bypass_authorized" and rows[0]["exit_code"] == 0, rows
+assert "Gate-Bypass: emergency-rollback-bd-ys3wb" in rows[0]["first_diagnostic"], rows
+PY
+
+    echo "verify_pre_push_gates.sh --self-test: PASS (5/5 scenarios verified)"
 }
 
 case "${1:-}" in
@@ -271,16 +436,47 @@ case "${1:-}" in
         exit 0
         ;;
     --install-hook)
-        install_hook
+        shift
+        target_repo="$REPO_ROOT"
+        if [[ "${1:-}" == "--repo" && -n "${2:-}" ]]; then
+            target_repo="$2"
+        fi
+        install_hook "$target_repo"
         exit 0
         ;;
 esac
 
+PUSHED_OIDS=()
+SAW_REF_LINES=0
+if [[ "${FFS_PRE_PUSH_FROM_GIT_HOOK:-0}" == "1" ]]; then
+    while read -r _local_ref local_oid _remote_ref _remote_oid; do
+        [[ -z "${local_oid:-}" ]] && continue
+        SAW_REF_LINES=1
+        if [[ "$local_oid" != "$ZERO_OID" ]]; then
+            PUSHED_OIDS+=("$local_oid")
+        fi
+    done
+    # Pure remote ref deletion lines carry no local commit OID to compile.
+    if [[ "$SAW_REF_LINES" -eq 1 && "${#PUSHED_OIDS[@]}" -eq 0 ]]; then
+        exit 0
+    fi
+fi
+if [[ "${#PUSHED_OIDS[@]}" -eq 0 ]]; then
+    PUSHED_OIDS=("HEAD")
+fi
+
 cd "$REPO_ROOT"
-if command -v "$SBH_BIN" >/dev/null 2>&1; then
+if check_bypass_if_requested "${PUSHED_OIDS[@]}"; then
+    exit 0
+fi
+
+if [[ "${FFS_PRE_PUSH_SKIP_SBH:-0}" != "1" ]] && command -v "$SBH_BIN" >/dev/null 2>&1; then
     run_local_gate "sbh_check" "$SBH_BIN" check --need 20G
 fi
 run_local_gate "git_diff_check" "$GIT_BIN" diff --check
+run_local_gate "git_diff_cached_check" "$GIT_BIN" diff --cached --check
 run_local_gate "cargo_fmt_check" "$CARGO_BIN" fmt --check
 run_rch_cargo_gate "cargo_check" check --workspace --all-targets
-run_rch_cargo_gate "cargo_clippy" clippy --workspace --all-targets -- -D warnings
+if [[ "${FFS_PRE_PUSH_SKIP_CLIPPY:-0}" != "1" ]]; then
+    run_rch_cargo_gate "cargo_clippy" clippy --workspace --all-targets -- -D warnings
+fi

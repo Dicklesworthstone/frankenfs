@@ -626,6 +626,27 @@ Passing those is necessary, not sufficient for filesystem readiness. Existing
 native-format compatibility, fault-injection, mounted and release gates remain
 in force; none are waived by adding a format or a new command.
 
+Direct-to-`main` pushes enforce `git diff --check`, `cargo fmt --check`,
+`cargo check --workspace --all-targets` and
+`cargo clippy --workspace --all-targets -- -D warnings` (plus performance-ledger
+preflight) through the repository hook installer:
+
+```sh
+./scripts/install_gate_hooks.sh
+./scripts/verify_pre_push_gates.sh
+./tests/gates/hook_refuses_red.sh
+```
+
+An emergency pre-push bypass requires both `FFS_PRE_PUSH_BYPASS=1` and an
+explicit `Gate-Bypass: <reason>` commit trailer on `HEAD`, which is recorded in
+`artifacts/gates/<timestamp>/summary.json`. On GitHub,
+`.github/workflows/ci.yml`, `.github/workflows/xfstests.yml` and
+`.github/workflows/artifact-gates.yml` execute automatically on every push to
+`main` (latest completed runs on `f08ef460a`:
+[Artifact Gates `42977453821`](https://github.com/Dicklesworthstone/frankenfs/actions/runs/42977453821) `success`,
+[xfstests `42977453888`](https://github.com/Dicklesworthstone/frankenfs/actions/runs/42977453888) `success`,
+and [CI `42977453897`](https://github.com/Dicklesworthstone/frankenfs/actions/runs/42977453897) `failure` — `Clippy` fixed in `4b0731725`; `FUSE E2E` live CLI telemetry mount teardown remains host-blocked under the Ubuntu 24.04 runner AppArmor `fusermount3` policy in `bd-dzbsp`).
+
 ### Source inventory
 
 The current source-derived test inventory contains 24 crates under `crates/`,

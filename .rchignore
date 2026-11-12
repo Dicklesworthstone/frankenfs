@@ -1,4 +1,5 @@
 artifacts/e2e/
+artifacts/gates/
 # Local implementation evidence includes host-specific tool symlinks, not source.
 artifacts/implementation/
 beads_compliance_audit/

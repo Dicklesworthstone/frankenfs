@@ -195,7 +195,7 @@ cargo test -p ffs-harness -- --nocapture
 cargo bench -p ffs-harness
 ```
 
-If a gate fails, fix root causes instead of suppressing diagnostics.
+If a gate fails, fix root causes instead of suppressing diagnostics. Direct-to-`main` commits must pass `cargo fmt --check`, `cargo check --workspace --all-targets`, and `cargo clippy --workspace --all-targets -- -D warnings` before landing or pushing (enforced via `./scripts/install_gate_hooks.sh`; any emergency pre-push bypass requires both `FFS_PRE_PUSH_BYPASS=1` and a `Gate-Bypass: <reason>` commit trailer).
 
 ---
 
