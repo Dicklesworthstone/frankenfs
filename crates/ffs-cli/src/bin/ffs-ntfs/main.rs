@@ -11,9 +11,11 @@ use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
 use ea_name::EaName;
-use ffs_ntfs::{StreamName, reader};
+use ffs_ntfs::{
+    NtfsDurableToken, NtfsTransactionEngine, NtfsTxOutcome, NtfsWriteOptions, StreamName, reader,
+};
 use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint};
-use ffs_ondisk::ntfs::{DATA, NtfsFileRecord, NtfsValue};
+use ffs_ondisk::ntfs::{DATA, NtfsFileRecord, NtfsReference, NtfsValue};
 use reader::NtfsVolume;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -132,6 +134,94 @@ struct RecordArgs {
     /// Refuse a stale file reference if the sequence number differs.
     #[arg(long)]
     sequence: Option<u16>,
+}
+
+#[derive(Debug, Args)]
+struct AdmissionProbeArgs {
+    image: PathBuf,
+    /// Byte offset of an already selected NTFS volume, not a sector number.
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    /// Restrict all reads to this many bytes of the selected volume.
+    #[arg(long)]
+    length: Option<u64>,
+    /// Confirm the image is offline and not mounted by another writer.
+    #[arg(long, required = true)]
+    offline_image: bool,
+}
+
+#[derive(Debug, Args)]
+struct TxWriteArgs {
+    image: PathBuf,
+    /// Byte offset of an already selected NTFS volume, not a sector number.
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    /// Restrict all operations to this many bytes of the selected volume.
+    #[arg(long)]
+    length: Option<u64>,
+    /// Confirm the image is offline and not mounted by another writer.
+    #[arg(long, required = true)]
+    offline_image: bool,
+    /// Explicitly authorize native on-disk NTFS journal and metadata mutations.
+    #[arg(long, required = true)]
+    allow_write: bool,
+    /// Authorize persistent ARIES $LogFile redo/undo recovery before mutating if dirty.
+    #[arg(long)]
+    recover_dirty: bool,
+}
+
+impl TxWriteArgs {
+    fn open(&self, cx: &Cx, force_recover_dirty: bool) -> Result<NtfsTransactionEngine> {
+        if !self.offline_image || !self.allow_write {
+            bail!("both --offline-image and --allow-write are required for native NTFS mutations");
+        }
+        NtfsTransactionEngine::open(
+            cx,
+            &self.image,
+            self.offset,
+            self.length,
+            NtfsWriteOptions {
+                offline_image: self.offline_image,
+                allow_write: self.allow_write,
+                recover_dirty: self.recover_dirty || force_recover_dirty,
+            },
+        )
+        .with_context(|| {
+            format!(
+                "opening offline NTFS image {} for native transactions",
+                self.image.display()
+            )
+        })
+    }
+}
+
+#[derive(Debug, Args)]
+struct PayloadArgs {
+    /// Exact UTF-8 payload string.
+    #[arg(long, conflicts_with_all = ["data_file", "empty"])]
+    data: Option<String>,
+    /// Read exact binary payload bytes from a host file.
+    #[arg(long, conflicts_with_all = ["data", "empty"])]
+    data_file: Option<PathBuf>,
+    /// Explicitly specify a zero-byte payload.
+    #[arg(long, conflicts_with_all = ["data", "data_file"])]
+    empty: bool,
+}
+
+impl PayloadArgs {
+    fn load(&self, require_explicit_selector: bool) -> Result<Vec<u8>> {
+        if let Some(text) = &self.data {
+            return Ok(text.as_bytes().to_vec());
+        }
+        if let Some(path) = &self.data_file {
+            return std::fs::read(path)
+                .with_context(|| format!("reading NTFS payload source {}", path.display()));
+        }
+        if self.empty || !require_explicit_selector {
+            return Ok(Vec::new());
+        }
+        bail!("specify --data, --data-file, or --empty for tx-write payload")
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -265,6 +355,113 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         gid: u32,
     },
+    /// Probe native NTFS 3.1 writable admission without modifying a single byte.
+    AdmitWrite {
+        #[command(flatten)]
+        probe: AdmissionProbeArgs,
+    },
+    /// Run persistent ARIES $LogFile redo/undo recovery and publish clean RSTR pages.
+    Recover {
+        #[command(flatten)]
+        target: TxWriteArgs,
+    },
+    /// Create a regular file in an offline NTFS 3.1 image via a native logged transaction.
+    TxCreate {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        parent_path: String,
+        name: String,
+        #[command(flatten)]
+        payload: PayloadArgs,
+    },
+    /// Create a directory in an offline NTFS 3.1 image via a native logged transaction.
+    TxMkdir {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        parent_path: String,
+        name: String,
+    },
+    /// Overwrite an unnamed DATA stream in an offline NTFS 3.1 image via a native logged transaction.
+    TxWrite {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+        #[command(flatten)]
+        payload: PayloadArgs,
+    },
+    /// Atomically rename an entry in an offline NTFS 3.1 image via a native logged transaction.
+    TxRename {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        src_path: String,
+        dst_path: String,
+        #[arg(long, requires = "expected_sequence")]
+        expected_record: Option<u64>,
+        #[arg(long, requires = "expected_record")]
+        expected_sequence: Option<u16>,
+    },
+    /// Unlink a regular file in an offline NTFS 3.1 image via a native logged transaction.
+    TxUnlink {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+    },
+    /// Grow $MFT logical record capacity in an offline NTFS 3.1 image via a native logged transaction.
+    TxGrowMft {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=65_536))]
+        records: u32,
+    },
+}
+
+fn emit_tx_outcome<T>(
+    operation: &str,
+    engine: &NtfsTransactionEngine,
+    outcome: NtfsTxOutcome<T>,
+    encode_value: impl FnOnce(T) -> serde_json::Value,
+) -> Result<()> {
+    match outcome {
+        NtfsTxOutcome::Committed { value, token } => {
+            let verified = token.matches_engine(engine);
+            if !verified {
+                bail!("NTFS transaction token failed storage/view binding verification");
+            }
+            let result_value = encode_value(value);
+            let report = token_report_json(operation, engine, &token, &result_value);
+            json(&report)
+        }
+        NtfsTxOutcome::NotCommitted(err) => {
+            bail!("NTFS transaction not_committed ({operation}): {err}")
+        }
+        NtfsTxOutcome::Uncertain {
+            reason,
+            transaction_id,
+            commit_lsn,
+        } => {
+            bail!(
+                "NTFS transaction uncertain ({operation}, tx={transaction_id}, commit_lsn={commit_lsn:#x}): {reason}"
+            )
+        }
+    }
+}
+
+fn token_report_json(
+    operation: &str,
+    engine: &NtfsTransactionEngine,
+    token: &NtfsDurableToken,
+    result_value: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "format": "NTFS",
+        "version": "3.1",
+        "operation": operation,
+        "outcome": "committed",
+        "result": result_value,
+        "token": token,
+        "storage_identity": engine.storage_identity(),
+        "recovery": engine.last_recovery(),
+    })
 }
 
 fn json(value: &serde_json::Value) -> Result<()> {
@@ -805,6 +1002,134 @@ fn main() -> Result<()> {
                 }
             );
             let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+        }
+        Command::AdmitWrite { probe } => {
+            if !probe.offline_image {
+                bail!(
+                    "--offline-image is required; an advisory lock does not prevent unrelated writers"
+                );
+            }
+            let report = NtfsTransactionEngine::admit_read_only_probe(
+                &cx,
+                &probe.image,
+                probe.offset,
+                probe.length,
+            )
+            .with_context(|| {
+                format!(
+                    "probing native NTFS writable admission on {}",
+                    probe.image.display()
+                )
+            })?;
+            json(&serde_json::json!({
+                "format": "NTFS",
+                "version": "3.1",
+                "operation": "admit_write",
+                "read_only": true,
+                "backing_writes": false,
+                "volume_offset": probe.offset,
+                "admission": report,
+            }))?;
+        }
+        Command::Recover { target } => {
+            let engine = target.open(&cx, true)?;
+            engine.check_clean_consistency(&cx)?;
+            json(&serde_json::json!({
+                "format": "NTFS",
+                "version": "3.1",
+                "operation": "recover",
+                "outcome": "clean",
+                "storage_identity": engine.storage_identity(),
+                "recovery": engine.last_recovery().cloned().unwrap_or_default(),
+            }))?;
+        }
+        Command::TxCreate {
+            target,
+            parent_path,
+            name,
+            payload,
+        } => {
+            let initial_data = payload.load(false)?;
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.create_file(&cx, &parent_path, &name, &initial_data);
+            emit_tx_outcome("tx_create", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "bytes": initial_data.len(),
+                })
+            })?;
+        }
+        Command::TxMkdir {
+            target,
+            parent_path,
+            name,
+        } => {
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.mkdir(&cx, &parent_path, &name);
+            emit_tx_outcome("tx_mkdir", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                })
+            })?;
+        }
+        Command::TxWrite {
+            target,
+            path,
+            payload,
+        } => {
+            let data = payload.load(true)?;
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.write_file_data(&cx, &path, &data);
+            emit_tx_outcome("tx_write", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "bytes": data.len(),
+                })
+            })?;
+        }
+        Command::TxRename {
+            target,
+            src_path,
+            dst_path,
+            expected_record,
+            expected_sequence,
+        } => {
+            let expected = match (expected_record, expected_sequence) {
+                (Some(record), Some(sequence)) => Some(NtfsReference { record, sequence }),
+                (None, None) => None,
+                _ => bail!("--expected-record and --expected-sequence must be provided together"),
+            };
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.rename_entry(&cx, &src_path, &dst_path, expected);
+            emit_tx_outcome("tx_rename", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                })
+            })?;
+        }
+        Command::TxUnlink { target, path } => {
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.unlink_file(&cx, &path);
+            emit_tx_outcome("tx_unlink", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                })
+            })?;
+        }
+        Command::TxGrowMft { target, records } => {
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.grow_mft(&cx, records);
+            emit_tx_outcome("tx_grow_mft", &engine, outcome, |logical_records| {
+                serde_json::json!({
+                    "added_records": records,
+                    "logical_records": logical_records,
+                })
+            })?;
         }
     }
     Ok(())
@@ -1599,6 +1924,188 @@ mod tests {
                     "--offline-image",
                     "--stream-utf16",
                     "0000",
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cli_admit_write_requires_offline_image_rejects_write_flags_and_mutates_nothing() {
+        assert!(Cli::try_parse_from(["ffs-ntfs", "admit-write", "disk.img"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "admit-write",
+                "disk.img",
+                "--offline-image",
+                "--allow-write",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "admit-write",
+            "disk.img",
+            "--offline-image",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+        ])
+        .unwrap();
+        let Command::AdmitWrite { probe } = cli.command else {
+            panic!("admit-write");
+        };
+        assert_eq!(
+            (probe.offset, probe.length, probe.offline_image),
+            (1_048_576, Some(67_108_864), true)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("non-ntfs.img");
+        let original = vec![0xA5_u8; 4096];
+        std::fs::write(&scratch, &original).unwrap();
+        let cx = Cx::for_testing();
+        assert!(NtfsTransactionEngine::admit_read_only_probe(&cx, &scratch, 0, None).is_err());
+        assert_eq!(std::fs::read(&scratch).unwrap(), original);
+    }
+
+    #[test]
+    fn cli_native_tx_subcommands_fail_closed_without_both_offline_and_allow_write() {
+        let cases: &[&[&str]] = &[
+            &["ffs-ntfs", "recover", "disk.img"],
+            &["ffs-ntfs", "tx-create", "disk.img", "/", "a.txt"],
+            &["ffs-ntfs", "tx-mkdir", "disk.img", "/", "sub"],
+            &[
+                "ffs-ntfs", "tx-write", "disk.img", "/a.txt", "--data", "abc",
+            ],
+            &["ffs-ntfs", "tx-rename", "disk.img", "/a.txt", "/b.txt"],
+            &["ffs-ntfs", "tx-unlink", "disk.img", "/a.txt"],
+            &["ffs-ntfs", "tx-grow-mft", "disk.img", "--records", "8"],
+        ];
+        for base in cases {
+            assert!(
+                Cli::try_parse_from(base.iter().copied()).is_err(),
+                "missing both authorization flags must fail: {base:?}"
+            );
+            let mut only_offline = base.to_vec();
+            only_offline.push("--offline-image");
+            assert!(
+                Cli::try_parse_from(only_offline).is_err(),
+                "missing --allow-write must fail: {base:?}"
+            );
+            let mut only_write = base.to_vec();
+            only_write.push("--allow-write");
+            assert!(
+                Cli::try_parse_from(only_write).is_err(),
+                "missing --offline-image must fail: {base:?}"
+            );
+            let mut both = base.to_vec();
+            both.extend(["--offline-image", "--allow-write"]);
+            assert!(
+                Cli::try_parse_from(both).is_ok(),
+                "explicit dual authorization must parse: {base:?}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("guard.img");
+        let original = vec![0x5A_u8; 4096];
+        std::fs::write(&scratch, &original).unwrap();
+        let cx = Cx::for_testing();
+        for (offline_image, allow_write) in [(false, false), (true, false), (false, true)] {
+            let args = TxWriteArgs {
+                image: scratch.clone(),
+                offset: 0,
+                length: None,
+                offline_image,
+                allow_write,
+                recover_dirty: false,
+            };
+            assert!(args.open(&cx, false).is_err());
+        }
+        assert_eq!(std::fs::read(&scratch).unwrap(), original);
+    }
+
+    #[test]
+    fn cli_tx_payload_rename_expectation_and_mft_growth_bounds_are_enforced() {
+        let missing_payload = PayloadArgs {
+            data: None,
+            data_file: None,
+            empty: false,
+        };
+        assert_eq!(missing_payload.load(false).unwrap(), Vec::<u8>::new());
+        assert!(missing_payload.load(true).is_err());
+        let empty_payload = PayloadArgs {
+            data: None,
+            data_file: None,
+            empty: true,
+        };
+        assert_eq!(empty_payload.load(true).unwrap(), Vec::<u8>::new());
+
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "tx-write",
+                "disk.img",
+                "/a.txt",
+                "--offline-image",
+                "--allow-write",
+                "--data",
+                "abc",
+                "--empty",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "tx-rename",
+                "disk.img",
+                "/a.txt",
+                "/b.txt",
+                "--offline-image",
+                "--allow-write",
+                "--expected-record",
+                "24",
+            ])
+            .is_err()
+        );
+        let rename = Cli::try_parse_from([
+            "ffs-ntfs",
+            "tx-rename",
+            "disk.img",
+            "/a.txt",
+            "/b.txt",
+            "--offline-image",
+            "--allow-write",
+            "--expected-record",
+            "24",
+            "--expected-sequence",
+            "2",
+        ])
+        .unwrap();
+        let Command::TxRename {
+            expected_record,
+            expected_sequence,
+            ..
+        } = rename.command
+        else {
+            panic!("tx-rename");
+        };
+        assert_eq!((expected_record, expected_sequence), (Some(24), Some(2)));
+
+        for invalid in ["0", "65537"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ffs-ntfs",
+                    "tx-grow-mft",
+                    "disk.img",
+                    "--offline-image",
+                    "--allow-write",
+                    "--records",
+                    invalid,
                 ])
                 .is_err()
             );

@@ -9,6 +9,7 @@ pub mod attribute_list;
 pub mod ea;
 pub mod index;
 mod log_transactions;
+pub mod logfile_writer;
 pub mod recovery;
 pub mod reparse;
 
@@ -245,6 +246,16 @@ impl NtfsReference {
             record: raw & 0x0000_FFFF_FFFF_FFFF,
             sequence: (raw >> 48) as u16,
         }
+    }
+
+    pub fn encode(self) -> Result<u64, ParseError> {
+        if self.record > 0x0000_FFFF_FFFF_FFFF || self.sequence == 0 {
+            return Err(invalid(
+                "ntfs.reference",
+                "record exceeds 48-bit range or sequence is zero",
+            ));
+        }
+        Ok((u64::from(self.sequence) << 48) | self.record)
     }
 }
 
@@ -546,6 +557,104 @@ pub fn decode_mapping_pairs(
     }
 }
 
+fn unsigned_width(value: u64) -> usize {
+    let mut width = 1_usize;
+    while width < 8 && (value >> (width * 8)) != 0 {
+        width += 1;
+    }
+    width
+}
+
+fn signed_width(value: i64) -> usize {
+    let bytes = value.to_le_bytes();
+    let mut width = 8_usize;
+    while width > 1 {
+        let sign_bit = (bytes[width - 2] & 0x80) != 0;
+        let expected_pad = if sign_bit { 0xFF } else { 0x00 };
+        if bytes[width - 1] == expected_pad {
+            width -= 1;
+        } else {
+            break;
+        }
+    }
+    width
+}
+
+/// Encode contiguous `NtfsRun`s starting at `first_vcn` into NTFS mapping pairs
+/// (including the trailing `0x00` terminator) and return `(encoded_bytes, last_vcn)`.
+/// Every output is validated through `decode_mapping_pairs` before returning.
+pub fn encode_mapping_pairs(
+    runs: &[NtfsRun],
+    first_vcn: u64,
+    volume_clusters: u64,
+) -> Result<(Vec<u8>, u64), ParseError> {
+    if volume_clusters == 0 || volume_clusters > i64::MAX as u64 {
+        return Err(invalid("ntfs.runlist", "invalid volume cluster bound"));
+    }
+    if runs.is_empty() {
+        if first_vcn != 0 {
+            return Err(invalid(
+                "ntfs.runlist",
+                "empty mapping pairs require first_vcn == 0",
+            ));
+        }
+        return Ok((vec![0x00], u64::MAX));
+    }
+    if runs.len() >= 65_536 {
+        return Err(invalid("ntfs.runlist", "run budget exceeded"));
+    }
+    let mut expected_vcn = first_vcn;
+    let mut prev_lcn = 0_i128;
+    let mut out = Vec::with_capacity(runs.len() * 6 + 1);
+    for run in runs {
+        if run.vcn != expected_vcn || run.clusters == 0 || run.clusters > i64::MAX as u64 {
+            return Err(invalid(
+                "ntfs.runlist",
+                "non-contiguous or invalid run length in mapping pairs",
+            ));
+        }
+        expected_vcn = expected_vcn
+            .checked_add(run.clusters)
+            .filter(|&end| end <= (i64::MAX as u64) + 1)
+            .ok_or_else(|| invalid("ntfs.runlist", "VCN interval overflow"))?;
+        let len_width = unsigned_width(run.clusters);
+        let len_le = run.clusters.to_le_bytes();
+        if let Some(lcn) = run.lcn {
+            if lcn
+                .checked_add(run.clusters)
+                .is_none_or(|end| end > volume_clusters)
+            {
+                return Err(invalid("ntfs.runlist", "physical run outside volume"));
+            }
+            let delta_i128 = i128::from(lcn) - prev_lcn;
+            let delta = i64::try_from(delta_i128)
+                .map_err(|_| invalid("ntfs.runlist", "LCN delta overflows i64"))?;
+            let off_width = signed_width(delta);
+            let delta_le = delta.to_le_bytes();
+            let header = u8::try_from((off_width << 4) | len_width)
+                .map_err(|_| invalid("ntfs.runlist", "header width overflow"))?;
+            out.push(header);
+            out.extend_from_slice(&len_le[..len_width]);
+            out.extend_from_slice(&delta_le[..off_width]);
+            prev_lcn = i128::from(lcn);
+        } else {
+            let header = u8::try_from(len_width)
+                .map_err(|_| invalid("ntfs.runlist", "header width overflow"))?;
+            out.push(header);
+            out.extend_from_slice(&len_le[..len_width]);
+        }
+    }
+    out.push(0x00);
+    let last_vcn = expected_vcn
+        .checked_sub(1)
+        .ok_or_else(|| invalid("ntfs.runlist", "empty VCN coverage"))?;
+    let roundtrip = decode_mapping_pairs(&out, first_vcn, last_vcn, volume_clusters)?;
+    if roundtrip != runs {
+        return Err(invalid("ntfs.runlist", "mapping-pairs roundtrip mismatch"));
+    }
+    Ok((out, last_vcn))
+}
+
 /// Re-apply update-sequence protection (`USA`) to an unpacked multi-sector record
 /// (`FILE`, `INDX`, `RSTR`, `RCRD`) so its 512-byte sector trailers carry the USA token
 /// and the USA array stores the actual trailer bytes.
@@ -667,6 +776,51 @@ impl NtfsLogOp {
             0x24 => Self::UpdateRelativeDataInIndex2,
             0x25 => Self::ZeroEndOfFileRecord,
             other => Self::Unknown(other),
+        }
+    }
+
+    #[must_use]
+    pub const fn to_raw(self) -> u16 {
+        match self {
+            Self::Noop => 0x00,
+            Self::CompensationLogRecord => 0x01,
+            Self::InitializeFileRecordSegment => 0x02,
+            Self::DeallocateFileRecordSegment => 0x03,
+            Self::WriteEndOfFileRecordSegment => 0x04,
+            Self::CreateAttribute => 0x05,
+            Self::DeleteAttribute => 0x06,
+            Self::UpdateResidentValue => 0x07,
+            Self::UpdateNonresidentValue => 0x08,
+            Self::UpdateMappingPairs => 0x09,
+            Self::DeleteDirtyClusters => 0x0A,
+            Self::SetNewAttributeSizes => 0x0B,
+            Self::AddIndexEntryRoot => 0x0C,
+            Self::DeleteIndexEntryRoot => 0x0D,
+            Self::AddIndexEntryAllocation => 0x0E,
+            Self::DeleteIndexEntryAllocation => 0x0F,
+            Self::WriteEndOfIndexBuffer => 0x10,
+            Self::SetIndexEntryVcnRoot => 0x11,
+            Self::SetIndexEntryVcnAllocation => 0x12,
+            Self::UpdateFileNameRoot => 0x13,
+            Self::UpdateFileNameAllocation => 0x14,
+            Self::SetBitsInNonresidentBitMap => 0x15,
+            Self::ClearBitsInNonresidentBitMap => 0x16,
+            Self::HotFix => 0x17,
+            Self::EndTopLevelAction => 0x18,
+            Self::PrepareTransaction => 0x19,
+            Self::CommitTransaction => 0x1A,
+            Self::ForgetTransaction => 0x1B,
+            Self::OpenNonresidentAttribute => 0x1C,
+            Self::OpenAttributeTableDump => 0x1D,
+            Self::AttributeNamesDump => 0x1E,
+            Self::DirtyPageTableDump => 0x1F,
+            Self::TransactionTableDump => 0x20,
+            Self::UpdateRecordDataRoot => 0x21,
+            Self::UpdateRecordDataAllocation => 0x22,
+            Self::UpdateRelativeDataInIndex => 0x23,
+            Self::UpdateRelativeDataInIndex2 => 0x24,
+            Self::ZeroEndOfFileRecord => 0x25,
+            Self::Unknown(other) => other,
         }
     }
 

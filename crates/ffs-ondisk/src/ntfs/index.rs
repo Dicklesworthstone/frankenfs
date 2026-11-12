@@ -38,6 +38,89 @@ impl NtfsFileName {
             name,
         })
     }
+
+    /// Encode a complete NTFS `FILE_NAME` (`0x30`) attribute value (`66 + name.len() * 2` bytes)
+    /// and verify that `NtfsFileName::parse` accepts it identically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode(
+        &self,
+        created_filetime: u64,
+        modified_filetime: u64,
+        mft_changed_filetime: u64,
+        accessed_filetime: u64,
+        allocated_size: u64,
+        data_size: u64,
+        file_attributes: u32,
+        reparse_or_ea: u32,
+    ) -> Result<Vec<u8>, ParseError> {
+        if self.name.is_empty() || self.name.len() > 255 || self.namespace > 3 {
+            return Err(invalid(
+                "ntfs.file_name",
+                "name length outside 1..=255 or invalid namespace",
+            ));
+        }
+        if self
+            .name
+            .iter()
+            .any(|&unit| matches!(unit, 0 | 0x2F | 0x5C))
+        {
+            return Err(invalid(
+                "ntfs.file_name",
+                "NUL or separator in path component",
+            ));
+        }
+        let parent_raw = self.parent.encode()?;
+        let mut out = Vec::with_capacity(66 + self.name.len() * 2);
+        out.extend_from_slice(&parent_raw.to_le_bytes());
+        out.extend_from_slice(&created_filetime.to_le_bytes());
+        out.extend_from_slice(&modified_filetime.to_le_bytes());
+        out.extend_from_slice(&mft_changed_filetime.to_le_bytes());
+        out.extend_from_slice(&accessed_filetime.to_le_bytes());
+        out.extend_from_slice(&allocated_size.to_le_bytes());
+        out.extend_from_slice(&data_size.to_le_bytes());
+        out.extend_from_slice(&file_attributes.to_le_bytes());
+        out.extend_from_slice(&reparse_or_ea.to_le_bytes());
+        out.push(u8::try_from(self.name.len()).map_err(|_| invalid("ntfs.file_name", "overflow"))?);
+        out.push(self.namespace);
+        for &unit in &self.name {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        let parsed = Self::parse(&out)?;
+        if parsed != *self {
+            return Err(invalid("ntfs.file_name", "FILE_NAME roundtrip mismatch"));
+        }
+        Ok(out)
+    }
+}
+
+/// Encode a leaf or internal `$I30` `INDEX_ENTRY` (`16 + aligned(key) [+ 8 child_vcn]`).
+pub fn encode_index_entry(
+    file_ref: NtfsReference,
+    file_name_bytes: &[u8],
+    child_vcn: Option<u64>,
+) -> Result<Vec<u8>, ParseError> {
+    let _ = NtfsFileName::parse(file_name_bytes)?;
+    let key_len = u16::try_from(file_name_bytes.len())
+        .map_err(|_| invalid("ntfs.index_entry", "key length overflow"))?;
+    let ref_raw = file_ref.encode()?;
+    let base_len = (16 + file_name_bytes.len() + 7) & !7;
+    let total_len = base_len + usize::from(child_vcn.is_some()) * 8;
+    let total_u16 = u16::try_from(total_len)
+        .map_err(|_| invalid("ntfs.index_entry", "entry length overflow"))?;
+    let entry_flags: u16 = u16::from(child_vcn.is_some());
+    let mut entry = vec![0_u8; total_len];
+    entry[0..8].copy_from_slice(&ref_raw.to_le_bytes());
+    entry[8..10].copy_from_slice(&total_u16.to_le_bytes());
+    entry[10..12].copy_from_slice(&key_len.to_le_bytes());
+    entry[12..14].copy_from_slice(&entry_flags.to_le_bytes());
+    entry[16..16 + file_name_bytes.len()].copy_from_slice(file_name_bytes);
+    if let Some(vcn) = child_vcn {
+        if vcn > i64::MAX as u64 {
+            return Err(invalid("ntfs.index_entry", "negative child VCN"));
+        }
+        entry[total_len - 8..total_len].copy_from_slice(&vcn.to_le_bytes());
+    }
+    Ok(entry)
 }
 
 #[derive(Debug, Clone)]

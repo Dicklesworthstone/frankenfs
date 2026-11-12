@@ -334,5 +334,114 @@ pub fn apply_file_edit(
     Ok(FileEditResult::Applied(result))
 }
 
+/// Initialize an MFT record slot (`InitializeFileRecordSegment`, `0x02`) from an
+/// unpacked template buffer `restored_template` whose bytes `[0..used_bytes]`
+/// contain a complete `FILE` header, attributes, and `0xFFFF_FFFF` terminator.
+///
+/// If `raw_existing` is already a USA-valid `FILE` record with `lsn >= pass_lsn`
+/// on `RecoveryPass::Redo(lsn)`, returns `FileEditResult::AlreadyApplied`.
+pub fn initialize_file_record_slot(
+    raw_existing: &[u8],
+    expected_record: u32,
+    pass: RecoveryPass,
+    restored_template: &[u8],
+) -> Result<FileEditResult, ParseError> {
+    if raw_existing.len() < 512
+        || raw_existing.len() != restored_template.len()
+        || !raw_existing.len().is_multiple_of(512)
+    {
+        return Err(bad("invalid MFT slot size for InitializeFileRecordSegment"));
+    }
+    if let RecoveryPass::Redo(lsn) = pass {
+        if lsn == 0 {
+            return Err(bad("InitializeFileRecordSegment redo has empty LSN"));
+        }
+        if let Ok(existing_restored) = restore_record(raw_existing, b"FILE")
+            && le64(&existing_restored, 8)? >= lsn
+        {
+            return Ok(FileEditResult::AlreadyApplied);
+        }
+    }
+    let mut result = restored_template.to_vec();
+    if result.get(..4) != Some(b"FILE".as_slice()) {
+        return Err(bad("InitializeFileRecordSegment payload lacks FILE magic"));
+    }
+    if let RecoveryPass::Redo(lsn) = pass {
+        result[8..16].copy_from_slice(&lsn.to_le_bytes());
+    }
+    // Preserve monotonic USA token relative to an existing initialized FILE slot if present.
+    if let Ok(old_usa) = le16(raw_existing, 4)
+        && usize::from(old_usa) + 2 <= raw_existing.len()
+        && raw_existing.get(..4) == Some(b"FILE".as_slice())
+        && let Ok(old_token) = le16(raw_existing, usize::from(old_usa))
+        && let Ok(new_usa) = le16(&result, 4)
+        && usize::from(new_usa) + 2 <= result.len()
+    {
+        result[usize::from(new_usa)..usize::from(new_usa) + 2]
+            .copy_from_slice(&old_token.to_le_bytes());
+    }
+    protect(&mut result)?;
+    let checked = NtfsFileRecord::parse(&result)?;
+    if checked.number != expected_record || !checked.in_use() || checked.sequence == 0 {
+        return Err(bad(
+            "InitializeFileRecordSegment produced invalid identity or inactive record",
+        ));
+    }
+    Ok(FileEditResult::Applied(result))
+}
+
+/// Deallocate an MFT record slot (`DeallocateFileRecordSegment`, `0x03`),
+/// clearing `in_use`, incrementing the 16-bit sequence number (`wrapping_add(1).max(1)`),
+/// resetting the attribute body to `0xFFFF_FFFF`, and applying USA fixups.
+pub fn deallocate_file_record_slot(
+    raw_existing: &[u8],
+    expected_record: u32,
+    pass: RecoveryPass,
+) -> Result<FileEditResult, ParseError> {
+    if let RecoveryPass::Redo(lsn) = pass {
+        if lsn == 0 {
+            return Err(bad("DeallocateFileRecordSegment redo has empty LSN"));
+        }
+        if let Ok(restored) = restore_record(raw_existing, b"FILE")
+            && le64(&restored, 8)? >= lsn
+        {
+            return Ok(FileEditResult::AlreadyApplied);
+        }
+    }
+    let mut result = restore_record(raw_existing, b"FILE")?;
+    let parsed = NtfsFileRecord::parse(raw_existing)?;
+    if parsed.number != expected_record {
+        return Err(bad("DeallocateFileRecordSegment record number mismatch"));
+    }
+    if matches!(pass, RecoveryPass::Undo) && !parsed.in_use() {
+        return Err(bad("DeallocateFileRecordSegment undo on already free slot"));
+    }
+    let first_attr = usize::from(le16(&result, 20)?);
+    if first_attr + 8 > result.len() || !first_attr.is_multiple_of(8) {
+        return Err(bad("invalid first_attribute offset on deallocated FILE"));
+    }
+    let next_seq = parsed.sequence.wrapping_add(1).max(1);
+    let new_flags = parsed.flags & !0x0001;
+    let new_used = first_attr + 8;
+    result[16..18].copy_from_slice(&next_seq.to_le_bytes());
+    result[18..20].copy_from_slice(&0_u16.to_le_bytes());
+    result[22..24].copy_from_slice(&new_flags.to_le_bytes());
+    put32(&mut result, 24, new_used)?;
+    result[32..40].fill(0);
+    result[first_attr..first_attr + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    result[first_attr + 4..].fill(0);
+    if let RecoveryPass::Redo(lsn) = pass {
+        result[8..16].copy_from_slice(&lsn.to_le_bytes());
+    }
+    protect(&mut result)?;
+    let checked = NtfsFileRecord::parse(&result)?;
+    if checked.number != expected_record || checked.in_use() || checked.sequence != next_seq {
+        return Err(bad(
+            "DeallocateFileRecordSegment left record active or wrong sequence",
+        ));
+    }
+    Ok(FileEditResult::Applied(result))
+}
+
 #[cfg(test)]
 mod tests;

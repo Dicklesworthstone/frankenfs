@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
-//! Native NTFS image reads and read-only filesystem operations.
+//! Native NTFS 3.1 image reads, read-only filesystem operations, and explicitly
+//! admitted native `$LogFile`/allocator/MFT transactions.
 //!
-//! Opening and recovery retain the reader's admission rules. Explicit recovery
-//! uses a volatile overlay; this crate never grants native write authority.
+//! `NtfsVolume` and `NtfsFs` retain strict read-only admission and volatile
+//! overlay recovery without granting write authority. Durable native mutations
+//! and persistent `$LogFile` ARIES recovery require the separate explicit
+//! [`transaction::NtfsTransactionEngine`] admission path.
 
 macro_rules! companion_bin_tests {
     ($($item:item)*) => {
@@ -12,7 +15,13 @@ macro_rules! companion_bin_tests {
 
 pub mod reader;
 pub mod stream_name;
+pub mod transaction;
 
 pub use reader::NtfsVolume;
 pub use reader::filesystem::NtfsFs;
 pub use stream_name::StreamName;
+pub use transaction::{
+    NtfsAdmissionReport, NtfsDurableToken, NtfsLogStateSummary, NtfsPersistenceEvent,
+    NtfsPersistenceStage, NtfsRecoverySummary, NtfsStorageIdentity, NtfsTransactionEngine,
+    NtfsTxOutcome, NtfsWriteOptions,
+};

@@ -19,13 +19,20 @@ use ffs_fuzz::{
 };
 use ffs_ntfs::reader::allocation::{AllocationLimits, NamespaceLimits, RecordOwnershipLimits};
 use ffs_ntfs::reader::security::SecurityCheckLimits;
-use ffs_ntfs::{NtfsVolume, StreamName};
+use ffs_ntfs::{
+    NtfsTransactionEngine, NtfsTxOutcome, NtfsVolume, NtfsWriteOptions, StreamName,
+};
 use ffs_ondisk::ntfs::attribute_list::parse_attribute_list;
 use ffs_ondisk::ntfs::ea::{parse_extended_attributes, NtfsEaInformation};
 use ffs_ondisk::ntfs::index::parse_index_block;
+use ffs_ondisk::ntfs::logfile_writer::{
+    encode_client_update_payload, encode_open_attribute_entry, encode_restart_table,
+    NtfsClientUpdateSpec, NtfsLogRingWriter, LFS_RECORD_CLIENT,
+};
 use ffs_ondisk::ntfs::reparse::NtfsReparsePoint;
 use ffs_ondisk::ntfs::{
     decode_mapping_pairs, parse_ntfs_logfile, restore_record, NtfsFileRecord, NtfsGeometry,
+    NtfsLogOp,
 };
 use ffs_ondisk::ntfs_security::{
     parse_security_index_block, NtfsSecurityDescriptor, NtfsSecurityHeader,
@@ -89,6 +96,48 @@ fn fuzz_pure_ntfs_parsers_and_codecs(data: &[u8], tracker: &FuzzBudgetTracker) {
     if let Ok(decoded) = lzx::decompress_chunk(slice, 32_768) {
         assert_eq!(decoded.len(), 32_768);
         let _ = tracker.charge_decoded(decoded.len());
+    }
+
+    // Native $LogFile ring/checkpoint/client-update writer roundtrip & hostile bounds.
+    if slice.len() >= 16 {
+        let mut table = std::collections::BTreeMap::new();
+        let entry = encode_open_attribute_entry(0x80, 0, 5 | (1_u64 << 48), 0);
+        let slot_off = 24_u32 + u32::from(slice[1] % 8) * 40;
+        table.insert(slot_off, entry.to_vec());
+        if let Ok(encoded_table) = encode_restart_table(40, &table) {
+            assert!(encoded_table.len() >= 64);
+        }
+        let payload_len = usize::from(slice[0]) % slice.len().min(128);
+        let spec = NtfsClientUpdateSpec {
+            redo_op: NtfsLogOp::UpdateResidentValue,
+            undo_op: NtfsLogOp::UpdateResidentValue,
+            target_attribute: 24,
+            record_offset: 56,
+            attribute_offset: 24,
+            cluster_block_offset: 0,
+            target_vcn: 0,
+            target_lcns: vec![4],
+            redo_data: slice[..payload_len].to_vec(),
+            undo_data: slice[..payload_len].to_vec(),
+        };
+        if let Ok(client_bytes) = encode_client_update_payload(&spec) {
+            if let Ok(mut ring) = NtfsLogRingWriter::new_fresh(4096, (1, 1), 64 * 4096, 1, 1) {
+                if let Ok(rec) =
+                    ring.append_raw_record(LFS_RECORD_CLIENT, 24, 0, 0, &client_bytes)
+                {
+                    let rstr0 = ring.build_next_rstr_page(false).unwrap();
+                    let rstr1 = ring.build_next_rstr_page(false).unwrap();
+                    let mut mini_log = vec![0_u8; 6 * 4096];
+                    mini_log[0..4096].copy_from_slice(&rstr0.bytes);
+                    mini_log[4096..8192].copy_from_slice(&rstr1.bytes);
+                    mini_log[4 * 4096..5 * 4096].copy_from_slice(&rec.protected_page);
+                    let parsed = parse_ntfs_logfile(&mini_log).unwrap();
+                    assert_eq!(parsed.records_parsed, 1);
+                    assert_eq!(parsed.restart.current_lsn, rec.lsn);
+                    assert_eq!(parsed.undo_actions.last().map(|a| a.lsn), Some(rec.lsn));
+                }
+            }
+        }
     }
 }
 
@@ -251,6 +300,7 @@ fuzz_target!(|data: &[u8]| {
     }
     dev.assert_invariants();
 
+    let tx_backing = backing_clone.clone();
     let facade_cx = Cx::for_testing();
     let facade_dev = BoundedRoFuzzDevice::new(
         backing_clone,
@@ -299,4 +349,51 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     facade_dev.assert_invariants();
+
+    // Native transaction engine admission & ARIES PreviewDevice preflight against hostile media:
+    // 1. Missing allow_write MUST fail closed with PermissionDenied and zero writes.
+    // 2. Explicit write options against BoundedRoFuzzDevice run full bootstrap + ARIES PreviewDevice
+    //    validation before attempting any write, and any attempted write fails closed with ReadOnly.
+    let tx_cx = Cx::for_testing();
+    let tx_dev = BoundedRoFuzzDevice::new(
+        tx_backing,
+        FuzzBudgetTracker::new(FuzzBudgets {
+            max_physical_read_bytes: 8 * 1024 * 1024,
+            max_decoded_bytes: 512 * 1024,
+            max_retained_bytes: 512 * 1024,
+            max_depth: 8,
+            max_ops: 2048,
+            max_replica_attempts: 48,
+        }),
+        cancel_after_ops,
+    );
+    assert!(matches!(
+        NtfsTransactionEngine::from_device(
+            &tx_cx,
+            Arc::clone(&tx_dev) as Arc<dyn ByteDevice>,
+            0,
+            tx_dev.len_bytes(),
+            NtfsWriteOptions {
+                offline_image: true,
+                allow_write: false,
+                recover_dirty: false,
+            },
+        ),
+        Err(FfsError::PermissionDenied | FfsError::Cancelled)
+    ));
+    if let Ok(mut engine) = NtfsTransactionEngine::from_device(
+        &tx_cx,
+        Arc::clone(&tx_dev) as Arc<dyn ByteDevice>,
+        0,
+        tx_dev.len_bytes(),
+        NtfsWriteOptions {
+            offline_image: true,
+            allow_write: true,
+            recover_dirty: recover_logfile,
+        },
+    ) {
+        let outcome = engine.create_file(&tx_cx, "/", "fuzz-denied.bin", b"x");
+        assert!(matches!(outcome, NtfsTxOutcome::NotCommitted(_)));
+    }
+    tx_dev.assert_invariants();
 });

@@ -1059,12 +1059,14 @@ name = "ffs-ntfs"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "blake3",
  "ffs-block",
  "ffs-core",
  "ffs-error",
  "ffs-ondisk",
  "ffs-types",
  "libc",
+ "serde",
  "tracing",
 ]
 

@@ -8557,6 +8557,25 @@ fn validate_mountpoint(mountpoint: &Path) -> Result<(), FuseError> {
     Ok(())
 }
 
+fn should_retry_owner_only_without_auto_unmount(
+    options: &MountOptions,
+    err: &std::io::Error,
+) -> bool {
+    options.auto_unmount
+        && !options.allow_other
+        && !io_uring_enabled()
+        && err.kind() == std::io::ErrorKind::PermissionDenied
+        && err
+            .to_string()
+            .contains("only allowed if 'user_allow_other' is set")
+}
+
+fn build_owner_only_fallback_options(options: &MountOptions) -> Vec<MountOption> {
+    let mut fallback = options.clone();
+    fallback.auto_unmount = false;
+    build_mount_options(&fallback)
+}
+
 /// Mount a FrankenFS filesystem at the given mountpoint (blocking).
 ///
 /// This function blocks until the filesystem is unmounted.
@@ -8571,7 +8590,18 @@ pub fn mount(
     let fuse_opts = build_mount_options(options);
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     resolve_xattr_suppression(&fs);
-    let mut session = fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts)?;
+    let mut session = match fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts) {
+        Ok(session) => session,
+        Err(err) if should_retry_owner_only_without_auto_unmount(options, &err) => {
+            warn!(
+                mountpoint = %mountpoint.display(),
+                "fusermount3 rejected implicit allow_other for auto_unmount; retrying owner-only mount without auto_unmount"
+            );
+            let fallback_opts = build_owner_only_fallback_options(options);
+            fuser::Session::new(fs.shared_handle(), mountpoint, &fallback_opts)?
+        }
+        Err(err) => return Err(err.into()),
+    };
     fs.install_kernel_notifier(session.notifier());
     // bd-vbqc6: FUSE-over-io_uring, opt-in, wired to the KNOBS rather than to
     // literals.
@@ -8683,15 +8713,30 @@ pub fn mount_background(
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     resolve_xattr_suppression(&fs);
     let notifier_owner = fs.shared_handle();
-    let session = if options.resolved_thread_count() > 1 {
-        fuser::spawn_mount2_with_workers(
-            fs,
-            mountpoint,
-            &fuse_opts,
-            options.resolved_thread_count(),
-        )?
-    } else {
-        fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?
+    let spawn_with_opts =
+        |mount_opts: &[MountOption]| -> std::io::Result<fuser::BackgroundSession> {
+            if options.resolved_thread_count() > 1 {
+                fuser::spawn_mount2_with_workers(
+                    fs.shared_handle(),
+                    mountpoint,
+                    mount_opts,
+                    options.resolved_thread_count(),
+                )
+            } else {
+                fuser::spawn_mount2(fs.shared_handle(), mountpoint, mount_opts)
+            }
+        };
+    let session = match spawn_with_opts(&fuse_opts) {
+        Ok(session) => session,
+        Err(err) if should_retry_owner_only_without_auto_unmount(options, &err) => {
+            warn!(
+                mountpoint = %mountpoint.display(),
+                "fusermount3 rejected implicit allow_other for auto_unmount; retrying owner-only background mount without auto_unmount"
+            );
+            let fallback_opts = build_owner_only_fallback_options(options);
+            spawn_with_opts(&fallback_opts)?
+        }
+        Err(err) => return Err(err.into()),
     };
     notifier_owner.install_kernel_notifier(session.notifier());
     Ok(session)
@@ -9195,15 +9240,31 @@ pub fn mount_managed(
     let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
 
-    let session = if thread_count > 1 {
-        fuser::spawn_mount2_with_workers(
-            fs,
-            mountpoint,
-            &fuse_opts,
-            config.options.resolved_thread_count(),
-        )?
-    } else {
-        fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?
+    let spawn_managed = |mount_opts: &[MountOption]| -> std::io::Result<fuser::BackgroundSession> {
+        if thread_count > 1 {
+            fuser::spawn_mount2_with_workers(
+                fs.shared_handle(),
+                mountpoint,
+                mount_opts,
+                config.options.resolved_thread_count(),
+            )
+        } else {
+            fuser::spawn_mount2(fs.shared_handle(), mountpoint, mount_opts)
+        }
+    };
+    let mut effective_config = config.clone();
+    let session = match spawn_managed(&fuse_opts) {
+        Ok(session) => session,
+        Err(err) if should_retry_owner_only_without_auto_unmount(&config.options, &err) => {
+            warn!(
+                mountpoint = %mountpoint.display(),
+                "fusermount3 rejected implicit allow_other for auto_unmount; retrying owner-only managed mount without auto_unmount"
+            );
+            let fallback_opts = build_owner_only_fallback_options(&config.options);
+            effective_config.options.auto_unmount = false;
+            spawn_managed(&fallback_opts)?
+        }
+        Err(err) => return Err(err.into()),
     };
     notifier_owner.install_kernel_notifier(session.notifier());
 
@@ -9218,7 +9279,7 @@ pub fn mount_managed(
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         metrics: metrics_ref,
         per_core_metrics: None,
-        config: config.clone(),
+        config: effective_config,
     })
 }
 
@@ -9250,8 +9311,30 @@ pub fn mount_managed_per_core(
     resolve_xattr_suppression(&fs);
     let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
-    let session =
-        fuser::spawn_mount2_with_per_core_workers(fs, mountpoint, &fuse_opts, thread_count)?;
+    let mut effective_config = config.clone();
+    let session = match fuser::spawn_mount2_with_per_core_workers(
+        fs.shared_handle(),
+        mountpoint,
+        &fuse_opts,
+        thread_count,
+    ) {
+        Ok(session) => session,
+        Err(err) if should_retry_owner_only_without_auto_unmount(&config.options, &err) => {
+            warn!(
+                mountpoint = %mountpoint.display(),
+                "fusermount3 rejected implicit allow_other for auto_unmount; retrying owner-only per-core mount without auto_unmount"
+            );
+            let fallback_opts = build_owner_only_fallback_options(&config.options);
+            effective_config.options.auto_unmount = false;
+            fuser::spawn_mount2_with_per_core_workers(
+                fs.shared_handle(),
+                mountpoint,
+                &fallback_opts,
+                thread_count,
+            )?
+        }
+        Err(err) => return Err(err.into()),
+    };
     let per_core_metrics = session.per_core_metrics();
     notifier_owner.install_kernel_notifier(session.notifier());
 
@@ -9270,7 +9353,7 @@ pub fn mount_managed_per_core(
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         metrics: metrics_ref,
         per_core_metrics,
-        config: config.clone(),
+        config: effective_config,
     })
 }
 
@@ -29160,6 +29243,54 @@ AllowOther"#;
         assert!(
             cx.checkpoint().is_err(),
             "cancelled request Cx must fail checkpoint"
+        );
+    }
+
+    #[test]
+    fn owner_only_auto_unmount_falls_back_only_when_allow_other_not_requested() {
+        let fusermount_denied = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf\n",
+        );
+        let generic_denied = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fusermount3: mount failed: Operation not permitted\n",
+        );
+
+        let owner_only = MountOptions {
+            read_only: true,
+            allow_other: false,
+            auto_unmount: true,
+            ..MountOptions::default()
+        };
+        if !io_uring_enabled() {
+            assert!(should_retry_owner_only_without_auto_unmount(
+                &owner_only,
+                &fusermount_denied
+            ));
+        }
+        assert!(!should_retry_owner_only_without_auto_unmount(
+            &owner_only,
+            &generic_denied
+        ));
+
+        let fallback = build_owner_only_fallback_options(&owner_only);
+        assert!(!fallback.contains(&MountOption::AutoUnmount));
+        assert!(!fallback.contains(&MountOption::AllowOther));
+        assert!(fallback.contains(&MountOption::RO));
+
+        let explicit_allow_other = MountOptions {
+            read_only: true,
+            allow_other: true,
+            auto_unmount: true,
+            ..MountOptions::default()
+        };
+        assert!(
+            !should_retry_owner_only_without_auto_unmount(
+                &explicit_allow_other,
+                &fusermount_denied
+            ),
+            "explicit allow_other must still fail closed when user_allow_other is absent"
         );
     }
 }
