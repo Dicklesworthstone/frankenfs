@@ -47338,17 +47338,12 @@ impl OpenFs {
         Self::validate_single_path_component(new_name)?;
 
         let mut alloc = alloc_mutex.write();
-        self.btrfs_require_directory_inode(&alloc, parent_oid)?;
-        self.btrfs_require_directory_inode(&alloc, new_parent_oid)?;
+        let parent_inode = self.btrfs_require_directory_inode(&alloc, parent_oid)?;
+        let new_parent_inode = self.btrfs_require_directory_inode(&alloc, new_parent_oid)?;
 
-        // POSIX: exchanging an entry with itself is a successful no-op.
-        if parent_oid == new_parent_oid && name == new_name {
-            return Ok(());
-        }
-
-        // Both entries must exist (renameat2(2): ENOENT otherwise). Confirm the
-        // matching INODE_REF too so the remove() calls below cannot fail
-        // half-way through after the dir entries are already gone.
+        // Both entries must exist (renameat2(2): ENOENT otherwise), including
+        // when exchanging an entry with itself. Confirm the matching INODE_REF
+        // and INODE_ITEM before short-circuiting or mutating the tree.
         let src = Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
         let dst = Self::btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name)?;
         Self::btrfs_refuse_subvol_link(&src)?;
@@ -47361,6 +47356,23 @@ impl OpenFs {
             new_parent_oid,
             new_name,
         )?;
+        let src_inode = self.btrfs_read_inode_from_tree(&alloc, src.child_objectid)?;
+        let dst_inode = self.btrfs_read_inode_from_tree(&alloc, dst.child_objectid)?;
+
+        // Linux `vfs_rename`: exchanging an existing entry with itself or
+        // exchanging two hard-linked names of the same inode is a true no-op
+        // before immutable/append permission checks or timestamp writes.
+        if src.child_objectid == dst.child_objectid {
+            return Ok(());
+        }
+
+        let protected_mask = BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND;
+        if (parent_inode.flags | new_parent_inode.flags | src_inode.flags | dst_inode.flags)
+            & protected_mask
+            != 0
+        {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
 
         // Cross-parent directory moves must not create a cycle: neither moved
         // directory may end up under itself (renameat2(2): EINVAL / vfs loop
@@ -47387,6 +47399,15 @@ impl OpenFs {
                 )));
             }
         }
+        Self::btrfs_preflight_dir_entry_insert(&alloc, parent_oid, name, dst.child_objectid)?;
+        Self::btrfs_preflight_inode_ref_insert(&alloc, dst.child_objectid, parent_oid)?;
+        Self::btrfs_preflight_dir_entry_insert(
+            &alloc,
+            new_parent_oid,
+            new_name,
+            src.child_objectid,
+        )?;
+        Self::btrfs_preflight_inode_ref_insert(&alloc, src.child_objectid, new_parent_oid)?;
 
         // Remove both entries and their INODE_REFs, then reinsert each name
         // pointing at the other entry's inode. Removing both before inserting
@@ -126949,9 +126970,8 @@ mod tests {
                         };
                         {
                             let mut alloc = fs.btrfs_alloc_state.as_ref().unwrap().write();
-                            let mut inode = fs
-                                .btrfs_read_inode_from_tree(&alloc, protected.0)
-                                .unwrap();
+                            let mut inode =
+                                fs.btrfs_read_inode_from_tree(&alloc, protected.0).unwrap();
                             inode.flags |= flag;
                             let key = BtrfsKey {
                                 objectid: protected.0,
@@ -126979,7 +126999,9 @@ mod tests {
                             source
                         );
                         assert_eq!(
-                            fs.lookup(&cx, destination, OsStr::new("target")).unwrap().ino,
+                            fs.lookup(&cx, destination, OsStr::new("target"))
+                                .unwrap()
+                                .ino,
                             target
                         );
                     }

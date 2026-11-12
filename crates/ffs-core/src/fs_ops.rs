@@ -1858,12 +1858,9 @@ impl FsOps for OpenFs {
         }
 
         if flags & RENAME_EXCHANGE != 0 {
-            // Both names are removed and re-added.
-            // Ext4 checks both parents after resolving a possible inode alias.
-            if !self.is_ext4() {
-                self.reject_dir_entry_change(cx, scope, parent, true)?;
-                self.reject_dir_entry_change(cx, scope, new_parent, true)?;
-            }
+            // Both ext4 and btrfs resolve both entries and short-circuit
+            // same-inode aliases before enforcing parent/child immutable and
+            // append-only flags, matching Linux `vfs_rename`.
             clear_readdir_snapshot(&self.readdir_snapshot);
             return match &self.flavor {
                 FsFlavor::Ext4(_) => {
