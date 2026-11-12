@@ -3307,17 +3307,18 @@ pub struct OpenFs {
     /// point mappings; this snapshot avoids re-reading/re-parsing every leaf
     /// when many small write calls hit the same unchanged fragmented inode.
     ext4_write_extent_snapshot: Mutex<Option<Ext4WriteExtentSnapshot>>,
-    /// Single-slot snapshot of the most-recently-listed directory's entries.
+    /// Inode-sharded snapshots of recently-listed directories' entries.
     ///
     /// A paginated `readdir` (FUSE issues one call per kernel buffer fill) would
     /// otherwise re-read and re-parse the WHOLE directory on every call and then
     /// discard everything before `offset` — `O(N)` per page, `O(N^2)` to list an
     /// N-entry directory. This caches the full entry list from the first page and
-    /// serves later pages by slicing it. The cache self-invalidates: every entry
-    /// also records the directory inode's `(ctime, ctime_extra, mtime, size)`, and
-    /// any mutation bumps ctime/mtime, so a stale snapshot is detected and rebuilt
-    /// rather than relying on hooking every mutation path.
-    readdir_snapshot: Mutex<Option<ReaddirSnapshot>>,
+    /// serves later pages by slicing it. Sharded across [`READDIR_SNAPSHOT_SHARDS`]
+    /// (`64`) inode-indexed slots with an atomic `populated_mask` so concurrent
+    /// paginated readers on distinct directories do not evict each other, and
+    /// `clear_readdir_snapshot` skips empty shards with zero mutex acquisitions on
+    /// hot namespace mutations while preserving strict linearizable invalidation.
+    readdir_snapshot: ReaddirSnapshots,
     /// Per-directory authoritative name set for O(1) negative lookups
     /// (the create existence-check). See [`DirNameIndex`]. SHARDED by dir inode
     /// (`inode % DIR_NAME_INDEX_SHARDS`): a single slot thrashed catastrophically
@@ -3797,6 +3798,36 @@ struct ReaddirSnapshot {
     entries: Arc<Vec<DirEntry>>,
 }
 
+const READDIR_SNAPSHOT_SHARDS: usize = 64;
+
+/// 64-way inode-sharded directory listing cache with an atomic populated-shard
+/// bitmask (`bd-uu90b`).
+struct ReaddirSnapshots {
+    shards: Box<[Mutex<Option<ReaddirSnapshot>>]>,
+    populated_mask: std::sync::atomic::AtomicU64,
+}
+
+impl ReaddirSnapshots {
+    fn new() -> Self {
+        Self {
+            shards: (0..READDIR_SNAPSHOT_SHARDS)
+                .map(|_| Mutex::new(None))
+                .collect(),
+            populated_mask: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn shard_index(ino: u64) -> usize {
+        usize::try_from(ino & ((READDIR_SNAPSHOT_SHARDS as u64) - 1)).unwrap_or(0)
+    }
+
+    #[inline]
+    fn shard(&self, ino: u64) -> &Mutex<Option<ReaddirSnapshot>> {
+        &self.shards[Self::shard_index(ino)]
+    }
+}
+
 /// Authoritative name membership for one directory, used to answer a NEGATIVE
 /// lookup (the create existence-check) in O(1) instead of the O(N) linear block
 /// scan that `lookup_name_with_scope` falls back to on an htree miss. Writable
@@ -4022,7 +4053,7 @@ pub fn btrfs_commit_fst_early() -> bool {
     })
 }
 
-fn readdir_snapshot_serve(
+fn readdir_snapshot_serve_slot(
     slot: &Mutex<Option<ReaddirSnapshot>>,
     ino: u64,
     validation: ReaddirValidation,
@@ -4032,6 +4063,15 @@ fn readdir_snapshot_serve(
         (snap.ino == ino && snap.validation == validation).then(|| Arc::clone(&snap.entries))
     });
     entries.map(|entries| slice_readdir_snapshot(entries, offset))
+}
+
+fn readdir_snapshot_serve(
+    snapshots: &ReaddirSnapshots,
+    ino: u64,
+    validation: ReaddirValidation,
+    offset: u64,
+) -> Option<ReaddirPage> {
+    readdir_snapshot_serve_slot(snapshots.shard(ino), ino, validation, offset)
 }
 
 /// Serve a readdir page from the snapshot WITHOUT re-validating it.
@@ -4046,7 +4086,7 @@ fn readdir_snapshot_serve(
 /// Matching on inode alone is the whole difference. That is safe here precisely
 /// because a snapshot only ever exists for a directory this process listed, so
 /// an inode match means the entries were read from the same immutable image.
-fn readdir_snapshot_serve_unvalidated(
+fn readdir_snapshot_serve_unvalidated_slot(
     slot: &Mutex<Option<ReaddirSnapshot>>,
     ino: u64,
     offset: u64,
@@ -4058,26 +4098,55 @@ fn readdir_snapshot_serve_unvalidated(
     entries.map(|entries| slice_readdir_snapshot(entries, offset))
 }
 
-/// Clear the readdir snapshot slot. Called on every directory mutation so a later
-/// readdir never serves a stale listing — the authoritative invalidation, since
-/// inode-timestamp self-validation alone can miss changes (e.g. a rename does not
-/// reliably bump the source directory's mtime).
-fn clear_readdir_snapshot(slot: &Mutex<Option<ReaddirSnapshot>>) {
-    *slot.lock() = None;
+fn readdir_snapshot_serve_unvalidated(
+    snapshots: &ReaddirSnapshots,
+    ino: u64,
+    offset: u64,
+) -> Option<ReaddirPage> {
+    readdir_snapshot_serve_unvalidated_slot(snapshots.shard(ino), ino, offset)
 }
 
-/// Replace the snapshot slot with a freshly-built full listing.
+/// Clear all populated readdir snapshot shards. Called on every directory mutation
+/// so a later readdir never serves a stale listing — the authoritative invalidation,
+/// since inode-timestamp self-validation alone can miss changes (e.g. a rename does
+/// not reliably bump the source directory's mtime).
+///
+/// `populated_mask` bits are set inside the shard lock on store and cleared inside
+/// the shard lock *after* `*guard = None`, so concurrent callers never skip a
+/// populated shard while mutations when no snapshot is live pay only one atomic load.
+fn clear_readdir_snapshot(snapshots: &ReaddirSnapshots) {
+    let mut bits = snapshots
+        .populated_mask
+        .load(std::sync::atomic::Ordering::SeqCst);
+    while bits != 0 {
+        let shard_idx = bits.trailing_zeros() as usize;
+        let mut guard = snapshots.shards[shard_idx].lock();
+        *guard = None;
+        snapshots
+            .populated_mask
+            .fetch_and(!(1_u64 << shard_idx), std::sync::atomic::Ordering::SeqCst);
+        drop(guard);
+        bits &= bits - 1;
+    }
+}
+
+/// Replace the inode's snapshot shard with a freshly-built full listing.
 fn readdir_snapshot_store(
-    slot: &Mutex<Option<ReaddirSnapshot>>,
+    snapshots: &ReaddirSnapshots,
     ino: u64,
     validation: ReaddirValidation,
     entries: Arc<Vec<DirEntry>>,
 ) {
-    *slot.lock() = Some(ReaddirSnapshot {
+    let shard_idx = ReaddirSnapshots::shard_index(ino);
+    let mut guard = snapshots.shards[shard_idx].lock();
+    *guard = Some(ReaddirSnapshot {
         ino,
         validation,
         entries,
     });
+    snapshots
+        .populated_mask
+        .fetch_or(1_u64 << shard_idx, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Nanoseconds since the Unix epoch, saturating — for comparing inode timestamps
@@ -8494,7 +8563,7 @@ impl OpenFs {
             btrfs_alloc_state: None,
             extent_cache: ffs_extent::ExtentCache::new(),
             ext4_write_extent_snapshot: Mutex::new(None),
-            readdir_snapshot: Mutex::new(None),
+            readdir_snapshot: ReaddirSnapshots::new(),
             btrfs_nested: Mutex::new(Vec::new()),
             btrfs_nested_enabled: true,
             btrfs_semantic_view_stale,
@@ -54234,23 +54303,103 @@ fn unvalidated_readdir_snapshot_matches_on_inode_only_bd_btrfs_ro_readdir() {
         size: 8192,
     };
     assert!(
-        readdir_snapshot_serve_unvalidated(&slot, 5, 0).is_some(),
+        readdir_snapshot_serve_unvalidated_slot(&slot, 5, 0).is_some(),
         "read-only serve must answer without consulting the validation key"
     );
     assert!(
-        readdir_snapshot_serve(&slot, 5, changed, 0).is_none(),
+        readdir_snapshot_serve_slot(&slot, 5, changed, 0).is_none(),
         "the validated path must still refuse a changed directory — if this \
              passed, the two paths would be identical and the knob pointless"
     );
 
     // A different inode is refused by BOTH: the unvalidated path drops the
     // validation check, not the identity check.
-    assert!(readdir_snapshot_serve_unvalidated(&slot, 6, 0).is_none());
-    assert!(readdir_snapshot_serve(&slot, 6, stored, 0).is_none());
+    assert!(readdir_snapshot_serve_unvalidated_slot(&slot, 6, 0).is_none());
+    assert!(readdir_snapshot_serve_slot(&slot, 6, stored, 0).is_none());
 
     // An empty slot yields nothing rather than panicking.
     let empty: Mutex<Option<ReaddirSnapshot>> = Mutex::new(None);
-    assert!(readdir_snapshot_serve_unvalidated(&empty, 5, 0).is_none());
+    assert!(readdir_snapshot_serve_unvalidated_slot(&empty, 5, 0).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn readdir_snapshots_sharded_interleaved_pagination_does_not_thrash_bd_uu90b() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let snapshots = ReaddirSnapshots::new();
+    assert_eq!(snapshots.populated_mask.load(SeqCst), 0);
+
+    let v_a = ReaddirValidation {
+        ctime: 10,
+        mtime: 10,
+        size: 16_384,
+    };
+    let v_b = ReaddirValidation {
+        ctime: 20,
+        mtime: 20,
+        size: 16_384,
+    };
+    let entries_a: Arc<Vec<DirEntry>> = Arc::new(
+        (1_u64..=1200)
+            .map(|i| DirEntry {
+                ino: InodeNumber(1000 + i),
+                offset: i,
+                kind: FileType::RegularFile,
+                name: format!("a_{i:04}").into_bytes(),
+            })
+            .collect(),
+    );
+    let entries_b: Arc<Vec<DirEntry>> = Arc::new(
+        (1_u64..=1200)
+            .map(|i| DirEntry {
+                ino: InodeNumber(3000 + i),
+                offset: i,
+                kind: FileType::RegularFile,
+                name: format!("b_{i:04}").into_bytes(),
+            })
+            .collect(),
+    );
+
+    // Pick two directory inodes in distinct shards (e.g. 12 and 13).
+    readdir_snapshot_store(&snapshots, 12, v_a, Arc::clone(&entries_a));
+    readdir_snapshot_store(&snapshots, 13, v_b, Arc::clone(&entries_b));
+    assert_eq!(
+        snapshots.populated_mask.load(SeqCst).count_ones(),
+        2,
+        "two distinct shards must remain populated simultaneously"
+    );
+
+    // Interleave paginated reads across BOTH directories without eviction.
+    let mut off_a = 0_u64;
+    let mut off_b = 0_u64;
+    let mut count_a = 0_usize;
+    let mut count_b = 0_usize;
+    loop {
+        let page_a = readdir_snapshot_serve(&snapshots, 12, v_a, off_a)
+            .expect("dir 12 snapshot must not be evicted by dir 13");
+        let page_b = readdir_snapshot_serve(&snapshots, 13, v_b, off_b)
+            .expect("dir 13 snapshot must not be evicted by dir 12");
+        if page_a.is_empty() && page_b.is_empty() {
+            break;
+        }
+        if let Some(last) = page_a.as_slice().last() {
+            count_a += page_a.len();
+            off_a = last.offset;
+        }
+        if let Some(last) = page_b.as_slice().last() {
+            count_b += page_b.len();
+            off_b = last.offset;
+        }
+    }
+    assert_eq!(count_a, 1200);
+    assert_eq!(count_b, 1200);
+
+    // Explicit clear invalidates both shards and resets populated_mask to 0.
+    clear_readdir_snapshot(&snapshots);
+    assert_eq!(snapshots.populated_mask.load(SeqCst), 0);
+    assert!(readdir_snapshot_serve(&snapshots, 12, v_a, 0).is_none());
+    assert!(readdir_snapshot_serve(&snapshots, 13, v_b, 0).is_none());
 }
 
 #[cfg(test)]
