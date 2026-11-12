@@ -568,9 +568,10 @@
 > matching worker/local hashes. Workspace/all-target check, strict Clippy in
 > both builds, and formatting pass. Unchanged UBS rules report zero critical
 > findings in the three changed code files; existing warnings remain.
-> Full workspace runtime, mounted/crash qualification and arbitrary outer-request
-> composition remain open under `bd-vuzzq`/`bd-9rutw`; no parity-rate or speedup
-> claim is added.
+> Full workspace runtime and mounted/crash qualification remain open;
+> `bd-vuzzq` and `bd-9rutw` closed on their scoped ext4 Bucket-B request-scope
+> composition contracts, with no parity-rate or speedup
+> claim added.
 
 > **Reclaimed capacity and symlink storage (2026-11-01):** tmpfile and symlink
 > births can now spend inode credits returned through the other allocator
@@ -624,10 +625,10 @@
 > Workspace/all-target check, strict default/feature Clippy and formatting pass
 > at the final source cut. FUSE reports 715 passes and one existing ignore;
 > actual mount lifecycle still returns early on
-> permission denial. Concurrent birth/parent-ACL/cancellation stress, arbitrary
-> outer-request composition, full-workspace tests and mounted/crash/performance
-> qualification remain open under `bd-vuzzq` and `bd-9rutw`. No parity rate or
-> speedup claim is added. Verification is solo.
+> permission denial. Concurrent birth/parent-ACL/cancellation stress, full-workspace
+> tests and mounted/crash/performance qualification remain open (`bd-vuzzq` and
+> `bd-9rutw` subsequently closed on their scoped Bucket-B request-scope contracts).
+> No parity rate or speedup claim is added. Verification is solo.
 
 > **Atomic ext4 unnamed creation (2026-10-31):** `O_TMPFILE` now stages inode
 > allocation, inherited access ACL/mode, external ACL storage and the inode's
@@ -647,7 +648,8 @@
 > Workspace/all-target check, strict Clippy and formatting pass. The FUSE
 > library reports 715 passes and one existing ignore; its live-mount lifecycle
 > case still returns early on permission denial and earns no mount credit.
-> The broader `bd-9rutw` and original baseline `bd-vuzzq` stay open.
+> (`bd-9rutw` and `bd-vuzzq` subsequently closed on their scoped Bucket-B
+> request-scope contracts.)
 
 > **POSIX ACL input and clearing (2026-10-31):** zero-length and header-only
 > ACL sets now clear access/default ACL storage while preserving the inode mode.
@@ -663,9 +665,9 @@
 > not FrankenFS image interchange. Full FUSE library results are 715 passed,
 > one existing ignore; the native lifecycle case returns early on mount denial.
 > Workspace check, strict Clippy and formatting pass at the tested source cut.
-> Atomic ACL inheritance with named inode/directory creation, broader namespace
-> composition and full native/crash qualification remain open under `bd-9rutw`
-> and `bd-vuzzq`; no parity percentage or performance claim is added.
+> Full native/crash qualification remains open (`bd-9rutw` and `bd-vuzzq`
+> subsequently closed on their scoped Bucket-B request-scope contracts); no parity
+> percentage or performance claim is added.
 
 > **Atomic ext4 namespace retirement and classic rename (2026-10-27):**
 > unlink, rmdir, final orphan reclamation and classic rename now stage their
@@ -789,8 +791,9 @@
 > ignores, including all six new regressions. Strict all-target Clippy, pinned
 > formatting and whitespace checks pass. Earlier memory-limited build attempts
 > are superseded by this executed run.
-> Native OpenZFS crash-image interchange and the broader `bd-ofjn7` acceptance
-> remain open. See `docs/ZFS_ZIL_TOPOLOGY_PROFILE.md` for the operation contract.
+> Live OpenZFS crash-image interchange remains separate from constructed-image
+> ZIL replay tests (`bd-ofjn7` closed on scoped SA xattr ZIL replay).
+> See `docs/ZFS_ZIL_TOPOLOGY_PROFILE.md` for the operation contract.
 
 > **2026-10-23 merged-source qualification (`bd-native-image-library-s4tde`):**
 > on base `05292f536` plus Rust overlay `421d75ff`, workspace/all-target check,
@@ -1404,9 +1407,31 @@
 > is partial pending external crash-image verification. Public execution-bound
 > reporting now separates declarations from nine mapped, bounded ext4 contracts
 > executed through `parity --verify ext4-journal` / `--verify ext4-reference`.
-> Remaining mappings and canonical gate coverage stay open in `bd-wh1xk` /
-> `bd-lc132`; do not interpret `97/97` as
+> Remaining mappings stay open in `bd-wh1xk` (`bd-lc132` closed on canonical
+> gate binding below); do not interpret `97/97` as
 > successful execution or release readiness.
+>
+> **2026-11-11 six-format companion & partition router status:** Beyond the V1
+> ext4/btrfs `97/97` denominator, the workspace ships pure-Rust engines and
+> unified `ffs-cli` routing (`inspect`, `partitions`, `info`, `ls`, `read`,
+> `walk`, `check`/`fsck`, `scrub`, `mount`, `format`, `streams`, `pool`,
+> `dataset`) plus bounded MBR/GPT `--partition <index|partuuid|label>` slice
+> discovery (`PartitionByteDevice`) across all six formats:
+> - **FAT16 / FAT32 (`ffs-fat`):** Read/ls/walk/mount, pure-Rust `format`,
+>   offline `create`/`mkdir`/`write`/`truncate`/`unlink`/`rmdir`/`rename`/`resize`,
+>   `check`/`recover`, and deterministic 12-row write-cut crash-matrix verification
+>   (`crates/ffs-fat/tests/crash_cut_matrix.rs`); live power-cut and Windows
+>   interchange qualification remain separate.
+> - **NTFS (`ffs-ntfs`):** Read-only namespace/indexed lookup, resident/nonresident
+>   and compressed (LZNT1, WOF XPRESS/LZX) reads, named Alternate Data Streams
+>   (`streams`), `$Bitmap`/record-ownership/namespace `check`, read-only FUSE
+>   mount, and restricted volatile `$LogFile` recovery; general NTFS mutation is
+>   unimplemented.
+> - **ZFS (`ffs-zfs`):** Read-only Uberblock/MOS/DSL/ZPL dataset & `@snapshot`
+>   inspection and reads, LZ4/gzip/zstd decompression, Fletcher4/SHA-256 checksum
+>   verification, single/mirror/striped-mirror/RAIDZ1-3 + explicit missing-member
+>   extraction, DMU readability & `--verify-redundancy` scrub, volatile ZIL replay,
+>   and read-only FUSE mount; native TXG/pool write allocation is unimplemented.
 >
 > **2026-09-11 canonical gate binding:** §22.1's seven gate commands are now
 > executed rather than assumed. `ffs-harness gates --all` runs each named command

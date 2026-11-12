@@ -1,6 +1,6 @@
 # PROPOSED_ARCHITECTURE.md — FrankenFS (ffs)
 
-> 22-member Cargo workspace architecture (21 members under `crates/`, plus `tools/ffs-ops`) for a FUSE-based Rust reimplementation of ext4 and btrfs with block-level MVCC and RaptorQ self-healing.
+> 25-member Cargo workspace architecture (24 members under `crates/`, plus `tools/ffs-ops`) for a FUSE-based Rust reimplementation of ext4 and btrfs with block-level MVCC, RaptorQ self-healing, and native FAT16/FAT32/NTFS/ZFS engines.
 
 > **Source check (2026-09-08):** Cargo.toml declares Rust 1.95 minimum, asupersync 0.3.9, and vendored fuser 0.17.0 with ABI 7.42 enabled. First-party crates forbid unsafe Rust; `vendor/fuser` is excluded from the workspace and contains unsafe transport code. Implemented CLI paths attach the ext4 JBD2 writer before enabling writes, selected ext4 writes stage merge proofs, and per-core FUSE dispatch calls vendored workers. These source connections do not substitute for fresh mounted/crash/performance evidence. Default mounted repair and fully region-scoped background work remain incomplete against the canonical specification.
 
@@ -770,7 +770,9 @@ so SPACE_INFO does not flatten DUP groups into SINGLE groups. The
 standard command remains a count query. `scripts/ffs_space_info.py` is a public
 consumer with bounded count/requery logic, an explicit native-kernel mode and
 no partial-success JSON. This is a transport extension, not native tool/ABI
-parity; current `OpenFs` accounting requires writable btrfs (`bd-k3hon`).
+parity; `OpenFs::get_btrfs_space_info` supports both read-only and writable
+btrfs mounts (`bd-k3hon` closed; read-only fallback wired in
+`bd-fix-fsops-arc-forwarding-and-ioctl-bugs-wugmo`).
 Native-mode consumption rechecks the count after each array query because
 the kernel's nonzero query reports records copied. Kernel global reserve is
 transient runtime accounting, distinct from the on-disk block-group records

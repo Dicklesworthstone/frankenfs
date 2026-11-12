@@ -96,6 +96,135 @@ fn injected_readme_merge_mechanism_count_drift_is_detected() -> Result<(), Strin
     }
 }
 
+#[test]
+fn workspace_docs_have_no_stale_open_bead_claims() -> Result<(), String> {
+    let root = workspace_root()?;
+    let issues_jsonl = read_to_string(&root, ".beads/issues.jsonl")?;
+    let mut all_errors = Vec::new();
+    for doc in [
+        "README.md",
+        "README_EXT4_BTRFS.md",
+        "FEATURE_PARITY.md",
+        "PROPOSED_ARCHITECTURE.md",
+        "PLAN_TO_PORT_FRANKENFS_TO_RUST.md",
+        "COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md",
+    ] {
+        let text = read_to_string(&root, doc)?;
+        all_errors.extend(ffs_harness::docs_status_drift::find_stale_open_bead_claims(
+            &issues_jsonl,
+            doc,
+            &text,
+        ));
+    }
+    if all_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "stale open-bead claims in workspace docs:\n{}",
+            all_errors.join("\n")
+        ))
+    }
+}
+
+#[test]
+fn injected_stale_open_bead_claim_is_detected() -> Result<(), String> {
+    let root = workspace_root()?;
+    let issues_jsonl = read_to_string(&root, ".beads/issues.jsonl")?;
+    let synthetic = "Follow-on items remain open under `bd-9rutw` and `bd-uzt72`.\n";
+    let errors = ffs_harness::docs_status_drift::find_stale_open_bead_claims(
+        &issues_jsonl,
+        "README.md",
+        synthetic,
+    );
+    let saw_closed = errors
+        .iter()
+        .any(|err| err.contains("bd-9rutw") && err.contains("status=closed"));
+    let saw_missing = errors
+        .iter()
+        .any(|err| err.contains("bd-uzt72") && err.contains("status=missing"));
+    if saw_closed && saw_missing {
+        Ok(())
+    } else {
+        Err(format!(
+            "injected stale/missing open-bead claims not detected: {errors:?}"
+        ))
+    }
+}
+
+#[test]
+fn mounted_scorecards_have_no_verdict_or_summary_drift() -> Result<(), String> {
+    let root = workspace_root()?;
+    let mut all_errors = Vec::new();
+    for doc in [
+        "docs/MOUNTED_KERNEL_SCORECARD.md",
+        "docs/MOUNTED_BTRFS_SCORECARD.md",
+    ] {
+        let text = read_to_string(&root, doc)?;
+        all_errors.extend(ffs_harness::docs_status_drift::find_scorecard_verdict_drift(doc, &text));
+    }
+    if all_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "mounted scorecard verdict/summary drift:\n{}",
+            all_errors.join("\n")
+        ))
+    }
+}
+
+#[test]
+fn injected_scorecard_verdict_drift_is_detected() -> Result<(), String> {
+    let root = workspace_root()?;
+    let btrfs_scorecard = read_to_string(&root, "docs/MOUNTED_BTRFS_SCORECARD.md")?;
+    let mutated = btrfs_scorecard.replacen(
+        "| **Multi-file parallel read** |",
+        "| **Multi-file parallel read** | `1.140683x` slower (`verdict=HONEST_LOSS`; THE WIN IS WITHDRAWN) | **WIN** |\n| **Shadow row** |",
+        1,
+    );
+    let errors = ffs_harness::docs_status_drift::find_scorecard_verdict_drift(
+        "docs/MOUNTED_BTRFS_SCORECARD.md",
+        &mutated,
+    );
+    if errors.iter().any(|err| {
+        err.contains("scorecard verdict drift") || err.contains("scorecard summary drift")
+    }) {
+        Ok(())
+    } else {
+        Err(format!(
+            "injected scorecard verdict drift not detected: {errors:?}"
+        ))
+    }
+}
+
+#[test]
+fn comprehensive_spec_trait_mapping_section_names_live_workspace_traits() -> Result<(), String> {
+    let root = workspace_root()?;
+    let spec = read_to_string(&root, "COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md")?;
+    if !spec.contains("### 9.9 Concrete Workspace Trait & Type Mapping") {
+        return Err("COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md missing §9.9 trait mapping".to_owned());
+    }
+    for (rel_path, needle) in [
+        ("crates/ffs-block/src/lib.rs", "pub trait ByteDevice"),
+        ("crates/ffs-block/src/lib.rs", "pub trait BlockDevice"),
+        ("crates/ffs-core/src/vfs.rs", "pub trait FsOps"),
+        (
+            "crates/ffs-repair/src/recovery.rs",
+            "pub trait BlockValidator",
+        ),
+        (
+            "crates/ffs-repair/src/recovery.rs",
+            "pub trait RecoveryWriteback",
+        ),
+        ("crates/ffs-mvcc/src/persist.rs", "pub trait WalWriter"),
+    ] {
+        let src = read_to_string(&root, rel_path)?;
+        if !src.contains(needle) {
+            return Err(format!("{rel_path} missing `{needle}` referenced by §9.9"));
+        }
+    }
+    Ok(())
+}
+
 fn collect_mismatches(root: &Path, readme: &str) -> Result<Vec<String>, String> {
     let crate_count = git_ls_files_count(root, "crates/*/Cargo.toml")?;
     let fuzz_target_count = git_ls_files_count(root, "fuzz/fuzz_targets/*.rs")?;
@@ -104,7 +233,9 @@ fn collect_mismatches(root: &Path, readme: &str) -> Result<Vec<String>, String> 
     let snapshot_count = git_ls_files_count(root, "*.snap")?;
 
     let btrfs_source = read_to_string(root, "crates/ffs-btrfs/src/lib.rs")?;
-    let btrfs_item_type_count = count_btrfs_item_type_constants(&btrfs_source);
+    let btrfs_backrefs = read_to_string(root, "crates/ffs-btrfs/src/backrefs.rs")?;
+    let btrfs_combined = format!("{btrfs_source}\n{btrfs_backrefs}");
+    let btrfs_item_type_count = count_btrfs_item_type_constants(&btrfs_combined);
     let send_command_count = count_enum_variants(&btrfs_source, "SendCommand")?;
 
     let evidence_source = read_to_string(root, "crates/ffs-repair/src/evidence.rs")?;

@@ -46,7 +46,7 @@ cargo metadata --no-deps --format-version 1 | jq '.workspace_members | length'
 ls crates | wc -l
 
 # Crate map / count wording drift.
-rg -n "19[- ]crate|19 crates|21[- ]crate|21 crates" -S *.md
+rg -n "19[- ]crate|19 crates|21[- ]crate|21 crates|22[- ]member" -S *.md
 
 # fuser planned vs required drift.
 rg -n "\\bfuser\\b" -S Cargo.toml crates/ffs-fuse/Cargo.toml *.md
@@ -54,7 +54,7 @@ rg -n "\\bfuser\\b" -S Cargo.toml crates/ffs-fuse/Cargo.toml *.md
 # Top-level normative contract presence in code.
 rg -n "pub struct (GroupNumber|BlockSize|ByteOffset)\\b" -S crates/ffs-types
 rg -n "enum (ParseError|FfsError)\\b" -S crates
-rg -n "trait (RepairManager|BlockEventSink|FfsOperations|FuseBackend)\\b" -S crates
+rg -n "pub trait (ByteDevice|BlockDevice|BlockCache|FsOps|BlockValidator|RecoveryWriteback|BlockAllocator|WalWriter)\\b" -S crates
 
 # Forbidden runtime creep.
 rg -n "\\btokio\\b" Cargo.lock
@@ -250,7 +250,7 @@ Core MVCC types are defined in `ffs-types` / `ffs-mvcc` and specified in §5 (MV
 ```toml
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -265,7 +265,7 @@ nursery  = { level = "deny", priority = -1 }
 | `#![forbid(unsafe_code)]` | Workspace lint + crate-root attribute | Memory safety non-negotiable. Third-party `unsafe` (e.g., `crc32c`) acceptable if audited + safe API. |
 | Edition 2024 | `[workspace.package]` | Latest language features. |
 | Nightly toolchain | `rust-toolchain.toml`: `channel = "nightly"` | Required for Edition 2024 + dependency features. |
-| `rust-version = "1.85"` | `[workspace.package]` | MSRV: minimum Rust version supporting Edition 2024. The nightly toolchain is unpinned (latest nightly). |
+| `rust-version = "1.95"` | `[workspace.package]` | MSRV declared in root `Cargo.toml` (`u64::is_multiple_of` stabilized in 1.87; workspace pinned at `1.95`). |
 | Clippy pedantic+nursery deny | Workspace lints | Idiomatic Rust, catch common bugs. |
 | No tokio | Dependency audit | See Section 1.4. |
 | `panic = "abort"` in release | `[profile.release]` | No unwinding; smaller binary; no catch_unwind misuse. |
@@ -3457,6 +3457,22 @@ AllocPolicy  MvccBlockMgr  JournalMgr
 and is notified by the write path, but does not participate in filesystem
 operations. This ensures repair can be tested, disabled, or reconfigured
 without affecting correctness.
+
+### 9.9 Concrete Workspace Trait & Type Mapping
+
+The normative contracts in §§9.1–9.7 map onto concrete traits and domain types
+in the workspace as follows:
+
+| Spec Contract | Concrete Workspace Trait(s) / Type(s) | Crate & Source Path |
+|---|---|---|
+| §9.1 `ByteDevice` / `BlockDevice` | `pub trait ByteDevice`, `pub trait BlockDevice`, `pub trait VectoredBlockDevice`, `pub trait IoEngine` | `ffs-block` (`crates/ffs-block/src/lib.rs`, `io_engine.rs`); `PartitionByteDevice` in `ffs` (`crates/ffs/src/native.rs`) |
+| §9.2 `CachePolicy` | `pub trait BlockCache`, `CacheConfig`, `ArcCache<D>` | `ffs-block` (`crates/ffs-block/src/lib.rs`) |
+| §9.3 `MvccBlockManager` | `MvccStore`, `ShardedMvccStore`, `Transaction`, `pub trait CowAllocator`, `pub trait MvccFlushLifecycle` | `ffs-mvcc` (`crates/ffs-mvcc/src/lib.rs`, `store.rs`), `ffs-block` (`crates/ffs-block/src/lib.rs`) |
+| §9.4 `FfsOperations` + FUSE adapter | `pub trait FsOps` (implemented by `OpenFs`, `ProtectedFs`, `ReadOnlyFs`, `FatFs`, `NtfsFs`, `ZfsFs`), consumed by `FrankenFuse` (`fuser::Filesystem`) | `ffs-core` (`crates/ffs-core/src/vfs.rs`), `ffs-fuse` (`crates/ffs-fuse/src/lib.rs`), `ffs` (`crates/ffs/src/native.rs`) |
+| §9.5 `RepairManager` / `ScrubProgress` | `pub trait BlockValidator`, `pub trait RecoveryWriteback`, `pub trait RepairFlushLifecycle`, `ScrubDaemon`, `RecoveryOrchestrator` | `ffs-repair` (`crates/ffs-repair/src/scrub.rs`, `recovery.rs`), `ffs-block` (`crates/ffs-block/src/lib.rs`) |
+| §9.6 `AllocPolicy` | `pub trait BlockAllocator`, `pub trait BtrfsAllocator`, `ShardedAllocator`, `AllocHint` | `ffs-btree` (`crates/ffs-btree/src/lib.rs`), `ffs-btrfs` (`crates/ffs-btrfs/src/lib.rs`), `ffs-alloc` (`crates/ffs-alloc/src/lib.rs`), `ffs-core` (`crates/ffs-core/src/sharded_alloc.rs`) |
+| §9.7 `JournalManager` | `pub trait WalWriter`, `Jbd2Writer`, `replay_jbd2`, `replay_fast_commit` | `ffs-journal` (`crates/ffs-journal/src/lib.rs`, `wal_buffer.rs`) |
+
 ## 10. Filesystem Operations Pipeline
 
 ### 10.1 Mount Sequence

@@ -181,7 +181,7 @@ To avoid wasted reading, here is what this project is explicitly **not** trying 
 
 ## Architecture
 
-FrankenFS is a 22-member Cargo workspace: 21 crates under `crates/` and the `tools/ffs-ops` operational CLI, with an acyclic dependency graph.
+FrankenFS is a 25-member Cargo workspace: 24 crates under `crates/` and the `tools/ffs-ops` operational CLI, with an acyclic dependency graph.
 
 ```text
 Layer 1 (Foundation):  [ffs-types]  [ffs-error]
@@ -211,7 +211,7 @@ Legacy extraction reference (retained, not on the runtime path):
 
 | Layer | Crates | What it does |
 |-------|--------|--------------|
-| **Foundation** | `ffs-types`, `ffs-error` | Newtypes (`BlockNumber`, `InodeNumber`, `TxnId`, `CommitSeq`, `ByteOffset`, `DeviceId`); 21-variant `FfsError` with errno mappings |
+| **Foundation** | `ffs-types`, `ffs-error` | Newtypes (`BlockNumber`, `InodeNumber`, `TxnId`, `CommitSeq`, `ByteOffset`, `DeviceId`); 22-variant `FfsError` with errno mappings |
 | **On-disk** | `ffs-ondisk` | Pure parsing of ext4 + btrfs superblocks, group descriptors, inodes, extents, B-tree headers. No I/O. |
 | **Storage** | `ffs-block`, `ffs-journal`, `ffs-mvcc` | Block I/O with ARC / S3-FIFO cache; JBD2 replay + ext4 fast-commit + external-journal pairing; native MVCC with version chains, sharded store, snapshot isolation, four same-block merge mechanisms behind semantic proof labels, three conflict policies, Zstd/Brotli version compression, WAL persistence + recovery |
 | **Tree / Alloc** | `ffs-btree`, `ffs-alloc`, `ffs-extent`, `ffs-btrfs` | B+tree search/insert/split/merge; mballoc-style buddy allocator with goal-directed placement and Orlov directory spreading; ext4 extent mapping; btrfs runtime tree walk, chunk/device mapping, tree-log replay, COW tree mutation helpers, and delayed-ref helpers consumed by `ffs-core` |
@@ -1417,7 +1417,7 @@ Filesystem methods generally borrow `Cx`. Rust checks the lifetime of that refer
 ### Why this matters for a filesystem
 
 1. **Pure parser convention.** `Ext4Superblock::parse_superblock_region(&[u8])` parses supplied bytes without I/O. Source review and tests protect this boundary; absence of a `Cx` parameter does not itself prohibit standard-library I/O.
-2. **Cancellation is cooperative.** When a caller cancels a `Cx`, nested calls see the cancel at their next `checkpoint()`. Kernel FUSE interrupts are not yet wired to request contexts (bd-gk01h).
+2. **Cancellation is cooperative.** When a caller cancels a `Cx`, nested calls see the cancel at their next `checkpoint()`. Kernel FUSE interrupts are not wired to request contexts (`bd-gk01h` closed on cooperative boundary scope).
 3. **Deadlines compose.** A FUSE callback can install a 5-second deadline; a sub-operation can derive a tighter 1-second context; the lower limit wins.
 4. **Determinism in tests.** Under `LabRuntime`, scheduling is deterministic for a given seed, so a failing seed replays. FrankenFS tests run one schedule per seed; they do not invoke asupersync's DPOR explorer.
 5. **Budget-aware GC and flush.** Background workers consult `cx.budget()` and shrink their batch size when the quota is low, avoiding starvation of foreground requests.
@@ -1547,7 +1547,7 @@ The project uses `.beads/issues.jsonl` as the canonical task store. Reasons:
 - Git-versioned: every issue change is a diff in `issues.jsonl`, reviewable in PR diffs.
 - Multi-project hygiene: cross-project pollution is detectable via the source-aware queue-state check.
 
-### Decision 10: 126 E2E gate scripts
+### Decision 10: 128 E2E gate scripts
 
 Each E2E script is a single scenario class: writeback-cache audit, repair writeback route, mounted differential oracle, etc. They could be a single mega-test. They are separate scripts because:
 
@@ -1560,7 +1560,7 @@ Each E2E script is a single scenario class: writeback-cache audit, repair writeb
 
 ## Observability and Evidence
 
-FrankenFS defines a machine-readable evidence ledger shared across subsystems. On a mount, repair/scrub events are written when `--background-scrub-ledger` is given; MVCC transaction and merge events are not yet wired on the mounted path (bd-7ssc7).
+FrankenFS defines a machine-readable evidence ledger shared across subsystems. On a mount, repair/scrub events are written when `--background-scrub-ledger` is given; MVCC transaction and merge events are emitted in store/CLI evidence paths and are not emitted automatically on ordinary mounts (`bd-7ssc7` closed on CLI policy wiring).
 
 ### Evidence ledger (23 event types)
 
@@ -3090,7 +3090,7 @@ The V1 surface (the tracked 97-row parity matrix) is implemented and tested. The
 | **Block-level dedup** | BLAKE3-keyed dedup table, COW reference counting | The native-mode BLAKE3 path already produces strong block identifiers |
 | **Compressed MVCC pages** | Per-page Zstd/Brotli compression *of MVCC metadata*, separate from version data | Version-data compression is done; metadata compression needs spec work |
 | **Mounted evidence for the conflict policies** | `--mvcc-policy {strict,safe-merge,adaptive}` exists on `ffs mount` (bd-7ssc7); what is missing is a mounted contention benchmark reporting merge/abort counts per policy | Needs the MVCC evidence ledger on the mounted store first |
-| **NUMA-aware allocator: authoritative large-host evidence** | Per-NUMA-node block group preference *proven* to improve `swarm.responsiveness` on a permissioned 64+ core / 256GB+ host | The opt-in allocator hook, contract, runtime topology propagation, and the advisory `numa_allocation_placement_report` evidence lane are implemented; authoritative large-host proof remains gated on the permissioned campaign `bd-rchk0.53.8` |
+| **NUMA-aware allocator: authoritative large-host evidence** | Per-NUMA-node block group preference *proven* to improve `swarm.responsiveness` on a permissioned 64+ core / 256GB+ host | The opt-in allocator hook, contract, runtime topology propagation, and the advisory `numa_allocation_placement_report` evidence lane are implemented (`bd-rchk0.53.8` closed on advisory lane); authoritative large-host proof remains gated on a permissioned 64+ core host run |
 
 These items are surfaced via the proof-bundle release-gate policy (`tests/release-gates/release_gate_policy_v1.json`) under explicit `non-goals` and `deferred` lists, so docs and release wording cannot accidentally claim coverage they don't have.
 
@@ -3242,11 +3242,12 @@ The recovery posture is consistent across these: **fail closed, emit structured 
 
 ## The `FfsError` Error Variant Reference
 
-The 21 variants of `FfsError` are the unified failure surface for every public API. Each one maps to a specific POSIX errno used by FUSE replies, and the variant carries enough structured context for diagnosis.
+The 22 variants of `FfsError` are the unified failure surface for every public API. Each one maps to a specific POSIX errno used by FUSE replies, and the variant carries enough structured context for diagnosis.
 
 | Variant | errno | When it fires | Common cause |
 |---|---|---|---|
 | `Io(std::io::Error)` | raw OS errno if present, else mapped from `ErrorKind`; `EIO` fallback | OS-level I/O failure | Disk error, file descriptor problem, network filesystem hiccup |
+| `RequestRejected { errno, detail }` | positive `errno`, else `EIO` | Semantic POSIX rejection distinct from storage I/O | `EFBIG`, `EPERM`, or explicit protocol refusal |
 | `Corruption { block, detail }` | `EIO` | Live metadata read produced invalid data at a known block | Checksum mismatch, truncated on-disk structure, out-of-range field |
 | `Format(String)` | `EINVAL` | Wrong filesystem type or unsupported format version | Bad superblock magic, image isn't ext4/btrfs |
 | `Parse(String)` | `EINVAL` | Higher-level surface lift of `ParseError` from `ffs-types` | Structure didn't decode; carrier for finer-grained parse errors |
@@ -3255,7 +3256,7 @@ The 21 variants of `FfsError` are the unified failure surface for every public A
 | `UnsupportedBlockSize(String)` | `EOPNOTSUPP` | Block size outside 1 KB / 2 KB / 4 KB | Format is valid but build doesn't accept this block size |
 | `InvalidGeometry(String)` | `EINVAL` | Mount-time geometry parameter out of range | Zero `blocks_per_group`, impossible `bytes_used > total_bytes`, zero-capacity device |
 | `MvccConflict { tx, block }` | `EAGAIN` | Block-level FCW conflict at commit time | Concurrent writer modified the block since the snapshot; retry the transaction |
-| `Cancelled` | `EINTR` | `Cx::checkpoint()` saw cancellation or deadline expiry | Caller-cancelled or deadline-expired `Cx` (FUSE interrupts are not wired, bd-gk01h) |
+| `Cancelled` | `EINTR` | `Cx::checkpoint()` saw cancellation or deadline expiry | Caller-cancelled or deadline-expired `Cx` (`bd-gk01h` closed on cooperative boundary scope; FUSE interrupts are non-preemptive) |
 | `NoSpace` | `ENOSPC` | No free blocks or inodes available | Disk full; allocator exhausted in target groups |
 | `NotFound(String)` | `ENOENT` | File / directory / object lookup failed | Path doesn't exist, missing inode, missing block-group descriptor |
 | `PermissionDenied` | `EACCES` | Insufficient permissions for the requested operation | Mode bits / owner / capabilities denied the op |
@@ -3963,8 +3964,8 @@ Rows in the btrfs experimental RW contract can still be `partially supported` or
 - **Self-healing.** RaptorQ codecs, refresh policies, durability autopilot, stale-window monitoring and repair ownership. Explicit sidecar-protected compatibility mounts route reads, writes and durability barriers through one repair device. Ordinary on-image background repair remains read-only; read-write activation requires permanent allocator ownership. Default/native repair remains incomplete.
 - **Writeback-cache.** Epoch-based commit barriers with per-inode staged/visible/durable tracking, deferred visibility for MVCC isolation, dirty-page ordering oracle, 12-point crash/replay matrix artifact gate, runtime guard, and host/lane manifest checks. Kernel option default-off; explicit opt-in is evidence-gated.
 - **Observability.** Evidence ledger with 23 event types and 8 operator presets (`replay-anomalies`, `repair-failures`, `pressure-transitions`, `contention`, `metrics`, `cache`, `mvcc`, `repair-live`), contention metrics, policy-switch detection, structured logging across all subsystems, JSONL audit trail.
-- **Selected CLI commands.** `inspect`, `read`, `walk`, `mvcc-stats`, `info`, `dump`, `fsck`, `repair`, `mount`, `scrub`, `parity`, `evidence`, `mkfs`; `ffs-cli --help` lists the full command set, including benchmark commands, and each subcommand's `--help` lists its current flags.
-- **Testing inventory (2026-09-08).** 22 workspace members, 63 fuzz targets, 173 Rust benchmark files, 125 E2E scripts, and 226 tracked insta snapshots. These counts describe source coverage inventory, not checks executed or passed, and do not prove that every emitted report is covered.
+- **Selected CLI commands.** `inspect`, `partitions`, `ls`, `read`, `walk`, `format`, `streams`, `pool`, `dataset`, `mvcc-stats`, `info`, `dump`, `fsck` (`check`), `repair`, `mount`, `scrub`, `parity`, `evidence`, `mkfs`; `ffs-cli --help` lists the full command set, including benchmark commands, and each subcommand's `--help` lists its current flags.
+- **Testing inventory (source-derived).** 25 workspace members (24 crates under `crates/` plus `tools/ffs-ops`), 63 fuzz targets, 174 Rust benchmark files, 128 E2E scripts, and 226 tracked insta snapshots. These counts describe source coverage inventory, not checks executed or passed, and do not prove that every emitted report is covered.
 
 ### Historical bridge closeouts and remaining work
 
@@ -4089,7 +4090,7 @@ A: Same on-disk format for the tracked V1 features, with different internals: MV
 | [`COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md`](COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md) | 347 KB | Canonical specification, all subsystems |
 | [`EXISTING_EXT4_BTRFS_STRUCTURE.md`](EXISTING_EXT4_BTRFS_STRUCTURE.md) | 100 KB | Behavioral extraction from Linux kernel ext4/btrfs source |
 | [`PLAN_TO_PORT_FRANKENFS_TO_RUST.md`](PLAN_TO_PORT_FRANKENFS_TO_RUST.md) | 79 KB | 9-phase porting roadmap with scope and acceptance criteria |
-| [`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md) | 33 KB | 22-member architecture, trait hierarchy, data flow |
+| [`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md) | 33 KB | 25-member architecture, trait hierarchy, data flow |
 | [`FEATURE_PARITY.md`](FEATURE_PARITY.md) | 93 KB | Quantitative implementation coverage |
 | [`CHANGELOG.md`](CHANGELOG.md) | 123 KB | Project history organized by capability area |
 | [`AGENTS.md`](AGENTS.md) | 44 KB | Guidelines for AI coding agents working in this codebase |

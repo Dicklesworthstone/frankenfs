@@ -277,12 +277,41 @@ pub fn run_docs_status_drift(config: &DocsStatusDriftConfig) -> Result<DocsStatu
             )
         })?;
 
-    Ok(analyze_docs_status_drift(
+    let mut report = analyze_docs_status_drift(
         &issues_jsonl,
         &feature_parity,
         snippets_json.as_deref(),
         &config.generated_artifact_paths,
-    ))
+    );
+
+    report.errors.extend(find_stale_open_bead_claims(
+        &issues_jsonl,
+        "FEATURE_PARITY.md",
+        &feature_parity,
+    ));
+    if let Some(root) = config.feature_parity_markdown.parent() {
+        for rel in ["README.md", "README_EXT4_BTRFS.md", "PROPOSED_ARCHITECTURE.md"] {
+            let candidate = root.join(rel);
+            if let Ok(doc_text) = fs::read_to_string(&candidate) {
+                report
+                    .errors
+                    .extend(find_stale_open_bead_claims(&issues_jsonl, rel, &doc_text));
+            }
+        }
+        for rel in [
+            "docs/MOUNTED_KERNEL_SCORECARD.md",
+            "docs/MOUNTED_BTRFS_SCORECARD.md",
+        ] {
+            let candidate = root.join(rel);
+            if let Ok(scorecard_text) = fs::read_to_string(&candidate) {
+                report
+                    .errors
+                    .extend(find_scorecard_verdict_drift(rel, &scorecard_text));
+            }
+        }
+    }
+    report.release_gate_pass = report.errors.is_empty();
+    Ok(report)
 }
 
 #[must_use]
@@ -1515,6 +1544,244 @@ where
     counts
 }
 
+/// Detect documentation statements claiming a Bead (`bd-...`) is still open
+/// (`open under`, `remain(s) open under`, `stay(s) open in`) when `.beads/issues.jsonl`
+/// records that Bead as `closed` or absent.
+#[must_use]
+pub fn find_stale_open_bead_claims(
+    issues_jsonl: &str,
+    doc_name: &str,
+    doc_text: &str,
+) -> Vec<String> {
+    let mut statuses = BTreeMap::new();
+    for line in issues_jsonl.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+            && let Some(id) = val.get("id").and_then(Value::as_str)
+        {
+            let status = val
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            statuses.insert(id.to_owned(), status);
+        }
+    }
+
+    let prefixes = [
+        "remain open under ",
+        "remains open under ",
+        "stay open in ",
+        "stays open in ",
+        "open under ",
+    ];
+    let mut errors = Vec::new();
+    for (idx, raw_line) in doc_text.lines().enumerate() {
+        let lower = raw_line.to_ascii_lowercase();
+        for prefix in prefixes {
+            let mut search_from = 0usize;
+            while let Some(rel_pos) = lower[search_from..].find(prefix) {
+                let after = search_from + rel_pos + prefix.len();
+                search_from = after;
+                let tail = &raw_line[after..];
+                for candidate in extract_leading_bead_ids(tail) {
+                    match statuses.get(&candidate).map(String::as_str) {
+                        Some("closed") => errors.push(format!(
+                            "stale open-bead claim doc={doc_name}:{} bead={candidate} status=closed",
+                            idx + 1
+                        )),
+                        None => errors.push(format!(
+                            "unknown open-bead claim doc={doc_name}:{} bead={candidate} status=missing",
+                            idx + 1
+                        )),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn extract_leading_bead_ids(segment: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let window_end = segment
+        .find(['.', ';', '\n'])
+        .unwrap_or_else(|| segment.len().min(96));
+    let window = &segment[..window_end];
+    let mut rest = window;
+    while let Some(pos) = rest.find("bd-") {
+        let from_bd = &rest[pos..];
+        let len = from_bd
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '.')
+            .map(char::len_utf8)
+            .sum::<usize>();
+        let candidate = from_bd[..len].trim_end_matches(['.', '-']);
+        if candidate.len() > 3 && !ids.iter().any(|existing| existing == candidate) {
+            ids.push(candidate.to_owned());
+        }
+        rest = &from_bd[len..];
+    }
+    ids
+}
+
+/// Detect mounted scorecard Verdict-column and summary-line drift where:
+/// - a row explicitly withdraws a win, supersedes a tie, declares arms not comparable,
+///   or carries an admitted `> 1.05x` `HONEST_LOSS` headline while its Verdict column
+///   still claims `WIN` or `NEUTRAL`; or
+/// - the `Score: W wins / L losses / N neutral` summary line disagrees with the table's
+///   actual row verdicts.
+#[must_use]
+pub fn find_scorecard_verdict_drift(doc_name: &str, scorecard_markdown: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut in_rows_section = false;
+    let mut seen_table_separator = false;
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+    let mut neutral = 0usize;
+    let mut row_count = 0usize;
+
+    for (idx, line) in scorecard_markdown.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "## The rows" {
+            in_rows_section = true;
+            seen_table_separator = false;
+            continue;
+        }
+        if !in_rows_section {
+            continue;
+        }
+        if trimmed.starts_with("## ") {
+            break;
+        }
+        if !trimmed.starts_with('|') {
+            if seen_table_separator && row_count > 0 && trimmed.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if trimmed.contains("| ---") {
+            seen_table_separator = true;
+            continue;
+        }
+        if !seen_table_separator {
+            continue;
+        }
+
+        let without_edges = trimmed.trim_start_matches('|').trim_end_matches('|');
+        let Some((workload_raw, _)) = without_edges.split_once('|') else {
+            continue;
+        };
+        let Some((_, verdict_raw)) = without_edges.rsplit_once('|') else {
+            continue;
+        };
+        let workload = workload_raw.trim().trim_matches('*').trim();
+        let verdict = verdict_raw
+            .trim()
+            .trim_matches('*')
+            .trim()
+            .to_ascii_uppercase();
+        row_count += 1;
+
+        match verdict.as_str() {
+            "WIN" => wins += 1,
+            "LOSE" => losses += 1,
+            "NEUTRAL" => neutral += 1,
+            _ => {}
+        }
+
+        if verdict == "WIN" || verdict == "NEUTRAL" {
+            let active_head = active_scorecard_row_head(without_edges);
+            let withdrawn_or_uncomparable = active_head.contains("THE WIN IS WITHDRAWN")
+                || active_head.contains("THE TIE IS SUPERSEDED")
+                || active_head.contains("NOT COMPARABLE — THE ARMS ARE IN DIFFERENT DURABILITY CLASSES")
+                || active_head.contains("verdict=HONEST_LOSS")
+                || has_unqualified_loss_ratio_above_threshold(active_head, 1.05);
+            if withdrawn_or_uncomparable {
+                errors.push(format!(
+                    "scorecard verdict drift doc={doc_name}:{} workload={workload:?} verdict={verdict} contradicts admitted loss/withdrawal",
+                    idx + 1
+                ));
+            }
+        }
+    }
+
+    if row_count > 0
+        && let Some((claimed_w, claimed_l, claimed_n)) =
+            parse_scorecard_summary_counts(scorecard_markdown)
+        && (claimed_w != wins || claimed_l != losses || claimed_n != neutral)
+    {
+        errors.push(format!(
+            "scorecard summary drift doc={doc_name} claimed={claimed_w}W/{claimed_l}L/{claimed_n}N observed={wins}W/{losses}L/{neutral}N"
+        ));
+    }
+
+    errors
+}
+
+fn active_scorecard_row_head(row: &str) -> &str {
+    let mut end = row.len();
+    for marker in ["Superseded:", "Older,", "Historical, superseded"] {
+        if let Some(pos) = row.find(marker) {
+            end = end.min(pos);
+        }
+    }
+    &row[..end]
+}
+
+fn has_unqualified_loss_ratio_above_threshold(text: &str, threshold: f64) -> bool {
+    let mut rest = text;
+    while let Some(open_tick) = rest.find('`') {
+        let after_open = &rest[open_tick + 1..];
+        let Some(close_tick) = after_open.find('`') else {
+            break;
+        };
+        let token = &after_open[..close_tick];
+        if let Some(num_str) = token.strip_suffix('x')
+            && let Ok(ratio) = num_str.parse::<f64>()
+            && ratio > threshold
+        {
+            let context_after = &after_open[close_tick + 1..after_open.len().min(close_tick + 160)];
+            if context_after.contains("slower") || context_after.contains("LOSS") {
+                return true;
+            }
+        }
+        rest = &after_open[close_tick + 1..];
+    }
+    false
+}
+
+fn parse_scorecard_summary_counts(markdown: &str) -> Option<(usize, usize, usize)> {
+    for line in markdown.lines() {
+        if !line.contains("win") || !line.contains("loss") || !line.contains("neutral") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('/').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let w = extract_last_usize_before(parts[0], "win")?;
+        let l = extract_last_usize_before(parts[1], "loss")?;
+        let n = extract_last_usize_before(parts[2], "neutral")?;
+        return Some((w, l, n));
+    }
+    None
+}
+
+fn extract_last_usize_before(segment: &str, keyword: &str) -> Option<usize> {
+    let lower = segment.to_ascii_lowercase();
+    let idx = lower.find(keyword)?;
+    segment[..idx]
+        .split(|ch: char| !ch.is_ascii_digit())
+        .rfind(|tok| !tok.is_empty())?
+        .parse::<usize>()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2019,6 +2286,64 @@ mod tests {
         insta::assert_snapshot!(
             "render_docs_status_drift_markdown_default_fixture",
             markdown
+        );
+    }
+
+    #[test]
+    fn detects_stale_open_claim_for_closed_or_missing_bead() {
+        let issues = concat!(
+            r#"{"id":"bd-open-1","status":"open"}"#,
+            "\n",
+            r#"{"id":"bd-closed-2","status":"closed"}"#,
+            "\n",
+        );
+        let clean_doc = "Remaining qualification stays open in `bd-open-1`.\n";
+        assert!(find_stale_open_bead_claims(issues, "README.md", clean_doc).is_empty());
+
+        let closed_claim =
+            "UBS tripwire review and publication remain open under `bd-closed-2`.\n";
+        let closed_errors = find_stale_open_bead_claims(issues, "README.md", closed_claim);
+        assert_eq!(closed_errors.len(), 1);
+        assert!(closed_errors[0].contains("bead=bd-closed-2 status=closed"));
+
+        let missing_claim = "Crash qualification remains open under `bd-nonexistent-999`.\n";
+        let missing_errors = find_stale_open_bead_claims(issues, "README.md", missing_claim);
+        assert_eq!(missing_errors.len(), 1);
+        assert!(missing_errors[0].contains("bead=bd-nonexistent-999 status=missing"));
+    }
+
+    #[test]
+    fn detects_scorecard_win_or_neutral_verdict_when_ratio_is_admitted_loss() {
+        let honest_scorecard = "\
+**Score: 0 wins / 2 losses / 0 neutral / 0 unscored.**
+
+## The rows
+
+| Workload | FrankenFS ÷ kernel | Null | Verdict |
+| --- | --- | --- | --- |
+| **Warm stat** | **`4.888392x` slower**, `verdict=HONEST_LOSS` | `0.999x` | **LOSE** |
+| **Parallel read** | ⛔⛔ **THE WIN IS WITHDRAWN — ADMITTED LOSS `1.085668x`**, `verdict=HONEST_LOSS` | `1.001x` | **LOSE** |
+";
+        assert!(
+            find_scorecard_verdict_drift("MOUNTED_BTRFS_SCORECARD.md", honest_scorecard).is_empty()
+        );
+
+        let inflated_verdict = honest_scorecard.replace(
+            "| ⛔⛔ **THE WIN IS WITHDRAWN — ADMITTED LOSS `1.085668x`**, `verdict=HONEST_LOSS` | `1.001x` | **LOSE** |",
+            "| ⛔⛔ **THE WIN IS WITHDRAWN — ADMITTED LOSS `1.085668x`**, `verdict=HONEST_LOSS` | `1.001x` | **WIN** |",
+        );
+        let errors = find_scorecard_verdict_drift("MOUNTED_BTRFS_SCORECARD.md", &inflated_verdict);
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("scorecard verdict drift") && err.contains("verdict=WIN")),
+            "expected verdict drift error, got {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("scorecard summary drift")),
+            "expected summary count mismatch error, got {errors:?}"
         );
     }
 }

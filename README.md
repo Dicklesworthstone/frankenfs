@@ -77,10 +77,10 @@ remain separately controlled by `--console`.
 |---|---|---|---|
 | **ext4** | Main `ffs-cli` / `OpenFs` path | Native reads, experimental mounted writes, journal integration, MVCC and repair work | Writeback, recovery and release readiness remain evidence-gated; see the detailed guide and current parity ledger. |
 | **btrfs** | Main `ffs-cli` / `OpenFs` path | Native reads and guarded experimental writes, transaction-commit and repair work | Native feature/topology admission and durability evidence still matter; not blanket kernel parity. |
-| **FAT16** | `ffs-fat` | Native reads/catalog/extraction, experimental ordinary/protected writable FUSE, allocation checks, formatting/population, and ordered offline file/directory/range mutation | New long names use bounded UTF-16 with ASCII aliases. Subdirectories can grow; [offline resize can expand the fixed root](docs/FAT_ROOT_EXPANSION.md) into a new image. Native/mounted crash qualification remains open; ordered mutation is not a crash-atomic transaction. |
-| **FAT32** | `ffs-fat` | The FAT16 companion surface plus root chains, selected-FAT handling, free-space hints and offline resize/relocation | Namespace and range operations retain ordered native publication and explicit dirty failure states. Complete native/mounted qualification remains open. |
-| **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection, physical allocation checking, shared security-store/file-reference checking and FUSE | The exact read profile controls admission. Restricted volatile `$LogFile` recovery exists; neither recovery nor structural checking grants native write authority or a general Windows consistency claim. General NTFS mutation remains unfinished. |
-| **ZFS** | `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction across mirror vdevs and volatile ZIL recovery | Read-only root selection is not native writable pool ownership. Missing-member extraction requires a survivor in every top-level vdev, is committed-view-only and forbids ZIL inspection/replay. Native allocation/TXG writing remains unfinished. |
+| **FAT16** | `ffs-cli` / `ffs-fat` | Native reads/catalog/extraction, experimental ordinary/protected writable FUSE, allocation checks, formatting/population, and ordered offline file/directory/range mutation | New long names use bounded UTF-16 with ASCII aliases. Subdirectories can grow; [offline resize can expand the fixed root](docs/FAT_ROOT_EXPANSION.md) into a new image. Deterministic offline write-cut recovery is tested; full mounted/power-cut qualification remains open, and ordered mutation is not a crash-atomic transaction. |
+| **FAT32** | `ffs-cli` / `ffs-fat` | The FAT16 companion surface plus root chains, selected-FAT handling, free-space hints and offline resize/relocation | Namespace and range operations retain ordered native publication and explicit dirty failure states. Complete mounted/power-cut qualification remains open. |
+| **NTFS** | `ffs-cli` / `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection, physical allocation checking, shared security-store/file-reference checking and FUSE | The exact read profile controls admission (`--offline-image`). Restricted volatile `$LogFile` recovery exists; neither recovery nor structural checking grants native write authority or a general Windows consistency claim. General NTFS mutation remains unfinished. |
+| **ZFS** | `ffs-cli` / `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction across mirror/RAIDZ vdevs and volatile ZIL recovery | Read-only root selection is not native writable pool ownership (`--offline-image`). Missing-member extraction requires a survivor in every top-level vdev, is committed-view-only and forbids ZIL inspection/replay. Native allocation/TXG writing remains unfinished. |
 
 On Linux kernels supporting FUSE_SYNCFS (protocol 7.34+), `--fuseblk-device PATH`
 enables filesystem-wide `sync -f` through the
@@ -114,8 +114,10 @@ profile flags, allocated bytes and used bytes as JSON. FrankenFS uses an
 explicit Linux/FUSE sized-command extension; the standard 16-byte SPACE_INFO
 command supports only the zero-slot count query through this transport.
 Nonzero legacy requests return EOVERFLOW. This does not make native
-`btrfs filesystem df` support FUSE. The current engine's accounting requires
-a writable mount; the queries themselves do not request filesystem mutation.
+`btrfs filesystem df` support FUSE. Both read-only and writable btrfs mounts
+support `SPACE_INFO` accounting (read-only mounts aggregate on-disk
+`BLOCK_GROUP_ITEM` and `CHUNK_TREE` profile records); the queries themselves do
+not request filesystem mutation.
 The native kernel also reports a transient global-reserve row, which the
 FrankenFS allocator does not currently expose. Native ioctl output is therefore
 not identical to the block-group array.
@@ -263,8 +265,9 @@ strict Clippy and full formatting through RCH. Its full FAT/facade run passed
 515 tests; all nine parent-repair tests passed again after equivalent test
 iterator corrections. Exact source cuts and logs are in `FEATURE_PARITY.md`
 and `.beads/pending_tasks.md`. The later FAT root-expansion feature is outside
-those cuts. UBS still reports three test-only panic tripwires; their separate
-review and publication remain open under `bd-native-image-library-s4tde`.
+those cuts. The merged-source library qualification closed under
+`bd-native-image-library-s4tde`; three test-only UBS panic tripwires remain
+tracked separately from release readiness.
 These bounded results do not constitute release acceptance.
 Explicit native checks require their real producer tools:
 
@@ -332,8 +335,11 @@ may leave a dirty image requiring native checking/recovery on another copy.
 Explicit `mkdir` initializes one empty native directory under an existing parent,
 including `.` and `..`, using the same parent-growth and publication protocol.
 Offline unlink/rmdir/rename and experimental writable mounts are implemented.
-Their mounted/native crash qualification remains open under `bd-uzt72`;
-bounded offline recovery does not establish general native crash replay.
+Deterministic 12-row offline write-cut recovery across `create`, `write`,
+`truncate`, `unlink`, `rename` and `resize` is verified in
+`crates/ffs-fat/tests/crash_cut_matrix.rs`, while live mounted/hardware
+power-cut crash qualification remains open; bounded offline recovery does not
+establish general native crash replay.
 See the [creation and directory-growth contract](docs/FAT_CREATE_PROFILE.md).
 
 ### Evidence for this increment
@@ -385,8 +391,8 @@ unexplained space is never declared reclaimable. Bitmap failures and cancellatio
 fail the operation. Discrepancies or limits print JSON and return nonzero.
 The command refuses sidecars and recovery overlays before opening images.
 The shared library exposes the same check without a serialization dependency.
-Ten library and four CLI/report controls are authored but not executed in this
- environment; native interchange and the Rust gates remain unverified. See the
+Library and CLI/report regression suites execute in `crates/ffs-ntfs` via RCH;
+broader Windows `chkdsk` corpus interchange remains separate from unit/constructed-image checks. See the
 [NTFS allocation-check profile](docs/NTFS_ALLOCATION_CHECK.md) for exact scope,
 resource limits and qualification requirements.
 
@@ -394,8 +400,8 @@ Add `--verify-record-ownership` to cross-check allocated MFT extensions against
 validated base ATTRIBUTE_LIST catalogs. The separate metadata budget is set with
 `--max-metadata-bytes`; free or stale catalog references fail, while incomplete
 coverage leaves owner-absence conclusions unknown. This does not grant repair
-or native write authority. Eight library and three CLI/report regressions are
-authored but unexecuted here. See the [record ownership profile](docs/NTFS_RECORD_OWNERSHIP.md).
+or native write authority. Library and CLI/report regressions execute in
+`crates/ffs-ntfs`; see the [record ownership profile](docs/NTFS_RECORD_OWNERSHIP.md).
 
 Add `--verify-namespace` to reconcile native directory indexes and FILE_NAME
 catalogs in both directions, validate record/parent sequences and allocation,
@@ -452,8 +458,8 @@ This profile does not infer missing disks or choose the newest surviving TXG.
 It refuses active pools, incomplete RAIDZ/striped topology, automatic import and
 log recovery. It performs no backing writes or healing. One survivor remains a
 mirror-owned view rather than being reinterpreted as a standalone leaf.
-The ten new controls are authored, not runtime-qualified in this implementation
-session. See the [missing-mirror extraction profile](docs/ZFS_MISSING_MIRROR_PROFILE.md)
+Constructed-image and CLI controls execute in `crates/ffs-zfs` via RCH; live
+multi-disk OpenZFS pool-fault field qualification remains separate. See the [missing-mirror extraction profile](docs/ZFS_MISSING_MIRROR_PROFILE.md)
 for exact limits, examples, proof scope and required validation.
 
 ### RAIDZ1/2/3 with explicitly absent children
@@ -473,9 +479,8 @@ ffs-zfs read first.img /important.bin --member second.img --offline-image \
 
 All absent GUIDs must be declared, and their count must fit native parity.
 Automatic import, replay and mixed mirror/RAIDZ declarations are refused before
-image opens; no pool healing or latest-state authority is implied. Thirteen
-new native-image, CLI and head/snapshot controls are authored but not executed
-in this implementation session. See the
+image opens; no pool healing or latest-state authority is implied. Constructed-image,
+CLI and head/snapshot controls execute in `crates/ffs-zfs` via RCH. See the
 [missing-RAIDZ extraction profile](docs/ZFS_MISSING_RAIDZ_PROFILE.md) for limits
 and validation still required before relying on the feature.
 
@@ -496,10 +501,11 @@ ffs-zfs read first.img /important.bin --member second.img \
 
 Ordinary blocks, gang headers/fragments, redundancy scrub and existing ZIL
 storage planning share the retained replica routing. A different vdev is not
-a fallback unless another declared DVA selects it. Missing children in these
-multi-vdev pools, multiple RAIDZ groups and native write/import
-authority remain outside this increment. Ten new Rust tests are authored but
-unexecuted here; see the [striped-mirror profile](docs/ZFS_STRIPED_MIRRORS.md).
+a fallback unless another declared DVA selects it. Explicit `--missing-mirror-member`
+is supported when every top-level mirror vdev retains at least one surviving
+child; multiple RAIDZ groups and native write/import
+authority remain outside this increment. Constructed-image Rust tests execute
+in `crates/ffs-zfs`; see the [striped-mirror profile](docs/ZFS_STRIPED_MIRRORS.md).
 
 Complete mirror/leaf stripes also support `--auto-import`. Selection checks all
 surviving valid configurations, scans independently located rings using each
@@ -516,8 +522,8 @@ ffs-zfs read first.img /important.bin --member second.img \
   --auto-import --pool-guid 123 --dataset data > recovered.bin
 ```
 
-Eight additional Rust controls and a revised explicit/automatic equivalence
-control are authored but unexecuted in this implementation environment. See
+Explicit/automatic equivalence and multi-vdev controls execute in
+`crates/ffs-zfs` via RCH. See
 the profile above for the retained limits and required validation.
 
 ### Check redundancy, not only readability
@@ -539,8 +545,8 @@ The independent work budget is reserved before extra audit I/O. Missing members,
 unverified parity, divergent gang headers and exhausted limits cannot
 produce a clean redundancy result. No writes, healing, resilvering or pool-wide
 coverage are implied; enclosing object-set roots, labels and other datasets stay
-outside this walk. The eleven earlier audit controls plus seven new gang-tree
-controls are authored but not executed in this environment. Gang audit charges
+outside this walk. Physical-copy and gang-tree audit controls execute in
+`crates/ffs-zfs` via RCH. Gang audit charges
 include a conservative whole-tree allowance before manifest I/O; an incomplete
 graph or saturated diagnostic ledger never becomes a clean audit. See the
 [physical-copy audit profile](docs/ZFS_REDUNDANCY_SCRUB.md)
@@ -554,14 +560,13 @@ Use the checked-in Rust toolchain and the platform/dependency instructions in th
 ```sh
 cargo build -p ffs-cli --bins
 
-# Existing ext4/btrfs entry point.
+# Unified six-format entry point (auto-detects ext4/btrfs/FAT16/FAT32/NTFS/ZFS + MBR/GPT --partition).
 cargo run -p ffs-cli -- inspect /path/to/fs.img --json
+cargo run -p ffs-cli -- partitions /path/to/disk.img --json
+cargo run -p ffs-cli -- --partition 1 ls /path/to/disk.img / --json
 
-# Native FAT image tools; reads do not require a FUSE mount.
+# Format-specific companion tools remain available for advanced offline flags.
 cargo run -p ffs-cli --bin ffs-fat -- inspect /path/to/fat.img
-cargo run -p ffs-cli --bin ffs-fat -- ls /path/to/fat.img /
-
-# Discover exact companion arguments before selecting a volume or ZFS pool.
 cargo run -p ffs-cli --bin ffs-ntfs -- --help
 cargo run -p ffs-cli --bin ffs-zfs -- --help
 ```
@@ -592,12 +597,14 @@ propagation. Full context propagation and worker scoping remain work, not a
 blanket property of every existing path.
 
 The multi-format plan deliberately separates native compatibility from
-FrankenFS-specific improvements. The remaining high-impact work includes FAT
-directory creation, broader namespace operations and native naming/interchange
-qualification; NTFS native recovery plus allocator/MFT/index mutation; ZFS
-native allocation/TXG/ZIL and pool lifecycle; shared backend integration; and
-executable native-interchange, crash/reopen and mounted-operation evidence for
-each admitted profile.
+FrankenFS-specific improvements. FAT directory creation (`mkdir`), offline
+`unlink`/`rmdir`/`rename`/`resize`, pure-Rust `format`, bounded MBR/GPT
+`--partition` slice discovery, and unified six-format read/inspect/check/scrub
+routing in `ffs-cli` are implemented. The remaining high-impact work includes
+FAT Windows naming/mounted power-cut qualification; NTFS native recovery plus
+allocator/MFT/index mutation; ZFS native allocation/TXG/ZIL and pool lifecycle;
+writable six-format `OpenFs` integration; and executable native-interchange,
+crash/reopen and mounted-operation evidence for each admitted profile.
 
 The [comprehensive plan](COMPREHENSIVE_PLAN_FOR_NTFS_FAT16_FAT32_AND_ZFS.md),
 [implementation workpackages](docs/NTFS_FAT_ZFS_IMPLEMENTATION_WORKPACKAGES.md),
@@ -622,15 +629,15 @@ in force; none are waived by adding a format or a new command.
 ### Source inventory
 
 The current source-derived test inventory contains 24 crates under `crates/`,
-63 fuzz targets, 173 Rust benchmark files, 126 tracked E2E scripts and
+63 fuzz targets, 174 Rust benchmark files, 128 tracked E2E scripts and
 226 tracked insta snapshots. The evidence schema declares 23 evidence-event types.
 These are source counts, not executed-test or readiness results.
 The [fuzz inventory](fuzz/fuzz_targets/) has the badge count
 ![63 fuzz targets](https://img.shields.io/badge/fuzz%20targets-63-brightgreen).
-The detailed guide retains [Decision 10: 126 E2E gate scripts](README_EXT4_BTRFS.md#decision-10-126-e2e-gate-scripts).
+The detailed guide retains [Decision 10: 128 E2E gate scripts](README_EXT4_BTRFS.md#decision-10-128-e2e-gate-scripts).
 
 The btrfs reader declares 23 command variants for send streams and item-type
-constants (24 currently). MVCC exposes 4 executable same-block merge mechanisms
+constants (26 currently). MVCC exposes 4 executable same-block merge mechanisms
 through the 5-outcome `MergeProofMechanism` enum; the remaining outcome refuses
 same-block merging. Enum and file counts do not qualify native interchange,
 durability or mounted behavior.

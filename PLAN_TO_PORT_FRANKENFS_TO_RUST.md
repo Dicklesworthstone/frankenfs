@@ -217,7 +217,7 @@ mounted CI, and performance baselines remain tracked separately.
 - **OS:** Linux (x86_64, aarch64)
 - **Interface:** FUSE 7.x via the `fuser` crate (kernel FUSE module required)
 - **Rust edition:** 2024
-- **MSRV:** 1.85 (required by Edition 2024)
+- **MSRV:** 1.95 (declared in workspace `Cargo.toml`; nightly toolchain pinned via `rust-toolchain.toml`)
 
 ### 1.4 Key Dependencies
 
