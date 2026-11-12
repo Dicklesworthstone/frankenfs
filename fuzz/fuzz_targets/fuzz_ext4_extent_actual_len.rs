@@ -26,7 +26,7 @@
 //! such regressions as fuzzer failures rather than silent data
 //! corruption.
 
-use ffs_ondisk::{EXT_INIT_MAX_LEN, Ext4Extent};
+use ffs_ondisk::{Ext4Extent, EXT_INIT_MAX_LEN};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

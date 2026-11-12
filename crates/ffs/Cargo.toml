@@ -20,6 +20,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
+blake3 = { workspace = true }
 clap = { workspace = true }
 ffs-fuse = { workspace = true }
 ffs-ondisk = { workspace = true }

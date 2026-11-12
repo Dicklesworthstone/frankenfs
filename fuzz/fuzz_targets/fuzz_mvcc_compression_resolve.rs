@@ -67,7 +67,7 @@ fn build_chain(cursor: &mut ByteCursor<'_>) -> Vec<VersionData> {
         let payload = cursor.next_bytes(payload_len);
 
         let variant = match kind {
-            0 => VersionData::Full(payload),
+            0 => VersionData::full(payload),
             // Identical at slot 0 is intentionally malformed and should
             // resolve to None. Later Identical entries must resolve exactly
             // like their predecessor, including when the predecessor is a
@@ -80,7 +80,7 @@ fn build_chain(cursor: &mut ByteCursor<'_>) -> Vec<VersionData> {
                 // happy path and stress decode_all on a valid stream.
                 match zstd::encode_all(payload.as_slice(), 0) {
                     Ok(encoded) => VersionData::Zstd(encoded),
-                    Err(_) => VersionData::Full(payload),
+                    Err(_) => VersionData::full(payload),
                 }
             }
             _ => {

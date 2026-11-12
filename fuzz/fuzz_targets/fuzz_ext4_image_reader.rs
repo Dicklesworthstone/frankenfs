@@ -1,7 +1,7 @@
 #![no_main]
 
 use ffs_ondisk::Ext4ImageReader;
-use ffs_types::{BlockNumber, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, GroupNumber, InodeNumber};
+use ffs_types::{BlockNumber, GroupNumber, InodeNumber, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPER_MAGIC};
 use libfuzzer_sys::fuzz_target;
 
 const BLOCK_SIZE: usize = 4096;

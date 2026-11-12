@@ -156,6 +156,14 @@ for target in "${TARGETS[@]}"; do
         DICT_ARGS=(-dict=fuzz/dictionaries/ext4.dict)
     elif [[ "$target" == *btrfs* ]]; then
         DICT_ARGS=(-dict=fuzz/dictionaries/btrfs.dict)
+    elif [[ "$target" == *fat* ]]; then
+        DICT_ARGS=(-dict=fuzz/dictionaries/fat.dict)
+    elif [[ "$target" == *ntfs* ]]; then
+        DICT_ARGS=(-dict=fuzz/dictionaries/ntfs.dict)
+    elif [[ "$target" == *zfs* ]]; then
+        DICT_ARGS=(-dict=fuzz/dictionaries/zfs.dict)
+    elif [[ "$target" == *partition* ]]; then
+        DICT_ARGS=(-dict=fuzz/dictionaries/partition.dict)
     fi
 
     run_remote_cargo_capture "$TARGET_LOG" run --manifest-path fuzz/Cargo.toml --bin "$target" \

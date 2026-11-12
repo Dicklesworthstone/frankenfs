@@ -1,12 +1,13 @@
 #![no_main]
 
 use ffs_btrfs::{
-    SendAttr, SendCommand, SendStreamBuilder, build_chmod_command, build_chown_command,
-    build_clone_command, build_link_command, build_mkdir_command, build_mkfifo_command,
-    build_mkfile_command, build_mknod_command, build_mksock_command, build_removexattr_command,
-    build_rename_command, build_rmdir_command, build_setxattr_command, build_snapshot_command,
-    build_subvol_command, build_symlink_command, build_truncate_command, build_unlink_command,
-    build_update_extent_command, build_utimes_command, build_write_command, parse_send_stream,
+    build_chmod_command, build_chown_command, build_clone_command, build_link_command,
+    build_mkdir_command, build_mkfifo_command, build_mkfile_command, build_mknod_command,
+    build_mksock_command, build_removexattr_command, build_rename_command, build_rmdir_command,
+    build_setxattr_command, build_snapshot_command, build_subvol_command, build_symlink_command,
+    build_truncate_command, build_unlink_command, build_update_extent_command,
+    build_utimes_command, build_write_command, parse_send_stream, SendAttr, SendCommand,
+    SendStreamBuilder,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -65,11 +66,7 @@ fn bounded_bytes(data: &[u8], offset: usize, max_len: usize) -> Vec<u8> {
     buf
 }
 
-fn add_command(
-    builder: &mut SendStreamBuilder,
-    cmd: SendCommand,
-    attrs: Vec<(SendAttr, Vec<u8>)>,
-) {
+fn add_command(builder: &mut SendStreamBuilder, cmd: SendCommand, attrs: Vec<(SendAttr, Vec<u8>)>) {
     let refs: Vec<(SendAttr, &[u8])> = attrs.iter().map(|(a, d)| (*a, d.as_slice())).collect();
     builder.add_command(cmd, &refs);
 }

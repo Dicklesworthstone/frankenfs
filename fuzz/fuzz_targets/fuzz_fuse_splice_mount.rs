@@ -1,7 +1,7 @@
 #![no_main]
 
 use asupersync::Cx;
-use ffs_core::{DirEntry, FileType, FsOps, InodeAttr, RequestScope};
+use ffs_core::{FileType, FsOps, InodeAttr, ReaddirPage, RequestScope};
 use ffs_error::FfsError;
 use ffs_fuse::{
     mount_option_labels_for_fuzzing, parse_mount_options_for_fuzzing, FrankenFuse, MountOptions,
@@ -229,8 +229,8 @@ impl FsOps for FuzzFs {
         _scope: &mut RequestScope,
         _ino: InodeNumber,
         _offset: u64,
-    ) -> ffs_error::Result<Vec<DirEntry>> {
-        Ok(Vec::new())
+    ) -> ffs_error::Result<ReaddirPage> {
+        Ok(ReaddirPage::new(Vec::new()))
     }
 
     fn read(

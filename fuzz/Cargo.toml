@@ -7,18 +7,26 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[lib]
+name = "ffs_fuzz"
+path = "src/lib.rs"
+doc = false
+
 [dependencies]
 anyhow = "1.0.102"
-asupersync = "=0.5.0"
+asupersync = { version = "=0.5.0", features = ["simd-intrinsics", "test-internals"] }
+blake3 = "1.8.5"
 brotli = "8.0"
 crc32c = "0.6.8"
 libc = "0.2.185"
 libfuzzer-sys = "0.4"
 serde_json = "1.0.149"
+sha2 = "0.11.0"
 zstd = "0.13"
 
 [dev-dependencies]
 proptest = "1.6"
+tempfile = "3.27.0"
 
 [dependencies.ffs-block]
 path = "../crates/ffs-block"
@@ -70,6 +78,18 @@ path = "../crates/ffs-extent"
 
 [dependencies.ffs-harness]
 path = "../crates/ffs-harness"
+
+[dependencies.ffs]
+path = "../crates/ffs"
+
+[dependencies.ffs-fat]
+path = "../crates/ffs-fat"
+
+[dependencies.ffs-ntfs]
+path = "../crates/ffs-ntfs"
+
+[dependencies.ffs-zfs]
+path = "../crates/ffs-zfs"
 
 [workspace]
 members = ["."]
@@ -391,3 +411,29 @@ doc = false
 name = "fuzz_send_stream_builder_roundtrip"
 path = "fuzz_targets/fuzz_send_stream_builder_roundtrip.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_fat_native_engine"
+path = "fuzz_targets/fuzz_fat_native_engine.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ntfs_native_engine"
+path = "fuzz_targets/fuzz_ntfs_native_engine.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_zfs_native_engine"
+path = "fuzz_targets/fuzz_zfs_native_engine.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_partition_discovery"
+path = "fuzz_targets/fuzz_partition_discovery.rs"
+doc = false
+
+[profile.release]
+opt-level = 3
+debug = 1
+debug-assertions = true
+overflow-checks = true

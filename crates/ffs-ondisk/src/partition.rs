@@ -573,27 +573,79 @@ impl PartitionTable {
 
     /// Verify that a selected partition slice does not itself contain a nested
     /// MBR or GPT partition table (partition-table bomb defense).
+    ///
+    /// Fails closed on:
+    /// - any complete nested MBR or GPT partition table (`NestedPartitionTable`),
+    /// - truncated or CRC-corrupt nested GPT headers / protective GPT MBRs at
+    ///   slice LBA 0..1 (`NestedPartitionTable`), and
+    /// - slice read / cancellation / option errors (`Io` / `InvalidOptions`).
     pub fn ensure_slice_not_nested_partition_table<F>(
         partition_index: u32,
         slice_byte_len: u64,
         logical_block_bytes: u32,
-        read_slice_at: F,
+        mut read_slice_at: F,
     ) -> Result<(), PartitionParseError>
     where
         F: FnMut(u64, &mut [u8]) -> Result<(), String>,
     {
+        if !matches!(
+            logical_block_bytes,
+            DEFAULT_LOGICAL_BLOCK_BYTES | NATIVE_4K_LOGICAL_BLOCK_BYTES
+        ) {
+            return Err(PartitionParseError::InvalidOptions(format!(
+                "logical_block_bytes must be 512 or 4096 (got {logical_block_bytes})"
+            )));
+        }
+        let lba_bytes = u64::from(logical_block_bytes);
+        if slice_byte_len >= lba_bytes {
+            let mut lba0 = [0_u8; 512];
+            read_slice_at(0, &mut lba0).map_err(PartitionParseError::Io)?;
+            if !looks_like_filesystem_vbr(&lba0, slice_byte_len) {
+                if slice_byte_len >= lba_bytes.saturating_mul(2) {
+                    let mut lba1_sig = [0_u8; 8];
+                    read_slice_at(lba_bytes, &mut lba1_sig).map_err(PartitionParseError::Io)?;
+                    if &lba1_sig == GPT_HEADER_SIGNATURE {
+                        return Err(PartitionParseError::NestedPartitionTable {
+                            partition_index,
+                            inner_scheme: PartitionScheme::Gpt,
+                        });
+                    }
+                }
+                let mbr_sig = u16::from_le_bytes([lba0[510], lba0[511]]);
+                if mbr_sig == MBR_SIGNATURE_LE
+                    && mbr_has_protective_gpt(&lba0)
+                    && mbr_protective_layout_valid(&lba0)
+                {
+                    return Err(PartitionParseError::NestedPartitionTable {
+                        partition_index,
+                        inner_scheme: PartitionScheme::Gpt,
+                    });
+                }
+            }
+        }
+
         let probe_opts = PartitionParseOptions {
             logical_block_bytes,
             allow_backup_gpt_fallback: true,
             max_gpt_entries: MAX_GPT_PARTITIONS,
         };
-        if let Ok(inner) = Self::parse_with_reader(slice_byte_len, &probe_opts, read_slice_at) {
-            return Err(PartitionParseError::NestedPartitionTable {
+        match Self::parse_with_reader(slice_byte_len, &probe_opts, &mut read_slice_at) {
+            Ok(inner) => Err(PartitionParseError::NestedPartitionTable {
                 partition_index,
                 inner_scheme: inner.scheme,
-            });
+            }),
+            Err(
+                PartitionParseError::PrimaryGptCorrupt { .. }
+                | PartitionParseError::BackupGptCorrupt { .. },
+            ) => Err(PartitionParseError::NestedPartitionTable {
+                partition_index,
+                inner_scheme: PartitionScheme::Gpt,
+            }),
+            Err(err @ (PartitionParseError::Io(_) | PartitionParseError::InvalidOptions(_))) => {
+                Err(err)
+            }
+            Err(_) => Ok(()),
         }
-        Ok(())
     }
 
     fn parse_legacy_mbr(
@@ -1475,6 +1527,40 @@ mod tests {
                 inner_scheme: PartitionScheme::Gpt
             }
         ));
+
+        // Truncated/header-only nested GPT bomb (protective MBR + "EFI PART"
+        // without matching inner backup LBA or entry CRC, discovered by
+        // fuzz_partition_discovery seed 0x04,0x00,0x01,0x00,0x00) must also fail closed!
+        let mut header_bomb = vec![0_u8; 64 * 512];
+        header_bomb[..2 * 512].copy_from_slice(&outer_disk[..2 * 512]);
+        let truncated_bomb_err = PartitionTable::ensure_slice_not_nested_partition_table(
+            1,
+            header_bomb.len() as u64,
+            DEFAULT_LOGICAL_BLOCK_BYTES,
+            |off, buf| {
+                let s = off as usize;
+                buf.copy_from_slice(&header_bomb[s..s + buf.len()]);
+                Ok(())
+            },
+        )
+        .expect_err("truncated nested GPT header bomb must be refused");
+        assert!(matches!(
+            truncated_bomb_err,
+            PartitionParseError::NestedPartitionTable {
+                partition_index: 1,
+                inner_scheme: PartitionScheme::Gpt
+            }
+        ));
+
+        // Read/cancellation failure during nested-table probe must propagate Io, never fail open!
+        let io_err = PartitionTable::ensure_slice_not_nested_partition_table(
+            1,
+            64 * 512,
+            DEFAULT_LOGICAL_BLOCK_BYTES,
+            |_off, _buf| Err("simulated cancellation".to_owned()),
+        )
+        .expect_err("I/O or cancellation during nested probe must fail closed");
+        assert!(matches!(io_err, PartitionParseError::Io(_)));
     }
 
     proptest! {

@@ -79,6 +79,7 @@ fn build_superblock(log_root: u64, log_root_level: u8, csum_type: u16) -> BtrfsS
         generation: GENERATION,
         root: 0,
         chunk_root: 0,
+        chunk_root_generation: GENERATION,
         log_root,
         total_bytes: 0,
         bytes_used: 0,
@@ -433,7 +434,7 @@ fn run_replay(
                 reason: "block not in fuzz image",
             })
     };
-    (replay_tree_log(&mut read, sb, chunks), reads)
+    (replay_tree_log(&mut read, sb, chunks, OWNER), reads)
 }
 
 fn assert_result_invariants(result: &TreeLogReplayResult, sb: &BtrfsSuperblock) {

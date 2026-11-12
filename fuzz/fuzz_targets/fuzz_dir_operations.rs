@@ -175,11 +175,20 @@ fuzz_target!(|data: &[u8]| {
                 .count();
             let retry =
                 normalize_remove_result(remove_entry(&mut first, target_name, reserved_tail));
-            let expected_retry = if occurrences > 1 { "ok:true" } else { "ok:false" };
+            let expected_retry = if occurrences > 1 {
+                "ok:true"
+            } else {
+                "ok:false"
+            };
             assert_eq!(
-                retry, expected_retry,
+                retry,
+                expected_retry,
                 "after removing a live entry of a {} name, second remove must report {}",
-                if occurrences > 1 { "duplicated" } else { "unique" },
+                if occurrences > 1 {
+                    "duplicated"
+                } else {
+                    "unique"
+                },
                 expected_retry,
             );
         }

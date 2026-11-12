@@ -1,10 +1,11 @@
 #![no_main]
 
 use ffs_btrfs::{
-    BTRFS_COMPRESS_LZO, BTRFS_COMPRESS_NONE, BTRFS_COMPRESS_ZLIB, BTRFS_COMPRESS_ZSTD,
-    BTRFS_FILE_EXTENT_INLINE, BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG, BtrfsDirItem,
-    BtrfsExtentData, BtrfsInodeItem, BtrfsRootItem, BtrfsRootRef, BtrfsXattrItem, parse_dir_items,
-    parse_extent_data, parse_inode_item, parse_root_item, parse_root_ref, parse_xattr_items,
+    parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item, parse_root_ref,
+    parse_xattr_items, BtrfsDirItem, BtrfsExtentData, BtrfsInodeItem, BtrfsRootItem, BtrfsRootRef,
+    BtrfsXattrItem, BTRFS_COMPRESS_LZO, BTRFS_COMPRESS_NONE, BTRFS_COMPRESS_ZLIB,
+    BTRFS_COMPRESS_ZSTD, BTRFS_FILE_EXTENT_INLINE, BTRFS_FILE_EXTENT_PREALLOC,
+    BTRFS_FILE_EXTENT_REG,
 };
 use ffs_types::ParseError;
 use libfuzzer_sys::fuzz_target;
@@ -136,6 +137,7 @@ fn build_root_item(cursor: &mut ByteCursor<'_>) -> BtrfsRootItem {
         level: cursor.next_u8() % 8,
         generation: cursor.next_u64(),
         root_dirid: cursor.next_u64(),
+        last_snapshot: cursor.next_u64(),
         flags: cursor.next_u64(),
         refs: u64::from(cursor.next_u32()),
         uuid: cursor.next_array_16(),

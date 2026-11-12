@@ -4,8 +4,8 @@ use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result};
 use ffs_journal::{
-    Jbd2Superblock, Jbd2Writer, JournalRegion, JournalSegment, ReplayOutcome, replay_jbd2,
-    replay_jbd2_segments,
+    replay_jbd2, replay_jbd2_segments, Jbd2Superblock, Jbd2Writer, JournalRegion, JournalSegment,
+    ReplayOutcome,
 };
 use ffs_types::BlockNumber;
 use libfuzzer_sys::fuzz_target;
@@ -222,7 +222,7 @@ fn structured_journal_blocks(
     first_txn.add_write(target_a, first_payload_a);
     first_txn.add_write(target_b, first_payload_b);
     first_txn.add_revoke(target_b);
-    let first_seq = first_txn.sequence();
+    let first_seq = writer.next_seq();
     let first_commit = writer.commit_transaction(&cx, &dev, &first_txn);
     assert!(
         first_commit.is_ok(),
@@ -231,7 +231,7 @@ fn structured_journal_blocks(
 
     let mut second_txn = writer.begin_transaction();
     second_txn.add_write(target_a, second_payload_a.clone());
-    let second_seq = second_txn.sequence();
+    let second_seq = writer.next_seq();
     let second_commit = writer.commit_transaction(&cx, &dev, &second_txn);
     assert!(
         second_commit.is_ok(),

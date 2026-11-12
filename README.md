@@ -629,11 +629,11 @@ in force; none are waived by adding a format or a new command.
 ### Source inventory
 
 The current source-derived test inventory contains 24 crates under `crates/`,
-63 fuzz targets, 174 Rust benchmark files, 128 tracked E2E scripts and
+67 fuzz targets, 174 Rust benchmark files, 128 tracked E2E scripts and
 226 tracked insta snapshots. The evidence schema declares 23 evidence-event types.
 These are source counts, not executed-test or readiness results.
 The [fuzz inventory](fuzz/fuzz_targets/) has the badge count
-![63 fuzz targets](https://img.shields.io/badge/fuzz%20targets-63-brightgreen).
+![67 fuzz targets](https://img.shields.io/badge/fuzz%20targets-67-brightgreen).
 The detailed guide retains [Decision 10: 128 E2E gate scripts](README_EXT4_BTRFS.md#decision-10-128-e2e-gate-scripts).
 
 The btrfs reader declares 23 command variants for send streams and item-type

@@ -1328,3 +1328,220 @@ fn gpt_multi_filesystem_disk_opens_ext4_and_fat16_partitions_by_index_uuid_and_l
     assert_eq!(recovered.format, FsFormatKind::Fat16);
     assert_eq!(fs::read(&damaged_path).unwrap(), damaged);
 }
+
+#[test]
+fn open_read_only_device_enforces_zero_write_sync_authority_and_rejects_path_companions() {
+    use ffs_ondisk::partition::{
+        PartUuid, PartitionSelector, SyntheticGptPartitionSpec, write_gpt_partition_table,
+    };
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StrictRoMemoryDevice {
+        bytes: Vec<u8>,
+        reads: Arc<AtomicUsize>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl ByteDevice for StrictRoMemoryDevice {
+        fn len_bytes(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let start = usize::try_from(offset.0)
+                .map_err(|_| FfsError::InvalidGeometry("offset overflow".to_owned()))?;
+            let end = start
+                .checked_add(buf.len())
+                .ok_or_else(|| FfsError::InvalidGeometry("length overflow".to_owned()))?;
+            let slice = self
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| FfsError::InvalidGeometry("read past end".to_owned()))?;
+            buf.copy_from_slice(slice);
+            Ok(())
+        }
+
+        fn write_all_at(&self, _cx: &Cx, _offset: ByteOffset, _buf: &[u8]) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            panic!("open_read_only_device must never invoke write_all_at");
+        }
+
+        fn sync(&self, _cx: &Cx) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            panic!("open_read_only_device must never invoke sync");
+        }
+
+        fn discard(&self, _cx: &Cx, _offset: ByteOffset, _length: u64) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            panic!("open_read_only_device must never invoke discard");
+        }
+    }
+
+    let cx = Cx::for_testing();
+    let dir = tempfile::tempdir().unwrap();
+    let fat16_bytes = fs::read(fat_image(&cx, dir.path(), "fat16")).unwrap();
+    let fat32_bytes = fs::read(fat_image(&cx, dir.path(), "fat32")).unwrap();
+    let ext4_bytes = ext4_image();
+
+    let p1_lba = 64_u64;
+    let p1_sectors = (ext4_bytes.len() / 512) as u64;
+    let p2_lba = p1_lba + p1_sectors + 8;
+    let p2_sectors = (fat16_bytes.len() / 512) as u64;
+    let p3_lba = p2_lba + p2_sectors + 8;
+    let p3_sectors = (fat32_bytes.len() / 512) as u64;
+    let total_lbas = p3_lba + p3_sectors + 64;
+    let mut disk = vec![0_u8; (total_lbas as usize) * 512];
+
+    let linux_guid = PartUuid::from_str("0fc63daf-8483-4772-8e79-3d69d8477de4").unwrap();
+    let efi_data_guid = PartUuid::from_str("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7").unwrap();
+    let disk_guid = PartUuid::from_str("87654321-1111-2222-3333-444455556666").unwrap();
+    let p1_uuid = PartUuid::from_str("bbbbbbbb-0000-4000-8000-000000000001").unwrap();
+    let p2_uuid = PartUuid::from_str("bbbbbbbb-0000-4000-8000-000000000002").unwrap();
+    let p3_uuid = PartUuid::from_str("bbbbbbbb-0000-4000-8000-000000000003").unwrap();
+
+    write_gpt_partition_table(
+        &mut disk,
+        disk_guid,
+        &[
+            SyntheticGptPartitionSpec {
+                type_guid: linux_guid,
+                part_uuid: p1_uuid,
+                start_lba: p1_lba,
+                end_lba_inclusive: p1_lba + p1_sectors - 1,
+                label: "DEV_EXT4".to_owned(),
+                attributes: 0,
+            },
+            SyntheticGptPartitionSpec {
+                type_guid: efi_data_guid,
+                part_uuid: p2_uuid,
+                start_lba: p2_lba,
+                end_lba_inclusive: p2_lba + p2_sectors - 1,
+                label: "DEV_FAT16".to_owned(),
+                attributes: 0,
+            },
+            SyntheticGptPartitionSpec {
+                type_guid: efi_data_guid,
+                part_uuid: p3_uuid,
+                start_lba: p3_lba,
+                end_lba_inclusive: p3_lba + p3_sectors - 1,
+                label: "DEV_FAT32".to_owned(),
+                attributes: 0,
+            },
+        ],
+    )
+    .unwrap();
+    let p1_start = (p1_lba as usize) * 512;
+    disk[p1_start..p1_start + ext4_bytes.len()].copy_from_slice(&ext4_bytes);
+    let p2_start = (p2_lba as usize) * 512;
+    disk[p2_start..p2_start + fat16_bytes.len()].copy_from_slice(&fat16_bytes);
+    let p3_start = (p3_lba as usize) * 512;
+    disk[p3_start..p3_start + fat32_bytes.len()].copy_from_slice(&fat32_bytes);
+
+    let before_digest = blake3::hash(&disk);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let backing = Arc::new(StrictRoMemoryDevice {
+        bytes: disk,
+        reads: Arc::clone(&reads),
+        writes: Arc::clone(&writes),
+    });
+    let dev_trait: Arc<dyn ByteDevice> = backing.clone();
+
+    // Path-bearing companion backends must be refused before any I/O!
+    let dummy_source = ImageSource {
+        path: PathBuf::from("/nonexistent/companion.img"),
+        offset: 0,
+        length: None,
+    };
+    for forbidden_backend in [
+        ReadOnlyBackend::Ext4 {
+            external_journal: Some(dummy_source.clone()),
+        },
+        ReadOnlyBackend::Btrfs {
+            root: BtrfsMountSelection::DefaultRoot,
+            additional_devices: vec![dummy_source.clone()],
+        },
+        ReadOnlyBackend::Zfs(ZfsReadOptions {
+            additional_images: vec![dummy_source],
+            ..ZfsReadOptions::default()
+        }),
+    ] {
+        assert!(matches!(
+            crate::open_read_only_device(
+                &cx,
+                Arc::clone(&dev_trait),
+                &ReadOnlyOpenOptions {
+                    backend: forbidden_backend,
+                    ..ReadOnlyOpenOptions::default()
+                },
+            ),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+    // Open ext4, FAT16, and FAT32 GPT partitions directly from the in-memory ByteDevice!
+    for (selector, expected_format, check_hello) in [
+        (
+            PartitionSelector::PartUuid(p1_uuid),
+            FsFormatKind::Ext4,
+            false,
+        ),
+        (
+            PartitionSelector::from_str("label:DEV_FAT16").unwrap(),
+            FsFormatKind::Fat16,
+            true,
+        ),
+        (PartitionSelector::Index(3), FsFormatKind::Fat32, true),
+    ] {
+        let opened = crate::open_read_only_device(
+            &cx,
+            Arc::clone(&dev_trait),
+            &ReadOnlyOpenOptions {
+                partition: Some(selector),
+                ..ReadOnlyOpenOptions::default()
+            },
+        )
+        .expect("open in-memory GPT partition read-only");
+        assert_eq!(opened.format, expected_format);
+        let mut scope = RequestScope::empty();
+        let root = opened
+            .filesystem
+            .getattr(&cx, &mut scope, InodeNumber(1))
+            .unwrap();
+        assert_eq!(root.kind, FileType::Directory);
+        if check_hello {
+            let hello = opened
+                .filesystem
+                .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("hello.txt"))
+                .unwrap();
+            assert_eq!(
+                opened
+                    .filesystem
+                    .read(&cx, &mut scope, hello.ino, 0, 128)
+                    .unwrap(),
+                b"native facade payload\0"
+            );
+            assert!(matches!(
+                opened
+                    .filesystem
+                    .write(&cx, &mut scope, hello.ino, 0, b"nope"),
+                Err(FfsError::ReadOnly)
+            ));
+        } else {
+            assert!(matches!(
+                opened
+                    .filesystem
+                    .write(&cx, &mut scope, InodeNumber(1), 0, b"nope"),
+                Err(FfsError::ReadOnly)
+            ));
+        }
+    }
+
+    assert!(reads.load(Ordering::SeqCst) > 0);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert_eq!(blake3::hash(&backing.bytes), before_digest);
+}

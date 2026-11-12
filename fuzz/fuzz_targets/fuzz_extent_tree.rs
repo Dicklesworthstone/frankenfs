@@ -1,6 +1,6 @@
 #![no_main]
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use asupersync::Cx;
 use ffs_alloc::{AllocHint, FsGeometry, GroupStats, PersistCtx};
@@ -9,6 +9,7 @@ use ffs_error::{FfsError, Result};
 use ffs_extent::{
     allocate_extent, allocate_unwritten_extent, collapse_range, insert_range,
     map_logical_to_physical, mark_written, punch_hole, truncate_extents, ExtentMapping,
+    ExtentOwner,
 };
 use ffs_ondisk::{Ext4DxRoot, Ext4ExtentHeader, Ext4ExtentIndex, Ext4Inode, ExtentTree};
 use ffs_types::{BlockNumber, GroupNumber, ParseError};
@@ -722,6 +723,7 @@ fn fuzz_stateful_extent_edits(data: &[u8]) {
                         count,
                         &AllocHint::default(),
                         &pctx,
+                        ExtentOwner::default(),
                     );
                     interesting_ranges.push((logical_start, count));
                 }
@@ -738,6 +740,7 @@ fn fuzz_stateful_extent_edits(data: &[u8]) {
                         count,
                         &AllocHint::default(),
                         &pctx,
+                        ExtentOwner::default(),
                     );
                     interesting_ranges.push((logical_start, count));
                 }
@@ -752,6 +755,7 @@ fn fuzz_stateful_extent_edits(data: &[u8]) {
                     logical_start,
                     u64::from(count),
                     &pctx,
+                    ExtentOwner::default(),
                 );
             }
             3 => {
@@ -764,6 +768,7 @@ fn fuzz_stateful_extent_edits(data: &[u8]) {
                     logical_start,
                     count,
                     &pctx,
+                    ExtentOwner::default(),
                 );
             }
             4 => {
@@ -776,6 +781,7 @@ fn fuzz_stateful_extent_edits(data: &[u8]) {
                     logical_start,
                     count,
                     &pctx,
+                    ExtentOwner::default(),
                 );
             }
             5 => {
@@ -788,6 +794,7 @@ fn fuzz_stateful_extent_edits(data: &[u8]) {
                     logical_start,
                     count,
                     &pctx,
+                    ExtentOwner::default(),
                 );
             }
             6 => {
@@ -803,6 +810,7 @@ fn fuzz_stateful_extent_edits(data: &[u8]) {
                     &mut groups,
                     logical_start,
                     &pctx,
+                    ExtentOwner::default(),
                 );
                 // Drop any interesting_ranges that now lie beyond
                 // the truncation boundary so post-op asserts don't
@@ -841,6 +849,7 @@ fn assert_failed_insert_preserves_boundary_tail(
         1,
         &AllocHint::default(),
         pctx,
+        ExtentOwner::default(),
     );
     if mapping.is_err() {
         return;
@@ -854,7 +863,17 @@ fn assert_failed_insert_preserves_boundary_tail(
     };
     assert_physical_mapping(&before, logical_start, 1);
 
-    let result = insert_range(cx, dev, &mut root, geo, groups, 0, 1, pctx);
+    let result = insert_range(
+        cx,
+        dev,
+        &mut root,
+        geo,
+        groups,
+        0,
+        1,
+        pctx,
+        ExtentOwner::default(),
+    );
     if result.is_ok() {
         invariant_failure(
             "insert_range must reject shifting the final logical block beyond ext4 space"
@@ -994,7 +1013,9 @@ fn make_groups(geo: &FsGeometry) -> Vec<GroupStats> {
         .map(|g| GroupStats {
             group: GroupNumber(g),
             free_blocks: geo.blocks_per_group,
+            block_largest_free_run: None,
             free_inodes: geo.inodes_per_group,
+            inode_search_start: 0,
             used_dirs: 0,
             block_bitmap_block: BlockNumber(u64::from(g) * 100 + 1),
             inode_bitmap_block: BlockNumber(u64::from(g) * 100 + 2),
@@ -1002,6 +1023,8 @@ fn make_groups(geo: &FsGeometry) -> Vec<GroupStats> {
             flags: 0,
             block_bitmap_csum: 0,
             inode_bitmap_csum: 0,
+            reserved_cache: OnceLock::new(),
+            reserved_confirmed: OnceLock::new(),
         })
         .collect()
 }
@@ -1009,6 +1032,7 @@ fn make_groups(geo: &FsGeometry) -> Vec<GroupStats> {
 fn make_pctx(geo: &FsGeometry) -> PersistCtx {
     PersistCtx {
         gdt_block: BlockNumber(50),
+        gdt_blocks: None,
         desc_size: geo.desc_size,
         has_metadata_csum: false,
         csum_seed: 0,

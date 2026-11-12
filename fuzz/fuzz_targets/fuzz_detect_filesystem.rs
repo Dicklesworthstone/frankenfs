@@ -1,10 +1,10 @@
 #![no_main]
 
-use ffs_core::{DetectionError, FrankenFsEngine, FsFlavor, detect_filesystem};
+use ffs_core::{detect_filesystem, DetectionError, FrankenFsEngine, FsFlavor};
 use ffs_ondisk::{EXT4_ORPHAN_FS, EXT4_VALID_FS};
 use ffs_types::{
-    BTRFS_CSUM_TYPE_CRC32C, BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, EXT4_SUPER_MAGIC,
-    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, crc32c,
+    crc32c, BTRFS_CSUM_TYPE_CRC32C, BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, EXT4_SUPERBLOCK_OFFSET,
+    EXT4_SUPERBLOCK_SIZE, EXT4_SUPER_MAGIC,
 };
 use libfuzzer_sys::fuzz_target;
 

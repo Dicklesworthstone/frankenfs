@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/ParityReport-97%2F97%20feature%20rows-blue" alt="ParityReport: 97/97 feature rows">
   <img src="https://img.shields.io/badge/parity%20columns-implemented%20%7C%20kernel--verified%20%7C%20rejection--only-lightgrey" alt="Parity accounting columns">
   <img src="https://img.shields.io/badge/tests-source--derived-brightgreen" alt="Tests source-derived">
-  <img src="https://img.shields.io/badge/fuzz%20targets-63-brightgreen" alt="63 fuzz targets">
+  <img src="https://img.shields.io/badge/fuzz%20targets-67-brightgreen" alt="67 fuzz targets">
   <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen.svg" alt="Unsafe Forbidden">
   <img src="https://img.shields.io/badge/runtime-asupersync%200.5-blueviolet.svg" alt="asupersync 0.5 runtime">
   <img src="https://img.shields.io/badge/status-experimental-yellow.svg" alt="Experimental">
@@ -2927,7 +2927,7 @@ frankenfs/
 │   └── …                       (29 top-level subdirectories in total)
 │
 ├── fuzz/
-│   └── fuzz_targets/           63 libfuzzer targets
+│   └── fuzz_targets/           67 libfuzzer targets
 │
 ├── scripts/
 │   ├── verify_golden.sh        Canonical CI verification gate
@@ -2967,7 +2967,7 @@ frankenfs/
 
 ## Fuzz Target Inventory
 
-All 63 libfuzzer targets are in `fuzz/fuzz_targets/`. Each one is driven by `cargo fuzz run <target>` (with `cargo-fuzz` installed) or via the smoke-gate script. Target-specific corpora live under `fuzz/corpus/<target>/`; shared regression seeds remain under `tests/fuzz_corpus/`. A categorized listing:
+All 67 libfuzzer targets are in `fuzz/fuzz_targets/`. Each one is driven by `cargo fuzz run <target>` (with `cargo-fuzz` installed) or via the smoke-gate script. Target-specific corpora live under `fuzz/corpus/<target>/`; shared regression seeds remain under `tests/fuzz_corpus/`. A categorized listing:
 
 ### On-disk parser fuzzers (ext4)
 
@@ -3071,6 +3071,15 @@ All 63 libfuzzer targets are in `fuzz/fuzz_targets/`. Each one is driven by `car
 | `fuzz_authoritative_lane_manifest` | Proof-bundle authoritative-lane manifest parser |
 | `fuzz_perf_baseline` | Performance manifest validator |
 | `fuzz_swarm_workload_harness` | Swarm workload harness manifest |
+
+### Multi-format native engines & partition discovery
+
+| Target | What it fuzzes |
+|---|---|
+| `fuzz_fat_native_engine` | Bounded FAT16/FAT32 BPB, LFN/OEM directory decoding, cluster-chain cycle/truncation rejection, `FatVolume::check`, and `ffs::open_read_only_device` |
+| `fuzz_ntfs_native_engine` | Bounded NTFS MFT USA fixups, `ATTRIBUTE_LIST`, mapping pairs, `$I30` B-tree lookup, `$LogFile`, LZNT1/XPRESS/LZX codecs, `$Secure`, ownership/namespace audits, and `ffs::open_read_only_device` |
+| `fuzz_zfs_native_engine` | Bounded ZFS 4-label XDR `NvList`, uberblocks, block pointers, gang headers, RAIDZ1/2/3 parity, LZJB/LZ4/ZSTD/GZIP/ZLE codecs, DMU/ZAP/ZPL/ZIL, scrub/allocation audits, and `ffs::open_read_only_device` |
+| `fuzz_partition_discovery` | Bounded MBR/GPT partition discovery, backup-GPT CRC fallback, overlapping/nested-table bomb rejection, `PartitionByteDevice`, and partitioned `ffs::open_read_only_device` |
 
 The full catalog is structurally pinned by a checked-in inventory snapshot, and `bd-0c2xy` guards target registration so a deleted or renamed target fails the fuzz-dashboard gate.
 
@@ -3965,7 +3974,7 @@ Rows in the btrfs experimental RW contract can still be `partially supported` or
 - **Writeback-cache.** Epoch-based commit barriers with per-inode staged/visible/durable tracking, deferred visibility for MVCC isolation, dirty-page ordering oracle, 12-point crash/replay matrix artifact gate, runtime guard, and host/lane manifest checks. Kernel option default-off; explicit opt-in is evidence-gated.
 - **Observability.** Evidence ledger with 23 event types and 8 operator presets (`replay-anomalies`, `repair-failures`, `pressure-transitions`, `contention`, `metrics`, `cache`, `mvcc`, `repair-live`), contention metrics, policy-switch detection, structured logging across all subsystems, JSONL audit trail.
 - **Selected CLI commands.** `inspect`, `partitions`, `ls`, `read`, `walk`, `format`, `streams`, `pool`, `dataset`, `mvcc-stats`, `info`, `dump`, `fsck` (`check`), `repair`, `mount`, `scrub`, `parity`, `evidence`, `mkfs`; `ffs-cli --help` lists the full command set, including benchmark commands, and each subcommand's `--help` lists its current flags.
-- **Testing inventory (source-derived).** 25 workspace members (24 crates under `crates/` plus `tools/ffs-ops`), 63 fuzz targets, 174 Rust benchmark files, 128 E2E scripts, and 226 tracked insta snapshots. These counts describe source coverage inventory, not checks executed or passed, and do not prove that every emitted report is covered.
+- **Testing inventory (source-derived).** 25 workspace members (24 crates under `crates/` plus `tools/ffs-ops`), 67 fuzz targets, 174 Rust benchmark files, 128 E2E scripts, and 226 tracked insta snapshots. These counts describe source coverage inventory, not checks executed or passed, and do not prove that every emitted report is covered.
 
 ### Historical bridge closeouts and remaining work
 

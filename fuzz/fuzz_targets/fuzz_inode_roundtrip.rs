@@ -128,12 +128,17 @@ const FILE_TYPE_CASES: [FileTypeCase; 7] = [
     },
 ];
 
-fn expected_encode_extra_timestamp(secs: u64, nsec: u32) -> u32 {
-    ((secs >> 32) as u32 & 0x3) | (nsec.min(999_999_999) << 2)
+fn expected_encode_extra_timestamp(secs: i64, nsec: u32) -> u32 {
+    (((secs.wrapping_sub(i64::from(secs as i32)) >> 32) & 0x3) as u32)
+        | (nsec.min(999_999_999) << 2)
 }
 
 fn choose_inode_size(cursor: &mut ByteCursor<'_>) -> usize {
-    if cursor.next_u8() & 1 == 0 { 128 } else { 256 }
+    if cursor.next_u8() & 1 == 0 {
+        128
+    } else {
+        256
+    }
 }
 
 fn choose_extra_isize(cursor: &mut ByteCursor<'_>, inode_size: usize) -> u16 {
@@ -204,23 +209,23 @@ fn build_synthetic_inode(
         mtime,
         dtime,
         atime_extra: if advertise(0x90) {
-            expected_encode_extra_timestamp(cursor.next_u64(), cursor.next_u32())
+            expected_encode_extra_timestamp(cursor.next_u64() as i64, cursor.next_u32())
         } else {
             0
         },
         ctime_extra: if advertise(0x88) {
-            expected_encode_extra_timestamp(cursor.next_u64(), cursor.next_u32())
+            expected_encode_extra_timestamp(cursor.next_u64() as i64, cursor.next_u32())
         } else {
             0
         },
         mtime_extra: if advertise(0x8C) {
-            expected_encode_extra_timestamp(cursor.next_u64(), cursor.next_u32())
+            expected_encode_extra_timestamp(cursor.next_u64() as i64, cursor.next_u32())
         } else {
             0
         },
         crtime,
         crtime_extra: if advertise(0x98) {
-            expected_encode_extra_timestamp(cursor.next_u64(), cursor.next_u32())
+            expected_encode_extra_timestamp(cursor.next_u64() as i64, cursor.next_u32())
         } else {
             0
         },
@@ -252,7 +257,7 @@ fn build_synthetic_inode(
         extent_bytes: {
             let mut v = cursor.take_vec(MAX_EXTENT_BYTES);
             v.resize(MAX_EXTENT_BYTES, 0);
-            v
+            v.into()
         },
         // The on-disk xattr_ibody fills the inode tail from
         // (128 + extra_isize) to inode_size, but only when
@@ -267,6 +272,7 @@ fn build_synthetic_inode(
         } else {
             Vec::new()
         },
+        number: 0,
     }
 }
 
@@ -386,7 +392,7 @@ fn verify_raw_bytes(raw: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     let mut cursor = ByteCursor::new(data);
-    let secs = cursor.next_u64();
+    let secs = cursor.next_u64() as i64;
     let nsec = cursor.next_u32();
     let encoded = encode_extra_timestamp(secs, nsec);
     assert_eq!(

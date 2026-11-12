@@ -2,11 +2,11 @@
 
 use asupersync::Cx;
 use ffs_core::{
-    DirEntry, FiemapExtent, FileType, FsOps, FsStat, FsxattrInfo, InodeAttr, RequestScope,
+    FiemapExtent, FileType, FsOps, FsStat, FsxattrInfo, InodeAttr, ReaddirPage, RequestScope,
 };
 use ffs_error::FfsError;
 use ffs_fuse::{FrankenFuse, MountOptions};
-use ffs_types::{InodeNumber, crc32c};
+use ffs_types::{crc32c, InodeNumber};
 use libfuzzer_sys::fuzz_target;
 use std::ffi::OsStr;
 use std::time::SystemTime;
@@ -323,8 +323,8 @@ impl FsOps for FuzzFs {
         _scope: &mut RequestScope,
         _ino: InodeNumber,
         _offset: u64,
-    ) -> ffs_error::Result<Vec<DirEntry>> {
-        Ok(Vec::new())
+    ) -> ffs_error::Result<ReaddirPage> {
+        Ok(ReaddirPage::new(Vec::new()))
     }
 
     fn read(

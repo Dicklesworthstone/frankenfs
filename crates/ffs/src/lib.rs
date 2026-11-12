@@ -16,7 +16,7 @@ pub use ffs_ondisk::partition::{
 pub use native::{
     ImageSource, PartitionByteDevice, ReadOnlyBackend, ReadOnlyFs, ReadOnlyOpenOptions,
     ZfsMissingMembers, ZfsReadOptions, ZfsRootSelection, discover_partitions,
-    discover_partitions_on_device, open_partition_read_only, open_read_only,
+    discover_partitions_on_device, open_partition_read_only, open_read_only, open_read_only_device,
     select_partition_device,
 };
 

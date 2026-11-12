@@ -181,8 +181,8 @@ fn assert_clean_structured_commit(
     tid: u32,
     inode_size: u16,
 ) {
-    let result =
-        replay_fast_commit(stream, inode_size).expect("structured fast-commit stream replays");
+    let result = replay_fast_commit(stream, MAX_INPUT_BYTES, inode_size)
+        .expect("structured fast-commit stream replays");
     assert_eq!(result.transactions_found, 1);
     assert_eq!(result.last_tid, tid);
     assert_eq!(result.blocks_scanned, 1);
@@ -221,7 +221,7 @@ fn assert_structured_padding_oracles(
 
     let mut nonzero_tail = stream.to_vec();
     nonzero_tail.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
-    let result = replay_fast_commit(&nonzero_tail, inode_size)
+    let result = replay_fast_commit(&nonzero_tail, MAX_INPUT_BYTES, inode_size)
         .expect("nonzero tail returns fallback result");
     assert_eq!(result.transactions_found, 1);
     assert_eq!(result.last_tid, tid);
@@ -249,7 +249,7 @@ fn assert_malformed_tlv_lengths(inode_size: u16) {
             stream.extend(build_fc_tag(8, &[0; 8]));
             assert!(
                 matches!(
-                    replay_fast_commit(&stream, inode_size),
+                    replay_fast_commit(&stream, MAX_INPUT_BYTES, inode_size),
                     Err(FfsError::Corruption { .. })
                 ),
                 "complete tag {tag} with payload length {len} must be corruption"
@@ -262,7 +262,8 @@ fn assert_truncated_transaction_requires_fallback(stream: &[u8], inode_size: u16
     // Remove part of TAIL's declared payload while leaving the complete HEAD
     // and operation. No operation may escape the uncommitted transaction.
     let truncated = &stream[..stream.len() - 1];
-    let result = replay_fast_commit(truncated, inode_size).expect("truncation returns fallback");
+    let result = replay_fast_commit(truncated, MAX_INPUT_BYTES, inode_size)
+        .expect("truncation returns fallback");
     assert!(result.operations.is_empty());
     assert_eq!(result.transactions_found, 0);
     assert_eq!(result.incomplete_transactions, 1);
@@ -270,8 +271,8 @@ fn assert_truncated_transaction_requires_fallback(stream: &[u8], inode_size: u16
 }
 
 fn assert_arbitrary_replay_determinism(data: &[u8], inode_size: u16) {
-    let first = replay_fast_commit(data, inode_size);
-    let second = replay_fast_commit(data, inode_size);
+    let first = replay_fast_commit(data, MAX_INPUT_BYTES, inode_size);
+    let second = replay_fast_commit(data, MAX_INPUT_BYTES, inode_size);
     assert_eq!(
         first.is_ok(),
         second.is_ok(),

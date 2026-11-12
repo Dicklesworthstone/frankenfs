@@ -28,7 +28,7 @@
 //!          InsufficientData (length-checking is the only thing
 //!          standing between this parser and a buffer over-read).
 
-use ffs_btrfs::{BtrfsInodeRef, parse_inode_refs};
+use ffs_btrfs::{parse_inode_refs, BtrfsInodeRef};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_NAME_BYTES: usize = 64;

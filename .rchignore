@@ -14,3 +14,7 @@ fuzz/corpus/fuzz_alloc*/[0-9a-f]*
 fuzz/corpus/fuzz_block*/[0-9a-f]*
 fuzz/corpus/fuzz_dir*/[0-9a-f]*
 fuzz/corpus/fuzz_fuse*/[0-9a-f]*
+fuzz/corpus/fuzz_fat*/[0-9a-f]*
+fuzz/corpus/fuzz_ntfs*/[0-9a-f]*
+fuzz/corpus/fuzz_zfs*/[0-9a-f]*
+fuzz/corpus/fuzz_partition*/[0-9a-f]*

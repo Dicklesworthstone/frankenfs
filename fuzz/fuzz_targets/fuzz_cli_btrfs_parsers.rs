@@ -4,10 +4,12 @@
 mod repair_btrfs_parsers;
 
 use libfuzzer_sys::fuzz_target;
-use repair_btrfs_parsers::{parse_btrfs_block_group_total_bytes, parse_btrfs_root_item_bytenr};
+use repair_btrfs_parsers::{
+    parse_btrfs_block_group_item, parse_btrfs_root_item_bytenr, BtrfsBlockGroupItemFields,
+};
 
 const ROOT_ITEM_MIN_LEN: usize = 184;
-const BLOCK_GROUP_MIN_LEN: usize = 16;
+const BLOCK_GROUP_MIN_LEN: usize = 24;
 const MAX_TAIL: usize = 32;
 
 struct ByteCursor<'a> {
@@ -109,31 +111,39 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    let (block_group_payload, block_group_len_mode, total_bytes) =
+    let (mut block_group_payload, block_group_len_mode, chunk_objectid) =
         build_payload(&mut cursor, BLOCK_GROUP_MIN_LEN, 8..16);
-    let block_group_first =
-        normalize_u64_result(parse_btrfs_block_group_total_bytes(&block_group_payload));
-    let block_group_second =
-        normalize_u64_result(parse_btrfs_block_group_total_bytes(&block_group_payload));
+    let used = cursor.next_u64();
+    let flags = cursor.next_u64();
+    if block_group_payload.len() >= BLOCK_GROUP_MIN_LEN {
+        block_group_payload[0..8].copy_from_slice(&used.to_le_bytes());
+        block_group_payload[8..16].copy_from_slice(&chunk_objectid.to_le_bytes());
+        block_group_payload[16..24].copy_from_slice(&flags.to_le_bytes());
+    }
+    let bg_first = parse_btrfs_block_group_item(&block_group_payload);
+    let bg_second = parse_btrfs_block_group_item(&block_group_payload);
     assert_eq!(
-        block_group_first, block_group_second,
+        bg_first.as_ref().ok(),
+        bg_second.as_ref().ok(),
         "block-group parser must be deterministic for identical payloads"
     );
     if block_group_payload.len() < BLOCK_GROUP_MIN_LEN || block_group_len_mode == 0 {
+        let err = bg_first
+            .expect_err("short block-group payloads must be rejected")
+            .to_string();
         assert!(
-            block_group_first.contains("payload too short"),
+            err.contains("payload too short"),
             "short block-group payloads must be rejected with a length error"
-        );
-    } else if total_bytes == 0 {
-        assert!(
-            block_group_first.contains("must be non-zero"),
-            "zero block-group total_bytes must be rejected"
         );
     } else {
         assert_eq!(
-            block_group_first,
-            format!("ok:{total_bytes}"),
-            "well-formed block-group payloads must decode total_bytes exactly"
+            bg_first.expect("well-formed block-group payload must parse"),
+            BtrfsBlockGroupItemFields {
+                used,
+                chunk_objectid,
+                flags,
+            },
+            "well-formed block-group payloads must decode fields exactly"
         );
     }
 });

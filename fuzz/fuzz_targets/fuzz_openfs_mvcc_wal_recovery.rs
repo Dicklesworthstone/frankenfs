@@ -5,11 +5,11 @@ use ffs_block::ByteDevice;
 use ffs_core::{OpenFs, OpenOptions};
 use ffs_error::{FfsError, Result};
 use ffs_mvcc::persist::WalRecoveryReport;
-use ffs_mvcc::wal::{self, HEADER_SIZE as WAL_HEADER_SIZE, WalCommit, WalHeader, WalWrite};
+use ffs_mvcc::wal::{self, WalCommit, WalHeader, WalWrite, HEADER_SIZE as WAL_HEADER_SIZE};
 use ffs_mvcc::wal_replay::{ReplayOutcome as WalReplayOutcome, TailPolicy};
 use ffs_ondisk::EXT4_VALID_FS;
 use ffs_types::{
-    BlockNumber, ByteOffset, CommitSeq, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, TxnId, crc32c,
+    crc32c, BlockNumber, ByteOffset, CommitSeq, TxnId, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPER_MAGIC,
 };
 use libfuzzer_sys::fuzz_target;
 use std::path::{Path, PathBuf};
@@ -387,13 +387,12 @@ fn classify_report(report: &WalRecoveryReport) -> RecoveryClass {
 
 fn store_digest(fs: &OpenFs) -> (usize, usize, u32) {
     let snapshot = fs.current_snapshot();
-    let store = fs.mvcc_store().read();
-    let version_count = store.version_count();
+    let version_count = fs.mvcc_telemetry().version_count;
     let mut digest_bytes = Vec::new();
     let mut visible_entries = 0usize;
 
     for block in TRACKED_BLOCKS {
-        if let Some(data) = store.read_visible(BlockNumber(block), snapshot) {
+        if let Some(data) = fs.mvcc_read_visible(BlockNumber(block), snapshot) {
             visible_entries = visible_entries.saturating_add(1);
             digest_bytes.extend_from_slice(&block.to_le_bytes());
             let len = u32::try_from(data.len()).unwrap_or(u32::MAX);

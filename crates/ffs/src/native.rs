@@ -460,6 +460,94 @@ fn selection_matches(backend: &ReadOnlyBackend, format: FsFormatKind) -> bool {
     }
 }
 
+fn validate_device_only_backend(backend: &ReadOnlyBackend) -> Result<()> {
+    match backend {
+        ReadOnlyBackend::Ext4 {
+            external_journal: Some(_),
+        } => Err(FfsError::UnsupportedFeature(
+            "open_read_only_device does not open external journal paths".to_owned(),
+        )),
+        ReadOnlyBackend::Btrfs {
+            additional_devices, ..
+        } if !additional_devices.is_empty() => Err(FfsError::UnsupportedFeature(
+            "open_read_only_device does not open additional btrfs device paths".to_owned(),
+        )),
+        ReadOnlyBackend::Zfs(options) if !options.additional_images.is_empty() => {
+            Err(FfsError::UnsupportedFeature(
+                "open_read_only_device does not open additional ZFS member paths".to_owned(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Open any admitted native format from an already-admitted [`ByteDevice`] with
+/// strict read-only authority and zero ambient pathname opens.
+///
+/// The supplied device is wrapped in a `VolumeAccess::ReadOnly` [`VolumeDevice`]
+/// (and optional [`PartitionByteDevice`] when `options.partition` is set) before
+/// any signature probe or native engine executes. Companion path options
+/// (`external_journal`, `additional_devices`, `additional_images`) are rejected
+/// with [`FfsError::UnsupportedFeature`].
+pub fn open_read_only_device(
+    cx: &Cx,
+    inner: Arc<dyn ByteDevice>,
+    options: &ReadOnlyOpenOptions,
+) -> Result<ReadOnlyFs> {
+    checkpoint(cx)?;
+    validate_selection(&options.backend)?;
+    validate_device_only_backend(&options.backend)?;
+    let (device, resolved_partition) = if let Some(selector) = &options.partition {
+        if options.offset != 0 || options.length.is_some() {
+            return Err(FfsError::InvalidGeometry(
+                "partition selector cannot be combined with manual byte offset/length".to_owned(),
+            ));
+        }
+        let parse_opts = PartitionParseOptions {
+            allow_backup_gpt_fallback: options.allow_backup_gpt,
+            ..PartitionParseOptions::default()
+        };
+        let (_table, part_dev) =
+            select_partition_device(cx, inner, selector, &parse_opts, VolumeAccess::ReadOnly)?;
+        let entry = part_dev.entry().clone();
+        let vol = VolumeDevice::new(
+            Arc::new(part_dev),
+            ByteOffset(0),
+            entry.byte_len,
+            VolumeAccess::ReadOnly,
+        )?;
+        (vol, Some(entry))
+    } else {
+        let length = match options.length {
+            Some(length) => length,
+            None => inner
+                .len_bytes()
+                .checked_sub(options.offset)
+                .ok_or_else(|| {
+                    FfsError::InvalidGeometry("volume base exceeds backing length".to_owned())
+                })?,
+        };
+        checkpoint(cx)?;
+        (
+            VolumeDevice::new(
+                inner,
+                ByteOffset(options.offset),
+                length,
+                VolumeAccess::ReadOnly,
+            )?,
+            None,
+        )
+    };
+    open_admitted_volume(
+        cx,
+        device,
+        resolved_partition,
+        options,
+        "open_read_only_device",
+        false,
+    )
+}
+
 /// Open any admitted native format through OS read-only, byte-bounded handles.
 ///
 /// The image must remain offline and immutable. Advisory locking is not a
@@ -510,6 +598,27 @@ pub fn open_read_only(
             None,
         )
     };
+    open_admitted_volume(
+        cx,
+        device,
+        resolved_partition,
+        options,
+        "open_read_only",
+        true,
+    )
+}
+
+fn open_admitted_volume(
+    cx: &Cx,
+    device: VolumeDevice,
+    resolved_partition: Option<PartitionEntry>,
+    options: &ReadOnlyOpenOptions,
+    operation: &'static str,
+    allow_companion_paths: bool,
+) -> Result<ReadOnlyFs> {
+    if !allow_companion_paths {
+        validate_device_only_backend(&options.backend)?;
+    }
     let effective_offset = resolved_partition
         .as_ref()
         .map_or(options.offset, |entry| entry.start_byte);
@@ -528,7 +637,7 @@ pub fn open_read_only(
     }
     tracing::info!(
         target: "ffs::native",
-        operation = "open_read_only",
+        operation,
         %format,
         partition_id = %partition_id,
         offset = effective_offset,

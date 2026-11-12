@@ -417,11 +417,11 @@ for target in "${EXPECTED_TARGETS[@]}"; do
 done
 
 #######################################
-# Scenario 5: Dictionaries exist for ext4 and btrfs
+# Scenario 5: Dictionaries exist for ext4, btrfs, fat, ntfs, zfs, and partition
 #######################################
 e2e_step "Scenario 5: Verify fuzz dictionaries"
 
-for dict in ext4.dict btrfs.dict; do
+for dict in ext4.dict btrfs.dict fat.dict ntfs.dict zfs.dict partition.dict; do
     DICT_PATH="fuzz/dictionaries/${dict}"
     if [[ -f "$DICT_PATH" ]]; then
         TOKEN_COUNT=$(grep -c '^"' "$DICT_PATH" || true)
