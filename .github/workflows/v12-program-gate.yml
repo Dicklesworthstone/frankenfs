@@ -21,8 +21,6 @@ jobs:
   v12-program-gate:
     name: V1.2 Program Gate
     runs-on: ubuntu-latest
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-v12-program-gate
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,6 +44,7 @@ jobs:
       - name: Select execution mode
         run: |
           set -euo pipefail
+          echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/cargo-target-v12-program-gate" >> "$GITHUB_ENV"
           if command -v rch >/dev/null 2>&1; then
             rch check
             echo "FFS_GATE_EXECUTOR=rch" >> "$GITHUB_ENV"

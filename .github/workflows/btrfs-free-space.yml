@@ -66,22 +66,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p ffs-core --lib btrfs_free_space::tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/fst-unit.log"
+          cargo test -p ffs-core --locked --lib btrfs_free_space::tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/fst-unit.log"
           grep -Eq 'test result: ok\. ([1-9][0-9]+) passed;' "$RUNNER_TEMP/fst-unit.log"
 
       - name: Real-image crash-window and publication regressions
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p ffs-core --test btrfs_commit_crash_window -- --nocapture 2>&1 | tee "$RUNNER_TEMP/fst-crash.log"
+          cargo test -p ffs-core --locked --test btrfs_commit_crash_window -- --nocapture 2>&1 | tee "$RUNNER_TEMP/fst-crash.log"
           ! grep -Eiq 'skipping|unavailable' "$RUNNER_TEMP/fst-crash.log"
-          grep -Eq 'test result: ok\. ([3-9]|[1-9][0-9]+) passed;' "$RUNNER_TEMP/fst-crash.log"
+          grep -Eq 'test result: ok\. ([1-9][0-9]*) passed;' "$RUNNER_TEMP/fst-crash.log"
+          cargo test -p ffs-core --locked --lib btrfs_commit_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/fst-publication.log"
+          ! grep -Eiq 'skipping|unavailable' "$RUNNER_TEMP/fst-publication.log"
+          grep -Eq 'test result: ok\. ([6-9]|[1-9][0-9]+) passed;' "$RUNNER_TEMP/fst-publication.log"
 
       - name: Check all core targets
-        run: cargo check -p ffs-core --all-targets
+        run: cargo check -p ffs-core --locked --all-targets
 
       - name: Core Clippy
-        run: cargo clippy -p ffs-core --all-targets -- -D warnings
+        run: cargo clippy -p ffs-core --locked --all-targets -- -D warnings
 
       - name: Preserve validation evidence
         if: always()

@@ -99,6 +99,32 @@ fn audit_workflow_text(filename: &str, text: &str) -> Vec<String> {
         }
     }
 
+    // GitHub Actions rejects `${{ runner.* }}` inside workflow-level (`indent == 0`) or
+    // job-level (`indent == 4`) `env:` blocks; `runner.*` is only valid inside `steps`.
+    let mut in_non_step_env = false;
+    let mut env_indent = 0_usize;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if in_non_step_env && indent <= env_indent {
+            in_non_step_env = false;
+        }
+        if trimmed == "env:" && indent <= 4 {
+            in_non_step_env = true;
+            env_indent = indent;
+            continue;
+        }
+        if in_non_step_env && trimmed.contains("runner.") {
+            violations.push(format!(
+                "{filename}:{}: references `runner.*` context inside workflow/job-level `env:` (only valid inside `steps`)",
+                idx + 1
+            ));
+        }
+    }
+
     violations
 }
 
@@ -220,33 +246,36 @@ fn workflows_have_tracked_nonempty_baselines_and_zero_vacuous_patterns() {
             "required workflow baseline must be non-empty: {rel_path}"
         );
 
-        let ignore_status = Command::new("git")
-            .args(["check-ignore", "-q", rel_path])
-            .current_dir(&root)
-            .status()
-            .expect("run git check-ignore");
-        assert!(
-            !ignore_status.success(),
-            "required workflow baseline `{rel_path}` must NOT be matched by .gitignore"
-        );
+        if root.join(".git").exists() {
+            let ignore_status = Command::new("git")
+                .args(["check-ignore", "-q", rel_path])
+                .current_dir(&root)
+                .status()
+                .expect("run git check-ignore");
+            assert_eq!(
+                ignore_status.code(),
+                Some(1),
+                "required workflow baseline `{rel_path}` must NOT be matched by .gitignore (expected git check-ignore exit 1, got {ignore_status:?})"
+            );
 
-        let ls_files = Command::new("git")
-            .args([
-                "ls-files",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "--",
-                rel_path,
-            ])
-            .current_dir(&root)
-            .output()
-            .expect("run git ls-files");
-        assert!(
-            ls_files.status.success()
-                && !String::from_utf8_lossy(&ls_files.stdout).trim().is_empty(),
-            "required workflow baseline `{rel_path}` must be tracked or trackable via git ls-files"
-        );
+            let ls_files = Command::new("git")
+                .args([
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    rel_path,
+                ])
+                .current_dir(&root)
+                .output()
+                .expect("run git ls-files");
+            assert!(
+                ls_files.status.success()
+                    && !String::from_utf8_lossy(&ls_files.stdout).trim().is_empty(),
+                "required workflow baseline `{rel_path}` must be tracked or trackable via git ls-files"
+            );
+        }
     }
 
     // Validate binary_size.txt and binary_sizes.json agree and record positive byte counts.
@@ -278,6 +307,29 @@ fn workflows_have_tracked_nonempty_baselines_and_zero_vacuous_patterns() {
             > 100_000,
         "ffs-protected-mount release size must be > 100 KiB"
     );
+
+    // Both workspace Cargo.lock and fuzz/Cargo.lock must satisfy `--locked` so CI workflows
+    // using `cargo test --locked` never fail on manifest drift.
+    for manifest_rel in ["Cargo.toml", "fuzz/Cargo.toml"] {
+        let manifest = root.join(manifest_rel);
+        let lock_out = Command::new("cargo")
+            .args([
+                "metadata",
+                "--manifest-path",
+                manifest.to_str().expect("utf8 manifest path"),
+                "--locked",
+                "--format-version",
+                "1",
+            ])
+            .current_dir(&root)
+            .output()
+            .expect("run cargo metadata --locked");
+        assert!(
+            lock_out.status.success(),
+            "`cargo metadata --locked` failed for `{manifest_rel}`:\n{}",
+            String::from_utf8_lossy(&lock_out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -309,13 +361,15 @@ env:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-v12
     steps:
       - run: |
           command -v rch
           rch check
 ";
     let v12_violations = audit_workflow_text("broken-v12.yml", broken_v12);
-    assert_eq!(v12_violations.len(), 2, "{v12_violations:?}");
+    assert_eq!(v12_violations.len(), 3, "{v12_violations:?}");
 
     let broken_blob = r#"
 jobs:

@@ -885,6 +885,7 @@ name = "ffs"
 version = "0.2.0"
 dependencies = [
  "asupersync",
+ "blake3",
  "clap",
  "ffs-block",
  "ffs-core",
@@ -979,6 +980,7 @@ dependencies = [
  "clap",
  "crc32c",
  "ctrlc",
+ "ffs",
  "ffs-block",
  "ffs-btrfs",
  "ffs-core",

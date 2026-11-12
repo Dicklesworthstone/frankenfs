@@ -109,7 +109,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            e2fsprogs btrfs-progs fuse3 \
+            e2fsprogs libext2fs-dev btrfs-progs fuse3 \
             build-essential autoconf automake pkg-config \
             uuid-dev libblkid-dev zlib1g-dev liblzo2-dev libzstd-dev libudev-dev
           # The unignored live TUI test uses fuser's auto-unmount helper.
@@ -122,17 +122,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/btrfs-progs-v6.16
-          key: btrfs-progs-v6.16-${{ runner.os }}-v1
+          key: btrfs-progs-v6.16-${{ runner.os }}-v2
 
       - name: Build btrfs-progs v6.16 golden anchor
         if: steps.btrfs-progs-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
+          rm -rf ~/btrfs-progs-v6.16
           git clone --depth 1 --branch v6.16 \
             https://git.kernel.org/pub/scm/linux/kernel/git/kdave/btrfs-progs.git ~/btrfs-progs-v6.16
           cd ~/btrfs-progs-v6.16
           ./autogen.sh
-          ./configure --disable-documentation --disable-python --disable-udev --disable-zoned
+          ./configure --disable-documentation --disable-python --disable-udev --disable-zoned --disable-convert
           make -j"$(nproc)" mkfs.btrfs btrfs
 
       - name: Activate btrfs-progs v6.16 golden anchor

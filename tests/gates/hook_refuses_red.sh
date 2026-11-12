@@ -44,19 +44,19 @@ edition = "2024"
 [workspace]
 TOML
 
-"$INSTALLER" --repo "$WORK_REPO" --pre-push-only | tee -a "$SUMMARY_LOG"
-if [[ ! -x "$WORK_REPO/.git/hooks/pre-push" ]]; then
-    log "FAIL: pre-push hook not installed or not executable"
-    exit 1
-fi
-
 # Scenario 1: Deliberately unformatted Rust commit MUST be refused by git push.
 log " Scenario 1: deliberately unformatted commit must be refused on git push "
 cat >"$WORK_REPO/src/lib.rs" <<'RS'
 #![forbid(unsafe_code)]
 pub fn   badly_formatted(  x:u32 )->u32{x+1}
 RS
-git -C "$WORK_REPO" add Cargo.toml src/lib.rs
+cargo generate-lockfile --manifest-path "$WORK_REPO/Cargo.toml" >/dev/null
+"$INSTALLER" --repo "$WORK_REPO" --pre-push-only | tee -a "$SUMMARY_LOG"
+if [[ ! -x "$WORK_REPO/.git/hooks/pre-push" ]]; then
+    log "FAIL: pre-push hook not installed or not executable"
+    exit 1
+fi
+git -C "$WORK_REPO" add Cargo.toml Cargo.lock src/lib.rs
 git -C "$WORK_REPO" commit -m "test: deliberately unformatted commit" >/dev/null
 
 set +e

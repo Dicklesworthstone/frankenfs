@@ -81,6 +81,24 @@ run_local_gate() {
     fi
 }
 
+run_local_cargo_lock_gate() {
+    local gate_name="$1"
+    local manifest_path="$2"
+    local start_ms end_ms rc err_out first_diag
+    start_ms="$(now_ms)"
+    set +e
+    err_out="$("$CARGO_BIN" metadata --manifest-path "$manifest_path" --locked --format-version 1 2>&1 >/dev/null)"
+    rc=$?
+    set -e
+    end_ms="$(now_ms)"
+    first_diag="$(extract_first_cargo_diag "$err_out" "$rc")"
+    emit_receipt "$gate_name" "local" "$rc" "$((end_ms - start_ms))" "$first_diag"
+    if [[ "$rc" -ne 0 ]]; then
+        printf '%s\n' "$err_out" >&2
+        return "$rc"
+    fi
+}
+
 extract_first_cargo_diag() {
     local raw_out="$1"
     local rc="$2"
@@ -427,7 +445,40 @@ assert len(rows) == 1 and rows[0]["gate_name"] == "gate_bypass_authorized" and r
 assert "Gate-Bypass: emergency-rollback-bd-ys3wb" in rows[0]["first_diagnostic"], rows
 PY
 
-    echo "verify_pre_push_gates.sh --self-test: PASS (5/5 scenarios verified)"
+    # Case 6: Stale Cargo.lock (--locked failure) -> MUST fail closed locally before RCH compile.
+    cat >"$tmpdir/mock_cargo_stale_lock" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "metadata" ]]; then
+    echo "error: cannot update the lock file /repo/Cargo.lock because --locked was passed to prevent this" >&2
+    exit 101
+fi
+exit 0
+EOF
+    chmod +x "$tmpdir/mock_cargo_stale_lock"
+
+    set +e
+    FFS_PRE_PUSH_SBH_BIN="$tmpdir/mock_sbh" \
+    FFS_PRE_PUSH_CARGO_BIN="$tmpdir/mock_cargo_stale_lock" \
+    FFS_PRE_PUSH_GIT_BIN="$tmpdir/mock_git_no_trailer" \
+    FFS_PRE_PUSH_RCH_BIN="$tmpdir/mock_rch_retry_ok" \
+    FFS_PRE_PUSH_RCH_WORKERS="w1" \
+    FFS_PRE_PUSH_RECEIPT="$tmpdir/fail_lock.jsonl" \
+        "$0" >/dev/null 2>&1
+    local rc_lock=$?
+    set -e
+    if [[ "$rc_lock" -ne 101 ]]; then
+        echo "self-test failed: expected stale Cargo.lock rc=101, got $rc_lock" >&2
+        exit 1
+    fi
+    python3 - "$tmpdir/fail_lock.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+lock_rows = [r for r in rows if r["gate_name"] == "cargo_lock_check"]
+assert len(lock_rows) == 1 and lock_rows[0]["exit_code"] == 101, rows
+assert "cannot update the lock file" in lock_rows[0]["first_diagnostic"], lock_rows
+PY
+
+    echo "verify_pre_push_gates.sh --self-test: PASS (6/6 scenarios verified)"
 }
 
 case "${1:-}" in
@@ -476,7 +527,11 @@ fi
 run_local_gate "git_diff_check" "$GIT_BIN" diff --check
 run_local_gate "git_diff_cached_check" "$GIT_BIN" diff --cached --check
 run_local_gate "cargo_fmt_check" "$CARGO_BIN" fmt --check
-run_rch_cargo_gate "cargo_check" check --workspace --all-targets
+run_local_cargo_lock_gate "cargo_lock_check" "$REPO_ROOT/Cargo.toml"
+if [[ -f "$REPO_ROOT/fuzz/Cargo.toml" ]]; then
+    run_local_cargo_lock_gate "fuzz_cargo_lock_check" "$REPO_ROOT/fuzz/Cargo.toml"
+fi
+run_rch_cargo_gate "cargo_check" check --workspace --all-targets --locked
 if [[ "${FFS_PRE_PUSH_SKIP_CLIPPY:-0}" != "1" ]]; then
-    run_rch_cargo_gate "cargo_clippy" clippy --workspace --all-targets -- -D warnings
+    run_rch_cargo_gate "cargo_clippy" clippy --workspace --all-targets --locked -- -D warnings
 fi
