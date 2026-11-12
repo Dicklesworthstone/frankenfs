@@ -69,7 +69,8 @@ LEDGERS: list[tuple[Path, int]] = [
 
 NULL_CONTROL = re.compile(
     r"A/A|A/A/B|null control|null floor|null-control|duplicate (?:FFS )?controls|"
-    r"two controls|frozen controls|null \d\.\d|null_median_ratio|null_floor_ratio",
+    r"two controls|frozen controls|null \d\.\d|null_median_ratio|null_floor_ratio|"
+    r"(?:fuse|kernel)_aa\b",
     re.I,
 )
 COUNTED_MECHANISM = re.compile(
@@ -109,11 +110,16 @@ CONTRACT_COUNTED_MECHANISM = re.compile(
     r"[^|\n]{0,80}(?:vs|->|→|to)\s*\d[\d,]*",
     re.I,
 )
+# `fuse_aa`/`kernel_aa` added 2026-11-12 (bd-x1dfp item 2): multi-line A/A blocks
+# put the "A/A NULL CONTROLS, same invocation, bootstrap median CI" header on one
+# line and the machine-emitted `fuse_aa 1.0229916 ... ci95 [...]` / `kernel_aa ...`
+# values on indented lines beneath it. Measured over all 405 live REJECT rows:
+# 284 failing before, 284 failing after (zero historical debt laundered).
 CONTRACT_NULL_VALUE = re.compile(
-    r"(?:A/A(?:/B)?|null(?:[- ]control| floor)|null_median_ratio)"
+    r"(?:A/A(?:/B)?|null(?:[- ]control| floor)|null_median_ratio|(?:fuse|kernel)_aa\b)"
     r"[^|\n]{0,120}(?:0|1|2)\.\d+(?:\s*(?:x|×))?"
     r"|(?:0|1|2)\.\d+(?:\s*(?:x|×))?[^|\n]{0,120}"
-    r"(?:A/A(?:/B)?|null(?:[- ]control| floor)|null_median_ratio)",
+    r"(?:A/A(?:/B)?|null(?:[- ]control| floor)|null_median_ratio|(?:fuse|kernel)_aa\b)",
     re.I,
 )
 SAME_INVOCATION_WITNESS = re.compile(
@@ -858,6 +864,18 @@ def unlinted_entry_headings(
     return found
 
 
+# An entry title that OPENS with an explicit rejection/inadmissibility verdict
+# (`BLOCKED — INADMISSIBLE ...`, `REJECT ...`, `REVERTED ...`, `REFUTED ...`)
+# remains REJECT even when its subtitle prose mentions a word in KEEP_VERDICT
+# such as "flipped its sign" or "pass" (bd-x1dfp item 2). Measured over all
+# 1,722 banked live rows: 0 existing verdicts move.
+LEADING_REJECT_VERDICT = re.compile(
+    r"^(?:[^A-Za-z0-9]+\s*)*(?:REJECT(?:ED)?|BLOCKED(?:\s*[—–-]\s*INADMISSIBLE)?|"
+    r"INADMISSIBLE|REVERTED|REFUTED)\b",
+    re.I,
+)
+
+
 def verdict_of(cells: list[str], title: str, body: str) -> str:
     """Verdict from the table's Verdict column, else the prose title, else the body."""
     if is_document_structure(cells, title):
@@ -876,6 +894,8 @@ def verdict_of(cells: list[str], title: str, body: str) -> str:
                     best, pos = name, m.start()
             if best:
                 return best
+    if LEADING_REJECT_VERDICT.search(title):
+        return "REJECT"
     if REJECT_VERDICT.search(title) and not KEEP_VERDICT.search(title):
         return "REJECT"
     if KEEP_VERDICT.search(title):
@@ -2339,8 +2359,114 @@ def cmd_self_test() -> int:
                 ),
             ),
             (
-                "the live ledgers hold exactly the 5 measured structure sections",
-                sum(1 for r in all_rows() if r.verdict == "STRUCTURE") == 5,
+                "synthetic ledgers classify the 5 canonical bd-eqm8s structure "
+                "sections without disturbing dated/bead decision rows",
+                (
+                    lambda synth: [r.verdict for r in synth]
+                    == [
+                        "STRUCTURE",
+                        "KEEP",
+                        "STRUCTURE",
+                        "STRUCTURE",
+                        "REJECT",
+                        "STRUCTURE",
+                        "STRUCTURE",
+                    ]
+                )(
+                    parse_text(
+                        sample_path,
+                        "## Rules\n"
+                        + rules_body
+                        + "\n## 2026-07-01 — KEEP: fast path\nbody\n"
+                        "## Gauntlet Release-Readiness Scorecard\nprose\n"
+                        "## Current Campaign Rows\nprose\n"
+                        "## `bd-4w2mf` — REJECT: no lever\nbody\n"
+                        "## Seeded Do-Not-Retry Rows From Prior No-Gaps Work\nprose\n",
+                        2,
+                    )
+                    + parse_text(
+                        sample_path,
+                        "### Also characterized (NOT landed) — MVCC prune scans all versioned blocks\n"
+                        "characterized only, not landed.\n",
+                        3,
+                    )
+                ),
+            ),
+            (
+                "live ledgers preserve all 5 canonical structure anchors and "
+                "zero structure sections smuggle decision evidence",
+                (
+                    lambda live_structs: {
+                        "Rules",
+                        "Gauntlet Release-Readiness Scorecard",
+                        "Current Campaign Rows",
+                        "Seeded Do-Not-Retry Rows From Prior No-Gaps Work",
+                        "Also characterized (NOT landed) — MVCC prune scans all versioned blocks",
+                    }.issubset({r.title for r in live_structs})
+                    and not any(structure_violations(r) for r in live_structs)
+                )([r for r in all_rows() if r.verdict == "STRUCTURE"]),
+            ),
+            # bd-x1dfp: BLOCKED — INADMISSIBLE multi-line fuse_aa/kernel_aa null
+            # blocks pass as REJECT when complete, and still block when missing.
+            (
+                "bd-x1dfp: BLOCKED — INADMISSIBLE heading with 'flipped its sign' "
+                "and multi-line fuse_aa/kernel_aa null block is a compliant REJECT",
+                (
+                    lambda parsed: len(parsed) == 1
+                    and parsed[0].verdict == "REJECT"
+                    and parsed[0].reject_contract_basis()
+                    == (True, "same-invocation A/A null control")
+                    and not contract_violations(parsed[0])
+                )(
+                    parse_text(
+                        sample_path,
+                        "### BLOCKED — INADMISSIBLE 2026-08-17 "
+                        "(bd-btrfs-readdir-stat-8x-8y7vp) — doubling pairs made "
+                        "the btrfs FUSE A/A null WORSE and flipped its sign\n\n"
+                        "    executed_on: thinkstation1\n"
+                        "    A/A NULL CONTROLS, same invocation, bootstrap median CI on each:\n"
+                        "      24 pairs:  fuse_aa 1.0229916  deviation +0.0229916  ci95 [0.9826635, 1.0558851]  FAIL\n"
+                        "      48 pairs:  kernel_aa 0.9899270  deviation 0.0100730  ci95 [0.9650803, 1.0053100]  pass\n",
+                        3,
+                    )
+                ),
+            ),
+            (
+                "bd-x1dfp negative: a new BLOCKED — INADMISSIBLE row without an "
+                "A/A null control or counted mechanism is still blocked",
+                contract_violations(
+                    parse_text(
+                        sample_path,
+                        "### BLOCKED — INADMISSIBLE 2026-08-17 (bd-bad-row) — "
+                        "flipped its sign with no null recorded\n\n"
+                        "    executed_on: thinkstation1\n"
+                        "    fuse_over_kernel 6.349379x\n",
+                        3,
+                    )[0]
+                )
+                == ["no A/A null control and no counted mechanism"],
+            ),
+            (
+                "bd-x1dfp staging isolation: appending a compliant row after an "
+                "unmodified historical contract-violating row checks only the new row",
+                (
+                    lambda parsed: len(parsed) == 2
+                    and bool(contract_violations(parsed[0]))
+                    and not contract_violations(parsed[1])
+                    and not set(range(parsed[1].line, parsed[1].line + 6)).intersection(
+                        row_line_span(parsed[0])
+                    )
+                )(
+                    parse_text(
+                        sample_path,
+                        "### REJECT 2026-07-01 (bd-old-broken) — historical row\n"
+                        "no mechanism recorded here.\n\n"
+                        "### REJECT 2026-08-17 (bd-new-clean) — counted probes\n"
+                        "executed_on: thinkstation1\n"
+                        "4000 probes -> 4000 probes across 2000 stats.\n",
+                        3,
+                    )
+                ),
             ),
             # bd-4sull: the ratchet-state report. Injected counts, never the live
             # ledgers -- the real counts move as agents bank rows, and a self-test
