@@ -226,15 +226,23 @@ fn workflows_have_tracked_nonempty_baselines_and_zero_vacuous_patterns() {
     for required_sandbox_token in [
         "bubblewrap",
         "ntfs-3g",
+        "zfsutils-linux",
+        "--example native_reader",
         "test_ffs_inspect_sandbox.py",
         "ffs_inspect_sandbox_native_e2e.sh",
+        "verify_ntfs_read.py",
+        "verify_ntfs_mount.py",
+        "verify_zfs_root.py",
+        "verify_zfs_files.py",
+        "verify_zfs_snapshots.py",
         "FFS_REQUIRE_SANDBOX: \"1\"",
         "FFS_REQUIRE_CGROUP: \"1\"",
         "FFS_REQUIRE_NTFS_TOOLS: \"1\"",
+        "FFS_REQUIRE_ZFS_TOOLS: \"1\"",
     ] {
         assert!(
             ci_yml.contains(required_sandbox_token),
-            "ci.yml fuse-e2e must qualify isolated sandbox readers (`{required_sandbox_token}`)"
+            "ci.yml fuse-e2e must qualify isolated sandbox & differential gates (`{required_sandbox_token}`)"
         );
     }
 

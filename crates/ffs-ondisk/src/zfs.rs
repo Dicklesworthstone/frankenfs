@@ -185,7 +185,11 @@ pub fn verify_label_checksum(bytes: &[u8], offset: u64) -> Result<Endian, ParseE
 /// Stamp an offset-salted SHA-256 embedded checksum (`zio_eck_t`) onto the
 /// trailing 40 bytes of a vdev label configuration or uberblock slot.
 /// `offset` is relative to the selected vdev, not the host file/partition base.
-pub fn stamp_label_checksum(bytes: &mut [u8], offset: u64, order: Endian) -> Result<(), ParseError> {
+pub fn stamp_label_checksum(
+    bytes: &mut [u8],
+    offset: u64,
+    order: Endian,
+) -> Result<(), ParseError> {
     if bytes.len() < 40 || bytes.len() > LABEL_CONFIG_BYTES {
         return Err(invalid("invalid embedded-checksum span"));
     }
@@ -320,8 +324,7 @@ impl BlockPointer {
             return Err(invalid("born-hole logical size exceeds 16-bit sector span"));
         }
         let mut words = [0_u64; 16];
-        words[6] =
-            (lsize_sectors - 1) | (u64::from(object_type) << 48) | (u64::from(level) << 56);
+        words[6] = (lsize_sectors - 1) | (u64::from(object_type) << 48) | (u64::from(level) << 56);
         words[10] = birth;
         Ok(Self { words })
     }
@@ -635,12 +638,12 @@ impl Uberblock {
             || self.root.birth() == 0
             || self.root.birth() > self.txg
         {
-            return Err(invalid(
-                "uberblock has an invalid TXG or MOS root pointer",
-            ));
+            return Err(invalid("uberblock has an invalid TXG or MOS root pointer"));
         }
         if mmp_magic == MMP_MAGIC && (mmp_config & 0xffff) != 0 {
-            return Err(invalid("refusing to encode active MMP sequence in uberblock"));
+            return Err(invalid(
+                "refusing to encode active MMP sequence in uberblock",
+            ));
         }
         let mut raw = vec![0_u8; slot_bytes];
         raw[0..8].copy_from_slice(&self.order.encode(UBER_MAGIC));
@@ -1153,7 +1156,10 @@ mod embedded_tests {
                     let slot = ub
                         .encode_with_meta(4096, vdev_offset, 5000, MMP_MAGIC, 0x0064_000a_0000)
                         .unwrap();
-                    assert_eq!(verify_label_checksum(&slot, vdev_offset).unwrap(), container);
+                    assert_eq!(
+                        verify_label_checksum(&slot, vdev_offset).unwrap(),
+                        container
+                    );
                     assert!(verify_label_checksum(&slot, vdev_offset + 4096).is_err());
                     let parsed_ub = Uberblock::parse(&slot, vdev_offset).unwrap();
                     assert_eq!(parsed_ub.txg, 78);

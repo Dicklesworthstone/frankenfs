@@ -17,12 +17,12 @@ use serde::Serialize;
 use crate::reader::dmu::Objects;
 
 use super::dmu_cow::{
-    DMU_OT_DIRECTORY_CONTENTS, DMU_OT_OBJSET, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA,
-    DMU_OT_ZNODE, DnodeCowSpec, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite,
-    WriteBucket, allocate_object_id, apply_objectset_quota_deltas, collect_non_hole_bps_from,
-    cow_update_dnode, encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist,
-    objectset_user_accounting_flags, put_dnode_in_table, read_staged_or_committed_dnode,
-    remove_dnode_from_table, zap_optional_u64, zap_required_u64,
+    DMU_OT_DIRECTORY_CONTENTS, DMU_OT_OBJSET, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
+    DnodeCowSpec, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite, WriteBucket,
+    allocate_object_id, apply_objectset_quota_deltas, collect_non_hole_bps_from, cow_update_dnode,
+    encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist, objectset_user_accounting_flags,
+    put_dnode_in_table, read_staged_or_committed_dnode, remove_dnode_from_table, zap_optional_u64,
+    zap_required_u64,
 };
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
@@ -159,12 +159,8 @@ fn open_head_dataset_context(
     }
     let (head_dn, head_ceiling) = mos.object_with_ceiling(cx, ds_row.head_object)?;
     let order = head_dn.order();
-    let prev_snap_txg = order
-        .u64(head_dn.bonus(), 16)
-        .map_err(|e| parse_err(&e))?;
-    let deadlist_obj = order
-        .u64(head_dn.bonus(), 64)
-        .map_err(|e| parse_err(&e))?;
+    let prev_snap_txg = order.u64(head_dn.bonus(), 16).map_err(|e| parse_err(&e))?;
+    let deadlist_obj = order.u64(head_dn.bonus(), 64).map_err(|e| parse_err(&e))?;
     let old_os_bp =
         BlockPointer::parse(&head_dn.bonus()[128..256], order).map_err(|e| parse_err(&e))?;
     let (os_raw, os_order, _) = mos
@@ -215,16 +211,17 @@ fn open_head_dataset_context(
             "native ZPL writer requires ZPL v4/v5 without normalization or case folding",
         ));
     }
-    let sa_registry = if let Some(sa_master) = zap_optional_u64(&master, b"SA_ATTRS")?.filter(|&v| v != 0) {
-        let sa_rows = os_view.zap_values(cx, sa_master)?;
-        let reg_obj = zap_required_u64(&sa_rows, b"REGISTRY")?;
-        let lay_obj = zap_required_u64(&sa_rows, b"LAYOUTS")?;
-        let reg_entries = os_view.zap_values(cx, reg_obj)?;
-        let lay_entries = os_view.zap_values(cx, lay_obj)?;
-        Some(SaRegistry::from_zaps(&reg_entries, &lay_entries).map_err(|e| parse_err(&e))?)
-    } else {
-        None
-    };
+    let sa_registry =
+        if let Some(sa_master) = zap_optional_u64(&master, b"SA_ATTRS")?.filter(|&v| v != 0) {
+            let sa_rows = os_view.zap_values(cx, sa_master)?;
+            let reg_obj = zap_required_u64(&sa_rows, b"REGISTRY")?;
+            let lay_obj = zap_required_u64(&sa_rows, b"LAYOUTS")?;
+            let reg_entries = os_view.zap_values(cx, reg_obj)?;
+            let lay_entries = os_view.zap_values(cx, lay_obj)?;
+            Some(SaRegistry::from_zaps(&reg_entries, &lay_entries).map_err(|e| parse_err(&e))?)
+        } else {
+            None
+        };
 
     Ok((
         DatasetContext {
@@ -279,7 +276,10 @@ fn load_zpl_node(
         object_id,
         order,
     )?;
-    if !matches!(dnode.object_type(), DMU_OT_PLAIN_FILE_CONTENTS | DMU_OT_DIRECTORY_CONTENTS) {
+    if !matches!(
+        dnode.object_type(),
+        DMU_OT_PLAIN_FILE_CONTENTS | DMU_OT_DIRECTORY_CONTENTS
+    ) {
         return Err(unsupported("target object is not a ZPL file or directory"));
     }
     let mut spill_bytes = None;
@@ -297,7 +297,8 @@ fn load_zpl_node(
                     .ok_or_else(|| corrupt("SA spill pointer is a hole"))?;
                 spill_bytes = Some(raw.as_ref().clone());
             }
-            let reg = sa_registry.ok_or_else(|| corrupt("SA object on dataset without SA_ATTRS"))?;
+            let reg =
+                sa_registry.ok_or_else(|| corrupt("SA object on dataset without SA_ATTRS"))?;
             reg.decode(dnode.bonus(), spill_bytes.as_deref())
                 .and_then(|attrs| attrs.metadata())
                 .map_err(|e| parse_err(&e))?
@@ -305,7 +306,9 @@ fn load_zpl_node(
         _ => return Err(unsupported("unsupported ZPL bonus representation")),
     };
     if metadata.flags & 1 != 0 {
-        return Err(unsupported("cannot directly mutate private ZPL xattr object"));
+        return Err(unsupported(
+            "cannot directly mutate private ZPL xattr object",
+        ));
     }
     Ok(LoadedZplNode {
         dnode,
@@ -396,7 +399,8 @@ fn encode_new_zpl_bonus(
     let bonus = new_meta
         .encode_legacy(None, order)
         .map_err(|e| parse_err(&e))?;
-    Ok((DMU_OT_ZNODE, 2, bonus))
+    let nblkptr = super::dmu_cow::max_nblkptr_for_dnode(1, bonus.len(), false)?;
+    Ok((DMU_OT_ZNODE, nblkptr, bonus))
 }
 
 fn read_dir_entries(
@@ -631,8 +635,8 @@ pub(super) fn stage_zpl_mutation(
                 objs_delta: 1,
             });
 
-            let ref_val = encode_directory_reference(new_obj, Kind::Regular)
-                .map_err(|e| parse_err(&e))?;
+            let ref_val =
+                encode_directory_reference(new_obj, Kind::Regular).map_err(|e| parse_err(&e))?;
             entries.push(RawZapEntry {
                 name: name.clone(),
                 integer_bytes: 8,
@@ -777,8 +781,8 @@ pub(super) fn stage_zpl_mutation(
                 &dir_out.dnode,
             )?;
 
-            let ref_val = encode_directory_reference(new_obj, Kind::Directory)
-                .map_err(|e| parse_err(&e))?;
+            let ref_val =
+                encode_directory_reference(new_obj, Kind::Directory).map_err(|e| parse_err(&e))?;
             entries.push(RawZapEntry {
                 name: name.clone(),
                 integer_bytes: 8,
@@ -890,6 +894,17 @@ pub(super) fn stage_zpl_mutation(
                 )?;
                 zpl_born.add_assign(out.born)?;
                 zpl_retired.extend(out.retired_bps);
+                let bytes_delta =
+                    signed_bytes_delta(out.dnode.used_bytes(), loaded.dnode.used_bytes())?;
+                if bytes_delta != 0 {
+                    quota_deltas.push(QuotaDelta {
+                        uid: new_meta.uid,
+                        gid: new_meta.gid,
+                        projid: Some(0),
+                        bytes_delta,
+                        objs_delta: 0,
+                    });
+                }
                 put_dnode_in_table(
                     cx,
                     &mut os_view,
@@ -1054,7 +1069,9 @@ pub(super) fn stage_zpl_mutation(
             checksum,
         } => {
             if i64::try_from(*new_size).is_err() {
-                return Err(FfsError::Format("ZFS truncate size exceeds i64::MAX".into()));
+                return Err(FfsError::Format(
+                    "ZFS truncate size exceeds i64::MAX".into(),
+                ));
             }
             let loaded = load_zpl_node(
                 cx,
@@ -1200,9 +1217,7 @@ pub(super) fn stage_zpl_mutation(
                     String::from_utf8_lossy(src_name).into_owned(),
                 ));
             };
-            let src_ref = src_entries[src_pos]
-                .scalar()
-                .map_err(|e| parse_err(&e))?;
+            let src_ref = src_entries[src_pos].scalar().map_err(|e| parse_err(&e))?;
             let (source_obj, _) = directory_reference(src_ref).map_err(|e| parse_err(&e))?;
             if let Some(expected) = expected_source_object
                 && source_obj != *expected
@@ -1267,9 +1282,7 @@ pub(super) fn stage_zpl_mutation(
 
             let mut replaced_dir = false;
             if let Some(dst_pos) = dst_entries.iter().position(|e| e.name == *dst_name) {
-                let dst_ref = dst_entries[dst_pos]
-                    .scalar()
-                    .map_err(|e| parse_err(&e))?;
+                let dst_ref = dst_entries[dst_pos].scalar().map_err(|e| parse_err(&e))?;
                 let (target_obj, _) = directory_reference(dst_ref).map_err(|e| parse_err(&e))?;
                 if target_obj == source_obj {
                     return Ok(source_obj);
@@ -1498,6 +1511,17 @@ pub(super) fn stage_zpl_mutation(
             )?;
             zpl_born.add_assign(m_out.born)?;
             zpl_retired.extend(m_out.retired_bps);
+            let moved_delta =
+                signed_bytes_delta(m_out.dnode.used_bytes(), src_obj_loaded.dnode.used_bytes())?;
+            if moved_delta != 0 {
+                quota_deltas.push(QuotaDelta {
+                    uid: moved_meta.uid,
+                    gid: moved_meta.gid,
+                    projid: Some(0),
+                    bytes_delta: moved_delta,
+                    objs_delta: 0,
+                });
+            }
             put_dnode_in_table(
                 cx,
                 &mut os_view,

@@ -443,7 +443,12 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
         meta.mode = 0o100_600;
         let encoded_legacy = meta.encode_legacy(Some(&prev_legacy), order).unwrap();
         assert_eq!(Metadata::legacy(&encoded_legacy, order).unwrap(), meta);
-        assert_eq!(XattrSources::legacy(&encoded_legacy, order).unwrap().directory, 777);
+        assert_eq!(
+            XattrSources::legacy(&encoded_legacy, order)
+                .unwrap()
+                .directory,
+            777
+        );
 
         // SA v5 update + template creation with dynamic ZPL_PROJID, ZPL_DACL_COUNT, ZPL_DACL_ACES
         let mut template_attrs = attributes(order, 0o040_755, 2);
@@ -479,7 +484,12 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
         let decoded_parent = registry.decode(&reencoded_parent, None).unwrap();
         assert_eq!(decoded_parent.metadata().unwrap(), updated_parent_meta);
         assert_eq!(
-            decoded_parent.xattrs().unwrap().inline.get("user.keep").map(Vec::as_slice),
+            decoded_parent
+                .xattrs()
+                .unwrap()
+                .inline
+                .get("user.keep")
+                .map(Vec::as_slice),
             Some(b"val".as_slice())
         );
 

@@ -169,10 +169,7 @@ impl Record {
                     return Err(invalid("invalid space-map debug or padding record"));
                 }
                 let action = u64::from(kind == MapType::Free);
-                let word = (2_u64 << 62)
-                    | (action << 60)
-                    | (u64::from(sync_pass) << 50)
-                    | txg;
+                let word = (2_u64 << 62) | (action << 60) | (u64::from(sync_pass) << 50) | txg;
                 Ok(order.encode(word).to_vec())
             }
             Self::Extent(Extent {

@@ -7,9 +7,7 @@ use std::ops::Range;
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::nvlist::{NvList, Value};
-use ffs_ondisk::zfs::{
-    BlockPointer, Dva, Endian, LABEL_CONFIG_BYTES, RegularBlockSpec,
-};
+use ffs_ondisk::zfs::{BlockPointer, Dva, Endian, LABEL_CONFIG_BYTES, RegularBlockSpec};
 use ffs_ondisk::zfs_dmu::space_map::{
     AllocationMap, Header as SpaceMapHeader, MapType, Record as SpaceMapRecord, Records,
     extent_records_for_range,
@@ -36,9 +34,9 @@ pub(super) const DMU_OT_OBJSET: u8 = 11;
 pub(super) const DMU_OT_ZNODE: u8 = 17;
 pub(super) const DMU_OT_PLAIN_FILE_CONTENTS: u8 = 19;
 pub(super) const DMU_OT_DIRECTORY_CONTENTS: u8 = 20;
-pub(super) const DMU_OT_BPOBJ_HDR: u8 = 36;
-pub(super) const DMU_OT_DEADLIST: u8 = 42;
-pub(super) const DMU_OT_DEADLIST_HDR: u8 = 43;
+pub(super) const DMU_OT_BPOBJ_HDR: u8 = 6;
+pub(super) const DMU_OT_DEADLIST: u8 = 50;
+pub(super) const DMU_OT_DEADLIST_HDR: u8 = 51;
 pub(super) const DMU_OT_SA: u8 = 44;
 
 pub(super) const SPACE_MAP_BLOCK_BYTES: usize = 4096;
@@ -579,6 +577,28 @@ pub(super) struct DnodeCowOutput {
     pub retired_bps: Vec<BlockPointer>,
 }
 
+pub(super) fn max_nblkptr_for_dnode(
+    slots: usize,
+    bonus_len: usize,
+    has_spill: bool,
+) -> Result<usize> {
+    let body_bytes = slots
+        .checked_mul(DNODE_BYTES)
+        .and_then(|total| total.checked_sub(64))
+        .ok_or_else(|| corrupt("invalid dnode slot count"))?;
+    let reserved = bonus_len
+        .checked_add(usize::from(has_spill) * 128)
+        .ok_or_else(|| corrupt("dnode bonus/spill size overflow"))?;
+    let avail = body_bytes
+        .checked_sub(reserved)
+        .ok_or_else(|| corrupt("dnode bonus/spill exceeds dnode body"))?;
+    let max_ptrs = (avail / 128).min(3);
+    if max_ptrs == 0 {
+        return Err(corrupt("dnode body has no room for a block pointer"));
+    }
+    Ok(max_ptrs)
+}
+
 fn pointer_fill_contribution(bp: &BlockPointer) -> u64 {
     if bp.embedded() {
         1
@@ -793,13 +813,24 @@ pub(super) fn cow_update_dnode(
         )?;
     }
 
-    // 2. Determine required indirection levels (`1..=7`).
+    // 2. Determine effective `dn_nblkptr` and required indirection levels (`1..=7`).
+    let max_ptrs = max_nblkptr_for_dnode(spec.slots, spec.bonus.len(), spec.spill.is_some())?;
+    let effective_nblkptr = spec.nblkptr.min(max_ptrs);
     let indirect_bytes = 1_usize << spec.indirect_shift;
     let fanout = (indirect_bytes / 128) as u64;
-    let mut levels = spec.existing.map_or(1_u8, |(n, _)| n.levels());
+    let old_levels = spec.existing.map_or(1_u8, |(n, _)| n.levels());
+    let mut levels = old_levels;
+    let mut preserved_single_block0 = None;
     if spec.max_block == 0 && levels > 1 {
-        // Shrinking back to single-block: retire all old indirect blocks (`level >= 1`).
+        // Shrinking back to single-block: retire all old indirect blocks (`level >= 1`)
+        // and preserve existing level-0 block 0 when not rewritten in `dirty_leaves`.
         if let Some((old_node, old_ceiling)) = spec.existing {
+            if !dirty_leaves.contains_key(&0)
+                && let Some((bp0, _)) =
+                    lookup_existing_bp_at_level(cx, view, old_node, old_ceiling, 0, 0)?
+            {
+                preserved_single_block0 = Some(bp0);
+            }
             let mut all_old = Vec::new();
             collect_non_hole_bps_from(cx, view, old_node, old_ceiling, 0, true, &mut all_old)?;
             for bp in all_old {
@@ -811,7 +842,7 @@ pub(super) fn cow_update_dnode(
         levels = 1;
     } else {
         while u128::from(spec.max_block)
-            >= (spec.nblkptr as u128) * (u128::from(fanout)).pow(u32::from(levels - 1))
+            >= (effective_nblkptr as u128) * (u128::from(fanout)).pow(u32::from(levels - 1))
         {
             levels = levels
                 .checked_add(1)
@@ -822,6 +853,9 @@ pub(super) fn cow_update_dnode(
 
     // 3. Build level-0 updated pointers for dirty leaves (`0..=spec.max_block`).
     let mut current_updates: BTreeMap<u64, BlockPointer> = BTreeMap::new();
+    if let Some(bp0) = preserved_single_block0 {
+        current_updates.insert(0, bp0);
+    }
     for (&block_id, maybe_bytes) in dirty_leaves {
         checkpoint(cx)?;
         if block_id > spec.max_block {
@@ -880,7 +914,6 @@ pub(super) fn cow_update_dnode(
     // If indirection grew (`levels > old_levels`), seed existing root pointers at `old_top`
     // into `level = old_top` updates so they get wrapped into new parent indirects at index 0
     // without losing unmodified subtrees!
-    let old_levels = spec.existing.map_or(1_u8, |(n, _)| n.levels());
     let mut promoted_seed: BTreeMap<u8, BTreeMap<u64, BlockPointer>> = BTreeMap::new();
     if let Some((old_node, _)) = spec.existing
         && levels > old_levels
@@ -944,8 +977,8 @@ pub(super) fn cow_update_dnode(
                         raw_block.copy_from_slice(&old_bytes);
                     } else {
                         for (slot, chunk) in old_bytes.as_chunks::<128>().0.iter().enumerate() {
-                            let parsed = BlockPointer::parse(chunk, old_order)
-                                .map_err(|e| parse_err(&e))?;
+                            let parsed =
+                                BlockPointer::parse(chunk, old_order).map_err(|e| parse_err(&e))?;
                             raw_block[slot * 128..(slot + 1) * 128]
                                 .copy_from_slice(&parsed.encode(spec.order));
                         }
@@ -956,8 +989,8 @@ pub(super) fn cow_update_dnode(
             // Zero any child slots strictly past `spec.max_block` at `child_level`.
             let child_span = (u128::from(fanout)).pow(u32::from(child_level));
             for slot in 0..(fanout as usize) {
-                let child_global = (u128::from(parent_idx) * u128::from(fanout) + slot as u128)
-                    * child_span;
+                let child_global =
+                    (u128::from(parent_idx) * u128::from(fanout) + slot as u128) * child_span;
                 if child_global > u128::from(spec.max_block) {
                     raw_block[slot * 128..(slot + 1) * 128].fill(0);
                 }
@@ -1013,12 +1046,17 @@ pub(super) fn cow_update_dnode(
         current_updates = next_updates;
     }
 
-    // 5. Assemble root pointers (`0..spec.nblkptr`) and exact `used_bytes`.
-    let mut root_pointers = vec![BlockPointer::hole_pointer(); spec.nblkptr];
+    // 5. Assemble root pointers (`0..effective_nblkptr`) and exact `used_bytes`.
+    let mut root_pointers = vec![BlockPointer::hole_pointer(); effective_nblkptr];
     if let Some((old_node, _)) = spec.existing
         && levels == old_levels
     {
-        for (slot, bp) in old_node.pointers().iter().take(spec.nblkptr).enumerate() {
+        for (slot, bp) in old_node
+            .pointers()
+            .iter()
+            .take(effective_nblkptr)
+            .enumerate()
+        {
             let root_span = (u128::from(fanout)).pow(u32::from(levels - 1));
             if (slot as u128) * root_span <= u128::from(spec.max_block) {
                 root_pointers[slot] = bp.clone();
@@ -1027,7 +1065,7 @@ pub(super) fn cow_update_dnode(
     }
     for (slot_u64, bp) in current_updates {
         let slot = usize::try_from(slot_u64).map_err(|_| corrupt("root pointer slot overflow"))?;
-        if slot >= spec.nblkptr {
+        if slot >= effective_nblkptr {
             return Err(corrupt("computed root pointer slot exceeds dn_nblkptr"));
         }
         root_pointers[slot] = bp;
@@ -1250,7 +1288,8 @@ pub(super) fn apply_objectset_quota_deltas(
         else {
             continue;
         };
-        let mut entries = read_embedded_zap_entries(cx, os_view, &emb_dn, os_view.root_birth_txg())?;
+        let mut entries =
+            read_embedded_zap_entries(cx, os_view, &emb_dn, os_view.root_birth_txg())?;
         for (key, delta) in changes {
             if delta == 0 {
                 continue;
@@ -1400,7 +1439,7 @@ pub(super) fn allocate_object_id(
             .ok_or_else(|| corrupt("missing loaded dnode table block"))?;
         let min_slot = usize::from(block_id == 0);
         if let Some(slot) =
-            find_free_dnode_slot(blk, slots_needed, min_slot).map_err(|e| parse_err(&e))?
+            find_free_dnode_slot(blk, min_slot, slots_needed).map_err(|e| parse_err(&e))?
         {
             return Ok(block_id * (slots_per_block as u64) + (slot as u64));
         }
@@ -1508,7 +1547,7 @@ pub(super) fn remove_dnode_from_table(
 }
 
 /// Append snapshot-retained `BlockPointer`s (`birth <= ds_prev_snap_txg`) to `ds_deadlist_obj`
-/// (`DMU_OT_BPOBJ = 5` old-format deadlist OR `DMU_OT_DEADLIST = 42` modern ZAP deadlist).
+/// (`DMU_OT_BPOBJ = 5` old-format deadlist OR `DMU_OT_DEADLIST = 50` modern ZAP deadlist).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn enqueue_into_dataset_deadlist(
     cx: &Cx,
@@ -1957,7 +1996,8 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
     let mut planned_sm: BTreeMap<usize, (usize, usize, usize)> = BTreeMap::new();
     for ms in &work_base_alloc.metaslabs {
         if ms.is_dirty() {
-            let prelim = ms.build_full_stream(new_txg, order, work_base_alloc.spacemap_v2_active)?;
+            let prelim =
+                ms.build_full_stream(new_txg, order, work_base_alloc.spacemap_v2_active)?;
             let plan = plan_spacemap_blocks(cx, mos, ms.object, &prelim, min_blk)?;
             planned_sm.insert(ms.id, plan);
         }
@@ -1977,14 +2017,8 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
         let dirty_ms_ids: Vec<usize> = planned_sm.keys().copied().collect();
         for &ms_id in &dirty_ms_ids {
             if alloc.metaslabs[ms_id].object == 0 {
-                let new_sm_obj = allocate_object_id(
-                    cx,
-                    mos,
-                    &mos_meta,
-                    mos_ceiling,
-                    &mut mos_dirty_dnodes,
-                    1,
-                )?;
+                let new_sm_obj =
+                    allocate_object_id(cx, mos, &mos_meta, mos_ceiling, &mut mos_dirty_dnodes, 1)?;
                 alloc.metaslabs[ms_id].object = new_sm_obj;
                 alloc.metaslabs[ms_id].preserved_smp_object = new_sm_obj;
                 if alloc.spacemap_histogram_present {
@@ -2290,8 +2324,11 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
             } else {
                 None
             };
-            let stream =
-                alloc.metaslabs[ms_id].build_full_stream(new_txg, order, alloc.spacemap_v2_active)?;
+            let stream = alloc.metaslabs[ms_id].build_full_stream(
+                new_txg,
+                order,
+                alloc.spacemap_v2_active,
+            )?;
             let mut real_dirty = BTreeMap::new();
             for bid in first_dirty..num_blocks {
                 let s = bid * bsize;
@@ -2377,11 +2414,8 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
         for (bid, blk) in mos_dirty_dnodes {
             real_meta_dirty.insert(bid, Some(blk));
         }
-        let mut fixed_meta = FixedDvaReplay::new(
-            &meta_reserved_dvas,
-            alloc.ashift,
-            alloc.hole_birth_active,
-        );
+        let mut fixed_meta =
+            FixedDvaReplay::new(&meta_reserved_dvas, alloc.ashift, alloc.hole_birth_active);
         let new_mos_meta = fixed_meta.encode_dnode(
             cx,
             mos,
@@ -2724,8 +2758,8 @@ impl<'a> FixedDvaReplay<'a> {
                 }
                 let child_span = (u128::from(fanout)).pow(u32::from(child_level));
                 for slot in 0..(fanout as usize) {
-                    let child_global = (u128::from(parent_idx) * u128::from(fanout) + slot as u128)
-                        * child_span;
+                    let child_global =
+                        (u128::from(parent_idx) * u128::from(fanout) + slot as u128) * child_span;
                     if child_global > u128::from(spec.max_block) {
                         raw_block[slot * 128..(slot + 1) * 128].fill(0);
                     }

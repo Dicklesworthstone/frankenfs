@@ -614,8 +614,7 @@ fn encode_leaf_block(
         next_chunk += 1;
         let name_first = alloc_array(&mut raw, &item.name_nul, &mut next_chunk);
         let value_first = alloc_array(&mut raw, &item.value_bytes, &mut next_chunk);
-        let slot =
-            (item.hash >> (64 - prefix_bits - buckets.ilog2())) as usize & (buckets - 1);
+        let slot = (item.hash >> (64 - prefix_bits - buckets.ilog2())) as usize & (buckets - 1);
         let prev_head = u16_at(&raw, 48 + slot * 2, order)?;
         let at = start + usize::from(entry_idx) * 24;
         raw[at] = 252;
@@ -713,9 +712,7 @@ pub fn encode_fatzap_with_flags(
     let mut hash_cd = BTreeMap::<u64, u32>::new();
     let mut prepared = Vec::with_capacity(entries.len());
     for entry in entries {
-        if entry.name.is_empty()
-            || entry.name.len() + 1 > MAX_NAME_BYTES
-            || entry.name.contains(&0)
+        if entry.name.is_empty() || entry.name.len() + 1 > MAX_NAME_BYTES || entry.name.contains(&0)
         {
             return Err(invalid("invalid fat-ZAP key name"));
         }
@@ -804,7 +801,9 @@ pub fn encode_fatzap_with_flags(
             continue;
         }
         if prefix_bits >= max_table_shift {
-            return Err(invalid("fat-ZAP hash collision chain exceeds leaf capacity"));
+            return Err(invalid(
+                "fat-ZAP hash collision chain exceeds leaf capacity",
+            ));
         }
         let bit_pos = 63 - prefix_bits;
         let mut left = Vec::new();

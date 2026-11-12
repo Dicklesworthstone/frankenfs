@@ -364,8 +364,8 @@ impl Dnode {
         {
             return Err(invalid("invalid dnode data-block geometry"));
         }
-        let data_sectors =
-            u16::try_from(self.data_bytes / 512).map_err(|_| invalid("dnode block sectors overflow"))?;
+        let data_sectors = u16::try_from(self.data_bytes / 512)
+            .map_err(|_| invalid("dnode block sectors overflow"))?;
         let bonus_start = 64 + self.pointers.len() * 128;
         let bonus_end = size - if self.spill.is_some() { 128 } else { 0 };
         if bonus_start > bonus_end || self.bonus.len() > bonus_end - bonus_start {
@@ -434,7 +434,9 @@ pub fn write_dnode_at(block: &mut [u8], slot: usize, dnode: &Dnode) -> Result<()
         } else if prev.slots < dnode.slots {
             for extra in (slot + prev.slots)..(slot + dnode.slots) {
                 if block[extra * DNODE_BYTES] != 0 {
-                    return Err(invalid("expanded dnode overlaps an allocated neighbor slot"));
+                    return Err(invalid(
+                        "expanded dnode overlaps an allocated neighbor slot",
+                    ));
                 }
             }
         }
@@ -1082,7 +1084,9 @@ impl ObjectSet {
         let rel = slot_offset - 720;
         if let Some(dn) = dnode {
             if dn.slots() != 1 {
-                return Err(invalid("embedded object-set dnode must occupy one 512B slot"));
+                return Err(invalid(
+                    "embedded object-set dnode must occupy one 512B slot",
+                ));
             }
             let encoded = dn.encode()?;
             self.tail_bytes[rel..rel + DNODE_BYTES].copy_from_slice(&encoded);
@@ -1157,7 +1161,9 @@ pub fn encode_microzap(
     let mut bucket_cd = std::collections::BTreeMap::<u64, u32>::new();
     for (index, item) in entries.iter().enumerate() {
         if item.name.is_empty() || item.name.len() > 49 || item.name.contains(&0) {
-            return Err(invalid("micro-ZAP name empty, NUL-containing or > 49 bytes"));
+            return Err(invalid(
+                "micro-ZAP name empty, NUL-containing or > 49 bytes",
+            ));
         }
         if !seen_names.insert(item.name.clone()) {
             return Err(invalid("duplicate micro-ZAP name"));
@@ -1454,7 +1460,11 @@ mod tests {
                 max_block: 0,
                 used_bytes: 16_384,
                 slots: 1,
-                pointers: vec![bp, BlockPointer::hole_pointer(), BlockPointer::hole_pointer()],
+                pointers: vec![
+                    bp,
+                    BlockPointer::hole_pointer(),
+                    BlockPointer::hole_pointer(),
+                ],
                 bonus: Vec::new(),
                 spill: None,
             })

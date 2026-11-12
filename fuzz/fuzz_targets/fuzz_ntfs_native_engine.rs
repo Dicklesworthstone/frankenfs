@@ -19,9 +19,7 @@ use ffs_fuzz::{
 };
 use ffs_ntfs::reader::allocation::{AllocationLimits, NamespaceLimits, RecordOwnershipLimits};
 use ffs_ntfs::reader::security::SecurityCheckLimits;
-use ffs_ntfs::{
-    NtfsTransactionEngine, NtfsTxOutcome, NtfsVolume, NtfsWriteOptions, StreamName,
-};
+use ffs_ntfs::{NtfsTransactionEngine, NtfsTxOutcome, NtfsVolume, NtfsWriteOptions, StreamName};
 use ffs_ondisk::ntfs::attribute_list::parse_attribute_list;
 use ffs_ondisk::ntfs::ea::{parse_extended_attributes, NtfsEaInformation};
 use ffs_ondisk::ntfs::index::parse_index_block;
@@ -122,8 +120,7 @@ fn fuzz_pure_ntfs_parsers_and_codecs(data: &[u8], tracker: &FuzzBudgetTracker) {
         };
         if let Ok(client_bytes) = encode_client_update_payload(&spec) {
             if let Ok(mut ring) = NtfsLogRingWriter::new_fresh(4096, (1, 1), 64 * 4096, 1, 1) {
-                if let Ok(rec) =
-                    ring.append_raw_record(LFS_RECORD_CLIENT, 24, 0, 0, &client_bytes)
+                if let Ok(rec) = ring.append_raw_record(LFS_RECORD_CLIENT, 24, 0, 0, &client_bytes)
                 {
                     let rstr0 = ring.build_next_rstr_page(false).unwrap();
                     let rstr1 = ring.build_next_rstr_page(false).unwrap();

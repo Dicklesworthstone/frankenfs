@@ -4,6 +4,7 @@
 mod allocation_commands;
 mod file_commands;
 mod properties_commands;
+mod write_commands;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -234,6 +235,8 @@ enum Command {
     File(file_commands::FileCommand),
     #[command(flatten)]
     Properties(properties_commands::PropertyCommand),
+    #[command(flatten)]
+    Write(write_commands::WriteCommand),
     /// Inventory checksum-valid configurations and uberblock candidates, not pool authority.
     Inspect {
         #[command(flatten)]
@@ -290,6 +293,7 @@ fn main() -> Result<()> {
         Command::Allocation(command) => command.run(&cx)?,
         Command::File(command) => command.run(&cx)?,
         Command::Properties(command) => command.run(&cx)?,
+        Command::Write(command) => command.run(&cx)?,
         Command::Inspect { image } => {
             let leaf = image.open(&cx)?;
             let mut labels = Vec::new();

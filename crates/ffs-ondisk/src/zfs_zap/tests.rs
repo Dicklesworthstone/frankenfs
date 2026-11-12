@@ -373,8 +373,7 @@ fn encode_fatzap_splits_leaves_scales_to_external_tables_and_roundtrips_arrays()
                     collision: 0,
                 });
             }
-            let blocks =
-                encode_fatzap_with_flags(&entries, 512, SALT, hash64, order).unwrap();
+            let blocks = encode_fatzap_with_flags(&entries, 512, SALT, hash64, order).unwrap();
             assert!(blocks.len() > 16);
             let max_block = (blocks.len() - 1) as u64;
             let hdr = FatHeader::parse(&blocks[0], order, max_block).unwrap();

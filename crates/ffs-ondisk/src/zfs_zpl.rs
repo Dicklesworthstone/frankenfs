@@ -613,7 +613,8 @@ impl SaRegistry {
             map.insert(b"ZPL_SYMLINK".to_vec(), target.clone());
         }
         if update_trivial_dacl {
-            let aces = encode_trivial_nfsv4_aces(checked.mode, checked.kind == Kind::Directory, order);
+            let aces =
+                encode_trivial_nfsv4_aces(checked.mode, checked.kind == Kind::Directory, order);
             map.insert(b"ZPL_DACL_COUNT".to_vec(), order.encode(3).to_vec());
             map.insert(b"ZPL_DACL_ACES".to_vec(), aces);
         }
@@ -673,7 +674,9 @@ impl SaRegistry {
         metadata: &Metadata,
     ) -> Result<Vec<u8>, ParseError> {
         if metadata.inline_symlink.is_some() {
-            return Err(invalid("inline symlink creation requires a symlink SA layout"));
+            return Err(invalid(
+                "inline symlink creation requires a symlink SA layout",
+            ));
         }
         let (order, template_layout) = self.parse_buffer_header(template_bonus)?;
         let mut template_decoded = Attributes {
@@ -713,9 +716,9 @@ impl SaRegistry {
                 .filter_map(|id| self.attributes.get(id).map(|r| r.name.as_slice()))
                 .collect();
             required_core.iter().all(|req| names.contains(req))
-                && names.iter().all(|name| {
-                    required_core.contains(name) || allowed_optional.contains(name)
-                })
+                && names
+                    .iter()
+                    .all(|name| required_core.contains(name) || allowed_optional.contains(name))
         };
 
         let chosen_layout = if layout_admissible(template_layout) {

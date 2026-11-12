@@ -113,6 +113,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             e2fsprogs libext2fs-dev btrfs-progs fuse3 \
+            dosfstools ntfs-3g zfsutils-linux \
             build-essential autoconf automake pkg-config \
             uuid-dev libblkid-dev zlib1g-dev liblzo2-dev libzstd-dev libudev-dev
           # The unignored live TUI test uses fuser's auto-unmount helper.
@@ -378,6 +379,7 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           test -w "$CARGO_TARGET_DIR"
           cargo build --release -p ffs-cli --bin ffs-cli --bin ffs-protected-mount --bin ffs-fat --bin ffs-ntfs --bin ffs-zfs
+          cargo build --release -p ffs --example native_reader
           cargo build --release -p ffs-repair --bin ffs-image-repair
           cargo test -p ffs-harness --no-run
           mkdir -p "$RUNNER_TEMP/ffs-cli-proof/bin" "$RUNNER_TEMP/ffs-cli-proof/artifacts"
@@ -387,6 +389,7 @@ jobs:
             target/release/ffs-fat \
             target/release/ffs-ntfs \
             target/release/ffs-zfs \
+            target/release/examples/native_reader \
             target/release/ffs-image-repair \
             "$RUNNER_TEMP/ffs-cli-proof/bin/"
           printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/ffs-cli-proof/source-revision.txt"
@@ -398,6 +401,7 @@ jobs:
             echo "FFS_FAT_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-fat"
             echo "FFS_NTFS_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-ntfs"
             echo "FFS_ZFS_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-zfs"
+            echo "FFS_NATIVE_READER_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/native_reader"
             echo "FFS_IMAGE_REPAIR_BIN=$RUNNER_TEMP/ffs-cli-proof/bin/ffs-image-repair"
             echo "FFS_CLI_SOURCE_STAMP=$GITHUB_SHA"
             echo "FFS_CLI_ARTIFACT_DIR=$RUNNER_TEMP/ffs-cli-proof/artifacts"
@@ -427,28 +431,44 @@ jobs:
           FFS_REQUIRE_SANDBOX: "1"
           FFS_REQUIRE_CGROUP: "1"
           FFS_REQUIRE_NTFS_TOOLS: "1"
+          FFS_REQUIRE_ZFS_TOOLS: "1"
           FFS_BIN_DIR: ${{ runner.temp }}/ffs-cli-proof/bin
         run: |
           set -euo pipefail
           python3 -I -m unittest discover -s scripts/tests -p test_ffs_inspect_sandbox.py -v
           zfs_dir="$(mktemp -d "$RUNNER_TEMP/ffs-sandbox-zpool.XXXXXX")"
           head -c 131072 /dev/urandom > "$zfs_dir/payload.bin"
-          if sudo modprobe zfs 2>/dev/null && [ -e /dev/zfs ]; then
-            pool_name="ffs_sbx_$$"
-            truncate -s 128M "$zfs_dir/pool.img"
-            mkdir -p "$zfs_dir/mnt"
-            sudo zpool create -d -m none -o cachefile=none -o ashift=12 "$pool_name" "$zfs_dir/pool.img"
-            sudo zfs create -o version=5 -o atime=off -o compression=lzjb -o "mountpoint=$zfs_dir/mnt" "$pool_name/data"
-            sudo cp "$zfs_dir/payload.bin" "$zfs_dir/mnt/payload.bin"
-            sync
-            sudo zpool export "$pool_name"
-            sudo chmod 0644 "$zfs_dir/pool.img"
-            export FFS_ZFS_LIVE_POOL_IMAGE="$zfs_dir/pool.img"
-            export FFS_ZFS_LIVE_PAYLOAD="$zfs_dir/payload.bin"
-            export FFS_ZFS_LIVE_DATASET="data"
-            export FFS_REQUIRE_ZFS_TOOLS="1"
-          fi
+          sudo modprobe zfs
+          test -e /dev/zfs
+          pool_name="ffs_sbx_$$"
+          truncate -s 128M "$zfs_dir/pool.img"
+          mkdir -p "$zfs_dir/mnt"
+          sudo zpool create -d -m none -o cachefile=none -o ashift=12 "$pool_name" "$zfs_dir/pool.img"
+          sudo zfs create -o version=5 -o atime=off -o compression=lzjb -o "mountpoint=$zfs_dir/mnt" "$pool_name/data"
+          sudo cp "$zfs_dir/payload.bin" "$zfs_dir/mnt/payload.bin"
+          sync
+          sudo zpool export "$pool_name"
+          sudo chmod 0644 "$zfs_dir/pool.img"
+          export FFS_ZFS_LIVE_POOL_IMAGE="$zfs_dir/pool.img"
+          export FFS_ZFS_LIVE_PAYLOAD="$zfs_dir/payload.bin"
+          export FFS_ZFS_LIVE_DATASET="data"
           ./scripts/e2e/ffs_inspect_sandbox_native_e2e.sh
+
+      - name: Native NTFS and ZFS differential and TXG write verification
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          sudo modprobe zfs
+          test -e /dev/zfs
+          python3 scripts/verify_zfs_root.py --self-test --binary "$FFS_ZFS_BIN"
+          python3 scripts/verify_zfs_files.py --self-test --binary "$FFS_ZFS_BIN"
+          python3 scripts/verify_zfs_snapshots.py --self-test --binary "$FFS_ZFS_BIN"
+          python3 scripts/verify_ntfs_read.py --binary "$FFS_NTFS_BIN" --facade-binary "$FFS_NATIVE_READER_BIN"
+          python3 scripts/verify_ntfs_mount.py --binary "$FFS_NTFS_BIN"
+          sudo env "PATH=/usr/sbin:/sbin:$PATH" python3 scripts/verify_zfs_root.py --binary "$FFS_ZFS_BIN" --create-scratch-pool
+          sudo env "PATH=/usr/sbin:/sbin:$PATH" python3 scripts/verify_zfs_files.py --binary "$FFS_ZFS_BIN" --facade-binary "$FFS_NATIVE_READER_BIN" --create-and-mount-scratch-pool
+          sudo env "PATH=/usr/sbin:/sbin:$PATH" python3 scripts/verify_zfs_snapshots.py --binary "$FFS_ZFS_BIN" --facade-binary "$FFS_NATIVE_READER_BIN" --create-and-mount-scratch-pool
 
       - name: FUSE shutdown ownership and final-flush controls
         if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
@@ -680,6 +700,10 @@ jobs:
             /tmp/ffs-live-tui-*/*.log
             /tmp/ffs-live-tui-*/*-profile.stdout
             /tmp/ffs-live-tui-*/*-profile.stderr
+            /tmp/ffs-ntfs-native-*/*.json
+            /tmp/ffs-zfs-native-*/*.json
+            /tmp/ffs-zpl-native-*/*.json
+            /tmp/ffs-snapshots-native-*/*.json
 
   # Warn if goldens are modified in a PR
   golden-change-check:

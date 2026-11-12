@@ -34,8 +34,8 @@ use self::dmu_cow::{
     DMU_OT_OBJSET, PoolSpaceAllocator, WriteBucket, finalize_mos_and_space_maps_to_convergence,
     zap_optional_u64, zap_required_u64,
 };
-use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
 pub use self::zpl_ops::ZfsDataChecksum;
+use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
 
 type FaultHook = Box<dyn FnMut(&ZfsPersistenceEvent) -> Result<()> + Send + Sync>;
 
@@ -196,14 +196,30 @@ impl<T> ZfsTxOutcome<T> {
 /// Ordered persistence stages emitted during TXG commit for persistence-prefix verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ZfsPersistenceStage {
-    ChildBlocksWrite { member_index: usize },
-    ChildBlocksBarrier { member_index: usize },
-    DatasetMetadataWrite { member_index: usize },
-    DatasetMetadataBarrier { member_index: usize },
-    MosSpaceMapWrite { member_index: usize },
-    MosSpaceMapBarrier { member_index: usize },
-    MosRootWrite { member_index: usize },
-    MosRootBarrier { member_index: usize },
+    ChildBlocksWrite {
+        member_index: usize,
+    },
+    ChildBlocksBarrier {
+        member_index: usize,
+    },
+    DatasetMetadataWrite {
+        member_index: usize,
+    },
+    DatasetMetadataBarrier {
+        member_index: usize,
+    },
+    MosSpaceMapWrite {
+        member_index: usize,
+    },
+    MosSpaceMapBarrier {
+        member_index: usize,
+    },
+    MosRootWrite {
+        member_index: usize,
+    },
+    MosRootBarrier {
+        member_index: usize,
+    },
     UberblockWrite {
         member_index: usize,
         label: usize,
@@ -311,6 +327,14 @@ impl ZfsTransactionEngine {
         options: ZfsWriteOptions,
     ) -> Result<Self> {
         checkpoint(cx)?;
+        if !options.offline_image || !options.allow_write {
+            return Err(FfsError::PermissionDenied);
+        }
+        if options.pool_guid == 0 || options.label >= 4 {
+            return Err(FfsError::Format(
+                "ZFS writer requires a non-zero pool_guid and label in 0..4".into(),
+            ));
+        }
         if paths.is_empty() || paths.len() > 8 {
             return Err(unsupported(
                 "ZFS native writer requires 1 leaf or 2..=8 mirror member files",
@@ -334,6 +358,14 @@ impl ZfsTransactionEngine {
         options: ZfsWriteOptions,
     ) -> Result<Self> {
         checkpoint(cx)?;
+        if !options.offline_image || !options.allow_write {
+            return Err(FfsError::PermissionDenied);
+        }
+        if options.pool_guid == 0 || options.label >= 4 {
+            return Err(FfsError::Format(
+                "ZFS writer requires a non-zero pool_guid and label in 0..4".into(),
+            ));
+        }
         if devices.is_empty() || devices.len() > 8 {
             return Err(unsupported(
                 "ZFS native writer requires 1 leaf or 2..=8 mirror devices",
@@ -480,10 +512,11 @@ impl ZfsTransactionEngine {
         let guid_sum = if members.len() == 1 {
             options.pool_guid.wrapping_add(top_guid)
         } else {
-            member_guids.iter().fold(
-                options.pool_guid.wrapping_add(top_guid),
-                |acc, &g| acc.wrapping_add(g),
-            )
+            member_guids
+                .iter()
+                .fold(options.pool_guid.wrapping_add(top_guid), |acc, &g| {
+                    acc.wrapping_add(g)
+                })
         };
 
         // 2. Scan all 4 labels x `slots_per_label` across all members to check MMP activity
@@ -575,13 +608,7 @@ impl ZfsTransactionEngine {
                             + UBERBLOCK_RING_OFFSET
                             + (options.slot * slot_bytes) as u64;
                         let encoded = synced_ub
-                            .encode_with_meta(
-                                slot_bytes,
-                                off,
-                                sw_ver.unwrap_or(default_sw),
-                                0,
-                                0,
-                            )
+                            .encode_with_meta(slot_bytes, off, sw_ver.unwrap_or(default_sw), 0, 0)
                             .map_err(|e| parse_err(&e))?;
                         member.write_raw(cx, off, &encoded)?;
                     }
@@ -657,14 +684,7 @@ impl ZfsTransactionEngine {
             let ds_bp = BlockPointer::parse(&hd_dn.bonus()[128..256], hd_dn.order())
                 .map_err(|e| parse_err(&e))?;
             let (ds_raw, ds_ord, _) = mos
-                .checked_raw(
-                    cx,
-                    &ds_bp,
-                    DMU_OT_OBJSET,
-                    0,
-                    ds_bp.logical_bytes(),
-                    hd_ceil,
-                )?
+                .checked_raw(cx, &ds_bp, DMU_OT_OBJSET, 0, ds_bp.logical_bytes(), hd_ceil)?
                 .ok_or_else(|| corrupt("head dataset ObjectSet is a hole"))?;
             let ds_os = ObjectSet::parse(&ds_raw, ds_ord).map_err(|e| parse_err(&e))?;
             if ds_os.zil_header.has_work() {
@@ -1103,9 +1123,7 @@ impl ZfsTransactionEngine {
                     ) {
                         return ZfsTxOutcome::NotCommitted(err);
                     }
-                    if let Err(err) =
-                        self.pool.leaves()[m_idx].write_raw(cx, phys_off, &w.bytes)
-                    {
+                    if let Err(err) = self.pool.leaves()[m_idx].write_raw(cx, phys_off, &w.bytes) {
                         return ZfsTxOutcome::NotCommitted(err);
                     }
                 }
@@ -1125,9 +1143,7 @@ impl ZfsTransactionEngine {
                         member_index: m_idx,
                     },
                 };
-                if let Err(err) =
-                    self.emit_event(op_name, barrier_stage, new_txg, m_idx, 0, 0)
-                {
+                if let Err(err) = self.emit_event(op_name, barrier_stage, new_txg, m_idx, 0, 0) {
                     return ZfsTxOutcome::NotCommitted(err);
                 }
                 if let Err(err) = self.pool.leaves()[m_idx].sync_raw(cx) {
@@ -1138,10 +1154,7 @@ impl ZfsTransactionEngine {
 
         // 3. Synchronized 2-wave 4-label Uberblock publication (`L0..L1` -> sync -> `L2..L3` -> sync).
         // Any error or cancellation from the first `UberblockWrite` onward is `Uncertain`!
-        let next_ts = self
-            .current_uberblock
-            .timestamp
-            .saturating_add(1);
+        let next_ts = self.current_uberblock.timestamp.saturating_add(1);
         let new_ub = Uberblock {
             order: self.order,
             version: self.storage_identity.version,
@@ -1150,13 +1163,13 @@ impl ZfsTransactionEngine {
             timestamp: next_ts,
             root: new_root_bp,
         };
-        let sw_version = self.current_software_version.unwrap_or(
-            if self.storage_identity.version == 5000 {
-                5000
-            } else {
-                self.storage_identity.version
-            },
-        );
+        let sw_version =
+            self.current_software_version
+                .unwrap_or(if self.storage_identity.version == 5000 {
+                    5000
+                } else {
+                    self.storage_identity.version
+                });
 
         let mut first_ub_written = false;
         for (wave_idx, labels) in [(1_u8, [0_usize, 1]), (2_u8, [2_usize, 3])] {
@@ -1165,27 +1178,22 @@ impl ZfsTransactionEngine {
                     let ub_off = self.label_offsets_per_member[m_idx][l_idx]
                         + UBERBLOCK_RING_OFFSET
                         + (target_slot * self.slot_bytes) as u64;
-                    let encoded = match new_ub.encode_with_meta(
-                        self.slot_bytes,
-                        ub_off,
-                        sw_version,
-                        0,
-                        0,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let err = parse_err(&e);
-                            if first_ub_written {
-                                self.poisoned_uncertain = true;
-                                return ZfsTxOutcome::Uncertain {
-                                    reason: err,
-                                    target_txg: new_txg,
-                                    target_slot,
-                                };
+                    let encoded =
+                        match new_ub.encode_with_meta(self.slot_bytes, ub_off, sw_version, 0, 0) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                let err = parse_err(&e);
+                                if first_ub_written {
+                                    self.poisoned_uncertain = true;
+                                    return ZfsTxOutcome::Uncertain {
+                                        reason: err,
+                                        target_txg: new_txg,
+                                        target_slot,
+                                    };
+                                }
+                                return ZfsTxOutcome::NotCommitted(err);
                             }
-                            return ZfsTxOutcome::NotCommitted(err);
-                        }
-                    };
+                        };
                     if let Err(err) = self.emit_event(
                         op_name,
                         ZfsPersistenceStage::UberblockWrite {
@@ -1209,9 +1217,7 @@ impl ZfsTransactionEngine {
                         return ZfsTxOutcome::NotCommitted(err);
                     }
                     first_ub_written = true;
-                    if let Err(err) =
-                        self.pool.leaves()[m_idx].write_raw(cx, ub_off, &encoded)
-                    {
+                    if let Err(err) = self.pool.leaves()[m_idx].write_raw(cx, ub_off, &encoded) {
                         self.poisoned_uncertain = true;
                         return ZfsTxOutcome::Uncertain {
                             reason: err,
@@ -1309,14 +1315,7 @@ impl ZfsTransactionEngine {
         hasher.update(&result_val.to_le_bytes());
         let operation_digest = *hasher.finalize().as_bytes();
 
-        let _ = self.emit_event(
-            op_name,
-            ZfsPersistenceStage::AckPublished,
-            new_txg,
-            0,
-            0,
-            0,
-        );
+        let _ = self.emit_event(op_name, ZfsPersistenceStage::AckPublished, new_txg, 0, 0, 0);
 
         let token = ZfsDurableToken {
             storage: self.storage_identity.clone(),

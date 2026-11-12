@@ -100,12 +100,7 @@ impl Objects {
     }
 
     #[must_use]
-    pub(crate) fn open_objectset_view(
-        &self,
-        meta: Dnode,
-        root_birth: u64,
-        txg: u64,
-    ) -> Self {
+    pub(crate) fn open_objectset_view(&self, meta: Dnode, root_birth: u64, txg: u64) -> Self {
         Self {
             pool: self.pool.clone(),
             config: self.config.clone(),

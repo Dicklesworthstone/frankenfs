@@ -6,8 +6,10 @@
 //! LZJB/LZ4/ZSTD/GZIP/ZLE decompressors, DMU/ZAP/ZPL/ZIL, scrub/allocation
 //! audits, and `ffs::open_read_only_device` (`bd-2tzok`).
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::sync::Arc;
+use std::io::Error;
+use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
 use ffs::{
@@ -15,7 +17,7 @@ use ffs::{
     ZfsReadOptions, ZfsRootSelection,
 };
 use ffs_block::ByteDevice;
-use ffs_error::FfsError;
+use ffs_error::{FfsError, Result};
 use ffs_fuzz::{
     zfs_baseline, BoundedRoFuzzDevice, ByteCursor, FuzzBacking, FuzzBudgetTracker, FuzzBudgets,
     PatchBuilder,
@@ -30,13 +32,117 @@ use ffs_ondisk::zfs::{
 };
 use ffs_ondisk::zfs_dmu::{microzap, Dnode, ObjectSet, ZilBlock, ZilHeader};
 use ffs_ondisk::zfs_zap::FatHeader;
-use ffs_ondisk::zfs_zpl::{directory_reference, Metadata as ZplMetadata};
+use ffs_ondisk::zfs_zpl::{directory_reference, Metadata as ZplMetadata, Timestamp};
+use ffs_types::ByteOffset;
 use ffs_zfs::reader::dmu::allocation::AllocationLimits;
 use ffs_zfs::reader::dmu::scrub::ScrubLimits;
-use ffs_zfs::{Leaf, Pool};
+use ffs_zfs::{Leaf, Pool, ZfsDataChecksum, ZfsTransactionEngine, ZfsTxOutcome, ZfsWriteOptions};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_INPUT_BYTES: usize = 4_096;
+const COW_PAGE_BYTES: usize = 4_096;
+const MAX_COW_DIRTY_PAGES: usize = 512;
+
+/// Isolated in-memory 4 KiB sparse copy-on-write `ByteDevice` over an immutable [`FuzzBacking`]
+/// for exercising `ZfsTransactionEngine` TXG commits without touching read-only backings.
+struct BoundedCowFuzzDevice {
+    backing: FuzzBacking,
+    tracker: Arc<FuzzBudgetTracker>,
+    pages: Mutex<BTreeMap<u64, Box<[u8; COW_PAGE_BYTES]>>>,
+}
+
+impl BoundedCowFuzzDevice {
+    fn new(backing: FuzzBacking, tracker: Arc<FuzzBudgetTracker>) -> Arc<Self> {
+        Arc::new(Self {
+            backing,
+            tracker,
+            pages: Mutex::new(BTreeMap::new()),
+        })
+    }
+}
+
+impl ByteDevice for BoundedCowFuzzDevice {
+    fn len_bytes(&self) -> u64 {
+        self.backing.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let _ = self.tracker.charge_op()?;
+        self.tracker.charge_physical_read(offset.0, buf.len())?;
+        self.backing.read_exact_at(offset.0, buf)?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let pages = self.pages.lock().unwrap();
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let first_page = offset.0 / (COW_PAGE_BYTES as u64);
+        let last_page = (offset.0 + (buf.len() as u64) - 1) / (COW_PAGE_BYTES as u64);
+        for page_id in first_page..=last_page {
+            if let Some(page) = pages.get(&page_id) {
+                let page_start = page_id * (COW_PAGE_BYTES as u64);
+                let copy_start = offset.0.max(page_start);
+                let copy_end =
+                    (offset.0 + (buf.len() as u64)).min(page_start + (COW_PAGE_BYTES as u64));
+                let dst_off = (copy_start - offset.0) as usize;
+                let src_off = (copy_start - page_start) as usize;
+                let count = (copy_end - copy_start) as usize;
+                buf[dst_off..dst_off + count].copy_from_slice(&page[src_off..src_off + count]);
+            }
+        }
+        Ok(())
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let _ = self.tracker.charge_op()?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .0
+            .checked_add(buf.len() as u64)
+            .filter(|&e| e <= self.len_bytes())
+            .ok_or_else(|| {
+                FfsError::Io(Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "fuzz CoW write past end",
+                ))
+            })?;
+        let mut pages = self.pages.lock().unwrap();
+        let first_page = offset.0 / (COW_PAGE_BYTES as u64);
+        let last_page = (end - 1) / (COW_PAGE_BYTES as u64);
+        for page_id in first_page..=last_page {
+            if !pages.contains_key(&page_id) {
+                if pages.len() >= MAX_COW_DIRTY_PAGES {
+                    return Err(FfsError::NoSpace);
+                }
+                let page_start = page_id * (COW_PAGE_BYTES as u64);
+                let avail = ((self.len_bytes() - page_start).min(COW_PAGE_BYTES as u64)) as usize;
+                let mut init = Box::new([0_u8; COW_PAGE_BYTES]);
+                self.backing.read_exact_at(page_start, &mut init[..avail])?;
+                pages.insert(page_id, init);
+            }
+            let page = pages.get_mut(&page_id).unwrap();
+            let page_start = page_id * (COW_PAGE_BYTES as u64);
+            let copy_start = offset.0.max(page_start);
+            let copy_end = end.min(page_start + (COW_PAGE_BYTES as u64));
+            let src_off = (copy_start - offset.0) as usize;
+            let dst_off = (copy_start - page_start) as usize;
+            let count = (copy_end - copy_start) as usize;
+            page[dst_off..dst_off + count].copy_from_slice(&buf[src_off..src_off + count]);
+        }
+        Ok(())
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let _ = self.tracker.charge_op()?;
+        Ok(())
+    }
+}
 
 const ZFS_INTERESTING_OFFSETS: [u64; 12] = [
     LABEL_CONFIG_OFFSET,
@@ -200,6 +306,8 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let backing_clone = backing.clone();
+    let tx_ro_backing = backing.clone();
+    let tx_cow_backing = backing.clone();
     let dev = BoundedRoFuzzDevice::new(backing, Arc::clone(&tracker), cancel_after_ops);
     let cx = Cx::for_testing();
 
@@ -328,4 +436,157 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     facade_dev.assert_invariants();
+
+    // 1. Strict read-only admission checks on `BoundedRoFuzzDevice`:
+    //    - `allow_write: false` MUST fail closed with `PermissionDenied` and zero writes.
+    //    - `inspect_admission` MUST run full 4-label/Uberblock/MMP/ZIL/space-map admission
+    //      without ever calling `write_all_at` or `sync`.
+    let tx_ro_cx = Cx::for_testing();
+    let tx_ro_dev = BoundedRoFuzzDevice::new(
+        tx_ro_backing,
+        FuzzBudgetTracker::new(FuzzBudgets {
+            max_physical_read_bytes: 16 * 1024 * 1024,
+            max_decoded_bytes: 2 * 1024 * 1024,
+            max_retained_bytes: 2 * 1024 * 1024,
+            max_depth: 8,
+            max_ops: 2048,
+            max_replica_attempts: 128,
+        }),
+        cancel_after_ops,
+    );
+    assert!(matches!(
+        ZfsTransactionEngine::from_devices(
+            &tx_ro_cx,
+            vec![Box::new(Arc::clone(&tx_ro_dev) as Arc<dyn ByteDevice>)],
+            ZfsWriteOptions {
+                offline_image: true,
+                allow_write: false,
+                pool_guid: 424_242,
+                label: 0,
+                slot: 0,
+                reconcile_torn_uberblocks: false,
+            },
+        ),
+        Err(FfsError::PermissionDenied | FfsError::Cancelled)
+    ));
+    if let Ok(ro_leaf) = Leaf::from_device(
+        &tx_ro_cx,
+        Box::new(Arc::clone(&tx_ro_dev) as Arc<dyn ByteDevice>),
+        0,
+        tx_ro_dev.len_bytes(),
+    ) {
+        let _ = ZfsTransactionEngine::inspect_admission(
+            &tx_ro_cx,
+            vec![ro_leaf],
+            ZfsWriteOptions {
+                offline_image: true,
+                allow_write: true,
+                pool_guid: 424_242,
+                label: 0,
+                slot: 0,
+                reconcile_torn_uberblocks: false,
+            },
+        );
+    }
+    tx_ro_dev.assert_invariants();
+
+    // 2. Bounded CoW TXG mutation fuzzing over an isolated 4 KiB sparse overlay:
+    let tx_cow_cx = Cx::for_testing();
+    let tx_cow_dev = BoundedCowFuzzDevice::new(
+        tx_cow_backing,
+        FuzzBudgetTracker::new(FuzzBudgets {
+            max_physical_read_bytes: 32 * 1024 * 1024,
+            max_decoded_bytes: 4 * 1024 * 1024,
+            max_retained_bytes: 4 * 1024 * 1024,
+            max_depth: 12,
+            max_ops: 4096,
+            max_replica_attempts: 256,
+        }),
+    );
+    let op_kind = cursor.next_u8() % 6;
+    let use_sha = cursor.next_bool();
+    let cksum = if use_sha {
+        ZfsDataChecksum::Sha256
+    } else {
+        ZfsDataChecksum::Fletcher4
+    };
+    let ts = Timestamp {
+        seconds: 1_710_000_000,
+        nanos: 0,
+    };
+    let payload = cursor.next_vec(2048);
+    if let Ok(mut engine) = ZfsTransactionEngine::from_devices(
+        &tx_cow_cx,
+        vec![Box::new(Arc::clone(&tx_cow_dev) as Arc<dyn ByteDevice>)],
+        ZfsWriteOptions {
+            offline_image: true,
+            allow_write: true,
+            pool_guid: 424_242,
+            label: 0,
+            slot: 0,
+            reconcile_torn_uberblocks: false,
+        },
+    ) {
+        assert_ne!(
+            mode, 4,
+            "corrupting all four ZFS vdev labels must never admit a native writer"
+        );
+        let outcome = match op_kind {
+            0 => engine.mkdir(&tx_cow_cx, &[], 2, b"fuzz_dir", 0o755, 0, 0, ts),
+            1 => engine.create_file(&tx_cow_cx, &[], 2, b"fuzz.bin", 0o644, 0, 0, ts, cksum),
+            2 => engine.write_file_data(
+                &tx_cow_cx,
+                &[],
+                3,
+                u64::from(cursor.next_u16() % 4096),
+                &payload,
+                ts,
+                cksum,
+            ),
+            3 => engine.truncate_file(
+                &tx_cow_cx,
+                &[],
+                3,
+                u64::from(cursor.next_u16() % 8192),
+                ts,
+                cksum,
+            ),
+            4 => engine.rename_entry(&tx_cow_cx, &[], 2, b"hello.txt", 2, b"moved.txt", None, ts),
+            _ => engine.unlink_entry(&tx_cow_cx, &[], 2, b"hello.txt", false, ts),
+        };
+        if let ZfsTxOutcome::Committed { token, .. } = outcome {
+            engine
+                .verify_token(&token)
+                .expect("committed ZFS TXG token must verify against engine identity");
+            if let Ok(verify_leaf) = Leaf::from_device(
+                &tx_cow_cx,
+                Box::new(Arc::clone(&tx_cow_dev) as Arc<dyn ByteDevice>),
+                0,
+                tx_cow_dev.len_bytes(),
+            ) {
+                if let Ok(verify_pool) = Pool::from_leaves(vec![verify_leaf]) {
+                    if let Ok(verify_objs) = verify_pool.import_objects(&tx_cow_cx, None) {
+                        let _ = verify_objs.allocation(
+                            &tx_cow_cx,
+                            AllocationLimits {
+                                metaslabs: 16,
+                                records: 1024,
+                                metadata_bytes: 1024 * 1024,
+                                ranges_per_metaslab: 512,
+                            },
+                        );
+                        let _ = verify_objs.scrub(
+                            &tx_cow_cx,
+                            ScrubLimits {
+                                pointers: 1024,
+                                decoded_bytes: 1024 * 1024,
+                                objects: 512,
+                                copy_bytes: Some(1024 * 1024),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
 });
