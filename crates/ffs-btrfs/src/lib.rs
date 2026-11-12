@@ -7119,13 +7119,6 @@ pub struct ChunkAllocationRequest {
     pub dev_uuid: [u8; 16],
 }
 
-/// Key type of a CHUNK_ITEM.
-///
-/// Verified against `/usr/include/linux/btrfs_tree.h` (`BTRFS_CHUNK_ITEM_KEY
-/// 228`), like every other key constant this plan uses: BLOCK_GROUP_ITEM 192,
-/// DEV_EXTENT 204, FIRST_CHUNK_TREE_OBJECTID 256.
-pub const BTRFS_ITEM_CHUNK_ITEM: u8 = 228;
-
 /// Build the complete, mutually consistent set of records for one SINGLE-profile
 /// chunk allocation.
 ///
@@ -7189,7 +7182,7 @@ pub fn plan_chunk_allocation(
     let chunk = BtrfsChunkEntry {
         key: BtrfsKey {
             objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
-            item_type: BTRFS_ITEM_CHUNK_ITEM,
+            item_type: BTRFS_ITEM_CHUNK,
             offset: request.logical,
         },
         length: request.length,
@@ -7388,7 +7381,7 @@ pub fn chunk_entries_from_chunk_tree(
             offset: u64::MAX,
         },
         |key, value| {
-            if unparseable || key.item_type != BTRFS_ITEM_CHUNK_ITEM {
+            if unparseable || key.item_type != BTRFS_ITEM_CHUNK {
                 return;
             }
             match parse_chunk_item(value, key.offset) {
@@ -21071,7 +21064,7 @@ mod tests {
         BtrfsChunkEntry {
             key: BtrfsKey {
                 objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
-                item_type: BTRFS_ITEM_CHUNK_ITEM,
+                item_type: BTRFS_ITEM_CHUNK,
                 offset: logical,
             },
             length,
@@ -21146,7 +21139,7 @@ mod tests {
         // objectid; the block group is keyed by the same logical address with the
         // length as its key offset.
         assert_eq!(plan.chunk.key.objectid, BTRFS_FIRST_CHUNK_TREE_OBJECTID);
-        assert_eq!(plan.chunk.key.item_type, BTRFS_ITEM_CHUNK_ITEM);
+        assert_eq!(plan.chunk.key.item_type, BTRFS_ITEM_CHUNK);
         assert_eq!(plan.chunk.key.offset, 128 * MB);
         assert_eq!(plan.block_group_key.objectid, plan.chunk.key.offset);
         assert_eq!(plan.block_group_key.item_type, BTRFS_ITEM_BLOCK_GROUP_ITEM);
@@ -22539,7 +22532,7 @@ mod tests {
             .insert(
                 BtrfsKey {
                     objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
-                    item_type: BTRFS_ITEM_CHUNK_ITEM,
+                    item_type: BTRFS_ITEM_CHUNK,
                     offset: 64 * MB,
                 },
                 &[0_u8; 8],

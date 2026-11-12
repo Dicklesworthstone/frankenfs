@@ -134,7 +134,8 @@ impl PartitionByteDevice {
                 "partition byte_len must be non-zero".to_owned(),
             ));
         }
-        let volume = VolumeDevice::new(inner, ByteOffset(entry.start_byte), entry.byte_len, access)?;
+        let volume =
+            VolumeDevice::new(inner, ByteOffset(entry.start_byte), entry.byte_len, access)?;
         Ok(Self { volume, entry })
     }
 
@@ -332,7 +333,13 @@ pub fn open_partition_read_only(
     options: &PartitionParseOptions,
 ) -> Result<(PartitionTable, PartitionByteDevice)> {
     let outer = open_image(cx, path.as_ref(), 0, None)?;
-    select_partition_device(cx, Arc::new(outer), selector, options, VolumeAccess::ReadOnly)
+    select_partition_device(
+        cx,
+        Arc::new(outer),
+        selector,
+        options,
+        VolumeAccess::ReadOnly,
+    )
 }
 
 /// An admitted native reader, ready for direct VFS use or a read-only FUSE mount.
@@ -487,7 +494,8 @@ pub fn open_read_only(
             allow_backup_gpt_fallback: options.allow_backup_gpt,
             ..PartitionParseOptions::default()
         };
-        let (_table, part_dev) = open_partition_read_only(cx, path.as_ref(), selector, &parse_opts)?;
+        let (_table, part_dev) =
+            open_partition_read_only(cx, path.as_ref(), selector, &parse_opts)?;
         let entry = part_dev.entry().clone();
         let vol = VolumeDevice::new(
             Arc::new(part_dev),

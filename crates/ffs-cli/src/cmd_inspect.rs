@@ -24,6 +24,7 @@ pub fn inspect(
     json: bool,
     list_subvolumes: bool,
     list_snapshots: bool,
+    six_format: &crate::cmd_six_format::SixFormatCliArgs,
 ) -> Result<()> {
     let command_span = info_span!(
         target: "ffs::cli::inspect",
@@ -36,25 +37,29 @@ pub fn inspect(
     info!(target: "ffs::cli::inspect", "inspect_start");
 
     let cx = cli_cx();
+    let before = crate::cmd_six_format::sha256_regular_file(path);
     let open_opts = OpenOptions {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
     let detected = detect_all_filesystems_at_path(&cx, path)
         .with_context(|| format!("failed to detect filesystem metadata in {}", path.display()))?;
+    six_format.validate_format_compatibility(detected.kind())?;
 
     // Handle --subvolumes and --snapshots for btrfs
     if list_subvolumes || list_snapshots {
         if let DetectedFilesystem::Btrfs(sb) = &detected {
             let flavor = FsFlavor::Btrfs(sb.clone());
-            return inspect_btrfs_subvolumes(
-                &cx,
+            inspect_btrfs_subvolumes(&cx, path, &flavor, json, list_subvolumes, list_snapshots)?;
+            crate::cmd_six_format::emit_router_telemetry(
+                "inspect",
+                detected.kind().as_str(),
+                None,
+                true,
+                before,
                 path,
-                &flavor,
-                json,
-                list_subvolumes,
-                list_snapshots,
             );
+            return Ok(());
         }
         anyhow::bail!("--subvolumes and --snapshots are only supported for btrfs images");
     }
@@ -134,11 +139,19 @@ pub fn inspect(
         duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         "inspect_complete"
     );
+    crate::cmd_six_format::emit_router_telemetry(
+        "inspect",
+        detected.kind().as_str(),
+        None,
+        true,
+        before,
+        path,
+    );
 
     Ok(())
 }
 
-fn print_inspect_output(output: &InspectOutput) {
+pub(crate) fn print_inspect_output(output: &InspectOutput) {
     println!("FrankenFS Inspector");
     match output {
         InspectOutput::Ext4 {

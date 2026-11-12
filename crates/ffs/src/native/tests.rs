@@ -1143,24 +1143,36 @@ fn partition_byte_device_rejects_out_of_bounds_reads_and_writes_before_inner_dev
     let mut one_byte = [0_u8; 1];
     let mut empty = [];
     let mut eight = [0_u8; 8];
-    assert!(rw_part
-        .read_exact_at(&cx, ByteOffset(partition_len), &mut one_byte)
-        .is_err());
-    assert!(rw_part
-        .read_exact_at(&cx, ByteOffset(partition_len), &mut empty)
-        .is_err());
-    assert!(rw_part
-        .read_exact_at(&cx, ByteOffset(partition_len - 4), &mut eight)
-        .is_err());
-    assert!(rw_part
-        .write_all_at(&cx, ByteOffset(partition_len), &[0x99])
-        .is_err());
-    assert!(rw_part
-        .write_all_at(&cx, ByteOffset(partition_len), &[])
-        .is_err());
-    assert!(rw_part
-        .write_all_at(&cx, ByteOffset(partition_len - 4), &[0x99; 8])
-        .is_err());
+    assert!(
+        rw_part
+            .read_exact_at(&cx, ByteOffset(partition_len), &mut one_byte)
+            .is_err()
+    );
+    assert!(
+        rw_part
+            .read_exact_at(&cx, ByteOffset(partition_len), &mut empty)
+            .is_err()
+    );
+    assert!(
+        rw_part
+            .read_exact_at(&cx, ByteOffset(partition_len - 4), &mut eight)
+            .is_err()
+    );
+    assert!(
+        rw_part
+            .write_all_at(&cx, ByteOffset(partition_len), &[0x99])
+            .is_err()
+    );
+    assert!(
+        rw_part
+            .write_all_at(&cx, ByteOffset(partition_len), &[])
+            .is_err()
+    );
+    assert!(
+        rw_part
+            .write_all_at(&cx, ByteOffset(partition_len - 4), &[0x99; 8])
+            .is_err()
+    );
     assert_eq!(
         io_calls.load(Ordering::SeqCst),
         0,
@@ -1249,10 +1261,7 @@ fn gpt_multi_filesystem_disk_opens_ext4_and_fat16_partitions_by_index_uuid_and_l
     )
     .expect("open ext4 GPT partition");
     assert_eq!(ext4_opened.format, FsFormatKind::Ext4);
-    assert_eq!(
-        ext4_opened.partition.as_ref().map(|p| p.index),
-        Some(1)
-    );
+    assert_eq!(ext4_opened.partition.as_ref().map(|p| p.index), Some(1));
     let root = ext4_opened
         .filesystem
         .getattr(&cx, &mut RequestScope::empty(), InodeNumber(1))
@@ -1294,16 +1303,18 @@ fn gpt_multi_filesystem_disk_opens_ext4_and_fat16_partitions_by_index_uuid_and_l
     let damaged_path = dir.path().join("damaged.gpt.img");
     fs::write(&damaged_path, &damaged).unwrap();
 
-    assert!(open_read_only(
-        &cx,
-        &damaged_path,
-        &ReadOnlyOpenOptions {
-            partition: Some(PartitionSelector::Index(2)),
-            allow_backup_gpt: false,
-            ..ReadOnlyOpenOptions::default()
-        },
-    )
-    .is_err());
+    assert!(
+        open_read_only(
+            &cx,
+            &damaged_path,
+            &ReadOnlyOpenOptions {
+                partition: Some(PartitionSelector::Index(2)),
+                allow_backup_gpt: false,
+                ..ReadOnlyOpenOptions::default()
+            },
+        )
+        .is_err()
+    );
 
     let recovered = open_read_only(
         &cx,

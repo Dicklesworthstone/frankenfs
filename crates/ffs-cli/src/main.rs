@@ -66,6 +66,7 @@ mod cmd_dump;
 mod cmd_evidence;
 mod cmd_inspect;
 mod cmd_repair;
+mod cmd_six_format;
 mod loop_device;
 mod mount_console;
 mod mount_worker;
@@ -102,7 +103,7 @@ use ffs_core::degradation::DegradationLevel;
 use ffs_core::{
     BackpressureGate, BtrfsMountSelection, CrashRecoveryOutcome, DegradationFsm, Ext4DataErrPolicy,
     Ext4JournalReplayMode, FsFlavor, FsOps, MvccIsolationMode, OpenFs, OpenOptions,
-    RepairWritebackBlock, detect_filesystem_at_path,
+    RepairWritebackBlock, detect_all_filesystems_at_path, detect_filesystem_at_path,
 };
 use ffs_fuse::{
     AtimePolicy, MountConfig, MountOptions, PerCoreTransportMetrics, WritebackCacheMode,
@@ -792,6 +793,8 @@ struct Cli {
     /// Precedence: `--log-format` > `FFS_LOG_FORMAT` > `human`.
     #[arg(long, value_enum, global = true)]
     log_format: Option<LogFormat>,
+    #[command(flatten)]
+    six_format: cmd_six_format::SixFormatCliArgs,
     #[command(subcommand)]
     command: Command,
 }
@@ -808,7 +811,7 @@ enum Command {
     /// not an end-user filesystem operation.
     #[command(name = "bench-evidence", hide = true)]
     BenchEvidence,
-    /// Inspect a filesystem image (ext4 or btrfs).
+    /// Inspect a filesystem image (ext4, btrfs, fat16, fat32, ntfs, or zfs) or its partition table.
     Inspect {
         /// Path to the filesystem image.
         image: PathBuf,
@@ -821,6 +824,9 @@ enum Command {
         /// List all btrfs snapshots.
         #[arg(long)]
         snapshots: bool,
+        /// Enumerate validated MBR or GPT partition slices instead of a single volume header.
+        #[arg(long)]
+        partitions: bool,
     },
     /// Read a file's data from a filesystem image to stdout (no FUSE mount).
     ///
@@ -1202,6 +1208,7 @@ enum Command {
         command: DumpCommand,
     },
     /// Run offline filesystem checks.
+    #[command(visible_alias = "check")]
     Fsck {
         /// Path to the filesystem image.
         image: PathBuf,
@@ -1598,10 +1605,11 @@ enum Command {
         #[arg(long)]
         summary: bool,
     },
-    /// Create a new ext4 filesystem image.
+    /// Create a new ext4 filesystem image by explicitly delegating to host `mkfs.ext4`.
     ///
-    /// Wraps `mkfs.ext4` to create a properly formatted ext4 image,
-    /// then verifies the result via FrankenFS parsing.
+    /// Wraps `mkfs.ext4` when `--delegate-host-mkfs` is passed, then verifies
+    /// the resulting image via FrankenFS parsing. Prefer `ffs format` for pure-Rust
+    /// FAT16/FAT32 volume formatting.
     Mkfs {
         /// Output path for the new image file.
         output: PathBuf,
@@ -1614,6 +1622,9 @@ enum Command {
         /// Volume label.
         #[arg(long, default_value = "frankenfs")]
         label: String,
+        /// Explicitly authorize delegation to host `mkfs.ext4`.
+        #[arg(long)]
+        delegate_host_mkfs: bool,
         /// Output in JSON format.
         #[arg(long)]
         json: bool,
@@ -1639,6 +1650,86 @@ enum Command {
         #[arg(long = "refresh-ms", default_value_t = 1000,
             value_parser = clap::value_parser!(u64).range(100..=1000))]
         refresh_ms: u64,
+    },
+    /// Enumerate validated MBR or GPT partition slices and auto-detect each slice's filesystem.
+    Partitions {
+        /// Path to the partitioned whole-disk image.
+        image: PathBuf,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List directory entries inside a filesystem image or partition slice (all 6 formats, no FUSE).
+    Ls {
+        /// Path to the filesystem image.
+        image: PathBuf,
+        /// Directory path inside the image (default `/`).
+        #[arg(default_value = "/")]
+        path: String,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Format a new filesystem image (pure-Rust for `fat16`/`fat32`; `--delegate-host-mkfs` required for `ext4`/`btrfs`).
+    Format {
+        /// Output path for the new image file (never overwrites an existing file).
+        output: PathBuf,
+        /// Target filesystem (`fat16`, `fat32`, `ext4`, `btrfs`).
+        #[arg(long, short = 't')]
+        filesystem: String,
+        /// Image size in MiB.
+        #[arg(long = "size-mib", visible_alias = "size-mb", default_value_t = 64)]
+        size_mib: u64,
+        /// Optional volume label.
+        #[arg(long)]
+        label: Option<String>,
+        /// Optional logical block size in bytes.
+        #[arg(long)]
+        block_size: Option<u32>,
+        /// Optional FAT sectors-per-cluster override.
+        #[arg(long)]
+        sectors_per_cluster: Option<u8>,
+        /// Explicitly authorize delegation to host `mkfs.ext4` or `mkfs.btrfs`.
+        #[arg(long)]
+        delegate_host_mkfs: bool,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect or extract NTFS `$DATA` streams (including named Alternate Data Streams).
+    Streams {
+        /// Path to the NTFS image or partitioned whole-disk image.
+        image: PathBuf,
+        /// Path inside the NTFS volume (e.g. `/hello.txt`) or MFT record number when `--record` is set.
+        target: String,
+        /// Optional named stream to extract raw bytes to stdout (e.g. `note`); omit to list all `$DATA` streams.
+        #[arg(long)]
+        stream: Option<String>,
+        /// Interpret `target` as a decimal MFT record number instead of a namespace path.
+        #[arg(long = "record")]
+        by_record: bool,
+        /// Output stream catalog in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect read-only ZFS pool labels, uberblock candidates, and pool status.
+    Pool {
+        #[command(subcommand)]
+        command: cmd_six_format::PoolCommand,
+    },
+    /// Inspect read-only ZFS datasets, snapshots, and DMU scrub status.
+    Dataset {
+        #[command(subcommand)]
+        command: cmd_six_format::DatasetCommand,
+    },
+    /// Deterministically synthesize clean six-format + multi-partition GPT test fixtures.
+    #[command(name = "synthesize-six-format-fixtures", hide = true)]
+    SynthesizeSixFormatFixtures {
+        /// Output directory for generated `.img` fixtures.
+        output_dir: PathBuf,
+        /// Emit fixture manifest as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1743,6 +1834,13 @@ impl Command {
             Self::Evidence { .. } => "evidence",
             Self::Mkfs { .. } => "mkfs",
             Self::Tui { .. } => "tui",
+            Self::Partitions { .. } => "partitions",
+            Self::Ls { .. } => "ls",
+            Self::Format { .. } => "format",
+            Self::Streams { .. } => "streams",
+            Self::Pool { .. } => "pool",
+            Self::Dataset { .. } => "dataset",
+            Self::SynthesizeSixFormatFixtures { .. } => "synthesize-six-format-fixtures",
         }
     }
 }
@@ -2549,11 +2647,33 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let log_format = init_logging(cli.log_format)?;
-    execute_command(cli.command, log_format)
+    execute_command(cli.command, &cli.six_format, log_format)
+}
+
+fn emit_unpartitioned_ro_telemetry(
+    command: &'static str,
+    image: &Path,
+    before_sha256: Option<[u8; 32]>,
+) {
+    let cx = cli_cx();
+    if let Ok(detected) = detect_all_filesystems_at_path(&cx, image) {
+        cmd_six_format::emit_router_telemetry(
+            command,
+            detected.kind().as_str(),
+            None,
+            true,
+            before_sha256,
+            image,
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]
-fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
+fn execute_command(
+    command: Command,
+    six_format: &cmd_six_format::SixFormatCliArgs,
+    log_format: LogFormat,
+) -> Result<()> {
     let command_name = command.name();
     let run_span = info_span!(
         target: "ffs::cli",
@@ -2590,13 +2710,43 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
             json,
             subvolumes,
             snapshots,
-        } => inspect(&image, json, subvolumes, snapshots),
+            partitions,
+        } => {
+            if partitions {
+                cmd_six_format::partitions_cmd(&image, json, six_format)
+            } else if six_format.partition.is_some() {
+                cmd_six_format::inspect_partitioned_cmd(
+                    &image, json, subvolumes, snapshots, six_format,
+                )
+            } else {
+                inspect(&image, json, subvolumes, snapshots, six_format)
+            }
+        }
         Command::Read {
             image,
             path,
             discard,
             bench_evidence,
-        } => read_file_cmd(&image, &path, discard, bench_evidence),
+        } => {
+            if cmd_six_format::maybe_route_read_cmd(
+                &image,
+                &path,
+                discard,
+                bench_evidence,
+                six_format,
+            )? {
+                Ok(())
+            } else {
+                let before = (!bench_evidence)
+                    .then(|| cmd_six_format::sha256_regular_file(&image))
+                    .flatten();
+                read_file_cmd(&image, &path, discard, bench_evidence)?;
+                if !bench_evidence {
+                    emit_unpartitioned_ro_telemetry("read", &image, before);
+                }
+                Ok(())
+            }
+        }
         Command::RandRead {
             image,
             path,
@@ -2675,7 +2825,16 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
             no_stat,
             parallel,
             read_data,
-        } => walk_cmd(&image, no_stat, parallel, read_data),
+        } => {
+            if cmd_six_format::maybe_route_walk_cmd(&image, no_stat, read_data, six_format)? {
+                Ok(())
+            } else {
+                let before = cmd_six_format::sha256_regular_file(&image);
+                walk_cmd(&image, no_stat, parallel, read_data)?;
+                emit_unpartitioned_ro_telemetry("walk", &image, before);
+                Ok(())
+            }
+        }
         Command::MvccStats { image, json } => mvcc_stats_cmd(&image, json),
         Command::Info {
             image,
@@ -2684,17 +2843,24 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
             repair,
             journal,
             json,
-        } => info_cmd(
-            &image,
-            InfoCommandOptions {
+        } => {
+            let info_opts = InfoCommandOptions {
                 sections: InfoSections::empty()
                     .with_groups(groups)
                     .with_mvcc(mvcc)
                     .with_repair(repair)
                     .with_journal(journal),
                 json,
-            },
-        ),
+            };
+            if cmd_six_format::maybe_route_info_cmd(&image, info_opts, six_format)? {
+                Ok(())
+            } else {
+                let before = cmd_six_format::sha256_regular_file(&image);
+                info_cmd(&image, info_opts)?;
+                emit_unpartitioned_ro_telemetry("info", &image, before);
+                Ok(())
+            }
+        }
         Command::Dump { command } => dump_cmd(&command),
         Command::Fsck {
             image,
@@ -2703,17 +2869,28 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
             verbose,
             block_group,
             json,
-        } => fsck_cmd(
-            &image,
-            FsckCommandOptions {
+        } => {
+            let fsck_opts = FsckCommandOptions {
                 flags: FsckFlags::empty()
                     .with_repair(repair)
                     .with_force(force)
                     .with_verbose(verbose)
                     .with_json(json),
                 block_group,
-            },
-        ),
+            };
+            if cmd_six_format::maybe_route_fsck_cmd(&image, fsck_opts, six_format)? {
+                Ok(())
+            } else {
+                let before = (!repair)
+                    .then(|| cmd_six_format::sha256_regular_file(&image))
+                    .flatten();
+                fsck_cmd(&image, fsck_opts)?;
+                if !repair {
+                    emit_unpartitioned_ro_telemetry("fsck", &image, before);
+                }
+                Ok(())
+            }
+        }
         Command::Repair {
             image,
             full_scrub,
@@ -2830,63 +3007,81 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
             )?
             .with_live_refresh(console_live)?;
             console.reject_unsupported_runtime(runtime_mode == MountRuntimeMode::Standard)?;
-            mount_cmd(
-                &image,
-                &mountpoint,
-                &MountCmdOptions {
-                    allow_other,
-                    read_write: rw,
-                    fsname,
-                    fuseblk_device,
-                    subtype,
-                    atime: atime.policy(),
-                    dev,
-                    suid,
-                    mount_mode: if native {
-                        MountMode::Native
-                    } else {
-                        MountMode::Compat
-                    },
-                    native_repair_max_working_bytes: native_repair_memory_mib
-                        .map(|mib| u64::from(mib) * 1024 * 1024),
-                    btrfs_mount_selection,
-                    btrfs_device_paths,
-                    ext4_data_err_policy: if ext4_data_err_abort {
-                        Ext4DataErrPolicy::Abort
-                    } else {
-                        Ext4DataErrPolicy::Ignore
-                    },
-                    ext4_verify_journal_checksums: !ext4_nojournal_checksum,
-                    btrfs_rw_ephemeral_ok,
-                    btrfs_verify_data_on_read,
-                    commit_interval_secs,
-                    mvcc_policy,
-                    mvcc_isolation,
-                    mvcc_evidence_ledger,
-                    runtime: MountRuntimeConfig {
-                        mode: runtime_mode,
-                        managed_unmount_timeout_secs,
-                    },
-                    adaptive_runtime: MountAdaptiveRuntimeConfig::from_cli(
-                        adaptive_runtime,
-                        adaptive_runtime_manifest,
-                    ),
-                    adaptive_runtime_summary: MountAdaptiveRuntimeSummaryConfig::from_cli(
-                        adaptive_runtime_summary_json,
-                        adaptive_runtime_summary_md,
-                    ),
-                    background_scrub,
-                    writeback_cache: MountWritebackCacheConfig::from_cli(
-                        writeback_cache,
-                        writeback_cache_gate,
-                        writeback_cache_ordering_oracle,
-                        writeback_cache_crash_replay_oracle,
-                    ),
-                    console,
+            let mount_opts = MountCmdOptions {
+                allow_other,
+                read_write: rw,
+                fsname,
+                fuseblk_device,
+                subtype,
+                atime: atime.policy(),
+                dev,
+                suid,
+                mount_mode: if native {
+                    MountMode::Native
+                } else {
+                    MountMode::Compat
                 },
-            )
+                native_repair_max_working_bytes: native_repair_memory_mib
+                    .map(|mib| u64::from(mib) * 1024 * 1024),
+                btrfs_mount_selection,
+                btrfs_device_paths,
+                ext4_data_err_policy: if ext4_data_err_abort {
+                    Ext4DataErrPolicy::Abort
+                } else {
+                    Ext4DataErrPolicy::Ignore
+                },
+                ext4_verify_journal_checksums: !ext4_nojournal_checksum,
+                btrfs_rw_ephemeral_ok,
+                btrfs_verify_data_on_read,
+                commit_interval_secs,
+                mvcc_policy,
+                mvcc_isolation,
+                mvcc_evidence_ledger,
+                runtime: MountRuntimeConfig {
+                    mode: runtime_mode,
+                    managed_unmount_timeout_secs,
+                },
+                adaptive_runtime: MountAdaptiveRuntimeConfig::from_cli(
+                    adaptive_runtime,
+                    adaptive_runtime_manifest,
+                ),
+                adaptive_runtime_summary: MountAdaptiveRuntimeSummaryConfig::from_cli(
+                    adaptive_runtime_summary_json,
+                    adaptive_runtime_summary_md,
+                ),
+                background_scrub,
+                writeback_cache: MountWritebackCacheConfig::from_cli(
+                    writeback_cache,
+                    writeback_cache_gate,
+                    writeback_cache_ordering_oracle,
+                    writeback_cache_crash_replay_oracle,
+                ),
+                console,
+            };
+            if cmd_six_format::maybe_route_mount_cmd(&image, &mountpoint, &mount_opts, six_format)?
+            {
+                Ok(())
+            } else {
+                let before = (!rw)
+                    .then(|| cmd_six_format::sha256_regular_file(&image))
+                    .flatten();
+                mount_cmd(&image, &mountpoint, &mount_opts)?;
+                if !rw {
+                    emit_unpartitioned_ro_telemetry("mount", &image, before);
+                }
+                Ok(())
+            }
         }
-        Command::Scrub { image, json } => scrub_cmd(&image, json),
+        Command::Scrub { image, json } => {
+            if cmd_six_format::maybe_route_scrub_cmd(&image, json, six_format)? {
+                Ok(())
+            } else {
+                let before = cmd_six_format::sha256_regular_file(&image);
+                scrub_cmd(&image, json)?;
+                emit_unpartitioned_ro_telemetry("scrub", &image, before);
+                Ok(())
+            }
+        }
         Command::Parity {
             json,
             verify,
@@ -2915,8 +3110,16 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
             size_mb,
             block_size,
             label,
+            delegate_host_mkfs,
             json,
-        } => mkfs_cmd(&output, size_mb, block_size, &label, json),
+        } => mkfs_cmd(
+            &output,
+            size_mb,
+            block_size,
+            &label,
+            json,
+            delegate_host_mkfs,
+        ),
         Command::Tui {
             image,
             mountpoint,
@@ -2931,6 +3134,50 @@ fn execute_command(command: Command, log_format: LogFormat) -> Result<()> {
             refresh_ms,
             log_format,
         ),
+        Command::Partitions { image, json } => {
+            cmd_six_format::partitions_cmd(&image, json, six_format)
+        }
+        Command::Ls { image, path, json } => {
+            cmd_six_format::ls_cmd(&image, &path, json, six_format)
+        }
+        Command::Format {
+            output,
+            filesystem,
+            size_mib,
+            label,
+            block_size,
+            sectors_per_cluster,
+            delegate_host_mkfs,
+            json,
+        } => cmd_six_format::format_cmd(
+            &output,
+            &filesystem,
+            size_mib,
+            label.as_deref(),
+            block_size,
+            sectors_per_cluster,
+            delegate_host_mkfs,
+            json,
+        ),
+        Command::Streams {
+            image,
+            target,
+            stream,
+            by_record,
+            json,
+        } => cmd_six_format::streams_cmd(
+            &image,
+            &target,
+            stream.as_deref(),
+            by_record,
+            json,
+            six_format,
+        ),
+        Command::Pool { command } => cmd_six_format::pool_cmd(&command, six_format),
+        Command::Dataset { command } => cmd_six_format::dataset_cmd(&command, six_format),
+        Command::SynthesizeSixFormatFixtures { output_dir, json } => {
+            cmd_six_format::synthesize_six_format_fixtures_cmd(&output_dir, json)
+        }
     };
 
     let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -10476,7 +10723,19 @@ struct MkfsOutput {
     inodes_count: u32,
 }
 
-fn mkfs_cmd(output: &Path, size_mb: u64, block_size: u32, label: &str, json: bool) -> Result<()> {
+fn mkfs_cmd(
+    output: &Path,
+    size_mb: u64,
+    block_size: u32,
+    label: &str,
+    json: bool,
+    delegate_host_mkfs: bool,
+) -> Result<()> {
+    if !delegate_host_mkfs {
+        bail!(
+            "ffs mkfs delegates ext4 volume creation to host mkfs.ext4; pass --delegate-host-mkfs to authorize external tool execution (or use `ffs format --filesystem fat16|fat32` for pure-Rust formatting)"
+        );
+    }
     mkfs_cmd_with_program(
         output,
         size_mb,
@@ -10763,7 +11022,7 @@ fn tui_cmd(
         arguments.push(image_path.as_os_str().to_owned());
         arguments.push(mountpoint.as_os_str().to_owned());
         let mount = Cli::try_parse_from(arguments).context("configure live read-only mount")?;
-        return execute_command(mount.command, log_format);
+        return execute_command(mount.command, &mount.six_format, log_format);
     }
 
     let snap = build_live_tui_snapshot(image_path, run_scrub)?;
@@ -10883,7 +11142,7 @@ mod tests {
         if fixture.is_file() {
             std::fs::copy(&fixture, &image).expect("copy ext4 fixture without mutating its source");
         } else {
-            super::mkfs_cmd(&image, 16, 4096, "bench-test", false)
+            super::mkfs_cmd(&image, 16, 4096, "bench-test", false, true)
                 .expect("create benchmark regression requires e2fsprogs");
         }
         eprintln!("preserved create-benchmark image: {}", image.display());
@@ -18909,12 +19168,14 @@ mod tests {
                 size_mb,
                 block_size,
                 label,
+                delegate_host_mkfs,
                 json,
             } => {
                 assert_eq!(output, PathBuf::from("/tmp/new.img"));
                 assert_eq!(size_mb, 128);
                 assert_eq!(block_size, 2048);
                 assert_eq!(label, "testvol");
+                assert!(!delegate_host_mkfs);
                 assert!(json);
             }
             other => assert!(
@@ -18935,12 +19196,14 @@ mod tests {
                 size_mb,
                 block_size,
                 label,
+                delegate_host_mkfs,
                 json,
             } => {
                 assert_eq!(output, PathBuf::from("/tmp/new.img"));
                 assert_eq!(size_mb, 64);
                 assert_eq!(block_size, 4096);
                 assert_eq!(label, "frankenfs");
+                assert!(!delegate_host_mkfs);
                 assert!(!json);
             }
             other => assert!(
@@ -18948,6 +19211,16 @@ mod tests {
                 "expected mkfs command"
             ),
         }
+    }
+
+    #[test]
+    fn mkfs_cmd_refuses_host_delegation_without_explicit_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("refused.ext4");
+        let err = super::mkfs_cmd(&output, 16, 4096, "frankenfs", false, false)
+            .expect_err("mkfs_cmd must refuse unacknowledged host mkfs.ext4 delegation");
+        assert!(err.to_string().contains("--delegate-host-mkfs"));
+        assert!(!output.exists());
     }
 
     #[test]
