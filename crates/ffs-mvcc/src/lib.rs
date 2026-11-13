@@ -1342,7 +1342,7 @@ pub enum CommitError {
     },
     #[error(
         "SSI: two-edge dangerous structure detected via block {pivot_block} \
-         (this txn read it at {read_version:?}, concurrent txn {concurrent_txn:?} wrote it at {write_version:?})"
+         (pivot read version {read_version:?}, writer {concurrent_txn:?} committed version {write_version:?})"
     )]
     SsiConflict {
         pivot_block: BlockNumber,
@@ -1381,6 +1381,10 @@ pub(crate) struct CommittedTxnRecord {
     pub(crate) snapshot: Snapshot,
     pub(crate) write_set: BTreeSet<BlockNumber>,
     pub(crate) read_set: BTreeMap<BlockNumber, CommitSeq>,
+    /// Earliest committed outgoing rw edge, retained with this pivot even if
+    /// the outgoing transaction's own history is pruned. A later incoming
+    /// transaction can still close a dangerous structure through this record.
+    pub(crate) outgoing_rw: Option<SsiRwEdge>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1393,7 +1397,8 @@ pub(crate) struct SsiRwEdge {
     pub(crate) write_version: CommitSeq,
 }
 
-/// Two adjacent rw-antidependencies with the committing transaction as pivot.
+/// Two adjacent rw-antidependencies. The committing transaction can be the
+/// pivot or an incoming transaction whose pivot has already committed.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SsiDangerousStructure {
     pub(crate) incoming: SsiRwEdge,
@@ -1411,11 +1416,13 @@ impl SsiDangerousStructure {
         }
     }
 
-    pub(crate) fn emit_logs(self, pivot_txn: TxnId) {
+    pub(crate) fn emit_logs(self, aborted_txn: TxnId) {
+        let pivot_txn = self.incoming.writer_txn;
         debug!(
             target: "ffs::ssi",
             event = "ssi_pivot_detected",
-            txn_id = pivot_txn.0,
+            txn_id = aborted_txn.0,
+            pivot_tx = pivot_txn.0,
             incoming_reader_txn = self.incoming.reader_txn.0,
             incoming_block = self.incoming.block.0,
             incoming_read_version = self.incoming.read_version.0,
@@ -1438,7 +1445,7 @@ impl SsiDangerousStructure {
         warn!(
             target: "ffs::ssi",
             event = "ssi_pivot_detected",
-            txn_id = pivot_txn.0,
+            txn_id = aborted_txn.0,
             pivot_tx = pivot_txn.0,
             incoming_reader_txn = self.incoming.reader_txn.0,
             in_tx = self.incoming.reader_txn.0,
@@ -1455,7 +1462,8 @@ impl SsiDangerousStructure {
         warn!(
             target: "ffs::mvcc::evidence",
             event = "txn_aborted",
-            txn_id = pivot_txn.0,
+            txn_id = aborted_txn.0,
+            pivot_tx = pivot_txn.0,
             reason = "ssi_cycle",
             incoming_reader_txn = self.incoming.reader_txn.0,
             incoming_block = self.incoming.block.0,
@@ -1547,32 +1555,77 @@ fn ssi_outgoing_edge(txn: &Transaction, record: &CommittedTxnRecord) -> Option<S
     }
 }
 
+/// Retain the earliest outgoing commit, not the last record visited. Its
+/// ordering decides whether a later read-only incoming snapshot is safe.
+pub(crate) fn earliest_ssi_outgoing<'a>(
+    txn: &Transaction,
+    records: impl IntoIterator<Item = &'a CommittedTxnRecord>,
+) -> Option<SsiRwEdge> {
+    if txn.write_set().is_empty() {
+        return None;
+    }
+    records
+        .into_iter()
+        .filter(|record| record.commit_seq > txn.snapshot().high)
+        .filter_map(|record| ssi_outgoing_edge(txn, record))
+        .min_by_key(|edge| (edge.write_version, edge.writer_txn, edge.block))
+}
+
 pub(crate) fn detect_ssi_dangerous_structure<'a>(
     txn: &Transaction,
     records: impl IntoIterator<Item = &'a CommittedTxnRecord>,
 ) -> (u64, Option<SsiDangerousStructure>) {
-    if txn.write_set().is_empty() {
-        return (0, None);
-    }
-
+    let read_only = txn.write_set().is_empty();
     let mut checks_performed = 0_u64;
-    let mut incoming = None;
-    let mut outgoing = None;
+    let mut incoming: Option<(SsiRwEdge, CommitSeq)> = None;
+    let mut outgoing: Option<SsiRwEdge> = None;
 
     for record in records {
-        if record.commit_seq <= txn.snapshot().high {
+        if record.commit_seq <= txn.snapshot().high || (read_only && record.outgoing_rw.is_none()) {
             continue;
         }
         checks_performed = checks_performed.saturating_add(1);
+        let read_to_record = ssi_outgoing_edge(txn, record);
 
-        if incoming.is_none() {
-            incoming = ssi_incoming_edge(txn, record);
+        // I may commit AFTER P. At P's commit, I was not in committed
+        // history, so only P -> O was visible. Retaining that edge lets I
+        // detect I -> P -> O here, including after O's record was pruned.
+        // A read-only I can participate only when O preceded I's snapshot.
+        if let (Some(incoming), Some(outgoing)) = (read_to_record, record.outgoing_rw)
+            && (!read_only || outgoing.write_version <= txn.snapshot().high)
+        {
+            return (
+                checks_performed,
+                Some(SsiDangerousStructure { incoming, outgoing }),
+            );
         }
-        if outgoing.is_none() {
-            outgoing = ssi_outgoing_edge(txn, record);
+        if read_only {
+            continue;
         }
 
-        if let (Some(incoming), Some(outgoing)) = (incoming, outgoing) {
+        // When this transaction is P, O must precede both P and I. For a
+        // read-only I, O must also precede I's snapshot. Keep the largest
+        // admissible bound and the earliest O so record order cannot hide
+        // a qualifying pair behind an ineligible first match.
+        let incoming_limit = if record.write_set.is_empty() {
+            record.snapshot.high
+        } else {
+            record.commit_seq
+        };
+        if incoming.is_none_or(|(_, limit)| incoming_limit > limit)
+            && let Some(edge) = ssi_incoming_edge(txn, record)
+        {
+            incoming = Some((edge, incoming_limit));
+        }
+        if let Some(edge) = read_to_record
+            && outgoing.is_none_or(|previous| edge.write_version < previous.write_version)
+        {
+            outgoing = Some(edge);
+        }
+
+        if let (Some((incoming, limit)), Some(outgoing)) = (incoming, outgoing)
+            && outgoing.write_version <= limit
+        {
             return (
                 checks_performed,
                 Some(SsiDangerousStructure { incoming, outgoing }),
@@ -10144,8 +10197,7 @@ mod tests {
         assert!(store.commit(t3).is_ok());
     }
 
-    /// SSI: read-only transaction (no writes) always commits regardless of
-    /// concurrent activity.
+    /// SSI: a read-only transaction with a single stale-read edge commits.
     #[test]
     fn ssi_read_only_txn_always_commits() {
         let mut store = MvccStore::new();
@@ -10163,7 +10215,7 @@ mod tests {
         t2.stage_write(BlockNumber(0), vec![2; 64]);
         store.commit_ssi(t2).expect("t2");
 
-        // T1 (read-only) commits — validate_ssi_read_set Ok(0) when writes empty.
+        // A single stale read has no adjacent rw edge through a committed pivot.
         assert!(store.commit_ssi(t1).is_ok());
     }
 
@@ -10219,6 +10271,139 @@ mod tests {
         store
             .commit_ssi(writer)
             .expect("single incoming rw edge remains serializable");
+    }
+
+    #[test]
+    fn ssi_rejects_cycle_through_committed_pivot() {
+        for read_only in [false, true] {
+            for prune_history in [false, true] {
+                let mut store = MvccStore::new();
+                let x = BlockNumber(10);
+                let y = BlockNumber(20);
+                let z = BlockNumber(30);
+                let mut seed = store.begin();
+                for block in [x, y, z] {
+                    seed.stage_write(block, vec![0]);
+                }
+                let initial = store.commit_ssi(seed).expect("seed");
+
+                // P overlaps both O and I. O commits before I begins, so I
+                // observes x=1 while its snapshot still contains y=0.
+                let mut pivot = store.begin();
+                pivot.record_read(x, initial);
+                pivot.stage_write(y, vec![1]);
+                let mut outgoing = store.begin();
+                outgoing.stage_write(x, vec![1]);
+                let outgoing_seq = store.commit_ssi(outgoing).expect("outgoing");
+
+                let mut incoming = store.begin();
+                let incoming_snapshot = incoming.snapshot();
+                assert_eq!(
+                    store.read_visible(x, incoming_snapshot).unwrap().as_ref(),
+                    &[1]
+                );
+                assert_eq!(
+                    store.read_visible(y, incoming_snapshot).unwrap().as_ref(),
+                    &[0]
+                );
+                incoming.record_read(x, outgoing_seq);
+                incoming.record_read(y, initial);
+                if !read_only {
+                    incoming.stage_write(z, vec![1]);
+                }
+                store
+                    .commit_ssi(pivot)
+                    .expect("one outgoing edge is allowed");
+
+                // The cycle is I -rw-> P -rw-> O -wr-> I. Checking only I as
+                // the pivot misses it. P must retain its outgoing witness
+                // after O's history passes the oldest active snapshot.
+                if prune_history {
+                    store.prune_ssi_log(incoming_snapshot.high);
+                    assert_eq!(store.ssi_log.len(), 1);
+                }
+                let before = store.current_snapshot();
+                let history_len = store.ssi_log.len();
+                let error = store
+                    .commit_ssi(incoming)
+                    .expect_err("committed pivot must prevent a serialization cycle");
+                assert!(matches!(error, CommitError::SsiConflict { .. }));
+                assert_eq!(store.current_snapshot(), before);
+                assert_eq!(store.ssi_log.len(), history_len);
+                assert_eq!(store.read_visible(z, before).unwrap().as_ref(), &[0]);
+                assert_eq!(store.read_visible(x, before).unwrap().as_ref(), &[1]);
+                assert_eq!(store.read_visible(y, before).unwrap().as_ref(), &[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn ssi_committed_pivot_allows_reader_before_outgoing_commit() {
+        for reader_commits_first in [false, true] {
+            let mut store = MvccStore::new();
+            let x = BlockNumber(10);
+            let y = BlockNumber(20);
+            let mut seed = store.begin();
+            seed.stage_write(x, vec![0]);
+            seed.stage_write(y, vec![0]);
+            let initial = store.commit_ssi(seed).expect("seed");
+
+            let mut pivot = store.begin();
+            pivot.record_read(x, initial);
+            pivot.stage_write(y, vec![1]);
+            let mut reader = store.begin();
+            reader.record_read(x, initial);
+            reader.record_read(y, initial);
+            let mut outgoing = store.begin();
+            outgoing.stage_write(x, vec![1]);
+            store.commit_ssi(outgoing).expect("outgoing");
+
+            // R -> P -> O is serializable: R saw neither writer. A read-only
+            // incoming transaction is unsafe only if O preceded its snapshot.
+            if reader_commits_first {
+                store.commit_ssi(reader).expect("safe read-only snapshot");
+                store.commit_ssi(pivot).expect("safe pivot");
+            } else {
+                store.commit_ssi(pivot).expect("pivot");
+                store.commit_ssi(reader).expect("safe read-only snapshot");
+            }
+        }
+    }
+
+    #[test]
+    fn ssi_committed_pivot_retains_earliest_outgoing_witness() {
+        let mut store = MvccStore::new();
+        let x = BlockNumber(10);
+        let y = BlockNumber(20);
+        let other = BlockNumber(30);
+        let mut seed = store.begin();
+        for block in [x, y, other] {
+            seed.stage_write(block, vec![0]);
+        }
+        let initial = store.commit_ssi(seed).expect("seed");
+
+        let mut pivot = store.begin();
+        pivot.record_read(x, initial);
+        pivot.record_read(other, initial);
+        pivot.stage_write(y, vec![1]);
+        let mut outgoing = store.begin();
+        outgoing.stage_write(x, vec![1]);
+        let first_outgoing = store.commit_ssi(outgoing).expect("first outgoing");
+        let mut reader = store.begin();
+        reader.record_read(x, first_outgoing);
+        reader.record_read(y, initial);
+        let mut later_outgoing = store.begin();
+        later_outgoing.stage_write(other, vec![1]);
+        store.commit_ssi(later_outgoing).expect("second outgoing");
+        store.commit_ssi(pivot).expect("pivot");
+        store.prune_ssi_log(reader.snapshot().high);
+
+        // Keeping only the most recent outgoing edge would incorrectly call
+        // this reader safe: the first outgoing preceded its snapshot.
+        assert!(matches!(
+            store.commit_ssi(reader),
+            Err(CommitError::SsiConflict { .. })
+        ));
     }
 
     /// SSI: write-write conflict is caught by FCW layer before SSI check.
@@ -10299,6 +10484,7 @@ mod tests {
         pivot.stage_write(BlockNumber(1_000_000), vec![1; 64]);
 
         let record = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(11),
             commit_seq: CommitSeq(1),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10329,6 +10515,7 @@ mod tests {
         pivot.stage_write(BlockNumber(5), vec![1; 64]);
 
         let record = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(71),
             commit_seq: CommitSeq(3),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10350,6 +10537,7 @@ mod tests {
         pivot.record_read(BlockNumber(5), CommitSeq(1));
 
         let record = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(81),
             commit_seq: CommitSeq(3),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10374,6 +10562,7 @@ mod tests {
         // block 0 and this record wrote it; the record reads nothing the pivot
         // wrote. One edge is not a pivot.
         let outgoing_only = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(31),
             commit_seq: CommitSeq(5),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10391,6 +10580,7 @@ mod tests {
         // Only an INCOMING edge (record.read ∩ pivot.write = {2}): this record read
         // block 2 and the pivot wrote it; the record writes nothing the pivot read.
         let incoming_only = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(32),
             commit_seq: CommitSeq(5),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10419,6 +10609,7 @@ mod tests {
         // it forms no rw-edge even though its key spans would otherwise create
         // both an incoming and an outgoing edge.
         let visible = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(41),
             commit_seq: CommitSeq(5),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10440,8 +10631,8 @@ mod tests {
 
     #[test]
     fn ssi_empty_write_set_is_never_a_dangerous_structure() {
-        // A read-only transaction (no writes) can never be the pivot of a
-        // write-skew; detect returns immediately without examining any records.
+        // A read-only transaction cannot itself be the pivot. Without a
+        // retained outgoing edge, this record cannot be its pivot either.
         let mut reader = Transaction::new(TxnId(50), Snapshot { high: CommitSeq(0) });
         reader.record_read(BlockNumber(0), CommitSeq(1));
         reader.record_read(BlockNumber(1), CommitSeq(1));
@@ -10449,6 +10640,7 @@ mod tests {
         // This record writes blocks the reader read (would form an incoming edge),
         // but with no write set the reader is never the pivot.
         let record = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(51),
             commit_seq: CommitSeq(5),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10458,7 +10650,7 @@ mod tests {
         let (checks_performed, dangerous) = detect_ssi_dangerous_structure(&reader, [&record]);
         assert_eq!(
             checks_performed, 0,
-            "no records examined for a read-only txn"
+            "no candidate pivot has an outgoing witness"
         );
         assert!(dangerous.is_none());
     }
@@ -10473,6 +10665,7 @@ mod tests {
         // rec1 alone completes BOTH edges: it writes block 0 (pivot read it ->
         // outgoing) AND reads block 2 (pivot wrote it -> incoming).
         let rec1 = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(91),
             commit_seq: CommitSeq(5),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10481,6 +10674,7 @@ mod tests {
         };
         // rec2 would also form both edges, but detect must stop before examining it.
         let rec2 = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(92),
             commit_seq: CommitSeq(6),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10504,6 +10698,7 @@ mod tests {
 
         // Record 1 writes a block the pivot read -> only an incoming edge.
         let rec1 = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(61),
             commit_seq: CommitSeq(5),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10512,6 +10707,7 @@ mod tests {
         };
         // Record 2 reads a block the pivot wrote -> only an outgoing edge.
         let rec2 = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(62),
             commit_seq: CommitSeq(6),
             snapshot: Snapshot { high: CommitSeq(0) },
@@ -10542,6 +10738,7 @@ mod tests {
         pivot.stage_write(BlockNumber(3), vec![1; 64]);
 
         let record = CommittedTxnRecord {
+            outgoing_rw: None,
             txn_id: TxnId(21),
             commit_seq: CommitSeq(5),
             snapshot: Snapshot { high: CommitSeq(0) },

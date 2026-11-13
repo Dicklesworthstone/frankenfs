@@ -536,16 +536,14 @@ impl MvccStore {
 
     /// Commit with Serializable Snapshot Isolation (SSI) enforcement.
     ///
-    /// This extends FCW with rw-antidependency tracking. A transaction aborts
-    /// only when it is the pivot of a two-edge dangerous structure:
+    /// This extends FCW with rw-antidependency tracking. Validation checks
+    /// both a committing pivot and an incoming transaction whose pivot has
+    /// already committed. Committed pivots retain their earliest outgoing
+    /// edge across history pruning.
     ///
-    /// 1. A concurrent transaction read a block this transaction writes.
-    /// 2. This transaction read a block that a concurrent transaction wrote
-    ///    after this transaction's snapshot.
-    ///
-    /// A single rw-antidependency edge remains serializable by itself and does
-    /// not trigger an SSI abort. Read-only transactions never trigger SSI
-    /// aborts.
+    /// A single rw edge does not trigger an abort. In a dangerous structure
+    /// the outgoing transaction must commit before both other transactions;
+    /// for a read-only incoming transaction it must also precede its snapshot.
     pub fn commit_ssi(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         let started = Instant::now();
         let txn_id = txn.id().0;
@@ -1364,8 +1362,8 @@ impl MvccStore {
         }
 
         // Step 2: SSI two-edge rw-antidependency check.
-        let checks_performed = match self.validate_ssi_read_set(&txn) {
-            Ok(count) => count,
+        let (checks_performed, outgoing_rw) = match self.validate_ssi_read_set(&txn) {
+            Ok(result) => result,
             Err(e) => return Err((e, txn)),
         };
 
@@ -1442,6 +1440,7 @@ impl MvccStore {
             snapshot,
             write_set: write_keys,
             read_set: reads,
+            outgoing_rw,
         });
 
         info!(
@@ -1522,13 +1521,17 @@ impl MvccStore {
         self.versions.entry(block).or_default().extend(versions);
     }
 
-    fn validate_ssi_read_set(&self, txn: &Transaction) -> Result<u64, CommitError> {
+    fn validate_ssi_read_set(
+        &self,
+        txn: &Transaction,
+    ) -> Result<(u64, Option<SsiRwEdge>), CommitError> {
         let records = self
             .ssi_log
             .iter()
             .rev()
             .take_while(|record| record.commit_seq > txn.snapshot.high);
-        let (checks_performed, dangerous_structure) = detect_ssi_dangerous_structure(txn, records);
+        let (checks_performed, dangerous_structure) =
+            detect_ssi_dangerous_structure(txn, records.clone());
 
         if let Some(dangerous_structure) = dangerous_structure {
             dangerous_structure.emit_logs(txn.id);
@@ -1543,7 +1546,7 @@ impl MvccStore {
             checks_performed,
             "ssi_two_edge_check_clean"
         );
-        Ok(checks_performed)
+        Ok((checks_performed, earliest_ssi_outgoing(txn, records)))
     }
 
     fn force_advance_oldest_snapshot(&mut self) -> Option<(CommitSeq, u64)> {
@@ -1811,9 +1814,9 @@ impl MvccStore {
 
     /// Prune SSI log entries older than `watermark`.
     ///
-    /// Once no active transaction has a snapshot older than `watermark`,
-    /// those log entries can no longer participate in antidependency
-    /// detection and can be safely removed.
+    /// Once no active transaction has an older snapshot, these entries cannot
+    /// be its directly concurrent pivot. An outgoing edge to an older entry
+    /// remains summarized in every retained pivot that can still matter.
     pub fn prune_ssi_log(&mut self, watermark: CommitSeq) {
         self.ssi_log.retain(|r| r.commit_seq > watermark);
     }
