@@ -2,6 +2,9 @@ name: Filesystem integrity validation
 on:
   push:
     branches: [validation/ffs-integrity-20261112]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 env:

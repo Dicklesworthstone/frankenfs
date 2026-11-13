@@ -1255,7 +1255,12 @@ impl NtfsTransactionEngine {
             attr_id += 1;
         }
         if let Some(payload) = file_payload {
-            if !allocated_data_runs.is_empty() {
+            if allocated_data_runs.is_empty() {
+                child_attrs.push((
+                    DATA,
+                    encode_resident_attribute(DATA, attr_id, &[], false, payload)?,
+                ));
+            } else {
                 child_attrs.push((
                     DATA,
                     encode_nonresident_attribute(
@@ -1267,11 +1272,6 @@ impl NtfsTransactionEngine {
                         payload.len() as u64,
                         payload.len() as u64,
                     )?,
-                ));
-            } else {
-                child_attrs.push((
-                    DATA,
-                    encode_resident_attribute(DATA, attr_id, &[], false, payload)?,
                 ));
             }
             attr_id += 1;
