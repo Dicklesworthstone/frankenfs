@@ -40,13 +40,13 @@ const ATTR_SECURITY_DESCRIPTOR: u32 = 0x50;
 const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
 const ATTR_BITMAP: u32 = 0xB0;
 
-const DEFAULT_NTFS_FILETIME: u64 = 133_500_000_000_000_000; // 2024-01-19 UTC in 100ns intervals
-const FILE_ATTR_DIRECTORY: u32 = 0x1000_0000; // DUP_FILE_NAME_INDEX_PRESENT
-const FILE_ATTR_ARCHIVE: u32 = 0x0000_0020;
-const MAX_RESIDENT_DATA_PAYLOAD: usize = 512;
+pub(super) const DEFAULT_NTFS_FILETIME: u64 = 133_500_000_000_000_000; // 2024-01-19 UTC in 100ns intervals
+pub(super) const FILE_ATTR_DIRECTORY: u32 = 0x1000_0000; // DUP_FILE_NAME_INDEX_PRESENT
+pub(super) const FILE_ATTR_ARCHIVE: u32 = 0x0000_0020;
+pub(super) const MAX_RESIDENT_DATA_PAYLOAD: usize = 512;
 
 #[derive(Debug)]
-enum TargetWriteKind {
+pub(super) enum TargetWriteKind {
     MftRecord {
         runs: Vec<NtfsRun>,
         record_no: u32,
@@ -65,15 +65,15 @@ enum TargetWriteKind {
 }
 
 #[derive(Debug)]
-struct PreparedTxPlan<T> {
-    operation: &'static str,
-    operation_digest: [u8; 32],
-    result_value: T,
-    pre_payload_writes: Vec<DirPrePayloadWrite>,
-    mft_zero_writes: Vec<DirPrePayloadWrite>,
-    open_attr_registrations: Vec<(u32, OpenAttrRuntime, NtfsClientUpdateSpec)>,
-    mutation_specs: Vec<NtfsClientUpdateSpec>,
-    target_writes: Vec<TargetWriteKind>,
+pub(super) struct PreparedTxPlan<T> {
+    pub(super) operation: &'static str,
+    pub(super) operation_digest: [u8; 32],
+    pub(super) result_value: T,
+    pub(super) pre_payload_writes: Vec<DirPrePayloadWrite>,
+    pub(super) mft_zero_writes: Vec<DirPrePayloadWrite>,
+    pub(super) open_attr_registrations: Vec<(u32, OpenAttrRuntime, NtfsClientUpdateSpec)>,
+    pub(super) mutation_specs: Vec<NtfsClientUpdateSpec>,
+    pub(super) target_writes: Vec<TargetWriteKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,7 +83,7 @@ enum FileDataEdit<'a> {
 }
 
 #[derive(Debug, Clone)]
-enum InheritedSecurity {
+pub(super) enum InheritedSecurity {
     SharedId(u32),
     Descriptor(Vec<u8>),
 }
@@ -109,7 +109,7 @@ fn minimal_self_relative_sd() -> Vec<u8> {
     sd
 }
 
-fn extract_parent_security(parent_rec: &NtfsFileRecord) -> InheritedSecurity {
+pub(super) fn extract_parent_security(parent_rec: &NtfsFileRecord) -> InheritedSecurity {
     if let Ok(std_info) = extract_resident_attr(parent_rec, ATTR_STANDARD_INFORMATION, &[])
         && std_info.len() == 72
     {
@@ -126,7 +126,7 @@ fn extract_parent_security(parent_rec: &NtfsFileRecord) -> InheritedSecurity {
     InheritedSecurity::Descriptor(minimal_self_relative_sd())
 }
 
-fn encode_standard_information(is_dir: bool, security: &InheritedSecurity) -> Vec<u8> {
+pub(super) fn encode_standard_information(is_dir: bool, security: &InheritedSecurity) -> Vec<u8> {
     let flags: u32 = if is_dir { 0 } else { FILE_ATTR_ARCHIVE };
     match security {
         InheritedSecurity::SharedId(sec_id) => {
@@ -212,7 +212,7 @@ fn build_restored_file_template(
     Ok(buf)
 }
 
-fn find_contiguous_zero_bits(
+pub(super) fn find_contiguous_zero_bits(
     bitmap: &[u8],
     limit_bits: u64,
     count: u64,
@@ -239,7 +239,7 @@ fn find_contiguous_zero_bits(
     None
 }
 
-fn set_or_clear_bits(bitmap: &mut [u8], start: u64, count: u64, set: bool) {
+pub(super) fn set_or_clear_bits(bitmap: &mut [u8], start: u64, count: u64, set: bool) {
     for b in start..start + count {
         let idx = (b / 8) as usize;
         let mask = 1_u8 << (b % 8);
@@ -394,7 +394,7 @@ impl NtfsTransactionEngine {
         Ok(runs)
     }
 
-    fn map_mft_record_transfer(
+    pub(super) fn map_mft_record_transfer(
         &self,
         mft_runs: &[NtfsRun],
         record_no: u32,
@@ -416,7 +416,7 @@ impl NtfsTransactionEngine {
     }
 
     #[allow(clippy::unused_self)]
-    fn plan_open_attr(
+    pub(super) fn plan_open_attr(
         &self,
         staged_open: &mut BTreeMap<u32, OpenAttrRuntime>,
         new_registrations: &mut Vec<(u32, OpenAttrRuntime, NtfsClientUpdateSpec)>,
@@ -476,7 +476,7 @@ impl NtfsTransactionEngine {
         Ok(slot_u16)
     }
 
-    fn build_bitmap_range_specs(
+    pub(super) fn build_bitmap_range_specs(
         &self,
         bitmap_attr_slot: u16,
         bitmap_runs: &[NtfsRun],
@@ -527,7 +527,11 @@ impl NtfsTransactionEngine {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute_logged_tx<T>(&mut self, cx: &Cx, plan: PreparedTxPlan<T>) -> NtfsTxOutcome<T> {
+    pub(super) fn execute_logged_tx<T>(
+        &mut self,
+        cx: &Cx,
+        plan: PreparedTxPlan<T>,
+    ) -> NtfsTxOutcome<T> {
         if let Err(err) = checkpoint(cx) {
             return NtfsTxOutcome::NotCommitted(err);
         }
@@ -3457,7 +3461,7 @@ impl NtfsTransactionEngine {
         })
     }
 
-    fn read_mft_bitmap_bytes(
+    pub(super) fn read_mft_bitmap_bytes(
         &self,
         cx: &Cx,
         mft0: &NtfsFileRecord,
@@ -3488,7 +3492,7 @@ impl NtfsTransactionEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn append_mft_bitmap_mutation(
+    pub(super) fn append_mft_bitmap_mutation(
         &self,
         staged_open: &mut BTreeMap<u32, OpenAttrRuntime>,
         open_regs: &mut Vec<(u32, OpenAttrRuntime, NtfsClientUpdateSpec)>,

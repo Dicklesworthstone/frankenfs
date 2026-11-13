@@ -1228,5 +1228,200 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
     })
 }
 
+pub const ATTR_DEF_ENTRY_BYTES: usize = 160;
+pub const ATTR_DEF_INDEXABLE: u32 = 0x0002;
+pub const ATTR_DEF_RESIDENT: u32 = 0x0040;
+pub const ATTR_DEF_NON_RESIDENT_LOG: u32 = 0x0080;
+
+/// Parsed 160-byte NTFS `$AttrDef` (`MFT` record 4) schema row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsAttrDef {
+    pub label: Vec<u16>,
+    pub type_code: u32,
+    pub display_rule: u32,
+    pub collation_rule: u32,
+    pub flags: u32,
+    pub min_size: u64,
+    pub max_size: u64,
+}
+
+/// Parse a raw `$AttrDef` `$DATA` stream into validated attribute definitions.
+///
+/// Requires whole 160-byte rows, unique 16-aligned `type_code`s, NUL-terminated
+/// UTF-16 labels within the 64-unit label field, and zero-filled bytes after the
+/// first `type_code == 0` terminator row.
+pub fn parse_attr_def_table(raw: &[u8]) -> Result<Vec<NtfsAttrDef>, ParseError> {
+    if raw.len() < ATTR_DEF_ENTRY_BYTES
+        || !raw.len().is_multiple_of(ATTR_DEF_ENTRY_BYTES)
+        || raw.len() > 1024 * ATTR_DEF_ENTRY_BYTES
+    {
+        return Err(invalid(
+            "ntfs.attr_def",
+            "invalid $AttrDef table byte length",
+        ));
+    }
+    let mut defs = Vec::new();
+    let mut seen_types = std::collections::BTreeSet::new();
+    let mut saw_terminator = false;
+    for chunk in raw.as_chunks::<ATTR_DEF_ENTRY_BYTES>().0 {
+        if saw_terminator {
+            if chunk.iter().any(|&b| b != 0) {
+                return Err(invalid(
+                    "ntfs.attr_def",
+                    "nonzero bytes after $AttrDef terminator entry",
+                ));
+            }
+            continue;
+        }
+        let type_code = le32(chunk, 128)?;
+        if type_code == 0 {
+            if chunk.iter().any(|&b| b != 0) {
+                return Err(invalid(
+                    "ntfs.attr_def",
+                    "nonzero fields in $AttrDef terminator entry",
+                ));
+            }
+            saw_terminator = true;
+            continue;
+        }
+        if type_code == u32::MAX || type_code & 0xF != 0 {
+            return Err(invalid("ntfs.attr_def", "invalid attribute type code"));
+        }
+        if !seen_types.insert(type_code) {
+            return Err(invalid("ntfs.attr_def", "duplicate attribute type code"));
+        }
+        let mut label = Vec::new();
+        let mut terminated = false;
+        for at in (0..128).step_by(2) {
+            let unit = le16(chunk, at)?;
+            if unit == 0 {
+                terminated = true;
+                break;
+            }
+            label.push(unit);
+        }
+        if !terminated {
+            return Err(invalid(
+                "ntfs.attr_def",
+                "unterminated UTF-16 label in $AttrDef",
+            ));
+        }
+        let display_rule = le32(chunk, 132)?;
+        let collation_rule = le32(chunk, 136)?;
+        let flags = le32(chunk, 140)?;
+        let min_size = le64(chunk, 144)?;
+        let max_size = le64(chunk, 152)?;
+        if max_size != 0 && max_size != u64::MAX && min_size > max_size {
+            return Err(invalid("ntfs.attr_def", "min_size exceeds max_size"));
+        }
+        defs.push(NtfsAttrDef {
+            label,
+            type_code,
+            display_rule,
+            collation_rule,
+            flags,
+            min_size,
+            max_size,
+        });
+    }
+    if defs.is_empty() {
+        return Err(invalid("ntfs.attr_def", "empty $AttrDef table"));
+    }
+    Ok(defs)
+}
+
+/// Validate that a parsed `$AttrDef` table satisfies standard NTFS 3.1 schema
+/// rules for all core attribute types mutated by FrankenFS.
+pub fn validate_ntfs31_attr_def_table(defs: &[NtfsAttrDef]) -> Result<(), ParseError> {
+    let find = |code: u32| -> Result<&NtfsAttrDef, ParseError> {
+        defs.iter().find(|d| d.type_code == code).ok_or_else(|| {
+            invalid(
+                "ntfs.attr_def",
+                "missing required core attribute definition",
+            )
+        })
+    };
+    let effective_max = |d: &NtfsAttrDef| {
+        if d.max_size == 0 {
+            u64::MAX
+        } else {
+            d.max_size
+        }
+    };
+
+    let std_info = find(0x10)?;
+    if std_info.flags & ATTR_DEF_RESIDENT == 0
+        || std_info.min_size > 48
+        || effective_max(std_info) < 72
+    {
+        return Err(invalid(
+            "ntfs.attr_def",
+            "incompatible $STANDARD_INFORMATION definition",
+        ));
+    }
+
+    let attr_list = find(ATTRIBUTE_LIST)?;
+    if attr_list.flags & ATTR_DEF_RESIDENT != 0 || effective_max(attr_list) < 4096 {
+        return Err(invalid(
+            "ntfs.attr_def",
+            "incompatible $ATTRIBUTE_LIST definition",
+        ));
+    }
+
+    let file_name = find(0x30)?;
+    if file_name.flags & ATTR_DEF_RESIDENT == 0
+        || file_name.collation_rule > 1
+        || file_name.min_size > 68
+        || effective_max(file_name) < 578
+    {
+        return Err(invalid(
+            "ntfs.attr_def",
+            "incompatible $FILE_NAME definition",
+        ));
+    }
+
+    let vol_info = find(VOLUME_INFORMATION)?;
+    if vol_info.flags & ATTR_DEF_RESIDENT == 0
+        || vol_info.min_size > 12
+        || effective_max(vol_info) < 12
+    {
+        return Err(invalid(
+            "ntfs.attr_def",
+            "incompatible $VOLUME_INFORMATION definition",
+        ));
+    }
+
+    let data = find(DATA)?;
+    if data.flags & ATTR_DEF_RESIDENT != 0
+        || data.min_size != 0
+        || effective_max(data) < (1_u64 << 30)
+    {
+        return Err(invalid("ntfs.attr_def", "incompatible $DATA definition"));
+    }
+
+    let index_root = find(0x90)?;
+    if index_root.flags & ATTR_DEF_RESIDENT == 0 {
+        return Err(invalid(
+            "ntfs.attr_def",
+            "incompatible $INDEX_ROOT definition",
+        ));
+    }
+
+    let index_alloc = find(0xA0)?;
+    if index_alloc.flags & ATTR_DEF_RESIDENT != 0 {
+        return Err(invalid(
+            "ntfs.attr_def",
+            "incompatible $INDEX_ALLOCATION definition",
+        ));
+    }
+
+    let bitmap = find(0xB0)?;
+    if bitmap.flags & ATTR_DEF_RESIDENT != 0 {
+        return Err(invalid("ntfs.attr_def", "incompatible $BITMAP definition"));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

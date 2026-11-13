@@ -22,6 +22,7 @@ pub use reader::filesystem::NtfsFs;
 pub use stream_name::StreamName;
 pub use transaction::{
     NtfsAdmissionReport, NtfsDurableToken, NtfsLogStateSummary, NtfsPersistenceEvent,
-    NtfsPersistenceStage, NtfsRecoverySummary, NtfsStorageIdentity, NtfsTransactionEngine,
-    NtfsTxOutcome, NtfsWriteOptions,
+    NtfsPersistenceStage, NtfsRecoverySummary, NtfsRenameOutcome, NtfsStorageIdentity,
+    NtfsTransactionEngine, NtfsTxOutcome, NtfsWriteOptions, validate_ntfs_component_utf16,
+    validate_ntfs_stream_name_utf16,
 };

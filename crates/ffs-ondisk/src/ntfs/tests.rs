@@ -328,3 +328,77 @@ fn ntfs_boot_drive_and_extended_signature_are_not_fat_reserved_fields() {
     b[32] = 1;
     assert!(NtfsGeometry::parse(&b, 8192 * 512).is_err());
 }
+
+#[test]
+fn attr_def_table_validates_ntfs31_schema_and_rejects_corrupt_or_custom_rows() {
+    fn row(label: &str, code: u32, collation: u32, flags: u32, min: u64, max: u64) -> [u8; 160] {
+        let mut out = [0_u8; 160];
+        for (idx, unit) in label.encode_utf16().enumerate() {
+            out[idx * 2..idx * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        out[128..132].copy_from_slice(&code.to_le_bytes());
+        out[136..140].copy_from_slice(&collation.to_le_bytes());
+        out[140..144].copy_from_slice(&flags.to_le_bytes());
+        out[144..152].copy_from_slice(&min.to_le_bytes());
+        out[152..160].copy_from_slice(&max.to_le_bytes());
+        out
+    }
+
+    let mut table = Vec::new();
+    for r in [
+        row("$STANDARD_INFORMATION", 0x10, 0, ATTR_DEF_RESIDENT, 48, 72),
+        row(
+            "$ATTRIBUTE_LIST",
+            0x20,
+            0,
+            ATTR_DEF_NON_RESIDENT_LOG,
+            0,
+            u64::MAX,
+        ),
+        row(
+            "$FILE_NAME",
+            0x30,
+            0,
+            ATTR_DEF_RESIDENT | ATTR_DEF_INDEXABLE,
+            68,
+            578,
+        ),
+        row("$VOLUME_INFORMATION", 0x70, 0, ATTR_DEF_RESIDENT, 12, 12),
+        row("$DATA", 0x80, 0, 0, 0, u64::MAX),
+        row("$INDEX_ROOT", 0x90, 0, ATTR_DEF_RESIDENT, 0, u64::MAX),
+        row(
+            "$INDEX_ALLOCATION",
+            0xA0,
+            0,
+            ATTR_DEF_NON_RESIDENT_LOG,
+            0,
+            u64::MAX,
+        ),
+        row("$BITMAP", 0xB0, 0, ATTR_DEF_NON_RESIDENT_LOG, 0, u64::MAX),
+        [0_u8; 160],
+        [0_u8; 160],
+    ] {
+        table.extend_from_slice(&r);
+    }
+
+    let defs = parse_attr_def_table(&table).unwrap();
+    assert_eq!(defs.len(), 8);
+    validate_ntfs31_attr_def_table(&defs).unwrap();
+
+    // Truncated row, empty table, or trailing garbage after terminator fails closed.
+    assert!(parse_attr_def_table(&table[..table.len() - 1]).is_err());
+    assert!(parse_attr_def_table(&[0_u8; 160]).is_err());
+    let mut bad_tail = table.clone();
+    *bad_tail.last_mut().unwrap() = 1;
+    assert!(parse_attr_def_table(&bad_tail).is_err());
+
+    // Incompatible schema (e.g. $DATA marked resident-only or missing $BITMAP) fails validation.
+    let mut resident_only_data = defs.clone();
+    resident_only_data
+        .iter_mut()
+        .find(|d| d.type_code == DATA)
+        .unwrap()
+        .flags |= ATTR_DEF_RESIDENT;
+    assert!(validate_ntfs31_attr_def_table(&resident_only_data).is_err());
+    assert!(validate_ntfs31_attr_def_table(&defs[..defs.len() - 1]).is_err());
+}

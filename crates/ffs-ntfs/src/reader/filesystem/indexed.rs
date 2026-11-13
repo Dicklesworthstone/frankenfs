@@ -1,5 +1,6 @@
 //! Explicit index-directed FsOps lookup; no path reconstruction or new parser.
 
+use super::lifetime::parse_ads_component;
 use super::{
     Cx, FfsError, FileType, InodeAttr, InodeNumber, NtfsFs, OsStr, ROOT, Result, checkpoint,
     corrupt, unsupported,
@@ -30,14 +31,34 @@ impl NtfsFs {
         if name.is_empty() || name.contains(['/', '\\', '\0']) {
             return Err(FfsError::Format("invalid NTFS path component".into()));
         }
-        if name.len() > 255 {
+        if name.len() > 255 && !name.contains(':') {
             return Err(FfsError::NameTooLong);
         }
         let units: Vec<_> = name.encode_utf16().collect();
-        let entry = self
-            .volume
-            .lookup_indexed_entry(cx, &directory, &units, &self.upcase)?
-            .ok_or_else(|| FfsError::NotFound(format!("NTFS name {name}")))?;
+        if parent == ROOT && self.is_hidden_root_folded_name(&self.fold_units(&units))? {
+            return Err(FfsError::NotFound(format!("NTFS name {name}")));
+        }
+        let volume = self.active_volume()?;
+        let found = if units.len() <= 255 {
+            volume.lookup_indexed_entry(cx, &directory, &units, &self.upcase)?
+        } else {
+            None
+        };
+        let Some(entry) = found else {
+            if let Some((base_utf16, stream_utf16)) = parse_ads_component(name)? {
+                drop(volume);
+                return self.lookup_ads_component(cx, parent, &base_utf16, &stream_utf16);
+            }
+            if name.len() > 255 {
+                return Err(FfsError::NameTooLong);
+            }
+            return Err(FfsError::NotFound(format!("NTFS name {name}")));
+        };
+        if parent == ROOT
+            && self.is_hidden_root_folded_name(&self.fold_units(&entry.filename.name))?
+        {
+            return Err(FfsError::NotFound(format!("NTFS name {name}")));
+        }
         // A native fold can select a different spelling. Check that stored
         // spelling too: a valid requested UTF-8 name does not make an unpaired
         // surrogate or overlong native name representable on this mount.
@@ -46,6 +67,7 @@ impl NtfsFs {
         if native_name.len() > 255 {
             return Err(FfsError::NameTooLong);
         }
+        drop(volume);
         let target = self.inode(entry.reference)?;
         let attr = self.describe(cx, target)?;
         // The index search validates the selected FILE_NAME but not every

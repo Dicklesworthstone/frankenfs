@@ -4,9 +4,16 @@
 //! durable writes and persistent `$LogFile` ARIES recovery require opening an
 //! [`NtfsTransactionEngine`] with explicit [`NtfsWriteOptions`].
 
+mod btree;
+mod catalog;
 mod dir_index;
+mod mutations;
 mod ops;
 mod recovery;
+
+pub use mutations::{
+    NtfsRenameOutcome, validate_ntfs_component_utf16, validate_ntfs_stream_name_utf16,
+};
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -24,14 +31,16 @@ use ffs_ondisk::ntfs::logfile_writer::{
     encode_open_attribute_entry, encode_restart_table,
 };
 use ffs_ondisk::ntfs::{
-    COMPRESSED, DATA, ENCRYPTED, NtfsFileRecord, NtfsGeometry, NtfsLogOp, NtfsReference, NtfsRun,
-    NtfsValue, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs,
+    ATTRIBUTE_LIST, COMPRESSED, DATA, ENCRYPTED, NtfsAttribute, NtfsFileRecord, NtfsGeometry,
+    NtfsLogOp, NtfsReference, NtfsRun, NtfsValue, REPARSE_POINT, SPARSE, VOLUME_INFORMATION,
+    decode_mapping_pairs, parse_attr_def_table, validate_ntfs31_attr_def_table,
 };
 use ffs_types::{ByteOffset, ParseError};
 use serde::Serialize;
 
 use crate::NtfsVolume;
 use crate::reader::allocation::{AllocationLimits, NamespaceLimits, RecordOwnershipLimits};
+use crate::reader::security::SecurityCheckLimits;
 
 pub(super) const LOG_PAGE_BYTES: u32 = 4096;
 pub(super) const SECTOR_BYTES: usize = 512;
@@ -42,6 +51,25 @@ const UPCASE_BYTES: usize = 131_072;
 /// writes validate the target but preserve larger streams without staging data.
 pub const MAX_FILE_EDIT_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_ERASED_LOG_BYTES: u64 = 64 * 1024 * 1024;
+const USNJRNL_UPPER: [u16; 8] = [
+    b'$' as u16,
+    b'U' as u16,
+    b'S' as u16,
+    b'N' as u16,
+    b'J' as u16,
+    b'R' as u16,
+    b'N' as u16,
+    b'L' as u16,
+];
+const QUOTA_UPPER: [u16; 6] = [
+    b'$' as u16,
+    b'Q' as u16,
+    b'U' as u16,
+    b'O' as u16,
+    b'T' as u16,
+    b'A' as u16,
+];
+const DOLLAR_Q_NAME: [u16; 2] = [b'$' as u16, b'Q' as u16];
 const HIBERFIL_UPPER: [u16; 12] = [
     b'H' as u16,
     b'I' as u16,
@@ -626,7 +654,7 @@ impl NtfsTransactionEngine {
             }
         }
 
-        // Load $UpCase (record 10, 128 KiB).
+        // Load $UpCase (record 10, 128 KiB) and verify idempotency + canonical ASCII folding.
         let upcase_rec = read_mft_record_via_runs(&bounded, cx, &geometry, &mft_runs, 10)?;
         let (upcase_runs, upcase_size, upcase_init) =
             extract_plain_nonresident_stream(&geometry, &upcase_rec, DATA, &[])?;
@@ -637,6 +665,18 @@ impl NtfsTransactionEngine {
         let mut upcase = vec![0_u16; 65_536].into_boxed_slice();
         for (idx, &[lo, hi]) in upcase_raw.as_chunks::<2>().0.iter().enumerate() {
             upcase[idx] = u16::from_le_bytes([lo, hi]);
+        }
+        for (idx, &mapped) in upcase.iter().enumerate() {
+            if upcase[usize::from(mapped)] != mapped {
+                return Err(corrupt(0, "NTFS $UpCase table is not idempotent"));
+            }
+            if (usize::from(b'a')..=usize::from(b'z')).contains(&idx)
+                && mapped != u16::try_from(idx - 32).unwrap_or(0)
+            {
+                return Err(unsupported(
+                    "NTFS $UpCase does not map ASCII a..=z canonically",
+                ));
+            }
         }
 
         // Load $LogFile (record 2).
@@ -680,10 +720,300 @@ impl NtfsTransactionEngine {
             stage_hook: None,
         };
 
-        // Refuse active Hibernation / Fast Startup (`hiberfil.sys`) before any write!
+        // Refuse active Hibernation / Fast Startup (`hiberfil.sys`), incompatible
+        // `$AttrDef`, or active `$Extend` secondary journals/quotas before any write!
         engine.refuse_hibernation_or_txf(cx, &mft_runs)?;
+        engine.validate_attrdef_and_extend_admission(cx, &mft0, &mft_runs)?;
         engine.load_clean_ring_if_present(cx)?;
         Ok(engine)
+    }
+
+    fn validate_attrdef_and_extend_admission(
+        &self,
+        cx: &Cx,
+        mft0: &NtfsFileRecord,
+        mft_runs: &[NtfsRun],
+    ) -> Result<()> {
+        let (_, _, mft_init_bytes) =
+            extract_plain_nonresident_stream(&self.geometry, mft0, DATA, &[])?;
+        let init_records = mft_init_bytes / u64::from(self.geometry.record_bytes());
+        let mft_bm = self.read_system_stream_bounded(cx, mft0, 0xB0, &[], 4 * 1024 * 1024)?;
+        let slot_allocated = |slot: u32| -> bool {
+            let bit_idx = u64::from(slot);
+            if bit_idx >= init_records {
+                return false;
+            }
+            let byte_idx = (bit_idx / 8) as usize;
+            byte_idx < mft_bm.len() && (mft_bm[byte_idx] & (1_u8 << (bit_idx % 8))) != 0
+        };
+
+        // 1. Validate $AttrDef (record 4) when allocated on the volume.
+        if slot_allocated(4) {
+            let attrdef_rec =
+                read_mft_record_via_runs(&self.device, cx, &self.geometry, mft_runs, 4)?;
+            for attr in attrdef_rec.attributes().map_err(|err| parse_err(&err))? {
+                if attr.flags & (COMPRESSED | ENCRYPTED | SPARSE) != 0 || attr.kind == 0x100 {
+                    return Err(unsupported(
+                        "$AttrDef carries unsupported compressed/encrypted/sparse/TxF metadata",
+                    ));
+                }
+            }
+            let attrdef_bytes =
+                self.read_system_stream_bounded(cx, &attrdef_rec, DATA, &[], 65_536)?;
+            let defs = parse_attr_def_table(&attrdef_bytes).map_err(|err| parse_err(&err))?;
+            validate_ntfs31_attr_def_table(&defs)
+                .map_err(|err| unsupported(format!("incompatible NTFS $AttrDef schema: {err}")))?;
+        }
+
+        // 2. Validate $Extend (record 11) secondary indexes when allocated on the volume.
+        if slot_allocated(11) {
+            let extend_rec =
+                read_mft_record_via_runs(&self.device, cx, &self.geometry, mft_runs, 11)?;
+            for attr in extend_rec.attributes().map_err(|err| parse_err(&err))? {
+                if attr.flags & (COMPRESSED | ENCRYPTED | SPARSE) != 0 || attr.kind == 0x100 {
+                    return Err(unsupported(
+                        "$Extend carries unsupported compressed/encrypted/sparse/TxF metadata",
+                    ));
+                }
+            }
+
+            // Refuse active $UsnJrnl ($J / $Max / $DATA).
+            if let Some(usn_ref) =
+                self.lookup_in_directory_raw(cx, mft_runs, &extend_rec, &USNJRNL_UPPER)?
+            {
+                let usn_no = u32::try_from(usn_ref.record)
+                    .map_err(|_| corrupt(0, "$UsnJrnl record number overflow"))?;
+                let usn_rec =
+                    read_mft_record_via_runs(&self.device, cx, &self.geometry, mft_runs, usn_no)?;
+                if usn_rec.sequence != usn_ref.sequence {
+                    return Err(corrupt(0, "stale $Extend/$UsnJrnl directory entry"));
+                }
+                for attr in usn_rec.attributes().map_err(|err| parse_err(&err))? {
+                    if attr.kind == ATTRIBUTE_LIST || attr.kind == DATA || attr.kind == 0x100 {
+                        return Err(unsupported(
+                            "active NTFS $UsnJrnl change journal is refused for native writes",
+                        ));
+                    }
+                }
+            }
+
+            // Refuse active $Quota tracking or enforcement ($Q index).
+            if let Some(quota_ref) =
+                self.lookup_in_directory_raw(cx, mft_runs, &extend_rec, &QUOTA_UPPER)?
+            {
+                let quota_no = u32::try_from(quota_ref.record)
+                    .map_err(|_| corrupt(0, "$Quota record number overflow"))?;
+                let quota_rec =
+                    read_mft_record_via_runs(&self.device, cx, &self.geometry, mft_runs, quota_no)?;
+                if quota_rec.sequence != quota_ref.sequence {
+                    return Err(corrupt(0, "stale $Extend/$Quota directory entry"));
+                }
+                Self::validate_inactive_quota_record(&quota_rec)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_inactive_quota_record(quota_rec: &NtfsFileRecord) -> Result<()> {
+        for attr in quota_rec.attributes().map_err(|err| parse_err(&err))? {
+            if attr.kind == ATTRIBUTE_LIST || attr.kind == 0x100 {
+                return Err(unsupported(
+                    "NTFS $Quota with extension catalog or $TXF_DATA is refused",
+                ));
+            }
+            if attr.kind == 0xA0 && attr.name == DOLLAR_Q_NAME {
+                return Err(unsupported(
+                    "NTFS $Quota with external $Q index blocks is refused",
+                ));
+            }
+            if attr.kind == 0x90 && attr.name == DOLLAR_Q_NAME {
+                let NtfsValue::Resident(ir) = attr.value else {
+                    return Err(corrupt(0, "nonresident $Quota::$Q INDEX_ROOT"));
+                };
+                if ir.len() < 32 {
+                    return Err(corrupt(0, "truncated $Quota::$Q INDEX_ROOT"));
+                }
+                // INDEX_HEADER starts at byte 16; flags at byte 28 (`LARGE_INDEX == 1`).
+                if ir[28] & 1 != 0 {
+                    return Err(unsupported(
+                        "NTFS $Quota with external $Q B-tree is refused",
+                    ));
+                }
+                let entries_off =
+                    usize::try_from(u32::from_le_bytes([ir[16], ir[17], ir[18], ir[19]]))
+                        .map_err(|_| corrupt(0, "invalid $Q entries_off"))?;
+                let total_bytes =
+                    usize::try_from(u32::from_le_bytes([ir[20], ir[21], ir[22], ir[23]]))
+                        .map_err(|_| corrupt(0, "invalid $Q total_bytes"))?;
+                let mut pos = 16_usize.saturating_add(entries_off);
+                let end = 16_usize.saturating_add(total_bytes);
+                if pos > end || end > ir.len() {
+                    return Err(corrupt(0, "out-of-bounds $Quota::$Q INDEX_ROOT entries"));
+                }
+                while pos < end {
+                    if pos + 16 > end {
+                        return Err(corrupt(0, "truncated $Quota::$Q index entry header"));
+                    }
+                    let data_off = usize::from(u16::from_le_bytes([ir[pos], ir[pos + 1]]));
+                    let data_len = usize::from(u16::from_le_bytes([ir[pos + 2], ir[pos + 3]]));
+                    let entry_len = usize::from(u16::from_le_bytes([ir[pos + 8], ir[pos + 9]]));
+                    let key_len = usize::from(u16::from_le_bytes([ir[pos + 10], ir[pos + 11]]));
+                    let entry_flags = u16::from_le_bytes([ir[pos + 12], ir[pos + 13]]);
+                    if entry_len < 16 || !entry_len.is_multiple_of(8) || pos + entry_len > end {
+                        return Err(corrupt(0, "invalid $Quota::$Q index entry length"));
+                    }
+                    if entry_flags & 1 != 0 {
+                        return Err(unsupported("NTFS $Quota subnode pointer is refused"));
+                    }
+                    if entry_flags & 2 != 0 {
+                        break;
+                    }
+                    if key_len != 4 || pos + 20 > pos + entry_len {
+                        return Err(unsupported(
+                            "unexpected key layout in NTFS $Quota::$Q index",
+                        ));
+                    }
+                    let owner_id = u32::from_le_bytes([
+                        ir[pos + 16],
+                        ir[pos + 17],
+                        ir[pos + 18],
+                        ir[pos + 19],
+                    ]);
+                    if owner_id != 1 {
+                        return Err(unsupported(
+                            "active per-user NTFS $Quota entries are refused for native writes",
+                        ));
+                    }
+                    if data_len < 8 || data_off < 20 || data_off + data_len > entry_len {
+                        return Err(corrupt(0, "invalid $Quota::$Q default entry payload"));
+                    }
+                    let qflags = u32::from_le_bytes([
+                        ir[pos + data_off + 4],
+                        ir[pos + data_off + 5],
+                        ir[pos + data_off + 6],
+                        ir[pos + data_off + 7],
+                    ]);
+                    // Refuse TRACKING_ENABLED (0x10), ENFORCEMENT_ENABLED (0x20),
+                    // TRACKING_REQUESTED (0x40), CORRUPT/OUT_OF_DATE/PENDING_DELETES (0x700).
+                    if qflags & 0x0770 != 0 {
+                        return Err(unsupported(format!(
+                            "active NTFS $Quota state ({qflags:#x}) is refused for native writes"
+                        )));
+                    }
+                    pos += entry_len;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_system_stream_bounded(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+        kind: u32,
+        name: &[u16],
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        for attr in record.attributes().map_err(|err| parse_err(&err))? {
+            if attr.kind == kind && attr.name == name {
+                return match attr.value {
+                    NtfsValue::Resident(bytes) => {
+                        if bytes.len() > max_bytes {
+                            return Err(unsupported("system attribute exceeds admission cap"));
+                        }
+                        Ok(bytes.to_vec())
+                    }
+                    NtfsValue::NonResident(nr) => {
+                        if attr.flags != 0 || nr.first_vcn != 0 {
+                            return Err(unsupported("transformed or fragmented system attribute"));
+                        }
+                        if nr.data_bytes > max_bytes as u64 || nr.initialized_bytes < nr.data_bytes
+                        {
+                            return Err(unsupported(
+                                "oversized or uninitialized system attribute stream",
+                            ));
+                        }
+                        let runs = decode_mapping_pairs(
+                            nr.mapping_pairs,
+                            nr.first_vcn,
+                            nr.last_vcn,
+                            self.geometry.cluster_count(),
+                        )
+                        .map_err(|err| parse_err(&err))?;
+                        read_mapped_runs(
+                            &self.device,
+                            cx,
+                            &self.geometry,
+                            &runs,
+                            0,
+                            nr.data_bytes as usize,
+                        )
+                    }
+                };
+            }
+        }
+        Err(FfsError::NotFound(format!(
+            "system attribute {kind:#x} not found on record {}",
+            record.number
+        )))
+    }
+
+    /// Refuse mutating a target record (or parent directory) that carries secondary-index
+    /// obligations or stream transforms outside FrankenFS's native NTFS write profile.
+    pub(super) fn refuse_unsupported_record_metadata(
+        record: &NtfsFileRecord,
+        attrs: &[NtfsAttribute<'_>],
+    ) -> Result<()> {
+        for attr in attrs {
+            if attr.flags & (COMPRESSED | ENCRYPTED) != 0 {
+                return Err(unsupported(format!(
+                    "record {} carries compressed or EFS-encrypted attribute {:#x}",
+                    record.number, attr.kind
+                )));
+            }
+            match attr.kind {
+                0x10 if attr.name.is_empty() => {
+                    if let NtfsValue::Resident(std_bytes) = attr.value
+                        && std_bytes.len() >= 36
+                    {
+                        let flags = u32::from_le_bytes([
+                            std_bytes[32],
+                            std_bytes[33],
+                            std_bytes[34],
+                            std_bytes[35],
+                        ]);
+                        // Refuse FILE_ATTRIBUTE_REPARSE_POINT (0x400), COMPRESSED (0x800), ENCRYPTED (0x4000).
+                        if flags & (0x0400 | 0x0800 | 0x4000) != 0 {
+                            return Err(unsupported(format!(
+                                "record {} has unsupported file attribute flags {flags:#x}",
+                                record.number
+                            )));
+                        }
+                    }
+                }
+                0x40 => {
+                    return Err(unsupported(format!(
+                        "record {} carries $OBJECT_ID (0x40); $Extend/$ObjId maintenance is refused",
+                        record.number
+                    )));
+                }
+                REPARSE_POINT => {
+                    return Err(unsupported(format!(
+                        "record {} carries $REPARSE_POINT (0xC0); reparse write maintenance is refused",
+                        record.number
+                    )));
+                }
+                0x100 | 0xF0 => {
+                    return Err(unsupported(format!(
+                        "record {} carries unsupported attribute {:#x}",
+                        record.number, attr.kind
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn refuse_hibernation_or_txf(&self, cx: &Cx, mft_runs: &[NtfsRun]) -> Result<()> {
@@ -797,6 +1127,17 @@ impl NtfsTransactionEngine {
         self.stage_hook = hook;
     }
 
+    #[must_use]
+    pub fn upcase(&self) -> &[u16] {
+        &self.upcase
+    }
+
+    /// Explicitly synchronize the underlying backing storage (`fsync` / `sync_fs`).
+    pub fn sync_device(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        self.device.sync(cx)
+    }
+
     /// Construct a fresh read-only [`NtfsVolume`] view over the current backing storage.
     pub fn volume_view(&self, cx: &Cx) -> Result<NtfsVolume> {
         NtfsVolume::from_device(
@@ -807,9 +1148,10 @@ impl NtfsTransactionEngine {
         )
     }
 
-    /// Run all four independent read-only consistency checkers (`check_allocations`,
-    /// `check_record_ownership`, `check_mft_mirror`, `check_namespace`) on a fresh
-    /// [`NtfsVolume`] view and refuse if any reports an inconsistency.
+    /// Run all independent read-only consistency checkers (`check_allocations`,
+    /// `check_record_ownership`, `check_mft_mirror`, `check_namespace`, plus
+    /// `check_security_references` whenever `$Secure` record 9 is allocated) on a
+    /// fresh [`NtfsVolume`] view and refuse if any reports an inconsistency.
     pub fn check_clean_consistency(&self, cx: &Cx) -> Result<()> {
         let volume = self.volume_view(cx)?;
         let alloc = volume.check_allocations(cx, AllocationLimits::default())?;
@@ -843,7 +1185,35 @@ impl NtfsTransactionEngine {
                 format!("NTFS namespace check failed: {:?}", ns.issues.first()),
             ));
         }
+        if self.is_mft_slot_allocated(cx, 9)? {
+            let sec =
+                volume.check_security_references(cx, SecurityCheckLimits::default(), 1_048_576)?;
+            if sec.limit_reached.is_some()
+                || sec.errors != 0
+                || sec.missing_shared_references != 0
+                || sec.extensions_without_owner.unwrap_or(0) != 0
+            {
+                return Err(corrupt(
+                    0,
+                    format!("NTFS $Secure check failed: {:?}", sec.issues.first()),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn is_mft_slot_allocated(&self, cx: &Cx, slot: u32) -> Result<bool> {
+        let mft0 = self.read_mft_record_zero(cx)?;
+        let (_, _, mft_init_bytes) =
+            extract_plain_nonresident_stream(&self.geometry, &mft0, DATA, &[])?;
+        let init_records = mft_init_bytes / u64::from(self.geometry.record_bytes());
+        let bit_idx = u64::from(slot);
+        if bit_idx >= init_records {
+            return Ok(false);
+        }
+        let mft_bm = self.read_system_stream_bounded(cx, &mft0, 0xB0, &[], 4 * 1024 * 1024)?;
+        let byte_idx = (bit_idx / 8) as usize;
+        Ok(byte_idx < mft_bm.len() && (mft_bm[byte_idx] & (1_u8 << (bit_idx % 8))) != 0)
     }
 
     pub(super) fn record_event_checked(

@@ -337,6 +337,8 @@ pub fn apply_file_edit(
 /// Initialize an MFT record slot (`InitializeFileRecordSegment`, `0x02`) from an
 /// unpacked template buffer `restored_template` whose bytes `[0..used_bytes]`
 /// contain a complete `FILE` header, attributes, and `0xFFFF_FFFF` terminator.
+/// `restored_template` may be either the full `raw_existing.len()` slot or the
+/// compact `[0..used_bytes]` prefix (matching native NTFS `$LogFile` payloads).
 ///
 /// If `raw_existing` is already a USA-valid `FILE` record with `lsn >= pass_lsn`
 /// on `RecoveryPass::Redo(lsn)`, returns `FileEditResult::AlreadyApplied`.
@@ -347,7 +349,8 @@ pub fn initialize_file_record_slot(
     restored_template: &[u8],
 ) -> Result<FileEditResult, ParseError> {
     if raw_existing.len() < 512
-        || raw_existing.len() != restored_template.len()
+        || restored_template.len() < 56
+        || restored_template.len() > raw_existing.len()
         || !raw_existing.len().is_multiple_of(512)
     {
         return Err(bad("invalid MFT slot size for InitializeFileRecordSegment"));
@@ -362,10 +365,18 @@ pub fn initialize_file_record_slot(
             return Ok(FileEditResult::AlreadyApplied);
         }
     }
-    let mut result = restored_template.to_vec();
-    if result.get(..4) != Some(b"FILE".as_slice()) {
+    if restored_template.get(..4) != Some(b"FILE".as_slice()) {
         return Err(bad("InitializeFileRecordSegment payload lacks FILE magic"));
     }
+    let used_bytes = usize::try_from(le32(restored_template, 24)?)
+        .map_err(|_| bad("InitializeFileRecordSegment used_bytes overflow"))?;
+    if used_bytes > restored_template.len() || used_bytes > raw_existing.len() {
+        return Err(bad(
+            "InitializeFileRecordSegment payload shorter than declared used_bytes",
+        ));
+    }
+    let mut result = vec![0_u8; raw_existing.len()];
+    result[..restored_template.len()].copy_from_slice(restored_template);
     if let RecoveryPass::Redo(lsn) = pass {
         result[8..16].copy_from_slice(&lsn.to_le_bytes());
     }

@@ -1,24 +1,34 @@
-//! Read-only FsOps for an immutable NTFS image. Native file references, not
-//! pathnames, identify nodes, so DOS aliases and hard links share one inode.
-//! Permissions are an explicit host projection, not an interpretation of ACLs.
+//! Read-only and native ARIES-backed writable `FsOps` for NTFS 3.1 images.
+//! Native file references, not pathnames, identify nodes, so DOS aliases and
+//! hard links share one inode, while Alternate Data Streams (`file:stream`)
+//! bind to deterministic compound ADS inodes.
 
 mod extents;
+mod health;
 mod indexed;
+mod lifetime;
 mod recovery;
+mod writable;
 
 use super::{
     Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume, Result, Stream,
     checkpoint, corrupt, parse, relative_link_target, unsupported,
 };
+use crate::transaction::NtfsTransactionEngine;
+use ffs_core::vfs::{OpenHandleOracle, ReleaseRequest};
 use ffs_core::{
     DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,
+    SetAttrRequest,
 };
 use ffs_ondisk::ntfs::ea::MAX_EA_NAME_BYTES;
 use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_types::InodeNumber;
+use health::{MountHealth, OperationGuard};
+use lifetime::{NtfsLifetime, is_ads_ino, parse_ads_component};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ROOT: InodeNumber = InodeNumber(1);
@@ -30,6 +40,22 @@ const MAX_CACHED_ATTRIBUTES: usize = 4096;
 const MAX_CACHED_STREAMS: usize = 8;
 const MAX_CACHED_DIRECTORIES: usize = 64;
 const DIRECTORY_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+pub(super) enum ActiveVolume<'a> {
+    Borrowed(&'a NtfsVolume),
+    Shared(Arc<NtfsVolume>),
+}
+
+impl Deref for ActiveVolume<'_> {
+    type Target = NtfsVolume;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(vol) => vol,
+            Self::Shared(vol) => vol.as_ref(),
+        }
+    }
+}
 
 struct DirectorySnapshot {
     rows: Vec<DirEntry>,
@@ -72,6 +98,11 @@ struct Cache {
 
 pub struct NtfsFs {
     volume: NtfsVolume,
+    live_volume: RwLock<Option<Arc<NtfsVolume>>>,
+    writer: Option<Mutex<NtfsTransactionEngine>>,
+    operations: RwLock<()>,
+    health: MountHealth,
+    lifetime: Mutex<NtfsLifetime>,
     root: NtfsReference,
     upcase: Vec<u16>,
     uid: u32,
@@ -167,6 +198,11 @@ impl NtfsFs {
         let fs = Self {
             root: reference(&record),
             volume,
+            live_volume: RwLock::new(None),
+            writer: None,
+            operations: RwLock::new(()),
+            health: MountHealth::new(),
+            lifetime: Mutex::new(NtfsLifetime::default()),
             upcase,
             uid,
             gid,
@@ -185,6 +221,24 @@ impl NtfsFs {
         Ok(fs)
     }
 
+    fn operation(&self, cx: &Cx, mutation: bool) -> Result<OperationGuard<'_>> {
+        self.health.operation(cx, &self.operations, mutation)
+    }
+
+    pub(super) fn active_volume(&self) -> Result<ActiveVolume<'_>> {
+        if !self.is_writable() {
+            return Ok(ActiveVolume::Borrowed(&self.volume));
+        }
+        let guard = self
+            .live_volume
+            .read()
+            .map_err(|_| FfsError::Io(std::io::Error::other("NTFS live volume RwLock poisoned")))?;
+        Ok(guard
+            .as_ref()
+            .cloned()
+            .map_or(ActiveVolume::Borrowed(&self.volume), ActiveVolume::Shared))
+    }
+
     fn cache(&self) -> Result<MutexGuard<'_, Cache>> {
         self.cache
             .lock()
@@ -192,7 +246,8 @@ impl NtfsFs {
     }
 
     fn user_eas(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<BTreeMap<String, Vec<u8>>> {
-        let catalog = self.volume.extended_attributes(cx, record)?;
+        let volume = self.active_volume()?;
+        let catalog = volume.extended_attributes(cx, record)?;
         let mut result = BTreeMap::new();
         for entry in catalog.entries {
             checkpoint(cx)?;
@@ -229,8 +284,33 @@ impl NtfsFs {
         ))
     }
 
+    pub(super) fn record_by_ref(
+        &self,
+        cx: &Cx,
+        vol: &NtfsVolume,
+        reference: NtfsReference,
+        retired_is_not_found: bool,
+    ) -> Result<NtfsFileRecord> {
+        if self.is_writable() && retired_is_not_found {
+            let rec = vol.record(cx, reference.record, None)?;
+            if rec.sequence != reference.sequence {
+                return Err(FfsError::NotFound(format!(
+                    "retired NTFS file reference {}:{}",
+                    reference.record, reference.sequence
+                )));
+            }
+            return Ok(rec);
+        }
+        vol.record(cx, reference.record, Some(reference.sequence))
+    }
+
     fn record(&self, cx: &Cx, ino: InodeNumber) -> Result<NtfsFileRecord> {
         checkpoint(cx)?;
+        if is_ads_ino(ino) {
+            return Err(FfsError::Format(
+                "NTFS alternate data stream inode has no standalone MFT record".into(),
+            ));
+        }
         let reference = if ino == ROOT {
             self.root
         } else {
@@ -249,8 +329,8 @@ impl NtfsFs {
             }
             reference
         };
-        self.volume
-            .record(cx, reference.record, Some(reference.sequence))
+        let volume = self.active_volume()?;
+        self.record_by_ref(cx, &volume, reference, true)
     }
 
     fn parent_reference(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<NtfsReference> {
@@ -260,7 +340,8 @@ impl NtfsFs {
         if reference(record) == self.root {
             return Ok(self.root);
         }
-        let catalog = self.volume.attributes(cx, record)?;
+        let volume = self.active_volume()?;
+        let catalog = volume.attributes(cx, record)?;
         let mut parent = None;
         for attr in catalog.all()? {
             checkpoint(cx)?;
@@ -289,6 +370,7 @@ impl NtfsFs {
 
     fn parent(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<InodeNumber> {
         let first = self.parent_reference(cx, record)?;
+        let volume = self.active_volume()?;
         let mut current = first;
         let mut seen = BTreeSet::from([u64::from(record.number)]);
         for _ in 0..256 {
@@ -299,9 +381,7 @@ impl NtfsFs {
             if !seen.insert(current.record) {
                 return Err(corrupt(0, "NTFS directory ancestry is cyclic"));
             }
-            let ancestor = self
-                .volume
-                .record(cx, current.record, Some(current.sequence))?;
+            let ancestor = volume.record(cx, current.record, Some(current.sequence))?;
             current = self.parent_reference(cx, &ancestor)?;
         }
         Err(unsupported("NTFS directory ancestry exceeds 256 levels"))
@@ -327,16 +407,24 @@ impl NtfsFs {
     }
 
     fn describe_uncached(&self, cx: &Cx, ino: InodeNumber) -> Result<InodeAttr> {
+        if is_ads_ino(ino) {
+            return self.describe_ads_uncached(cx, ino);
+        }
         let record = self.record(cx, ino)?;
-        let catalog = self.volume.attributes(cx, &record)?;
+        let volume = self.active_volume()?;
+        let catalog = volume.attributes(cx, &record)?;
         let all = catalog.all()?;
-        let nlink = super::namespace::host_link_count(cx, &all)?;
-        let reparse = self.volume.reparse_from_catalog(cx, &catalog)?;
-        let standard = catalog.select(&self.volume.geometry, 0x10, &[])?;
+        let nlink = if self.is_retained_file(ino)? {
+            0
+        } else {
+            super::namespace::host_link_count(cx, &all)?
+        };
+        let reparse = volume.reparse_from_catalog(cx, &catalog)?;
+        let standard = catalog.select(&volume.geometry, 0x10, &[])?;
         if !standard.resident() || !matches!(standard.size, 48 | 72) {
             return Err(corrupt(0, "invalid resident NTFS STANDARD_INFORMATION"));
         }
-        let times = self.volume.read(cx, &standard, 0, 72)?;
+        let times = volume.read(cx, &standard, 0, 72)?;
         let flags = u32::from_le_bytes(
             times[32..36]
                 .try_into()
@@ -352,7 +440,7 @@ impl NtfsFs {
             .as_ref()
             .is_some_and(|point| point.tag == super::wof::TAG)
         {
-            let stream = self.volume.data_from_catalog(cx, &record, &catalog, &[])?;
+            let stream = volume.data_from_catalog(cx, &record, &catalog, &[])?;
             (
                 FileType::RegularFile,
                 stream.size,
@@ -360,7 +448,7 @@ impl NtfsFs {
             )
         } else if let Some(point) = reparse {
             let target = relative_link_target(&point)?;
-            let allocation = catalog.select(&self.volume.geometry, super::REPARSE_POINT, &[])?;
+            let allocation = catalog.select(&volume.geometry, super::REPARSE_POINT, &[])?;
             (
                 FileType::Symlink,
                 target.len() as u64,
@@ -375,7 +463,7 @@ impl NtfsFs {
             // Directory logical size is a host projection; count only native
             // external index allocation, never manufacture file DATA bytes.
             let allocation = if all.iter().any(|attr| attr.kind == 0xA0 && attr.name == I30) {
-                Some(catalog.select(&self.volume.geometry, 0xA0, I30)?)
+                Some(catalog.select(&volume.geometry, 0xA0, I30)?)
             } else {
                 None
             };
@@ -385,7 +473,7 @@ impl NtfsFs {
                 allocation.map_or(0, |stream| stream.allocated.div_ceil(512)),
             )
         } else {
-            let stream = self.volume.data_from_catalog(cx, &record, &catalog, &[])?;
+            let stream = volume.data_from_catalog(cx, &record, &catalog, &[])?;
             let blocks = if stream.resident() {
                 0
             } else {
@@ -405,6 +493,31 @@ impl NtfsFs {
                     .map_err(|_| corrupt(0, "short NTFS timestamp"))?,
             ))
         };
+        let perm = if self.is_writable() {
+            match kind {
+                FileType::Directory => {
+                    if ino != ROOT && (flags & 0x01 != 0) {
+                        0o555
+                    } else {
+                        0o755
+                    }
+                }
+                FileType::Symlink => 0o777,
+                _ => {
+                    if flags & 0x01 != 0 {
+                        0o444
+                    } else {
+                        0o644
+                    }
+                }
+            }
+        } else {
+            match kind {
+                FileType::Directory => 0o555,
+                FileType::Symlink => 0o777,
+                _ => 0o444,
+            }
+        };
         checkpoint(cx)?;
         Ok(InodeAttr {
             ino,
@@ -415,16 +528,12 @@ impl NtfsFs {
             ctime: time(16)?,
             atime: time(24)?,
             kind,
-            perm: match kind {
-                FileType::Directory => 0o555,
-                FileType::Symlink => 0o777,
-                _ => 0o444,
-            },
+            perm,
             nlink,
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
-            blksize: self.volume.geometry.cluster_bytes(),
+            blksize: volume.geometry.cluster_bytes(),
             generation: u64::from(record.sequence),
         })
     }
@@ -466,7 +575,8 @@ impl NtfsFs {
     fn directory_uncached(&self, cx: &Cx, ino: InodeNumber) -> Result<DirectorySnapshot> {
         let record = self.record(cx, ino)?;
         let parent = self.parent(cx, &record)?;
-        let native = self.volume.list_directory(cx, &record)?;
+        let volume = self.active_volume()?;
+        let native = volume.list_directory(cx, &record)?;
         let mut entries = vec![
             DirEntry {
                 ino,
@@ -486,6 +596,11 @@ impl NtfsFs {
         let mut folded = BTreeMap::new();
         for entry in native {
             checkpoint(cx)?;
+            if ino == ROOT
+                && self.is_hidden_root_folded_name(&self.fold_units(&entry.filename.name))?
+            {
+                continue;
+            }
             let name = String::from_utf16(&entry.filename.name)
                 .map_err(|_| unsupported("NTFS name cannot be represented losslessly as UTF-8"))?;
             if name.len() > 255 {
@@ -518,11 +633,8 @@ impl NtfsFs {
                         "NTFS directory entry aliases itself or the mount root",
                     ));
                 }
-                let child = self.volume.record(
-                    cx,
-                    entry.reference.record,
-                    Some(entry.reference.sequence),
-                )?;
+                let child =
+                    volume.record(cx, entry.reference.record, Some(entry.reference.sequence))?;
                 if self.parent(cx, &child)? != ino {
                     return Err(corrupt(0, "NTFS directory parent differs from its listing"));
                 }
@@ -540,6 +652,10 @@ impl NtfsFs {
                 name: name.into_bytes(),
             });
         }
+        drop(volume);
+        if self.is_writable() {
+            self.assign_dir_cookies(ino, &mut entries)?;
+        }
         checkpoint(cx)?;
         Ok(DirectorySnapshot {
             rows: entries,
@@ -555,17 +671,22 @@ impl NtfsFs {
             checkpoint(cx)?;
             return Ok(hit);
         }
-        // A caller need not have issued LOOKUP first. Enforce metadata-side
-        // reparse/EFS admission on OPEN and READ as well as GETATTR.
-        let kind = self.describe(cx, ino)?.kind;
-        if kind == FileType::Symlink {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ELOOP)));
-        }
-        let record = self.record(cx, ino)?;
-        if record.is_directory() {
-            return Err(FfsError::IsDirectory);
-        }
-        let stream = Arc::new(self.volume.data_stream(cx, &record, &[])?);
+        let stream = if is_ads_ino(ino) {
+            Arc::new(self.ads_stream_uncached(cx, ino)?)
+        } else {
+            // A caller need not have issued LOOKUP first. Enforce metadata-side
+            // reparse/EFS admission on OPEN and READ as well as GETATTR.
+            let kind = self.describe(cx, ino)?.kind;
+            if kind == FileType::Symlink {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ELOOP)));
+            }
+            let record = self.record(cx, ino)?;
+            if record.is_directory() {
+                return Err(FfsError::IsDirectory);
+            }
+            let volume = self.active_volume()?;
+            Arc::new(volume.data_stream(cx, &record, &[])?)
+        };
         checkpoint(cx)?;
         let mut cache = self.cache()?;
         if let Some(existing) = cache.streams.get(&ino).cloned() {
@@ -583,6 +704,7 @@ impl NtfsFs {
     }
 
     fn count_free(&self, cx: &Cx, bitmap: &Stream, bits: u64) -> Result<u64> {
+        let volume = self.active_volume()?;
         let bytes = bits.div_ceil(8);
         if bitmap.initialized < bytes || bitmap.size < bytes {
             return Err(corrupt(
@@ -595,7 +717,7 @@ impl NtfsFs {
                 return Err(corrupt(0, "compressed NTFS allocation bitmap"));
             }
             super::Storage::Mapped(runs) => {
-                let clusters = bytes.div_ceil(u64::from(self.volume.geometry.cluster_bytes()));
+                let clusters = bytes.div_ceil(u64::from(volume.geometry.cluster_bytes()));
                 if runs
                     .iter()
                     .any(|run| run.vcn < clusters && run.lcn.is_none())
@@ -610,7 +732,7 @@ impl NtfsFs {
         while offset < bytes {
             checkpoint(cx)?;
             let length = (bytes - offset).min(65_536) as usize;
-            let data = self.volume.read(cx, bitmap, offset, length)?;
+            let data = volume.read(cx, bitmap, offset, length)?;
             if data.len() != length {
                 return Err(corrupt(0, "short NTFS allocation bitmap"));
             }
@@ -635,6 +757,7 @@ impl NtfsFs {
 
 impl FsOps for NtfsFs {
     fn getattr(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<InodeAttr> {
+        let _op = self.operation(cx, false)?;
         self.describe(cx, ino)
     }
 
@@ -645,6 +768,7 @@ impl FsOps for NtfsFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> Result<InodeAttr> {
+        let _op = self.operation(cx, false)?;
         if self.indexed_lookup {
             return self.lookup_indexed(cx, parent, name);
         }
@@ -664,27 +788,35 @@ impl FsOps for NtfsFs {
         if name.is_empty() || name.contains(['/', '\\', '\0']) {
             return Err(FfsError::Format("invalid NTFS path component".into()));
         }
-        if name.len() > 255 {
+        if name.len() > 255 && !name.contains(':') {
             return Err(FfsError::NameTooLong);
         }
         let units: Vec<u16> = name.encode_utf16().collect();
-        let target = if let Ok(index) = directory.exact.binary_search_by(|(key, _)| key.cmp(&units))
-        {
-            directory.exact[index].1
-        } else {
+        if units.len() <= 255 {
+            if let Ok(index) = directory.exact.binary_search_by(|(key, _)| key.cmp(&units)) {
+                return self.describe(cx, directory.exact[index].1);
+            }
             let folded: Vec<_> = units
                 .iter()
                 .map(|unit| self.upcase[usize::from(*unit)])
                 .collect();
-            let index = directory
+            if let Ok(index) = directory
                 .folded
                 .binary_search_by(|(key, _)| key.cmp(&folded))
-                .map_err(|_| FfsError::NotFound(format!("NTFS name {name}")))?;
-            directory.folded[index]
-                .1
-                .ok_or_else(|| corrupt(0, "ambiguous NTFS folded mount name"))?
-        };
-        self.describe(cx, target)
+            {
+                let target = directory.folded[index]
+                    .1
+                    .ok_or_else(|| corrupt(0, "ambiguous NTFS folded mount name"))?;
+                return self.describe(cx, target);
+            }
+        }
+        if let Some((base_utf16, stream_utf16)) = parse_ads_component(name)? {
+            return self.lookup_ads_component(cx, parent, &base_utf16, &stream_utf16);
+        }
+        if name.len() > 255 {
+            return Err(FfsError::NameTooLong);
+        }
+        Err(FfsError::NotFound(format!("NTFS name {name}")))
     }
 
     fn readdir(
@@ -694,12 +826,13 @@ impl FsOps for NtfsFs {
         ino: InodeNumber,
         offset: u64,
     ) -> Result<ReaddirPage> {
+        let _op = self.operation(cx, false)?;
         if self.describe(cx, ino)?.kind != FileType::Directory {
             return Err(FfsError::NotDirectory);
         }
         let snapshot = self.directory(cx, ino)?;
         let entries = &snapshot.rows;
-        let end = entries.len() as u64;
+        let end = entries.last().map_or(0, |e| e.offset);
         let start = entries.partition_point(|entry| entry.offset <= offset);
         let page = entries[start..entries.len().min(start + PAGE_ENTRIES)].to_vec();
         checkpoint(cx)?;
@@ -714,8 +847,10 @@ impl FsOps for NtfsFs {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
+        let _op = self.operation(cx, false)?;
         let stream = self.stream(cx, ino)?;
-        self.volume.read(cx, &stream, offset, size as usize)
+        let volume = self.active_volume()?;
+        volume.read(cx, &stream, offset, size as usize)
     }
 
     fn open(
@@ -725,31 +860,202 @@ impl FsOps for NtfsFs {
         ino: InodeNumber,
         flags: i32,
     ) -> Result<(u64, u32)> {
-        checkpoint(cx)?;
-        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_CREAT) != 0
-        {
-            return Err(FfsError::ReadOnly);
+        let mutation = self.is_writable() && (flags & libc::O_TRUNC != 0);
+        let op = self.operation(cx, mutation)?;
+        let res = self.open_locked(cx, ino, flags)?;
+        op.complete(res)
+    }
+
+    fn create(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<InodeAttr> {
+        let op = self.operation(cx, true)?;
+        let attr = self.create_locked(cx, parent, name, mode)?;
+        op.complete(attr)
+    }
+
+    fn mkdir(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<InodeAttr> {
+        let op = self.operation(cx, true)?;
+        let attr = self.mkdir_locked(cx, parent, name, mode)?;
+        op.complete(attr)
+    }
+
+    fn write(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32> {
+        let op = self.operation(cx, true)?;
+        let written = self.write_locked(cx, ino, offset, data)?;
+        op.complete(written)
+    }
+
+    fn setattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> Result<InodeAttr> {
+        let op = self.operation(cx, true)?;
+        let attr = self.setattr_locked(cx, ino, attrs)?;
+        op.complete(attr)
+    }
+
+    fn touch_atime(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        now: SystemTime,
+        strict: bool,
+    ) -> Result<bool> {
+        if !self.is_writable() {
+            let _op = self.operation(cx, false)?;
+            return Ok(false);
         }
-        self.stream(cx, ino)?;
-        Ok((0, 0))
+        let op = self.operation(cx, true)?;
+        let updated = self.touch_atime_locked(cx, ino, now, strict)?;
+        op.complete(updated)
+    }
+
+    fn unlink(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<()> {
+        let op = self.operation(cx, true)?;
+        self.unlink_locked(cx, parent, name)?;
+        op.complete(())
+    }
+
+    fn rmdir(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<()> {
+        let op = self.operation(cx, true)?;
+        self.rmdir_locked(cx, parent, name)?;
+        op.complete(())
+    }
+
+    fn link(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> Result<InodeAttr> {
+        let op = self.operation(cx, true)?;
+        let attr = self.link_locked(cx, ino, new_parent, new_name)?;
+        op.complete(attr)
+    }
+
+    fn rename(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> Result<()> {
+        let op = self.operation(cx, true)?;
+        self.rename_locked(cx, parent, name, new_parent, new_name, false)?;
+        op.complete(())
+    }
+
+    fn rename2(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> Result<()> {
+        let op = self.operation(cx, true)?;
+        if flags != 0 && flags != libc::RENAME_NOREPLACE {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        self.rename_locked(
+            cx,
+            parent,
+            name,
+            new_parent,
+            new_name,
+            flags == libc::RENAME_NOREPLACE,
+        )?;
+        op.complete(())
     }
 
     fn readlink(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<Vec<u8>> {
+        let _op = self.operation(cx, false)?;
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
         let record = self.record(cx, ino)?;
-        self.volume.readlink(cx, &record)
+        let volume = self.active_volume()?;
+        volume.readlink(cx, &record)
+    }
+
+    fn get_inode_flags(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<u32> {
+        let _op = self.operation(cx, false)?;
+        self.describe(cx, ino)?;
+        Ok(0)
     }
 
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> Result<Vec<String>> {
+        let _op = self.operation(cx, false)?;
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Ok(Vec::new());
+        }
         let record = self.record(cx, ino)?;
         Ok(self.user_eas(cx, &record)?.into_keys().collect())
     }
 
     fn getxattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> Result<Option<Vec<u8>>> {
-        let record = self.record(cx, ino)?;
+        let _op = self.operation(cx, false)?;
         if name.len() > MAX_EA_NAME_BYTES {
             return Err(FfsError::NameTooLong);
         }
         let Some(suffix) = name.strip_prefix("user.") else {
+            if is_ads_ino(ino) {
+                self.describe(cx, ino)?;
+            } else {
+                self.record(cx, ino)?;
+            }
             return Err(unsupported(
                 "only native NTFS user.* EAs are exposed as host xattrs",
             ));
@@ -757,25 +1063,54 @@ impl FsOps for NtfsFs {
         if suffix.is_empty() || suffix.as_bytes().contains(&0) {
             return Err(FfsError::Format("invalid user xattr name".into()));
         }
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Ok(None);
+        }
+        let record = self.record(cx, ino)?;
         let result = self.user_eas(cx, &record)?.remove(name);
         checkpoint(cx)?;
         Ok(result)
     }
 
+    fn removexattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        name: &str,
+    ) -> Result<bool> {
+        let _op = self.operation(cx, false)?;
+        self.ensure_writable()?;
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Ok(false);
+        }
+        let record = self.record(cx, ino)?;
+        if name.starts_with("user.") && self.user_eas(cx, &record)?.contains_key(name) {
+            return Err(unsupported(
+                "removing existing native NTFS user.* extended attributes is not supported",
+            ));
+        }
+        Ok(false)
+    }
+
     fn statfs(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<FsStat> {
+        let _op = self.operation(cx, false)?;
         self.describe(cx, ino)?;
         let hit = self.cache()?.statistics.clone();
         if let Some(hit) = hit {
             checkpoint(cx)?;
             return Ok(hit);
         }
-        let record = self.volume.record(cx, 6, None)?;
-        let bitmap = self.volume.select_stream(cx, &record, DATA, &[])?;
-        let blocks = self.volume.geometry.cluster_count();
+        let volume = self.active_volume()?;
+        let record = volume.record(cx, 6, None)?;
+        let bitmap = volume.select_stream(cx, &record, DATA, &[])?;
+        let blocks = volume.geometry.cluster_count();
         let free = self.count_free(cx, &bitmap, blocks)?;
-        let record = self.volume.record(cx, 0, None)?;
-        let bitmap = self.volume.select_stream(cx, &record, 0xB0, &[])?;
-        let files = self.volume.record_count();
+        let record = volume.record(cx, 0, None)?;
+        let bitmap = volume.select_stream(cx, &record, 0xB0, &[])?;
+        let files = volume.record_count();
         let files_free = self.count_free(cx, &bitmap, files)?;
         let statistics = FsStat {
             blocks,
@@ -783,14 +1118,57 @@ impl FsOps for NtfsFs {
             blocks_available: free,
             files,
             files_free,
-            block_size: self.volume.geometry.cluster_bytes(),
-            fragment_size: self.volume.geometry.cluster_bytes(),
+            block_size: volume.geometry.cluster_bytes(),
+            fragment_size: volume.geometry.cluster_bytes(),
             name_max: 255,
         };
+        drop(volume);
         checkpoint(cx)?;
         self.cache()?.statistics = Some(statistics.clone());
         checkpoint(cx)?;
         Ok(statistics)
+    }
+
+    fn flush(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        _ino: InodeNumber,
+        _fh: u64,
+        _lock_owner: u64,
+    ) -> Result<()> {
+        let _op = self.operation(cx, false)?;
+        checkpoint(cx)
+    }
+
+    fn install_open_handle_oracle(&self, oracle: OpenHandleOracle) {
+        self.install_lifetime_oracle(oracle);
+    }
+
+    fn release(&self, cx: &Cx, _scope: &mut RequestScope, request: ReleaseRequest) -> Result<()> {
+        if !self.is_writable() {
+            let _op = self.operation(cx, false)?;
+            return checkpoint(cx);
+        }
+        let op = self.operation(cx, true)?;
+        self.release_open(request.ino, request.fh)?;
+        self.reap_retained_inode_locked(cx, request.ino, false)?;
+        op.complete(())
+    }
+
+    fn finalize_unlinked_inode(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> Result<bool> {
+        if !self.is_writable() {
+            let _op = self.operation(cx, false)?;
+            return Ok(false);
+        }
+        let op = self.operation(cx, true)?;
+        let reclaimed = self.reap_retained_inode_locked(cx, ino, false)?;
+        op.complete(reclaimed)
     }
 
     fn fsync(
@@ -801,8 +1179,31 @@ impl FsOps for NtfsFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        self.record(cx, ino)?;
-        checkpoint(cx)
+        if !self.is_writable() {
+            let _op = self.operation(cx, false)?;
+            self.record(cx, ino)?;
+            return checkpoint(cx);
+        }
+        let op = self.operation(cx, true)?;
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+        } else {
+            self.record(cx, ino)?;
+        }
+        self.sync_device_locked(cx)?;
+        checkpoint(cx)?;
+        op.complete(())
+    }
+
+    fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> Result<()> {
+        if !self.is_writable() {
+            let _op = self.operation(cx, false)?;
+            return checkpoint(cx);
+        }
+        let op = self.operation(cx, true)?;
+        self.sync_device_locked(cx)?;
+        checkpoint(cx)?;
+        op.complete(())
     }
 
     fn fsyncdir(
@@ -813,10 +1214,32 @@ impl FsOps for NtfsFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
+        if !self.is_writable() {
+            let _op = self.operation(cx, false)?;
+            if self.describe(cx, ino)?.kind != FileType::Directory {
+                return Err(FfsError::NotDirectory);
+            }
+            return checkpoint(cx);
+        }
+        let op = self.operation(cx, true)?;
         if self.describe(cx, ino)?.kind != FileType::Directory {
             return Err(FfsError::NotDirectory);
         }
-        checkpoint(cx)
+        self.sync_device_locked(cx)?;
+        checkpoint(cx)?;
+        op.complete(())
+    }
+
+    fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
+        if !self.is_writable() {
+            let _op = self.operation(cx, false)?;
+            return checkpoint(cx);
+        }
+        let op = self.operation(cx, true)?;
+        self.reap_all_retained_locked(cx)?;
+        self.sync_device_locked(cx)?;
+        checkpoint(cx)?;
+        op.complete(())
     }
 
     fn fiemap(
@@ -827,19 +1250,15 @@ impl FsOps for NtfsFs {
         start: u64,
         length: u64,
     ) -> Result<Vec<ffs_core::FiemapExtent>> {
+        let _op = self.operation(cx, false)?;
         if self.describe(cx, ino)?.kind != FileType::RegularFile {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,
             )));
         }
         let stream = self.stream(cx, ino)?;
-        extents::fiemap(
-            cx,
-            &stream,
-            self.volume.geometry.cluster_bytes(),
-            start,
-            length,
-        )
+        let volume = self.active_volume()?;
+        extents::fiemap(cx, &stream, volume.geometry.cluster_bytes(), start, length)
     }
 
     fn lseek(
@@ -850,14 +1269,10 @@ impl FsOps for NtfsFs {
         offset: u64,
         whence: SeekWhence,
     ) -> Result<u64> {
+        let _op = self.operation(cx, false)?;
         let stream = self.stream(cx, ino)?;
-        extents::seek(
-            cx,
-            &stream,
-            self.volume.geometry.cluster_bytes(),
-            offset,
-            whence,
-        )
+        let volume = self.active_volume()?;
+        extents::seek(cx, &stream, volume.geometry.cluster_bytes(), offset, whence)
     }
 }
 
