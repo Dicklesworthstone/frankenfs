@@ -1319,7 +1319,7 @@ fn rename_and_unlink_refuse_coupled_native_aliases_without_mutating_either_name(
         assert_eq!(device.write_bytes_total(), 0);
         assert_eq!(device.snapshot_live(), before);
         assert_eq!(device.snapshot_durable_only(), before);
-        assert!(engine.persistence_trace().is_empty());
+        assert_eq!(engine.persistence_trace(), []);
     }
     let tree = read_all_files_from_clean_volume(&device.snapshot_live());
     assert_eq!(tree.get("/NativeLongName.txt"), tree.get("/NATIVE~1.TXT"));
@@ -1568,7 +1568,7 @@ fn unlink_directory_refuses_incomplete_or_provider_metadata_before_writes() {
         ));
         assert_eq!(device.snapshot_live(), before);
         assert_eq!(device.write_bytes_total(), writes);
-        assert!(engine.persistence_trace().is_empty());
+        assert_eq!(engine.persistence_trace(), []);
     }
 }
 
@@ -1735,8 +1735,9 @@ fn positioned_writes_and_truncation_preserve_bytes_and_native_consistency() {
         .truncate_file(&cx, "/range.bin", 0)
         .into_result()
         .unwrap();
-    assert!(
-        read_all_files_from_clean_volume(&dev.snapshot_durable_only())["/range.bin"].is_empty()
+    assert_eq!(
+        read_all_files_from_clean_volume(&dev.snapshot_durable_only())["/range.bin"].as_slice(),
+        b""
     );
     engine.check_clean_consistency(&cx).unwrap();
     let reopened = NtfsTransactionEngine::from_device(
