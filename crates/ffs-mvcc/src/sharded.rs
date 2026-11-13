@@ -14,9 +14,10 @@ use crate::{
     ConflictPolicy, ContentionMetrics, ContentionSampleDetail, EbrVersionReclaimer,
     EbrVersionStats, EvidenceRecord, MergeAppliedDetail, MergeProof, MergeProofCheckedDetail,
     MergeRejectedDetail, MvccEvidenceSink, PolicySwitchedDetail, SerializationConflictDetail,
-    Transaction, TransactionCommitDetail, TransactionOutcomeStats, TxnAbortReason,
-    TxnAbortedDetail, detect_ssi_dangerous_structure, merge_proof_variant_name,
-    resolve_version_bytes_cow_at_or_before, saturating_increment_atomic, validate_transaction_id,
+    SsiRwEdge, Transaction, TransactionCommitDetail, TransactionOutcomeStats, TxnAbortReason,
+    TxnAbortedDetail, detect_ssi_dangerous_structure, earliest_ssi_outgoing,
+    merge_proof_variant_name, resolve_version_bytes_cow_at_or_before, saturating_increment_atomic,
+    validate_transaction_id,
 };
 use asupersync::Cx;
 use ffs_block::BlockDevice;
@@ -1609,7 +1610,7 @@ impl ShardedMvccStore {
         &self,
         txn: &Transaction,
         shard_guards: &[(usize, ShardWriteGuard<'_>)],
-    ) -> Result<(), CommitError> {
+    ) -> Result<Option<SsiRwEdge>, CommitError> {
         for block in txn.read_set().keys().chain(txn.write_set().keys()) {
             let shard_idx = self.shard_index(*block);
             if shard_guards
@@ -1641,7 +1642,7 @@ impl ShardedMvccStore {
             return Err(dangerous_structure.to_commit_error());
         }
 
-        Ok(())
+        Ok(earliest_ssi_outgoing(txn, records.values()))
     }
 
     fn append_ssi_record_locked(
@@ -2269,7 +2270,10 @@ impl ShardedMvccStore {
             return Err((error, txn));
         }
 
-        if txn.write_set().is_empty() {
+        // A tracked read-only transaction still participates in SSI. Its
+        // reads must be validated and retained for a pivot that commits later.
+        // Only a transaction with no reads or writes can bypass the history.
+        if txn.write_set().is_empty() && txn.read_set().is_empty() {
             let commit_seq = self.current_snapshot().high;
             self.emit_transaction_commit(txn_id, commit_seq, 0, started);
             return Ok(commit_seq);
@@ -2291,11 +2295,14 @@ impl ShardedMvccStore {
             return Err((error, txn));
         }
 
-        if let Err(error) = self.validate_ssi_read_set_locked(&txn, &shard_guards) {
-            drop(shard_guards);
-            self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
-            return Err((error, txn));
-        }
+        let outgoing_rw = match self.validate_ssi_read_set_locked(&txn, &shard_guards) {
+            Ok(outgoing) => outgoing,
+            Err(error) => {
+                drop(shard_guards);
+                self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
+                return Err((error, txn));
+            }
+        };
 
         let commit_seq = match self.next_commit_seq() {
             Ok(seq) => seq,
@@ -2345,6 +2352,7 @@ impl ShardedMvccStore {
             snapshot: install_ctx.snapshot,
             write_set: write_keys,
             read_set,
+            outgoing_rw,
         };
         Self::append_ssi_record_locked(&mut shard_guards, &ssi_record);
 
@@ -3602,6 +3610,110 @@ mod tests {
             matches!(result, Err((CommitError::SsiConflict { .. }, _))),
             "SSI should reject T2"
         );
+    }
+
+    #[test]
+    fn ssi_rejects_cycle_through_committed_pivot() {
+        for shards in [1, 4] {
+            for read_only in [false, true] {
+                for prune_history in [false, true] {
+                    let store = make_store(shards);
+                    let x = BlockNumber(10);
+                    let y = BlockNumber(20);
+                    let z = BlockNumber(30);
+                    let mut seed = store.begin();
+                    for block in [x, y, z] {
+                        seed.stage_write(block, vec![0]);
+                    }
+                    let initial = store.commit_ssi(seed).expect("seed");
+
+                    let mut pivot = store.begin();
+                    pivot.record_read(x, initial);
+                    pivot.stage_write(y, vec![1]);
+                    let mut outgoing = store.begin();
+                    outgoing.stage_write(x, vec![1]);
+                    let outgoing_seq = store.commit_ssi(outgoing).expect("outgoing");
+
+                    let mut incoming = store.begin();
+                    incoming.record_read(x, outgoing_seq);
+                    incoming.record_read(y, initial);
+                    if !read_only {
+                        incoming.stage_write(z, vec![1]);
+                    }
+                    let incoming_id = incoming.id();
+                    let incoming_snapshot = incoming.snapshot();
+                    assert_eq!(store.read_visible(x, incoming_snapshot).unwrap(), vec![1]);
+                    assert_eq!(store.read_visible(y, incoming_snapshot).unwrap(), vec![0]);
+                    store.commit_ssi(pivot).expect("pivot");
+                    if prune_history {
+                        store.prune_versions_older_than(incoming_snapshot.high);
+                    }
+
+                    let before = store.current_snapshot();
+                    let versions_before = store.version_count();
+                    let (error, rejected) = store
+                        .commit_ssi(incoming)
+                        .expect_err("I -> P -> O -> I must not commit");
+                    assert!(matches!(error, CommitError::SsiConflict { .. }));
+                    assert_eq!(rejected.id(), incoming_id);
+                    assert_eq!(rejected.pending_writes(), usize::from(!read_only));
+                    assert_eq!(store.current_snapshot(), before);
+                    assert_eq!(store.version_count(), versions_before);
+                    assert_eq!(store.read_visible(z, before).unwrap(), vec![0]);
+                    assert_eq!(store.read_visible(x, before).unwrap(), vec![1]);
+                    assert_eq!(store.read_visible(y, before).unwrap(), vec![1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ssi_read_only_history_participates_in_pivot_validation() {
+        for reader_started_early in [false, true] {
+            for reader_commits_first in [false, true] {
+                let store = make_store(4);
+                let x = BlockNumber(10);
+                let y = BlockNumber(20);
+                let mut seed = store.begin();
+                seed.stage_write(x, vec![0]);
+                seed.stage_write(y, vec![0]);
+                let initial = store.commit_ssi(seed).expect("seed");
+
+                let mut pivot = store.begin();
+                pivot.record_read(x, initial);
+                pivot.stage_write(y, vec![1]);
+                let early_reader = reader_started_early.then(|| store.begin());
+                let mut outgoing = store.begin();
+                outgoing.stage_write(x, vec![1]);
+                let outgoing_seq = store.commit_ssi(outgoing).expect("outgoing");
+                let mut reader = early_reader.unwrap_or_else(|| store.begin());
+                reader.record_read(
+                    x,
+                    if reader_started_early {
+                        initial
+                    } else {
+                        outgoing_seq
+                    },
+                );
+                reader.record_read(y, initial);
+
+                // A reader that sees x=1,y=0 closes the cycle through P and
+                // O, whichever of reader/P commits last. An earlier reader
+                // seeing x=0,y=0 is serializable before both writers.
+                let result = if reader_commits_first {
+                    store.commit_ssi(reader).expect("first reader");
+                    store.commit_ssi(pivot)
+                } else {
+                    store.commit_ssi(pivot).expect("first pivot");
+                    store.commit_ssi(reader)
+                };
+                if reader_started_early {
+                    result.expect("safe read-only snapshot must not abort");
+                } else {
+                    assert!(matches!(result, Err((CommitError::SsiConflict { .. }, _))));
+                }
+            }
+        }
     }
 
     #[test]

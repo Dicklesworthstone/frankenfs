@@ -1357,6 +1357,68 @@ mod tests {
     }
 
     #[test]
+    fn ssi_committed_pivot_rejection_never_reaches_wal() {
+        for read_only in [false, true] {
+            let cx = test_cx();
+            let tmp = NamedTempFile::new().expect("create temp file");
+            let path = tmp.path().to_path_buf();
+            let store = PersistentMvccStore::open(&cx, &path).expect("open");
+            let x = BlockNumber(10);
+            let y = BlockNumber(20);
+            let z = BlockNumber(30);
+            let mut seed = store.begin();
+            for block in [x, y, z] {
+                seed.stage_write(block, vec![0]);
+            }
+            let initial = store.commit_ssi(seed).expect("seed");
+
+            let mut pivot = store.begin();
+            pivot.record_read(x, initial);
+            pivot.stage_write(y, vec![1]);
+            let mut outgoing = store.begin();
+            outgoing.stage_write(x, vec![1]);
+            let outgoing_seq = store.commit_ssi(outgoing).expect("outgoing");
+            let mut incoming = store.begin();
+            incoming.record_read(x, outgoing_seq);
+            incoming.record_read(y, initial);
+            if !read_only {
+                incoming.stage_write(z, vec![1]);
+            }
+            store.commit_ssi(pivot).expect("pivot");
+
+            let before = store.current_snapshot();
+            let stats_before = store.wal_stats();
+            let bytes_before = std::fs::read(&path).expect("read durable WAL");
+            let error = store
+                .commit_ssi(incoming)
+                .expect_err("serialization cycle must be rejected before WAL append");
+            assert!(matches!(error, CommitError::SsiConflict { .. }));
+            assert_eq!(store.current_snapshot(), before);
+            assert_eq!(
+                store.wal_stats().commits_written,
+                stats_before.commits_written
+            );
+            assert_eq!(
+                store.wal_stats().wal_size_bytes,
+                stats_before.wal_size_bytes
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read unchanged WAL"),
+                bytes_before
+            );
+            assert_eq!(store.read_visible(z, before).unwrap(), vec![0]);
+            drop(store);
+
+            let reopened = PersistentMvccStore::open(&cx, &path).expect("reopen");
+            let snapshot = reopened.current_snapshot();
+            assert_eq!(snapshot, before);
+            assert_eq!(reopened.read_visible(x, snapshot).unwrap(), vec![1]);
+            assert_eq!(reopened.read_visible(y, snapshot).unwrap(), vec![1]);
+            assert_eq!(reopened.read_visible(z, snapshot).unwrap(), vec![0]);
+        }
+    }
+
+    #[test]
     fn wal_append_failure_rolls_back_commit_state() {
         let cx = test_cx();
         let tmp = NamedTempFile::new().expect("create temp file");

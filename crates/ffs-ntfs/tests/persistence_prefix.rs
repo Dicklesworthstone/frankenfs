@@ -14,7 +14,7 @@ use ffs_ntfs::reader::allocation::{AllocationLimits, NamespaceLimits, RecordOwne
 use ffs_ntfs::transaction::{
     NtfsPersistenceStage, NtfsTransactionEngine, NtfsTxOutcome, NtfsWriteOptions,
 };
-use ffs_ondisk::ntfs::index::NtfsFileName;
+use ffs_ondisk::ntfs::index::{NtfsFileName, encode_index_entry};
 use ffs_ondisk::ntfs::logfile_writer::{
     LFS_RECORD_CLIENT, NtfsClientUpdateSpec, NtfsLogRingWriter, NtfsRestartConfig,
     encode_client_update_payload,
@@ -739,6 +739,308 @@ fn clean_admission_and_end_to_end_lifecycle_passes_all_four_checkers() {
     );
     assert!(!tree.contains_key("/docs/blob.bin"));
     assert!(!tree.contains_key("/docs/readme.txt"));
+}
+
+#[test]
+fn directory_rename_rejects_case_folded_ancestry_without_writes() {
+    let cx = Cx::for_testing();
+    let img = build_clean_ntfs_image(512, 64, 0x9988_7766_5544_3311);
+    let vol_len = img.len() as u64 - SECTOR_BYTES as u64;
+    let dev = FaultInjectingNtfsDevice::new(img);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .expect("open clean NTFS");
+    engine.mkdir(&cx, "/", "Parent").into_result().unwrap();
+    engine.mkdir(&cx, "/Parent", "Child").into_result().unwrap();
+    engine
+        .mkdir(&cx, "/Parent/Child", "Grandchild")
+        .into_result()
+        .unwrap();
+    engine
+        .create_file(&cx, "/Parent/Child/Grandchild", "keep.txt", b"preserved")
+        .into_result()
+        .unwrap();
+
+    let before_live = dev.snapshot_live();
+    let before_durable = dev.snapshot_durable_only();
+    let before_writes = dev.write_bytes_total();
+    for destination in [
+        "/parent/moved",
+        "/PARENT/Child/moved",
+        "/parent/child/GRANDCHILD/moved",
+    ] {
+        let outcome = engine.rename_entry(&cx, "/Parent", destination, None);
+        assert!(
+            matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::Format(_))),
+            "directory move into an alias of its own subtree: {destination}: {outcome:?}"
+        );
+        assert_eq!(dev.write_bytes_total(), before_writes);
+        assert_eq!(dev.snapshot_live(), before_live);
+        assert_eq!(dev.snapshot_durable_only(), before_durable);
+    }
+    engine.check_clean_consistency(&cx).unwrap();
+
+    // A distinct directory sharing the same string prefix is not an ancestor.
+    engine
+        .mkdir(&cx, "/", "ParentSibling")
+        .into_result()
+        .unwrap();
+    engine
+        .rename_entry(&cx, "/Parent", "/parentsibling/Moved", None)
+        .into_result()
+        .unwrap();
+    engine.check_clean_consistency(&cx).unwrap();
+    let tree = read_all_files_from_clean_volume(&dev.snapshot_durable_only());
+    assert_eq!(
+        tree.get("/ParentSibling/Moved/Child/Grandchild/keep.txt")
+            .map(Vec::as_slice),
+        Some(b"preserved".as_slice())
+    );
+    assert!(!tree.contains_key("/Parent/"));
+}
+
+#[test]
+fn directory_rename_rejects_invalid_native_ancestry_without_writes() {
+    let cx = Cx::for_testing();
+    for corruption in ["stale", "cycle", "nondirectory"] {
+        let img = build_clean_ntfs_image(512, 64, 0x9988_7766_5544_3312);
+        let vol_len = img.len() as u64 - SECTOR_BYTES as u64;
+        let dev = FaultInjectingNtfsDevice::new(img);
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&dev) as Arc<dyn ByteDevice>,
+            0,
+            vol_len,
+            write_options_clean(),
+        )
+        .expect("open clean NTFS");
+        engine.mkdir(&cx, "/", "Source").into_result().unwrap();
+        let (target, _) = engine.mkdir(&cx, "/", "Target").into_result().unwrap();
+        let (file, _) = engine
+            .create_file(&cx, "/", "keep.txt", b"preserved")
+            .into_result()
+            .unwrap();
+        let invalid_parent = match corruption {
+            "stale" => NtfsReference {
+                record: 5,
+                sequence: 2,
+            },
+            "cycle" => target,
+            "nondirectory" => file,
+            _ => unreachable!(),
+        };
+
+        // Inject a native parent-reference fault after clean admission, leaving
+        // the root's index and record sequence valid so path lookup succeeds.
+        let at = CLUSTER_BYTES + usize::try_from(target.record).unwrap() * RECORD_BYTES;
+        let image = dev.snapshot_live();
+        let mut restored = restore_record(&image[at..at + RECORD_BYTES], b"FILE").unwrap();
+        let mut attribute = usize::from(u16::from_le_bytes([restored[20], restored[21]]));
+        loop {
+            let kind = u32::from_le_bytes(restored[attribute..attribute + 4].try_into().unwrap());
+            assert_ne!(kind, u32::MAX, "Target must have a FILE_NAME attribute");
+            if kind == 0x30 {
+                let value = attribute
+                    + usize::from(u16::from_le_bytes([
+                        restored[attribute + 20],
+                        restored[attribute + 21],
+                    ]));
+                restored[value..value + 8]
+                    .copy_from_slice(&invalid_parent.encode().unwrap().to_le_bytes());
+                break;
+            }
+            attribute +=
+                u32::from_le_bytes(restored[attribute + 4..attribute + 8].try_into().unwrap())
+                    as usize;
+        }
+        let raw = protect_record_bytes(restored, 0x3456);
+        {
+            let mut state = dev.state.lock().unwrap();
+            state.live[at..at + RECORD_BYTES].copy_from_slice(&raw);
+            state.durable[at..at + RECORD_BYTES].copy_from_slice(&raw);
+        }
+
+        let before_live = dev.snapshot_live();
+        let before_durable = dev.snapshot_durable_only();
+        let before_writes = dev.write_bytes_total();
+        let outcome = engine.rename_entry(&cx, "/Source", "/Target/Moved", None);
+        assert!(
+            matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+            ),
+            "invalid {corruption} directory ancestry must refuse: {outcome:?}"
+        );
+        assert_eq!(dev.write_bytes_total(), before_writes);
+        assert_eq!(dev.snapshot_live(), before_live);
+        assert_eq!(dev.snapshot_durable_only(), before_durable);
+    }
+}
+
+#[test]
+fn multiname_rename_preserves_native_links_without_writes() {
+    fn word16(bytes: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
+    }
+
+    fn word32(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn raw_attributes(restored: &[u8]) -> Vec<Vec<u8>> {
+        let mut at = usize::from(word16(restored, 20));
+        let mut result = Vec::new();
+        while word32(restored, at) != u32::MAX {
+            let len = word32(restored, at + 4) as usize;
+            result.push(restored[at..at + len].to_vec());
+            at += len;
+        }
+        result
+    }
+
+    let cx = Cx::for_testing();
+    for (namespace, second_name) in [(1, "second.txt"), (2, "SECOND~1.TXT")] {
+        let image = build_clean_ntfs_image(512, 64, 0x9988_7766_5544_3313);
+        let vol_len = image.len() as u64 - SECTOR_BYTES as u64;
+        let dev = FaultInjectingNtfsDevice::new(image);
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&dev) as Arc<dyn ByteDevice>,
+            0,
+            vol_len,
+            write_options_clean(),
+        )
+        .expect("open clean NTFS");
+        let (file, _) = engine
+            .create_file(&cx, "/", "first.txt", b"shared native bytes")
+            .into_result()
+            .unwrap();
+        let mut image = dev.snapshot_durable_only();
+        drop(engine);
+
+        let root_at = CLUSTER_BYTES + 5 * RECORD_BYTES;
+        let root_record = NtfsFileRecord::parse(&image[root_at..root_at + RECORD_BYTES]).unwrap();
+        let root_restored =
+            restore_record(&image[root_at..root_at + RECORD_BYTES], b"FILE").unwrap();
+        let file_at = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * RECORD_BYTES;
+        let file_restored =
+            restore_record(&image[file_at..file_at + RECORD_BYTES], b"FILE").unwrap();
+        let mut file_attrs = raw_attributes(&file_restored);
+        let original_name = file_attrs
+            .iter()
+            .find(|attr| word32(attr, 0) == 0x30)
+            .unwrap();
+        let name_offset = usize::from(word16(original_name, 20));
+        let name_length = word32(original_name, 16) as usize;
+        let original_value = &original_name[name_offset..name_offset + name_length];
+        let mut second_value = NtfsFileName {
+            parent: NtfsReference {
+                record: 5,
+                sequence: root_record.sequence,
+            },
+            namespace,
+            name: second_name.encode_utf16().collect(),
+        }
+        .encode(0, 0, 0, 0, 0, 0, 0, 0)
+        .unwrap();
+        second_value[8..64].copy_from_slice(&original_value[8..64]);
+        let next_id = file_attrs
+            .iter()
+            .map(|attr| word16(attr, 14))
+            .max()
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        file_attrs.push(build_resident_attr(0x30, next_id, &[], true, &second_value));
+        file_attrs.sort_by_key(|attr| word32(attr, 0));
+        let file_raw = build_file_record(
+            u32::try_from(file.record).unwrap(),
+            file.sequence,
+            2,
+            false,
+            &file_attrs,
+        );
+        image[file_at..file_at + RECORD_BYTES].copy_from_slice(&file_raw);
+
+        let mut root_attrs = raw_attributes(&root_restored);
+        let index_position = root_attrs
+            .iter()
+            .position(|attr| word32(attr, 0) == 0x90)
+            .unwrap();
+        let index_attr = &root_attrs[index_position];
+        let index_offset = usize::from(word16(index_attr, 20));
+        let index_length = word32(index_attr, 16) as usize;
+        let old_index = &index_attr[index_offset..index_offset + index_length];
+        let old_used = word32(old_index, 20) as usize;
+        let mut index = build_empty_i30_root();
+        let terminal = index.split_off(32);
+        // FIRST.TXT precedes both SECOND names in the native UpCase ordering.
+        index.extend_from_slice(&old_index[32..old_used]);
+        index.extend_from_slice(&encode_index_entry(file, &second_value, None).unwrap());
+        index.extend_from_slice(&terminal);
+        let used = u32::try_from(index.len() - 16).unwrap();
+        index[20..24].copy_from_slice(&used.to_le_bytes());
+        index[24..28].copy_from_slice(&used.to_le_bytes());
+        root_attrs[index_position] = build_resident_attr(
+            0x90,
+            word16(index_attr, 14),
+            &[36, 73, 51, 48],
+            index_attr[22] != 0,
+            &index,
+        );
+        let root_raw = build_file_record(
+            5,
+            root_record.sequence,
+            root_record.hard_links,
+            true,
+            &root_attrs,
+        );
+        image[root_at..root_at + RECORD_BYTES].copy_from_slice(&root_raw);
+
+        // Both the ordinary hard link and DOS-alias fixture pass all four
+        // consistency checkers and retain native read access through both names.
+        let tree = read_all_files_from_clean_volume(&image);
+        assert_eq!(
+            tree.get("/first.txt").map(Vec::as_slice),
+            Some(b"shared native bytes".as_slice())
+        );
+        assert_eq!(
+            tree.get(&format!("/{second_name}")).map(Vec::as_slice),
+            Some(b"shared native bytes".as_slice())
+        );
+        let dev = FaultInjectingNtfsDevice::new(image.clone());
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&dev) as Arc<dyn ByteDevice>,
+            0,
+            vol_len,
+            write_options_clean(),
+        )
+        .expect("multi-name image passes native clean admission");
+        let before_writes = dev.write_bytes_total();
+        let outcome = engine.rename_entry(
+            &cx,
+            &format!("/{}", second_name.to_ascii_lowercase()),
+            "/renamed.txt",
+            Some(file),
+        );
+        assert!(
+            matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+            ),
+            "multi-name rename must not update the first FILE_NAME: {outcome:?}"
+        );
+        assert_eq!(dev.write_bytes_total(), before_writes);
+        assert_eq!(dev.snapshot_live(), image);
+        assert_eq!(dev.snapshot_durable_only(), image);
+        engine.check_clean_consistency(&cx).unwrap();
+    }
 }
 
 #[test]

@@ -16,27 +16,33 @@ env:
   CFLAGS: "-g0 -O2"
 
 jobs:
-  baseline-regression:
+  required-gates:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Prove pre-fix committed-pivot regression
+      - name: Source identity
         run: |
-          set +e
-          cargo test --locked -p ffs-mvcc --lib tests::ssi_rejects_cycle_through_committed_pivot -- --exact > ssi-before.log 2>&1
-          status=$?
-          set -e
-          cat ssi-before.log
-          test "$status" -eq 101
-          grep -Fx 'running 1 test' ssi-before.log
-          grep -Fx 'test tests::ssi_rejects_cycle_through_committed_pivot ... FAILED' ssi-before.log
-          grep -F 'test result: FAILED. 0 passed; 1 failed;' ssi-before.log
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ssi-baseline-regression
-          path: ssi-before.log
+          git rev-parse HEAD
+          rustc -Vv
+          git diff --check
+      - name: Workspace formatting
+        run: cargo fmt --check
+      - name: Workspace compiler check
+        if: ${{ !cancelled() }}
+        run: cargo check --locked --workspace --all-targets
+      - name: Workspace clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Complete MVCC tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-mvcc
+      - name: Complete NTFS tests and persistence cuts
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-ntfs
+      - name: NTFS CLI consumer tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --bin ffs-ntfs

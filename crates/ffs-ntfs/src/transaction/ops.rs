@@ -3,7 +3,7 @@
 //! `$Bitmap` & `$MFT::$BITMAP` reservation, `$MFTMirr` sync, and `NtfsTxOutcome`
 //! classification (`Committed`, `NotCommitted`, `Uncertain`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -1797,6 +1797,61 @@ impl NtfsTransactionEngine {
         }
     }
 
+    /// Resolve native parent identities rather than comparing path spellings:
+    /// `$UpCase` and DOS aliases can name the same directory with unrelated text.
+    fn check_rename_destination_ancestry(
+        &self,
+        cx: &Cx,
+        mft_runs: &[NtfsRun],
+        source: NtfsReference,
+        destination_parent: NtfsReference,
+    ) -> Result<()> {
+        const MAX_ANCESTORS: usize = 1024;
+        let mut ancestor = destination_parent;
+        let mut seen = BTreeSet::new();
+        for _ in 0..MAX_ANCESTORS {
+            checkpoint(cx)?;
+            if ancestor == source {
+                return Err(FfsError::Format(
+                    "cannot rename NTFS directory into its own subtree".into(),
+                ));
+            }
+            if ancestor.sequence == 0 || !seen.insert((ancestor.record, ancestor.sequence)) {
+                return Err(corrupt(0, "invalid or cyclic NTFS directory ancestry"));
+            }
+            let record_no = u32::try_from(ancestor.record)
+                .map_err(|_| corrupt(0, "ancestor MFT record number overflow"))?;
+            let record =
+                read_mft_record_via_runs(&self.device, cx, &self.geometry, mft_runs, record_no)?;
+            if record.sequence != ancestor.sequence || !record.is_directory() {
+                return Err(corrupt(0, "stale or nondirectory NTFS ancestor reference"));
+            }
+            if record_no == 5 {
+                return Ok(());
+            }
+
+            let mut parent = None;
+            for attr in record.attributes().map_err(|err| parse_err(&err))? {
+                if attr.kind != ATTR_FILE_NAME {
+                    continue;
+                }
+                let NtfsValue::Resident(value) = attr.value else {
+                    return Err(corrupt(0, "nonresident ancestor FILE_NAME attribute"));
+                };
+                let candidate = NtfsFileName::parse(value)
+                    .map_err(|err| parse_err(&err))?
+                    .parent;
+                if parent.is_some_and(|existing| existing != candidate) {
+                    return Err(corrupt(0, "ambiguous NTFS directory parent references"));
+                }
+                parent = Some(candidate);
+            }
+            ancestor =
+                parent.ok_or_else(|| corrupt(0, "NTFS ancestor lacks a parent reference"))?;
+        }
+        Err(unsupported("NTFS directory ancestry exceeds 1024 records"))
+    }
+
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn plan_rename_entry(
         &self,
@@ -1817,6 +1872,11 @@ impl NtfsTransactionEngine {
         if src_no < 24 {
             return Err(FfsError::PermissionDenied);
         }
+        if src_rec.hard_links > 1 {
+            return Err(unsupported(
+                "multi-name NTFS rename requires coordinated FILE_NAME and alias updates",
+            ));
+        }
         let src_ref = NtfsReference {
             record: u64::from(src_no),
             sequence: src_rec.sequence,
@@ -1827,19 +1887,19 @@ impl NtfsTransactionEngine {
             return Err(corrupt(0, "rename_entry expected_source_ref mismatch"));
         }
 
-        // Refuse moving a directory into itself or its own descendant!
-        if src_rec.is_directory() {
-            let norm_src = format!("/{}/", src_path.trim_matches('/'));
-            let norm_dst = format!("/{}/", dst_path.trim_matches('/'));
-            if norm_dst.starts_with(&norm_src) {
-                return Err(FfsError::Format(
-                    "cannot rename NTFS directory into its own subtree".into(),
-                ));
-            }
-        }
-
         let (src_dir_no, src_dir_rec) = self.resolve_path_raw(cx, &mft_runs, &src_parent_path)?;
         let (dst_dir_no, dst_dir_rec) = self.resolve_path_raw(cx, &mft_runs, &dst_parent_path)?;
+        if src_rec.is_directory() {
+            self.check_rename_destination_ancestry(
+                cx,
+                &mft_runs,
+                src_ref,
+                NtfsReference {
+                    record: u64::from(dst_dir_no),
+                    sequence: dst_dir_rec.sequence,
+                },
+            )?;
+        }
         if self
             .lookup_in_directory_raw(cx, &mft_runs, &dst_dir_rec, &self.fold_upcase(&dst_leaf))?
             .is_some()
