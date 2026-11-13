@@ -742,6 +742,495 @@ fn clean_admission_and_end_to_end_lifecycle_passes_all_four_checkers() {
 }
 
 #[test]
+fn rename_rejects_case_folded_directory_ancestry_without_writes() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0x7A11_C1C1_E000_0001);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (docs, _) = engine.mkdir(&cx, "/", "docs").into_result().unwrap();
+    let (sub, _) = engine.mkdir(&cx, "/docs", "sub").into_result().unwrap();
+    engine
+        .create_file(&cx, "/docs/sub", "keep.txt", b"reachable native data")
+        .into_result()
+        .unwrap();
+    let before = device.snapshot_live();
+    let writes = device.write_bytes_total();
+    let trace_len = engine.persistence_trace().len();
+
+    for (source, destination, identity) in [
+        ("/docs", "/DOCS/moved", docs),
+        ("/DOCS", "/docs/sub/moved", docs),
+        ("/docs", "/DoCs/SuB/moved", docs),
+        ("/docs/sub", "/DOCS/SUB/moved", sub),
+    ] {
+        let outcome = engine.rename_entry(&cx, source, destination, Some(identity));
+        assert!(
+            matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::Format(_))),
+            "rename {source} -> {destination} must reject a native directory cycle: {outcome:?}"
+        );
+        assert_eq!(device.write_bytes_total(), writes);
+        assert_eq!(device.snapshot_live(), before);
+        assert_eq!(engine.persistence_trace().len(), trace_len);
+        engine.check_clean_consistency(&cx).unwrap();
+    }
+    let tree = read_all_files_from_clean_volume(&device.snapshot_live());
+    assert_eq!(
+        tree.get("/docs/sub/keep.txt").map(Vec::as_slice),
+        Some(b"reachable native data".as_slice())
+    );
+}
+
+#[test]
+fn rename_uses_native_source_spelling_and_sequence_identity() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0x7A11_C1C1_E000_0002);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (docs, _) = engine.mkdir(&cx, "/", "docs").into_result().unwrap();
+    engine.mkdir(&cx, "/", "archive").into_result().unwrap();
+    let (readme, _) = engine
+        .create_file(&cx, "/docs", "ReadMe.txt", b"same native file")
+        .into_result()
+        .unwrap();
+
+    let before = device.snapshot_live();
+    let writes = device.write_bytes_total();
+    let stale = NtfsReference {
+        record: readme.record,
+        sequence: readme.sequence.wrapping_add(1),
+    };
+    assert!(matches!(
+        engine.rename_entry(&cx, "/DOCS/README.TXT", "/ARCHIVE/renamed.txt", Some(stale)),
+        NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+    ));
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(device.snapshot_live(), before);
+
+    let (moved, token) = engine
+        .rename_entry(
+            &cx,
+            "/DOCS/README.TXT",
+            "/ARCHIVE/renamed.txt",
+            Some(readme),
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(moved, readme);
+    assert!(token.matches_engine(&engine));
+    engine.check_clean_consistency(&cx).unwrap();
+
+    let (case_renamed, _) = engine
+        .rename_entry(
+            &cx,
+            "/ARCHIVE/RENAMED.TXT",
+            "/archive/Renamed.txt",
+            Some(readme),
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(case_renamed, readme);
+    engine.check_clean_consistency(&cx).unwrap();
+
+    let (moved_directory, _) = engine
+        .rename_entry(&cx, "/DOCS", "/ARCHIVE/documents", Some(docs))
+        .into_result()
+        .unwrap();
+    assert_eq!(moved_directory, docs);
+    let tree = read_all_files_from_clean_volume(&device.snapshot_live());
+    assert_eq!(
+        tree.get("/archive/Renamed.txt").map(Vec::as_slice),
+        Some(b"same native file".as_slice())
+    );
+    assert!(tree.contains_key("/archive/documents/"));
+    assert!(!tree.contains_key("/docs/"));
+}
+
+#[test]
+fn rename_and_unlink_refuse_coupled_native_aliases_without_mutating_either_name() {
+    fn raw_attributes(record: &NtfsFileRecord) -> Vec<Vec<u8>> {
+        let bytes = record.used_bytes();
+        let mut offset = usize::from(u16::from_le_bytes([bytes[20], bytes[21]]));
+        let mut attributes = Vec::new();
+        while bytes[offset..offset + 4] != u32::MAX.to_le_bytes() {
+            let length =
+                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            attributes.push(bytes[offset..offset + length].to_vec());
+            offset += length;
+        }
+        attributes
+    }
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0x7A11_C1C1_E000_0003);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (file_ref, _) = engine
+        .create_file(&cx, "/", "NativeLongName.txt", b"one file, two names")
+        .into_result()
+        .unwrap();
+    let view = engine.volume_view(&cx).unwrap();
+    let record = view
+        .record(&cx, file_ref.record, Some(file_ref.sequence))
+        .unwrap();
+    let root = view.record(&cx, 5, Some(5)).unwrap();
+    let alias = NtfsFileName {
+        parent: NtfsReference {
+            record: 5,
+            sequence: 5,
+        },
+        namespace: 2,
+        name: "NATIVE~1.TXT".encode_utf16().collect(),
+    }
+    .encode(
+        DEFAULT_FILETIME,
+        DEFAULT_FILETIME,
+        DEFAULT_FILETIME,
+        DEFAULT_FILETIME,
+        24,
+        19,
+        0x20,
+        0,
+    )
+    .unwrap();
+    let mut attributes = raw_attributes(&record);
+    attributes.push(build_resident_attr(
+        0x30,
+        u16::try_from(attributes.len()).unwrap(),
+        &[],
+        true,
+        &alias,
+    ));
+    attributes.sort_by_key(|attr| u32::from_le_bytes(attr[..4].try_into().unwrap()));
+    let aliased_record = build_file_record(record.number, record.sequence, 2, false, &attributes);
+
+    let root_attrs = root.attributes().unwrap();
+    let index_attr = root_attrs.iter().find(|attr| attr.kind == 0x90).unwrap();
+    let ffs_ondisk::ntfs::NtfsValue::Resident(index) = &index_attr.value else {
+        panic!("fixture root index must be resident");
+    };
+    let mut index = index.to_vec();
+    let terminal = index.split_off(index.len() - 16);
+    index.extend(ffs_ondisk::ntfs::index::encode_index_entry(file_ref, &alias, None).unwrap());
+    index.extend(terminal);
+    let used = u32::try_from(index.len() - 16).unwrap();
+    index[20..24].copy_from_slice(&used.to_le_bytes());
+    index[24..28].copy_from_slice(&used.to_le_bytes());
+    let mut root_raw_attrs = raw_attributes(&root);
+    let index_position = root_raw_attrs
+        .iter()
+        .position(|attr| attr[..4] == 0x90_u32.to_le_bytes())
+        .unwrap();
+    root_raw_attrs[index_position] =
+        build_resident_attr(0x90, index_attr.id, &index_attr.name, false, &index);
+    let aliased_root = build_file_record(5, 5, root.hard_links, true, &root_raw_attrs);
+    let mut aliased_image = device.snapshot_live();
+    let file_offset = CLUSTER_BYTES + usize::try_from(file_ref.record).unwrap() * RECORD_BYTES;
+    aliased_image[file_offset..file_offset + RECORD_BYTES].copy_from_slice(&aliased_record);
+    let root_offset = CLUSTER_BYTES + 5 * RECORD_BYTES;
+    aliased_image[root_offset..root_offset + RECORD_BYTES].copy_from_slice(&aliased_root);
+
+    // Admit the complete two-name image through all unchanged native checkers.
+    // The negative control must not rely on malformed input to prevent writes.
+    let device = FaultInjectingNtfsDevice::new(aliased_image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let before = device.snapshot_live();
+    for source in ["/NativeLongName.txt", "/NATIVE~1.TXT"] {
+        let outcome = engine.rename_entry(&cx, source, "/renamed.txt", Some(file_ref));
+        assert!(matches!(
+            outcome,
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(matches!(
+            engine.unlink_file(&cx, source),
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+        ));
+        assert_eq!(device.write_bytes_total(), 0);
+        assert_eq!(device.snapshot_live(), before);
+        assert!(engine.persistence_trace().is_empty());
+    }
+    let tree = read_all_files_from_clean_volume(&device.snapshot_live());
+    assert_eq!(tree.get("/NativeLongName.txt"), tree.get("/NATIVE~1.TXT"));
+    assert_eq!(
+        tree.get("/NativeLongName.txt").map(Vec::as_slice),
+        Some(b"one file, two names".as_slice())
+    );
+}
+
+#[test]
+fn unlink_reclaims_empty_external_directory_and_named_stream_after_native_case_lookup() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0x7A11_C1C1_E000_0004);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (directory, _) = engine.mkdir(&cx, "/", "Archive").into_result().unwrap();
+    for number in 0..12 {
+        let name = format!("entry_{number:02}_extended_filename_for_external_index.txt");
+        engine
+            .create_file(&cx, "/Archive", &name, b"native child")
+            .into_result()
+            .unwrap();
+    }
+    let before = device.snapshot_live();
+    let writes = device.write_bytes_total();
+    assert!(matches!(
+        engine.unlink_file(&cx, "/ARCHIVE"),
+        NtfsTxOutcome::NotCommitted(FfsError::NotEmpty)
+    ));
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.write_bytes_total(), writes);
+
+    for number in 0..12 {
+        let path = format!("/ARCHIVE/ENTRY_{number:02}_EXTENDED_FILENAME_FOR_EXTERNAL_INDEX.TXT");
+        engine.unlink_file(&cx, &path).into_result().unwrap();
+    }
+    engine.check_clean_consistency(&cx).unwrap();
+
+    // A directory may own both external $I30 allocation and a named DATA
+    // stream. Both allocations must retire with the same logged unlink.
+    let image = device.snapshot_live();
+    let record_offset = CLUSTER_BYTES + usize::try_from(directory.record).unwrap() * RECORD_BYTES;
+    let mut attributes =
+        copied_test_record_attributes(&image[record_offset..record_offset + RECORD_BYTES]);
+    assert!(
+        attributes
+            .iter()
+            .any(|attr| attr[..4] == 0xA0_u32.to_le_bytes())
+    );
+    let named_cluster = 500_u64;
+    let named_name: Vec<u16> = "directory-notes".encode_utf16().collect();
+    attributes.push(build_nonresident_attr(
+        DATA,
+        30,
+        &named_name,
+        named_cluster,
+        1,
+        5,
+        512,
+    ));
+    attributes.sort_by_key(|attr| u32::from_le_bytes(attr[..4].try_into().unwrap()));
+    let changed = build_file_record(
+        directory.record as u32,
+        directory.sequence,
+        1,
+        true,
+        &attributes,
+    );
+    device
+        .write_all_at(&cx, ByteOffset(record_offset as u64), &changed)
+        .unwrap();
+    device
+        .write_all_at(
+            &cx,
+            ByteOffset(named_cluster * CLUSTER_BYTES as u64),
+            b"notes",
+        )
+        .unwrap();
+    let bitmap_byte = 74 * CLUSTER_BYTES + usize::try_from(named_cluster / 8).unwrap();
+    let bitmap_mask = 1_u8 << (named_cluster % 8);
+    assert_eq!(image[bitmap_byte] & bitmap_mask, 0);
+    device
+        .write_all_at(
+            &cx,
+            ByteOffset(bitmap_byte as u64),
+            &[image[bitmap_byte] | bitmap_mask],
+        )
+        .unwrap();
+    device.sync(&cx).unwrap();
+    engine.check_clean_consistency(&cx).unwrap();
+    let view = engine.volume_view(&cx).unwrap();
+    let record = view
+        .record(&cx, directory.record, Some(directory.sequence))
+        .unwrap();
+    let notes = view.data_stream(&cx, &record, &named_name).unwrap();
+    assert_eq!(view.read(&cx, &notes, 0, 5).unwrap(), b"notes");
+    let mut owned_clusters = Vec::new();
+    for attribute in record.attributes().unwrap() {
+        if let ffs_ondisk::ntfs::NtfsValue::NonResident(extent) = attribute.value {
+            for run in ffs_ondisk::ntfs::decode_mapping_pairs(
+                extent.mapping_pairs,
+                extent.first_vcn,
+                extent.last_vcn,
+                512,
+            )
+            .unwrap()
+            {
+                if let Some(lcn) = run.lcn {
+                    owned_clusters.extend(lcn..lcn + run.clusters);
+                }
+            }
+        }
+    }
+    assert!(owned_clusters.contains(&named_cluster));
+    assert!(owned_clusters.len() >= 2);
+
+    let before_tree = read_all_files_from_clean_volume(&device.snapshot_durable_only());
+    type Cut = (NtfsPersistenceStage, bool, Vec<u8>, Vec<u8>);
+    let cuts: Arc<Mutex<Vec<Cut>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&cuts);
+    let observed_device = Arc::clone(&device);
+    let mut committed = false;
+    engine.set_stage_hook(Some(Box::new(move |event| {
+        committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+        if matches!(
+            event.stage,
+            NtfsPersistenceStage::DirtyRestartBarrier
+                | NtfsPersistenceStage::LogRecordWrite
+                | NtfsPersistenceStage::LogCommitBarrier
+                | NtfsPersistenceStage::TargetMetadataWrite
+                | NtfsPersistenceStage::TargetMetadataBarrier
+                | NtfsPersistenceStage::AckPublished
+        ) {
+            let mut snapshots = captured.lock().unwrap();
+            if !snapshots
+                .iter()
+                .any(|(stage, _, _, _)| *stage == event.stage)
+            {
+                snapshots.push((
+                    event.stage,
+                    committed,
+                    observed_device.snapshot_durable_only(),
+                    observed_device.snapshot_reordered_pending(true),
+                ));
+            }
+        }
+        Ok(())
+    })));
+    let (removed, token) = engine.unlink_file(&cx, "/ARCHIVE").into_result().unwrap();
+    engine.set_stage_hook(None);
+    assert_eq!(removed, directory);
+    assert!(token.matches_engine(&engine));
+    let after_image = device.snapshot_durable_only();
+    let after_tree = read_all_files_from_clean_volume(&after_image);
+    assert!(after_tree.is_empty());
+    let retired =
+        NtfsFileRecord::parse(&after_image[record_offset..record_offset + RECORD_BYTES]).unwrap();
+    assert!(!retired.in_use());
+    assert_ne!(retired.sequence, directory.sequence);
+    for cluster in owned_clusters {
+        let byte = 74 * CLUSTER_BYTES + usize::try_from(cluster / 8).unwrap();
+        assert_eq!(after_image[byte] & (1_u8 << (cluster % 8)), 0);
+    }
+    let snapshots = cuts.lock().unwrap();
+    assert_eq!(snapshots.len(), 6);
+    for (stage, committed, durable, reordered) in snapshots.iter() {
+        assert_eq!(
+            recover_crash_image_and_verify(durable),
+            if *committed {
+                &after_tree
+            } else {
+                &before_tree
+            }
+            .clone(),
+            "directory removal durable prefix at {stage:?}"
+        );
+        let recovered = recover_crash_image_and_verify(reordered);
+        if *committed {
+            assert_eq!(
+                recovered, after_tree,
+                "committed directory removal at {stage:?}"
+            );
+        } else {
+            assert!(recovered == before_tree || recovered == after_tree);
+        }
+    }
+}
+
+#[test]
+fn unlink_directory_refuses_incomplete_or_provider_metadata_before_writes() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0x7A11_C1C1_E000_0005);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let seed = FaultInjectingNtfsDevice::new(image);
+    let mut seed_engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&seed) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (directory, _) = seed_engine.mkdir(&cx, "/", "empty").into_result().unwrap();
+    let clean = seed.snapshot_durable_only();
+    let offset = CLUSTER_BYTES + usize::try_from(directory.record).unwrap() * RECORD_BYTES;
+    let original = copied_test_record_attributes(&clean[offset..offset + RECORD_BYTES]);
+    for kind in [0x20_u32, 0x40, 0xC0, 0x100] {
+        let device = FaultInjectingNtfsDevice::new(clean.clone());
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&device) as Arc<dyn ByteDevice>,
+            0,
+            volume_bytes,
+            write_options_clean(),
+        )
+        .unwrap();
+        let mut attributes = original.clone();
+        attributes.push(build_resident_attr(kind, 30, &[], false, &[0; 16]));
+        attributes.sort_by_key(|attr| u32::from_le_bytes(attr[..4].try_into().unwrap()));
+        let changed = build_file_record(
+            directory.record as u32,
+            directory.sequence,
+            1,
+            true,
+            &attributes,
+        );
+        // Mutate after admission to exercise the per-operation refusal even if
+        // an unsupported catalog becomes visible during this engine lifetime.
+        device
+            .write_all_at(&cx, ByteOffset(offset as u64), &changed)
+            .unwrap();
+        device.sync(&cx).unwrap();
+        let before = device.snapshot_live();
+        let writes = device.write_bytes_total();
+        assert!(matches!(
+            engine.unlink_file(&cx, "/empty"),
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+        ));
+        assert_eq!(device.snapshot_live(), before);
+        assert_eq!(device.write_bytes_total(), writes);
+        assert!(engine.persistence_trace().is_empty());
+    }
+}
+
+#[test]
 fn directory_bplus_promotion_leaf_split_rename_and_unlink_consistency() {
     let cx = Cx::for_testing();
     let img = build_clean_ntfs_image(768, 64, 0x9988_7766_5544_3322);
@@ -811,6 +1300,282 @@ fn directory_bplus_promotion_leaf_split_rename_and_unlink_consistency() {
 
     let actual = read_all_files_from_clean_volume(&dev.snapshot_live());
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn positioned_writes_and_truncation_preserve_bytes_and_native_consistency() {
+    let cx = Cx::for_testing();
+    let img = build_clean_ntfs_image(512, 64, 0x2345_6789);
+    let vol_len = img.len() as u64 - SECTOR_BYTES as u64;
+    let dev = FaultInjectingNtfsDevice::new(img);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (reference, _) = engine
+        .create_file(&cx, "/", "range.bin", b"abcdefghij")
+        .into_result()
+        .unwrap();
+
+    let (updated, token) = engine
+        .write_file_range(&cx, "/range.bin", 3, b"XYZ")
+        .into_result()
+        .unwrap();
+    assert_eq!(updated, reference);
+    assert!(token.matches_engine(&engine));
+    assert_eq!(
+        read_all_files_from_clean_volume(&dev.snapshot_durable_only())["/range.bin"],
+        b"abcXYZghij"
+    );
+    assert!(
+        engine
+            .persistence_trace()
+            .iter()
+            .any(|event| event.operation == "write_file_range"
+                && event.stage == NtfsPersistenceStage::AckPublished)
+    );
+
+    // A resident stream becomes nonresident, with a gap that must not contain
+    // old bytes from the chosen free clusters.
+    engine
+        .write_file_range(&cx, "/RANGE.BIN", 20, &vec![0x4A; 5000])
+        .into_result()
+        .unwrap();
+    let mut expected = b"abcXYZghij".to_vec();
+    expected.resize(20, 0);
+    expected.extend_from_slice(&vec![0x4A; 5000]);
+    assert_eq!(
+        read_all_files_from_clean_volume(&dev.snapshot_durable_only())["/range.bin"],
+        expected
+    );
+
+    // Overwrite across a cluster boundary, retaining both sides of the range.
+    engine
+        .write_file_range(&cx, "/range.bin", 4093, b"boundary")
+        .into_result()
+        .unwrap();
+    expected[4093..4101].copy_from_slice(b"boundary");
+    assert_eq!(
+        read_all_files_from_clean_volume(&dev.snapshot_durable_only())["/range.bin"],
+        expected
+    );
+
+    engine
+        .truncate_file(&cx, "/range.bin", 6)
+        .into_result()
+        .unwrap();
+    expected.truncate(6);
+    engine
+        .truncate_file(&cx, "/range.bin", 8195)
+        .into_result()
+        .unwrap();
+    expected.resize(8195, 0);
+    assert_eq!(
+        read_all_files_from_clean_volume(&dev.snapshot_durable_only())["/range.bin"],
+        expected,
+        "growth must not resurrect bytes discarded by shrink"
+    );
+
+    // A zero-byte write at an otherwise unrepresentable position is not growth.
+    engine
+        .write_file_range(&cx, "/range.bin", u64::MAX, b"")
+        .into_result()
+        .unwrap();
+    assert_eq!(
+        read_all_files_from_clean_volume(&dev.snapshot_durable_only())["/range.bin"],
+        expected
+    );
+    engine
+        .truncate_file(&cx, "/range.bin", 0)
+        .into_result()
+        .unwrap();
+    assert!(
+        read_all_files_from_clean_volume(&dev.snapshot_durable_only())["/range.bin"].is_empty()
+    );
+    engine.check_clean_consistency(&cx).unwrap();
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .unwrap();
+    reopened.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn positioned_write_never_exposes_allocation_beyond_initialized_length() {
+    let cx = Cx::for_testing();
+    let img = build_clean_ntfs_image(512, 64, 0x5678_9ABC);
+    let vol_len = img.len() as u64 - SECTOR_BYTES as u64;
+    let dev = FaultInjectingNtfsDevice::new(img);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (reference, _) = engine
+        .create_file(&cx, "/", "initialized.bin", &vec![0xA6; 8192])
+        .into_result()
+        .unwrap();
+    let mut image = dev.snapshot_durable_only();
+    let mft_cluster = u64::from_le_bytes(image[0x30..0x38].try_into().unwrap());
+    let record_at = usize::try_from(mft_cluster).unwrap() * CLUSTER_BYTES
+        + usize::try_from(reference.record).unwrap() * RECORD_BYTES;
+    let mut raw = restore_record(&image[record_at..record_at + RECORD_BYTES], b"FILE").unwrap();
+    let mut at = usize::from(u16::from_le_bytes(raw[20..22].try_into().unwrap()));
+    loop {
+        let kind = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
+        assert_ne!(kind, u32::MAX, "fixture must contain an unnamed stream");
+        if kind == DATA && raw[at + 9] == 0 {
+            assert_eq!(raw[at + 8], 1, "fixture stream must be nonresident");
+            raw[at + 56..at + 64].copy_from_slice(&5_u64.to_le_bytes());
+            break;
+        }
+        at += u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+    }
+    image[record_at..record_at + RECORD_BYTES].copy_from_slice(&protect_record_bytes(raw, 0x4826));
+    let initialized_dev = FaultInjectingNtfsDevice::new(image);
+    let mut initialized_engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&initialized_dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .unwrap();
+    initialized_engine
+        .write_file_range(&cx, "/initialized.bin", 10, b"edit")
+        .into_result()
+        .unwrap();
+    let mut expected = vec![0_u8; 8192];
+    expected[..5].fill(0xA6);
+    expected[10..14].copy_from_slice(b"edit");
+    assert_eq!(
+        read_all_files_from_clean_volume(&initialized_dev.snapshot_durable_only())["/initialized.bin"],
+        expected,
+        "uninitialized physical bytes must remain logically zero"
+    );
+}
+
+#[test]
+fn range_and_truncate_limits_refuse_before_any_backing_write() {
+    let cx = Cx::for_testing();
+    let img = build_clean_ntfs_image(512, 64, 0x3456_789A);
+    let vol_len = img.len() as u64 - SECTOR_BYTES as u64;
+    let dev = FaultInjectingNtfsDevice::new(img);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .unwrap();
+    engine
+        .create_file(&cx, "/", "keep.bin", b"preserve me")
+        .into_result()
+        .unwrap();
+    let before = dev.snapshot_live();
+    let writes = dev.write_bytes_total();
+    let max_size = ffs_ntfs::transaction::MAX_FILE_EDIT_BYTES;
+    for outcome in [
+        engine.write_file_range(&cx, "/keep.bin", u64::MAX, b"xx"),
+        engine.write_file_range(&cx, "/keep.bin", max_size, b"x"),
+        engine.truncate_file(&cx, "/keep.bin", max_size + 1),
+        engine.truncate_file(&cx, "/keep.bin", u64::MAX),
+    ] {
+        let NtfsTxOutcome::NotCommitted(error) = outcome else {
+            panic!("oversized edit must be rejected before publication");
+        };
+        assert_eq!(error.to_errno(), libc::EFBIG);
+    }
+    assert!(matches!(
+        engine.write_file_range(&cx, "/missing", 0, b"x"),
+        NtfsTxOutcome::NotCommitted(FfsError::NotFound(_))
+    ));
+    assert!(matches!(
+        engine.truncate_file(&cx, "/", 0),
+        NtfsTxOutcome::NotCommitted(FfsError::IsDirectory)
+    ));
+    assert_eq!(dev.write_bytes_total(), writes);
+    assert_eq!(dev.snapshot_live(), before);
+}
+
+#[test]
+fn range_and_truncate_crash_cuts_recover_only_the_acknowledged_prefix() {
+    let cx = Cx::for_testing();
+    let img = build_clean_ntfs_image(512, 64, 0x4567_89AB);
+    let vol_len = img.len() as u64 - SECTOR_BYTES as u64;
+    let dev = FaultInjectingNtfsDevice::new(img);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .unwrap();
+    engine
+        .create_file(&cx, "/", "range.bin", &vec![0x35; 4500])
+        .into_result()
+        .unwrap();
+
+    // Covers COW positioned growth, nonresident shrink, zero-extension, and
+    // complete reclamation. Every observation is reopened by a new engine.
+    for (size, range) in [(9000, true), (700, false), (6000, false), (0, false)] {
+        let before = read_all_files_from_clean_volume(&dev.snapshot_durable_only());
+        type Cut = (NtfsPersistenceStage, bool, Vec<u8>, Vec<u8>);
+        let cuts: Arc<Mutex<Vec<Cut>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&cuts);
+        let device = Arc::clone(&dev);
+        let mut committed = false;
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+            captured.lock().unwrap().push((
+                event.stage,
+                committed,
+                device.snapshot_durable_only(),
+                device.snapshot_reordered_pending(true),
+            ));
+            Ok(())
+        })));
+        let outcome = if range {
+            engine.write_file_range(&cx, "/range.bin", size, b"persisted-range")
+        } else {
+            engine.truncate_file(&cx, "/range.bin", size)
+        };
+        outcome.into_result().unwrap();
+        engine.set_stage_hook(None);
+        let after = read_all_files_from_clean_volume(&dev.snapshot_durable_only());
+        let captured = cuts.lock().unwrap();
+        assert!(captured.iter().any(|(_, committed, _, _)| !committed));
+        assert!(captured.iter().any(|(_, committed, _, _)| *committed));
+        for (stage, committed, durable, reordered) in captured.iter() {
+            assert_eq!(
+                recover_crash_image_and_verify(durable),
+                if *committed { &after } else { &before }.clone(),
+                "durable prefix at {stage:?}, size={size}, range={range}"
+            );
+            let recovered = recover_crash_image_and_verify(reordered);
+            if *committed {
+                assert_eq!(recovered, after, "acknowledged journal prefix at {stage:?}");
+            } else {
+                assert!(
+                    recovered == before || recovered == after,
+                    "partial pending writes at {stage:?} must not expose mixed content"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1677,4 +2442,523 @@ fn negative_controls_refuse_hibernation_unknown_opcode_prepared_tx_and_foreign_t
         Err(FfsError::UnsupportedFeature(_))
     ));
     assert_eq!(dev_unk.write_bytes_total(), 0);
+}
+
+fn copied_test_record_attributes(raw: &[u8]) -> Vec<Vec<u8>> {
+    let restored = restore_record(raw, b"FILE").unwrap();
+    let mut at = usize::from(u16::from_le_bytes([restored[20], restored[21]]));
+    let mut attributes = Vec::new();
+    loop {
+        let kind = u32::from_le_bytes(restored[at..at + 4].try_into().unwrap());
+        if kind == u32::MAX {
+            return attributes;
+        }
+        let bytes = u32::from_le_bytes(restored[at + 4..at + 8].try_into().unwrap()) as usize;
+        attributes.push(restored[at..at + bytes].to_vec());
+        at += bytes;
+    }
+}
+
+#[test]
+fn plain_data_writes_refuse_unsupported_target_metadata_without_mutation() {
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        DataFlags(u16),
+        StandardFlags(u32),
+        UnsupportedAttribute(u32),
+        MultipleNames,
+        MultipleLinks,
+        DuplicateData,
+        TransformedNamedStream,
+        DosOnlyName,
+    }
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0xB0A0_0000_0000_0001);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let seed = FaultInjectingNtfsDevice::new(image);
+    let mut seed_engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&seed) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (file, _) = seed_engine
+        .create_file(&cx, "/", "plain.bin", b"original bytes")
+        .into_result()
+        .unwrap();
+    let clean = seed.snapshot_live();
+    let offset = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * RECORD_BYTES;
+    let base_attributes = copied_test_record_attributes(&clean[offset..offset + RECORD_BYTES]);
+
+    for shape in [
+        Shape::DataFlags(ffs_ondisk::ntfs::COMPRESSED),
+        Shape::DataFlags(ffs_ondisk::ntfs::ENCRYPTED),
+        Shape::DataFlags(ffs_ondisk::ntfs::SPARSE),
+        Shape::DataFlags(0x0002),
+        Shape::StandardFlags(0x0200),
+        Shape::StandardFlags(0x0400),
+        Shape::StandardFlags(0x0800),
+        Shape::StandardFlags(0x4000),
+        Shape::UnsupportedAttribute(ffs_ondisk::ntfs::ATTRIBUTE_LIST),
+        Shape::UnsupportedAttribute(ffs_ondisk::ntfs::REPARSE_POINT),
+        Shape::UnsupportedAttribute(0x0100),
+        Shape::MultipleNames,
+        Shape::MultipleLinks,
+        Shape::DuplicateData,
+        Shape::TransformedNamedStream,
+        Shape::DosOnlyName,
+    ] {
+        let device = FaultInjectingNtfsDevice::new(clean.clone());
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&device) as Arc<dyn ByteDevice>,
+            0,
+            volume_bytes,
+            write_options_clean(),
+        )
+        .unwrap();
+        let mut attributes = base_attributes.clone();
+        let mut links = 1;
+        let attr_kind = |attr: &&mut Vec<u8>| u32::from_le_bytes(attr[0..4].try_into().unwrap());
+        match shape {
+            Shape::DataFlags(flags) => {
+                let data = attributes
+                    .iter_mut()
+                    .find(|attr| attr_kind(attr) == DATA)
+                    .unwrap();
+                data[12..14].copy_from_slice(&flags.to_le_bytes());
+            }
+            Shape::StandardFlags(flags) => {
+                let info = attributes
+                    .iter_mut()
+                    .find(|attr| attr_kind(attr) == 0x10)
+                    .unwrap();
+                let value = usize::from(u16::from_le_bytes([info[20], info[21]]));
+                info[value + 32..value + 36].copy_from_slice(&flags.to_le_bytes());
+            }
+            Shape::UnsupportedAttribute(kind) => {
+                attributes.push(build_resident_attr(kind, 30, &[], false, &[0; 8]));
+            }
+            Shape::MultipleNames | Shape::DuplicateData => {
+                let kind = if matches!(shape, Shape::MultipleNames) {
+                    0x30
+                } else {
+                    DATA
+                };
+                let mut duplicate = attributes
+                    .iter_mut()
+                    .find(|attr| attr_kind(attr) == kind)
+                    .unwrap()
+                    .clone();
+                duplicate[14..16].copy_from_slice(&30_u16.to_le_bytes());
+                attributes.push(duplicate);
+            }
+            Shape::MultipleLinks => links = 2,
+            Shape::TransformedNamedStream => {
+                let mut named =
+                    build_resident_attr(DATA, 30, &[u16::from(b'x')], false, b"encrypted ADS");
+                named[12..14].copy_from_slice(&ffs_ondisk::ntfs::ENCRYPTED.to_le_bytes());
+                attributes.push(named);
+            }
+            Shape::DosOnlyName => {
+                let name = attributes
+                    .iter_mut()
+                    .find(|attr| attr_kind(attr) == 0x30)
+                    .unwrap();
+                let value = usize::from(u16::from_le_bytes([name[20], name[21]]));
+                name[value + 65] = 2;
+            }
+        }
+        // Change the targeted FILE after clean admission to exercise the
+        // per-operation guard, independently of the volume admission checks.
+        let changed =
+            build_file_record(file.record as u32, file.sequence, links, false, &attributes);
+        device
+            .write_all_at(&cx, ByteOffset(offset as u64), &changed)
+            .unwrap();
+        device.sync(&cx).unwrap();
+        let before = device.snapshot_live();
+        let writes = device.write_bytes_total();
+        let events = engine.persistence_trace().len();
+
+        for outcome in [
+            engine.write_file_data(&cx, "/plain.bin", b"replacement"),
+            engine.write_file_range(&cx, "/plain.bin", 2, b"range"),
+            engine.truncate_file(&cx, "/plain.bin", 4),
+            engine.write_file_range(&cx, "/plain.bin", u64::MAX, b""),
+            engine.truncate_file(&cx, "/plain.bin", b"original bytes".len() as u64),
+            engine.unlink_file(&cx, "/plain.bin"),
+        ] {
+            assert!(
+                matches!(
+                    outcome,
+                    NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+                ),
+                "unsupported target {shape:?} must refuse before mutation: {outcome:?}"
+            );
+            assert_eq!(device.write_bytes_total(), writes, "{shape:?}");
+            assert_eq!(device.snapshot_live(), before, "{shape:?}");
+            assert_eq!(engine.persistence_trace().len(), events, "{shape:?}");
+        }
+    }
+}
+
+#[test]
+fn plain_data_writes_preserve_named_stream_and_security_with_native_case_lookup() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0xB0A0_0000_0000_0002);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (file, _) = engine
+        .create_file(&cx, "/", "MixedCase.bin", b"original")
+        .into_result()
+        .unwrap();
+    let before = device.snapshot_live();
+    let offset = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * RECORD_BYTES;
+    let mut attributes = copied_test_record_attributes(&before[offset..offset + RECORD_BYTES]);
+    let security = attributes
+        .iter()
+        .find(|attr| u32::from_le_bytes(attr[0..4].try_into().unwrap()) == 0x50)
+        .unwrap()
+        .clone();
+    let name: Vec<u16> = "keep".encode_utf16().collect();
+    let payload = b"unmodified native named stream";
+    attributes.push(build_resident_attr(DATA, 30, &name, false, payload));
+    let changed = build_file_record(file.record as u32, file.sequence, 1, false, &attributes);
+    device
+        .write_all_at(&cx, ByteOffset(offset as u64), &changed)
+        .unwrap();
+    device.sync(&cx).unwrap();
+    engine.check_clean_consistency(&cx).unwrap();
+
+    for replacement in [b"resident replacement".to_vec(), vec![0xB7; 9_000]] {
+        let (identity, _) = engine
+            .write_file_data(&cx, "/mixedCASE.BIN", &replacement)
+            .into_result()
+            .unwrap();
+        assert_eq!(identity, file);
+        engine.check_clean_consistency(&cx).unwrap();
+        let volume = engine.volume_view(&cx).unwrap();
+        let record = volume
+            .record(&cx, file.record, Some(file.sequence))
+            .unwrap();
+        let named = volume.data_stream(&cx, &record, &name).unwrap();
+        assert_eq!(volume.read(&cx, &named, 0, payload.len()).unwrap(), payload);
+        let unnamed = volume.data_stream(&cx, &record, &[]).unwrap();
+        assert_eq!(
+            volume.read(&cx, &unnamed, 0, replacement.len()).unwrap(),
+            replacement
+        );
+        let after = device.snapshot_live();
+        let stored = copied_test_record_attributes(&after[offset..offset + RECORD_BYTES]);
+        assert!(
+            stored.contains(&security),
+            "native security descriptor changed"
+        );
+    }
+}
+
+#[test]
+fn plain_data_writes_reject_incomplete_nonresident_extent_without_mutation() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0xB0A0_0000_0000_0003);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (file, _) = engine
+        .create_file(&cx, "/", "extent.bin", &vec![0x4B; 9_000])
+        .into_result()
+        .unwrap();
+    let pristine = device.snapshot_live();
+    let offset = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * RECORD_BYTES;
+    let original_attributes =
+        copied_test_record_attributes(&pristine[offset..offset + RECORD_BYTES]);
+    for compression_unit in [false, true] {
+        let mut attributes = original_attributes.clone();
+        let data = attributes
+            .iter_mut()
+            .find(|attr| u32::from_le_bytes(attr[0..4].try_into().unwrap()) == DATA)
+            .unwrap();
+        if compression_unit {
+            data[34..36].copy_from_slice(&4_u16.to_le_bytes());
+        } else {
+            data[40..48].copy_from_slice(&(4 * CLUSTER_BYTES as u64).to_le_bytes());
+        }
+        let changed = build_file_record(file.record as u32, file.sequence, 1, false, &attributes);
+        device
+            .write_all_at(&cx, ByteOffset(offset as u64), &changed)
+            .unwrap();
+        device.sync(&cx).unwrap();
+        let before = device.snapshot_live();
+        let writes = device.write_bytes_total();
+        let outcome = engine.write_file_data(&cx, "/extent.bin", b"do not discard extents");
+        assert!(
+            matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(
+                    FfsError::Corruption { .. } | FfsError::UnsupportedFeature(_)
+                )
+            ),
+            "incomplete native extent must refuse before allocation or WAL writes: {outcome:?}"
+        );
+        assert_eq!(device.write_bytes_total(), writes);
+        assert_eq!(device.snapshot_live(), before);
+    }
+}
+
+#[test]
+fn unchanged_range_edits_commit_without_reallocation_on_a_full_volume() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0xB0A0_0000_0000_0004);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    // The fixture reserves 11 clusters, 64 log pages and 32 UpCase clusters.
+    // Consume every remaining cluster with a single complete native DATA run.
+    let payload = vec![0x5D; (512 - (11 + 64 + 32)) * CLUSTER_BYTES];
+    let (file, _) = engine
+        .create_file(&cx, "/", "full.bin", &payload)
+        .into_result()
+        .unwrap();
+    engine.check_clean_consistency(&cx).unwrap();
+    let baseline = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    assert!(matches!(
+        engine.write_file_data(&cx, "/full.bin", &payload),
+        NtfsTxOutcome::NotCommitted(FfsError::NoSpace)
+    ));
+    assert_eq!(device.write_bytes_total(), writes);
+
+    for truncate in [false, true] {
+        let trace_start = engine.persistence_trace().len();
+        let outcome = if truncate {
+            engine.truncate_file(&cx, "/full.bin", payload.len() as u64)
+        } else {
+            engine.write_file_range(&cx, "/full.bin", u64::MAX, b"")
+        };
+        let (identity, token) = outcome.into_result().unwrap();
+        assert_eq!(identity, file);
+        assert!(token.matches_engine(&engine));
+        let events = &engine.persistence_trace()[trace_start..];
+        assert!(
+            events
+                .iter()
+                .any(|event| event.stage == NtfsPersistenceStage::LogCommitBarrier)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.stage == NtfsPersistenceStage::AckPublished)
+        );
+        assert!(events.iter().all(|event| !matches!(
+            event.stage,
+            NtfsPersistenceStage::PayloadDataWrite
+                | NtfsPersistenceStage::TargetMetadataWrite
+                | NtfsPersistenceStage::MftSlotZeroWrite
+        )));
+        let after = device.snapshot_durable_only();
+        let logfile_start = 10 * CLUSTER_BYTES;
+        let logfile_end = (10 + 64) * CLUSTER_BYTES;
+        assert_eq!(after[..logfile_start], baseline[..logfile_start]);
+        assert_eq!(after[logfile_end..], baseline[logfile_end..]);
+        assert_eq!(
+            read_all_files_from_clean_volume(&after)["/full.bin"],
+            payload
+        );
+        engine.check_clean_consistency(&cx).unwrap();
+    }
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    reopened.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn plain_data_writes_require_exact_posix_namespace_spelling() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0xB0A0_0000_0000_0005);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let initial = b"POSIX bytes";
+    let (file, _) = engine
+        .create_file(&cx, "/", "MixedCase.bin", initial)
+        .into_result()
+        .unwrap();
+    let before = device.snapshot_live();
+    let file_at = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * RECORD_BYTES;
+    let root_at = CLUSTER_BYTES + 5 * RECORD_BYTES;
+    let mut file_attrs = copied_test_record_attributes(&before[file_at..file_at + RECORD_BYTES]);
+    let file_name = file_attrs
+        .iter_mut()
+        .find(|attr| u32::from_le_bytes(attr[..4].try_into().unwrap()) == 0x30)
+        .unwrap();
+    let name_value = usize::from(u16::from_le_bytes(file_name[20..22].try_into().unwrap()));
+    file_name[name_value + 65] = 0;
+
+    let mut root_attrs = copied_test_record_attributes(&before[root_at..root_at + RECORD_BYTES]);
+    let root_index = root_attrs
+        .iter_mut()
+        .find(|attr| u32::from_le_bytes(attr[..4].try_into().unwrap()) == 0x90)
+        .unwrap();
+    let index_value = usize::from(u16::from_le_bytes(root_index[20..22].try_into().unwrap()));
+    let entry_offset = u32::from_le_bytes(
+        root_index[index_value + 16..index_value + 20]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    root_index[index_value + 16 + entry_offset + 16 + 65] = 0;
+    for (offset, record) in [
+        (
+            file_at,
+            build_file_record(file.record as u32, file.sequence, 1, false, &file_attrs),
+        ),
+        (root_at, build_file_record(5, 5, 1, true, &root_attrs)),
+    ] {
+        device
+            .write_all_at(&cx, ByteOffset(offset as u64), &record)
+            .unwrap();
+    }
+    device.sync(&cx).unwrap();
+    engine.check_clean_consistency(&cx).unwrap();
+    let before = device.snapshot_live();
+    let writes = device.write_bytes_total();
+    let trace_len = engine.persistence_trace().len();
+    for outcome in [
+        engine.write_file_data(&cx, "/mixedcase.bin", b"wrong name"),
+        engine.write_file_range(&cx, "/mixedcase.bin", 0, b"wrong name"),
+        engine.truncate_file(&cx, "/mixedcase.bin", 0),
+        engine.write_file_range(&cx, "/mixedcase.bin", 0, b""),
+        engine.truncate_file(&cx, "/mixedcase.bin", initial.len() as u64),
+    ] {
+        assert!(
+            matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+            ),
+            "case-folded lookup must not select a POSIX native name: {outcome:?}"
+        );
+        assert_eq!(device.write_bytes_total(), writes);
+        assert_eq!(device.snapshot_live(), before);
+        assert_eq!(engine.persistence_trace().len(), trace_len);
+    }
+    engine
+        .write_file_range(&cx, "/MixedCase.bin", 1, b"x")
+        .into_result()
+        .unwrap();
+    assert_eq!(
+        read_all_files_from_clean_volume(&device.snapshot_durable_only())["/MixedCase.bin"],
+        b"PxSIX bytes"
+    );
+    engine.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn oversized_streams_admit_empty_writes_and_bounded_shrink() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(4352, 64, 0xB0A0_0000_0000_0006);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let limit = ffs_ntfs::transaction::MAX_FILE_EDIT_BYTES;
+    let (file, _) = engine
+        .create_file(&cx, "/", "large.bin", &vec![0x63; limit as usize + 1])
+        .into_result()
+        .unwrap();
+    engine.check_clean_consistency(&cx).unwrap();
+    let volume = engine.volume_view(&cx).unwrap();
+    let before = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
+    let trace_start = engine.persistence_trace().len();
+    let (identity, token) = engine
+        .write_file_range(&cx, "/large.bin", u64::MAX, b"")
+        .into_result()
+        .unwrap();
+    assert_eq!(identity, file);
+    assert!(token.matches_engine(&engine));
+    assert!(
+        engine.persistence_trace()[trace_start..]
+            .iter()
+            .all(|event| event.stage != NtfsPersistenceStage::PayloadDataWrite)
+    );
+    let volume = engine.volume_view(&cx).unwrap();
+    let after = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
+    assert_eq!(after.used_bytes(), before.used_bytes());
+    let stream = volume.data_stream(&cx, &after, &[]).unwrap();
+    assert_eq!(stream.size, limit + 1);
+    assert_eq!(volume.read(&cx, &stream, limit, 1).unwrap(), vec![0x63]);
+
+    let writes = device.write_bytes_total();
+    for outcome in [
+        engine.write_file_range(&cx, "/large.bin", 0, b"x"),
+        engine.truncate_file(&cx, "/large.bin", limit + 1),
+    ] {
+        let NtfsTxOutcome::NotCommitted(error) = outcome else {
+            panic!("oversized edit requests must fail before publication");
+        };
+        assert_eq!(error.to_errno(), libc::EFBIG);
+        assert_eq!(device.write_bytes_total(), writes);
+    }
+
+    // The reader rejects requests larger than 16 MiB. Successful shrink proves
+    // the old suffix is discarded without trying to materialize the whole file.
+    engine
+        .truncate_file(&cx, "/large.bin", 16)
+        .into_result()
+        .unwrap();
+    let volume = engine.volume_view(&cx).unwrap();
+    let record = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    assert_eq!(stream.size, 16);
+    assert_eq!(volume.read(&cx, &stream, 0, 16).unwrap(), vec![0x63; 16]);
+    engine.check_clean_consistency(&cx).unwrap();
 }

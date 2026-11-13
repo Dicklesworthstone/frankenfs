@@ -3,7 +3,7 @@
 //! `$Bitmap` & `$MFT::$BITMAP` reservation, `$MFTMirr` sync, and `NtfsTxOutcome`
 //! classification (`Committed`, `NotCommitted`, `Uncertain`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -17,8 +17,8 @@ use ffs_ondisk::ntfs::recovery::{
     deallocate_file_record_slot, initialize_file_record_slot,
 };
 use ffs_ondisk::ntfs::{
-    DATA, NtfsFileRecord, NtfsLogOp, NtfsReference, NtfsRun, NtfsValue, decode_mapping_pairs,
-    encode_mapping_pairs, restore_record,
+    DATA, EA, EA_INFORMATION, NtfsFileRecord, NtfsLogOp, NtfsNonResident, NtfsReference, NtfsRun,
+    NtfsValue, decode_mapping_pairs, encode_mapping_pairs, restore_record,
 };
 
 use super::dir_index::{
@@ -73,6 +73,12 @@ struct PreparedTxPlan<T> {
     open_attr_registrations: Vec<(u32, OpenAttrRuntime, NtfsClientUpdateSpec)>,
     mutation_specs: Vec<NtfsClientUpdateSpec>,
     target_writes: Vec<TargetWriteKind>,
+}
+
+#[derive(Clone, Copy)]
+enum FileDataEdit<'a> {
+    Write { offset: u64, data: &'a [u8] },
+    Truncate { size: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -1320,6 +1326,159 @@ impl NtfsTransactionEngine {
         })
     }
 
+    /// Write at a byte offset without truncating the existing suffix. Gaps beyond
+    /// EOF are initialized to zero before the new stream becomes reachable.
+    ///
+    /// A nonempty write's resulting stream must fit [`super::MAX_FILE_EDIT_BYTES`].
+    /// The current implementation stages a bounded complete replacement, then
+    /// uses the same native WAL and disjoint-cluster publication as
+    /// [`Self::write_file_data`]. An empty write validates the native target and
+    /// commits without staging data, preserving even a larger stream at any offset.
+    pub fn write_file_range(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> NtfsTxOutcome<NtfsReference> {
+        self.edit_file_data(cx, path, FileDataEdit::Write { offset, data })
+    }
+
+    /// Set a regular file's unnamed stream length through a native logged
+    /// transaction. Growth initializes every newly exposed byte to zero; shrink
+    /// retires old allocation only with the recoverable metadata transaction.
+    ///
+    /// The requested size must fit [`super::MAX_FILE_EDIT_BYTES`]. A larger
+    /// existing stream can be shrunk without reading its discarded suffix.
+    pub fn truncate_file(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        size: u64,
+    ) -> NtfsTxOutcome<NtfsReference> {
+        self.edit_file_data(cx, path, FileDataEdit::Truncate { size })
+    }
+
+    fn edit_file_data(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        edit: FileDataEdit<'_>,
+    ) -> NtfsTxOutcome<NtfsReference> {
+        match self.plan_file_data_edit(cx, path, edit) {
+            Ok(plan) => self.execute_logged_tx(cx, plan),
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
+    }
+
+    fn plan_file_data_edit(
+        &self,
+        cx: &Cx,
+        path: &str,
+        edit: FileDataEdit<'_>,
+    ) -> Result<PreparedTxPlan<NtfsReference>> {
+        checkpoint(cx)?;
+        let too_large = || FfsError::RequestRejected {
+            errno: libc::EFBIG,
+            detail: "NTFS positioned write/truncate exceeds the 16 MiB staging limit".into(),
+        };
+        let requested_end = match edit {
+            FileDataEdit::Write { offset, data } if !data.is_empty() => offset
+                .checked_add(u64::try_from(data.len()).map_err(|_| too_large())?)
+                .ok_or_else(too_large)?,
+            FileDataEdit::Write { .. } => 0,
+            FileDataEdit::Truncate { size } => size,
+        };
+        if requested_end > super::MAX_FILE_EDIT_BYTES {
+            return Err(too_large());
+        }
+
+        let mft0 = self.read_mft_record_zero(cx)?;
+        let mft_runs = extract_plain_nonresident_runs(&self.geometry, &mft0, DATA, &[])?;
+        let (file_no, file_rec) = self.resolve_path_raw(cx, &mft_runs, path)?;
+        if file_rec.is_directory() {
+            return Err(FfsError::IsDirectory);
+        }
+        if file_no < 24 {
+            return Err(FfsError::PermissionDenied);
+        }
+        let (parent_path, leaf_utf16) = split_parent_and_leaf(path)?;
+        let (parent_no, parent_rec) = self.resolve_path_raw(cx, &mft_runs, &parent_path)?;
+        self.admit_plain_data_target(
+            &file_rec,
+            NtfsReference {
+                record: u64::from(parent_no),
+                sequence: parent_rec.sequence,
+            },
+            &leaf_utf16,
+        )?;
+        let volume = self.volume_view(cx)?;
+        let stream = volume.data_stream(cx, &file_rec, &[])?;
+
+        let mut hasher = blake3::Hasher::new();
+        let (operation, unchanged) = match edit {
+            FileDataEdit::Write { offset, data } => {
+                hasher.update(b"ntfs.write_file_range:");
+                hasher.update(&offset.to_le_bytes());
+                hasher.update(&(data.len() as u64).to_le_bytes());
+                hasher.update(blake3::hash(data).as_bytes());
+                ("write_file_range", data.is_empty())
+            }
+            FileDataEdit::Truncate { size } => {
+                hasher.update(b"ntfs.truncate_file:");
+                hasher.update(&size.to_le_bytes());
+                ("truncate_file", size == stream.size)
+            }
+        };
+        hasher.update(path.as_bytes());
+        let digest = *hasher.finalize().as_bytes();
+        if unchanged {
+            // Commit the ordinary WAL barrier/token transaction without reading
+            // or relocating an unchanged stream, even when no free clusters remain.
+            return Ok(PreparedTxPlan {
+                operation,
+                operation_digest: digest,
+                result_value: NtfsReference {
+                    record: u64::from(file_no),
+                    sequence: file_rec.sequence,
+                },
+                pre_payload_writes: Vec::new(),
+                mft_zero_writes: Vec::new(),
+                open_attr_registrations: Vec::new(),
+                mutation_specs: Vec::new(),
+                target_writes: Vec::new(),
+            });
+        }
+        let new_size = match edit {
+            FileDataEdit::Write { .. } => stream.size.max(requested_end),
+            FileDataEdit::Truncate { size } => size,
+        };
+        if new_size > super::MAX_FILE_EDIT_BYTES {
+            return Err(too_large());
+        }
+        let new_len = usize::try_from(new_size).map_err(|_| too_large())?;
+        let retained = usize::try_from(stream.size.min(new_size)).map_err(|_| too_large())?;
+        // The reader also enforces initialized length: old allocation beyond
+        // ValidDataLength must remain zeros in the replacement, never stale data.
+        let mut replacement = volume.read(cx, &stream, 0, retained)?;
+        if replacement.len() != retained {
+            return Err(corrupt(0, "short NTFS stream read while staging an edit"));
+        }
+        replacement
+            .try_reserve_exact(new_len - replacement.len())
+            .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+        replacement.resize(new_len, 0);
+
+        if let FileDataEdit::Write { offset, data } = edit {
+            let start = usize::try_from(offset).map_err(|_| too_large())?;
+            replacement[start..start + data.len()].copy_from_slice(data);
+        }
+        checkpoint(cx)?;
+        let mut plan = self.plan_write_file_data(cx, digest, path, &replacement)?;
+        plan.operation = operation;
+        Ok(plan)
+    }
+
     /// Overwrite a regular file's unnamed `DATA` stream (resident, resident->nonresident,
     /// or nonresident copy-on-write cluster replacement with pre-commit payload flush).
     pub fn write_file_data(
@@ -1339,6 +1498,165 @@ impl NtfsTransactionEngine {
             Ok(plan) => self.execute_logged_tx(cx, plan),
             Err(err) => NtfsTxOutcome::NotCommitted(err),
         }
+    }
+
+    /// The current replacement transaction owns one base-record unnamed stream
+    /// and one FILE_NAME/$I30 pair. Preserve ordinary security, EA and same-record
+    /// plain ADS values, but do not turn an unsupported native provider or an
+    /// incomplete extent/link catalog into an apparently successful overwrite.
+    fn admit_plain_data_write(&self, record: &NtfsFileRecord) -> Result<NtfsFileName> {
+        if record.base.record != 0 || record.base.sequence != 0 || record.flags != 1 {
+            return Err(unsupported(
+                "NTFS data writes require an ordinary in-use base FILE record",
+            ));
+        }
+        if record.hard_links != 1 {
+            return Err(unsupported(
+                "NTFS data writes require maintenance of every hard-link FILE_NAME",
+            ));
+        }
+        let mut file_name = None;
+        let mut standard_information = false;
+        let mut stream_names = BTreeSet::new();
+        for attribute in record.attributes().map_err(|err| parse_err(&err))? {
+            if attribute.flags != 0 {
+                return Err(unsupported(
+                    "NTFS data writes do not yet maintain transformed attributes",
+                ));
+            }
+            match attribute.kind {
+                ATTR_STANDARD_INFORMATION => {
+                    let NtfsValue::Resident(value) = attribute.value else {
+                        return Err(corrupt(0, "nonresident NTFS STANDARD_INFORMATION"));
+                    };
+                    if standard_information
+                        || !attribute.name.is_empty()
+                        || !matches!(value.len(), 48 | 72)
+                    {
+                        return Err(corrupt(0, "ambiguous NTFS STANDARD_INFORMATION"));
+                    }
+                    let flags = u32::from_le_bytes(
+                        value[32..36]
+                            .try_into()
+                            .map_err(|_| corrupt(0, "file flags"))?,
+                    );
+                    // Native sparse/compressed/reparse/encrypted FILE attributes
+                    // carry obligations even if a DATA header omits its flag.
+                    if flags & 0x4E00 != 0 {
+                        return Err(unsupported(
+                            "NTFS data writes require a plain file without native transforms or reparse semantics",
+                        ));
+                    }
+                    standard_information = true;
+                }
+                ATTR_FILE_NAME => {
+                    if file_name.is_some() || !attribute.name.is_empty() {
+                        return Err(unsupported(
+                            "NTFS data writes require maintenance of every native name or alias",
+                        ));
+                    }
+                    let NtfsValue::Resident(value) = attribute.value else {
+                        return Err(corrupt(0, "nonresident NTFS FILE_NAME"));
+                    };
+                    file_name = Some(NtfsFileName::parse(value).map_err(|err| parse_err(&err))?);
+                }
+                DATA => {
+                    if !stream_names.insert(attribute.name) {
+                        return Err(unsupported(
+                            "NTFS data writes require a complete unambiguous stream extent catalog",
+                        ));
+                    }
+                    if let NtfsValue::NonResident(extent) = attribute.value {
+                        self.admit_plain_data_extent(&extent)?;
+                    }
+                }
+                ATTR_SECURITY_DESCRIPTOR | EA_INFORMATION | EA => {}
+                kind => {
+                    return Err(unsupported(format!(
+                        "NTFS data writes cannot yet maintain native attribute {kind:#x}"
+                    )));
+                }
+            }
+        }
+        if !standard_information || !stream_names.contains(&Vec::<u16>::new()) {
+            return Err(corrupt(
+                0,
+                "NTFS file lacks standard information or unnamed DATA",
+            ));
+        }
+        file_name.ok_or_else(|| corrupt(0, "NTFS file lacks its native FILE_NAME"))
+    }
+
+    fn admit_plain_data_extent(&self, extent: &NtfsNonResident<'_>) -> Result<()> {
+        if extent.first_vcn != 0 || extent.compression_unit != 0 {
+            return Err(unsupported(
+                "NTFS data writes require an untransformed complete base-record extent",
+            ));
+        }
+        let runs = decode_mapping_pairs(
+            extent.mapping_pairs,
+            extent.first_vcn,
+            extent.last_vcn,
+            self.geometry.cluster_count(),
+        )
+        .map_err(|err| parse_err(&err))?;
+        let coverage = runs
+            .last()
+            .map_or(0, |run| run.vcn + run.clusters)
+            .checked_mul(u64::from(self.geometry.cluster_bytes()))
+            .ok_or_else(|| corrupt(0, "NTFS data mapping size overflow"))?;
+        if runs.iter().any(|run| run.lcn.is_none()) {
+            return Err(unsupported(
+                "NTFS data writes do not yet maintain sparse extents",
+            ));
+        }
+        if extent.allocated_bytes != coverage
+            || extent.data_bytes > coverage
+            || extent.data_bytes > i64::MAX as u64
+            || extent.initialized_bytes > extent.data_bytes
+        {
+            return Err(corrupt(
+                0,
+                "NTFS data mapping does not cover its declared allocation",
+            ));
+        }
+        let mut physical: Vec<_> = runs
+            .iter()
+            .filter_map(|run| run.lcn.map(|lcn| (lcn, lcn + run.clusters)))
+            .collect();
+        physical.sort_unstable();
+        if physical.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(corrupt(
+                0,
+                "NTFS data stream aliases its own physical clusters",
+            ));
+        }
+        Ok(())
+    }
+
+    fn admit_plain_data_target(
+        &self,
+        record: &NtfsFileRecord,
+        parent: NtfsReference,
+        leaf: &[u16],
+    ) -> Result<Vec<u16>> {
+        let native_name = self.admit_plain_data_write(record)?;
+        if native_name.namespace == 2 {
+            return Err(unsupported(
+                "NTFS DOS alias data writes require coupled long-name maintenance",
+            ));
+        }
+        if native_name.parent != parent
+            || (native_name.name.as_slice() != leaf
+                && (native_name.namespace == 0
+                    || self.fold_upcase(&native_name.name) != self.fold_upcase(leaf)))
+        {
+            return Err(corrupt(
+                0,
+                "NTFS write target FILE_NAME disagrees with its parent index",
+            ));
+        }
+        Ok(native_name.name)
     }
 
     #[allow(clippy::too_many_lines, clippy::similar_names)]
@@ -1362,6 +1680,14 @@ impl NtfsTransactionEngine {
         if file_no < 24 {
             return Err(FfsError::PermissionDenied);
         }
+        let leaf_utf16 = self.admit_plain_data_target(
+            &file_rec,
+            NtfsReference {
+                record: u64::from(parent_no),
+                sequence: parent_rec.sequence,
+            },
+            &leaf_utf16,
+        )?;
         let file_ref = NtfsReference {
             record: u64::from(file_no),
             sequence: file_rec.sequence,
@@ -1827,22 +2153,61 @@ impl NtfsTransactionEngine {
             return Err(corrupt(0, "rename_entry expected_source_ref mismatch"));
         }
 
-        // Refuse moving a directory into itself or its own descendant!
-        if src_rec.is_directory() {
-            let norm_src = format!("/{}/", src_path.trim_matches('/'));
-            let norm_dst = format!("/{}/", dst_path.trim_matches('/'));
-            if norm_dst.starts_with(&norm_src) {
-                return Err(FfsError::Format(
-                    "cannot rename NTFS directory into its own subtree".into(),
-                ));
-            }
+        let (src_dir_no, src_dir_rec) = self.resolve_path_raw(cx, &mft_runs, &src_parent_path)?;
+        let (dst_dir_no, dst_dir_rec) = self.resolve_path_raw_avoiding(
+            cx,
+            &mft_runs,
+            &dst_parent_path,
+            src_rec.is_directory().then_some(src_ref),
+        )?;
+        if !src_dir_rec.is_directory() || !dst_dir_rec.is_directory() {
+            return Err(FfsError::NotDirectory);
         }
 
-        let (src_dir_no, src_dir_rec) = self.resolve_path_raw(cx, &mft_runs, &src_parent_path)?;
-        let (dst_dir_no, dst_dir_rec) = self.resolve_path_raw(cx, &mft_runs, &dst_parent_path)?;
-        if self
-            .lookup_in_directory_raw(cx, &mft_runs, &dst_dir_rec, &self.fold_upcase(&dst_leaf))?
-            .is_some()
+        // The native name, its parent sequence and the selected source must
+        // identify the same link. Until coupled DOS aliases and extension
+        // records are maintained, do not rename an arbitrary first FILE_NAME.
+        let source_attributes = src_rec.attributes().map_err(|err| parse_err(&err))?;
+        if source_attributes.iter().any(|attr| attr.kind == 0x20) {
+            return Err(unsupported(
+                "NTFS rename with ATTRIBUTE_LIST requires complete name-catalog mutation",
+            ));
+        }
+        let mut source_names = source_attributes
+            .iter()
+            .filter(|attr| attr.kind == ATTR_FILE_NAME);
+        let source_name_attr = source_names
+            .next()
+            .ok_or_else(|| corrupt(0, "rename source lacks FILE_NAME"))?;
+        if source_names.next().is_some() || src_rec.hard_links != 1 {
+            return Err(unsupported(
+                "multi-link or aliased NTFS rename requires selective FILE_NAME maintenance",
+            ));
+        }
+        let NtfsValue::Resident(source_name_value) = &source_name_attr.value else {
+            return Err(corrupt(0, "rename source FILE_NAME must be resident"));
+        };
+        let source_name = NtfsFileName::parse(source_name_value).map_err(|err| parse_err(&err))?;
+        if source_name.namespace == 2 {
+            return Err(unsupported(
+                "NTFS DOS alias rename requires coupled long-name maintenance",
+            ));
+        }
+        let source_parent_ref = NtfsReference {
+            record: u64::from(src_dir_no),
+            sequence: src_dir_rec.sequence,
+        };
+        if source_name.parent != source_parent_ref
+            || (source_name.name != src_leaf
+                && (source_name.namespace == 0
+                    || self.fold_upcase(&source_name.name) != self.fold_upcase(&src_leaf)))
+        {
+            return Err(corrupt(0, "rename source FILE_NAME identity mismatch"));
+        }
+
+        if let Some(destination_ref) =
+            self.lookup_in_directory_raw(cx, &mft_runs, &dst_dir_rec, &self.fold_upcase(&dst_leaf))?
+            && (src_dir_no != dst_dir_no || destination_ref != src_ref)
         {
             return Err(FfsError::Exists);
         }
@@ -1998,7 +2363,7 @@ impl NtfsTransactionEngine {
             sd_cbo,
             &sd_lcns,
             src_indx_slot,
-            &src_leaf,
+            &source_name.name,
         )?;
         mutation_specs.extend(del_plan.log_specs);
 
@@ -2274,6 +2639,11 @@ impl NtfsTransactionEngine {
     /// Unlink a regular file or an empty directory, freeing its `$I30` entry,
     /// deallocating its MFT slot (incrementing sequence number), and releasing
     /// `$MFT::$BITMAP` and `$Bitmap` clusters.
+    ///
+    /// Reclamation covers complete ordinary base-record streams, including
+    /// named DATA and directory index allocation. Extension records, aliases,
+    /// transformed streams and provider-maintained metadata are refused before
+    /// any persistent mutation because their complete teardown is not supported.
     pub fn unlink_file(&mut self, cx: &Cx, path: &str) -> NtfsTxOutcome<NtfsReference> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"ntfs.unlink_file:");
@@ -2284,6 +2654,117 @@ impl NtfsTransactionEngine {
             Ok(plan) => self.execute_logged_tx(cx, plan),
             Err(err) => NtfsTxOutcome::NotCommitted(err),
         }
+    }
+
+    /// Directory unlink owns the complete ordinary $I30 catalog in this record.
+    /// Every other native index or extension catalog requires its own teardown.
+    fn admit_directory_unlink(record: &NtfsFileRecord) -> Result<NtfsFileName> {
+        if record.base.record != 0
+            || record.base.sequence != 0
+            || record.flags != 3
+            || record.hard_links != 1
+        {
+            return Err(unsupported(
+                "NTFS directory removal requires one ordinary base-record link",
+            ));
+        }
+        let mut identities = BTreeSet::new();
+        let mut standard_information = false;
+        let mut index_root = false;
+        let mut file_name = None;
+        for attribute in record.attributes().map_err(|err| parse_err(&err))? {
+            if attribute.flags != 0 || !identities.insert((attribute.kind, attribute.name.clone()))
+            {
+                return Err(unsupported(
+                    "NTFS directory removal requires complete untransformed attribute catalogs",
+                ));
+            }
+            match attribute.kind {
+                ATTR_STANDARD_INFORMATION => {
+                    let NtfsValue::Resident(value) = attribute.value else {
+                        return Err(corrupt(0, "nonresident NTFS STANDARD_INFORMATION"));
+                    };
+                    if !attribute.name.is_empty() || !matches!(value.len(), 48 | 72) {
+                        return Err(corrupt(0, "invalid NTFS STANDARD_INFORMATION"));
+                    }
+                    let flags = u32::from_le_bytes(
+                        value[32..36]
+                            .try_into()
+                            .map_err(|_| corrupt(0, "short NTFS STANDARD_INFORMATION flags"))?,
+                    );
+                    if flags & 0x4E00 != 0 {
+                        return Err(unsupported(
+                            "NTFS directory removal cannot maintain transformed or reparse metadata",
+                        ));
+                    }
+                    standard_information = true;
+                }
+                ATTR_FILE_NAME => {
+                    if file_name.is_some() || !attribute.name.is_empty() {
+                        return Err(unsupported(
+                            "NTFS directory removal requires a single native name",
+                        ));
+                    }
+                    let NtfsValue::Resident(value) = attribute.value else {
+                        return Err(corrupt(0, "nonresident NTFS FILE_NAME"));
+                    };
+                    file_name = Some(NtfsFileName::parse(value).map_err(|err| parse_err(&err))?);
+                }
+                0x90 if attribute.name == I30_NAME => {
+                    if !matches!(attribute.value, NtfsValue::Resident(_)) {
+                        return Err(corrupt(0, "nonresident NTFS INDEX_ROOT"));
+                    }
+                    index_root = true;
+                }
+                ATTR_INDEX_ALLOCATION if attribute.name == I30_NAME => {
+                    if !matches!(attribute.value, NtfsValue::NonResident(_)) {
+                        return Err(corrupt(0, "resident NTFS INDEX_ALLOCATION"));
+                    }
+                }
+                ATTR_BITMAP if attribute.name == I30_NAME => {}
+                DATA if !attribute.name.is_empty() => {}
+                ATTR_SECURITY_DESCRIPTOR | EA_INFORMATION | EA if attribute.name.is_empty() => {}
+                kind => {
+                    return Err(unsupported(format!(
+                        "NTFS directory removal cannot yet maintain native attribute {kind:#x}"
+                    )));
+                }
+            }
+        }
+        if !standard_information || !index_root {
+            return Err(corrupt(
+                0,
+                "NTFS directory lacks standard information or $I30",
+            ));
+        }
+        file_name.ok_or_else(|| corrupt(0, "NTFS directory lacks its native FILE_NAME"))
+    }
+
+    fn unlink_owned_runs(&self, record: &NtfsFileRecord) -> Result<Vec<NtfsRun>> {
+        let mut runs = Vec::new();
+        for attribute in record.attributes().map_err(|err| parse_err(&err))? {
+            if let NtfsValue::NonResident(extent) = attribute.value {
+                self.admit_plain_data_extent(&extent)?;
+                runs.extend(
+                    decode_mapping_pairs(
+                        extent.mapping_pairs,
+                        extent.first_vcn,
+                        extent.last_vcn,
+                        self.geometry.cluster_count(),
+                    )
+                    .map_err(|err| parse_err(&err))?,
+                );
+            }
+        }
+        let mut physical: Vec<_> = runs
+            .iter()
+            .filter_map(|run| run.lcn.map(|lcn| (lcn, lcn + run.clusters)))
+            .collect();
+        physical.sort_unstable();
+        if physical.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(corrupt(0, "NTFS unlink streams share physical clusters"));
+        }
+        Ok(runs)
     }
 
     #[allow(clippy::too_many_lines, clippy::similar_names)]
@@ -2317,14 +2798,38 @@ impl NtfsTransactionEngine {
         if target_no < 24 {
             return Err(FfsError::PermissionDenied);
         }
+        if !parent_rec.is_directory() {
+            return Err(FfsError::NotDirectory);
+        }
+        let native_name = if target_rec.is_directory() {
+            Self::admit_directory_unlink(&target_rec)?
+        } else {
+            self.admit_plain_data_write(&target_rec)?
+        };
+        if native_name.namespace == 2 {
+            return Err(unsupported(
+                "NTFS DOS alias unlink requires coupled long-name maintenance",
+            ));
+        }
+        if native_name.parent
+            != (NtfsReference {
+                record: u64::from(parent_no),
+                sequence: parent_rec.sequence,
+            })
+            || (native_name.name != leaf_utf16
+                && (native_name.namespace == 0
+                    || self.fold_upcase(&native_name.name) != self.fold_upcase(&leaf_utf16)))
+        {
+            return Err(corrupt(
+                0,
+                "NTFS unlink FILE_NAME disagrees with its parent index",
+            ));
+        }
+        let runs_to_free = self.unlink_owned_runs(&target_rec)?;
         if target_rec.is_directory() && !self.directory_is_empty(cx, &target_rec)? {
             return Err(FfsError::NotEmpty);
         }
-        if target_rec.hard_links > 1 {
-            return Err(unsupported(
-                "multi-link NTFS unlink requires selective FILE_NAME removal",
-            ));
-        }
+        let leaf_utf16 = native_name.name;
 
         let target_ref = NtfsReference {
             record: u64::from(target_no),
@@ -2406,20 +2911,7 @@ impl NtfsTransactionEngine {
             }
         }
 
-        // 2. Collect all physical clusters owned by target_rec and free in $Bitmap!
-        let mut runs_to_free = Vec::new();
-        for attr in target_rec.attributes().map_err(|err| parse_err(&err))? {
-            if let NtfsValue::NonResident(nr) = attr.value {
-                let decoded = decode_mapping_pairs(
-                    nr.mapping_pairs,
-                    nr.first_vcn,
-                    nr.last_vcn,
-                    self.geometry.cluster_count(),
-                )
-                .map_err(|err| parse_err(&err))?;
-                runs_to_free.extend(decoded);
-            }
-        }
+        // 2. Free the complete, validated owned cluster set in $Bitmap!
         if !runs_to_free.is_empty() {
             let bm_rec = read_mft_record_via_runs(&self.device, cx, &self.geometry, &mft_runs, 6)?;
             let (bm_runs, bm_size, _) =

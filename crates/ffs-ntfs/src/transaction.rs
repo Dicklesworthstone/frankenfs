@@ -36,6 +36,11 @@ use crate::reader::allocation::{AllocationLimits, NamespaceLimits, RecordOwnersh
 pub(super) const LOG_PAGE_BYTES: u32 = 4096;
 pub(super) const SECTOR_BYTES: usize = 512;
 const UPCASE_BYTES: usize = 131_072;
+/// Maximum resulting stream length for nonempty positioned writes, and maximum
+/// requested truncate length. These operations stage a complete replacement
+/// before native WAL publication; the bound prevents memory exhaustion. Empty
+/// writes validate the target but preserve larger streams without staging data.
+pub const MAX_FILE_EDIT_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_ERASED_LOG_BYTES: u64 = 64 * 1024 * 1024;
 const HIBERFIL_UPPER: [u16; 12] = [
     b'H' as u16,

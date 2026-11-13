@@ -510,10 +510,36 @@ impl NtfsTransactionEngine {
         mft_runs: &[NtfsRun],
         path: &str,
     ) -> Result<(u32, NtfsFileRecord)> {
+        self.resolve_path_raw_avoiding(cx, mft_runs, path, None)
+    }
+
+    /// Resolve through native directory identities, optionally refusing an
+    /// ancestor before a directory rename can make it its own descendant.
+    /// Comparing path strings is insufficient because `$UpCase` and aliases
+    /// can give one directory several accepted spellings.
+    pub(super) fn resolve_path_raw_avoiding(
+        &self,
+        cx: &Cx,
+        mft_runs: &[NtfsRun],
+        path: &str,
+        forbidden_ancestor: Option<NtfsReference>,
+    ) -> Result<(u32, NtfsFileRecord)> {
+        checkpoint(cx)?;
         let components = parse_path_components(path)?;
         let mut cur_no = 5_u32;
         let mut cur_rec = read_mft_record_via_runs(&self.device, cx, &self.geometry, mft_runs, 5)?;
+        if forbidden_ancestor
+            == Some(NtfsReference {
+                record: u64::from(cur_no),
+                sequence: cur_rec.sequence,
+            })
+        {
+            return Err(FfsError::Format(
+                "cannot rename NTFS directory into its own subtree".into(),
+            ));
+        }
         for (idx, comp) in components.iter().enumerate() {
+            checkpoint(cx)?;
             if !cur_rec.is_directory() {
                 return Err(FfsError::NotDirectory);
             }
@@ -528,6 +554,11 @@ impl NtfsTransactionEngine {
                 read_mft_record_via_runs(&self.device, cx, &self.geometry, mft_runs, next_no)?;
             if child_record.sequence != next_ref.sequence {
                 return Err(corrupt(0, "NTFS directory entry sequence mismatch"));
+            }
+            if forbidden_ancestor == Some(next_ref) {
+                return Err(FfsError::Format(
+                    "cannot rename NTFS directory into its own subtree".into(),
+                ));
             }
             if idx + 1 < components.len() && !child_record.is_directory() {
                 return Err(FfsError::NotDirectory);
