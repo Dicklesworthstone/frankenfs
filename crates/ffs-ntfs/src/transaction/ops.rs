@@ -3624,6 +3624,6 @@ mod data_run_tests {
             find_free_data_runs(&cx, &[0], 4, 4, 4),
             Err(FfsError::NoSpace)
         ));
-        assert!(find_free_data_runs(&cx, &[], 0, 0, 0).unwrap().is_empty());
+        assert_eq!(find_free_data_runs(&cx, &[], 0, 0, 0).unwrap().len(), 0);
     }
 }

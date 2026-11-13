@@ -2196,7 +2196,7 @@ mod tests {
             panic!("empty range write");
         };
         assert_eq!(start, u64::MAX);
-        assert!(payload.load_range(start).unwrap().is_empty());
+        assert_eq!(payload.load_range(start).unwrap(), Vec::<u8>::new());
 
         let truncate_base = [
             "ffs-ntfs",
