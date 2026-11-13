@@ -1,12 +1,9 @@
 name: Filesystem integrity validation
-
 on:
   push:
     branches: [validation/ffs-integrity-20261112]
-
 permissions:
   contents: read
-
 env:
   CARGO_TERM_COLOR: never
   CARGO_BUILD_JOBS: "2"
@@ -14,7 +11,6 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
   CFLAGS: "-g0 -O2"
-
 jobs:
   required-gates:
     runs-on: ubuntu-latest
@@ -46,3 +42,9 @@ jobs:
       - name: NTFS CLI consumer tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-cli --bin ffs-ntfs
+      - name: Install native NTFS oracle
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update && sudo apt-get install -y ntfs-3g
+      - name: Native NTFS CLI range and truncate round trip
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --test cli_e2e native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection -- --ignored --exact --nocapture
