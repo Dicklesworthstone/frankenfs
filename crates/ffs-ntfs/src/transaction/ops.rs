@@ -3,7 +3,8 @@
 //! `$Bitmap` & `$MFT::$BITMAP` reservation, `$MFTMirr` sync, and `NtfsTxOutcome`
 //! classification (`Committed`, `NotCommitted`, `Uncertain`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -244,7 +245,149 @@ fn set_or_clear_bits(bitmap: &mut [u8], start: u64, count: u64, set: bool) {
     }
 }
 
+/// Prefer the earliest contiguous allocation, otherwise use the largest free
+/// runs to minimize mapping pairs. One cancellable scan retains at most
+/// `max_runs` candidates and never reuses an allocated COW source cluster.
+fn find_free_data_runs(
+    cx: &Cx,
+    bitmap: &[u8],
+    volume_clusters: u64,
+    clusters: u64,
+    max_runs: usize,
+) -> Result<Vec<NtfsRun>> {
+    checkpoint(cx)?;
+    if clusters == 0 {
+        return Ok(Vec::new());
+    }
+    if max_runs == 0 {
+        return Err(unsupported("DATA allocation has no mapping-pair capacity"));
+    }
+
+    let limit = volume_clusters.min((bitmap.len() as u64).saturating_mul(8));
+    // The heap root is the shortest retained run; equal lengths discard the
+    // latest physical run first. Its size depends on FILE capacity, not on
+    // volume size or the number of holes encountered during the scan.
+    let mut candidates: BinaryHeap<(Reverse<u64>, u64)> = BinaryHeap::new();
+    let mut retain_run = |start: u64, length: u64| {
+        let candidate = (Reverse(length), start);
+        if candidates.len() < max_runs {
+            candidates.push(candidate);
+        } else if let Some(mut worst) = candidates.peek_mut()
+            && candidate < *worst
+        {
+            *worst = candidate;
+        }
+    };
+    let mut free_clusters = 0_u64;
+    let mut run_start = 1;
+    let mut run_length = 0;
+    for cluster in 1..limit {
+        if cluster.is_multiple_of(4096) {
+            checkpoint(cx)?;
+        }
+        if bitmap[(cluster / 8) as usize] & (1 << (cluster % 8)) != 0 {
+            if run_length != 0 {
+                retain_run(run_start, run_length);
+                run_length = 0;
+            }
+            continue;
+        }
+        if run_length == 0 {
+            run_start = cluster;
+        }
+        run_length += 1;
+        free_clusters += 1;
+        if run_length == clusters {
+            return Ok(vec![NtfsRun {
+                vcn: 0,
+                clusters,
+                lcn: Some(run_start),
+            }]);
+        }
+    }
+    if run_length != 0 {
+        retain_run(run_start, run_length);
+    }
+    if free_clusters < clusters {
+        return Err(FfsError::NoSpace);
+    }
+
+    // Ascending heap keys put the largest extents first. Take only as many
+    // runs as needed before sorting physically, so early tiny holes cannot
+    // consume the mapping budget when larger later holes suffice.
+    let mut runs = Vec::new();
+    let mut remaining = clusters;
+    for (Reverse(length), start) in candidates.into_sorted_vec() {
+        let allocated = length.min(remaining);
+        runs.push(NtfsRun {
+            vcn: 0,
+            clusters: allocated,
+            lcn: Some(start),
+        });
+        remaining -= allocated;
+        if remaining == 0 {
+            break;
+        }
+    }
+    if remaining != 0 {
+        return Err(unsupported(
+            "fragmented DATA mapping requires an attribute-list extension",
+        ));
+    }
+    runs.sort_unstable_by_key(|run| run.lcn);
+    let mut vcn = 0;
+    for run in &mut runs {
+        run.vcn = vcn;
+        vcn += run.clusters;
+    }
+    Ok(runs)
+}
+
 impl NtfsTransactionEngine {
+    fn reserve_data_payload(
+        &self,
+        cx: &Cx,
+        bitmap: &mut [u8],
+        payload: &[u8],
+        pre_payload_writes: &mut Vec<DirPrePayloadWrite>,
+    ) -> Result<Vec<NtfsRun>> {
+        let cluster_bytes = u64::from(self.geometry.cluster_bytes());
+        let clusters = (payload.len() as u64).div_ceil(cluster_bytes);
+        // Each non-sparse mapping pair needs at least a header, length and LCN
+        // delta. The complete encoded attribute must still fit its FILE record;
+        // this upper bound prevents building an unbounded run/log plan first.
+        let max_runs = self.geometry.record_bytes() as usize / 3;
+        let runs = find_free_data_runs(
+            cx,
+            bitmap,
+            self.geometry.cluster_count(),
+            clusters,
+            max_runs,
+        )?;
+        for run in &runs {
+            checkpoint(cx)?;
+            let lcn = run
+                .lcn
+                .ok_or_else(|| corrupt(0, "sparse DATA reservation"))?;
+            let allocated_bytes =
+                usize::try_from(run.clusters * cluster_bytes).map_err(|_| FfsError::NoSpace)?;
+            let payload_start =
+                usize::try_from(run.vcn * cluster_bytes).map_err(|_| FfsError::NoSpace)?;
+            let copied = allocated_bytes.min(payload.len() - payload_start);
+            let mut initialized = vec![0; allocated_bytes];
+            initialized[..copied].copy_from_slice(&payload[payload_start..payload_start + copied]);
+            pre_payload_writes.push(DirPrePayloadWrite {
+                phys_offset: self
+                    .geometry
+                    .cluster_offset(lcn)
+                    .map_err(|err| parse_err(&err))?,
+                bytes: initialized,
+            });
+            set_or_clear_bits(bitmap, lcn, run.clusters, true);
+        }
+        Ok(runs)
+    }
+
     fn map_mft_record_transfer(
         &self,
         mft_runs: &[NtfsRun],
@@ -800,6 +943,8 @@ impl NtfsTransactionEngine {
     }
 
     /// Create a regular file inside `parent_path` with initial resident or cluster-backed `DATA`.
+    /// Nonresident data may span multiple free runs when the mapping pairs fit
+    /// the new FILE record. Each allocated run is initialized before publication.
     pub fn create_file(
         &mut self,
         cx: &Cx,
@@ -951,7 +1096,7 @@ impl NtfsTransactionEngine {
 
         let mut pre_payload_writes = Vec::new();
         let mut mutation_specs = Vec::new();
-        let mut allocated_data_run: Option<(u64, u64)> = None;
+        let mut allocated_data_runs = Vec::new();
         let cluster_bytes = u64::from(self.geometry.cluster_bytes());
 
         let is_dir = file_payload.is_none();
@@ -964,21 +1109,9 @@ impl NtfsTransactionEngine {
                 (aligned, payload.len() as u64)
             } else {
                 let n_clusters = (payload.len() as u64).div_ceil(cluster_bytes);
-                let lcn = find_contiguous_zero_bits(&vol_bm, vol_clusters, n_clusters, 1)
-                    .ok_or(FfsError::NoSpace)?;
-                set_or_clear_bits(&mut vol_bm, lcn, n_clusters, true);
-                allocated_data_run = Some((lcn, n_clusters));
+                allocated_data_runs =
+                    self.reserve_data_payload(cx, &mut vol_bm, payload, &mut pre_payload_writes)?;
                 let alloc_b = n_clusters * cluster_bytes;
-                let mut padded = vec![0_u8; alloc_b as usize];
-                padded[..payload.len()].copy_from_slice(payload);
-                let phys = self
-                    .geometry
-                    .cluster_offset(lcn)
-                    .map_err(|err| parse_err(&err))?;
-                pre_payload_writes.push(DirPrePayloadWrite {
-                    phys_offset: phys,
-                    bytes: padded,
-                });
                 (alloc_b, payload.len() as u64)
             }
         } else {
@@ -1118,20 +1251,15 @@ impl NtfsTransactionEngine {
             attr_id += 1;
         }
         if let Some(payload) = file_payload {
-            if let Some((lcn, n_clusters)) = allocated_data_run {
-                let run = NtfsRun {
-                    vcn: 0,
-                    clusters: n_clusters,
-                    lcn: Some(lcn),
-                };
+            if !allocated_data_runs.is_empty() {
                 child_attrs.push((
                     DATA,
                     encode_nonresident_attribute(
                         DATA,
                         attr_id,
                         &[],
-                        &[run],
-                        n_clusters * cluster_bytes,
+                        &allocated_data_runs,
+                        alloc_size_for_fn,
                         payload.len() as u64,
                         payload.len() as u64,
                     )?,
@@ -1245,14 +1373,17 @@ impl NtfsTransactionEngine {
         mutation_specs.extend(dir_plan.log_specs);
 
         // Emit $Bitmap log specs + TargetWriteKind::BitmapStream for any allocated clusters!
-        if let Some((lcn, count)) = allocated_data_run {
-            mutation_specs.extend(self.build_bitmap_range_specs(
-                bm_attr_slot,
-                &bm_runs,
-                lcn,
-                count,
-                true,
-            )?);
+        for run in &allocated_data_runs {
+            mutation_specs.extend(
+                self.build_bitmap_range_specs(
+                    bm_attr_slot,
+                    &bm_runs,
+                    run.lcn
+                        .ok_or_else(|| corrupt(0, "sparse DATA reservation"))?,
+                    run.clusters,
+                    true,
+                )?,
+            );
         }
         if let Some((lcn, count)) = dir_plan.allocated_clusters.or(dir_alloc_run) {
             mutation_specs.extend(self.build_bitmap_range_specs(
@@ -1263,7 +1394,7 @@ impl NtfsTransactionEngine {
                 true,
             )?);
         }
-        if allocated_data_run.is_some() || dir_plan.allocated_clusters.is_some() {
+        if !allocated_data_runs.is_empty() || dir_plan.allocated_clusters.is_some() {
             target_writes.push(TargetWriteKind::BitmapStream {
                 runs: bm_runs,
                 byte_offset: 0,
@@ -1322,6 +1453,9 @@ impl NtfsTransactionEngine {
 
     /// Overwrite a regular file's unnamed `DATA` stream (resident, resident->nonresident,
     /// or nonresident copy-on-write cluster replacement with pre-commit payload flush).
+    /// Replacement data may use fragmented free space while the old clusters
+    /// remain reserved. Files with multiple names or attribute lists are refused
+    /// before writes until coordinated name and extension-record mutation exists.
     pub fn write_file_data(
         &mut self,
         cx: &Cx,
@@ -1361,6 +1495,22 @@ impl NtfsTransactionEngine {
         }
         if file_no < 24 {
             return Err(FfsError::PermissionDenied);
+        }
+        let mut file_names = 0;
+        for attribute in file_rec.attributes().map_err(|err| parse_err(&err))? {
+            if attribute.kind == 0x20 {
+                return Err(unsupported(
+                    "NTFS DATA replacement requires attribute-list mutation support",
+                ));
+            }
+            if attribute.kind == ATTR_FILE_NAME {
+                file_names += 1;
+            }
+        }
+        if file_rec.hard_links != 1 || file_names != 1 {
+            return Err(unsupported(
+                "multi-name NTFS writes require coordinated FILE_NAME and index updates",
+            ));
         }
         let file_ref = NtfsReference {
             record: u64::from(file_no),
@@ -1495,40 +1645,21 @@ impl NtfsTransactionEngine {
             };
 
             let new_clusters = (new_data.len() as u64).div_ceil(cluster_bytes);
-            let mut new_runs = Vec::new();
-            if new_clusters > 0 {
-                // Allocate from currently-free bits BEFORE freeing old_runs_to_free so new LCNs are strictly disjoint!
-                let new_lcn = find_contiguous_zero_bits(
-                    &vol_bm,
-                    self.geometry.cluster_count(),
-                    new_clusters,
-                    1,
-                )
-                .ok_or(FfsError::NoSpace)?;
-                set_or_clear_bits(&mut vol_bm, new_lcn, new_clusters, true);
-                mutation_specs.extend(self.build_bitmap_range_specs(
-                    bm_attr_slot,
-                    &bm_runs,
-                    new_lcn,
-                    new_clusters,
-                    true,
-                )?);
-                let alloc_b = new_clusters * cluster_bytes;
-                let mut padded = vec![0_u8; alloc_b as usize];
-                padded[..new_data.len()].copy_from_slice(new_data);
-                let phys = self
-                    .geometry
-                    .cluster_offset(new_lcn)
-                    .map_err(|err| parse_err(&err))?;
-                pre_payload_writes.push(DirPrePayloadWrite {
-                    phys_offset: phys,
-                    bytes: padded,
-                });
-                new_runs.push(NtfsRun {
-                    vcn: 0,
-                    clusters: new_clusters,
-                    lcn: Some(new_lcn),
-                });
+            // Reserve every replacement run BEFORE releasing any old run so
+            // loser undo and every pre-commit crash retain the previous bytes.
+            let new_runs =
+                self.reserve_data_payload(cx, &mut vol_bm, new_data, &mut pre_payload_writes)?;
+            for run in &new_runs {
+                mutation_specs.extend(
+                    self.build_bitmap_range_specs(
+                        bm_attr_slot,
+                        &bm_runs,
+                        run.lcn
+                            .ok_or_else(|| corrupt(0, "sparse DATA reservation"))?,
+                        run.clusters,
+                        true,
+                    )?,
+                );
             }
 
             for old_r in &old_runs_to_free {
@@ -3024,5 +3155,64 @@ impl NtfsTransactionEngine {
             });
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod data_run_tests {
+    use super::{Cx, FfsError, find_free_data_runs, set_or_clear_bits};
+
+    #[test]
+    fn fragmented_data_uses_later_large_holes_within_mapping_budget() {
+        let cx = Cx::for_testing();
+        let mut bitmap = [u8::MAX; 4];
+        for (start, count) in [(1, 1), (3, 1), (5, 1), (8, 3), (16, 4)] {
+            set_or_clear_bits(&mut bitmap, start, count, false);
+        }
+        let runs = find_free_data_runs(&cx, &bitmap, 32, 6, 2).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            (runs[0].vcn, runs[0].clusters, runs[0].lcn),
+            (0, 2, Some(8))
+        );
+        assert_eq!(
+            (runs[1].vcn, runs[1].clusters, runs[1].lcn),
+            (2, 4, Some(16))
+        );
+    }
+
+    #[test]
+    fn fragmented_data_preserves_earliest_contiguous_allocation() {
+        let cx = Cx::for_testing();
+        let mut bitmap = [u8::MAX; 4];
+        for (start, count) in [(1, 2), (5, 4), (12, 6)] {
+            set_or_clear_bits(&mut bitmap, start, count, false);
+        }
+        let runs = find_free_data_runs(&cx, &bitmap, 32, 4, 1).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (runs[0].vcn, runs[0].clusters, runs[0].lcn),
+            (0, 4, Some(5))
+        );
+    }
+
+    #[test]
+    fn fragmented_data_distinguishes_capacity_and_space_exhaustion() {
+        let cx = Cx::for_testing();
+        let bitmap = [0b0101_0101_u8];
+        assert!(matches!(
+            find_free_data_runs(&cx, &bitmap, 8, 3, 2),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(matches!(
+            find_free_data_runs(&cx, &bitmap, 8, 5, 2),
+            Err(FfsError::NoSpace)
+        ));
+        // Bit zero and bits beyond the declared volume are never usable.
+        assert!(matches!(
+            find_free_data_runs(&cx, &[0], 4, 4, 4),
+            Err(FfsError::NoSpace)
+        ));
+        assert!(find_free_data_runs(&cx, &[], 0, 0, 0).unwrap().is_empty());
     }
 }

@@ -47,6 +47,226 @@ const fn write_options_recover() -> NtfsWriteOptions {
     }
 }
 
+fn fragmented_data_fixture() -> (Arc<FaultInjectingNtfsDevice>, NtfsTransactionEngine) {
+    let cx = Cx::for_testing();
+    let mut image = build_clean_ntfs_image(99, 50, 0xF12A_6E17_0000_0001);
+    // Give free space stale nonzero contents so a partial final cluster must
+    // actually be initialized; an already-zero image would hide that bug.
+    image[93 * CLUSTER_BYTES..99 * CLUSTER_BYTES].fill(0xD3);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    for index in 0_u8..4 {
+        engine
+            .create_file(&cx, "/", &format!("f{index}"), &vec![index; CLUSTER_BYTES])
+            .into_result()
+            .unwrap();
+    }
+    for name in ["/f0", "/f2"] {
+        engine.unlink_file(&cx, name).into_result().unwrap();
+    }
+    engine.check_clean_consistency(&cx).unwrap();
+
+    // Only public native operations fragmented the fixture. Ensure the test
+    // cannot pass by accidentally leaving one large contiguous allocation.
+    let image = device.snapshot_durable_only();
+    let bitmap = &image[60 * CLUSTER_BYTES..61 * CLUSTER_BYTES];
+    let mut free_count = 0;
+    let mut current_run = 0;
+    let mut longest_run = 0;
+    for cluster in 0..99 {
+        if bitmap[cluster / 8] & (1 << (cluster % 8)) == 0 {
+            free_count += 1;
+            current_run += 1;
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    assert!(free_count >= 3, "fixture must have room for three clusters");
+    assert!(
+        longest_run < 3,
+        "fixture must require fragmented allocation"
+    );
+    (device, engine)
+}
+
+#[test]
+fn fragmented_data_create_preserves_other_files_and_zeroes_cluster_slack() {
+    let cx = Cx::for_testing();
+    let (device, mut engine) = fragmented_data_fixture();
+    let before = device.snapshot_durable_only();
+    let payload: Vec<u8> = (0..2 * CLUSTER_BYTES + 137)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let (reference, token) = engine
+        .create_file(&cx, "/", "new", &payload)
+        .into_result()
+        .expect("allocate three clusters across isolated free runs");
+    assert!(token.matches_engine(&engine));
+
+    let image = device.snapshot_durable_only();
+    let files = read_all_files_from_clean_volume(&image);
+    assert_eq!(files.get("/new"), Some(&payload));
+    assert_eq!(files.get("/f1"), Some(&vec![1; CLUSTER_BYTES]));
+    assert_eq!(files.get("/f3"), Some(&vec![3; CLUSTER_BYTES]));
+    let record_at = CLUSTER_BYTES + reference.record as usize * RECORD_BYTES;
+    let record = NtfsFileRecord::parse(&image[record_at..record_at + RECORD_BYTES]).unwrap();
+    let attributes = record.attributes().unwrap();
+    let data = attributes
+        .iter()
+        .find(|attribute| attribute.kind == DATA && attribute.name.is_empty())
+        .unwrap();
+    let ffs_ondisk::ntfs::NtfsValue::NonResident(stream) = &data.value else {
+        panic!("three clusters must be nonresident");
+    };
+    let runs = ffs_ondisk::ntfs::decode_mapping_pairs(
+        stream.mapping_pairs,
+        stream.first_vcn,
+        stream.last_vcn,
+        99,
+    )
+    .unwrap();
+    assert!(runs.len() > 1);
+    let last = runs.last().unwrap();
+    let slack_at = (last.lcn.unwrap() + last.clusters - 1) as usize * CLUSTER_BYTES + 137;
+    assert!(
+        before[slack_at..slack_at + CLUSTER_BYTES - 137]
+            .iter()
+            .any(|byte| *byte != 0),
+        "allocated slack must contain stale bytes before initialization"
+    );
+    assert!(
+        image[slack_at..slack_at + CLUSTER_BYTES - 137]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+}
+
+#[test]
+fn fragmented_data_cow_overwrite_and_no_space_preserve_durable_contents() {
+    let cx = Cx::for_testing();
+    let (device, mut engine) = fragmented_data_fixture();
+    let payload = vec![0xA7; 3 * CLUSTER_BYTES];
+    engine
+        .write_file_data(&cx, "/f1", &payload)
+        .into_result()
+        .expect("COW replacement can use separate free runs");
+    let before = device.snapshot_durable_only();
+    let files = read_all_files_from_clean_volume(&before);
+    assert_eq!(files.get("/f1"), Some(&payload));
+    assert_eq!(files.get("/f3"), Some(&vec![3; CLUSTER_BYTES]));
+    let written = device.write_bytes_total();
+    assert!(matches!(
+        engine.write_file_data(&cx, "/f1", &vec![0xBB; 7 * CLUSTER_BYTES]),
+        NtfsTxOutcome::NotCommitted(FfsError::NoSpace)
+    ));
+    assert_eq!(device.write_bytes_total(), written);
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.snapshot_durable_only(), before);
+}
+
+#[test]
+fn fragmented_data_cow_recovers_every_persistence_cut_without_mixed_contents() {
+    struct Cut {
+        stage: NtfsPersistenceStage,
+        committed: bool,
+        durable: Vec<u8>,
+        live: Vec<u8>,
+        reordered: Vec<u8>,
+    }
+
+    let cx = Cx::for_testing();
+    let (device, mut engine) = fragmented_data_fixture();
+    let before = read_all_files_from_clean_volume(&device.snapshot_durable_only());
+    assert_eq!(before.get("/f1"), Some(&vec![1; CLUSTER_BYTES]));
+    assert_eq!(before.get("/f3"), Some(&vec![3; CLUSTER_BYTES]));
+    let cuts = Arc::new(Mutex::new(Vec::<Cut>::new()));
+    {
+        let captured = Arc::clone(&cuts);
+        let device = Arc::clone(&device);
+        let mut committed = false;
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+            captured.lock().unwrap().push(Cut {
+                stage: event.stage,
+                committed,
+                durable: device.snapshot_durable_only(),
+                live: device.snapshot_live(),
+                reordered: device.snapshot_reordered_pending(true),
+            });
+            Ok(())
+        })));
+    }
+
+    let payload: Vec<u8> = (0..2 * CLUSTER_BYTES + 137)
+        .map(|index| (index % 239) as u8)
+        .collect();
+    engine
+        .write_file_data(&cx, "/f1", &payload)
+        .into_result()
+        .expect("fragmented COW replacement");
+    engine.set_stage_hook(None);
+    let mut after = before.clone();
+    after.insert("/f1".to_owned(), payload);
+    assert_eq!(
+        read_all_files_from_clean_volume(&device.snapshot_durable_only()),
+        after
+    );
+
+    let cuts = std::mem::take(&mut *cuts.lock().unwrap());
+    assert!(
+        cuts.iter()
+            .filter(|cut| cut.stage == NtfsPersistenceStage::PayloadDataWrite)
+            .count()
+            >= 2,
+        "the crash trace must include separate physical payload runs"
+    );
+    assert!(
+        cuts.iter()
+            .any(|cut| { !cut.committed && cut.stage == NtfsPersistenceStage::LogRecordWrite })
+    );
+    assert!(cuts.iter().any(|cut| cut.committed));
+
+    for cut in cuts {
+        // Losing all writes since the last sync preserves the old file until
+        // the commit barrier; every later cut must preserve the replacement.
+        let expected = if cut.committed { &after } else { &before };
+        assert_eq!(
+            &recover_crash_image_and_verify(&cut.durable),
+            expected,
+            "durable cut at {:?}",
+            cut.stage
+        );
+        for (kind, image) in [("live", &cut.live), ("reordered", &cut.reordered)] {
+            let recovered = recover_crash_image_and_verify(image);
+            if cut.committed {
+                assert_eq!(
+                    recovered, after,
+                    "{kind} cut after commit at {:?}",
+                    cut.stage
+                );
+            } else {
+                // An unflushed CommitTransaction may already be durable, so
+                // either complete prefix is valid. Partial payload/bitmap
+                // publication must never expose a mixture or harm /f3.
+                assert!(
+                    recovered == before || recovered == after,
+                    "{kind} cut before commit at {:?} exposed a mixed prefix",
+                    cut.stage
+                );
+            }
+        }
+    }
+}
+
 fn protect_record_bytes(mut raw: Vec<u8>, token: u16) -> Vec<u8> {
     let usa = usize::from(u16::from_le_bytes([raw[4], raw[5]]));
     let count = usize::from(u16::from_le_bytes([raw[6], raw[7]]));
@@ -883,7 +1103,7 @@ fn directory_rename_rejects_invalid_native_ancestry_without_writes() {
 }
 
 #[test]
-fn multiname_rename_preserves_native_links_without_writes() {
+fn multiname_mutation_preserves_native_links_without_writes() {
     fn word16(bytes: &[u8], at: usize) -> u16 {
         u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
     }
@@ -1039,8 +1259,130 @@ fn multiname_rename_preserves_native_links_without_writes() {
         assert_eq!(dev.write_bytes_total(), before_writes);
         assert_eq!(dev.snapshot_live(), image);
         assert_eq!(dev.snapshot_durable_only(), image);
+        for path in ["/first.txt".to_owned(), format!("/{second_name}")] {
+            let outcome = engine.write_file_data(&cx, &path, b"replacement must not publish");
+            assert!(
+                matches!(
+                    outcome,
+                    NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+                ),
+                "multi-name writes must not leave stale FILE_NAME or index sizes: {outcome:?}"
+            );
+            assert_eq!(dev.write_bytes_total(), before_writes);
+            assert_eq!(dev.snapshot_live(), image);
+            assert_eq!(dev.snapshot_durable_only(), image);
+        }
         engine.check_clean_consistency(&cx).unwrap();
     }
+}
+
+#[test]
+fn attribute_list_data_replacement_refuses_without_writes() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(512, 64, 0x9988_7766_5544_3314);
+    let vol_len = image.len() as u64 - SECTOR_BYTES as u64;
+    let dev = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .expect("open clean NTFS");
+    let original = b"single-name file with a complete native attribute catalog";
+    let (file, _) = engine
+        .create_file(&cx, "/", "catalog.txt", original)
+        .into_result()
+        .unwrap();
+    let mut image = dev.snapshot_durable_only();
+    drop(engine);
+
+    let record_at = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * RECORD_BYTES;
+    let raw = &image[record_at..record_at + RECORD_BYTES];
+    let record = NtfsFileRecord::parse(raw).unwrap();
+    let restored = restore_record(raw, b"FILE").unwrap();
+    assert_eq!(record.hard_links, 1);
+    let attributes = record.attributes().unwrap();
+    assert_eq!(
+        attributes.iter().filter(|attr| attr.kind == 0x30).count(),
+        1
+    );
+
+    // A valid ATTRIBUTE_LIST catalog describes every original attribute and
+    // binds its instance to this exact base record and sequence. It does not
+    // list itself, require an extension record, or alter the single FILE_NAME.
+    let mut catalog = Vec::new();
+    for attribute in &attributes {
+        let length = (26 + attribute.name.len() * 2).next_multiple_of(8);
+        let mut entry = vec![0_u8; length];
+        entry[..4].copy_from_slice(&attribute.kind.to_le_bytes());
+        entry[4..6].copy_from_slice(&u16::try_from(length).unwrap().to_le_bytes());
+        entry[6] = u8::try_from(attribute.name.len()).unwrap();
+        entry[7] = 26;
+        entry[16..24].copy_from_slice(&file.encode().unwrap().to_le_bytes());
+        entry[24..26].copy_from_slice(&attribute.id.to_le_bytes());
+        for (index, unit) in attribute.name.iter().enumerate() {
+            entry[26 + index * 2..28 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        catalog.extend_from_slice(&entry);
+    }
+    let list_id = attributes
+        .iter()
+        .map(|attribute| attribute.id)
+        .max()
+        .unwrap()
+        .checked_add(1)
+        .unwrap();
+    let mut file_attrs = Vec::new();
+    let mut at = usize::from(u16::from_le_bytes([restored[20], restored[21]]));
+    loop {
+        let kind = u32::from_le_bytes(restored[at..at + 4].try_into().unwrap());
+        if kind == u32::MAX {
+            break;
+        }
+        let length = u32::from_le_bytes(restored[at + 4..at + 8].try_into().unwrap()) as usize;
+        file_attrs.push(restored[at..at + length].to_vec());
+        at += length;
+    }
+    file_attrs.push(build_resident_attr(0x20, list_id, &[], false, &catalog));
+    file_attrs.sort_by_key(|attribute| u32::from_le_bytes(attribute[..4].try_into().unwrap()));
+    let with_catalog = build_file_record(
+        u32::try_from(file.record).unwrap(),
+        file.sequence,
+        1,
+        false,
+        &file_attrs,
+    );
+    image[record_at..record_at + RECORD_BYTES].copy_from_slice(&with_catalog);
+
+    let files = read_all_files_from_clean_volume(&image);
+    assert_eq!(
+        files.get("/catalog.txt").map(Vec::as_slice),
+        Some(original.as_slice())
+    );
+    let dev = FaultInjectingNtfsDevice::new(image.clone());
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&dev) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .expect("complete base-only attribute catalog passes clean admission");
+    let before_writes = dev.write_bytes_total();
+    let outcome = engine.write_file_data(&cx, "/catalog.txt", &vec![0xA7; 3 * CLUSTER_BYTES]);
+    assert!(
+        matches!(
+            outcome,
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+        ),
+        "ATTRIBUTE_LIST replacement requires coordinated catalog updates: {outcome:?}"
+    );
+    assert_eq!(dev.write_bytes_total(), before_writes);
+    assert_eq!(dev.snapshot_live(), image);
+    assert_eq!(dev.snapshot_durable_only(), image);
+    engine.check_clean_consistency(&cx).unwrap();
 }
 
 #[test]
