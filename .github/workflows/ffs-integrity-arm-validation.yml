@@ -1,0 +1,50 @@
+name: Filesystem integrity ARM validation
+on:
+  push:
+    branches: [validation/ffs-integrity-arm-20261113]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  CFLAGS: "-g0 -O2"
+jobs:
+  required-gates:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Source identity
+        run: |
+          git rev-parse HEAD
+          rustc -Vv
+          git diff --check
+      - name: Workspace formatting
+        run: cargo fmt --check
+      - name: Workspace compiler check
+        if: ${{ !cancelled() }}
+        run: cargo check --locked --workspace --all-targets
+      - name: Workspace clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Complete MVCC tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-mvcc
+      - name: Complete NTFS tests and persistence cuts
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-ntfs
+      - name: NTFS CLI consumer tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --bin ffs-ntfs
+      - name: Install native NTFS oracle
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update && sudo apt-get install -y ntfs-3g
+      - name: Native NTFS CLI range and truncate round trip
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --test cli_e2e native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection -- --ignored --exact --nocapture

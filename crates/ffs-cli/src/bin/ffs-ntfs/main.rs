@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Native, read-only NTFS 3.1 inspection, directory traversal and stream extraction.
+//! Native NTFS 3.1 inspection, read-only mounts and explicitly admitted transactions.
 
 mod allocation_commands;
 mod ea_name;
@@ -11,19 +11,20 @@ use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
 use ea_name::EaName;
+use ffs_ntfs::transaction::MAX_FILE_EDIT_BYTES;
 use ffs_ntfs::{
     NtfsDurableToken, NtfsTransactionEngine, NtfsTxOutcome, NtfsWriteOptions, StreamName, reader,
 };
 use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint};
 use ffs_ondisk::ntfs::{DATA, NtfsFileRecord, NtfsReference, NtfsValue};
 use reader::NtfsVolume;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "ffs-ntfs",
-    about = "Inspect and mount offline NTFS images with optional volatile log recovery"
+    about = "Inspect, mount read-only, and transactionally edit offline NTFS images"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -220,7 +221,38 @@ impl PayloadArgs {
         if self.empty || !require_explicit_selector {
             return Ok(Vec::new());
         }
-        bail!("specify --data, --data-file, or --empty for tx-write payload")
+        bail!("specify --data, --data-file, or --empty for a native NTFS write payload")
+    }
+
+    fn load_range(&self, start: u64) -> Result<Vec<u8>> {
+        // Bound host-file reads before opening a writable image, including when
+        // persistent recovery was requested. Empty writes admit any offset.
+        let maximum = MAX_FILE_EDIT_BYTES.saturating_sub(start);
+        let too_large = || {
+            anyhow::anyhow!(
+                "tx-write-range payload at --start {start} exceeds the {MAX_FILE_EDIT_BYTES}-byte edit limit"
+            )
+        };
+        if let Some(text) = &self.data
+            && u64::try_from(text.len())? > maximum
+        {
+            return Err(too_large());
+        }
+        let data = if let Some(path) = &self.data_file {
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .with_context(|| format!("opening NTFS payload source {}", path.display()))?
+                .take(maximum + 1)
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("reading NTFS payload source {}", path.display()))?;
+            bytes
+        } else {
+            self.load(true)?
+        };
+        if u64::try_from(data.len())? > maximum {
+            return Err(too_large());
+        }
+        Ok(data)
     }
 }
 
@@ -388,6 +420,26 @@ enum Command {
         path: String,
         #[command(flatten)]
         payload: PayloadArgs,
+    },
+    /// Write bytes at a file offset, preserving the suffix and zero-filling any gap beyond EOF.
+    TxWriteRange {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+        /// Byte offset in the file, distinct from the volume's --offset. A nonempty write's resulting file must fit 16 MiB.
+        #[arg(long)]
+        start: u64,
+        #[command(flatten)]
+        payload: PayloadArgs,
+    },
+    /// Set an unnamed DATA stream's length, zero-filling growth through a native logged transaction.
+    TxTruncate {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+        /// New file size in bytes, from zero through 16 MiB.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(..=MAX_FILE_EDIT_BYTES))]
+        size: u64,
     },
     /// Atomically rename an entry in an offline NTFS 3.1 image via a native logged transaction.
     TxRename {
@@ -1087,6 +1139,35 @@ fn main() -> Result<()> {
                     "record": reference.record,
                     "sequence": reference.sequence,
                     "bytes": data.len(),
+                })
+            })?;
+        }
+        Command::TxWriteRange {
+            target,
+            path,
+            start,
+            payload,
+        } => {
+            let data = payload.load_range(start)?;
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.write_file_range(&cx, &path, start, &data);
+            emit_tx_outcome("tx_write_range", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "start": start,
+                    "bytes": data.len(),
+                })
+            })?;
+        }
+        Command::TxTruncate { target, path, size } => {
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.truncate_file(&cx, &path, size);
+            emit_tx_outcome("tx_truncate", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "size": size,
                 })
             })?;
         }
@@ -1980,6 +2061,24 @@ mod tests {
             &[
                 "ffs-ntfs", "tx-write", "disk.img", "/a.txt", "--data", "abc",
             ],
+            &[
+                "ffs-ntfs",
+                "tx-write-range",
+                "disk.img",
+                "/a.txt",
+                "--start",
+                "3",
+                "--data",
+                "abc",
+            ],
+            &[
+                "ffs-ntfs",
+                "tx-truncate",
+                "disk.img",
+                "/a.txt",
+                "--size",
+                "0",
+            ],
             &["ffs-ntfs", "tx-rename", "disk.img", "/a.txt", "/b.txt"],
             &["ffs-ntfs", "tx-unlink", "disk.img", "/a.txt"],
             &["ffs-ntfs", "tx-grow-mft", "disk.img", "--records", "8"],
@@ -2026,6 +2125,146 @@ mod tests {
             assert!(args.open(&cx, false).is_err());
         }
         assert_eq!(std::fs::read(&scratch).unwrap(), original);
+    }
+
+    #[test]
+    fn cli_range_edits_distinguish_file_and_volume_offsets_and_enforce_sizes() {
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "tx-write-range",
+            "disk.img",
+            "/a.bin",
+            "--offline-image",
+            "--allow-write",
+            "--recover-dirty",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+            "--start",
+            "4099",
+            "--data-file",
+            "payload.bin",
+        ])
+        .unwrap();
+        let Command::TxWriteRange {
+            target,
+            path,
+            start,
+            payload,
+        } = cli.command
+        else {
+            panic!("tx-write-range");
+        };
+        assert_eq!(
+            (target.offset, target.length),
+            (1_048_576, Some(67_108_864))
+        );
+        assert!(target.offline_image && target.allow_write && target.recover_dirty);
+        assert_eq!((path.as_str(), start), ("/a.bin", 4099));
+        assert_eq!(payload.data_file, Some(PathBuf::from("payload.bin")));
+
+        let range_base = [
+            "ffs-ntfs",
+            "tx-write-range",
+            "disk.img",
+            "/a.bin",
+            "--offline-image",
+            "--allow-write",
+            "--empty",
+        ];
+        assert!(Cli::try_parse_from(range_base).is_err());
+        for start in ["-1", "18446744073709551616"] {
+            assert!(Cli::try_parse_from(range_base.into_iter().chain(["--start", start])).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(range_base.into_iter().chain([
+                "--start",
+                "0",
+                "--data",
+                "conflicting payload",
+            ]))
+            .is_err()
+        );
+        let cli = Cli::try_parse_from(
+            range_base
+                .into_iter()
+                .chain(["--start", "18446744073709551615"]),
+        )
+        .unwrap();
+        let Command::TxWriteRange { start, payload, .. } = cli.command else {
+            panic!("empty range write");
+        };
+        assert_eq!(start, u64::MAX);
+        assert!(payload.load_range(start).unwrap().is_empty());
+
+        let truncate_base = [
+            "ffs-ntfs",
+            "tx-truncate",
+            "disk.img",
+            "/a.bin",
+            "--offline-image",
+            "--allow-write",
+        ];
+        assert!(Cli::try_parse_from(truncate_base).is_err());
+        for (argument, expected) in [("0", 0), ("16777216", MAX_FILE_EDIT_BYTES)] {
+            let cli =
+                Cli::try_parse_from(truncate_base.into_iter().chain(["--size", argument])).unwrap();
+            let Command::TxTruncate { size, .. } = cli.command else {
+                panic!("tx-truncate");
+            };
+            assert_eq!(size, expected);
+        }
+        for invalid in ["-1", "16777217", "18446744073709551615"] {
+            assert!(
+                Cli::try_parse_from(truncate_base.into_iter().chain(["--size", invalid])).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cli_range_payload_reads_are_binary_exact_and_bounded_before_image_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("payload.bin");
+        let bytes = [0x00, 0xFF, 0x80, 0x41];
+        std::fs::write(&source, bytes).unwrap();
+        let payload = PayloadArgs {
+            data: None,
+            data_file: Some(source.clone()),
+            empty: false,
+        };
+        assert_eq!(payload.load_range(MAX_FILE_EDIT_BYTES - 4).unwrap(), bytes);
+        assert!(payload.load_range(MAX_FILE_EDIT_BYTES - 3).is_err());
+        assert!(payload.load_range(u64::MAX).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+
+        let oversized = directory.path().join("oversized.bin");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_FILE_EDIT_BYTES + 1)
+            .unwrap();
+        let payload = PayloadArgs {
+            data: None,
+            data_file: Some(oversized),
+            empty: false,
+        };
+        assert!(payload.load_range(0).is_err());
+        let payload = PayloadArgs {
+            data: Some("é".into()),
+            data_file: None,
+            empty: false,
+        };
+        assert_eq!(
+            payload.load_range(MAX_FILE_EDIT_BYTES - 2).unwrap(),
+            "é".as_bytes()
+        );
+        assert!(payload.load_range(MAX_FILE_EDIT_BYTES - 1).is_err());
+        let missing = PayloadArgs {
+            data: None,
+            data_file: None,
+            empty: false,
+        };
+        assert!(missing.load_range(0).is_err());
     }
 
     #[test]

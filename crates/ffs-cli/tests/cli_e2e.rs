@@ -1,7 +1,7 @@
 //! CLI binary E2E tests and explicit observation-policy component controls.
 //!
 //! Native scenarios execute the CLI against real filesystem images created by
-//! mkfs.ext4/mkfs.btrfs. Component controls label planted failures separately.
+//! mkfs.ext4/mkfs.btrfs/mkntfs. Component controls label planted failures separately.
 
 #![allow(
     clippy::uninlined_format_args,
@@ -66,6 +66,232 @@ fn native_companion_read_profile_fat() {
 #[ignore = "requires ntfs-3g tools; retains native images and command evidence"]
 fn native_companion_read_profile_ntfs() {
     run_native_companion_read_profile("verify_ntfs_read.py", env!("CARGO_BIN_EXE_ffs-ntfs"));
+}
+
+#[test]
+#[ignore = "requires ntfs-3g mkntfs and ntfscat; executes native NTFS mutations and an independent read oracle"]
+fn native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection() {
+    use std::io::Write as _;
+
+    for tool in ["mkntfs", "ntfscat"] {
+        assert!(
+            command_available(tool),
+            "native NTFS CLI test requires {tool}; install ntfs-3g before explicitly running it"
+        );
+    }
+    const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+    let directory = tempfile::tempdir().expect("native NTFS CLI test directory");
+    let native_image = directory.path().join("native.img");
+    let embedded_image = directory.path().join("embedded.img");
+    fs::File::create(&native_image)
+        .unwrap()
+        .set_len(VOLUME_BYTES)
+        .unwrap();
+    let checked = |binary: &Path, args: &[&str]| {
+        let output = run_cli_binary(binary, args);
+        assert!(
+            output.status.success(),
+            "{} {args:?} failed: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let native_path = native_image.to_str().unwrap();
+    checked(
+        Path::new("mkntfs"),
+        &["-F", "-Q", "-s", "512", "-c", "4096", native_path],
+    );
+    // Select the NTFS volume with --offset while --start selects bytes inside
+    // its file. Native mutation must preserve both host-file boundary regions.
+    let prefix = vec![0xA5; 1_048_576];
+    let suffix = [0x5A; 4096];
+    {
+        let mut embedded = fs::File::create(&embedded_image).unwrap();
+        embedded.write_all(&prefix).unwrap();
+        std::io::copy(&mut fs::File::open(&native_image).unwrap(), &mut embedded).unwrap();
+        embedded.write_all(&suffix).unwrap();
+    }
+    let binary = Path::new(env!("CARGO_BIN_EXE_ffs-ntfs"));
+    let embedded_path = embedded_image.to_str().unwrap();
+    let selection = ["--offset", "1048576", "--length", "67108864"];
+    let mut last_commit_lsn = 0;
+    let mut transaction = |command: &str, arguments: &[&str]| {
+        let mut args = vec![command, embedded_path, "--offline-image", "--allow-write"];
+        args.extend(selection);
+        args.extend_from_slice(arguments);
+        let output = checked(binary, &args);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["format"], "NTFS");
+        assert_eq!(report["outcome"], "committed");
+        assert_eq!(report["token"]["storage"], report["storage_identity"]);
+        let commit_lsn = report["token"]["commit_lsn"].as_u64().unwrap();
+        assert!(commit_lsn > last_commit_lsn);
+        last_commit_lsn = commit_lsn;
+        report
+    };
+    let contents = |expected: &[u8]| {
+        let mut embedded = fs::File::open(&embedded_image).unwrap();
+        let mut before_volume = vec![0; prefix.len()];
+        embedded.read_exact(&mut before_volume).unwrap();
+        assert_eq!(before_volume, prefix);
+        let mut extracted = fs::File::create(&native_image).unwrap();
+        assert_eq!(
+            std::io::copy(&mut (&mut embedded).take(VOLUME_BYTES), &mut extracted).unwrap(),
+            VOLUME_BYTES
+        );
+        extracted.sync_all().unwrap();
+        let mut after_volume = [0; 4096];
+        embedded.read_exact(&mut after_volume).unwrap();
+        assert_eq!(after_volume, suffix);
+        assert_eq!(embedded.read(&mut [0; 1]).unwrap(), 0);
+
+        // Reopen through an independent native implementation after every CLI
+        // process exits, checking exact bytes including initialized zero gaps.
+        let oracle = checked(Path::new("ntfscat"), &[native_path, "/edit.bin"]);
+        assert_eq!(oracle.stdout, expected);
+        let mut args = vec!["read", embedded_path, "/edit.bin", "--offline-image"];
+        args.extend(selection);
+        assert_eq!(checked(binary, &args).stdout, expected);
+    };
+
+    let created = transaction("tx-create", &["/", "edit.bin", "--data", "0123456789"]);
+    let identity = (
+        created["result"]["record"].clone(),
+        created["result"]["sequence"].clone(),
+    );
+    let written = transaction(
+        "tx-write-range",
+        &["/edit.bin", "--start", "3", "--data", "XYZ"],
+    );
+    assert_eq!(written["operation"], "tx_write_range");
+    assert_eq!(written["result"]["start"], 3);
+    assert_eq!(written["result"]["bytes"], 3);
+    assert_eq!(written["result"]["record"], identity.0);
+    assert_eq!(written["result"]["sequence"], identity.1);
+    let mut expected = b"012XYZ6789".to_vec();
+    contents(&expected);
+
+    let payload_path = directory.path().join("payload.bin");
+    let payload = [0xFF, 0x00, 0x80, 0x41];
+    fs::write(&payload_path, payload).unwrap();
+    transaction(
+        "tx-write-range",
+        &[
+            "/edit.bin",
+            "--start",
+            "12291",
+            "--data-file",
+            payload_path.to_str().unwrap(),
+        ],
+    );
+    expected.resize(12_291, 0);
+    expected.extend(payload);
+    contents(&expected);
+
+    let grown = transaction("tx-truncate", &["/edit.bin", "--size", "16405"]);
+    assert_eq!(grown["operation"], "tx_truncate");
+    assert_eq!(grown["result"]["size"], 16_405);
+    assert_eq!(grown["result"]["record"], identity.0);
+    assert_eq!(grown["result"]["sequence"], identity.1);
+    expected.resize(16_405, 0);
+    contents(&expected);
+    transaction("tx-truncate", &["/edit.bin", "--size", "5"]);
+    expected.truncate(5);
+    contents(&expected);
+    transaction("tx-truncate", &["/edit.bin", "--size", "0"]);
+    contents(&[]);
+    transaction(
+        "tx-write-range",
+        &["/edit.bin", "--start", "18446744073709551615", "--empty"],
+    );
+    contents(&[]);
+
+    let unchanged = sha256_file(&embedded_image);
+    for (command, edit_args, outcome_name) in [
+        (
+            "tx-write-range",
+            &["--start", "0", "--data", "x"][..],
+            "tx_write_range",
+        ),
+        ("tx-truncate", &["--size", "1"][..], "tx_truncate"),
+    ] {
+        for target in ["/missing.bin", "/"] {
+            let mut args = vec![
+                command,
+                embedded_path,
+                target,
+                "--offline-image",
+                "--allow-write",
+            ];
+            args.extend(selection);
+            args.extend_from_slice(edit_args);
+            let output = run_cli_binary(binary, &args);
+            assert!(!output.status.success(), "invalid file target must fail");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains(&format!("not_committed ({outcome_name})")),
+                "native transaction errors must retain their outcome classification: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(sha256_file(&embedded_image), unchanged);
+        }
+    }
+    for (command, arguments) in [
+        (
+            "tx-write-range",
+            &["/edit.bin", "--start", "1", "--data", "denied"][..],
+        ),
+        ("tx-truncate", &["/edit.bin", "--size", "7"][..]),
+    ] {
+        for authorization in [None, Some("--offline-image"), Some("--allow-write")] {
+            let mut args = vec![command, embedded_path];
+            args.extend(selection);
+            args.extend_from_slice(arguments);
+            args.extend(authorization);
+            let output = run_cli_binary(binary, &args);
+            assert!(
+                !output.status.success(),
+                "missing write authority must fail"
+            );
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("--offline-image") || error.contains("--allow-write"));
+            assert_eq!(sha256_file(&embedded_image), unchanged);
+        }
+    }
+    for (command, arguments) in [
+        (
+            "tx-write-range",
+            &[
+                "/edit.bin",
+                "--start",
+                "18446744073709551615",
+                "--data",
+                "x",
+            ][..],
+        ),
+        (
+            "tx-write-range",
+            &[
+                "/edit.bin",
+                "--start",
+                "16777215",
+                "--data-file",
+                payload_path.to_str().unwrap(),
+            ][..],
+        ),
+        ("tx-truncate", &["/edit.bin", "--size", "16777217"][..]),
+    ] {
+        let mut args = vec![command, embedded_path, "--offline-image", "--allow-write"];
+        args.extend(selection);
+        args.extend_from_slice(arguments);
+        let output = run_cli_binary(binary, &args);
+        assert!(
+            !output.status.success(),
+            "oversized edit must fail: {args:?}"
+        );
+        assert_eq!(sha256_file(&embedded_image), unchanged);
+    }
 }
 
 #[test]
