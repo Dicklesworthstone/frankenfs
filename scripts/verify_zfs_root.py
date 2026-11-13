@@ -192,16 +192,42 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def make_tree_world_readable(root: Path) -> None:
+    if not root.exists():
+        return
+    root.chmod(0o755)
+    for dirpath, dirnames, filenames in os.walk(root):
+        base = Path(dirpath)
+        for dirname in dirnames:
+            target = base / dirname
+            if not target.is_symlink():
+                target.chmod(0o755)
+        for filename in filenames:
+            target = base / filename
+            if not target.is_symlink():
+                target.chmod(0o644)
+
+
 def head_identities(report: dict, pool: str) -> dict[str, str]:
     """Do not let duplicate candidate rows disappear in a dict comprehension."""
     result = {}
+    seen_origin = False
     for row in report["datasets"]:
         relative = row["relative_name"]
         require(isinstance(relative, str), "native fixture name was not losslessly represented")
+        require(str(row["guid"]).isdecimal() and int(row["guid"]) > 0, "invalid candidate dataset GUID")
+        if row["objectset_kind"] is None:
+            # OpenZFS 2.2+ creates an uninitialized hidden $ORIGIN DSL head with
+            # a zero root pointer and zero birth (`bd2fac9c4`), omitted from `zfs list`.
+            require(
+                relative == "$ORIGIN" and row["root_birth"] == 0 and not seen_origin,
+                "unexpected or non-zero uninitialized DSL head",
+            )
+            seen_origin = True
+            continue
         name = pool + ("/" + relative if relative else "")
         require(name not in result, "candidate returned duplicate dataset names")
         require(row["objectset_kind"] == 2, "native filesystem was reported as another object-set kind")
-        require(str(row["guid"]).isdecimal() and int(row["guid"]) > 0, "invalid candidate dataset GUID")
         result[name] = str(row["guid"])
     return result
 
@@ -275,11 +301,40 @@ def main() -> None:
 
     if args.self_test:
         root = Path(tempfile.mkdtemp(prefix="ffs-zfs-root-selftest-"))
+        root.chmod(0o755)
+        origin_identities = head_identities(
+            {
+                "datasets": [
+                    {"relative_name": "", "guid": "101", "objectset_kind": 2, "root_birth": 4},
+                    {"relative_name": "$ORIGIN", "guid": "102", "objectset_kind": None, "root_birth": 0},
+                    {"relative_name": "data", "guid": "103", "objectset_kind": 2, "root_birth": 9},
+                ]
+            },
+            "pool0",
+        )
+        require(
+            origin_identities == {"pool0": "101", "pool0/data": "103"},
+            "self-test failed to preserve visible heads while admitting $ORIGIN",
+        )
+        bad_origin_rejected = False
+        try:
+            head_identities(
+                {
+                    "datasets": [
+                        {"relative_name": "rogue", "guid": "104", "objectset_kind": None, "root_birth": 0},
+                    ]
+                },
+                "pool0",
+            )
+        except RuntimeError:
+            bad_origin_rejected = True
+        require(bad_origin_rejected, "self-test accepted non-$ORIGIN uninitialized DSL head")
         synthetic = [(f"item-{idx}", f"payload-{idx}".encode()) for idx in range(4)]
         lookup = dict(synthetic)
         summary = {
             "mode": "self-test",
             "status": "passed",
+            "origin_head_handling_verified": True,
             "negative_controls": run_negative_controls(
                 synthetic,
                 lambda key: lookup[key],
@@ -288,6 +343,7 @@ def main() -> None:
             ),
         }
         (root / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
+        make_tree_world_readable(root)
         print(json.dumps(summary), flush=True)
         return
 
@@ -295,6 +351,7 @@ def main() -> None:
     require(args.create_scratch_pool, "--create-scratch-pool is required unless --self-test is passed")
     resolved_tools = check_required_tools(["zpool", "zfs", "zdb"])
     root = Path(tempfile.mkdtemp(prefix="ffs-zfs-native-"))
+    root.chmod(0o755)
     print(f"Retaining images, raw root bytes and command logs in {root}", flush=True)
     sequence = 0
     report = {"status": "running", "candidate_sha256": digest(binary),
@@ -567,6 +624,7 @@ def main() -> None:
         raise
     finally:
         (root / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        make_tree_world_readable(root)
 
 
 if __name__ == "__main__":

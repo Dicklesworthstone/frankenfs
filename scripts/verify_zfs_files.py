@@ -209,6 +209,22 @@ def run_negative_controls(
     }
 
 
+def make_tree_world_readable(root: Path) -> None:
+    if not root.exists():
+        return
+    root.chmod(0o755)
+    for dirpath, dirnames, filenames in os.walk(root):
+        base = Path(dirpath)
+        for dirname in dirnames:
+            target = base / dirname
+            if not target.is_symlink():
+                target.chmod(0o755)
+        for filename in filenames:
+            target = base / filename
+            if not target.is_symlink():
+                target.chmod(0o644)
+
+
 def digest(path: Path) -> str:
     result = hashlib.sha256()
     with path.open("rb") as stream:
@@ -277,6 +293,7 @@ def main() -> None:
             "--create-and-mount-scratch-pool is required unless --self-test is passed")
     resolved_tools = check_required_tools(["zpool", "zfs", "zdb"])
     root = Path(tempfile.mkdtemp(prefix="ffs-zpl-native-"))
+    root.chmod(0o755)
     print(f"Retaining all images, file oracles and logs in {root}", flush=True)
     # The native link's ../../ target exists outside the image. A refusal must
     # not be an accidental ENOENT after following a host path.
@@ -629,6 +646,7 @@ def main() -> None:
         raise
     finally:
         (root / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        make_tree_world_readable(root)
 
 
 if __name__ == "__main__":

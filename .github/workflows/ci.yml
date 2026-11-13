@@ -133,8 +133,12 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf ~/btrfs-progs-v6.16
-          git clone --depth 1 --branch v6.16 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/kdave/btrfs-progs.git ~/btrfs-progs-v6.16
+          if ! git clone --depth 1 --branch v6.16 \
+            https://github.com/kdave/btrfs-progs.git ~/btrfs-progs-v6.16; then
+            rm -rf ~/btrfs-progs-v6.16
+            git clone --depth 1 --branch v6.16 \
+              https://git.kernel.org/pub/scm/linux/kernel/git/kdave/btrfs-progs.git ~/btrfs-progs-v6.16
+          fi
           cd ~/btrfs-progs-v6.16
           ./autogen.sh
           ./configure --disable-documentation --disable-python --disable-udev --disable-zoned --disable-convert
@@ -672,6 +676,15 @@ jobs:
             printf 'AppArmor profile list unavailable (exit %s); command error retained below.\n' "$profile_read_status"
             cat artifacts/e2e/fuse-helper-diagnostics/apparmor.log
           fi
+
+      - name: Ensure retained root-owned E2E scratch trees are artifact-readable
+        if: always()
+        run: |
+          for dir in /tmp/ffs-ntfs-native-* /tmp/ffs-ntfs-mounted-* /tmp/ffs-zfs-native-* /tmp/ffs-zpl-native-* /tmp/ffs-snapshots-native-*; do
+            if [ -e "$dir" ]; then
+              sudo chmod -R a+rX "$dir"
+            fi
+          done
 
       - name: Retain E2E and differential control evidence
         if: always()

@@ -192,6 +192,22 @@ def run_negative_controls(
     }
 
 
+def make_tree_world_readable(root: Path) -> None:
+    if not root.exists():
+        return
+    root.chmod(0o755)
+    for dirpath, dirnames, filenames in os.walk(root):
+        base = Path(dirpath)
+        for dirname in dirnames:
+            target = base / dirname
+            if not target.is_symlink():
+                target.chmod(0o755)
+        for filename in filenames:
+            target = base / filename
+            if not target.is_symlink():
+                target.chmod(0o644)
+
+
 def digest(path: Path) -> str:
     result = hashlib.sha256()
     with path.open("rb") as stream:
@@ -271,6 +287,7 @@ def main() -> None:
             "--create-and-mount-scratch-pool is required unless --self-test is passed")
     resolved_tools = check_required_tools(["zpool", "zfs", "zdb"])
     root = Path(tempfile.mkdtemp(prefix="ffs-snapshots-native-"))
+    root.chmod(0o755)
     print(f"Retaining images, snapshot oracles and command logs in {root}", flush=True)
     sequence = 0
     report = {"status": "running", "candidate_sha256": digest(binary),
@@ -713,6 +730,7 @@ def main() -> None:
         raise
     finally:
         (root / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        make_tree_world_readable(root)
 
 
 if __name__ == "__main__":
