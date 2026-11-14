@@ -1,4 +1,4 @@
-//! Native ZPL head-dataset mutations (create, mkdir, write, truncate, rename, unlink)
+//! Native ZPL head-dataset mutations (create, mkdir, write, truncate, link, rename, unlink)
 //! lowered into COW DMU object-set, DSL dataset/dir accounting, and deadlist updates.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,6 +80,12 @@ pub(super) enum ZplMutation {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
+    LinkEntry {
+        source_object: u64,
+        parent_dir: u64,
+        name: Vec<u8>,
+        timestamp: Timestamp,
+    },
     RenameEntry {
         src_dir: u64,
         src_name: Vec<u8>,
@@ -103,6 +109,7 @@ impl ZplMutation {
             Self::Mkdir { .. } => "mkdir",
             Self::WriteData { .. } => "write_data",
             Self::TruncateFile { .. } => "truncate_file",
+            Self::LinkEntry { .. } => "link_entry",
             Self::RenameEntry { .. } => "rename_entry",
             Self::UnlinkEntry { .. } => "unlink_entry",
         }
@@ -821,6 +828,190 @@ pub(super) fn stage_zpl_mutation(
                 &parent_dn,
             )?;
             new_obj
+        }
+
+        ZplMutation::LinkEntry {
+            source_object,
+            parent_dir,
+            name,
+            timestamp,
+        } => {
+            validate_component(name, ds_ctx.utf8_only)?;
+            let source = load_zpl_node(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &zpl_dirty_dnodes,
+                ds_ctx.sa_registry.as_ref(),
+                *source_object,
+                order,
+            )?;
+            if source.metadata.kind == Kind::Directory {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EPERM,
+                    detail: "ZPL directories cannot have user-created hard links".into(),
+                });
+            }
+            if source.metadata.kind != Kind::Regular {
+                return Err(unsupported(
+                    "native hard links currently require a regular file",
+                ));
+            }
+            if source.metadata.links == 0 {
+                return Err(FfsError::NotFound("unlinked ZPL source object".into()));
+            }
+            let new_links =
+                source
+                    .metadata
+                    .links
+                    .checked_add(1)
+                    .ok_or_else(|| FfsError::RequestRejected {
+                        errno: libc::EMLINK,
+                        detail: "ZPL native link count is exhausted".into(),
+                    })?;
+            let parent = load_zpl_node(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &zpl_dirty_dnodes,
+                ds_ctx.sa_registry.as_ref(),
+                *parent_dir,
+                order,
+            )?;
+            if parent.metadata.kind != Kind::Directory {
+                return Err(FfsError::NotDirectory);
+            }
+            // Native persistent flags from OpenZFS zfs_znode.h. Preserve all
+            // flags; do not bypass immutable/append-only or project inheritance.
+            const IMMUTABLE: u64 = 0x0000_0010_0000_0000;
+            const APPEND_ONLY: u64 = 0x0000_0040_0000_0000;
+            const PROJECT_INHERIT: u64 = 0x0000_4000_0000_0000;
+            if source.metadata.flags & (IMMUTABLE | APPEND_ONLY) != 0
+                || parent.metadata.flags & IMMUTABLE != 0
+            {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EPERM,
+                    detail: "native ZPL flags prohibit this hard link".into(),
+                });
+            }
+            if parent.metadata.flags & PROJECT_INHERIT != 0 {
+                return Err(unsupported(
+                    "hard links into project-inheriting directories require project-ID admission",
+                ));
+            }
+            let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
+            if entries.iter().any(|entry| entry.name == *name) {
+                return Err(FfsError::Exists);
+            }
+            let mut parent_meta = parent.metadata.clone();
+            parent_meta.size = parent_meta
+                .size
+                .checked_add(1)
+                .ok_or_else(|| corrupt("ZPL directory entry count overflow"))?;
+            parent_meta.times[1] = *timestamp;
+            parent_meta.times[2] = *timestamp;
+
+            // Native ZPL_PARENT is a hint for multiply linked files. OpenZFS
+            // updates it to the directory receiving the newest link; it is not
+            // an exclusive ownership edge. Preserve data, generation and mtime.
+            let mut source_meta = source.metadata.clone();
+            source_meta.links = new_links;
+            source_meta.parent = *parent_dir;
+            source_meta.times[2] = *timestamp;
+            let (bonus, spill) = encode_updated_zpl_bonus(
+                &source,
+                &source_meta,
+                ds_ctx.sa_registry.as_ref(),
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?;
+            let source_out = cow_update_dnode(
+                cx,
+                &mut os_view,
+                alloc,
+                DnodeCowSpec {
+                    existing: Some((&source.dnode, source.ceiling)),
+                    object_type: source.dnode.object_type(),
+                    bonus_type: source.dnode.bonus_type(),
+                    checksum_type: source.dnode.checksum_type(),
+                    compress_type: source.dnode.compress_type(),
+                    user_flags: acct_flags,
+                    indirect_shift: source.dnode.indirect_shift(),
+                    data_bytes: source.dnode.data_bytes(),
+                    max_block: source.dnode.max_block(),
+                    slots: source.dnode.slots(),
+                    nblkptr: source.dnode.pointers().len(),
+                    bonus,
+                    spill,
+                    order,
+                    new_txg,
+                    leaf_bucket: WriteBucket::ChildBlocks,
+                    indirect_bucket: WriteBucket::ChildBlocks,
+                },
+                &BTreeMap::new(),
+                staged_writes,
+            )?;
+            zpl_born.add_assign(source_out.born)?;
+            zpl_retired.extend(source_out.retired_bps);
+            let bytes_delta =
+                signed_bytes_delta(source_out.dnode.used_bytes(), source.dnode.used_bytes())?;
+            if bytes_delta != 0 {
+                quota_deltas.push(QuotaDelta {
+                    uid: source_meta.uid,
+                    gid: source_meta.gid,
+                    projid: Some(0),
+                    bytes_delta,
+                    objs_delta: 0,
+                });
+            }
+            put_dnode_in_table(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &mut zpl_dirty_dnodes,
+                *source_object,
+                &source_out.dnode,
+            )?;
+            entries.push(RawZapEntry {
+                name: name.clone(),
+                integer_bytes: 8,
+                values: vec![
+                    encode_directory_reference(*source_object, Kind::Regular)
+                        .map_err(|error| parse_err(&error))?,
+                ],
+                collision: 0,
+            });
+            let parent_node = flush_dir_node(
+                cx,
+                &mut os_view,
+                alloc,
+                &parent,
+                &parent_meta,
+                &entries,
+                ds_ctx.sa_registry.as_ref(),
+                acct_flags,
+                order,
+                new_txg,
+                staged_writes,
+                &mut zpl_born,
+                &mut zpl_retired,
+                &mut quota_deltas,
+            )?;
+            put_dnode_in_table(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &mut zpl_dirty_dnodes,
+                *parent_dir,
+                &parent_node,
+            )?;
+            *source_object
         }
 
         ZplMutation::WriteData {

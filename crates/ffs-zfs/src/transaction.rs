@@ -926,6 +926,30 @@ impl ZfsTransactionEngine {
         )
     }
 
+    /// Add a name for an existing regular file in the same head dataset.
+    /// The source object and destination directory are dataset-local object IDs;
+    /// the link count and namespace entry publish together in one native TXG.
+    pub fn link_entry(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        source_object: u64,
+        parent_dir: u64,
+        name: &[u8],
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::LinkEntry {
+                source_object,
+                parent_dir,
+                name: name.to_vec(),
+                timestamp,
+            },
+        )
+    }
+
     /// Rename `(src_dir, src_name)` to `(dst_dir, dst_name)` with optional `expected_source_object`
     /// idempotency guard (so retrying after post-commit cancellation refuses duplicate renames).
     #[allow(clippy::too_many_arguments)]

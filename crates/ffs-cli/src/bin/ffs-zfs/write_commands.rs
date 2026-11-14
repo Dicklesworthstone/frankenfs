@@ -193,6 +193,15 @@ pub enum WriteCommand {
         #[arg(long)]
         size: u64,
     },
+    /// Create another name for a regular file in the same ZPL head dataset.
+    TxLink {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Existing regular-file path inside the selected dataset.
+        src_path: PathBuf,
+        /// New path inside the same dataset; it must not already exist.
+        dst_path: PathBuf,
+    },
     /// Rename a ZPL file or directory within a head dataset and publish a committed TXG.
     TxRename {
         #[command(flatten)]
@@ -468,6 +477,25 @@ impl WriteCommand {
                 );
                 emit_tx_outcome("tx_truncate", &pool.dataset, &engine, outcome)
             }
+            Self::TxLink {
+                pool,
+                src_path,
+                dst_path,
+            } => {
+                let (parent_path, name) = split_parent_and_leaf(dst_path.as_os_str())?;
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let source = resolve_target_object(cx, &engine, &components, src_path.as_os_str())?;
+                let parent_dir = resolve_parent_dir(cx, &engine, &components, &parent_path)?;
+                let outcome = engine.link_entry(
+                    cx,
+                    &components,
+                    source,
+                    parent_dir,
+                    &name,
+                    pool.zpl_timestamp(),
+                );
+                emit_tx_outcome("tx_link", &pool.dataset, &engine, outcome)
+            }
             Self::TxRename {
                 pool,
                 src_path,
@@ -573,6 +601,51 @@ mod tests {
                 "--sha256",
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn cli_hard_link_requires_both_paths_and_explicit_write_authority() {
+        let base = [
+            "ffs-zfs",
+            "tx-link",
+            "leaf.img",
+            "/source",
+            "/new-name",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--dataset",
+            "data",
+        ];
+        for flags in [vec![], vec!["--offline-image"], vec!["--allow-write"]] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(flags)).is_err());
+        }
+        let args =
+            Cli::try_parse_from(base.into_iter().chain(["--offline-image", "--allow-write"]))
+                .unwrap();
+        let crate::Command::Write(WriteCommand::TxLink { .. }) = args.command else {
+            panic!("tx-link must dispatch to the native writer");
+        };
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "tx-link",
+                "leaf.img",
+                "/source",
+                "--offline-image",
+                "--allow-write",
+                "--pool-guid",
+                "123",
+                "--label",
+                "0",
+                "--slot",
+                "2",
+            ])
+            .is_err()
         );
     }
 

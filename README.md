@@ -79,8 +79,8 @@ remain separately controlled by `--console`.
 | **btrfs** | Main `ffs-cli` / `OpenFs` path | Native reads and guarded experimental writes, transaction-commit and repair work | Native feature/topology admission and durability evidence still matter; not blanket kernel parity. |
 | **FAT16** | `ffs-cli` / `ffs-fat` | Native reads/catalog/extraction, experimental ordinary/protected writable FUSE, allocation checks, formatting/population, and ordered offline file/directory/range mutation | New long names use bounded UTF-16 with ASCII aliases. Subdirectories can grow; [offline resize can expand the fixed root](docs/FAT_ROOT_EXPANSION.md) into a new image. Deterministic offline write-cut recovery is tested; full mounted/power-cut qualification remains open, and ordered mutation is not a crash-atomic transaction. |
 | **FAT32** | `ffs-cli` / `ffs-fat` | The FAT16 companion surface plus root chains, selected-FAT handling, free-space hints and offline resize/relocation | Namespace and range operations retain ordered native publication and explicit dirty failure states. Complete mounted/power-cut qualification remains open. |
-| **NTFS** | `ffs-cli` / `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection, physical allocation checking, shared security-store/file-reference checking and FUSE | The exact read profile controls admission (`--offline-image`). Restricted volatile `$LogFile` recovery exists; neither recovery nor structural checking grants native write authority or a general Windows consistency claim. General NTFS mutation remains unfinished. |
-| **ZFS** | `ffs-cli` / `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction across mirror/RAIDZ vdevs and volatile ZIL recovery | Read-only root selection is not native writable pool ownership (`--offline-image`). Missing-member extraction requires a survivor in every top-level vdev, is committed-view-only and forbids ZIL inspection/replay. Native allocation/TXG writing remains unfinished. |
+| **NTFS** | `ffs-cli` / `ffs-ntfs` | Native namespace and file/stream reads, sparse and admitted compressed/transformed data, metadata/allocation/security checks, admitted native logged mutations and experimental ordinary writable FUSE | `mount` remains read-only; `mount-write` requires `--offline-image --allow-write` and native writer admission. Host ownership/modes are synthetic, native ACLs are not enforced, and broader Windows consistency and mounted interoperability remain unqualified. |
+| **ZFS** | `ffs-cli` / `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction, volatile ZIL recovery and admitted offline native TXG mutations | Offline writes require an explicitly selected clean pool and complete supported single-leaf/mirror membership. Missing-member extraction is committed-view-only and forbids ZIL inspection/replay. Mounted writes, broader pool lifecycle and native writer interoperability qualification remain unfinished. |
 
 On Linux kernels supporting FUSE_SYNCFS (protocol 7.34+), `--fuseblk-device PATH`
 enables filesystem-wide `sync -f` through the
@@ -440,6 +440,50 @@ native CLI checks also passed named/compressed reads and a separately produced
 functional results make no speed claim or indexed FsOps mount claim. See the
 [indexed lookup profile](docs/NTFS_INDEXED_LOOKUP.md).
 
+## NTFS: explicit experimental writable mounts
+
+```bash
+ffs-ntfs mount-write disk.img /mnt/ntfs --offline-image --allow-write \
+  --uid 1000 --gid 1000
+```
+
+The mountpoint must already exist and be empty. This entry point uses the
+admitted native NTFS 3.1 logged writer for ordinary create/mkdir, unnamed-DATA
+write/truncate, simple rename, unlink and rmdir. `--recover-dirty` explicitly
+enables native log recovery during admission; recovery-required or uncertain
+storage states fence further mutations. The existing `mount` command remains
+read-only.
+
+Ownership and modes are fixed host projections; native Windows ACLs are not
+enforced. ADS writes, hard-link creation and overwriting a distinct rename
+destination are refused. An open file survives unlink through a retained native
+name hidden from the live mounted namespace and reaped on its last release.
+A crash can leave an ordinary recoverable `.ffs-unlinked-*` file visible after
+reopen: durable orphan replay is not implemented. These capabilities do not
+establish native Windows or mounted interoperability qualification.
+
+## ZFS: offline hard links
+
+`ffs-zfs tx-link` adds a name for an existing regular file within one selected
+case-sensitive ZPL v4/v5 head dataset. Supply the inspected pool GUID and current
+committed uberblock slot, along with every member of an admitted single-leaf or
+mirror pool:
+
+```bash
+ffs-zfs tx-link pool.img /existing.bin /another-name.bin --dataset data \
+  --pool-guid "$POOL_GUID" --label 0 --slot "$SLOT" \
+  --offline-image --allow-write
+```
+
+The new path must not exist. Directory links, symlink sources and cross-dataset
+links are outside this operation. Source link count, ctime and the destination
+directory entry publish in one native TXG; existing data and snapshots retain
+their object identity. A committed result and its durable token remain committed
+if cancellation arrives after all required member/label syncs. Interrupted
+publication still reports uncertainty requiring native ring reconciliation.
+ZFS mounts remain read-only, and native OpenZFS writer interoperability remains
+unqualified.
+
 ## ZFS: extract from surviving mirror disks
 
 `--missing-mirror-member GUID` explicitly identifies every absent child of one
@@ -601,8 +645,8 @@ FrankenFS-specific improvements. FAT directory creation (`mkdir`), offline
 `unlink`/`rmdir`/`rename`/`resize`, pure-Rust `format`, bounded MBR/GPT
 `--partition` slice discovery, and unified six-format read/inspect/check/scrub
 routing in `ffs-cli` are implemented. The remaining high-impact work includes
-FAT Windows naming/mounted power-cut qualification; NTFS native recovery plus
-allocator/MFT/index mutation; ZFS native allocation/TXG/ZIL and pool lifecycle;
+FAT Windows naming/mounted power-cut qualification; broader NTFS writable-profile
+coverage and durable orphan recovery; ZFS mounted writes, ZIL writing and pool lifecycle;
 writable six-format `OpenFs` integration; and executable native-interchange,
 crash/reopen and mounted-operation evidence for each admitted profile.
 

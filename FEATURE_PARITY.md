@@ -3261,3 +3261,55 @@ host. Native byte inspection is not Rust checker execution or Windows
 qualification. The full NTFS-07/`bd-h7cme` goals remain open, with no tracked V1
 parity or performance credit added. See `docs/NTFS_ALLOCATION_CHECK.md` and
 `docs/NTFS_READ_PROFILE.md` for commands and precise scope.
+
+### NTFS ordinary writable mount integration (2026-11-14)
+
+`ffs-ntfs mount-write IMAGE MOUNTPOINT --offline-image --allow-write` exposes
+admitted native logged create/mkdir, unnamed-DATA write/truncate, simple rename,
+unlink and rmdir with recovery/health fencing. The existing `mount` stays
+read-only. Sequence-bound native references are checked again before mutation;
+an interrupted journal publication requires explicit recovery before writer
+reuse. A known durable commit finishes publication through the original
+caller's cancellation mask.
+
+Host ownership/modes are fixed projections without native ACL enforcement.
+ADS writes, hard-link creation and distinct-target rename overwrite remain
+refused. Open-unlink retains a native name hidden from the live mount until
+final release, including base files pinned by alternate-stream handles. Crash
+recovery can expose an ordinary `.ffs-unlinked-*` file; durable orphan replay
+is not implemented. No native Windows or mounted oracle qualification is added
+by this integration.
+
+### ZFS offline hard links and durable cancellation outcomes (2026-11-14)
+
+The native TXG engine and `ffs-zfs tx-link` add a destination name and increment
+the existing regular file's native link count atomically within one admitted,
+case-sensitive ZPL v4/v5 head dataset. Metadata updates preserve data pointers,
+generation, ownership and mtime while updating ctime and the native parent
+hint. Directory, symlink and cross-dataset links are outside this write surface.
+Native immutable/append-only flags and unsupported project inheritance are
+checked before backing writes. Cancellation after every required
+uberblock/member barrier preserves the committed token and live writer state;
+incomplete publication retains the uncertain outcome.
+
+Constructed-image regressions have been authored for native NTFS lifecycle
+operations, MFT generation reuse, cached-read fencing, recovery-required writer
+reuse, open-unlink and ADS lifetimes, zero-write refusal and committed
+cancellation. ZFS regressions cover legacy and SA/spill metadata, mirrors,
+fat-ZAP promotion, fresh reopen, shared writes, same-object rename, last unlink,
+both snapshot deadlist forms and persistence cuts with dropped/reordered
+volatile writes.
+
+Full workspace Rust formatting and the existing `ffs-ondisk` library check
+pass under the pinned nightly. The workspace all-targets compile check remains
+blocked in unchanged `asupersync 0.5.0`: its compiler received SIGKILL at
+approximately 5.35 GiB maximum RSS with one build job and one compiler thread.
+A separate production-only check without `test-internals` also received
+SIGKILL in that dependency before reaching the changed crates. No dependency
+features or source were altered to obtain a smaller check.
+
+The newly authored NTFS/ZFS regressions, CLI tests and strict workspace Clippy
+remain unexecuted. The direct-to-main commits record an explicit gate bypass
+for this execution-environment block. These additions do not establish mounted
+ZFS writing, native Windows/OpenZFS interoperability or completion of the
+broader writer beads.
