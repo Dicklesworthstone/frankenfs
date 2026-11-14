@@ -48,6 +48,7 @@ jobs:
       - name: Tree-log publication and recovery regressions
         if: ${{ !cancelled() }}
         run: |
+          cargo test -p ffs-core --locked --lib btrfs_tree_log_ -- --test-threads=1 --nocapture
           cargo test -p ffs-core --locked --lib btrfs_publish_tree_log_ -- --nocapture
           cargo test -p ffs-core --locked --lib btrfs_fsync_collapses_mvcc_barrier_and_retries_on_failed_sync_bd_jhuob -- --nocapture
           cargo test -p ffs-core --locked --lib btrfs_full_commit_retires_the_tree_log_bd_mogn1 -- --nocapture

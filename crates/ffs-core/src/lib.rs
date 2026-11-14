@@ -42776,6 +42776,16 @@ impl OpenFs {
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        // A log patches the last durable superblock and cannot publish a new
+        // chunk tree. Logging extents in a write-time-grown chunk would thus
+        // acknowledge data that a cold mount cannot map. Refuse before log
+        // allocation or MVCC flushing so the caller commits both allocation
+        // trees and the file together through its existing full-commit path.
+        if alloc.chunk_trees_dirty {
+            return Err(FfsError::UnsupportedFeature(
+                "btrfs tree log requires committed chunk mappings; use full commit".into(),
+            ));
+        }
         // The superblock as it is ON DISK, so the tree-log publish patches it rather
         // than rebuilding it — a rebuild zeroes dev_item and the kernel then refuses
         // the filesystem (bd-jhuob).
@@ -42827,6 +42837,16 @@ impl OpenFs {
                 // bd-0mcvt: publish the log node on every DUP copy.
                 let mapping = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, *logical)
                     .map_err(|e| parse_to_ffs_error(&e))?
+                    .or_else(|| {
+                        // A previous full commit can have grown the mapping
+                        // since mount. Its successful final sync publishes the
+                        // complete list for readers holding allocator exclusion.
+                        self.btrfs_live_chunks().and_then(|live| {
+                            ffs_ondisk::map_logical_to_stripes(&live, *logical)
+                                .ok()
+                                .flatten()
+                        })
+                    })
                     .ok_or_else(|| FfsError::Corruption {
                         block: *logical,
                         detail: "tree-log logical bytenr not covered by any btrfs chunk".into(),
@@ -43610,11 +43630,6 @@ impl OpenFs {
         // shortfall is a prediction; refusing the transaction on a prediction
         // turns a maybe into a certainty. The allocator's own `NoSpace` stays the
         // authority and `alloc_no_space_*` (c77d122d) reports why.
-        // Carries a SYSTEM chunk's `sys_chunk_array` bytes from the growth block
-        // down to the superblock stamping. The commit patches a byte buffer read
-        // from disk rather than writing a `BtrfsSuperblock`, so the extended array
-        // has to travel as bytes (bd-a136s).
-        let mut grown_sys_chunk_array: Option<Vec<u8>> = None;
         'grow: {
             if !self.btrfs_grow_chunks_enabled() {
                 break 'grow;
@@ -43818,10 +43833,10 @@ impl OpenFs {
             // reach the `sys_chunk_array`, because that array is the whole of
             // what the kernel can map before it has read any tree.
             // `apply_chunk_allocation` refuses a system chunk given `None`, so
-            // growth hands it a CLONE of the superblock and the extended array is
-            // carried down to the stamping below — the commit patches a byte
-            // buffer read from disk rather than writing this struct, so the array
-            // has to travel as bytes.
+            // growth hands it a CLONE of the superblock with the current SYSTEM
+            // entries to validate the bootstrap capacity before allocating. The
+            // final stamping rebuilds the array from the complete chunk tree,
+            // including growth retained from an earlier failed publication.
             if alloc.chunk_trees_dirty {
                 let system_need = overhead.saturating_mul(u64::from(nodesize));
                 let system_have = alloc
@@ -43838,6 +43853,19 @@ impl OpenFs {
                     ) {
                         Ok(Some(plan)) => {
                             let mut sb_with_array = sb.clone();
+                            // The mount-time superblock omits SYSTEM chunks
+                            // grown by earlier commits. Rebuild its bootstrap
+                            // map from the authoritative current chunk tree
+                            // before appending the newly planned SYSTEM chunk.
+                            sb_with_array.sys_chunk_array.clear();
+                            sb_with_array.sys_chunk_array_size = 0;
+                            for chunk in &chunks {
+                                if chunk.chunk_type & BTRFS_BLOCK_GROUP_SYSTEM != 0 {
+                                    sb_with_array
+                                        .append_sys_chunk_entry(chunk)
+                                        .map_err(|e| parse_to_ffs_error(&e))?;
+                                }
+                            }
                             let state = &mut *alloc;
                             match ffs_btrfs::apply_chunk_allocation(
                                 &plan,
@@ -43847,8 +43875,6 @@ impl OpenFs {
                                 Some(&mut sb_with_array),
                             ) {
                                 Ok(()) => {
-                                    grown_sys_chunk_array =
-                                        Some(sb_with_array.sys_chunk_array.clone());
                                     info!(
                                         target: "ffs::btrfs::alloc",
                                         shortfall,
@@ -45230,14 +45256,27 @@ impl OpenFs {
             sb_bytes[0xC7] = chunk_root_level;
         }
 
-        // bd-a136s: a SYSTEM chunk allocated this commit must also appear in the
-        // superblock's `sys_chunk_array`, which is the ONLY thing the kernel can
-        // map before it has read any tree. `append_sys_chunk_entry` already
-        // refused anything that would not fit (bd-q4qr8), so an array arriving
-        // here is within the 2048-byte limit — but it is re-checked rather than
-        // trusted, because writing past the array clobbers the fields after it and
-        // this is the one buffer where that is unrecoverable.
-        if let Some(array) = grown_sys_chunk_array {
+        // Republish every authoritative SYSTEM entry whenever the chunk tree is
+        // replaced. A failed superblock write may leave the old bootstrap on
+        // disk while retaining newly grown chunks in memory. Its retry can have
+        // ample SYSTEM space and allocate no new chunk, yet still must publish
+        // that retained mapping alongside its new chunk root.
+        if alloc.chunk_trees_dirty {
+            let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            let mut bootstrap = sb.clone();
+            bootstrap.sys_chunk_array.clear();
+            bootstrap.sys_chunk_array_size = 0;
+            for chunk in &chunks {
+                if chunk.chunk_type & BTRFS_BLOCK_GROUP_SYSTEM != 0 {
+                    bootstrap
+                        .append_sys_chunk_entry(chunk)
+                        .map_err(|e| parse_to_ffs_error(&e))?;
+                }
+            }
+            let array = bootstrap.sys_chunk_array;
+            // Recheck the helper's capacity bound at the raw buffer boundary:
+            // an overrun here would clobber unrelated superblock fields.
             const SYS_CHUNK_ARRAY_OFFSET: usize = 0x32B;
             const SYS_CHUNK_ARRAY_MAX: usize = 2048;
             if array.len() > SYS_CHUNK_ARRAY_MAX {
@@ -45257,7 +45296,7 @@ impl OpenFs {
             debug!(
                 target: "ffs::btrfs::alloc",
                 bytes = array.len(),
-                "sys_chunk_array_extended_for_a_new_system_chunk"
+                "sys_chunk_array_refreshed_for_chunk_tree_commit"
             );
         }
 
@@ -45367,6 +45406,16 @@ impl OpenFs {
             self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
         })?;
 
+        if alloc.chunk_trees_dirty {
+            // All chunk/device roots and any SYSTEM bootstrap mapping are now
+            // durable. Publish the complete map, including metadata-only growth,
+            // before allowing a subsequent tree-log fsync to use these chunks.
+            // A failed commit keeps the dirty flag (or restores its snapshot),
+            // so it cannot authorize a log with unpublished chunk mappings.
+            self.btrfs_grown_chunks
+                .store(Some(std::sync::Arc::new(chunks_for_writeback)));
+            alloc.chunk_trees_dirty = false;
+        }
         alloc.reset_pending_metadata();
         self.btrfs_block_writes_at_boundary
             .fetch_max(data_writes_at_boundary, Ordering::AcqRel);
@@ -117150,6 +117199,865 @@ mod tests {
                 "CHUNK_AUTHORITY|load_fault=false|write=success|new_chunk=true|native_check=clean|reopen=exact"
             );
         }
+    }
+
+    #[test]
+    fn btrfs_tree_log_fsync_commits_pending_data_chunk_growth_before_acknowledging() {
+        let Some((fs, device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(128, &["-m", "single", "-d", "single"])
+        else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        fs.set_btrfs_grow_chunks(false);
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let filler = fs
+            .create(&cx, InodeNumber(1), OsStr::new("filler"), 0o600, 0, 0)
+            .unwrap();
+        let victim = fs
+            .create(&cx, InodeNumber(1), OsStr::new("grown"), 0o600, 0, 0)
+            .unwrap();
+        let initial_free = fs
+            .require_btrfs_alloc_state()
+            .unwrap()
+            .read()
+            .extent_alloc
+            .allocatable_bytes(BTRFS_BLOCK_GROUP_DATA);
+        let sector = fs.btrfs_superblock().unwrap().sectorsize;
+        assert!(initial_free >= u64::from(sector) && initial_free < 64 * 1024 * 1024);
+        let original = vec![0xA7; usize::try_from(initial_free).unwrap()];
+        fs.write(&cx, filler.ino, 0, &original).unwrap();
+        fs.btrfs_full_transaction_commit(&cx, "tree-log-growth-seed")
+            .unwrap();
+        assert_eq!(
+            fs.require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .extent_alloc
+                .allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+            0
+        );
+
+        // A successful ordinary write grows DATA, but no commit has yet made
+        // the new CHUNK_ITEM/DEV_EXTENT reachable from the on-disk superblock.
+        fs.set_btrfs_grow_chunks(true);
+        let payload = vec![0xBC; sector as usize];
+        fs.write(&cx, victim.ino, 0, &payload).unwrap();
+        assert!(
+            fs.btrfs_grown_chunks.load_full().unwrap().len()
+                > fs.btrfs_context().unwrap().chunks.len()
+        );
+        let before = blake3::hash(&device.snapshot_bytes());
+        let generation = BtrfsSuperblock::parse_from_image(&device.snapshot_bytes())
+            .unwrap()
+            .generation;
+        {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            assert!(alloc.chunk_trees_dirty);
+            let state = (
+                alloc.extent_alloc.space_info(),
+                alloc.extent_alloc.delayed_ref_count(),
+                alloc.btrfs_live_log_blocks.clone(),
+                alloc.btrfs_logged_inodes.clone(),
+            );
+            let refusal = fs.btrfs_write_tree_log_for_sync(
+                &cx,
+                &mut alloc,
+                victim.ino,
+                "unpublished-growth-control",
+            );
+            assert!(
+                matches!(refusal, Err(FfsError::UnsupportedFeature(_))),
+                "unpublished chunk mappings must use the full-commit fallback"
+            );
+            assert_eq!(
+                state,
+                (
+                    alloc.extent_alloc.space_info(),
+                    alloc.extent_alloc.delayed_ref_count(),
+                    alloc.btrfs_live_log_blocks.clone(),
+                    alloc.btrfs_logged_inodes.clone(),
+                ),
+                "tree-log refusal must not allocate or rotate a log"
+            );
+        }
+        assert_eq!(blake3::hash(&device.snapshot_bytes()), before);
+
+        let ops: &dyn FsOps = &fs;
+        ops.fsync(&cx, &mut RequestScope::empty(), victim.ino, 0, false)
+            .unwrap();
+        let committed = device.snapshot_bytes();
+        let sb = BtrfsSuperblock::parse_from_image(&committed).unwrap();
+        assert!(
+            sb.generation > generation,
+            "fsync must commit the new chunk tree"
+        );
+        assert_eq!(
+            sb.log_root, 0,
+            "an unpublished map cannot be made durable by a tree log"
+        );
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(!alloc.chunk_trees_dirty);
+            assert_eq!(
+                fs.btrfs_grown_chunks.load_full().unwrap().as_ref(),
+                &ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap()
+            );
+        }
+        std::fs::write(&image, &committed).unwrap();
+        let Some((clean, output)) = run_btrfs_check(&image) else {
+            oracle_unavailable("btrfs check after chunk-growth fsync");
+            return;
+        };
+        assert!(
+            clean,
+            "fsync growth fallback must produce a native-valid image: {output}"
+        );
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(committed)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let grown = cold
+            .lookup(&cx, InodeNumber(1), OsStr::new("grown"))
+            .unwrap();
+        assert_eq!(cold.read(&cx, grown.ino, 0, sector + 1).unwrap(), payload);
+        let retained = cold
+            .lookup(&cx, InodeNumber(1), OsStr::new("filler"))
+            .unwrap();
+        assert_eq!(
+            cold.read(&cx, retained.ino, 0, u32::try_from(initial_free).unwrap())
+                .unwrap(),
+            original
+        );
+        drop(cold);
+
+        // Clearing the per-transaction growth flag must preserve the durable
+        // chunk/device roots across the next ordinary, non-growing commit.
+        let dev_root_before = {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            OpenFs::btrfs_find_root_item(&alloc.root_tree, BTRFS_DEV_TREE_OBJECTID)
+                .unwrap()
+                .unwrap()
+        };
+        fs.set_btrfs_grow_chunks(false);
+        let marker = fs
+            .create(&cx, InodeNumber(1), OsStr::new("after-growth"), 0o600, 0, 0)
+            .unwrap();
+        fs.write(&cx, marker.ino, 0, b"ordinary next commit")
+            .unwrap();
+        fs.btrfs_full_transaction_commit(&cx, "ordinary-commit-after-growth")
+            .unwrap();
+        let ordinary = device.snapshot_bytes();
+        let next_sb = BtrfsSuperblock::parse_from_image(&ordinary).unwrap();
+        assert!(next_sb.generation > sb.generation);
+        assert_eq!(
+            (
+                next_sb.chunk_root,
+                next_sb.chunk_root_generation,
+                next_sb.chunk_root_level,
+                &next_sb.sys_chunk_array,
+            ),
+            (
+                sb.chunk_root,
+                sb.chunk_root_generation,
+                sb.chunk_root_level,
+                &sb.sys_chunk_array,
+            ),
+            "a non-growing commit must retain the durable chunk bootstrap"
+        );
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(!alloc.chunk_trees_dirty);
+            assert_eq!(
+                OpenFs::btrfs_find_root_item(&alloc.root_tree, BTRFS_DEV_TREE_OBJECTID)
+                    .unwrap()
+                    .unwrap(),
+                dev_root_before,
+                "the device root, including its generation, must remain unchanged"
+            );
+        }
+        std::fs::write(&image, &ordinary).unwrap();
+        let Some((clean, output)) = run_btrfs_check(&image) else {
+            oracle_unavailable("btrfs check after ordinary post-growth commit");
+            return;
+        };
+        assert!(
+            clean,
+            "ordinary post-growth commit must be native-valid: {output}"
+        );
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(ordinary)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cold.read(&cx, victim.ino, 0, sector + 1).unwrap(), payload);
+        assert_eq!(
+            cold.read(&cx, filler.ino, 0, u32::try_from(initial_free).unwrap())
+                .unwrap(),
+            original
+        );
+        let marker = cold
+            .lookup(&cx, InodeNumber(1), OsStr::new("after-growth"))
+            .unwrap();
+        assert_eq!(
+            cold.read(&cx, marker.ino, 0, 4096).unwrap(),
+            b"ordinary next commit"
+        );
+    }
+
+    #[test]
+    fn btrfs_tree_log_maps_committed_grown_data_and_metadata_chunks_after_mount() {
+        for kind in [ffs_btrfs::ChunkKind::Data, ffs_btrfs::ChunkKind::Metadata] {
+            let Some((fs, device, _tmp, image)) =
+                open_writable_btrfs_mkfs_args(128, &["-m", "single", "-d", "single"])
+            else {
+                return;
+            };
+            let cx = Cx::for_testing();
+            fs.set_btrfs_grow_chunks(false);
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            let file = fs
+                .create(&cx, InodeNumber(1), OsStr::new("logged"), 0o600, 0, 0)
+                .unwrap();
+            let sector = fs.btrfs_superblock().unwrap().sectorsize;
+            let mut expected = vec![0x31; sector as usize];
+            fs.write(&cx, file.ino, 0, &expected).unwrap();
+            fs.btrfs_full_transaction_commit(&cx, "grown-log-mapping-seed")
+                .unwrap();
+
+            // Allocate through the real chunk planner and commit through the
+            // normal native writer. Deliberately leave the mount-time context
+            // unchanged, and do not publish a test-owned ArcSwap mapping.
+            let chunk = {
+                let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+                assert!(alloc.chunk_trees_authoritative);
+                let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap();
+                let growth_device = ffs_btrfs::GrowthDevice::from_chunk_tree(
+                    &alloc.chunk_tree,
+                    fs.btrfs_superblock().unwrap().fsid,
+                )
+                .unwrap();
+                let plan = ffs_btrfs::plan_growth_for_shortfall(
+                    &chunks,
+                    kind,
+                    2 * u64::from(alloc.nodesize),
+                    &growth_device,
+                    &ffs_btrfs::ChunkSizePolicy::default(),
+                )
+                .unwrap()
+                .expect("the native image must have unallocated space");
+                let chunk = plan.chunk.clone();
+                let state = &mut *alloc;
+                ffs_btrfs::apply_chunk_allocation(
+                    &plan,
+                    &mut state.chunk_tree,
+                    &mut state.dev_tree,
+                    &mut state.extent_alloc,
+                    None,
+                )
+                .unwrap();
+                state.chunk_trees_dirty = true;
+                chunk
+            };
+            assert!(
+                ffs_ondisk::map_logical_to_stripes(
+                    &fs.btrfs_context().unwrap().chunks,
+                    chunk.key.offset,
+                )
+                .unwrap()
+                .is_none()
+            );
+            fs.btrfs_full_transaction_commit(&cx, "commit-grown-log-mapping")
+                .unwrap();
+            assert!(
+                !fs.require_btrfs_alloc_state()
+                    .unwrap()
+                    .read()
+                    .chunk_trees_dirty
+            );
+            let live = fs
+                .btrfs_grown_chunks
+                .load_full()
+                .expect("commit publishes every grown chunk kind");
+            assert!(
+                ffs_ondisk::map_logical_to_stripes(&live, chunk.key.offset)
+                    .unwrap()
+                    .is_some()
+            );
+            std::fs::write(&image, device.snapshot_bytes()).unwrap();
+            let Some((clean, output)) = run_btrfs_check(&image) else {
+                oracle_unavailable("btrfs check after committed mapping growth");
+                return;
+            };
+            assert!(
+                clean,
+                "committed {kind:?} growth must be native-valid: {output}"
+            );
+            let generation = BtrfsSuperblock::parse_from_image(&device.snapshot_bytes())
+                .unwrap()
+                .generation;
+            let suffix = vec![0x5A; sector as usize];
+            fs.write(&cx, file.ino, u64::from(sector), &suffix).unwrap();
+            expected.extend_from_slice(&suffix);
+            {
+                let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+                assert!(!alloc.chunk_trees_dirty);
+                // Synthetic allocation pressure isolates the mapping under
+                // test without thousands of unrelated namespace mutations.
+                // The persisted maps remain native-valid. Force both log nodes
+                // into the newly committed group; DATA exercises the existing
+                // metadata-exhaustion fallback, METADATA its normal allocation.
+                for group in alloc.extent_alloc.free_space_extents().unwrap() {
+                    let pressure = group.flags & BTRFS_BLOCK_GROUP_METADATA != 0
+                        || (matches!(kind, ffs_btrfs::ChunkKind::Data)
+                            && group.flags & BTRFS_BLOCK_GROUP_DATA != 0);
+                    if pressure && group.start != chunk.key.offset {
+                        for (start, length) in group.free_ranges {
+                            alloc.extent_alloc.pin_live_tree_block(start, length);
+                        }
+                    }
+                }
+                if matches!(kind, ffs_btrfs::ChunkKind::Data) {
+                    assert_eq!(
+                        alloc
+                            .extent_alloc
+                            .allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA),
+                        0
+                    );
+                }
+            }
+            let ops: &dyn FsOps = &fs;
+            ops.fsync(&cx, &mut RequestScope::empty(), file.ino, 0, false)
+                .unwrap();
+            let logged = device.snapshot_bytes();
+            let sb = BtrfsSuperblock::parse_from_image(&logged).unwrap();
+            assert_eq!(
+                sb.generation, generation,
+                "a committed map must retain fast fsync"
+            );
+            assert_ne!(sb.log_root, 0);
+            {
+                let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+                assert_eq!(alloc.btrfs_live_log_blocks.len(), 2);
+                for &(logical, bytes, metadata) in &alloc.btrfs_live_log_blocks {
+                    assert!(
+                        logical >= chunk.key.offset
+                            && logical + bytes <= chunk.key.offset + chunk.length
+                    );
+                    assert_eq!(metadata, matches!(kind, ffs_btrfs::ChunkKind::Metadata));
+                }
+            }
+            // Snapshot immediately after fsync: no clean unmount or full commit
+            // can mask an unmappable log root or missing acknowledged payload.
+            let cold = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(logged)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let file = cold
+                .lookup(&cx, InodeNumber(1), OsStr::new("logged"))
+                .unwrap();
+            assert_eq!(
+                cold.read(&cx, file.ino, 0, 2 * sector + 1).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_tree_log_chunk_growth_final_sync_failure_retains_full_commit_requirement() {
+        let Some((seed_fs, seed_device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(128, &["-m", "single", "-d", "single"])
+        else {
+            return;
+        };
+        let seed = seed_device.snapshot_bytes();
+        drop(seed_fs);
+        drop(seed_device);
+        let cx = Cx::for_testing();
+        let payload = [0x75; 8192];
+        let prepare = |device: &CrashDevice| {
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(device.clone()),
+                &OpenOptions {
+                    btrfs_rw_ephemeral_ok: true,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.set_btrfs_grow_chunks(false);
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            let file = fs
+                .create(&cx, InodeNumber(1), OsStr::new("retry-grown"), 0o600, 0, 0)
+                .unwrap();
+            fs.write(&cx, file.ino, 0, &payload).unwrap();
+            let logical = {
+                let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+                assert!(alloc.chunk_trees_authoritative);
+                let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap();
+                let growth_device = ffs_btrfs::GrowthDevice::from_chunk_tree(
+                    &alloc.chunk_tree,
+                    fs.btrfs_superblock().unwrap().fsid,
+                )
+                .unwrap();
+                let plan = ffs_btrfs::plan_growth_for_shortfall(
+                    &chunks,
+                    ffs_btrfs::ChunkKind::Metadata,
+                    2 * u64::from(alloc.nodesize),
+                    &growth_device,
+                    &ffs_btrfs::ChunkSizePolicy::default(),
+                )
+                .unwrap()
+                .expect("the native image must have unallocated space");
+                let state = &mut *alloc;
+                ffs_btrfs::apply_chunk_allocation(
+                    &plan,
+                    &mut state.chunk_tree,
+                    &mut state.dev_tree,
+                    &mut state.extent_alloc,
+                    None,
+                )
+                .unwrap();
+                state.chunk_trees_dirty = true;
+                plan.chunk.key.offset
+            };
+            // Metadata growth is committed through the native chunk/device
+            // writer; no test-owned mapping publication hides its final barrier.
+            assert!(fs.btrfs_grown_chunks.load_full().is_none());
+            (fs, file.ino, logical)
+        };
+        let sync_span = {
+            let device = CrashDevice::from_vec(seed.clone());
+            let (fs, ino, _) = prepare(&device);
+            let before = device.sync_count();
+            let ops: &dyn FsOps = &fs;
+            ops.fsync(&cx, &mut RequestScope::empty(), ino, 0, false)
+                .expect("successful growth-fsync barrier control");
+            device.sync_count() - before
+        };
+        assert!(sync_span >= 2, "separate tree and superblock barriers");
+
+        let device = CrashDevice::from_vec(seed);
+        let (fs, ino, logical) = prepare(&device);
+        let failed_at = device.sync_count() + sync_span;
+        device.arm_sync_failure(failed_at);
+        let ops: &dyn FsOps = &fs;
+        let failure = ops
+            .fsync(&cx, &mut RequestScope::empty(), ino, 0, false)
+            .expect_err("the final superblock barrier must fail");
+        assert!(failure.to_string().contains("injected sync failure"));
+        assert_eq!(device.sync_count(), failed_at);
+        assert!(
+            fs.btrfs_grown_chunks.load_full().is_none(),
+            "failed final sync must not publish the commit's metadata mapping"
+        );
+        let before_refusal = blake3::hash(&device.volatile.lock());
+        {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            assert!(
+                alloc.chunk_trees_dirty,
+                "uncertain publication must retain the full-commit requirement"
+            );
+            assert!(matches!(
+                fs.btrfs_write_tree_log_for_sync(&cx, &mut alloc, ino, "failed-growth-barrier"),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+        }
+        assert_eq!(blake3::hash(&device.volatile.lock()), before_refusal);
+        assert_eq!(device.sync_count(), failed_at);
+
+        device.disarm();
+        ops.fsync(&cx, &mut RequestScope::empty(), ino, 0, false)
+            .expect("retry must durably commit the retained chunk-tree work");
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(!alloc.chunk_trees_dirty);
+            let live = fs.btrfs_grown_chunks.load_full().unwrap();
+            assert!(
+                ffs_ondisk::map_logical_to_stripes(&live, logical)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                live.as_ref(),
+                &ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap()
+            );
+        }
+        let durable = device.durable_bytes();
+        assert_eq!(
+            BtrfsSuperblock::parse_from_image(&durable)
+                .unwrap()
+                .log_root,
+            0
+        );
+        std::fs::write(&image, &durable).unwrap();
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(durable)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let file = cold
+            .lookup(&cx, InodeNumber(1), OsStr::new("retry-grown"))
+            .unwrap();
+        assert_eq!(file.ino, ino);
+        assert_eq!(cold.read(&cx, ino, 0, 8193).unwrap(), payload);
+        let Some((clean, output)) = run_btrfs_check(&image) else {
+            oracle_unavailable("btrfs check after chunk-growth barrier retry");
+            return;
+        };
+        assert!(clean, "retried chunk growth must be native-valid: {output}");
+    }
+
+    #[test]
+    fn btrfs_tree_log_chunk_growth_preserves_repeated_system_bootstrap() {
+        let Some((fs, device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(128, &["-m", "single", "-d", "single"])
+        else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        fs.set_btrfs_grow_chunks(false);
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let file = fs
+            .create(
+                &cx,
+                InodeNumber(1),
+                OsStr::new("system-growth"),
+                0o600,
+                0,
+                0,
+            )
+            .unwrap();
+        let payload = [0xC7; 8192];
+        fs.write(&cx, file.ino, 0, &payload).unwrap();
+        fs.btrfs_full_transaction_commit(&cx, "system-growth-seed")
+            .unwrap();
+        let initial_systems =
+            parse_sys_chunk_array(&fs.btrfs_superblock().unwrap().sys_chunk_array)
+                .unwrap()
+                .len();
+        fs.set_btrfs_grow_chunks(true);
+
+        for round in 1..=2 {
+            let previous_systems = {
+                let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+                assert!(alloc.chunk_trees_authoritative);
+                assert!(!alloc.chunk_trees_dirty);
+                let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap();
+                let previous_systems: Vec<_> = chunks
+                    .iter()
+                    .filter(|chunk| chunk.chunk_type & BTRFS_BLOCK_GROUP_SYSTEM != 0)
+                    .map(|chunk| chunk.key.offset)
+                    .collect();
+                let growth_device = ffs_btrfs::GrowthDevice::from_chunk_tree(
+                    &alloc.chunk_tree,
+                    fs.btrfs_superblock().unwrap().fsid,
+                )
+                .unwrap();
+                let plan = ffs_btrfs::plan_growth_for_shortfall(
+                    &chunks,
+                    ffs_btrfs::ChunkKind::Data,
+                    u64::from(alloc.sectorsize),
+                    &growth_device,
+                    &ffs_btrfs::ChunkSizePolicy::default(),
+                )
+                .unwrap()
+                .expect("the native image must fit both growth rounds");
+                let state = &mut *alloc;
+                ffs_btrfs::apply_chunk_allocation(
+                    &plan,
+                    &mut state.chunk_tree,
+                    &mut state.dev_tree,
+                    &mut state.extent_alloc,
+                    None,
+                )
+                .unwrap();
+                state.chunk_trees_dirty = true;
+
+                // Real chunk-tree work above enters the SYSTEM growth branch.
+                // Temporary allocator pins force its ordinary shortfall path
+                // without constructing invalid extent items or disk geometry.
+                // The successful commit releases them before the next round.
+                for group in state.extent_alloc.free_space_extents().unwrap() {
+                    if group.flags & BTRFS_BLOCK_GROUP_SYSTEM != 0 {
+                        for (start, length) in group.free_ranges {
+                            state.extent_alloc.pin_live_tree_block(start, length);
+                        }
+                    }
+                }
+                assert_eq!(
+                    state
+                        .extent_alloc
+                        .allocatable_bytes(BTRFS_BLOCK_GROUP_SYSTEM),
+                    0
+                );
+                previous_systems
+            };
+            fs.btrfs_full_transaction_commit(&cx, "repeat-system-chunk-growth")
+                .unwrap();
+            let committed = device.snapshot_bytes();
+            let sb = BtrfsSuperblock::parse_from_image(&committed).unwrap();
+            let bootstrap = parse_sys_chunk_array(&sb.sys_chunk_array).unwrap();
+            let authoritative: Vec<_> = {
+                let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+                assert!(!alloc.chunk_trees_dirty);
+                ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|chunk| chunk.chunk_type & BTRFS_BLOCK_GROUP_SYSTEM != 0)
+                    .collect()
+            };
+            assert_eq!(bootstrap.len(), initial_systems + round);
+            assert_eq!(
+                bootstrap, authoritative,
+                "round {round} must retain every earlier SYSTEM mapping"
+            );
+            let grown = bootstrap
+                .iter()
+                .find(|chunk| !previous_systems.contains(&chunk.key.offset))
+                .expect("this commit must allocate a new SYSTEM chunk");
+            assert!(
+                sb.chunk_root >= grown.key.offset
+                    && sb.chunk_root + u64::from(sb.nodesize) <= grown.key.offset + grown.length,
+                "the chunk root must exercise the newly grown bootstrap mapping"
+            );
+            assert!(
+                ffs_ondisk::map_logical_to_stripes(&bootstrap, sb.chunk_root)
+                    .unwrap()
+                    .is_some()
+            );
+            std::fs::write(&image, &committed).unwrap();
+            let Some((clean, output)) = run_btrfs_check(&image) else {
+                oracle_unavailable("btrfs check after repeated SYSTEM growth");
+                return;
+            };
+            assert!(
+                clean,
+                "SYSTEM growth round {round} must be native-valid: {output}"
+            );
+            let cold = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(committed)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let found = cold
+                .lookup(&cx, InodeNumber(1), OsStr::new("system-growth"))
+                .unwrap();
+            assert_eq!(found.ino, file.ino);
+            assert_eq!(cold.read(&cx, found.ino, 0, 8193).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn btrfs_tree_log_chunk_growth_superblock_write_retry_preserves_system_bootstrap() {
+        let Some((seed_fs, seed_device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(128, &["-m", "single", "-d", "single"])
+        else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        seed_fs.set_btrfs_grow_chunks(false);
+        seed_fs.set_btrfs_dirty_bytes_threshold(0);
+        let file = seed_fs
+            .create(&cx, InodeNumber(1), OsStr::new("retry-system"), 0o600, 0, 0)
+            .unwrap();
+        seed_fs.write(&cx, file.ino, 0, &[0xC7; 8192]).unwrap();
+        seed_fs
+            .btrfs_full_transaction_commit(&cx, "system-write-retry-seed")
+            .unwrap();
+        let seed = seed_device.snapshot_bytes();
+        let primary_before = seed[BTRFS_SUPER_INFO_OFFSET..BTRFS_SUPER_INFO_OFFSET + 4096].to_vec();
+        let original_bootstrap = parse_sys_chunk_array(
+            &BtrfsSuperblock::parse_from_image(&seed)
+                .unwrap()
+                .sys_chunk_array,
+        )
+        .unwrap();
+        drop(seed_fs);
+        drop(seed_device);
+        let payload = [0x64; 8192];
+        let prepare = |device: &TestDevice, fail_on| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let fault = ValidationFaultDevice {
+                inner: device.clone(),
+                attempts: Arc::clone(&attempts),
+                fail_on,
+                events: Arc::clone(&events),
+            };
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(fault),
+                &OpenOptions {
+                    btrfs_rw_ephemeral_ok: true,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.set_btrfs_grow_chunks(false);
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            fs.write(&cx, file.ino, 0, &payload).unwrap();
+            {
+                let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+                assert!(alloc.chunk_trees_authoritative);
+                let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap();
+                let growth_device = ffs_btrfs::GrowthDevice::from_chunk_tree(
+                    &alloc.chunk_tree,
+                    fs.btrfs_superblock().unwrap().fsid,
+                )
+                .unwrap();
+                let plan = ffs_btrfs::plan_growth_for_shortfall(
+                    &chunks,
+                    ffs_btrfs::ChunkKind::Data,
+                    u64::from(alloc.sectorsize),
+                    &growth_device,
+                    &ffs_btrfs::ChunkSizePolicy::default(),
+                )
+                .unwrap()
+                .expect("the native image must have unallocated space");
+                let state = &mut *alloc;
+                ffs_btrfs::apply_chunk_allocation(
+                    &plan,
+                    &mut state.chunk_tree,
+                    &mut state.dev_tree,
+                    &mut state.extent_alloc,
+                    None,
+                )
+                .unwrap();
+                state.chunk_trees_dirty = true;
+                // Force a real SYSTEM allocation for the chunk tree this
+                // DATA mutation requires, using temporary allocator pressure.
+                for group in state.extent_alloc.free_space_extents().unwrap() {
+                    if group.flags & BTRFS_BLOCK_GROUP_SYSTEM != 0 {
+                        for (start, length) in group.free_ranges {
+                            state.extent_alloc.pin_live_tree_block(start, length);
+                        }
+                    }
+                }
+                assert_eq!(
+                    state
+                        .extent_alloc
+                        .allocatable_bytes(BTRFS_BLOCK_GROUP_SYSTEM),
+                    0
+                );
+            }
+            fs.set_btrfs_grow_chunks(true);
+            (fs, events, attempts)
+        };
+
+        // Use the existing write-fault device and measure the exact primary
+        // superblock write in a successful control, independent of node counts.
+        let primary_write = {
+            let device = TestDevice::from_vec(seed.clone());
+            let (fs, events, _) = prepare(&device, usize::MAX);
+            fs.btrfs_full_transaction_commit(&cx, "system-write-control")
+                .unwrap();
+            let writes: Vec<_> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|offset| *offset)
+                .collect();
+            assert_eq!(
+                writes
+                    .iter()
+                    .filter(|&&offset| offset == BTRFS_SUPER_INFO_OFFSET as u64)
+                    .count(),
+                1
+            );
+            writes
+                .iter()
+                .position(|&offset| offset == BTRFS_SUPER_INFO_OFFSET as u64)
+                .unwrap()
+                + 1
+        };
+        let device = TestDevice::from_vec(seed);
+        let (fs, events, attempts) = prepare(&device, primary_write);
+        let failure = fs
+            .btrfs_full_transaction_commit(&cx, "system-write-failure")
+            .expect_err("the primary superblock write must fail before copying bytes");
+        assert!(failure.to_string().contains("superblock write failed"));
+        assert!(
+            failure
+                .to_string()
+                .contains("injected native validation write failure")
+        );
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), primary_write);
+        assert_eq!(
+            events.lock().unwrap().last(),
+            Some(&Some(BTRFS_SUPER_INFO_OFFSET as u64))
+        );
+        assert_eq!(
+            &device.snapshot_bytes()[BTRFS_SUPER_INFO_OFFSET..BTRFS_SUPER_INFO_OFFSET + 4096],
+            primary_before,
+            "the device retained the old superblock and its old bootstrap"
+        );
+        let retained_chunks = {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(alloc.chunk_trees_dirty);
+            ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap()
+        };
+        let retained_systems: Vec<_> = retained_chunks
+            .iter()
+            .filter(|chunk| chunk.chunk_type & BTRFS_BLOCK_GROUP_SYSTEM != 0)
+            .cloned()
+            .collect();
+        assert_eq!(retained_systems.len(), original_bootstrap.len() + 1);
+
+        // Retrying cannot rely on growing another SYSTEM chunk to reconstruct
+        // the array: all mapping work already exists and growth is disabled.
+        fs.set_btrfs_grow_chunks(false);
+        let ops: &dyn FsOps = &fs;
+        ops.fsync(&cx, &mut RequestScope::empty(), file.ino, 0, false)
+            .expect("retry must publish the retained SYSTEM mapping");
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(!alloc.chunk_trees_dirty);
+            assert_eq!(
+                ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap(),
+                retained_chunks,
+                "retry must use exactly the already retained chunks"
+            );
+        }
+        let committed = device.snapshot_bytes();
+        let sb = BtrfsSuperblock::parse_from_image(&committed).unwrap();
+        assert_eq!(sb.log_root, 0);
+        let bootstrap = parse_sys_chunk_array(&sb.sys_chunk_array).unwrap();
+        assert_eq!(bootstrap, retained_systems);
+        assert!(
+            ffs_ondisk::map_logical_to_stripes(&bootstrap, sb.chunk_root)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::write(&image, &committed).unwrap();
+        let Some((clean, output)) = run_btrfs_check(&image) else {
+            oracle_unavailable("btrfs check after SYSTEM superblock-write retry");
+            return;
+        };
+        assert!(
+            clean,
+            "SYSTEM superblock-write retry must be native-valid: {output}"
+        );
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(committed)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let found = cold
+            .lookup(&cx, InodeNumber(1), OsStr::new("retry-system"))
+            .unwrap();
+        assert_eq!(found.ino, file.ino);
+        assert_eq!(cold.read(&cx, found.ino, 0, 8193).unwrap(), payload);
     }
 
     /// bd-34blv: with default settings a btrfs RW mount grows data chunks on
