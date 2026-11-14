@@ -442,10 +442,7 @@ fn native_ntfs_named_stream_edits_preserve_other_data_and_volume_bounds() {
     expected.resize(8195, 0);
     expected.extend([0xFF, 0x00, 0x80, 0x41]);
     contents(&expected);
-    transaction(
-        "tx-truncate",
-        &["--stream", "metadata", "--size", "12301"],
-    );
+    transaction("tx-truncate", &["--stream", "metadata", "--size", "12301"]);
     expected.resize(12_301, 0);
     contents(&expected);
     transaction(

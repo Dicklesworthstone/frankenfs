@@ -820,10 +820,11 @@ impl NtfsTransactionEngine {
     }
 
     fn validate_inactive_quota_record(quota_rec: &NtfsFileRecord) -> Result<()> {
+        let mut found_root = false;
         for attr in quota_rec.attributes().map_err(|err| parse_err(&err))? {
-            if attr.kind == ATTRIBUTE_LIST || attr.kind == 0x100 {
+            if attr.flags != 0 || attr.kind == ATTRIBUTE_LIST || attr.kind == 0x100 {
                 return Err(unsupported(
-                    "NTFS $Quota with extension catalog or $TXF_DATA is refused",
+                    "NTFS $Quota with transformed attributes, extension catalog or $TXF_DATA is refused",
                 ));
             }
             if attr.kind == 0xA0 && attr.name == DOLLAR_Q_NAME {
@@ -832,82 +833,144 @@ impl NtfsTransactionEngine {
                 ));
             }
             if attr.kind == 0x90 && attr.name == DOLLAR_Q_NAME {
+                if found_root {
+                    return Err(corrupt(0, "duplicate $Quota::$Q INDEX_ROOT"));
+                }
                 let NtfsValue::Resident(ir) = attr.value else {
                     return Err(corrupt(0, "nonresident $Quota::$Q INDEX_ROOT"));
                 };
-                if ir.len() < 32 {
-                    return Err(corrupt(0, "truncated $Quota::$Q INDEX_ROOT"));
-                }
-                // INDEX_HEADER starts at byte 16; flags at byte 28 (`LARGE_INDEX == 1`).
-                if ir[28] & 1 != 0 {
-                    return Err(unsupported(
-                        "NTFS $Quota with external $Q B-tree is refused",
+                Self::validate_inactive_quota_root(ir)?;
+                found_root = true;
+            }
+        }
+        if !found_root {
+            return Err(unsupported(
+                "NTFS $Quota lacks a verifiable default $Q state",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_inactive_quota_root(ir: &[u8]) -> Result<()> {
+        if ir.len() < 48 || ir[..4] != [0; 4] || ir[4..8] != 16_u32.to_le_bytes() {
+            return Err(corrupt(0, "invalid $Quota::$Q INDEX_ROOT schema"));
+        }
+        // $Q uses unsigned 32-bit owner keys, not FILE_NAME collation. The
+        // complete resident tree must be examined before trusting its defaults.
+        if ir[28] != 0 {
+            return Err(unsupported(
+                "NTFS $Quota with external or unknown $Q B-tree flags is refused",
+            ));
+        }
+        let entries_off = u32::from_le_bytes([ir[16], ir[17], ir[18], ir[19]]) as usize;
+        let total_bytes = u32::from_le_bytes([ir[20], ir[21], ir[22], ir[23]]) as usize;
+        let allocated = u32::from_le_bytes([ir[24], ir[25], ir[26], ir[27]]) as usize;
+        if entries_off < 16
+            || !entries_off.is_multiple_of(8)
+            || entries_off > total_bytes
+            || total_bytes > allocated
+            || allocated > ir.len() - 16
+            || ir[13..16] != [0; 3]
+            || ir[29..32] != [0; 3]
+        {
+            return Err(corrupt(0, "out-of-bounds $Quota::$Q INDEX_ROOT entries"));
+        }
+        let mut pos = 16 + entries_off;
+        let end = 16 + total_bytes;
+        let mut previous_owner = 0;
+        let mut found_default = false;
+        while pos < end {
+            let entry = &ir[pos..end];
+            if entry.len() < 16 {
+                return Err(corrupt(0, "truncated $Quota::$Q index entry header"));
+            }
+            let data_off = usize::from(u16::from_le_bytes([entry[0], entry[1]]));
+            let data_len = usize::from(u16::from_le_bytes([entry[2], entry[3]]));
+            let entry_len = usize::from(u16::from_le_bytes([entry[8], entry[9]]));
+            let key_len = usize::from(u16::from_le_bytes([entry[10], entry[11]]));
+            let flags = u16::from_le_bytes([entry[12], entry[13]]);
+            if entry_len < 16
+                || !entry_len.is_multiple_of(8)
+                || entry_len > entry.len()
+                || entry[4..8] != [0; 4]
+                || entry[14..16] != [0; 2]
+                || flags & !3 != 0
+            {
+                return Err(corrupt(0, "invalid $Quota::$Q index entry header"));
+            }
+            if flags & 1 != 0 {
+                return Err(unsupported("NTFS $Quota subnode pointer is refused"));
+            }
+            if flags & 2 != 0 {
+                if entry_len != 16
+                    || entry_len != entry.len()
+                    || key_len != 0
+                    || data_off != 0
+                    || data_len != 0
+                    || !found_default
+                {
+                    return Err(corrupt(
+                        0,
+                        "invalid $Quota::$Q terminal or missing defaults",
                     ));
                 }
-                let entries_off =
-                    usize::try_from(u32::from_le_bytes([ir[16], ir[17], ir[18], ir[19]]))
-                        .map_err(|_| corrupt(0, "invalid $Q entries_off"))?;
-                let total_bytes =
-                    usize::try_from(u32::from_le_bytes([ir[20], ir[21], ir[22], ir[23]]))
-                        .map_err(|_| corrupt(0, "invalid $Q total_bytes"))?;
-                let mut pos = 16_usize.saturating_add(entries_off);
-                let end = 16_usize.saturating_add(total_bytes);
-                if pos > end || end > ir.len() {
-                    return Err(corrupt(0, "out-of-bounds $Quota::$Q INDEX_ROOT entries"));
-                }
-                while pos < end {
-                    if pos + 16 > end {
-                        return Err(corrupt(0, "truncated $Quota::$Q index entry header"));
-                    }
-                    let data_off = usize::from(u16::from_le_bytes([ir[pos], ir[pos + 1]]));
-                    let data_len = usize::from(u16::from_le_bytes([ir[pos + 2], ir[pos + 3]]));
-                    let entry_len = usize::from(u16::from_le_bytes([ir[pos + 8], ir[pos + 9]]));
-                    let key_len = usize::from(u16::from_le_bytes([ir[pos + 10], ir[pos + 11]]));
-                    let entry_flags = u16::from_le_bytes([ir[pos + 12], ir[pos + 13]]);
-                    if entry_len < 16 || !entry_len.is_multiple_of(8) || pos + entry_len > end {
-                        return Err(corrupt(0, "invalid $Quota::$Q index entry length"));
-                    }
-                    if entry_flags & 1 != 0 {
-                        return Err(unsupported("NTFS $Quota subnode pointer is refused"));
-                    }
-                    if entry_flags & 2 != 0 {
-                        break;
-                    }
-                    if key_len != 4 || pos + 20 > pos + entry_len {
-                        return Err(unsupported(
-                            "unexpected key layout in NTFS $Quota::$Q index",
-                        ));
-                    }
-                    let owner_id = u32::from_le_bytes([
-                        ir[pos + 16],
-                        ir[pos + 17],
-                        ir[pos + 18],
-                        ir[pos + 19],
-                    ]);
-                    if owner_id != 1 {
-                        return Err(unsupported(
-                            "active per-user NTFS $Quota entries are refused for native writes",
-                        ));
-                    }
-                    if data_len < 8 || data_off < 20 || data_off + data_len > entry_len {
-                        return Err(corrupt(0, "invalid $Quota::$Q default entry payload"));
-                    }
-                    let qflags = u32::from_le_bytes([
-                        ir[pos + data_off + 4],
-                        ir[pos + data_off + 5],
-                        ir[pos + data_off + 6],
-                        ir[pos + data_off + 7],
-                    ]);
-                    // Refuse TRACKING_ENABLED (0x10), ENFORCEMENT_ENABLED (0x20),
-                    // TRACKING_REQUESTED (0x40), CORRUPT/OUT_OF_DATE/PENDING_DELETES (0x700).
-                    if qflags & 0x0770 != 0 {
-                        return Err(unsupported(format!(
-                            "active NTFS $Quota state ({qflags:#x}) is refused for native writes"
-                        )));
-                    }
-                    pos += entry_len;
-                }
+                return Ok(());
             }
+            if key_len != 4
+                || entry_len < 20
+                || data_off < 20
+                || data_off > entry_len
+                || data_len > entry_len - data_off
+            {
+                return Err(corrupt(0, "invalid $Quota::$Q key or payload bounds"));
+            }
+            let owner = u32::from_le_bytes([entry[16], entry[17], entry[18], entry[19]]);
+            if owner <= previous_owner {
+                return Err(corrupt(0, "unordered or duplicate $Quota::$Q owner IDs"));
+            }
+            Self::validate_inactive_quota_entry(owner, &entry[data_off..data_off + data_len])?;
+            found_default |= owner == 1;
+            previous_owner = owner;
+            pos += entry_len;
+        }
+        Err(corrupt(0, "missing $Quota::$Q terminal entry"))
+    }
+
+    fn validate_inactive_quota_entry(owner: u32, data: &[u8]) -> Result<()> {
+        // NTFS-3G 2022.10.3 mkntfs.c::initialize_quota seeds owner 0x100
+        // (S-1-5-32-544, builtin Administrators) even with tracking disabled.
+        // Admit only that unused bootstrap entry, never arbitrary user quotas.
+        // QUOTA_CONTROL_ENTRY/QUOTA_FLAGS: NTFS-3G layout.h and Linux v6.7
+        // fs/ntfs/layout.h; pending deletes is 0x800, not 0x100.
+        const ADMINISTRATORS: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
+        let expected_len = match owner {
+            1 => 48,
+            0x100 => 64,
+            _ => {
+                return Err(unsupported(
+                    "non-bootstrap per-user NTFS $Quota entries are refused",
+                ));
+            }
+        };
+        if data.len() != expected_len {
+            return Err(corrupt(0, "invalid $Quota::$Q control entry length"));
+        }
+        let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        if version != 2 || flags & !1 != 0 || (owner == 0x100 && flags != 1) {
+            return Err(unsupported(format!(
+                "active or unknown NTFS $Quota state (version {version}, flags {flags:#x}) is refused"
+            )));
+        }
+        if data[8..16] != [0; 8] || data[24..40] != [0xFF; 16] || data[40..48] != [0; 8] {
+            return Err(unsupported(
+                "initialized or limited NTFS $Quota accounting is refused",
+            ));
+        }
+        if owner == 0x100 && data[48..64] != ADMINISTRATORS {
+            return Err(unsupported(
+                "non-bootstrap NTFS $Quota owner SID is refused",
+            ));
         }
         Ok(())
     }

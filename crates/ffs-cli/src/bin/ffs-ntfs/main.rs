@@ -1219,7 +1219,8 @@ fn main() -> Result<()> {
             let stream = select_write_stream(stream.as_deref(), stream_utf16)?;
             let data = payload.load_range(start)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.write_file_stream_range(&cx, &path, stream.as_units(), start, &data);
+            let outcome =
+                engine.write_file_stream_range(&cx, &path, stream.as_units(), start, &data);
             emit_tx_outcome("tx_write_range", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -2390,18 +2391,16 @@ mod tests {
                 (vec!["--stream-utf16", "d800,0061"], vec![0xd800, 0x61]),
             ] {
                 let cli = Cli::try_parse_from(base.iter().copied().chain(selector)).unwrap();
-                let (
-                    Command::TxWriteRange {
-                        stream,
-                        stream_utf16,
-                        ..
-                    }
-                    | Command::TxTruncate {
-                        stream,
-                        stream_utf16,
-                        ..
-                    }
-                ) = cli.command
+                let (Command::TxWriteRange {
+                    stream,
+                    stream_utf16,
+                    ..
+                }
+                | Command::TxTruncate {
+                    stream,
+                    stream_utf16,
+                    ..
+                }) = cli.command
                 else {
                     panic!("native stream edit");
                 };

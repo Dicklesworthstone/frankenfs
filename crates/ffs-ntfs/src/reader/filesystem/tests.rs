@@ -230,10 +230,10 @@ fn image() -> Vec<u8> {
                     &[
                         (24, "hello.txt", 1),
                         (24, "HELLO~1.TXT", 2),
+                        (29, "mixed", 0),
                         (26, "packed.bin", 1),
                         (27, "Subdir", 1),
                         (28, "Ä.bin", 1),
-                        (29, "mixed", 0),
                     ],
                     5,
                 ),

@@ -1628,6 +1628,7 @@ impl NtfsTransactionEngine {
                 sequence: parent_rec.sequence,
             },
             &leaf_utf16,
+            stream_name,
         )?;
         let volume = self.volume_view(cx)?;
         let stream = volume.data_stream(cx, &file_rec, stream_name)?;
@@ -1681,8 +1682,7 @@ impl NtfsTransactionEngine {
             replacement[start..start + data.len()].copy_from_slice(data);
         }
         checkpoint(cx)?;
-        let mut plan =
-            self.plan_write_stream_data(cx, digest, path, stream_name, &replacement)?;
+        let mut plan = self.plan_write_stream_data(cx, digest, path, stream_name, &replacement)?;
         plan.operation = operation;
         Ok(plan)
     }
@@ -1847,8 +1847,19 @@ impl NtfsTransactionEngine {
         record: &NtfsFileRecord,
         parent: NtfsReference,
         leaf: &[u16],
+        stream_name: &[u16],
     ) -> Result<Vec<u16>> {
         let native_name = self.admit_plain_data_write(record)?;
+        // NtfsFileRecord validates every attribute span and restores the sector
+        // trailers. DATA has no indexed-resident semantics: native promotion
+        // must never mistake its removal for deletion of a FILE_NAME link.
+        // Check unchanged-value edits before they can receive a commit token.
+        let restored = record.used_bytes();
+        let (data_at, _) = find_attr_offset_in_restored(restored, DATA, stream_name)?
+            .ok_or_else(|| FfsError::NotFound("NTFS DATA stream".into()))?;
+        if restored[data_at + 8] == 0 && restored[data_at + 22..data_at + 24] != [0, 0] {
+            return Err(corrupt(0, "NTFS resident DATA has nonzero indexed flags"));
+        }
         if native_name.namespace == 2 {
             return Err(unsupported(
                 "NTFS DOS alias data writes require coupled long-name maintenance",
@@ -1896,6 +1907,7 @@ impl NtfsTransactionEngine {
                 sequence: parent_rec.sequence,
             },
             &leaf_utf16,
+            stream_name,
         )?;
         let file_ref = NtfsReference {
             record: u64::from(file_no),

@@ -3467,6 +3467,277 @@ fn copied_test_record_attributes(raw: &[u8]) -> Vec<Vec<u8>> {
     }
 }
 
+fn bootstrap_quota_root(include_administrators: bool) -> Vec<u8> {
+    // Native NTFS-3G 2022.10.3 initialize_quota layout: a 48-byte default
+    // QUOTA_CONTROL_ENTRY and an optional 64-byte builtin Administrators entry.
+    let mut root = build_empty_i30_root();
+    root[..4].fill(0);
+    root[4..8].copy_from_slice(&16_u32.to_le_bytes());
+    let terminal = root.split_off(32);
+    for owner in [1_u32, 0x100] {
+        if owner == 0x100 && !include_administrators {
+            continue;
+        }
+        let data_len: usize = if owner == 1 { 48 } else { 64 };
+        let entry_len = (20 + data_len).next_multiple_of(8);
+        let mut entry = vec![0; entry_len];
+        entry[..2].copy_from_slice(&20_u16.to_le_bytes());
+        entry[2..4].copy_from_slice(&(data_len as u16).to_le_bytes());
+        entry[8..10].copy_from_slice(&(entry_len as u16).to_le_bytes());
+        entry[10..12].copy_from_slice(&4_u16.to_le_bytes());
+        entry[16..20].copy_from_slice(&owner.to_le_bytes());
+        entry[20..24].copy_from_slice(&2_u32.to_le_bytes());
+        entry[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        entry[36..44].copy_from_slice(&DEFAULT_FILETIME.to_le_bytes());
+        entry[44..60].fill(0xFF);
+        if owner == 0x100 {
+            entry[68..84].copy_from_slice(&[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0]);
+        }
+        root.extend(entry);
+    }
+    root.extend(terminal);
+    let used = (root.len() - 16) as u32;
+    root[20..24].copy_from_slice(&used.to_le_bytes());
+    root[24..28].copy_from_slice(&used.to_le_bytes());
+    root
+}
+
+fn quota_admission_image(quota_root: &[u8]) -> Vec<u8> {
+    let mut image = build_clean_ntfs_image(256, 64, 0x0A07_A000_0000_0001);
+    let filename = |parent, name: &str, directory| {
+        NtfsFileName {
+            parent,
+            namespace: 3,
+            name: name.encode_utf16().collect(),
+        }
+        .encode(
+            DEFAULT_FILETIME,
+            DEFAULT_FILETIME,
+            DEFAULT_FILETIME,
+            DEFAULT_FILETIME,
+            0,
+            0,
+            if directory { 0x1000_0000 } else { 0x2000_0026 },
+            0,
+        )
+        .unwrap()
+    };
+    let index = |reference, name: &[u8]| {
+        let mut root = build_empty_i30_root();
+        let terminal = root.split_off(32);
+        root.extend(ffs_ondisk::ntfs::index::encode_index_entry(reference, name, None).unwrap());
+        root.extend(terminal);
+        let used = (root.len() - 16) as u32;
+        root[20..24].copy_from_slice(&used.to_le_bytes());
+        root[24..28].copy_from_slice(&used.to_le_bytes());
+        root
+    };
+    let extend_reference = NtfsReference {
+        record: 11,
+        sequence: 11,
+    };
+    let quota_reference = NtfsReference {
+        record: 24,
+        sequence: 1,
+    };
+    let extend_name = filename(
+        NtfsReference {
+            record: 5,
+            sequence: 5,
+        },
+        "$Extend",
+        true,
+    );
+    let quota_name = filename(extend_reference, "$Quota", false);
+    let i30: Vec<_> = "$I30".encode_utf16().collect();
+    let root_at = CLUSTER_BYTES + 5 * RECORD_BYTES;
+    let mut root_attrs = copied_test_record_attributes(&image[root_at..root_at + RECORD_BYTES]);
+    *root_attrs
+        .iter_mut()
+        .find(|attr| attr[..4] == 0x90_u32.to_le_bytes())
+        .unwrap() =
+        build_resident_attr(0x90, 3, &i30, false, &index(extend_reference, &extend_name));
+    let root_record = build_file_record(5, 5, 1, true, &root_attrs);
+    image[root_at..root_at + RECORD_BYTES].copy_from_slice(&root_record);
+    let extend_record = build_file_record(
+        11,
+        11,
+        1,
+        true,
+        &[
+            build_resident_attr(0x10, 0, &[], false, &[0; 48]),
+            build_resident_attr(0x30, 1, &[], true, &extend_name),
+            build_resident_attr(0x50, 2, &[], false, &build_root_security_descriptor()),
+            build_resident_attr(0x90, 3, &i30, false, &index(quota_reference, &quota_name)),
+        ],
+    );
+    let extend_at = CLUSTER_BYTES + 11 * RECORD_BYTES;
+    image[extend_at..extend_at + RECORD_BYTES].copy_from_slice(&extend_record);
+    let quota_record = build_file_record(
+        24,
+        1,
+        1,
+        false,
+        &[
+            build_resident_attr(0x10, 0, &[], false, &[0; 48]),
+            build_resident_attr(0x30, 1, &[], true, &quota_name),
+            build_resident_attr(0x50, 2, &[], false, &build_root_security_descriptor()),
+            build_resident_attr(
+                0x90,
+                3,
+                &"$Q".encode_utf16().collect::<Vec<_>>(),
+                false,
+                quota_root,
+            ),
+        ],
+    );
+    let quota_at = CLUSTER_BYTES + 24 * RECORD_BYTES;
+    image[quota_at..quota_at + RECORD_BYTES].copy_from_slice(&quota_record);
+    let mut mft_attrs =
+        copied_test_record_attributes(&image[CLUSTER_BYTES..CLUSTER_BYTES + RECORD_BYTES]);
+    let bitmap = mft_attrs
+        .iter_mut()
+        .find(|attr| attr[..4] == 0xB0_u32.to_le_bytes())
+        .unwrap();
+    let value_at = usize::from(u16::from_le_bytes(bitmap[20..22].try_into().unwrap()));
+    bitmap[value_at + 1] |= 1 << 3;
+    bitmap[value_at + 3] |= 1;
+    let mft_record = build_file_record(0, 1, 0, false, &mft_attrs);
+    image[CLUSTER_BYTES..CLUSTER_BYTES + RECORD_BYTES].copy_from_slice(&mft_record);
+    image[9 * CLUSTER_BYTES..9 * CLUSTER_BYTES + RECORD_BYTES].copy_from_slice(&mft_record);
+    image
+}
+
+#[test]
+fn inactive_bootstrap_quota_admits_native_writes_without_changing_accounting() {
+    let cx = Cx::for_testing();
+    for administrators in [false, true] {
+        for default_flags in [0_u32, 1] {
+            let mut root = bootstrap_quota_root(administrators);
+            root[56..60].copy_from_slice(&default_flags.to_le_bytes());
+            let image = quota_admission_image(&root);
+            let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+            let quota_at = CLUSTER_BYTES + 24 * RECORD_BYTES;
+            let before = image[quota_at..quota_at + RECORD_BYTES].to_vec();
+            let device = FaultInjectingNtfsDevice::new(image);
+            let mut engine = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&device) as Arc<dyn ByteDevice>,
+                0,
+                volume_bytes,
+                write_options_clean(),
+            )
+            .expect("unused default and bootstrap quota entries are inactive");
+            assert_eq!(device.write_bytes_total(), 0);
+            engine
+                .create_file(&cx, "/", "quota-safe.bin", b"initial")
+                .into_result()
+                .unwrap();
+            engine
+                .write_file_range(&cx, "/quota-safe.bin", 4096, b"replacement")
+                .into_result()
+                .unwrap();
+            engine.check_clean_consistency(&cx).unwrap();
+            assert_eq!(
+                &device.snapshot_durable_only()[quota_at..quota_at + RECORD_BYTES],
+                before
+            );
+            drop(engine);
+            NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&device) as Arc<dyn ByteDevice>,
+                0,
+                volume_bytes,
+                write_options_clean(),
+            )
+            .expect("native edits retain an admissible inactive quota state");
+        }
+    }
+}
+
+#[test]
+fn active_or_malformed_quota_refuses_before_any_backing_write() {
+    let cx = Cx::for_testing();
+    let original = bootstrap_quota_root(true);
+    let mut cases = Vec::new();
+    // Exercise default-only global flags and per-user flags independently,
+    // including PENDING_DELETES (0x800) missed by the old admission mask.
+    for entry_at in [32_usize, 104] {
+        for flag in [
+            2_u32,
+            4,
+            8,
+            0x10,
+            0x20,
+            0x40,
+            0x80,
+            0x100,
+            0x200,
+            0x400,
+            0x800,
+            0x1000,
+            0x8000_0000,
+        ] {
+            let mut root = original.clone();
+            root[entry_at + 24..entry_at + 28].copy_from_slice(&(1 | flag).to_le_bytes());
+            cases.push((format!("entry {entry_at} flags {flag:#x}"), root));
+        }
+        for (offset, value) in [(20, 3), (28, 1), (44, 0), (52, 0), (60, 1)] {
+            let mut root = original.clone();
+            root[entry_at + offset] = value;
+            cases.push((format!("entry {entry_at} control field {offset}"), root));
+        }
+    }
+    for (label, offset, bytes) in [
+        ("unrelated owner", 120, 0x101_u32.to_le_bytes()),
+        ("duplicate owner", 120, 1_u32.to_le_bytes()),
+        ("missing defaults", 48, 2_u32.to_le_bytes()),
+        ("wrong SID", 184, 545_u32.to_le_bytes()),
+        ("wrong collation", 4, 1_u32.to_le_bytes()),
+        ("entries overlap header", 16, 8_u32.to_le_bytes()),
+        ("used exceeds allocation", 20, 200_u32.to_le_bytes()),
+        ("allocation exceeds value", 24, 200_u32.to_le_bytes()),
+    ] {
+        let mut root = original.clone();
+        root[offset..offset + 4].copy_from_slice(&bytes);
+        cases.push((label.to_owned(), root));
+    }
+    for (label, offset, value) in [
+        ("external tree", 28, 1),
+        ("unknown root flags", 28, 2),
+        ("payload overlaps key", 32, 16),
+        ("truncated control entry", 34, 8),
+        ("subnode", 44, 1),
+        ("unknown entry flags", 44, 4),
+        ("terminal hides owner", 44, 2),
+        ("terminal has key", 202, 4),
+        ("terminal absent", 204, 0),
+    ] {
+        let mut root = original.clone();
+        root[offset] = value;
+        cases.push((label.to_owned(), root));
+    }
+    for (label, root) in cases {
+        let image = quota_admission_image(&root);
+        let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+        let device = FaultInjectingNtfsDevice::new(image.clone());
+        let result = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&device) as Arc<dyn ByteDevice>,
+            0,
+            volume_bytes,
+            write_options_recover(),
+        );
+        let Err(error) = result else {
+            panic!("quota control accepted {label}")
+        };
+        assert!(error.to_string().contains("$Quota"), "{label}: {error}");
+        assert_eq!(device.write_bytes_total(), 0, "{label}");
+        assert_eq!(device.snapshot_live(), image, "{label}");
+        assert_eq!(device.snapshot_durable_only(), image, "{label}");
+    }
+}
+
 #[test]
 fn plain_data_writes_refuse_unsupported_target_metadata_without_mutation() {
     #[derive(Clone, Copy, Debug)]
@@ -3973,13 +4244,16 @@ fn oversized_streams_admit_empty_writes_and_bounded_shrink() {
     engine.check_clean_consistency(&cx).unwrap();
 }
 
-
 /// Constructed native records intentionally include another large resident ADS.
 /// A small replacement can therefore require promotion before the general
 /// 512-byte resident threshold; it must not overwrite a neighboring attribute.
 fn named_stream_fixture(
     name: &[u16],
-) -> (Arc<FaultInjectingNtfsDevice>, NtfsTransactionEngine, NtfsReference) {
+) -> (
+    Arc<FaultInjectingNtfsDevice>,
+    NtfsTransactionEngine,
+    NtfsReference,
+) {
     let cx = Cx::for_testing();
     let image = build_clean_ntfs_image(256, 64, 0xAD50_0000_0000_0001);
     let length = image.len() as u64 - SECTOR_BYTES as u64;
@@ -4014,6 +4288,66 @@ fn named_stream_fixture(
     device.sync(&cx).unwrap();
     engine.check_clean_consistency(&cx).unwrap();
     (device, engine, file)
+}
+
+#[test]
+fn resident_data_indexed_flags_refuse_before_log_or_payload_writes() {
+    let cx = Cx::for_testing();
+    let name: Vec<_> = "Metadata".encode_utf16().collect();
+    for named in [false, true] {
+        for flags in [1_u16, 2, 0x0100] {
+            let (device, mut engine, file) = named_stream_fixture(&name);
+            let image = device.snapshot_durable_only();
+            let offset = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * RECORD_BYTES;
+            let mut attributes =
+                copied_test_record_attributes(&image[offset..offset + RECORD_BYTES]);
+            let attribute = attributes
+                .iter_mut()
+                .find(|attr| {
+                    u32::from_le_bytes(attr[..4].try_into().unwrap()) == DATA
+                        && if named {
+                            u16::from_le_bytes(attr[14..16].try_into().unwrap()) == 30
+                        } else {
+                            attr[9] == 0
+                        }
+                })
+                .unwrap();
+            let size = u64::from(u32::from_le_bytes(attribute[16..20].try_into().unwrap()));
+            attribute[22..24].copy_from_slice(&flags.to_le_bytes());
+            let record =
+                build_file_record(file.record as u32, file.sequence, 1, false, &attributes);
+            device
+                .write_all_at(&cx, ByteOffset(offset as u64), &record)
+                .unwrap();
+            device.sync(&cx).unwrap();
+            let before = device.snapshot_durable_only();
+            let writes = device.write_bytes_total();
+            let events = engine.persistence_trace().len();
+            let stream = if named { name.as_slice() } else { &[] };
+            let mut outcomes = vec![
+                engine.write_file_stream_range(&cx, "/Streams.bin", stream, 0, b"x"),
+                engine.write_stream_range(&cx, file, stream, u64::MAX, &[]),
+                engine.truncate_file_stream(&cx, "/Streams.bin", stream, size),
+                engine.truncate_stream(&cx, file, stream, 0),
+                engine.write_stream_range(&cx, file, stream, 9000, b"promote"),
+            ];
+            if !named {
+                outcomes.push(engine.write_file_data(&cx, "/Streams.bin", b"replacement"));
+            }
+            for outcome in outcomes {
+                assert!(
+                    matches!(
+                        outcome,
+                        NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+                    ),
+                    "indexed resident DATA must refuse before any token: named={named}, flags={flags:#x}, outcome={outcome:?}"
+                );
+            }
+            assert_eq!(device.snapshot_durable_only(), before);
+            assert_eq!(device.write_bytes_total(), writes);
+            assert_eq!(engine.persistence_trace().len(), events);
+        }
+    }
 }
 
 fn all_data_stream_bytes(
@@ -4093,9 +4427,14 @@ fn writable_fsops_named_stream_edits_preserve_unnamed_sizes_and_native_metadata(
         .unwrap();
     assert_ne!(ads.ino, base.ino);
     assert_eq!(
-        fs.lookup(&cx, &mut scope, root, OsStr::new("Streams.bin:Metadata:$DATA"))
-            .unwrap()
-            .ino,
+        fs.lookup(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("Streams.bin:Metadata:$DATA")
+        )
+        .unwrap()
+        .ino,
         ads.ino,
         "folded host lookup must retain the exact native stream identity"
     );
@@ -4108,8 +4447,7 @@ fn writable_fsops_named_stream_edits_preserve_unnamed_sizes_and_native_metadata(
 
     // 400 bytes is below the fixed resident threshold, but the existing
     // sentinel attribute leaves too little FILE space for that resident value.
-    fs.write(&cx, &mut scope, ads.ino, 0, &[0x42; 400])
-        .unwrap();
+    fs.write(&cx, &mut scope, ads.ino, 0, &[0x42; 400]).unwrap();
     expected = vec![0x42; 400];
     let image = device.snapshot_durable_only();
     let volume = NtfsVolume::from_device(
@@ -4119,7 +4457,9 @@ fn writable_fsops_named_stream_edits_preserve_unnamed_sizes_and_native_metadata(
         image.len() as u64 - SECTOR_BYTES as u64,
     )
     .unwrap();
-    let record = volume.record(&cx, file.record, Some(file.sequence)).unwrap();
+    let record = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
     assert!(
         !volume.data_stream(&cx, &record, &name).unwrap().resident(),
         "a full FILE must promote DATA instead of discarding another attribute"
@@ -4141,7 +4481,10 @@ fn writable_fsops_named_stream_edits_preserve_unnamed_sizes_and_native_metadata(
             fs.read(&cx, &mut scope, ads.ino, 0, 8192).unwrap(),
             expected
         );
-        assert_eq!(fs.getattr(&cx, &mut scope, base.ino).unwrap().size, base.size);
+        assert_eq!(
+            fs.getattr(&cx, &mut scope, base.ino).unwrap().size,
+            base.size
+        );
         let image = device.snapshot_durable_only();
         assert_eq!(
             recover_named_stream_bytes(&image, file),
@@ -4233,15 +4576,42 @@ fn named_stream_exact_utf16_identity_and_preflight_refusals_preserve_all_bytes()
     let oversized = vec![u16::from(b'x'); 256];
     let limit = ffs_ntfs::transaction::MAX_FILE_EDIT_BYTES;
     let outcomes = [
-        (engine.write_stream_range(&cx, file, &[0xD801, 120], 0, b"x"), libc::ENOENT),
-        (engine.truncate_file_stream(&cx, "/Streams.bin", &[110], 0), libc::ENOENT),
-        (engine.write_file_stream_range(&cx, "/missing", &name, 0, b"x"), libc::ENOENT),
-        (engine.write_stream_range(&cx, stale, &name, 0, b"x"), libc::ESTALE),
-        (engine.write_stream_range(&cx, file, &[58], 0, b"x"), libc::EINVAL),
-        (engine.truncate_file_stream(&cx, "/Streams.bin", &oversized, 0), libc::ENAMETOOLONG),
-        (engine.write_stream_range(&cx, file, &name, u64::MAX, b"x"), libc::EFBIG),
-        (engine.truncate_stream(&cx, file, &name, limit + 1), libc::EFBIG),
-        (engine.truncate_stream(&cx, file, &name, length), libc::ENOSPC),
+        (
+            engine.write_stream_range(&cx, file, &[0xD801, 120], 0, b"x"),
+            libc::ENOENT,
+        ),
+        (
+            engine.truncate_file_stream(&cx, "/Streams.bin", &[110], 0),
+            libc::ENOENT,
+        ),
+        (
+            engine.write_file_stream_range(&cx, "/missing", &name, 0, b"x"),
+            libc::ENOENT,
+        ),
+        (
+            engine.write_stream_range(&cx, stale, &name, 0, b"x"),
+            libc::ESTALE,
+        ),
+        (
+            engine.write_stream_range(&cx, file, &[58], 0, b"x"),
+            libc::EINVAL,
+        ),
+        (
+            engine.truncate_file_stream(&cx, "/Streams.bin", &oversized, 0),
+            libc::ENAMETOOLONG,
+        ),
+        (
+            engine.write_stream_range(&cx, file, &name, u64::MAX, b"x"),
+            libc::EFBIG,
+        ),
+        (
+            engine.truncate_stream(&cx, file, &name, limit + 1),
+            libc::EFBIG,
+        ),
+        (
+            engine.truncate_stream(&cx, file, &name, length),
+            libc::ENOSPC,
+        ),
     ];
     for (outcome, errno) in outcomes {
         let NtfsTxOutcome::NotCommitted(error) = outcome else {
@@ -4260,7 +4630,6 @@ fn named_stream_exact_utf16_identity_and_preflight_refusals_preserve_all_bytes()
     assert_eq!(device.snapshot_durable_only(), before);
     engine.check_clean_consistency(&cx).unwrap();
 }
-
 
 #[test]
 fn named_stream_growth_never_exposes_bytes_beyond_initialized_length() {
@@ -4436,7 +4805,10 @@ fn named_stream_failed_flush_and_post_commit_cancellation_keep_native_outcomes()
             NtfsTxOutcome::Committed { .. } => unreachable!(),
         }
     }
-    assert!(failures >= 4, "the test must actually exercise native sync failures");
+    assert!(
+        failures >= 4,
+        "the test must actually exercise native sync failures"
+    );
 
     let cx = Cx::for_testing();
     let device = FaultInjectingNtfsDevice::new(pristine);
@@ -4469,7 +4841,6 @@ fn named_stream_failed_flush_and_post_commit_cancellation_keep_native_outcomes()
     );
 }
 
-
 #[test]
 fn named_stream_admission_rejects_crosslinked_data_before_any_backing_write() {
     let cx = Cx::for_testing();
@@ -4496,8 +4867,7 @@ fn named_stream_admission_rejects_crosslinked_data_before_any_backing_write() {
     aliased[14..16].copy_from_slice(&31_u16.to_le_bytes());
     let name_at = usize::from(u16::from_le_bytes(aliased[10..12].try_into().unwrap()));
     for (index, unit) in sentinel.iter().enumerate() {
-        aliased[name_at + index * 2..name_at + index * 2 + 2]
-            .copy_from_slice(&unit.to_le_bytes());
+        aliased[name_at + index * 2..name_at + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
     }
     *attributes
         .iter_mut()
@@ -4515,13 +4885,8 @@ fn named_stream_admission_rejects_crosslinked_data_before_any_backing_write() {
     ));
     let length = image.len() as u64 - SECTOR_BYTES as u64;
     let device = FaultInjectingNtfsDevice::new(image.clone());
-    let volume = NtfsVolume::from_device(
-        &cx,
-        Box::new(ArcDevice(Arc::clone(&device))),
-        0,
-        length,
-    )
-    .unwrap();
+    let volume =
+        NtfsVolume::from_device(&cx, Box::new(ArcDevice(Arc::clone(&device))), 0, length).unwrap();
     let report = volume
         .check_allocations(&cx, AllocationLimits::default())
         .unwrap();
