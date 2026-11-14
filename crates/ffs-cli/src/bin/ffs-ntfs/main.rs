@@ -196,6 +196,14 @@ impl TxWriteArgs {
     }
 }
 
+fn select_write_stream(text: Option<&str>, native: Option<StreamName>) -> Result<StreamName> {
+    let stream = StreamName::select(text, native).map_err(anyhow::Error::msg)?;
+    // Reject invalid mutation selectors before opening a writable engine:
+    // --recover-dirty can otherwise change native recovery state on open.
+    ffs_ntfs::transaction::validate_ntfs_stream_name_utf16(stream.as_units())?;
+    Ok(stream)
+}
+
 #[derive(Debug, Args)]
 struct PayloadArgs {
     /// Exact UTF-8 payload string.
@@ -433,23 +441,35 @@ enum Command {
         #[command(flatten)]
         payload: PayloadArgs,
     },
-    /// Write bytes at a file offset, preserving the suffix and zero-filling any gap beyond EOF.
+    /// Write bytes in an existing DATA stream, preserving the suffix and zero-filling any gap beyond EOF.
     TxWriteRange {
         #[command(flatten)]
         target: TxWriteArgs,
         path: String,
-        /// Byte offset in the file, distinct from the volume's --offset. A nonempty write's resulting file must fit 16 MiB.
+        /// Exact existing Unicode stream name. Omit both selectors for unnamed DATA.
+        #[arg(long, conflicts_with = "stream_utf16")]
+        stream: Option<String>,
+        /// Exact UTF-16 units, comma-separated four-digit hex (for example d800,0061).
+        #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream")]
+        stream_utf16: Option<StreamName>,
+        /// Byte offset in the stream, distinct from the volume's --offset. A nonempty write's resulting stream must fit 16 MiB.
         #[arg(long)]
         start: u64,
         #[command(flatten)]
         payload: PayloadArgs,
     },
-    /// Set an unnamed DATA stream's length, zero-filling growth through a native logged transaction.
+    /// Set an existing DATA stream's length, zero-filling growth through a native logged transaction.
     TxTruncate {
         #[command(flatten)]
         target: TxWriteArgs,
         path: String,
-        /// New file size in bytes, from zero through 16 MiB.
+        /// Exact existing Unicode stream name. Omit both selectors for unnamed DATA.
+        #[arg(long, conflicts_with = "stream_utf16")]
+        stream: Option<String>,
+        /// Exact UTF-16 units, comma-separated four-digit hex (for example d800,0061).
+        #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream")]
+        stream_utf16: Option<StreamName>,
+        /// New stream size in bytes, from zero through 16 MiB.
         #[arg(long, value_parser = clap::value_parser!(u64).range(..=MAX_FILE_EDIT_BYTES))]
         size: u64,
     },
@@ -1191,28 +1211,40 @@ fn main() -> Result<()> {
         Command::TxWriteRange {
             target,
             path,
+            stream,
+            stream_utf16,
             start,
             payload,
         } => {
+            let stream = select_write_stream(stream.as_deref(), stream_utf16)?;
             let data = payload.load_range(start)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.write_file_range(&cx, &path, start, &data);
+            let outcome = engine.write_file_stream_range(&cx, &path, stream.as_units(), start, &data);
             emit_tx_outcome("tx_write_range", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
                     "sequence": reference.sequence,
+                    "stream_name_utf16": stream.as_units(),
                     "start": start,
                     "bytes": data.len(),
                 })
             })?;
         }
-        Command::TxTruncate { target, path, size } => {
+        Command::TxTruncate {
+            target,
+            path,
+            stream,
+            stream_utf16,
+            size,
+        } => {
+            let stream = select_write_stream(stream.as_deref(), stream_utf16)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.truncate_file(&cx, &path, size);
+            let outcome = engine.truncate_file_stream(&cx, &path, stream.as_units(), size);
             emit_tx_outcome("tx_truncate", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
                     "sequence": reference.sequence,
+                    "stream_name_utf16": stream.as_units(),
                     "size": size,
                 })
             })?;
@@ -2265,6 +2297,8 @@ mod tests {
             path,
             start,
             payload,
+            stream,
+            stream_utf16,
         } = cli.command
         else {
             panic!("tx-write-range");
@@ -2275,6 +2309,7 @@ mod tests {
         );
         assert!(target.offline_image && target.allow_write && target.recover_dirty);
         assert_eq!((path.as_str(), start), ("/a.bin", 4099));
+        assert!(stream.is_none() && stream_utf16.is_none());
         assert_eq!(payload.data_file, Some(PathBuf::from("payload.bin")));
 
         let range_base = [
@@ -2332,6 +2367,69 @@ mod tests {
             assert!(
                 Cli::try_parse_from(truncate_base.into_iter().chain(["--size", invalid])).is_err()
             );
+        }
+    }
+
+    #[test]
+    fn cli_stream_edits_preserve_exact_selectors_and_refuse_conflicts() {
+        for (command, edit) in [
+            ("tx-write-range", vec!["--start", "3", "--data", "payload"]),
+            ("tx-truncate", vec!["--size", "7"]),
+        ] {
+            let mut base = vec![
+                "ffs-ntfs",
+                command,
+                "disk.img",
+                "/a.bin",
+                "--offline-image",
+                "--allow-write",
+            ];
+            base.extend(edit);
+            for (selector, expected) in [
+                (vec!["--stream", "note"], vec![0x6e, 0x6f, 0x74, 0x65]),
+                (vec!["--stream-utf16", "d800,0061"], vec![0xd800, 0x61]),
+            ] {
+                let cli = Cli::try_parse_from(base.iter().copied().chain(selector)).unwrap();
+                let (
+                    Command::TxWriteRange {
+                        stream,
+                        stream_utf16,
+                        ..
+                    }
+                    | Command::TxTruncate {
+                        stream,
+                        stream_utf16,
+                        ..
+                    }
+                ) = cli.command
+                else {
+                    panic!("native stream edit");
+                };
+                let selected = StreamName::select(stream.as_deref(), stream_utf16).unwrap();
+                assert_eq!(selected.as_units(), expected);
+            }
+            assert!(
+                Cli::try_parse_from(base.iter().copied().chain([
+                    "--stream",
+                    "note",
+                    "--stream-utf16",
+                    "006e,006f,0074,0065",
+                ]))
+                .is_err()
+            );
+            for invalid in ["0000", "not-hex", "006"] {
+                assert!(
+                    Cli::try_parse_from(base.iter().copied().chain(["--stream-utf16", invalid]))
+                        .is_err(),
+                    "{command} must reject invalid stream selector {invalid}"
+                );
+            }
+        }
+        for text in ["bad/name", "bad\\name", "bad:name"] {
+            assert!(select_write_stream(Some(text), None).is_err());
+        }
+        for native in ["002f", "005c", "003a"] {
+            assert!(select_write_stream(None, Some(StreamName::parse(native).unwrap())).is_err());
         }
     }
 

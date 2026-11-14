@@ -295,6 +295,211 @@ fn native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection() {
 }
 
 #[test]
+#[ignore = "requires ntfs-3g mkntfs, ntfscp and ntfscat; edits native alternate DATA streams"]
+fn native_ntfs_named_stream_edits_preserve_other_data_and_volume_bounds() {
+    use std::io::Write as _;
+
+    for tool in ["mkntfs", "ntfscp", "ntfscat"] {
+        assert!(
+            command_available(tool),
+            "native NTFS stream test requires {tool}; install ntfs-3g before explicitly running it"
+        );
+    }
+    const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+    let directory = tempfile::tempdir().expect("native NTFS stream test directory");
+    let native_image = directory.path().join("native.img");
+    let embedded_image = directory.path().join("embedded.img");
+    let source_file = directory.path().join("source.bin");
+    fs::File::create(&native_image)
+        .unwrap()
+        .set_len(VOLUME_BYTES)
+        .unwrap();
+    let checked = |binary: &Path, args: &[&str]| {
+        let output = run_cli_binary(binary, args);
+        assert!(
+            output.status.success(),
+            "{} {args:?} failed: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let native_path = native_image.to_str().unwrap();
+    checked(
+        Path::new("mkntfs"),
+        &["-F", "-Q", "-s", "512", "-c", "4096", native_path],
+    );
+    let main_data = b"the unnamed stream must stay unchanged";
+    let other_data = b"a separate named stream must stay unchanged";
+    fs::write(&source_file, main_data).unwrap();
+    checked(
+        Path::new("ntfscp"),
+        &[native_path, source_file.to_str().unwrap(), "/streams.bin"],
+    );
+    for (name, data) in [
+        ("metadata", b"0123456789".as_slice()),
+        ("untouched", other_data.as_slice()),
+    ] {
+        fs::write(&source_file, data).unwrap();
+        checked(
+            Path::new("ntfscp"),
+            &[
+                "-N",
+                name,
+                native_path,
+                source_file.to_str().unwrap(),
+                "/streams.bin",
+            ],
+        );
+    }
+
+    let prefix = vec![0xA5; 1_048_576];
+    let suffix = [0x5A; 4096];
+    {
+        let mut embedded = fs::File::create(&embedded_image).unwrap();
+        embedded.write_all(&prefix).unwrap();
+        std::io::copy(&mut fs::File::open(&native_image).unwrap(), &mut embedded).unwrap();
+        embedded.write_all(&suffix).unwrap();
+    }
+    let binary = Path::new(env!("CARGO_BIN_EXE_ffs-ntfs"));
+    let embedded_path = embedded_image.to_str().unwrap();
+    let selection = ["--offset", "1048576", "--length", "67108864"];
+    let stream_units = [0x6d, 0x65, 0x74, 0x61, 0x64, 0x61, 0x74, 0x61];
+    let mut last_commit_lsn = 0;
+    let mut transaction = |command: &str, arguments: &[&str]| {
+        let mut args = vec![
+            command,
+            embedded_path,
+            "/streams.bin",
+            "--offline-image",
+            "--allow-write",
+        ];
+        args.extend(selection);
+        args.extend_from_slice(arguments);
+        let output = checked(binary, &args);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["outcome"], "committed");
+        assert_eq!(report["token"]["storage"], report["storage_identity"]);
+        assert_eq!(
+            report["result"]["stream_name_utf16"],
+            serde_json::json!(stream_units)
+        );
+        let commit_lsn = report["token"]["commit_lsn"].as_u64().unwrap();
+        assert!(commit_lsn > last_commit_lsn);
+        last_commit_lsn = commit_lsn;
+    };
+    let contents = |expected: &[u8]| {
+        let mut embedded = fs::File::open(&embedded_image).unwrap();
+        let mut before_volume = vec![0; prefix.len()];
+        embedded.read_exact(&mut before_volume).unwrap();
+        assert_eq!(before_volume, prefix);
+        let mut extracted = fs::File::create(&native_image).unwrap();
+        assert_eq!(
+            std::io::copy(&mut (&mut embedded).take(VOLUME_BYTES), &mut extracted).unwrap(),
+            VOLUME_BYTES
+        );
+        extracted.sync_all().unwrap();
+        let mut after_volume = [0; 4096];
+        embedded.read_exact(&mut after_volume).unwrap();
+        assert_eq!(after_volume, suffix);
+        assert_eq!(embedded.read(&mut [0; 1]).unwrap(), 0);
+        for (name, bytes) in [
+            ("", main_data.as_slice()),
+            ("metadata", expected),
+            ("untouched", other_data.as_slice()),
+        ] {
+            let mut oracle_args = vec![native_path, "/streams.bin"];
+            let mut reader_args = vec!["read", embedded_path, "/streams.bin", "--offline-image"];
+            reader_args.extend(selection);
+            if !name.is_empty() {
+                oracle_args.extend(["-n", name]);
+                reader_args.extend(["--stream", name]);
+            }
+            assert_eq!(checked(Path::new("ntfscat"), &oracle_args).stdout, bytes);
+            assert_eq!(checked(binary, &reader_args).stdout, bytes);
+        }
+    };
+
+    contents(b"0123456789");
+    transaction(
+        "tx-write-range",
+        &["--stream", "metadata", "--start", "3", "--data", "XYZ"],
+    );
+    let mut expected = b"012XYZ6789".to_vec();
+    contents(&expected);
+    fs::write(&source_file, [0xFF, 0x00, 0x80, 0x41]).unwrap();
+    transaction(
+        "tx-write-range",
+        &[
+            "--stream-utf16",
+            "006d,0065,0074,0061,0064,0061,0074,0061",
+            "--start",
+            "8195",
+            "--data-file",
+            source_file.to_str().unwrap(),
+        ],
+    );
+    expected.resize(8195, 0);
+    expected.extend([0xFF, 0x00, 0x80, 0x41]);
+    contents(&expected);
+    transaction(
+        "tx-truncate",
+        &["--stream", "metadata", "--size", "12301"],
+    );
+    expected.resize(12_301, 0);
+    contents(&expected);
+    transaction(
+        "tx-truncate",
+        &[
+            "--stream-utf16",
+            "006d,0065,0074,0061,0064,0061,0074,0061",
+            "--size",
+            "5",
+        ],
+    );
+    expected.truncate(5);
+    contents(&expected);
+    transaction("tx-truncate", &["--stream", "metadata", "--size", "0"]);
+    contents(&[]);
+    transaction(
+        "tx-write-range",
+        &[
+            "--stream",
+            "metadata",
+            "--start",
+            "18446744073709551615",
+            "--empty",
+        ],
+    );
+    contents(&[]);
+
+    let unchanged = sha256_file(&embedded_image);
+    for (command, edit_args) in [
+        ("tx-write-range", vec!["--start", "0", "--data", "denied"]),
+        ("tx-truncate", vec!["--size", "7"]),
+    ] {
+        let mut args = vec![
+            command,
+            embedded_path,
+            "/streams.bin",
+            "--offline-image",
+            "--allow-write",
+            "--stream",
+            "missing",
+        ];
+        args.extend(selection);
+        args.extend(edit_args);
+        let output = run_cli_binary(binary, &args);
+        assert!(
+            !output.status.success(),
+            "an absent stream must not be created"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not_committed"));
+        assert_eq!(sha256_file(&embedded_image), unchanged);
+    }
+}
+
+#[test]
 fn parity_default_reports_declarations_without_execution_credit() {
     let output = run_ffs_cli(&["parity", "--json"]);
     assert!(

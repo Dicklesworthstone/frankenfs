@@ -77,9 +77,45 @@ pub(super) struct PreparedTxPlan<T> {
 }
 
 #[derive(Clone, Copy)]
-enum FileDataEdit<'a> {
+pub(super) enum FileDataEdit<'a> {
     Write { offset: u64, data: &'a [u8] },
     Truncate { size: u64 },
+}
+
+impl FileDataEdit<'_> {
+    fn operation(self, named: bool) -> &'static str {
+        match (self, named) {
+            (Self::Write { .. }, false) => "write_file_range",
+            (Self::Write { .. }, true) => "write_stream_range",
+            (Self::Truncate { .. }, false) => "truncate_file",
+            (Self::Truncate { .. }, true) => "truncate_stream",
+        }
+    }
+
+    fn digest(self, path: &str, reference: NtfsReference, stream: &[u16]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ntfs.stream_data_edit:");
+        hasher.update(self.operation(!stream.is_empty()).as_bytes());
+        hasher.update(&reference.record.to_le_bytes());
+        hasher.update(&reference.sequence.to_le_bytes());
+        match self {
+            Self::Write { offset, data } => {
+                hasher.update(&offset.to_le_bytes());
+                hasher.update(&(data.len() as u64).to_le_bytes());
+                hasher.update(blake3::hash(data).as_bytes());
+            }
+            Self::Truncate { size } => {
+                hasher.update(&size.to_le_bytes());
+            }
+        }
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(&(stream.len() as u64).to_le_bytes());
+        for unit in stream {
+            hasher.update(&unit.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1482,7 +1518,27 @@ impl NtfsTransactionEngine {
         offset: u64,
         data: &[u8],
     ) -> NtfsTxOutcome<NtfsReference> {
-        self.edit_file_data(cx, path, FileDataEdit::Write { offset, data })
+        self.write_file_stream_range(cx, path, &[], offset, data)
+    }
+
+    /// Write an existing plain DATA stream selected by path and exact UTF-16
+    /// name. Empty selects unnamed DATA. Other streams and their native
+    /// attributes are preserved; new stream creation is not implied.
+    ///
+    /// The staging, initialization and native WAL guarantees of
+    /// [`Self::write_file_range`] apply equally to named streams.
+    pub fn write_file_stream_range(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        stream: &[u16],
+        offset: u64,
+        data: &[u8],
+    ) -> NtfsTxOutcome<NtfsReference> {
+        if let Err(error) = super::validate_ntfs_stream_name_utf16(stream) {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
+        self.edit_stream_data(cx, path, stream, FileDataEdit::Write { offset, data })
     }
 
     /// Set a regular file's unnamed stream length through a native logged
@@ -1497,25 +1553,45 @@ impl NtfsTransactionEngine {
         path: &str,
         size: u64,
     ) -> NtfsTxOutcome<NtfsReference> {
-        self.edit_file_data(cx, path, FileDataEdit::Truncate { size })
+        self.truncate_file_stream(cx, path, &[], size)
     }
 
-    fn edit_file_data(
+    /// Truncate an existing plain DATA stream by path and exact UTF-16 name.
+    /// Named streams retain their native identity through zero-length
+    /// truncation and do not change the unnamed sizes in FILE_NAME or $I30.
+    /// The same bounded staging and recovery contract as [`Self::truncate_file`]
+    /// applies; missing streams fail before any backing write.
+    pub fn truncate_file_stream(
         &mut self,
         cx: &Cx,
         path: &str,
+        stream: &[u16],
+        size: u64,
+    ) -> NtfsTxOutcome<NtfsReference> {
+        if let Err(error) = super::validate_ntfs_stream_name_utf16(stream) {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
+        self.edit_stream_data(cx, path, stream, FileDataEdit::Truncate { size })
+    }
+
+    pub(super) fn edit_stream_data(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        stream_name: &[u16],
         edit: FileDataEdit<'_>,
     ) -> NtfsTxOutcome<NtfsReference> {
-        match self.plan_file_data_edit(cx, path, edit) {
+        match self.plan_stream_data_edit(cx, path, stream_name, edit) {
             Ok(plan) => self.execute_logged_tx(cx, plan),
             Err(error) => NtfsTxOutcome::NotCommitted(error),
         }
     }
 
-    fn plan_file_data_edit(
+    fn plan_stream_data_edit(
         &self,
         cx: &Cx,
         path: &str,
+        stream_name: &[u16],
         edit: FileDataEdit<'_>,
     ) -> Result<PreparedTxPlan<NtfsReference>> {
         checkpoint(cx)?;
@@ -1554,35 +1630,25 @@ impl NtfsTransactionEngine {
             &leaf_utf16,
         )?;
         let volume = self.volume_view(cx)?;
-        let stream = volume.data_stream(cx, &file_rec, &[])?;
+        let stream = volume.data_stream(cx, &file_rec, stream_name)?;
 
-        let mut hasher = blake3::Hasher::new();
-        let (operation, unchanged) = match edit {
-            FileDataEdit::Write { offset, data } => {
-                hasher.update(b"ntfs.write_file_range:");
-                hasher.update(&offset.to_le_bytes());
-                hasher.update(&(data.len() as u64).to_le_bytes());
-                hasher.update(blake3::hash(data).as_bytes());
-                ("write_file_range", data.is_empty())
-            }
-            FileDataEdit::Truncate { size } => {
-                hasher.update(b"ntfs.truncate_file:");
-                hasher.update(&size.to_le_bytes());
-                ("truncate_file", size == stream.size)
-            }
+        let reference = NtfsReference {
+            record: u64::from(file_no),
+            sequence: file_rec.sequence,
         };
-        hasher.update(path.as_bytes());
-        let digest = *hasher.finalize().as_bytes();
+        let operation = edit.operation(!stream_name.is_empty());
+        let digest = edit.digest(path, reference, stream_name);
+        let unchanged = match edit {
+            FileDataEdit::Write { data, .. } => data.is_empty(),
+            FileDataEdit::Truncate { size } => size == stream.size,
+        };
         if unchanged {
             // Commit the ordinary WAL barrier/token transaction without reading
             // or relocating an unchanged stream, even when no free clusters remain.
             return Ok(PreparedTxPlan {
                 operation,
                 operation_digest: digest,
-                result_value: NtfsReference {
-                    record: u64::from(file_no),
-                    sequence: file_rec.sequence,
-                },
+                result_value: reference,
                 pre_payload_writes: Vec::new(),
                 mft_zero_writes: Vec::new(),
                 open_attr_registrations: Vec::new(),
@@ -1615,7 +1681,8 @@ impl NtfsTransactionEngine {
             replacement[start..start + data.len()].copy_from_slice(data);
         }
         checkpoint(cx)?;
-        let mut plan = self.plan_write_file_data(cx, digest, path, &replacement)?;
+        let mut plan =
+            self.plan_write_stream_data(cx, digest, path, stream_name, &replacement)?;
         plan.operation = operation;
         Ok(plan)
     }
@@ -1635,15 +1702,15 @@ impl NtfsTransactionEngine {
         hasher.update(blake3::hash(new_data).as_bytes());
         let digest = *hasher.finalize().as_bytes();
 
-        match self.plan_write_file_data(cx, digest, path, new_data) {
+        match self.plan_write_stream_data(cx, digest, path, &[], new_data) {
             Ok(plan) => self.execute_logged_tx(cx, plan),
             Err(err) => NtfsTxOutcome::NotCommitted(err),
         }
     }
 
-    /// The current replacement transaction owns one base-record unnamed stream
-    /// and one FILE_NAME/$I30 pair. Preserve ordinary security, EA and same-record
-    /// plain ADS values, but do not turn an unsupported native provider or an
+    /// The current replacement transaction owns one base-record DATA stream
+    /// and, for unnamed DATA, one FILE_NAME/$I30 pair. Preserve ordinary security,
+    /// EA and other same-record streams, but do not turn a native provider or an
     /// incomplete extent/link catalog into an apparently successful overwrite.
     fn admit_plain_data_write(&self, record: &NtfsFileRecord) -> Result<NtfsFileName> {
         if record.base.record != 0 || record.base.sequence != 0 || record.flags != 1 {
@@ -1801,11 +1868,12 @@ impl NtfsTransactionEngine {
     }
 
     #[allow(clippy::too_many_lines, clippy::similar_names)]
-    fn plan_write_file_data(
+    fn plan_write_stream_data(
         &self,
         cx: &Cx,
         operation_digest: [u8; 32],
         path: &str,
+        stream_name: &[u16],
         new_data: &[u8],
     ) -> Result<PreparedTxPlan<NtfsReference>> {
         checkpoint(cx)?;
@@ -1840,9 +1908,30 @@ impl NtfsTransactionEngine {
             read_mft_record_raw_via_runs(&self.device, cx, &self.geometry, &mft_runs, file_no)?;
         let file_rest = restore_record(&file_raw, b"FILE").map_err(|err| parse_err(&err))?;
 
-        let (data_at, data_sz) = find_attr_offset_in_restored(&file_rest, DATA, &[])?
-            .ok_or_else(|| corrupt(0, "file lacks unnamed DATA attribute"))?;
+        let (data_at, data_sz) = find_attr_offset_in_restored(&file_rest, DATA, stream_name)?
+            .ok_or_else(|| FfsError::NotFound("NTFS DATA stream".into()))?;
         let was_nonresident = file_rest[data_at + 8] == 1;
+        let resident_fits = if was_nonresident {
+            false
+        } else {
+            let value_offset = usize::from(u16::from_le_bytes([
+                file_rest[data_at + 20],
+                file_rest[data_at + 21],
+            ]));
+            let used = u32::from_le_bytes(
+                file_rest[24..28]
+                    .try_into()
+                    .map_err(|_| corrupt(0, "FILE used bytes"))?,
+            ) as usize;
+            let new_attribute_bytes = value_offset
+                .checked_add(new_data.len())
+                .and_then(|length| length.checked_add(7))
+                .map(|length| length & !7)
+                .ok_or(FfsError::NoSpace)?;
+            used.checked_sub(data_sz)
+                .and_then(|other| other.checked_add(new_attribute_bytes))
+                .is_some_and(|total| total <= file_rest.len())
+        };
 
         let mut staged_open = self.open_attrs.clone();
         let mut open_regs = Vec::new();
@@ -1866,7 +1955,7 @@ impl NtfsTransactionEngine {
         let cluster_bytes = u64::from(self.geometry.cluster_bytes());
 
         let new_alloc_for_fn: u64;
-        if !was_nonresident && new_data.len() <= MAX_RESIDENT_DATA_PAYLOAD {
+        if resident_fits && new_data.len() <= MAX_RESIDENT_DATA_PAYLOAD {
             // Fast allocation-preserving resident DATA update (also compatible with NtfsVolume --recover-logfile)!
             let val_off = usize::from(u16::from_le_bytes([
                 file_rest[data_at + 20],
@@ -1998,12 +2087,12 @@ impl NtfsTransactionEngine {
             let data_id = u16::from_le_bytes([file_rest[data_at + 14], file_rest[data_at + 15]]);
             let old_attr_bytes = file_rest[data_at..data_at + data_sz].to_vec();
             let new_attr_bytes = if new_clusters == 0 {
-                encode_resident_attribute(DATA, data_id, &[], false, &[])?
+                encode_resident_attribute(DATA, data_id, stream_name, false, &[])?
             } else {
                 encode_nonresident_attribute(
                     DATA,
                     data_id,
-                    &[],
+                    stream_name,
                     &new_runs,
                     new_alloc_for_fn,
                     new_data.len() as u64,
@@ -2073,9 +2162,12 @@ impl NtfsTransactionEngine {
             });
         }
 
-        // Update 0x30 FILE_NAME duplicated sizes on the file's FILE record + parent $I30!
+        // FILE_NAME and $I30 duplicate unnamed DATA sizes, not an ADS's sizes.
+        // Editing a named stream must leave both copies unchanged.
         let cur_rest = restore_record(&cur_file_raw, b"FILE").map_err(|err| parse_err(&err))?;
-        if let Some((fn_at, _)) = find_attr_offset_in_restored(&cur_rest, ATTR_FILE_NAME, &[])? {
+        if stream_name.is_empty()
+            && let Some((fn_at, _)) = find_attr_offset_in_restored(&cur_rest, ATTR_FILE_NAME, &[])?
+        {
             let fn_voff = usize::from(u16::from_le_bytes([
                 cur_rest[fn_at + 20],
                 cur_rest[fn_at + 21],
