@@ -101277,6 +101277,141 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_tree_log_cannot_roll_back_a_concurrent_full_commit() {
+        struct PausedSuperblockRead {
+            inner: CrashDevice,
+            armed: Arc<AtomicBool>,
+            captured: std::sync::mpsc::Sender<()>,
+            resume: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl ByteDevice for PausedSuperblockRead {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.read_exact_at(cx, offset, buf)?;
+                if offset.0 == BTRFS_SUPER_INFO_OFFSET as u64
+                    && buf.len() == BTRFS_SUPER_INFO_SIZE
+                    && self.armed.swap(false, AtomicOrdering::SeqCst)
+                {
+                    self.captured
+                        .send(())
+                        .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+                    self.resume
+                        .lock()
+                        .expect("resume channel lock")
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+                }
+                Ok(())
+            }
+
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.write_all_at(cx, offset, buf)
+            }
+
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let device = CrashDevice::from_vec(build_btrfs_csum_image());
+        let armed = Arc::new(AtomicBool::new(false));
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(PausedSuperblockRead {
+                inner: device.clone(),
+                armed: Arc::clone(&armed),
+                captured: captured_tx,
+                resume: Mutex::new(resume_rx),
+            }),
+            &OpenOptions {
+                btrfs_rw_ephemeral_ok: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open synthetic btrfs");
+        fs.enable_writes(&cx).expect("enable writes");
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let ino = InodeNumber(257);
+        let offset = 16_384;
+        let payload = [0x5A_u8; 4096];
+        assert_eq!(
+            fs.write(&cx, ino, offset, &payload).expect("stage data"),
+            payload.len() as u32
+        );
+
+        // Stop after copying the superblock, before preparing the log. If the
+        // full-commit exclusion is absent, finish a newer durable commit here
+        // before allowing the stale log to publish. try_write decides whether
+        // that schedule is possible without relying on a timed thread race.
+        armed.store(true, AtomicOrdering::SeqCst);
+        let committed = std::thread::scope(|threads| {
+            let logged = threads.spawn(|| fs.fsync(&Cx::for_testing(), ino, 0, false));
+            captured_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("tree-log fsync must capture the superblock");
+            let can_interleave = fs
+                .require_btrfs_alloc_state()
+                .expect("allocator")
+                .try_write()
+                .is_some();
+            let interleaved = can_interleave
+                .then(|| fs.btrfs_full_transaction_commit(&cx, "interleaved-full-commit"));
+            resume_tx.send(()).expect("release paused log writer");
+            logged
+                .join()
+                .expect("log writer thread")
+                .expect("tree-log fsync");
+            interleaved
+                .unwrap_or_else(|| fs.btrfs_full_transaction_commit(&cx, "serialized-full-commit"))
+                .expect("full commit")
+        });
+
+        let durable = device.durable_bytes();
+        let published = BtrfsSuperblock::parse_from_image(&durable).expect("durable superblock");
+        assert_eq!(
+            published.generation, committed.new_generation,
+            "tree-log fsync must not overwrite an acknowledged full-commit generation"
+        );
+        assert_eq!(
+            published.log_root, 0,
+            "the serialized full commit retires the log"
+        );
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(durable)),
+            &OpenOptions::default(),
+        )
+        .expect("cold reopen after both syncs");
+        assert_eq!(
+            reopened.getattr(&cx, ino).expect("reopened inode").size,
+            offset + payload.len() as u64
+        );
+        assert_eq!(
+            reopened
+                .read(&cx, ino, offset, payload.len() as u32)
+                .expect("cold read of acknowledged data"),
+            payload
+        );
+    }
+
+    #[test]
     fn btrfs_fsync_collapses_mvcc_barrier_and_retries_on_failed_sync_bd_jhuob() {
         for ephemeral in [true, false] {
             let Some((seed_fs, seed_dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
