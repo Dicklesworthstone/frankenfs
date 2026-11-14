@@ -31,9 +31,9 @@ use ffs_ondisk::ntfs::logfile_writer::{
     encode_open_attribute_entry, encode_restart_table,
 };
 use ffs_ondisk::ntfs::{
-    ATTRIBUTE_LIST, COMPRESSED, DATA, ENCRYPTED, NtfsAttribute, NtfsFileRecord, NtfsGeometry,
-    NtfsLogOp, NtfsReference, NtfsRun, NtfsValue, REPARSE_POINT, SPARSE, VOLUME_INFORMATION,
-    decode_mapping_pairs, parse_attr_def_table, validate_ntfs31_attr_def_table,
+    ATTRIBUTE_LIST, COMPRESSED, DATA, ENCRYPTED, NtfsFileRecord, NtfsGeometry, NtfsLogOp,
+    NtfsReference, NtfsRun, NtfsValue, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs,
+    parse_attr_def_table, validate_ntfs31_attr_def_table,
 };
 use ffs_types::{ByteOffset, ParseError};
 use serde::Serialize;
@@ -962,63 +962,6 @@ impl NtfsTransactionEngine {
             "system attribute {kind:#x} not found on record {}",
             record.number
         )))
-    }
-
-    /// Refuse mutating a target record (or parent directory) that carries secondary-index
-    /// obligations or stream transforms outside FrankenFS's native NTFS write profile.
-    pub(super) fn refuse_unsupported_record_metadata(
-        record: &NtfsFileRecord,
-        attrs: &[NtfsAttribute<'_>],
-    ) -> Result<()> {
-        for attr in attrs {
-            if attr.flags & (COMPRESSED | ENCRYPTED) != 0 {
-                return Err(unsupported(format!(
-                    "record {} carries compressed or EFS-encrypted attribute {:#x}",
-                    record.number, attr.kind
-                )));
-            }
-            match attr.kind {
-                0x10 if attr.name.is_empty() => {
-                    if let NtfsValue::Resident(std_bytes) = attr.value
-                        && std_bytes.len() >= 36
-                    {
-                        let flags = u32::from_le_bytes([
-                            std_bytes[32],
-                            std_bytes[33],
-                            std_bytes[34],
-                            std_bytes[35],
-                        ]);
-                        // Refuse FILE_ATTRIBUTE_REPARSE_POINT (0x400), COMPRESSED (0x800), ENCRYPTED (0x4000).
-                        if flags & (0x0400 | 0x0800 | 0x4000) != 0 {
-                            return Err(unsupported(format!(
-                                "record {} has unsupported file attribute flags {flags:#x}",
-                                record.number
-                            )));
-                        }
-                    }
-                }
-                0x40 => {
-                    return Err(unsupported(format!(
-                        "record {} carries $OBJECT_ID (0x40); $Extend/$ObjId maintenance is refused",
-                        record.number
-                    )));
-                }
-                REPARSE_POINT => {
-                    return Err(unsupported(format!(
-                        "record {} carries $REPARSE_POINT (0xC0); reparse write maintenance is refused",
-                        record.number
-                    )));
-                }
-                0x100 | 0xF0 => {
-                    return Err(unsupported(format!(
-                        "record {} carries unsupported attribute {:#x}",
-                        record.number, attr.kind
-                    )));
-                }
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
     fn refuse_hibernation_or_txf(&self, cx: &Cx, mft_runs: &[NtfsRun]) -> Result<()> {

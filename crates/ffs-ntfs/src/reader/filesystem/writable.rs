@@ -326,7 +326,7 @@ impl NtfsFs {
         // name on reopen merely because it resembles this prefix.
         for _ in 0..16 {
             let sequence = RETAINED_SEQUENCE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| FfsError::NoSpace)?;
             let retained: Vec<u16> = format!(".ffs-unlinked-{:016x}-{sequence:016x}", ino.0)
                 .encode_utf16()

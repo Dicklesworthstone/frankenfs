@@ -8,6 +8,7 @@ use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::ntfs::NtfsReference;
 
+use super::ops::FileDataEdit;
 use super::{NtfsTransactionEngine, NtfsTxOutcome, unsupported};
 
 /// Objects participating in one completed native rename transaction.
@@ -106,7 +107,10 @@ impl NtfsTransactionEngine {
         }
     }
 
-    /// Write a currently admitted DATA stream by stable FILE reference.
+    /// Write an existing plain base-record DATA stream by stable FILE reference
+    /// and exact native UTF-16 name. Empty selects unnamed DATA. This preserves
+    /// all other streams and admits the same bounded native COW/WAL path as
+    /// [`Self::write_file_range`]; extension and transformed streams stay refused.
     pub fn write_stream_range(
         &mut self,
         cx: &Cx,
@@ -117,18 +121,19 @@ impl NtfsTransactionEngine {
     ) -> NtfsTxOutcome<NtfsReference> {
         let admission = (|| {
             validate_ntfs_stream_name_utf16(stream)?;
-            if !stream.is_empty() {
-                return Err(unsupported("native named-stream mutation is not admitted"));
-            }
             self.resolve_reference_path(cx, reference)
         })();
         match admission {
-            Ok(path) => self.write_file_range(cx, &path, offset, data),
+            Ok(path) => {
+                self.edit_stream_data(cx, &path, stream, FileDataEdit::Write { offset, data })
+            }
             Err(error) => NtfsTxOutcome::NotCommitted(error),
         }
     }
 
-    /// Truncate a currently admitted DATA stream by stable FILE reference.
+    /// Truncate an existing plain base-record DATA stream selected by exact
+    /// native name. Growth zero-initializes new bytes before publication, and
+    /// a named stream never changes the unnamed sizes in FILE_NAME or $I30.
     pub fn truncate_stream(
         &mut self,
         cx: &Cx,
@@ -138,13 +143,10 @@ impl NtfsTransactionEngine {
     ) -> NtfsTxOutcome<NtfsReference> {
         let admission = (|| {
             validate_ntfs_stream_name_utf16(stream)?;
-            if !stream.is_empty() {
-                return Err(unsupported("native named-stream mutation is not admitted"));
-            }
             self.resolve_reference_path(cx, reference)
         })();
         match admission {
-            Ok(path) => self.truncate_file(cx, &path, size),
+            Ok(path) => self.edit_stream_data(cx, &path, stream, FileDataEdit::Truncate { size }),
             Err(error) => NtfsTxOutcome::NotCommitted(error),
         }
     }
