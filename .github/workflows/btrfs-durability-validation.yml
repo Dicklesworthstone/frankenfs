@@ -1,0 +1,66 @@
+name: Btrfs durability validation
+
+on:
+  push:
+    branches: [validation/btrfs-durable-publication-20261114]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  FFS_REQUIRE_ORACLES: "1"
+
+jobs:
+  durability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly-2026-08-31
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: btrfs-durable-publication
+          cache-on-failure: true
+      - name: Install native Btrfs oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs e2fsprogs
+          command -v mkfs.btrfs
+          command -v btrfs
+      - name: Deterministic stale-superblock regression
+        run: cargo test -p ffs-core --locked --lib tests::btrfs_tree_log_cannot_roll_back_a_concurrent_full_commit -- --exact --nocapture
+      - name: Core formatting
+        if: ${{ !cancelled() }}
+        run: cargo fmt -p ffs-core --check
+      - name: Core target check
+        if: ${{ !cancelled() }}
+        run: cargo check -p ffs-core --locked --all-targets
+      - name: Core clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p ffs-core --locked --all-targets -- -D warnings
+      - name: Tree-log publication and recovery regressions
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test -p ffs-core --locked --lib btrfs_publish_tree_log_ -- --nocapture
+          cargo test -p ffs-core --locked --lib btrfs_fsync_collapses_mvcc_barrier_and_retries_on_failed_sync_bd_jhuob -- --nocapture
+          cargo test -p ffs-core --locked --lib btrfs_full_commit_retires_the_tree_log_bd_mogn1 -- --nocapture
+          cargo test -p ffs-core --locked --lib bd_uxh7t -- --nocapture
+          cargo test -p ffs-core --locked --lib bd_dm01m -- --nocapture
+          cargo test -p ffs-core --locked --test btrfs_tree_log_crash_replay -- --nocapture
+      - name: Workspace formatting gate
+        if: ${{ !cancelled() }}
+        run: cargo fmt --check
+      - name: Workspace compilation gate
+        if: ${{ !cancelled() }}
+        run: cargo check --locked --workspace --all-targets
+      - name: Workspace clippy gate
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
