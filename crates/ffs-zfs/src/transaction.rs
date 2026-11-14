@@ -161,16 +161,18 @@ impl ZfsDurableToken {
 }
 
 /// Outcome of a native ZFS TXG publication, distinguishing pre-Uberblock failure,
-/// durable 4-label commit, and post-Uberblock-write barrier/cancellation uncertainty.
+/// durable 4-label commit, and incomplete Uberblock publication uncertainty.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ZfsTxOutcome<T> {
     /// All child blocks, MOS root, and all 4 Uberblock labels on every member synced durably.
+    /// Cancellation after that boundary preserves this known outcome and its token.
     Committed { value: T, token: ZfsDurableToken },
     /// Rejected or failed strictly before the first `UberblockWrite` (prior TXG stays intact).
     NotCommitted(FfsError),
-    /// Failed or cancelled at/after the first `UberblockWrite`; native label/ring inspection
-    /// must reconcile whether `target_txg` or the predecessor TXG is authoritative.
+    /// Failed or cancelled after starting `UberblockWrite`, before every required
+    /// publication barrier succeeded. Native label/ring inspection must reconcile
+    /// whether `target_txg` or the predecessor TXG is authoritative.
     Uncertain {
         reason: FfsError,
         target_txg: u64,
@@ -1153,7 +1155,8 @@ impl ZfsTransactionEngine {
         }
 
         // 3. Synchronized 2-wave 4-label Uberblock publication (`L0..L1` -> sync -> `L2..L3` -> sync).
-        // Any error or cancellation from the first `UberblockWrite` onward is `Uncertain`!
+        // Errors after starting a write and before all publication barriers succeed
+        // are `Uncertain`. After the final barrier, the commit is known durable.
         let next_ts = self.current_uberblock.timestamp.saturating_add(1);
         let new_ub = Uberblock {
             order: self.order,
@@ -1257,33 +1260,10 @@ impl ZfsTransactionEngine {
             }
         }
 
-        // 4. Pre-reply cancellation / fault point (`BeforeAcknowledge`): TXG is durable on disk,
-        // but caller has not yet received the acknowledgement!
-        if let Err(err) = self.emit_event(
-            op_name,
-            ZfsPersistenceStage::BeforeAcknowledge,
-            new_txg,
-            0,
-            0,
-            0,
-        ) {
-            self.poisoned_uncertain = true;
-            return ZfsTxOutcome::Uncertain {
-                reason: err,
-                target_txg: new_txg,
-                target_slot,
-            };
-        }
-        if let Err(err) = checkpoint(cx) {
-            self.poisoned_uncertain = true;
-            return ZfsTxOutcome::Uncertain {
-                reason: err,
-                target_txg: new_txg,
-                target_slot,
-            };
-        }
-
-        // 5. Advance committed in-memory allocator and root state for subsequent TXGs!
+        // 4. Every required device barrier succeeded. Advance the in-memory root
+        // and allocator before observing any further cancellation or reply fault.
+        // A cancelled reply cannot make this durable TXG uncertain, poison the
+        // owner, or leave subsequent requests using the predecessor allocator.
         let allow_v2 = converged_alloc.spacemap_v2_active;
         for ms in &mut converged_alloc.metaslabs {
             if ms.is_dirty() {
@@ -1315,8 +1295,6 @@ impl ZfsTransactionEngine {
         hasher.update(&result_val.to_le_bytes());
         let operation_digest = *hasher.finalize().as_bytes();
 
-        let _ = self.emit_event(op_name, ZfsPersistenceStage::AckPublished, new_txg, 0, 0, 0);
-
         let token = ZfsDurableToken {
             storage: self.storage_identity.clone(),
             committed_txg: new_txg,
@@ -1325,6 +1303,18 @@ impl ZfsTransactionEngine {
             generation: self.generation,
             operation_digest,
         };
+        // These events concern delivery of a known result, not native durability.
+        // Preserve the token even if the request is cancelled or its reply fails:
+        // the caller can reconcile the committed operation without replaying it.
+        let _ = self.emit_event(
+            op_name,
+            ZfsPersistenceStage::BeforeAcknowledge,
+            new_txg,
+            0,
+            0,
+            0,
+        );
+        let _ = self.emit_event(op_name, ZfsPersistenceStage::AckPublished, new_txg, 0, 0, 0);
         ZfsTxOutcome::Committed {
             value: result_val,
             token,

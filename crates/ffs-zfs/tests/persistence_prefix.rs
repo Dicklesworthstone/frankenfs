@@ -3169,9 +3169,9 @@ fn persistence_prefix_fault_cuts_reorder_torn_mirror_split_flush_fail_and_cancel
         );
     }
 
-    // E. Post-commit pre-reply cancellation (`BeforeAcknowledge` cut on `rename_entry`):
-    // Retrying with `expected_source_object` MUST refuse duplicate rename even if a new file
-    // reused the original source name!
+    // E. Post-commit pre-reply cancellation preserves the known committed result.
+    // The idempotency guard still refuses a duplicate rename after a fresh reopen,
+    // including when another file has reused the original source name.
     {
         let dev = FaultableMemberDevice::new(base_built.members[0].clone());
         let mut eng = open_engine_on_devices(
@@ -3215,9 +3215,14 @@ fn persistence_prefix_fault_cuts_reorder_torn_mirror_split_flush_fail_and_cancel
             }
         });
         let out = eng.rename_entry(&cx, &ds, 2, b"src.txt", 2, b"dst.txt", Some(orig_obj), ts);
-        let ZfsTxOutcome::Uncertain { target_slot, .. } = out else {
-            panic!("BeforeAcknowledge cancel must return Uncertain");
+        let ZfsTxOutcome::Committed { value, token } = out else {
+            panic!("post-durability cancellation must preserve the committed rename");
         };
+        assert_eq!(value, orig_obj);
+        eng.verify_token(&token).unwrap();
+        let target_slot = token.published_slot();
+        assert_eq!(eng.committed_slot(), target_slot);
+        assert_eq!(eng.committed_txg(), token.committed_txg());
 
         // Reopen fresh engine at `target_slot`: `dst.txt` is already committed!
         let fresh_dev = dev.fresh_from_durable();
@@ -3264,6 +3269,112 @@ fn persistence_prefix_fault_cuts_reorder_torn_mirror_split_flush_fail_and_cancel
             zpl.read(&cx, dst_resolved, 0, 64).unwrap(),
             b"precious-original-payload"
         );
+    }
+}
+
+#[test]
+fn cancellation_after_final_barrier_preserves_token_and_live_writer_state() {
+    let ts = Timestamp {
+        seconds: 1_715_000_400,
+        nanos: 0,
+    };
+    let ds = [b"data".to_vec()];
+    for mirror_width in [1, 2] {
+        for cancel_context in [false, true] {
+            let cx = Cx::for_testing();
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                mirror_width,
+                ..PoolFixtureSpec::default()
+            });
+            let devs: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devs,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            let cancelled = cx.clone();
+            engine.with_fault_hook(move |event| {
+                if event.stage == ZfsPersistenceStage::BeforeAcknowledge {
+                    if cancel_context {
+                        cancelled.cancel_with(
+                            asupersync::types::CancelKind::User,
+                            Some("after final ZFS publication barrier"),
+                        );
+                    } else {
+                        return Err(FfsError::Cancelled);
+                    }
+                }
+                Ok(())
+            });
+            let (created, token) = engine
+                .create_file(
+                    &cx,
+                    &ds,
+                    2,
+                    b"durable.txt",
+                    0o600,
+                    0,
+                    0,
+                    ts,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .expect("all publication barriers succeeded before cancellation");
+            assert_eq!(token.committed_txg(), INITIAL_TXG + 1);
+            assert_eq!(engine.committed_txg(), token.committed_txg());
+            assert_eq!(engine.committed_slot(), token.published_slot());
+            engine.verify_token(&token).unwrap();
+
+            // A new request can use the same owner. Its allocator and root must
+            // already reflect the committed operation, with no forced reopen.
+            engine.clear_fault_hook();
+            let next_cx = Cx::for_testing();
+            let (size, next_token) = engine
+                .write_file_data(
+                    &next_cx,
+                    &ds,
+                    created,
+                    0,
+                    b"survives cancellation and power loss",
+                    ts,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .expect("post-cancellation writer retains its committed allocator");
+            assert_eq!(size, 36);
+            assert_eq!(next_token.committed_txg(), INITIAL_TXG + 2);
+            engine.verify_token(&token).unwrap();
+            engine.verify_token(&next_token).unwrap();
+
+            let durable: Vec<_> = devs
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let fresh = open_engine_on_devices(
+                &next_cx,
+                &durable,
+                default_write_opts(built.pool_guid, next_token.published_slot()),
+            )
+            .unwrap();
+            let mut mos = fresh.open_read_objects(&next_cx).unwrap();
+            let mut zpl = mos.zpl(&next_cx, &ds).unwrap();
+            assert_eq!(zpl.resolve(&next_cx, b"/durable.txt").unwrap(), created);
+            assert_eq!(
+                zpl.read(&next_cx, created, 0, 64).unwrap(),
+                b"survives cancellation and power loss"
+            );
+            assert_pool_scrub_and_allocation_clean(
+                &next_cx,
+                &durable,
+                built.pool_guid,
+                Some(next_token.published_slot()),
+            );
+        }
     }
 }
 
