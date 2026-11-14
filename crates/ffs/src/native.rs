@@ -358,7 +358,9 @@ impl ReadOnlyFs {
     /// no pathname is reopened and no mutable volume reference is exposed.
     #[must_use]
     pub fn ntfs_volume(&self) -> Option<&ffs_ntfs::NtfsVolume> {
-        self.ntfs.as_ref().map(|filesystem| filesystem.volume())
+        self.ntfs
+            .as_ref()
+            .and_then(|filesystem| filesystem.volume())
     }
 }
 

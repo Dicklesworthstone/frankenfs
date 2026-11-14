@@ -409,6 +409,10 @@ pub struct NtfsTransactionEngine {
     pub(super) logfile_runs: Vec<NtfsRun>,
     pub(super) logfile_bytes: u64,
     pub(super) ring: Option<NtfsLogRingWriter>,
+    /// A publication/recovery attempt has touched journal state and has not
+    /// completed every required clean-state barrier. This is independent of
+    /// whether that attempt's user operation reached its commit point.
+    pub(super) recovery_required: bool,
     pub(super) open_attrs: BTreeMap<u32, OpenAttrRuntime>,
     pub(super) next_tx_slot_index: u32,
     pub(super) generation: u64,
@@ -710,6 +714,7 @@ impl NtfsTransactionEngine {
             logfile_runs,
             logfile_bytes,
             ring: None,
+            recovery_required: false,
             open_attrs: BTreeMap::new(),
             next_tx_slot_index: 0,
             generation: 0,
@@ -1113,6 +1118,24 @@ impl NtfsTransactionEngine {
         self.last_recovery.as_ref()
     }
 
+    /// Whether a failed publication requires native recovery before this
+    /// engine can issue another transaction or acknowledge synchronization.
+    /// A known-uncommitted operation can still leave dirty restart pages.
+    #[must_use]
+    pub const fn requires_recovery(&self) -> bool {
+        self.recovery_required
+    }
+
+    pub(super) fn require_clean_writer(&self) -> Result<()> {
+        if self.recovery_required {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EIO,
+                detail: "NTFS journal publication is incomplete; native recovery is required before another transaction".into(),
+            });
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn persistence_trace(&self) -> &[NtfsPersistenceEvent] {
         &self.trace
@@ -1135,6 +1158,7 @@ impl NtfsTransactionEngine {
     /// Explicitly synchronize the underlying backing storage (`fsync` / `sync_fs`).
     pub fn sync_device(&mut self, cx: &Cx) -> Result<()> {
         checkpoint(cx)?;
+        self.require_clean_writer()?;
         self.device.sync(cx)
     }
 
@@ -1338,6 +1362,7 @@ impl NtfsTransactionEngine {
     /// Initialize a virgin (`0xFF`) `$LogFile` with an initial clean `LFS_CLIENT_RESTART`
     /// checkpoint and dual clean `RSTR` pages before appending client transactions.
     pub(super) fn ensure_ring_initialized(&mut self, cx: &Cx, operation: &str) -> Result<()> {
+        self.require_clean_writer()?;
         if self.ring.is_some() {
             return Ok(());
         }
@@ -1350,6 +1375,9 @@ impl NtfsTransactionEngine {
         let rec = ring
             .append_raw_record(LFS_RECORD_CLIENT_RESTART, 0, 0, 0, &ckpt)
             .map_err(|err| parse_err(&err))?;
+        // A failed initialization must not be mistaken for an erased journal
+        // on the next request. Even the first target write can fail partially.
+        self.recovery_required = true;
         self.write_logfile_page(
             cx,
             operation,
@@ -1409,6 +1437,7 @@ impl NtfsTransactionEngine {
 
         self.open_attrs.clear();
         self.ring = Some(ring);
+        self.recovery_required = false;
         Ok(())
     }
 

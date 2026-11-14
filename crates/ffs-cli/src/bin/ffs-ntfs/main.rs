@@ -387,6 +387,18 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         gid: u32,
     },
+    /// Mount the explicitly admitted ordinary native writer (experimental).
+    MountWrite {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        /// Existing empty directory; must not contain the backing image.
+        mountpoint: PathBuf,
+        /// Synthetic host ownership; native Windows ACLs are not enforced.
+        #[arg(long, default_value_t = 0)]
+        uid: u32,
+        #[arg(long, default_value_t = 0)]
+        gid: u32,
+    },
     /// Probe native NTFS 3.1 writable admission without modifying a single byte.
     AdmitWrite {
         #[command(flatten)]
@@ -1052,6 +1064,40 @@ fn main() -> Result<()> {
                 } else {
                     "clean-log"
                 }
+            );
+            let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+        }
+        Command::MountWrite {
+            target,
+            mountpoint,
+            uid,
+            gid,
+        } => {
+            let mountpoint = mountpoint
+                .canonicalize()
+                .context("resolve NTFS mountpoint")?;
+            if !mountpoint.is_dir()
+                || std::fs::read_dir(&mountpoint)?
+                    .next()
+                    .transpose()?
+                    .is_some()
+            {
+                bail!("NTFS mountpoint must be an existing empty directory");
+            }
+            if target.image.canonicalize()?.starts_with(&mountpoint) {
+                bail!("NTFS mountpoint would hide its backing image");
+            }
+            let engine = target.open(&cx, false)?;
+            let fs = reader::filesystem::NtfsFs::from_engine(&cx, engine, uid, gid)?;
+            let options = ffs_fuse::MountOptions {
+                read_only: false,
+                allow_other: false,
+                auto_unmount: true,
+                atime: ffs_fuse::AtimePolicy::NoAtime,
+                ..ffs_fuse::MountOptions::default()
+            };
+            eprintln!(
+                "experimental NTFS ordinary writer: native WAL commits; fixed host permissions and noatime; native ACLs are not enforced"
             );
             let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
         }
@@ -1863,6 +1909,73 @@ mod tests {
                 "/mnt/ntfs",
                 "--offline-image",
                 "--rw",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_mount_write_requires_native_authority_and_preserves_bounded_selection() {
+        for arguments in [
+            vec!["ffs-ntfs", "mount-write", "disk.img", "/mnt/ntfs"],
+            vec![
+                "ffs-ntfs",
+                "mount-write",
+                "disk.img",
+                "/mnt/ntfs",
+                "--offline-image",
+            ],
+            vec![
+                "ffs-ntfs",
+                "mount-write",
+                "disk.img",
+                "/mnt/ntfs",
+                "--allow-write",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "mount-write",
+            "disk.img",
+            "/mnt/ntfs",
+            "--offline-image",
+            "--allow-write",
+            "--recover-dirty",
+            "--offset",
+            "4096",
+            "--length",
+            "1048576",
+            "--uid",
+            "1000",
+            "--gid",
+            "1001",
+        ])
+        .unwrap();
+        let Command::MountWrite {
+            target,
+            mountpoint,
+            uid,
+            gid,
+        } = cli.command
+        else {
+            panic!("expected explicit native writable mount");
+        };
+        assert!(target.offline_image && target.allow_write && target.recover_dirty);
+        assert_eq!((target.offset, target.length), (4096, Some(1_048_576)));
+        assert_eq!((uid, gid), (1000, 1001));
+        assert_eq!(mountpoint, PathBuf::from("/mnt/ntfs"));
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "mount-write",
+                "disk.img",
+                "/mnt/ntfs",
+                "--offline-image",
+                "--allow-write",
+                "--sidecar",
+                "archive.rq",
             ])
             .is_err()
         );

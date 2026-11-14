@@ -948,9 +948,16 @@ impl NtfsTransactionEngine {
     /// before any write if unknown opcodes, torn `RCRD` records, or invalid targets are present.
     pub fn recover_in_place(&mut self, cx: &Cx) -> Result<NtfsRecoverySummary> {
         checkpoint(cx)?;
+        self.recovery_required = true;
         let (vol_flags, _, _) = self.read_volume_status_and_mft_counts(cx)?;
         let log_state = self.inspect_log_state(cx)?;
         if log_state.clean && log_state.torn_rstr_slot.is_none() && (vol_flags & 0x0001 == 0) {
+            // A prior failure can leave clean bytes visible but not durable.
+            // Revalidate and synchronize before clearing the sticky guard.
+            self.check_clean_consistency(cx)?;
+            self.device.sync(cx)?;
+            self.load_clean_ring_if_present(cx)?;
+            self.recovery_required = false;
             return Ok(NtfsRecoverySummary::default());
         }
         if log_state.erased {
@@ -1368,6 +1375,7 @@ impl NtfsTransactionEngine {
         self.ring = Some(ring);
         let final_ckpt_lsn = self.publish_clean_checkpoint_and_rstr(cx, "recover_in_place", 24)?;
         self.check_clean_consistency(cx)?;
+        self.recovery_required = false;
 
         Ok(NtfsRecoverySummary {
             was_dirty: true,

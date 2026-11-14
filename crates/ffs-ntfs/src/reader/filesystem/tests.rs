@@ -1607,3 +1607,117 @@ fn wof_stream_cache_keeps_payload_errors_visible_and_valid_data_tail_zero() {
     );
     assert!(reads.lock().unwrap().is_empty());
 }
+
+#[test]
+fn alternate_stream_aliases_share_identity_and_retirement_evicts_cached_bytes() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    put(
+        &mut bytes,
+        24,
+        &record(
+            24,
+            false,
+            3,
+            &[
+                standard(),
+                resident(DATA, 0, "", b"hello"),
+                resident(DATA, 5, "Notes", b"private stream bytes"),
+                resident(0x30, 2, "", &filename(5, "hello.txt", 1)),
+                resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
+                resident(0x30, 4, "", &filename(27, "link.txt", 1)),
+            ],
+        ),
+    );
+    let fs = open(bytes, Arc::default(), None).unwrap();
+    let mut scope = RequestScope::empty();
+    let base = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+        .unwrap();
+    let stream = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt:Notes"))
+        .unwrap();
+    let alias = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("HELLO~1.TXT:notes:$DATA"))
+        .unwrap();
+    assert_eq!(stream.ino, alias.ino);
+    assert_ne!(base.ino, stream.ino);
+    assert_eq!((stream.size, stream.blocks, stream.nlink), (20, 0, 2));
+    assert_eq!(
+        fs.read(&cx, &mut scope, stream.ino, 0, 100).unwrap(),
+        b"private stream bytes"
+    );
+    assert_eq!(
+        fs.read(&cx, &mut scope, base.ino, 0, 100).unwrap(),
+        b"hello"
+    );
+    let handle = fs.register_open(stream.ino, libc::O_RDONLY).unwrap();
+    assert!(
+        fs.pinned(base.ino).unwrap(),
+        "ADS handles retain the base record"
+    );
+    fs.release_open(stream.ino, handle).unwrap();
+    assert!(!fs.pinned(base.ino).unwrap());
+
+    fs.retire_ads_for_base(base.ino).unwrap();
+    assert!(matches!(
+        fs.getattr(&cx, &mut scope, stream.ino),
+        Err(FfsError::NotFound(_))
+    ));
+    assert!(matches!(
+        fs.read(&cx, &mut scope, stream.ino, 0, 100),
+        Err(FfsError::NotFound(_))
+    ));
+    let recreated = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt:Notes"))
+        .unwrap();
+    assert_ne!(recreated.ino, stream.ino);
+    assert_eq!(
+        fs.read(&cx, &mut scope, recreated.ino, 0, 100).unwrap(),
+        b"private stream bytes"
+    );
+}
+
+#[test]
+fn literal_native_colon_name_precedes_stream_projection() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    put(
+        &mut bytes,
+        5,
+        &record(
+            5,
+            true,
+            1,
+            &[
+                standard(),
+                resident(0x30, 501, "", &filename(5, ".", 3)),
+                index(&[(29, "hello.txt:Notes", 0)], 5),
+            ],
+        ),
+    );
+    put(
+        &mut bytes,
+        29,
+        &record(
+            29,
+            false,
+            1,
+            &[
+                standard(),
+                resident(DATA, 0, "", b"literal colon name"),
+                resident(0x30, 2, "", &filename(5, "hello.txt:Notes", 0)),
+            ],
+        ),
+    );
+    let fs = open(bytes, Arc::default(), None).unwrap();
+    let mut scope = RequestScope::empty();
+    let attr = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt:Notes"))
+        .unwrap();
+    assert!(!is_ads_ino(attr.ino));
+    assert_eq!(
+        fs.read(&cx, &mut scope, attr.ino, 0, 100).unwrap(),
+        b"literal colon name"
+    );
+}

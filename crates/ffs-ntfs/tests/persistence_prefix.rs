@@ -99,6 +99,672 @@ fn fragmented_data_fixture() -> (Arc<FaultInjectingNtfsDevice>, NtfsTransactionE
 }
 
 #[test]
+fn writable_fsops_publishes_native_changes_and_retains_open_unlinked_files() {
+    use ffs_core::vfs::ReleaseRequest;
+    use ffs_core::{FsOps, RequestScope, SetAttrRequest};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(2048, 50, 0xF501_0000_0000_0001);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+    let file = fs
+        .create(&cx, &mut scope, root, OsStr::new("note"), 0o644, 1000, 1000)
+        .unwrap();
+    assert_eq!(file.perm, 0o644);
+    assert_eq!(fs.write(&cx, &mut scope, file.ino, 0, b"hello").unwrap(), 5);
+    assert_eq!(fs.write(&cx, &mut scope, file.ino, 9, b"!").unwrap(), 1);
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(),
+        b"hello\0\0\0\0!"
+    );
+    let dir = fs
+        .mkdir(&cx, &mut scope, root, OsStr::new("dir"), 0o755, 1000, 1000)
+        .unwrap();
+    fs.rename(
+        &cx,
+        &mut scope,
+        root,
+        OsStr::new("note"),
+        dir.ino,
+        OsStr::new("moved"),
+    )
+    .unwrap();
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, root, OsStr::new("note")),
+        Err(FfsError::NotFound(_))
+    ));
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("moved"))
+            .unwrap()
+            .ino,
+        file.ino
+    );
+    let (fh, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDWR).unwrap();
+    fs.unlink(&cx, &mut scope, dir.ino, OsStr::new("moved"))
+        .unwrap();
+    assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap().nlink, 0);
+    assert_eq!(fs.readdir(&cx, &mut scope, dir.ino, 0).unwrap().len(), 2);
+    assert!(
+        fs.readdir(&cx, &mut scope, root, 0)
+            .unwrap()
+            .iter()
+            .all(|entry| !entry.name.starts_with(b".ffs-unlinked-"))
+    );
+    fs.write(&cx, &mut scope, file.ino, 1, b"AB").unwrap();
+    fs.setattr(
+        &cx,
+        &mut scope,
+        file.ino,
+        &SetAttrRequest {
+            size: Some(6),
+            ..SetAttrRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(),
+        b"hABlo\0"
+    );
+    fs.fsync(&cx, &mut scope, file.ino, fh, false).unwrap();
+    fs.release(
+        &cx,
+        &mut scope,
+        ReleaseRequest {
+            ino: file.ino,
+            fh,
+            flags: libc::O_RDWR,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    assert!(fs.getattr(&cx, &mut scope, file.ino).is_err());
+    let replacement = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("replacement"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    assert_ne!(
+        replacement.ino, file.ino,
+        "record reuse must change the exposed sequence identity"
+    );
+    fs.write(&cx, &mut scope, replacement.ino, 0, b"durable")
+        .unwrap();
+    fs.rmdir(&cx, &mut scope, root, OsStr::new("dir")).unwrap();
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+    let stored = device.snapshot_durable_only();
+    let files = read_all_files_from_clean_volume(&stored);
+    assert_eq!(files.get("/replacement"), Some(&b"durable".to_vec()));
+    assert!(!files.contains_key("/note"));
+    assert!(!files.contains_key("/dir/moved"));
+    assert!(files.keys().all(|name| !name.contains(".ffs-unlinked-")));
+    NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap()
+    .check_clean_consistency(&cx)
+    .unwrap();
+}
+
+#[test]
+fn writable_fsops_preflight_refusals_leave_bytes_and_mount_usable() {
+    use ffs_core::{FsOps, RequestScope, SetAttrRequest};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(2048, 50, 0xF501_0000_0000_0002);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+    let file = fs
+        .create(&cx, &mut scope, root, OsStr::new("keep"), 0o644, 1000, 1000)
+        .unwrap();
+    fs.write(&cx, &mut scope, file.ino, 0, b"unchanged")
+        .unwrap();
+    let before = device.snapshot_live();
+    let writes = device.write_bytes_total();
+    assert!(
+        fs.create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("private"),
+            0o600,
+            1000,
+            1000
+        )
+        .is_err()
+    );
+    assert!(
+        fs.setattr(
+            &cx,
+            &mut scope,
+            file.ino,
+            &SetAttrRequest {
+                size: Some(0),
+                uid: Some(2000),
+                ..SetAttrRequest::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        fs.create(&cx, &mut scope, root, OsStr::new("keep"), 0o644, 1000, 1000)
+            .is_err()
+    );
+    assert!(
+        fs.rename2(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("keep"),
+            root,
+            OsStr::new("other"),
+            libc::RENAME_EXCHANGE
+        )
+        .is_err()
+    );
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(),
+        b"unchanged"
+    );
+    fs.create(
+        &cx,
+        &mut scope,
+        root,
+        OsStr::new("after"),
+        0o644,
+        1000,
+        1000,
+    )
+    .unwrap();
+}
+
+#[test]
+fn reference_mutations_follow_native_renames_and_reject_reused_records_without_writes() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0041);
+    let length = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+    let root_record = engine
+        .volume_view(&cx)
+        .unwrap()
+        .record(&cx, 5, None)
+        .unwrap();
+    let root = NtfsReference {
+        record: 5,
+        sequence: root_record.sequence,
+    };
+    let directory_name: Vec<_> = "documents".encode_utf16().collect();
+    let (directory, _) = engine
+        .mkdir_at(&cx, root, &directory_name)
+        .into_result()
+        .unwrap();
+    let file_name: Vec<_> = "résumé.txt".encode_utf16().collect();
+    let (file, _) = engine
+        .create_file_at(&cx, directory, &file_name, b"abcdef")
+        .into_result()
+        .unwrap();
+    engine
+        .write_stream_range(&cx, file, &[], 2, b"XY")
+        .into_result()
+        .unwrap();
+    engine
+        .write_stream_range(&cx, file, &[], 8, b"!")
+        .into_result()
+        .unwrap();
+    let renamed: Vec<_> = "renamed.txt".encode_utf16().collect();
+    let (outcome, _) = engine
+        .rename_at(&cx, directory, &file_name, root, &renamed, file, true)
+        .into_result()
+        .unwrap();
+    assert_eq!(outcome.source, file);
+    assert_eq!(outcome.replaced, None);
+    assert_eq!(
+        engine.resolve_reference_path(&cx, file).unwrap(),
+        "/renamed.txt"
+    );
+    engine
+        .truncate_stream(&cx, file, &[], 10)
+        .into_result()
+        .unwrap();
+    let image = device.snapshot_durable_only();
+    assert_eq!(
+        read_all_files_from_clean_volume(&image)
+            .get("/renamed.txt")
+            .map(Vec::as_slice),
+        Some(b"abXYef\0\0!\0".as_slice())
+    );
+    engine
+        .unlink_at(&cx, root, &renamed, file)
+        .into_result()
+        .unwrap();
+    let (replacement, _) = engine
+        .create_file_at(&cx, root, &renamed, b"replacement")
+        .into_result()
+        .unwrap();
+    assert_eq!(
+        replacement.record, file.record,
+        "fixture must reuse the retired slot"
+    );
+    assert_ne!(replacement.sequence, file.sequence);
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    for outcome in [
+        engine.write_stream_range(&cx, file, &[], 0, b"stale"),
+        engine.truncate_stream(&cx, file, &[], 0),
+        engine.unlink_at(&cx, root, &renamed, file),
+    ] {
+        assert!(
+            matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::RequestRejected {
+                    errno: libc::ESTALE,
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.snapshot_durable_only(), before);
+    engine.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn reference_mutation_admission_refuses_stale_parents_and_unsupported_overwrite_before_io() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0042);
+    let length = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+    let root_record = engine
+        .volume_view(&cx)
+        .unwrap()
+        .record(&cx, 5, None)
+        .unwrap();
+    let root = NtfsReference {
+        record: 5,
+        sequence: root_record.sequence,
+    };
+    let left: Vec<_> = "left".encode_utf16().collect();
+    let right: Vec<_> = "right".encode_utf16().collect();
+    let (file, _) = engine
+        .create_file_at(&cx, root, &left, b"left")
+        .into_result()
+        .unwrap();
+    engine
+        .create_file_at(&cx, root, &right, b"right")
+        .into_result()
+        .unwrap();
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let stale = NtfsReference {
+        sequence: root.sequence.wrapping_add(1),
+        ..root
+    };
+    assert!(matches!(
+        engine.mkdir_at(&cx, stale, &left),
+        NtfsTxOutcome::NotCommitted(FfsError::RequestRejected {
+            errno: libc::ESTALE,
+            ..
+        })
+    ));
+    assert!(matches!(
+        engine.create_file_at(&cx, root, &[47], b""),
+        NtfsTxOutcome::NotCommitted(FfsError::RequestRejected {
+            errno: libc::EINVAL,
+            ..
+        })
+    ));
+    assert!(matches!(
+        engine.rename_at(&cx, root, &left, root, &right, file, true),
+        NtfsTxOutcome::NotCommitted(FfsError::Exists)
+    ));
+    assert!(matches!(
+        engine.rename_at(&cx, root, &left, root, &right, file, false),
+        NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+    ));
+    assert!(matches!(
+        engine.write_stream_range(&cx, file, &[110], 0, b"stream"),
+        NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+    ));
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.snapshot_durable_only(), before);
+}
+
+#[test]
+fn durable_native_commit_finishes_publication_when_the_caller_is_cancelled() {
+    for stage in [
+        NtfsPersistenceStage::LogCommitBarrier,
+        NtfsPersistenceStage::TargetMetadataBarrier,
+        NtfsPersistenceStage::AckPublished,
+    ] {
+        let cx = Cx::for_testing();
+        let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0044);
+        let length = image.len() as u64 - SECTOR_BYTES as u64;
+        let device = FaultInjectingNtfsDevice::new(image);
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&device) as Arc<dyn ByteDevice>,
+            0,
+            length,
+            write_options_clean(),
+        )
+        .unwrap();
+        let (file, _) = engine
+            .create_file(&cx, "/", "saved", b"old")
+            .into_result()
+            .unwrap();
+        let cancellation = cx.clone();
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            if event.stage == stage {
+                cancellation.set_cancel_requested(true);
+            }
+            Ok(())
+        })));
+        let (updated, token) = engine
+            .write_file_data(&cx, "/saved", b"new")
+            .into_result()
+            .unwrap_or_else(|error| panic!("durable publication at {stage:?}: {error}"));
+        engine.set_stage_hook(None);
+        assert_eq!(updated, file);
+        assert!(token.matches_engine(&engine));
+        assert!(!engine.requires_recovery(), "{stage:?}");
+        assert!(cx.checkpoint().is_err(), "cancellation remains requested");
+        assert_eq!(
+            read_all_files_from_clean_volume(&device.snapshot_durable_only())["/saved"],
+            b"new",
+            "{stage:?}"
+        );
+        let next = Cx::for_testing();
+        engine.check_clean_consistency(&next).unwrap();
+        engine
+            .create_file(&next, "/", "subsequent", b"allowed")
+            .into_result()
+            .unwrap();
+    }
+}
+
+#[test]
+fn writable_fsops_preserve_success_when_cancelled_after_native_commit() {
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0045);
+    let length = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+    let cancellation = cx.clone();
+    engine.set_stage_hook(Some(Box::new(move |event| {
+        if event.stage == NtfsPersistenceStage::AckPublished {
+            cancellation.set_cancel_requested(true);
+        }
+        Ok(())
+    })));
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let mut scope = RequestScope::empty();
+    let created = fs
+        .create(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("committed"),
+            0o644,
+            1000,
+            1000,
+        )
+        .expect("committed create must publish its view and return attributes");
+    assert!(cx.checkpoint().is_err());
+    let next = Cx::for_testing();
+    let visible = fs
+        .lookup(&next, &mut scope, InodeNumber(1), OsStr::new("committed"))
+        .unwrap();
+    assert_eq!(visible.ino, created.ino);
+    assert!(
+        fs.read(&next, &mut scope, created.ino, 0, 64)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fs.write(&next, &mut scope, created.ino, 0, b"usable")
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        fs.read(&next, &mut scope, created.ino, 0, 64).unwrap(),
+        b"usable"
+    );
+    assert_eq!(
+        read_all_files_from_clean_volume(&device.snapshot_durable_only())["/committed"],
+        b"usable"
+    );
+}
+
+#[test]
+fn failed_native_publication_cannot_reinitialize_the_log_before_recovery() {
+    for stage in [
+        NtfsPersistenceStage::DirtyRestartBarrier,
+        NtfsPersistenceStage::LogCommitBarrier,
+        NtfsPersistenceStage::TargetMetadataBarrier,
+    ] {
+        let cx = Cx::for_testing();
+        let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0043);
+        let length = image.len() as u64 - SECTOR_BYTES as u64;
+        let device = FaultInjectingNtfsDevice::new(image);
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&device) as Arc<dyn ByteDevice>,
+            0,
+            length,
+            write_options_clean(),
+        )
+        .unwrap();
+        engine
+            .create_file(&cx, "/", "saved", b"old")
+            .into_result()
+            .unwrap();
+        assert!(!engine.requires_recovery());
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            if event.stage == stage {
+                return Err(FfsError::Io(std::io::Error::other("publication cut")));
+            }
+            Ok(())
+        })));
+        let outcome = engine.write_file_data(&cx, "/saved", b"new");
+        if stage == NtfsPersistenceStage::DirtyRestartBarrier {
+            assert!(matches!(outcome, NtfsTxOutcome::NotCommitted(_)));
+        } else {
+            assert!(matches!(outcome, NtfsTxOutcome::Uncertain { .. }));
+        }
+        engine.set_stage_hook(None);
+        assert!(engine.requires_recovery(), "{stage:?}");
+        let before = device.snapshot_live();
+        let durable = device.snapshot_durable_only();
+        let writes = device.write_bytes_total();
+        assert!(matches!(
+            engine.create_file(&cx, "/", "must-not-appear", b"unrelated"),
+            NtfsTxOutcome::NotCommitted(_)
+        ));
+        assert!(engine.sync_device(&cx).is_err());
+        assert_eq!(device.write_bytes_total(), writes, "{stage:?}");
+        assert_eq!(device.snapshot_live(), before, "{stage:?}");
+        assert_eq!(device.snapshot_durable_only(), durable, "{stage:?}");
+        engine
+            .recover_in_place(&cx)
+            .expect("explicit native recovery resolves the interrupted transaction");
+        assert!(!engine.requires_recovery());
+        let recovered = read_all_files_from_clean_volume(&device.snapshot_durable_only());
+        let expected = if stage == NtfsPersistenceStage::DirtyRestartBarrier {
+            b"old"
+        } else {
+            b"new"
+        };
+        assert_eq!(
+            recovered.get("/saved").map(Vec::as_slice),
+            Some(expected.as_slice())
+        );
+        assert!(!recovered.contains_key("/must-not-appear"));
+        engine
+            .create_file(&cx, "/", "after-recovery", b"allowed")
+            .into_result()
+            .unwrap();
+        engine.check_clean_consistency(&cx).unwrap();
+    }
+}
+
+#[test]
+fn writable_fsops_failed_native_publication_fences_cached_reads_and_retries() {
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(2048, 50, 0xF501_0000_0000_0003);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    engine
+        .create_file(&cx, "/", "existing", b"cached")
+        .into_result()
+        .unwrap();
+    engine.set_stage_hook(Some(Box::new(|event| {
+        if event.stage == NtfsPersistenceStage::DirtyRestartBarrier {
+            return Err(FfsError::Io(std::io::Error::other(
+                "injected interrupted publication",
+            )));
+        }
+        Ok(())
+    })));
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    assert!(
+        fs.volume().is_none(),
+        "raw reads must not escape writable publication fencing"
+    );
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+    let old = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("existing"))
+        .unwrap();
+    assert_eq!(fs.read(&cx, &mut scope, old.ino, 0, 64).unwrap(), b"cached");
+    assert!(
+        fs.create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("interrupted"),
+            0o644,
+            1000,
+            1000
+        )
+        .is_err()
+    );
+    let after_failure = device.snapshot_live();
+    let writes = device.write_bytes_total();
+    assert!(fs.read(&cx, &mut scope, old.ino, 0, 64).is_err());
+    assert!(fs.getattr(&cx, &mut scope, old.ino).is_err());
+    assert!(
+        fs.create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("retry"),
+            0o644,
+            1000,
+            1000
+        )
+        .is_err()
+    );
+    assert!(fs.sync_fs(&cx, &mut scope).is_err());
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(device.snapshot_live(), after_failure);
+    drop(fs);
+    let recovered = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_recover(),
+    )
+    .unwrap();
+    recovered.check_clean_consistency(&cx).unwrap();
+    let files = read_all_files_from_clean_volume(&device.snapshot_durable_only());
+    assert_eq!(files.get("/existing"), Some(&b"cached".to_vec()));
+    assert!(!files.contains_key("/interrupted"));
+    assert!(!files.contains_key("/retry"));
+}
+
+#[test]
 fn fragmented_data_create_preserves_other_files_and_zeroes_cluster_slack() {
     let cx = Cx::for_testing();
     let (device, mut engine) = fragmented_data_fixture();

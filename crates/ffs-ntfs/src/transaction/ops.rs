@@ -535,6 +535,9 @@ impl NtfsTransactionEngine {
         if let Err(err) = checkpoint(cx) {
             return NtfsTxOutcome::NotCommitted(err);
         }
+        if let Err(err) = self.require_clean_writer() {
+            return NtfsTxOutcome::NotCommitted(err);
+        }
         if let Err(err) = self.ensure_ring_initialized(cx, plan.operation) {
             return NtfsTxOutcome::NotCommitted(err);
         }
@@ -667,6 +670,7 @@ impl NtfsTransactionEngine {
             Ok(p) => p,
             Err(e) => return NtfsTxOutcome::NotCommitted(parse_err(&e)),
         };
+        self.recovery_required = true;
         for dirty_rstr in [&dirty_rstr_a, &dirty_rstr_b] {
             if let Err(err) = self.write_logfile_page(
                 cx,
@@ -806,7 +810,10 @@ impl NtfsTransactionEngine {
         }
 
         // Stage 5: Write target metadata (stamping FILE/INDX pages with commit_lsn and syncing $MFTMirr)!
-        let post_commit_step = (|| -> Result<u64> {
+        // The log commit is durable. Finish its bounded metadata publication
+        // under the caller's capabilities even if cancellation arrives now;
+        // real I/O and validation failures still produce an uncertain outcome.
+        let post_commit_step = cx.masked(|| -> Result<u64> {
             let mft0_for_mirr = self.read_mft_record_zero(cx)?;
             let mft0_runs_init =
                 extract_plain_nonresident_runs(&self.geometry, &mft0_for_mirr, DATA, &[])?;
@@ -900,10 +907,11 @@ impl NtfsTransactionEngine {
                 0,
             )?;
             Ok(ckpt_lsn)
-        })();
+        });
 
         match post_commit_step {
             Ok(ckpt_lsn) => {
+                self.recovery_required = false;
                 let token =
                     self.make_token(tx_id, commit_lsn, Some(ckpt_lsn), plan.operation_digest);
                 NtfsTxOutcome::Committed {
@@ -2189,6 +2197,9 @@ impl NtfsTransactionEngine {
         dst_path: &str,
         expected_source_ref: Option<NtfsReference>,
     ) -> NtfsTxOutcome<NtfsReference> {
+        if let Err(error) = self.require_clean_writer() {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"ntfs.rename_entry:");
         hasher.update(src_path.as_bytes());
