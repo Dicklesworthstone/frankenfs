@@ -42763,6 +42763,7 @@ impl OpenFs {
     fn btrfs_write_tree_log_for_sync(
         &self,
         cx: &Cx,
+        alloc: &mut BtrfsAllocState,
         ino: InodeNumber,
         operation_id: &str,
     ) -> Result<(BtrfsTreeLogWriteStats, usize), FfsError> {
@@ -42772,7 +42773,6 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?
             .clone();
         let canonical = self.btrfs_canonical_inode(ino)?;
-        let alloc_mutex = self.require_btrfs_alloc_state()?;
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
@@ -42791,21 +42791,21 @@ impl OpenFs {
             .inspect_err(|_| {
                 self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_READ_ERRS);
             })?;
-        // Prepare and allocate the log blocks BEFORE taking `mvcc_flushed_through`.
-        // Dropping `alloc_mutex` here keeps `alloc_mutex` and `mvcc_flushed_through`
-        // completely non-overlapping on the tree-log path and allows an overflow
-        // (`UnsupportedFeature`) to fall back to `btrfs_full_transaction_commit`
-        // without touching the MVCC flush cursor (bd-jhuob).
-        let (nodes, sb_bytes, stats) = {
-            let mut alloc = alloc_mutex.write();
-            Self::btrfs_prepare_tree_log_write(
-                &sb,
-                &mut alloc,
-                canonical,
-                ctx.subvol_objectid,
-                &on_disk_sb,
-            )?
-        };
+        // The caller retains allocator-write exclusion from before this
+        // superblock read through the final sync. A full commit must not land
+        // between the read and publication of these patched bytes, nor may a
+        // writer retire the extents this log is about to make durable.
+        // Prepare before taking `mvcc_flushed_through`, preserving the full
+        // commit's allocator -> flush-cursor lock order. Overflow leaves the
+        // cursor untouched and the caller releases the allocator before its
+        // full-commit fallback.
+        let (nodes, sb_bytes, stats) = Self::btrfs_prepare_tree_log_write(
+            &sb,
+            alloc,
+            canonical,
+            ctx.subvol_objectid,
+            &on_disk_sb,
+        )?;
         // EVERY node gets the same checks the single node used to get. The log
         // root tree is as capable of straddling a chunk boundary as the log tree,
         // and a check that covered only one of them would be worse than none —
@@ -42845,7 +42845,11 @@ impl OpenFs {
         let superblock_offset = match span_validation {
             Ok(offset) => offset,
             Err(err) => {
-                self.btrfs_rollback_unwritten_tree_log(&stats.retired_log_blocks, operation_id);
+                Self::btrfs_rollback_unwritten_tree_log(
+                    alloc,
+                    &stats.retired_log_blocks,
+                    operation_id,
+                );
                 return Err(err);
             }
         };
@@ -42870,7 +42874,11 @@ impl OpenFs {
                         self.btrfs_primary_devid(),
                         BTRFS_DEV_STAT_WRITE_ERRS,
                     );
-                    self.btrfs_rollback_unwritten_tree_log(&stats.retired_log_blocks, operation_id);
+                    Self::btrfs_rollback_unwritten_tree_log(
+                        alloc,
+                        &stats.retired_log_blocks,
+                        operation_id,
+                    );
                     return Err(err);
                 }
             };
@@ -42891,20 +42899,28 @@ impl OpenFs {
             Err(TreeLogPublishError::NodeWrite(err)) => {
                 drop(flushed_through);
                 self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_WRITE_ERRS);
-                self.btrfs_rollback_unwritten_tree_log(&stats.retired_log_blocks, operation_id);
+                Self::btrfs_rollback_unwritten_tree_log(
+                    alloc,
+                    &stats.retired_log_blocks,
+                    operation_id,
+                );
                 Err(err)
             }
             Err(TreeLogPublishError::PreSuperblockSync(err)) => {
                 drop(flushed_through);
                 self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);
-                self.btrfs_rollback_unwritten_tree_log(&stats.retired_log_blocks, operation_id);
+                Self::btrfs_rollback_unwritten_tree_log(
+                    alloc,
+                    &stats.retired_log_blocks,
+                    operation_id,
+                );
                 Err(err)
             }
             Err(TreeLogPublishError::SuperblockWrite(err)) => {
                 *flushed_through = (*flushed_through).max(durable_through);
                 drop(flushed_through);
                 self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_WRITE_ERRS);
-                self.btrfs_repin_retired_tree_log_blocks(&stats.retired_log_blocks);
+                Self::btrfs_repin_retired_tree_log_blocks(alloc, &stats.retired_log_blocks);
                 Err(err)
             }
         }
@@ -43089,29 +43105,39 @@ impl OpenFs {
             "tree_log_fast_fsync"
         );
 
+        // Serialize the entire log publication with native writers, other log
+        // publishers and full commits. Protecting only preparation lets a log
+        // overwrite a newer committed superblock or publish extents that a
+        // concurrent commit has already retired and made reusable.
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let mut alloc = alloc_mutex.write();
+
         // bd-dm01m + bd-jhuob: prepare the tree log first so an overflow falls
         // back cleanly to `btrfs_full_transaction_commit`, and otherwise stage
         // MVCC data blocks + tree-log nodes ahead of ONE shared pre-superblock
         // barrier (`2` barriers/fsync total instead of `3`).
-        let (tree_log, flushed) = match self.btrfs_write_tree_log_for_sync(cx, ino, operation_id) {
-            Ok(result) => result,
-            Err(FfsError::UnsupportedFeature(_)) => {
-                info!(
-                    target: "ffs::btrfs::rw",
-                    operation_id = %operation_id,
-                    scenario_id,
-                    outcome = "applied",
-                    ino = ino.0,
-                    datasync,
-                    commit_strategy = "full_commit_log_overflow_fallback",
-                    "btrfs_sync_applied"
-                );
-                return self
-                    .btrfs_full_transaction_commit(cx, operation_id)
-                    .map(|_| ());
-            }
-            Err(other) => return Err(other),
-        };
+        let (tree_log, flushed) =
+            match self.btrfs_write_tree_log_for_sync(cx, &mut alloc, ino, operation_id) {
+                Ok(result) => result,
+                Err(FfsError::UnsupportedFeature(_)) => {
+                    // The full commit acquires this same write lock itself.
+                    drop(alloc);
+                    info!(
+                        target: "ffs::btrfs::rw",
+                        operation_id = %operation_id,
+                        scenario_id,
+                        outcome = "applied",
+                        ino = ino.0,
+                        datasync,
+                        commit_strategy = "full_commit_log_overflow_fallback",
+                        "btrfs_sync_applied"
+                    );
+                    return self
+                        .btrfs_full_transaction_commit(cx, operation_id)
+                        .map(|_| ());
+                }
+                Err(other) => return Err(other),
+            };
         if flushed > 0 {
             trace!(
                 target: "ffs::btrfs::rw",
@@ -43128,7 +43154,11 @@ impl OpenFs {
                 // back. Freeing it BEFORE this point would let the next
                 // allocation overwrite the log that a crash would still have to
                 // replay from.
-                self.btrfs_free_retired_log_blocks(&tree_log.retired_log_blocks, operation_id);
+                Self::btrfs_free_retired_log_blocks(
+                    &mut alloc,
+                    &tree_log.retired_log_blocks,
+                    operation_id,
+                );
                 info!(
                     target: "ffs::btrfs::rw",
                     operation_id = %operation_id,
@@ -43154,7 +43184,7 @@ impl OpenFs {
                 // The superblock write was issued before this failed sync, so
                 // either the old OR the new `log_root` may be on disk. Keep
                 // both sets pinned until a later fsync or full commit succeeds.
-                self.btrfs_repin_retired_tree_log_blocks(&tree_log.retired_log_blocks);
+                Self::btrfs_repin_retired_tree_log_blocks(&mut alloc, &tree_log.retired_log_blocks);
                 warn!(
                     target: "ffs::btrfs::rw",
                     operation_id = %operation_id,
@@ -43175,36 +43205,27 @@ impl OpenFs {
     /// newly allocated tree-log blocks when publication fails BEFORE writing
     /// the superblock (`bd-jhuob`).
     fn btrfs_rollback_unwritten_tree_log(
-        &self,
+        alloc: &mut BtrfsAllocState,
         retired_log_blocks: &[(u64, u64, bool)],
         operation_id: &str,
     ) {
-        let unwritten = self.require_btrfs_alloc_state().map_or_else(
-            |_| Vec::new(),
-            |alloc_mutex| {
-                let mut alloc = alloc_mutex.write();
-                std::mem::replace(
-                    &mut alloc.btrfs_live_log_blocks,
-                    retired_log_blocks.to_vec(),
-                )
-            },
+        let unwritten = std::mem::replace(
+            &mut alloc.btrfs_live_log_blocks,
+            retired_log_blocks.to_vec(),
         );
-        self.btrfs_free_retired_log_blocks(&unwritten, operation_id);
+        Self::btrfs_free_retired_log_blocks(alloc, &unwritten, operation_id);
     }
 
     /// Keep `retired_log_blocks` pinned alongside the newly published log blocks
     /// when a superblock write or trailing sync fails, since either pointer may
     /// reach stable storage before recovery (`bd-jhuob`).
-    fn btrfs_repin_retired_tree_log_blocks(&self, retired_log_blocks: &[(u64, u64, bool)]) {
-        if retired_log_blocks.is_empty() {
-            return;
-        }
-        if let Ok(alloc_mutex) = self.require_btrfs_alloc_state() {
-            let mut alloc = alloc_mutex.write();
-            for &entry in retired_log_blocks {
-                if !alloc.btrfs_live_log_blocks.contains(&entry) {
-                    alloc.btrfs_live_log_blocks.push(entry);
-                }
+    fn btrfs_repin_retired_tree_log_blocks(
+        alloc: &mut BtrfsAllocState,
+        retired_log_blocks: &[(u64, u64, bool)],
+    ) {
+        for &entry in retired_log_blocks {
+            if !alloc.btrfs_live_log_blocks.contains(&entry) {
+                alloc.btrfs_live_log_blocks.push(entry);
             }
         }
     }
@@ -43214,26 +43235,22 @@ impl OpenFs {
     /// has already succeeded durably, and turning a space-accounting problem
     /// into a failed fsync would be the worse trade.
     fn btrfs_free_retired_log_blocks(
-        &self,
+        alloc: &mut BtrfsAllocState,
         retired_log_blocks: &[(u64, u64, bool)],
         operation_id: &str,
     ) {
         for &(bytenr, num_bytes, is_metadata) in retired_log_blocks {
-            if let Ok(alloc_mutex) = self.require_btrfs_alloc_state() {
-                let free_result =
-                    alloc_mutex
-                        .write()
-                        .extent_alloc
-                        .free_extent(bytenr, num_bytes, is_metadata);
-                if let Err(err) = free_result {
-                    warn!(
-                        target: "ffs::btrfs::rw",
-                        operation_id = %operation_id,
-                        retired_log_bytenr = bytenr,
-                        error = ?err,
-                        "btrfs tree-log: superseded block not freed; space leaked"
-                    );
-                }
+            if let Err(err) = alloc
+                .extent_alloc
+                .free_extent(bytenr, num_bytes, is_metadata)
+            {
+                warn!(
+                    target: "ffs::btrfs::rw",
+                    operation_id = %operation_id,
+                    retired_log_bytenr = bytenr,
+                    error = ?err,
+                    "btrfs tree-log: superseded block not freed; space leaked"
+                );
             }
         }
     }
