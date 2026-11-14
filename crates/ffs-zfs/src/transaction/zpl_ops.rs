@@ -212,7 +212,11 @@ fn open_head_dataset_context(
     {
         Some(PropertyValue::Number(0)) => {}
         Some(PropertyValue::Number(1)) => return Err(FfsError::ReadOnly),
-        _ => return Err(corrupt("missing or invalid effective ZFS readonly property")),
+        _ => {
+            return Err(corrupt(
+                "missing or invalid effective ZFS readonly property",
+            ));
+        }
     }
     let (head_dn, head_ceiling) = mos.object_with_ceiling(cx, ds_row.head_object)?;
     let order = head_dn.order();
@@ -1177,8 +1181,11 @@ pub(super) fn stage_zpl_mutation(
             // Choose new `data_bytes` (`dn_datablkszsec`) following OpenZFS variable-block rule:
             // single-block files grow in multiples of `min_blk` (`512`..=`recordsize`), and
             // multi-block files lock to `recordsize` (or keep existing `data_bytes` if already multi-block).
+            // A later reduction of the dataset's recordsize must never shrink an
+            // existing block. Reinterpreting its bytes at the smaller geometry
+            // would discard the untouched suffix and turn it into holes.
             let old_bsize = loaded.dnode.data_bytes();
-            let target_bsize = if loaded.dnode.max_block() > 0 {
+            let target_bsize = if loaded.dnode.max_block() > 0 || old_bsize >= ds_ctx.recordsize {
                 old_bsize
             } else if end_offset as usize > ds_ctx.recordsize
                 || loaded.metadata.size as usize > ds_ctx.recordsize

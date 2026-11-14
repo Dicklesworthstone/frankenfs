@@ -2300,7 +2300,10 @@ fn assert_native_write_refused(
             (media.write_calls, media.sync_calls)
         })
         .collect();
-    assert_eq!(io_after, io_before, "admission failure performed backing I/O");
+    assert_eq!(
+        io_after, io_before,
+        "admission failure performed backing I/O"
+    );
 }
 
 fn assert_readonly_mutations_refused(
@@ -2374,14 +2377,24 @@ fn native_write_admission_resolves_readonly_inheritance_and_received_values() {
         ("inherited", vec![(READONLY, 1)], vec![], false),
         ("local-on", vec![(READONLY, 0)], vec![(READONLY, 1)], false),
         ("local-off", vec![(READONLY, 1)], vec![(READONLY, 0)], true),
-        ("received-off", vec![(READONLY, 1)], vec![(RECEIVED, 0)], true),
+        (
+            "received-off",
+            vec![(READONLY, 1)],
+            vec![(RECEIVED, 0)],
+            true,
+        ),
         (
             "inherit-suppresses-received-off",
             vec![(READONLY, 1)],
             vec![(RECEIVED, 0), (INHERIT, 1)],
             false,
         ),
-        ("received-on", vec![(READONLY, 0)], vec![(RECEIVED, 1)], false),
+        (
+            "received-on",
+            vec![(READONLY, 0)],
+            vec![(RECEIVED, 1)],
+            false,
+        ),
         (
             "inherit-suppresses-received-on",
             vec![(READONLY, 0)],
@@ -2434,13 +2447,7 @@ fn native_write_admission_resolves_readonly_inheritance_and_received_values() {
                     });
                 }
             } else {
-                assert_readonly_mutations_refused(
-                    &cx,
-                    &mut engine,
-                    &devices,
-                    &dataset,
-                    timestamp,
-                );
+                assert_readonly_mutations_refused(&cx, &mut engine, &devices, &dataset, timestamp);
             }
             // A fresh native reader sees exactly the expected published state,
             // not a mutation left only in an in-memory view.
@@ -2648,10 +2655,7 @@ fn native_write_admission_protects_directory_namespace_and_project_inheritance()
     };
     let dataset = vec![b"data".to_vec()];
     // Test the destination directory independently of the source directory.
-    for (flag, errno) in [
-        (1_u64 << 36, libc::EPERM),
-        (1_u64 << 46, libc::EOPNOTSUPP),
-    ] {
+    for (flag, errno) in [(1_u64 << 36, libc::EPERM), (1_u64 << 46, libc::EOPNOTSUPP)] {
         let built = build_clean_zfs_pool(&PoolFixtureSpec {
             deadlist_mode: DeadlistMode::NativeDeadlist,
             zpl_flags: BTreeMap::from([(6, flag)]),
@@ -2849,14 +2853,7 @@ fn native_write_admission_preserves_append_and_dos_readonly_semantics() {
         .into_result()
         .expect("authorized DOS-readonly data write");
     assert_native_write_refused(&mut engine, &devices, libc::EPERM, |writer| {
-        writer.truncate_file(
-            &cx,
-            &dataset,
-            5,
-            0,
-            timestamp,
-            ZfsDataChecksum::Fletcher4,
-        )
+        writer.truncate_file(&cx, &dataset, 5, 0, timestamp, ZfsDataChecksum::Fletcher4)
     });
 
     let (new_file, _) = engine
@@ -3339,6 +3336,96 @@ fn partition_slice_open_files_at_preserves_prefix_and_suffix_canaries() {
 // ---------------------------------------------------------------------------
 // 3. Snapshotted dataset COW + Deadlist (`DMU_OT_BPOBJ` & `DMU_OT_DEADLIST`)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn writes_preserve_existing_blocks_after_recordsize_reduction() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_715_000_199,
+        nanos: 0,
+    };
+    let dataset = [b"data".to_vec()];
+    let patch = b"replacement bytes across the former record boundary";
+
+    for (zpl_version, mirror_width, ashift) in [(4, 1, 9), (5, 2, 12)] {
+        for offset in [13_usize, 3070, 4083, 8205] {
+            // A native property reduction leaves existing files' block geometry
+            // intact. The compressed 4 KiB file predates this 512-byte setting.
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                zpl_version,
+                mirror_width,
+                ashift,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                data_properties: vec![(b"recordsize", 512)],
+                ..PoolFixtureSpec::default()
+            });
+            let devs: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devs,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            let source = engine
+                .open_read_objects(&cx)
+                .unwrap()
+                .zpl(&cx, &dataset)
+                .unwrap()
+                .resolve(&cx, b"/hello.txt")
+                .unwrap();
+            let mut expected = built.snap_hello_expected.clone();
+            expected.resize(expected.len().max(offset + patch.len()), 0);
+            expected[offset..offset + patch.len()].copy_from_slice(patch);
+
+            let (size, token) = engine
+                .write_file_data(
+                    &cx,
+                    &dataset,
+                    source,
+                    offset as u64,
+                    patch,
+                    timestamp,
+                    ZfsDataChecksum::Sha256,
+                )
+                .into_result()
+                .unwrap();
+            assert_eq!(size, expected.len() as u64);
+            engine.verify_token(&token).unwrap();
+            let slot = engine.committed_slot();
+            drop(engine);
+
+            // Reopen from durable bytes, rather than trusting the writer's view.
+            let durable: Vec<_> = devs
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let reopened =
+                open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                    .unwrap();
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            let mut head = mos.zpl(&cx, &dataset).unwrap();
+            assert_eq!(head.resolve(&cx, b"/hello.txt").unwrap(), source);
+            assert_eq!(
+                head.read(&cx, source, 0, expected.len() + 1).unwrap(),
+                expected,
+                "recordsize reduction must preserve unrelated bytes at offset {offset}"
+            );
+            let mut snapshot = mos.zpl_snapshot(&cx, &dataset, b"before").unwrap();
+            assert_eq!(
+                snapshot
+                    .read(&cx, source, 0, built.snap_hello_expected.len() + 1)
+                    .unwrap(),
+                built.snap_hello_expected,
+                "COW must preserve the snapshotted original block"
+            );
+            assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+        }
+    }
+}
 
 #[test]
 fn snapshotted_dataset_cow_preserves_historical_lzjb_snapshot_with_bpobj_and_deadlist() {
@@ -3829,7 +3916,9 @@ fn hard_link_persistence_cuts_never_split_directory_entry_from_link_count() {
                 }
             });
             let outcome = engine.link_entry(&cx, &ds, source, 2, b"alias.txt", ts);
-            if seq < first_uberblock_seq {
+            // Fault hooks run before their device operation: the first
+            // UberblockWrite cut has not attempted publication yet.
+            if seq <= first_uberblock_seq {
                 assert!(
                     matches!(outcome, ZfsTxOutcome::NotCommitted(_)),
                     "cut {:?}",
@@ -3864,7 +3953,7 @@ fn hard_link_persistence_cuts_never_split_directory_entry_from_link_count() {
             let mut mos = pool.import_objects(&cx, Some(built.pool_guid)).unwrap();
             assert!([INITIAL_TXG, INITIAL_TXG + 1].contains(&mos.txg));
             let recovered_new = mos.txg == INITIAL_TXG + 1;
-            if seq < first_uberblock_seq {
+            if seq <= first_uberblock_seq {
                 assert!(!recovered_new);
             }
             if seq >= durable_seq {
@@ -3994,10 +4083,11 @@ fn persistence_prefix_fault_cuts_reorder_torn_mirror_split_flush_fail_and_cancel
         );
     }
 
-    // A. Cut at EVERY event strictly before `first_ub_pos` (including reordered/dropped volatile cache):
+    // A. Cut at EVERY event through the first prewrite Uberblock hook (including
+    // reordered/dropped volatile cache). The hook runs before the write itself.
     // Every cut MUST return `ZfsTxOutcome::NotCommitted`, leave `INITIAL_TXG` 100% intact on fresh engine,
     // and allow a subsequent TXG to commit with zero leaks!
-    for cut_ev in recorded_events.iter().take(first_ub_pos) {
+    for cut_ev in recorded_events.iter().take(first_ub_pos + 1) {
         let target_seq = cut_ev.seq;
         for reorder_mode in [false, true] {
             let dev = FaultableMemberDevice::new(base_built.members[0].clone());
