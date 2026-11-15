@@ -113,11 +113,12 @@ pub struct NtfsFs {
 
 impl NtfsFs {
     /// Borrow the admitted immutable volume for native stream/metadata access.
-    /// This retains the filesystem's backing capability and its explicit clean
-    /// or recovered-view admission.
+    /// Writable instances return `None`: an unguarded reader would bypass their
+    /// publication lock and recovery-required latch. Use `FsOps` on those
+    /// instances. Read-only volumes retain their clean or recovered admission.
     #[must_use]
-    pub fn volume(&self) -> &NtfsVolume {
-        &self.volume
+    pub fn volume(&self) -> Option<&NtfsVolume> {
+        self.writer.is_none().then_some(&self.volume)
     }
 
     pub fn new(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
@@ -1181,7 +1182,11 @@ impl FsOps for NtfsFs {
     ) -> Result<()> {
         if !self.is_writable() {
             let _op = self.operation(cx, false)?;
-            self.record(cx, ino)?;
+            if is_ads_ino(ino) {
+                self.describe(cx, ino)?;
+            } else {
+                self.record(cx, ino)?;
+            }
             return checkpoint(cx);
         }
         let op = self.operation(cx, true)?;

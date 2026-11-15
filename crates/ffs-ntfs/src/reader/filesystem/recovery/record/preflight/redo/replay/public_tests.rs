@@ -449,9 +449,10 @@ fn recovered_fsops_expose_complete_redo_undo_without_backing_writes() {
                 Err(FfsError::ReadOnly)
             ));
             fs.fsyncdir(&cx, &mut scope, root, 0, false).unwrap();
-            assert_eq!(fs.volume().volume_flags, 1);
+            assert_eq!(fs.volume().unwrap().volume_flags, 1);
             assert!(
                 !fs.volume()
+                    .unwrap()
                     .logfile_recovery
                     .as_ref()
                     .unwrap()
@@ -460,6 +461,7 @@ fn recovered_fsops_expose_complete_redo_undo_without_backing_writes() {
             );
             let mut backing = vec![0; VOLUME_BYTES];
             fs.volume()
+                .unwrap()
                 .source
                 .device
                 .read_exact_at(&cx, ByteOffset(0), &mut backing)
@@ -1089,9 +1091,10 @@ fn dirty_external_directory_and_file_replay_publish_one_read_only_fsops_view() {
                 fs.lookup(&cx, &mut scope, directory.ino, OsStr::new("gamma")),
                 Err(FfsError::NotFound(_))
             ));
-            assert_eq!(fs.volume().volume_flags, 1);
+            assert_eq!(fs.volume().unwrap().volume_flags, 1);
             let mut backing = vec![0; VOLUME_BYTES];
             fs.volume()
+                .unwrap()
                 .source
                 .device
                 .read_exact_at(&cx, ByteOffset(0), &mut backing)

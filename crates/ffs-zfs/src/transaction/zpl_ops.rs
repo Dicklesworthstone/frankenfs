@@ -1,4 +1,4 @@
-//! Native ZPL head-dataset mutations (create, mkdir, write, truncate, rename, unlink)
+//! Native ZPL head-dataset mutations (create, mkdir, write, truncate, link, rename, unlink)
 //! lowered into COW DMU object-set, DSL dataset/dir accounting, and deadlist updates.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,6 +15,7 @@ use ffs_ondisk::zfs_zpl::{
 use serde::Serialize;
 
 use crate::reader::dmu::Objects;
+use crate::reader::dmu::properties::PropertyValue;
 
 use super::dmu_cow::{
     DMU_OT_DIRECTORY_CONTENTS, DMU_OT_OBJSET, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
@@ -29,6 +30,42 @@ use super::{checkpoint, corrupt, parse_err, unsupported};
 const DEFAULT_RECORDSIZE: usize = 131_072;
 const MAX_WRITE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PATH_DEPTH: usize = 256;
+
+// Native persistent ZPL flags (OpenZFS zfs-2.3.0, sys/zfs_znode.h).
+// Dataset `readonly` is a separate, inherited DSL property.
+const ZFS_READONLY: u64 = 0x0000_0001_0000_0000;
+const ZFS_IMMUTABLE: u64 = 0x0000_0010_0000_0000;
+const ZFS_NOUNLINK: u64 = 0x0000_0020_0000_0000;
+const ZFS_APPENDONLY: u64 = 0x0000_0040_0000_0000;
+const ZFS_PROJINHERIT: u64 = 0x0000_4000_0000_0000;
+
+fn reject_flags(metadata: &Metadata, prohibited: u64) -> Result<()> {
+    if metadata.flags & prohibited != 0 {
+        return Err(FfsError::RequestRejected {
+            errno: libc::EPERM,
+            detail: "native ZPL persistent flags prohibit this mutation".into(),
+        });
+    }
+    Ok(())
+}
+
+fn admit_directory_add(parent: &Metadata) -> Result<()> {
+    // Append-only directories may gain new names, but immutable directories
+    // cannot. Project inheritance requires preserving the native project ID
+    // and, for new directories, the inheritance flag itself.
+    reject_flags(parent, ZFS_IMMUTABLE)?;
+    if parent.flags & ZFS_PROJINHERIT != 0 {
+        return Err(unsupported(
+            "mutations into project-inheriting directories require project-ID admission",
+        ));
+    }
+    Ok(())
+}
+
+fn admit_directory_remove(parent: &Metadata, target: &Metadata) -> Result<()> {
+    reject_flags(parent, ZFS_IMMUTABLE | ZFS_APPENDONLY)?;
+    reject_flags(target, ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_NOUNLINK)
+}
 
 /// Checksum algorithm used for newly written DMU data blocks (`ZIO_CHECKSUM_*`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -80,6 +117,12 @@ pub(super) enum ZplMutation {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
+    LinkEntry {
+        source_object: u64,
+        parent_dir: u64,
+        name: Vec<u8>,
+        timestamp: Timestamp,
+    },
     RenameEntry {
         src_dir: u64,
         src_name: Vec<u8>,
@@ -103,6 +146,7 @@ impl ZplMutation {
             Self::Mkdir { .. } => "mkdir",
             Self::WriteData { .. } => "write_data",
             Self::TruncateFile { .. } => "truncate_file",
+            Self::LinkEntry { .. } => "link_entry",
             Self::RenameEntry { .. } => "rename_entry",
             Self::UnlinkEntry { .. } => "unlink_entry",
         }
@@ -156,6 +200,23 @@ fn open_head_dataset_context(
         return Err(unsupported(
             "native ZFS ZPL writes require an initialized case-sensitive filesystem head",
         ));
+    }
+    // Resolve the same local/received/inherited policy that a native import
+    // observes. Checking only this directory's property ZAP would permit writes
+    // under an inherited readonly=on and miss received/$inherit precedence.
+    let properties = mos.properties(cx, dataset_components, None, &["readonly".into()])?;
+    match properties
+        .values
+        .first()
+        .and_then(|property| property.value.as_ref())
+    {
+        Some(PropertyValue::Number(0)) => {}
+        Some(PropertyValue::Number(1)) => return Err(FfsError::ReadOnly),
+        _ => {
+            return Err(corrupt(
+                "missing or invalid effective ZFS readonly property",
+            ));
+        }
     }
     let (head_dn, head_ceiling) = mos.object_with_ceiling(cx, ds_row.head_object)?;
     let order = head_dn.order();
@@ -551,6 +612,7 @@ pub(super) fn stage_zpl_mutation(
             if parent_loaded.metadata.kind != Kind::Directory {
                 return Err(FfsError::NotDirectory);
             }
+            admit_directory_add(&parent_loaded.metadata)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|e| e.name == *name) {
                 return Err(FfsError::Exists);
@@ -698,6 +760,7 @@ pub(super) fn stage_zpl_mutation(
             if parent_loaded.metadata.kind != Kind::Directory {
                 return Err(FfsError::NotDirectory);
             }
+            admit_directory_add(&parent_loaded.metadata)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|e| e.name == *name) {
                 return Err(FfsError::Exists);
@@ -823,6 +886,174 @@ pub(super) fn stage_zpl_mutation(
             new_obj
         }
 
+        ZplMutation::LinkEntry {
+            source_object,
+            parent_dir,
+            name,
+            timestamp,
+        } => {
+            validate_component(name, ds_ctx.utf8_only)?;
+            let source = load_zpl_node(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &zpl_dirty_dnodes,
+                ds_ctx.sa_registry.as_ref(),
+                *source_object,
+                order,
+            )?;
+            if source.metadata.kind == Kind::Directory {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EPERM,
+                    detail: "ZPL directories cannot have user-created hard links".into(),
+                });
+            }
+            if source.metadata.kind != Kind::Regular {
+                return Err(unsupported(
+                    "native hard links currently require a regular file",
+                ));
+            }
+            if source.metadata.links == 0 {
+                return Err(FfsError::NotFound("unlinked ZPL source object".into()));
+            }
+            let new_links =
+                source
+                    .metadata
+                    .links
+                    .checked_add(1)
+                    .ok_or_else(|| FfsError::RequestRejected {
+                        errno: libc::EMLINK,
+                        detail: "ZPL native link count is exhausted".into(),
+                    })?;
+            let parent = load_zpl_node(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &zpl_dirty_dnodes,
+                ds_ctx.sa_registry.as_ref(),
+                *parent_dir,
+                order,
+            )?;
+            if parent.metadata.kind != Kind::Directory {
+                return Err(FfsError::NotDirectory);
+            }
+            reject_flags(&source.metadata, ZFS_IMMUTABLE | ZFS_APPENDONLY)?;
+            admit_directory_add(&parent.metadata)?;
+            let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
+            if entries.iter().any(|entry| entry.name == *name) {
+                return Err(FfsError::Exists);
+            }
+            let mut parent_meta = parent.metadata.clone();
+            parent_meta.size = parent_meta
+                .size
+                .checked_add(1)
+                .ok_or_else(|| corrupt("ZPL directory entry count overflow"))?;
+            parent_meta.times[1] = *timestamp;
+            parent_meta.times[2] = *timestamp;
+
+            // Native ZPL_PARENT is a hint for multiply linked files. OpenZFS
+            // updates it to the directory receiving the newest link; it is not
+            // an exclusive ownership edge. Preserve data, generation and mtime.
+            let mut source_meta = source.metadata.clone();
+            source_meta.links = new_links;
+            source_meta.parent = *parent_dir;
+            source_meta.times[2] = *timestamp;
+            let (bonus, spill) = encode_updated_zpl_bonus(
+                &source,
+                &source_meta,
+                ds_ctx.sa_registry.as_ref(),
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?;
+            let source_out = cow_update_dnode(
+                cx,
+                &mut os_view,
+                alloc,
+                DnodeCowSpec {
+                    existing: Some((&source.dnode, source.ceiling)),
+                    object_type: source.dnode.object_type(),
+                    bonus_type: source.dnode.bonus_type(),
+                    checksum_type: source.dnode.checksum_type(),
+                    compress_type: source.dnode.compress_type(),
+                    user_flags: acct_flags,
+                    indirect_shift: source.dnode.indirect_shift(),
+                    data_bytes: source.dnode.data_bytes(),
+                    max_block: source.dnode.max_block(),
+                    slots: source.dnode.slots(),
+                    nblkptr: source.dnode.pointers().len(),
+                    bonus,
+                    spill,
+                    order,
+                    new_txg,
+                    leaf_bucket: WriteBucket::ChildBlocks,
+                    indirect_bucket: WriteBucket::ChildBlocks,
+                },
+                &BTreeMap::new(),
+                staged_writes,
+            )?;
+            zpl_born.add_assign(source_out.born)?;
+            zpl_retired.extend(source_out.retired_bps);
+            let bytes_delta =
+                signed_bytes_delta(source_out.dnode.used_bytes(), source.dnode.used_bytes())?;
+            if bytes_delta != 0 {
+                quota_deltas.push(QuotaDelta {
+                    uid: source_meta.uid,
+                    gid: source_meta.gid,
+                    projid: Some(0),
+                    bytes_delta,
+                    objs_delta: 0,
+                });
+            }
+            put_dnode_in_table(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &mut zpl_dirty_dnodes,
+                *source_object,
+                &source_out.dnode,
+            )?;
+            entries.push(RawZapEntry {
+                name: name.clone(),
+                integer_bytes: 8,
+                values: vec![
+                    encode_directory_reference(*source_object, Kind::Regular)
+                        .map_err(|error| parse_err(&error))?,
+                ],
+                collision: 0,
+            });
+            let parent_node = flush_dir_node(
+                cx,
+                &mut os_view,
+                alloc,
+                &parent,
+                &parent_meta,
+                &entries,
+                ds_ctx.sa_registry.as_ref(),
+                acct_flags,
+                order,
+                new_txg,
+                staged_writes,
+                &mut zpl_born,
+                &mut zpl_retired,
+                &mut quota_deltas,
+            )?;
+            put_dnode_in_table(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &mut zpl_dirty_dnodes,
+                *parent_dir,
+                &parent_node,
+            )?;
+            *source_object
+        }
+
         ZplMutation::WriteData {
             file_obj,
             offset,
@@ -850,6 +1081,16 @@ pub(super) fn stage_zpl_mutation(
             if loaded.metadata.kind != Kind::Regular {
                 return Err(unsupported("ZPL data write requires a regular file"));
             }
+            // Like native zfs_write, positioned writes to append-only files
+            // may start at or beyond EOF but cannot overwrite existing bytes.
+            // DOS ZFS_READONLY is an open/access policy, not revocation of an
+            // already authorized data-write capability.
+            let prohibited = if *offset < loaded.metadata.size {
+                ZFS_IMMUTABLE | ZFS_APPENDONLY
+            } else {
+                ZFS_IMMUTABLE
+            };
+            reject_flags(&loaded.metadata, prohibited)?;
             let new_size = loaded.metadata.size.max(end_offset);
             let mut new_meta = loaded.metadata.clone();
             new_meta.size = new_size;
@@ -940,8 +1181,11 @@ pub(super) fn stage_zpl_mutation(
             // Choose new `data_bytes` (`dn_datablkszsec`) following OpenZFS variable-block rule:
             // single-block files grow in multiples of `min_blk` (`512`..=`recordsize`), and
             // multi-block files lock to `recordsize` (or keep existing `data_bytes` if already multi-block).
+            // A later reduction of the dataset's recordsize must never shrink an
+            // existing block. Reinterpreting its bytes at the smaller geometry
+            // would discard the untouched suffix and turn it into holes.
             let old_bsize = loaded.dnode.data_bytes();
-            let target_bsize = if loaded.dnode.max_block() > 0 {
+            let target_bsize = if loaded.dnode.max_block() > 0 || old_bsize >= ds_ctx.recordsize {
                 old_bsize
             } else if end_offset as usize > ds_ctx.recordsize
                 || loaded.metadata.size as usize > ds_ctx.recordsize
@@ -1086,6 +1330,10 @@ pub(super) fn stage_zpl_mutation(
             if loaded.metadata.kind != Kind::Regular {
                 return Err(unsupported("ZPL truncate requires a regular file"));
             }
+            reject_flags(
+                &loaded.metadata,
+                ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_READONLY,
+            )?;
             let old_size = loaded.metadata.size;
             let prev_block_bytes = loaded.dnode.data_bytes();
             let mut dirty_leaves: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
@@ -1241,6 +1489,8 @@ pub(super) fn stage_zpl_mutation(
                 order,
             )?;
             let is_dir = src_obj_loaded.metadata.kind == Kind::Directory;
+            admit_directory_remove(&src_parent.metadata, &src_obj_loaded.metadata)?;
+            admit_directory_add(&dst_parent.metadata)?;
 
             // Cycle check if moving a directory across parents.
             if is_dir && *src_dir != *dst_dir {
@@ -1298,6 +1548,7 @@ pub(super) fn stage_zpl_mutation(
                     order,
                 )?;
                 let target_is_dir = target_loaded.metadata.kind == Kind::Directory;
+                admit_directory_remove(&dst_parent.metadata, &target_loaded.metadata)?;
                 if target_is_dir != is_dir {
                     return Err(if target_is_dir {
                         FfsError::IsDirectory
@@ -1576,6 +1827,7 @@ pub(super) fn stage_zpl_mutation(
                 order,
             )?;
             let target_is_dir = target_loaded.metadata.kind == Kind::Directory;
+            admit_directory_remove(&parent_loaded.metadata, &target_loaded.metadata)?;
             if target_is_dir != *rmdir {
                 return Err(if target_is_dir {
                     FfsError::IsDirectory

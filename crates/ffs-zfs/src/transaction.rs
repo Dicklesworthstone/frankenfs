@@ -58,6 +58,15 @@ pub(super) fn unsupported(detail: impl Into<String>) -> FfsError {
     FfsError::UnsupportedFeature(detail.into())
 }
 
+fn same_uberblock(left: &Uberblock, right: &Uberblock) -> bool {
+    left.order == right.order
+        && left.version == right.version
+        && left.txg == right.txg
+        && left.guid_sum == right.guid_sum
+        && left.timestamp == right.timestamp
+        && left.root == right.root
+}
+
 /// Explicit authorization and root-binding required to open a ZFS pool for native TXG writes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ZfsWriteOptions {
@@ -161,16 +170,18 @@ impl ZfsDurableToken {
 }
 
 /// Outcome of a native ZFS TXG publication, distinguishing pre-Uberblock failure,
-/// durable 4-label commit, and post-Uberblock-write barrier/cancellation uncertainty.
+/// durable 4-label commit, and incomplete Uberblock publication uncertainty.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ZfsTxOutcome<T> {
     /// All child blocks, MOS root, and all 4 Uberblock labels on every member synced durably.
+    /// Cancellation after that boundary preserves this known outcome and its token.
     Committed { value: T, token: ZfsDurableToken },
     /// Rejected or failed strictly before the first `UberblockWrite` (prior TXG stays intact).
     NotCommitted(FfsError),
-    /// Failed or cancelled at/after the first `UberblockWrite`; native label/ring inspection
-    /// must reconcile whether `target_txg` or the predecessor TXG is authoritative.
+    /// Failed or cancelled after starting `UberblockWrite`, before every required
+    /// publication barrier succeeded. Native label/ring inspection must reconcile
+    /// whether `target_txg` or the predecessor TXG is authoritative.
     Uncertain {
         reason: FfsError,
         target_txg: u64,
@@ -563,96 +574,50 @@ impl ZfsTransactionEngine {
             ));
         }
 
-        // 3. Reconcile torn Uberblocks ONLY if explicitly requested; otherwise require unanimous
-        // 4-label agreement across all members on `(options.label, options.slot)`!
-        if options.reconcile_torn_uberblocks {
-            let Some((_, ref cand_ub, cand_order, sw_ver)) = selected_ub_from_scan else {
-                return Err(corrupt(
-                    "reconcile_torn_uberblocks target (label, slot) has no valid Uberblock on any member",
-                ));
-            };
-            if cand_ub.txg != max_ring_txg {
-                return Err(corrupt(
-                    "reconcile_torn_uberblocks refuses non-maximal Uberblock TXG",
-                ));
-            }
-            // Verify full pool scrub & allocation via `import_objects` before writing any label!
-            let imported = pool.import_objects(cx, Some(options.pool_guid))?;
-            if imported.txg != cand_ub.txg {
+        // 3. Select and verify the requested root without modifying any member.
+        // Reconciliation must not heal labels for a pool that fails later write admission.
+        let (_, expected_ub, expected_order, current_sw_version) =
+            selected_ub_from_scan.as_ref().ok_or_else(|| {
+                corrupt("explicitly selected (label, slot) does not contain a valid Uberblock")
+            })?;
+        if expected_ub.txg != max_ring_txg {
+            return Err(corrupt(
+                "explicitly selected Uberblock slot is older than a newer committed TXG in the ring",
+            ));
+        }
+        let root_block = if options.reconcile_torn_uberblocks {
+            let (_, _, imported_root) = pool.import_active(cx, Some(options.pool_guid))?;
+            if !same_uberblock(&imported_root.uberblock, expected_ub) {
                 return Err(corrupt(
                     "reconcile_torn_uberblocks candidate disagrees with verified active pool root",
                 ));
             }
-            let scrub = imported.scrub(
-                cx,
-                ScrubLimits {
-                    copy_bytes: Some(1 << 30),
-                    ..ScrubLimits::default()
-                },
-            )?;
-            if !scrub.is_clean() {
-                return Err(corrupt(
-                    "reconcile_torn_uberblocks refused: MOS scrub detected errors",
-                ));
-            }
-            let _ = imported.allocation(cx, AllocationLimits::default())?;
-
-            // Synchronize `(0..4, options.slot)` across all members in 2 waves (`L0..L1`, `L2..L3`).
-            let default_sw = if version == 5000 { 5000 } else { version };
-            let mut synced_ub = cand_ub.clone();
-            synced_ub.order = cand_order;
-            for wave_labels in [[0_usize, 1], [2, 3]] {
-                for (m_idx, member) in members.iter().enumerate() {
-                    for l_idx in wave_labels {
-                        let off = label_offsets_per_member[m_idx][l_idx]
-                            + UBERBLOCK_RING_OFFSET
-                            + (options.slot * slot_bytes) as u64;
-                        let encoded = synced_ub
-                            .encode_with_meta(slot_bytes, off, sw_ver.unwrap_or(default_sw), 0, 0)
-                            .map_err(|e| parse_err(&e))?;
-                        member.write_raw(cx, off, &encoded)?;
-                    }
-                }
-                for member in members {
-                    member.sync_raw(cx)?;
-                }
-            }
+            imported_root
         } else {
-            // Strict unanimity across all 4 labels of every member at `options.slot`!
-            let (_, expected_ub, _, _) = selected_ub_from_scan.as_ref().ok_or_else(|| {
-                corrupt("explicitly selected (label, slot) does not contain a valid Uberblock")
-            })?;
+            // Strict unanimity across all 4 labels of every member at the selected slot.
             for member in members {
                 for l_idx in 0..4 {
                     let lbl = member.label(cx, l_idx)?;
                     let other = member.uberblock(cx, &lbl, options.slot)?;
-                    if other.version != expected_ub.version
-                        || other.txg != expected_ub.txg
-                        || other.guid_sum != expected_ub.guid_sum
-                        || other.timestamp != expected_ub.timestamp
-                        || other.root != expected_ub.root
-                    {
+                    if !same_uberblock(&other, expected_ub) {
                         return Err(corrupt(
                             "Uberblock slots disagree across labels or members; explicit reconciliation required",
                         ));
                     }
                 }
             }
-        }
-
-        let root_block = pool.root(cx, options.label, options.slot, options.pool_guid)?;
-        if root_block.uberblock.txg != max_ring_txg {
-            return Err(corrupt(
-                "explicitly selected Uberblock slot is older than a newer committed TXG in the ring",
-            ));
-        }
+            pool.root(cx, options.label, options.slot, options.pool_guid)?
+        };
+        let current_uberblock = root_block.uberblock.clone();
         let vcfg = root_block.vdev_config().clone();
-        let order = root_block.uberblock.root.payload_order();
+        let order = current_uberblock.root.payload_order();
         let mos_os = ObjectSet::parse(&root_block.data, order).map_err(|e| parse_err(&e))?;
-        let current_sw_version = selected_ub_from_scan.and_then(|(_, _, _, sw)| sw);
+        let current_sw_version = *current_sw_version;
 
-        // 4. Open `Objects`, validate MOS feature catalogs for WRITES, and inspect ZIL on all heads.
-        let mut mos = pool.objects(cx, options.label, options.slot, options.pool_guid)?;
+        // 4. Open the exact verified root, admit writes, and inspect ZIL on every head.
+        // A split mirror cannot use the strict label reader until reconciliation,
+        // but this constructor retains complete read-feature and checksum admission.
+        let mut mos = Objects::from_root(cx, pool.clone(), root_block)?;
         let mut write_features = BTreeMap::new();
         let mut write_features_obj = None;
         let dir_entries = mos.zap_values(cx, 1)?;
@@ -708,9 +673,53 @@ impl ZfsTransactionEngine {
             )));
         }
 
-        // 5. Load metaslab space maps and verify accounting.
+        // 5. Load metaslab space maps and verify accounting before any recovery write.
         let allocator =
             PoolSpaceAllocator::load(cx, &mut mos, &write_features, &vcfg.read_features)?;
+
+        // 6. Only a fully admitted writer may reconcile the selected ring copies.
+        if options.reconcile_torn_uberblocks {
+            let scrub = mos.scrub(
+                cx,
+                ScrubLimits {
+                    copy_bytes: Some(1 << 30),
+                    ..ScrubLimits::default()
+                },
+            )?;
+            if !scrub.is_clean() {
+                return Err(corrupt(
+                    "reconcile_torn_uberblocks refused: MOS scrub detected errors",
+                ));
+            }
+            let _ = mos.allocation(cx, AllocationLimits::default())?;
+
+            // Preserve both publication waves and all-member durability barriers.
+            let default_sw = if version == 5000 { 5000 } else { version };
+            let mut synced_ub = current_uberblock.clone();
+            synced_ub.order = *expected_order;
+            for wave_labels in [[0_usize, 1], [2, 3]] {
+                for (m_idx, member) in members.iter().enumerate() {
+                    for l_idx in wave_labels {
+                        let off = label_offsets_per_member[m_idx][l_idx]
+                            + UBERBLOCK_RING_OFFSET
+                            + (options.slot * slot_bytes) as u64;
+                        let encoded = synced_ub
+                            .encode_with_meta(
+                                slot_bytes,
+                                off,
+                                current_sw_version.unwrap_or(default_sw),
+                                0,
+                                0,
+                            )
+                            .map_err(|e| parse_err(&e))?;
+                        member.write_raw(cx, off, &encoded)?;
+                    }
+                }
+                for member in members {
+                    member.sync_raw(cx)?;
+                }
+            }
+        }
 
         let storage_identity = ZfsStorageIdentity {
             pool_guid: options.pool_guid,
@@ -734,7 +743,7 @@ impl ZfsTransactionEngine {
             version,
             ashift: vcfg.ashift,
             label_txg,
-            selected_txg: root_block.uberblock.txg,
+            selected_txg: current_uberblock.txg,
             max_ring_txg,
             selected_label: options.label,
             selected_slot: options.slot,
@@ -753,9 +762,9 @@ impl ZfsTransactionEngine {
             slot_bytes,
             slots_per_label,
             label_offsets_per_member,
-            committed_txg: root_block.uberblock.txg,
+            committed_txg: current_uberblock.txg,
             committed_slot: options.slot,
-            current_uberblock: root_block.uberblock,
+            current_uberblock,
             current_software_version: current_sw_version,
             mos_os,
             write_features,
@@ -920,6 +929,30 @@ impl ZfsTransactionEngine {
                 new_size,
                 timestamp,
                 checksum,
+            },
+        )
+    }
+
+    /// Add a name for an existing regular file in the same head dataset.
+    /// The source object and destination directory are dataset-local object IDs;
+    /// the link count and namespace entry publish together in one native TXG.
+    pub fn link_entry(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        source_object: u64,
+        parent_dir: u64,
+        name: &[u8],
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::LinkEntry {
+                source_object,
+                parent_dir,
+                name: name.to_vec(),
+                timestamp,
             },
         )
     }
@@ -1153,7 +1186,8 @@ impl ZfsTransactionEngine {
         }
 
         // 3. Synchronized 2-wave 4-label Uberblock publication (`L0..L1` -> sync -> `L2..L3` -> sync).
-        // Any error or cancellation from the first `UberblockWrite` onward is `Uncertain`!
+        // Errors after starting a write and before all publication barriers succeed
+        // are `Uncertain`. After the final barrier, the commit is known durable.
         let next_ts = self.current_uberblock.timestamp.saturating_add(1);
         let new_ub = Uberblock {
             order: self.order,
@@ -1257,33 +1291,10 @@ impl ZfsTransactionEngine {
             }
         }
 
-        // 4. Pre-reply cancellation / fault point (`BeforeAcknowledge`): TXG is durable on disk,
-        // but caller has not yet received the acknowledgement!
-        if let Err(err) = self.emit_event(
-            op_name,
-            ZfsPersistenceStage::BeforeAcknowledge,
-            new_txg,
-            0,
-            0,
-            0,
-        ) {
-            self.poisoned_uncertain = true;
-            return ZfsTxOutcome::Uncertain {
-                reason: err,
-                target_txg: new_txg,
-                target_slot,
-            };
-        }
-        if let Err(err) = checkpoint(cx) {
-            self.poisoned_uncertain = true;
-            return ZfsTxOutcome::Uncertain {
-                reason: err,
-                target_txg: new_txg,
-                target_slot,
-            };
-        }
-
-        // 5. Advance committed in-memory allocator and root state for subsequent TXGs!
+        // 4. Every required device barrier succeeded. Advance the in-memory root
+        // and allocator before observing any further cancellation or reply fault.
+        // A cancelled reply cannot make this durable TXG uncertain, poison the
+        // owner, or leave subsequent requests using the predecessor allocator.
         let allow_v2 = converged_alloc.spacemap_v2_active;
         for ms in &mut converged_alloc.metaslabs {
             if ms.is_dirty() {
@@ -1315,8 +1326,6 @@ impl ZfsTransactionEngine {
         hasher.update(&result_val.to_le_bytes());
         let operation_digest = *hasher.finalize().as_bytes();
 
-        let _ = self.emit_event(op_name, ZfsPersistenceStage::AckPublished, new_txg, 0, 0, 0);
-
         let token = ZfsDurableToken {
             storage: self.storage_identity.clone(),
             committed_txg: new_txg,
@@ -1325,6 +1334,18 @@ impl ZfsTransactionEngine {
             generation: self.generation,
             operation_digest,
         };
+        // These events concern delivery of a known result, not native durability.
+        // Preserve the token even if the request is cancelled or its reply fails:
+        // the caller can reconcile the committed operation without replaying it.
+        let _ = self.emit_event(
+            op_name,
+            ZfsPersistenceStage::BeforeAcknowledge,
+            new_txg,
+            0,
+            0,
+            0,
+        );
+        let _ = self.emit_event(op_name, ZfsPersistenceStage::AckPublished, new_txg, 0, 0, 0);
         ZfsTxOutcome::Committed {
             value: result_val,
             token,

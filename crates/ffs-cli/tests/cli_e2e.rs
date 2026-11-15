@@ -295,6 +295,557 @@ fn native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection() {
 }
 
 #[test]
+#[ignore = "requires ntfs-3g mkntfs, ntfscp and ntfscat; edits native alternate DATA streams"]
+fn native_ntfs_named_stream_edits_preserve_other_data_and_volume_bounds() {
+    use std::io::Write as _;
+
+    for tool in ["mkntfs", "ntfscp", "ntfscat"] {
+        assert!(
+            command_available(tool),
+            "native NTFS stream test requires {tool}; install ntfs-3g before explicitly running it"
+        );
+    }
+    const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+    let directory = tempfile::tempdir().expect("native NTFS stream test directory");
+    let native_image = directory.path().join("native.img");
+    let embedded_image = directory.path().join("embedded.img");
+    let source_file = directory.path().join("source.bin");
+    fs::File::create(&native_image)
+        .unwrap()
+        .set_len(VOLUME_BYTES)
+        .unwrap();
+    let checked = |binary: &Path, args: &[&str]| {
+        let output = run_cli_binary(binary, args);
+        assert!(
+            output.status.success(),
+            "{} {args:?} failed: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let native_path = native_image.to_str().unwrap();
+    checked(
+        Path::new("mkntfs"),
+        &["-F", "-Q", "-s", "512", "-c", "4096", native_path],
+    );
+    let main_data = b"the unnamed stream must stay unchanged";
+    let other_data = b"a separate named stream must stay unchanged";
+    fs::write(&source_file, main_data).unwrap();
+    checked(
+        Path::new("ntfscp"),
+        &[native_path, source_file.to_str().unwrap(), "/streams.bin"],
+    );
+    for (name, data) in [
+        ("metadata", b"0123456789".as_slice()),
+        ("untouched", other_data.as_slice()),
+    ] {
+        fs::write(&source_file, data).unwrap();
+        checked(
+            Path::new("ntfscp"),
+            &[
+                "-N",
+                name,
+                native_path,
+                source_file.to_str().unwrap(),
+                "/streams.bin",
+            ],
+        );
+    }
+
+    let prefix = vec![0xA5; 1_048_576];
+    let suffix = [0x5A; 4096];
+    {
+        let mut embedded = fs::File::create(&embedded_image).unwrap();
+        embedded.write_all(&prefix).unwrap();
+        std::io::copy(&mut fs::File::open(&native_image).unwrap(), &mut embedded).unwrap();
+        embedded.write_all(&suffix).unwrap();
+    }
+    let binary = Path::new(env!("CARGO_BIN_EXE_ffs-ntfs"));
+    let embedded_path = embedded_image.to_str().unwrap();
+    let selection = ["--offset", "1048576", "--length", "67108864"];
+    let stream_units = [0x6d, 0x65, 0x74, 0x61, 0x64, 0x61, 0x74, 0x61];
+    let mut last_commit_lsn = 0;
+    let mut transaction = |command: &str, arguments: &[&str]| {
+        let mut args = vec![
+            command,
+            embedded_path,
+            "/streams.bin",
+            "--offline-image",
+            "--allow-write",
+        ];
+        args.extend(selection);
+        args.extend_from_slice(arguments);
+        let output = checked(binary, &args);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["outcome"], "committed");
+        assert_eq!(report["token"]["storage"], report["storage_identity"]);
+        assert_eq!(
+            report["result"]["stream_name_utf16"],
+            serde_json::json!(stream_units)
+        );
+        let commit_lsn = report["token"]["commit_lsn"].as_u64().unwrap();
+        assert!(commit_lsn > last_commit_lsn);
+        last_commit_lsn = commit_lsn;
+    };
+    let contents = |expected: &[u8]| {
+        let mut embedded = fs::File::open(&embedded_image).unwrap();
+        let mut before_volume = vec![0; prefix.len()];
+        embedded.read_exact(&mut before_volume).unwrap();
+        assert_eq!(before_volume, prefix);
+        let mut extracted = fs::File::create(&native_image).unwrap();
+        assert_eq!(
+            std::io::copy(&mut (&mut embedded).take(VOLUME_BYTES), &mut extracted).unwrap(),
+            VOLUME_BYTES
+        );
+        extracted.sync_all().unwrap();
+        let mut after_volume = [0; 4096];
+        embedded.read_exact(&mut after_volume).unwrap();
+        assert_eq!(after_volume, suffix);
+        assert_eq!(embedded.read(&mut [0; 1]).unwrap(), 0);
+        for (name, bytes) in [
+            ("", main_data.as_slice()),
+            ("metadata", expected),
+            ("untouched", other_data.as_slice()),
+        ] {
+            let mut oracle_args = vec![native_path, "/streams.bin"];
+            let mut reader_args = vec!["read", embedded_path, "/streams.bin", "--offline-image"];
+            reader_args.extend(selection);
+            if !name.is_empty() {
+                oracle_args.extend(["-n", name]);
+                reader_args.extend(["--stream", name]);
+            }
+            assert_eq!(checked(Path::new("ntfscat"), &oracle_args).stdout, bytes);
+            assert_eq!(checked(binary, &reader_args).stdout, bytes);
+        }
+    };
+
+    contents(b"0123456789");
+    transaction(
+        "tx-write-range",
+        &["--stream", "metadata", "--start", "3", "--data", "XYZ"],
+    );
+    let mut expected = b"012XYZ6789".to_vec();
+    contents(&expected);
+    fs::write(&source_file, [0xFF, 0x00, 0x80, 0x41]).unwrap();
+    transaction(
+        "tx-write-range",
+        &[
+            "--stream-utf16",
+            "006d,0065,0074,0061,0064,0061,0074,0061",
+            "--start",
+            "8195",
+            "--data-file",
+            source_file.to_str().unwrap(),
+        ],
+    );
+    expected.resize(8195, 0);
+    expected.extend([0xFF, 0x00, 0x80, 0x41]);
+    contents(&expected);
+    transaction("tx-truncate", &["--stream", "metadata", "--size", "12301"]);
+    expected.resize(12_301, 0);
+    contents(&expected);
+    transaction(
+        "tx-truncate",
+        &[
+            "--stream-utf16",
+            "006d,0065,0074,0061,0064,0061,0074,0061",
+            "--size",
+            "5",
+        ],
+    );
+    expected.truncate(5);
+    contents(&expected);
+    transaction("tx-truncate", &["--stream", "metadata", "--size", "0"]);
+    contents(&[]);
+    transaction(
+        "tx-write-range",
+        &[
+            "--stream",
+            "metadata",
+            "--start",
+            "18446744073709551615",
+            "--empty",
+        ],
+    );
+    contents(&[]);
+
+    let unchanged = sha256_file(&embedded_image);
+    for (command, edit_args) in [
+        ("tx-write-range", vec!["--start", "0", "--data", "denied"]),
+        ("tx-truncate", vec!["--size", "7"]),
+    ] {
+        let mut args = vec![
+            command,
+            embedded_path,
+            "/streams.bin",
+            "--offline-image",
+            "--allow-write",
+            "--stream",
+            "missing",
+        ];
+        args.extend(selection);
+        args.extend(edit_args);
+        let output = run_cli_binary(binary, &args);
+        assert!(
+            !output.status.success(),
+            "an absent stream must not be created"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not_committed"));
+        assert_eq!(sha256_file(&embedded_image), unchanged);
+    }
+}
+
+#[test]
+#[ignore = "requires ntfs-3g mkntfs, ntfscp, ntfsls and ntfscat; verifies native hard-link lifecycle and allocation"]
+fn native_ntfs_hardlinks_preserve_identity_data_and_volume_bounds() {
+    use std::collections::BTreeMap;
+    use std::io::Write as _;
+
+    for tool in ["mkntfs", "ntfscp", "ntfsls", "ntfscat"] {
+        assert!(
+            command_available(tool),
+            "native NTFS hard-link test requires {tool}; install ntfs-3g before explicitly running it"
+        );
+    }
+    const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+    let directory = tempfile::tempdir().expect("native NTFS hard-link test directory");
+    let native_image = directory.path().join("native.img");
+    let embedded_image = directory.path().join("embedded.img");
+    let source_file = directory.path().join("source.bin");
+    fs::File::create(&native_image)
+        .unwrap()
+        .set_len(VOLUME_BYTES)
+        .unwrap();
+    // Native Unicode presentation must not depend on the test runner's locale.
+    let run = |binary: &Path, args: &[&str]| {
+        Command::new(binary)
+            .args(args)
+            .env("LC_ALL", "C.UTF-8")
+            .output()
+            .unwrap_or_else(|error| panic!("execute {}: {error}", binary.display()))
+    };
+    let checked = |binary: &Path, args: &[&str]| {
+        let output = run(binary, args);
+        assert!(
+            output.status.success(),
+            "{} {args:?} failed: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let native_path = native_image.to_str().unwrap();
+    checked(
+        Path::new("mkntfs"),
+        &["-F", "-Q", "-s", "512", "-c", "4096", native_path],
+    );
+    let initial_data = b"0123456789";
+    let metadata = b"preserve this native alternate stream";
+    let sentinel = b"an unrelated native file must remain intact";
+    fs::write(&source_file, initial_data).unwrap();
+    checked(
+        Path::new("ntfscp"),
+        &[native_path, source_file.to_str().unwrap(), "/seed.bin"],
+    );
+    fs::write(&source_file, metadata).unwrap();
+    checked(
+        Path::new("ntfscp"),
+        &[
+            "-N",
+            "metadata",
+            native_path,
+            source_file.to_str().unwrap(),
+            "/seed.bin",
+        ],
+    );
+    fs::write(&source_file, sentinel).unwrap();
+    checked(
+        Path::new("ntfscp"),
+        &[native_path, source_file.to_str().unwrap(), "/untouched.bin"],
+    );
+    let native_names = |parent: &str| {
+        let output = checked(Path::new("ntfsls"), &["-a", "-i", "-p", parent, native_path]);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let split = line.find(char::is_whitespace)?;
+                let record = line[..split].parse::<u64>().ok()?;
+                Some((line[split..].trim().to_owned(), record))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let native_record = native_names("/")["seed.bin"];
+    let record_number = native_record.to_string();
+
+    let prefix = vec![0xA5; 1_048_576];
+    let suffix = [0x5A; 4096];
+    {
+        let mut embedded = fs::File::create(&embedded_image).unwrap();
+        embedded.write_all(&prefix).unwrap();
+        std::io::copy(&mut fs::File::open(&native_image).unwrap(), &mut embedded).unwrap();
+        embedded.write_all(&suffix).unwrap();
+    }
+    let binary = Path::new(env!("CARGO_BIN_EXE_ffs-ntfs"));
+    let embedded_path = embedded_image.to_str().unwrap();
+    let selection = ["--offset", "1048576", "--length", "67108864"];
+    let mut record_args = vec!["record", embedded_path, &record_number, "--offline-image"];
+    record_args.extend(selection);
+    let original_record: serde_json::Value =
+        serde_json::from_slice(&checked(binary, &record_args).stdout).unwrap();
+    assert_eq!(original_record["record"], native_record);
+    assert_eq!(original_record["hard_links"], 1);
+    let mut security_args = vec![
+        "security",
+        embedded_path,
+        &record_number,
+        "--offline-image",
+        "--raw",
+    ];
+    security_args.extend(selection);
+    let original_security = checked(binary, &security_args).stdout;
+
+    let mut last_commit_lsn = 0;
+    let mut transaction = |command: &str, arguments: &[&str]| {
+        let mut args = vec![command, embedded_path, "--offline-image", "--allow-write"];
+        args.extend(selection);
+        args.extend_from_slice(arguments);
+        let output = checked(binary, &args);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["format"], "NTFS");
+        assert_eq!(report["outcome"], "committed");
+        assert_eq!(report["token"]["storage"], report["storage_identity"]);
+        let commit_lsn = report["token"]["commit_lsn"].as_u64().unwrap();
+        assert!(commit_lsn > last_commit_lsn);
+        last_commit_lsn = commit_lsn;
+        report
+    };
+    let verify = |paths: &[&str], absent: &[&str], expected: &[u8]| {
+        // The independent tools consume only the selected volume. Also verify
+        // the containing host file's prefix, suffix and total length each time.
+        let mut embedded = fs::File::open(&embedded_image).unwrap();
+        let mut before_volume = vec![0; prefix.len()];
+        embedded.read_exact(&mut before_volume).unwrap();
+        assert_eq!(before_volume, prefix);
+        let mut extracted = fs::File::create(&native_image).unwrap();
+        assert_eq!(
+            std::io::copy(&mut (&mut embedded).take(VOLUME_BYTES), &mut extracted).unwrap(),
+            VOLUME_BYTES
+        );
+        extracted.sync_all().unwrap();
+        let mut after_volume = [0; 4096];
+        embedded.read_exact(&mut after_volume).unwrap();
+        assert_eq!(after_volume, suffix);
+        assert_eq!(embedded.read(&mut [0; 1]).unwrap(), 0);
+        let unchanged = sha256_file(&embedded_image);
+        let native_unchanged = sha256_file(&native_image);
+
+        for path in paths {
+            let (parent, name) = path.rsplit_once('/').unwrap();
+            let parent = if parent.is_empty() { "/" } else { parent };
+            assert_eq!(native_names(parent).get(name), Some(&native_record));
+            assert_eq!(
+                checked(Path::new("ntfscat"), &[native_path, path]).stdout,
+                expected,
+                "native unnamed stream at {path}"
+            );
+            assert_eq!(
+                checked(Path::new("ntfscat"), &["-n", "metadata", native_path, path]).stdout,
+                metadata,
+                "native alternate stream at {path}"
+            );
+            let mut args = vec!["read", embedded_path, path, "--offline-image"];
+            args.extend(selection);
+            assert_eq!(checked(binary, &args).stdout, expected);
+        }
+        for path in absent {
+            let (parent, name) = path.rsplit_once('/').unwrap();
+            let parent = if parent.is_empty() { "/" } else { parent };
+            assert!(!native_names(parent).contains_key(name), "{path} still exists");
+            assert!(
+                !run(Path::new("ntfscat"), &[native_path, path])
+                    .status
+                    .success(),
+                "the native reader must refuse removed name {path}"
+            );
+            let mut args = vec!["read", embedded_path, path, "--offline-image"];
+            args.extend(selection);
+            assert!(!run(binary, &args).status.success());
+        }
+        assert_eq!(
+            checked(Path::new("ntfscat"), &[native_path, "/untouched.bin"]).stdout,
+            sentinel
+        );
+        if !paths.is_empty() {
+            let record: serde_json::Value =
+                serde_json::from_slice(&checked(binary, &record_args).stdout).unwrap();
+            assert_eq!(record["record"], original_record["record"]);
+            assert_eq!(record["sequence"], original_record["sequence"]);
+            assert_eq!(record["hard_links"], serde_json::json!(paths.len()));
+            assert_eq!(checked(binary, &security_args).stdout, original_security);
+        }
+
+        let mut args = vec![
+            "check-allocation",
+            embedded_path,
+            "--offline-image",
+            "--verify-record-ownership",
+            "--verify-namespace",
+            "--verify-mft-mirror",
+        ];
+        args.extend(selection);
+        let report: serde_json::Value =
+            serde_json::from_slice(&checked(binary, &args).stdout).unwrap();
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["allocation_consistent"], true);
+        assert_eq!(report["requested_checks_consistent"], true);
+        for check in ["record_ownership", "namespace", "mft_mirror"] {
+            assert_eq!(report[check]["complete"], true, "{check}: {report}");
+            assert_eq!(report[check]["consistent"], true, "{check}: {report}");
+        }
+        assert_eq!(sha256_file(&embedded_image), unchanged);
+        assert_eq!(sha256_file(&native_image), native_unchanged);
+        report
+    };
+
+    verify(&["/seed.bin"], &[], initial_data);
+    transaction("tx-mkdir", &["/", "links"]);
+    for (parent, name) in [("/", "alias.bin"), ("/links", "résumé.bin")] {
+        let linked = transaction("tx-link", &["/seed.bin", parent, name]);
+        assert_eq!(linked["operation"], "tx_link");
+        assert_eq!(linked["result"]["record"], original_record["record"]);
+        assert_eq!(linked["result"]["sequence"], original_record["sequence"]);
+        assert_eq!(linked["result"]["source_path"], "/seed.bin");
+        assert_eq!(linked["result"]["parent_path"], parent);
+        assert_eq!(linked["result"]["name"], name);
+    }
+    let all_names = ["/seed.bin", "/alias.bin", "/links/résumé.bin"];
+    verify(&all_names, &[], initial_data);
+
+    // A case-only rename changes the selected native spelling even though its
+    // folded lookup resolves to the same FILE and other links remain present.
+    transaction("tx-rename", &["/seed.bin", "/SEED.BIN"]);
+    verify(
+        &["/SEED.BIN", "/alias.bin", "/links/résumé.bin"],
+        &[],
+        initial_data,
+    );
+    assert!(!native_names("/").contains_key("seed.bin"));
+    transaction("tx-rename", &["/SEED.BIN", "/seed.bin"]);
+    verify(&all_names, &[], initial_data);
+    assert!(!native_names("/").contains_key("SEED.BIN"));
+
+    transaction(
+        "tx-write-range",
+        &["/alias.bin", "--start", "3", "--data", "XYZ"],
+    );
+    let mut expected = b"012XYZ6789".to_vec();
+    verify(&all_names, &[], &expected);
+    fs::write(&source_file, [0xFF, 0x00, 0x80, 0x41]).unwrap();
+    transaction(
+        "tx-write-range",
+        &[
+            "/links/résumé.bin",
+            "--start",
+            "8195",
+            "--data-file",
+            source_file.to_str().unwrap(),
+        ],
+    );
+    expected.resize(8195, 0);
+    expected.extend([0xFF, 0x00, 0x80, 0x41]);
+    verify(&all_names, &[], &expected);
+    transaction("tx-truncate", &["/seed.bin", "--size", "16397"]);
+    expected.resize(16_397, 0);
+    verify(&all_names, &[], &expected);
+    transaction("tx-truncate", &["/alias.bin", "--size", "5000"]);
+    expected.truncate(5000);
+    verify(&all_names, &[], &expected);
+
+    // Native namespace failures and missing write authority must be no-write
+    // refusals, including a Unicode case collision through the volume UpCase.
+    let unchanged = sha256_file(&embedded_image);
+    for arguments in [
+        ["/seed.bin", "/", "alias.bin"],
+        ["/seed.bin", "/links", "RÉSUMÉ.BIN"],
+        ["/missing.bin", "/", "new-link.bin"],
+        ["/links", "/", "directory-link"],
+        ["/seed.bin", "/missing-directory", "new-link.bin"],
+        ["/seed.bin", "/seed.bin", "new-link.bin"],
+    ] {
+        let mut args = vec!["tx-link", embedded_path, "--offline-image", "--allow-write"];
+        args.extend(selection);
+        args.extend(arguments);
+        let output = run(binary, &args);
+        assert!(!output.status.success(), "invalid link must fail: {args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not_committed (tx_link)"));
+        assert_eq!(sha256_file(&embedded_image), unchanged);
+    }
+    for authorization in [None, Some("--offline-image"), Some("--allow-write")] {
+        let mut args = vec!["tx-link", embedded_path, "/seed.bin", "/", "not-created.bin"];
+        args.extend(selection);
+        args.extend(authorization);
+        let output = run(binary, &args);
+        assert!(!output.status.success(), "missing write authority must fail");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("--offline-image") || error.contains("--allow-write"));
+        assert_eq!(sha256_file(&embedded_image), unchanged);
+    }
+
+    transaction("tx-rename", &["/alias.bin", "/links/renamed.bin"]);
+    verify(
+        &["/seed.bin", "/links/résumé.bin", "/links/renamed.bin"],
+        &["/alias.bin"],
+        &expected,
+    );
+    transaction("tx-unlink", &["/seed.bin"]);
+    verify(
+        &["/links/résumé.bin", "/links/renamed.bin"],
+        &["/seed.bin", "/alias.bin"],
+        &expected,
+    );
+    transaction("tx-unlink", &["/links/résumé.bin"]);
+    let last_link = verify(
+        &["/links/renamed.bin"],
+        &["/seed.bin", "/alias.bin", "/links/résumé.bin"],
+        &expected,
+    );
+    transaction("tx-unlink", &["/links/renamed.bin"]);
+    let removed = verify(
+        &[],
+        &[
+            "/seed.bin",
+            "/alias.bin",
+            "/links/résumé.bin",
+            "/links/renamed.bin",
+        ],
+        &[],
+    );
+    assert_eq!(
+        last_link["counts"]["bitmap_allocated_clusters"]
+            .as_u64()
+            .unwrap(),
+        removed["counts"]["bitmap_allocated_clusters"]
+            .as_u64()
+            .unwrap()
+            + 2,
+        "only the final link releases the two clusters of the 5000-byte stream"
+    );
+    assert_eq!(
+        last_link["counts"]["allocated_records_examined"]
+            .as_u64()
+            .unwrap(),
+        removed["counts"]["allocated_records_examined"]
+            .as_u64()
+            .unwrap()
+            + 1,
+        "only the final link releases the native FILE record"
+    );
+}
+
+#[test]
 fn parity_default_reports_declarations_without_execution_credit() {
     let output = run_ffs_cli(&["parity", "--json"]);
     assert!(
@@ -5941,4 +6492,281 @@ fn cli_inspect_sandbox_native_readers_and_cgroup_quotas_bd_qx2om() {
         "PASS",
         Some("all_six_formats_gpt_hostile_and_cgroup_verified"),
     );
+}
+
+#[test]
+#[ignore = "requires ntfs-3g mkntfs, ntfscp, ntfsls and ntfscat; verifies atomic replacement and native stream reclamation"]
+fn native_ntfs_replace_rename_preserves_aliases_and_reclaims_retired_streams() {
+    use std::collections::BTreeMap;
+    use std::io::Write as _;
+
+    for tool in ["mkntfs", "ntfscp", "ntfsls", "ntfscat"] {
+        assert!(
+            command_available(tool),
+            "native NTFS replacement test requires {tool}; install ntfs-3g before explicitly running it"
+        );
+    }
+    const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+    let directory = tempfile::tempdir().expect("native NTFS replacement test directory");
+    let native_image = directory.path().join("native.img");
+    let embedded_image = directory.path().join("embedded.img");
+    let payload_file = directory.path().join("payload.bin");
+    fs::File::create(&native_image)
+        .unwrap()
+        .set_len(VOLUME_BYTES)
+        .unwrap();
+    let run = |binary: &Path, args: &[&str]| {
+        Command::new(binary)
+            .args(args)
+            .env("LC_ALL", "C.UTF-8")
+            .output()
+            .unwrap_or_else(|error| panic!("execute {}: {error}", binary.display()))
+    };
+    let checked = |binary: &Path, args: &[&str]| {
+        let output = run(binary, args);
+        assert!(
+            output.status.success(),
+            "{} {args:?} failed: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let native_path = native_image.to_str().unwrap();
+    checked(
+        Path::new("mkntfs"),
+        &["-F", "-Q", "-s", "512", "-c", "4096", native_path],
+    );
+    let source_data = b"new file content";
+    let source_stream = b"source alternate stream";
+    let victim_data = vec![0xD3_u8; 5_000];
+    let victim_stream = vec![0x6B_u8; 7_000];
+    let sentinel = b"leave this native file alone";
+    for (path, stream, bytes) in [
+        ("/source.bin", None, source_data.as_slice()),
+        ("/source.bin", Some("origin"), source_stream.as_slice()),
+        ("/victim.bin", None, victim_data.as_slice()),
+        ("/victim.bin", Some("retired"), victim_stream.as_slice()),
+        ("/untouched.bin", None, sentinel.as_slice()),
+    ] {
+        fs::write(&payload_file, bytes).unwrap();
+        let mut args = Vec::new();
+        if let Some(stream) = stream {
+            args.extend(["-N", stream]);
+        }
+        args.extend([native_path, payload_file.to_str().unwrap(), path]);
+        checked(Path::new("ntfscp"), &args);
+    }
+    let native_names = |parent: &str| {
+        let output = checked(Path::new("ntfsls"), &["-a", "-i", "-p", parent, native_path]);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let split = line.find(char::is_whitespace)?;
+                let record = line[..split].parse::<u64>().ok()?;
+                Some((line[split..].trim().to_owned(), record))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let initial_names = native_names("/");
+    let source_record = initial_names["source.bin"];
+    let victim_record = initial_names["victim.bin"];
+    assert_ne!(source_record, victim_record);
+    let prefix = vec![0xC3; 1_048_576];
+    let suffix = [0x3C; 4096];
+    {
+        let mut embedded = fs::File::create(&embedded_image).unwrap();
+        embedded.write_all(&prefix).unwrap();
+        std::io::copy(&mut fs::File::open(&native_image).unwrap(), &mut embedded).unwrap();
+        embedded.write_all(&suffix).unwrap();
+    }
+    let binary = Path::new(env!("CARGO_BIN_EXE_ffs-ntfs"));
+    let embedded_path = embedded_image.to_str().unwrap();
+    let selection = ["--offset", "1048576", "--length", "67108864"];
+    let mut last_commit_lsn = 0;
+    let mut transaction = |command: &str, arguments: &[&str]| {
+        let mut args = vec![command, embedded_path, "--offline-image", "--allow-write"];
+        args.extend(selection);
+        args.extend_from_slice(arguments);
+        let report: serde_json::Value =
+            serde_json::from_slice(&checked(binary, &args).stdout).unwrap();
+        assert_eq!(report["outcome"], "committed");
+        assert_eq!(report["token"]["storage"], report["storage_identity"]);
+        let lsn = report["token"]["commit_lsn"].as_u64().unwrap();
+        assert!(lsn > last_commit_lsn);
+        last_commit_lsn = lsn;
+        report
+    };
+    let check_volume = || {
+        let mut embedded = fs::File::open(&embedded_image).unwrap();
+        let mut before_volume = vec![0; prefix.len()];
+        embedded.read_exact(&mut before_volume).unwrap();
+        assert_eq!(before_volume, prefix);
+        let mut extracted = fs::File::create(&native_image).unwrap();
+        assert_eq!(
+            std::io::copy(&mut (&mut embedded).take(VOLUME_BYTES), &mut extracted).unwrap(),
+            VOLUME_BYTES
+        );
+        extracted.sync_all().unwrap();
+        let mut after_volume = [0; 4096];
+        embedded.read_exact(&mut after_volume).unwrap();
+        assert_eq!(after_volume, suffix);
+        assert_eq!(embedded.read(&mut [0; 1]).unwrap(), 0);
+        let before = sha256_file(&embedded_image);
+        let native_before = sha256_file(&native_image);
+        let mut args = vec![
+            "check-allocation",
+            embedded_path,
+            "--offline-image",
+            "--verify-record-ownership",
+            "--verify-namespace",
+            "--verify-mft-mirror",
+        ];
+        args.extend(selection);
+        let report: serde_json::Value =
+            serde_json::from_slice(&checked(binary, &args).stdout).unwrap();
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["allocation_consistent"], true);
+        assert_eq!(report["requested_checks_consistent"], true);
+        for check in ["record_ownership", "namespace", "mft_mirror"] {
+            assert_eq!(report[check]["complete"], true, "{check}: {report}");
+            assert_eq!(report[check]["consistent"], true, "{check}: {report}");
+        }
+        assert_eq!(
+            checked(Path::new("ntfscat"), &[native_path, "/untouched.bin"]).stdout,
+            sentinel
+        );
+        assert_eq!(sha256_file(&embedded_image), before);
+        assert_eq!(sha256_file(&native_image), native_before);
+        report
+    };
+    let verify_file = |path: &str, record: u64, bytes: &[u8], name: &str, stream: &[u8]| {
+        let before = sha256_file(&native_image);
+        let embedded_before = sha256_file(&embedded_image);
+        let (parent, leaf) = path.rsplit_once('/').unwrap();
+        let parent = if parent.is_empty() { "/" } else { parent };
+        assert_eq!(native_names(parent).get(leaf), Some(&record));
+        assert_eq!(
+            checked(Path::new("ntfscat"), &[native_path, path]).stdout,
+            bytes
+        );
+        assert_eq!(
+            checked(Path::new("ntfscat"), &["-n", name, native_path, path]).stdout,
+            stream
+        );
+        let mut args = vec!["read", embedded_path, path, "--offline-image"];
+        args.extend(selection);
+        assert_eq!(checked(binary, &args).stdout, bytes);
+        assert_eq!(sha256_file(&native_image), before);
+        assert_eq!(sha256_file(&embedded_image), embedded_before);
+    };
+    transaction("tx-mkdir", &["/", "archive"]);
+    transaction("tx-link", &["/victim.bin", "/archive", "saved.bin"]);
+    let linked_source = transaction("tx-link", &["/source.bin", "/", "source-alias.bin"]);
+    assert_eq!(linked_source["result"]["record"], source_record);
+    let source_sequence = linked_source["result"]["sequence"].as_u64().unwrap();
+    let before_replacement = check_volume();
+    verify_file(
+        "/source.bin",
+        source_record,
+        source_data,
+        "origin",
+        source_stream,
+    );
+    verify_file(
+        "/archive/saved.bin",
+        victim_record,
+        &victim_data,
+        "retired",
+        &victim_stream,
+    );
+
+    let unchanged = sha256_file(&embedded_image);
+    for destination in ["/victim.bin", "/source-alias.bin", "/source.bin"] {
+        let mut args = vec![
+            "tx-rename",
+            embedded_path,
+            "/source.bin",
+            destination,
+            "--no-replace",
+            "--offline-image",
+            "--allow-write",
+        ];
+        args.extend(selection);
+        let output = run(binary, &args);
+        assert!(!output.status.success(), "no-replace must refuse {destination}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not_committed (tx_rename)"));
+        assert_eq!(sha256_file(&embedded_image), unchanged);
+    }
+
+    // Replacing one victim link must leave its other name and both native
+    // streams alive, while both source names still identify the source FILE.
+    let first = transaction("tx-rename", &["/source.bin", "/victim.bin"]);
+    assert_eq!(first["result"]["record"], source_record);
+    assert_eq!(first["result"]["sequence"], source_sequence);
+    assert_eq!(first["result"]["no_replace"], false);
+    let nonfinal = check_volume();
+    assert_eq!(
+        nonfinal["counts"]["bitmap_allocated_clusters"],
+        before_replacement["counts"]["bitmap_allocated_clusters"]
+    );
+    assert_eq!(
+        nonfinal["counts"]["allocated_records_examined"],
+        before_replacement["counts"]["allocated_records_examined"]
+    );
+    assert!(!native_names("/").contains_key("source.bin"));
+    for path in ["/victim.bin", "/source-alias.bin"] {
+        verify_file(path, source_record, source_data, "origin", source_stream);
+    }
+    verify_file(
+        "/archive/saved.bin",
+        victim_record,
+        &victim_data,
+        "retired",
+        &victim_stream,
+    );
+
+    // The cross-directory replacement now removes the victim's final link.
+    // Its two nonresident DATA streams own two clusters apiece.
+    let second = transaction("tx-rename", &["/source-alias.bin", "/archive/saved.bin"]);
+    assert_eq!(second["result"]["record"], source_record);
+    assert_eq!(second["result"]["sequence"], source_sequence);
+    let retired = check_volume();
+    assert!(!native_names("/").contains_key("source-alias.bin"));
+    for path in ["/victim.bin", "/archive/saved.bin"] {
+        verify_file(path, source_record, source_data, "origin", source_stream);
+        assert!(
+            !run(Path::new("ntfscat"), &["-n", "retired", native_path, path])
+                .status
+                .success(),
+            "replacement must expose only the source's native stream catalog"
+        );
+    }
+    assert_eq!(
+        nonfinal["counts"]["bitmap_allocated_clusters"]
+            .as_u64()
+            .unwrap(),
+        retired["counts"]["bitmap_allocated_clusters"]
+            .as_u64()
+            .unwrap()
+            + 4
+    );
+    assert_eq!(
+        nonfinal["counts"]["allocated_records_examined"]
+            .as_u64()
+            .unwrap(),
+        retired["counts"]["allocated_records_examined"]
+            .as_u64()
+            .unwrap()
+            + 1
+    );
+    let record_number = source_record.to_string();
+    let mut args = vec!["record", embedded_path, &record_number, "--offline-image"];
+    args.extend(selection);
+    let source: serde_json::Value =
+        serde_json::from_slice(&checked(binary, &args).stdout).unwrap();
+    assert_eq!(source["hard_links"], 2);
+    assert_eq!(source["sequence"], source_sequence);
 }

@@ -159,7 +159,7 @@ impl Objects {
         }
     }
 
-    fn from_root(cx: &Cx, pool: Pool, root: RootBlock) -> Result<Self> {
+    pub(crate) fn from_root(cx: &Cx, pool: Pool, root: RootBlock) -> Result<Self> {
         let objectset = ObjectSet::parse(&root.data, root.uberblock.root.payload_order())
             .map_err(|error| parse(&error))?;
         if objectset.kind != 1 {

@@ -1,7 +1,10 @@
 name: Filesystem integrity validation
 on:
   push:
-    branches: [validation/ffs-integrity-20261112]
+    branches:
+      - validation/ffs-integrity-20261112
+      - validation/native-writers-20261114
+      - validation/ntfs-replacement-20261115
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -23,11 +26,16 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          cache-workspace-crates: "true"
       - name: Source identity
         run: |
           git rev-parse HEAD
           rustc -Vv
           git diff --check
+          free -h
+          df -h .
       - name: Workspace formatting
         run: cargo fmt --check
       - name: Workspace compiler check
@@ -36,9 +44,15 @@ jobs:
       - name: Workspace clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Native NTFS journal reservation tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-ondisk ntfs::logfile_writer::tests
       - name: Complete MVCC tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-mvcc
+      - name: Complete ZFS tests and persistence cuts
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-zfs
       - name: Complete NTFS tests and persistence cuts
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-ntfs
@@ -51,3 +65,28 @@ jobs:
       - name: Native NTFS CLI range and truncate round trip
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-cli --test cli_e2e native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection -- --ignored --exact --nocapture
+      - name: Native NTFS named stream persistence and volume bounds
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          test_name=native_ntfs_named_stream_edits_preserve_other_data_and_volume_bounds
+          cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --list | tee "$RUNNER_TEMP/ntfs-named-stream-tests.txt"
+          grep -Fx "$test_name: test" "$RUNNER_TEMP/ntfs-named-stream-tests.txt"
+          cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --nocapture
+      - name: Native NTFS hard-link lifecycle and volume bounds
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          test_name=native_ntfs_hardlinks_preserve_identity_data_and_volume_bounds
+          cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --list | tee "$RUNNER_TEMP/ntfs-hard-link-tests.txt"
+          grep -Fx "$test_name: test" "$RUNNER_TEMP/ntfs-hard-link-tests.txt"
+          cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --nocapture
+
+      - name: Native NTFS replacement rename and stream reclamation
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          test_name=native_ntfs_replace_rename_preserves_aliases_and_reclaims_retired_streams
+          cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --list | tee "$RUNNER_TEMP/ntfs-replacement-tests.txt"
+          grep -Fx "$test_name: test" "$RUNNER_TEMP/ntfs-replacement-tests.txt"
+          cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --nocapture
