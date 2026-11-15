@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Native read-only ZFS label inspection and explicit MOS-root extraction.
+//! Native ZFS inspection, extraction, and explicitly authorized offline writes.
 
 mod allocation_commands;
 mod file_commands;
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Parser)]
 #[command(
     name = "ffs-zfs",
-    about = "Inspect offline ZFS leaves without importing, replaying or writing"
+    about = "Inspect offline ZFS pools and perform explicitly authorized native writes"
 )]
 struct Cli {
     #[command(subcommand)]

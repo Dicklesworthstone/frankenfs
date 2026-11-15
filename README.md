@@ -80,7 +80,7 @@ remain separately controlled by `--console`.
 | **FAT16** | `ffs-cli` / `ffs-fat` | Native reads/catalog/extraction, experimental ordinary/protected writable FUSE, allocation checks, formatting/population, and ordered offline file/directory/range mutation | New long names use bounded UTF-16 with ASCII aliases. Subdirectories can grow; [offline resize can expand the fixed root](docs/FAT_ROOT_EXPANSION.md) into a new image. Deterministic offline write-cut recovery is tested; full mounted/power-cut qualification remains open, and ordered mutation is not a crash-atomic transaction. |
 | **FAT32** | `ffs-cli` / `ffs-fat` | The FAT16 companion surface plus root chains, selected-FAT handling, free-space hints and offline resize/relocation | Namespace and range operations retain ordered native publication and explicit dirty failure states. Complete mounted/power-cut qualification remains open. |
 | **NTFS** | `ffs-cli` / `ffs-ntfs` | Native namespace and file/stream reads, sparse and admitted compressed/transformed data, metadata/allocation/security checks, admitted native logged mutations and experimental ordinary writable FUSE | `mount` remains read-only; `mount-write` requires `--offline-image --allow-write` and native writer admission. Host ownership/modes are synthetic, native ACLs are not enforced, and broader Windows consistency and mounted interoperability remain unqualified. |
-| **ZFS** | `ffs-cli` / `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction, volatile ZIL recovery and admitted offline native TXG mutations | Offline writes require an explicitly selected clean pool and complete supported single-leaf/mirror membership. Missing-member extraction is committed-view-only and forbids ZIL inspection/replay. Mounted writes, broader pool lifecycle and native writer interoperability qualification remain unfinished. |
+| **ZFS** | `ffs-cli` / `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction, volatile ZIL recovery, admitted offline native TXG mutations and experimental synchronous writable FUSE | Native writes require an explicitly selected clean pool and complete supported single-leaf/mirror membership. `mount-write` adds explicit offline/write authorization and keeps snapshots read-only. Native ACLs, open-unlink retention, broader pool lifecycle and mounted/native writer interoperability qualification remain unfinished. Missing-member extraction remains committed-view-only. |
 
 On Linux kernels supporting FUSE_SYNCFS (protocol 7.34+), `--fuseblk-device PATH`
 enables filesystem-wide `sync -f` through the
@@ -543,8 +543,57 @@ directory entry publish in one native TXG; existing data and snapshots retain
 their object identity. A committed result and its durable token remain committed
 if cancellation arrives after all required member/label syncs. Interrupted
 publication still reports uncertainty requiring native ring reconciliation.
-ZFS mounts remain read-only, and native OpenZFS writer interoperability remains
-unqualified.
+The existing `mount` command remains read-only. The separate `mount-write`
+command below enables the admitted native writer; native OpenZFS writer
+interoperability remains unqualified.
+
+## ZFS: writable head dataset mount
+
+`mount-write` exposes an admitted ZPL v4/v5 head dataset through FUSE. Every
+successful mutation publishes a synchronous native TXG. Supply the inspected
+pool GUID and current uberblock candidate, and include every member of a mirror:
+
+```bash
+ffs-zfs mount-write pool.img /mnt/zfs --dataset data \
+  --pool-guid "$POOL_GUID" --label 0 --slot "$SLOT" \
+  --offline-image --allow-write
+
+# Complete mirrors use additional explicit member images.
+ffs-zfs mount-write member-0.img /mnt/zfs --member member-1.img --dataset data \
+  --pool-guid "$POOL_GUID" --label 0 --slot "$SLOT" \
+  --offline-image --allow-write
+```
+
+The mountpoint must already exist and be empty. Images must be offline regular
+files; the engine retains exclusive ownership for the mount lifetime. Optional
+`--offset` and `--length` select the same bounded partition on each member.
+Active pools, active MMP, pending ZIL, incomplete mirrors, unsupported write
+features and readonly datasets are refused. Torn native ring copies require
+explicit `--reconcile-torn-uberblocks` after full writer admission.
+
+The writable profile supports ordinary create/mkdir, reads and range writes,
+size changes, hard links, rename with ordinary replacement, unlink and rmdir.
+Reads observe the latest committed head, while existing snapshots remain
+read-only. Native object generations keep stale mount inodes from reaching
+reused objects. Native mode bits and numeric ownership, including parent SGID
+inheritance, are exposed with kernel permission checks, `noatime`, `nodev`, and
+`nosuid`; `allow_other` is disabled. Native ACL evaluation is not implemented.
+
+Open and create requests retain backend handles. Final unlink or replacement of
+a file that remains open returns `EBUSY`; native orphan retention is not yet
+implemented. Cached lookups alone do not prevent a closed file from being
+removed. Directory continuation cookies become stale after a committed
+mutation, and removed-directory references cannot alias a reused object.
+Changing mode, ownership or explicit timestamps, creating symlinks, and
+creating/deleting datasets or snapshots remain outside this mount profile.
+Truncation of files with native set-ID bits or Linux file capabilities is refused
+before mutation because atomic privilege removal is not implemented. Ordinary
+writes also refuse any required privilege removal that cannot be completed.
+`fsync`, directory sync and unmount issue real device barriers and report errors.
+An uncertain publication fences the mount until explicit recovery and reopen.
+
+This entry point is experimental. Storage-model and FUSE transport regressions
+do not establish native OpenZFS interchange or real mounted-syscall qualification.
 
 ## ZFS: extract from surviving mirror disks
 
