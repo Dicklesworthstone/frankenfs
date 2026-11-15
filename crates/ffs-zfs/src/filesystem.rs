@@ -1,12 +1,19 @@
-//! Read-only extraction mount of one explicitly selected ZPL head or snapshot.
+//! ZPL filesystem operations over an immutable view or an admitted native writer.
 //!
-//! The view owns its immutable leaf and its root-local block cache. Native
-//! object numbers identify hard links within this mount; generations are checked
-//! on every access. Host ownership/modes are synthetic, not a ZFS ACL projection.
+//! Immutable extraction views retain synthetic host ownership and permissions.
+//! Writable heads retain the single pool transaction owner and publish each
+//! mutation through its native TXG boundary. Snapshots stay read-only; native
+//! object generations and mount-local identities prevent reuse through stale
+//! inodes. Native ACL evaluation and open-unlink retention are not implemented:
+//! the final unlink or replacement of a pinned object fails with `EBUSY`.
+
+mod writable;
 
 use super::reader::dmu::zpl::Zpl;
 use asupersync::Cx;
-use ffs_core::{DirEntry, FileType, FsOps, InodeAttr, ReaddirPage, RequestScope, SeekWhence};
+use ffs_core::{
+    DirEntry, FileType, FsOps, InodeAttr, ReaddirPage, RequestScope, SeekWhence, SetAttrRequest,
+};
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata, Timestamp};
 use ffs_types::InodeNumber;
@@ -15,6 +22,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use writable::{MutableView, WriterState, errno, native_timestamp};
 
 const ROOT: InodeNumber = InodeNumber(1);
 const CTL_FLAG: u64 = 1_u64 << 62;
@@ -87,6 +95,7 @@ struct ViewState {
     nodes: BTreeMap<InodeNumber, Identity>,
     directories: VecDeque<CachedDirectory>,
     directory_bytes: usize,
+    mutable: Option<MutableView>,
 }
 
 impl ViewState {
@@ -108,6 +117,7 @@ impl ViewState {
             nodes: BTreeMap::from([(root_ino, identity)]),
             directories: VecDeque::new(),
             directory_bytes: 0,
+            mutable: None,
         };
         state.directory(cx, root_ino)?;
         Ok(state)
@@ -120,6 +130,13 @@ impl ViewState {
         if object == 0 || object >= (1 << 48) - 1 {
             return Err(corrupt("invalid ZPL mount object number"));
         }
+        if let Some(mutable) = &self.mutable {
+            return mutable
+                .objects
+                .get(&object)
+                .copied()
+                .ok_or_else(|| FfsError::NotFound("ZPL mount parent identity".into()));
+        }
         Ok(InodeNumber(self.ino_prefix | (object + 1)))
     }
 
@@ -130,7 +147,11 @@ impl ViewState {
             .get(&ino)
             .ok_or_else(|| FfsError::NotFound(format!("ZPL mount inode {}", ino.0)))?;
         let (metadata, allocated) = self.view.stat(cx, expected.object)?;
-        if Identity::from_metadata(expected.object, &metadata) != expected {
+        let actual = Identity::from_metadata(expected.object, &metadata);
+        if actual.generation != expected.generation
+            || actual.kind != expected.kind
+            || (self.mutable.is_none() && actual.directory_parent != expected.directory_parent)
+        {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::ESTALE,
             )));
@@ -169,45 +190,37 @@ impl ViewState {
         };
         let mut entries = self.view.list(cx, object)?;
         entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        let cookie_base = self.cookie_base();
         let mut rows = vec![
             DirEntry {
                 ino,
-                offset: 1,
+                offset: cookie_base | 1,
                 kind: FileType::Directory,
                 name: b".".to_vec(),
             },
             DirEntry {
                 ino: parent,
-                offset: 2,
+                offset: cookie_base | 2,
                 kind: FileType::Directory,
                 name: b"..".to_vec(),
             },
         ];
         let mut pending = BTreeMap::new();
+        let mut pending_objects = BTreeMap::new();
+        let mut next_ino = self.mutable.as_ref().map_or(0, |view| view.next_ino);
         for entry in entries {
             checkpoint(cx)?;
-            let target = self.inode(entry.object)?;
             let identity = Identity::from_metadata(entry.object, &entry.metadata);
             let kind = file_type(entry.metadata.kind)?;
-            if self
-                .nodes
-                .get(&target)
-                .or_else(|| pending.get(&target))
-                .is_some_and(|previous| *previous != identity)
-            {
-                return Err(corrupt(
-                    "ZPL mount object has conflicting native identities",
-                ));
-            }
-            if !self.nodes.contains_key(&target) {
-                pending.insert(target, identity);
-                if self.nodes.len() + pending.len() > MAX_NODES {
-                    return Err(unsupported("ZPL mount exceeds 131072 object identities"));
-                }
-            }
+            let target = self.stage_identity(
+                identity,
+                &mut pending,
+                &mut pending_objects,
+                &mut next_ino,
+            )?;
             rows.push(DirEntry {
                 ino: target,
-                offset: rows.len() as u64 + 1,
+                offset: cookie_base | (rows.len() as u64 + 1),
                 kind,
                 name: entry.name,
             });
@@ -216,6 +229,10 @@ impl ViewState {
         // part becomes visible. Failed reads cannot publish a partial listing.
         checkpoint(cx)?;
         self.nodes.extend(pending);
+        if let Some(mutable) = &mut self.mutable {
+            mutable.objects.extend(pending_objects);
+            mutable.next_ino = next_ino;
+        }
         let bytes = rows.capacity() * std::mem::size_of::<DirEntry>()
             + rows.iter().map(|row| row.name.capacity()).sum::<usize>();
         let rows = Arc::new(rows);
@@ -243,6 +260,8 @@ struct State {
     head: ViewState,
     snapshot_names: Option<Vec<Vec<u8>>>,
     snapshots: BTreeMap<u16, ViewState>,
+    writer: Option<WriterState>,
+    recovery_required: bool,
 }
 
 impl State {
@@ -301,6 +320,8 @@ impl ZfsFs {
                 head,
                 snapshot_names: None,
                 snapshots: BTreeMap::new(),
+                writer: None,
+                recovery_required: false,
             }),
             uid,
             gid,
@@ -309,11 +330,15 @@ impl ZfsFs {
 
     fn state(&self, cx: &Cx) -> Result<MutexGuard<'_, State>> {
         checkpoint(cx)?;
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| FfsError::Io(std::io::Error::other("ZPL mount state poisoned")))?;
         checkpoint(cx)?;
+        if state.recovery_required {
+            return Err(errno(libc::EIO));
+        }
+        state.refresh_head(cx)?;
         Ok(state)
     }
 
@@ -356,13 +381,32 @@ impl ZfsFs {
             let nlink = u32::try_from(2 + count).unwrap_or(u32::MAX);
             return self.ctl_attributes(cx, state, ZFS_SNAPDIR_INO, nlink);
         }
+        let native_ownership = state.writer.is_some();
+        let writable_head = native_ownership && ino.0 & CTL_FLAG == 0;
         let view_state = state.view_for_ino(cx, ino)?;
         let (metadata, allocated) = view_state.metadata(cx, ino)?;
         let kind = file_type(metadata.kind)?;
-        let perm = match kind {
-            FileType::Directory => 0o555,
-            FileType::Symlink => 0o777,
-            _ => 0o444,
+        let perm = if native_ownership {
+            let native = (metadata.mode & 0o7777) as u16;
+            if writable_head {
+                native
+            } else {
+                native & !0o222
+            }
+        } else {
+            match kind {
+                FileType::Directory => 0o555,
+                FileType::Symlink => 0o777,
+                _ => 0o444,
+            }
+        };
+        let (uid, gid) = if native_ownership {
+            (
+                u32::try_from(metadata.uid).map_err(|_| errno(libc::EOVERFLOW))?,
+                u32::try_from(metadata.gid).map_err(|_| errno(libc::EOVERFLOW))?,
+            )
+        } else {
+            (self.uid, self.gid)
         };
         let nlink = u32::try_from(metadata.links)
             .map_err(|_| FfsError::Io(std::io::Error::from_raw_os_error(libc::EOVERFLOW)))?;
@@ -377,8 +421,8 @@ impl ZfsFs {
             kind,
             perm,
             nlink,
-            uid: self.uid,
-            gid: self.gid,
+            uid,
+            gid,
             rdev: 0,
             blksize: 4096,
             generation: metadata.generation,
@@ -387,6 +431,24 @@ impl ZfsFs {
 }
 
 impl FsOps for ZfsFs {
+    fn requires_stateful_open(&self) -> bool {
+        // A poisoned writer must never silently downgrade to stateless OPEN.
+        self.state.lock().map_or(true, |state| state.writer.is_some())
+    }
+
+    fn begin_request_scope(
+        &self,
+        cx: &Cx,
+        op: ffs_core::vfs::RequestOp,
+    ) -> Result<RequestScope> {
+        // RELEASE must reach its lifetime cleanup even if the request is
+        // already cancelled. Other operations retain normal admission.
+        if op != ffs_core::vfs::RequestOp::Release {
+            checkpoint(cx)?;
+        }
+        Ok(RequestScope::empty())
+    }
+
     fn getattr(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<InodeAttr> {
         let mut state = self.state(cx)?;
         self.attributes(cx, &mut state, ino)
@@ -523,11 +585,14 @@ impl FsOps for ZfsFs {
             return Ok(ReaddirPage::new(rows[start..end].to_vec())
                 .with_end_cookie(Some(rows.len() as u64)));
         }
-        let rows = state.view_for_ino(cx, ino)?.directory(cx, ino)?;
+        let view_state = state.view_for_ino(cx, ino)?;
+        view_state.validate_cookie(offset)?;
+        let rows = view_state.directory(cx, ino)?;
         let start = rows.partition_point(|row| row.offset <= offset);
         let end = rows.len().min(start + PAGE_ENTRIES);
         checkpoint(cx)?;
-        Ok(ReaddirPage::new(rows[start..end].to_vec()).with_end_cookie(Some(rows.len() as u64)))
+        Ok(ReaddirPage::new(rows[start..end].to_vec())
+            .with_end_cookie(rows.last().map(|row| row.offset)))
     }
 
     fn read(
@@ -556,20 +621,288 @@ impl FsOps for ZfsFs {
         flags: i32,
     ) -> Result<(u64, u32)> {
         checkpoint(cx)?;
-        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_CREAT) != 0
-        {
+        let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY
+            || flags & (libc::O_TRUNC | libc::O_CREAT) != 0;
+        let mut state = self.state(cx)?;
+        if wants_write && (state.writer.is_none() || ino.0 & CTL_FLAG != 0) {
             return Err(FfsError::ReadOnly);
         }
         if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
             return Err(FfsError::IsDirectory);
         }
-        let mut state = self.state(cx)?;
-        let kind = state.view_for_ino(cx, ino)?.metadata(cx, ino)?.0.kind;
-        match kind {
-            Kind::Directory => Err(FfsError::IsDirectory),
-            Kind::Regular => Ok((0, 0)),
-            _ => Err(unsupported("ZPL open requires a regular file")),
+        let metadata = state.view_for_ino(cx, ino)?.metadata(cx, ino)?.0;
+        match metadata.kind {
+            Kind::Directory => return Err(FfsError::IsDirectory),
+            Kind::Regular => {}
+            _ => return Err(unsupported("ZPL open requires a regular file")),
         }
+        if flags & libc::O_DIRECTORY != 0 {
+            return Err(FfsError::NotDirectory);
+        }
+        if state.writer.is_none() {
+            return Ok((0, 0));
+        }
+        if flags & libc::O_ACCMODE == libc::O_ACCMODE {
+            return Err(errno(libc::EINVAL));
+        }
+        // Native DOS read-only and immutable flags are admission checks on
+        // writable opens. Existing authorized handles remain governed by the
+        // transaction engine's mutation-specific native flag rules.
+        if wants_write && metadata.flags & (0x0000_0001_0000_0000 | 0x0000_0010_0000_0000) != 0 {
+            return Err(FfsError::PermissionDenied);
+        }
+        if wants_write && metadata.flags & 0x0000_0040_0000_0000 != 0
+            && flags & libc::O_APPEND == 0
+        {
+            return Err(FfsError::PermissionDenied);
+        }
+        let handle = state.next_open_handle()?;
+        if flags & libc::O_TRUNC != 0 {
+            state.admit_truncate(cx, ino, &metadata)?;
+            let object = state.head.nodes[&ino].object;
+            let timestamp = native_timestamp(SystemTime::now())?;
+            state.mutate(|engine, dataset| {
+                engine.truncate_file(
+                    cx, dataset, object, 0, timestamp, crate::ZfsDataChecksum::default(),
+                )
+            })?;
+        }
+        state.publish_open_handle(ino, handle);
+        Ok((handle, 0))
+    }
+
+    fn create(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<InodeAttr> {
+        self.create_with_handle(cx, parent, name, mode, uid, gid, None)
+            .map(|(attr, _, _)| attr)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_open(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    ) -> Result<(InodeAttr, u64, u32)> {
+        self.create_with_handle(cx, parent, name, mode, uid, gid, Some(flags))
+    }
+
+    fn mkdir(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<InodeAttr> {
+        let mut state = self.state(cx)?;
+        let parent_object = state.writable_parent(cx, parent, name.as_bytes())?;
+        let (mode, gid) = state.creation_mode_gid(cx, parent, mode, gid, true)?;
+        state.reserve_identity()?;
+        let timestamp = native_timestamp(SystemTime::now())?;
+        let object = state.mutate(|engine, dataset| {
+            engine.mkdir(
+                cx, dataset, parent_object, name.as_bytes(), mode,
+                u64::from(uid), u64::from(gid), timestamp,
+            )
+        })?;
+        state.publish_committed(|state| {
+            state.refresh_head(cx)?;
+            let ino = state.head.remember_object(cx, object)?;
+            self.attributes(cx, state, ino)
+        })
+    }
+
+    fn write(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32> {
+        let mut state = self.state(cx)?;
+        let metadata = state.writable_metadata(cx, ino)?;
+        if metadata.kind == Kind::Directory {
+            return Err(FfsError::IsDirectory);
+        }
+        if metadata.kind != Kind::Regular {
+            return Err(unsupported("ZPL writes require a regular file"));
+        }
+        // Direct FsOps callers need the same native admission as OPEN. This
+        // profile does not mutate DOS flags, so existing writable handles do
+        // not need to survive a later change to the native read-only flag.
+        if metadata.flags & 0x0000_0001_0000_0000 != 0 {
+            return Err(FfsError::PermissionDenied);
+        }
+        let written = u32::try_from(data.len()).map_err(|_| errno(libc::EFBIG))?;
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let object = state.head.nodes[&ino].object;
+        let timestamp = native_timestamp(SystemTime::now())?;
+        state.mutate(|engine, dataset| {
+            engine.write_file_data(
+                cx, dataset, object, offset, data, timestamp, crate::ZfsDataChecksum::default(),
+            )
+        })?;
+        Ok(written)
+    }
+
+    fn setattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> Result<InodeAttr> {
+        let mut state = self.state(cx)?;
+        let metadata = state.writable_metadata(cx, ino)?;
+        // Reject an unsupported compound request before a truncate can commit.
+        // Only exact no-ops are accepted for fields without a native writer.
+        if (attrs.size.is_some() && attrs.mtime.is_some())
+            || attrs.mode.is_some_and(|mode| u64::from(mode) != metadata.mode & 0o7777)
+            || attrs.uid.is_some_and(|uid| u64::from(uid) != metadata.uid)
+            || attrs.gid.is_some_and(|gid| u64::from(gid) != metadata.gid)
+            || attrs.atime.is_some_and(|time| system_time(metadata.times[0]).ok() != Some(time))
+            || attrs.mtime.is_some_and(|time| system_time(metadata.times[1]).ok() != Some(time))
+        {
+            return Err(unsupported("ZPL setattr currently supports size and exact metadata no-ops"));
+        }
+        if let Some(size) = attrs.size {
+            if metadata.kind == Kind::Directory {
+                return Err(FfsError::IsDirectory);
+            }
+            if metadata.kind != Kind::Regular {
+                return Err(unsupported("ZPL truncate requires a regular file"));
+            }
+            state.admit_truncate(cx, ino, &metadata)?;
+            let object = state.head.nodes[&ino].object;
+            let timestamp = native_timestamp(SystemTime::now())?;
+            state.mutate(|engine, dataset| {
+                engine.truncate_file(
+                    cx, dataset, object, size, timestamp, crate::ZfsDataChecksum::default(),
+                )
+            })?;
+            return state.publish_committed(|state| {
+                state.refresh_head(cx)?;
+                self.attributes(cx, state, ino)
+            });
+        }
+        self.attributes(cx, &mut state, ino)
+    }
+
+    fn link(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> Result<InodeAttr> {
+        let mut state = self.state(cx)?;
+        state.writable_metadata(cx, ino)?;
+        let object = state.head.nodes[&ino].object;
+        let parent = state.writable_parent(cx, new_parent, new_name.as_bytes())?;
+        let timestamp = native_timestamp(SystemTime::now())?;
+        state.mutate(|engine, dataset| {
+            engine.link_entry(cx, dataset, object, parent, new_name.as_bytes(), timestamp)
+        })?;
+        state.publish_committed(|state| {
+            state.refresh_head(cx)?;
+            self.attributes(cx, state, ino)
+        })
+    }
+
+    fn unlink(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<()> {
+        self.remove_entry(cx, parent, name, false)
+    }
+
+    fn rmdir(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<()> {
+        self.remove_entry(cx, parent, name, true)
+    }
+
+    fn rename(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> Result<()> {
+        self.rename2(cx, scope, parent, name, new_parent, new_name, 0)
+    }
+
+    fn rename2(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> Result<()> {
+        let mut state = self.state(cx)?;
+        let source_parent = state.writable_parent(cx, parent, name.as_bytes())?;
+        let target_parent = state.writable_parent(cx, new_parent, new_name.as_bytes())?;
+        if flags & !libc::RENAME_NOREPLACE != 0 {
+            return Err(errno(libc::EINVAL));
+        }
+        let source = state.child(cx, parent, name.as_bytes())?;
+        let object = state.head.nodes[&source].object;
+        match state.child(cx, new_parent, new_name.as_bytes()) {
+            Ok(target) => {
+                if flags & libc::RENAME_NOREPLACE != 0 {
+                    return Err(FfsError::Exists);
+                }
+                if target == source {
+                    return Ok(());
+                }
+                let metadata = state.head.metadata(cx, target)?.0;
+                if metadata.kind == Kind::Directory || metadata.links <= 1 {
+                    state.reject_pinned_reclamation(target)?;
+                }
+            }
+            Err(FfsError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let timestamp = native_timestamp(SystemTime::now())?;
+        state.mutate(|engine, dataset| {
+            engine.rename_entry(
+                cx, dataset, source_parent, name.as_bytes(),
+                target_parent, new_name.as_bytes(), Some(object), timestamp,
+            )
+        })?;
+        Ok(())
     }
 
     fn readlink(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<Vec<u8>> {
@@ -607,19 +940,41 @@ impl FsOps for ZfsFs {
         view_state.view.getxattr(cx, object, name)
     }
 
+    fn removexattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        name: &str,
+    ) -> Result<bool> {
+        let mut state = self.state(cx)?;
+        state.writable_metadata(cx, ino)?;
+        if name != "security.capability" {
+            return Err(unsupported("native ZPL xattr removal is not implemented"));
+        }
+        let object = state.head.nodes[&ino].object;
+        if state.head.view.has_file_capabilities(cx, object)? {
+            return Err(unsupported("native ZPL capability removal is not implemented"));
+        }
+        // FUSE's killpriv path asks to drop capabilities before ordinary writes.
+        // A proven-absent attribute needs no mutation; a present one is refused.
+        Ok(false)
+    }
+
     fn fsync(
         &self,
         cx: &Cx,
         _scope: &mut RequestScope,
         ino: InodeNumber,
-        _fh: u64,
+        fh: u64,
         _datasync: bool,
     ) -> Result<()> {
         let mut state = self.state(cx)?;
+        state.validate_handle(ino, fh)?;
         if ino != ZFS_CTL_INO && ino != ZFS_SNAPDIR_INO {
             state.view_for_ino(cx, ino)?.metadata(cx, ino)?;
         }
-        checkpoint(cx)
+        state.sync(cx)
     }
 
     fn fsyncdir(
@@ -635,12 +990,64 @@ impl FsOps for ZfsFs {
             if !state.head.view.has_snapshot_dir() {
                 return Err(FfsError::NotFound("ZPL control directory".into()));
             }
-            return checkpoint(cx);
+            return state.sync(cx);
         }
         if state.view_for_ino(cx, ino)?.metadata(cx, ino)?.0.kind != Kind::Directory {
             return Err(FfsError::NotDirectory);
         }
+        state.sync(cx)
+    }
+
+    fn flush(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        fh: u64,
+        _lock_owner: u64,
+    ) -> Result<()> {
+        let state = self.state(cx)?;
+        state.validate_handle(ino, fh)
+    }
+
+    fn release(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        request: ffs_core::vfs::ReleaseRequest,
+    ) -> Result<()> {
+        // Releasing a backend lifetime pin is required even when the request
+        // was cancelled or a previous durable commit still needs view refresh.
+        // Otherwise a failed RELEASE would permanently prevent reclamation.
+        let mut state = self.state.lock().map_err(|_| errno(libc::EIO))?;
+        state.release_open_handle(request)?;
+        if state.recovery_required {
+            return Err(errno(libc::EIO));
+        }
+        if request.flush {
+            state.sync(cx)?;
+        }
         checkpoint(cx)
+    }
+
+    fn finalize_unlinked_inode(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        _ino: InodeNumber,
+    ) -> Result<bool> {
+        let _state = self.state(cx)?;
+        // Pinned final-link removals are rejected before native mutation, so
+        // this profile never has a hidden object awaiting deferred reclamation.
+        Ok(false)
+    }
+
+    fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> Result<()> {
+        self.state(cx)?.sync(cx)
+    }
+
+    fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
+        self.state(cx)?.sync(cx)
     }
 
     fn statfs(
@@ -650,17 +1057,27 @@ impl FsOps for ZfsFs {
         ino: InodeNumber,
     ) -> Result<ffs_core::FsStat> {
         let mut state = self.state(cx)?;
-        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+        let mut stats = if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
             if !state.head.view.has_snapshot_dir() {
                 return Err(FfsError::NotFound("ZPL control directory".into()));
             }
-            checkpoint(cx)?;
-            return Ok(state.head.view.statfs_info());
-        }
-        let view_state = state.view_for_ino(cx, ino)?;
-        view_state.metadata(cx, ino)?;
+            state.head.view.statfs_info()
+        } else {
+            let view_state = state.view_for_ino(cx, ino)?;
+            view_state.metadata(cx, ino)?;
+            view_state.view.statfs_info()
+        };
         checkpoint(cx)?;
-        Ok(view_state.view.statfs_info())
+        if let Some(writer) = &state.writer {
+            let fragment_size = u64::from(stats.fragment_size);
+            if fragment_size == 0 {
+                return Err(corrupt("ZPL statfs fragment size is zero"));
+            }
+            stats.blocks = writer.engine.storage_identity().asize / fragment_size;
+            stats.blocks_free = writer.engine.free_bytes() / fragment_size;
+            stats.blocks_available = stats.blocks_free;
+        }
+        Ok(stats)
     }
 
     fn lseek(

@@ -4,6 +4,9 @@
 //! mirror-split-flush / post-commit-cancel schedules, upfront `ENOSPC`, negative
 //! admission controls, and OpenZFS `zdb` leak/checksum oracle verification.
 
+#[path = "persistence_prefix/writable_fs.rs"]
+mod writable_fs;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -5045,5 +5048,113 @@ fn reconciliation_refuses_unadmitted_writers_without_rewriting_any_member() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn native_writer_sync_reports_member_errors_without_minting_a_commit() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 2,
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    assert!(!engine.requires_recovery());
+    assert_eq!(engine.free_bytes(), engine.admission_report().free_bytes);
+    let timestamp = Timestamp {
+        seconds: 1_715_000_500,
+        nanos: 0,
+    };
+    let (_, token) = engine
+        .create_file(
+            &cx,
+            &[b"data".to_vec()],
+            2,
+            b"synced.txt",
+            0o644,
+            0,
+            0,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let free_bytes = engine.free_bytes();
+    let allocated_bytes = engine.allocated_bytes();
+    assert_eq!(
+        free_bytes + allocated_bytes,
+        engine.storage_identity().asize
+    );
+    let before: Vec<_> = devices
+        .iter()
+        .map(|device| {
+            let state = device.state.lock().unwrap();
+            (state.write_calls, state.sync_calls)
+        })
+        .collect();
+    devices[1].set_fault(DeviceFault::FailSyncOnCall {
+        sync_index: before[1].1,
+    });
+    assert!(matches!(engine.sync_devices(&cx), Err(FfsError::Io(_))));
+    assert!(!engine.requires_recovery());
+    assert_eq!(engine.committed_txg(), token.committed_txg());
+    assert_eq!(engine.committed_slot(), token.published_slot());
+    engine.verify_token(&token).unwrap();
+    assert_eq!(engine.free_bytes(), free_bytes);
+    assert_eq!(engine.allocated_bytes(), allocated_bytes);
+    for (device, &(writes, syncs)) in devices.iter().zip(&before) {
+        let state = device.state.lock().unwrap();
+        assert_eq!(state.write_calls, writes);
+        assert_eq!(state.sync_calls, syncs + 1);
+    }
+    devices[1].set_fault(DeviceFault::None);
+    engine.sync_devices(&cx).unwrap();
+
+    engine.with_fault_hook(|event| {
+        if matches!(
+            event.stage,
+            ZfsPersistenceStage::UberblockWrite { label: 1, .. }
+        ) {
+            Err(FfsError::Io(std::io::Error::other(
+                "cut during root publication",
+            )))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(
+        engine.mkdir(
+            &cx,
+            &[b"data".to_vec()],
+            2,
+            b"uncertain",
+            0o755,
+            0,
+            0,
+            timestamp
+        ),
+        ZfsTxOutcome::Uncertain { .. }
+    ));
+    assert!(engine.requires_recovery());
+    let syncs: Vec<_> = devices
+        .iter()
+        .map(|device| device.state.lock().unwrap().sync_calls)
+        .collect();
+    assert!(matches!(
+        engine.sync_devices(&cx),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    for (device, syncs) in devices.iter().zip(syncs) {
+        assert_eq!(device.state.lock().unwrap().sync_calls, syncs);
     }
 }

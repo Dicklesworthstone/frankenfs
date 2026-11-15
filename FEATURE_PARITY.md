@@ -1,5 +1,20 @@
 # FEATURE_PARITY
 
+> **ZFS native writable FsOps:**
+> An admitted single-leaf or complete-mirror writer can be consumed by
+> `ZfsFs::with_writer` for synchronous native create/mkdir/write/truncate,
+> hard-link, rename, unlink and rmdir operations on one ZPL v4/v5 head dataset.
+> The mount retains its writer, native ownership/modes and SGID inheritance,
+> generation-safe inode identities, current committed reads and real member
+> barriers. Snapshots remain read-only; uncertain publication fences further
+> operations. Stateful OPEN and atomic CREATE handles protect actual open-file
+> lifetimes without treating cached LOOKUP references as open handles.
+> Final removal of an open file returns `EBUSY` pending native orphan retention.
+> The implementation includes storage-model and FUSE transport regressions.
+> Their execution and full workspace gates remain pending after executor loss;
+> no native OpenZFS interchange or mounted-syscall qualification is claimed.
+> This advances ZFS-05/06 without closing the broader roadmap obligations.
+
 > **NTFS atomic ordinary-file replacement (2026-11-15):**
 > Native rename can replace a distinct ordinary file in one logged transaction.
 > The source retains its FILE identity and other links. A nonfinal destination

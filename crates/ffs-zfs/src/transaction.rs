@@ -811,6 +811,43 @@ impl ZfsTransactionEngine {
         self.committed_slot
     }
 
+    /// Whether an incomplete uberblock publication requires a fresh, explicitly
+    /// reconciled writer before this handle can serve further mutations.
+    #[must_use]
+    pub const fn requires_recovery(&self) -> bool {
+        self.poisoned_uncertain
+    }
+
+    /// Allocated bytes in the currently committed native metaslab maps.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocator.total_allocated_bytes()
+    }
+
+    /// Free bytes in the currently committed native metaslab maps.
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        self.allocator.total_free_bytes()
+    }
+
+    /// Issue a durability barrier on every retained member.
+    ///
+    /// Mutations already publish synchronously. This additional barrier lets a
+    /// filesystem consumer report current device errors from fsync and unmount;
+    /// it cannot resolve an uncertain native publication or mint a new token.
+    pub fn sync_devices(&self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        if self.requires_recovery() {
+            return Err(unsupported(
+                "ZFS writer requires explicit recovery before synchronization",
+            ));
+        }
+        for member in self.pool.leaves() {
+            member.sync_raw(cx)?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn persistence_events(&self) -> &[ZfsPersistenceEvent] {
         &self.events
