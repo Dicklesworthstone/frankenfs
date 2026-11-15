@@ -196,6 +196,13 @@ impl TxWriteArgs {
     }
 }
 
+fn parse_link_name(text: &str) -> std::result::Result<String, String> {
+    let units: Vec<_> = text.encode_utf16().collect();
+    ffs_ntfs::transaction::validate_ntfs_component_utf16(&units)
+        .map_err(|error| error.to_string())?;
+    Ok(text.to_owned())
+}
+
 fn select_write_stream(text: Option<&str>, native: Option<StreamName>) -> Result<StreamName> {
     let stream = StreamName::select(text, native).map_err(anyhow::Error::msg)?;
     // Reject invalid mutation selectors before opening a writable engine:
@@ -431,6 +438,16 @@ enum Command {
         #[command(flatten)]
         target: TxWriteArgs,
         parent_path: String,
+        name: String,
+    },
+    /// Add a native hard link to an existing ordinary file without copying its DATA.
+    TxLink {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        source_path: String,
+        parent_path: String,
+        /// New native filename component, preserved without normalization.
+        #[arg(value_parser = parse_link_name)]
         name: String,
     },
     /// Overwrite an unnamed DATA stream in an offline NTFS 3.1 image via a native logged transaction.
@@ -1189,6 +1206,24 @@ fn main() -> Result<()> {
                 serde_json::json!({
                     "record": reference.record,
                     "sequence": reference.sequence,
+                })
+            })?;
+        }
+        Command::TxLink {
+            target,
+            source_path,
+            parent_path,
+            name,
+        } => {
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.link_file(&cx, &source_path, &parent_path, &name);
+            emit_tx_outcome("tx_link", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "source_path": source_path,
+                    "parent_path": parent_path,
+                    "name": name,
                 })
             })?;
         }
@@ -2205,6 +2240,9 @@ mod tests {
             &["ffs-ntfs", "tx-create", "disk.img", "/", "a.txt"],
             &["ffs-ntfs", "tx-mkdir", "disk.img", "/", "sub"],
             &[
+                "ffs-ntfs", "tx-link", "disk.img", "/a.txt", "/", "another.txt",
+            ],
+            &[
                 "ffs-ntfs", "tx-write", "disk.img", "/a.txt", "--data", "abc",
             ],
             &[
@@ -2271,6 +2309,74 @@ mod tests {
             assert!(args.open(&cx, false).is_err());
         }
         assert_eq!(std::fs::read(&scratch).unwrap(), original);
+    }
+
+    #[test]
+    fn cli_native_link_preserves_source_name_and_bounded_volume_selection() {
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "tx-link",
+            "disk.img",
+            "/original.bin",
+            "/archive",
+            "Linked 🦀.bin",
+            "--offline-image",
+            "--allow-write",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+            "--recover-dirty",
+        ])
+        .unwrap();
+        let Command::TxLink {
+            target,
+            source_path,
+            parent_path,
+            name,
+        } = cli.command
+        else {
+            panic!("tx-link");
+        };
+        assert_eq!(source_path, "/original.bin");
+        assert_eq!(parent_path, "/archive");
+        assert_eq!(name, "Linked 🦀.bin");
+        assert_eq!(target.offset, 1_048_576);
+        assert_eq!(target.length, Some(67_108_864));
+        assert!(target.offline_image && target.allow_write && target.recover_dirty);
+    }
+
+    #[test]
+    fn cli_native_link_rejects_invalid_names_before_writable_recovery() {
+        let oversized = "a".repeat(256);
+        for name in [
+            "",
+            ".",
+            "..",
+            "sub/name",
+            "sub\\name",
+            "file:stream",
+            "nul\0name",
+            &oversized,
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "ffs-ntfs",
+                    "tx-link",
+                    "disk.img",
+                    "/original.bin",
+                    "/",
+                    name,
+                    "--offline-image",
+                    "--allow-write",
+                    "--recover-dirty",
+                ])
+                .is_err(),
+                "invalid name must fail before image admission: {name:?}"
+            );
+        }
+        let maximum = "é".repeat(255);
+        assert_eq!(parse_link_name(&maximum).unwrap(), maximum);
     }
 
     #[test]

@@ -469,6 +469,33 @@ A crash can leave an ordinary recoverable `.ffs-unlinked-*` file visible after
 reopen: durable orphan replay is not implemented. These capabilities do not
 establish native Windows or mounted interoperability qualification.
 
+## NTFS: native hard links from the companion CLI
+
+`tx-link` adds a name for an existing ordinary file in a selected offline volume.
+The destination parent must already exist, and the new name must be absent:
+
+```bash
+ffs-ntfs tx-link volume.img /report.bin /archive report-copy.bin \
+  --offline-image --allow-write
+
+# Both names identify the same FILE and DATA streams.
+ffs-ntfs tx-write-range volume.img /archive/report-copy.bin \
+  --start 0 --data updated --offline-image --allow-write
+ffs-ntfs read volume.img /report.bin --offline-image
+
+# Removing one name preserves the file through its remaining links.
+ffs-ntfs tx-unlink volume.img /archive/report-copy.bin \
+  --offline-image --allow-write
+```
+
+The command preserves the source record and sequence, native stream contents and
+security descriptor. Name validation runs before writable image admission.
+`--offset` and `--length` constrain all native journal, directory and allocation
+writes to the selected volume. Its JSON result includes the new name, source
+identity and storage-bound native commit token. The same ordinary base-record
+limits apply as for the writable mount above; creating links does not enable
+coupled DOS aliases, extension catalogs or transformed-file mutation.
+
 ## ZFS: offline hard links
 
 `ffs-zfs tx-link` adds a name for an existing regular file within one selected
