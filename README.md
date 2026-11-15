@@ -586,9 +586,9 @@ removed. Directory continuation cookies become stale after a committed
 mutation, and removed-directory references cannot alias a reused object.
 Changing mode, ownership or explicit timestamps, creating symlinks, and
 creating/deleting datasets or snapshots remain outside this mount profile.
-Truncation of files with native set-ID bits or Linux file capabilities is refused
-before mutation because atomic privilege removal is not implemented. Ordinary
-writes also refuse any required privilege removal that cannot be completed.
+Nonempty writes, file-range copies and truncation of files with native set-ID
+bits or Linux file capabilities are refused before data mutation because atomic
+privilege removal is not implemented.
 `fsync`, directory sync and unmount issue real device barriers and report errors.
 An uncertain publication fences the mount until explicit recovery and reopen.
 

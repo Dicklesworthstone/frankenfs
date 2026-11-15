@@ -658,7 +658,7 @@ impl FsOps for ZfsFs {
         }
         let handle = state.next_open_handle()?;
         if flags & libc::O_TRUNC != 0 {
-            state.admit_truncate(cx, ino, &metadata)?;
+            state.admit_data_mutation(cx, ino, &metadata)?;
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
             state.mutate(|engine, dataset| {
@@ -754,6 +754,7 @@ impl FsOps for ZfsFs {
         if data.is_empty() {
             return Ok(0);
         }
+        state.admit_data_mutation(cx, ino, &metadata)?;
         let object = state.head.nodes[&ino].object;
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(|engine, dataset| {
@@ -791,7 +792,7 @@ impl FsOps for ZfsFs {
             if metadata.kind != Kind::Regular {
                 return Err(unsupported("ZPL truncate requires a regular file"));
             }
-            state.admit_truncate(cx, ino, &metadata)?;
+            state.admit_data_mutation(cx, ino, &metadata)?;
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
             state.mutate(|engine, dataset| {

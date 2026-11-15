@@ -428,18 +428,31 @@ fn fsync_propagates_member_flush_failures_after_a_known_commit_and_can_retry() {
 }
 
 #[test]
-fn truncate_refuses_set_id_files_before_commit_and_does_not_leak_open_handles() {
+fn data_mutations_refuse_set_id_files_before_commit_and_do_not_leak_handles() {
     let cx = Cx::for_testing();
     for mode in [0o4755, 0o2755] {
-        let (engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
-        let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
-        let mut scope = RequestScope::empty();
-        // Direct library writes seed a privileged native object; mounted writes
-        // run the transport's killpriv policy before reaching this operation.
-        let file = fs.create(&cx, &mut scope, ROOT, OsStr::new("privileged"), mode, 1234, 5678).unwrap();
+        let (mut engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
+        let dataset = vec![b"data".to_vec()];
+        let timestamp = Timestamp { seconds: 1_715_000_000, nanos: 0 };
         let payload = b"privileged contents must survive refusal";
-        fs.write(&cx, &mut scope, file.ino, 0, payload).unwrap();
-        assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap().perm, mode);
+        // The explicit image editor can seed privileged native data. The mounted
+        // profile cannot modify it until atomic privilege clearing is implemented.
+        let (object, _) = engine.create_file(&cx, &dataset, 2, b"privileged",
+            mode, 1234, 5678, timestamp, ZfsDataChecksum::Fletcher4).into_result().unwrap();
+        engine.write_file_data(&cx, &dataset, object, 0, payload, timestamp,
+            ZfsDataChecksum::Fletcher4).into_result().unwrap();
+        let fs = ZfsFs::with_writer(&cx, engine, dataset).unwrap();
+        let mut scope = RequestScope::empty();
+        let file = lookup(&fs, &cx, ROOT, "privileged");
+        assert_eq!(file.perm, mode);
+        assert_eq!(read(&fs, &cx, file.ino), payload);
+        let source = create(&fs, &cx, ROOT, "source");
+        let replacement = b"replacement bytes";
+        fs.write(&cx, &mut scope, source.ino, 0, replacement).unwrap();
+        let ordinary = create(&fs, &cx, ROOT, "ordinary");
+        assert_eq!(fs.copy_file_range(&cx, &mut scope, source.ino, 0,
+            ordinary.ino, 0, replacement.len() as u64).unwrap(), replacement.len() as u64);
+        assert_eq!(read(&fs, &cx, ordinary.ino), replacement);
         let (handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
         release(&fs, &cx, file.ino, handle);
         let token = fs.last_durable_token().unwrap().unwrap();
@@ -449,10 +462,15 @@ fn truncate_refuses_set_id_files_before_commit_and_does_not_leak_open_handles() 
         }).unwrap_err().to_errno(), libc::EOPNOTSUPP);
         assert_eq!(fs.open(&cx, &mut scope, file.ino, libc::O_WRONLY | libc::O_TRUNC)
             .unwrap_err().to_errno(), libc::EOPNOTSUPP);
+        assert_eq!(fs.write(&cx, &mut scope, file.ino, 0, replacement)
+            .unwrap_err().to_errno(), libc::EOPNOTSUPP);
+        assert_eq!(fs.copy_file_range(&cx, &mut scope, source.ino, 0,
+            file.ino, 0, replacement.len() as u64).unwrap_err().to_errno(), libc::EOPNOTSUPP);
         assert_eq!(io_counts(&devices), before);
         assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
         assert_eq!(read(&fs, &cx, file.ino), payload);
-        assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap().perm, mode);
+        let unchanged = fs.getattr(&cx, &mut scope, file.ino).unwrap();
+        assert_eq!((unchanged.perm, unchanged.size), (mode, payload.len() as u64));
         let (next_handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
         assert_eq!(next_handle, handle + 1);
         release(&fs, &cx, file.ino, next_handle);

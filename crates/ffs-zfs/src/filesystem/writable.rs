@@ -368,21 +368,22 @@ impl State {
         Ok((inherited_mode, inherited_gid))
     }
 
-    pub(super) fn admit_truncate(
+    pub(super) fn admit_data_mutation(
         &mut self,
         cx: &Cx,
         ino: InodeNumber,
         metadata: &Metadata,
     ) -> Result<()> {
-        // The transport may drop privileges after SETATTR has changed size.
-        // This profile cannot atomically clear set-ID bits or native capability
-        // attributes, so refuse their truncate before any native write.
+        // Some transport paths drop privileges after SETATTR, while streaming
+        // copy reaches WRITE directly. This profile cannot atomically clear
+        // set-ID bits or native capabilities, so refuse before any native data
+        // mutation.
         if metadata.mode & 0o6000 != 0 {
-            return Err(unsupported("native ZPL truncate cannot clear set-ID permissions"));
+            return Err(unsupported("native ZPL data mutation cannot clear set-ID permissions"));
         }
         let object = self.head.nodes[&ino].object;
         if self.head.view.has_file_capabilities(cx, object)? {
-            return Err(unsupported("native ZPL truncate cannot clear file capabilities"));
+            return Err(unsupported("native ZPL data mutation cannot clear file capabilities"));
         }
         Ok(())
     }
