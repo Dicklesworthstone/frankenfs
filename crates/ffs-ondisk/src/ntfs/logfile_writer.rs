@@ -716,10 +716,17 @@ impl NtfsLogRingWriter {
     pub fn check_space_for_payloads(&self, payload_lengths: &[usize]) -> Result<(), ParseError> {
         let mut probe = self.clone();
         for &len in payload_lengths {
-            if len > probe.max_single_page_payload_bytes() {
-                return Err(bad("client record exceeds single-page RCRD capacity"));
+            let (lsn, record_offset, aligned) = probe.reserve_record_slot(len)?;
+            // Reservation locates a slot but append_raw_record consumes it only
+            // after encoding the page. Advance the same capacity state here so
+            // later records include this record's header and alignment padding.
+            probe.active_next_off = u16::try_from(usize::from(record_offset) + aligned)
+                .map_err(|_| bad("next_record_off overflow"))?;
+            probe.current_lsn = lsn;
+            if probe.oldest_lsn == 0 {
+                // A fresh batch must not wrap over its own first proposed record.
+                probe.oldest_lsn = lsn;
             }
-            probe.reserve_record_slot(len)?;
         }
         Ok(())
     }
@@ -983,6 +990,192 @@ mod tests {
         assert_eq!(wrapped.page_vbo, ring.first_ring_vbo());
         assert_eq!(lsn_sequence(wrapped.lsn, ring.seq_num_bits()).unwrap(), 2);
         assert!(wrapped.lsn > last_lsn);
+    }
+
+    #[test]
+    fn ring_capacity_preflight_counts_every_record_and_retains_a_fresh_batch() {
+        for version in [(1, 1), (2, 0)] {
+            for page_size in [512, 1024, 2048, 4096] {
+                let file_size = 50 * u64::from(page_size);
+                let ring =
+                    NtfsLogRingWriter::new_fresh(page_size, version, file_size, 1, 1).unwrap();
+                let pages = usize::try_from(
+                    (file_size - ring.first_ring_vbo()) / u64::from(page_size),
+                )
+                .unwrap();
+                let payload = vec![0xA5; ring.max_single_page_payload_bytes()];
+                let mut lengths = vec![payload.len(); pages];
+                ring.check_space_for_payloads(&[]).unwrap();
+                ring.check_space_for_payloads(&lengths).unwrap();
+                lengths.push(payload.len());
+                assert!(
+                    ring.check_space_for_payloads(&lengths)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("ring full")
+                );
+                assert_eq!(ring.current_lsn(), 0);
+                assert_eq!(ring.oldest_lsn(), 0);
+                assert_eq!(ring.active_next_off, ring.data_off);
+
+                let mut actual = ring;
+                for index in 0..pages {
+                    let record = actual
+                        .append_raw_record(LFS_RECORD_CLIENT, 1, actual.current_lsn(), 0, &payload)
+                        .unwrap();
+                    assert_eq!(
+                        record.page_vbo,
+                        actual.first_ring_vbo()
+                            + u64::try_from(index).unwrap() * u64::from(page_size)
+                    );
+                    assert_eq!(record.record_offset, actual.data_off);
+                    assert_eq!(u32::from(actual.active_next_off), page_size);
+                }
+                assert!(
+                    actual
+                        .append_raw_record(LFS_RECORD_CLIENT, 1, actual.current_lsn(), 0, &payload)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("ring full")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ring_capacity_preflight_matches_resumed_tail_packing_and_alignment() {
+        for version in [(1, 1), (2, 0)] {
+            for page_size in [512, 1024, 2048, 4096] {
+                let file_size = 50 * u64::from(page_size);
+                let mut ring =
+                    NtfsLogRingWriter::new_fresh(page_size, version, file_size, 1, 1).unwrap();
+                let pages = (file_size - ring.first_ring_vbo()) / u64::from(page_size);
+                let maximum = ring.max_single_page_payload_bytes();
+                for _ in 0..pages - 1 {
+                    ring.append_raw_record(LFS_RECORD_CLIENT, 1, 0, 0, &vec![0; maximum])
+                        .unwrap();
+                }
+                // Leave exactly 64 bytes on the final page. A 16-byte payload
+                // plus its 48-byte LFS header fits; 17 bytes rounds up to 72.
+                let last = ring
+                    .append_raw_record(LFS_RECORD_CLIENT, 1, 0, 0, &vec![0; maximum - 64])
+                    .unwrap();
+                let resumed = NtfsLogRingWriter::resume(
+                    page_size,
+                    version,
+                    file_size,
+                    1,
+                    1,
+                    ring.oldest_lsn(),
+                    last.lsn,
+                    last.data_len,
+                    0,
+                    Some(&last.protected_page),
+                    0,
+                    1,
+                )
+                .unwrap();
+                assert_eq!(u32::from(resumed.active_next_off), page_size - 64);
+                resumed.check_space_for_payloads(&[16]).unwrap();
+                let mut exact = resumed.clone();
+                let record = exact
+                    .append_raw_record(LFS_RECORD_CLIENT, 1, last.lsn, 0, &[0; 16])
+                    .unwrap();
+                assert_eq!(record.page_vbo, last.page_vbo);
+                assert_eq!(u32::from(exact.active_next_off), page_size);
+
+                for (lengths, expected_prefix) in [
+                    (vec![17], 0),
+                    (vec![0, 0], 1),
+                    (vec![1, 0], 1),
+                    (vec![16, 0], 1),
+                ] {
+                    assert!(
+                        resumed
+                            .check_space_for_payloads(&lengths)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("ring full"),
+                        "{version:?} page={page_size} lengths={lengths:?}"
+                    );
+                    let mut actual = resumed.clone();
+                    let mut appended = 0;
+                    for len in lengths {
+                        match actual.append_raw_record(LFS_RECORD_CLIENT, 1, 0, 0, &vec![0; len]) {
+                            Ok(_) => appended += 1,
+                            Err(error) => {
+                                assert!(error.to_string().contains("ring full"));
+                                break;
+                            }
+                        }
+                    }
+                    assert_eq!(appended, expected_prefix);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ring_capacity_preflight_wraps_but_never_reuses_a_retained_records_page() {
+        for version in [(1, 1), (2, 0)] {
+            for page_size in [512, 1024, 2048, 4096] {
+                let file_size = 50 * u64::from(page_size);
+                let mut ring =
+                    NtfsLogRingWriter::new_fresh(page_size, version, file_size, 1, 1).unwrap();
+                let pages = (file_size - ring.first_ring_vbo()) / u64::from(page_size);
+                let maximum = ring.max_single_page_payload_bytes();
+                let mut retained_lsn = 0;
+                for index in 0..pages {
+                    if index == 3 {
+                        ring.append_raw_record(LFS_RECORD_CLIENT, 1, 0, 0, &[])
+                            .unwrap();
+                        retained_lsn = ring
+                            .append_raw_record(
+                                LFS_RECORD_CLIENT,
+                                1,
+                                0,
+                                0,
+                                &vec![0; maximum - LFS_HEADER_BYTES],
+                            )
+                            .unwrap()
+                            .lsn;
+                    } else {
+                        ring.append_raw_record(LFS_RECORD_CLIENT, 1, 0, 0, &vec![0; maximum])
+                            .unwrap();
+                    }
+                }
+                ring.advance_oldest_lsn(retained_lsn).unwrap();
+                // The retained record starts after another record on page 3.
+                // Its freed prefix does not make any of that page reusable.
+                ring.check_space_for_payloads(&[maximum; 3]).unwrap();
+                assert!(
+                    ring.check_space_for_payloads(&[maximum; 4])
+                        .unwrap_err()
+                        .to_string()
+                        .contains("ring full")
+                );
+
+                let previous_lsn = ring.current_lsn();
+                for index in 0..3_u64 {
+                    let record = ring
+                        .append_raw_record(LFS_RECORD_CLIENT, 1, 0, 0, &vec![0; maximum])
+                        .unwrap();
+                    assert_eq!(
+                        record.page_vbo,
+                        ring.first_ring_vbo() + index * u64::from(page_size)
+                    );
+                    assert_eq!(lsn_sequence(record.lsn, ring.seq_num_bits()).unwrap(), 2);
+                    assert!(record.lsn > previous_lsn);
+                }
+                assert!(
+                    ring.append_raw_record(LFS_RECORD_CLIENT, 1, 0, 0, &vec![0; maximum])
+                        .unwrap_err()
+                        .to_string()
+                        .contains("ring full")
+                );
+                assert_eq!(ring.oldest_lsn(), retained_lsn);
+            }
+        }
     }
 
     #[test]
