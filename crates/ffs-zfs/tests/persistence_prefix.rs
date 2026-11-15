@@ -68,6 +68,7 @@ struct PoolFixtureSpec {
     multihost_label: bool,
     active_mmp_uberblock: bool,
     dirty_zil: bool,
+    additional_write_features: Vec<(&'static [u8], u64)>,
     zpl_flags: BTreeMap<u64, u64>,
     root_properties: Vec<(&'static [u8], u64)>,
     data_properties: Vec<(&'static [u8], u64)>,
@@ -90,6 +91,7 @@ impl Default for PoolFixtureSpec {
             multihost_label: false,
             active_mmp_uberblock: false,
             dirty_zil: false,
+            additional_write_features: Vec::new(),
             zpl_flags: BTreeMap::new(),
             root_properties: Vec::new(),
             data_properties: Vec::new(),
@@ -1470,20 +1472,18 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
     } else {
         1
     };
-    let wf_raw = mzap(
-        &[
-            (b"com.delphix:async_destroy", 0),
-            (b"com.delphix:empty_bpobj", empty_bpobj_refcount),
-            (b"com.delphix:enabled_txg", 1),
-            (
-                b"com.delphix:spacemap_histogram",
-                initial_allocated_spacemaps,
-            ),
-            (b"com.delphix:spacemap_v2", 1),
-        ],
-        0x109,
-        order,
-    );
+    let mut write_features: Vec<(&[u8], u64)> = vec![
+        (b"com.delphix:async_destroy", 0),
+        (b"com.delphix:empty_bpobj", empty_bpobj_refcount),
+        (b"com.delphix:enabled_txg", 1),
+        (
+            b"com.delphix:spacemap_histogram",
+            initial_allocated_spacemaps,
+        ),
+        (b"com.delphix:spacemap_v2", 1),
+    ];
+    write_features.extend_from_slice(&spec.additional_write_features);
+    let wf_raw = mzap(&write_features, 0x109, order);
     let wf_bp = arena.alloc_block(&wf_raw, 196, 0, INITIAL_TXG, order);
     set_mos(
         &mut mos_tables,
@@ -4971,4 +4971,79 @@ fn native_openzfs_zdb_oracle_verifies_committed_pool_and_space_maps() {
         "ffszdbpool",
         &img_path,
     );
+}
+
+#[test]
+fn reconciliation_refuses_unadmitted_writers_without_rewriting_any_member() {
+    let cx = Cx::for_testing();
+    for (mirror_width, ashift) in [(1, 9), (1, 12), (2, 9), (2, 12)] {
+        for dirty_zil in [false, true] {
+            for torn in [false, true] {
+                let spec = PoolFixtureSpec {
+                    mirror_width,
+                    ashift,
+                    dirty_zil,
+                    additional_write_features: if dirty_zil {
+                        Vec::new()
+                    } else {
+                        vec![(b"org.openzfs:device_rebuild", 1)]
+                    },
+                    ..PoolFixtureSpec::default()
+                };
+                let mut built = build_clean_zfs_pool(&spec);
+                if torn {
+                    let offsets = label_offsets(spec.image_bytes).unwrap();
+                    let slot_bytes = 1_usize << spec.ashift.max(10);
+                    for member in &mut built.members {
+                        for label in [2, 3] {
+                            let offset = offsets[label]
+                                + UBERBLOCK_RING_OFFSET
+                                + (built.initial_slot * slot_bytes) as u64;
+                            let start = usize::try_from(offset).unwrap();
+                            member[start..start + slot_bytes].fill(0);
+                        }
+                    }
+                }
+                let devices: Vec<_> = built
+                    .members
+                    .into_iter()
+                    .map(FaultableMemberDevice::new)
+                    .collect();
+                let before: Vec<_> = devices
+                    .iter()
+                    .map(FaultableMemberDevice::durable_snapshot)
+                    .collect();
+                let result = open_engine_on_devices(
+                    &cx,
+                    &devices,
+                    ZfsWriteOptions {
+                        reconcile_torn_uberblocks: true,
+                        ..default_write_opts(built.pool_guid, built.initial_slot)
+                    },
+                );
+                match result {
+                    Err(FfsError::UnsupportedFeature(reason)) => {
+                        let expected = if dirty_zil {
+                            "pending ZIL"
+                        } else {
+                            "active ZFS write feature org.openzfs:device_rebuild"
+                        };
+                        assert!(reason.contains(expected), "{reason}");
+                    }
+                    Err(error) => panic!("unexpected admission error: {error}"),
+                    Ok(_) => panic!("unadmitted writer was accepted"),
+                }
+                for (device, original) in devices.iter().zip(&before) {
+                    let media = device.state.lock().unwrap();
+                    assert_eq!(
+                        (media.write_calls, media.sync_calls),
+                        (0, 0),
+                        "rejected writer touched media: mirror={mirror_width}, ashift={ashift}, dirty_zil={dirty_zil}, torn={torn}"
+                    );
+                    assert!(media.volatile.is_empty());
+                    assert_eq!(media.durable.as_slice(), original.as_slice());
+                }
+            }
+        }
+    }
 }
