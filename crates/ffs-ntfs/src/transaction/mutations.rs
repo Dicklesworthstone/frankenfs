@@ -107,6 +107,36 @@ impl NtfsTransactionEngine {
         }
     }
 
+    /// Add a directory link to a sequence-bound ordinary FILE reference.
+    /// Source and destination identities are revalidated before WAL planning.
+    pub fn link_at(
+        &mut self,
+        cx: &Cx,
+        reference: NtfsReference,
+        parent: NtfsReference,
+        name: &[u16],
+    ) -> NtfsTxOutcome<NtfsReference> {
+        let admission = (|| {
+            validate_ntfs_component_utf16(name)?;
+            let text = String::from_utf16(name)
+                .map_err(|_| unsupported("NTFS link name is not lossless UTF-8"))?;
+            let source = self.resolve_reference_path(cx, reference)?;
+            let destination_parent = self.resolve_reference_path(cx, parent)?;
+            match self.lookup_reference(cx, parent, name) {
+                Ok(_) => return Err(FfsError::Exists),
+                Err(FfsError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+            Ok((source, destination_parent, text))
+        })();
+        match admission {
+            Ok((source, destination_parent, name)) => {
+                self.link_file(cx, &source, &destination_parent, &name)
+            }
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
+    }
+
     /// Write an existing plain base-record DATA stream by stable FILE reference
     /// and exact native UTF-16 name. Empty selects unnamed DATA. This preserves
     /// all other streams and admits the same bounded native COW/WAL path as

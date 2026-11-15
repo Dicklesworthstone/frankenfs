@@ -626,6 +626,17 @@ impl NtfsTransactionEngine {
         dir_rec: &NtfsFileRecord,
         exact_name: &[u16],
     ) -> Result<LocatedDirectoryEntry> {
+        self.locate_directory_entry_with_overrides(cx, dir_raw, dir_rec, exact_name, &[])
+    }
+
+    fn locate_directory_entry_with_overrides(
+        &self,
+        cx: &Cx,
+        dir_raw: &[u8],
+        dir_rec: &NtfsFileRecord,
+        exact_name: &[u16],
+        indx_overrides: &[(u64, Vec<u8>)],
+    ) -> Result<LocatedDirectoryEntry> {
         let restored = restore_record(dir_raw, b"FILE").map_err(|err| parse_err(&err))?;
         let (root_at, root_sz) =
             find_attr_offset_in_restored(&restored, ATTR_INDEX_ROOT, &I30_NAME)?
@@ -690,14 +701,20 @@ impl NtfsTransactionEngine {
                 return Err(corrupt(byte_off, "INDX child exceeds stream"));
             }
             let block_idx = byte_off / u64::from(root_parsed.block_bytes);
-            let block_raw = read_mapped_runs(
-                &self.device,
-                cx,
-                &self.geometry,
-                &runs,
-                byte_off,
-                root_parsed.block_bytes as usize,
-            )?;
+            let block_raw = if let Some((_, bytes)) =
+                indx_overrides.iter().find(|(offset, _)| *offset == byte_off)
+            {
+                bytes.clone()
+            } else {
+                read_mapped_runs(
+                    &self.device,
+                    cx,
+                    &self.geometry,
+                    &runs,
+                    byte_off,
+                    root_parsed.block_bytes as usize,
+                )?
+            };
             let block_restored =
                 restore_record(&block_raw, b"INDX").map_err(|err| parse_err(&err))?;
             let spans = parse_node_spans(&block_restored, 24)?;
@@ -1911,18 +1928,29 @@ impl NtfsTransactionEngine {
         dir_mft_cbo: u16,
         dir_mft_lcns: &[u64],
         indx_attr_slot_if_open: Option<u16>,
-        exact_name: &[u16],
+        expected_reference: NtfsReference,
+        native_name: &NtfsFileName,
         new_dup_56: &[u8],
+        indx_overrides: &[(u64, Vec<u8>)],
     ) -> Result<PlannedDirMutation> {
         if new_dup_56.len() != DUPLICATED_INFO_BYTES {
             return Err(corrupt(0, "FILE_NAME dup update must be 56 bytes"));
         }
-        let located = self.locate_directory_entry(cx, dir_raw, dir_rec, exact_name)?;
-        let (_, _, key_raw) = located
+        let located = self.locate_directory_entry_with_overrides(
+            cx,
+            dir_raw,
+            dir_rec,
+            &native_name.name,
+            indx_overrides,
+        )?;
+        let (reference, indexed_name, key_raw) = located
             .span
             .key
             .as_ref()
             .ok_or_else(|| corrupt(0, "terminal entry has no FILE_NAME"))?;
+        if *reference != expected_reference || indexed_name != native_name {
+            return Err(corrupt(0, "NTFS duplicated-info target changed native link identity"));
+        }
         let old_dup = key_raw[8..64].to_vec();
 
         if let Some((leaf_vcn, _)) = located.external_vcn {
@@ -1938,14 +1966,20 @@ impl NtfsTransactionEngine {
                 &I30_NAME,
             )?;
             let byte_off = leaf_vcn * u64::from(root_parsed.vcn_bytes);
-            let leaf_raw = read_mapped_runs(
-                &self.device,
-                cx,
-                &self.geometry,
-                &a0_runs,
-                byte_off,
-                root_parsed.block_bytes as usize,
-            )?;
+            let leaf_raw = if let Some((_, bytes)) =
+                indx_overrides.iter().find(|(offset, _)| *offset == byte_off)
+            {
+                bytes.clone()
+            } else {
+                read_mapped_runs(
+                    &self.device,
+                    cx,
+                    &self.geometry,
+                    &a0_runs,
+                    byte_off,
+                    root_parsed.block_bytes as usize,
+                )?
+            };
             let (target_vcn, cbo, rec_off, target_lcns) =
                 map_indx_transfer(&self.geometry, &a0_runs, byte_off, root_parsed.block_bytes)?;
             let FileEditResult::Applied(updated_leaf) = apply_index_edit(

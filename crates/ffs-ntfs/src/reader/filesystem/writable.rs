@@ -372,12 +372,20 @@ impl NtfsFs {
         name: &OsStr,
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
-        self.describe(cx, ino)?;
-        self.directory_reference(cx, parent)?;
-        self.component(parent, name)?;
-        Err(unsupported(
-            "native NTFS hard-link creation is not admitted",
-        ))
+        let attr = self.describe(cx, ino)?;
+        if is_ads_ino(ino) || attr.kind != FileType::RegularFile {
+            return Err(FfsError::PermissionDenied);
+        }
+        // Retained names are owned by final-unlink cleanup. Resurrection would
+        // need to retire that hidden name in the same native transaction.
+        if attr.nlink == 0 || self.is_retained_file(ino)? {
+            return Err(unsupported("linking an unlinked NTFS handle is not admitted"));
+        }
+        let name = self.component(parent, name)?;
+        let parent = self.directory_reference(cx, parent)?;
+        let target = reference(&self.record(cx, ino)?);
+        self.transact(cx, |engine| engine.link_at(cx, target, parent, &name))?;
+        cx.masked(|| self.describe(cx, ino))
     }
 
     pub(super) fn rename_locked(

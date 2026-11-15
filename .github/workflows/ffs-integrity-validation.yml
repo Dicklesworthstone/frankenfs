@@ -43,6 +43,9 @@ jobs:
       - name: Workspace clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Native NTFS journal reservation tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-ondisk ntfs::logfile_writer::tests
       - name: Complete MVCC tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-mvcc

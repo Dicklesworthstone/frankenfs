@@ -1,5 +1,19 @@
 # FEATURE_PARITY
 
+> **NTFS ordinary hard-link mutation (2026-11-14):**
+> The native transaction engine and writable FsOps support same-parent and
+> cross-parent links to ordinary base-record files. Unnamed DATA edits maintain
+> every FILE_NAME and $I30 duplicate, including names sharing one resident root
+> or external INDX block. Rename selects the requested link; renaming onto a
+> different link to the same FILE preserves both. Nonfinal unlink preserves the
+> FILE and all streams; final unlink reclaims their validated allocation.
+> Sequence-bound entry points preserve identity, while malformed link catalogs,
+> coupled DOS aliases, extension records and transformed files remain refused.
+> Regression coverage lives in `crates/ffs-ntfs/tests/persistence_prefix.rs`;
+> hosted execution is tracked by the filesystem-integrity workflow. This adds
+> no Windows-interchange, real mounted-syscall or full NTFS-profile claim, and
+> does not close the broader NTFS-05 / staged `bd-wmzge` work package.
+
 > **FUSE directory-cookie overflow (2026-11-11 UTC):** READDIR and READDIRPLUS
 > now reject native continuation cookies above `i64::MAX` with `EOVERFLOW`
 > instead of mapping different values onto the same signed limit. A valid

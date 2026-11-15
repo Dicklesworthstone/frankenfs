@@ -448,15 +448,22 @@ ffs-ntfs mount-write disk.img /mnt/ntfs --offline-image --allow-write \
 ```
 
 The mountpoint must already exist and be empty. This entry point uses the
-admitted native NTFS 3.1 logged writer for ordinary create/mkdir, unnamed-DATA
-write/truncate, simple rename, unlink and rmdir. `--recover-dirty` explicitly
-enables native log recovery during admission; recovery-required or uncertain
-storage states fence further mutations. The existing `mount` command remains
-read-only.
+admitted native NTFS 3.1 logged writer for ordinary create/mkdir, existing
+unnamed and named DATA write/truncate, hard links, simple rename, unlink and
+rmdir. `--recover-dirty` explicitly enables native log recovery during admission;
+recovery-required or uncertain storage states fence further mutations.
+The existing `mount` command remains read-only.
+
+Ordinary hard links retain one native FILE identity across names and parents.
+Writes and truncation through any link preserve the others, update every
+FILE_NAME and directory-index size copy, and reclaim file storage only after
+the final link is removed. These operations require complete ordinary
+base-record metadata; coupled DOS aliases, extension-record catalogs and
+transformed streams retain their existing refusal boundaries.
 
 Ownership and modes are fixed host projections; native Windows ACLs are not
-enforced. ADS writes, hard-link creation and overwriting a distinct rename
-destination are refused. An open file survives unlink through a retained native
+enforced. Creating or deleting ADS and overwriting a distinct rename destination
+remain refused. An open file survives its final unlink through a retained native
 name hidden from the live mounted namespace and reaped on its last release.
 A crash can leave an ordinary recoverable `.ffs-unlinked-*` file visible after
 reopen: durable orphan replay is not implemented. These capabilities do not
