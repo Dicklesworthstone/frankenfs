@@ -491,9 +491,9 @@ pub fn zero_message_open_measurement_enabled() -> bool {
         //   * "needs rows outside this regime" — btrfs readdir+stat (interleaved)
         //     and btrfs bulk durable write both measured BIT-IDENTICAL with it on
         //     and off, attested by `FUSE_NO_OPEN_SUPPORT negotiated` in the log;
-        //   * RELEASE carrying a duty — `FsOps::release`'s trait default is
-        //     `Ok(())`, the only other definition is the `Arc` forwarder, and
-        //     `no_fsops_impl_overrides_release_bd_q0xnl` keeps it that way.
+        //   * RELEASE carrying a duty — stateful backends opt out through
+        //     `FsOps::requires_stateful_open`; negotiation and dispatch both
+        //     honor it, preserving their OPEN/CREATE/RELEASE lifetimes.
         // Worth 48.60% of this row's crossings and a balanced 1.160389x.
         zero_message_open_from_value(std::env::var("FFS_FUSE_ZERO_MESSAGE_OPEN").ok().as_deref())
     })
@@ -6220,7 +6220,7 @@ impl Filesystem for FrankenFuse {
         // The zero-message-open rejection above is kept for history but was
         // REFUTED by measurement: the page cache is not dropped and O_DIRECT is
         // still honoured — see `zero_message_open_measurement_enabled`.
-        if zero_message_open_measurement_enabled() && !self.every_open_drops_page_cache() {
+        if self.zero_message_open_enabled() {
             match config.add_capabilities(fuse_consts::FUSE_NO_OPEN_SUPPORT) {
                 // WARN, not info: the perf scripts count this line under
                 // RUST_LOG=warn to attest the configuration of each run.
@@ -6501,39 +6501,7 @@ impl Filesystem for FrankenFuse {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        // Zero-message open, default ON. Setting FUSE_NO_OPEN_SUPPORT at INIT is
-        // NECESSARY BUT NOT SUFFICIENT — measured 2026-08-27: with the capability
-        // negotiated and this branch absent, `crossings_open` stayed at 12,544 of
-        // 12,544, byte-identical to the control. The kernel only stops sending OPEN
-        // once the daemon answers one with ENOSYS, exactly as `opendir` does below.
-        // See `zero_message_open_measurement_enabled` for the measurements behind
-        // the default.
-        if zero_message_open_measurement_enabled() && !self.every_open_drops_page_cache() {
-            reply.error(libc::ENOSYS);
-            return;
-        }
-        self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
-        match self.with_request_scope(&cx, RequestOp::Open, |cx, scope| {
-            self.inner.ops.open(cx, scope, InodeNumber(ino), flags)
-        }) {
-            Ok((fh, open_flags)) => {
-                let mut kernel_flags = Self::kernel_open_flags(flags, open_flags);
-                if self.every_open_drops_page_cache() {
-                    kernel_flags &= !fuse_consts::FOPEN_KEEP_CACHE;
-                }
-                reply.opened(fh, kernel_flags);
-            }
-            Err(e) => {
-                let ctx = FuseErrorContext {
-                    error: &e,
-                    operation: "open",
-                    ino,
-                    offset: None,
-                };
-                reply.error(ctx.log_and_errno());
-            }
-        }
+        self.open_impl(ino, flags, reply);
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -7902,7 +7870,6 @@ impl Filesystem for FrankenFuse {
         reply.ok();
     }
 
-    #[allow(clippy::cast_possible_truncation)] // FUSE mode u32 → ext4 u16
     fn create(
         &mut self,
         req: &Request<'_>,
@@ -7910,51 +7877,10 @@ impl Filesystem for FrankenFuse {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
-        if self.inner.read_only {
-            reply.error(libc::EROFS);
-            return;
-        }
-        let cx = Self::cx_for_request();
-        let mode = self.create_mode(&cx, parent, mode, umask);
-        if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Create) {
-            warn!(parent, "backpressure: shedding create");
-            reply.error(errno);
-            return;
-        }
-        match self.with_request_scope(&cx, RequestOp::Create, |cx, scope| {
-            let attr = self.inner.ops.create(
-                cx,
-                scope,
-                InodeNumber(parent),
-                name,
-                mode as u16,
-                req.uid(),
-                req.gid(),
-            )?;
-            self.inner.ops.commit_request_scope(cx, scope)?;
-            Ok(attr)
-        }) {
-            Ok(attr) => {
-                self.inner.lookup_refcounts.retain(attr.ino.0);
-                reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
-                self.notify_created_entry_invalidation(parent, name);
-                self.notify_parent_invalidation(parent);
-            }
-            Err(e) => {
-                Self::reply_error_create(
-                    &FuseErrorContext {
-                        error: &e,
-                        operation: "create",
-                        ino: parent,
-                        offset: None,
-                    },
-                    reply,
-                );
-            }
-        }
+        self.create_impl(parent, name, mode, umask, flags, req.uid(), req.gid(), reply);
     }
 
     /// `open(dir, O_TMPFILE)`. The reply's entry reference is the only thing
@@ -8023,6 +7949,14 @@ impl Filesystem for FrankenFuse {
 /// method with the same name and signature is valid Rust. Only a live mount
 /// could see it.
 impl FrankenFuse {
+    /// The process knob is only an optimization for backends without an open
+    /// lifetime. Both INIT negotiation and the first OPEN reply use this gate.
+    fn zero_message_open_enabled(&self) -> bool {
+        zero_message_open_measurement_enabled()
+            && !self.inner.ops.requires_stateful_open()
+            && !self.every_open_drops_page_cache()
+    }
+
     /// `strictatime` on a writable mount: every access must reach READ, so
     /// OPEN is a real round trip answered without `FOPEN_KEEP_CACHE`, and the
     /// kernel drops the file's cached pages at each open. Otherwise a re-read
@@ -23189,37 +23123,9 @@ mod tests {
         );
     }
 
-    /// bd-q0xnl: nothing may give `FsOps::release` a duty while zero-message open
-    /// is the default.
-    ///
-    /// With `FUSE_NO_OPEN_SUPPORT` negotiated the kernel never sends RELEASE, so a
-    /// `release` implementation that did real work would be silently skipped — no
-    /// error, no test failure, just work that stops happening. That is safe today
-    /// only because the trait default is `Ok(())` and the sole other definition is
-    /// the `Arc` forwarder. This pins that fact so the default flip cannot rot.
-    #[test]
-    fn no_fsops_impl_overrides_release_bd_q0xnl() {
-        let vfs = include_str!("../../ffs-core/src/vfs.rs");
-        let defs = vfs.matches("\n    fn release(").count();
-
-        // Positive control: a path that read the wrong file, or an empty string,
-        // would pass the real assertion vacuously.
-        assert!(
-            vfs.contains("\n    fn release("),
-            "the scan did not find `fn release(` in ffs-core/src/vfs.rs, so it is not \
-             reading the trait definition and its verdict is meaningless"
-        );
-
-        assert_eq!(
-            defs, 2,
-            "ffs-core/src/vfs.rs now defines `fn release(` {defs} times, not 2 (the \
-             trait default returning Ok(()) and the Arc forwarder). If one of them \
-             does real work it is SILENTLY SKIPPED under the default-on \
-             FFS_FUSE_ZERO_MESSAGE_OPEN, because FUSE_NO_OPEN_SUPPORT means the \
-             kernel never sends RELEASE. Either keep release free of duties, or \
-             make zero-message open opt-in again."
-        );
-    }
+    // Runtime lifecycle coverage replaces the old count-of-release-definitions
+    // guard: stateful backends now explicitly disable zero-message OPEN.
+    include!("stateful_open_tests.rs");
 
     /// bd-q0xnl: no filesystem backend may force `FOPEN_DIRECT_IO`.
     ///
