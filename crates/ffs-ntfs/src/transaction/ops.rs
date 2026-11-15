@@ -52,6 +52,15 @@ struct StagedNameDirectory {
 }
 
 #[derive(Debug)]
+struct ReplacementLink {
+    record_no: u32,
+    record: NtfsFileRecord,
+    raw: Vec<u8>,
+    name: NtfsFileName,
+    runs_to_free: Vec<NtfsRun>,
+}
+
+#[derive(Debug)]
 pub(super) enum TargetWriteKind {
     MftRecord {
         runs: Vec<NtfsRun>,
@@ -2748,6 +2757,8 @@ impl NtfsTransactionEngine {
 
     /// Atomically rename a file or directory across same or different directories,
     /// supporting post-commit pre-reply retry idempotency via `expected_source_ref`.
+    /// An ordinary file can replace another ordinary file; destination aliases
+    /// retain their FILE and streams until the final link is removed.
     pub fn rename_entry(
         &mut self,
         cx: &Cx,
@@ -2755,18 +2766,46 @@ impl NtfsTransactionEngine {
         dst_path: &str,
         expected_source_ref: Option<NtfsReference>,
     ) -> NtfsTxOutcome<NtfsReference> {
+        self.rename_entry_with_mode(cx, src_path, dst_path, expected_source_ref, false)
+    }
+
+    /// Rename only when the destination does not already exist. An existing
+    /// same-FILE link or case-only spelling change also returns `Exists`.
+    pub fn rename_entry_no_replace(
+        &mut self,
+        cx: &Cx,
+        src_path: &str,
+        dst_path: &str,
+        expected_source_ref: Option<NtfsReference>,
+    ) -> NtfsTxOutcome<NtfsReference> {
+        self.rename_entry_with_mode(cx, src_path, dst_path, expected_source_ref, true)
+    }
+
+    fn rename_entry_with_mode(
+        &mut self,
+        cx: &Cx,
+        src_path: &str,
+        dst_path: &str,
+        expected_source_ref: Option<NtfsReference>,
+        no_replace: bool,
+    ) -> NtfsTxOutcome<NtfsReference> {
         if let Err(error) = self.require_clean_writer() {
             return NtfsTxOutcome::NotCommitted(error);
         }
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"ntfs.rename_entry:");
+        hasher.update(if no_replace {
+            b"ntfs.rename_entry_no_replace:"
+        } else {
+            b"ntfs.rename_entry:"
+        });
         hasher.update(src_path.as_bytes());
         hasher.update(b"->");
         hasher.update(dst_path.as_bytes());
         let digest = *hasher.finalize().as_bytes();
 
         // Check post-commit pre-reply idempotent retry BEFORE mutating!
-        if let Some(expected_ref) = expected_source_ref
+        if !no_replace
+            && let Some(expected_ref) = expected_source_ref
             && let Ok(mft0) = self.read_mft_record_zero(cx)
             && let Ok(mft_runs) = extract_plain_nonresident_runs(&self.geometry, &mft0, DATA, &[])
             && matches!(
@@ -2792,7 +2831,14 @@ impl NtfsTransactionEngine {
             };
         }
 
-        match self.plan_rename_entry(cx, digest, src_path, dst_path, expected_source_ref) {
+        match self.plan_rename_entry(
+            cx,
+            digest,
+            src_path,
+            dst_path,
+            expected_source_ref,
+            no_replace,
+        ) {
             Ok(plan) => {
                 let target_ref = plan.result_value;
                 let out = self.execute_logged_tx(cx, plan);
@@ -2814,6 +2860,7 @@ impl NtfsTransactionEngine {
         src_path: &str,
         dst_path: &str,
         expected_source_ref: Option<NtfsReference>,
+        no_replace: bool,
     ) -> Result<PreparedTxPlan<NtfsReference>> {
         checkpoint(cx)?;
         let (src_parent_path, src_leaf) = split_parent_and_leaf(src_path)?;
@@ -2855,42 +2902,120 @@ impl NtfsTransactionEngine {
         let source_name = self.select_native_name(&source_names, source_parent_ref, &src_leaf)?;
         self.validate_file_name_indexes(cx, &mft_runs, src_ref, &source_names)?;
 
+        let mut replacement = None;
         if let Some(destination_ref) =
             self.lookup_in_directory_raw(cx, &mft_runs, &dst_dir_rec, &self.fold_upcase(&dst_leaf))?
         {
-            if destination_ref != src_ref {
+            if no_replace {
                 return Err(FfsError::Exists);
             }
-            let destination_name = if src_dir_no == dst_dir_no
-                && self.fold_upcase(&source_name.name) == self.fold_upcase(&dst_leaf)
-            {
-                // The folded lookup finds the source itself when only its
-                // spelling changes, including a case-sensitive POSIX name.
-                source_name.clone()
-            } else {
-                self.select_native_name(
-                    &source_names,
+            if destination_ref != src_ref {
+                let destination_no = u32::try_from(destination_ref.record)
+                    .map_err(|_| unsupported("NTFS rename destination exceeds MFT record range"))?;
+                if destination_no < 24 {
+                    return Err(FfsError::PermissionDenied);
+                }
+                let destination_raw = read_mft_record_raw_via_runs(
+                    &self.device,
+                    cx,
+                    &self.geometry,
+                    &mft_runs,
+                    destination_no,
+                )?;
+                let destination =
+                    NtfsFileRecord::parse(&destination_raw).map_err(|err| parse_err(&err))?;
+                if !destination.in_use()
+                    || destination.number != destination_no
+                    || destination.sequence != destination_ref.sequence
+                {
+                    return Err(corrupt(0, "NTFS rename destination has a stale FILE reference"));
+                }
+                if src_rec.is_directory() {
+                    return Err(if destination.is_directory() {
+                        unsupported(
+                            "NTFS directory replacement requires complete directory retirement",
+                        )
+                    } else {
+                        FfsError::NotDirectory
+                    });
+                }
+                if destination.is_directory() {
+                    return Err(FfsError::IsDirectory);
+                }
+                let _source_catalog = self.admit_plain_data_write(&src_rec)?;
+                let destination_names = self.admit_plain_data_write(&destination)?;
+                let destination_name = self.select_native_name(
+                    &destination_names,
                     NtfsReference {
                         record: u64::from(dst_dir_no),
                         sequence: dst_dir_rec.sequence,
                     },
                     &dst_leaf,
-                )?
-            };
-            // Two distinct links to one FILE are already the same object:
-            // POSIX rename preserves both. A case-only spelling change selects
-            // the same native link and must still perform the rename below.
-            if destination_name != source_name {
-                return Ok(PreparedTxPlan {
-                    operation: "rename_entry",
-                    operation_digest,
-                    result_value: src_ref,
-                    pre_payload_writes: Vec::new(),
-                    mft_zero_writes: Vec::new(),
-                    open_attr_registrations: Vec::new(),
-                    mutation_specs: Vec::new(),
-                    target_writes: Vec::new(),
+                )?;
+                self.validate_file_name_indexes(
+                    cx,
+                    &mft_runs,
+                    destination_ref,
+                    &destination_names,
+                )?;
+                let source_runs = self.unlink_owned_runs(&src_rec)?;
+                let mut destination_runs = self.unlink_owned_runs(&destination)?;
+                for source_run in &source_runs {
+                    for destination_run in &destination_runs {
+                        if let (Some(source_lcn), Some(destination_lcn)) =
+                            (source_run.lcn, destination_run.lcn)
+                            && source_lcn < destination_lcn + destination_run.clusters
+                            && destination_lcn < source_lcn + source_run.clusters
+                        {
+                            return Err(corrupt(
+                                0,
+                                "NTFS rename source and destination share clusters",
+                            ));
+                        }
+                    }
+                }
+                if destination.hard_links > 1 {
+                    destination_runs.clear();
+                }
+                replacement = Some(ReplacementLink {
+                    record_no: destination_no,
+                    record: destination,
+                    raw: destination_raw,
+                    name: destination_name,
+                    runs_to_free: destination_runs,
                 });
+            } else {
+                let destination_name = if src_dir_no == dst_dir_no
+                    && self.fold_upcase(&source_name.name) == self.fold_upcase(&dst_leaf)
+                {
+                    // The folded lookup finds the source itself when only its
+                    // spelling changes, including a case-sensitive POSIX name.
+                    source_name.clone()
+                } else {
+                    self.select_native_name(
+                        &source_names,
+                        NtfsReference {
+                            record: u64::from(dst_dir_no),
+                            sequence: dst_dir_rec.sequence,
+                        },
+                        &dst_leaf,
+                    )?
+                };
+                // Two distinct links to one FILE are already the same object:
+                // POSIX rename preserves both. A case-only spelling change
+                // selects the same native link and still performs the rename.
+                if destination_name != source_name {
+                    return Ok(PreparedTxPlan {
+                        operation: "rename_entry",
+                        operation_digest,
+                        result_value: src_ref,
+                        pre_payload_writes: Vec::new(),
+                        mft_zero_writes: Vec::new(),
+                        open_attr_registrations: Vec::new(),
+                        mutation_specs: Vec::new(),
+                        target_writes: Vec::new(),
+                    });
+                }
             }
         }
 
@@ -2907,19 +3032,6 @@ impl NtfsTransactionEngine {
             &[],
             0,
         )?;
-
-        let bm_rec = read_mft_record_via_runs(&self.device, cx, &self.geometry, &mft_runs, 6)?;
-        let (bm_runs, bm_size, _) =
-            extract_plain_nonresident_stream(&self.geometry, &bm_rec, DATA, &[])?;
-        let mut vol_bm = read_mapped_runs(
-            &self.device,
-            cx,
-            &self.geometry,
-            &bm_runs,
-            0,
-            bm_size as usize,
-        )?;
-        let mut bm_dirty = false;
 
         // 1. Update 0x30 FILE_NAME on src_no (DeleteAttribute + CreateAttribute)!
         let src_raw =
@@ -3054,6 +3166,172 @@ impl NtfsTransactionEngine {
             record_no: src_no,
             raw_protected: s_ins,
         }];
+
+        if let Some(destination) = replacement {
+            // Replacing an existing equal-collation key needs no index space.
+            // Never make a retired destination cluster available to a
+            // precommit payload write in this transaction.
+            if !pre_payload_writes.is_empty() || del_plan.allocated_clusters.is_some() {
+                return Err(unsupported(
+                    "NTFS rename replacement requires allocation-free source deletion",
+                ));
+            }
+            let mut directories = BTreeMap::new();
+            directories.insert(
+                src_dir_no,
+                (
+                    src_dir_raw,
+                    StagedNameDirectory {
+                        raw: del_plan.updated_dir_raw,
+                        indx: del_plan.updated_indx_blocks,
+                    },
+                ),
+            );
+            if src_dir_no != dst_dir_no {
+                let raw = read_mft_record_raw_via_runs(
+                    &self.device,
+                    cx,
+                    &self.geometry,
+                    &mft_runs,
+                    dst_dir_no,
+                )?;
+                directories.insert(
+                    dst_dir_no,
+                    (
+                        raw.clone(),
+                        StagedNameDirectory {
+                            raw,
+                            indx: Vec::new(),
+                        },
+                    ),
+                );
+            }
+            let (_, staged_destination) = directories
+                .get_mut(&dst_dir_no)
+                .ok_or_else(|| corrupt(0, "missing staged rename destination directory"))?;
+            let staged_destination_rec =
+                NtfsFileRecord::parse(&staged_destination.raw).map_err(|err| parse_err(&err))?;
+            let destination_indx_slot =
+                if let Some(block_bytes) = directory_has_external_indx(&staged_destination_rec)? {
+                    Some(self.plan_open_attr(
+                        &mut staged_open,
+                        &mut open_regs,
+                        dst_parent_ref,
+                        ATTR_INDEX_ALLOCATION,
+                        &I30_NAME,
+                        block_bytes,
+                    )?)
+                } else {
+                    None
+                };
+            let (vcn, cbo, lcns) = self.map_mft_record_transfer(&mft_runs, dst_dir_no)?;
+            let replace_plan = self.plan_directory_replace(
+                cx,
+                dst_dir_no,
+                &staged_destination.raw,
+                &staged_destination_rec,
+                mft_attr_slot,
+                vcn,
+                cbo,
+                &lcns,
+                destination_indx_slot,
+                NtfsReference {
+                    record: u64::from(destination.record_no),
+                    sequence: destination.record.sequence,
+                },
+                &destination.name,
+                src_ref,
+                &new_fn_val,
+                &staged_destination.indx,
+            )?;
+            if !replace_plan.pre_payload_writes.is_empty()
+                || replace_plan.allocated_clusters.is_some()
+            {
+                return Err(unsupported(
+                    "NTFS rename replacement requires allocation-free index editing",
+                ));
+            }
+            mutation_specs.extend(replace_plan.log_specs);
+            staged_destination.raw = replace_plan.updated_dir_raw;
+            for (offset, raw) in replace_plan.updated_indx_blocks {
+                if let Some((_, previous)) = staged_destination
+                    .indx
+                    .iter_mut()
+                    .find(|(existing, _)| *existing == offset)
+                {
+                    *previous = raw;
+                } else {
+                    staged_destination.indx.push((offset, raw));
+                }
+            }
+            for (directory_no, (original_raw, staged)) in directories {
+                if !staged.indx.is_empty() {
+                    let record =
+                        NtfsFileRecord::parse(&staged.raw).map_err(|err| parse_err(&err))?;
+                    let (runs, _, _) = extract_plain_nonresident_stream(
+                        &self.geometry,
+                        &record,
+                        ATTR_INDEX_ALLOCATION,
+                        &I30_NAME,
+                    )?;
+                    for (byte_offset, raw_protected) in staged.indx {
+                        target_writes.push(TargetWriteKind::IndxBlock {
+                            runs: runs.clone(),
+                            byte_offset,
+                            raw_protected,
+                        });
+                    }
+                }
+                if staged.raw != original_raw {
+                    target_writes.push(TargetWriteKind::MftRecord {
+                        runs: mft_runs.clone(),
+                        record_no: directory_no,
+                        raw_protected: staged.raw,
+                    });
+                }
+            }
+            let mft0_raw =
+                read_mft_record_raw_via_runs(&self.device, cx, &self.geometry, &mft_runs, 0)?;
+            self.append_unlinked_file_retirement(
+                cx,
+                &mft0_raw,
+                &mft0,
+                &mft_runs,
+                destination.record_no,
+                &destination.record,
+                &destination.raw,
+                &destination.name,
+                &destination.runs_to_free,
+                mft_attr_slot,
+                &mut staged_open,
+                &mut open_regs,
+                &mut mutation_specs,
+                &mut target_writes,
+            )?;
+            return Ok(PreparedTxPlan {
+                operation: "rename_entry",
+                operation_digest,
+                result_value: src_ref,
+                pre_payload_writes,
+                mft_zero_writes: Vec::new(),
+                open_attr_registrations: open_regs,
+                mutation_specs,
+                target_writes,
+            });
+        }
+
+        let bm_rec = read_mft_record_via_runs(&self.device, cx, &self.geometry, &mft_runs, 6)?;
+        let (bm_runs, bm_size, _) =
+            extract_plain_nonresident_stream(&self.geometry, &bm_rec, DATA, &[])?;
+        let mut vol_bm = read_mapped_runs(
+            &self.device,
+            cx,
+            &self.geometry,
+            &bm_runs,
+            0,
+            bm_size as usize,
+        )?;
+        let mut bm_dirty = false;
 
         if src_dir_no == dst_dir_no {
             // Same-directory rename! If external INDX was modified by del_plan, we must apply
@@ -3448,6 +3726,170 @@ impl NtfsTransactionEngine {
         Ok(runs)
     }
 
+    /// Append removal of one already-admitted native link after its directory
+    /// entry has been removed or replaced in this transaction. Ordinary
+    /// nonfinal links retain the complete FILE and stream allocation.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn append_unlinked_file_retirement(
+        &self,
+        cx: &Cx,
+        mft0_raw: &[u8],
+        mft0: &NtfsFileRecord,
+        mft_runs: &[NtfsRun],
+        target_no: u32,
+        target_rec: &NtfsFileRecord,
+        target_raw: &[u8],
+        native_name: &NtfsFileName,
+        runs_to_free: &[NtfsRun],
+        mft_attr_slot: u16,
+        staged_open: &mut BTreeMap<u32, OpenAttrRuntime>,
+        open_regs: &mut Vec<(u32, OpenAttrRuntime, NtfsClientUpdateSpec)>,
+        mutation_specs: &mut Vec<NtfsClientUpdateSpec>,
+        target_writes: &mut Vec<TargetWriteKind>,
+    ) -> Result<()> {
+        let target_rest = restore_record(target_raw, b"FILE").map_err(|err| parse_err(&err))?;
+        if target_rec.hard_links > 1 {
+            let (name_at, name_bytes) = Self::native_name_span(target_rec, native_name)?;
+            let FileEditResult::Applied(updated) = apply_file_edit(
+                target_raw,
+                target_no,
+                RecoveryPass::Undo,
+                &FileEdit {
+                    operation: FileOperation::DeleteAttribute,
+                    record_offset: u16::try_from(name_at)
+                        .map_err(|_| corrupt(0, "FILE_NAME offset"))?,
+                    attribute_offset: 0,
+                    data: &[],
+                },
+            )
+            .map_err(|err| parse_err(&err))?
+            else {
+                return Err(corrupt(0, "AlreadyApplied"));
+            };
+            let (vcn, cbo, lcns) = self.map_mft_record_transfer(mft_runs, target_no)?;
+            mutation_specs.push(NtfsClientUpdateSpec {
+                redo_op: NtfsLogOp::DeleteAttribute,
+                undo_op: NtfsLogOp::CreateAttribute,
+                target_attribute: mft_attr_slot,
+                record_offset: u16::try_from(name_at)
+                    .map_err(|_| corrupt(0, "FILE_NAME offset"))?,
+                attribute_offset: 0,
+                cluster_block_offset: cbo,
+                target_vcn: vcn,
+                target_lcns: lcns,
+                redo_data: Vec::new(),
+                undo_data: target_rest[name_at..name_at + name_bytes].to_vec(),
+            });
+            target_writes.push(TargetWriteKind::MftRecord {
+                runs: mft_runs.to_vec(),
+                record_no: target_no,
+                raw_protected: updated,
+            });
+            return Ok(());
+        }
+
+        // Reclaim only the complete stream catalog validated by the caller.
+        if !runs_to_free.is_empty() {
+            let bm_rec = read_mft_record_via_runs(&self.device, cx, &self.geometry, mft_runs, 6)?;
+            let (bm_runs, bm_size, _) =
+                extract_plain_nonresident_stream(&self.geometry, &bm_rec, DATA, &[])?;
+            let mut vol_bm = read_mapped_runs(
+                &self.device,
+                cx,
+                &self.geometry,
+                &bm_runs,
+                0,
+                bm_size as usize,
+            )?;
+            let bm_attr_slot = self.plan_open_attr(
+                staged_open,
+                open_regs,
+                NtfsReference {
+                    record: 6,
+                    sequence: bm_rec.sequence,
+                },
+                DATA,
+                &[],
+                0,
+            )?;
+            for run in runs_to_free {
+                if let Some(lcn) = run.lcn
+                    && run.clusters > 0
+                {
+                    set_or_clear_bits(&mut vol_bm, lcn, run.clusters, false);
+                    mutation_specs.extend(self.build_bitmap_range_specs(
+                        bm_attr_slot,
+                        &bm_runs,
+                        lcn,
+                        run.clusters,
+                        false,
+                    )?);
+                }
+            }
+            target_writes.push(TargetWriteKind::BitmapStream {
+                runs: bm_runs,
+                byte_offset: 0,
+                bytes: vol_bm,
+            });
+        }
+
+        let (_, mft_size, _) =
+            extract_plain_nonresident_stream(&self.geometry, mft0, DATA, &[])?;
+        let logical_records = mft_size / u64::from(self.geometry.record_bytes());
+        let mut mft_bm = self.read_mft_bitmap_bytes(cx, mft0, logical_records)?;
+        set_or_clear_bits(&mut mft_bm, u64::from(target_no), 1, false);
+        let mut cur_mft0_raw = mft0_raw.to_vec();
+        let mut mft0_modified = false;
+        self.append_mft_bitmap_mutation(
+            staged_open,
+            open_regs,
+            mutation_specs,
+            target_writes,
+            &mut cur_mft0_raw,
+            &mut mft0_modified,
+            mft_attr_slot,
+            mft_runs,
+            u64::from(target_no),
+            false,
+            &mft_bm,
+        )?;
+        if mft0_modified {
+            target_writes.push(TargetWriteKind::MftRecord {
+                runs: mft_runs.to_vec(),
+                record_no: 0,
+                raw_protected: cur_mft0_raw,
+            });
+        }
+
+        // Native deallocation increments the sequence; the complete beforeimage
+        // restores the old reference and every stream during loser undo.
+        let FileEditResult::Applied(dealloc_raw) =
+            deallocate_file_record_slot(target_raw, target_no, RecoveryPass::Undo)
+                .map_err(|err| parse_err(&err))?
+        else {
+            return Err(corrupt(0, "AlreadyApplied on DeallocateFileRecordSegment"));
+        };
+        let (vcn, cbo, lcns) = self.map_mft_record_transfer(mft_runs, target_no)?;
+        mutation_specs.push(NtfsClientUpdateSpec {
+            redo_op: NtfsLogOp::DeallocateFileRecordSegment,
+            undo_op: NtfsLogOp::InitializeFileRecordSegment,
+            target_attribute: mft_attr_slot,
+            record_offset: 0,
+            attribute_offset: 0,
+            cluster_block_offset: cbo,
+            target_vcn: vcn,
+            target_lcns: lcns,
+            redo_data: Vec::new(),
+            undo_data: target_rest,
+        });
+        target_writes.push(TargetWriteKind::MftRecord {
+            runs: mft_runs.to_vec(),
+            record_no: target_no,
+            raw_protected: dealloc_raw,
+        });
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn plan_unlink_file(
         &self,
@@ -3470,9 +3912,7 @@ impl NtfsTransactionEngine {
             0,
         )?;
         let mft0 = NtfsFileRecord::parse(&mft0_raw).map_err(|err| parse_err(&err))?;
-        let (mft_runs, mft_size, _) =
-            extract_plain_nonresident_stream(&self.geometry, &mft0, DATA, &[])?;
-        let logical_records = mft_size / u64::from(self.geometry.record_bytes());
+        let mft_runs = extract_plain_nonresident_runs(&self.geometry, &mft0, DATA, &[])?;
 
         let (parent_no, parent_rec) = self.resolve_path_raw(cx, &mft_runs, &parent_path)?;
         let (target_no, target_rec) = self.resolve_path_raw(cx, &mft_runs, path)?;
@@ -3517,7 +3957,6 @@ impl NtfsTransactionEngine {
             read_mft_record_raw_via_runs(&self.device, cx, &self.geometry, &mft_runs, parent_no)?;
         let target_raw =
             read_mft_record_raw_via_runs(&self.device, cx, &self.geometry, &mft_runs, target_no)?;
-        let target_rest = restore_record(&target_raw, b"FILE").map_err(|err| parse_err(&err))?;
 
         let mut staged_open = self.open_attrs.clone();
         let mut open_regs = Vec::new();
@@ -3589,160 +4028,28 @@ impl NtfsTransactionEngine {
             }
         }
 
-        if target_rec.hard_links > 1 {
-            // This name owns no allocation by itself. Remove exactly its
-            // indexed FILE_NAME; the native edit decrements the header count.
-            // The FILE, all streams and both allocation bitmaps remain live.
-            let (name_at, name_bytes) = Self::native_name_span(&target_rec, &native_name)?;
-            let FileEditResult::Applied(updated) = apply_file_edit(
-                &target_raw,
-                target_no,
-                RecoveryPass::Undo,
-                &FileEdit {
-                    operation: FileOperation::DeleteAttribute,
-                    record_offset: u16::try_from(name_at)
-                        .map_err(|_| corrupt(0, "FILE_NAME offset"))?,
-                    attribute_offset: 0,
-                    data: &[],
-                },
-            )
-            .map_err(|err| parse_err(&err))?
-            else {
-                return Err(corrupt(0, "AlreadyApplied"));
-            };
-            let (vcn, cbo, lcns) = self.map_mft_record_transfer(&mft_runs, target_no)?;
-            mutation_specs.push(NtfsClientUpdateSpec {
-                redo_op: NtfsLogOp::DeleteAttribute,
-                undo_op: NtfsLogOp::CreateAttribute,
-                target_attribute: mft_attr_slot,
-                record_offset: u16::try_from(name_at)
-                    .map_err(|_| corrupt(0, "FILE_NAME offset"))?,
-                attribute_offset: 0,
-                cluster_block_offset: cbo,
-                target_vcn: vcn,
-                target_lcns: lcns,
-                redo_data: Vec::new(),
-                undo_data: target_rest[name_at..name_at + name_bytes].to_vec(),
-            });
-            target_writes.push(TargetWriteKind::MftRecord {
-                runs: mft_runs,
-                record_no: target_no,
-                raw_protected: updated,
-            });
-            return Ok(PreparedTxPlan {
-                operation: "unlink_file",
-                operation_digest,
-                result_value: target_ref,
-                pre_payload_writes: del_plan.pre_payload_writes,
-                mft_zero_writes: Vec::new(),
-                open_attr_registrations: open_regs,
-                mutation_specs,
-                target_writes,
-            });
-        }
-
-        // 2. Free the complete, validated owned cluster set in $Bitmap!
-        if !runs_to_free.is_empty() {
-            let bm_rec = read_mft_record_via_runs(&self.device, cx, &self.geometry, &mft_runs, 6)?;
-            let (bm_runs, bm_size, _) =
-                extract_plain_nonresident_stream(&self.geometry, &bm_rec, DATA, &[])?;
-            let mut vol_bm = read_mapped_runs(
-                &self.device,
-                cx,
-                &self.geometry,
-                &bm_runs,
-                0,
-                bm_size as usize,
-            )?;
-            let bm_attr_slot = self.plan_open_attr(
-                &mut staged_open,
-                &mut open_regs,
-                NtfsReference {
-                    record: 6,
-                    sequence: bm_rec.sequence,
-                },
-                DATA,
-                &[],
-                0,
-            )?;
-            for r in &runs_to_free {
-                if let Some(lcn) = r.lcn
-                    && r.clusters > 0
-                {
-                    set_or_clear_bits(&mut vol_bm, lcn, r.clusters, false);
-                    mutation_specs.extend(self.build_bitmap_range_specs(
-                        bm_attr_slot,
-                        &bm_runs,
-                        lcn,
-                        r.clusters,
-                        false,
-                    )?);
-                }
-            }
-            target_writes.push(TargetWriteKind::BitmapStream {
-                runs: bm_runs,
-                byte_offset: 0,
-                bytes: vol_bm,
-            });
-        }
-
-        // 3. Clear target_no bit in $MFT::$BITMAP!
-        let mut mft_bm = self.read_mft_bitmap_bytes(cx, &mft0, logical_records)?;
-        set_or_clear_bits(&mut mft_bm, u64::from(target_no), 1, false);
-        let mut cur_mft0_raw = mft0_raw;
-        let mut mft0_modified = false;
-        self.append_mft_bitmap_mutation(
+        self.append_unlinked_file_retirement(
+            cx,
+            &mft0_raw,
+            &mft0,
+            &mft_runs,
+            target_no,
+            &target_rec,
+            &target_raw,
+            &native_name,
+            &runs_to_free,
+            mft_attr_slot,
             &mut staged_open,
             &mut open_regs,
             &mut mutation_specs,
             &mut target_writes,
-            &mut cur_mft0_raw,
-            &mut mft0_modified,
-            mft_attr_slot,
-            &mft_runs,
-            u64::from(target_no),
-            false,
-            &mft_bm,
         )?;
-        if mft0_modified {
-            target_writes.push(TargetWriteKind::MftRecord {
-                runs: mft_runs.clone(),
-                record_no: 0,
-                raw_protected: cur_mft0_raw,
-            });
-        }
-
-        // 4. DeallocateFileRecordSegment (0x03) on target_no (undo = InitializeFileRecordSegment 0x02)!
-        let FileEditResult::Applied(dealloc_raw) =
-            deallocate_file_record_slot(&target_raw, target_no, RecoveryPass::Undo)
-                .map_err(|err| parse_err(&err))?
-        else {
-            return Err(corrupt(0, "AlreadyApplied on DeallocateFileRecordSegment"));
-        };
-        let (t_vcn, t_cbo, t_lcns) = self.map_mft_record_transfer(&mft_runs, target_no)?;
-        mutation_specs.push(NtfsClientUpdateSpec {
-            redo_op: NtfsLogOp::DeallocateFileRecordSegment,
-            undo_op: NtfsLogOp::InitializeFileRecordSegment,
-            target_attribute: mft_attr_slot,
-            record_offset: 0,
-            attribute_offset: 0,
-            cluster_block_offset: t_cbo,
-            target_vcn: t_vcn,
-            target_lcns: t_lcns,
-            redo_data: Vec::new(),
-            undo_data: target_rest,
-        });
-        target_writes.push(TargetWriteKind::MftRecord {
-            runs: mft_runs,
-            record_no: target_no,
-            raw_protected: dealloc_raw,
-        });
 
         Ok(PreparedTxPlan {
             operation: "unlink_file",
             operation_digest,
             result_value: target_ref,
-            pre_payload_writes: Vec::new(),
+            pre_payload_writes: del_plan.pre_payload_writes,
             mft_zero_writes: Vec::new(),
             open_attr_registrations: open_regs,
             mutation_specs,

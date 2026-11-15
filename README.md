@@ -449,8 +449,8 @@ ffs-ntfs mount-write disk.img /mnt/ntfs --offline-image --allow-write \
 
 The mountpoint must already exist and be empty. This entry point uses the
 admitted native NTFS 3.1 logged writer for ordinary create/mkdir, existing
-unnamed and named DATA write/truncate, hard links, simple rename, unlink and
-rmdir. `--recover-dirty` explicitly enables native log recovery during admission;
+unnamed and named DATA write/truncate, hard links, rename with ordinary file
+replacement, unlink and rmdir. `--recover-dirty` explicitly enables native log recovery during admission;
 recovery-required or uncertain storage states fence further mutations.
 The existing `mount` command remains read-only.
 
@@ -462,9 +462,10 @@ base-record metadata; coupled DOS aliases, extension-record catalogs and
 transformed streams retain their existing refusal boundaries.
 
 Ownership and modes are fixed host projections; native Windows ACLs are not
-enforced. Creating or deleting ADS and overwriting a distinct rename destination
-remain refused. An open file survives its final unlink through a retained native
-name hidden from the live mounted namespace and reaped on its last release.
+enforced. Creating or deleting ADS remains refused. Replacement of a mounted
+destination held open through a file or ADS handle is also refused. An open file
+survives its final unlink through a retained native name hidden from the live
+mounted namespace and reaped on its last release.
 A crash can leave an ordinary recoverable `.ffs-unlinked-*` file visible after
 reopen: durable orphan replay is not implemented. These capabilities do not
 establish native Windows or mounted interoperability qualification.
@@ -495,6 +496,33 @@ writes to the selected volume. Its JSON result includes the new name, source
 identity and storage-bound native commit token. The same ordinary base-record
 limits apply as for the writable mount above; creating links does not enable
 coupled DOS aliases, extension catalogs or transformed-file mutation.
+
+## NTFS: atomic replacement rename
+
+`tx-rename` can replace an existing distinct ordinary file in the same native
+journal transaction as moving the source name:
+
+```bash
+ffs-ntfs tx-rename volume.img /report.tmp /report.bin \
+  --offline-image --allow-write
+
+# Require the destination to be absent instead.
+ffs-ntfs tx-rename volume.img /report.bin /archive/report.bin \
+  --no-replace --offline-image --allow-write
+```
+
+Replacement preserves the source FILE identity and its other hard links. If the
+destination has other links, those links retain the old destination's contents
+and streams. Removing its final link reclaims the old FILE and every admitted
+DATA allocation. The planner replaces the existing directory entry in place,
+without allocating an index block from storage being retired by that operation.
+
+Both ordinary base-record catalogs and their native index bindings must be
+valid. Directory replacement, coupled DOS aliases, extension catalogs and other
+unsupported metadata remain refused. `--no-replace` refuses any existing
+destination, including another hard link to the source. The existing
+`--expected-record` and `--expected-sequence` pair can bind the requested source
+identity; volume `--offset` and `--length` bounds apply to replacement as well.
 
 ## ZFS: offline hard links
 

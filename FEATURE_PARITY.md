@@ -1,6 +1,20 @@
 # FEATURE_PARITY
 
-> **NTFS ordinary hard-link mutation (2026-11-14):**
+> **NTFS atomic ordinary-file replacement (2026-11-15):**
+> Native rename can replace a distinct ordinary file in one logged transaction.
+> The source retains its FILE identity and other links. A nonfinal destination
+> link is removed without freeing its streams; a final destination releases
+> every validated DATA allocation and its FILE slot. Staged directory lookup
+> preserves source-deletion changes before replacing the existing destination
+> index entry, so this path needs no new directory allocation.
+> Path and reference APIs expose no-replace semantics; the companion CLI accepts
+> `tx-rename --no-replace`. Mounted replacement retains the refusal for a pinned
+> destination and retires final-victim ADS cache identities after publication.
+> Regression cases cover shared directory blocks, separator promotion, stream
+> ownership, crash prefixes and native CLI consumers. Directory replacement and
+> the broader NTFS-05 / staged `bd-wmzge` obligations remain open.
+
+> **NTFS ordinary hard-link mutation (2026-11-15):**
 > The native transaction engine and writable FsOps support same-parent and
 > cross-parent links to ordinary base-record files. Unnamed DATA edits maintain
 > every FILE_NAME and $I30 duplicate, including names sharing one resident root

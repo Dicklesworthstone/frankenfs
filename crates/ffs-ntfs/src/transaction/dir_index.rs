@@ -1915,6 +1915,236 @@ impl NtfsTransactionEngine {
         })
     }
 
+    /// Replace an existing directory entry without changing its key length,
+    /// ordering or child pointer. The caller supplies the latest directory and
+    /// INDX images after any preceding source-name deletion.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn plan_directory_replace(
+        &self,
+        cx: &Cx,
+        dir_no: u32,
+        dir_raw: &[u8],
+        dir_rec: &NtfsFileRecord,
+        mft_slot_attr_id: u16,
+        dir_mft_vcn: u64,
+        dir_mft_cbo: u16,
+        dir_mft_lcns: &[u64],
+        indx_attr_slot_if_open: Option<u16>,
+        expected_reference: NtfsReference,
+        native_name: &NtfsFileName,
+        replacement_reference: NtfsReference,
+        replacement_file_name: &[u8],
+        indx_overrides: &[(u64, Vec<u8>)],
+    ) -> Result<PlannedDirMutation> {
+        let located = self.locate_directory_entry_with_overrides(
+            cx,
+            dir_raw,
+            dir_rec,
+            &native_name.name,
+            indx_overrides,
+        )?;
+        let (reference, indexed_name, key_raw) = located
+            .span
+            .key
+            .as_ref()
+            .ok_or_else(|| corrupt(0, "terminal entry has no FILE_NAME"))?;
+        if *reference != expected_reference || indexed_name != native_name {
+            return Err(corrupt(0, "NTFS rename destination changed native link identity"));
+        }
+        let replacement_name =
+            NtfsFileName::parse(replacement_file_name).map_err(|err| parse_err(&err))?;
+        if replacement_name.parent != native_name.parent
+            || self.fold_upcase(&replacement_name.name) != self.fold_upcase(&native_name.name)
+            || replacement_file_name.len() != key_raw.len()
+        {
+            return Err(unsupported(
+                "NTFS rename replacement requires the same native index key length and collation",
+            ));
+        }
+        let replacement_raw = replacement_reference.encode().map_err(|err| parse_err(&err))?;
+        let make_entry = |old_entry: &[u8]| -> Result<Vec<u8>> {
+            let child_bytes = if located.span.child_vcn.is_some() { 8 } else { 0 };
+            if 16 + replacement_file_name.len() + child_bytes > old_entry.len() {
+                return Err(corrupt(0, "NTFS rename destination key overlaps its child pointer"));
+            }
+            // Preserve the exact entry length, padding, flags and child VCN.
+            let mut entry = old_entry.to_vec();
+            entry[..8].copy_from_slice(&replacement_raw.to_le_bytes());
+            entry[16..16 + replacement_file_name.len()].copy_from_slice(replacement_file_name);
+            Ok(entry)
+        };
+
+        if let Some((leaf_vcn, _)) = located.external_vcn {
+            let indx_slot = indx_attr_slot_if_open
+                .ok_or_else(|| corrupt(0, "missing open-attribute slot for $I30"))?;
+            let root_bytes = extract_resident_attr(dir_rec, ATTR_INDEX_ROOT, &I30_NAME)?;
+            let root_parsed = NtfsIndexRoot::parse(&root_bytes, self.geometry.cluster_bytes())
+                .map_err(|err| parse_err(&err))?;
+            let (a0_runs, _, _) = extract_plain_nonresident_stream(
+                &self.geometry,
+                dir_rec,
+                ATTR_INDEX_ALLOCATION,
+                &I30_NAME,
+            )?;
+            let byte_off = leaf_vcn * u64::from(root_parsed.vcn_bytes);
+            let leaf_raw = if let Some((_, bytes)) =
+                indx_overrides.iter().find(|(offset, _)| *offset == byte_off)
+            {
+                bytes.clone()
+            } else {
+                read_mapped_runs(
+                    &self.device,
+                    cx,
+                    &self.geometry,
+                    &a0_runs,
+                    byte_off,
+                    root_parsed.block_bytes as usize,
+                )?
+            };
+            let restored = restore_record(&leaf_raw, b"INDX").map_err(|err| parse_err(&err))?;
+            let old_entry = restored
+                [located.span.offset_in_node..located.span.offset_in_node + located.span.length]
+                .to_vec();
+            let new_entry = make_entry(&old_entry)?;
+            let offset = u16::try_from(located.span.offset_in_node)
+                .map_err(|_| corrupt(0, "index entry offset"))?;
+            let FileEditResult::Applied(deleted) = apply_index_edit(
+                &leaf_raw,
+                leaf_vcn,
+                RecoveryPass::Undo,
+                &IndexEdit {
+                    operation: IndexOperation::DeleteEntry,
+                    entry_offset: offset,
+                    data: &[],
+                },
+            )
+            .map_err(|err| parse_err(&err))?
+            else {
+                return Err(corrupt(0, "AlreadyApplied on rename index deletion"));
+            };
+            let FileEditResult::Applied(updated) = apply_index_edit(
+                &deleted,
+                leaf_vcn,
+                RecoveryPass::Undo,
+                &IndexEdit {
+                    operation: IndexOperation::AddEntry,
+                    entry_offset: offset,
+                    data: &new_entry,
+                },
+            )
+            .map_err(|err| parse_err(&err))?
+            else {
+                return Err(corrupt(0, "AlreadyApplied on rename index replacement"));
+            };
+            let (target_vcn, cbo, rec_off, target_lcns) =
+                map_indx_transfer(&self.geometry, &a0_runs, byte_off, root_parsed.block_bytes)?;
+            return Ok(PlannedDirMutation {
+                pre_payload_writes: Vec::new(),
+                allocated_clusters: None,
+                log_specs: vec![
+                    NtfsClientUpdateSpec {
+                        redo_op: NtfsLogOp::DeleteIndexEntryAllocation,
+                        undo_op: NtfsLogOp::AddIndexEntryAllocation,
+                        target_attribute: indx_slot,
+                        record_offset: rec_off,
+                        attribute_offset: offset,
+                        cluster_block_offset: cbo,
+                        target_vcn,
+                        target_lcns: target_lcns.clone(),
+                        redo_data: Vec::new(),
+                        undo_data: old_entry,
+                    },
+                    NtfsClientUpdateSpec {
+                        redo_op: NtfsLogOp::AddIndexEntryAllocation,
+                        undo_op: NtfsLogOp::DeleteIndexEntryAllocation,
+                        target_attribute: indx_slot,
+                        record_offset: rec_off,
+                        attribute_offset: offset,
+                        cluster_block_offset: cbo,
+                        target_vcn,
+                        target_lcns,
+                        redo_data: new_entry,
+                        undo_data: Vec::new(),
+                    },
+                ],
+                updated_dir_raw: dir_raw.to_vec(),
+                updated_indx_blocks: vec![(byte_off, updated)],
+            });
+        }
+
+        let restored = restore_record(dir_raw, b"FILE").map_err(|err| parse_err(&err))?;
+        let entry_at = usize::from(located.root_attr_offset)
+            + usize::from(located.root_value_offset)
+            + located.span.offset_in_node;
+        let old_entry = restored[entry_at..entry_at + located.span.length].to_vec();
+        let new_entry = make_entry(&old_entry)?;
+        let offset =
+            u16::try_from(usize::from(located.root_value_offset) + located.span.offset_in_node)
+                .map_err(|_| corrupt(0, "index entry offset"))?;
+        let FileEditResult::Applied(deleted) = apply_file_edit(
+            dir_raw,
+            dir_no,
+            RecoveryPass::Undo,
+            &FileEdit {
+                operation: FileOperation::IndexRoot(IndexOperation::DeleteEntry),
+                record_offset: located.root_attr_offset,
+                attribute_offset: offset,
+                data: &[],
+            },
+        )
+        .map_err(|err| parse_err(&err))?
+        else {
+            return Err(corrupt(0, "AlreadyApplied on rename index deletion"));
+        };
+        let FileEditResult::Applied(updated) = apply_file_edit(
+            &deleted,
+            dir_no,
+            RecoveryPass::Undo,
+            &FileEdit {
+                operation: FileOperation::IndexRoot(IndexOperation::AddEntry),
+                record_offset: located.root_attr_offset,
+                attribute_offset: offset,
+                data: &new_entry,
+            },
+        )
+        .map_err(|err| parse_err(&err))?
+        else {
+            return Err(corrupt(0, "AlreadyApplied on rename index replacement"));
+        };
+        Ok(PlannedDirMutation {
+            pre_payload_writes: Vec::new(),
+            allocated_clusters: None,
+            log_specs: vec![
+                NtfsClientUpdateSpec {
+                    redo_op: NtfsLogOp::DeleteIndexEntryRoot,
+                    undo_op: NtfsLogOp::AddIndexEntryRoot,
+                    target_attribute: mft_slot_attr_id,
+                    record_offset: located.root_attr_offset,
+                    attribute_offset: offset,
+                    cluster_block_offset: dir_mft_cbo,
+                    target_vcn: dir_mft_vcn,
+                    target_lcns: dir_mft_lcns.to_vec(),
+                    redo_data: Vec::new(),
+                    undo_data: old_entry,
+                },
+                NtfsClientUpdateSpec {
+                    redo_op: NtfsLogOp::AddIndexEntryRoot,
+                    undo_op: NtfsLogOp::DeleteIndexEntryRoot,
+                    target_attribute: mft_slot_attr_id,
+                    record_offset: located.root_attr_offset,
+                    attribute_offset: offset,
+                    cluster_block_offset: dir_mft_cbo,
+                    target_vcn: dir_mft_vcn,
+                    target_lcns: dir_mft_lcns.to_vec(),
+                    redo_data: new_entry,
+                    undo_data: Vec::new(),
+                },
+            ],
+            updated_dir_raw: updated,
+            updated_indx_blocks: Vec::new(),
+        })
+    }
+
     /// Plan an in-place `$I30` `FILE_NAME::dup` 56-byte update (`0x10` or `0x19`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn plan_directory_update_dup(

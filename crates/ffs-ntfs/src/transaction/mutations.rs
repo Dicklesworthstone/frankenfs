@@ -205,8 +205,9 @@ impl NtfsTransactionEngine {
     }
 
     /// Rename an existing native link without losing its stable FILE identity.
-    /// Existing distinct destinations are refused before any write until their
-    /// removal and open-handle retention share the same native transaction.
+    /// Ordinary file replacement retires exactly the destination link in the
+    /// same transaction. Callers must separately enforce pinned-destination
+    /// lifetime rules before admitting replacement.
     #[allow(clippy::too_many_arguments)]
     pub fn rename_at(
         &mut self,
@@ -222,29 +223,34 @@ impl NtfsTransactionEngine {
             if self.lookup_reference(cx, parent, name)? != expected {
                 return Err(stale_target());
             }
-            match self.lookup_reference(cx, new_parent, new_name) {
+            let replaced = match self.lookup_reference(cx, new_parent, new_name) {
                 Ok(_) if no_replace => return Err(FfsError::Exists),
-                Ok(destination) if destination != expected => {
-                    return Err(unsupported(
-                        "NTFS rename replacement requires atomic destination retirement",
-                    ));
-                }
-                Ok(_) | Err(FfsError::NotFound(_)) => {}
+                Ok(destination) => (destination != expected).then_some(destination),
+                Err(FfsError::NotFound(_)) => None,
                 Err(error) => return Err(error),
-            }
+            };
             let source = self.child_mutation_path(cx, parent, name)?;
             self.validate_mutation_path_reference(cx, &source, expected)?;
-            Ok((source, self.child_mutation_path(cx, new_parent, new_name)?))
+            Ok((
+                source,
+                self.child_mutation_path(cx, new_parent, new_name)?,
+                replaced,
+            ))
         })();
-        let (source, destination) = match admission {
+        let (source, destination, replaced) = match admission {
             Ok(paths) => paths,
             Err(error) => return NtfsTxOutcome::NotCommitted(error),
         };
-        match self.rename_entry(cx, &source, &destination, Some(expected)) {
+        let outcome = if no_replace {
+            self.rename_entry_no_replace(cx, &source, &destination, Some(expected))
+        } else {
+            self.rename_entry(cx, &source, &destination, Some(expected))
+        };
+        match outcome {
             NtfsTxOutcome::Committed { value, token } => NtfsTxOutcome::Committed {
                 value: NtfsRenameOutcome {
                     source: value,
-                    replaced: None,
+                    replaced,
                 },
                 token,
             },

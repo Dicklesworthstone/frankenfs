@@ -500,6 +500,9 @@ enum Command {
         expected_record: Option<u64>,
         #[arg(long, requires = "expected_record")]
         expected_sequence: Option<u16>,
+        /// Refuse to replace any existing destination, including another link to the same FILE.
+        #[arg(long)]
+        no_replace: bool,
     },
     /// Unlink a regular file in an offline NTFS 3.1 image via a native logged transaction.
     TxUnlink {
@@ -1291,6 +1294,7 @@ fn main() -> Result<()> {
             dst_path,
             expected_record,
             expected_sequence,
+            no_replace,
         } => {
             let expected = match (expected_record, expected_sequence) {
                 (Some(record), Some(sequence)) => Some(NtfsReference { record, sequence }),
@@ -1298,11 +1302,16 @@ fn main() -> Result<()> {
                 _ => bail!("--expected-record and --expected-sequence must be provided together"),
             };
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.rename_entry(&cx, &src_path, &dst_path, expected);
+            let outcome = if no_replace {
+                engine.rename_entry_no_replace(&cx, &src_path, &dst_path, expected)
+            } else {
+                engine.rename_entry(&cx, &src_path, &dst_path, expected)
+            };
             emit_tx_outcome("tx_rename", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
                     "sequence": reference.sequence,
+                    "no_replace": no_replace,
                 })
             })?;
         }
@@ -2309,6 +2318,53 @@ mod tests {
             assert!(args.open(&cx, false).is_err());
         }
         assert_eq!(std::fs::read(&scratch).unwrap(), original);
+    }
+
+    #[test]
+    fn cli_native_rename_preserves_no_replace_identity_and_volume_options() {
+        let base = [
+            "ffs-ntfs",
+            "tx-rename",
+            "disk.img",
+            "/source",
+            "/destination",
+            "--offline-image",
+            "--allow-write",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+            "--expected-record",
+            "64",
+            "--expected-sequence",
+            "7",
+        ];
+        for requested in [false, true] {
+            let mut args = base.to_vec();
+            if requested {
+                args.push("--no-replace");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::TxRename {
+                target,
+                src_path,
+                dst_path,
+                expected_record,
+                expected_sequence,
+                no_replace,
+            } = cli.command
+            else {
+                panic!("tx-rename");
+            };
+            assert_eq!(no_replace, requested);
+            assert_eq!(src_path, "/source");
+            assert_eq!(dst_path, "/destination");
+            assert_eq!(expected_record, Some(64));
+            assert_eq!(expected_sequence, Some(7));
+            assert_eq!(target.offset, 1_048_576);
+            assert_eq!(target.length, Some(67_108_864));
+            assert!(target.offline_image && target.allow_write);
+        }
     }
 
     #[test]

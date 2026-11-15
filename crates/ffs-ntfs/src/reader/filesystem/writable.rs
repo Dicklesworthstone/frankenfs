@@ -404,23 +404,37 @@ impl NtfsFs {
         let new_parent = self.directory_reference(cx, new_parent)?;
         let engine = self.writer()?;
         let target = engine.lookup_reference(cx, parent, &name)?;
-        match engine.lookup_reference(cx, new_parent, &new_name) {
-            Ok(destination)
-                if destination != target && self.pinned(self.inode(destination)?)? =>
-            {
-                return Err(if no_replace {
-                    FfsError::Exists
-                } else {
-                    unsupported("rename over an open NTFS destination requires atomic retention")
-                });
+        let destination = match engine.lookup_reference(cx, new_parent, &new_name) {
+            Ok(destination) if destination != target => {
+                let ino = self.inode(destination)?;
+                if self.pinned(ino)? {
+                    return Err(if no_replace {
+                        FfsError::Exists
+                    } else {
+                        unsupported(
+                            "rename over an open NTFS destination requires atomic retention",
+                        )
+                    });
+                }
+                Some((destination, ino))
             }
-            Ok(_) | Err(FfsError::NotFound(_)) => {}
+            Ok(_) | Err(FfsError::NotFound(_)) => None,
             Err(error) => return Err(error),
-        }
+        };
         drop(engine);
-        self.transact(cx, |engine| {
+        let final_destination = if let Some((reference, ino)) = destination {
+            (self.describe(cx, ino)?.nlink == 1).then_some((reference, ino))
+        } else {
+            None
+        };
+        let outcome = self.transact(cx, |engine| {
             engine.rename_at(cx, parent, &name, new_parent, &new_name, target, no_replace)
         })?;
+        if let Some((reference, ino)) = final_destination
+            && outcome.replaced == Some(reference)
+        {
+            self.retire_ads_for_base(ino)?;
+        }
         Ok(())
     }
 
