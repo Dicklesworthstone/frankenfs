@@ -268,6 +268,40 @@ impl XattrSources {
     }
 }
 
+/// Native ownership that must be handled before reclaiming a ZPL object.
+/// External ACL objects and xattr directories are separate DMU objects, not
+/// children of the file's data or SA-spill block tree. Project IDs identify the
+/// quota account to debit when the object is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclamationOwnership {
+    pub xattr_directory: u64,
+    pub external_acl_object: u64,
+    pub project_id: u64,
+}
+
+impl ReclamationOwnership {
+    fn validate(self) -> Result<Self, ParseError> {
+        if self.xattr_directory >= OBJECT_LIMIT || self.external_acl_object >= OBJECT_LIMIT {
+            return Err(invalid(
+                "ZPL reclamation reference exceeds the object namespace",
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Read the external ACL pointer from `zp_acl.z_acl_extern_obj`, at byte
+    /// 176 of a legacy znode. Legacy znodes have no project-ID system attribute.
+    pub fn legacy(raw: &[u8], order: Endian) -> Result<Self, ParseError> {
+        let xattrs = XattrSources::legacy(raw, order)?;
+        Self {
+            xattr_directory: xattrs.directory,
+            external_acl_object: order.u64(raw, 176)?,
+            project_id: 0,
+        }
+        .validate()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Registration {
     name: Vec<u8>,
@@ -872,6 +906,33 @@ impl Attributes {
             }
         }
         XattrSources { directory, inline }.validate()
+    }
+
+    /// Recover external ownership and quota identity without assuming that all
+    /// attributes share the dnode's byte order or reside in its bonus buffer.
+    pub fn reclamation_ownership(&self) -> Result<ReclamationOwnership, ParseError> {
+        let xattrs = self.xattrs()?;
+        let external_acl_object = if let Some(acl) = self.values.get(b"ZPL_ZNODE_ACL".as_slice()) {
+            if acl.swap != 3 || acl.bytes.len() != 88 {
+                return Err(invalid(
+                    "ZPL legacy ACL system attribute is not an 88-byte value",
+                ));
+            }
+            acl.order.u64(&acl.bytes, 0)?
+        } else {
+            0
+        };
+        let project_id = if self.values.contains_key(b"ZPL_PROJID".as_slice()) {
+            self.integer("ZPL_PROJID")?
+        } else {
+            0
+        };
+        ReclamationOwnership {
+            xattr_directory: xattrs.directory,
+            external_acl_object,
+            project_id,
+        }
+        .validate()
     }
 
     pub fn metadata(&self) -> Result<Metadata, ParseError> {

@@ -38,5 +38,6 @@ pub use reader::dmu::zpl::Zpl;
 pub use reader::{Label, Leaf, Pool, RootBlock};
 pub use transaction::{
     ZfsAdmissionReport, ZfsDataChecksum, ZfsDurableToken, ZfsPersistenceEvent, ZfsPersistenceStage,
-    ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, ZfsWriteOptions,
+    ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, ZfsUnlinkedObject,
+    ZfsWriteOptions,
 };

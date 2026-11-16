@@ -93,6 +93,111 @@ fn packed(id: u16, attrs: &[(u16, Vec<u8>)], variables: &[u16], order: Endian) -
 }
 
 #[test]
+fn legacy_reclamation_ownership_retains_native_references_and_checks_bounds() {
+    for order in [Endian::Little, Endian::Big] {
+        let mut raw = legacy(order, 0o100_640, 17);
+        assert_eq!(
+            ReclamationOwnership::legacy(&raw, order).unwrap(),
+            ReclamationOwnership {
+                xattr_directory: 0,
+                external_acl_object: 0,
+                project_id: 0,
+            }
+        );
+        raw[104..112].copy_from_slice(&order.encode(42));
+        raw[176..184].copy_from_slice(&order.encode(0x0001_0203));
+        assert_eq!(
+            ReclamationOwnership::legacy(&raw, order).unwrap(),
+            ReclamationOwnership {
+                xattr_directory: 42,
+                external_acl_object: 0x0001_0203,
+                project_id: 0,
+            }
+        );
+        for length in [0, 104, 176, 183, 263] {
+            assert!(ReclamationOwnership::legacy(&raw[..length], order).is_err());
+        }
+        raw[176..184].copy_from_slice(&order.encode(OBJECT_LIMIT));
+        assert!(ReclamationOwnership::legacy(&raw, order).is_err());
+        raw[176..184].copy_from_slice(&order.encode(0));
+        raw[104..112].copy_from_slice(&order.encode(OBJECT_LIMIT));
+        assert!(ReclamationOwnership::legacy(&raw, order).is_err());
+    }
+}
+
+#[test]
+fn sa_reclamation_ownership_uses_each_buffer_byte_order_and_native_layout() {
+    for (bonus_order, spill_order) in [(Endian::Little, Endian::Big), (Endian::Big, Endian::Little)]
+    {
+        let bonus_attrs = vec![
+            (42, bonus_order.encode(9001).to_vec()),
+            (9, bonus_order.encode(73).to_vec()),
+        ];
+        let mut acl = vec![0; 88];
+        acl[..8].copy_from_slice(&spill_order.encode(0x0001_0203));
+        let spill_attrs = vec![(15, acl)];
+        let registry = SaRegistry::from_zaps(
+            &[registration("ZPL_PROJID", 42, 8, 0)],
+            &[layout(2, &bonus_attrs), layout(3, &spill_attrs)],
+        )
+        .unwrap();
+        let bonus = packed(2, &bonus_attrs, &[], bonus_order);
+        let spill = packed(3, &spill_attrs, &[], spill_order);
+        let decoded = registry.decode(&bonus, Some(&spill)).unwrap();
+        assert_eq!(
+            decoded.reclamation_ownership().unwrap(),
+            ReclamationOwnership {
+                xattr_directory: 73,
+                external_acl_object: 0x0001_0203,
+                project_id: 9001,
+            }
+        );
+
+        let mut invalid_acl = vec![0; 88];
+        invalid_acl[..8].copy_from_slice(&spill_order.encode(OBJECT_LIMIT));
+        let spill = packed(3, &[(15, invalid_acl)], &[], spill_order);
+        assert!(
+            registry
+                .decode(&bonus, Some(&spill))
+                .unwrap()
+                .reclamation_ownership()
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn sa_reclamation_ownership_defaults_absent_fields_but_rejects_mistyped_project_ids() {
+    let empty_registry = SaRegistry::from_zaps(&[], &[]).unwrap();
+    let empty = empty_registry
+        .decode(&packed(1, &[], &[], Endian::Little), None)
+        .unwrap();
+    assert_eq!(
+        empty.reclamation_ownership().unwrap(),
+        ReclamationOwnership {
+            xattr_directory: 0,
+            external_acl_object: 0,
+            project_id: 0,
+        }
+    );
+    for (length, swap) in [(4, 1), (16, 0), (8, 3)] {
+        let attrs = vec![(42, vec![0; usize::from(length)])];
+        let registry = SaRegistry::from_zaps(
+            &[registration("ZPL_PROJID", 42, length, swap)],
+            &[layout(2, &attrs)],
+        )
+        .unwrap();
+        assert!(
+            registry
+                .decode(&packed(2, &attrs, &[], Endian::Little), None)
+                .unwrap()
+                .reclamation_ownership()
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn legacy_metadata_retains_native_times_ids_and_inline_links_in_both_orders() {
     for order in [Endian::Little, Endian::Big] {
         let raw = legacy(order, 0o100_640, 17);
