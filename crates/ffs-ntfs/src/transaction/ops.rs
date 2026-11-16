@@ -1624,8 +1624,7 @@ impl NtfsTransactionEngine {
         if id == u16::MAX || source.hard_links == u16::MAX {
             return Err(FfsError::NoSpace);
         }
-        let name_attribute =
-            encode_resident_attribute(ATTR_FILE_NAME, id, &[], true, &name_value)?;
+        let name_attribute = encode_resident_attribute(ATTR_FILE_NAME, id, &[], true, &name_value)?;
         if restored
             .len()
             .checked_add(name_attribute.len())
@@ -1751,9 +1750,13 @@ impl NtfsTransactionEngine {
                 0,
             )?;
             for (lcn, count) in allocated {
-                mutation_specs.extend(
-                    self.build_bitmap_range_specs(bitmap_slot, &bitmap_runs, lcn, count, true)?,
-                );
+                mutation_specs.extend(self.build_bitmap_range_specs(
+                    bitmap_slot,
+                    &bitmap_runs,
+                    lcn,
+                    count,
+                    true,
+                )?);
             }
             target_writes.push(TargetWriteKind::BitmapStream {
                 runs: bitmap_runs,
@@ -1866,6 +1869,353 @@ impl NtfsTransactionEngine {
             return NtfsTxOutcome::NotCommitted(error);
         }
         self.edit_stream_data(cx, path, stream, FileDataEdit::Truncate { size })
+    }
+
+    /// Create one named, ordinary base-record DATA attribute. Its complete
+    /// initial payload is initialized before native WAL publication; the
+    /// unnamed DATA stream and every FILE_NAME/$I30 size remain unchanged.
+    pub fn create_file_stream(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        stream: &[u16],
+        data: &[u8],
+    ) -> NtfsTxOutcome<NtfsReference> {
+        self.edit_named_stream(cx, path, stream, Some(data))
+    }
+
+    /// Remove exactly the named DATA attribute and reclaim its admitted native
+    /// allocation in the same recoverable transaction. Empty names never remove
+    /// the unnamed stream. Mounted callers must first exclude open ADS handles.
+    pub fn remove_file_stream(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        stream: &[u16],
+    ) -> NtfsTxOutcome<NtfsReference> {
+        self.edit_named_stream(cx, path, stream, None)
+    }
+
+    fn edit_named_stream(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        stream: &[u16],
+        create_data: Option<&[u8]>,
+    ) -> NtfsTxOutcome<NtfsReference> {
+        match self.plan_named_stream_edit(cx, path, stream, create_data) {
+            Ok(plan) => self.execute_logged_tx(cx, plan),
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn plan_named_stream_edit(
+        &self,
+        cx: &Cx,
+        path: &str,
+        stream: &[u16],
+        create_data: Option<&[u8]>,
+    ) -> Result<PreparedTxPlan<NtfsReference>> {
+        checkpoint(cx)?;
+        super::validate_ntfs_stream_name_utf16(stream)?;
+        if stream.is_empty() {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "creating or removing DATA requires a nonempty stream name".into(),
+            });
+        }
+        if create_data.is_some_and(|data| data.len() as u64 > super::MAX_FILE_EDIT_BYTES) {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EFBIG,
+                detail: "NTFS stream creation exceeds the 16 MiB staging limit".into(),
+            });
+        }
+        let mft0 = self.read_mft_record_zero(cx)?;
+        let mft_runs = extract_plain_nonresident_runs(&self.geometry, &mft0, DATA, &[])?;
+        let (file_no, record) = self.resolve_path_raw(cx, &mft_runs, path)?;
+        if record.is_directory() {
+            return Err(FfsError::IsDirectory);
+        }
+        if file_no < 24 {
+            return Err(FfsError::PermissionDenied);
+        }
+        let native_names = self.admit_plain_data_write(&record)?;
+        // Validate complete physical ownership before a stream's allocation can
+        // be retired, including overlap with another stream in the same FILE.
+        self.unlink_owned_runs(&record)?;
+        let reference = NtfsReference {
+            record: u64::from(file_no),
+            sequence: record.sequence,
+        };
+        self.validate_file_name_indexes(cx, &mft_runs, reference, &native_names)?;
+        let attributes = record.attributes().map_err(|err| parse_err(&err))?;
+        let existing = attributes
+            .iter()
+            .find(|attribute| attribute.kind == DATA && attribute.name == stream);
+        let folded = self.fold_upcase(stream);
+        if create_data.is_some()
+            && attributes.iter().any(|attribute| {
+                attribute.kind == DATA && self.fold_upcase(&attribute.name) == folded
+            })
+        {
+            return Err(FfsError::Exists);
+        }
+        if create_data.is_none() && existing.is_none() {
+            return Err(FfsError::NotFound("NTFS DATA stream".into()));
+        }
+        let raw =
+            read_mft_record_raw_via_runs(&self.device, cx, &self.geometry, &mft_runs, file_no)?;
+        let restored = record.used_bytes();
+        let mut staged_open = self.open_attrs.clone();
+        let mut open_regs = Vec::new();
+        let mft_slot = self.plan_open_attr(
+            &mut staged_open,
+            &mut open_regs,
+            NtfsReference {
+                record: 0,
+                sequence: mft0.sequence,
+            },
+            DATA,
+            &[],
+            0,
+        )?;
+        let mut pre_payload_writes = Vec::new();
+        let mut mutation_specs = Vec::new();
+        let mut target_writes = Vec::new();
+
+        let (offset, payload, create) = if let Some(data) = create_data {
+            let id = attributes
+                .iter()
+                .map(|attribute| attribute.id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(FfsError::NoSpace)?
+                .max(u16::from_le_bytes([restored[40], restored[41]]));
+            if id == u16::MAX {
+                return Err(FfsError::NoSpace);
+            }
+            // Native attributes collate by kind, then $UpCase name and exact
+            // code units. Retain every unrelated attribute byte-for-byte.
+            let mut offset = usize::from(u16::from_le_bytes([restored[20], restored[21]]));
+            for attribute in &attributes {
+                if attribute.kind > DATA
+                    || (attribute.kind == DATA
+                        && self.fold_upcase(&attribute.name).as_slice() > folded.as_slice())
+                {
+                    break;
+                }
+                offset += u32::from_le_bytes(
+                    restored[offset + 4..offset + 8]
+                        .try_into()
+                        .map_err(|_| corrupt(0, "NTFS attribute length"))?,
+                ) as usize;
+            }
+            let resident = (data.len() <= MAX_RESIDENT_DATA_PAYLOAD)
+                .then(|| encode_resident_attribute(DATA, id, stream, false, data))
+                .transpose()?
+                .filter(|attribute| {
+                    restored
+                        .len()
+                        .checked_add(attribute.len())
+                        .is_some_and(|used| used <= raw.len())
+                });
+            let attribute = if let Some(resident) = resident {
+                resident
+            } else if data.is_empty() {
+                return Err(FfsError::NoSpace);
+            } else {
+                let bitmap =
+                    read_mft_record_via_runs(&self.device, cx, &self.geometry, &mft_runs, 6)?;
+                let (runs, bytes, _) =
+                    extract_plain_nonresident_stream(&self.geometry, &bitmap, DATA, &[])?;
+                let mut contents =
+                    read_mapped_runs(&self.device, cx, &self.geometry, &runs, 0, bytes as usize)?;
+                let slot = self.plan_open_attr(
+                    &mut staged_open,
+                    &mut open_regs,
+                    NtfsReference {
+                        record: 6,
+                        sequence: bitmap.sequence,
+                    },
+                    DATA,
+                    &[],
+                    0,
+                )?;
+                let allocated =
+                    self.reserve_data_payload(cx, &mut contents, data, &mut pre_payload_writes)?;
+                for run in &allocated {
+                    mutation_specs.extend(
+                        self.build_bitmap_range_specs(
+                            slot,
+                            &runs,
+                            run.lcn
+                                .ok_or_else(|| corrupt(0, "sparse DATA reservation"))?,
+                            run.clusters,
+                            true,
+                        )?,
+                    );
+                }
+                let allocation = (data.len() as u64)
+                    .div_ceil(u64::from(self.geometry.cluster_bytes()))
+                    * u64::from(self.geometry.cluster_bytes());
+                target_writes.push(TargetWriteKind::BitmapStream {
+                    runs,
+                    byte_offset: 0,
+                    bytes: contents,
+                });
+                encode_nonresident_attribute(
+                    DATA,
+                    id,
+                    stream,
+                    &allocated,
+                    allocation,
+                    data.len() as u64,
+                    data.len() as u64,
+                )?
+            };
+            if restored
+                .len()
+                .checked_add(attribute.len())
+                .is_none_or(|used| used > raw.len())
+            {
+                return Err(FfsError::NoSpace);
+            }
+            (offset, attribute, true)
+        } else {
+            let attribute =
+                existing.ok_or_else(|| FfsError::NotFound("NTFS DATA stream".into()))?;
+            if let NtfsValue::NonResident(extent) = &attribute.value {
+                let allocated = decode_mapping_pairs(
+                    extent.mapping_pairs,
+                    extent.first_vcn,
+                    extent.last_vcn,
+                    self.geometry.cluster_count(),
+                )
+                .map_err(|err| parse_err(&err))?;
+                let bitmap =
+                    read_mft_record_via_runs(&self.device, cx, &self.geometry, &mft_runs, 6)?;
+                let (runs, bytes, _) =
+                    extract_plain_nonresident_stream(&self.geometry, &bitmap, DATA, &[])?;
+                let mut contents =
+                    read_mapped_runs(&self.device, cx, &self.geometry, &runs, 0, bytes as usize)?;
+                let slot = self.plan_open_attr(
+                    &mut staged_open,
+                    &mut open_regs,
+                    NtfsReference {
+                        record: 6,
+                        sequence: bitmap.sequence,
+                    },
+                    DATA,
+                    &[],
+                    0,
+                )?;
+                for run in allocated {
+                    let lcn = run
+                        .lcn
+                        .ok_or_else(|| corrupt(0, "sparse DATA retirement"))?;
+                    set_or_clear_bits(&mut contents, lcn, run.clusters, false);
+                    mutation_specs.extend(self.build_bitmap_range_specs(
+                        slot,
+                        &runs,
+                        lcn,
+                        run.clusters,
+                        false,
+                    )?);
+                }
+                target_writes.push(TargetWriteKind::BitmapStream {
+                    runs,
+                    byte_offset: 0,
+                    bytes: contents,
+                });
+            }
+            let (offset, length) = find_attr_offset_in_restored(restored, DATA, stream)?
+                .ok_or_else(|| corrupt(0, "named DATA disappeared during planning"))?;
+            (offset, restored[offset..offset + length].to_vec(), false)
+        };
+        let record_offset =
+            u16::try_from(offset).map_err(|_| corrupt(0, "DATA attribute offset"))?;
+        let FileEditResult::Applied(updated) = apply_file_edit(
+            &raw,
+            file_no,
+            RecoveryPass::Undo,
+            &FileEdit {
+                operation: if create {
+                    FileOperation::CreateAttribute
+                } else {
+                    FileOperation::DeleteAttribute
+                },
+                record_offset,
+                attribute_offset: 0,
+                data: if create { &payload } else { &[] },
+            },
+        )
+        .map_err(|err| parse_err(&err))?
+        else {
+            return Err(corrupt(0, "AlreadyApplied on named DATA catalog edit"));
+        };
+        let (vcn, cbo, lcns) = self.map_mft_record_transfer(&mft_runs, file_no)?;
+        let (redo_op, undo_op, redo_data, undo_data) = if create {
+            (
+                NtfsLogOp::CreateAttribute,
+                NtfsLogOp::DeleteAttribute,
+                payload,
+                Vec::new(),
+            )
+        } else {
+            (
+                NtfsLogOp::DeleteAttribute,
+                NtfsLogOp::CreateAttribute,
+                Vec::new(),
+                payload,
+            )
+        };
+        mutation_specs.push(NtfsClientUpdateSpec {
+            redo_op,
+            undo_op,
+            target_attribute: mft_slot,
+            record_offset,
+            attribute_offset: 0,
+            cluster_block_offset: cbo,
+            target_vcn: vcn,
+            target_lcns: lcns,
+            redo_data,
+            undo_data,
+        });
+        target_writes.push(TargetWriteKind::MftRecord {
+            runs: mft_runs,
+            record_no: file_no,
+            raw_protected: updated,
+        });
+        let operation = if create {
+            "create_stream"
+        } else {
+            "remove_stream"
+        };
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ntfs.named_stream:");
+        hasher.update(operation.as_bytes());
+        hasher.update(&reference.record.to_le_bytes());
+        hasher.update(&reference.sequence.to_le_bytes());
+        hasher.update(&(stream.len() as u64).to_le_bytes());
+        for unit in stream {
+            hasher.update(&unit.to_le_bytes());
+        }
+        if let Some(data) = create_data {
+            hasher.update(&(data.len() as u64).to_le_bytes());
+            hasher.update(blake3::hash(data).as_bytes());
+        }
+        Ok(PreparedTxPlan {
+            operation,
+            operation_digest: *hasher.finalize().as_bytes(),
+            result_value: reference,
+            pre_payload_writes,
+            mft_zero_writes: Vec::new(),
+            open_attr_registrations: open_regs,
+            mutation_specs,
+            target_writes,
+        })
     }
 
     pub(super) fn edit_stream_data(
@@ -2012,7 +2362,9 @@ impl NtfsTransactionEngine {
     /// DOS aliases and extension catalogs remain indivisible unsupported units.
     fn native_file_names(&self, record: &NtfsFileRecord) -> Result<Vec<NtfsFileName>> {
         if record.base.record != 0 || record.base.sequence != 0 || !record.in_use() {
-            return Err(unsupported("NTFS mutation requires an in-use base FILE record"));
+            return Err(unsupported(
+                "NTFS mutation requires an in-use base FILE record",
+            ));
         }
         let attributes = record.attributes().map_err(|err| parse_err(&err))?;
         if attributes.iter().any(|attr| attr.kind == 0x20) {
@@ -2136,7 +2488,10 @@ impl NtfsTransactionEngine {
                 || parent.number != parent_no
                 || parent.sequence != name.parent.sequence
             {
-                return Err(corrupt(0, "NTFS link parent is not a live matching directory"));
+                return Err(corrupt(
+                    0,
+                    "NTFS link parent is not a live matching directory",
+                ));
             }
             let located = self.locate_directory_entry(cx, &parent_raw, &parent, &name.name)?;
             if !located
@@ -2145,7 +2500,10 @@ impl NtfsTransactionEngine {
                 .as_ref()
                 .is_some_and(|(target, indexed, _)| *target == reference && indexed == name)
             {
-                return Err(corrupt(0, "NTFS FILE_NAME and parent index identities disagree"));
+                return Err(corrupt(
+                    0,
+                    "NTFS FILE_NAME and parent index identities disagree",
+                ));
             }
         }
         Ok(())
@@ -2203,10 +2561,7 @@ impl NtfsTransactionEngine {
                                 .ok_or_else(|| corrupt(0, "resident DATA attribute is absent"))?;
                         // Only FILE_NAME attributes own native link counts.
                         if restored[at + 22..at + 24] != [0, 0] {
-                            return Err(corrupt(
-                                0,
-                                "NTFS resident DATA has nonzero indexed flags",
-                            ));
+                            return Err(corrupt(0, "NTFS resident DATA has nonzero indexed flags"));
                         }
                     }
                     if !stream_names.insert(attribute.name) {
@@ -2695,9 +3050,7 @@ impl NtfsTransactionEngine {
                 mutation_specs.extend(dir_upd.log_specs);
                 let mut indx = staged.indx;
                 for (offset, bytes) in dir_upd.updated_indx_blocks {
-                    if let Some((_, previous)) =
-                        indx.iter_mut().find(|(old, _)| *old == offset)
-                    {
+                    if let Some((_, previous)) = indx.iter_mut().find(|(old, _)| *old == offset) {
                         *previous = bytes;
                     } else {
                         indx.push((offset, bytes));
@@ -2928,7 +3281,10 @@ impl NtfsTransactionEngine {
                     || destination.number != destination_no
                     || destination.sequence != destination_ref.sequence
                 {
-                    return Err(corrupt(0, "NTFS rename destination has a stale FILE reference"));
+                    return Err(corrupt(
+                        0,
+                        "NTFS rename destination has a stale FILE reference",
+                    ));
                 }
                 if src_rec.is_directory() {
                     return Err(if destination.is_directory() {
@@ -3833,8 +4189,7 @@ impl NtfsTransactionEngine {
             });
         }
 
-        let (_, mft_size, _) =
-            extract_plain_nonresident_stream(&self.geometry, mft0, DATA, &[])?;
+        let (_, mft_size, _) = extract_plain_nonresident_stream(&self.geometry, mft0, DATA, &[])?;
         let logical_records = mft_size / u64::from(self.geometry.record_bytes());
         let mut mft_bm = self.read_mft_bitmap_bytes(cx, mft0, logical_records)?;
         set_or_clear_bits(&mut mft_bm, u64::from(target_no), 1, false);

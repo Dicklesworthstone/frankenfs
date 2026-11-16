@@ -451,7 +451,10 @@ fn reference_mutation_admission_refuses_stale_parents_and_directory_overwrite_be
         .into_result()
         .unwrap();
     let directory: Vec<_> = "directory".encode_utf16().collect();
-    engine.mkdir_at(&cx, root, &directory).into_result().unwrap();
+    engine
+        .mkdir_at(&cx, root, &directory)
+        .into_result()
+        .unwrap();
     let before = device.snapshot_durable_only();
     let writes = device.write_bytes_total();
     let stale = NtfsReference {
@@ -4914,6 +4917,446 @@ fn named_stream_admission_rejects_crosslinked_data_before_any_backing_write() {
     assert_eq!(device.snapshot_durable_only(), image);
 }
 
+#[test]
+fn named_stream_catalog_create_remove_preserves_native_identity_and_other_attributes() {
+    let cx = Cx::for_testing();
+    let original: Vec<_> = "Metadata".encode_utf16().collect();
+    let (device, mut engine, file) = named_stream_fixture(&original);
+    let before = expected_named_stream_bytes(&original, b"original ADS".to_vec());
+    let record_at = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * RECORD_BYTES;
+    let baseline = device.snapshot_durable_only();
+    let initial_free = engine
+        .volume_view(&cx)
+        .unwrap()
+        .check_allocations(&cx, AllocationLimits::default())
+        .unwrap()
+        .bitmap_free_clusters;
+    let unrelated = |image: &[u8]| {
+        copied_test_record_attributes(&image[record_at..record_at + RECORD_BYTES])
+            .into_iter()
+            .filter(|attribute| u32::from_le_bytes(attribute[..4].try_into().unwrap()) != DATA)
+            .collect::<Vec<_>>()
+    };
+    // Cover both insertion before existing DATA and append, lossless non-UTF8
+    // native names, empty resident streams, and nonresident initial payloads.
+    for (name, data) in [
+        ("AAFirst".encode_utf16().collect::<Vec<_>>(), Vec::new()),
+        (
+            "Last".encode_utf16().collect(),
+            b"resident payload".to_vec(),
+        ),
+        (vec![0xD800, 0x7A], vec![0xC7; 9001]),
+    ] {
+        let (created, token) = engine
+            .create_stream(&cx, file, &name, &data)
+            .into_result()
+            .unwrap();
+        assert_eq!(created, file);
+        assert!(token.matches_engine(&engine));
+        let mut expected = before.clone();
+        expected.insert(name.clone(), data.clone());
+        let image = device.snapshot_durable_only();
+        assert_eq!(recover_named_stream_bytes(&image, file), expected);
+        assert_eq!(unrelated(&image), unrelated(&baseline));
+        let view = engine.volume_view(&cx).unwrap();
+        let record = view.record(&cx, file.record, Some(file.sequence)).unwrap();
+        assert_eq!(record.hard_links, 1);
+        let stream = view.data_stream(&cx, &record, &name).unwrap();
+        assert_eq!(stream.resident(), data.len() <= 512);
+        let allocated = if stream.resident() {
+            0
+        } else {
+            (data.len() as u64).div_ceil(CLUSTER_BYTES as u64)
+        };
+        assert_eq!(
+            view.check_allocations(&cx, AllocationLimits::default())
+                .unwrap()
+                .bitmap_free_clusters,
+            initial_free - allocated,
+            "only the new stream's payload owns fresh clusters"
+        );
+        let ids: std::collections::BTreeSet<_> = record
+            .attributes()
+            .unwrap()
+            .iter()
+            .map(|attribute| attribute.id)
+            .collect();
+        assert_eq!(ids.len(), record.attributes().unwrap().len());
+        drop(view);
+        engine.check_clean_consistency(&cx).unwrap();
+
+        engine
+            .remove_stream(&cx, file, &name)
+            .into_result()
+            .unwrap();
+        let image = device.snapshot_durable_only();
+        assert_eq!(recover_named_stream_bytes(&image, file), before);
+        assert_eq!(unrelated(&image), unrelated(&baseline));
+        engine.check_clean_consistency(&cx).unwrap();
+        assert_eq!(
+            engine
+                .volume_view(&cx)
+                .unwrap()
+                .check_allocations(&cx, AllocationLimits::default())
+                .unwrap()
+                .bitmap_free_clusters,
+            initial_free,
+            "stream deletion must reclaim every allocated cluster"
+        );
+    }
+}
+
+#[test]
+fn named_stream_catalog_invalid_requests_do_not_publish_or_change_storage() {
+    let cx = Cx::for_testing();
+    let name: Vec<_> = "Metadata".encode_utf16().collect();
+    let (device, mut engine, file) = named_stream_fixture(&name);
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let events = engine.persistence_trace().len();
+    let stale = NtfsReference {
+        sequence: file.sequence.wrapping_add(1),
+        ..file
+    };
+    let folded: Vec<_> = "metadata".encode_utf16().collect();
+    let new: Vec<_> = "new".encode_utf16().collect();
+    let oversized = vec![0x61; 256];
+    for (outcome, errno) in [
+        (
+            engine.create_stream(&cx, file, &folded, b"replace"),
+            libc::EEXIST,
+        ),
+        (
+            engine.create_stream(&cx, file, &[], b"unnamed"),
+            libc::EINVAL,
+        ),
+        (engine.remove_stream(&cx, file, &[]), libc::EINVAL),
+        (
+            engine.create_stream(&cx, file, &[0x3A], b"invalid"),
+            libc::EINVAL,
+        ),
+        (engine.remove_stream(&cx, file, &new), libc::ENOENT),
+        (engine.remove_stream(&cx, file, &folded), libc::ENOENT),
+        (
+            engine.create_stream(&cx, stale, &new, b"stale"),
+            libc::ESTALE,
+        ),
+        (engine.remove_stream(&cx, stale, &name), libc::ESTALE),
+        (
+            engine.create_stream(&cx, file, &oversized, b"long"),
+            libc::ENAMETOOLONG,
+        ),
+        (
+            engine.create_file_stream(&cx, "/", &new, b"dir"),
+            libc::EISDIR,
+        ),
+        (
+            engine.create_file_stream(&cx, "/missing", &new, b"missing"),
+            libc::ENOENT,
+        ),
+    ] {
+        let NtfsTxOutcome::NotCommitted(error) = outcome else {
+            panic!("stream catalog refusal must precede native publication: {outcome:?}");
+        };
+        assert_eq!(error.to_errno(), errno, "{error}");
+    }
+    let cancelled = Cx::for_testing();
+    cancelled.set_cancel_requested(true);
+    assert!(matches!(
+        engine.create_stream(&cancelled, file, &new, b"cancelled"),
+        NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
+    ));
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(engine.persistence_trace().len(), events);
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.snapshot_durable_only(), before);
+}
+
+#[test]
+fn named_stream_catalog_crash_prefixes_recover_atomic_creation_and_reclamation() {
+    let cx = Cx::for_testing();
+    let original: Vec<_> = "Metadata".encode_utf16().collect();
+    let (device, mut engine, file) = named_stream_fixture(&original);
+    let name: Vec<_> = "Journaled".encode_utf16().collect();
+    let mut expected = expected_named_stream_bytes(&original, b"original ADS".to_vec());
+    for data in [
+        Some(b"resident".to_vec()),
+        None,
+        Some(vec![0xB7; 9001]),
+        None,
+    ] {
+        let before = expected.clone();
+        if let Some(payload) = &data {
+            expected.insert(name.clone(), payload.clone());
+        } else {
+            expected.remove(&name);
+        }
+        type Cut = (NtfsPersistenceStage, bool, Vec<u8>, Vec<u8>);
+        let cuts: Arc<Mutex<Vec<Cut>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&cuts);
+        let backing = Arc::clone(&device);
+        let mut committed = false;
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+            captured.lock().unwrap().push((
+                event.stage,
+                committed,
+                backing.snapshot_durable_only(),
+                backing.snapshot_reordered_pending(true),
+            ));
+            Ok(())
+        })));
+        let outcome = if let Some(payload) = &data {
+            engine.create_stream(&cx, file, &name, payload)
+        } else {
+            engine.remove_stream(&cx, file, &name)
+        };
+        outcome.into_result().unwrap();
+        engine.set_stage_hook(None);
+        assert_eq!(
+            recover_named_stream_bytes(&device.snapshot_durable_only(), file),
+            expected
+        );
+        let cuts = std::mem::take(&mut *cuts.lock().unwrap());
+        assert!(cuts.iter().any(|(_, committed, _, _)| !committed));
+        assert!(cuts.iter().any(|(_, committed, _, _)| *committed));
+        for (stage, committed, durable, reordered) in cuts {
+            assert_eq!(
+                recover_named_stream_bytes(&durable, file),
+                if committed { &expected } else { &before }.clone(),
+                "catalog durable prefix at {stage:?}, creation={}",
+                data.is_some()
+            );
+            let recovered = recover_named_stream_bytes(&reordered, file);
+            if committed {
+                assert_eq!(recovered, expected, "catalog committed prefix at {stage:?}");
+            } else {
+                assert!(
+                    recovered == before || recovered == expected,
+                    "catalog reordered prefix at {stage:?} exposed partial or collateral state"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn named_stream_catalog_failed_barriers_and_committed_cancellation_preserve_outcomes() {
+    let original: Vec<_> = "Metadata".encode_utf16().collect();
+    let name: Vec<_> = "Journaled".encode_utf16().collect();
+    let payload = vec![0xB7; 9001];
+    for create in [true, false] {
+        let cx = Cx::for_testing();
+        let (device, mut engine, file) = named_stream_fixture(&original);
+        let mut before = expected_named_stream_bytes(&original, b"original ADS".to_vec());
+        if !create {
+            engine
+                .create_stream(&cx, file, &name, &payload)
+                .into_result()
+                .unwrap();
+            before.insert(name.clone(), payload.clone());
+        }
+        let pristine = device.snapshot_durable_only();
+        let length = pristine.len() as u64 - SECTOR_BYTES as u64;
+        let mut after = before.clone();
+        if create {
+            after.insert(name.clone(), payload.clone());
+        } else {
+            after.remove(&name);
+        }
+        let mut failures = 0;
+        for failed_sync in 1..=8 {
+            let device = FaultInjectingNtfsDevice::new(pristine.clone());
+            let mut engine = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&device) as Arc<dyn ByteDevice>,
+                0,
+                length,
+                write_options_clean(),
+            )
+            .unwrap();
+            device.set_fail_sync_call(Some(failed_sync));
+            let outcome = if create {
+                engine.create_stream(&cx, file, &name, &payload)
+            } else {
+                engine.remove_stream(&cx, file, &name)
+            };
+            let recovered = recover_named_stream_bytes(&device.snapshot_durable_only(), file);
+            match outcome {
+                NtfsTxOutcome::Committed { .. } => assert_eq!(recovered, after),
+                NtfsTxOutcome::NotCommitted(_) => {
+                    failures += 1;
+                    assert_eq!(recovered, before, "uncommitted catalog sync {failed_sync}");
+                }
+                NtfsTxOutcome::Uncertain { .. } => {
+                    failures += 1;
+                    assert!(engine.requires_recovery());
+                    assert!(
+                        recovered == before || recovered == after,
+                        "failed catalog sync {failed_sync} exposed a partial transaction"
+                    );
+                }
+            }
+        }
+        assert!(failures >= 4, "exercise actual native barrier failures");
+        let cx = Cx::for_testing();
+        let cancellation = cx.clone();
+        let device = FaultInjectingNtfsDevice::new(pristine);
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&device) as Arc<dyn ByteDevice>,
+            0,
+            length,
+            write_options_clean(),
+        )
+        .unwrap();
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            if event.stage == NtfsPersistenceStage::LogCommitBarrier {
+                cancellation.set_cancel_requested(true);
+            }
+            Ok(())
+        })));
+        let outcome = if create {
+            engine.create_stream(&cx, file, &name, &payload)
+        } else {
+            engine.remove_stream(&cx, file, &name)
+        };
+        let (updated, token) = outcome.into_result().unwrap();
+        assert_eq!(updated, file);
+        assert!(token.matches_engine(&engine));
+        assert!(cx.checkpoint().is_err());
+        assert!(!engine.requires_recovery());
+        assert_eq!(
+            recover_named_stream_bytes(&device.snapshot_durable_only(), file),
+            after
+        );
+    }
+}
+
+#[test]
+fn named_stream_catalog_mount_create_remove_rejects_open_streams_and_retires_identity() {
+    use ffs_core::vfs::ReleaseRequest;
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let original: Vec<_> = "Metadata".encode_utf16().collect();
+    let (device, engine, file) = named_stream_fixture(&original);
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+    let base = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("Streams.bin"))
+        .unwrap();
+    let new = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("streams.bin:Created"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(new.size, 0);
+    assert_ne!(new.ino, base.ino);
+    fs.write(&cx, &mut scope, new.ino, 9000, b"payload")
+        .unwrap();
+    let writes = device.write_bytes_total();
+    let (handle, _) = fs.open(&cx, &mut scope, new.ino, libc::O_RDWR).unwrap();
+    assert_eq!(
+        fs.unlink(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("Streams.bin:created:$DATA")
+        )
+        .unwrap_err()
+        .to_errno(),
+        libc::EBUSY
+    );
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(
+        fs.read(&cx, &mut scope, new.ino, 9000, 64).unwrap(),
+        b"payload"
+    );
+    fs.release(
+        &cx,
+        &mut scope,
+        ReleaseRequest {
+            ino: new.ino,
+            fh: handle,
+            flags: libc::O_RDWR,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    // A handle on unnamed DATA does not pin an independently closed ADS.
+    let (base_handle, _) = fs.open(&cx, &mut scope, base.ino, libc::O_RDONLY).unwrap();
+    fs.unlink(&cx, &mut scope, root, OsStr::new("Streams.bin:created"))
+        .unwrap();
+    assert!(fs.getattr(&cx, &mut scope, new.ino).is_err());
+    assert!(fs.read(&cx, &mut scope, new.ino, 0, 1).is_err());
+    assert!(
+        fs.lookup(&cx, &mut scope, root, OsStr::new("Streams.bin:Created"))
+            .is_err()
+    );
+    let recreated = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("Streams.bin:Created:$DATA"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    assert_ne!(new.ino, recreated.ino);
+    assert_eq!(fs.read(&cx, &mut scope, recreated.ino, 0, 64).unwrap(), b"");
+    assert_eq!(
+        fs.read(&cx, &mut scope, base.ino, 0, 64).unwrap(),
+        b"unchanged unnamed stream"
+    );
+    assert_eq!(
+        fs.create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("Streams.bin:metadata"),
+            0o644,
+            1000,
+            1000
+        )
+        .unwrap_err()
+        .to_errno(),
+        libc::EEXIST
+    );
+    fs.release(
+        &cx,
+        &mut scope,
+        ReleaseRequest {
+            ino: base.ino,
+            fh: base_handle,
+            flags: libc::O_RDONLY,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+    let mut expected = expected_named_stream_bytes(&original, b"original ADS".to_vec());
+    expected.insert("Created".encode_utf16().collect(), Vec::new());
+    assert_eq!(
+        recover_named_stream_bytes(&device.snapshot_durable_only(), file),
+        expected
+    );
+}
+
 #[derive(Debug)]
 struct HardLinkIndexValue {
     name: NtfsFileName,
@@ -4929,10 +5372,11 @@ fn collect_hard_link_index_values(
     block_vcn: Option<u64>,
     values: &mut Vec<HardLinkIndexValue>,
 ) {
-    let mut at = header
-        + u32::from_le_bytes(node[header..header + 4].try_into().unwrap()) as usize;
+    let mut at = header + u32::from_le_bytes(node[header..header + 4].try_into().unwrap()) as usize;
     loop {
-        let length = usize::from(u16::from_le_bytes(node[at + 8..at + 10].try_into().unwrap()));
+        let length = usize::from(u16::from_le_bytes(
+            node[at + 8..at + 10].try_into().unwrap(),
+        ));
         let flags = u16::from_le_bytes(node[at + 12..at + 14].try_into().unwrap());
         if flags & 2 != 0 {
             break;
@@ -4940,8 +5384,9 @@ fn collect_hard_link_index_values(
         if NtfsReference::decode(u64::from_le_bytes(node[at..at + 8].try_into().unwrap()))
             == reference
         {
-            let key_length =
-                usize::from(u16::from_le_bytes(node[at + 10..at + 12].try_into().unwrap()));
+            let key_length = usize::from(u16::from_le_bytes(
+                node[at + 10..at + 12].try_into().unwrap(),
+            ));
             let key = &node[at + 16..at + 16 + key_length];
             values.push(HardLinkIndexValue {
                 name: NtfsFileName::parse(key).unwrap(),
@@ -5006,8 +5451,7 @@ fn hard_link_index_values(
             .iter()
             .find(|run| vcn >= run.vcn && vcn - run.vcn < run.clusters)
             .unwrap();
-        let physical =
-            usize::try_from(run.lcn.unwrap() + vcn - run.vcn).unwrap() * CLUSTER_BYTES;
+        let physical = usize::try_from(run.lcn.unwrap() + vcn - run.vcn).unwrap() * CLUSTER_BYTES;
         let raw = &image[physical..physical + INDEX_BYTES];
         let entries = parse_index_block(raw, vcn).unwrap();
         let restored = restore_record(raw, b"INDX").unwrap();
@@ -5201,10 +5645,7 @@ fn native_hard_links_preserve_identity_through_edits_renames_and_final_reclamati
         .unwrap();
     let paths = ["/source", "/other/moved", "/other/third"];
     assert_native_hard_links(&device.snapshot_durable_only(), reference, &paths, &payload);
-    engine
-        .unlink_file(&cx, "/source")
-        .into_result()
-        .unwrap();
+    engine.unlink_file(&cx, "/source").into_result().unwrap();
     let paths = ["/other/moved", "/other/third"];
     assert_native_hard_links(&device.snapshot_durable_only(), reference, &paths, &payload);
     engine
@@ -5293,19 +5734,14 @@ fn native_hard_link_size_updates_accumulate_in_shared_external_index_blocks() {
         .unwrap();
     let paths = ["/large/zz0", "/large/zz1", "/other/third"];
     let mut payload = vec![0x37; 5_000];
-    let locations = assert_native_hard_links(
-        &device.snapshot_durable_only(),
-        reference,
-        &paths,
-        &payload,
-    );
+    let locations =
+        assert_native_hard_links(&device.snapshot_durable_only(), reference, &paths, &payload);
     assert!(
         locations["/large/zz0"].is_some(),
         "must exercise external INDX"
     );
     assert_eq!(
-        locations["/large/zz0"],
-        locations["/large/zz1"],
+        locations["/large/zz0"], locations["/large/zz1"],
         "both aliases must share the same external index block"
     );
 
@@ -5706,15 +6142,7 @@ fn writable_fsops_hard_links_keep_open_files_until_the_final_name_is_removed() {
     let root = InodeNumber(1);
     let mut scope = RequestScope::empty();
     let file = fs
-        .create(
-            &cx,
-            &mut scope,
-            root,
-            OsStr::new("note"),
-            0o644,
-            1000,
-            1000,
-        )
+        .create(&cx, &mut scope, root, OsStr::new("note"), 0o644, 1000, 1000)
         .unwrap();
     fs.write(&cx, &mut scope, file.ino, 0, b"hello").unwrap();
     let (handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDWR).unwrap();
@@ -5746,7 +6174,8 @@ fn writable_fsops_hard_links_keep_open_files_until_the_final_name_is_removed() {
     assert_eq!(third.ino, file.ino);
     assert_eq!(third.nlink, 3);
 
-    fs.unlink(&cx, &mut scope, root, OsStr::new("note")).unwrap();
+    fs.unlink(&cx, &mut scope, root, OsStr::new("note"))
+        .unwrap();
     assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap().nlink, 2);
     assert_eq!(
         fs.lookup(&cx, &mut scope, root, OsStr::new("alias"))
@@ -5755,8 +6184,12 @@ fn writable_fsops_hard_links_keep_open_files_until_the_final_name_is_removed() {
         file.ino
     );
     fs.write(&cx, &mut scope, alias.ino, 1, b"XY").unwrap();
-    assert_eq!(fs.read(&cx, &mut scope, third.ino, 0, 64).unwrap(), b"hXYlo");
-    fs.unlink(&cx, &mut scope, root, OsStr::new("alias")).unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, third.ino, 0, 64).unwrap(),
+        b"hXYlo"
+    );
+    fs.unlink(&cx, &mut scope, root, OsStr::new("alias"))
+        .unwrap();
     assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap().nlink, 1);
     let files = read_all_files_from_clean_volume(&device.snapshot_durable_only());
     assert_eq!(files.get("/directory/third"), Some(&b"hXYlo".to_vec()));
@@ -5766,7 +6199,10 @@ fn writable_fsops_hard_links_keep_open_files_until_the_final_name_is_removed() {
         .unwrap();
     assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap().nlink, 0);
     assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(), b"hXYlo");
-    assert_eq!(fs.readdir(&cx, &mut scope, directory.ino, 0).unwrap().len(), 2);
+    assert_eq!(
+        fs.readdir(&cx, &mut scope, directory.ino, 0).unwrap().len(),
+        2
+    );
     assert!(
         fs.readdir(&cx, &mut scope, root, 0)
             .unwrap()
@@ -5776,19 +6212,16 @@ fn writable_fsops_hard_links_keep_open_files_until_the_final_name_is_removed() {
     let before = device.snapshot_durable_only();
     let writes = device.write_bytes_total();
     assert!(
-        fs.link(
-            &cx,
-            &mut scope,
-            file.ino,
-            root,
-            OsStr::new("resurrected"),
-        )
-        .is_err()
+        fs.link(&cx, &mut scope, file.ino, root, OsStr::new("resurrected"),)
+            .is_err()
     );
     assert_eq!(device.write_bytes_total(), writes);
     assert_eq!(device.snapshot_live(), before);
     fs.write(&cx, &mut scope, file.ino, 5, b"!").unwrap();
-    assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(), b"hXYlo!");
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(),
+        b"hXYlo!"
+    );
     fs.release(
         &cx,
         &mut scope,
@@ -5937,7 +6370,10 @@ fn writable_hard_link_publication_survives_post_commit_cancellation() {
     assert!(cx.checkpoint().is_err());
     let next = Cx::for_testing();
     assert_eq!(fs.getattr(&next, &mut scope, source.ino).unwrap().nlink, 2);
-    assert_eq!(fs.read(&next, &mut scope, alias.ino, 0, 64).unwrap(), b"kept");
+    assert_eq!(
+        fs.read(&next, &mut scope, alias.ino, 0, 64).unwrap(),
+        b"kept"
+    );
     assert_native_hard_links(
         &device.snapshot_durable_only(),
         reference,
@@ -6034,15 +6470,7 @@ fn native_rename_replacement_preserves_source_and_surviving_victim_links_and_str
         drop(before_view);
 
         let (outcome, token) = engine
-            .rename_at(
-                &cx,
-                root,
-                &source_name,
-                root,
-                &victim_name,
-                source,
-                false,
-            )
+            .rename_at(&cx, root, &source_name, root, &victim_name, source, false)
             .into_result()
             .unwrap();
         assert_eq!(outcome.source, source);
@@ -6216,8 +6644,7 @@ fn native_rename_replacement_composes_shared_leaf_and_promoted_separator_edits()
         let before = device.snapshot_durable_only();
         let mut expected = read_all_files_from_clean_volume(&before);
         let victim_data = expected[&victim_path].clone();
-        let source_locations =
-            assert_native_hard_links(&before, source, &[&source_path], &payload);
+        let source_locations = assert_native_hard_links(&before, source, &[&source_path], &payload);
         let victim_locations =
             assert_native_hard_links(&before, victim, &[&victim_path], &victim_data);
         assert!(
@@ -6228,8 +6655,7 @@ fn native_rename_replacement_composes_shared_leaf_and_promoted_separator_edits()
             assert_eq!(source_locations[&source_path], None);
         } else {
             assert_eq!(
-                source_locations[&source_path],
-                victim_locations[&victim_path],
+                source_locations[&source_path], victim_locations[&victim_path],
                 "source deletion and replacement must touch the same external block"
             );
         }
@@ -6348,7 +6774,10 @@ fn recover_rename_replacement_state(
             })
             .map(String::as_str)
             .collect();
-        assert!(!paths.is_empty(), "a live FILE must retain its native names");
+        assert!(
+            !paths.is_empty(),
+            "a live FILE must retain its native names"
+        );
         assert_native_hard_links(&recovered, reference, &paths, &files[paths[0]]);
     }
     RenameReplacementState {
@@ -6425,9 +6854,11 @@ fn native_rename_replacement_crash_cuts_preserve_complete_names_streams_and_allo
         let captured = std::mem::take(&mut *cuts.lock().unwrap());
         assert!(captured.iter().any(|(_, committed, _, _, _)| !committed));
         assert!(captured.iter().any(|(_, committed, _, _, _)| *committed));
-        assert!(captured.iter().any(|(stage, _, _, _, _)| {
-            *stage == NtfsPersistenceStage::TargetMetadataWrite
-        }));
+        assert!(
+            captured
+                .iter()
+                .any(|(stage, _, _, _, _)| { *stage == NtfsPersistenceStage::TargetMetadataWrite })
+        );
         for (stage, committed, durable, live, reordered) in captured {
             assert_eq!(
                 &recover_rename_replacement_state(&durable, source, victim),
@@ -6503,15 +6934,7 @@ fn native_rename_replacement_no_replace_and_stale_references_fail_before_writes(
         ));
     }
     assert!(matches!(
-        engine.rename_at(
-            &cx,
-            root,
-            &source_name,
-            root,
-            &victim_name,
-            source,
-            true,
-        ),
+        engine.rename_at(&cx, root, &source_name, root, &victim_name, source, true,),
         NtfsTxOutcome::NotCommitted(FfsError::Exists)
     ));
     for (parent, new_parent, expected) in [
@@ -6547,12 +6970,7 @@ fn native_rename_replacement_no_replace_and_stale_references_fail_before_writes(
     assert_eq!(engine.persistence_trace().len(), events);
     assert_eq!(device.snapshot_live(), before);
     assert_eq!(device.snapshot_durable_only(), before);
-    assert_native_hard_links(
-        &before,
-        source,
-        &["/source", "/alias"],
-        b"source data",
-    );
+    assert_native_hard_links(&before, source, &["/source", "/alias"], b"source data");
     assert_native_hard_links(&before, victim, &["/victim"], b"victim data");
 
     let (renamed, token) = engine
@@ -6672,9 +7090,8 @@ fn native_rename_replacement_rejects_malformed_source_and_victim_catalogs_before
                     name[at..at + 8].copy_from_slice(&stale.to_le_bytes());
                 }
             }
-            attributes.sort_by_key(|attribute| {
-                u32::from_le_bytes(attribute[..4].try_into().unwrap())
-            });
+            attributes
+                .sort_by_key(|attribute| u32::from_le_bytes(attribute[..4].try_into().unwrap()));
             let changed = build_file_record(
                 reference.record as u32,
                 reference.sequence,
@@ -6720,8 +7137,7 @@ fn writable_rename_replacement_refuses_pinned_ads_and_retires_only_final_victim_
             .unwrap();
         let image = device.snapshot_durable_only();
         let offset = CLUSTER_BYTES + usize::try_from(source.record).unwrap() * RECORD_BYTES;
-        let mut attributes =
-            copied_test_record_attributes(&image[offset..offset + RECORD_BYTES]);
+        let mut attributes = copied_test_record_attributes(&image[offset..offset + RECORD_BYTES]);
         attributes.push(build_resident_attr(
             DATA,
             30,
@@ -6836,12 +7252,7 @@ fn writable_rename_replacement_refuses_pinned_ads_and_retires_only_final_victim_
             source_attr.ino
         );
         let new_ads = fs
-            .lookup(
-                &next,
-                &mut scope,
-                root,
-                OsStr::new("Streams.bin:content"),
-            )
+            .lookup(&next, &mut scope, root, OsStr::new("Streams.bin:content"))
             .unwrap();
         assert_ne!(new_ads.ino, old_ads.ino);
         assert_eq!(
@@ -6866,14 +7277,9 @@ fn writable_rename_replacement_refuses_pinned_ads_and_retires_only_final_victim_
                 1
             );
             assert_eq!(
-                fs.lookup(
-                    &next,
-                    &mut scope,
-                    root,
-                    OsStr::new("survivor:content"),
-                )
-                .unwrap()
-                .ino,
+                fs.lookup(&next, &mut scope, root, OsStr::new("survivor:content"),)
+                    .unwrap()
+                    .ino,
                 old_ads.ino
             );
             assert_eq!(
@@ -6944,8 +7350,7 @@ fn native_rename_replacement_refuses_crosslinked_source_and_victim_allocation() 
         .find(|attribute| u32::from_le_bytes(attribute[..4].try_into().unwrap()) == DATA)
         .unwrap();
     assert_eq!(data[8], 1, "fixture DATA must own physical clusters");
-    let mut attributes =
-        copied_test_record_attributes(&clean[victim_at..victim_at + RECORD_BYTES]);
+    let mut attributes = copied_test_record_attributes(&clean[victim_at..victim_at + RECORD_BYTES]);
     let target = attributes
         .iter_mut()
         .find(|attribute| u32::from_le_bytes(attribute[..4].try_into().unwrap()) == DATA)
@@ -6953,8 +7358,7 @@ fn native_rename_replacement_refuses_crosslinked_source_and_victim_allocation() 
     let id = [target[14], target[15]];
     *target = data;
     target[14..16].copy_from_slice(&id);
-    let changed =
-        build_file_record(victim.record as u32, victim.sequence, 1, false, &attributes);
+    let changed = build_file_record(victim.record as u32, victim.sequence, 1, false, &attributes);
     device
         .write_all_at(&cx, ByteOffset(victim_at as u64), &changed)
         .unwrap();
@@ -6972,7 +7376,10 @@ fn native_rename_replacement_refuses_crosslinked_source_and_victim_allocation() 
     let writes = device.write_bytes_total();
     let events = engine.persistence_trace().len();
     let outcome = engine.rename_entry(&cx, "/source", "/victim", Some(source));
-    assert!(matches!(outcome, NtfsTxOutcome::NotCommitted(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, NtfsTxOutcome::NotCommitted(_)),
+        "{outcome:?}"
+    );
     assert_eq!(device.write_bytes_total(), writes);
     assert_eq!(engine.persistence_trace().len(), events);
     assert_eq!(device.snapshot_live(), before);

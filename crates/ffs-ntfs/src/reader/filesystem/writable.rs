@@ -129,6 +129,38 @@ impl NtfsFs {
         Ok(units)
     }
 
+    fn ads_mutation_component(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<Option<(Vec<u16>, Vec<u16>)>> {
+        let text = name
+            .to_str()
+            .ok_or_else(|| unsupported("NTFS mutation requires lossless UTF-8"))?;
+        if !text.contains(':') {
+            return Ok(None);
+        }
+        // A literal native colon name takes precedence over the host ADS
+        // projection. Never reinterpret its removal as another file's stream.
+        let directory = self.record(cx, parent)?;
+        if !directory.is_directory() {
+            return Err(FfsError::NotDirectory);
+        }
+        let units: Vec<_> = text.encode_utf16().collect();
+        let volume = self.active_volume()?;
+        if units.len() <= 255
+            && volume
+                .lookup_indexed_entry(cx, &directory, &units, &self.upcase)?
+                .is_some()
+        {
+            return Err(unsupported(
+                "mutation of literal native colon filenames is not admitted",
+            ));
+        }
+        parse_ads_component(text)
+    }
+
     fn directory_reference(&self, cx: &Cx, ino: InodeNumber) -> Result<NtfsReference> {
         if self.describe(cx, ino)?.kind != FileType::Directory {
             return Err(FfsError::NotDirectory);
@@ -212,6 +244,18 @@ impl NtfsFs {
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
         Self::check_create_mode(mode, false)?;
+        if let Some((base, stream)) = self.ads_mutation_component(cx, parent, name)? {
+            let base_name = String::from_utf16(&base)
+                .map_err(|_| unsupported("NTFS stream base name is not lossless UTF-8"))?;
+            let base_attr = self.lookup_indexed(cx, parent, OsStr::new(&base_name))?;
+            let (target, _) = self.data_target(cx, base_attr.ino)?;
+            self.check_ads_registration(target, &stream)?;
+            self.transact(cx, |engine| engine.create_stream(cx, target, &stream, &[]))?;
+            return cx.masked(|| {
+                let ino = self.register_ads(target, &stream)?;
+                self.describe(cx, ino)
+            });
+        }
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
         let target = self.transact(cx, |engine| engine.create_file_at(cx, parent, &name, &[]))?;
@@ -293,6 +337,19 @@ impl NtfsFs {
 
     pub(super) fn unlink_locked(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> Result<()> {
         self.ensure_writable()?;
+        if let Some((base, stream)) = self.ads_mutation_component(cx, parent, name)? {
+            let attr = self.lookup_ads_component(cx, parent, &base, &stream)?;
+            let (target, exact_name) = self.data_target(cx, attr.ino)?;
+            if self.pinned(attr.ino)? {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EBUSY,
+                    detail: "removing an open NTFS stream requires native stream retention".into(),
+                });
+            }
+            self.transact(cx, |engine| engine.remove_stream(cx, target, &exact_name))?;
+            self.retire_ads(attr.ino)?;
+            return Ok(());
+        }
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
         let target = self.writer()?.lookup_reference(cx, parent, &name)?;
@@ -379,7 +436,9 @@ impl NtfsFs {
         // Retained names are owned by final-unlink cleanup. Resurrection would
         // need to retire that hidden name in the same native transaction.
         if attr.nlink == 0 || self.is_retained_file(ino)? {
-            return Err(unsupported("linking an unlinked NTFS handle is not admitted"));
+            return Err(unsupported(
+                "linking an unlinked NTFS handle is not admitted",
+            ));
         }
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
