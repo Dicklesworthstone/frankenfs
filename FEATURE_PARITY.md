@@ -25,13 +25,14 @@
 > Native transaction, checkpoint and recovery-log pages publish in logical append
 > order, with a durable prefix before each later page, including across ring wrap.
 > A split Commit/Forget sequence enters postcommit cancellation handling at the
-> actual commit barrier. Recovery rejects a missing or foreign predecessor inside
-> the retained scan window even when an earlier record of the transaction survives;
-> checkpoint references older than that window retain their existing treatment.
+> actual commit barrier. Recovery rejects retained predecessors that are missing,
+> belong to another transaction, or cross an observed Forget boundary, even when
+> an earlier record of the current transaction survives. Checkpoint references
+> older than the retained window keep their existing treatment.
 > Persistence-cut regressions exercise hard links and replacement rename with
 > reordered pending writes, alongside a direct missing-middle-chain refusal case.
-> Hosted validation of this follow-up is pending; these changes do not establish
-> Windows interchange or remove the broader NTFS writer restrictions.
+> The filesystem-integrity workflows exercise this scope on x86-64 and AArch64.
+> Windows interchange and broader NTFS writer restrictions remain separate work.
 
 > **NTFS atomic ordinary-file replacement (2026-11-15):**
 > Native rename can replace a distinct ordinary file in one logged transaction.

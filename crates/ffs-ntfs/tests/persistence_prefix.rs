@@ -16,8 +16,9 @@ use ffs_ntfs::transaction::{
 };
 use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_ondisk::ntfs::logfile_writer::{
-    LFS_RECORD_CLIENT, NtfsClientUpdateSpec, NtfsLogRingWriter, NtfsRestartConfig,
-    encode_client_update_payload,
+    LFS_RECORD_CLIENT, LFS_RECORD_CLIENT_RESTART, NtfsCheckpointPayload, NtfsClientUpdateSpec,
+    NtfsLogRingWriter, NtfsRestartConfig, encode_client_update_payload, encode_restart_table,
+    encode_transaction_entry,
 };
 use ffs_ondisk::ntfs::{
     DATA, NtfsFileRecord, NtfsLogOp, NtfsReference, NtfsRun, VOLUME_INFORMATION,
@@ -3575,6 +3576,121 @@ fn recovery_refuses_a_missing_middle_predecessor_but_accepts_retained_prefixes()
         } else {
             opened.unwrap().check_clean_consistency(&cx).unwrap();
             assert_eq!(device.snapshot_live(), device.snapshot_durable_only());
+        }
+    }
+}
+
+#[test]
+fn recovery_refuses_predecessors_from_an_older_reuse_of_the_same_transaction_id() {
+    let cx = Cx::for_testing();
+    let clean = build_clean_ntfs_image(256, 64, 0xA11E_5000_0000_0043);
+    let volume_bytes = clean.len() as u64 - SECTOR_BYTES as u64;
+    let payload = |op, redo_data| {
+        encode_client_update_payload(&NtfsClientUpdateSpec {
+            redo_op: op,
+            undo_op: NtfsLogOp::Noop,
+            target_attribute: 0,
+            record_offset: 0,
+            attribute_offset: 0,
+            cluster_block_offset: 0,
+            target_vcn: 0,
+            target_lcns: Vec::new(),
+            redo_data,
+            undo_data: Vec::new(),
+        })
+        .unwrap()
+    };
+    let append = |ring: &mut NtfsLogRingWriter, op, previous| {
+        ring.append_raw_record(LFS_RECORD_CLIENT, 24, previous, 0, &payload(op, Vec::new()))
+            .unwrap()
+    };
+
+    for seeded in [false, true] {
+        for predecessor_kind in 0..4 {
+            let mut ring = NtfsLogRingWriter::new_fresh(
+                CLUSTER_BYTES as u32,
+                (2, 0),
+                64 * CLUSTER_BYTES as u64,
+                1,
+                1,
+            )
+            .unwrap();
+            let old_head = append(&mut ring, NtfsLogOp::Noop, 0);
+            let old_commit = append(&mut ring, NtfsLogOp::CommitTransaction, old_head.lsn);
+            let old_forget = append(&mut ring, NtfsLogOp::ForgetTransaction, old_commit.lsn);
+            let current_head = append(&mut ring, NtfsLogOp::Noop, 0);
+            if seeded {
+                // The fuzzy checkpoint already describes the current lifetime,
+                // but its retained scan starts before the previous one completed.
+                let entry =
+                    encode_transaction_entry(1, current_head.lsn, current_head.lsn, 0).unwrap();
+                let table =
+                    encode_restart_table(40, &BTreeMap::from([(24, entry.to_vec())])).unwrap();
+                let table_len = u32::try_from(table.len()).unwrap();
+                let dump = ring
+                    .append_raw_record(
+                        LFS_RECORD_CLIENT,
+                        64,
+                        0,
+                        0,
+                        &payload(NtfsLogOp::TransactionTableDump, table),
+                    )
+                    .unwrap();
+                ring.append_raw_record(
+                    LFS_RECORD_CLIENT,
+                    64,
+                    dump.lsn,
+                    0,
+                    &payload(NtfsLogOp::ForgetTransaction, Vec::new()),
+                )
+                .unwrap();
+                let checkpoint = NtfsCheckpointPayload {
+                    start_of_checkpoint_lsn: old_head.lsn,
+                    transaction_table_lsn: dump.lsn,
+                    transaction_table_len: table_len,
+                    ..NtfsCheckpointPayload::default()
+                }
+                .encode()
+                .unwrap();
+                ring.append_raw_record(LFS_RECORD_CLIENT_RESTART, 0, 0, 0, &checkpoint)
+                    .unwrap();
+            }
+            let predecessor = match predecessor_kind {
+                0 => current_head.lsn,
+                1 => old_head.lsn,
+                2 => old_commit.lsn,
+                _ => old_forget.lsn,
+            };
+            let current_commit = append(&mut ring, NtfsLogOp::CommitTransaction, predecessor);
+            assert_eq!(old_head.page_vbo, current_commit.page_vbo);
+            let mut image = clean.clone();
+            let at = 10 * CLUSTER_BYTES + usize::try_from(current_commit.page_vbo).unwrap();
+            image[at..at + CLUSTER_BYTES].copy_from_slice(&current_commit.protected_page);
+            for _ in 0..2 {
+                let restart = ring.build_next_rstr_page(false).unwrap();
+                let at = 10 * CLUSTER_BYTES + usize::try_from(restart.page_vbo).unwrap();
+                image[at..at + CLUSTER_BYTES].copy_from_slice(&restart.bytes);
+            }
+            let device = FaultInjectingNtfsDevice::new(image.clone());
+            let opened = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&device) as Arc<dyn ByteDevice>,
+                0,
+                volume_bytes,
+                write_options_recover(),
+            );
+            if predecessor_kind == 0 {
+                opened.unwrap().check_clean_consistency(&cx).unwrap();
+                assert_eq!(device.snapshot_live(), device.snapshot_durable_only());
+            } else {
+                assert!(matches!(
+                    opened,
+                    Err(FfsError::Corruption { detail, .. })
+                        if detail.contains("different transaction lifetime")
+                ));
+                assert_eq!(device.write_bytes_total(), 0);
+                assert_eq!(device.snapshot_live(), image);
+            }
         }
     }
 }

@@ -1042,7 +1042,7 @@ impl NtfsTransactionEngine {
         // Analysis pass over client records.
         let mut client_by_lsn: BTreeMap<u64, ClientRecord> = BTreeMap::new();
         let mut committed_lifetimes: BTreeSet<(u32, u64)> = BTreeSet::new();
-        let mut record_first_lsn: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut last_forget_lsn: BTreeMap<u32, u64> = BTreeMap::new();
 
         for raw in &raw_records {
             if raw.record_type == LFS_CLIENT_RESTART {
@@ -1071,6 +1071,18 @@ impl NtfsTransactionEngine {
                     return Err(corrupt(
                         client.lsn,
                         "transaction predecessor belongs to a different transaction",
+                    ));
+                }
+                // A fuzzy checkpoint can seed a later reuse of this numeric
+                // slot while the retained scan still includes its old records.
+                // A validated Forget is an independent, chronological boundary.
+                if last_forget_lsn
+                    .get(&tx_id)
+                    .is_some_and(|&retired| client.previous_lsn <= retired)
+                {
+                    return Err(corrupt(
+                        client.lsn,
+                        "transaction predecessor belongs to a different transaction lifetime",
                     ));
                 }
             }
@@ -1116,9 +1128,9 @@ impl NtfsTransactionEngine {
                 });
             }
             let first_lsn = tx_table[&tx_id].first_lsn;
-            record_first_lsn.insert(client.lsn, first_lsn);
 
             if client.redo_op == NtfsLogOp::ForgetTransaction {
+                last_forget_lsn.insert(tx_id, client.lsn);
                 tx_table.remove(&tx_id);
                 client_by_lsn.insert(client.lsn, client);
                 continue;
@@ -1203,7 +1215,6 @@ impl NtfsTransactionEngine {
         // and prior CLRs) in chronological LSN order in private memory BEFORE Undo!
         let mut staged = StagedSectorBuffer::new(&self.device, self.geometry.volume_bytes());
         let mut redo_applied = 0_usize;
-        let _ = &record_first_lsn;
         for (&lsn, rec) in &client_by_lsn {
             if !is_data_mutation_op(rec.redo_op) {
                 continue;
