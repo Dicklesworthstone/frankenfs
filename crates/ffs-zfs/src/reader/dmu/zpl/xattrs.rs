@@ -257,7 +257,7 @@ impl Zpl {
         Ok(catalog.inline.contains_key("security.capability")
             || catalog
                 .directory
-                .contains_key("security.capability".as_bytes()))
+                .contains_key(b"security.capability".as_slice()))
     }
 
     /// Complete, sorted, unique host user names. Both native representations

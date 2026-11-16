@@ -6419,13 +6419,20 @@ fn native_rename_replacement_crash_cuts_preserve_complete_names_streams_and_allo
                 .iter()
                 .any(|(stage, _, _, _, _)| { *stage == NtfsPersistenceStage::TargetMetadataWrite })
         );
-        for (stage, committed, durable, live, reordered) in captured {
+        for (cut, (stage, committed, durable, live, reordered)) in captured.into_iter().enumerate()
+        {
+            eprintln!(
+                "replacement recovery cut={cut} stage={stage:?} image=durable committed={committed} keep_victim={keep_victim}"
+            );
             assert_eq!(
                 &recover_rename_replacement_state(&durable, source, victim),
                 if committed { &after } else { &before },
                 "durable replacement prefix at {stage:?}, keep_victim={keep_victim}"
             );
             for (label, image) in [("live", live), ("reordered", reordered)] {
+                eprintln!(
+                    "replacement recovery cut={cut} stage={stage:?} image={label} committed={committed} keep_victim={keep_victim}"
+                );
                 let recovered = recover_rename_replacement_state(&image, source, victim);
                 if committed {
                     assert_eq!(
@@ -6910,12 +6917,14 @@ fn native_rename_replacement_refuses_crosslinked_source_and_victim_allocation() 
         .find(|attribute| u32::from_le_bytes(attribute[..4].try_into().unwrap()) == DATA)
         .unwrap();
     assert_eq!(data[8], 1, "fixture DATA must own physical clusters");
+    let source_data_id = u16::from_le_bytes([data[14], data[15]]);
     let mut attributes = copied_test_record_attributes(&clean[victim_at..victim_at + RECORD_BYTES]);
     let target = attributes
         .iter_mut()
         .find(|attribute| u32::from_le_bytes(attribute[..4].try_into().unwrap()) == DATA)
         .unwrap();
     let id = [target[14], target[15]];
+    let victim_data_id = u16::from_le_bytes(id);
     *target = data;
     target[14..16].copy_from_slice(&id);
     let changed = build_file_record(victim.record as u32, victim.sequence, 1, false, &attributes);
@@ -6923,21 +6932,41 @@ fn native_rename_replacement_refuses_crosslinked_source_and_victim_allocation() 
         .write_all_at(&cx, ByteOffset(victim_at as u64), &changed)
         .unwrap();
     device.sync(&cx).unwrap();
+    let volume = engine.volume_view(&cx).unwrap();
+    // FILE catalog ownership stays valid: the injected defect is two DATA
+    // attributes claiming the same physical clusters, checked independently.
     assert!(
-        !engine
-            .volume_view(&cx)
-            .unwrap()
+        volume
             .check_record_ownership(&cx, RecordOwnershipLimits::default())
             .unwrap()
-            .is_consistent(),
-        "corrupted fixture must contain shared physical ownership"
+            .is_consistent()
     );
+    let allocations = volume
+        .check_allocations(&cx, AllocationLimits::default())
+        .unwrap();
+    assert_eq!(
+        allocations.cross_linked_clusters, 2,
+        "both clusters of the 5,000-byte stream must be shared: {allocations:?}"
+    );
+    assert!(allocations.issues.iter().any(|issue| {
+        let owners = [
+            (issue.record, issue.attribute_id),
+            (issue.other_record, issue.other_attribute_id),
+        ];
+        issue.category == "cross_link"
+            && owners.contains(&(Some(source.record), Some(source_data_id)))
+            && owners.contains(&(Some(victim.record), Some(victim_data_id)))
+    }));
     let before = device.snapshot_durable_only();
     let writes = device.write_bytes_total();
     let events = engine.persistence_trace().len();
     let outcome = engine.rename_entry(&cx, "/source", "/victim", Some(source));
     assert!(
-        matches!(outcome, NtfsTxOutcome::NotCommitted(_)),
+        matches!(
+            &outcome,
+            NtfsTxOutcome::NotCommitted(FfsError::Corruption { detail, .. })
+                if detail.contains("source and destination share clusters")
+        ),
         "{outcome:?}"
     );
     assert_eq!(device.write_bytes_total(), writes);

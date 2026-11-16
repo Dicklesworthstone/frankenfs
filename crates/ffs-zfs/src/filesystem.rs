@@ -1126,7 +1126,7 @@ impl FsOps for ZfsFs {
         ino: InodeNumber,
     ) -> Result<ffs_core::FsStat> {
         let mut state = self.state(cx)?;
-        let mut stats = if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+        let mut space_info = if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
             if !state.head.view.has_snapshot_dir() {
                 return Err(FfsError::NotFound("ZPL control directory".into()));
             }
@@ -1138,15 +1138,15 @@ impl FsOps for ZfsFs {
         };
         checkpoint(cx)?;
         if let Some(writer) = &state.writer {
-            let fragment_size = u64::from(stats.fragment_size);
+            let fragment_size = u64::from(space_info.fragment_size);
             if fragment_size == 0 {
                 return Err(corrupt("ZPL statfs fragment size is zero"));
             }
-            stats.blocks = writer.engine.storage_identity().asize / fragment_size;
-            stats.blocks_free = writer.engine.free_bytes() / fragment_size;
-            stats.blocks_available = stats.blocks_free;
+            space_info.blocks = writer.engine.storage_identity().asize / fragment_size;
+            space_info.blocks_free = writer.engine.free_bytes() / fragment_size;
+            space_info.blocks_available = space_info.blocks_free;
         }
-        Ok(stats)
+        Ok(space_info)
     }
 
     fn lseek(

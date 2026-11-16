@@ -6594,7 +6594,8 @@ fn host_provenance() -> Result<HostProvenance> {
             matches!(key.trim(), "model name" | "Hardware").then(|| value.trim().to_owned())
         })
         .ok_or_else(|| anyhow!("CPU model missing from /proc/cpuinfo"))?;
-    let runtime_features = [
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let detected_features = [
         ("sse2", std::is_x86_feature_detected!("sse2")),
         ("sse4.2", std::is_x86_feature_detected!("sse4.2")),
         ("avx", std::is_x86_feature_detected!("avx")),
@@ -6603,10 +6604,22 @@ fn host_provenance() -> Result<HostProvenance> {
         ("fma", std::is_x86_feature_detected!("fma")),
         ("avx512f", std::is_x86_feature_detected!("avx512f")),
         ("avx512bw", std::is_x86_feature_detected!("avx512bw")),
-    ]
-    .into_iter()
-    .filter_map(|(name, detected)| detected.then_some(name))
-    .collect();
+    ];
+    #[cfg(target_arch = "aarch64")]
+    let detected_features = [
+        ("neon", std::arch::is_aarch64_feature_detected!("neon")),
+        ("crc", std::arch::is_aarch64_feature_detected!("crc")),
+        ("aes", std::arch::is_aarch64_feature_detected!("aes")),
+        ("sha2", std::arch::is_aarch64_feature_detected!("sha2")),
+        ("sve", std::arch::is_aarch64_feature_detected!("sve")),
+        ("sve2", std::arch::is_aarch64_feature_detected!("sve2")),
+    ];
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    let detected_features: [(&str, bool); 0] = [];
+    let runtime_features = detected_features
+        .into_iter()
+        .filter_map(|(name, detected)| detected.then_some(name))
+        .collect();
     let cpu_frequency_policy = cpu_frequency_policy(&allowed_cpus_before_pin)?;
     Ok(HostProvenance {
         hostname: fs::read_to_string("/proc/sys/kernel/hostname")

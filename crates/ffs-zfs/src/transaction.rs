@@ -608,7 +608,7 @@ impl ZfsTransactionEngine {
             }
             pool.root(cx, options.label, options.slot, options.pool_guid)?
         };
-        let current_uberblock = root_block.uberblock.clone();
+        let mut current_uberblock = root_block.uberblock.clone();
         let vcfg = root_block.vdev_config().clone();
         let order = current_uberblock.root.payload_order();
         let mos_os = ObjectSet::parse(&root_block.data, order).map_err(|e| parse_err(&e))?;
@@ -695,15 +695,15 @@ impl ZfsTransactionEngine {
 
             // Preserve both publication waves and all-member durability barriers.
             let default_sw = if version == 5000 { 5000 } else { version };
-            let mut synced_ub = current_uberblock.clone();
-            synced_ub.order = *expected_order;
+            let selected_order = current_uberblock.order;
+            current_uberblock.order = *expected_order;
             for wave_labels in [[0_usize, 1], [2, 3]] {
                 for (m_idx, member) in members.iter().enumerate() {
                     for l_idx in wave_labels {
                         let off = label_offsets_per_member[m_idx][l_idx]
                             + UBERBLOCK_RING_OFFSET
                             + (options.slot * slot_bytes) as u64;
-                        let encoded = synced_ub
+                        let encoded = current_uberblock
                             .encode_with_meta(
                                 slot_bytes,
                                 off,
@@ -719,6 +719,9 @@ impl ZfsTransactionEngine {
                     member.sync_raw(cx)?;
                 }
             }
+            // The native copies use label order; retain the selected in-memory
+            // representation after reconciliation without cloning its root.
+            current_uberblock.order = selected_order;
         }
 
         let storage_identity = ZfsStorageIdentity {

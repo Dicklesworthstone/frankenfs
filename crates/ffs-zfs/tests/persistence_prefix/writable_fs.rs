@@ -109,7 +109,6 @@ fn native_fsops_lifecycle_persists_metadata_and_reads_its_latest_txg() {
             stats.blocks_free,
             native_free / u64::from(stats.fragment_size)
         );
-        let free_before = stats.blocks_free;
         let dir = fs
             .mkdir(
                 &cx,
@@ -190,10 +189,27 @@ fn native_fsops_lifecycle_persists_metadata_and_reads_its_latest_txg() {
             .unwrap();
         assert_eq!((resized.size, resized.nlink), (6, 1));
         assert_eq!(read(&fs, &cx, file.ino), b"\0\0\0pay");
-        let free_after = fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free;
+        // The preceding lifecycle both allocates and reclaims storage, so its
+        // net free-space delta need not be negative. Exercise allocation and
+        // reclamation separately; a stale statfs result must fail both checks.
+        let probe = create(&fs, &cx, ROOT, "allocation-probe");
+        let before_allocation = fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free;
+        let payload = vec![0xA5; 1024 * 1024];
+        assert_eq!(
+            fs.write(&cx, &mut scope, probe.ino, 0, &payload).unwrap(),
+            u32::try_from(payload.len()).unwrap()
+        );
+        let after_allocation = fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free;
         assert!(
-            free_after < free_before,
-            "new native allocations must change statfs"
+            after_allocation < before_allocation,
+            "new data must consume native space: {before_allocation} -> {after_allocation}"
+        );
+        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("allocation-probe"))
+            .unwrap();
+        let reported_free = fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free;
+        assert!(
+            reported_free > after_allocation,
+            "final unlink must release native data: {after_allocation} -> {reported_free}"
         );
 
         let before_rejected = io_counts(&devices);
@@ -254,7 +270,16 @@ fn native_fsops_lifecycle_persists_metadata_and_reads_its_latest_txg() {
             default_write_opts(POOL_GUID, token.published_slot()),
         )
         .unwrap();
+        assert_eq!(
+            reported_free,
+            reopened.free_bytes() / u64::from(stats.fragment_size),
+            "mounted statfs must match allocation reconstructed from durable media"
+        );
         let fs = ZfsFs::with_writer(&cx, reopened, vec![b"data".to_vec()]).unwrap();
+        assert_eq!(
+            fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free,
+            reported_free
+        );
         let persisted = lookup(&fs, &cx, ROOT, "persisted");
         assert_eq!(
             (persisted.perm, persisted.uid, persisted.gid),

@@ -3378,8 +3378,9 @@ invalid timestamp preflight. Every recorded publication-stage cut is restarted
 from durable media with dropped or reordered pending writes; recovered size and
 times must belong to one whole predecessor or successor transaction.
 
-Execution is pending while these changes are being validated. These are
-constructed-image/storage-model tests, not native OpenZFS or mounted qualification.
+The feature-specific regressions passed on both x86-64 and AArch64 at source
+`cee8ba03dd39724f4392b7063d134006f92590ce`. These are constructed-image/storage-model
+tests, not native OpenZFS or mounted qualification.
 The broader `bd-jdned` and `bd-uetvl` work packages remain open.
 
 Final unlink and replacement now reject native xattr-directory or external-ACL
@@ -3416,6 +3417,14 @@ targets, setgid inheritance, duplicate and invalid-target refusal, readonly and
 immutable parents, snapshot isolation, cold reopen, rename/unlink, and every
 recorded publication-stage cut with dropped or reordered pending writes. The
 project fixture uses a nonzero owner and compressed spill so metadata COW changes
-physical allocation and detects incorrect quota attribution. Execution evidence
-is pending validation of the integrated candidate. These fixtures do not establish
-native OpenZFS interchange or a real mounted syscall result.
+physical allocation and detects incorrect quota attribution.
+
+At source `cee8ba03dd39724f4392b7063d134006f92590ce`, both the
+[x86-64 validation](https://github.com/Dicklesworthstone/frankenfs/actions/runs/43788725930)
+and [AArch64 validation](https://github.com/Dicklesworthstone/frankenfs/actions/runs/43788705713)
+passed 13 ZPL codec tests, 345 ZFS unit tests, and every new timestamp, symlink,
+project-accounting and auxiliary-ownership persistence regression. The broader
+runs exposed an existing ZFS statfs lifecycle assertion, three NTFS persistence
+failures, Clippy diagnostics, and an AArch64-only harness probe build failure;
+those runs therefore do not establish an all-green workspace. These fixtures
+also do not establish native OpenZFS interchange or a real mounted syscall result.

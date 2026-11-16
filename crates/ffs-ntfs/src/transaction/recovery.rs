@@ -1084,7 +1084,10 @@ impl NtfsTransactionEngine {
                 if client.previous_lsn != 0 && scan_start <= client.previous_lsn {
                     return Err(corrupt(
                         client.lsn,
-                        "transaction record references missing predecessor",
+                        format!(
+                            "transaction {tx_id} record {} ({:?}) references missing predecessor {} in retained window {scan_start}..={}",
+                            client.lsn, client.redo_op, client.previous_lsn, selected.current_lsn
+                        ),
                     ));
                 }
                 vacant.insert(TxRuntime {

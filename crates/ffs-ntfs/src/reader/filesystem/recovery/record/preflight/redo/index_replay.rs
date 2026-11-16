@@ -302,12 +302,12 @@ fn identity(action: &Action<'_>, geometry: Geometry) -> Result<()> {
     if !index_target(action.attribute)
         || action.attribute.name != I30
         || owner.sequence == 0
-        || owner.record < 16
+        || (owner.record < 16 && owner.record != 5)
         || owner.record >= geometry.records
         || action.attribute.opened > action.record.lsn
     {
         return Err(unsupported(
-            "INDX replay requires a surviving non-system $I30 directory identity",
+            "INDX replay requires a surviving root or user $I30 directory identity",
         ));
     }
     if action.record.kind != LFS_CLIENT_RECORD
