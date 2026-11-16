@@ -55,6 +55,19 @@ enum DeadlistMode {
     NativeDeadlist,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuxiliaryOwnership {
+    XattrDirectory,
+    ExternalAcl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaSpillFixture {
+    None,
+    Opaque,
+    Mtime,
+}
+
 #[derive(Debug, Clone)]
 struct PoolFixtureSpec {
     pool_name: String,
@@ -64,6 +77,7 @@ struct PoolFixtureSpec {
     mirror_width: usize,
     zpl_version: u64,
     with_sa_spill: bool,
+    with_sa_spill_timestamps: bool,
     user_accounting: bool,
     deadlist_mode: DeadlistMode,
     preallocate_nearly_full: bool,
@@ -75,6 +89,7 @@ struct PoolFixtureSpec {
     zpl_flags: BTreeMap<u64, u64>,
     root_properties: Vec<(&'static [u8], u64)>,
     data_properties: Vec<(&'static [u8], u64)>,
+    auxiliary_ownership: Option<(u64, AuxiliaryOwnership)>,
 }
 
 impl Default for PoolFixtureSpec {
@@ -87,6 +102,7 @@ impl Default for PoolFixtureSpec {
             mirror_width: 1,
             zpl_version: 5,
             with_sa_spill: false,
+            with_sa_spill_timestamps: false,
             user_accounting: false,
             deadlist_mode: DeadlistMode::None,
             preallocate_nearly_full: false,
@@ -98,6 +114,19 @@ impl Default for PoolFixtureSpec {
             zpl_flags: BTreeMap::new(),
             root_properties: Vec::new(),
             data_properties: Vec::new(),
+            auxiliary_ownership: None,
+        }
+    }
+}
+
+impl PoolFixtureSpec {
+    fn spill_profile(&self) -> SaSpillFixture {
+        if self.with_sa_spill_timestamps {
+            SaSpillFixture::Mtime
+        } else if self.with_sa_spill {
+            SaSpillFixture::Opaque
+        } else {
+            SaSpillFixture::None
         }
     }
 }
@@ -498,6 +527,30 @@ fn build_sa_registry_objects(
             values: vec![18],
             collision: 0,
         },
+        RawZapEntry {
+            name: b"4".to_vec(),
+            integer_bytes: 2,
+            values: vec![9],
+            collision: 0,
+        },
+        RawZapEntry {
+            name: b"5".to_vec(),
+            integer_bytes: 2,
+            values: vec![15],
+            collision: 0,
+        },
+        RawZapEntry {
+            name: b"6".to_vec(),
+            integer_bytes: 2,
+            values: vec![5, 6, 4, 12, 13, 7, 11, 0, 2, 3, 8],
+            collision: 0,
+        },
+        RawZapEntry {
+            name: b"7".to_vec(),
+            integer_bytes: 2,
+            values: vec![1, 18],
+            collision: 0,
+        },
     ];
     let registry = SaRegistry::from_zaps(&reg_entries, &lay_entries).expect("valid SaRegistry");
 
@@ -537,7 +590,7 @@ fn encode_zpl_bonus_for_fixture(
     meta: &Metadata,
     zpl_version: u64,
     sa_reg: Option<&SaRegistry>,
-    with_spill: bool,
+    spill_profile: SaSpillFixture,
     arena: &mut RawArena,
     birth: u64,
     order: Endian,
@@ -563,13 +616,18 @@ fn encode_zpl_bonus_for_fixture(
                 tmpl[4..6].copy_from_slice(&hdr_info.to_be_bytes());
             }
         }
-        let bonus = reg
+        let mut bonus = reg
             .encode_new_from_template(&tmpl, meta)
             .expect("encode SA metadata");
-        let spill = if with_spill {
+        let spill = if spill_profile != SaSpillFixture::None {
             // Valid SA header `[magic(4), (header_bytes=8 => 1<<10 | layout=3), 32B attr 18]`
             let mut sraw = vec![0_u8; 512];
-            let hdr_word: u16 = (1_u16 << 10) | 3_u16;
+            let layout = if spill_profile == SaSpillFixture::Mtime {
+                7
+            } else {
+                3
+            };
+            let hdr_word: u16 = (1_u16 << 10) | layout;
             match order {
                 Endian::Little => {
                     sraw[0..4].copy_from_slice(&[0x5a, 0x50, 0x2f, 0x00]);
@@ -580,7 +638,20 @@ fn encode_zpl_bonus_for_fixture(
                     sraw[4..6].copy_from_slice(&hdr_word.to_be_bytes());
                 }
             }
-            sraw[8..40].fill(0xAB);
+            if spill_profile == SaSpillFixture::Mtime {
+                sraw[8..24].copy_from_slice(&bonus[80..96]);
+                sraw[24..56].fill(0xAB);
+                let mut split_bonus = bonus[..80].to_vec();
+                split_bonus.extend_from_slice(&bonus[96..]);
+                let split_header = (1_u16 << 10) | 6;
+                split_bonus[4..6].copy_from_slice(&match order {
+                    Endian::Little => split_header.to_le_bytes(),
+                    Endian::Big => split_header.to_be_bytes(),
+                });
+                bonus = split_bonus;
+            } else {
+                sraw[8..40].fill(0xAB);
+            }
             Some(arena.alloc_block(&sraw, 44, 0, birth, order))
         } else {
             None
@@ -727,7 +798,7 @@ fn build_zpl_objectset(
             &hello_meta,
             spec.zpl_version,
             sa_reg.as_ref(),
-            spec.with_sa_spill,
+            spec.spill_profile(),
             arena,
             birth,
             order,
@@ -760,7 +831,7 @@ fn build_zpl_objectset(
             &keep_meta,
             spec.zpl_version,
             sa_reg.as_ref(),
-            false,
+            SaSpillFixture::None,
             arena,
             birth,
             order,
@@ -801,7 +872,7 @@ fn build_zpl_objectset(
             &sub_meta,
             spec.zpl_version,
             sa_reg.as_ref(),
-            false,
+            SaSpillFixture::None,
             arena,
             birth,
             order,
@@ -822,7 +893,7 @@ fn build_zpl_objectset(
             encode_directory_reference(6, Kind::Directory).unwrap(),
         ));
         subdir_count += 1;
-    } else if spec.with_sa_spill {
+    } else if spec.with_sa_spill || spec.with_sa_spill_timestamps {
         // Seed a file `spilled.txt` (Object 4) with a valid SA spill block so COW updates preserve it!
         let sp_data = b"initial-spilled-content".to_vec();
         let mut padded = sp_data.clone();
@@ -845,7 +916,7 @@ fn build_zpl_objectset(
             &sp_meta,
             spec.zpl_version,
             sa_reg.as_ref(),
-            true,
+            spec.spill_profile(),
             arena,
             birth,
             order,
@@ -867,6 +938,140 @@ fn build_zpl_objectset(
         ));
     }
 
+    if populate_snapshot_files && let Some((owner, auxiliary)) = spec.auxiliary_ownership {
+        // Native ownership edges live in the bonus/SA, independently of the
+        // owner's data block pointers. Seed real allocated private objects so
+        // final-link tests can distinguish preservation from a leaked object.
+        let owner_index = usize::try_from(owner).unwrap();
+        let owner_node = Dnode::parse(
+            &table[owner_index * DNODE_BYTES..(owner_index + 1) * DNODE_BYTES],
+            order,
+        )
+        .unwrap();
+        assert!(owner_node.spill().is_none());
+        let metadata = if spec.zpl_version == 4 {
+            Metadata::legacy(owner_node.bonus(), order).unwrap()
+        } else {
+            sa_reg
+                .as_ref()
+                .unwrap()
+                .decode(owner_node.bonus(), None)
+                .unwrap()
+                .metadata()
+                .unwrap()
+        };
+        let (attribute, layout, payload) = match auxiliary {
+            AuxiliaryOwnership::XattrDirectory => {
+                let value = b"private value survives namespace changes";
+                let mut padded = value.to_vec();
+                padded.resize((1_usize << spec.ashift).max(512), 0);
+                let value_bp = arena.alloc_block(&padded, 19, 0, birth, order);
+                let value_meta = Metadata {
+                    mode: (Kind::Regular.to_tag() << 12) | 0o600,
+                    kind: Kind::Regular,
+                    size: value.len() as u64,
+                    parent: 13,
+                    links: 1,
+                    flags: 1,
+                    inline_symlink: None,
+                    ..metadata.clone()
+                };
+                let value_node = make_dnode(
+                    19,
+                    padded.len(),
+                    vec![value_bp],
+                    17,
+                    value_meta.encode_legacy(None, order).unwrap(),
+                    None,
+                    acct_flags,
+                    order,
+                );
+                write_dnode_at(&mut table, 14, &value_node).unwrap();
+                let entries = mzap(
+                    &[(
+                        b"user.retained",
+                        encode_directory_reference(14, Kind::Regular).unwrap(),
+                    )],
+                    0xA113,
+                    order,
+                );
+                let directory_bp = arena.alloc_block(&entries, 20, 0, birth, order);
+                let directory_meta = Metadata {
+                    mode: (Kind::Directory.to_tag() << 12) | 0o700,
+                    kind: Kind::Directory,
+                    size: 3,
+                    parent: owner,
+                    links: 2,
+                    flags: 1,
+                    inline_symlink: None,
+                    ..metadata
+                };
+                let directory_node = make_dnode(
+                    20,
+                    entries.len(),
+                    vec![directory_bp],
+                    17,
+                    directory_meta.encode_legacy(None, order).unwrap(),
+                    None,
+                    acct_flags,
+                    order,
+                );
+                write_dnode_at(&mut table, 13, &directory_node).unwrap();
+                (104, 4, order.encode(13).to_vec())
+            }
+            AuxiliaryOwnership::ExternalAcl => {
+                // OpenZFS zfs-2.3.0 zfs_acl_phys_t: external object, byte
+                // length, version, ACE count, then 72 inline bytes. Twelve
+                // compact FUID ACEs exceed that inline capacity.
+                let mut acl_data = vec![0_u8; (1_usize << spec.ashift).max(512)];
+                for ace in acl_data[..96].chunks_exact_mut(8) {
+                    ace[2..4].copy_from_slice(&0x1000_u16.to_le_bytes());
+                    ace[4..8].copy_from_slice(&1_u32.to_le_bytes());
+                }
+                let acl_bp = arena.alloc_block(&acl_data, 33, 0, birth, order);
+                let acl_node = make_dnode(
+                    33,
+                    acl_data.len(),
+                    vec![acl_bp],
+                    0,
+                    Vec::new(),
+                    None,
+                    0,
+                    order,
+                );
+                write_dnode_at(&mut table, 13, &acl_node).unwrap();
+                let mut acl = vec![0_u8; 88];
+                acl[..8].copy_from_slice(&order.encode(13));
+                acl[8..12].copy_from_slice(&96_u32.to_le_bytes());
+                acl[12..14].copy_from_slice(&1_u16.to_le_bytes());
+                acl[14..16].copy_from_slice(&12_u16.to_le_bytes());
+                (176, 5, acl)
+            }
+        };
+        let mut bonus = owner_node.bonus().to_vec();
+        let spill = if spec.zpl_version == 4 {
+            bonus[attribute..attribute + payload.len()].copy_from_slice(&payload);
+            None
+        } else {
+            let mut raw = vec![0_u8; (1_usize << spec.ashift).max(512)];
+            raw[..4].copy_from_slice(&[0x5a, 0x50, 0x2f, 0]);
+            raw[4..6].copy_from_slice(&((1_u16 << 10) | layout).to_le_bytes());
+            raw[8..8 + payload.len()].copy_from_slice(&payload);
+            Some(arena.alloc_block(&raw, 44, 0, birth, order))
+        };
+        let owner_node = make_dnode(
+            owner_node.object_type(),
+            owner_node.data_bytes(),
+            owner_node.pointers().to_vec(),
+            owner_node.bonus_type(),
+            bonus,
+            spill,
+            acct_flags,
+            order,
+        );
+        write_dnode_at(&mut table, owner_index, &owner_node).unwrap();
+    }
+
     let root_raw = mzap(&root_entries, 0x88, order);
     let root_bp = arena.alloc_block(&root_raw, 20, 0, birth, order);
     let root_meta = Metadata {
@@ -886,7 +1091,7 @@ fn build_zpl_objectset(
         &root_meta,
         spec.zpl_version,
         sa_reg.as_ref(),
-        false,
+        SaSpillFixture::None,
         arena,
         birth,
         order,
@@ -3522,6 +3727,181 @@ fn snapshotted_dataset_cow_preserves_historical_lzjb_snapshot_with_bpobj_and_dea
             snap_zpl.read(&cx, snap_keep, 0, 8192).unwrap(),
             vec![0x5A; 4096]
         );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_210,
+        nanos: 29,
+    };
+    for (zpl_version, mirror_width, ashift) in [(4, 1, 9), (5, 2, 12)] {
+        for auxiliary in [
+            AuxiliaryOwnership::XattrDirectory,
+            AuxiliaryOwnership::ExternalAcl,
+        ] {
+            for owner in [4, 6] {
+                let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                    zpl_version,
+                    mirror_width,
+                    ashift,
+                    deadlist_mode: DeadlistMode::NativeDeadlist,
+                    auxiliary_ownership: Some((owner, auxiliary)),
+                    ..PoolFixtureSpec::default()
+                });
+                let devices: Vec<_> = built
+                    .members
+                    .into_iter()
+                    .map(FaultableMemberDevice::new)
+                    .collect();
+                let mut engine = open_engine_on_devices(
+                    &cx,
+                    &devices,
+                    default_write_opts(built.pool_guid, built.initial_slot),
+                )
+                .unwrap();
+                let directory = owner == 6;
+                let name: &[u8] = if directory { b"sub" } else { b"hello.txt" };
+                let replacement = if directory {
+                    engine
+                        .mkdir(&cx, &dataset, 2, b"replacement", 0o755, 0, 0, timestamp)
+                        .into_result()
+                        .unwrap()
+                        .0
+                } else {
+                    engine
+                        .create_file(
+                            &cx,
+                            &dataset,
+                            2,
+                            b"replacement",
+                            0o600,
+                            0,
+                            0,
+                            timestamp,
+                            ZfsDataChecksum::Fletcher4,
+                        )
+                        .into_result()
+                        .unwrap()
+                        .0
+                };
+                let before: Vec<_> = devices
+                    .iter()
+                    .map(FaultableMemberDevice::durable_snapshot)
+                    .collect();
+                assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                    writer.unlink_entry(&cx, &dataset, 2, name, directory, timestamp)
+                });
+                assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                    writer.rename_entry(
+                        &cx,
+                        &dataset,
+                        2,
+                        b"replacement",
+                        2,
+                        name,
+                        Some(replacement),
+                        timestamp,
+                    )
+                });
+                for (device, bytes) in devices.iter().zip(&before) {
+                    let media = device.state.lock().unwrap();
+                    assert_eq!(&media.durable, bytes);
+                    assert!(media.volatile.is_empty());
+                }
+
+                if !directory {
+                    // Removing one of several links retains the owner and its
+                    // auxiliary tree. Both unlink and replacement must remain
+                    // usable rather than refusing every attributed file.
+                    engine
+                        .link_entry(&cx, &dataset, owner, 2, b"alias", timestamp)
+                        .into_result()
+                        .unwrap();
+                    engine
+                        .unlink_entry(&cx, &dataset, 2, b"alias", false, timestamp)
+                        .into_result()
+                        .unwrap();
+                    engine
+                        .link_entry(&cx, &dataset, owner, 2, b"alias", timestamp)
+                        .into_result()
+                        .unwrap();
+                    engine
+                        .rename_entry(
+                            &cx,
+                            &dataset,
+                            2,
+                            b"replacement",
+                            2,
+                            b"alias",
+                            Some(replacement),
+                            timestamp,
+                        )
+                        .into_result()
+                        .unwrap();
+                    engine
+                        .unlink_entry(&cx, &dataset, 2, b"alias", false, timestamp)
+                        .into_result()
+                        .unwrap();
+                } else {
+                    engine
+                        .unlink_entry(&cx, &dataset, 2, b"replacement", true, timestamp)
+                        .into_result()
+                        .unwrap();
+                }
+
+                // Moving the attributed owner itself never reclaims it.
+                engine
+                    .rename_entry(
+                        &cx,
+                        &dataset,
+                        2,
+                        name,
+                        2,
+                        b"preserved",
+                        Some(owner),
+                        timestamp,
+                    )
+                    .into_result()
+                    .unwrap();
+                let slot = engine.committed_slot();
+                let fresh: Vec<_> = devices
+                    .iter()
+                    .map(FaultableMemberDevice::fresh_from_durable)
+                    .collect();
+                let mut reopened =
+                    open_engine_on_devices(&cx, &fresh, default_write_opts(built.pool_guid, slot))
+                        .unwrap();
+                let mut mos = reopened.open_read_objects(&cx).unwrap();
+                let mut zpl = mos.zpl(&cx, &dataset).unwrap();
+                assert_eq!(zpl.resolve(&cx, b"/preserved").unwrap(), owner);
+                assert_eq!(
+                    zpl.stat(&cx, owner).unwrap().0.links,
+                    if directory { 2 } else { 1 }
+                );
+                if auxiliary == AuxiliaryOwnership::XattrDirectory {
+                    assert_eq!(
+                        zpl.getxattr(&cx, owner, "user.retained").unwrap(),
+                        Some(b"private value survives namespace changes".to_vec())
+                    );
+                }
+                if !directory {
+                    assert_eq!(
+                        zpl.read(&cx, owner, 0, built.snap_hello_expected.len())
+                            .unwrap(),
+                        built.snap_hello_expected
+                    );
+                }
+                assert_native_write_refused(&mut reopened, &fresh, libc::EOPNOTSUPP, |writer| {
+                    writer.unlink_entry(&cx, &dataset, 2, b"preserved", directory, timestamp)
+                });
+                assert_pool_scrub_and_allocation_clean(&cx, &fresh, built.pool_guid, Some(slot));
+            }
+        }
     }
 }
 

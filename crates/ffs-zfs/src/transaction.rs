@@ -34,7 +34,7 @@ use self::dmu_cow::{
     DMU_OT_OBJSET, PoolSpaceAllocator, WriteBucket, finalize_mos_and_space_maps_to_convergence,
     zap_optional_u64, zap_required_u64,
 };
-pub use self::zpl_ops::ZfsDataChecksum;
+pub use self::zpl_ops::{ZfsDataChecksum, ZfsSetAttr};
 use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
 
 type FaultHook = Box<dyn FnMut(&ZfsPersistenceEvent) -> Result<()> + Send + Sync>;
@@ -958,12 +958,46 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
+        self.set_attributes(
+            cx,
+            dataset_components,
+            file_obj,
+            &ZfsSetAttr {
+                size: Some(new_size),
+                ..ZfsSetAttr::default()
+            },
+            timestamp,
+            checksum,
+        )
+    }
+
+    /// Publish size and native timestamps atomically in one TXG, returning the
+    /// resulting logical size. `timestamp` supplies ctime and, for a size change
+    /// without an explicit mtime, the new mtime. Empty requests are rejected.
+    /// Native readonly and persistent flag rules apply before publication.
+    ///
+    /// A metadata-only change preserves the existing data tree and does not use
+    /// `checksum`; that algorithm is used only for blocks rewritten by truncation.
+    pub fn set_attributes(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        object: u64,
+        attrs: &ZfsSetAttr,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        // Validate the whole compound request before opening metadata or staging
+        // a size change. A bad explicit time cannot leave a truncated file.
+        if let Err(error) = attrs.validate(timestamp) {
+            return ZfsTxOutcome::NotCommitted(error);
+        }
         self.execute_zpl_txg(
             cx,
             dataset_components,
-            &ZplMutation::TruncateFile {
-                file_obj,
-                new_size,
+            &ZplMutation::SetAttributes {
+                file_obj: object,
+                attrs: attrs.clone(),
                 timestamp,
                 checksum,
             },

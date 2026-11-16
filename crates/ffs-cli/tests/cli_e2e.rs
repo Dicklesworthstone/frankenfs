@@ -565,7 +565,10 @@ fn native_ntfs_hardlinks_preserve_identity_data_and_volume_bounds() {
         &[native_path, source_file.to_str().unwrap(), "/untouched.bin"],
     );
     let native_names = |parent: &str| {
-        let output = checked(Path::new("ntfsls"), &["-a", "-i", "-p", parent, native_path]);
+        let output = checked(
+            Path::new("ntfsls"),
+            &["-a", "-i", "-p", parent, native_path],
+        );
         String::from_utf8(output.stdout)
             .unwrap()
             .lines()
@@ -663,7 +666,10 @@ fn native_ntfs_hardlinks_preserve_identity_data_and_volume_bounds() {
         for path in absent {
             let (parent, name) = path.rsplit_once('/').unwrap();
             let parent = if parent.is_empty() { "/" } else { parent };
-            assert!(!native_names(parent).contains_key(name), "{path} still exists");
+            assert!(
+                !native_names(parent).contains_key(name),
+                "{path} still exists"
+            );
             assert!(
                 !run(Path::new("ntfscat"), &[native_path, path])
                     .status
@@ -784,11 +790,20 @@ fn native_ntfs_hardlinks_preserve_identity_data_and_volume_bounds() {
         assert_eq!(sha256_file(&embedded_image), unchanged);
     }
     for authorization in [None, Some("--offline-image"), Some("--allow-write")] {
-        let mut args = vec!["tx-link", embedded_path, "/seed.bin", "/", "not-created.bin"];
+        let mut args = vec![
+            "tx-link",
+            embedded_path,
+            "/seed.bin",
+            "/",
+            "not-created.bin",
+        ];
         args.extend(selection);
         args.extend(authorization);
         let output = run(binary, &args);
-        assert!(!output.status.success(), "missing write authority must fail");
+        assert!(
+            !output.status.success(),
+            "missing write authority must fail"
+        );
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(error.contains("--offline-image") || error.contains("--allow-write"));
         assert_eq!(sha256_file(&embedded_image), unchanged);
@@ -6558,7 +6573,10 @@ fn native_ntfs_replace_rename_preserves_aliases_and_reclaims_retired_streams() {
         checked(Path::new("ntfscp"), &args);
     }
     let native_names = |parent: &str| {
-        let output = checked(Path::new("ntfsls"), &["-a", "-i", "-p", parent, native_path]);
+        let output = checked(
+            Path::new("ntfsls"),
+            &["-a", "-i", "-p", parent, native_path],
+        );
         String::from_utf8(output.stdout)
             .unwrap()
             .lines()
@@ -6696,7 +6714,10 @@ fn native_ntfs_replace_rename_preserves_aliases_and_reclaims_retired_streams() {
         ];
         args.extend(selection);
         let output = run(binary, &args);
-        assert!(!output.status.success(), "no-replace must refuse {destination}");
+        assert!(
+            !output.status.success(),
+            "no-replace must refuse {destination}"
+        );
         assert!(String::from_utf8_lossy(&output.stderr).contains("not_committed (tx_rename)"));
         assert_eq!(sha256_file(&embedded_image), unchanged);
     }
@@ -6765,8 +6786,7 @@ fn native_ntfs_replace_rename_preserves_aliases_and_reclaims_retired_streams() {
     let record_number = source_record.to_string();
     let mut args = vec!["record", embedded_path, &record_number, "--offline-image"];
     args.extend(selection);
-    let source: serde_json::Value =
-        serde_json::from_slice(&checked(binary, &args).stdout).unwrap();
+    let source: serde_json::Value = serde_json::from_slice(&checked(binary, &args).stdout).unwrap();
     assert_eq!(source["hard_links"], 2);
     assert_eq!(source["sequence"], source_sequence);
 }

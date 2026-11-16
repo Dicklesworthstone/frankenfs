@@ -668,6 +668,14 @@ directories, links, xattrs/ACLs, file data, properties, and allocation reporting
 Do not skip large dnodes, spill metadata, or transformed data encountered in an
 admitted feature profile.
 
+The bounded native writer exposes size and explicit atime/mtime updates through
+`ZfsTransactionEngine::set_attributes` and writable `FsOps::setattr`. A compound
+request publishes the resize and both timestamps in the same TXG. Metadata-only
+updates preserve native data pointers, ACL/xattr values, ownership, object
+generation and birth time; native immutable/read-only rules are applied before
+publication. Native mode/ownership changes, ACL mutation and evaluation, and the
+remaining dataset/shared-reference lifecycle remain required by this plan.
+
 Read snapshots at their selected immutable root. Enumerate datasets, properties,
 clones, and snapshots independently of which dataset is mounted. Parent/child
 dataset boundaries and mount policy cannot be inferred solely from a ZPL file

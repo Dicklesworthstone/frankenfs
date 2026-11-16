@@ -73,13 +73,22 @@ impl ZfsFs {
             return Err(errno(libc::EIO));
         }
         let mut objects = engine.open_read_objects(cx)?;
-        let properties = objects.properties(cx, &dataset_components, None, &["readonly".to_owned()])?;
-        match properties.values.first().and_then(|property| property.value.as_ref()) {
+        let properties =
+            objects.properties(cx, &dataset_components, None, &["readonly".to_owned()])?;
+        match properties
+            .values
+            .first()
+            .and_then(|property| property.value.as_ref())
+        {
             Some(crate::reader::dmu::properties::PropertyValue::Number(0)) => {}
             Some(crate::reader::dmu::properties::PropertyValue::Number(1)) => {
                 return Err(FfsError::ReadOnly);
             }
-            _ => return Err(corrupt("missing or invalid effective ZFS readonly property")),
+            _ => {
+                return Err(corrupt(
+                    "missing or invalid effective ZFS readonly property",
+                ));
+            }
         }
         let view = objects.zpl(cx, &dataset_components)?;
         if !(4..=5).contains(&view.version) {
@@ -91,7 +100,11 @@ impl ZfsFs {
         let gid = u32::try_from(root.gid).map_err(|_| errno(libc::EOVERFLOW))?;
         let next_ino = head.nodes.last_key_value().map_or(2, |(ino, _)| ino.0 + 1);
         head.mutable = Some(MutableView {
-            objects: head.nodes.iter().map(|(&ino, id)| (id.object, ino)).collect(),
+            objects: head
+                .nodes
+                .iter()
+                .map(|(&ino, id)| (id.object, ino))
+                .collect(),
             next_ino,
             revision: 1,
         });
@@ -122,7 +135,10 @@ impl ZfsFs {
     /// view refresh failed. Reading this token performs no I/O or recovery.
     pub fn last_durable_token(&self) -> Result<Option<ZfsDurableToken>> {
         let state = self.state.lock().map_err(|_| errno(libc::EIO))?;
-        Ok(state.writer.as_ref().and_then(|writer| writer.last_token.clone()))
+        Ok(state
+            .writer
+            .as_ref()
+            .and_then(|writer| writer.last_token.clone()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -156,8 +172,15 @@ impl ZfsFs {
         let timestamp = native_timestamp(SystemTime::now())?;
         let object = state.mutate(|engine, dataset| {
             engine.create_file(
-                cx, dataset, parent_object, name.as_bytes(), mode, u64::from(uid),
-                u64::from(gid), timestamp, crate::ZfsDataChecksum::default(),
+                cx,
+                dataset,
+                parent_object,
+                name.as_bytes(),
+                mode,
+                u64::from(uid),
+                u64::from(gid),
+                timestamp,
+                crate::ZfsDataChecksum::default(),
             )
         })?;
         let attr = state.publish_committed(|state| {
@@ -194,7 +217,14 @@ impl ZfsFs {
         }
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(|engine, dataset| {
-            engine.unlink_entry(cx, dataset, parent_object, name.as_bytes(), directory, timestamp)
+            engine.unlink_entry(
+                cx,
+                dataset,
+                parent_object,
+                name.as_bytes(),
+                directory,
+                timestamp,
+            )
         })?;
         Ok(())
     }
@@ -202,7 +232,9 @@ impl ZfsFs {
 
 impl ViewState {
     pub(super) fn cookie_base(&self) -> u64 {
-        self.mutable.as_ref().map_or(0, |view| u64::from(view.revision) << 32)
+        self.mutable
+            .as_ref()
+            .map_or(0, |view| u64::from(view.revision) << 32)
     }
 
     pub(super) fn validate_cookie(&self, cookie: u64) -> Result<()> {
@@ -233,15 +265,18 @@ impl ViewState {
                 .or_else(|| mutable.objects.get(&identity.object))
                 .copied();
             let current = mapped.filter(|ino| {
-                self.nodes.get(ino).or_else(|| pending.get(ino)).is_some_and(|old| {
-                    old.generation == identity.generation
-                })
+                self.nodes
+                    .get(ino)
+                    .or_else(|| pending.get(ino))
+                    .is_some_and(|old| old.generation == identity.generation)
             });
             if let Some(ino) = current {
                 ino
             } else {
                 if identity.object == self.view.root {
-                    return Err(corrupt("ZPL root generation changed during native mutation"));
+                    return Err(corrupt(
+                        "ZPL root generation changed during native mutation",
+                    ));
                 }
                 if *next_ino >= CTL_FLAG {
                     return Err(errno(libc::EOVERFLOW));
@@ -258,9 +293,12 @@ impl ViewState {
             if previous.object != identity.object
                 || previous.generation != identity.generation
                 || previous.kind != identity.kind
-                || (self.mutable.is_none() && previous.directory_parent != identity.directory_parent)
+                || (self.mutable.is_none()
+                    && previous.directory_parent != identity.directory_parent)
             {
-                return Err(corrupt("ZPL mount object has conflicting native identities"));
+                return Err(corrupt(
+                    "ZPL mount object has conflicting native identities",
+                ));
             }
         } else {
             pending.insert(target, identity);
@@ -277,7 +315,8 @@ impl ViewState {
         let mut pending = BTreeMap::new();
         let mut pending_objects = BTreeMap::new();
         let mut next_ino = self.mutable.as_ref().map_or(0, |view| view.next_ino);
-        let ino = self.stage_identity(identity, &mut pending, &mut pending_objects, &mut next_ino)?;
+        let ino =
+            self.stage_identity(identity, &mut pending, &mut pending_objects, &mut next_ino)?;
         checkpoint(cx)?;
         self.nodes.extend(pending);
         if let Some(mutable) = &mut self.mutable {
@@ -296,7 +335,9 @@ impl State {
         if !writer.refresh_needed {
             return Ok(());
         }
-        let refreshed = writer.engine.open_read_objects(cx)
+        let refreshed = writer
+            .engine
+            .open_read_objects(cx)
             .and_then(|mut objects| objects.zpl(cx, &writer.dataset));
         let view = match refreshed {
             Ok(view) => view,
@@ -339,7 +380,12 @@ impl State {
         if name.len() > 255 {
             return Err(FfsError::NameTooLong);
         }
-        if name.is_empty() || name == b"." || name == b".." || name.contains(&0) || name.contains(&b'/') {
+        if name.is_empty()
+            || name == b"."
+            || name == b".."
+            || name.contains(&0)
+            || name.contains(&b'/')
+        {
             return Err(FfsError::Format("invalid ZPL mount path component".into()));
         }
         if parent == ROOT && name == b".zfs" {
@@ -379,16 +425,25 @@ impl State {
         // set-ID bits or native capabilities, so refuse before any native data
         // mutation.
         if metadata.mode & 0o6000 != 0 {
-            return Err(unsupported("native ZPL data mutation cannot clear set-ID permissions"));
+            return Err(unsupported(
+                "native ZPL data mutation cannot clear set-ID permissions",
+            ));
         }
         let object = self.head.nodes[&ino].object;
         if self.head.view.has_file_capabilities(cx, object)? {
-            return Err(unsupported("native ZPL data mutation cannot clear file capabilities"));
+            return Err(unsupported(
+                "native ZPL data mutation cannot clear file capabilities",
+            ));
         }
         Ok(())
     }
 
-    pub(super) fn child(&mut self, cx: &Cx, parent: InodeNumber, name: &[u8]) -> Result<InodeNumber> {
+    pub(super) fn child(
+        &mut self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+    ) -> Result<InodeNumber> {
         let rows = self.head.directory(cx, parent)?;
         let position = rows[2..]
             .binary_search_by(|entry| entry.name.as_slice().cmp(name))
@@ -400,7 +455,12 @@ impl State {
         if self.head.nodes.len() >= MAX_NODES {
             return Err(unsupported("ZPL mount exceeds 131072 object identities"));
         }
-        if self.head.mutable.as_ref().is_some_and(|view| view.next_ino >= CTL_FLAG) {
+        if self
+            .head
+            .mutable
+            .as_ref()
+            .is_some_and(|view| view.next_ino >= CTL_FLAG)
+        {
             return Err(errno(libc::EOVERFLOW));
         }
         Ok(())
@@ -479,7 +539,10 @@ impl State {
         if writer.handles.get(&request.fh) != Some(&request.ino) {
             return Err(errno(libc::EBADF));
         }
-        let count = writer.counts.get_mut(&request.ino).ok_or_else(|| errno(libc::EIO))?;
+        let count = writer
+            .counts
+            .get_mut(&request.ino)
+            .ok_or_else(|| errno(libc::EIO))?;
         *count = count.checked_sub(1).ok_or_else(|| errno(libc::EIO))?;
         if *count == 0 {
             writer.counts.remove(&request.ino);
@@ -490,7 +553,10 @@ impl State {
 
     pub(super) fn validate_handle(&self, ino: InodeNumber, fh: u64) -> Result<()> {
         if fh != 0
-            && self.writer.as_ref().is_some_and(|writer| writer.handles.get(&fh) != Some(&ino))
+            && self
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.handles.get(&fh) != Some(&ino))
         {
             return Err(errno(libc::EBADF));
         }

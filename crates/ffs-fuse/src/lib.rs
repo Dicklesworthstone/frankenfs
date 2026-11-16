@@ -7880,7 +7880,16 @@ impl Filesystem for FrankenFuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        self.create_impl(parent, name, mode, umask, flags, req.uid(), req.gid(), reply);
+        self.create_impl(
+            parent,
+            name,
+            mode,
+            umask,
+            flags,
+            req.uid(),
+            req.gid(),
+            reply,
+        );
     }
 
     /// `open(dir, O_TMPFILE)`. The reply's entry reference is the only thing

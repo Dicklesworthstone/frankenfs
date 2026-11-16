@@ -701,8 +701,9 @@ impl NtfsTransactionEngine {
                 return Err(corrupt(byte_off, "INDX child exceeds stream"));
             }
             let block_idx = byte_off / u64::from(root_parsed.block_bytes);
-            let block_raw = if let Some((_, bytes)) =
-                indx_overrides.iter().find(|(offset, _)| *offset == byte_off)
+            let block_raw = if let Some((_, bytes)) = indx_overrides
+                .iter()
+                .find(|(offset, _)| *offset == byte_off)
             {
                 bytes.clone()
             } else {
@@ -1949,7 +1950,10 @@ impl NtfsTransactionEngine {
             .as_ref()
             .ok_or_else(|| corrupt(0, "terminal entry has no FILE_NAME"))?;
         if *reference != expected_reference || indexed_name != native_name {
-            return Err(corrupt(0, "NTFS rename destination changed native link identity"));
+            return Err(corrupt(
+                0,
+                "NTFS rename destination changed native link identity",
+            ));
         }
         let replacement_name =
             NtfsFileName::parse(replacement_file_name).map_err(|err| parse_err(&err))?;
@@ -1961,11 +1965,20 @@ impl NtfsTransactionEngine {
                 "NTFS rename replacement requires the same native index key length and collation",
             ));
         }
-        let replacement_raw = replacement_reference.encode().map_err(|err| parse_err(&err))?;
+        let replacement_raw = replacement_reference
+            .encode()
+            .map_err(|err| parse_err(&err))?;
         let make_entry = |old_entry: &[u8]| -> Result<Vec<u8>> {
-            let child_bytes = if located.span.child_vcn.is_some() { 8 } else { 0 };
+            let child_bytes = if located.span.child_vcn.is_some() {
+                8
+            } else {
+                0
+            };
             if 16 + replacement_file_name.len() + child_bytes > old_entry.len() {
-                return Err(corrupt(0, "NTFS rename destination key overlaps its child pointer"));
+                return Err(corrupt(
+                    0,
+                    "NTFS rename destination key overlaps its child pointer",
+                ));
             }
             // Preserve the exact entry length, padding, flags and child VCN.
             let mut entry = old_entry.to_vec();
@@ -1987,8 +2000,9 @@ impl NtfsTransactionEngine {
                 &I30_NAME,
             )?;
             let byte_off = leaf_vcn * u64::from(root_parsed.vcn_bytes);
-            let leaf_raw = if let Some((_, bytes)) =
-                indx_overrides.iter().find(|(offset, _)| *offset == byte_off)
+            let leaf_raw = if let Some((_, bytes)) = indx_overrides
+                .iter()
+                .find(|(offset, _)| *offset == byte_off)
             {
                 bytes.clone()
             } else {
@@ -2179,7 +2193,10 @@ impl NtfsTransactionEngine {
             .as_ref()
             .ok_or_else(|| corrupt(0, "terminal entry has no FILE_NAME"))?;
         if *reference != expected_reference || indexed_name != native_name {
-            return Err(corrupt(0, "NTFS duplicated-info target changed native link identity"));
+            return Err(corrupt(
+                0,
+                "NTFS duplicated-info target changed native link identity",
+            ));
         }
         let old_dup = key_raw[8..64].to_vec();
 
@@ -2196,8 +2213,9 @@ impl NtfsTransactionEngine {
                 &I30_NAME,
             )?;
             let byte_off = leaf_vcn * u64::from(root_parsed.vcn_bytes);
-            let leaf_raw = if let Some((_, bytes)) =
-                indx_overrides.iter().find(|(offset, _)| *offset == byte_off)
+            let leaf_raw = if let Some((_, bytes)) = indx_overrides
+                .iter()
+                .find(|(offset, _)| *offset == byte_off)
             {
                 bytes.clone()
             } else {

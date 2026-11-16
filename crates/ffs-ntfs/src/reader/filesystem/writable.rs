@@ -379,7 +379,9 @@ impl NtfsFs {
         // Retained names are owned by final-unlink cleanup. Resurrection would
         // need to retire that hidden name in the same native transaction.
         if attr.nlink == 0 || self.is_retained_file(ino)? {
-            return Err(unsupported("linking an unlinked NTFS handle is not admitted"));
+            return Err(unsupported(
+                "linking an unlinked NTFS handle is not admitted",
+            ));
         }
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;

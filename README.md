@@ -572,7 +572,11 @@ features and readonly datasets are refused. Torn native ring copies require
 explicit `--reconcile-torn-uberblocks` after full writer admission.
 
 The writable profile supports ordinary create/mkdir, reads and range writes,
-size changes, hard links, rename with ordinary replacement, unlink and rmdir.
+size and explicit access/modification-time changes, hard links, rename with
+ordinary replacement, unlink and rmdir. A combined size/timestamp request
+publishes all fields in one native TXG, including sparse extension and truncation.
+Timestamp-only updates retain file data, native ACL/xattr metadata, ownership,
+generation and creation time. Signed seconds and nanosecond precision are preserved.
 Reads observe the latest committed head, while existing snapshots remain
 read-only. Native object generations keep stale mount inodes from reaching
 reused objects. Native mode bits and numeric ownership, including parent SGID
@@ -584,7 +588,11 @@ a file that remains open returns `EBUSY`; native orphan retention is not yet
 implemented. Cached lookups alone do not prevent a closed file from being
 removed. Directory continuation cookies become stale after a committed
 mutation, and removed-directory references cannot alias a reused object.
-Changing mode, ownership or explicit timestamps, creating symlinks, and
+Final unlink or replacement also refuses an object that still owns a native
+xattr directory or external ACL object; those auxiliary allocations need a
+complete reclamation path. Removing an extra hard link and moving the owner
+remain supported, as does final removal of inline-only metadata.
+Changing mode or ownership, creating symlinks, and
 creating/deleting datasets or snapshots remain outside this mount profile.
 Nonempty writes, file-range copies and truncation of files with native set-ID
 bits or Linux file capabilities are refused before data mutation because atomic

@@ -3356,3 +3356,37 @@ remain unexecuted. The direct-to-main commits record an explicit gate bypass
 for this execution-environment block. These additions do not establish mounted
 ZFS writing, native Windows/OpenZFS interoperability or completion of the
 broader writer beads.
+
+### ZFS native timestamps and atomic resize attributes (2026-11-15)
+
+`ZfsTransactionEngine::set_attributes` and writable `FsOps::setattr` support
+explicit access/modification times and optional file size in one native TXG.
+Explicit mtime wins over the automatic resize timestamp. Metadata-only updates
+preserve data geometry and pointers; legacy bonus, SA bonus/spill, snapshot
+deadlists and quota accounting use the existing native publication path.
+Creation time, object generation, ownership, mode and ACL/xattr values are retained.
+Immutable files permit atime-only changes, while native immutable/read-only/
+append-only size restrictions remain enforced. Unsupported mode/owner changes
+reject the whole compound request before mutation. Snapshot views remain read-only.
+
+The native semantics reference is OpenZFS `zfs-2.3.0`,
+`module/os/linux/zfs/zfs_vnops_os.c::zfs_setattr`. Focused regressions in
+`crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs` cover negative/future
+nanosecond timestamps, legacy and SA/spill layouts, mirror publication, sparse
+growth, cold reopen, snapshot preservation, unsupported-field/flag refusal and
+invalid timestamp preflight. Every recorded publication-stage cut is restarted
+from durable media with dropped or reordered pending writes; recovered size and
+times must belong to one whole predecessor or successor transaction.
+
+Execution is pending while these changes are being validated. These are
+constructed-image/storage-model tests, not native OpenZFS or mounted qualification.
+The broader `bd-jdned` and `bd-uetvl` work packages remain open.
+
+Final unlink and replacement now reject native xattr-directory or external-ACL
+ownership before any backing write. The shared retirement helper performs this
+check only when the object would actually be reclaimed; nonfinal hard links and
+renaming the owning object remain supported. Legacy bonus and SA bonus/spill
+references use checked lengths and byte order. Constructed legacy/SA, file/
+directory, single/mirror controls in `final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects`
+check zero-write refusal, surviving links, cold reopen and allocation integrity.
+Complete recursive auxiliary-object reclamation remains part of `bd-jdned`.

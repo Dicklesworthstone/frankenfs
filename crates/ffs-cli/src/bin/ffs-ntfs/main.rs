@@ -2249,7 +2249,12 @@ mod tests {
             &["ffs-ntfs", "tx-create", "disk.img", "/", "a.txt"],
             &["ffs-ntfs", "tx-mkdir", "disk.img", "/", "sub"],
             &[
-                "ffs-ntfs", "tx-link", "disk.img", "/a.txt", "/", "another.txt",
+                "ffs-ntfs",
+                "tx-link",
+                "disk.img",
+                "/a.txt",
+                "/",
+                "another.txt",
             ],
             &[
                 "ffs-ntfs", "tx-write", "disk.img", "/a.txt", "--data", "abc",

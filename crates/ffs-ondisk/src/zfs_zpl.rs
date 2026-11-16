@@ -874,6 +874,25 @@ impl Attributes {
         XattrSources { directory, inline }.validate()
     }
 
+    /// External object owned by a legacy `zfs_acl_phys_t` retained in SA.
+    /// The ACL is a byte attribute, but its object reference follows the SA
+    /// buffer's native byte order. A missing attribute owns no external ACL.
+    pub fn external_acl_object(&self) -> Result<u64, ParseError> {
+        let Some(attribute) = self.values.get(b"ZPL_ZNODE_ACL".as_slice()) else {
+            return Ok(0);
+        };
+        if attribute.swap != 3 || attribute.bytes.len() != 88 {
+            return Err(invalid("invalid legacy ACL system attribute"));
+        }
+        let object = attribute.order.u64(&attribute.bytes, 0)?;
+        if object >= OBJECT_LIMIT {
+            return Err(invalid(
+                "external ACL reference exceeds the object namespace",
+            ));
+        }
+        Ok(object)
+    }
+
     pub fn metadata(&self) -> Result<Metadata, ParseError> {
         let inline_symlink = self
             .values

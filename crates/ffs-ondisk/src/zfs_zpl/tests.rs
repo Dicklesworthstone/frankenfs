@@ -425,6 +425,41 @@ fn dxattr_values_reject_wrong_native_types_duplicates_tails_and_bounds() {
 }
 
 #[test]
+fn external_acl_ownership_obeys_sa_order_and_native_object_bounds() {
+    let empty = SaRegistry::from_zaps(&[], &[]).unwrap();
+    assert_eq!(
+        empty
+            .decode(&[], None)
+            .unwrap()
+            .external_acl_object()
+            .unwrap(),
+        0
+    );
+    for order in [Endian::Little, Endian::Big] {
+        for object in [0, 42, OBJECT_LIMIT - 1, OBJECT_LIMIT] {
+            let mut acl = vec![0_u8; 88];
+            acl[..8].copy_from_slice(&order.encode(object));
+            let attributes = [(15, acl)];
+            let registry = SaRegistry::from_zaps(&[], &[layout(2, &attributes)]).unwrap();
+            let bytes = packed(2, &attributes, &[], order);
+            for spill in [false, true] {
+                let decoded = if spill {
+                    registry.decode(&[], Some(&bytes))
+                } else {
+                    registry.decode(&bytes, None)
+                }
+                .unwrap();
+                if object == OBJECT_LIMIT {
+                    assert!(decoded.external_acl_object().is_err());
+                } else {
+                    assert_eq!(decoded.external_acl_object().unwrap(), object);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve_extras() {
     for order in [Endian::Little, Endian::Big] {
         let dir_ref = encode_directory_reference(42, Kind::Directory).unwrap();

@@ -1,4 +1,4 @@
-//! Native ZPL head-dataset mutations (create, mkdir, write, truncate, link, rename, unlink)
+//! Native ZPL head-dataset mutations (create, mkdir, write, setattr, link, rename, unlink)
 //! lowered into COW DMU object-set, DSL dataset/dir accounting, and deadlist updates.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::{BlockPointer, Endian, RegularBlockSpec};
-use ffs_ondisk::zfs_dmu::{DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, ObjectSet};
+use ffs_ondisk::zfs_dmu::{
+    DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, DnodeSpec, ObjectSet,
+};
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use ffs_ondisk::zfs_zpl::{
     Kind, Metadata, SA_BYTES, SaRegistry, Timestamp, directory_reference,
@@ -19,11 +21,11 @@ use crate::reader::dmu::properties::PropertyValue;
 
 use super::dmu_cow::{
     DMU_OT_DIRECTORY_CONTENTS, DMU_OT_OBJSET, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
-    DnodeCowSpec, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite, WriteBucket,
-    allocate_object_id, apply_objectset_quota_deltas, collect_non_hole_bps_from, cow_update_dnode,
-    encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist, objectset_user_accounting_flags,
-    put_dnode_in_table, read_staged_or_committed_dnode, remove_dnode_from_table, zap_optional_u64,
-    zap_required_u64,
+    DnodeCowOutput, DnodeCowSpec, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite,
+    WriteBucket, allocate_object_id, apply_objectset_quota_deltas, collect_non_hole_bps_from,
+    cow_update_dnode, encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist,
+    objectset_user_accounting_flags, put_dnode_in_table, read_staged_or_committed_dnode,
+    remove_dnode_from_table, zap_optional_u64, zap_required_u64,
 };
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
@@ -85,6 +87,40 @@ impl ZfsDataChecksum {
     }
 }
 
+/// Native size and timestamp updates published together in one head-dataset TXG.
+///
+/// Size changes apply only to regular files. Timestamp-only updates preserve the
+/// object's data tree, native permissions, ownership, ACLs and extended attributes.
+/// An explicit modification time takes precedence over the automatic modification
+/// time accompanying a size change. Creation time and object generation are retained.
+#[derive(Debug, Clone, Default)]
+pub struct ZfsSetAttr {
+    pub size: Option<u64>,
+    pub atime: Option<Timestamp>,
+    pub mtime: Option<Timestamp>,
+}
+
+impl ZfsSetAttr {
+    pub(super) fn validate(&self, timestamp: Timestamp) -> Result<()> {
+        if self.size.is_none() && self.atime.is_none() && self.mtime.is_none() {
+            return Err(FfsError::Format("empty native ZPL attribute update".into()));
+        }
+        if self.size.is_some_and(|size| i64::try_from(size).is_err()) {
+            return Err(FfsError::Format(
+                "ZFS truncate size exceeds i64::MAX".into(),
+            ));
+        }
+        if [Some(timestamp), self.atime, self.mtime]
+            .into_iter()
+            .flatten()
+            .any(|time| time.nanos >= 1_000_000_000)
+        {
+            return Err(FfsError::Format("invalid ZPL nanoseconds".into()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum ZplMutation {
     CreateFile {
@@ -111,9 +147,9 @@ pub(super) enum ZplMutation {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
-    TruncateFile {
+    SetAttributes {
         file_obj: u64,
-        new_size: u64,
+        attrs: ZfsSetAttr,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
@@ -145,7 +181,7 @@ impl ZplMutation {
             Self::CreateFile { .. } => "create_file",
             Self::Mkdir { .. } => "mkdir",
             Self::WriteData { .. } => "write_data",
-            Self::TruncateFile { .. } => "truncate_file",
+            Self::SetAttributes { .. } => "set_attributes",
             Self::LinkEntry { .. } => "link_entry",
             Self::RenameEntry { .. } => "rename_entry",
             Self::UnlinkEntry { .. } => "unlink_entry",
@@ -439,6 +475,58 @@ fn encode_updated_zpl_bonus(
         }
         _ => Err(unsupported("unsupported ZPL bonus type")),
     }
+}
+
+/// Replace only bonus/spill metadata. Unlike a data-tree COW, this retains the
+/// exact indirection and root pointers even when a sparse tree could be collapsed.
+/// Changed SA spills still enter the ordinary allocation and deadlist accounting.
+fn update_metadata_only_dnode(
+    loaded: &LoadedZplNode,
+    bonus: Vec<u8>,
+    spill: Option<BlockPointer>,
+    order: Endian,
+) -> Result<DnodeCowOutput> {
+    let mut born = SpaceDelta::default();
+    let mut retired_bps = Vec::new();
+    let mut retired_bytes = 0;
+    if loaded.dnode.spill() != spill.as_ref() {
+        if let Some(old_spill) = loaded.dnode.spill() {
+            retired_bytes = SpaceDelta::from_bp(old_spill)?.dsize;
+            retired_bps.push(old_spill.clone());
+        }
+        if let Some(new_spill) = &spill {
+            born = SpaceDelta::from_bp(new_spill)?;
+        }
+    }
+    let used_bytes = loaded
+        .dnode
+        .used_bytes()
+        .checked_add(born.dsize)
+        .and_then(|used| used.checked_sub(retired_bytes))
+        .ok_or_else(|| corrupt("dnode used_bytes underflow or overflow"))?;
+    let dnode = Dnode::from_spec(DnodeSpec {
+        object_type: loaded.dnode.object_type(),
+        bonus_type: loaded.dnode.bonus_type(),
+        checksum_type: loaded.dnode.checksum_type(),
+        compress_type: loaded.dnode.compress_type(),
+        flags: loaded.dnode.flags(),
+        order,
+        levels: loaded.dnode.levels(),
+        indirect_shift: loaded.dnode.indirect_shift(),
+        data_bytes: loaded.dnode.data_bytes(),
+        max_block: loaded.dnode.max_block(),
+        used_bytes,
+        slots: loaded.dnode.slots(),
+        pointers: loaded.dnode.pointers().to_vec(),
+        bonus,
+        spill,
+    })
+    .map_err(|e| parse_err(&e))?;
+    Ok(DnodeCowOutput {
+        dnode,
+        born,
+        retired_bps,
+    })
 }
 
 fn encode_new_zpl_bonus(
@@ -1306,17 +1394,12 @@ pub(super) fn stage_zpl_mutation(
             new_size
         }
 
-        ZplMutation::TruncateFile {
+        ZplMutation::SetAttributes {
             file_obj,
-            new_size,
+            attrs,
             timestamp,
             checksum,
         } => {
-            if i64::try_from(*new_size).is_err() {
-                return Err(FfsError::Format(
-                    "ZFS truncate size exceeds i64::MAX".into(),
-                ));
-            }
             let loaded = load_zpl_node(
                 cx,
                 &mut os_view,
@@ -1327,23 +1410,32 @@ pub(super) fn stage_zpl_mutation(
                 *file_obj,
                 order,
             )?;
-            if loaded.metadata.kind != Kind::Regular {
+            if attrs.size.is_some() && loaded.metadata.kind != Kind::Regular {
                 return Err(unsupported("ZPL truncate requires a regular file"));
             }
-            reject_flags(
-                &loaded.metadata,
-                ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_READONLY,
-            )?;
+            // Native zfs_setattr permits atime-only updates on immutable nodes.
+            // DOS readonly and append-only affect truncation, not timestamps.
+            if attrs.size.is_some() {
+                reject_flags(
+                    &loaded.metadata,
+                    ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_READONLY,
+                )?;
+            } else if attrs.mtime.is_some() {
+                reject_flags(&loaded.metadata, ZFS_IMMUTABLE)?;
+            }
             let old_size = loaded.metadata.size;
+            let new_size = attrs.size.unwrap_or(old_size);
             let prev_block_bytes = loaded.dnode.data_bytes();
             let mut dirty_leaves: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
-            let (target_bsize, target_max_block) = if *new_size == 0 {
+            let (target_bsize, target_max_block) = if attrs.size.is_none() {
+                (prev_block_bytes, loaded.dnode.max_block())
+            } else if new_size == 0 {
                 dirty_leaves.insert(0, None);
                 (min_blk, 0)
-            } else if *new_size < old_size {
-                let last_bid = (*new_size - 1) / (prev_block_bytes as u64);
+            } else if new_size < old_size {
+                let last_bid = (new_size - 1) / (prev_block_bytes as u64);
                 let new_max = loaded.dnode.max_block().min(last_bid);
-                let rem = (*new_size as usize) % prev_block_bytes;
+                let rem = (new_size as usize) % prev_block_bytes;
                 if rem != 0
                     && last_bid <= loaded.dnode.max_block()
                     && let Some((existing_bytes, _, _)) =
@@ -1359,8 +1451,15 @@ pub(super) fn stage_zpl_mutation(
             };
 
             let mut new_meta = loaded.metadata.clone();
-            new_meta.size = *new_size;
-            new_meta.times[1] = *timestamp;
+            new_meta.size = new_size;
+            if let Some(atime) = attrs.atime {
+                new_meta.times[0] = atime;
+            }
+            if let Some(mtime) = attrs.mtime {
+                new_meta.times[1] = mtime;
+            } else if attrs.size.is_some() {
+                new_meta.times[1] = *timestamp;
+            }
             new_meta.times[2] = *timestamp;
             let (bonus, spill) = encode_updated_zpl_bonus(
                 &loaded,
@@ -1372,32 +1471,36 @@ pub(super) fn stage_zpl_mutation(
                 staged_writes,
             )?;
             let old_used = loaded.dnode.used_bytes();
-            let out = cow_update_dnode(
-                cx,
-                &mut os_view,
-                alloc,
-                DnodeCowSpec {
-                    existing: Some((&loaded.dnode, loaded.ceiling)),
-                    object_type: DMU_OT_PLAIN_FILE_CONTENTS,
-                    bonus_type: loaded.dnode.bonus_type(),
-                    checksum_type: checksum.code(),
-                    compress_type: 2,
-                    user_flags: acct_flags,
-                    indirect_shift: loaded.dnode.indirect_shift(),
-                    data_bytes: target_bsize,
-                    max_block: target_max_block,
-                    slots: loaded.dnode.slots(),
-                    nblkptr: loaded.dnode.pointers().len(),
-                    bonus,
-                    spill,
-                    order,
-                    new_txg,
-                    leaf_bucket: WriteBucket::ChildBlocks,
-                    indirect_bucket: WriteBucket::ChildBlocks,
-                },
-                &dirty_leaves,
-                staged_writes,
-            )?;
+            let out = if attrs.size.is_some() {
+                cow_update_dnode(
+                    cx,
+                    &mut os_view,
+                    alloc,
+                    DnodeCowSpec {
+                        existing: Some((&loaded.dnode, loaded.ceiling)),
+                        object_type: DMU_OT_PLAIN_FILE_CONTENTS,
+                        bonus_type: loaded.dnode.bonus_type(),
+                        checksum_type: checksum.code(),
+                        compress_type: loaded.dnode.compress_type(),
+                        user_flags: acct_flags,
+                        indirect_shift: loaded.dnode.indirect_shift(),
+                        data_bytes: target_bsize,
+                        max_block: target_max_block,
+                        slots: loaded.dnode.slots(),
+                        nblkptr: loaded.dnode.pointers().len(),
+                        bonus,
+                        spill,
+                        order,
+                        new_txg,
+                        leaf_bucket: WriteBucket::ChildBlocks,
+                        indirect_bucket: WriteBucket::ChildBlocks,
+                    },
+                    &dirty_leaves,
+                    staged_writes,
+                )?
+            } else {
+                update_metadata_only_dnode(&loaded, bonus, spill, order)?
+            };
             zpl_born.add_assign(out.born)?;
             zpl_retired.extend(out.retired_bps);
             let bytes_delta = signed_bytes_delta(out.dnode.used_bytes(), old_used)?;
@@ -1419,7 +1522,7 @@ pub(super) fn stage_zpl_mutation(
                 *file_obj,
                 &out.dnode,
             )?;
-            *new_size
+            new_size
         }
 
         ZplMutation::RenameEntry {
@@ -2000,6 +2103,51 @@ fn retire_or_decrement_zpl_target(
             target_obj,
             &out.dnode,
         );
+    }
+
+    // The data tree and SA spill do not own every allocation associated with a
+    // znode. Its private xattr directory and legacy external ACL live in separate
+    // DMU objects. Dropping the final owner would strand those objects because
+    // their native reclamation is not yet implemented. Keep nonfinal link removal
+    // above usable: it preserves the owner and all of its auxiliary references.
+    let (xattr_directory, external_acl) = match target_loaded.dnode.bonus_type() {
+        DMU_OT_ZNODE => (
+            ffs_ondisk::zfs_zpl::XattrSources::legacy(
+                target_loaded.dnode.bonus(),
+                target_loaded.dnode.order(),
+            )
+            .map_err(|error| parse_err(&error))?
+            .directory,
+            target_loaded
+                .dnode
+                .order()
+                .u64(target_loaded.dnode.bonus(), 176)
+                .map_err(|error| parse_err(&error))?,
+        ),
+        DMU_OT_SA => {
+            let registry = sa_registry.ok_or_else(|| corrupt("missing SA registry"))?;
+            let attributes = registry
+                .decode(
+                    target_loaded.dnode.bonus(),
+                    target_loaded.spill_bytes.as_deref(),
+                )
+                .map_err(|error| parse_err(&error))?;
+            (
+                attributes
+                    .xattrs()
+                    .map_err(|error| parse_err(&error))?
+                    .directory,
+                attributes
+                    .external_acl_object()
+                    .map_err(|error| parse_err(&error))?,
+            )
+        }
+        _ => return Err(unsupported("unsupported ZPL bonus type")),
+    };
+    if xattr_directory != 0 || external_acl != 0 {
+        return Err(unsupported(
+            "native final-link reclamation requires private xattr and external ACL cleanup",
+        ));
     }
 
     // Links == 0: retire all leaf, indirect, and spill blocks, update quota, and free dnode slot!

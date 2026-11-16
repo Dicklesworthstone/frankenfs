@@ -1624,8 +1624,7 @@ impl NtfsTransactionEngine {
         if id == u16::MAX || source.hard_links == u16::MAX {
             return Err(FfsError::NoSpace);
         }
-        let name_attribute =
-            encode_resident_attribute(ATTR_FILE_NAME, id, &[], true, &name_value)?;
+        let name_attribute = encode_resident_attribute(ATTR_FILE_NAME, id, &[], true, &name_value)?;
         if restored
             .len()
             .checked_add(name_attribute.len())
@@ -1751,9 +1750,13 @@ impl NtfsTransactionEngine {
                 0,
             )?;
             for (lcn, count) in allocated {
-                mutation_specs.extend(
-                    self.build_bitmap_range_specs(bitmap_slot, &bitmap_runs, lcn, count, true)?,
-                );
+                mutation_specs.extend(self.build_bitmap_range_specs(
+                    bitmap_slot,
+                    &bitmap_runs,
+                    lcn,
+                    count,
+                    true,
+                )?);
             }
             target_writes.push(TargetWriteKind::BitmapStream {
                 runs: bitmap_runs,
@@ -2012,7 +2015,9 @@ impl NtfsTransactionEngine {
     /// DOS aliases and extension catalogs remain indivisible unsupported units.
     fn native_file_names(&self, record: &NtfsFileRecord) -> Result<Vec<NtfsFileName>> {
         if record.base.record != 0 || record.base.sequence != 0 || !record.in_use() {
-            return Err(unsupported("NTFS mutation requires an in-use base FILE record"));
+            return Err(unsupported(
+                "NTFS mutation requires an in-use base FILE record",
+            ));
         }
         let attributes = record.attributes().map_err(|err| parse_err(&err))?;
         if attributes.iter().any(|attr| attr.kind == 0x20) {
@@ -2136,7 +2141,10 @@ impl NtfsTransactionEngine {
                 || parent.number != parent_no
                 || parent.sequence != name.parent.sequence
             {
-                return Err(corrupt(0, "NTFS link parent is not a live matching directory"));
+                return Err(corrupt(
+                    0,
+                    "NTFS link parent is not a live matching directory",
+                ));
             }
             let located = self.locate_directory_entry(cx, &parent_raw, &parent, &name.name)?;
             if !located
@@ -2145,7 +2153,10 @@ impl NtfsTransactionEngine {
                 .as_ref()
                 .is_some_and(|(target, indexed, _)| *target == reference && indexed == name)
             {
-                return Err(corrupt(0, "NTFS FILE_NAME and parent index identities disagree"));
+                return Err(corrupt(
+                    0,
+                    "NTFS FILE_NAME and parent index identities disagree",
+                ));
             }
         }
         Ok(())
@@ -2194,7 +2205,6 @@ impl NtfsTransactionEngine {
                     }
                     standard_information = true;
                 }
-                ATTR_FILE_NAME => {}
                 DATA => {
                     if matches!(&attribute.value, NtfsValue::Resident(_)) {
                         let restored = record.used_bytes();
@@ -2203,10 +2213,7 @@ impl NtfsTransactionEngine {
                                 .ok_or_else(|| corrupt(0, "resident DATA attribute is absent"))?;
                         // Only FILE_NAME attributes own native link counts.
                         if restored[at + 22..at + 24] != [0, 0] {
-                            return Err(corrupt(
-                                0,
-                                "NTFS resident DATA has nonzero indexed flags",
-                            ));
+                            return Err(corrupt(0, "NTFS resident DATA has nonzero indexed flags"));
                         }
                     }
                     if !stream_names.insert(attribute.name) {
@@ -2218,7 +2225,7 @@ impl NtfsTransactionEngine {
                         self.admit_plain_data_extent(&extent)?;
                     }
                 }
-                ATTR_SECURITY_DESCRIPTOR | EA_INFORMATION | EA => {}
+                ATTR_FILE_NAME | ATTR_SECURITY_DESCRIPTOR | EA_INFORMATION | EA => {}
                 kind => {
                     return Err(unsupported(format!(
                         "NTFS data writes cannot yet maintain native attribute {kind:#x}"
@@ -2695,9 +2702,7 @@ impl NtfsTransactionEngine {
                 mutation_specs.extend(dir_upd.log_specs);
                 let mut indx = staged.indx;
                 for (offset, bytes) in dir_upd.updated_indx_blocks {
-                    if let Some((_, previous)) =
-                        indx.iter_mut().find(|(old, _)| *old == offset)
-                    {
+                    if let Some((_, previous)) = indx.iter_mut().find(|(old, _)| *old == offset) {
                         *previous = bytes;
                     } else {
                         indx.push((offset, bytes));
@@ -2909,7 +2914,39 @@ impl NtfsTransactionEngine {
             if no_replace {
                 return Err(FfsError::Exists);
             }
-            if destination_ref != src_ref {
+            if destination_ref == src_ref {
+                let destination_name = if src_dir_no == dst_dir_no
+                    && self.fold_upcase(&source_name.name) == self.fold_upcase(&dst_leaf)
+                {
+                    // The folded lookup finds the source itself when only its
+                    // spelling changes, including a case-sensitive POSIX name.
+                    source_name.clone()
+                } else {
+                    self.select_native_name(
+                        &source_names,
+                        NtfsReference {
+                            record: u64::from(dst_dir_no),
+                            sequence: dst_dir_rec.sequence,
+                        },
+                        &dst_leaf,
+                    )?
+                };
+                // Two distinct links to one FILE are already the same object:
+                // POSIX rename preserves both. A case-only spelling change
+                // selects the same native link and still performs the rename.
+                if destination_name != source_name {
+                    return Ok(PreparedTxPlan {
+                        operation: "rename_entry",
+                        operation_digest,
+                        result_value: src_ref,
+                        pre_payload_writes: Vec::new(),
+                        mft_zero_writes: Vec::new(),
+                        open_attr_registrations: Vec::new(),
+                        mutation_specs: Vec::new(),
+                        target_writes: Vec::new(),
+                    });
+                }
+            } else {
                 let destination_no = u32::try_from(destination_ref.record)
                     .map_err(|_| unsupported("NTFS rename destination exceeds MFT record range"))?;
                 if destination_no < 24 {
@@ -2928,7 +2965,10 @@ impl NtfsTransactionEngine {
                     || destination.number != destination_no
                     || destination.sequence != destination_ref.sequence
                 {
-                    return Err(corrupt(0, "NTFS rename destination has a stale FILE reference"));
+                    return Err(corrupt(
+                        0,
+                        "NTFS rename destination has a stale FILE reference",
+                    ));
                 }
                 if src_rec.is_directory() {
                     return Err(if destination.is_directory() {
@@ -2984,38 +3024,6 @@ impl NtfsTransactionEngine {
                     name: destination_name,
                     runs_to_free: destination_runs,
                 });
-            } else {
-                let destination_name = if src_dir_no == dst_dir_no
-                    && self.fold_upcase(&source_name.name) == self.fold_upcase(&dst_leaf)
-                {
-                    // The folded lookup finds the source itself when only its
-                    // spelling changes, including a case-sensitive POSIX name.
-                    source_name.clone()
-                } else {
-                    self.select_native_name(
-                        &source_names,
-                        NtfsReference {
-                            record: u64::from(dst_dir_no),
-                            sequence: dst_dir_rec.sequence,
-                        },
-                        &dst_leaf,
-                    )?
-                };
-                // Two distinct links to one FILE are already the same object:
-                // POSIX rename preserves both. A case-only spelling change
-                // selects the same native link and still performs the rename.
-                if destination_name != source_name {
-                    return Ok(PreparedTxPlan {
-                        operation: "rename_entry",
-                        operation_digest,
-                        result_value: src_ref,
-                        pre_payload_writes: Vec::new(),
-                        mft_zero_writes: Vec::new(),
-                        open_attr_registrations: Vec::new(),
-                        mutation_specs: Vec::new(),
-                        target_writes: Vec::new(),
-                    });
-                }
             }
         }
 
@@ -3833,8 +3841,7 @@ impl NtfsTransactionEngine {
             });
         }
 
-        let (_, mft_size, _) =
-            extract_plain_nonresident_stream(&self.geometry, mft0, DATA, &[])?;
+        let (_, mft_size, _) = extract_plain_nonresident_stream(&self.geometry, mft0, DATA, &[])?;
         let logical_records = mft_size / u64::from(self.geometry.record_bytes());
         let mut mft_bm = self.read_mft_bitmap_bytes(cx, mft0, logical_records)?;
         set_or_clear_bits(&mut mft_bm, u64::from(target_no), 1, false);

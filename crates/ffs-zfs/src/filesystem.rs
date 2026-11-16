@@ -212,12 +212,8 @@ impl ViewState {
             checkpoint(cx)?;
             let identity = Identity::from_metadata(entry.object, &entry.metadata);
             let kind = file_type(entry.metadata.kind)?;
-            let target = self.stage_identity(
-                identity,
-                &mut pending,
-                &mut pending_objects,
-                &mut next_ino,
-            )?;
+            let target =
+                self.stage_identity(identity, &mut pending, &mut pending_objects, &mut next_ino)?;
             rows.push(DirEntry {
                 ino: target,
                 offset: cookie_base | (rows.len() as u64 + 1),
@@ -433,14 +429,12 @@ impl ZfsFs {
 impl FsOps for ZfsFs {
     fn requires_stateful_open(&self) -> bool {
         // A poisoned writer must never silently downgrade to stateless OPEN.
-        self.state.lock().map_or(true, |state| state.writer.is_some())
+        self.state
+            .lock()
+            .map_or(true, |state| state.writer.is_some())
     }
 
-    fn begin_request_scope(
-        &self,
-        cx: &Cx,
-        op: ffs_core::vfs::RequestOp,
-    ) -> Result<RequestScope> {
+    fn begin_request_scope(&self, cx: &Cx, op: ffs_core::vfs::RequestOp) -> Result<RequestScope> {
         // RELEASE must reach its lifetime cleanup even if the request is
         // already cancelled. Other operations retain normal admission.
         if op != ffs_core::vfs::RequestOp::Release {
@@ -651,8 +645,7 @@ impl FsOps for ZfsFs {
         if wants_write && metadata.flags & (0x0000_0001_0000_0000 | 0x0000_0010_0000_0000) != 0 {
             return Err(FfsError::PermissionDenied);
         }
-        if wants_write && metadata.flags & 0x0000_0040_0000_0000 != 0
-            && flags & libc::O_APPEND == 0
+        if wants_write && metadata.flags & 0x0000_0040_0000_0000 != 0 && flags & libc::O_APPEND == 0
         {
             return Err(FfsError::PermissionDenied);
         }
@@ -663,7 +656,12 @@ impl FsOps for ZfsFs {
             let timestamp = native_timestamp(SystemTime::now())?;
             state.mutate(|engine, dataset| {
                 engine.truncate_file(
-                    cx, dataset, object, 0, timestamp, crate::ZfsDataChecksum::default(),
+                    cx,
+                    dataset,
+                    object,
+                    0,
+                    timestamp,
+                    crate::ZfsDataChecksum::default(),
                 )
             })?;
         }
@@ -717,8 +715,14 @@ impl FsOps for ZfsFs {
         let timestamp = native_timestamp(SystemTime::now())?;
         let object = state.mutate(|engine, dataset| {
             engine.mkdir(
-                cx, dataset, parent_object, name.as_bytes(), mode,
-                u64::from(uid), u64::from(gid), timestamp,
+                cx,
+                dataset,
+                parent_object,
+                name.as_bytes(),
+                mode,
+                u64::from(uid),
+                u64::from(gid),
+                timestamp,
             )
         })?;
         state.publish_committed(|state| {
@@ -759,7 +763,13 @@ impl FsOps for ZfsFs {
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(|engine, dataset| {
             engine.write_file_data(
-                cx, dataset, object, offset, data, timestamp, crate::ZfsDataChecksum::default(),
+                cx,
+                dataset,
+                object,
+                offset,
+                data,
+                timestamp,
+                crate::ZfsDataChecksum::default(),
             )
         })?;
         Ok(written)
@@ -774,18 +784,25 @@ impl FsOps for ZfsFs {
     ) -> Result<InodeAttr> {
         let mut state = self.state(cx)?;
         let metadata = state.writable_metadata(cx, ino)?;
-        // Reject an unsupported compound request before a truncate can commit.
-        // Only exact no-ops are accepted for fields without a native writer.
-        if (attrs.size.is_some() && attrs.mtime.is_some())
-            || attrs.mode.is_some_and(|mode| u64::from(mode) != metadata.mode & 0o7777)
+        // Ownership and mode changes still require native ACL/accounting support.
+        // Refuse the entire request before publishing any supported size or time
+        // field; accepting only part would leave callers with a committed surprise.
+        if attrs
+            .mode
+            .is_some_and(|mode| u64::from(mode) != metadata.mode & 0o7777)
             || attrs.uid.is_some_and(|uid| u64::from(uid) != metadata.uid)
             || attrs.gid.is_some_and(|gid| u64::from(gid) != metadata.gid)
-            || attrs.atime.is_some_and(|time| system_time(metadata.times[0]).ok() != Some(time))
-            || attrs.mtime.is_some_and(|time| system_time(metadata.times[1]).ok() != Some(time))
         {
-            return Err(unsupported("ZPL setattr currently supports size and exact metadata no-ops"));
+            return Err(unsupported(
+                "native ZPL mode and ownership changes are not implemented",
+            ));
         }
-        if let Some(size) = attrs.size {
+        let native_attrs = crate::ZfsSetAttr {
+            size: attrs.size,
+            atime: attrs.atime.map(native_timestamp).transpose()?,
+            mtime: attrs.mtime.map(native_timestamp).transpose()?,
+        };
+        if attrs.size.is_some() {
             if metadata.kind == Kind::Directory {
                 return Err(FfsError::IsDirectory);
             }
@@ -793,11 +810,18 @@ impl FsOps for ZfsFs {
                 return Err(unsupported("ZPL truncate requires a regular file"));
             }
             state.admit_data_mutation(cx, ino, &metadata)?;
+        }
+        if attrs.size.is_some() || attrs.atime.is_some() || attrs.mtime.is_some() {
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
             state.mutate(|engine, dataset| {
-                engine.truncate_file(
-                    cx, dataset, object, size, timestamp, crate::ZfsDataChecksum::default(),
+                engine.set_attributes(
+                    cx,
+                    dataset,
+                    object,
+                    &native_attrs,
+                    timestamp,
+                    crate::ZfsDataChecksum::default(),
                 )
             })?;
             return state.publish_committed(|state| {
@@ -899,8 +923,14 @@ impl FsOps for ZfsFs {
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(|engine, dataset| {
             engine.rename_entry(
-                cx, dataset, source_parent, name.as_bytes(),
-                target_parent, new_name.as_bytes(), Some(object), timestamp,
+                cx,
+                dataset,
+                source_parent,
+                name.as_bytes(),
+                target_parent,
+                new_name.as_bytes(),
+                Some(object),
+                timestamp,
             )
         })?;
         Ok(())
@@ -955,7 +985,9 @@ impl FsOps for ZfsFs {
         }
         let object = state.head.nodes[&ino].object;
         if state.head.view.has_file_capabilities(cx, object)? {
-            return Err(unsupported("native ZPL capability removal is not implemented"));
+            return Err(unsupported(
+                "native ZPL capability removal is not implemented",
+            ));
         }
         // FUSE's killpriv path asks to drop capabilities before ordinary writes.
         // A proven-absent attribute needs no mutation; a present one is refused.

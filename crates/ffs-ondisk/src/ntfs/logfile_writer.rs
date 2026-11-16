@@ -999,10 +999,9 @@ mod tests {
                 let file_size = 50 * u64::from(page_size);
                 let ring =
                     NtfsLogRingWriter::new_fresh(page_size, version, file_size, 1, 1).unwrap();
-                let pages = usize::try_from(
-                    (file_size - ring.first_ring_vbo()) / u64::from(page_size),
-                )
-                .unwrap();
+                let pages =
+                    usize::try_from((file_size - ring.first_ring_vbo()) / u64::from(page_size))
+                        .unwrap();
                 let payload = vec![0xA5; ring.max_single_page_payload_bytes()];
                 let mut lengths = vec![payload.len(); pages];
                 ring.check_space_for_payloads(&[]).unwrap();

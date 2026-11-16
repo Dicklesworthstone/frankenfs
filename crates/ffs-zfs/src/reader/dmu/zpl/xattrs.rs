@@ -255,7 +255,9 @@ impl Zpl {
     pub(crate) fn has_file_capabilities(&mut self, cx: &Cx, owner: u64) -> Result<bool> {
         let catalog = self.xattr_catalog(cx, owner)?;
         Ok(catalog.inline.contains_key("security.capability")
-            || catalog.directory.contains_key("security.capability".as_bytes()))
+            || catalog
+                .directory
+                .contains_key("security.capability".as_bytes()))
     }
 
     /// Complete, sorted, unique host user names. Both native representations
