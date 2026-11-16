@@ -31,7 +31,7 @@ use super::{
     LOG_PAGE_BYTES, MAX_ERASED_LOG_BYTES, NtfsLogStateSummary, NtfsPersistenceStage,
     NtfsRecoverySummary, NtfsTransactionEngine, OpenAttrRuntime, SECTOR_BYTES, checkpoint, corrupt,
     extract_plain_nonresident_runs, extract_plain_nonresident_stream, map_logical_offset,
-    map_ring_err, parse_err, same_logical_record, unsupported,
+    map_ring_err, parse_err, same_logical_record, stage_log_page, unsupported,
 };
 
 const I30_NAME: [u16; 4] = [0x24, 0x49, 0x33, 0x30];
@@ -1052,6 +1052,28 @@ impl NtfsTransactionEngine {
                 return Err(unsupported("unknown LFS record_type in recovery scan"));
             }
             let client = decode_client_record(raw)?;
+            let tx_id = client.transaction_id;
+            // A checkpoint may seed a predecessor older than this scan. Inside
+            // the retained interval, however, every predecessor must already
+            // have been scanned, even when the transaction's first page exists.
+            // Otherwise a surviving Commit could conceal a missing middle page.
+            if client.previous_lsn != 0 && scan_start <= client.previous_lsn {
+                let previous = client_by_lsn.get(&client.previous_lsn).ok_or_else(|| {
+                    corrupt(
+                        client.lsn,
+                        format!(
+                            "transaction {tx_id} record {} ({:?}) references missing predecessor {} in retained window {scan_start}..={}",
+                            client.lsn, client.redo_op, client.previous_lsn, selected.current_lsn
+                        ),
+                    )
+                })?;
+                if previous.transaction_id != tx_id {
+                    return Err(corrupt(
+                        client.lsn,
+                        "transaction predecessor belongs to a different transaction",
+                    ));
+                }
+            }
             if client.redo_op == NtfsLogOp::OpenNonresidentAttribute {
                 if client.redo_data.len() != 40 || !client.undo_data.len().is_multiple_of(2) {
                     return Err(corrupt(
@@ -1079,15 +1101,11 @@ impl NtfsTransactionEngine {
                 );
             }
 
-            let tx_id = client.transaction_id;
             if let std::collections::btree_map::Entry::Vacant(vacant) = tx_table.entry(tx_id) {
                 if client.previous_lsn != 0 && scan_start <= client.previous_lsn {
                     return Err(corrupt(
                         client.lsn,
-                        format!(
-                            "transaction {tx_id} record {} ({:?}) references missing predecessor {} in retained window {scan_start}..={}",
-                            client.lsn, client.redo_op, client.previous_lsn, selected.current_lsn
-                        ),
+                        "transaction record follows a previously forgotten transaction lifetime",
                     ));
                 }
                 vacant.insert(TxRuntime {
@@ -1205,7 +1223,7 @@ impl NtfsTransactionEngine {
         // ARIES Reverse-LSN Loser Undo pass + Compensation Log Record generation in memory.
         let mut undo_applied = 0_usize;
         let mut clr_written = 0_usize;
-        let mut log_pages: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut log_pages = Vec::new();
         let mut last_logged_lsn = selected.current_lsn;
         let mut visited_undo = BTreeSet::new();
         while let Some((undo_lsn, tx_id, first_lsn)) = undo_heap.pop() {
@@ -1248,7 +1266,8 @@ impl NtfsTransactionEngine {
                     t.last_lsn = clr_rec.lsn;
                 }
                 last_logged_lsn = clr_rec.lsn;
-                log_pages.insert(clr_rec.page_vbo, clr_rec.protected_page);
+                let clr_lsn = clr_rec.lsn;
+                stage_log_page(&mut log_pages, clr_rec);
                 clr_written += 1;
 
                 // Stamp the undone page with clr_rec.lsn so any post-TargetMetadataWrite crash
@@ -1259,7 +1278,7 @@ impl NtfsTransactionEngine {
                     &open_attrs,
                     rec,
                     true,
-                    RecoveryPass::Redo(clr_rec.lsn),
+                    RecoveryPass::Redo(clr_lsn),
                 )? {
                     undo_applied += 1;
                 }
@@ -1331,20 +1350,17 @@ impl NtfsTransactionEngine {
                 .append_raw_record(LFS_RECORD_CLIENT, tx_id, prev_lsn, 0, &forget_payload)
                 .map_err(|err| map_ring_err(&err))?;
             last_logged_lsn = rec.lsn;
-            log_pages.insert(rec.page_vbo, rec.protected_page);
+            stage_log_page(&mut log_pages, rec);
         }
         if !log_pages.is_empty() {
-            for (vbo, bytes) in &log_pages {
-                self.write_logfile_page(
-                    cx,
-                    "recover_in_place",
-                    NtfsPersistenceStage::LogRecordWrite,
-                    0,
-                    last_logged_lsn,
-                    *vbo,
-                    bytes,
-                )?;
-            }
+            self.write_ordered_log_pages(
+                cx,
+                "recover_in_place",
+                NtfsPersistenceStage::LogRecordWrite,
+                NtfsPersistenceStage::LogPrefixBarrier,
+                0,
+                &log_pages,
+            )?;
             self.barrier(
                 cx,
                 "recover_in_place",

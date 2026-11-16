@@ -31,7 +31,8 @@ use super::{
     NtfsPersistenceStage, NtfsTransactionEngine, NtfsTxOutcome, OpenAttrRuntime, SECTOR_BYTES,
     checkpoint, corrupt, extract_plain_nonresident_runs, extract_plain_nonresident_stream,
     extract_resident_attr, map_logical_offset, map_ring_err, parse_err, read_mapped_runs,
-    read_mft_record_raw_via_runs, read_mft_record_via_runs, unsupported, write_mapped_runs,
+    read_mft_record_raw_via_runs, read_mft_record_via_runs, stage_log_page, unsupported,
+    write_mapped_runs,
 };
 
 const ATTR_STANDARD_INFORMATION: u32 = 0x10;
@@ -752,7 +753,7 @@ impl NtfsTransactionEngine {
         // Stage 4a: Append and write pre-commit LFS records (Active transaction window).
         let mut prev_lsn = 0_u64;
         let mut undo_next_lsn = 0_u64;
-        let mut pre_pages: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut pre_pages = Vec::new();
         let mut open_reg_iter = plan.open_attr_registrations.iter();
         for (payload, undoable) in &pre_commit_payloads {
             let rec = match working_ring.append_raw_record(
@@ -776,21 +777,18 @@ impl NtfsTransactionEngine {
                 rt.opened_lsn = rec.lsn;
                 working_open.insert(*slot, rt);
             }
-            pre_pages.insert(rec.page_vbo, rec.protected_page);
+            stage_log_page(&mut pre_pages, rec);
         }
-        for (vbo, page_bytes) in &pre_pages {
-            if let Err(err) = self.write_logfile_page(
-                cx,
-                plan.operation,
-                NtfsPersistenceStage::LogRecordWrite,
-                tx_id,
-                prev_lsn,
-                *vbo,
-                page_bytes,
-            ) {
-                self.ring = None;
-                return NtfsTxOutcome::NotCommitted(err);
-            }
+        if let Err(err) = self.write_ordered_log_pages(
+            cx,
+            plan.operation,
+            NtfsPersistenceStage::LogRecordWrite,
+            NtfsPersistenceStage::LogPrefixBarrier,
+            tx_id,
+            &pre_pages,
+        ) {
+            self.ring = None;
+            return NtfsTxOutcome::NotCommitted(err);
         }
 
         // Stage 4b: COMMIT POINT — append CommitTransaction (0x1A) + ForgetTransaction (0x1B)
@@ -809,8 +807,8 @@ impl NtfsTransactionEngine {
             }
         };
         let commit_lsn = commit_rec.lsn;
-        let mut commit_pages: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-        commit_pages.insert(commit_rec.page_vbo, commit_rec.protected_page);
+        let mut commit_pages = Vec::new();
+        stage_log_page(&mut commit_pages, commit_rec);
 
         let forget_rec = match working_ring.append_raw_record(
             LFS_RECORD_CLIENT,
@@ -825,33 +823,66 @@ impl NtfsTransactionEngine {
                 return NtfsTxOutcome::NotCommitted(map_ring_err(&e));
             }
         };
-        commit_pages.insert(forget_rec.page_vbo, forget_rec.protected_page);
+        stage_log_page(&mut commit_pages, forget_rec);
 
-        for (vbo, page_bytes) in &commit_pages {
-            if let Err(err) = self.write_logfile_page(
+        // A commit image on the same page includes the complete active prefix.
+        // If it starts a different page, make that predecessor durable first;
+        // failure here is still strictly before any CommitTransaction write.
+        if let Some(last_pre) = pre_pages.last()
+            && last_pre.page_vbo != commit_pages[0].page_vbo
+            && let Err(err) = self.barrier(
+                cx,
+                plan.operation,
+                NtfsPersistenceStage::LogPrefixBarrier,
+                tx_id,
+                last_pre.lsn,
+            )
+        {
+            self.ring = None;
+            return NtfsTxOutcome::NotCommitted(err);
+        }
+
+        let commit_result = (|| -> Result<()> {
+            self.write_ordered_log_pages(
                 cx,
                 plan.operation,
                 NtfsPersistenceStage::LogRecordWrite,
+                NtfsPersistenceStage::LogCommitBarrier,
+                tx_id,
+                &commit_pages[..1],
+            )?;
+            self.barrier(
+                cx,
+                plan.operation,
+                NtfsPersistenceStage::LogCommitBarrier,
                 tx_id,
                 commit_lsn,
-                *vbo,
-                page_bytes,
-            ) {
-                self.ring = None;
-                return NtfsTxOutcome::Uncertain {
-                    reason: err,
-                    transaction_id: tx_id,
-                    commit_lsn,
-                };
+            )?;
+            // Commit and Forget can straddle a page boundary. The first sync
+            // already commits the transaction, so finish the remaining log
+            // publication under the same cancellation mask as target writes.
+            if commit_pages.len() > 1 {
+                cx.masked(|| -> Result<()> {
+                    self.write_ordered_log_pages(
+                        cx,
+                        plan.operation,
+                        NtfsPersistenceStage::LogRecordWrite,
+                        NtfsPersistenceStage::LogCommitBarrier,
+                        tx_id,
+                        &commit_pages[1..],
+                    )?;
+                    self.barrier(
+                        cx,
+                        plan.operation,
+                        NtfsPersistenceStage::LogCommitBarrier,
+                        tx_id,
+                        commit_lsn,
+                    )
+                })?;
             }
-        }
-        if let Err(err) = self.barrier(
-            cx,
-            plan.operation,
-            NtfsPersistenceStage::LogCommitBarrier,
-            tx_id,
-            commit_lsn,
-        ) {
+            Ok(())
+        })();
+        if let Err(err) = commit_result {
             self.ring = None;
             return NtfsTxOutcome::Uncertain {
                 reason: err,

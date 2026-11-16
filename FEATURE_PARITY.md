@@ -3,17 +3,35 @@
 > **ZFS native writable FsOps:**
 > An admitted single-leaf or complete-mirror writer can be consumed by
 > `ZfsFs::with_writer` for synchronous native create/mkdir/write/truncate,
-> hard-link, rename, unlink and rmdir operations on one ZPL v4/v5 head dataset.
+> symlink, hard-link, rename, unlink and rmdir operations on one ZPL v4/v5 head
+> dataset. Size, atime and mtime changes publish atomically in one native TXG;
+> existing-node quota deltas follow the actual native project owner.
 > The mount retains its writer, native ownership/modes and SGID inheritance,
 > generation-safe inode identities, current committed reads and real member
 > barriers. Snapshots remain read-only; uncertain publication fences further
 > operations. Stateful OPEN and atomic CREATE handles protect actual open-file
 > lifetimes without treating cached LOOKUP references as open handles.
 > Final removal of an open file returns `EBUSY` pending native orphan retention.
-> The implementation includes storage-model and FUSE transport regressions.
-> Their execution and full workspace gates remain pending after executor loss;
-> no native OpenZFS interchange or mounted-syscall qualification is claimed.
+> Final reclamation refuses unsupported private xattr-directory or external-ACL
+> ownership before writes. The new timestamp, symlink, project-accounting and
+> auxiliary-ownership storage regressions passed on x86-64 and AArch64 at
+> `cee8ba03`; full workspace validation is tracked below. Native OpenZFS
+> interchange and real mounted-syscall qualification remain open.
 > This advances ZFS-05/06 without closing the broader roadmap obligations.
+
+> **NTFS root-directory recovery and durable log prefixes (2026-11-16):**
+> Journal replay admits verified root-directory FILE and $I30 INDX updates while
+> retaining bootstrap-record, allocation, mapping and directory-identity guards.
+> Native transaction, checkpoint and recovery-log pages publish in logical append
+> order, with a durable prefix before each later page, including across ring wrap.
+> A split Commit/Forget sequence enters postcommit cancellation handling at the
+> actual commit barrier. Recovery rejects a missing or foreign predecessor inside
+> the retained scan window even when an earlier record of the transaction survives;
+> checkpoint references older than that window retain their existing treatment.
+> Persistence-cut regressions exercise hard links and replacement rename with
+> reordered pending writes, alongside a direct missing-middle-chain refusal case.
+> Hosted validation of this follow-up is pending; these changes do not establish
+> Windows interchange or remove the broader NTFS writer restrictions.
 
 > **NTFS atomic ordinary-file replacement (2026-11-15):**
 > Native rename can replace a distinct ordinary file in one logged transaction.

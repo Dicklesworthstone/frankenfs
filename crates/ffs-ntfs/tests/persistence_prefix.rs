@@ -3245,9 +3245,38 @@ fn logfile_ring_wrap_enospc_sync_failure_outcomes_and_idempotent_rename_retry() 
     )
     .unwrap();
 
-    // 4. Inject ByteDevice::sync() failure on 2nd barrier (LogCommitBarrier -> at/after commit write):
-    //    MUST return Uncertain, NEVER Committed!
-    dev.set_fail_sync_call(Some(2));
+    // 4. Fail the actual commit sync. Depending on the current ring offset,
+    // predecessor-page barriers may precede it; measure the same transaction
+    // against a separate copy instead of assuming the second sync commits.
+    let probe_device = FaultInjectingNtfsDevice::new(dev.snapshot_live());
+    let mut probe = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&probe_device) as Arc<dyn ByteDevice>,
+        0,
+        vol_len,
+        write_options_clean(),
+    )
+    .unwrap();
+    probe_device.set_fail_sync_call(None);
+    let commit_sync = Arc::new(Mutex::new(None));
+    let captured_sync = Arc::clone(&commit_sync);
+    let measured_device = Arc::clone(&probe_device);
+    probe.set_stage_hook(Some(Box::new(move |event| {
+        if event.stage == NtfsPersistenceStage::LogCommitBarrier {
+            captured_sync
+                .lock()
+                .unwrap()
+                .get_or_insert(measured_device.state.lock().unwrap().sync_calls);
+        }
+        Ok(())
+    })));
+    probe
+        .write_file_data(&cx, "/counter.txt", b"sync-fail-2")
+        .into_result()
+        .unwrap();
+    let commit_sync = commit_sync.lock().unwrap().unwrap();
+    assert!(commit_sync >= 2);
+    dev.set_fail_sync_call(Some(commit_sync));
     let commit_sync_fail = engine.write_file_data(&cx, "/counter.txt", b"sync-fail-2");
     assert!(matches!(commit_sync_fail, NtfsTxOutcome::Uncertain { .. }));
     dev.set_fail_sync_call(None);
@@ -3455,6 +3484,99 @@ fn negative_controls_refuse_hibernation_unknown_opcode_prepared_tx_and_foreign_t
         Err(FfsError::UnsupportedFeature(_))
     ));
     assert_eq!(dev_unk.write_bytes_total(), 0);
+}
+
+#[test]
+fn recovery_refuses_a_missing_middle_predecessor_but_accepts_retained_prefixes() {
+    let cx = Cx::for_testing();
+    let clean = build_clean_ntfs_image(256, 64, 0xA11E_5000_0000_0042);
+    let volume_bytes = clean.len() as u64 - SECTOR_BYTES as u64;
+    let payload = |op, bytes| {
+        encode_client_update_payload(&NtfsClientUpdateSpec {
+            redo_op: op,
+            undo_op: NtfsLogOp::Noop,
+            target_attribute: 0,
+            record_offset: 0,
+            attribute_offset: 0,
+            cluster_block_offset: 0,
+            target_vcn: 0,
+            target_lcns: Vec::new(),
+            redo_data: vec![0; bytes],
+            undo_data: Vec::new(),
+        })
+        .unwrap()
+    };
+    let mut ring = NtfsLogRingWriter::new_fresh(
+        CLUSTER_BYTES as u32,
+        (2, 0),
+        64 * CLUSTER_BYTES as u64,
+        1,
+        1,
+    )
+    .unwrap();
+    let first = ring
+        .append_raw_record(LFS_RECORD_CLIENT, 24, 0, 0, &payload(NtfsLogOp::Noop, 0))
+        .unwrap();
+    let first_end = usize::from(first.record_offset)
+        + (48 + usize::try_from(first.data_len).unwrap()).next_multiple_of(8);
+    let middle_bytes = CLUSTER_BYTES - first_end - 48 - payload(NtfsLogOp::Noop, 0).len();
+    let middle = ring
+        .append_raw_record(
+            LFS_RECORD_CLIENT,
+            24,
+            first.lsn,
+            0,
+            &payload(NtfsLogOp::Noop, middle_bytes),
+        )
+        .unwrap();
+    let commit = ring
+        .append_raw_record(
+            LFS_RECORD_CLIENT,
+            24,
+            middle.lsn,
+            0,
+            &payload(NtfsLogOp::CommitTransaction, 0),
+        )
+        .unwrap();
+    assert_eq!(first.page_vbo, middle.page_vbo);
+    assert_ne!(first.page_vbo, commit.page_vbo);
+
+    for (missing_middle, trimmed_prefix) in [(false, false), (false, true), (true, false)] {
+        let mut image = clean.clone();
+        let first_page = if missing_middle { &first } else { &middle };
+        for record in [first_page, &commit] {
+            let at = 10 * CLUSTER_BYTES + usize::try_from(record.page_vbo).unwrap();
+            image[at..at + CLUSTER_BYTES].copy_from_slice(&record.protected_page);
+        }
+        let mut restart_ring = ring.clone();
+        if trimmed_prefix {
+            restart_ring.advance_oldest_lsn(middle.lsn).unwrap();
+        }
+        for _ in 0..2 {
+            let restart = restart_ring.build_next_rstr_page(false).unwrap();
+            let at = 10 * CLUSTER_BYTES + usize::try_from(restart.page_vbo).unwrap();
+            image[at..at + CLUSTER_BYTES].copy_from_slice(&restart.bytes);
+        }
+        let device = FaultInjectingNtfsDevice::new(image.clone());
+        let opened = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&device) as Arc<dyn ByteDevice>,
+            0,
+            volume_bytes,
+            write_options_recover(),
+        );
+        if missing_middle {
+            assert!(matches!(
+                opened,
+                Err(FfsError::Corruption { detail, .. }) if detail.contains("missing predecessor")
+            ));
+            assert_eq!(device.write_bytes_total(), 0);
+            assert_eq!(device.snapshot_live(), image);
+        } else {
+            opened.unwrap().check_clean_consistency(&cx).unwrap();
+            assert_eq!(device.snapshot_live(), device.snapshot_durable_only());
+        }
+    }
 }
 
 fn copied_test_record_attributes(raw: &[u8]) -> Vec<Vec<u8>> {
@@ -6447,6 +6569,51 @@ fn native_rename_replacement_crash_cuts_preserve_complete_names_streams_and_allo
                 }
             }
         }
+    }
+}
+
+#[test]
+fn failed_log_prefix_barrier_never_claims_a_native_replacement_commit() {
+    let cx = Cx::for_testing();
+    let RenameReplacementFixture {
+        device,
+        mut engine,
+        source,
+        victim,
+        ..
+    } = rename_replacement_fixture(false);
+    let before = recover_rename_replacement_state(&device.snapshot_durable_only(), source, victim);
+    let saw_prefix = Arc::new(Mutex::new(false));
+    let captured_prefix = Arc::clone(&saw_prefix);
+    let mut committed = false;
+    engine.set_stage_hook(Some(Box::new(move |event| {
+        committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+        if event.stage == NtfsPersistenceStage::LogPrefixBarrier && !committed {
+            *captured_prefix.lock().unwrap() = true;
+            return Err(FfsError::Io(std::io::Error::other(
+                "cut after publishing a complete WAL predecessor page",
+            )));
+        }
+        Ok(())
+    })));
+    let outcome = engine.rename_entry(&cx, "/source", "/Streams.bin", Some(source));
+    assert!(matches!(
+        outcome,
+        NtfsTxOutcome::NotCommitted(FfsError::Io(_))
+    ));
+    assert!(*saw_prefix.lock().unwrap());
+    assert!(engine.requires_recovery());
+    engine.set_stage_hook(None);
+    for image in [
+        device.snapshot_durable_only(),
+        device.snapshot_live(),
+        device.snapshot_reordered_pending(true),
+    ] {
+        assert_eq!(
+            recover_rename_replacement_state(&image, source, victim),
+            before,
+            "a durable precommit page must recover the complete old namespace and allocation"
+        );
     }
 }
 
