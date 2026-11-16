@@ -1,4 +1,4 @@
-//! Native ZPL head-dataset mutations (create, mkdir, write, setattr, link, rename, unlink)
+//! Native ZPL head-dataset mutations (create, mkdir, symlink, write, setattr, link, rename, unlink)
 //! lowered into COW DMU object-set, DSL dataset/dir accounting, and deadlist updates.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,9 +32,14 @@ use super::{checkpoint, corrupt, parse_err, unsupported};
 const DEFAULT_RECORDSIZE: usize = 131_072;
 const MAX_WRITE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PATH_DEPTH: usize = 256;
+// One 512-byte dnode, minus its 64-byte header, one 128-byte data pointer,
+// and the 264-byte legacy znode. Longer targets use ordinary file data.
+const MAX_INLINE_SYMLINK_BYTES: usize = 56;
 
 // Native persistent ZPL flags (OpenZFS zfs-2.3.0, sys/zfs_znode.h).
 // Dataset `readonly` is a separate, inherited DSL property.
+const ZFS_ACL_TRIVIAL: u64 = 0x4;
+const ZFS_NO_EXECS_DENIED: u64 = 0x100;
 const ZFS_READONLY: u64 = 0x0000_0001_0000_0000;
 const ZFS_IMMUTABLE: u64 = 0x0000_0010_0000_0000;
 const ZFS_NOUNLINK: u64 = 0x0000_0020_0000_0000;
@@ -130,6 +135,7 @@ pub(super) enum ZplMutation {
         mode: u16,
         uid: u64,
         gid: u64,
+        symlink_target: Option<Vec<u8>>,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
@@ -179,6 +185,10 @@ pub(super) enum ZplMutation {
 impl ZplMutation {
     pub fn op_name(&self) -> &'static str {
         match self {
+            Self::CreateFile {
+                symlink_target: Some(_),
+                ..
+            } => "create_symlink",
             Self::CreateFile { .. } => "create_file",
             Self::Mkdir { .. } => "mkdir",
             Self::WriteData { .. } => "write_data",
@@ -547,6 +557,47 @@ fn update_metadata_only_dnode(
     })
 }
 
+/// Encode the compact native FUID ACL for a newly created mode-0777 symlink.
+/// OpenZFS skips inherited ACEs for symlinks, then applies chmod-derived masks.
+/// These are the three ALLOW ACEs produced by `acl_trivial_access_masks` in
+/// OpenZFS zfs-2.3.0 `zfs_acl.c`; no deny ACEs are needed for mode 0777.
+fn encode_symlink_acl(bonus: &mut [u8], order: Endian) {
+    // znode_phys_t.zp_acl starts at 176; zfs_acl_phys_t has a 16-byte header.
+    bonus[176..184].fill(0);
+    let (size, version, count) = match order {
+        Endian::Little => (
+            24_u32.to_le_bytes(),
+            1_u16.to_le_bytes(),
+            3_u16.to_le_bytes(),
+        ),
+        Endian::Big => (
+            24_u32.to_be_bytes(),
+            1_u16.to_be_bytes(),
+            3_u16.to_be_bytes(),
+        ),
+    };
+    bonus[184..188].copy_from_slice(&size);
+    bonus[188..190].copy_from_slice(&version);
+    bonus[190..192].copy_from_slice(&count);
+    for (index, (flags, mask)) in [
+        (0x1000_u16, 0x001e_01bf_u32), // owner@
+        (0x2040_u16, 0x0012_00af_u32), // group@ | ACE_IDENTIFIER_GROUP
+        (0x4000_u16, 0x0012_00af_u32), // everyone@
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = 192 + index * 8;
+        let (flags, mask) = match order {
+            Endian::Little => (flags.to_le_bytes(), mask.to_le_bytes()),
+            Endian::Big => (flags.to_be_bytes(), mask.to_be_bytes()),
+        };
+        bonus[at..at + 2].fill(0); // ACE_ACCESS_ALLOWED_ACE_TYPE
+        bonus[at + 2..at + 4].copy_from_slice(&flags);
+        bonus[at + 4..at + 8].copy_from_slice(&mask);
+    }
+}
+
 fn encode_new_zpl_bonus(
     parent_loaded: &LoadedZplNode,
     new_meta: &Metadata,
@@ -554,7 +605,11 @@ fn encode_new_zpl_bonus(
     sa_registry: Option<&SaRegistry>,
     order: Endian,
 ) -> Result<(u8, usize, Vec<u8>, u64)> {
-    if zpl_version >= 5
+    // Native ZPL v5 also admits legacy znodes. Creating a legacy symlink keeps
+    // the target in its native inline/data form without inventing an SA layout
+    // or changing the existing parent's SA registry and attributes.
+    if new_meta.kind != Kind::Symlink
+        && zpl_version >= 5
         && parent_loaded.dnode.bonus_type() == DMU_OT_SA
         && let Some(reg) = sa_registry
     {
@@ -567,9 +622,12 @@ fn encode_new_zpl_bonus(
             .map_err(|e| parse_err(&e))?;
         return Ok((DMU_OT_SA, 1, bonus, project_id));
     }
-    let bonus = new_meta
+    let mut bonus = new_meta
         .encode_legacy(None, order)
         .map_err(|e| parse_err(&e))?;
+    if new_meta.kind == Kind::Symlink {
+        encode_symlink_acl(&mut bonus, order);
+    }
     let nblkptr = super::dmu_cow::max_nblkptr_for_dnode(1, bonus.len(), false)?;
     Ok((DMU_OT_ZNODE, nblkptr, bonus, 0))
 }
@@ -705,6 +763,7 @@ pub(super) fn stage_zpl_mutation(
             mode,
             uid,
             gid,
+            symlink_target,
             timestamp,
             checksum,
         } => {
@@ -735,18 +794,32 @@ pub(super) fn stage_zpl_mutation(
                 &mut zpl_dirty_dnodes,
                 1,
             )?;
+            let kind = if symlink_target.is_some() {
+                Kind::Symlink
+            } else {
+                Kind::Regular
+            };
             let clean_meta = Metadata {
-                mode: (Kind::Regular.to_tag() << 12) | u64::from((*mode) & 0o7777),
-                kind: Kind::Regular,
+                mode: (kind.to_tag() << 12) | u64::from((*mode) & 0o7777),
+                kind,
                 uid: *uid,
                 gid: *gid,
-                size: 0,
+                size: symlink_target
+                    .as_ref()
+                    .map_or(0, |target| target.len() as u64),
                 links: 1,
                 parent: *parent_dir,
-                flags: 0,
+                flags: if kind == Kind::Symlink {
+                    ZFS_ACL_TRIVIAL | ZFS_NO_EXECS_DENIED
+                } else {
+                    0
+                },
                 generation: new_txg,
                 times: [*timestamp; 4],
-                inline_symlink: None,
+                inline_symlink: symlink_target
+                    .as_ref()
+                    .filter(|target| target.len() <= MAX_INLINE_SYMLINK_BYTES)
+                    .cloned(),
             };
             let (bonus_type, nblkptr, bonus, project_id) = encode_new_zpl_bonus(
                 &parent_loaded,
@@ -755,8 +828,16 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.sa_registry.as_ref(),
                 order,
             )?;
-            let mut file_dirty = BTreeMap::new();
-            file_dirty.insert(0, None);
+            let (data_bytes, file_contents) = match symlink_target {
+                Some(target) if clean_meta.inline_symlink.is_none() => {
+                    let data_bytes = target.len().next_power_of_two().max(min_blk);
+                    let mut bytes = vec![0_u8; data_bytes];
+                    bytes[..target.len()].copy_from_slice(target);
+                    (data_bytes, Some(bytes))
+                }
+                _ => (min_blk, None),
+            };
+            let file_dirty = BTreeMap::from([(0, file_contents)]);
             let file_out = cow_update_dnode(
                 cx,
                 &mut os_view,
@@ -769,7 +850,7 @@ pub(super) fn stage_zpl_mutation(
                     compress_type: 2,
                     user_flags: acct_flags,
                     indirect_shift: 17,
-                    data_bytes: min_blk,
+                    data_bytes,
                     max_block: 0,
                     slots: 1,
                     nblkptr,
@@ -783,6 +864,8 @@ pub(super) fn stage_zpl_mutation(
                 &file_dirty,
                 staged_writes,
             )?;
+            zpl_born.add_assign(file_out.born)?;
+            zpl_retired.extend(file_out.retired_bps);
             let mut file_dn = file_out.dnode;
             if *checksum == ZfsDataChecksum::Sha256 {
                 // Record explicit ZIO_CHECKSUM_SHA256 (8) on dnode checksum_type if requested.
@@ -803,12 +886,11 @@ pub(super) fn stage_zpl_mutation(
                 uid: *uid,
                 gid: *gid,
                 projid: Some(project_id),
-                bytes_delta: 0,
+                bytes_delta: signed_bytes_delta(file_dn.used_bytes(), 0)?,
                 objs_delta: 1,
             });
 
-            let ref_val =
-                encode_directory_reference(new_obj, Kind::Regular).map_err(|e| parse_err(&e))?;
+            let ref_val = encode_directory_reference(new_obj, kind).map_err(|e| parse_err(&e))?;
             entries.push(RawZapEntry {
                 name: name.clone(),
                 integer_bytes: 8,
@@ -816,7 +898,10 @@ pub(super) fn stage_zpl_mutation(
                 collision: 0,
             });
             let mut new_parent_meta = parent_loaded.metadata.clone();
-            new_parent_meta.size += 1;
+            new_parent_meta.size = new_parent_meta
+                .size
+                .checked_add(1)
+                .ok_or_else(|| corrupt("ZPL directory entry count overflow"))?;
             new_parent_meta.times[1] = *timestamp;
             new_parent_meta.times[2] = *timestamp;
             let parent_dn = flush_dir_node(

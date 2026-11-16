@@ -20,6 +20,7 @@ use ffs_types::InodeNumber;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use writable::{MutableView, WriterState, errno, native_timestamp};
@@ -723,6 +724,41 @@ impl FsOps for ZfsFs {
                 u64::from(uid),
                 u64::from(gid),
                 timestamp,
+            )
+        })?;
+        state.publish_committed(|state| {
+            state.refresh_head(cx)?;
+            let ino = state.head.remember_object(cx, object)?;
+            self.attributes(cx, state, ino)
+        })
+    }
+
+    fn symlink(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        target: &Path,
+        uid: u32,
+        gid: u32,
+    ) -> Result<InodeAttr> {
+        let mut state = self.state(cx)?;
+        let parent_object = state.writable_parent(cx, parent, name.as_bytes())?;
+        let (_, gid) = state.creation_mode_gid(cx, parent, 0o777, gid, false)?;
+        state.reserve_identity()?;
+        let timestamp = native_timestamp(SystemTime::now())?;
+        let object = state.mutate(|engine, dataset| {
+            engine.create_symlink(
+                cx,
+                dataset,
+                parent_object,
+                name.as_bytes(),
+                target.as_os_str().as_bytes(),
+                u64::from(uid),
+                u64::from(gid),
+                timestamp,
+                crate::ZfsDataChecksum::default(),
             )
         })?;
         state.publish_committed(|state| {

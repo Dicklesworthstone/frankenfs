@@ -3390,3 +3390,32 @@ references use checked lengths and byte order. Constructed legacy/SA, file/
 directory, single/mirror controls in `final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects`
 check zero-write refusal, surviving links, cold reopen and allocation integrity.
 Complete recursive auxiliary-object reclamation remains part of `bd-jdned`.
+
+## ZFS native symlink creation and project accounting (2026-11-15)
+
+`ZfsTransactionEngine::create_symlink` and writable `FsOps::symlink` create the
+target, native object and parent directory entry in one TXG. Both ZPL v4 and v5
+use a native legacy znode with a trivial 0777 ACL; this does not add or alter SA
+registry layouts. Targets of at most 56 bytes fit inline, while longer targets
+use checksummed native data blocks with allocation and quota accounting. The
+Linux profile accepts nonempty targets through 4095 bytes, including non-UTF-8
+bytes, and refuses NUL, oversized targets and invalid nanoseconds before staging.
+Mounted creation preserves the parent SGID group, supports ordinary rename and
+unlink, and preserves the existing snapshot and uncertain-publication fences.
+
+Existing-node quota changes now use the checked project ID belonging to the
+native owner when its ZFS_PROJID flag is set, rather than charging every mutation
+to project 0. This covers changed SA spill allocation, file range writes and
+resize, directory changes, hard links, moves and final reclamation. New children
+default to project 0 when project inheritance is absent; inherited project
+creation remains explicitly unsupported. Nonfinal unlink accounts for any
+changed spill allocation as well as preserving the surviving owner's metadata.
+
+Regressions exercise inline/data boundaries, maximum-length and non-UTF-8
+targets, setgid inheritance, duplicate and invalid-target refusal, readonly and
+immutable parents, snapshot isolation, cold reopen, rename/unlink, and every
+recorded publication-stage cut with dropped or reordered pending writes. The
+project fixture uses a nonzero owner and compressed spill so metadata COW changes
+physical allocation and detects incorrect quota attribution. Execution evidence
+is pending validation of the integrated candidate. These fixtures do not establish
+native OpenZFS interchange or a real mounted syscall result.

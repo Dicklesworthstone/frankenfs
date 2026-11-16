@@ -39,6 +39,12 @@ jobs:
       - name: Complete MVCC tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-mvcc
+      - name: Native ZPL metadata codec tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-ondisk --lib zfs_zpl::tests
+      - name: Complete ZFS tests and persistence cuts
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-zfs
       - name: Complete NTFS tests and persistence cuts
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-ntfs

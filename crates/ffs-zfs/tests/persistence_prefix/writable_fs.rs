@@ -2,11 +2,13 @@
 //! These fixtures exercise the storage model, not native OpenZFS or FUSE mounts.
 
 use super::*;
-use ffs_core::vfs::{ReleaseRequest, RequestOp};
+use ffs_core::vfs::{FileType, ReleaseRequest, RequestOp};
 use ffs_core::{FsOps, InodeAttr, RequestScope, SetAttrRequest};
 use ffs_types::InodeNumber;
 use ffs_zfs::ZfsFs;
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -836,6 +838,480 @@ fn native_setattr_persistence_cuts_never_split_size_from_explicit_times() {
                     seconds: 1_700_000_000,
                     nanos: 0
                 }; 4]
+            );
+            assert_eq!(
+                snapshot.read(&cx, 4, 0, 8192).unwrap(),
+                built.snap_hello_expected
+            );
+            assert_pool_scrub_and_allocation_clean(&cx, &devices, built.pool_guid, None);
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_symlink_targets_persist_inline_and_in_data_with_namespace_lifecycle() {
+    let cx = Cx::for_testing();
+    for (zpl_version, mirror_width, ashift) in [(4, 1, 9), (5, 2, 12)] {
+        let (engine, devices) = writer_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                zpl_version,
+                mirror_width,
+                ashift,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                with_sa_spill: zpl_version == 5,
+                user_accounting: true,
+                image_bytes: 24 * 1024 * 1024,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+        let mut scope = RequestScope::empty();
+        let directory = fs
+            .mkdir(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("links"),
+                0o2750,
+                1234,
+                5678,
+            )
+            .unwrap();
+        let targets = [
+            b".".to_vec(),
+            vec![b'a'; 56],
+            vec![b'b'; 57],
+            vec![b'c'; 4095],
+            vec![b'.', b'/', 0xff, b'/', 0xfe],
+        ];
+        let mut created = Vec::new();
+        for (index, target) in targets.into_iter().enumerate() {
+            let name = format!("link-{index}");
+            let previous = fs.last_durable_token().unwrap().unwrap();
+            let link = fs
+                .symlink(
+                    &cx,
+                    &mut scope,
+                    directory.ino,
+                    OsStr::new(&name),
+                    Path::new(OsStr::from_bytes(&target)),
+                    1234,
+                    9999,
+                )
+                .unwrap();
+            assert_eq!(link.kind, FileType::Symlink);
+            assert_eq!(
+                (link.perm, link.uid, link.gid, link.nlink),
+                (0o777, 1234, 5678, 1)
+            );
+            assert_eq!(link.size, u64::try_from(target.len()).unwrap());
+            if target.len() <= 56 {
+                assert_eq!(link.blocks, 0);
+            } else {
+                assert!(link.blocks > 0);
+            }
+            assert_eq!(fs.readlink(&cx, &mut scope, link.ino).unwrap(), target);
+            assert_eq!(lookup(&fs, &cx, directory.ino, &name), link);
+            assert_eq!(
+                fs.last_durable_token().unwrap().unwrap().committed_txg(),
+                previous.committed_txg() + 1
+            );
+            assert!(
+                fs.readdir(&cx, &mut scope, directory.ino, 0)
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.name == name.as_bytes()
+                        && entry.ino == link.ino
+                        && entry.kind == FileType::Symlink)
+            );
+            let counts = io_counts(&devices);
+            let token = fs.last_durable_token().unwrap().unwrap();
+            assert_eq!(
+                fs.symlink(
+                    &cx,
+                    &mut scope,
+                    directory.ino,
+                    OsStr::new(&name),
+                    Path::new("different-target"),
+                    0,
+                    0,
+                )
+                .unwrap_err()
+                .to_errno(),
+                libc::EEXIST
+            );
+            assert_eq!(io_counts(&devices), counts);
+            assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+            let retained_name = format!("kept-{index}");
+            fs.rename(
+                &cx,
+                &mut scope,
+                directory.ino,
+                OsStr::new(&name),
+                directory.ino,
+                OsStr::new(&retained_name),
+            )
+            .unwrap();
+            let retained = lookup(&fs, &cx, directory.ino, &retained_name);
+            assert_eq!(
+                (retained.ino, retained.generation),
+                (link.ino, link.generation)
+            );
+            assert_eq!(fs.readlink(&cx, &mut scope, retained.ino).unwrap(), target);
+            created.push((retained_name, target, retained));
+        }
+        let control = lookup(&fs, &cx, ROOT, ".zfs");
+        let snapshots = lookup(&fs, &cx, control.ino, "snapshot");
+        let before = lookup(&fs, &cx, snapshots.ino, "before");
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, before.ino, OsStr::new("links"))
+                .unwrap_err()
+                .to_errno(),
+            libc::ENOENT
+        );
+        let counts = io_counts(&devices);
+        assert_eq!(
+            fs.symlink(
+                &cx,
+                &mut scope,
+                before.ino,
+                OsStr::new("forbidden"),
+                Path::new("target"),
+                0,
+                0,
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EROFS
+        );
+        assert_eq!(io_counts(&devices), counts);
+        let historical = lookup(&fs, &cx, before.ino, "hello.txt");
+        assert_eq!(read(&fs, &cx, historical.ino), b"SNAPDATA".repeat(512));
+        let token = fs.last_durable_token().unwrap().unwrap();
+        drop(fs);
+        for device in &devices {
+            device.state.lock().unwrap().crash_drop_unsynced();
+        }
+        let fresh: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let engine = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(POOL_GUID, token.published_slot()),
+        )
+        .unwrap();
+        let reopened = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+        let directory = lookup(&reopened, &cx, ROOT, "links");
+        for (name, target, original) in created {
+            let link = lookup(&reopened, &cx, directory.ino, &name);
+            assert_eq!(
+                (
+                    link.kind,
+                    link.size,
+                    link.generation,
+                    link.crtime,
+                    link.uid,
+                    link.gid
+                ),
+                (
+                    original.kind,
+                    original.size,
+                    original.generation,
+                    original.crtime,
+                    1234,
+                    5678
+                )
+            );
+            assert_eq!(
+                reopened.readlink(&cx, &mut scope, link.ino).unwrap(),
+                target
+            );
+            reopened
+                .unlink(&cx, &mut scope, directory.ino, OsStr::new(&name))
+                .unwrap();
+            assert!(reopened.getattr(&cx, &mut scope, link.ino).is_err());
+        }
+        reopened
+            .rmdir(&cx, &mut scope, ROOT, OsStr::new("links"))
+            .unwrap();
+        let live = lookup(&reopened, &cx, ROOT, "hello.txt");
+        assert_eq!(read(&reopened, &cx, live.ino), b"SNAPDATA".repeat(512));
+        let token = reopened.last_durable_token().unwrap().unwrap();
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &fresh,
+            POOL_GUID,
+            Some(token.published_slot()),
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_symlink_creation_refuses_invalid_targets_and_parent_restrictions_without_writes() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_715_000_310,
+        nanos: 19,
+    };
+    let dataset = [b"data".to_vec()];
+    let (mut engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
+    for (target, time, errno) in [
+        (Vec::new(), timestamp, libc::ENOENT),
+        (b"has\0nul".to_vec(), timestamp, libc::EINVAL),
+        (vec![b'x'; 4096], timestamp, libc::ENAMETOOLONG),
+        (
+            b"target".to_vec(),
+            Timestamp {
+                seconds: 1,
+                nanos: 1_000_000_000,
+            },
+            libc::EINVAL,
+        ),
+    ] {
+        assert_native_write_refused(&mut engine, &devices, errno, |writer| {
+            writer.create_symlink(
+                &cx,
+                &dataset,
+                2,
+                b"refused",
+                &target,
+                0,
+                0,
+                time,
+                ZfsDataChecksum::Fletcher4,
+            )
+        });
+    }
+    let fs = ZfsFs::with_writer(&cx, engine, dataset.to_vec()).unwrap();
+    let mut scope = RequestScope::empty();
+    let counts = io_counts(&devices);
+    for (target, errno) in [
+        (Vec::new(), libc::ENOENT),
+        (b"has\0nul".to_vec(), libc::EINVAL),
+        (vec![b'x'; 4096], libc::ENAMETOOLONG),
+    ] {
+        assert_eq!(
+            fs.symlink(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("refused"),
+                Path::new(OsStr::from_bytes(&target)),
+                0,
+                0,
+            )
+            .unwrap_err()
+            .to_errno(),
+            errno
+        );
+        assert_eq!(io_counts(&devices), counts);
+        assert!(fs.last_durable_token().unwrap().is_none());
+    }
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("refused"))
+            .unwrap_err()
+            .to_errno(),
+        libc::ENOENT
+    );
+
+    for (spec, errno) in [
+        (
+            PoolFixtureSpec {
+                zpl_flags: BTreeMap::from([(2, 0x0000_0010_0000_0000)]),
+                ..PoolFixtureSpec::default()
+            },
+            libc::EPERM,
+        ),
+        (
+            PoolFixtureSpec {
+                zpl_flags: BTreeMap::from([(2, 0x0000_4000_0000_0000)]),
+                ..PoolFixtureSpec::default()
+            },
+            libc::EOPNOTSUPP,
+        ),
+        (
+            PoolFixtureSpec {
+                root_properties: vec![(b"readonly", 1)],
+                ..PoolFixtureSpec::default()
+            },
+            libc::EROFS,
+        ),
+    ] {
+        let (mut engine, devices) = writer_fixture(&cx, &spec);
+        assert_native_write_refused(&mut engine, &devices, errno, |writer| {
+            writer.create_symlink(
+                &cx,
+                &dataset,
+                2,
+                b"refused",
+                b"target",
+                0,
+                0,
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+        });
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_symlink_persistence_cuts_publish_complete_target_or_no_link() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let target = vec![b'x'; 4095];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_320,
+        nanos: 23,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 2,
+        with_sa_spill: true,
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        user_accounting: true,
+        ..PoolFixtureSpec::default()
+    });
+    let probe_devices: Vec<_> = built
+        .members
+        .iter()
+        .cloned()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut probe = open_engine_on_devices(
+        &cx,
+        &probe_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    probe
+        .create_symlink(
+            &cx,
+            &dataset,
+            2,
+            b"atomic-link",
+            &target,
+            1234,
+            5678,
+            timestamp,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .unwrap();
+    let events = probe.persistence_events().to_vec();
+    let first_publication = events
+        .iter()
+        .find(|event| matches!(event.stage, ZfsPersistenceStage::UberblockWrite { .. }))
+        .unwrap()
+        .seq;
+    let durable = events
+        .iter()
+        .find(|event| event.stage == ZfsPersistenceStage::BeforeAcknowledge)
+        .unwrap()
+        .seq;
+    for cut in events {
+        for reorder in [false, true] {
+            let devices: Vec<_> = built
+                .members
+                .iter()
+                .cloned()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            let sequence = cut.seq;
+            engine.with_fault_hook(move |event| {
+                if event.seq == sequence {
+                    Err(FfsError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            let result = engine.create_symlink(
+                &cx,
+                &dataset,
+                2,
+                b"atomic-link",
+                &target,
+                1234,
+                5678,
+                timestamp,
+                ZfsDataChecksum::Sha256,
+            );
+            if sequence <= first_publication {
+                assert!(
+                    matches!(result, ZfsTxOutcome::NotCommitted(_)),
+                    "{:?}",
+                    cut.stage
+                );
+            } else if sequence < durable {
+                assert!(
+                    matches!(result, ZfsTxOutcome::Uncertain { .. }),
+                    "{:?}",
+                    cut.stage
+                );
+            } else {
+                assert!(result.is_committed(), "{:?}", cut.stage);
+            }
+            for device in &devices {
+                let mut media = device.state.lock().unwrap();
+                if reorder {
+                    media.crash_reorder_and_drop_half_unsynced();
+                } else {
+                    media.crash_drop_unsynced();
+                }
+            }
+            let leaves = devices
+                .iter()
+                .map(|device| {
+                    let fresh = device.fresh_from_durable();
+                    let len = fresh.len_bytes();
+                    Leaf::from_device(&cx, Box::new(fresh), 0, len).unwrap()
+                })
+                .collect();
+            let pool = Pool::from_leaves(leaves).unwrap();
+            let mut mos = pool.import_objects(&cx, Some(built.pool_guid)).unwrap();
+            assert!([INITIAL_TXG, INITIAL_TXG + 1].contains(&mos.txg));
+            let committed = mos.txg == INITIAL_TXG + 1;
+            if sequence <= first_publication {
+                assert!(!committed);
+            }
+            if sequence >= durable {
+                assert!(committed);
+            }
+            let mut head = mos.zpl(&cx, &dataset).unwrap();
+            if committed {
+                let object = head.resolve(&cx, b"/atomic-link").unwrap();
+                let metadata = head.stat(&cx, object).unwrap().0;
+                assert_eq!(metadata.kind, ffs_ondisk::zfs_zpl::Kind::Symlink);
+                assert_eq!(
+                    (metadata.mode, metadata.links, metadata.size),
+                    (0o120777, 1, 4095)
+                );
+                assert_eq!((metadata.uid, metadata.gid), (1234, 5678));
+                assert_eq!(metadata.times, [timestamp; 4]);
+                assert_eq!(head.readlink(&cx, object).unwrap(), target);
+            } else {
+                assert_eq!(
+                    head.resolve(&cx, b"/atomic-link").unwrap_err().to_errno(),
+                    libc::ENOENT
+                );
+            }
+            let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
+            assert_eq!(
+                snapshot
+                    .resolve(&cx, b"/atomic-link")
+                    .unwrap_err()
+                    .to_errno(),
+                libc::ENOENT
             );
             assert_eq!(
                 snapshot.read(&cx, 4, 0, 8192).unwrap(),

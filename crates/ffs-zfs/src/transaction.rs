@@ -890,6 +890,61 @@ impl ZfsTransactionEngine {
                 mode,
                 uid,
                 gid,
+                symlink_target: None,
+                timestamp,
+                checksum,
+            },
+        )
+    }
+
+    /// Create a native symbolic link and its directory entry in one TXG.
+    ///
+    /// Targets are uninterpreted bytes, excluding NUL, with the Linux maximum
+    /// length of 4095 bytes. Empty targets are rejected. The new symlink has
+    /// mode `0777`; callers apply any parent group inheritance before supplying
+    /// `gid`. Legacy native znodes support both ZPL v4 and v5 without altering
+    /// the dataset's SA registry or the parent's metadata representation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_symlink(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        parent_dir: u64,
+        name: &[u8],
+        target: &[u8],
+        uid: u64,
+        gid: u64,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        // Validate the whole request before metadata reads or COW staging.
+        // Linux rejects an empty symlink target as an empty pathname (ENOENT).
+        if target.is_empty() {
+            return ZfsTxOutcome::NotCommitted(FfsError::NotFound(
+                "empty ZPL symlink target".into(),
+            ));
+        }
+        if target.contains(&0) {
+            return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                "ZPL symlink target contains NUL".into(),
+            ));
+        }
+        if target.len() > 4095 {
+            return ZfsTxOutcome::NotCommitted(FfsError::NameTooLong);
+        }
+        if timestamp.nanos >= 1_000_000_000 {
+            return ZfsTxOutcome::NotCommitted(FfsError::Format("invalid ZPL nanoseconds".into()));
+        }
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::CreateFile {
+                parent_dir,
+                name: name.to_vec(),
+                mode: 0o777,
+                uid,
+                gid,
+                symlink_target: Some(target.to_vec()),
                 timestamp,
                 checksum,
             },
