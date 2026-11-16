@@ -40,6 +40,7 @@ const ZFS_IMMUTABLE: u64 = 0x0000_0010_0000_0000;
 const ZFS_NOUNLINK: u64 = 0x0000_0020_0000_0000;
 const ZFS_APPENDONLY: u64 = 0x0000_0040_0000_0000;
 const ZFS_PROJINHERIT: u64 = 0x0000_4000_0000_0000;
+const ZFS_PROJID: u64 = 0x0000_8000_0000_0000;
 
 fn reject_flags(metadata: &Metadata, prohibited: u64) -> Result<()> {
     if metadata.flags & prohibited != 0 {
@@ -342,6 +343,7 @@ struct LoadedZplNode {
     dnode: Dnode,
     ceiling: u64,
     metadata: Metadata,
+    project_id: u64,
     spill_bytes: Option<Vec<u8>>,
 }
 
@@ -380,9 +382,16 @@ fn load_zpl_node(
         return Err(unsupported("target object is not a ZPL file or directory"));
     }
     let mut spill_bytes = None;
-    let metadata = match dnode.bonus_type() {
+    let (metadata, project_id) = match dnode.bonus_type() {
         DMU_OT_ZNODE => {
-            Metadata::legacy(dnode.bonus(), dnode.order()).map_err(|e| parse_err(&e))?
+            let metadata =
+                Metadata::legacy(dnode.bonus(), dnode.order()).map_err(|e| parse_err(&e))?;
+            if metadata.flags & ZFS_PROJID != 0 {
+                return Err(corrupt(
+                    "legacy ZFS_PROJID flag lacks its project ID attribute",
+                ));
+            }
+            (metadata, 0)
         }
         DMU_OT_SA => {
             if let Some(sbp) = dnode.spill() {
@@ -396,9 +405,17 @@ fn load_zpl_node(
             }
             let reg =
                 sa_registry.ok_or_else(|| corrupt("SA object on dataset without SA_ATTRS"))?;
-            reg.decode(dnode.bonus(), spill_bytes.as_deref())
-                .and_then(|attrs| attrs.metadata())
-                .map_err(|e| parse_err(&e))?
+            let attrs = reg
+                .decode(dnode.bonus(), spill_bytes.as_deref())
+                .map_err(|e| parse_err(&e))?;
+            let metadata = attrs.metadata().map_err(|e| parse_err(&e))?;
+            let stored_project_id = attrs.project_id().map_err(|e| parse_err(&e))?;
+            let project_id = if metadata.flags & ZFS_PROJID != 0 {
+                stored_project_id
+            } else {
+                0
+            };
+            (metadata, project_id)
         }
         _ => return Err(unsupported("unsupported ZPL bonus representation")),
     };
@@ -411,6 +428,7 @@ fn load_zpl_node(
         dnode,
         ceiling,
         metadata,
+        project_id,
         spill_bytes,
     })
 }
@@ -535,7 +553,7 @@ fn encode_new_zpl_bonus(
     zpl_version: u64,
     sa_registry: Option<&SaRegistry>,
     order: Endian,
-) -> Result<(u8, usize, Vec<u8>)> {
+) -> Result<(u8, usize, Vec<u8>, u64)> {
     if zpl_version >= 5
         && parent_loaded.dnode.bonus_type() == DMU_OT_SA
         && let Some(reg) = sa_registry
@@ -543,13 +561,17 @@ fn encode_new_zpl_bonus(
         let bonus = reg
             .encode_new_from_template(parent_loaded.dnode.bonus(), new_meta)
             .map_err(|e| parse_err(&e))?;
-        return Ok((DMU_OT_SA, 1, bonus));
+        let project_id = reg
+            .decode(&bonus, None)
+            .and_then(|attrs| attrs.project_id())
+            .map_err(|e| parse_err(&e))?;
+        return Ok((DMU_OT_SA, 1, bonus, project_id));
     }
     let bonus = new_meta
         .encode_legacy(None, order)
         .map_err(|e| parse_err(&e))?;
     let nblkptr = super::dmu_cow::max_nblkptr_for_dnode(1, bonus.len(), false)?;
-    Ok((DMU_OT_ZNODE, nblkptr, bonus))
+    Ok((DMU_OT_ZNODE, nblkptr, bonus, 0))
 }
 
 fn read_dir_entries(
@@ -637,7 +659,7 @@ fn flush_dir_node(
         quota_deltas.push(QuotaDelta {
             uid: new_dir_meta.uid,
             gid: new_dir_meta.gid,
-            projid: Some(0),
+            projid: Some(dir_loaded.project_id),
             bytes_delta,
             objs_delta: 0,
         });
@@ -726,7 +748,7 @@ pub(super) fn stage_zpl_mutation(
                 times: [*timestamp; 4],
                 inline_symlink: None,
             };
-            let (bonus_type, nblkptr, bonus) = encode_new_zpl_bonus(
+            let (bonus_type, nblkptr, bonus, project_id) = encode_new_zpl_bonus(
                 &parent_loaded,
                 &clean_meta,
                 ds_ctx.zpl_version,
@@ -780,7 +802,7 @@ pub(super) fn stage_zpl_mutation(
             quota_deltas.push(QuotaDelta {
                 uid: *uid,
                 gid: *gid,
-                projid: Some(0),
+                projid: Some(project_id),
                 bytes_delta: 0,
                 objs_delta: 1,
             });
@@ -874,7 +896,7 @@ pub(super) fn stage_zpl_mutation(
                 times: [*timestamp; 4],
                 inline_symlink: None,
             };
-            let (bonus_type, nblkptr, bonus) = encode_new_zpl_bonus(
+            let (bonus_type, nblkptr, bonus, project_id) = encode_new_zpl_bonus(
                 &parent_loaded,
                 &dir_meta,
                 ds_ctx.zpl_version,
@@ -917,7 +939,7 @@ pub(super) fn stage_zpl_mutation(
             quota_deltas.push(QuotaDelta {
                 uid: *uid,
                 gid: *gid,
-                projid: Some(0),
+                projid: Some(project_id),
                 bytes_delta: i64::try_from(dir_out.dnode.used_bytes())
                     .map_err(|_| corrupt("ZFS quota bytes_delta overflow"))?,
                 objs_delta: 1,
@@ -1091,7 +1113,7 @@ pub(super) fn stage_zpl_mutation(
                 quota_deltas.push(QuotaDelta {
                     uid: source_meta.uid,
                     gid: source_meta.gid,
-                    projid: Some(0),
+                    projid: Some(source.project_id),
                     bytes_delta,
                     objs_delta: 0,
                 });
@@ -1229,7 +1251,7 @@ pub(super) fn stage_zpl_mutation(
                     quota_deltas.push(QuotaDelta {
                         uid: new_meta.uid,
                         gid: new_meta.gid,
-                        projid: Some(0),
+                        projid: Some(loaded.project_id),
                         bytes_delta,
                         objs_delta: 0,
                     });
@@ -1377,7 +1399,7 @@ pub(super) fn stage_zpl_mutation(
                 quota_deltas.push(QuotaDelta {
                     uid: new_meta.uid,
                     gid: new_meta.gid,
-                    projid: Some(0),
+                    projid: Some(loaded.project_id),
                     bytes_delta,
                     objs_delta: 0,
                 });
@@ -1508,7 +1530,7 @@ pub(super) fn stage_zpl_mutation(
                 quota_deltas.push(QuotaDelta {
                     uid: new_meta.uid,
                     gid: new_meta.gid,
-                    projid: Some(0),
+                    projid: Some(loaded.project_id),
                     bytes_delta,
                     objs_delta: 0,
                 });
@@ -1871,7 +1893,7 @@ pub(super) fn stage_zpl_mutation(
                 quota_deltas.push(QuotaDelta {
                     uid: moved_meta.uid,
                     gid: moved_meta.gid,
-                    projid: Some(0),
+                    projid: Some(src_obj_loaded.project_id),
                     bytes_delta: moved_delta,
                     objs_delta: 0,
                 });
@@ -2094,6 +2116,17 @@ fn retire_or_decrement_zpl_target(
         )?;
         zpl_born.add_assign(out.born)?;
         zpl_retired.extend(out.retired_bps);
+        let bytes_delta =
+            signed_bytes_delta(out.dnode.used_bytes(), target_loaded.dnode.used_bytes())?;
+        if bytes_delta != 0 {
+            quota_deltas.push(QuotaDelta {
+                uid: next_meta.uid,
+                gid: next_meta.gid,
+                projid: Some(target_loaded.project_id),
+                bytes_delta,
+                objs_delta: 0,
+            });
+        }
         return put_dnode_in_table(
             cx,
             os_view,
@@ -2166,7 +2199,7 @@ fn retire_or_decrement_zpl_target(
     quota_deltas.push(QuotaDelta {
         uid: target_loaded.metadata.uid,
         gid: target_loaded.metadata.gid,
-        projid: Some(0),
+        projid: Some(target_loaded.project_id),
         bytes_delta: -i64::try_from(target_loaded.dnode.used_bytes())
             .map_err(|_| corrupt("ZFS quota bytes_delta overflow"))?,
         objs_delta: -1,

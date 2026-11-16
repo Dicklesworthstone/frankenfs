@@ -224,6 +224,56 @@ fn bonus_and_spill_use_independent_layouts_and_value_byte_orders() {
     assert!(registry.decode(&bonus, Some(&bonus)).is_err());
     assert!(registry.decode(&bonus, None).unwrap().metadata().is_err());
 }
+
+#[test]
+fn project_accounting_owner_requires_a_scalar_and_preserves_native_byte_order() {
+    for order in [Endian::Little, Endian::Big] {
+        let core = attributes(order, 0o100_640, 17);
+        let project = vec![(47, order.encode(0x1234_5678_90ab_cdef).to_vec())];
+        let registry = SaRegistry::from_zaps(
+            &[registration("ZPL_PROJID", 47, 8, 0)],
+            &[layout(2, &core), layout(3, &project)],
+        )
+        .unwrap();
+        let bonus = packed(2, &core, &[], order);
+        let project_bytes = packed(3, &project, &[], order);
+        assert_eq!(
+            registry.decode(&bonus, None).unwrap().project_id().unwrap(),
+            0
+        );
+        let mut flagged = core.clone();
+        flagged.iter_mut().find(|(id, _)| *id == 11).unwrap().1 =
+            order.encode(0x0000_8000_0000_0000).to_vec();
+        let missing_project = packed(2, &flagged, &[], order);
+        assert!(
+            registry
+                .decode(&missing_project, None)
+                .unwrap()
+                .project_id()
+                .is_err()
+        );
+        for (bonus, spill) in [
+            (project_bytes.as_slice(), None),
+            (bonus.as_slice(), Some(project_bytes.as_slice())),
+        ] {
+            assert_eq!(
+                registry.decode(bonus, spill).unwrap().project_id().unwrap(),
+                0x1234_5678_90ab_cdef
+            );
+        }
+        for (length, swap) in [(16, 0), (8, 3)] {
+            let malformed = vec![(47, vec![0_u8; usize::from(length)])];
+            let registry = SaRegistry::from_zaps(
+                &[registration("ZPL_PROJID", 47, length, swap)],
+                &[layout(3, &malformed)],
+            )
+            .unwrap();
+            let bytes = packed(3, &malformed, &[], order);
+            assert!(registry.decode(&bytes, None).unwrap().project_id().is_err());
+        }
+    }
+}
+
 #[test]
 fn invalid_registrations_layouts_and_ambiguous_catalogs_are_refused() {
     for entries in [
@@ -518,6 +568,7 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
         assert!(spill.is_none());
         let decoded_parent = registry.decode(&reencoded_parent, None).unwrap();
         assert_eq!(decoded_parent.metadata().unwrap(), updated_parent_meta);
+        assert_eq!(decoded_parent.project_id().unwrap(), 99);
         assert_eq!(
             decoded_parent
                 .xattrs()
@@ -541,5 +592,6 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
         let decoded_child = registry.decode(&child_bonus, None).unwrap();
         assert_eq!(decoded_child.metadata().unwrap(), child_meta);
         assert!(decoded_child.xattrs().unwrap().inline.is_empty());
+        assert_eq!(decoded_child.project_id().unwrap(), 0);
     }
 }

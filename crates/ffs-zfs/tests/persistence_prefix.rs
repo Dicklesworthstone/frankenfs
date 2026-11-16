@@ -28,7 +28,8 @@ use ffs_ondisk::zfs_dmu::{
     DMU_OT_DNODE, DMU_OT_OBJECT_DIRECTORY, DMU_OT_OBJSET, DNODE_BLOCK_BYTES, DNODE_BYTES,
     DNODE_FLAG_SPILL_BLKPTR, DNODE_FLAG_USED_BYTES, DNODE_FLAG_USEROBJUSED_ACCOUNTED,
     DNODE_FLAG_USERUSED_ACCOUNTED, Dnode, DnodeSpec, OBJSET_GROUPUSED_OFFSET,
-    OBJSET_USERUSED_OFFSET, ObjectSet, ZapEntry, ZilHeader, encode_microzap, write_dnode_at,
+    OBJSET_PROJECTUSED_OFFSET, OBJSET_USERUSED_OFFSET, ObjectSet, ZapEntry, ZilHeader,
+    encode_microzap, write_dnode_at,
 };
 use ffs_ondisk::zfs_zap::{Entry as RawZapEntry, encode_fatzap_with_flags};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata, SaRegistry, Timestamp, encode_directory_reference};
@@ -66,6 +67,7 @@ enum SaSpillFixture {
     None,
     Opaque,
     Mtime,
+    Project(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +81,9 @@ struct PoolFixtureSpec {
     with_sa_spill: bool,
     with_sa_spill_timestamps: bool,
     user_accounting: bool,
+    project_accounting: bool,
+    sa_project_id: Option<u64>,
+    malformed_project_id: bool,
     deadlist_mode: DeadlistMode,
     preallocate_nearly_full: bool,
     pool_state: u64,
@@ -104,6 +109,9 @@ impl Default for PoolFixtureSpec {
             with_sa_spill: false,
             with_sa_spill_timestamps: false,
             user_accounting: false,
+            project_accounting: false,
+            sa_project_id: None,
+            malformed_project_id: false,
             deadlist_mode: DeadlistMode::None,
             preallocate_nearly_full: false,
             pool_state: 1,
@@ -121,7 +129,9 @@ impl Default for PoolFixtureSpec {
 
 impl PoolFixtureSpec {
     fn spill_profile(&self) -> SaSpillFixture {
-        if self.with_sa_spill_timestamps {
+        if let Some(project_id) = self.sa_project_id {
+            SaSpillFixture::Project(project_id)
+        } else if self.with_sa_spill_timestamps {
             SaSpillFixture::Mtime
         } else if self.with_sa_spill {
             SaSpillFixture::Opaque
@@ -422,6 +432,7 @@ fn build_sa_registry_objects(
     arena: &mut RawArena,
     birth: u64,
     order: Endian,
+    malformed_project_id: bool,
 ) -> (SaRegistry, Dnode, Dnode, Dnode) {
     // Attribute IDs matching OpenZFS `SaRegistry::LEGACY` (0..16) + custom attr 18:
     // 0: ATIME(16,0), 1: MTIME(16,0), 2: CTIME(16,0), 3: CRTIME(16,0), 4: GEN(8,0),
@@ -512,6 +523,12 @@ fn build_sa_registry_objects(
             values: vec![(0x20_u64 << 24) | (2_u64 << 16) | 0x12],
             collision: 0,
         },
+        RawZapEntry {
+            name: b"ZPL_PROJID".to_vec(),
+            integer_bytes: 8,
+            values: vec![((if malformed_project_id { 16_u64 } else { 8 }) << 24) | 19],
+            collision: 0,
+        },
     ];
     // Layout 2: standard file/dir layout; Layout 3: spill layout `[18]`
     let lay_entries = vec![
@@ -549,6 +566,12 @@ fn build_sa_registry_objects(
             name: b"7".to_vec(),
             integer_bytes: 2,
             values: vec![1, 18],
+            collision: 0,
+        },
+        RawZapEntry {
+            name: b"8".to_vec(),
+            integer_bytes: 2,
+            values: vec![1, 18, 19],
             collision: 0,
         },
     ];
@@ -621,11 +644,22 @@ fn encode_zpl_bonus_for_fixture(
             .expect("encode SA metadata");
         let spill = if spill_profile != SaSpillFixture::None {
             // Valid SA header `[magic(4), (header_bytes=8 => 1<<10 | layout=3), 32B attr 18]`
-            let mut sraw = vec![0_u8; 512];
-            let layout = if spill_profile == SaSpillFixture::Mtime {
-                7
-            } else {
-                3
+            let with_mtime = matches!(
+                spill_profile,
+                SaSpillFixture::Mtime | SaSpillFixture::Project(_)
+            );
+            let mut sraw = vec![
+                0_u8;
+                if matches!(spill_profile, SaSpillFixture::Project(_)) {
+                    8192
+                } else {
+                    512
+                }
+            ];
+            let layout = match spill_profile {
+                SaSpillFixture::Project(_) => 8,
+                SaSpillFixture::Mtime => 7,
+                _ => 3,
             };
             let hdr_word: u16 = (1_u16 << 10) | layout;
             match order {
@@ -638,7 +672,7 @@ fn encode_zpl_bonus_for_fixture(
                     sraw[4..6].copy_from_slice(&hdr_word.to_be_bytes());
                 }
             }
-            if spill_profile == SaSpillFixture::Mtime {
+            if with_mtime {
                 sraw[8..24].copy_from_slice(&bonus[80..96]);
                 sraw[24..56].fill(0xAB);
                 let mut split_bonus = bonus[..80].to_vec();
@@ -652,7 +686,47 @@ fn encode_zpl_bonus_for_fixture(
             } else {
                 sraw[8..40].fill(0xAB);
             }
-            Some(arena.alloc_block(&sraw, 44, 0, birth, order))
+            if let SaSpillFixture::Project(project_id) = spill_profile {
+                sraw[56..64].copy_from_slice(&order.encode(project_id));
+                // Real LZJB: literal header/attributes followed by a zero run.
+                // Timestamp COW emits an uncompressed 8 KiB spill, which must
+                // charge its physical growth to this object's project owner.
+                let mut compressed = Vec::new();
+                for literals in sraw[..72].chunks_exact(8) {
+                    compressed.push(0);
+                    compressed.extend_from_slice(literals);
+                }
+                assert!(sraw[72..].iter().all(|byte| *byte == 0));
+                let mut produced = 72;
+                while produced < sraw.len() {
+                    let mut map = 0_u8;
+                    let mut group = Vec::new();
+                    for bit in 0..8 {
+                        let remaining = sraw.len() - produced;
+                        if remaining == 0 {
+                            break;
+                        }
+                        if remaining >= 3 {
+                            let take = remaining.min(66);
+                            map |= 1 << bit;
+                            group.extend_from_slice(&[u8::try_from(take - 3).unwrap() << 2, 1]);
+                            produced += take;
+                        } else {
+                            group.push(0);
+                            produced += 1;
+                        }
+                    }
+                    compressed.push(map);
+                    compressed.extend_from_slice(&group);
+                }
+                assert_eq!(
+                    ffs_ondisk::zfs::decompress(&compressed, 3, sraw.len()).unwrap(),
+                    sraw
+                );
+                Some(arena.alloc_raw_compressed(&sraw, &compressed, 44, 0, 3, 7, birth, order))
+            } else {
+                Some(arena.alloc_block(&sraw, 44, 0, birth, order))
+            }
         } else {
             None
         };
@@ -669,14 +743,15 @@ fn build_zpl_objectset(
     order: Endian,
 ) -> (BlockPointer, u64, Vec<u8>) {
     let mut table = vec![0_u8; DNODE_BLOCK_BYTES];
-    let acct_flags = if spec.user_accounting {
+    let acct_flags = if spec.user_accounting || spec.project_accounting {
         DNODE_FLAG_USERUSED_ACCOUNTED | DNODE_FLAG_USEROBJUSED_ACCOUNTED
     } else {
         0
     };
 
     let (sa_reg, sa_objs) = if spec.zpl_version == 5 {
-        let (r, m_dn, r_dn, l_dn) = build_sa_registry_objects(arena, birth, order);
+        let (r, m_dn, r_dn, l_dn) =
+            build_sa_registry_objects(arena, birth, order, spec.malformed_project_id);
         (Some(r), Some((m_dn, r_dn, l_dn)))
     } else {
         (None, None)
@@ -789,7 +864,13 @@ fn build_zpl_objectset(
             parent: 2,
             uid: 1000,
             gid: 1000,
-            flags: 0x408 | spec.zpl_flags.get(&4).copied().unwrap_or(0),
+            flags: 0x408
+                | spec.zpl_flags.get(&4).copied().unwrap_or(0)
+                | if spec.sa_project_id.is_some() {
+                    0x0000_8000_0000_0000
+                } else {
+                    0
+                },
             generation: birth,
             times: [ts; 4],
             inline_symlink: None,
@@ -893,7 +974,7 @@ fn build_zpl_objectset(
             encode_directory_reference(6, Kind::Directory).unwrap(),
         ));
         subdir_count += 1;
-    } else if spec.with_sa_spill || spec.with_sa_spill_timestamps {
+    } else if spec.with_sa_spill || spec.with_sa_spill_timestamps || spec.sa_project_id.is_some() {
         // Seed a file `spilled.txt` (Object 4) with a valid SA spill block so COW updates preserve it!
         let sp_data = b"initial-spilled-content".to_vec();
         let mut padded = sp_data.clone();
@@ -907,7 +988,13 @@ fn build_zpl_objectset(
             parent: 2,
             uid: 1000,
             gid: 1000,
-            flags: 0x408 | spec.zpl_flags.get(&4).copied().unwrap_or(0),
+            flags: 0x408
+                | spec.zpl_flags.get(&4).copied().unwrap_or(0)
+                | if spec.sa_project_id.is_some() {
+                    0x0000_8000_0000_0000
+                } else {
+                    0
+                },
             generation: birth,
             times: [ts; 4],
             inline_symlink: None,
@@ -1135,45 +1222,92 @@ fn build_zpl_objectset(
         ZilHeader::empty()
     };
 
-    let os_bytes = if spec.user_accounting {
+    let os_bytes = if spec.user_accounting || spec.project_accounting {
         4096
     } else {
         1024_usize.max(1_usize << spec.ashift)
     };
-    let os_flags = if spec.user_accounting { 0x03 } else { 0 };
+    let os_flags = if spec.project_accounting {
+        0x07
+    } else if spec.user_accounting {
+        0x03
+    } else {
+        0
+    };
     let mut os_obj = ObjectSet::new(2, os_flags, meta_dn, zil_header, os_bytes).expect("zpl os");
-    if spec.user_accounting {
-        let u_raw = mzap(&[], 0x99, order);
-        let u_bp = arena.alloc_block(&u_raw, 39, 0, birth, order);
-        let u_dn = make_dnode(
-            39,
-            u_bp.logical_bytes(),
-            vec![u_bp],
-            0,
-            Vec::new(),
-            None,
-            0,
-            order,
-        );
-        os_obj
-            .set_embedded_dnode(OBJSET_USERUSED_OFFSET, Some(&u_dn))
-            .expect("userused dnode");
-
-        let g_raw = mzap(&[], 0xAA, order);
-        let g_bp = arena.alloc_block(&g_raw, 39, 0, birth, order);
-        let g_dn = make_dnode(
-            39,
-            g_bp.logical_bytes(),
-            vec![g_bp],
-            0,
-            Vec::new(),
-            None,
-            0,
-            order,
-        );
-        os_obj
-            .set_embedded_dnode(OBJSET_GROUPUSED_OFFSET, Some(&g_dn))
-            .expect("groupused dnode");
+    if spec.user_accounting || spec.project_accounting {
+        let mut counters: NativeAccountingCounters = std::array::from_fn(|_| BTreeMap::new());
+        for (object, raw) in table.chunks_exact(DNODE_BYTES).enumerate() {
+            if !matches!(raw[0], 19 | 20) {
+                continue;
+            }
+            let node = Dnode::parse(raw, order).unwrap();
+            let (metadata, project) = if node.bonus_type() == 17 {
+                (Metadata::legacy(node.bonus(), order).unwrap(), 0)
+            } else {
+                let spill = node.spill().map(|pointer| {
+                    let dva = pointer.regular_dvas().unwrap()[0];
+                    ffs_ondisk::zfs::decompress(
+                        &arena.blocks[&dva.offset][..pointer.physical_bytes()],
+                        pointer.compression(),
+                        pointer.logical_bytes(),
+                    )
+                    .unwrap()
+                });
+                let attributes = sa_reg
+                    .as_ref()
+                    .unwrap()
+                    .decode(node.bonus(), spill.as_deref())
+                    .unwrap();
+                // A deliberately malformed scalar still has a known intended
+                // owner in the refusal fixture; no mutation may consume it.
+                let project = if object == 4 && spec.malformed_project_id {
+                    spec.sa_project_id.unwrap_or(0)
+                } else {
+                    attributes.project_id().unwrap()
+                };
+                (attributes.metadata().unwrap(), project)
+            };
+            for (map, owner) in counters
+                .iter_mut()
+                .zip([metadata.uid, metadata.gid, project])
+            {
+                *map.entry(format!("{owner:x}").into_bytes()).or_default() += node.used_bytes();
+                *map.entry(format!("obj-{owner:x}").into_bytes())
+                    .or_default() += 1;
+            }
+        }
+        for (index, (offset, salt)) in [
+            (OBJSET_USERUSED_OFFSET, 0x99),
+            (OBJSET_GROUPUSED_OFFSET, 0xAA),
+            (OBJSET_PROJECTUSED_OFFSET, 0xBB),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 2 && !spec.project_accounting {
+                continue;
+            }
+            let entries: Vec<_> = counters[index]
+                .iter()
+                .map(|(key, value)| (key.as_slice(), *value))
+                .collect();
+            let raw = mzap(&entries, salt, order);
+            let pointer = arena.alloc_block(&raw, 39, 0, birth, order);
+            let node = make_dnode(
+                39,
+                pointer.logical_bytes(),
+                vec![pointer],
+                0,
+                Vec::new(),
+                None,
+                0,
+                order,
+            );
+            os_obj
+                .set_embedded_dnode(offset, Some(&node))
+                .expect("accounting dnode");
+        }
     }
     let encoded_os = os_obj.encode(order).expect("encode zpl os");
     let os_bp = arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, order);
@@ -3192,6 +3326,269 @@ fn native_write_admission_preserves_append_and_dos_readonly_semantics() {
 // ---------------------------------------------------------------------------
 // 1. Happy-path ZPL v4 & v5 + ashift 9 & 12 + single & 2-way mirror lifecycle
 // ---------------------------------------------------------------------------
+
+type NativeAccountingCounters = [BTreeMap<Vec<u8>, u64>; 3];
+
+fn native_accounting_snapshot(
+    cx: &Cx,
+    engine: &ZfsTransactionEngine,
+    device: &FaultableMemberDevice,
+) -> (Option<Dnode>, NativeAccountingCounters) {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    let head = mos.object(cx, 18).unwrap();
+    let root = BlockPointer::parse(&head.bonus()[128..256], head.order()).unwrap();
+    let image = device.durable_snapshot();
+    let read = |pointer: &BlockPointer| {
+        let dva = pointer.regular_dvas().unwrap()[0];
+        let start = usize::try_from(DATA_OFFSET + dva.offset).unwrap();
+        ffs_ondisk::zfs::decompress(
+            &image[start..start + pointer.physical_bytes()],
+            pointer.compression(),
+            pointer.logical_bytes(),
+        )
+        .unwrap()
+    };
+    let objectset = ObjectSet::parse(&read(&root), root.payload_order()).unwrap();
+    assert_eq!(objectset.meta.levels(), 1);
+    let table_pointer = &objectset.meta.pointers()[0];
+    let node =
+        ffs_ondisk::zfs_dmu::dnode_at(&read(table_pointer), 4, table_pointer.payload_order())
+            .unwrap();
+    let counters = std::array::from_fn(|index| {
+        let offset = [
+            OBJSET_USERUSED_OFFSET,
+            OBJSET_GROUPUSED_OFFSET,
+            OBJSET_PROJECTUSED_OFFSET,
+        ][index];
+        let node = objectset
+            .embedded_dnode(offset, root.payload_order())
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.levels(), 1);
+        let pointer = &node.pointers()[0];
+        ffs_ondisk::zfs_dmu::microzap(&read(pointer), pointer.payload_order())
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name, entry.value))
+            .collect()
+    });
+    (node, counters)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_500,
+        nanos: 123,
+    };
+    for (ashift, mirror_width) in [(9, 1), (12, 2)] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            ashift,
+            mirror_width,
+            image_bytes: 24 * 1024 * 1024,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            project_accounting: true,
+            sa_project_id: Some(42),
+            additional_write_features: vec![(b"org.zfsonlinux:project_quota", 1)],
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let (original_node, original_counters) =
+            native_accounting_snapshot(&cx, &engine, &devices[0]);
+        let original_node = original_node.unwrap();
+        let old_spill = original_node.spill().unwrap();
+        assert_eq!(
+            (old_spill.compression(), old_spill.logical_bytes()),
+            (3, 8192)
+        );
+        let expected_growth = 8192 - bp_allocated_bytes(old_spill);
+        assert!(
+            expected_growth > 0,
+            "fixture must exercise a physical accounting delta"
+        );
+
+        engine
+            .set_attributes(
+                &cx,
+                &dataset,
+                4,
+                &ffs_zfs::ZfsSetAttr {
+                    mtime: Some(timestamp),
+                    ..ffs_zfs::ZfsSetAttr::default()
+                },
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        let (updated_node, updated_counters) =
+            native_accounting_snapshot(&cx, &engine, &devices[0]);
+        let updated_node = updated_node.unwrap();
+        assert_eq!(
+            updated_node.pointers(),
+            original_node.pointers(),
+            "timestamps must retain the exact data tree"
+        );
+        assert_eq!(
+            updated_node.used_bytes(),
+            original_node.used_bytes() + expected_growth
+        );
+        for (index, owner) in [b"3e8".as_slice(), b"3e8".as_slice(), b"2a".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                updated_counters[index][owner],
+                original_counters[index][owner] + expected_growth
+            );
+            let mut expected = original_counters[index].clone();
+            *expected.get_mut(owner).unwrap() += expected_growth;
+            assert_eq!(
+                updated_counters[index], expected,
+                "only the native accounting owner's bytes may change"
+            );
+        }
+        assert_eq!(
+            updated_counters[2][b"0".as_slice()],
+            original_counters[2][b"0".as_slice()]
+        );
+
+        engine
+            .truncate_file(&cx, &dataset, 4, 0, timestamp, ZfsDataChecksum::Fletcher4)
+            .into_result()
+            .unwrap();
+        let (truncated_node, truncated_counters) =
+            native_accounting_snapshot(&cx, &engine, &devices[0]);
+        let truncated_node = truncated_node.unwrap();
+        assert_eq!(truncated_node.used_bytes(), 8192);
+        assert_eq!(truncated_counters[2][b"2a".as_slice()], 8192);
+        assert_eq!(truncated_counters[2][b"obj-2a".as_slice()], 1);
+        assert_eq!(
+            truncated_counters[2][b"0".as_slice()],
+            original_counters[2][b"0".as_slice()]
+        );
+
+        let (_, token) = engine
+            .unlink_entry(&cx, &dataset, 2, b"hello.txt", false, timestamp)
+            .into_result()
+            .unwrap();
+        let (removed, final_counters) = native_accounting_snapshot(&cx, &engine, &devices[0]);
+        assert!(removed.is_none());
+        assert!(!final_counters[2].contains_key(b"2a".as_slice()));
+        assert!(!final_counters[2].contains_key(b"obj-2a".as_slice()));
+        assert_eq!(
+            final_counters[2][b"0".as_slice()],
+            original_counters[2][b"0".as_slice()]
+        );
+        drop(engine);
+        for device in &devices {
+            device.state.lock().unwrap().crash_drop_unsynced();
+        }
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &devices,
+            built.pool_guid,
+            Some(token.published_slot()),
+        );
+        let fresh: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(built.pool_guid, token.published_slot()),
+        )
+        .unwrap();
+        let (_, persisted_counters) = native_accounting_snapshot(&cx, &reopened, &fresh[0]);
+        assert_eq!(persisted_counters, final_counters);
+        let mut mos = reopened.open_read_objects(&cx).unwrap();
+        let mut zpl = mos.zpl(&cx, &dataset).unwrap();
+        let mut snapshot = zpl.open_snapshot(&cx, b"before").unwrap();
+        let historical = snapshot.resolve(&cx, b"/hello.txt").unwrap();
+        assert_eq!(
+            snapshot
+                .read(&cx, historical, 0, built.snap_hello_expected.len())
+                .unwrap(),
+            built.snap_hello_expected
+        );
+    }
+}
+
+#[test]
+fn malformed_project_owner_refuses_compound_setattr_before_any_backing_write() {
+    let cx = Cx::for_testing();
+    for spec in [
+        PoolFixtureSpec {
+            project_accounting: true,
+            sa_project_id: Some(42),
+            malformed_project_id: true,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            additional_write_features: vec![(b"org.zfsonlinux:project_quota", 1)],
+            ..PoolFixtureSpec::default()
+        },
+        PoolFixtureSpec {
+            zpl_version: 4,
+            project_accounting: true,
+            zpl_flags: BTreeMap::from([(4, 0x0000_8000_0000_0000)]),
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            additional_write_features: vec![(b"org.zfsonlinux:project_quota", 1)],
+            ..PoolFixtureSpec::default()
+        },
+    ] {
+        let built = build_clean_zfs_pool(&spec);
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let before: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::durable_snapshot)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let timestamp = Timestamp {
+            seconds: 1_715_000_500,
+            nanos: 123,
+        };
+        assert_native_write_refused(&mut engine, &devices, libc::EIO, |engine| {
+            engine.set_attributes(
+                &cx,
+                &[b"data".to_vec()],
+                4,
+                &ffs_zfs::ZfsSetAttr {
+                    size: Some(0),
+                    mtime: Some(timestamp),
+                    ..ffs_zfs::ZfsSetAttr::default()
+                },
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+        });
+        for (device, expected) in devices.iter().zip(before) {
+            assert_eq!(device.durable_snapshot(), expected);
+            assert!(device.state.lock().unwrap().volatile.is_empty());
+        }
+    }
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]

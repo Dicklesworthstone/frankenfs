@@ -732,13 +732,18 @@ impl SaRegistry {
         };
 
         let mut map = BTreeMap::<Vec<u8>, Vec<u8>>::new();
-        // Seed optional defaults (and inherit ZPL_PROJID if present on template)
-        let projid_bytes = template_decoded
+        // Native children inherit a project only when the parent explicitly
+        // enables ZFS_PROJINHERIT, not merely because its SA layout has an ID.
+        let project_id = if template_decoded
             .values
-            .get(b"ZPL_PROJID".as_slice())
-            .filter(|a| a.bytes.len() == 8)
-            .map_or_else(|| order.encode(0).to_vec(), |a| a.bytes.clone());
-        map.insert(b"ZPL_PROJID".to_vec(), projid_bytes);
+            .contains_key(b"ZPL_FLAGS".as_slice())
+            && template_decoded.integer("ZPL_FLAGS")? & 0x0000_4000_0000_0000 != 0
+        {
+            template_decoded.project_id()?
+        } else {
+            0
+        };
+        map.insert(b"ZPL_PROJID".to_vec(), order.encode(project_id).to_vec());
         map.insert(b"ZPL_RDEV".to_vec(), order.encode(0).to_vec());
         map.insert(b"ZPL_PAD".to_vec(), vec![0_u8; 32]);
         let znode_acl = template_decoded
@@ -843,6 +848,21 @@ impl Attributes {
         let attr = self.required(name, 16)?;
         timestamp(&attr.bytes, attr.order)
     }
+
+    /// Native project accounting owner. Objects without `ZPL_PROJID` belong to
+    /// the default project; a present attribute must be one native u64 scalar.
+    pub fn project_id(&self) -> Result<u64, ParseError> {
+        if self.values.contains_key(b"ZPL_PROJID".as_slice()) {
+            self.integer("ZPL_PROJID")
+        } else if self.values.contains_key(b"ZPL_FLAGS".as_slice())
+            && self.integer("ZPL_FLAGS")? & 0x0000_8000_0000_0000 != 0
+        {
+            Err(invalid("ZFS_PROJID flag lacks its project ID attribute"))
+        } else {
+            Ok(0)
+        }
+    }
+
     pub fn xattrs(&self) -> Result<XattrSources, ParseError> {
         let directory = if self.values.contains_key(b"ZPL_XATTR".as_slice()) {
             self.integer("ZPL_XATTR")?
