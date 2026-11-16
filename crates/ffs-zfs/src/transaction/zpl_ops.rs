@@ -35,6 +35,16 @@ const MAX_PATH_DEPTH: usize = 256;
 // One 512-byte dnode, minus its 64-byte header, one 128-byte data pointer,
 // and the 264-byte legacy znode. Longer targets use ordinary file data.
 const MAX_INLINE_SYMLINK_BYTES: usize = 56;
+const DMU_OT_UNLINKED_SET: u8 = 22;
+const MAX_PENDING_UNLINKS: usize = 65_536;
+
+/// A generation-bound object retained in the native ZPL unlinked set.
+/// The object number alone is insufficient authority to reclaim a reused slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ZfsUnlinkedObject {
+    pub object: u64,
+    pub generation: u64,
+}
 
 // Native persistent ZPL flags (OpenZFS zfs-2.3.0, sys/zfs_znode.h).
 // Dataset `readonly` is a separate, inherited DSL property.
@@ -172,13 +182,18 @@ pub(super) enum ZplMutation {
         dst_dir: u64,
         dst_name: Vec<u8>,
         expected_source_object: Option<u64>,
+        retain_replaced: Option<ZfsUnlinkedObject>,
         timestamp: Timestamp,
     },
     UnlinkEntry {
         parent_dir: u64,
         name: Vec<u8>,
         rmdir: bool,
+        retain: Option<ZfsUnlinkedObject>,
         timestamp: Timestamp,
+    },
+    ReapUnlinked {
+        identity: ZfsUnlinkedObject,
     },
 }
 
@@ -196,6 +211,7 @@ impl ZplMutation {
             Self::LinkEntry { .. } => "link_entry",
             Self::RenameEntry { .. } => "rename_entry",
             Self::UnlinkEntry { .. } => "unlink_entry",
+            Self::ReapUnlinked { .. } => "reap_unlinked",
         }
     }
 }
@@ -212,6 +228,7 @@ struct DatasetContext {
     utf8_only: bool,
     sa_registry: Option<SaRegistry>,
     recordsize: usize,
+    unlinked_set: Option<u64>,
 }
 
 fn validate_component(name: &[u8], utf8_only: bool) -> Result<()> {
@@ -310,6 +327,7 @@ fn open_head_dataset_context(
     let mut os_view = mos.open_objectset_view(os.meta.clone(), old_os_bp.birth(), mos.txg);
     let master = os_view.zap_values(cx, 1)?;
     let root_dir = zap_required_u64(&master, b"ROOT")?;
+    let unlinked_set = zap_optional_u64(&master, b"DELETE_QUEUE")?.filter(|&object| object != 0);
     let zpl_version = zap_required_u64(&master, b"VERSION")?;
     let utf8_only = zap_optional_u64(&master, b"utf8only")?.unwrap_or(0) != 0;
     let norm = zap_optional_u64(&master, b"normalization")?.unwrap_or(0);
@@ -344,6 +362,7 @@ fn open_head_dataset_context(
             utf8_only,
             sa_registry,
             recordsize,
+            unlinked_set,
         },
         os_view,
     ))
@@ -723,6 +742,231 @@ fn flush_dir_node(
         });
     }
     Ok(out.dnode)
+}
+
+fn read_unlinked_set(
+    cx: &Cx,
+    view: &mut Objects,
+    object: Option<u64>,
+) -> Result<(u64, Dnode, u64, Vec<RawZapEntry>)> {
+    let object = object.ok_or_else(|| unsupported("ZPL dataset has no native unlinked set"))?;
+    let (node, ceiling) = view.object_with_ceiling(cx, object)?;
+    if node.object_type() != DMU_OT_UNLINKED_SET || node.bonus_type() != 0 || node.spill().is_some()
+    {
+        return Err(corrupt("ZPL unlinked set has the wrong native object type"));
+    }
+    let entries = view.zap_values(cx, object)?;
+    if entries.len() > MAX_PENDING_UNLINKS {
+        return Err(unsupported(
+            "ZPL unlinked set exceeds the reclamation work budget",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for entry in &entries {
+        checkpoint(cx)?;
+        let target = entry.scalar().map_err(|e| parse_err(&e))?;
+        // OpenZFS zfs-2.3.0 zap_add_int stores an unpadded lowercase hexadecimal
+        // name and one uint64 object value, not a directory reference/tag.
+        if entry.integer_bytes != 8
+            || target == 0
+            || target >= (1 << 48) - 1
+            || entry.name != format!("{target:x}").as_bytes()
+            || !seen.insert(target)
+        {
+            return Err(corrupt("invalid native ZPL unlinked-set entry"));
+        }
+    }
+    Ok((object, node, ceiling, entries))
+}
+
+fn admit_unlinked_file(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<()> {
+    if loaded.metadata.kind != Kind::Regular {
+        return Err(unsupported(
+            "native orphan reclamation currently requires a regular file",
+        ));
+    }
+    admit_zpl_reclamation(loaded, registry)
+}
+
+fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<()> {
+    let ownership = match loaded.dnode.bonus_type() {
+        DMU_OT_ZNODE => ffs_ondisk::zfs_zpl::ReclamationOwnership::legacy(
+            loaded.dnode.bonus(),
+            loaded.dnode.order(),
+        )
+        .map_err(|e| parse_err(&e))?,
+        DMU_OT_SA => registry
+            .ok_or_else(|| corrupt("missing SA registry"))?
+            .decode(loaded.dnode.bonus(), loaded.spill_bytes.as_deref())
+            .and_then(|attrs| attrs.reclamation_ownership())
+            .map_err(|e| parse_err(&e))?,
+        _ => return Err(unsupported("unsupported orphan bonus representation")),
+    };
+    if ownership.xattr_directory != 0 {
+        return Err(unsupported(
+            "ZPL reclamation with a native xattr directory is unavailable",
+        ));
+    }
+    if ownership.external_acl_object != 0 {
+        return Err(unsupported(
+            "ZPL reclamation with an external ACL object is unavailable",
+        ));
+    }
+    // load_zpl_node validates the native project attribute and its presence
+    // flag. Retention and final retirement charge their deltas to that loaded
+    // owner, including nonzero project IDs.
+    Ok(())
+}
+
+fn retain_unlinked_target(
+    object: u64,
+    loaded: &LoadedZplNode,
+    identity: Option<ZfsUnlinkedObject>,
+    registry: Option<&SaRegistry>,
+) -> Result<bool> {
+    let Some(identity) = identity else {
+        return Ok(false);
+    };
+    if identity.object != object || identity.generation != loaded.metadata.generation {
+        return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+            libc::ESTALE,
+        )));
+    }
+    if loaded.metadata.links == 0 {
+        return Err(corrupt(
+            "directory entry refers to an already unlinked file",
+        ));
+    }
+    admit_unlinked_file(loaded, registry)?;
+    Ok(loaded.metadata.links == 1)
+}
+
+/// Inspect the native queue before mount ownership is exposed to callers.
+/// This performs no writes and preflights the whole bounded reclamation batch.
+pub(super) fn pending_unlinks(
+    cx: &Cx,
+    mos: &mut Objects,
+    dataset_components: &[Vec<u8>],
+) -> Result<Vec<ZfsUnlinkedObject>> {
+    let (context, mut view) = open_head_dataset_context(cx, mos, dataset_components)?;
+    if context.unlinked_set.is_none() {
+        return Ok(Vec::new());
+    }
+    let (_, _, _, entries) = read_unlinked_set(cx, &mut view, context.unlinked_set)?;
+    let mut pending = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry.values[0];
+        let loaded = load_zpl_node(
+            cx,
+            &mut view,
+            &context.os.meta,
+            context.old_os_bp.birth(),
+            &BTreeMap::new(),
+            context.sa_registry.as_ref(),
+            object,
+            context.os.meta.order(),
+        )?;
+        if loaded.metadata.links != 0 || object == context.root_dir {
+            return Err(corrupt("native unlinked set references a live ZPL object"));
+        }
+        admit_unlinked_file(&loaded, context.sa_registry.as_ref())?;
+        pending.push(ZfsUnlinkedObject {
+            object,
+            generation: loaded.metadata.generation,
+        });
+    }
+    Ok(pending)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_unlinked_set_change(
+    cx: &Cx,
+    view: &mut Objects,
+    context: &DatasetContext,
+    dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    target: u64,
+    add: bool,
+    alloc: &mut PoolSpaceAllocator,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+    born: &mut SpaceDelta,
+    retired: &mut Vec<BlockPointer>,
+) -> Result<()> {
+    let (object, node, ceiling, mut entries) = read_unlinked_set(cx, view, context.unlinked_set)?;
+    let position = entries.iter().position(|entry| entry.values[0] == target);
+    if add {
+        if position.is_some() {
+            return Err(corrupt(
+                "linked object is already in the native unlinked set",
+            ));
+        }
+        if entries.len() == MAX_PENDING_UNLINKS {
+            return Err(unsupported(
+                "native unlinked set is at the reclamation work limit",
+            ));
+        }
+        entries.push(RawZapEntry {
+            name: format!("{target:x}").into_bytes(),
+            integer_bytes: 8,
+            values: vec![target],
+            collision: 0,
+        });
+    } else {
+        let position =
+            position.ok_or_else(|| FfsError::NotFound("native unlinked object".into()))?;
+        entries.remove(position);
+    }
+    let (block_size, blocks) = encode_zap_blocks_for_dnode(
+        cx,
+        view,
+        Some((&node, ceiling)),
+        &entries,
+        order,
+        (1_usize << alloc.ashift).max(512),
+    )?;
+    let dirty: BTreeMap<_, _> = blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| (index as u64, Some(bytes)))
+        .collect();
+    let out = cow_update_dnode(
+        cx,
+        view,
+        alloc,
+        DnodeCowSpec {
+            existing: Some((&node, ceiling)),
+            object_type: DMU_OT_UNLINKED_SET,
+            bonus_type: node.bonus_type(),
+            checksum_type: 7,
+            compress_type: 2,
+            user_flags: 0,
+            indirect_shift: node.indirect_shift(),
+            data_bytes: block_size,
+            max_block: (dirty.len() - 1) as u64,
+            slots: node.slots(),
+            nblkptr: node.pointers().len(),
+            bonus: node.bonus().to_vec(),
+            spill: None,
+            order,
+            new_txg,
+            leaf_bucket: WriteBucket::ChildBlocks,
+            indirect_bucket: WriteBucket::ChildBlocks,
+        },
+        &dirty,
+        staged_writes,
+    )?;
+    born.add_assign(out.born)?;
+    retired.extend(out.retired_bps);
+    put_dnode_in_table(
+        cx,
+        view,
+        &context.os.meta,
+        context.old_os_bp.birth(),
+        dirty_dnodes,
+        object,
+        &out.dnode,
+    )
 }
 
 /// Stage a single ZPL mutation on `dataset_components` in memory, updating `mos_dirty_dnodes`,
@@ -1638,6 +1882,7 @@ pub(super) fn stage_zpl_mutation(
             dst_dir,
             dst_name,
             expected_source_object,
+            retain_replaced,
             timestamp,
         } => {
             validate_component(src_name, ds_ctx.utf8_only)?;
@@ -1774,6 +2019,28 @@ pub(super) fn stage_zpl_mutation(
                     }
                     replaced_dir = true;
                 }
+                let retain = retain_unlinked_target(
+                    target_obj,
+                    &target_loaded,
+                    *retain_replaced,
+                    ds_ctx.sa_registry.as_ref(),
+                )?;
+                if retain {
+                    stage_unlinked_set_change(
+                        cx,
+                        &mut os_view,
+                        &ds_ctx,
+                        &mut zpl_dirty_dnodes,
+                        target_obj,
+                        true,
+                        alloc,
+                        order,
+                        new_txg,
+                        staged_writes,
+                        &mut zpl_born,
+                        &mut zpl_retired,
+                    )?;
+                }
                 dst_entries.remove(dst_pos);
                 retire_or_decrement_zpl_target(
                     cx,
@@ -1784,6 +2051,7 @@ pub(super) fn stage_zpl_mutation(
                     target_obj,
                     &target_loaded,
                     target_is_dir,
+                    retain,
                     ds_ctx.sa_registry.as_ref(),
                     acct_flags,
                     alloc,
@@ -1795,6 +2063,8 @@ pub(super) fn stage_zpl_mutation(
                     &mut zpl_retired,
                     &mut quota_deltas,
                 )?;
+            } else if retain_replaced.is_some() {
+                return Err(FfsError::NotFound("expected ZPL rename replacement".into()));
             }
 
             let encoded_ref = encode_directory_reference(source_obj, src_obj_loaded.metadata.kind)
@@ -1999,6 +2269,7 @@ pub(super) fn stage_zpl_mutation(
             parent_dir,
             name,
             rmdir,
+            retain,
             timestamp,
         } => {
             validate_component(name, ds_ctx.utf8_only)?;
@@ -2051,6 +2322,28 @@ pub(super) fn stage_zpl_mutation(
                     return Err(FfsError::NotEmpty);
                 }
             }
+            let retain = retain_unlinked_target(
+                target_obj,
+                &target_loaded,
+                *retain,
+                ds_ctx.sa_registry.as_ref(),
+            )?;
+            if retain {
+                stage_unlinked_set_change(
+                    cx,
+                    &mut os_view,
+                    &ds_ctx,
+                    &mut zpl_dirty_dnodes,
+                    target_obj,
+                    true,
+                    alloc,
+                    order,
+                    new_txg,
+                    staged_writes,
+                    &mut zpl_born,
+                    &mut zpl_retired,
+                )?;
+            }
 
             entries.remove(pos);
             let mut p_meta = parent_loaded.metadata.clone();
@@ -2096,6 +2389,7 @@ pub(super) fn stage_zpl_mutation(
                 target_obj,
                 &target_loaded,
                 target_is_dir,
+                retain,
                 ds_ctx.sa_registry.as_ref(),
                 acct_flags,
                 alloc,
@@ -2108,6 +2402,70 @@ pub(super) fn stage_zpl_mutation(
                 &mut quota_deltas,
             )?;
             target_obj
+        }
+        ZplMutation::ReapUnlinked { identity } => {
+            let (_, _, _, entries) = read_unlinked_set(cx, &mut os_view, ds_ctx.unlinked_set)?;
+            if !entries
+                .iter()
+                .any(|entry| entry.values[0] == identity.object)
+            {
+                return Err(FfsError::NotFound("native unlinked object".into()));
+            }
+            let loaded = load_zpl_node(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &zpl_dirty_dnodes,
+                ds_ctx.sa_registry.as_ref(),
+                identity.object,
+                order,
+            )?;
+            if loaded.metadata.generation != identity.generation {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::ESTALE,
+                )));
+            }
+            if loaded.metadata.links != 0 || identity.object == ds_ctx.root_dir {
+                return Err(corrupt("native unlinked set references a live ZPL object"));
+            }
+            admit_unlinked_file(&loaded, ds_ctx.sa_registry.as_ref())?;
+            retire_or_decrement_zpl_target(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &mut zpl_dirty_dnodes,
+                identity.object,
+                &loaded,
+                false,
+                false,
+                ds_ctx.sa_registry.as_ref(),
+                acct_flags,
+                alloc,
+                order,
+                new_txg,
+                loaded.metadata.times[2],
+                staged_writes,
+                &mut zpl_born,
+                &mut zpl_retired,
+                &mut quota_deltas,
+            )?;
+            stage_unlinked_set_change(
+                cx,
+                &mut os_view,
+                &ds_ctx,
+                &mut zpl_dirty_dnodes,
+                identity.object,
+                false,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+                &mut zpl_born,
+                &mut zpl_retired,
+            )?;
+            identity.object
         }
     };
 
@@ -2144,6 +2502,7 @@ fn retire_or_decrement_zpl_target(
     target_obj: u64,
     target_loaded: &LoadedZplNode,
     target_is_dir: bool,
+    retain_unlinked: bool,
     sa_registry: Option<&SaRegistry>,
     acct_flags: u8,
     alloc: &mut PoolSpaceAllocator,
@@ -2160,7 +2519,7 @@ fn retire_or_decrement_zpl_target(
     } else {
         target_loaded.metadata.links.saturating_sub(1)
     };
-    if rem_links > 0 {
+    if rem_links > 0 || retain_unlinked {
         let mut next_meta = target_loaded.metadata.clone();
         next_meta.links = rem_links;
         next_meta.times[2] = timestamp;
@@ -2223,50 +2582,10 @@ fn retire_or_decrement_zpl_target(
         );
     }
 
-    // The data tree and SA spill do not own every allocation associated with a
-    // znode. Its private xattr directory and legacy external ACL live in separate
-    // DMU objects. Dropping the final owner would strand those objects because
-    // their native reclamation is not yet implemented. Keep nonfinal link removal
-    // above usable: it preserves the owner and all of its auxiliary references.
-    let (xattr_directory, external_acl) = match target_loaded.dnode.bonus_type() {
-        DMU_OT_ZNODE => (
-            ffs_ondisk::zfs_zpl::XattrSources::legacy(
-                target_loaded.dnode.bonus(),
-                target_loaded.dnode.order(),
-            )
-            .map_err(|error| parse_err(&error))?
-            .directory,
-            target_loaded
-                .dnode
-                .order()
-                .u64(target_loaded.dnode.bonus(), 176)
-                .map_err(|error| parse_err(&error))?,
-        ),
-        DMU_OT_SA => {
-            let registry = sa_registry.ok_or_else(|| corrupt("missing SA registry"))?;
-            let attributes = registry
-                .decode(
-                    target_loaded.dnode.bonus(),
-                    target_loaded.spill_bytes.as_deref(),
-                )
-                .map_err(|error| parse_err(&error))?;
-            (
-                attributes
-                    .xattrs()
-                    .map_err(|error| parse_err(&error))?
-                    .directory,
-                attributes
-                    .external_acl_object()
-                    .map_err(|error| parse_err(&error))?,
-            )
-        }
-        _ => return Err(unsupported("unsupported ZPL bonus type")),
-    };
-    if xattr_directory != 0 || external_acl != 0 {
-        return Err(unsupported(
-            "native final-link reclamation requires private xattr and external ACL cleanup",
-        ));
-    }
+    // The data tree and SA spill do not own private xattr directories or legacy
+    // external ACL objects. Require their cleanup support before final unlink,
+    // replacement, or reap. Nonfinal decrements above preserve these owners.
+    admit_zpl_reclamation(target_loaded, sa_registry)?;
 
     // Links == 0: retire all leaf, indirect, and spill blocks, update quota, and free dnode slot!
     collect_non_hole_bps_from(

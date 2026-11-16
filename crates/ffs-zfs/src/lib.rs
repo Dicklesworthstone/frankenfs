@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Native ZFS pool, DMU, ZPL and read-only filesystem operations.
+//! Native ZFS pool, DMU, ZPL and admitted read/write filesystem operations.
 //!
 //! The library retains the reader's explicit topology and root admission rules.
 //! ZIL recovery uses a volatile view; it never grants native write authority.
@@ -39,5 +39,5 @@ pub use reader::{Label, Leaf, Pool, RootBlock};
 pub use transaction::{
     ZfsAdmissionReport, ZfsDataChecksum, ZfsDurableToken, ZfsPersistenceEvent, ZfsPersistenceStage,
     ZfsSetAttr, ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome,
-    ZfsWriteOptions,
+    ZfsUnlinkedObject, ZfsWriteOptions,
 };

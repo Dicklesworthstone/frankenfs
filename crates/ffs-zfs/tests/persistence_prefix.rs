@@ -38,7 +38,7 @@ use ffs_zfs::reader::dmu::allocation::AllocationLimits;
 use ffs_zfs::reader::dmu::scrub::ScrubLimits;
 use ffs_zfs::{
     Leaf, Pool, ZfsDataChecksum, ZfsPersistenceStage, ZfsTopologyKind, ZfsTransactionEngine,
-    ZfsTxOutcome, ZfsWriteOptions,
+    ZfsTxOutcome, ZfsUnlinkedObject, ZfsWriteOptions,
 };
 
 const POOL_GUID: u64 = 0x5A46_535F_5445_5354;
@@ -92,6 +92,8 @@ struct PoolFixtureSpec {
     dirty_zil: bool,
     additional_write_features: Vec<(&'static [u8], u64)>,
     zpl_flags: BTreeMap<u64, u64>,
+    root_ids: (u64, u64),
+    hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
     root_properties: Vec<(&'static [u8], u64)>,
     data_properties: Vec<(&'static [u8], u64)>,
     auxiliary_ownership: Option<(u64, AuxiliaryOwnership)>,
@@ -120,6 +122,8 @@ impl Default for PoolFixtureSpec {
             dirty_zil: false,
             additional_write_features: Vec::new(),
             zpl_flags: BTreeMap::new(),
+            root_ids: (0, 0),
+            hello_ownership: None,
             root_properties: Vec::new(),
             data_properties: Vec::new(),
             auxiliary_ownership: None,
@@ -433,12 +437,13 @@ fn build_sa_registry_objects(
     birth: u64,
     order: Endian,
     malformed_project_id: bool,
+    with_reclamation_ownership: bool,
 ) -> (SaRegistry, Dnode, Dnode, Dnode) {
     // Attribute IDs matching OpenZFS `SaRegistry::LEGACY` (0..16) + custom attr 18:
     // 0: ATIME(16,0), 1: MTIME(16,0), 2: CTIME(16,0), 3: CRTIME(16,0), 4: GEN(8,0),
     // 5: MODE(8,0), 6: SIZE(8,0), 7: PARENT(8,0), 8: LINKS(8,0), 10: RDEV(8,0),
     // 11: FLAGS(8,0), 12: UID(8,0), 13: GID(8,0), 18: ZPL_SCANSTAMP(32,2)
-    let reg_entries = vec![
+    let mut reg_entries = vec![
         RawZapEntry {
             name: b"ZPL_ATIME".to_vec(),
             integer_bytes: 8,
@@ -531,7 +536,7 @@ fn build_sa_registry_objects(
         },
     ];
     // Layout 2: standard file/dir layout; Layout 3: spill layout `[18]`
-    let lay_entries = vec![
+    let mut lay_entries = vec![
         RawZapEntry {
             name: b"2".to_vec(),
             integer_bytes: 2,
@@ -575,6 +580,25 @@ fn build_sa_registry_objects(
             collision: 0,
         },
     ];
+    if with_reclamation_ownership {
+        for (name, id, length, swap) in [
+            (b"ZPL_XATTR".as_slice(), 9_u64, 8_u64, 0_u64),
+            (b"ZPL_ZNODE_ACL".as_slice(), 15, 88, 3),
+        ] {
+            reg_entries.push(RawZapEntry {
+                name: name.to_vec(),
+                integer_bytes: 8,
+                values: vec![(length << 24) | (swap << 16) | id],
+                collision: 0,
+            });
+        }
+        lay_entries.push(RawZapEntry {
+            name: b"9".to_vec(),
+            integer_bytes: 2,
+            values: vec![9, 15, 19],
+            collision: 0,
+        });
+    }
     let registry = SaRegistry::from_zaps(&reg_entries, &lay_entries).expect("valid SaRegistry");
 
     let sa_master_raw = mzap(&[(b"REGISTRY", 9), (b"LAYOUTS", 10)], 0x1234, order);
@@ -750,8 +774,13 @@ fn build_zpl_objectset(
     };
 
     let (sa_reg, sa_objs) = if spec.zpl_version == 5 {
-        let (r, m_dn, r_dn, l_dn) =
-            build_sa_registry_objects(arena, birth, order, spec.malformed_project_id);
+        let (r, m_dn, r_dn, l_dn) = build_sa_registry_objects(
+            arena,
+            birth,
+            order,
+            spec.malformed_project_id,
+            spec.hello_ownership.is_some(),
+        );
         (Some(r), Some((m_dn, r_dn, l_dn)))
     } else {
         (None, None)
@@ -875,15 +904,49 @@ fn build_zpl_objectset(
             times: [ts; 4],
             inline_symlink: None,
         };
-        let (bt, bbytes, spill) = encode_zpl_bonus_for_fixture(
+        let (bt, mut bbytes, mut spill) = encode_zpl_bonus_for_fixture(
             &hello_meta,
             spec.zpl_version,
             sa_reg.as_ref(),
-            spec.spill_profile(),
+            if spec.hello_ownership.is_some() {
+                SaSpillFixture::None
+            } else {
+                spec.spill_profile()
+            },
             arena,
             birth,
             order,
         );
+        if let Some(ownership) = spec.hello_ownership {
+            if spec.zpl_version == 4 {
+                assert_eq!(ownership.project_id, 0, "legacy znodes have no project ID");
+                bbytes[104..112].copy_from_slice(&order.encode(ownership.xattr_directory));
+                bbytes[176..184].copy_from_slice(&order.encode(ownership.external_acl_object));
+            } else {
+                // Independent native layout 9: XATTR(8), ZNODE_ACL(88), PROJID(8).
+                // Keep ownership in a real SA spill, outside the core bonus.
+                let mut raw = vec![0_u8; 512];
+                let header = (1_u16 << 10) | 9;
+                match order {
+                    Endian::Little => {
+                        raw[..4].copy_from_slice(&[0x5a, 0x50, 0x2f, 0]);
+                        raw[4..6].copy_from_slice(&header.to_le_bytes());
+                    }
+                    Endian::Big => {
+                        raw[..4].copy_from_slice(&[0, 0x2f, 0x50, 0x5a]);
+                        raw[4..6].copy_from_slice(&header.to_be_bytes());
+                    }
+                }
+                for (offset, value) in [
+                    (8, ownership.xattr_directory),
+                    (16, ownership.external_acl_object),
+                    (104, ownership.project_id),
+                ] {
+                    raw[offset..offset + 8].copy_from_slice(&order.encode(value));
+                }
+                spill = Some(arena.alloc_block(&raw, 44, 0, birth, order));
+            }
+        }
         let hello_dn = make_dnode(
             19,
             snap_hello_bytes.len(),
@@ -1167,8 +1230,8 @@ fn build_zpl_objectset(
         size: 2 + (root_entries.len() as u64),
         links: 2 + subdir_count,
         parent: 2,
-        uid: 0,
-        gid: 0,
+        uid: spec.root_ids.0,
+        gid: spec.root_ids.1,
         flags: 0x408 | spec.zpl_flags.get(&2).copied().unwrap_or(0),
         generation: birth,
         times: [ts; 4],
@@ -3529,6 +3592,221 @@ fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_600,
+        nanos: 321,
+    };
+    for (ashift, mirror_width, replace) in
+        [(9, 1, false), (9, 1, true), (12, 2, false), (12, 2, true)]
+    {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            ashift,
+            mirror_width,
+            image_bytes: 24 * 1024 * 1024,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            project_accounting: true,
+            sa_project_id: Some(42),
+            additional_write_features: vec![(b"org.zfsonlinux:project_quota", 1)],
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let (original_node, original_counters) =
+            native_accounting_snapshot(&cx, &engine, &devices[0]);
+        let original_node = original_node.unwrap();
+        let old_spill = original_node.spill().unwrap();
+        assert_eq!(
+            (old_spill.compression(), old_spill.logical_bytes()),
+            (3, 8192)
+        );
+        let expected_growth = 8192 - bp_allocated_bytes(old_spill);
+        assert!(expected_growth > 0);
+        let identity = {
+            let mut mos = engine.open_read_objects(&cx).unwrap();
+            let mut zpl = mos.zpl(&cx, &dataset).unwrap();
+            ZfsUnlinkedObject {
+                object: 4,
+                generation: zpl.stat(&cx, 4).unwrap().0.generation,
+            }
+        };
+        let outcome = if replace {
+            engine.rename_retaining_open_target(
+                &cx,
+                &dataset,
+                2,
+                b"keep.bin",
+                2,
+                b"hello.txt",
+                Some(5),
+                identity,
+                timestamp,
+            )
+        } else {
+            engine.unlink_open_file(&cx, &dataset, 2, b"hello.txt", identity, timestamp)
+        };
+        let (_, retained_token) = outcome.into_result().unwrap();
+        assert_eq!(engine.pending_unlinks(&cx, &dataset).unwrap(), [identity]);
+        let (retained_node, retained_counters) =
+            native_accounting_snapshot(&cx, &engine, &devices[0]);
+        assert_eq!(
+            retained_node.unwrap().used_bytes(),
+            original_node.used_bytes() + expected_growth
+        );
+        for (index, owner) in [b"3e8".as_slice(), b"3e8".as_slice(), b"2a".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut expected = original_counters[index].clone();
+            *expected.get_mut(owner).unwrap() += expected_growth;
+            assert_eq!(
+                retained_counters[index], expected,
+                "retention must preserve object charges and charge spill growth to its owner"
+            );
+        }
+        drop(engine);
+        for device in &devices {
+            device.state.lock().unwrap().crash_drop_unsynced();
+        }
+        let fresh: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut reopened = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(built.pool_guid, retained_token.published_slot()),
+        )
+        .unwrap();
+        assert_eq!(reopened.pending_unlinks(&cx, &dataset).unwrap(), [identity]);
+        let (_, persisted_counters) = native_accounting_snapshot(&cx, &reopened, &fresh[0]);
+        assert_eq!(persisted_counters, retained_counters);
+        {
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            let mut zpl = mos.zpl(&cx, &dataset).unwrap();
+            assert_eq!(zpl.stat(&cx, 4).unwrap().0.links, 0);
+            assert_eq!(
+                zpl.read(&cx, 4, 0, built.snap_hello_expected.len())
+                    .unwrap(),
+                built.snap_hello_expected
+            );
+            if replace {
+                assert_eq!(zpl.resolve(&cx, b"/hello.txt").unwrap(), 5);
+                assert!(matches!(
+                    zpl.resolve(&cx, b"/keep.bin"),
+                    Err(FfsError::NotFound(_))
+                ));
+            } else {
+                assert!(matches!(
+                    zpl.resolve(&cx, b"/hello.txt"),
+                    Err(FfsError::NotFound(_))
+                ));
+                assert_eq!(zpl.resolve(&cx, b"/keep.bin").unwrap(), 5);
+            }
+        }
+
+        reopened
+            .truncate_file(&cx, &dataset, 4, 0, timestamp, ZfsDataChecksum::Fletcher4)
+            .into_result()
+            .unwrap();
+        let (truncated_node, truncated_counters) =
+            native_accounting_snapshot(&cx, &reopened, &fresh[0]);
+        let truncated_node = truncated_node.unwrap();
+        assert_eq!(truncated_node.used_bytes(), 8192);
+        assert_eq!(truncated_counters[2][b"2a".as_slice()], 8192);
+        assert_eq!(truncated_counters[2][b"obj-2a".as_slice()], 1);
+        assert_eq!(
+            truncated_counters[2][b"0".as_slice()],
+            original_counters[2][b"0".as_slice()]
+        );
+        assert_eq!(reopened.pending_unlinks(&cx, &dataset).unwrap(), [identity]);
+
+        let (_, reaped_token) = reopened
+            .reap_unlinked_file(&cx, &dataset, identity)
+            .into_result()
+            .unwrap();
+        assert!(reopened.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+        let (removed, final_counters) = native_accounting_snapshot(&cx, &reopened, &fresh[0]);
+        assert!(removed.is_none());
+        for (index, (owner, object_key)) in [
+            (b"3e8".as_slice(), b"obj-3e8".as_slice()),
+            (b"3e8".as_slice(), b"obj-3e8".as_slice()),
+            (b"2a".as_slice(), b"obj-2a".as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut expected = truncated_counters[index].clone();
+            for (key, decrement) in [(owner, truncated_node.used_bytes()), (object_key, 1)] {
+                let remaining = expected[key].checked_sub(decrement).unwrap();
+                if remaining == 0 {
+                    expected.remove(key);
+                } else {
+                    *expected.get_mut(key).unwrap() = remaining;
+                }
+            }
+            assert_eq!(
+                final_counters[index], expected,
+                "reaping must debit the actual owner exactly once"
+            );
+        }
+        assert!(!final_counters[2].contains_key(b"2a".as_slice()));
+        assert!(!final_counters[2].contains_key(b"obj-2a".as_slice()));
+        drop(reopened);
+        for device in &fresh {
+            device.state.lock().unwrap().crash_drop_unsynced();
+        }
+        let durable: Vec<_> = fresh
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let final_engine = open_engine_on_devices(
+            &cx,
+            &durable,
+            default_write_opts(built.pool_guid, reaped_token.published_slot()),
+        )
+        .unwrap();
+        let (removed, persisted_counters) =
+            native_accounting_snapshot(&cx, &final_engine, &durable[0]);
+        assert!(removed.is_none());
+        assert_eq!(persisted_counters, final_counters);
+        assert!(
+            final_engine
+                .pending_unlinks(&cx, &dataset)
+                .unwrap()
+                .is_empty()
+        );
+        let mut mos = final_engine.open_read_objects(&cx).unwrap();
+        let mut zpl = mos.zpl(&cx, &dataset).unwrap();
+        let mut snapshot = zpl.open_snapshot(&cx, b"before").unwrap();
+        assert_eq!(
+            snapshot
+                .read(&cx, 4, 0, built.snap_hello_expected.len())
+                .unwrap(),
+            built.snap_hello_expected
+        );
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &durable,
+            built.pool_guid,
+            Some(reaped_token.published_slot()),
+        );
+    }
+}
+
+#[test]
 fn malformed_project_owner_refuses_compound_setattr_before_any_backing_write() {
     let cx = Cx::for_testing();
     for spec in [
@@ -4768,6 +5046,291 @@ fn hard_link_persistence_cuts_never_split_directory_entry_from_link_count() {
     }
 }
 
+#[test]
+fn native_unlinked_reclamation_rejects_stale_or_unowned_objects_without_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let ts = Timestamp {
+        seconds: 1_715_000_300,
+        nanos: 17,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(POOL_GUID, built.initial_slot),
+    )
+    .unwrap();
+    let mut head = engine
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &dataset)
+        .unwrap();
+    let object = head.resolve(&cx, b"/hello.txt").unwrap();
+    let identity = ZfsUnlinkedObject {
+        object,
+        generation: head.stat(&cx, object).unwrap().0.generation,
+    };
+    let stale = ZfsUnlinkedObject {
+        generation: identity.generation + 1,
+        ..identity
+    };
+    assert_native_write_refused(&mut engine, &devices, libc::ENOENT, |writer| {
+        writer.reap_unlinked_file(&cx, &dataset, identity)
+    });
+    assert_native_write_refused(&mut engine, &devices, libc::ESTALE, |writer| {
+        writer.unlink_open_file(&cx, &dataset, 2, b"hello.txt", stale, ts)
+    });
+    engine
+        .unlink_open_file(&cx, &dataset, 2, b"hello.txt", identity, ts)
+        .into_result()
+        .unwrap();
+    assert_eq!(
+        engine.pending_unlinks(&cx, &dataset).unwrap(),
+        vec![identity]
+    );
+    assert_native_write_refused(&mut engine, &devices, libc::ESTALE, |writer| {
+        writer.reap_unlinked_file(&cx, &dataset, stale)
+    });
+    engine
+        .reap_unlinked_file(&cx, &dataset, identity)
+        .into_result()
+        .unwrap();
+    assert!(engine.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+    let (reused, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"reused",
+            0o600,
+            1000,
+            1000,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(
+        reused, object,
+        "fixture must exercise native object slot reuse"
+    );
+    assert_native_write_refused(&mut engine, &devices, libc::ENOENT, |writer| {
+        writer.reap_unlinked_file(&cx, &dataset, identity)
+    });
+    let mut head = engine
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &dataset)
+        .unwrap();
+    assert_ne!(
+        head.stat(&cx, reused).unwrap().0.generation,
+        identity.generation
+    );
+    assert_eq!(head.resolve(&cx, b"/reused").unwrap(), reused);
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+}
+
+#[test]
+fn native_unlink_and_reap_persistence_cuts_preserve_queue_namespace_and_snapshots() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let ts = Timestamp {
+        seconds: 1_715_000_301,
+        nanos: 19,
+    };
+    for reaping in [false, true] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            mirror_width: 2,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            user_accounting: true,
+            ..PoolFixtureSpec::default()
+        });
+        let seed_devices: Vec<_> = built
+            .members
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut seed = open_engine_on_devices(
+            &cx,
+            &seed_devices,
+            default_write_opts(POOL_GUID, built.initial_slot),
+        )
+        .unwrap();
+        let mut seed_head = seed
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        let object = seed_head.resolve(&cx, b"/hello.txt").unwrap();
+        let identity = ZfsUnlinkedObject {
+            object,
+            generation: seed_head.stat(&cx, object).unwrap().0.generation,
+        };
+        if reaping {
+            seed.unlink_open_file(&cx, &dataset, 2, b"hello.txt", identity, ts)
+                .into_result()
+                .unwrap();
+        }
+        let initial_slot = seed.committed_slot();
+        let initial_txg = seed.committed_txg();
+        let initial: Vec<_> = seed_devices
+            .iter()
+            .map(FaultableMemberDevice::durable_snapshot)
+            .collect();
+        drop(seed);
+        let operation = |engine: &mut ZfsTransactionEngine| {
+            if reaping {
+                engine.reap_unlinked_file(&cx, &dataset, identity)
+            } else {
+                engine.unlink_open_file(&cx, &dataset, 2, b"hello.txt", identity, ts)
+            }
+        };
+        let probe_devices: Vec<_> = initial
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut probe = open_engine_on_devices(
+            &cx,
+            &probe_devices,
+            default_write_opts(POOL_GUID, initial_slot),
+        )
+        .unwrap();
+        let (_, token) = operation(&mut probe).into_result().unwrap();
+        let events = probe.persistence_events().to_vec();
+        let first_publish = events
+            .iter()
+            .find(|event| matches!(event.stage, ZfsPersistenceStage::UberblockWrite { .. }))
+            .unwrap()
+            .seq;
+        let acknowledged = events
+            .iter()
+            .find(|event| event.stage == ZfsPersistenceStage::BeforeAcknowledge)
+            .unwrap()
+            .seq;
+        for cut in events {
+            for reorder in [false, true] {
+                let devices: Vec<_> = initial
+                    .iter()
+                    .cloned()
+                    .map(FaultableMemberDevice::new)
+                    .collect();
+                let mut engine = open_engine_on_devices(
+                    &cx,
+                    &devices,
+                    default_write_opts(POOL_GUID, initial_slot),
+                )
+                .unwrap();
+                let sequence = cut.seq;
+                engine.with_fault_hook(move |event| {
+                    if event.seq == sequence {
+                        Err(FfsError::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                });
+                let outcome = operation(&mut engine);
+                if sequence <= first_publish {
+                    assert!(
+                        matches!(outcome, ZfsTxOutcome::NotCommitted(_)),
+                        "{reaping} {:?}",
+                        cut.stage
+                    );
+                } else if sequence < acknowledged {
+                    assert!(
+                        matches!(outcome, ZfsTxOutcome::Uncertain { .. }),
+                        "{reaping} {:?}",
+                        cut.stage
+                    );
+                } else {
+                    assert!(outcome.is_committed(), "{reaping} {:?}", cut.stage);
+                }
+                drop(engine);
+                for device in &devices {
+                    let mut media = device.state.lock().unwrap();
+                    if reorder {
+                        media.crash_reorder_and_drop_half_unsynced();
+                    } else {
+                        media.crash_drop_unsynced();
+                    }
+                }
+                let leaves = devices
+                    .iter()
+                    .map(|device| {
+                        let fresh = device.fresh_from_durable();
+                        let len = fresh.len_bytes();
+                        Leaf::from_device(&cx, Box::new(fresh), 0, len).unwrap()
+                    })
+                    .collect();
+                let mut mos = Pool::from_leaves(leaves)
+                    .unwrap()
+                    .import_objects(&cx, Some(POOL_GUID))
+                    .unwrap();
+                assert!([initial_txg, initial_txg + 1].contains(&mos.txg));
+                let published = mos.txg == initial_txg + 1;
+                if sequence <= first_publish {
+                    assert!(!published);
+                }
+                if sequence >= acknowledged {
+                    assert!(published);
+                }
+                let mut head = mos.zpl(&cx, &dataset).unwrap();
+                let removed = reaping || published;
+                assert_eq!(
+                    matches!(head.resolve(&cx, b"/hello.txt"), Err(FfsError::NotFound(_))),
+                    removed
+                );
+                if reaping && published {
+                    assert!(head.stat(&cx, object).is_err());
+                } else {
+                    assert_eq!(head.stat(&cx, object).unwrap().0.links, u64::from(!removed));
+                    assert_eq!(
+                        head.read(&cx, object, 0, 8192).unwrap(),
+                        built.snap_hello_expected
+                    );
+                }
+                let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
+                assert_eq!(
+                    snapshot.read(&cx, object, 0, 8192).unwrap(),
+                    built.snap_hello_expected
+                );
+                assert_eq!(snapshot.stat(&cx, object).unwrap().0.links, 1);
+                assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+
+                // Explicit native-ring reconciliation preserves the root selected
+                // above; it does not replay or change the dataset's queue.
+                let slot = if published {
+                    token.published_slot()
+                } else {
+                    initial_slot
+                };
+                let mut options = default_write_opts(POOL_GUID, slot);
+                options.reconcile_torn_uberblocks = true;
+                let recovered = open_engine_on_devices(&cx, &devices, options).unwrap();
+                let queue = recovered.pending_unlinks(&cx, &dataset).unwrap();
+                assert_eq!(
+                    queue,
+                    if reaping != published {
+                        vec![identity]
+                    } else {
+                        Vec::new()
+                    }
+                );
+            }
+        }
+    }
+}
+
 fn spec_len(dev: &FaultableMemberDevice) -> u64 {
     dev.len_bytes()
 }
@@ -5742,8 +6305,39 @@ fn native_openzfs_zdb_oracle_verifies_committed_pool_and_space_maps() {
         )
         .into_result()
         .unwrap();
+    let mut head = eng.open_read_objects(&cx).unwrap().zpl(&cx, &ds).unwrap();
+    let retained = ZfsUnlinkedObject {
+        object: fobj,
+        generation: head.stat(&cx, fobj).unwrap().0.generation,
+    };
+    drop(head);
+    let (_, retained_token) = eng
+        .unlink_open_file(&cx, &ds, sub_dir, b"verified.bin", retained, ts)
+        .into_result()
+        .unwrap();
     drop(eng);
 
+    // The native checker must accept both a live unlinked-set member and the
+    // fully reclaimed state; self-round-trip is not the allocation oracle.
+    run_zdb_check(
+        &zdb,
+        ld_path.as_deref(),
+        dir.path(),
+        "ffszdbpool",
+        &img_path,
+    );
+    let mut eng = ZfsTransactionEngine::open_files(
+        &cx,
+        &[img_path.as_path()],
+        default_write_opts(built.pool_guid, retained_token.published_slot()),
+    )
+    .unwrap();
+    assert_eq!(eng.pending_unlinks(&cx, &ds).unwrap(), vec![retained]);
+    eng.reap_unlinked_file(&cx, &ds, retained)
+        .into_result()
+        .unwrap();
+    assert!(eng.pending_unlinks(&cx, &ds).unwrap().is_empty());
+    drop(eng);
     run_zdb_check(
         &zdb,
         ld_path.as_deref(),

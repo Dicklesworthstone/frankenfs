@@ -44,14 +44,27 @@ jobs:
       - name: Workspace clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Install native filesystem oracles
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update && sudo apt-get install -y ntfs-3g zfsutils-linux
       - name: Native NTFS journal reservation tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-ondisk ntfs::logfile_writer::tests
       - name: Complete MVCC tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-mvcc
-      - name: Complete ZFS tests and persistence cuts
+      - name: Repair refresh capture and publication regressions
         if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p ffs-repair --lib refresh_ -- --test-threads=1
+          cargo test --locked -p ffs-repair --lib source_block_digest_manifest_roundtrip_and_tamper_detection_bd_jufod -- --test-threads=1
+      - name: Repair CLI publication regressions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --bin ffs-cli repair_rebuild_ -- --test-threads=1
+      - name: Complete ZFS tests, persistence cuts, and native zdb oracle
+        if: ${{ !cancelled() }}
+        env:
+          FFS_REQUIRE_ORACLES: "1"
         run: cargo test --locked -p ffs-zfs
       - name: Native ZPL metadata codec tests
         if: ${{ !cancelled() }}
@@ -62,9 +75,6 @@ jobs:
       - name: NTFS CLI consumer tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-cli --bin ffs-ntfs
-      - name: Install native NTFS oracle
-        if: ${{ !cancelled() }}
-        run: sudo apt-get update && sudo apt-get install -y ntfs-3g
       - name: Native NTFS CLI range and truncate round trip
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-cli --test cli_e2e native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection -- --ignored --exact --nocapture
@@ -76,6 +86,9 @@ jobs:
           cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --list | tee "$RUNNER_TEMP/ntfs-named-stream-tests.txt"
           grep -Fx "$test_name: test" "$RUNNER_TEMP/ntfs-named-stream-tests.txt"
           cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --nocapture
+      - name: Native NTFS named stream creation and removal
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --test cli_e2e native_ntfs_named_stream_catalog_cli_preserves_native_data_and_allocation -- --ignored --exact --nocapture
       - name: Native NTFS hard-link lifecycle and volume bounds
         if: ${{ !cancelled() }}
         shell: bash

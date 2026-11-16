@@ -1,5 +1,32 @@
 # FEATURE_PARITY
 
+> **NTFS named DATA lifecycle (2026-11-15):**
+> The native logged writer can create and remove ordinary named DATA streams
+> through sequence-bound references and paths. Resident/nonresident payloads,
+> exact UTF-16 identities, native UpCase collision checks, and allocation
+> reservation/reclamation share the existing WAL transaction and recovery path.
+> Writable FsOps expose create/unlink through `file:stream`; deletion refuses an
+> open stream and retires its mounted identity after commit. The companion CLI
+> exposes `tx-create-stream` and `tx-remove-stream`, with bounded initial payloads
+> and exact UTF-16 selectors. Authored regressions cover catalog preservation,
+> stale identities, failed barriers, committed cancellation, durable/reordered
+> crash prefixes, and mounted handle lifetimes. Directory streams, transformed
+> stream mutation, ATTRIBUTE_LIST spill, stream rename, deletion of open ADS,
+> and durable NTFS orphan recovery remain outside this slice. This advances
+> `bd-kx0m7` without closing NTFS-05 or claiming Windows/mounted qualification.
+
+> **Repair parity/source capture consistency (2026-11-15):**
+> Refresh and CLI rebuild derive parity and BLAKE3 source manifests from the
+> same captured buffers. Before any validation-tail writes, publication rereads
+> those sources and refuses a changed, unreadable, or cancelled capture, even
+> when no validation blocks are reserved. Pristine CLI descriptor bootstrap now
+> follows this validation. Authored regressions check unchanged previous tail
+> bytes, generation, dirty state and refresh evidence on refusal, plus parity
+> and digest agreement against independently retained source bytes. This does
+> not add external-writer exclusion or an atomic replacement manifest protocol;
+> allocator-owned storage and read-write mounted background repair remain open
+> under `bd-11a8t` / `bd-j7a4e`.
+
 > **ZFS native writable FsOps:**
 > An admitted single-leaf or complete-mirror writer can be consumed by
 > `ZfsFs::with_writer` for synchronous native create/mkdir/write/truncate,
@@ -11,12 +38,25 @@
 > barriers. Snapshots remain read-only; uncertain publication fences further
 > operations. Stateful OPEN and atomic CREATE handles protect actual open-file
 > lifetimes without treating cached LOOKUP references as open handles.
-> Final removal of an open file returns `EBUSY` pending native orphan retention.
-> Final reclamation refuses unsupported private xattr-directory or external-ACL
-> ownership before writes. The new timestamp, symlink, project-accounting and
-> auxiliary-ownership storage regressions passed on x86-64 and AArch64 at
-> `cee8ba03`; full workspace validation is tracked below. Native OpenZFS
-> interchange and real mounted-syscall qualification remain open.
+> Final unlink and replacement now preserve admitted open regular files in the
+> native `DELETE_QUEUE`, with namespace removal and queue insertion in one TXG.
+> Existing handles can read/write/truncate the zero-link object; final release
+> reclaims it, and filesystem sync/reopen can retry cleanup after cancellation
+> or failure.
+> Mount admission validates the view and complete bounded orphan queue before
+> cleanup; native generations protect against stale reclamation. Shared final
+> retirement refuses external ACL/xattr owners it cannot fully reclaim; existing
+> project IDs retain their own quota accounting. Nonfinal hard links retain all
+> auxiliary owners.
+> Added storage-model cases cover replacement, name reuse, two-handle lifetimes,
+> snapshots, restart cleanup, stale generations, ownership refusal and cuts at
+> every recorded unlink/reap persistence point, including reordered unsynced
+> writes. The independent `zdb` oracle also checks queued and reaped states.
+> Execution and full workspace gates are pending; no native OpenZFS interchange
+> or mounted-syscall qualification is claimed by these authored regressions.
+> The preceding timestamp, symlink, project-accounting and auxiliary-ownership
+> storage regressions passed on x86-64 and AArch64 at `cee8ba03`; full workspace
+> validation is tracked below.
 > This advances ZFS-05/06 without closing the broader roadmap obligations.
 
 > **NTFS root-directory recovery and durable log prefixes (2026-11-16):**

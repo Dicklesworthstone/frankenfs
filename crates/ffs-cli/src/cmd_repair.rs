@@ -8,7 +8,7 @@ use ffs_ondisk::{
     BtrfsChunkEntry, BtrfsSuperblock, Ext4Superblock, map_logical_to_physical,
     verify_btrfs_superblock_checksum,
 };
-use ffs_repair::codec::{EncodedGroup, encode_group};
+use ffs_repair::codec::{EncodedGroupWithDigests, encode_group_with_digests};
 use ffs_repair::ownership::{AcquireResult, OwnershipGuard, RepairOwnership};
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryOutcome};
 use ffs_repair::scrub::{BlockValidator, Ext4MetadataValidator, ScrubReport, Scrubber, Severity};
@@ -2630,9 +2630,10 @@ fn publish_rebuilt_symbols(
     cx: &Cx,
     device: &dyn BlockDevice,
     layout: RepairGroupLayout,
-    encoded: EncodedGroup,
+    captured: EncodedGroupWithDigests,
 ) -> Result<()> {
     let storage = RepairGroupStorage::new(device, layout);
+    let encoded = captured.encoded;
     let bootstrap = RepairGroupDescExt {
         transfer_length: u64::from(encoded.source_block_count) * u64::from(encoded.symbol_size),
         symbol_size: u16::try_from(encoded.symbol_size)
@@ -2671,16 +2672,20 @@ fn publish_rebuilt_symbols(
     if geometry.to_bytes() != bootstrap.to_bytes() {
         bail!("stored repair geometry differs from regenerated source geometry");
     }
-    if pristine {
-        storage.write_group_desc_ext(cx, &bootstrap)?;
-    }
-    let source_block_count = encoded.source_block_count;
     let symbols: Vec<_> = encoded
         .repair_symbols
         .into_iter()
         .map(|symbol| (symbol.esi, symbol.data))
         .collect();
-    storage.write_source_digests(cx, layout.group_start, source_block_count, next)?;
+    storage.write_source_digests(
+        cx,
+        captured.source_first_block,
+        &captured.source_digests,
+        next,
+    )?;
+    if pristine {
+        storage.write_group_desc_ext(cx, &bootstrap)?;
+    }
     storage.write_repair_symbols(cx, &symbols, next)?;
     Ok(())
 }
@@ -2729,7 +2734,7 @@ pub fn rebuild_btrfs_repair_symbols(
             continue;
         }
 
-        let encoded = match encode_group(
+        let encoded = match encode_group_with_digests(
             &cx,
             &block_dev,
             &fs_uuid,
@@ -2809,7 +2814,7 @@ pub fn rebuild_ext4_repair_symbols(
             continue;
         }
 
-        let encoded = match encode_group(
+        let encoded = match encode_group_with_digests(
             &cx,
             &block_dev,
             &fs_uuid,
@@ -3842,8 +3847,9 @@ mod coordination_tests {
         (path, device, layout)
     }
 
-    fn repair_rebuild_encoding(cx: &Cx, device: &dyn BlockDevice) -> EncodedGroup {
-        encode_group(cx, device, &[7; 16], GroupNumber(0), BlockNumber(0), 4, 2).unwrap()
+    fn repair_rebuild_encoding(cx: &Cx, device: &dyn BlockDevice) -> EncodedGroupWithDigests {
+        encode_group_with_digests(cx, device, &[7; 16], GroupNumber(0), BlockNumber(0), 4, 2)
+            .unwrap()
     }
 
     struct InterruptedParityWrite<'a> {
@@ -3890,6 +3896,45 @@ mod coordination_tests {
     }
 
     #[test]
+    fn repair_rebuild_refuses_sources_changed_after_encoding_without_tail_writes() {
+        for validation_blocks in [0, 1] {
+            for initialized in [false, true] {
+                let (path, device, _) = repair_rebuild_fixture();
+                let cx = cli_cx();
+                let layout = RepairGroupLayout::new(
+                    GroupNumber(0),
+                    BlockNumber(0),
+                    16,
+                    validation_blocks,
+                    2,
+                )
+                .unwrap();
+                if initialized {
+                    publish_rebuilt_symbols(
+                        &cx,
+                        &device,
+                        layout,
+                        repair_rebuild_encoding(&cx, &device),
+                    )
+                    .unwrap();
+                }
+                let captured = repair_rebuild_encoding(&cx, &device);
+                device
+                    .write_block(&cx, BlockNumber(0), &[0xA5; 512])
+                    .unwrap();
+                let before = std::fs::read(&path).unwrap();
+
+                let error = publish_rebuilt_symbols(&cx, &device, layout, captured).unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<ffs_error::FfsError>(),
+                    Some(ffs_error::FfsError::Corruption { block: 0, .. })
+                ));
+                assert_eq!(std::fs::read(path).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
     fn repair_rebuild_resumes_durable_pending_generation_without_source_writes() {
         let (path, device, layout) = repair_rebuild_fixture();
         let cx = cli_cx();
@@ -3898,6 +3943,7 @@ mod coordination_tests {
             .unwrap();
         let encoded = repair_rebuild_encoding(&cx, &device);
         let expected: Vec<_> = encoded
+            .encoded
             .repair_symbols
             .into_iter()
             .map(|symbol| (symbol.esi, symbol.data))

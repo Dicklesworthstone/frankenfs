@@ -4,8 +4,9 @@
 //! Writable heads retain the single pool transaction owner and publish each
 //! mutation through its native TXG boundary. Snapshots stay read-only; native
 //! object generations and mount-local identities prevent reuse through stale
-//! inodes. Native ACL evaluation and open-unlink retention are not implemented:
-//! the final unlink or replacement of a pinned object fails with `EBUSY`.
+//! inodes. Open regular files survive final unlink or replacement through the
+//! native unlinked set and are reclaimed after the last backend handle closes.
+//! Native ACL evaluation and reclamation of external ownership remain unsupported.
 
 mod writable;
 
@@ -940,7 +941,7 @@ impl FsOps for ZfsFs {
         }
         let source = state.child(cx, parent, name.as_bytes())?;
         let object = state.head.nodes[&source].object;
-        match state.child(cx, new_parent, new_name.as_bytes()) {
+        let retained = match state.child(cx, new_parent, new_name.as_bytes()) {
             Ok(target) => {
                 if flags & libc::RENAME_NOREPLACE != 0 {
                     return Err(FfsError::Exists);
@@ -949,26 +950,55 @@ impl FsOps for ZfsFs {
                     return Ok(());
                 }
                 let metadata = state.head.metadata(cx, target)?.0;
-                if metadata.kind == Kind::Directory || metadata.links <= 1 {
+                if metadata.kind == Kind::Directory {
                     state.reject_pinned_reclamation(target)?;
                 }
+                (metadata.kind == Kind::Regular
+                    && metadata.links <= 1
+                    && state.has_open_handles(target))
+                .then(|| {
+                    (
+                        target,
+                        crate::ZfsUnlinkedObject {
+                            object: state.head.nodes[&target].object,
+                            generation: metadata.generation,
+                        },
+                    )
+                })
             }
-            Err(FfsError::NotFound(_)) => {}
+            Err(FfsError::NotFound(_)) => None,
             Err(error) => return Err(error),
-        }
+        };
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(|engine, dataset| {
-            engine.rename_entry(
-                cx,
-                dataset,
-                source_parent,
-                name.as_bytes(),
-                target_parent,
-                new_name.as_bytes(),
-                Some(object),
-                timestamp,
-            )
+            if let Some((_, identity)) = retained {
+                engine.rename_retaining_open_target(
+                    cx,
+                    dataset,
+                    source_parent,
+                    name.as_bytes(),
+                    target_parent,
+                    new_name.as_bytes(),
+                    Some(object),
+                    identity,
+                    timestamp,
+                )
+            } else {
+                engine.rename_entry(
+                    cx,
+                    dataset,
+                    source_parent,
+                    name.as_bytes(),
+                    target_parent,
+                    new_name.as_bytes(),
+                    Some(object),
+                    timestamp,
+                )
+            }
         })?;
+        if let Some((ino, identity)) = retained {
+            state.remember_unlinked(ino, identity);
+        }
         Ok(())
     }
 
@@ -1093,6 +1123,7 @@ impl FsOps for ZfsFs {
         if state.recovery_required {
             return Err(errno(libc::EIO));
         }
+        state.reap_closed_orphan(cx, request.ino)?;
         if request.flush {
             state.sync(cx)?;
         }
@@ -1103,20 +1134,21 @@ impl FsOps for ZfsFs {
         &self,
         cx: &Cx,
         _scope: &mut RequestScope,
-        _ino: InodeNumber,
+        ino: InodeNumber,
     ) -> Result<bool> {
-        let _state = self.state(cx)?;
-        // Pinned final-link removals are rejected before native mutation, so
-        // this profile never has a hidden object awaiting deferred reclamation.
-        Ok(false)
+        self.state(cx)?.reap_closed_orphan(cx, ino)
     }
 
     fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> Result<()> {
-        self.state(cx)?.sync(cx)
+        let mut state = self.state(cx)?;
+        state.reap_closed_orphans(cx)?;
+        state.sync(cx)
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
-        self.state(cx)?.sync(cx)
+        let mut state = self.state(cx)?;
+        state.reap_closed_orphans(cx)?;
+        state.sync(cx)
     }
 
     fn statfs(

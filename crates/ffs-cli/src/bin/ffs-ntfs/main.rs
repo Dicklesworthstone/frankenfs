@@ -7,7 +7,7 @@ mod ea_name;
 #[cfg(test)]
 mod indexed_tests;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
 use ea_name::EaName;
@@ -211,6 +211,15 @@ fn select_write_stream(text: Option<&str>, native: Option<StreamName>) -> Result
     Ok(stream)
 }
 
+fn select_named_write_stream(text: Option<&str>, native: Option<StreamName>) -> Result<StreamName> {
+    let stream = select_write_stream(text, native)?;
+    ensure!(
+        !stream.as_units().is_empty(),
+        "creating or removing a stream requires a nonempty name"
+    );
+    Ok(stream)
+}
+
 #[derive(Debug, Args)]
 struct PayloadArgs {
     /// Exact UTF-8 payload string.
@@ -245,7 +254,7 @@ impl PayloadArgs {
         let maximum = MAX_FILE_EDIT_BYTES.saturating_sub(start);
         let too_large = || {
             anyhow::anyhow!(
-                "tx-write-range payload at --start {start} exceeds the {MAX_FILE_EDIT_BYTES}-byte edit limit"
+                "NTFS payload at byte offset {start} exceeds the {MAX_FILE_EDIT_BYTES}-byte edit limit"
             )
         };
         if let Some(text) = &self.data
@@ -489,6 +498,40 @@ enum Command {
         /// New stream size in bytes, from zero through 16 MiB.
         #[arg(long, value_parser = clap::value_parser!(u64).range(..=MAX_FILE_EDIT_BYTES))]
         size: u64,
+    },
+    /// Create a named DATA stream without replacing an existing stream or the unnamed data.
+    TxCreateStream {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+        /// Native stream name, checked for collisions using the volume's $UpCase.
+        #[arg(
+            long,
+            conflicts_with = "stream_utf16",
+            required_unless_present = "stream_utf16"
+        )]
+        stream: Option<String>,
+        /// Exact UTF-16 units, comma-separated four-digit hex.
+        #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream", required_unless_present = "stream")]
+        stream_utf16: Option<StreamName>,
+        #[command(flatten)]
+        payload: PayloadArgs,
+    },
+    /// Remove exactly one named DATA stream and reclaim its allocation in a native logged transaction.
+    TxRemoveStream {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+        /// Exact existing Unicode stream name. Unnamed DATA cannot be removed.
+        #[arg(
+            long,
+            conflicts_with = "stream_utf16",
+            required_unless_present = "stream_utf16"
+        )]
+        stream: Option<String>,
+        /// Exact UTF-16 units, comma-separated four-digit hex.
+        #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream", required_unless_present = "stream")]
+        stream_utf16: Option<StreamName>,
     },
     /// Atomically rename an entry in an offline NTFS 3.1 image via a native logged transaction.
     TxRename {
@@ -1285,6 +1328,43 @@ fn main() -> Result<()> {
                     "sequence": reference.sequence,
                     "stream_name_utf16": stream.as_units(),
                     "size": size,
+                })
+            })?;
+        }
+        Command::TxCreateStream {
+            target,
+            path,
+            stream,
+            stream_utf16,
+            payload,
+        } => {
+            let stream = select_named_write_stream(stream.as_deref(), stream_utf16)?;
+            let data = payload.load_range(0)?;
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.create_file_stream(&cx, &path, stream.as_units(), &data);
+            emit_tx_outcome("tx_create_stream", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "stream_name_utf16": stream.as_units(),
+                    "bytes": data.len(),
+                })
+            })?;
+        }
+        Command::TxRemoveStream {
+            target,
+            path,
+            stream,
+            stream_utf16,
+        } => {
+            let stream = select_named_write_stream(stream.as_deref(), stream_utf16)?;
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.remove_file_stream(&cx, &path, stream.as_units());
+            emit_tx_outcome("tx_remove_stream", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "stream_name_utf16": stream.as_units(),
                 })
             })?;
         }
@@ -2597,6 +2677,61 @@ mod tests {
         for native in ["002f", "005c", "003a"] {
             assert!(select_write_stream(None, Some(StreamName::parse(native).unwrap())).is_err());
         }
+    }
+
+    #[test]
+    fn cli_stream_catalog_requires_named_selector_and_preserves_native_units() {
+        for command in ["tx-create-stream", "tx-remove-stream"] {
+            let mut base = vec![
+                "ffs-ntfs",
+                command,
+                "disk.img",
+                "/a.bin",
+                "--offline-image",
+                "--allow-write",
+            ];
+            if command == "tx-create-stream" {
+                base.extend(["--data", "initial payload"]);
+            }
+            assert!(
+                Cli::try_parse_from(&base).is_err(),
+                "a named selector is mandatory"
+            );
+            for (option, value, expected) in [
+                ("--stream", "note", vec![0x6E, 0x6F, 0x74, 0x65]),
+                ("--stream-utf16", "d800,0061", vec![0xD800, 0x61]),
+            ] {
+                let cli = Cli::try_parse_from(base.iter().copied().chain([option, value])).unwrap();
+                let (Command::TxCreateStream {
+                    stream,
+                    stream_utf16,
+                    ..
+                }
+                | Command::TxRemoveStream {
+                    stream,
+                    stream_utf16,
+                    ..
+                }) = cli.command
+                else {
+                    panic!("native stream catalog command");
+                };
+                let name = select_named_write_stream(stream.as_deref(), stream_utf16).unwrap();
+                assert_eq!(name.as_units(), expected);
+            }
+            assert!(
+                Cli::try_parse_from(base.iter().copied().chain([
+                    "--stream",
+                    "a",
+                    "--stream-utf16",
+                    "0061",
+                ]))
+                .is_err()
+            );
+        }
+        for text in ["", "bad:name", "bad/name", "bad\\name"] {
+            assert!(select_named_write_stream(Some(text), None).is_err());
+        }
+        assert!(select_named_write_stream(None, Some(StreamName::parse("").unwrap())).is_err());
     }
 
     #[test]

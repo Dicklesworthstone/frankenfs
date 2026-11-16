@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::autopilot::{DurabilityAutopilot, OverheadDecision};
-use crate::codec::{EncodedGroup, encode_group};
+use crate::codec::encode_group_with_digests;
 use crate::evidence::{
     CorruptionDetail, EvidenceLedger, EvidenceRecord, PolicyDecisionDetail, RepairDetail,
     SymbolRefreshDetail,
@@ -2133,8 +2133,8 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             "refreshing repair symbols"
         );
 
-        // Re-encode.
-        let encoded: EncodedGroup = encode_group(
+        // Capture once so the manifest describes the same bytes as the parity.
+        let captured = encode_group_with_digests(
             cx,
             self.device,
             &self.fs_uuid,
@@ -2145,19 +2145,21 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         )?;
 
         // Write symbols.
-        let symbols: Vec<(u32, Vec<u8>)> = encoded
+        let symbols: Vec<(u32, Vec<u8>)> = captured
+            .encoded
             .repair_symbols
             .into_iter()
             .map(|s| (s.esi, s.data))
             .collect();
         let symbols_generated = u32::try_from(symbols.len()).unwrap_or(u32::MAX);
 
-        // Refresh generation-bound BLAKE3 source-block digests (when validation
-        // blocks are reserved) before sealing parity + descriptor at `new_gen`.
+        // Refuse a changed capture before touching the tail, then persist its
+        // digests when validation blocks are reserved. Never hash a different
+        // source generation into the manifest paired with this parity.
         storage.write_source_digests(
             cx,
-            group_cfg.source_first_block,
-            group_cfg.source_block_count,
+            captured.source_first_block,
+            &captured.source_digests,
             new_gen,
         )?;
 
@@ -2749,6 +2751,60 @@ mod tests {
 
         fn sync(&self, _cx: &Cx) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RefreshSourceFault {
+        Change,
+        ReadError,
+        Cancel,
+    }
+
+    /// Change the first source on its second read, after the encoder captured
+    /// its original bytes but before the digest/publication pass reads it.
+    struct RefreshSourceFaultDevice<'a> {
+        inner: &'a MemBlockDevice,
+        fault: RefreshSourceFault,
+        first_source_reads: AtomicU64,
+        writes: AtomicU64,
+    }
+
+    impl BlockDevice for RefreshSourceFaultDevice<'_> {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            if block == BlockNumber(0)
+                && self.first_source_reads.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                match self.fault {
+                    RefreshSourceFault::Change => {
+                        self.inner.write_block(cx, block, &[0xA5; 256])?;
+                    }
+                    RefreshSourceFault::ReadError => {
+                        return Err(FfsError::Io(std::io::Error::other(
+                            "injected source revalidation read failure",
+                        )));
+                    }
+                    RefreshSourceFault::Cancel => cx.set_cancel_requested(true),
+                }
+            }
+            self.inner.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.write_block(cx, block, data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
         }
     }
 
@@ -4705,6 +4761,138 @@ mod tests {
 
         let generation_after = read_generation(&cx, &device, layout);
         assert_eq!(generation_after, generation_before + 1);
+    }
+
+    #[test]
+    fn refresh_publishes_matching_captured_parity_and_source_digests() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 64);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 2, 4).expect("layout");
+        let mut originals = write_source_blocks(&cx, &device, BlockNumber(0), 8);
+        bootstrap_storage(&cx, &device, layout, BlockNumber(0), 8, 4);
+        originals[3] = vec![0xD3; 256];
+        device
+            .write_block(&cx, BlockNumber(3), &originals[3])
+            .expect("client write");
+        let validator = CorruptBlockValidator::new(vec![]);
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![GroupConfig {
+                layout,
+                source_first_block: BlockNumber(0),
+                source_block_count: 8,
+            }],
+            Vec::new(),
+            4,
+        )
+        .with_group_refresh_policy(GroupNumber(0), RefreshPolicy::Eager);
+
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("refresh the updated source generation");
+
+        let storage = RepairGroupStorage::new(&device, layout);
+        assert_eq!(read_generation(&cx, &device, layout), 2);
+        assert!(!pipeline.is_group_dirty(GroupNumber(0)));
+        assert_eq!(pipeline.runtime_metrics().symbol_refresh_count, 1);
+        let expected_digests: Vec<_> = originals
+            .iter()
+            .map(|source| *blake3::hash(source).as_bytes())
+            .collect();
+        assert_eq!(
+            storage
+                .read_source_digests_for_generation(&cx, BlockNumber(0), 8, 2)
+                .expect("read source manifest"),
+            Some(expected_digests)
+        );
+        // Use the direct encoder over independently retained bytes as the
+        // oracle, rather than repeating the production capture/project path.
+        let mut reference = asupersync::raptorq::systematic::SystematicEncoder::new(
+            &originals,
+            256,
+            crate::symbol::repair_seed(&test_uuid(), GroupNumber(0)),
+        )
+        .expect("reference encoder");
+        let expected_symbols: Vec<_> = reference
+            .emit_repair(4)
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+        assert_eq!(
+            storage.read_repair_symbols(&cx).expect("read parity"),
+            expected_symbols
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_changed_sources_before_publication() {
+        assert_refresh_source_fault_preserves_previous_generation(RefreshSourceFault::Change);
+    }
+
+    #[test]
+    fn refresh_source_revalidation_errors_preserve_previous_generation() {
+        assert_refresh_source_fault_preserves_previous_generation(RefreshSourceFault::ReadError);
+        assert_refresh_source_fault_preserves_previous_generation(RefreshSourceFault::Cancel);
+    }
+
+    fn assert_refresh_source_fault_preserves_previous_generation(fault: RefreshSourceFault) {
+        for validation_blocks in [2, 0] {
+            let cx = Cx::for_testing();
+            let device = MemBlockDevice::new(256, 64);
+            let layout =
+                RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, validation_blocks, 4)
+                    .expect("layout");
+            write_source_blocks(&cx, &device, BlockNumber(0), 8);
+            bootstrap_storage(&cx, &device, layout, BlockNumber(0), 8, 4);
+            let mut expected_bytes = device.blocks.lock().expect("image").clone();
+            let guarded = RefreshSourceFaultDevice {
+                inner: &device,
+                fault,
+                first_source_reads: AtomicU64::new(0),
+                writes: AtomicU64::new(0),
+            };
+            let validator = CorruptBlockValidator::new(vec![]);
+            let mut pipeline = ScrubWithRecovery::new(
+                &guarded,
+                &validator,
+                test_uuid(),
+                vec![GroupConfig {
+                    layout,
+                    source_first_block: BlockNumber(0),
+                    source_block_count: 8,
+                }],
+                Vec::new(),
+                4,
+            )
+            .with_group_refresh_policy(GroupNumber(0), RefreshPolicy::Eager);
+
+            let error = pipeline
+                .on_group_write(&cx, GroupNumber(0))
+                .expect_err("an unverified source capture must not publish");
+            match fault {
+                RefreshSourceFault::Change => {
+                    assert!(matches!(error, FfsError::Corruption { block: 0, .. }));
+                    expected_bytes.insert(0, vec![0xA5; 256]);
+                }
+                RefreshSourceFault::ReadError => assert!(matches!(error, FfsError::Io(_))),
+                RefreshSourceFault::Cancel => assert!(matches!(error, FfsError::Cancelled)),
+            }
+            assert_eq!(guarded.first_source_reads.load(Ordering::SeqCst), 2);
+            assert_eq!(guarded.writes.load(Ordering::SeqCst), 0);
+            assert_eq!(*device.blocks.lock().expect("image"), expected_bytes);
+            assert!(pipeline.is_group_dirty(GroupNumber(0)));
+            assert_eq!(pipeline.runtime_metrics().symbol_refresh_count, 0);
+            assert_eq!(read_generation(&Cx::for_testing(), &device, layout), 1);
+            let records = crate::evidence::parse_evidence_ledger(&pipeline.into_ledger());
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.event_type != EvidenceEventType::SymbolRefresh)
+            );
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use super::{
     CTL_FLAG, Cx, FfsError, Identity, InodeAttr, InodeNumber, MAX_NODES, Metadata, ROOT, Result,
     State, SystemTime, Timestamp, UNIX_EPOCH, ViewState, ZfsFs, checkpoint, corrupt, unsupported,
 };
-use crate::{ZfsDurableToken, ZfsTransactionEngine, ZfsTxOutcome};
+use crate::{ZfsDurableToken, ZfsTransactionEngine, ZfsTxOutcome, ZfsUnlinkedObject};
 use ffs_core::vfs::ReleaseRequest;
 use ffs_ondisk::zfs_zpl::Kind;
 use std::collections::BTreeMap;
@@ -51,6 +51,7 @@ pub(super) struct WriterState {
     refresh_needed: bool,
     handles: BTreeMap<u64, InodeNumber>,
     counts: BTreeMap<InodeNumber, u64>,
+    orphans: BTreeMap<InodeNumber, ZfsUnlinkedObject>,
     next_handle: u64,
 }
 
@@ -61,17 +62,22 @@ impl ZfsFs {
     ///
     /// Native mode bits and numeric owner IDs are exposed; this does not implement
     /// native ACL evaluation. The mount frontend must retain its permission policy.
-    /// Final-link removal of an open file is refused until native orphan retention
-    /// exists. Snapshot and control-directory operations remain read-only.
+    /// Open regular files survive final unlink in the native unlinked set. A
+    /// fresh owner drains pending regular-file reclamation before exposing the
+    /// mount. Snapshot and control-directory operations remain read-only.
     pub fn with_writer(
         cx: &Cx,
-        engine: ZfsTransactionEngine,
+        mut engine: ZfsTransactionEngine,
         dataset_components: Vec<Vec<u8>>,
     ) -> Result<Self> {
         checkpoint(cx)?;
         if engine.requires_recovery() {
             return Err(errno(libc::EIO));
         }
+        // Preflight the complete native queue and mount view before beginning
+        // recovery writes. Unsupported host identities must refuse the mount
+        // without modifying even an otherwise reclaimable orphan.
+        let pending = engine.pending_unlinks(cx, &dataset_components)?;
         let mut objects = engine.open_read_objects(cx)?;
         let properties =
             objects.properties(cx, &dataset_components, None, &["readonly".to_owned()])?;
@@ -98,6 +104,25 @@ impl ZfsFs {
         let (root, _) = head.metadata(cx, ROOT)?;
         let uid = u32::try_from(root.uid).map_err(|_| errno(libc::EOVERFLOW))?;
         let gid = u32::try_from(root.gid).map_err(|_| errno(libc::EOVERFLOW))?;
+        // The engine is moved into its only mount owner, so persisted orphans
+        // have no live handles in this new mount lifetime. Reclamation changes
+        // the native object-set root even though visible directory entries and
+        // their already admitted identities stay unchanged.
+        let mut last_token = None;
+        for identity in pending {
+            let (_, token) = engine
+                .reap_unlinked_file(cx, &dataset_components, identity)
+                .into_result()?;
+            last_token = Some(token);
+        }
+        if last_token.is_some() {
+            let mut objects = engine.open_read_objects(cx)?;
+            let view = objects.zpl(cx, &dataset_components)?;
+            if view.root != head.view.root || view.dataset_guid != head.view.dataset_guid {
+                return Err(corrupt("reclaimed ZPL dataset identity changed"));
+            }
+            head.view = view;
+        }
         let next_ino = head.nodes.last_key_value().map_or(2, |(ino, _)| ino.0 + 1);
         head.mutable = Some(MutableView {
             objects: head
@@ -118,10 +143,11 @@ impl ZfsFs {
                 writer: Some(WriterState {
                     engine,
                     dataset: dataset_components,
-                    last_token: None,
+                    last_token,
                     refresh_needed: false,
                     handles: BTreeMap::new(),
                     counts: BTreeMap::new(),
+                    orphans: BTreeMap::new(),
                     next_handle: 1,
                 }),
                 recovery_required: false,
@@ -212,20 +238,41 @@ impl ZfsFs {
                 FfsError::IsDirectory
             });
         }
-        if directory || metadata.links <= 1 {
+        if directory {
             state.reject_pinned_reclamation(ino)?;
         }
+        let retained =
+            (!directory && metadata.links <= 1 && state.has_open_handles(ino)).then(|| {
+                ZfsUnlinkedObject {
+                    object: state.head.nodes[&ino].object,
+                    generation: metadata.generation,
+                }
+            });
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(|engine, dataset| {
-            engine.unlink_entry(
-                cx,
-                dataset,
-                parent_object,
-                name.as_bytes(),
-                directory,
-                timestamp,
-            )
+            if let Some(identity) = retained {
+                engine.unlink_open_file(
+                    cx,
+                    dataset,
+                    parent_object,
+                    name.as_bytes(),
+                    identity,
+                    timestamp,
+                )
+            } else {
+                engine.unlink_entry(
+                    cx,
+                    dataset,
+                    parent_object,
+                    name.as_bytes(),
+                    directory,
+                    timestamp,
+                )
+            }
         })?;
+        if let Some(identity) = retained {
+            state.remember_unlinked(ino, identity);
+        }
         Ok(())
     }
 }
@@ -491,12 +538,54 @@ impl State {
     }
 
     pub(super) fn reject_pinned_reclamation(&self, ino: InodeNumber) -> Result<()> {
-        let writer = self.writer.as_ref().ok_or(FfsError::ReadOnly)?;
+        self.writer.as_ref().ok_or(FfsError::ReadOnly)?;
         // FUSE OPEN and CREATE both hold real backend handles for this writer.
         // LOOKUP references alone must not prevent ordinary closed-file unlink;
         // the generation registry prevents them from naming a reused object.
-        if writer.counts.get(&ino).copied().unwrap_or(0) != 0 {
+        if self.has_open_handles(ino) {
             return Err(errno(libc::EBUSY));
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_open_handles(&self, ino: InodeNumber) -> bool {
+        self.writer
+            .as_ref()
+            .is_some_and(|writer| writer.counts.contains_key(&ino))
+    }
+
+    pub(super) fn remember_unlinked(&mut self, ino: InodeNumber, identity: ZfsUnlinkedObject) {
+        if let Some(writer) = &mut self.writer {
+            writer.orphans.insert(ino, identity);
+        }
+    }
+
+    pub(super) fn reap_closed_orphan(&mut self, cx: &Cx, ino: InodeNumber) -> Result<bool> {
+        if self.has_open_handles(ino) {
+            return Ok(false);
+        }
+        let Some(identity) = self
+            .writer
+            .as_ref()
+            .and_then(|writer| writer.orphans.get(&ino))
+            .copied()
+        else {
+            return Ok(false);
+        };
+        self.mutate(|engine, dataset| engine.reap_unlinked_file(cx, dataset, identity))?;
+        if let Some(writer) = &mut self.writer {
+            writer.orphans.remove(&ino);
+        }
+        Ok(true)
+    }
+
+    pub(super) fn reap_closed_orphans(&mut self, cx: &Cx) -> Result<()> {
+        let pending: Vec<_> = self
+            .writer
+            .as_ref()
+            .map_or_else(Vec::new, |writer| writer.orphans.keys().copied().collect());
+        for ino in pending {
+            self.reap_closed_orphan(cx, ino)?;
         }
         Ok(())
     }

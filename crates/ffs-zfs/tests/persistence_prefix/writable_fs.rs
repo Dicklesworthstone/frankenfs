@@ -1449,7 +1449,7 @@ fn directory_moves_refresh_cached_parents_and_no_replace_is_atomic() {
 }
 
 #[test]
-fn create_and_open_handles_prevent_reclamation_but_cached_lookups_do_not() {
+fn create_and_open_handles_retain_replaced_files_until_the_last_release() {
     let cx = Cx::for_testing();
     let (engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
     let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
@@ -1470,14 +1470,6 @@ fn create_and_open_handles_prevent_reclamation_but_cached_lookups_do_not() {
     assert_ne!(created_handle, 0);
     fs.write(&cx, &mut scope, file.ino, 0, b"still open")
         .unwrap();
-    let before = io_counts(&devices);
-    assert_eq!(
-        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("open"))
-            .unwrap_err()
-            .to_errno(),
-        libc::EBUSY
-    );
-    assert_eq!(io_counts(&devices), before);
     let (handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDWR).unwrap();
     assert_ne!(handle, 0);
     assert_ne!(handle, created_handle);
@@ -1487,33 +1479,8 @@ fn create_and_open_handles_prevent_reclamation_but_cached_lookups_do_not() {
     fs.unlink(&cx, &mut scope, ROOT, OsStr::new("another-link"))
         .unwrap();
     let replacement = create(&fs, &cx, ROOT, "replacement");
-    let before = io_counts(&devices);
-    assert_eq!(
-        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("open"))
-            .unwrap_err()
-            .to_errno(),
-        libc::EBUSY
-    );
-    assert_eq!(
-        fs.rename(
-            &cx,
-            &mut scope,
-            ROOT,
-            OsStr::new("replacement"),
-            ROOT,
-            OsStr::new("open")
-        )
-        .unwrap_err()
-        .to_errno(),
-        libc::EBUSY
-    );
-    assert_eq!(io_counts(&devices), before);
-    assert_eq!(read(&fs, &cx, file.ino), b"still open");
-    release(&fs, &cx, file.ino, handle);
-
-    // FUSE's legacy oracle counts cached LOOKUP references. A closed file must
-    // remain removable even while its old inode is present in the kernel cache.
-    fs.install_open_handle_oracle(Arc::new(|_| 1));
+    fs.write(&cx, &mut scope, replacement.ino, 0, b"replacement bytes")
+        .unwrap();
     fs.rename(
         &cx,
         &mut scope,
@@ -1523,6 +1490,18 @@ fn create_and_open_handles_prevent_reclamation_but_cached_lookups_do_not() {
         OsStr::new("open"),
     )
     .unwrap();
+    assert_eq!(lookup(&fs, &cx, ROOT, "open").ino, replacement.ino);
+    assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap().nlink, 0);
+    assert_eq!(read(&fs, &cx, file.ino), b"still open");
+    fs.write(&cx, &mut scope, file.ino, 0, b"after move")
+        .unwrap();
+    assert_eq!(read(&fs, &cx, file.ino), b"after move");
+    assert_eq!(read(&fs, &cx, replacement.ino), b"replacement bytes");
+    release(&fs, &cx, file.ino, handle);
+
+    // FUSE's legacy oracle counts cached LOOKUP references. A closed file must
+    // remain removable even while its old inode is present in the kernel cache.
+    fs.install_open_handle_oracle(Arc::new(|_| 1));
     assert_eq!(lookup(&fs, &cx, ROOT, "open").ino, replacement.ino);
     assert!(fs.getattr(&cx, &mut scope, file.ino).is_err());
     assert_eq!(
@@ -1549,6 +1528,278 @@ fn create_and_open_handles_prevent_reclamation_but_cached_lookups_do_not() {
     );
     fs.unlink(&cx, &mut scope, ROOT, OsStr::new("open"))
         .unwrap();
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+}
+
+#[test]
+fn symlink_replacement_retains_open_regular_data_and_refuses_orphan_relink() {
+    let cx = Cx::for_testing();
+    let (engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
+    let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+    let mut scope = RequestScope::empty();
+    let old = create(&fs, &cx, ROOT, "destination");
+    fs.write(&cx, &mut scope, old.ino, 0, b"old payload")
+        .unwrap();
+    let (handle, _) = fs.open(&cx, &mut scope, old.ino, libc::O_RDWR).unwrap();
+    let link = fs
+        .symlink(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("source-link"),
+            Path::new("target/location"),
+            1234,
+            5678,
+        )
+        .unwrap();
+
+    fs.rename(
+        &cx,
+        &mut scope,
+        ROOT,
+        OsStr::new("source-link"),
+        ROOT,
+        OsStr::new("destination"),
+    )
+    .unwrap();
+    let replacement = lookup(&fs, &cx, ROOT, "destination");
+    assert_eq!(replacement.ino, link.ino);
+    assert_eq!(replacement.kind, FileType::Symlink);
+    assert_eq!(
+        fs.readlink(&cx, &mut scope, replacement.ino).unwrap(),
+        b"target/location"
+    );
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("source-link")),
+        Err(FfsError::NotFound(_))
+    ));
+    assert_eq!(fs.getattr(&cx, &mut scope, old.ino).unwrap().nlink, 0);
+    assert_eq!(read(&fs, &cx, old.ino), b"old payload");
+    fs.write(&cx, &mut scope, old.ino, 0, b"new payload")
+        .unwrap();
+    assert_eq!(read(&fs, &cx, old.ino), b"new payload");
+
+    // A queued zero-link object cannot be resurrected while its orphan record
+    // still authorizes reclamation on final release.
+    let counts = io_counts(&devices);
+    let token = fs.last_durable_token().unwrap().unwrap();
+    assert_eq!(
+        fs.link(&cx, &mut scope, old.ino, ROOT, OsStr::new("resurrected"))
+            .unwrap_err()
+            .to_errno(),
+        libc::ENOENT
+    );
+    assert_eq!(io_counts(&devices), counts);
+    assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("resurrected")),
+        Err(FfsError::NotFound(_))
+    ));
+
+    release(&fs, &cx, old.ino, handle);
+    assert!(fs.getattr(&cx, &mut scope, old.ino).is_err());
+    assert_eq!(lookup(&fs, &cx, ROOT, "destination").ino, link.ino);
+    assert_eq!(
+        fs.readlink(&cx, &mut scope, link.ino).unwrap(),
+        b"target/location"
+    );
+    assert!(
+        !fs.finalize_unlinked_inode(&cx, &mut scope, old.ino)
+            .unwrap()
+    );
+    fs.unlink(&cx, &mut scope, ROOT, OsStr::new("destination"))
+        .unwrap();
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+}
+
+#[test]
+fn unlinked_open_files_survive_name_reuse_and_restart_reclaims_only_the_orphan() {
+    let cx = Cx::for_testing();
+    let dataset = vec![b"data".to_vec()];
+    for zpl_version in [4, 5] {
+        let (engine, devices) = writer_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                zpl_version,
+                mirror_width: 2,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                user_accounting: true,
+                image_bytes: 24 * 1024 * 1024,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        let fs = ZfsFs::with_writer(&cx, engine, dataset.clone()).unwrap();
+        let mut scope = RequestScope::empty();
+        let old = lookup(&fs, &cx, ROOT, "hello.txt");
+        let original = read(&fs, &cx, old.ino);
+        let (first, _) = fs.open(&cx, &mut scope, old.ino, libc::O_RDWR).unwrap();
+        let (second, _) = fs.open(&cx, &mut scope, old.ino, libc::O_RDWR).unwrap();
+        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+            .unwrap();
+        assert!(matches!(
+            fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt")),
+            Err(FfsError::NotFound(_))
+        ));
+        assert_eq!(fs.getattr(&cx, &mut scope, old.ino).unwrap().nlink, 0);
+        assert_eq!(read(&fs, &cx, old.ino), original);
+        release(&fs, &cx, old.ino, first);
+        let replacement = create(&fs, &cx, ROOT, "hello.txt");
+        assert_ne!(old.ino, replacement.ino);
+        fs.write(&cx, &mut scope, replacement.ino, 0, b"new name")
+            .unwrap();
+        let orphan_mtime = UNIX_EPOCH + Duration::new(1_715_000_333, 987_654_321);
+        let truncated = fs
+            .setattr(
+                &cx,
+                &mut scope,
+                old.ino,
+                &SetAttrRequest {
+                    size: Some(0),
+                    mtime: Some(orphan_mtime),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((truncated.size, truncated.nlink), (0, 0));
+        assert_eq!(truncated.mtime, orphan_mtime);
+        assert_eq!(truncated.generation, old.generation);
+        fs.write(&cx, &mut scope, old.ino, 0, b"unlinked but still open")
+            .unwrap();
+        assert_eq!(read(&fs, &cx, old.ino), b"unlinked but still open");
+        assert_eq!(read(&fs, &cx, replacement.ino), b"new name");
+        fs.fsync(&cx, &mut scope, old.ino, second, false).unwrap();
+        let token = fs.last_durable_token().unwrap().unwrap();
+        drop(fs); // Process death: no final RELEASE, only the durable native queue survives.
+        for device in &devices {
+            device.state.lock().unwrap().crash_drop_unsynced();
+        }
+        let fresh: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let engine = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(POOL_GUID, token.published_slot()),
+        )
+        .unwrap();
+        let pending = engine.pending_unlinks(&cx, &dataset).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].generation, old.generation);
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let mut head = mos.zpl(&cx, &dataset).unwrap();
+        assert_eq!(
+            head.read(&cx, pending[0].object, 0, 4096).unwrap(),
+            b"unlinked but still open"
+        );
+        let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
+        assert_eq!(
+            snapshot.read(&cx, pending[0].object, 0, 8192).unwrap(),
+            original
+        );
+
+        let recovered = ZfsFs::with_writer(&cx, engine, dataset.clone()).unwrap();
+        assert_eq!(
+            read(
+                &recovered,
+                &cx,
+                lookup(&recovered, &cx, ROOT, "hello.txt").ino
+            ),
+            b"new name"
+        );
+        let recovered_token = recovered.last_durable_token().unwrap().unwrap();
+        assert!(recovered_token.committed_txg() > token.committed_txg());
+        drop(recovered);
+        let engine = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(POOL_GUID, recovered_token.published_slot()),
+        )
+        .unwrap();
+        assert!(engine.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+        let mut head = engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        assert!(head.stat(&cx, pending[0].object).is_err());
+        let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
+        assert_eq!(
+            snapshot.read(&cx, pending[0].object, 0, 8192).unwrap(),
+            original
+        );
+        assert_pool_scrub_and_allocation_clean(&cx, &fresh, POOL_GUID, None);
+    }
+}
+
+#[test]
+fn cancelled_or_failed_last_release_keeps_durable_reclamation_retryable() {
+    let cx = Cx::for_testing();
+    for cancelled_release in [true, false] {
+        let (engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
+        let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+        let mut scope = RequestScope::empty();
+        let (file, handle, _) = fs
+            .create_open(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("deferred"),
+                0o600,
+                0,
+                0,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&cx, &mut scope, file.ino, 0, b"recoverable")
+            .unwrap();
+        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("deferred"))
+            .unwrap();
+        let token = fs.last_durable_token().unwrap().unwrap();
+        let release_cx = Cx::for_testing();
+        if cancelled_release {
+            release_cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("last release cancelled"),
+            );
+        } else {
+            let call_index = devices[0].write_calls();
+            devices[0].set_fault(DeviceFault::FailWriteOnCall { call_index });
+        }
+        let error = fs
+            .release(
+                &release_cx,
+                &mut scope,
+                ReleaseRequest {
+                    ino: file.ino,
+                    fh: handle,
+                    flags: libc::O_RDWR,
+                    lock_owner: None,
+                    flush: false,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_errno(),
+            if cancelled_release {
+                libc::EINTR
+            } else {
+                libc::EIO
+            }
+        );
+        assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+        assert_eq!(read(&fs, &cx, file.ino), b"recoverable");
+        assert_eq!(
+            fs.flush(&cx, &mut scope, file.ino, handle, 0)
+                .unwrap_err()
+                .to_errno(),
+            libc::EBADF
+        );
+        devices[0].set_fault(DeviceFault::None);
+        fs.sync_fs(&cx, &mut scope).unwrap();
+        assert!(fs.getattr(&cx, &mut scope, file.ino).is_err());
+        assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+    }
 }
 
 #[test]
@@ -2105,5 +2356,182 @@ fn data_mutations_refuse_set_id_files_before_commit_and_do_not_leak_handles() {
         release(&fs, &cx, file.ino, next_handle);
         fs.unlink(&cx, &mut scope, ROOT, OsStr::new("privileged"))
             .unwrap();
+    }
+}
+
+#[test]
+fn native_reclamation_refuses_external_owners_without_writes() {
+    use ffs_ondisk::zfs_zpl::ReclamationOwnership;
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_400,
+        nanos: 23,
+    };
+    let unowned = ReclamationOwnership {
+        xattr_directory: 0,
+        external_acl_object: 0,
+        project_id: 0,
+    };
+    for zpl_version in [4, 5] {
+        for ownership in [
+            ReclamationOwnership {
+                xattr_directory: 6,
+                ..unowned
+            },
+            ReclamationOwnership {
+                external_acl_object: 42,
+                ..unowned
+            },
+        ] {
+            let (mut engine, devices) = writer_fixture(
+                &cx,
+                &PoolFixtureSpec {
+                    zpl_version,
+                    hello_ownership: Some(ownership),
+                    deadlist_mode: DeadlistMode::NativeDeadlist,
+                    ..PoolFixtureSpec::default()
+                },
+            );
+            let mut head = engine
+                .open_read_objects(&cx)
+                .unwrap()
+                .zpl(&cx, &dataset)
+                .unwrap();
+            let object = head.resolve(&cx, b"/hello.txt").unwrap();
+            let source = head.resolve(&cx, b"/keep.bin").unwrap();
+            let payload = head.read(&cx, object, 0, 8192).unwrap();
+            let identity = ZfsUnlinkedObject {
+                object,
+                generation: head.stat(&cx, object).unwrap().0.generation,
+            };
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.unlink_open_file(&cx, &dataset, 2, b"hello.txt", identity, timestamp)
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.rename_retaining_open_target(
+                    &cx,
+                    &dataset,
+                    2,
+                    b"keep.bin",
+                    2,
+                    b"hello.txt",
+                    Some(source),
+                    identity,
+                    timestamp,
+                )
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.unlink_entry(&cx, &dataset, 2, b"hello.txt", false, timestamp)
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.rename_entry(
+                    &cx,
+                    &dataset,
+                    2,
+                    b"keep.bin",
+                    2,
+                    b"hello.txt",
+                    Some(source),
+                    timestamp,
+                )
+            });
+            assert!(engine.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+            let mut head = engine
+                .open_read_objects(&cx)
+                .unwrap()
+                .zpl(&cx, &dataset)
+                .unwrap();
+            assert_eq!(head.resolve(&cx, b"/hello.txt").unwrap(), object);
+            assert_eq!(head.resolve(&cx, b"/keep.bin").unwrap(), source);
+            assert_eq!(head.read(&cx, object, 0, 8192).unwrap(), payload);
+
+            // A nonfinal link removal keeps all native ownership intact and
+            // remains supported even when final reclamation is not admitted.
+            engine
+                .link_entry(&cx, &dataset, object, 2, b"alias", timestamp)
+                .into_result()
+                .unwrap();
+            engine
+                .unlink_entry(&cx, &dataset, 2, b"alias", false, timestamp)
+                .into_result()
+                .unwrap();
+            let mut head = engine
+                .open_read_objects(&cx)
+                .unwrap()
+                .zpl(&cx, &dataset)
+                .unwrap();
+            assert_eq!(head.stat(&cx, object).unwrap().0.links, 1);
+            assert_eq!(head.resolve(&cx, b"/hello.txt").unwrap(), object);
+            assert_eq!(head.read(&cx, object, 0, 8192).unwrap(), payload);
+        }
+    }
+}
+
+#[test]
+fn mount_admission_precedes_durable_orphan_cleanup() {
+    let cx = Cx::for_testing();
+    let dataset = vec![b"data".to_vec()];
+    let out_of_range = u64::from(u32::MAX) + 1;
+    let timestamp = Timestamp {
+        seconds: 1_715_000_401,
+        nanos: 29,
+    };
+    for zpl_version in [4, 5] {
+        for root_ids in [(out_of_range, 0), (0, out_of_range)] {
+            let (mut engine, devices) = writer_fixture(
+                &cx,
+                &PoolFixtureSpec {
+                    zpl_version,
+                    root_ids,
+                    deadlist_mode: DeadlistMode::NativeDeadlist,
+                    ..PoolFixtureSpec::default()
+                },
+            );
+            let mut head = engine
+                .open_read_objects(&cx)
+                .unwrap()
+                .zpl(&cx, &dataset)
+                .unwrap();
+            let object = head.resolve(&cx, b"/hello.txt").unwrap();
+            let identity = ZfsUnlinkedObject {
+                object,
+                generation: head.stat(&cx, object).unwrap().0.generation,
+            };
+            let payload = head.read(&cx, object, 0, 8192).unwrap();
+            let (_, token) = engine
+                .unlink_open_file(&cx, &dataset, 2, b"hello.txt", identity, timestamp)
+                .into_result()
+                .unwrap();
+            let before = io_counts(&devices);
+            let error = ZfsFs::with_writer(&cx, engine, dataset.clone())
+                .err()
+                .expect("unrepresentable root identity must refuse mounting");
+            assert_eq!(error.to_errno(), libc::EOVERFLOW);
+            assert_eq!(
+                io_counts(&devices),
+                before,
+                "mount admission refusal reclaimed storage"
+            );
+
+            let recovered = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(POOL_GUID, token.published_slot()),
+            )
+            .unwrap();
+            assert_eq!(
+                recovered.pending_unlinks(&cx, &dataset).unwrap(),
+                vec![identity]
+            );
+            let mut head = recovered
+                .open_read_objects(&cx)
+                .unwrap()
+                .zpl(&cx, &dataset)
+                .unwrap();
+            assert_eq!(head.stat(&cx, object).unwrap().0.links, 0);
+            assert_eq!(head.read(&cx, object, 0, 8192).unwrap(), payload);
+        }
     }
 }

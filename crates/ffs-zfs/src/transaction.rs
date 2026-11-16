@@ -34,7 +34,7 @@ use self::dmu_cow::{
     DMU_OT_OBJSET, PoolSpaceAllocator, WriteBucket, finalize_mos_and_space_maps_to_convergence,
     zap_optional_u64, zap_required_u64,
 };
-pub use self::zpl_ops::{ZfsDataChecksum, ZfsSetAttr};
+pub use self::zpl_ops::{ZfsDataChecksum, ZfsSetAttr, ZfsUnlinkedObject};
 use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
 
 type FaultHook = Box<dyn FnMut(&ZfsPersistenceEvent) -> Result<()> + Send + Sync>;
@@ -1109,6 +1109,7 @@ impl ZfsTransactionEngine {
                 dst_dir,
                 dst_name: dst_name.to_vec(),
                 expected_source_object,
+                retain_replaced: None,
                 timestamp,
             },
         )
@@ -1131,8 +1132,92 @@ impl ZfsTransactionEngine {
                 parent_dir,
                 name: name.to_vec(),
                 rmdir,
+                retain: None,
                 timestamp,
             },
+        )
+    }
+
+    /// Remove a name while retaining its final-link regular file in the native
+    /// `DELETE_QUEUE`. A live handle may keep reading/writing the object until
+    /// its owner calls [`Self::reap_unlinked_file`]. With other hard links, only
+    /// the requested name is removed. The identity is checked before any writes.
+    pub fn unlink_open_file(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        parent_dir: u64,
+        name: &[u8],
+        identity: ZfsUnlinkedObject,
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::UnlinkEntry {
+                parent_dir,
+                name: name.to_vec(),
+                rmdir: false,
+                retain: Some(identity),
+                timestamp,
+            },
+        )
+    }
+
+    /// Atomically replace a name while preserving its open target in the native
+    /// unlinked set. Source publication and target retention share one TXG.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rename_retaining_open_target(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        src_dir: u64,
+        src_name: &[u8],
+        dst_dir: u64,
+        dst_name: &[u8],
+        expected_source_object: Option<u64>,
+        target: ZfsUnlinkedObject,
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::RenameEntry {
+                src_dir,
+                src_name: src_name.to_vec(),
+                dst_dir,
+                dst_name: dst_name.to_vec(),
+                expected_source_object,
+                retain_replaced: Some(target),
+                timestamp,
+            },
+        )
+    }
+
+    /// Inspect pending regular-file reclamation without mutating storage.
+    /// Owners may drain this set when opening a fresh mount, before exposing
+    /// any handles. Never reap it while another dataset consumer holds pins.
+    pub fn pending_unlinks(
+        &self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+    ) -> Result<Vec<ZfsUnlinkedObject>> {
+        zpl_ops::pending_unlinks(cx, &mut self.open_read_objects(cx)?, dataset_components)
+    }
+
+    /// Reclaim one generation-bound, zero-link regular file and remove its
+    /// native queue entry in the same TXG. The caller must ensure no live handles
+    /// remain; stale identities, live links, and unsupported ownership are refused.
+    pub fn reap_unlinked_file(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        identity: ZfsUnlinkedObject,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::ReapUnlinked { identity },
         )
     }
 
