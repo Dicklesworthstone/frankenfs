@@ -4425,8 +4425,14 @@ mod tests {
         let dummy_symbols: Vec<(u32, Vec<u8>)> = (0..repair_blocks)
             .map(|i| (source_block_count + i, vec![0x5A_u8; 4096]))
             .collect();
+        let source_digests: Vec<_> = (0..source_block_count)
+            .map(|i| {
+                let source = dev.read_block(&cx, BlockNumber(u64::from(i))).unwrap();
+                *blake3::hash(source.as_slice()).as_bytes()
+            })
+            .collect();
         storage
-            .write_source_digests(&cx, BlockNumber(0), source_block_count, 1)
+            .write_source_digests(&cx, BlockNumber(0), &source_digests, 1)
             .expect("write source digests");
         storage
             .initialize_raw_repair_symbols(&cx, &bootstrap, &dummy_symbols, 1)

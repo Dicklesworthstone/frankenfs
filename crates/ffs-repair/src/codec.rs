@@ -81,6 +81,21 @@ pub struct EncodedGroup {
     pub repair_symbols: Vec<EmittedSymbol>,
 }
 
+/// Repair symbols and source digests derived from the same captured bytes.
+///
+/// Capturing the blocks does not provide an atomic device snapshot. Publishers
+/// must revalidate `source_digests` before writing the repair generation and
+/// retain whatever writer exclusion their device requires during publication.
+#[derive(Debug)]
+pub struct EncodedGroupWithDigests {
+    /// Encoded repair symbols for the captured source blocks.
+    pub encoded: EncodedGroup,
+    /// First source block represented by the encoding and digests.
+    pub source_first_block: BlockNumber,
+    /// BLAKE3 digests, in the same source-block order used by the encoder.
+    pub source_digests: Vec<[u8; 32]>,
+}
+
 /// One bounded direct encoding operation over an admitted source range.
 #[derive(Debug, Clone, Copy)]
 pub struct DirectEncodeRequest {
@@ -371,14 +386,69 @@ pub fn encode_group(
     )
 }
 
+/// Capture source blocks once and derive both repair symbols and their digests.
+///
+/// The returned digests describe the exact buffers supplied to the encoder;
+/// they must not be replaced by hashes from a later, independent device read.
+/// Use [`crate::storage::RepairGroupStorage::write_source_digests`] to revalidate
+/// the capture before publishing its repair symbols.
+///
+/// # Errors
+///
+/// Returns an error on cancellation, a failed or incomplete source-block read,
+/// or an encoding failure. No device writes are performed.
+pub fn encode_group_with_digests(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    fs_uuid: &[u8; 16],
+    group: GroupNumber,
+    first_block: BlockNumber,
+    source_block_count: u32,
+    repair_count: u32,
+) -> Result<EncodedGroupWithDigests> {
+    let block_size = device.block_size();
+    let source_symbols = read_source_symbols_serial(cx, device, first_block, source_block_count)?;
+    let mut source_digests = Vec::with_capacity(source_symbols.len());
+    for (index, source) in source_symbols.iter().enumerate() {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if source.len() != block_size as usize {
+            return Err(FfsError::Corruption {
+                block: first_block.0 + index as u64,
+                detail: format!(
+                    "repair source read returned {} bytes, expected {block_size}",
+                    source.len()
+                ),
+            });
+        }
+        source_digests.push(*blake3::hash(source).as_bytes());
+    }
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    let encoded = finish_encode_group(
+        &source_symbols,
+        block_size,
+        repair_seed(fs_uuid, group),
+        repair_count,
+        group,
+        source_block_count,
+    )?;
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    Ok(EncodedGroupWithDigests {
+        encoded,
+        source_first_block: first_block,
+        source_digests,
+    })
+}
+
 fn read_source_symbols_serial(
     cx: &Cx,
     device: &dyn BlockDevice,
     first_block: BlockNumber,
     source_block_count: u32,
 ) -> Result<Vec<Vec<u8>>> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     let mut source_symbols: Vec<Vec<u8>> = Vec::with_capacity(source_block_count as usize);
     for i in 0..u64::from(source_block_count) {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let block_num = BlockNumber(first_block.0.checked_add(i).ok_or_else(|| {
             FfsError::RepairFailed(format!(
                 "encode_group: block address overflow at first_block={} + offset={i}",
