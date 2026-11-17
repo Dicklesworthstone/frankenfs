@@ -8310,3 +8310,133 @@ fn writable_fsops_open_overwrite_retention_and_setattr_modes_timestamps_recover_
         recovered.check_clean_consistency(&cx).unwrap();
     }
 }
+
+#[test]
+fn cli_extended_path_and_stream_workflow_spills_renames_and_reclaims_extension_records() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(4096, 64, 0xABCD_EF01_2345_9999);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+
+    let root_ref = engine.resolve_path_reference(&cx, "/").unwrap();
+    let dir_name: Vec<u16> = "NativeDir".encode_utf16().collect();
+    let (dir_ref, _) = engine
+        .mkdir_at(&cx, root_ref, &dir_name)
+        .into_result()
+        .unwrap();
+    let file_name: Vec<u16> = "multi.bin".encode_utf16().collect();
+    let initial_main = vec![0x4D_u8; 3 * CLUSTER_BYTES + 19];
+    let (multi_ref, _) = engine
+        .create_file_at(&cx, dir_ref, &file_name, &initial_main)
+        .into_result()
+        .unwrap();
+
+    let _ = engine.grow_mft(&cx, 32).into_result().unwrap();
+
+    let mut expected_streams: std::collections::BTreeMap<String, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for idx in 0..34_usize {
+        let sname = format!("tx-ext-{idx:02}");
+        let units: Vec<u16> = sname.encode_utf16().collect();
+        let repeat = if idx % 6 == 0 { 24 } else { 1 };
+        let payload: Vec<u8> = (0..(192 * repeat))
+            .map(|b| ((b + idx) % 251) as u8)
+            .collect();
+        let resolved = engine
+            .resolve_path_reference(&cx, "/NativeDir/multi.bin")
+            .unwrap();
+        assert_eq!(resolved, multi_ref);
+        let (committed_ref, _) = engine
+            .create_stream(&cx, resolved, &units, &payload)
+            .into_result()
+            .unwrap_or_else(|err| panic!("create_stream {sname} failed: {err}"));
+        assert_eq!(committed_ref, multi_ref);
+        expected_streams.insert(sname, payload);
+    }
+
+    let old_s: Vec<u16> = "tx-ext-05".encode_utf16().collect();
+    let new_s: Vec<u16> = "tx-ext-05-renamed".encode_utf16().collect();
+    engine
+        .rename_file_stream(&cx, "/NativeDir/multi.bin", &old_s, &new_s, true)
+        .into_result()
+        .unwrap();
+    let moved_payload = expected_streams.remove("tx-ext-05").unwrap();
+    expected_streams.insert("tx-ext-05-renamed".to_owned(), moved_payload);
+
+    let rem_s: Vec<u16> = "tx-ext-00".encode_utf16().collect();
+    engine
+        .remove_stream(&cx, multi_ref, &rem_s)
+        .into_result()
+        .unwrap();
+    expected_streams.remove("tx-ext-00");
+
+    // Replace unnamed $DATA on an $ATTRIBUTE_LIST-bearing file via write_file_data_extended!
+    let updated_main = vec![0x5A_u8; CLUSTER_BYTES + 77];
+    engine
+        .write_file_data_extended(&cx, "/NativeDir/multi.bin", &updated_main)
+        .into_result()
+        .unwrap();
+
+    // Rename an $ATTRIBUTE_LIST-bearing file twice with expected_source_ref idempotency!
+    for _ in 0..2 {
+        let (ren_ref, _) = engine
+            .rename_path_extended(
+                &cx,
+                "/NativeDir/multi.bin",
+                "/NativeDir/multi-renamed.bin",
+                Some(multi_ref),
+                false,
+            )
+            .into_result()
+            .unwrap();
+        assert_eq!(ren_ref, multi_ref);
+    }
+
+    engine.check_clean_consistency(&cx).unwrap();
+    let view = engine.volume_view(&cx).unwrap();
+    let ownership = view
+        .check_record_ownership(&cx, RecordOwnershipLimits::default())
+        .unwrap();
+    assert!(ownership.is_consistent());
+    assert!(ownership.extension_records_examined >= 2);
+
+    let rec = view
+        .record(&cx, multi_ref.record, Some(multi_ref.sequence))
+        .unwrap();
+    let main_ds = view.data_stream(&cx, &rec, &[]).unwrap();
+    assert_eq!(
+        view.read(&cx, &main_ds, 0, updated_main.len()).unwrap(),
+        updated_main
+    );
+    for (sname, payload) in &expected_streams {
+        let units: Vec<u16> = sname.encode_utf16().collect();
+        let ds = view.data_stream(&cx, &rec, &units).unwrap();
+        assert_eq!(
+            &view.read(&cx, &ds, 0, payload.len()).unwrap(),
+            payload,
+            "mismatch on {sname}"
+        );
+    }
+
+    // Finally unlink the $ATTRIBUTE_LIST-bearing file via unlink_path_extended and verify 0 leaked extension records!
+    let (unlinked_ref, _) = engine
+        .unlink_path_extended(&cx, "/NativeDir/multi-renamed.bin")
+        .into_result()
+        .unwrap();
+    assert_eq!(unlinked_ref, multi_ref);
+    engine.check_clean_consistency(&cx).unwrap();
+    let post_view = engine.volume_view(&cx).unwrap();
+    let post_ownership = post_view
+        .check_record_ownership(&cx, RecordOwnershipLimits::default())
+        .unwrap();
+    assert!(post_ownership.is_consistent());
+    assert_eq!(post_ownership.extension_records_examined, 0);
+}

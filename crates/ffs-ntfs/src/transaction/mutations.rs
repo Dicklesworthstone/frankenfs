@@ -1260,8 +1260,10 @@ impl NtfsTransactionEngine {
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome =
                 self.edit_stream_data(cx, &path, stream, FileDataEdit::Write { offset, data });
-            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
-                || self.requires_recovery()
+            if !matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+            ) || self.requires_recovery()
             {
                 return outcome;
             }
@@ -1309,8 +1311,10 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.edit_stream_data(cx, &path, stream, FileDataEdit::Truncate { size });
-            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
-                || self.requires_recovery()
+            if !matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+            ) || self.requires_recovery()
             {
                 return outcome;
             }
@@ -1360,8 +1364,10 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.create_file_stream(cx, &path, stream, data);
-            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
-                || self.requires_recovery()
+            if !matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+            ) || self.requires_recovery()
             {
                 return outcome;
             }
@@ -1392,8 +1398,10 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.remove_file_stream(cx, &path, stream);
-            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
-                || self.requires_recovery()
+            if !matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+            ) || self.requires_recovery()
             {
                 return outcome;
             }
@@ -3651,6 +3659,277 @@ impl NtfsTransactionEngine {
                 commit_lsn,
             },
         }
+    }
+
+    /// Split a `/` or `\` separated UTF-8 path into its parent directory
+    /// [`NtfsReference`] (resolved through multi-level `$I30` B-trees) and validated
+    /// native UTF-16 leaf component.
+    pub fn resolve_parent_and_leaf(
+        &self,
+        cx: &Cx,
+        path: &str,
+    ) -> Result<(NtfsReference, Vec<u16>)> {
+        checkpoint(cx)?;
+        let trimmed = path.trim_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "root directory '/' has no parent/leaf split".into(),
+            });
+        }
+        let (parent_path, leaf_str) = trimmed.rfind(['/', '\\']).map_or_else(
+            || ("/".to_owned(), trimmed),
+            |idx| (format!("/{}", &trimmed[..idx]), &trimmed[idx + 1..]),
+        );
+        let leaf_utf16: Vec<u16> = leaf_str.encode_utf16().collect();
+        validate_ntfs_component_utf16(&leaf_utf16)?;
+        let parent_ref = self.resolve_path_reference(cx, &parent_path)?;
+        Ok((parent_ref, leaf_utf16))
+    }
+
+    /// Atomically replace an existing unnamed or named `$DATA` stream on `target_ref`
+    /// in a single native WAL transaction, supporting `$ATTRIBUTE_LIST`, `SPARSE`,
+    /// fragmented allocations, and multi-level `$I30` parent directories.
+    pub fn replace_stream_at(
+        &mut self,
+        cx: &Cx,
+        target_ref: NtfsReference,
+        stream_utf16: &[u16],
+        new_data: &[u8],
+        now_ticks: u64,
+    ) -> NtfsTxOutcome<NtfsReference> {
+        if let Err(err) = checkpoint(cx) {
+            return NtfsTxOutcome::NotCommitted(err);
+        }
+        if let Err(err) = validate_ntfs_stream_name_utf16(stream_utf16) {
+            return NtfsTxOutcome::NotCommitted(err);
+        }
+        if new_data.len() as u64 > MAX_FILE_EDIT_BYTES {
+            return NtfsTxOutcome::NotCommitted(too_large_edit());
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ntfs.replace_stream_at:");
+        hasher.update(&target_ref.record.to_le_bytes());
+        hasher.update(&target_ref.sequence.to_le_bytes());
+        for &u in stream_utf16 {
+            hasher.update(&u.to_le_bytes());
+        }
+        hasher.update(&(new_data.len() as u64).to_le_bytes());
+        hasher.update(blake3::hash(new_data).as_bytes());
+        let digest = *hasher.finalize().as_bytes();
+
+        let cb = u64::from(self.geometry.cluster_bytes());
+        let plan_res = (|| -> Result<PreparedTxPlan<NtfsReference>> {
+            let mut ws = TxWorkspace::load(self, cx)?;
+            let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
+            if cat_ro.is_directory {
+                return Err(FfsError::IsDirectory);
+            }
+            if target_ref.record < MIN_USER_MFT_SLOT {
+                return Err(FfsError::PermissionDenied);
+            }
+            let target_folded = self.fold_upcase(stream_utf16);
+            let stream_idx = cat_ro
+                .data_streams
+                .iter()
+                .position(|s| self.fold_upcase(&s.name) == target_folded)
+                .ok_or_else(|| FfsError::NotFound("NTFS data stream not found".into()))?;
+            if !stream_utf16.is_empty() && cat_ro.data_streams[stream_idx].name != stream_utf16 {
+                return Err(FfsError::NotFound(
+                    "NTFS exact named stream not found".into(),
+                ));
+            }
+            if let EditableStreamStorage::NonResident { ref runs, .. } =
+                cat_ro.data_streams[stream_idx].storage
+            {
+                ws.free_clusters_deferred(&physical_spans_of_runs(runs));
+            }
+
+            let updated_storage = if new_data.len() <= MAX_RESIDENT_DATA_PAYLOAD {
+                EditableStreamStorage::Resident(new_data.to_vec())
+            } else {
+                let need_vcns = (new_data.len() as u64).div_ceil(cb);
+                let spans = ws.alloc_clusters(need_vcns, 1)?;
+                let mut runs = Vec::with_capacity(spans.len());
+                let mut cur_vcn = 0_u64;
+                for &(lcn, cnt) in &spans {
+                    runs.push(NtfsRun {
+                        vcn: cur_vcn,
+                        clusters: cnt,
+                        lcn: Some(lcn),
+                    });
+                    cur_vcn += cnt;
+                }
+                let mut padded = vec![0_u8; (need_vcns * cb) as usize];
+                padded[..new_data.len()].copy_from_slice(new_data);
+                stage_runs_writes(&self.geometry, &runs, &padded, &mut ws.pre_payload_writes)?;
+                EditableStreamStorage::NonResident {
+                    runs: normalize_ntfs_runs(runs),
+                    sparse: false,
+                    compression_unit: 0,
+                    data_bytes: new_data.len() as u64,
+                    initialized_bytes: new_data.len() as u64,
+                }
+            };
+
+            {
+                let cat = ws.catalog_mut(self, cx, target_ref)?;
+                cat.data_streams[stream_idx].storage = updated_storage;
+                cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
+            }
+            if stream_utf16.is_empty() {
+                ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
+            }
+            ws.finalize(self, cx, "replace_stream_at", digest, target_ref)
+        })();
+
+        match plan_res {
+            Ok(plan) => self.execute_logged_tx(cx, plan),
+            Err(err) => NtfsTxOutcome::NotCommitted(err),
+        }
+    }
+
+    /// Replace `path`'s unnamed `$DATA` stream, falling back from the single-record
+    /// fast path to [`Self::replace_stream_at`] when `$ATTRIBUTE_LIST`, `SPARSE`,
+    /// or multi-level `$I30` directories participate.
+    pub fn write_file_data_extended(
+        &mut self,
+        cx: &Cx,
+        path: &str,
+        new_data: &[u8],
+    ) -> NtfsTxOutcome<NtfsReference> {
+        let outcome = self.write_file_data(cx, path, new_data);
+        if !matches!(
+            outcome,
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+        ) || self.requires_recovery()
+        {
+            return outcome;
+        }
+        let target_ref = match self.resolve_path_reference(cx, path) {
+            Ok(r) => r,
+            Err(err) => return NtfsTxOutcome::NotCommitted(err),
+        };
+        self.replace_stream_at(cx, target_ref, &[], new_data, DEFAULT_NTFS_FILETIME)
+    }
+
+    /// Rename `source_path` to `destination_path`, falling back from the single-record
+    /// fast path to [`Self::rename_at`] for `$ATTRIBUTE_LIST`, `SPARSE`, or multi-level
+    /// `$I30` directories while preserving `--expected-record`/`--expected-sequence`
+    /// post-commit retry idempotency.
+    pub fn rename_path_extended(
+        &mut self,
+        cx: &Cx,
+        source_path: &str,
+        destination_path: &str,
+        expected_source_ref: Option<NtfsReference>,
+        no_replace: bool,
+    ) -> NtfsTxOutcome<NtfsReference> {
+        let outcome = if no_replace {
+            self.rename_entry_no_replace(cx, source_path, destination_path, expected_source_ref)
+        } else {
+            self.rename_entry(cx, source_path, destination_path, expected_source_ref)
+        };
+        if !matches!(
+            outcome,
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+        ) || self.requires_recovery()
+        {
+            return outcome;
+        }
+
+        if !no_replace
+            && let Some(expected_ref) = expected_source_ref
+            && matches!(
+                self.resolve_path_reference(cx, source_path),
+                Err(FfsError::NotFound(_))
+            )
+            && self.resolve_path_reference(cx, destination_path).ok() == Some(expected_ref)
+        {
+            if let Err(err) = self.check_clean_consistency(cx) {
+                return NtfsTxOutcome::NotCommitted(err);
+            }
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"ntfs.rename_path_extended:");
+            hasher.update(source_path.as_bytes());
+            hasher.update(b"->");
+            hasher.update(destination_path.as_bytes());
+            let digest = *hasher.finalize().as_bytes();
+            let cur_lsn = self.ring.as_ref().map_or(1, |r| r.current_lsn().max(1));
+            let ckpt_lsn = self
+                .ring
+                .as_ref()
+                .map(ffs_ondisk::ntfs::logfile_writer::NtfsLogRingWriter::client_restart_lsn);
+            let token = self.make_token(0, cur_lsn, ckpt_lsn, digest);
+            return NtfsTxOutcome::Committed {
+                value: expected_ref,
+                token,
+            };
+        }
+
+        let (source_parent, source_leaf) = match self.resolve_parent_and_leaf(cx, source_path) {
+            Ok(pair) => pair,
+            Err(err) => return NtfsTxOutcome::NotCommitted(err),
+        };
+        let source_ref = match self.lookup_reference(cx, source_parent, &source_leaf) {
+            Ok(r) => r,
+            Err(err) => return NtfsTxOutcome::NotCommitted(err),
+        };
+        if let Some(expected_ref) = expected_source_ref
+            && expected_ref != source_ref
+        {
+            return NtfsTxOutcome::NotCommitted(stale_target());
+        }
+        let (dest_parent, dest_leaf) = match self.resolve_parent_and_leaf(cx, destination_path) {
+            Ok(pair) => pair,
+            Err(err) => return NtfsTxOutcome::NotCommitted(err),
+        };
+        match self.rename_at(
+            cx,
+            source_parent,
+            &source_leaf,
+            dest_parent,
+            &dest_leaf,
+            source_ref,
+            no_replace,
+        ) {
+            NtfsTxOutcome::Committed { value, token } => NtfsTxOutcome::Committed {
+                value: value.source,
+                token,
+            },
+            NtfsTxOutcome::NotCommitted(err) => NtfsTxOutcome::NotCommitted(err),
+            NtfsTxOutcome::Uncertain {
+                reason,
+                transaction_id,
+                commit_lsn,
+            } => NtfsTxOutcome::Uncertain {
+                reason,
+                transaction_id,
+                commit_lsn,
+            },
+        }
+    }
+
+    /// Unlink `path`, falling back from the single-record fast path to [`Self::unlink_at`]
+    /// for `$ATTRIBUTE_LIST`, `SPARSE`, or multi-level `$I30` directories.
+    pub fn unlink_path_extended(&mut self, cx: &Cx, path: &str) -> NtfsTxOutcome<NtfsReference> {
+        let outcome = self.unlink_file(cx, path);
+        if !matches!(
+            outcome,
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+        ) || self.requires_recovery()
+        {
+            return outcome;
+        }
+        let (parent_ref, leaf_utf16) = match self.resolve_parent_and_leaf(cx, path) {
+            Ok(pair) => pair,
+            Err(err) => return NtfsTxOutcome::NotCommitted(err),
+        };
+        let expected_ref = match self.lookup_reference(cx, parent_ref, &leaf_utf16) {
+            Ok(r) => r,
+            Err(err) => return NtfsTxOutcome::NotCommitted(err),
+        };
+        self.unlink_at(cx, parent_ref, &leaf_utf16, expected_ref)
     }
 }
 

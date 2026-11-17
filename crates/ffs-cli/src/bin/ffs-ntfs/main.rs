@@ -1263,7 +1263,13 @@ fn main() -> Result<()> {
         } => {
             let initial_data = payload.load(false)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.create_file(&cx, &parent_path, &name, &initial_data);
+            let name_utf16: Vec<u16> = name.encode_utf16().collect();
+            let outcome = match engine.resolve_path_reference(&cx, &parent_path) {
+                Ok(parent_ref) => {
+                    engine.create_file_at(&cx, parent_ref, &name_utf16, &initial_data)
+                }
+                Err(err) => NtfsTxOutcome::NotCommitted(err),
+            };
             emit_tx_outcome("tx_create", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1278,7 +1284,11 @@ fn main() -> Result<()> {
             name,
         } => {
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.mkdir(&cx, &parent_path, &name);
+            let name_utf16: Vec<u16> = name.encode_utf16().collect();
+            let outcome = match engine.resolve_path_reference(&cx, &parent_path) {
+                Ok(parent_ref) => engine.mkdir_at(&cx, parent_ref, &name_utf16),
+                Err(err) => NtfsTxOutcome::NotCommitted(err),
+            };
             emit_tx_outcome("tx_mkdir", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1293,7 +1303,16 @@ fn main() -> Result<()> {
             name,
         } => {
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.link_file(&cx, &source_path, &parent_path, &name);
+            let name_utf16: Vec<u16> = name.encode_utf16().collect();
+            let outcome = match (
+                engine.resolve_path_reference(&cx, &source_path),
+                engine.resolve_path_reference(&cx, &parent_path),
+            ) {
+                (Ok(source_ref), Ok(parent_ref)) => {
+                    engine.link_at(&cx, source_ref, parent_ref, &name_utf16)
+                }
+                (Err(err), _) | (_, Err(err)) => NtfsTxOutcome::NotCommitted(err),
+            };
             emit_tx_outcome("tx_link", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1311,7 +1330,7 @@ fn main() -> Result<()> {
         } => {
             let data = payload.load(true)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.write_file_data(&cx, &path, &data);
+            let outcome = engine.write_file_data_extended(&cx, &path, &data);
             emit_tx_outcome("tx_write", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1331,8 +1350,12 @@ fn main() -> Result<()> {
             let stream = select_write_stream(stream.as_deref(), stream_utf16)?;
             let data = payload.load_range(start)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome =
-                engine.write_file_stream_range(&cx, &path, stream.as_units(), start, &data);
+            let outcome = match engine.resolve_path_reference(&cx, &path) {
+                Ok(file_ref) => {
+                    engine.write_stream_range(&cx, file_ref, stream.as_units(), start, &data)
+                }
+                Err(err) => NtfsTxOutcome::NotCommitted(err),
+            };
             emit_tx_outcome("tx_write_range", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1352,7 +1375,10 @@ fn main() -> Result<()> {
         } => {
             let stream = select_write_stream(stream.as_deref(), stream_utf16)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.truncate_file_stream(&cx, &path, stream.as_units(), size);
+            let outcome = match engine.resolve_path_reference(&cx, &path) {
+                Ok(file_ref) => engine.truncate_stream(&cx, file_ref, stream.as_units(), size),
+                Err(err) => NtfsTxOutcome::NotCommitted(err),
+            };
             emit_tx_outcome("tx_truncate", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1372,7 +1398,10 @@ fn main() -> Result<()> {
             let stream = select_named_write_stream(stream.as_deref(), stream_utf16)?;
             let data = payload.load_range(0)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.create_file_stream(&cx, &path, stream.as_units(), &data);
+            let outcome = match engine.resolve_path_reference(&cx, &path) {
+                Ok(file_ref) => engine.create_stream(&cx, file_ref, stream.as_units(), &data),
+                Err(err) => NtfsTxOutcome::NotCommitted(err),
+            };
             emit_tx_outcome("tx_create_stream", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1390,7 +1419,10 @@ fn main() -> Result<()> {
         } => {
             let stream = select_named_write_stream(stream.as_deref(), stream_utf16)?;
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.remove_file_stream(&cx, &path, stream.as_units());
+            let outcome = match engine.resolve_path_reference(&cx, &path) {
+                Ok(file_ref) => engine.remove_stream(&cx, file_ref, stream.as_units()),
+                Err(err) => NtfsTxOutcome::NotCommitted(err),
+            };
             emit_tx_outcome("tx_remove_stream", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1460,11 +1492,8 @@ fn main() -> Result<()> {
                 _ => bail!("--expected-record and --expected-sequence must be provided together"),
             };
             let mut engine = target.open(&cx, false)?;
-            let outcome = if no_replace {
-                engine.rename_entry_no_replace(&cx, &src_path, &dst_path, expected)
-            } else {
-                engine.rename_entry(&cx, &src_path, &dst_path, expected)
-            };
+            let outcome =
+                engine.rename_path_extended(&cx, &src_path, &dst_path, expected, no_replace);
             emit_tx_outcome("tx_rename", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
@@ -1475,7 +1504,7 @@ fn main() -> Result<()> {
         }
         Command::TxUnlink { target, path } => {
             let mut engine = target.open(&cx, false)?;
-            let outcome = engine.unlink_file(&cx, &path);
+            let outcome = engine.unlink_path_extended(&cx, &path);
             emit_tx_outcome("tx_unlink", &engine, outcome, |reference| {
                 serde_json::json!({
                     "record": reference.record,
