@@ -136,6 +136,22 @@ pub enum WriteCommand {
         #[command(flatten)]
         args: AdmitArgs,
     },
+    /// Mount one head dataset using the explicitly admitted synchronous native TXG writer.
+    MountWrite {
+        #[command(flatten)]
+        target: AdmitArgs,
+        /// Existing empty host directory outside every backing image's path.
+        mountpoint: PathBuf,
+        /// Explicitly authorize native allocation and durable pool mutations.
+        #[arg(long, required = true)]
+        allow_write: bool,
+        /// Relative head dataset name; empty selects the pool root dataset.
+        #[arg(long, default_value = "")]
+        dataset: String,
+        /// Reconcile split uberblock copies after complete writer admission.
+        #[arg(long)]
+        reconcile_torn_uberblocks: bool,
+    },
     /// Create a new regular file in a ZPL head dataset and publish a committed TXG.
     TxCreate {
         #[command(flatten)]
@@ -246,6 +262,24 @@ fn parse_dataset_components(dataset: &str) -> Result<Vec<Vec<u8>>> {
         out.push(part.as_bytes().to_vec());
     }
     Ok(out)
+}
+
+fn writable_mountpoint(target: &AdmitArgs, path: &Path) -> Result<PathBuf> {
+    let mountpoint = path.canonicalize().context("resolve ZFS mountpoint")?;
+    if !mountpoint.is_dir()
+        || std::fs::read_dir(&mountpoint)?
+            .next()
+            .transpose()?
+            .is_some()
+    {
+        bail!("ZFS mountpoint must be an existing empty directory");
+    }
+    for image in std::iter::once(&target.image).chain(&target.members) {
+        if image.canonicalize()?.starts_with(&mountpoint) {
+            bail!("ZFS mountpoint would hide a backing image");
+        }
+    }
+    Ok(mountpoint)
 }
 
 fn parse_mode_bits(raw: &str) -> Result<u16> {
@@ -388,6 +422,56 @@ impl WriteCommand {
                     "backing_writes": false,
                     "admission": report,
                 }))
+            }
+            Self::MountWrite {
+                target,
+                mountpoint,
+                allow_write,
+                dataset,
+                reconcile_torn_uberblocks,
+            } => {
+                if !target.offline_image || !allow_write {
+                    bail!("writable ZFS mounts require --offline-image and --allow-write");
+                }
+                if target.members.len() > 7 {
+                    bail!("at most seven additional member images are supported");
+                }
+                let components = parse_dataset_components(&dataset)?;
+                // Host paths and dataset component syntax are checked before
+                // writable opens and explicitly requested ring reconciliation.
+                let mountpoint = writable_mountpoint(&target, &mountpoint)?;
+                let paths: Vec<&Path> = std::iter::once(&target.image)
+                    .chain(&target.members)
+                    .map(PathBuf::as_path)
+                    .collect();
+                let engine = ZfsTransactionEngine::open_files_at(
+                    cx,
+                    &paths,
+                    target.offset,
+                    target.length,
+                    ZfsWriteOptions {
+                        offline_image: target.offline_image,
+                        allow_write,
+                        pool_guid: target.pool_guid,
+                        label: target.label as usize,
+                        slot: target.slot as usize,
+                        reconcile_torn_uberblocks,
+                    },
+                )
+                .context("admitting the native ZFS mount writer")?;
+                let fs = ffs_zfs::ZfsFs::with_writer(cx, engine, components)?;
+                let options = ffs_fuse::MountOptions {
+                    read_only: false,
+                    allow_other: false,
+                    auto_unmount: true,
+                    atime: ffs_fuse::AtimePolicy::NoAtime,
+                    ..ffs_fuse::MountOptions::default()
+                };
+                eprintln!(
+                    "experimental ZFS writer: synchronous native TXG commits; native mode/ownership, noatime; native ACL enforcement and open-unlink retention are not implemented"
+                );
+                let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+                Ok(())
             }
             Self::TxCreate {
                 pool,
@@ -542,6 +626,118 @@ mod tests {
     use super::*;
     use crate::Cli;
     use clap::Parser;
+
+    #[test]
+    fn writable_mount_requires_authority_and_keeps_explicit_pool_selection() {
+        let base = [
+            "ffs-zfs",
+            "mount-write",
+            "primary.img",
+            "/mnt/zfs",
+            "--pool-guid",
+            "123",
+            "--label",
+            "2",
+            "--slot",
+            "11",
+            "--dataset",
+            "data/work",
+            "--member",
+            "mirror.img",
+            "--offset",
+            "4096",
+            "--length",
+            "16777216",
+            "--reconcile-torn-uberblocks",
+        ];
+        for authority in [vec![], vec!["--offline-image"], vec!["--allow-write"]] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(authority)).is_err());
+        }
+        let args =
+            Cli::try_parse_from(base.into_iter().chain(["--offline-image", "--allow-write"]))
+                .unwrap();
+        let crate::Command::Write(WriteCommand::MountWrite {
+            target,
+            mountpoint,
+            allow_write,
+            dataset,
+            reconcile_torn_uberblocks,
+        }) = args.command
+        else {
+            panic!("mount-write must dispatch to the explicit native writer");
+        };
+        assert!(target.offline_image && allow_write && reconcile_torn_uberblocks);
+        assert_eq!(target.image, PathBuf::from("primary.img"));
+        assert_eq!(target.members, vec![PathBuf::from("mirror.img")]);
+        assert_eq!(target.pool_guid, 123);
+        assert_eq!((target.label, target.slot), (2, 11));
+        assert_eq!((target.offset, target.length), (4096, Some(16_777_216)));
+        assert_eq!(mountpoint, PathBuf::from("/mnt/zfs"));
+        assert_eq!(
+            parse_dataset_components(&dataset).unwrap(),
+            [b"data".to_vec(), b"work".to_vec()]
+        );
+        for forbidden in [
+            vec!["--auto-import"],
+            vec!["--replay-zil"],
+            vec!["--snapshot", "before"],
+            vec!["--sidecar", "pool.ffs-repair"],
+            vec!["--allow-other"],
+            vec!["--timestamp", "1710000000"],
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    base.into_iter()
+                        .chain(["--offline-image", "--allow-write"])
+                        .chain(forbidden),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn writable_mountpoint_preflight_preserves_all_backing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary.img");
+        let member = temp.path().join("member.img");
+        let mountpoint = temp.path().join("mount");
+        std::fs::write(&primary, b"primary sentinel").unwrap();
+        std::fs::write(&member, b"mirror sentinel").unwrap();
+        std::fs::create_dir(&mountpoint).unwrap();
+        let mut target = AdmitArgs {
+            image: primary.clone(),
+            offline_image: true,
+            offset: 0,
+            length: None,
+            members: vec![member.clone()],
+            label: 0,
+            slot: 2,
+            pool_guid: 123,
+        };
+        assert_eq!(
+            writable_mountpoint(&target, &mountpoint).unwrap(),
+            mountpoint.canonicalize().unwrap()
+        );
+        assert!(writable_mountpoint(&target, temp.path()).is_err());
+        assert!(writable_mountpoint(&target, &primary).is_err());
+        assert!(writable_mountpoint(&target, &temp.path().join("absent")).is_err());
+        let alias = temp.path().join("member-link.img");
+        std::os::unix::fs::symlink(&member, &alias).unwrap();
+        target.members = vec![alias];
+        assert_eq!(
+            writable_mountpoint(&target, &mountpoint).unwrap(),
+            mountpoint.canonicalize().unwrap()
+        );
+        std::fs::write(mountpoint.join("occupied"), b"existing content").unwrap();
+        assert!(writable_mountpoint(&target, &mountpoint).is_err());
+        assert_eq!(std::fs::read(&primary).unwrap(), b"primary sentinel");
+        assert_eq!(std::fs::read(&member).unwrap(), b"mirror sentinel");
+        assert_eq!(
+            std::fs::read(mountpoint.join("occupied")).unwrap(),
+            b"existing content"
+        );
+    }
 
     #[test]
     fn cli_write_subcommands_require_explicit_offline_and_write_flags() {

@@ -268,6 +268,40 @@ impl XattrSources {
     }
 }
 
+/// Native ownership that must be handled before reclaiming a ZPL object.
+/// External ACL objects and xattr directories are separate DMU objects, not
+/// children of the file's data or SA-spill block tree. Project IDs identify the
+/// quota account to debit when the object is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclamationOwnership {
+    pub xattr_directory: u64,
+    pub external_acl_object: u64,
+    pub project_id: u64,
+}
+
+impl ReclamationOwnership {
+    fn validate(self) -> Result<Self, ParseError> {
+        if self.xattr_directory >= OBJECT_LIMIT || self.external_acl_object >= OBJECT_LIMIT {
+            return Err(invalid(
+                "ZPL reclamation reference exceeds the object namespace",
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Read the external ACL pointer from `zp_acl.z_acl_extern_obj`, at byte
+    /// 176 of a legacy znode. Legacy znodes have no project-ID system attribute.
+    pub fn legacy(raw: &[u8], order: Endian) -> Result<Self, ParseError> {
+        let xattrs = XattrSources::legacy(raw, order)?;
+        Self {
+            xattr_directory: xattrs.directory,
+            external_acl_object: order.u64(raw, 176)?,
+            project_id: 0,
+        }
+        .validate()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Registration {
     name: Vec<u8>,
@@ -732,13 +766,18 @@ impl SaRegistry {
         };
 
         let mut map = BTreeMap::<Vec<u8>, Vec<u8>>::new();
-        // Seed optional defaults (and inherit ZPL_PROJID if present on template)
-        let projid_bytes = template_decoded
+        // Native children inherit a project only when the parent explicitly
+        // enables ZFS_PROJINHERIT, not merely because its SA layout has an ID.
+        let project_id = if template_decoded
             .values
-            .get(b"ZPL_PROJID".as_slice())
-            .filter(|a| a.bytes.len() == 8)
-            .map_or_else(|| order.encode(0).to_vec(), |a| a.bytes.clone());
-        map.insert(b"ZPL_PROJID".to_vec(), projid_bytes);
+            .contains_key(b"ZPL_FLAGS".as_slice())
+            && template_decoded.integer("ZPL_FLAGS")? & 0x0000_4000_0000_0000 != 0
+        {
+            template_decoded.project_id()?
+        } else {
+            0
+        };
+        map.insert(b"ZPL_PROJID".to_vec(), order.encode(project_id).to_vec());
         map.insert(b"ZPL_RDEV".to_vec(), order.encode(0).to_vec());
         map.insert(b"ZPL_PAD".to_vec(), vec![0_u8; 32]);
         let znode_acl = template_decoded
@@ -843,6 +882,21 @@ impl Attributes {
         let attr = self.required(name, 16)?;
         timestamp(&attr.bytes, attr.order)
     }
+
+    /// Native project accounting owner. Objects without `ZPL_PROJID` belong to
+    /// the default project; a present attribute must be one native u64 scalar.
+    pub fn project_id(&self) -> Result<u64, ParseError> {
+        if self.values.contains_key(b"ZPL_PROJID".as_slice()) {
+            self.integer("ZPL_PROJID")
+        } else if self.values.contains_key(b"ZPL_FLAGS".as_slice())
+            && self.integer("ZPL_FLAGS")? & 0x0000_8000_0000_0000 != 0
+        {
+            Err(invalid("ZFS_PROJID flag lacks its project ID attribute"))
+        } else {
+            Ok(0)
+        }
+    }
+
     pub fn xattrs(&self) -> Result<XattrSources, ParseError> {
         let directory = if self.values.contains_key(b"ZPL_XATTR".as_slice()) {
             self.integer("ZPL_XATTR")?
@@ -872,6 +926,37 @@ impl Attributes {
             }
         }
         XattrSources { directory, inline }.validate()
+    }
+
+    /// External object owned by a legacy `zfs_acl_phys_t` retained in SA.
+    /// The ACL is a byte attribute, but its object reference follows the SA
+    /// buffer's native byte order. A missing attribute owns no external ACL.
+    pub fn external_acl_object(&self) -> Result<u64, ParseError> {
+        let Some(attribute) = self.values.get(b"ZPL_ZNODE_ACL".as_slice()) else {
+            return Ok(0);
+        };
+        if attribute.swap != 3 || attribute.bytes.len() != 88 {
+            return Err(invalid("invalid legacy ACL system attribute"));
+        }
+        let object = attribute.order.u64(&attribute.bytes, 0)?;
+        if object >= OBJECT_LIMIT {
+            return Err(invalid(
+                "external ACL reference exceeds the object namespace",
+            ));
+        }
+        Ok(object)
+    }
+
+    /// Recover external ownership and quota identity without assuming that all
+    /// attributes share the dnode's byte order or reside in its bonus buffer.
+    pub fn reclamation_ownership(&self) -> Result<ReclamationOwnership, ParseError> {
+        let xattrs = self.xattrs()?;
+        ReclamationOwnership {
+            xattr_directory: xattrs.directory,
+            external_acl_object: self.external_acl_object()?,
+            project_id: self.project_id()?,
+        }
+        .validate()
     }
 
     pub fn metadata(&self) -> Result<Metadata, ParseError> {

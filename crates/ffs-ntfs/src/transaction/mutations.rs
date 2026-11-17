@@ -181,6 +181,35 @@ impl NtfsTransactionEngine {
         }
     }
 
+    /// Create a named DATA stream on a sequence-bound ordinary FILE. Exact
+    /// native code units are preserved; existing case-folded aliases collide.
+    pub fn create_stream(
+        &mut self,
+        cx: &Cx,
+        reference: NtfsReference,
+        stream: &[u16],
+        data: &[u8],
+    ) -> NtfsTxOutcome<NtfsReference> {
+        match self.resolve_reference_path(cx, reference) {
+            Ok(path) => self.create_file_stream(cx, &path, stream, data),
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
+    }
+
+    /// Remove a named DATA stream without retiring its FILE or any other
+    /// stream. The FILE sequence is revalidated before native WAL planning.
+    pub fn remove_stream(
+        &mut self,
+        cx: &Cx,
+        reference: NtfsReference,
+        stream: &[u16],
+    ) -> NtfsTxOutcome<NtfsReference> {
+        match self.resolve_reference_path(cx, reference) {
+            Ok(path) => self.remove_file_stream(cx, &path, stream),
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
+    }
+
     /// Remove exactly the selected current directory link. Stale callers cannot
     /// remove a replacement which now occupies the same name.
     pub fn unlink_at(

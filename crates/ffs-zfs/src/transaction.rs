@@ -34,7 +34,7 @@ use self::dmu_cow::{
     DMU_OT_OBJSET, PoolSpaceAllocator, WriteBucket, finalize_mos_and_space_maps_to_convergence,
     zap_optional_u64, zap_required_u64,
 };
-pub use self::zpl_ops::ZfsDataChecksum;
+pub use self::zpl_ops::{ZfsDataChecksum, ZfsSetAttr, ZfsUnlinkedObject};
 use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
 
 type FaultHook = Box<dyn FnMut(&ZfsPersistenceEvent) -> Result<()> + Send + Sync>;
@@ -608,7 +608,7 @@ impl ZfsTransactionEngine {
             }
             pool.root(cx, options.label, options.slot, options.pool_guid)?
         };
-        let current_uberblock = root_block.uberblock.clone();
+        let mut current_uberblock = root_block.uberblock.clone();
         let vcfg = root_block.vdev_config().clone();
         let order = current_uberblock.root.payload_order();
         let mos_os = ObjectSet::parse(&root_block.data, order).map_err(|e| parse_err(&e))?;
@@ -695,15 +695,15 @@ impl ZfsTransactionEngine {
 
             // Preserve both publication waves and all-member durability barriers.
             let default_sw = if version == 5000 { 5000 } else { version };
-            let mut synced_ub = current_uberblock.clone();
-            synced_ub.order = *expected_order;
+            let selected_order = current_uberblock.order;
+            current_uberblock.order = *expected_order;
             for wave_labels in [[0_usize, 1], [2, 3]] {
                 for (m_idx, member) in members.iter().enumerate() {
                     for l_idx in wave_labels {
                         let off = label_offsets_per_member[m_idx][l_idx]
                             + UBERBLOCK_RING_OFFSET
                             + (options.slot * slot_bytes) as u64;
-                        let encoded = synced_ub
+                        let encoded = current_uberblock
                             .encode_with_meta(
                                 slot_bytes,
                                 off,
@@ -719,6 +719,9 @@ impl ZfsTransactionEngine {
                     member.sync_raw(cx)?;
                 }
             }
+            // The native copies use label order; retain the selected in-memory
+            // representation after reconciliation without cloning its root.
+            current_uberblock.order = selected_order;
         }
 
         let storage_identity = ZfsStorageIdentity {
@@ -811,6 +814,43 @@ impl ZfsTransactionEngine {
         self.committed_slot
     }
 
+    /// Whether an incomplete uberblock publication requires a fresh, explicitly
+    /// reconciled writer before this handle can serve further mutations.
+    #[must_use]
+    pub const fn requires_recovery(&self) -> bool {
+        self.poisoned_uncertain
+    }
+
+    /// Allocated bytes in the currently committed native metaslab maps.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocator.total_allocated_bytes()
+    }
+
+    /// Free bytes in the currently committed native metaslab maps.
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        self.allocator.total_free_bytes()
+    }
+
+    /// Issue a durability barrier on every retained member.
+    ///
+    /// Mutations already publish synchronously. This additional barrier lets a
+    /// filesystem consumer report current device errors from fsync and unmount;
+    /// it cannot resolve an uncertain native publication or mint a new token.
+    pub fn sync_devices(&self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        if self.requires_recovery() {
+            return Err(unsupported(
+                "ZFS writer requires explicit recovery before synchronization",
+            ));
+        }
+        for member in self.pool.leaves() {
+            member.sync_raw(cx)?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn persistence_events(&self) -> &[ZfsPersistenceEvent] {
         &self.events
@@ -853,6 +893,61 @@ impl ZfsTransactionEngine {
                 mode,
                 uid,
                 gid,
+                symlink_target: None,
+                timestamp,
+                checksum,
+            },
+        )
+    }
+
+    /// Create a native symbolic link and its directory entry in one TXG.
+    ///
+    /// Targets are uninterpreted bytes, excluding NUL, with the Linux maximum
+    /// length of 4095 bytes. Empty targets are rejected. The new symlink has
+    /// mode `0777`; callers apply any parent group inheritance before supplying
+    /// `gid`. Legacy native znodes support both ZPL v4 and v5 without altering
+    /// the dataset's SA registry or the parent's metadata representation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_symlink(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        parent_dir: u64,
+        name: &[u8],
+        target: &[u8],
+        uid: u64,
+        gid: u64,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        // Validate the whole request before metadata reads or COW staging.
+        // Linux rejects an empty symlink target as an empty pathname (ENOENT).
+        if target.is_empty() {
+            return ZfsTxOutcome::NotCommitted(FfsError::NotFound(
+                "empty ZPL symlink target".into(),
+            ));
+        }
+        if target.contains(&0) {
+            return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                "ZPL symlink target contains NUL".into(),
+            ));
+        }
+        if target.len() > 4095 {
+            return ZfsTxOutcome::NotCommitted(FfsError::NameTooLong);
+        }
+        if timestamp.nanos >= 1_000_000_000 {
+            return ZfsTxOutcome::NotCommitted(FfsError::Format("invalid ZPL nanoseconds".into()));
+        }
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::CreateFile {
+                parent_dir,
+                name: name.to_vec(),
+                mode: 0o777,
+                uid,
+                gid,
+                symlink_target: Some(target.to_vec()),
                 timestamp,
                 checksum,
             },
@@ -921,12 +1016,46 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
+        self.set_attributes(
+            cx,
+            dataset_components,
+            file_obj,
+            &ZfsSetAttr {
+                size: Some(new_size),
+                ..ZfsSetAttr::default()
+            },
+            timestamp,
+            checksum,
+        )
+    }
+
+    /// Publish size and native timestamps atomically in one TXG, returning the
+    /// resulting logical size. `timestamp` supplies ctime and, for a size change
+    /// without an explicit mtime, the new mtime. Empty requests are rejected.
+    /// Native readonly and persistent flag rules apply before publication.
+    ///
+    /// A metadata-only change preserves the existing data tree and does not use
+    /// `checksum`; that algorithm is used only for blocks rewritten by truncation.
+    pub fn set_attributes(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        object: u64,
+        attrs: &ZfsSetAttr,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        // Validate the whole compound request before opening metadata or staging
+        // a size change. A bad explicit time cannot leave a truncated file.
+        if let Err(error) = attrs.validate(timestamp) {
+            return ZfsTxOutcome::NotCommitted(error);
+        }
         self.execute_zpl_txg(
             cx,
             dataset_components,
-            &ZplMutation::TruncateFile {
-                file_obj,
-                new_size,
+            &ZplMutation::SetAttributes {
+                file_obj: object,
+                attrs: attrs.clone(),
                 timestamp,
                 checksum,
             },
@@ -980,6 +1109,7 @@ impl ZfsTransactionEngine {
                 dst_dir,
                 dst_name: dst_name.to_vec(),
                 expected_source_object,
+                retain_replaced: None,
                 timestamp,
             },
         )
@@ -1002,8 +1132,92 @@ impl ZfsTransactionEngine {
                 parent_dir,
                 name: name.to_vec(),
                 rmdir,
+                retain: None,
                 timestamp,
             },
+        )
+    }
+
+    /// Remove a name while retaining its final-link regular file in the native
+    /// `DELETE_QUEUE`. A live handle may keep reading/writing the object until
+    /// its owner calls [`Self::reap_unlinked_file`]. With other hard links, only
+    /// the requested name is removed. The identity is checked before any writes.
+    pub fn unlink_open_file(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        parent_dir: u64,
+        name: &[u8],
+        identity: ZfsUnlinkedObject,
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::UnlinkEntry {
+                parent_dir,
+                name: name.to_vec(),
+                rmdir: false,
+                retain: Some(identity),
+                timestamp,
+            },
+        )
+    }
+
+    /// Atomically replace a name while preserving its open target in the native
+    /// unlinked set. Source publication and target retention share one TXG.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rename_retaining_open_target(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        src_dir: u64,
+        src_name: &[u8],
+        dst_dir: u64,
+        dst_name: &[u8],
+        expected_source_object: Option<u64>,
+        target: ZfsUnlinkedObject,
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::RenameEntry {
+                src_dir,
+                src_name: src_name.to_vec(),
+                dst_dir,
+                dst_name: dst_name.to_vec(),
+                expected_source_object,
+                retain_replaced: Some(target),
+                timestamp,
+            },
+        )
+    }
+
+    /// Inspect pending regular-file reclamation without mutating storage.
+    /// Owners may drain this set when opening a fresh mount, before exposing
+    /// any handles. Never reap it while another dataset consumer holds pins.
+    pub fn pending_unlinks(
+        &self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+    ) -> Result<Vec<ZfsUnlinkedObject>> {
+        zpl_ops::pending_unlinks(cx, &mut self.open_read_objects(cx)?, dataset_components)
+    }
+
+    /// Reclaim one generation-bound, zero-link regular file and remove its
+    /// native queue entry in the same TXG. The caller must ensure no live handles
+    /// remain; stale identities, live links, and unsupported ownership are refused.
+    pub fn reap_unlinked_file(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        identity: ZfsUnlinkedObject,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::ReapUnlinked { identity },
         )
     }
 

@@ -1,5 +1,79 @@
 # FEATURE_PARITY
 
+> **NTFS named DATA lifecycle (2026-11-15):**
+> The native logged writer can create and remove ordinary named DATA streams
+> through sequence-bound references and paths. Resident/nonresident payloads,
+> exact UTF-16 identities, native UpCase collision checks, and allocation
+> reservation/reclamation share the existing WAL transaction and recovery path.
+> Writable FsOps expose create/unlink through `file:stream`; deletion refuses an
+> open stream and retires its mounted identity after commit. The companion CLI
+> exposes `tx-create-stream` and `tx-remove-stream`, with bounded initial payloads
+> and exact UTF-16 selectors. Authored regressions cover catalog preservation,
+> stale identities, failed barriers, committed cancellation, durable/reordered
+> crash prefixes, and mounted handle lifetimes. Directory streams, transformed
+> stream mutation, ATTRIBUTE_LIST spill, stream rename, deletion of open ADS,
+> and durable NTFS orphan recovery remain outside this slice. This advances
+> `bd-kx0m7` without closing NTFS-05 or claiming Windows/mounted qualification.
+
+> **Repair parity/source capture consistency (2026-11-15):**
+> Refresh and CLI rebuild derive parity and BLAKE3 source manifests from the
+> same captured buffers. Before any validation-tail writes, publication rereads
+> those sources and refuses a changed, unreadable, or cancelled capture, even
+> when no validation blocks are reserved. Pristine CLI descriptor bootstrap now
+> follows this validation. Authored regressions check unchanged previous tail
+> bytes, generation, dirty state and refresh evidence on refusal, plus parity
+> and digest agreement against independently retained source bytes. This does
+> not add external-writer exclusion or an atomic replacement manifest protocol;
+> allocator-owned storage and read-write mounted background repair remain open
+> under `bd-11a8t` / `bd-j7a4e`.
+
+> **ZFS native writable FsOps:**
+> An admitted single-leaf or complete-mirror writer can be consumed by
+> `ZfsFs::with_writer` for synchronous native create/mkdir/write/truncate,
+> symlink, hard-link, rename, unlink and rmdir operations on one ZPL v4/v5 head
+> dataset. Size, atime and mtime changes publish atomically in one native TXG;
+> existing-node quota deltas follow the actual native project owner.
+> The mount retains its writer, native ownership/modes and SGID inheritance,
+> generation-safe inode identities, current committed reads and real member
+> barriers. Snapshots remain read-only; uncertain publication fences further
+> operations. Stateful OPEN and atomic CREATE handles protect actual open-file
+> lifetimes without treating cached LOOKUP references as open handles.
+> Final unlink and replacement now preserve admitted open regular files in the
+> native `DELETE_QUEUE`, with namespace removal and queue insertion in one TXG.
+> Existing handles can read/write/truncate the zero-link object; final release
+> reclaims it, and filesystem sync/reopen can retry cleanup after cancellation
+> or failure.
+> Mount admission validates the view and complete bounded orphan queue before
+> cleanup; native generations protect against stale reclamation. Shared final
+> retirement refuses external ACL/xattr owners it cannot fully reclaim; existing
+> project IDs retain their own quota accounting. Nonfinal hard links retain all
+> auxiliary owners.
+> Added storage-model cases cover replacement, name reuse, two-handle lifetimes,
+> snapshots, restart cleanup, stale generations, ownership refusal and cuts at
+> every recorded unlink/reap persistence point, including reordered unsynced
+> writes. The independent `zdb` oracle also checks queued and reaped states.
+> Execution and full workspace gates are pending; no native OpenZFS interchange
+> or mounted-syscall qualification is claimed by these authored regressions.
+> The preceding timestamp, symlink, project-accounting and auxiliary-ownership
+> storage regressions passed on x86-64 and AArch64 at `cee8ba03`; full workspace
+> validation is tracked below.
+> This advances ZFS-05/06 without closing the broader roadmap obligations.
+
+> **NTFS root-directory recovery and durable log prefixes (2026-11-16):**
+> Journal replay admits verified root-directory FILE and $I30 INDX updates while
+> retaining bootstrap-record, allocation, mapping and directory-identity guards.
+> Native transaction, checkpoint and recovery-log pages publish in logical append
+> order, with a durable prefix before each later page, including across ring wrap.
+> A split Commit/Forget sequence enters postcommit cancellation handling at the
+> actual commit barrier. Recovery rejects retained predecessors that are missing,
+> belong to another transaction, or cross an observed Forget boundary, even when
+> an earlier record of the current transaction survives. Checkpoint references
+> older than the retained window keep their existing treatment.
+> Persistence-cut regressions exercise hard links and replacement rename with
+> reordered pending writes, alongside a direct missing-middle-chain refusal case.
+> The filesystem-integrity workflows exercise this scope on x86-64 and AArch64.
+> Windows interchange and broader NTFS writer restrictions remain separate work.
+
 > **NTFS atomic ordinary-file replacement (2026-11-15):**
 > Native rename can replace a distinct ordinary file in one logged transaction.
 > The source retains its FILE identity and other links. A nonfinal destination
@@ -3341,3 +3415,75 @@ remain unexecuted. The direct-to-main commits record an explicit gate bypass
 for this execution-environment block. These additions do not establish mounted
 ZFS writing, native Windows/OpenZFS interoperability or completion of the
 broader writer beads.
+
+### ZFS native timestamps and atomic resize attributes (2026-11-15)
+
+`ZfsTransactionEngine::set_attributes` and writable `FsOps::setattr` support
+explicit access/modification times and optional file size in one native TXG.
+Explicit mtime wins over the automatic resize timestamp. Metadata-only updates
+preserve data geometry and pointers; legacy bonus, SA bonus/spill, snapshot
+deadlists and quota accounting use the existing native publication path.
+Creation time, object generation, ownership, mode and ACL/xattr values are retained.
+Immutable files permit atime-only changes, while native immutable/read-only/
+append-only size restrictions remain enforced. Unsupported mode/owner changes
+reject the whole compound request before mutation. Snapshot views remain read-only.
+
+The native semantics reference is OpenZFS `zfs-2.3.0`,
+`module/os/linux/zfs/zfs_vnops_os.c::zfs_setattr`. Focused regressions in
+`crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs` cover negative/future
+nanosecond timestamps, legacy and SA/spill layouts, mirror publication, sparse
+growth, cold reopen, snapshot preservation, unsupported-field/flag refusal and
+invalid timestamp preflight. Every recorded publication-stage cut is restarted
+from durable media with dropped or reordered pending writes; recovered size and
+times must belong to one whole predecessor or successor transaction.
+
+The feature-specific regressions passed on both x86-64 and AArch64 at source
+`cee8ba03dd39724f4392b7063d134006f92590ce`. These are constructed-image/storage-model
+tests, not native OpenZFS or mounted qualification.
+The broader `bd-jdned` and `bd-uetvl` work packages remain open.
+
+Final unlink and replacement now reject native xattr-directory or external-ACL
+ownership before any backing write. The shared retirement helper performs this
+check only when the object would actually be reclaimed; nonfinal hard links and
+renaming the owning object remain supported. Legacy bonus and SA bonus/spill
+references use checked lengths and byte order. Constructed legacy/SA, file/
+directory, single/mirror controls in `final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects`
+check zero-write refusal, surviving links, cold reopen and allocation integrity.
+Complete recursive auxiliary-object reclamation remains part of `bd-jdned`.
+
+## ZFS native symlink creation and project accounting (2026-11-15)
+
+`ZfsTransactionEngine::create_symlink` and writable `FsOps::symlink` create the
+target, native object and parent directory entry in one TXG. Both ZPL v4 and v5
+use a native legacy znode with a trivial 0777 ACL; this does not add or alter SA
+registry layouts. Targets of at most 56 bytes fit inline, while longer targets
+use checksummed native data blocks with allocation and quota accounting. The
+Linux profile accepts nonempty targets through 4095 bytes, including non-UTF-8
+bytes, and refuses NUL, oversized targets and invalid nanoseconds before staging.
+Mounted creation preserves the parent SGID group, supports ordinary rename and
+unlink, and preserves the existing snapshot and uncertain-publication fences.
+
+Existing-node quota changes now use the checked project ID belonging to the
+native owner when its ZFS_PROJID flag is set, rather than charging every mutation
+to project 0. This covers changed SA spill allocation, file range writes and
+resize, directory changes, hard links, moves and final reclamation. New children
+default to project 0 when project inheritance is absent; inherited project
+creation remains explicitly unsupported. Nonfinal unlink accounts for any
+changed spill allocation as well as preserving the surviving owner's metadata.
+
+Regressions exercise inline/data boundaries, maximum-length and non-UTF-8
+targets, setgid inheritance, duplicate and invalid-target refusal, readonly and
+immutable parents, snapshot isolation, cold reopen, rename/unlink, and every
+recorded publication-stage cut with dropped or reordered pending writes. The
+project fixture uses a nonzero owner and compressed spill so metadata COW changes
+physical allocation and detects incorrect quota attribution.
+
+At source `cee8ba03dd39724f4392b7063d134006f92590ce`, both the
+[x86-64 validation](https://github.com/Dicklesworthstone/frankenfs/actions/runs/43788725930)
+and [AArch64 validation](https://github.com/Dicklesworthstone/frankenfs/actions/runs/43788705713)
+passed 13 ZPL codec tests, 345 ZFS unit tests, and every new timestamp, symlink,
+project-accounting and auxiliary-ownership persistence regression. The broader
+runs exposed an existing ZFS statfs lifecycle assertion, three NTFS persistence
+failures, Clippy diagnostics, and an AArch64-only harness probe build failure;
+those runs therefore do not establish an all-green workspace. These fixtures
+also do not establish native OpenZFS interchange or a real mounted syscall result.

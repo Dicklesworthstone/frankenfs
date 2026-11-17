@@ -80,7 +80,7 @@ remain separately controlled by `--console`.
 | **FAT16** | `ffs-cli` / `ffs-fat` | Native reads/catalog/extraction, experimental ordinary/protected writable FUSE, allocation checks, formatting/population, and ordered offline file/directory/range mutation | New long names use bounded UTF-16 with ASCII aliases. Subdirectories can grow; [offline resize can expand the fixed root](docs/FAT_ROOT_EXPANSION.md) into a new image. Deterministic offline write-cut recovery is tested; full mounted/power-cut qualification remains open, and ordered mutation is not a crash-atomic transaction. |
 | **FAT32** | `ffs-cli` / `ffs-fat` | The FAT16 companion surface plus root chains, selected-FAT handling, free-space hints and offline resize/relocation | Namespace and range operations retain ordered native publication and explicit dirty failure states. Complete mounted/power-cut qualification remains open. |
 | **NTFS** | `ffs-cli` / `ffs-ntfs` | Native namespace and file/stream reads, sparse and admitted compressed/transformed data, metadata/allocation/security checks, admitted native logged mutations and experimental ordinary writable FUSE | `mount` remains read-only; `mount-write` requires `--offline-image --allow-write` and native writer admission. Host ownership/modes are synthetic, native ACLs are not enforced, and broader Windows consistency and mounted interoperability remain unqualified. |
-| **ZFS** | `ffs-cli` / `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction, volatile ZIL recovery and admitted offline native TXG mutations | Offline writes require an explicitly selected clean pool and complete supported single-leaf/mirror membership. Missing-member extraction is committed-view-only and forbids ZIL inspection/replay. Mounted writes, broader pool lifecycle and native writer interoperability qualification remain unfinished. |
+| **ZFS** | `ffs-cli` / `ffs-zfs` | Native dataset/snapshot reads, automatic read-only root selection, admitted compression/checksums, selected mirror/RAIDZ, explicit missing-member extraction, volatile ZIL recovery, admitted offline native TXG mutations and experimental synchronous writable FUSE with regular-file open-unlink retention | Native writes require an explicitly selected clean pool and complete supported single-leaf/mirror membership. `mount-write` adds explicit offline/write authorization and keeps snapshots read-only. Native ACLs, broader pool lifecycle and mounted/native writer interoperability qualification remain unfinished. Missing-member extraction remains committed-view-only. |
 
 On Linux kernels supporting FUSE_SYNCFS (protocol 7.34+), `--fuseblk-device PATH`
 enables filesystem-wide `sync -f` through the
@@ -448,9 +448,9 @@ ffs-ntfs mount-write disk.img /mnt/ntfs --offline-image --allow-write \
 ```
 
 The mountpoint must already exist and be empty. This entry point uses the
-admitted native NTFS 3.1 logged writer for ordinary create/mkdir, existing
-unnamed and named DATA write/truncate, hard links, rename with ordinary file
-replacement, unlink and rmdir. `--recover-dirty` explicitly enables native log recovery during admission;
+admitted native NTFS 3.1 logged writer for ordinary create/mkdir, unnamed and
+named DATA write/truncate, named DATA creation/removal, hard links, rename with
+ordinary file replacement, unlink and rmdir. `--recover-dirty` explicitly enables native log recovery during admission;
 recovery-required or uncertain storage states fence further mutations.
 The existing `mount` command remains read-only.
 
@@ -461,14 +461,58 @@ the final link is removed. These operations require complete ordinary
 base-record metadata; coupled DOS aliases, extension-record catalogs and
 transformed streams retain their existing refusal boundaries.
 
+Named streams on an existing ordinary file use `file:stream` or
+`file:stream:$DATA`. Creation refuses an existing stream alias according to the
+volume's native `$UpCase` table. Removal reclaims that stream's allocation and
+retires its mounted identity; the unnamed DATA stream and other named streams
+remain intact. Removing a stream with open handles returns `EBUSY`; a handle on
+the unnamed DATA stream does not prevent removal of an independently closed ADS.
+Directory streams, stream rename, transformed data and extension-record catalogs
+remain outside this writer profile.
+
 Ownership and modes are fixed host projections; native Windows ACLs are not
-enforced. Creating or deleting ADS remains refused. Replacement of a mounted
-destination held open through a file or ADS handle is also refused. An open file
+enforced. Replacement of a mounted destination held open through a file or ADS
+handle is also refused. An open file
 survives its final unlink through a retained native name hidden from the live
 mounted namespace and reaped on its last release.
 A crash can leave an ordinary recoverable `.ffs-unlinked-*` file visible after
 reopen: durable orphan replay is not implemented. These capabilities do not
 establish native Windows or mounted interoperability qualification.
+
+## NTFS: create and remove named DATA streams
+
+`tx-create-stream` creates a named stream on an existing ordinary file without
+replacing another stream. Supply its initial bytes explicitly with `--data`,
+`--data-file`, or `--empty`; the initial payload is limited to 16 MiB:
+
+```bash
+ffs-ntfs tx-create-stream volume.img /report.bin --stream audit \
+  --data 'initial audit record' --offline-image --allow-write
+ffs-ntfs tx-write-range volume.img /report.bin --stream audit \
+  --start 0 --data updated --offline-image --allow-write
+ffs-ntfs tx-remove-stream volume.img /report.bin --stream audit \
+  --offline-image --allow-write
+
+# Exact native UTF-16 code units, including names that are not valid Unicode.
+ffs-ntfs tx-create-stream volume.img /report.bin --stream-utf16 d800,0061 \
+  --empty --offline-image --allow-write
+ffs-ntfs tx-remove-stream volume.img /report.bin --stream-utf16 d800,0061 \
+  --offline-image --allow-write
+```
+
+Both commands require a nonempty stream name; they cannot remove unnamed DATA.
+Creation checks native case-folded collisions, while CLI removal selects the
+exact existing name. Resident and ordinary nonresident DATA use native
+`CreateAttribute`/`DeleteAttribute` journal records and matching allocation-bitmap
+updates. Initial nonresident payloads are initialized before journal publication;
+removal reclaims only the selected stream's clusters. The FILE identity, hard
+link count, unnamed DATA and FILE_NAME/directory-index sizes are preserved.
+
+These mutations require complete ordinary base-record metadata. Creation also
+requires enough FILE record space for the attribute; it does not spill attributes
+into extension records. `--offset` and `--length` bound every payload, journal and allocation
+write to the selected volume; the JSON result includes the native FILE reference,
+exact stream-name units and a storage-bound native commit token.
 
 ## NTFS: native hard links from the companion CLI
 
@@ -543,8 +587,77 @@ directory entry publish in one native TXG; existing data and snapshots retain
 their object identity. A committed result and its durable token remain committed
 if cancellation arrives after all required member/label syncs. Interrupted
 publication still reports uncertainty requiring native ring reconciliation.
-ZFS mounts remain read-only, and native OpenZFS writer interoperability remains
-unqualified.
+The existing `mount` command remains read-only. The separate `mount-write`
+command below enables the admitted native writer; native OpenZFS writer
+interoperability remains unqualified.
+
+## ZFS: writable head dataset mount
+
+`mount-write` exposes an admitted ZPL v4/v5 head dataset through FUSE. Every
+successful mutation publishes a synchronous native TXG. Supply the inspected
+pool GUID and current uberblock candidate, and include every member of a mirror:
+
+```bash
+ffs-zfs mount-write pool.img /mnt/zfs --dataset data \
+  --pool-guid "$POOL_GUID" --label 0 --slot "$SLOT" \
+  --offline-image --allow-write
+
+# Complete mirrors use additional explicit member images.
+ffs-zfs mount-write member-0.img /mnt/zfs --member member-1.img --dataset data \
+  --pool-guid "$POOL_GUID" --label 0 --slot "$SLOT" \
+  --offline-image --allow-write
+```
+
+The mountpoint must already exist and be empty. Images must be offline regular
+files; the engine retains exclusive ownership for the mount lifetime. Optional
+`--offset` and `--length` select the same bounded partition on each member.
+Active pools, active MMP, pending ZIL, incomplete mirrors, unsupported write
+features and readonly datasets are refused. Torn native ring copies require
+explicit `--reconcile-torn-uberblocks` after full writer admission.
+
+The writable profile supports ordinary create/mkdir and symlink creation, reads
+and range writes, size and explicit access/modification-time changes, hard links, rename with
+ordinary replacement, unlink and rmdir. A combined size/timestamp request
+publishes all fields in one native TXG, including sparse extension and truncation.
+Timestamp-only updates retain file data, native ACL/xattr metadata, ownership,
+generation and creation time. Signed seconds and nanosecond precision are preserved.
+Symlink creation publishes the target and directory entry together, supports
+non-UTF-8 targets up to 4095 bytes, and retains parent SGID group inheritance.
+Short targets use native inline storage and longer targets use native data blocks;
+both representations survive rename, reopen and final removal.
+Reads observe the latest committed head, while existing snapshots remain
+read-only. Native object generations keep stale mount inodes from reaching
+reused objects. Native mode bits and numeric ownership, including parent SGID
+inheritance, are exposed with kernel permission checks, `noatime`, `nodev`, and
+`nosuid`; `allow_other` is disabled. Native ACL evaluation is not implemented.
+
+Open and create requests retain backend handles. Final unlink or replacement of
+an admitted open regular file removes its name while preserving reads, writes
+and truncation through existing handles. The same native TXG records its
+zero-link object in the dataset's `DELETE_QUEUE` unlinked set. The final release
+reclaims the object; a cancelled or failed release leaves durable cleanup
+retryable at filesystem sync or reopen. Writer admission validates the whole pending queue
+and reclaims admitted orphans before exposing a new mount. Native generations
+prevent stale cleanup from reaching a reused object, and snapshots retain their
+original contents. Final reclamation and retention refuse external ACL objects
+and external xattr directories whose allocations cannot yet be reclaimed.
+Removing an extra hard link and moving the owner remain supported, as does
+final removal of inline-only metadata.
+Cached lookups alone do not prevent a closed file from being removed. Directory
+continuation cookies become stale after a committed mutation, and
+removed-directory references cannot alias a reused object.
+Changing mode or ownership and creating/deleting datasets or snapshots remain
+outside this mount profile. Existing native project IDs are retained and charged
+to their own quota records through mutation and final reclamation; new children
+default to project 0 while project inheritance remains unsupported.
+Nonempty writes, file-range copies and truncation of files with native set-ID
+bits or Linux file capabilities are refused before data mutation because atomic
+privilege removal is not implemented.
+`fsync`, directory sync and unmount issue real device barriers and report errors.
+An uncertain publication fences the mount until explicit recovery and reopen.
+
+This entry point is experimental. Storage-model and FUSE transport regressions
+do not establish native OpenZFS interchange or real mounted-syscall qualification.
 
 ## ZFS: extract from surviving mirror disks
 

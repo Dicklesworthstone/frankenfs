@@ -223,9 +223,10 @@ fn target(
     }
     let number = u32::try_from(logical / layout.record_bytes as u64)
         .map_err(|_| corrupt(0, "FILE replay record identity overflows"))?;
-    // The current bootstrap and bitmap streams are immutable inputs. Mutating
-    // their own metadata would require rebuilding those views before reuse.
-    if number < 16 {
+    // The current bootstrap and bitmap streams are immutable inputs. Record 5
+    // is the namespace root: unlike those streams, its directory contents are
+    // read through the combined staged view and validated before publication.
+    if number < 16 && number != 5 {
         return Err(unsupported(
             "NTFS system-record replay requires bootstrap-view reconstruction",
         ));
@@ -398,11 +399,7 @@ fn execute(
                 return Err(corrupt(0, "short FILE replay target read"));
             }
             let record = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
-            if record.base.sequence != 0 && record.base.record < 16 {
-                return Err(unsupported(
-                    "NTFS system extension replay requires bootstrap reconstruction",
-                ));
-            }
+            recovery_apply::validate_file_identity(&record, action.number)?;
             if u64_at(&raw, 8)? > layout.boundary_lsn {
                 return Err(unsupported(
                     "FILE page is newer than the selected journal boundary",
@@ -425,6 +422,8 @@ fn execute(
         {
             FileEditResult::AlreadyApplied => stage.summary.skipped += 1,
             FileEditResult::Applied(raw) => {
+                let record = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
+                recovery_apply::validate_file_identity(&record, action.number)?;
                 stage.records.insert(action.number, raw);
                 match action.pass {
                     RecoveryPass::Redo(_) => stage.summary.redo += 1,

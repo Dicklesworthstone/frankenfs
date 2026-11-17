@@ -668,6 +668,22 @@ directories, links, xattrs/ACLs, file data, properties, and allocation reporting
 Do not skip large dnodes, spill metadata, or transformed data encountered in an
 admitted feature profile.
 
+The bounded native writer exposes size and explicit atime/mtime updates through
+`ZfsTransactionEngine::set_attributes` and writable `FsOps::setattr`. A compound
+request publishes the resize and both timestamps in the same TXG. Metadata-only
+updates preserve native data pointers, ACL/xattr values, ownership, object
+generation and birth time; native immutable/read-only rules are applied before
+publication. Native mode/ownership changes, ACL mutation and evaluation, and the
+remaining dataset/shared-reference lifecycle remain required by this plan.
+
+Native symlink creation is exposed through `ZfsTransactionEngine::create_symlink`
+and writable `FsOps::symlink`. Target bytes and the namespace entry publish in
+one TXG, with short inline and longer data-backed legacy znodes on both ZPL v4
+and v5. The bounded Linux mount profile accepts nonempty, NUL-free targets up to
+4095 bytes and applies parent SGID group inheritance. Existing-node quota updates
+use the object's checked native project identity; project inheritance and changes
+to project ownership remain outside this increment.
+
 Read snapshots at their selected immutable root. Enumerate datasets, properties,
 clones, and snapshots independently of which dataset is mounted. Parent/child
 dataset boundaries and mount policy cannot be inferred solely from a ZPL file

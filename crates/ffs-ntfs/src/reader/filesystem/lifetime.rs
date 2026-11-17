@@ -359,6 +359,29 @@ impl NtfsFs {
         locked(&self.lifetime)?.register_ads(base, reference, name)
     }
 
+    /// Check mount-identity capacity before a native stream creation commits.
+    /// The caller holds the exclusive operation gate through registration.
+    pub(super) fn check_ads_registration(
+        &self,
+        reference: NtfsReference,
+        name: &[u16],
+    ) -> Result<()> {
+        let base = self.inode(reference)?;
+        let state = locked(&self.lifetime)?;
+        if state.ads_keys.contains_key(&(base, name.to_vec())) {
+            return Ok(());
+        }
+        if state.ads.len() >= MAX_ADS_IDENTITIES {
+            return Err(errno(libc::ENOSPC));
+        }
+        state
+            .next_ads
+            .checked_add(1)
+            .filter(|serial| *serial < ADS_BIT)
+            .ok_or_else(|| errno(libc::EOVERFLOW))?;
+        Ok(())
+    }
+
     pub(super) fn ads_target(&self, ino: InodeNumber) -> Result<(NtfsReference, Vec<u16>)> {
         let state = locked(&self.lifetime)?;
         let identity = state

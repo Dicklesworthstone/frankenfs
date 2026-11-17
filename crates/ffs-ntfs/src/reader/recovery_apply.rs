@@ -206,12 +206,44 @@ fn target(layout: Layout, action: &NtfsRecoveryAction) -> Result<u32> {
     }
     let number = u32::try_from(logical / layout.record_bytes as u64)
         .map_err(|_| corrupt(logical, "semantic FILE record number overflows"))?;
-    if number < 16 {
+    // The root directory is ordinary namespace metadata, not a cached
+    // bootstrap stream. Its resident index can be replayed under the same
+    // storage-preservation checks and final directory validation as user dirs.
+    if number < 16 && number != 5 {
         return Err(unsupported(
             "system FILE replay needs bootstrap and mirror reconstruction",
         ));
     }
     Ok(number)
+}
+
+pub(super) fn validate_file_identity(record: &NtfsFileRecord, number: u32) -> Result<()> {
+    if record.number != number || !record.in_use() || record.sequence == 0 {
+        return Err(corrupt(
+            0,
+            "semantic FILE target has the wrong identity or is not live",
+        ));
+    }
+    if record.base.record != 0 && record.base.sequence == 0 {
+        return Err(corrupt(
+            0,
+            "semantic FILE extension has an invalid base reference",
+        ));
+    }
+    if record.base.sequence != 0 && record.base.record < 16 && record.base.record != 5 {
+        return Err(unsupported(
+            "system FILE extension replay needs bootstrap reconstruction",
+        ));
+    }
+    if number == 5
+        && (!record.is_directory() || record.base.record != 0 || record.base.sequence != 0)
+    {
+        return Err(corrupt(
+            0,
+            "NTFS root replay target is not a base directory",
+        ));
+    }
+    Ok(())
 }
 
 /// Preserve direct mappings, resident ATTRIBUTE_LIST indirections AND resident
@@ -352,23 +384,7 @@ fn execute(cx: &Cx, input: &mut impl Input, plan: &NtfsLogFilePlan) -> Result<Ov
                 return Err(corrupt(0, "short semantic FILE target read"));
             }
             let record = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
-            if record.number != number || !record.in_use() || record.sequence == 0 {
-                return Err(corrupt(
-                    0,
-                    "semantic FILE target has the wrong identity or is not live",
-                ));
-            }
-            if record.base.record != 0 && record.base.sequence == 0 {
-                return Err(corrupt(
-                    0,
-                    "semantic FILE extension has an invalid base reference",
-                ));
-            }
-            if record.base.sequence != 0 && record.base.record < 16 {
-                return Err(unsupported(
-                    "system FILE extension replay needs bootstrap reconstruction",
-                ));
-            }
+            validate_file_identity(&record, number)?;
             let page_lsn = u64::from_le_bytes(
                 raw[8..16]
                     .try_into()
@@ -400,6 +416,7 @@ fn execute(cx: &Cx, input: &mut impl Input, plan: &NtfsLogFilePlan) -> Result<Ov
             FileEditResult::Applied(updated) => {
                 let before = NtfsFileRecord::parse(raw).map_err(|error| parse(&error))?;
                 let after = NtfsFileRecord::parse(&updated).map_err(|error| parse(&error))?;
+                validate_file_identity(&after, number)?;
                 if storage_metadata(&before)? != storage_metadata(&after)? {
                     return Err(unsupported(
                         "public FILE replay cannot change allocation or attribute-list metadata",

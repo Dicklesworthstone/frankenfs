@@ -249,6 +249,17 @@ impl Zpl {
         })
     }
 
+    /// Check both native stores for the capability key without exposing its
+    /// payload or projecting it into the user xattr namespace. Writable mounts
+    /// use this to distinguish an absent killpriv target from unsupported removal.
+    pub(crate) fn has_file_capabilities(&mut self, cx: &Cx, owner: u64) -> Result<bool> {
+        let catalog = self.xattr_catalog(cx, owner)?;
+        Ok(catalog.inline.contains_key("security.capability")
+            || catalog
+                .directory
+                .contains_key(b"security.capability".as_slice()))
+    }
+
     /// Complete, sorted, unique host user names. Both native representations
     /// are admitted before publishing names; attribute payloads are read on get.
     pub fn listxattr(&mut self, cx: &Cx, owner: u64) -> Result<Vec<String>> {

@@ -452,33 +452,40 @@ impl<'a> RepairGroupStorage<'a> {
         Ok(())
     }
 
-    /// Persist a generation-bound [`SourceBlockDigestManifest`] (`FFSCDG01`)
-    /// into this group's `validation_block_count` region (`bd-jufod`).
+    /// Revalidate captured source digests and persist their generation-bound
+    /// [`SourceBlockDigestManifest`] (`FFSCDG01`) in the validation region.
     ///
-    /// No-op when `layout.validation_block_count == 0`, `source_block_count == 0`,
-    /// or `repair_generation == 0`. Call before `write_repair_symbols(..., repair_generation)`
-    /// so the subsequent parity/descriptor sync seals both parity and digests.
+    /// `source_digests` must come from the same source buffers used to encode the
+    /// repair symbols. A changed, unreadable, or incomplete source block aborts
+    /// before any manifest writes. Sources are checked even when no validation
+    /// blocks are reserved; only manifest persistence is omitted in that case.
+    /// Call before `write_repair_symbols(..., repair_generation)` so its sync
+    /// seals both parity and digests. This check does not exclude concurrent
+    /// writers; callers must retain their device's publication synchronization.
+    ///
+    /// Empty digests or a zero generation are a no-op.
     pub fn write_source_digests(
         &self,
         cx: &Cx,
         source_first_block: BlockNumber,
-        source_block_count: u32,
+        source_digests: &[[u8; 32]],
         repair_generation: u64,
     ) -> Result<()> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        if self.layout.validation_block_count == 0
-            || source_block_count == 0
-            || repair_generation == 0
-        {
+        if source_digests.is_empty() || repair_generation == 0 {
             return Ok(());
         }
+        let source_block_count = u32::try_from(source_digests.len())
+            .map_err(|_| FfsError::RepairFailed("source digest count exceeds u32".to_owned()))?;
         let block_size_u32 = self.device.block_size();
         let block_size = self.block_size_usize()?;
         let needed_blocks = SourceBlockDigestManifest::required_validation_blocks(
             source_block_count,
             block_size_u32,
         );
-        if needed_blocks == 0 || needed_blocks > self.layout.validation_block_count {
+        if self.layout.validation_block_count != 0
+            && (needed_blocks == 0 || needed_blocks > self.layout.validation_block_count)
+        {
             return Err(FfsError::RepairFailed(format!(
                 "validation block region too small for group {}: needed={} reserved={}",
                 self.layout.group.0, needed_blocks, self.layout.validation_block_count
@@ -505,13 +512,21 @@ impl<'a> RepairGroupStorage<'a> {
             .map(|i| BlockNumber(source_first_block.0 + u64::from(i)))
             .collect();
         let reads = Self::read_blocks_parallel(self.device, cx, &source_blocks);
-        let count_usize = usize::try_from(source_block_count)
-            .map_err(|_| FfsError::RepairFailed("source_block_count exceeds usize".to_owned()))?;
-        let mut digest_table = Vec::with_capacity(count_usize.saturating_mul(32));
-        for read in reads {
+        for ((block, read), expected) in source_blocks.iter().zip(reads).zip(source_digests) {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let buf = read?;
-            digest_table.extend_from_slice(blake3::hash(buf.as_slice()).as_bytes());
+            if buf.len() != block_size || blake3::hash(buf.as_slice()).as_bytes() != expected {
+                return Err(FfsError::Corruption {
+                    block: block.0,
+                    detail: "source changed during repair refresh".to_owned(),
+                });
+            }
         }
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if self.layout.validation_block_count == 0 {
+            return Ok(());
+        }
+        let digest_table: Vec<u8> = source_digests.iter().flatten().copied().collect();
 
         let mut header_prefix = [0_u8; 32];
         header_prefix[0..8].copy_from_slice(SourceBlockDigestManifest::MAGIC);
@@ -535,6 +550,7 @@ impl<'a> RepairGroupStorage<'a> {
 
         let val_start = self.layout.validation_start_block().0;
         for idx in 0..val_blocks_usize {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let start = idx * block_size;
             let end = start + block_size;
             self.device

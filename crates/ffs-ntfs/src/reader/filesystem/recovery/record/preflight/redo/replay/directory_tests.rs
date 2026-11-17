@@ -138,6 +138,7 @@ fn targets() -> State {
 }
 
 struct Input {
+    number: u32,
     raw: Vec<u8>,
     reads: usize,
     mapping_delta: u64,
@@ -147,6 +148,7 @@ struct Input {
 impl Input {
     fn new() -> Self {
         Self {
+            number: 42,
             raw: file(),
             reads: 0,
             mapping_delta: 100,
@@ -173,7 +175,7 @@ impl MftInput for Input {
         Ok(self.allocated)
     }
     fn read_record(&mut self, _cx: &Cx, number: u32) -> Result<Vec<u8>> {
-        assert_eq!(number, 42);
+        assert_eq!(number, self.number);
         self.reads += 1;
         Ok(self.raw.clone())
     }
@@ -191,6 +193,64 @@ fn names(raw: &[u8]) -> Vec<Vec<u16>> {
         .into_iter()
         .filter_map(|entry| entry.key.map(|(_, name)| name.name))
         .collect()
+}
+
+#[test]
+fn native_root_directory_replays_but_bootstrap_records_and_root_impostors_do_not() {
+    let cx = Cx::for_testing();
+    for number in [0_u32, 1, 2, 3, 4, 5, 6, 10, 15] {
+        let vcn = u64::from(number) * 2;
+        let mut targets = targets();
+        targets.clusters.clear();
+        for vcn in [vcn, vcn + 1] {
+            targets.clusters.insert(
+                (24, vcn),
+                Cluster {
+                    oldest: 20,
+                    lcn: Some(vcn + 100),
+                },
+            );
+        }
+        let mut entry = row(65);
+        entry[16..24].copy_from_slice(&((7_u64 << 48) | u64::from(number)).to_le_bytes());
+        let mut record = update(20, 24, 64, 0x0C, 0x0D, &entry);
+        for (at, value) in [(24, vcn), (32, vcn + 100), (40, vcn + 101)] {
+            record.data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let history = [record];
+        let plan = build(&cx, &targets, &history).unwrap();
+        let mut input = Input::new();
+        input.number = number;
+        input.raw[44..48].copy_from_slice(&number.to_le_bytes());
+        let original = input.raw.clone();
+        let result = execute(&cx, &mut input, &plan, &[], &targets);
+        if number == 5 {
+            let staged = result.unwrap();
+            assert_eq!(names(&staged.records[&5]), vec![vec![65_u16]]);
+            assert_eq!((staged.summary.redo, input.reads), (1, 1));
+            // The root's reserved number must not admit a regular FILE or an
+            // extension pretending to be the namespace root.
+            for extension in [false, true] {
+                input.raw = original.clone();
+                if extension {
+                    input.raw[32..40].copy_from_slice(&((7_u64 << 48) | 42).to_le_bytes());
+                } else {
+                    input.raw[22..24].copy_from_slice(&1_u16.to_le_bytes());
+                }
+                assert!(matches!(
+                    execute(&cx, &mut input, &plan, &[], &targets),
+                    Err(reader::FfsError::Corruption { .. })
+                ));
+            }
+        } else {
+            assert!(matches!(
+                result,
+                Err(reader::FfsError::UnsupportedFeature(_))
+            ));
+            assert_eq!(input.reads, 0);
+            assert_eq!(input.raw, original);
+        }
+    }
 }
 
 #[test]

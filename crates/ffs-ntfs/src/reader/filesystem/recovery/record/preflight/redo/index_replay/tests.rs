@@ -86,6 +86,7 @@ fn record(lsn: u64, redo: u16, undo: u16, at: u16, payload: &[u8], inverse: &[u8
 }
 
 struct Memory {
+    owner: u64,
     geometry: Geometry,
     shape: Shape,
     blocks: BTreeMap<u64, Vec<u8>>,
@@ -99,6 +100,7 @@ struct Memory {
 impl Memory {
     fn new() -> Self {
         Self {
+            owner: OWNER,
             geometry: Geometry {
                 cluster_bytes: 512,
                 clusters: 1024,
@@ -139,7 +141,7 @@ impl Input for Memory {
     }
     fn block(&mut self, _cx: &Cx, reference: u64, offset: u64, size: usize) -> Result<Vec<u8>> {
         self.reads += 1;
-        assert_eq!(reference, OWNER);
+        assert_eq!(reference, self.owner);
         assert_eq!(size, 1024);
         if let Some(error) = self.failure.take() {
             return Err(error);
@@ -166,6 +168,36 @@ fn names(raw: &[u8]) -> Vec<Vec<u16>> {
         .into_iter()
         .filter_map(|entry| entry.key.map(|(_, name)| name.name))
         .collect()
+}
+
+#[test]
+fn native_root_index_replay_exports_verified_namespace_sectors() {
+    let cx = Cx::for_testing();
+    let owner = (7_u64 << 48) | 5;
+    let mut attribute = attribute();
+    attribute.reference = owner;
+    let mut payload = entry(98);
+    payload[16..24].copy_from_slice(&owner.to_le_bytes());
+    let update = record(20, 0x0E, 0x0F, 152, &payload, &[]);
+    let mut source = Memory::new();
+    source.owner = owner;
+    source.blocks.get_mut(&1024).unwrap()[80..88].copy_from_slice(&owner.to_le_bytes());
+    let original = source.blocks.clone();
+    let staged = execute(&cx, &mut source, &[action(&update, &attribute, false)]).unwrap();
+    assert_eq!(names(&staged.blocks[&(owner, 1024)]), [vec![97], vec![98]]);
+    let published = export(&cx, &source, &staged).unwrap();
+    assert_eq!(
+        published.directories,
+        [ffs_ondisk::ntfs::NtfsReference::decode(owner)]
+    );
+    assert_eq!(
+        published.overlay.keys().copied().collect::<Vec<_>>(),
+        [50, 102]
+    );
+    assert_eq!(source.blocks, original);
+    source.free.insert((None, true, 5));
+    assert!(execute(&cx, &mut source, &[action(&update, &attribute, false)]).is_err());
+    assert_eq!(source.blocks, original);
 }
 
 #[test]
@@ -295,7 +327,7 @@ fn later_unsupported_opcode_and_forged_stream_identity_fail_before_any_open() {
             }
             1 => attribute.name = vec![0x24, 0x53, 0x49, 0x49],
             2 => attribute.reference = 42,
-            3 => attribute.reference = (7_u64 << 48) | 5,
+            3 => attribute.reference = (7_u64 << 48) | 6,
             4 => attribute.opened = 40,
             _ => later.data[6..8].copy_from_slice(&u16::MAX.to_le_bytes()),
         }

@@ -1123,6 +1123,17 @@ pub trait FsOps: Send + Sync {
         Ok((0, 0))
     }
 
+    /// Require the transport to deliver every file open and release.
+    ///
+    /// Backends that enforce admission or retain storage through open handles
+    /// must return `true`. The transport must then disable zero-message OPEN
+    /// and preserve handles returned by [`Self::open`] and [`Self::create_open`].
+    /// This answer must remain stable while the backend is mounted.
+    /// The default keeps stateless backends' existing mount behavior.
+    fn requires_stateful_open(&self) -> bool {
+        false
+    }
+
     /// Read the target of a symbolic link.
     ///
     /// Returns the raw bytes of the symlink target. Returns
@@ -1219,6 +1230,28 @@ pub trait FsOps: Send + Sync {
         _gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         Err(FfsError::ReadOnly)
+    }
+
+    /// Create and open a regular file for a transport CREATE request.
+    ///
+    /// Returns the attributes, backend handle, and FUSE open flags. Stateful
+    /// backends can reserve the handle before committing the create and publish
+    /// the inode and its open lifetime together. The default preserves the
+    /// existing stateless CREATE reply and does not call [`Self::open`].
+    #[allow(clippy::too_many_arguments)]
+    fn create_open(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        _flags: i32,
+    ) -> ffs_error::Result<(InodeAttr, u64, u32)> {
+        self.create(cx, scope, parent, name, mode, uid, gid)
+            .map(|attr| (attr, 0, 0))
     }
 
     /// Record an access to `ino` at `now`: atime only, never ctime. With
@@ -3180,6 +3213,10 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         self.as_ref().open(cx, scope, ino, flags)
     }
 
+    fn requires_stateful_open(&self) -> bool {
+        self.as_ref().requires_stateful_open()
+    }
+
     fn readlink(
         &self,
         cx: &Cx,
@@ -3245,6 +3282,21 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
     ) -> ffs_error::Result<InodeAttr> {
         self.as_ref()
             .create(cx, scope, parent, name, mode, uid, gid)
+    }
+
+    fn create_open(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    ) -> ffs_error::Result<(InodeAttr, u64, u32)> {
+        self.as_ref()
+            .create_open(cx, scope, parent, name, mode, uid, gid, flags)
     }
 
     fn tmpfile(
@@ -4379,6 +4431,10 @@ macro_rules! delegate_fs_ops {
             ($target).open(cx, scope, ino, flags)
         }
 
+        fn requires_stateful_open(&$self) -> bool {
+            ($target).requires_stateful_open()
+        }
+
         fn readlink(
             &$self,
             cx: &$crate::vfs::__delegate_support::Cx,
@@ -4447,6 +4503,24 @@ macro_rules! delegate_fs_ops {
             gid: u32,
         ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
             ($target).create(cx, scope, parent, name, mode, uid, gid)
+        }
+
+        fn create_open(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+            mode: u16,
+            uid: u32,
+            gid: u32,
+            flags: i32,
+        ) -> $crate::vfs::__delegate_support::Result<(
+            $crate::vfs::__delegate_support::InodeAttr,
+            u64,
+            u32,
+        )> {
+            ($target).create_open(cx, scope, parent, name, mode, uid, gid, flags)
         }
 
         fn tmpfile(
@@ -6315,6 +6389,10 @@ mod fs_ops_wrapper_completeness_pins {
             self.record("open");
             Ok((7, 3))
         }
+        fn requires_stateful_open(&self) -> bool {
+            self.record("requires_stateful_open");
+            true
+        }
         fn readlink(
             &self,
             _cx: &Cx,
@@ -6389,6 +6467,21 @@ mod fs_ops_wrapper_completeness_pins {
         ) -> ffs_error::Result<InodeAttr> {
             self.record("create");
             Ok(Self::dummy_attr(parent))
+        }
+        fn create_open(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            _name: &OsStr,
+            _mode: u16,
+            _uid: u32,
+            _gid: u32,
+            flags: i32,
+        ) -> ffs_error::Result<(InodeAttr, u64, u32)> {
+            self.record("create_open");
+            assert_eq!(flags, libc::O_RDWR);
+            Ok((Self::dummy_attr(parent), 9, 5))
         }
         fn tmpfile(
             &self,
@@ -7455,7 +7548,7 @@ mod fs_ops_wrapper_completeness_pins {
         crate::delegate_fs_ops!(self, &self.inner);
     }
 
-    fn invoke_all_132_methods(ops: &dyn FsOps) {
+    fn invoke_all_methods(ops: &dyn FsOps) {
         let cx = Cx::for_testing();
         let mut s = RequestScope::empty();
         let ino = InodeNumber(2);
@@ -7471,6 +7564,7 @@ mod fs_ops_wrapper_completeness_pins {
         let _ = ops.readdir(&cx, &mut s, ino, 0);
         let _ = ops.read(&cx, &mut s, ino, 0, 16);
         let _ = ops.open(&cx, &mut s, ino, 0);
+        assert!(ops.requires_stateful_open());
         let _ = ops.readlink(&cx, &mut s, ino);
         let _ = ops.statfs(&cx, &mut s, ino);
         let _ = ops.listxattr(&cx, ino);
@@ -7478,6 +7572,10 @@ mod fs_ops_wrapper_completeness_pins {
         let _ = ops.setxattr(&cx, &mut s, ino, "user.k", b"v", XattrSetMode::Set);
         let _ = ops.removexattr(&cx, &mut s, ino, "user.k");
         let _ = ops.create(&cx, &mut s, ino, name, 0o644, 0, 0);
+        let (_, fh, flags) = ops
+            .create_open(&cx, &mut s, ino, name, 0o644, 0, 0, libc::O_RDWR)
+            .expect("forward create-open");
+        assert_eq!((fh, flags), (9, 5));
         let _ = ops.tmpfile(&cx, &mut s, ino, 0o600, 0, 0);
         let _ = ops.touch_atime(&cx, &mut s, ino, SystemTime::UNIX_EPOCH, false);
         let _ = ops.mkdir(&cx, &mut s, ino, name, 0o755, 0, 0);
@@ -7607,7 +7705,7 @@ mod fs_ops_wrapper_completeness_pins {
     }
 
     #[test]
-    fn arc_and_delegate_macro_invoke_implementor_for_all_132_methods_at_runtime() {
+    fn arc_and_delegate_macro_invoke_every_implementor_method_at_runtime() {
         let source = include_str!("vfs.rs");
         let trait_start = source.find("\npub trait FsOps: Send + Sync {\n").unwrap();
         let trait_tail = &source[trait_start + 1..];
@@ -7617,7 +7715,7 @@ mod fs_ops_wrapper_completeness_pins {
         // 1. Box<Arc<SpyFsOps>> behind &dyn FsOps (exact production mount topology)
         let spy = Arc::new(SpyFsOps::default());
         let boxed_arc: Box<dyn FsOps> = Box::new(Arc::clone(&spy));
-        invoke_all_132_methods(boxed_arc.as_ref());
+        invoke_all_methods(boxed_arc.as_ref());
         let recorded_arc: BTreeSet<String> = spy
             .calls
             .lock()
@@ -7636,7 +7734,7 @@ mod fs_ops_wrapper_completeness_pins {
         let delegated = DelegatedSpyFsOps {
             inner: SpyFsOps::default(),
         };
-        invoke_all_132_methods(&delegated);
+        invoke_all_methods(&delegated);
         let recorded_delegated: BTreeSet<String> = delegated
             .inner
             .calls

@@ -93,6 +93,111 @@ fn packed(id: u16, attrs: &[(u16, Vec<u8>)], variables: &[u16], order: Endian) -
 }
 
 #[test]
+fn legacy_reclamation_ownership_retains_native_references_and_checks_bounds() {
+    for order in [Endian::Little, Endian::Big] {
+        let mut raw = legacy(order, 0o100_640, 17);
+        assert_eq!(
+            ReclamationOwnership::legacy(&raw, order).unwrap(),
+            ReclamationOwnership {
+                xattr_directory: 0,
+                external_acl_object: 0,
+                project_id: 0,
+            }
+        );
+        raw[104..112].copy_from_slice(&order.encode(42));
+        raw[176..184].copy_from_slice(&order.encode(0x0001_0203));
+        assert_eq!(
+            ReclamationOwnership::legacy(&raw, order).unwrap(),
+            ReclamationOwnership {
+                xattr_directory: 42,
+                external_acl_object: 0x0001_0203,
+                project_id: 0,
+            }
+        );
+        for length in [0, 104, 176, 183, 263] {
+            assert!(ReclamationOwnership::legacy(&raw[..length], order).is_err());
+        }
+        raw[176..184].copy_from_slice(&order.encode(OBJECT_LIMIT));
+        assert!(ReclamationOwnership::legacy(&raw, order).is_err());
+        raw[176..184].copy_from_slice(&order.encode(0));
+        raw[104..112].copy_from_slice(&order.encode(OBJECT_LIMIT));
+        assert!(ReclamationOwnership::legacy(&raw, order).is_err());
+    }
+}
+
+#[test]
+fn sa_reclamation_ownership_uses_each_buffer_byte_order_and_native_layout() {
+    for (bonus_order, spill_order) in [(Endian::Little, Endian::Big), (Endian::Big, Endian::Little)]
+    {
+        let bonus_attrs = vec![
+            (42, bonus_order.encode(9001).to_vec()),
+            (9, bonus_order.encode(73).to_vec()),
+        ];
+        let mut acl = vec![0; 88];
+        acl[..8].copy_from_slice(&spill_order.encode(0x0001_0203));
+        let spill_attrs = vec![(15, acl)];
+        let registry = SaRegistry::from_zaps(
+            &[registration("ZPL_PROJID", 42, 8, 0)],
+            &[layout(2, &bonus_attrs), layout(3, &spill_attrs)],
+        )
+        .unwrap();
+        let bonus = packed(2, &bonus_attrs, &[], bonus_order);
+        let spill = packed(3, &spill_attrs, &[], spill_order);
+        let decoded = registry.decode(&bonus, Some(&spill)).unwrap();
+        assert_eq!(
+            decoded.reclamation_ownership().unwrap(),
+            ReclamationOwnership {
+                xattr_directory: 73,
+                external_acl_object: 0x0001_0203,
+                project_id: 9001,
+            }
+        );
+
+        let mut invalid_acl = vec![0; 88];
+        invalid_acl[..8].copy_from_slice(&spill_order.encode(OBJECT_LIMIT));
+        let spill = packed(3, &[(15, invalid_acl)], &[], spill_order);
+        assert!(
+            registry
+                .decode(&bonus, Some(&spill))
+                .unwrap()
+                .reclamation_ownership()
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn sa_reclamation_ownership_defaults_absent_fields_but_rejects_mistyped_project_ids() {
+    let empty_registry = SaRegistry::from_zaps(&[], &[]).unwrap();
+    let empty = empty_registry
+        .decode(&packed(1, &[], &[], Endian::Little), None)
+        .unwrap();
+    assert_eq!(
+        empty.reclamation_ownership().unwrap(),
+        ReclamationOwnership {
+            xattr_directory: 0,
+            external_acl_object: 0,
+            project_id: 0,
+        }
+    );
+    for (length, swap) in [(4, 1), (16, 0), (8, 3)] {
+        let attrs = vec![(42, vec![0; usize::from(length)])];
+        let registry = SaRegistry::from_zaps(
+            &[registration("ZPL_PROJID", 42, length, swap)],
+            &[layout(2, &attrs)],
+        )
+        .unwrap();
+        assert!(
+            registry
+                .decode(&packed(2, &attrs, &[], Endian::Little), None)
+                .unwrap()
+                .reclamation_ownership()
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn legacy_metadata_retains_native_times_ids_and_inline_links_in_both_orders() {
     for order in [Endian::Little, Endian::Big] {
         let raw = legacy(order, 0o100_640, 17);
@@ -224,6 +329,56 @@ fn bonus_and_spill_use_independent_layouts_and_value_byte_orders() {
     assert!(registry.decode(&bonus, Some(&bonus)).is_err());
     assert!(registry.decode(&bonus, None).unwrap().metadata().is_err());
 }
+
+#[test]
+fn project_accounting_owner_requires_a_scalar_and_preserves_native_byte_order() {
+    for order in [Endian::Little, Endian::Big] {
+        let core = attributes(order, 0o100_640, 17);
+        let project = vec![(47, order.encode(0x1234_5678_90ab_cdef).to_vec())];
+        let registry = SaRegistry::from_zaps(
+            &[registration("ZPL_PROJID", 47, 8, 0)],
+            &[layout(2, &core), layout(3, &project)],
+        )
+        .unwrap();
+        let bonus = packed(2, &core, &[], order);
+        let project_bytes = packed(3, &project, &[], order);
+        assert_eq!(
+            registry.decode(&bonus, None).unwrap().project_id().unwrap(),
+            0
+        );
+        let mut flagged = core.clone();
+        flagged.iter_mut().find(|(id, _)| *id == 11).unwrap().1 =
+            order.encode(0x0000_8000_0000_0000).to_vec();
+        let missing_project = packed(2, &flagged, &[], order);
+        assert!(
+            registry
+                .decode(&missing_project, None)
+                .unwrap()
+                .project_id()
+                .is_err()
+        );
+        for (bonus, spill) in [
+            (project_bytes.as_slice(), None),
+            (bonus.as_slice(), Some(project_bytes.as_slice())),
+        ] {
+            assert_eq!(
+                registry.decode(bonus, spill).unwrap().project_id().unwrap(),
+                0x1234_5678_90ab_cdef
+            );
+        }
+        for (length, swap) in [(16, 0), (8, 3)] {
+            let malformed = vec![(47, vec![0_u8; usize::from(length)])];
+            let registry = SaRegistry::from_zaps(
+                &[registration("ZPL_PROJID", 47, length, swap)],
+                &[layout(3, &malformed)],
+            )
+            .unwrap();
+            let bytes = packed(3, &malformed, &[], order);
+            assert!(registry.decode(&bytes, None).unwrap().project_id().is_err());
+        }
+    }
+}
+
 #[test]
 fn invalid_registrations_layouts_and_ambiguous_catalogs_are_refused() {
     for entries in [
@@ -425,6 +580,41 @@ fn dxattr_values_reject_wrong_native_types_duplicates_tails_and_bounds() {
 }
 
 #[test]
+fn external_acl_ownership_obeys_sa_order_and_native_object_bounds() {
+    let empty = SaRegistry::from_zaps(&[], &[]).unwrap();
+    assert_eq!(
+        empty
+            .decode(&[], None)
+            .unwrap()
+            .external_acl_object()
+            .unwrap(),
+        0
+    );
+    for order in [Endian::Little, Endian::Big] {
+        for object in [0, 42, OBJECT_LIMIT - 1, OBJECT_LIMIT] {
+            let mut acl = vec![0_u8; 88];
+            acl[..8].copy_from_slice(&order.encode(object));
+            let attributes = [(15, acl)];
+            let registry = SaRegistry::from_zaps(&[], &[layout(2, &attributes)]).unwrap();
+            let bytes = packed(2, &attributes, &[], order);
+            for spill in [false, true] {
+                let decoded = if spill {
+                    registry.decode(&[], Some(&bytes))
+                } else {
+                    registry.decode(&bytes, None)
+                }
+                .unwrap();
+                if object == OBJECT_LIMIT {
+                    assert!(decoded.external_acl_object().is_err());
+                } else {
+                    assert_eq!(decoded.external_acl_object().unwrap(), object);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve_extras() {
     for order in [Endian::Little, Endian::Big] {
         let dir_ref = encode_directory_reference(42, Kind::Directory).unwrap();
@@ -483,6 +673,7 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
         assert!(spill.is_none());
         let decoded_parent = registry.decode(&reencoded_parent, None).unwrap();
         assert_eq!(decoded_parent.metadata().unwrap(), updated_parent_meta);
+        assert_eq!(decoded_parent.project_id().unwrap(), 99);
         assert_eq!(
             decoded_parent
                 .xattrs()
@@ -506,5 +697,6 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
         let decoded_child = registry.decode(&child_bonus, None).unwrap();
         assert_eq!(decoded_child.metadata().unwrap(), child_meta);
         assert!(decoded_child.xattrs().unwrap().inline.is_empty());
+        assert_eq!(decoded_child.project_id().unwrap(), 0);
     }
 }

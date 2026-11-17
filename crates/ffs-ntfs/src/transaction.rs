@@ -26,9 +26,9 @@ use ffs_block::ByteDevice;
 use ffs_block::io_engine::{VolumeAccess, VolumeDevice};
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::ntfs::logfile_writer::{
-    LFS_RECORD_CLIENT, LFS_RECORD_CLIENT_RESTART, NtfsCheckpointPayload, NtfsClientUpdateSpec,
-    NtfsLogRingWriter, StagedLogPage, encode_attribute_names_dump, encode_client_update_payload,
-    encode_open_attribute_entry, encode_restart_table,
+    AppendedLogRecord, LFS_RECORD_CLIENT, LFS_RECORD_CLIENT_RESTART, NtfsCheckpointPayload,
+    NtfsClientUpdateSpec, NtfsLogRingWriter, encode_attribute_names_dump,
+    encode_client_update_payload, encode_open_attribute_entry, encode_restart_table,
 };
 use ffs_ondisk::ntfs::{
     ATTRIBUTE_LIST, COMPRESSED, DATA, ENCRYPTED, NtfsFileRecord, NtfsGeometry, NtfsLogOp,
@@ -224,6 +224,8 @@ pub enum NtfsPersistenceStage {
     DirtyRestartWrite,
     DirtyRestartBarrier,
     LogRecordWrite,
+    /// A complete predecessor page is durable before publishing its successor.
+    LogPrefixBarrier,
     LogCommitBarrier,
     TargetMetadataWrite,
     TargetMetadataBarrier,
@@ -245,6 +247,18 @@ pub struct NtfsPersistenceEvent {
     pub lsn: u64,
     pub offset: u64,
     pub bytes: usize,
+}
+
+/// Coalesce successive images of the active page without sorting physical ring
+/// offsets: after wrap, a smaller VBO contains a later part of the log.
+pub(super) fn stage_log_page(pages: &mut Vec<AppendedLogRecord>, record: AppendedLogRecord) {
+    if let Some(last) = pages.last_mut()
+        && last.page_vbo == record.page_vbo
+    {
+        *last = record;
+    } else {
+        pages.push(record);
+    }
 }
 
 /// Summary of inspected `$LogFile` state during admission.
@@ -1349,6 +1363,41 @@ impl NtfsTransactionEngine {
         self.record_event_checked(operation, stage, transaction_id, lsn, vbo, page.len())
     }
 
+    /// Publish complete RCRD pages in append order. A later page must never
+    /// survive without the earlier page containing its transaction predecessor,
+    /// including while writes are pending before the final commit barrier.
+    pub(super) fn write_ordered_log_pages(
+        &mut self,
+        cx: &Cx,
+        operation: &str,
+        write_stage: NtfsPersistenceStage,
+        prefix_stage: NtfsPersistenceStage,
+        transaction_id: u32,
+        pages: &[AppendedLogRecord],
+    ) -> Result<()> {
+        for (index, page) in pages.iter().enumerate() {
+            if index != 0 {
+                self.barrier(
+                    cx,
+                    operation,
+                    prefix_stage,
+                    transaction_id,
+                    pages[index - 1].lsn,
+                )?;
+            }
+            self.write_logfile_page(
+                cx,
+                operation,
+                write_stage,
+                transaction_id,
+                page.lsn,
+                page.page_vbo,
+                &page.protected_page,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn read_mft_record_zero(&self, cx: &Cx) -> Result<NtfsFileRecord> {
         let mft0_off = self
             .geometry
@@ -1461,7 +1510,7 @@ impl NtfsTransactionEngine {
                 .ring
                 .as_mut()
                 .ok_or_else(|| corrupt(0, "missing initialized $LogFile ring"))?;
-            let mut pages: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+            let mut pages = Vec::new();
             let mut open_table_lsn = 0_u64;
             let mut attr_table_bytes = 0_u32;
             let mut names_lsn = 0_u64;
@@ -1508,7 +1557,7 @@ impl NtfsTransactionEngine {
                 start_lsn = rec.lsn;
                 open_table_lsn = rec.lsn;
                 attr_table_bytes = attr_dump_len;
-                pages.insert(rec.page_vbo, rec.protected_page);
+                stage_log_page(&mut pages, rec);
 
                 if !attr_names.is_empty() {
                     let names_dump =
@@ -1540,7 +1589,7 @@ impl NtfsTransactionEngine {
                         .map_err(|err| map_ring_err(&err))?;
                     names_lsn = nrec.lsn;
                     attr_names_bytes = names_dump_len;
-                    pages.insert(nrec.page_vbo, nrec.protected_page);
+                    stage_log_page(&mut pages, nrec);
                 }
 
                 // Close the ephemeral dump transaction slot cleanly with ForgetTransaction.
@@ -1565,7 +1614,7 @@ impl NtfsTransactionEngine {
                 let frec = ring
                     .append_raw_record(LFS_RECORD_CLIENT, dump_tx, prev, 0, &forget_payload)
                     .map_err(|err| map_ring_err(&err))?;
-                pages.insert(frec.page_vbo, frec.protected_page);
+                stage_log_page(&mut pages, frec);
             }
 
             let ckpt_bytes = NtfsCheckpointPayload {
@@ -1584,13 +1633,10 @@ impl NtfsTransactionEngine {
             let ckpt_rec = ring
                 .append_raw_record(LFS_RECORD_CLIENT_RESTART, 0, 0, 0, &ckpt_bytes)
                 .map_err(|err| map_ring_err(&err))?;
-            pages.insert(ckpt_rec.page_vbo, ckpt_rec.protected_page);
+            let ckpt_lsn = ckpt_rec.lsn;
+            stage_log_page(&mut pages, ckpt_rec);
 
-            let new_oldest = if start_lsn != 0 {
-                start_lsn
-            } else {
-                ckpt_rec.lsn
-            };
+            let new_oldest = if start_lsn != 0 { start_lsn } else { ckpt_lsn };
             // Update open_attrs opened_lsn <= new_oldest so checkpoint seed stays valid.
             for info in self.open_attrs.values_mut() {
                 if info.opened_lsn == 0 || info.opened_lsn > new_oldest {
@@ -1606,24 +1652,17 @@ impl NtfsTransactionEngine {
             let rstr_b = ring
                 .build_next_rstr_page(true)
                 .map_err(|err| parse_err(&err))?;
-            let staged_vec: Vec<StagedLogPage> = pages
-                .into_iter()
-                .map(|(page_vbo, bytes)| StagedLogPage { page_vbo, bytes })
-                .collect();
-            (staged_vec, ckpt_rec.lsn, rstr_a, rstr_b)
+            (pages, ckpt_lsn, rstr_a, rstr_b)
         };
 
-        for page in &pages_to_write {
-            self.write_logfile_page(
-                cx,
-                operation,
-                NtfsPersistenceStage::CheckpointWrite,
-                tx_id,
-                ckpt_lsn,
-                page.page_vbo,
-                &page.bytes,
-            )?;
-        }
+        self.write_ordered_log_pages(
+            cx,
+            operation,
+            NtfsPersistenceStage::CheckpointWrite,
+            NtfsPersistenceStage::LogPrefixBarrier,
+            tx_id,
+            &pages_to_write,
+        )?;
         self.barrier(
             cx,
             operation,

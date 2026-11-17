@@ -318,11 +318,86 @@ impl FrankenFuse {
     #[doc(hidden)]
     pub fn open_for_fuzzing(&self, ino: u64, flags: i32) -> std::result::Result<(u64, u32), c_int> {
         let cx = Self::cx_for_request();
-        self.with_request_scope(&cx, RequestOp::Open, |cx, scope| {
-            self.inner.ops.open(cx, scope, InodeNumber(ino), flags)
-        })
-        .map(|(fh, open_flags)| (fh, Self::kernel_open_flags(flags, open_flags)))
-        .map_err(|error| error.to_errno())
+        self.dispatch_open(&cx, InodeNumber(ino), flags)
+            .map(|(fh, open_flags)| (fh, Self::kernel_open_flags(flags, open_flags)))
+            .map_err(|error| error.to_errno())
+    }
+
+    fn open_impl(&self, ino: u64, flags: i32, reply: ReplyOpen) {
+        // Negotiation alone does not stop OPEN: the kernel also needs one
+        // ENOSYS reply. Stateful backends must bypass neither lifecycle hook.
+        if self.zero_message_open_enabled() {
+            reply.error(libc::ENOSYS);
+            return;
+        }
+        self.inner.metrics.record_metadata_request();
+        let cx = Self::cx_for_request();
+        match self.dispatch_open(&cx, InodeNumber(ino), flags) {
+            Ok((fh, open_flags)) => {
+                let mut kernel_flags = Self::kernel_open_flags(flags, open_flags);
+                if self.every_open_drops_page_cache() {
+                    kernel_flags &= !fuse_consts::FOPEN_KEEP_CACHE;
+                }
+                reply.opened(fh, kernel_flags);
+            }
+            Err(error) => {
+                reply.error(
+                    FuseErrorContext {
+                        error: &error,
+                        operation: "open",
+                        ino,
+                        offset: None,
+                    }
+                    .log_and_errno(),
+                );
+            }
+        }
+    }
+
+    fn dispatch_open(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        flags: i32,
+    ) -> ffs_error::Result<(u64, u32)> {
+        let mut opened = None;
+        let result = self.with_request_scope(cx, RequestOp::Open, |cx, scope| {
+            let reply = self.inner.ops.open(cx, scope, ino, flags)?;
+            opened = Some(reply.0);
+            Ok(reply)
+        });
+        if result.is_err()
+            && let Some(fh) = opened
+        {
+            self.release_failed_open(ino, fh, flags);
+        }
+        result
+    }
+
+    fn release_failed_open(&self, ino: InodeNumber, fh: u64, flags: i32) {
+        if !self.inner.ops.requires_stateful_open() {
+            return;
+        }
+        // A failed commit/scope must not strand a handle the kernel never
+        // received. Cleanup has its own context, independent of cancellation
+        // of the original request, and does not undo a durable CREATE.
+        let cx = Self::cx_for_request();
+        let result = self.with_request_scope(&cx, RequestOp::Release, |cx, scope| {
+            self.inner.ops.release(
+                cx,
+                scope,
+                ReleaseRequest {
+                    ino,
+                    fh,
+                    flags,
+                    lock_owner: None,
+                    flush: false,
+                },
+            )
+        });
+        if let Err(error) = result {
+            warn!(ino = ino.0, fh, %error, "failed to release undelivered file handle");
+        }
     }
 
     /// Execute read without a live kernel mount.
@@ -571,6 +646,96 @@ impl FrankenFuse {
             Ok(attr)
         })
         .map_err(|error| error.to_errno())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+    fn create_impl(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        uid: u32,
+        gid: u32,
+        reply: ReplyCreate,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        let mode = self.create_mode(&cx, parent, mode, umask);
+        if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Create) {
+            warn!(parent, "backpressure: shedding create");
+            reply.error(errno);
+            return;
+        }
+        // Keep namespace publication and its reply ordered with other mutations
+        // of this parent; a stateful backend publishes the open pin atomically.
+        let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
+        match self.dispatch_create_open(
+            &cx,
+            InodeNumber(parent),
+            name,
+            mode as u16,
+            uid,
+            gid,
+            flags,
+        ) {
+            Ok((attr, fh, open_flags)) => {
+                self.inner.lookup_refcounts.retain(attr.ino.0);
+                reply.created(
+                    &ATTR_TTL,
+                    &to_file_attr(&attr),
+                    attr.generation,
+                    fh,
+                    open_flags,
+                );
+                self.notify_created_entry_invalidation(parent, name);
+                self.notify_parent_invalidation(parent);
+            }
+            Err(error) => {
+                Self::reply_error_create(
+                    &FuseErrorContext {
+                        error: &error,
+                        operation: "create",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_create_open(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    ) -> ffs_error::Result<(InodeAttr, u64, u32)> {
+        let mut opened = None;
+        let result = self.with_request_scope(cx, RequestOp::Create, |cx, scope| {
+            let reply = self
+                .inner
+                .ops
+                .create_open(cx, scope, parent, name, mode, uid, gid, flags)?;
+            opened = Some((reply.0.ino, reply.1));
+            self.inner.ops.commit_request_scope(cx, scope)?;
+            Ok(reply)
+        });
+        if result.is_err()
+            && let Some((ino, fh)) = opened
+        {
+            self.release_failed_open(ino, fh, flags);
+        }
+        result
     }
 
     /// Execute setattr without a live kernel mount.
