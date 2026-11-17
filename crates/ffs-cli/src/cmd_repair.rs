@@ -4239,6 +4239,7 @@ mod coordination_tests {
                 blocks_per_group: count,
                 validation_block_count: 0,
                 repair_block_count: 0,
+                validation_start_override: None,
             },
         };
         let report = ScrubReport {

@@ -83,6 +83,7 @@ pub fn preset_event_types(preset: &str) -> Option<&'static [EvidenceEventType]> 
             EvidenceEventType::SymbolRefresh,
             EvidenceEventType::ScrubCycleComplete,
             EvidenceEventType::PolicyDecision,
+            EvidenceEventType::AnytimeScrubMonitor,
         ]),
         _ => None,
     }
@@ -1276,6 +1277,7 @@ pub const fn evidence_event_type_name(event_type: EvidenceEventType) -> &'static
         EvidenceEventType::MergeRejected => "merge_rejected",
         EvidenceEventType::PolicySwitched => "policy_switched",
         EvidenceEventType::ContentionSample => "contention_sample",
+        EvidenceEventType::AnytimeScrubMonitor => "anytime_scrub_monitor",
     }
 }
 
@@ -1334,6 +1336,18 @@ fn print_evidence_record_event_payload(record: &EvidenceRecord) {
         EvidenceEventType::MergeRejected => print_merge_rejected_payload(record),
         EvidenceEventType::PolicySwitched => print_policy_switched_payload(record),
         EvidenceEventType::ContentionSample => print_contention_sample_payload(record),
+        EvidenceEventType::AnytimeScrubMonitor => {
+            if let Some(m) = record.anytime_scrub_monitor.as_ref() {
+                print!(
+                    " e={:.3} threshold={:.1} rejected={} div={} bps={}",
+                    m.e_value,
+                    m.threshold,
+                    m.null_rejected,
+                    m.recommended_interval_divisor,
+                    m.recommended_overhead_bps
+                );
+            }
+        }
     }
 }
 
@@ -1939,6 +1953,7 @@ mod tests {
             corruption: None,
             repair: None,
             scrub_cycle: None,
+            anytime_scrub_monitor: None,
             policy: None,
             symbol_refresh: None,
             wal_recovery: None,

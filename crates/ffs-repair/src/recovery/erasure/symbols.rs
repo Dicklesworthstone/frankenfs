@@ -89,10 +89,8 @@ fn committed_descriptor(
         .0
         .checked_add(u64::from(desc.repair_block_count))
         .ok_or_else(|| invalid("repair symbol range overflows"))?;
-    if desc.repair_start_block.0 < layout.group_start.0
-        || end > slots[0].0
-        || end > device.block_count()
-    {
+    let (storage_min, _) = layout.storage_bounds();
+    if desc.repair_start_block.0 < storage_min || end > slots[0].0 || end > device.block_count() {
         return Err(invalid(
             "repair symbols exceed the declared device geometry",
         ));

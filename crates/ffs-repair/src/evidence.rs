@@ -97,6 +97,8 @@ pub enum EvidenceEventType {
     PolicySwitched,
     /// Periodic contention metrics sample.
     ContentionSample,
+    /// Ville/Wald anytime-valid e-process scrub monitor observation.
+    AnytimeScrubMonitor,
 }
 
 // ── Detail structs ──────────────────────────────────────────────────────────
@@ -145,6 +147,37 @@ pub struct ScrubCycleDetail {
     pub blocks_io_error: u64,
     /// Total number of individual findings.
     pub findings_count: usize,
+}
+
+/// Detail payload for Ville/Wald anytime-valid scrub monitor events (`bd-11a8t`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnytimeScrubMonitorDetail {
+    /// Healthy-media null corruption rate bound `p_0`.
+    pub p0: f64,
+    /// Betting fraction `lambda` (`0 < lambda < 1 / p_0`).
+    pub lambda: f64,
+    /// Type-I error tolerance `alpha` (`reject H_0` iff `e_value >= 1 / alpha`).
+    pub alpha: f64,
+    /// Rejection threshold `1 / alpha`.
+    pub threshold: f64,
+    /// Natural-log wealth `ln(E_t)` after incorporating this scrub batch.
+    pub log_e_value: f64,
+    /// Current Ville/Wald wealth `E_t = exp(log_e_value)`.
+    pub e_value: f64,
+    /// Blocks scanned in this batch.
+    pub blocks_scanned: u64,
+    /// Corrupt blocks observed in this batch.
+    pub blocks_corrupt: u64,
+    /// Cumulative blocks observed across batches for this group.
+    pub cumulative_blocks: u64,
+    /// Cumulative corrupt blocks observed across batches for this group.
+    pub cumulative_corrupt: u64,
+    /// Sticky indicator that `E_t` has crossed `1 / alpha` at some stopping time `<= t`.
+    pub null_rejected: bool,
+    /// Recommended scrub sleep-interval divisor (`1`, `2`, or `4`).
+    pub recommended_interval_divisor: u32,
+    /// Recommended repair parity overhead in basis points (`500`, `750`, or `1000`).
+    pub recommended_overhead_bps: u32,
 }
 
 /// Detail payload for Bayesian autopilot policy decisions.
@@ -512,6 +545,9 @@ pub struct EvidenceRecord {
     /// Contention-sample detail (present when `event_type` is `ContentionSample`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contention_sample: Option<ContentionSampleDetail>,
+    /// Anytime-valid Ville/Wald scrub monitor detail (present when `event_type` is `AnytimeScrubMonitor`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anytime_scrub_monitor: Option<AnytimeScrubMonitorDetail>,
 }
 
 impl EvidenceRecord {
@@ -542,6 +578,7 @@ impl EvidenceRecord {
             merge_rejected: None,
             policy_switched: None,
             contention_sample: None,
+            anytime_scrub_monitor: None,
         }
     }
 
@@ -726,6 +763,14 @@ impl EvidenceRecord {
     pub fn contention_sample(detail: ContentionSampleDetail) -> Self {
         let mut r = Self::base(EvidenceEventType::ContentionSample, 0);
         r.contention_sample = Some(detail);
+        r
+    }
+
+    /// Create a Ville/Wald anytime-valid scrub monitor evidence record.
+    #[must_use]
+    pub fn anytime_scrub_monitor(block_group: u32, detail: AnytimeScrubMonitorDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::AnytimeScrubMonitor, block_group);
+        r.anytime_scrub_monitor = Some(detail);
         r
     }
 
@@ -1457,6 +1502,7 @@ mod tests {
         assert!(!json.contains("\"dirty_block_discarded\""));
         assert!(!json.contains("\"durability_policy_changed\""));
         assert!(!json.contains("\"refresh_policy_changed\""));
+        assert!(!json.contains("\"anytime_scrub_monitor\""));
     }
 
     #[test]
@@ -1526,6 +1572,7 @@ mod tests {
             MergeRejected,
             PolicySwitched,
             ContentionSample,
+            AnytimeScrubMonitor,
         ];
         for variant in variants {
             let json = serde_json::to_string(&variant).expect("serialize");

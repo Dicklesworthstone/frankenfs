@@ -36,7 +36,7 @@ use crate::recovery::{
     DecodedViewValidatorFactory, DirectDeviceRecoveryWriteback, GroupRecoveryOrchestrator,
     RecoveryAttemptResult, RecoveryDecoderStats, RecoveryOutcome, RecoveryWriteback,
 };
-use crate::scrub::{BlockValidator, ScrubReport, Scrubber, Severity};
+use crate::scrub::{BlockValidator, ScrubReport, Scrubber, Severity, VilleWaldScrubMonitor};
 use crate::storage::{RepairGroupLayout, RepairGroupStorage};
 
 // ── Per-group configuration ───────────────────────────────────────────────
@@ -843,6 +843,8 @@ pub struct ScrubWithRecovery<'a, W: Write> {
     policy_decisions: BTreeMap<u32, OverheadDecision>,
     /// Per-group refresh protocol state (dirty tracking + policy).
     refresh_states: BTreeMap<u32, GroupRefreshState>,
+    /// Per-group Ville/Wald anytime-valid scrub monitors (`bd-11a8t`).
+    scrub_monitors: BTreeMap<u32, VilleWaldScrubMonitor>,
     /// Runtime metrics for scrub/decode/refresh activity.
     runtime_metrics: RepairRuntimeMetrics,
     /// Optional thread-safe atomic metrics for concurrent external observation.
@@ -895,6 +897,11 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             })
             .collect();
 
+        let scrub_monitors = groups
+            .iter()
+            .map(|group_cfg| (group_cfg.layout.group.0, VilleWaldScrubMonitor::default()))
+            .collect();
+
         Self {
             device,
             validator,
@@ -907,6 +914,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             metadata_groups,
             policy_decisions: BTreeMap::new(),
             refresh_states,
+            scrub_monitors,
             runtime_metrics: RepairRuntimeMetrics::default(),
             atomic_metrics: None,
             recovery_writeback: Arc::new(DirectDeviceRecoveryWriteback),
@@ -1248,6 +1256,21 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         self.sync_atomic_staleness_gauge();
 
         if report.is_clean() {
+            for group_cfg in &self.groups {
+                let gid = group_cfg.layout.group.0;
+                let detail = self
+                    .scrub_monitors
+                    .entry(gid)
+                    .or_default()
+                    .observe_counts(u64::from(group_cfg.source_block_count), 0);
+                self.ledger
+                    .append(&EvidenceRecord::anytime_scrub_monitor(gid, detail))
+                    .map_err(|e| {
+                        FfsError::RepairFailed(format!(
+                            "failed to write anytime scrub monitor evidence: {e}"
+                        ))
+                    })?;
+            }
             info!("scrub_and_recover: no corruption found");
             return Ok(RecoveryReport {
                 blocks_scanned: report.blocks_scanned,
@@ -1291,6 +1314,26 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
                 self.observe_corrupt_group(group_cfg.layout.group, corrupt_blocks)?
             };
             group_summaries.push(summary);
+        }
+
+        for group_cfg in &self.groups {
+            let gid = group_cfg.layout.group.0;
+            let group_corrupt_cnt = grouped_corrupt
+                .iter()
+                .find(|(cfg, _)| cfg.layout.group.0 == gid)
+                .map_or(0_u64, |(_, blocks)| blocks.len() as u64);
+            let detail = self
+                .scrub_monitors
+                .entry(gid)
+                .or_default()
+                .observe_counts(u64::from(group_cfg.source_block_count), group_corrupt_cnt);
+            self.ledger
+                .append(&EvidenceRecord::anytime_scrub_monitor(gid, detail))
+                .map_err(|e| {
+                    FfsError::RepairFailed(format!(
+                        "failed to write anytime scrub monitor evidence: {e}"
+                    ))
+                })?;
         }
 
         Ok(RecoveryReport {
@@ -1357,6 +1400,21 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         self.ledger.append(&scrub_record).map_err(|e| {
             FfsError::RepairFailed(format!("failed to write scrub-cycle evidence: {e}"))
         })?;
+        let monitor_detail = self
+            .scrub_monitors
+            .entry(group.0)
+            .or_default()
+            .observe_report(&report);
+        self.ledger
+            .append(&EvidenceRecord::anytime_scrub_monitor(
+                group.0,
+                monitor_detail,
+            ))
+            .map_err(|e| {
+                FfsError::RepairFailed(format!(
+                    "failed to write anytime scrub monitor evidence: {e}"
+                ))
+            })?;
 
         self.update_adaptive_policy(&report)?;
         let corrupt_blocks = Self::corrupt_blocks_from_report(&report);
@@ -1747,13 +1805,42 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         Ok(())
     }
 
+    /// Highest Ville/Wald recommended scrub sleep-interval divisor (`1`, `2`, or `4`)
+    /// across all monitored groups.
+    #[must_use]
+    pub fn max_recommended_interval_divisor(&self) -> u32 {
+        self.scrub_monitors
+            .values()
+            .map(VilleWaldScrubMonitor::recommended_interval_divisor)
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+
     #[must_use]
     fn selected_refresh_symbol_count(&self, group_cfg: &GroupConfig) -> u32 {
-        self.policy_decisions
+        let base = self
+            .policy_decisions
             .get(&group_cfg.layout.group.0)
             .map_or(self.repair_symbol_count, |decision| {
                 decision.symbols_selected
-            })
+            });
+        if base == 0 {
+            return 0;
+        }
+        let Some(monitor) = self.scrub_monitors.get(&group_cfg.layout.group.0) else {
+            return base;
+        };
+        let bps = monitor.recommended_overhead_bps();
+        if bps <= 500 {
+            return base;
+        }
+        let escalated = u32::try_from(
+            (u64::from(group_cfg.source_block_count) * u64::from(bps)).div_ceil(10_000),
+        )
+        .unwrap_or(u32::MAX)
+        .min(group_cfg.layout.repair_block_count);
+        base.max(escalated)
     }
 
     fn log_repair_attempt(
@@ -2485,7 +2572,9 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
             }
 
             let tick_elapsed = tick_started.elapsed();
-            let idle = self.config.interval.saturating_sub(tick_elapsed);
+            let divisor = self.pipeline.max_recommended_interval_divisor();
+            let effective_interval = self.config.interval / divisor;
+            let idle = effective_interval.saturating_sub(tick_elapsed);
             if let Err(err) = self.sleep_with_checkpoint(cx, idle) {
                 if matches!(err, FfsError::Cancelled) {
                     info!(
@@ -8355,5 +8444,96 @@ mod tests {
                 "block {i} not restored"
             );
         }
+    }
+
+    #[test]
+    fn pipeline_emits_ville_wald_anytime_scrub_monitor_and_escalates_cadence() {
+        struct MarkerByteValidator(u32);
+        impl BlockValidator for MarkerByteValidator {
+            fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
+                if block.0 < u64::from(self.0) && data.as_slice().first() == Some(&0xCC) {
+                    BlockVerdict::Corrupt(vec![(
+                        CorruptionKind::ChecksumMismatch,
+                        Severity::Error,
+                        "planted 0xCC corruption".to_owned(),
+                    )])
+                } else {
+                    BlockVerdict::Clean
+                }
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let block_size = 256_u32;
+        let source_count = 20_u32;
+        let repair_blocks = 4_u32;
+        let total_blocks = source_count + repair_blocks + 2;
+        let device = MemBlockDevice::new(block_size, u64::from(total_blocks));
+        let layout = RepairGroupLayout::new(
+            GroupNumber(0),
+            BlockNumber(0),
+            total_blocks,
+            0,
+            repair_blocks,
+        )
+        .expect("layout");
+        write_source_blocks(&cx, &device, BlockNumber(0), source_count);
+        bootstrap_storage(&cx, &device, layout, BlockNumber(0), source_count, 1);
+
+        let validator = MarkerByteValidator(source_count);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: BlockNumber(0),
+            source_block_count: source_count,
+        };
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            Vec::new(),
+            1,
+        );
+
+        // Clean pass: interval divisor = 1, base refresh symbols = 1.
+        let clean_report = pipeline.scrub_and_recover(&cx).expect("clean scrub");
+        assert_eq!(clean_report.total_corrupt, 0);
+        assert_eq!(pipeline.max_recommended_interval_divisor(), 1);
+        assert_eq!(pipeline.selected_refresh_symbol_count(&group_cfg), 1);
+
+        // Inject 2 corrupt blocks across two scrub passes (1 per pass so 1-symbol parity heals each),
+        // pushing Ville/Wald E_t >= 1000 and rejecting H_0!
+        device
+            .write_block(&cx, BlockNumber(2), &vec![0xCC; block_size as usize])
+            .expect("inject corruption block 2");
+        let r1 = pipeline.scrub_and_recover(&cx).expect("pass 1 recover");
+        assert_eq!(r1.total_recovered, 1);
+        assert_eq!(pipeline.max_recommended_interval_divisor(), 2);
+
+        device
+            .write_block(&cx, BlockNumber(5), &vec![0xCC; block_size as usize])
+            .expect("inject corruption block 5");
+        let r2 = pipeline.scrub_and_recover(&cx).expect("pass 2 recover");
+        assert_eq!(r2.total_recovered, 1);
+        assert_eq!(pipeline.max_recommended_interval_divisor(), 4);
+        assert_eq!(
+            pipeline.selected_refresh_symbol_count(&group_cfg),
+            2,
+            "1000 bps on 20 blocks escalates refresh symbol count from 1 to 2"
+        );
+
+        let records = crate::evidence::parse_evidence_ledger(&pipeline.into_ledger());
+        let monitor_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::AnytimeScrubMonitor)
+            .collect();
+        assert_eq!(monitor_records.len(), 3);
+        let last = monitor_records[2]
+            .anytime_scrub_monitor
+            .as_ref()
+            .expect("detail");
+        assert!(last.null_rejected);
+        assert_eq!(last.recommended_interval_divisor, 4);
+        assert_eq!(last.recommended_overhead_bps, 1000);
     }
 }

@@ -2468,6 +2468,202 @@ impl BlockValidator for BtrfsScrubValidator {
     }
 }
 
+// ── Anytime-valid Ville/Wald scrub monitor (`bd-11a8t`) ─────────────────────
+
+/// Configuration for a per-group Ville/Wald sequential e-process testing the
+/// healthy-media null hypothesis `H_0: p <= p_0` via
+/// `E_t = prod_{i=1}^t (1 + lambda * (X_i - p_0))`, rejecting `H_0` iff
+/// `E_t >= 1 / alpha`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VilleWaldConfig {
+    /// Null upper bound on per-block corruption probability `p_0 in (0, 1)`.
+    pub p0: f64,
+    /// Betting multiplier `lambda in (0, 1 / p_0)`.
+    pub lambda: f64,
+    /// Anytime Type-I false-alarm bound `alpha in (0, 1)`.
+    pub alpha: f64,
+}
+
+impl Default for VilleWaldConfig {
+    fn default() -> Self {
+        // With p0 = 1e-6, lambda = 50.0 (lambda * p0 = 5e-5 << 1), alpha = 1e-3
+        // (threshold = 1000.0):
+        // - Under p <= p0, E_p[1 + lambda * (X - p0)] <= 1 (exact Ville supermartingale).
+        // - One corrupt block enters the warning band (>= sqrt(1000)) and two corrupt
+        //   blocks yield ~2601 >= 1000, rejecting H_0, while a clean 32,768-block scan
+        //   drifts gently by ~-1.64 nats without upward clamping.
+        Self {
+            p0: 1e-6,
+            lambda: 50.0,
+            alpha: 1e-3,
+        }
+    }
+}
+
+impl VilleWaldConfig {
+    /// Validate that `(p0, lambda, alpha)` defines a non-negative Ville supermartingale.
+    pub fn validate(self) -> Result<()> {
+        if !self.p0.is_finite() || self.p0 <= 0.0 || self.p0 >= 1.0 {
+            return Err(FfsError::InvalidGeometry(format!(
+                "VilleWaldConfig.p0 ({}) must be finite in (0, 1)",
+                self.p0
+            )));
+        }
+        let max_lambda = 1.0 / self.p0;
+        if !self.lambda.is_finite() || self.lambda <= 0.0 || self.lambda >= max_lambda {
+            return Err(FfsError::InvalidGeometry(format!(
+                "VilleWaldConfig.lambda ({}) must be finite in (0, 1/p0 = {max_lambda})",
+                self.lambda
+            )));
+        }
+        if !self.alpha.is_finite() || self.alpha <= 0.0 || self.alpha >= 1.0 {
+            return Err(FfsError::InvalidGeometry(format!(
+                "VilleWaldConfig.alpha ({}) must be finite in (0, 1)",
+                self.alpha
+            )));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn threshold(self) -> f64 {
+        1.0 / self.alpha
+    }
+}
+
+/// Per-group anytime-valid Ville/Wald e-process monitor (`bd-11a8t`).
+#[derive(Debug, Clone)]
+pub struct VilleWaldScrubMonitor {
+    config: VilleWaldConfig,
+    log_e_value: f64,
+    cumulative_blocks: u64,
+    cumulative_corrupt: u64,
+    null_rejected: bool,
+}
+
+impl Default for VilleWaldScrubMonitor {
+    fn default() -> Self {
+        Self::with_default_config()
+    }
+}
+
+impl VilleWaldScrubMonitor {
+    /// Construct a monitor with validated configuration.
+    pub fn new(config: VilleWaldConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            log_e_value: 0.0,
+            cumulative_blocks: 0,
+            cumulative_corrupt: 0,
+            null_rejected: false,
+        })
+    }
+
+    /// Construct a monitor with [`VilleWaldConfig::default()`].
+    #[must_use]
+    pub fn with_default_config() -> Self {
+        Self {
+            config: VilleWaldConfig::default(),
+            log_e_value: 0.0,
+            cumulative_blocks: 0,
+            cumulative_corrupt: 0,
+            null_rejected: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> VilleWaldConfig {
+        self.config
+    }
+
+    #[must_use]
+    pub const fn log_e_value(&self) -> f64 {
+        self.log_e_value
+    }
+
+    #[must_use]
+    pub fn e_value(&self) -> f64 {
+        self.log_e_value.exp().min(f64::MAX)
+    }
+
+    #[must_use]
+    pub const fn null_rejected(&self) -> bool {
+        self.null_rejected
+    }
+
+    #[must_use]
+    pub fn recommended_interval_divisor(&self) -> u32 {
+        let threshold = self.config.threshold();
+        let e_val = self.e_value();
+        if self.null_rejected || e_val >= threshold {
+            4
+        } else if e_val >= threshold.sqrt() {
+            2
+        } else {
+            1
+        }
+    }
+
+    #[must_use]
+    pub fn recommended_overhead_bps(&self) -> u32 {
+        let threshold = self.config.threshold();
+        let e_val = self.e_value();
+        if self.null_rejected || e_val >= threshold {
+            1000
+        } else if e_val >= threshold.sqrt() {
+            750
+        } else {
+            500
+        }
+    }
+
+    /// Observe `blocks_scanned` block outcomes (`blocks_corrupt` with `X_i = 1`,
+    /// the remainder with `X_i = 0`) in `O(1)` log-space without upward clamping,
+    /// preserving Ville's inequality `sup_{p <= p_0} P_p(exists t: E_t >= 1/alpha) <= alpha`.
+    pub fn observe_counts(
+        &mut self,
+        blocks_scanned: u64,
+        blocks_corrupt: u64,
+    ) -> crate::evidence::AnytimeScrubMonitorDetail {
+        let corrupt = blocks_corrupt.min(blocks_scanned);
+        let clean = blocks_scanned - corrupt;
+        let hit_step = (self.config.lambda * (1.0 - self.config.p0)).ln_1p();
+        let clean_step = (-self.config.lambda * self.config.p0).ln_1p();
+        self.log_e_value += (clean as f64).mul_add(clean_step, (corrupt as f64) * hit_step);
+        self.cumulative_blocks = self.cumulative_blocks.saturating_add(blocks_scanned);
+        self.cumulative_corrupt = self.cumulative_corrupt.saturating_add(corrupt);
+        let threshold = self.config.threshold();
+        let e_value = self.e_value();
+        if e_value >= threshold {
+            self.null_rejected = true;
+        }
+        crate::evidence::AnytimeScrubMonitorDetail {
+            p0: self.config.p0,
+            lambda: self.config.lambda,
+            alpha: self.config.alpha,
+            threshold,
+            log_e_value: self.log_e_value,
+            e_value,
+            blocks_scanned,
+            blocks_corrupt: corrupt,
+            cumulative_blocks: self.cumulative_blocks,
+            cumulative_corrupt: self.cumulative_corrupt,
+            null_rejected: self.null_rejected,
+            recommended_interval_divisor: self.recommended_interval_divisor(),
+            recommended_overhead_bps: self.recommended_overhead_bps(),
+        }
+    }
+
+    /// Convenience wrapper observing a completed [`ScrubReport`].
+    pub fn observe_report(
+        &mut self,
+        report: &ScrubReport,
+    ) -> crate::evidence::AnytimeScrubMonitorDetail {
+        self.observe_counts(report.blocks_scanned, report.blocks_corrupt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4664,5 +4860,51 @@ mod tests {
             inactive_owned[0],
             (20, Ext4OwnedBlock::Jbd2Superblock)
         ));
+    }
+
+    #[test]
+    fn ville_wald_monitor_supermartingale_validity_and_corruption_escalation() {
+        let cfg = VilleWaldConfig::default();
+        cfg.validate().expect("default config valid");
+        // Exact martingale expectation under p = p0: p0*(1 + lambda*(1 - p0)) + (1 - p0)*(1 - lambda*p0) == 1.
+        let hit_factor = cfg.lambda.mul_add(1.0 - cfg.p0, 1.0);
+        let clean_factor = cfg.lambda.mul_add(-cfg.p0, 1.0);
+        let expected_factor = (1.0 - cfg.p0).mul_add(clean_factor, cfg.p0 * hit_factor);
+        assert!((expected_factor - 1.0).abs() < 1e-15);
+
+        let mut monitor = VilleWaldScrubMonitor::new(cfg).expect("monitor");
+        let clean = monitor.observe_counts(1000, 0);
+        assert!(!clean.null_rejected);
+        assert!(
+            clean.log_e_value < 0.0,
+            "clean batch must drift downward without clamping"
+        );
+        assert_eq!(clean.recommended_interval_divisor, 1);
+        assert_eq!(clean.recommended_overhead_bps, 500);
+
+        // Single corrupt block enters warning band (>= sqrt(1000) ~= 31.62) without rejecting H_0.
+        let one_hit = monitor.observe_counts(16, 1);
+        assert!(!one_hit.null_rejected);
+        assert!(one_hit.e_value >= cfg.threshold().sqrt());
+        assert_eq!(one_hit.recommended_interval_divisor, 2);
+        assert_eq!(one_hit.recommended_overhead_bps, 750);
+
+        // Second corrupt block pushes E_t >= 1000, rejecting H_0 and escalating cadence/overhead.
+        let two_hits = monitor.observe_counts(16, 1);
+        assert!(two_hits.null_rejected);
+        assert!(two_hits.e_value >= cfg.threshold());
+        assert_eq!(two_hits.recommended_interval_divisor, 4);
+        assert_eq!(two_hits.recommended_overhead_bps, 1000);
+
+        // Invalid parameters are rejected fail-closed.
+        assert!(VilleWaldScrubMonitor::new(VilleWaldConfig { p0: 0.0, ..cfg }).is_err());
+        assert!(
+            VilleWaldScrubMonitor::new(VilleWaldConfig {
+                lambda: 1.0 / cfg.p0,
+                ..cfg
+            })
+            .is_err()
+        );
+        assert!(VilleWaldScrubMonitor::new(VilleWaldConfig { alpha: 1.0, ..cfg }).is_err());
     }
 }

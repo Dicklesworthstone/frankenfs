@@ -97,6 +97,10 @@ pub struct RepairGroupLayout {
     pub validation_block_count: u32,
     /// Reserved repair symbol blocks.
     pub repair_block_count: u32,
+    /// Optional detached storage base block (`validation | repair | desc_a | desc_b`)
+    /// when parity/digest blocks live outside `[group_start, group_start + blocks_per_group)`
+    /// (for example, allocator-owned btrfs `.frankenfs-repair` `DATA` extents).
+    pub validation_start_override: Option<BlockNumber>,
 }
 
 impl RepairGroupLayout {
@@ -111,42 +115,87 @@ impl RepairGroupLayout {
         validation_block_count: u32,
         repair_block_count: u32,
     ) -> Result<Self> {
-        if blocks_per_group == 0 {
-            return Err(FfsError::InvalidGeometry(
-                "blocks_per_group must be > 0".to_owned(),
-            ));
-        }
-        if repair_block_count == 0 {
-            return Err(FfsError::InvalidGeometry(
-                "repair_block_count must be > 0".to_owned(),
-            ));
-        }
-        group_start
-            .0
-            .checked_add(u64::from(blocks_per_group))
-            .ok_or_else(|| {
-                FfsError::InvalidGeometry(format!(
-                    "group range overflows u64: group_start={} blocks_per_group={blocks_per_group}",
-                    group_start.0
-                ))
-            })?;
-
-        let reserved = u64::from(validation_block_count)
-            + u64::from(repair_block_count)
-            + u64::from(REPAIR_DESC_SLOT_COUNT);
-        if reserved > u64::from(blocks_per_group) {
-            return Err(FfsError::InvalidGeometry(format!(
-                "repair tail does not fit group: reserved={reserved} blocks_per_group={blocks_per_group}"
-            )));
-        }
-
-        Ok(Self {
+        let layout = Self {
             group,
             group_start,
             blocks_per_group,
             validation_block_count,
             repair_block_count,
-        })
+            validation_start_override: None,
+        };
+        layout.validate_self()?;
+        Ok(layout)
+    }
+
+    /// Construct a layout whose validation, repair, and descriptor blocks live in a
+    /// detached contiguous region starting at `detached_validation_start`, disjoint
+    /// from the source window `[group_start, group_start + blocks_per_group)`.
+    pub fn with_detached_storage(
+        group: GroupNumber,
+        group_start: BlockNumber,
+        blocks_per_group: u32,
+        validation_block_count: u32,
+        repair_block_count: u32,
+        detached_validation_start: BlockNumber,
+    ) -> Result<Self> {
+        let layout = Self {
+            group,
+            group_start,
+            blocks_per_group,
+            validation_block_count,
+            repair_block_count,
+            validation_start_override: Some(detached_validation_start),
+        };
+        layout.validate_self()?;
+        Ok(layout)
+    }
+
+    /// Validate internal arithmetic and disjointness invariants of `self`.
+    pub fn validate_self(self) -> Result<()> {
+        if self.blocks_per_group == 0 {
+            return Err(FfsError::InvalidGeometry(
+                "blocks_per_group must be > 0".to_owned(),
+            ));
+        }
+        if self.repair_block_count == 0 {
+            return Err(FfsError::InvalidGeometry(
+                "repair_block_count must be > 0".to_owned(),
+            ));
+        }
+        let group_end = self
+            .group_start
+            .0
+            .checked_add(u64::from(self.blocks_per_group))
+            .ok_or_else(|| {
+                FfsError::InvalidGeometry(format!(
+                    "group range overflows u64: group_start={} blocks_per_group={}",
+                    self.group_start.0, self.blocks_per_group
+                ))
+            })?;
+
+        let reserved = u64::from(self.validation_block_count)
+            + u64::from(self.repair_block_count)
+            + u64::from(REPAIR_DESC_SLOT_COUNT);
+        if let Some(det_start) = self.validation_start_override {
+            let det_end = det_start.0.checked_add(reserved).ok_or_else(|| {
+                FfsError::InvalidGeometry(format!(
+                    "detached repair storage overflows u64: start={} reserved={reserved}",
+                    det_start.0
+                ))
+            })?;
+            if self.group_start.0 < det_end && det_start.0 < group_end {
+                return Err(FfsError::InvalidGeometry(format!(
+                    "detached repair storage [{}, {det_end}) overlaps source group [{}, {group_end})",
+                    det_start.0, self.group_start.0
+                )));
+            }
+        } else if reserved > u64::from(self.blocks_per_group) {
+            return Err(FfsError::InvalidGeometry(format!(
+                "repair tail does not fit group: reserved={reserved} blocks_per_group={}",
+                self.blocks_per_group
+            )));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -156,27 +205,67 @@ impl RepairGroupLayout {
             .saturating_add(u64::from(self.blocks_per_group))
     }
 
+    /// Exclusive end block of the source data region for this group.
+    #[must_use]
+    pub fn source_end_exclusive(self) -> u64 {
+        if self.validation_start_override.is_some() {
+            self.group_end_exclusive()
+        } else {
+            self.validation_start_block().0
+        }
+    }
+
+    /// Inclusive-start / exclusive-end bounds of the storage region holding
+    /// validation, repair, and descriptor blocks.
+    #[must_use]
+    pub fn storage_bounds(self) -> (u64, u64) {
+        self.validation_start_override.map_or_else(
+            || (self.group_start.0, self.group_end_exclusive()),
+            |det_start| {
+                let end = det_start
+                    .0
+                    .saturating_add(u64::from(self.validation_block_count))
+                    .saturating_add(u64::from(self.repair_block_count))
+                    .saturating_add(u64::from(REPAIR_DESC_SLOT_COUNT));
+                (det_start.0, end)
+            },
+        )
+    }
+
     #[must_use]
     pub fn repair_start_block(self) -> BlockNumber {
-        let end = self.group_end_exclusive();
-        BlockNumber(
-            end.saturating_sub(u64::from(REPAIR_DESC_SLOT_COUNT))
-                .saturating_sub(u64::from(self.repair_block_count)),
+        self.validation_start_override.map_or_else(
+            || {
+                let end = self.group_end_exclusive();
+                BlockNumber(
+                    end.saturating_sub(u64::from(REPAIR_DESC_SLOT_COUNT))
+                        .saturating_sub(u64::from(self.repair_block_count)),
+                )
+            },
+            |det_start| {
+                BlockNumber(
+                    det_start
+                        .0
+                        .saturating_add(u64::from(self.validation_block_count)),
+                )
+            },
         )
     }
 
     #[must_use]
     pub fn validation_start_block(self) -> BlockNumber {
-        BlockNumber(
-            self.repair_start_block()
-                .0
-                .saturating_sub(u64::from(self.validation_block_count)),
-        )
+        self.validation_start_override.unwrap_or_else(|| {
+            BlockNumber(
+                self.repair_start_block()
+                    .0
+                    .saturating_sub(u64::from(self.validation_block_count)),
+            )
+        })
     }
 
     #[must_use]
     pub fn descriptor_blocks(self) -> [BlockNumber; REPAIR_DESC_SLOT_COUNT_USIZE] {
-        let end = self.group_end_exclusive();
+        let (_, end) = self.storage_bounds();
         [
             BlockNumber(end.saturating_sub(2)),
             BlockNumber(end.saturating_sub(1)),
@@ -496,7 +585,7 @@ impl<'a> RepairGroupStorage<'a> {
             .checked_add(u64::from(source_block_count))
             .ok_or_else(|| FfsError::RepairFailed("source digest range overflow".to_owned()))?;
         if source_first_block.0 < self.layout.group_start.0
-            || source_end > self.layout.validation_start_block().0
+            || source_end > self.layout.source_end_exclusive()
         {
             return Err(FfsError::RepairFailed(format!(
                 "source digest range [{}, {}) outside group {} data region [{}, {})",
@@ -504,7 +593,7 @@ impl<'a> RepairGroupStorage<'a> {
                 source_end,
                 self.layout.group.0,
                 self.layout.group_start.0,
-                self.layout.validation_start_block().0
+                self.layout.source_end_exclusive()
             )));
         }
 
@@ -1088,13 +1177,25 @@ impl<'a> RepairGroupStorage<'a> {
                 self.layout.group.0, blocks[0].0
             )));
         }
-        let group_start = self.layout.group_start.0;
-        let group_end = self.layout.group_end_exclusive();
+        let (storage_start, storage_end) = if self.layout.validation_start_override.is_some() {
+            let group_start = self.layout.group_start.0;
+            let group_end = self.layout.group_end_exclusive();
+            let (det_start, det_end) = self.layout.storage_bounds();
+            if group_start < det_end && det_start < group_end {
+                return Err(FfsError::RepairFailed(format!(
+                    "detached repair storage [{det_start}, {det_end}) overlaps group {} range [{group_start}, {group_end})",
+                    self.layout.group.0
+                )));
+            }
+            (det_start, det_end)
+        } else {
+            (self.layout.group_start.0, self.layout.group_end_exclusive())
+        };
         for block in blocks {
-            if block.0 < group_start || block.0 >= group_end {
+            if block.0 < storage_start || block.0 >= storage_end {
                 return Err(FfsError::RepairFailed(format!(
                     "descriptor block {} outside group {} range [{}, {})",
-                    block.0, self.layout.group.0, group_start, group_end
+                    block.0, self.layout.group.0, storage_start, storage_end
                 )));
             }
         }
@@ -1521,6 +1622,7 @@ mod tests {
             blocks_per_group: 4,
             validation_block_count: 0,
             repair_block_count: 1,
+            validation_start_override: None,
         };
 
         assert_eq!(layout.group_end_exclusive(), u64::MAX);
@@ -1538,6 +1640,7 @@ mod tests {
             blocks_per_group: 1,
             validation_block_count: 4,
             repair_block_count: 4,
+            validation_start_override: None,
         };
 
         assert_eq!(layout.group_end_exclusive(), 1);
@@ -1556,6 +1659,7 @@ mod tests {
             blocks_per_group: 1,
             validation_block_count: 4,
             repair_block_count: 4,
+            validation_start_override: None,
         };
         let storage = RepairGroupStorage::new(&device, layout);
         let desc = make_desc(layout, 0, 32);
@@ -1583,6 +1687,7 @@ mod tests {
             blocks_per_group: 4,
             validation_block_count: 0,
             repair_block_count: 1,
+            validation_start_override: None,
         };
         assert_eq!(
             layout.descriptor_blocks(),
@@ -1867,6 +1972,71 @@ mod tests {
             [BlockNumber(101), BlockNumber(102)]
         );
         assert_eq!(layout.group_end_exclusive(), 103);
+    }
+
+    #[test]
+    fn detached_storage_layout_rejects_overlap_and_roundtrips_raw_symbols() {
+        let cx = Cx::for_testing();
+        // Overlap between source [16, 48) and detached [40, 48) must fail closed.
+        assert!(
+            RepairGroupLayout::with_detached_storage(
+                GroupNumber(0),
+                BlockNumber(16),
+                32,
+                2,
+                4,
+                BlockNumber(40),
+            )
+            .is_err()
+        );
+
+        // Detached storage before source [32, 64) at [4, 12) AND after source at [80, 88).
+        for det_start in [BlockNumber(4), BlockNumber(80)] {
+            let layout = RepairGroupLayout::with_detached_storage(
+                GroupNumber(2),
+                BlockNumber(32),
+                32,
+                2,
+                4,
+                det_start,
+            )
+            .expect("disjoint detached storage layout");
+            assert_eq!(layout.source_end_exclusive(), 64);
+            assert_eq!(layout.validation_start_block(), det_start);
+            assert_eq!(layout.repair_start_block(), BlockNumber(det_start.0 + 2));
+            assert_eq!(
+                layout.descriptor_blocks(),
+                [BlockNumber(det_start.0 + 6), BlockNumber(det_start.0 + 7)]
+            );
+
+            let device = MemBlockDevice::new(256, 128);
+            let storage = RepairGroupStorage::new(&device, layout);
+            let bootstrap = RepairGroupDescExt {
+                transfer_length: 32 * 256,
+                symbol_size: 256,
+                source_block_count: 32,
+                sub_blocks: 1,
+                symbol_alignment: 4,
+                repair_start_block: layout.repair_start_block(),
+                repair_block_count: layout.repair_block_count,
+                repair_generation: 0,
+                checksum: 0,
+            };
+            let symbols = vec![
+                (32, vec![0xAA; 256]),
+                (33, vec![0xBB; 256]),
+                (34, vec![0xCC; 256]),
+                (35, vec![0xDD; 256]),
+            ];
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &symbols, 3)
+                .expect("initialize detached raw symbols");
+            let (desc, readback) = storage
+                .read_verified_raw_generation(&cx, false)
+                .expect("read verified detached raw symbols");
+            assert_eq!(desc.repair_generation, 3);
+            assert_eq!(readback, symbols);
+        }
     }
 
     proptest! {

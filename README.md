@@ -870,7 +870,7 @@ and [CI `42977453897`](https://github.com/Dicklesworthstone/frankenfs/actions/ru
 
 The current source-derived test inventory contains 24 crates under `crates/`,
 67 fuzz targets, 174 Rust benchmark files, 128 tracked E2E scripts and
-226 tracked insta snapshots. The evidence schema declares 23 evidence-event types.
+226 tracked insta snapshots. The evidence schema declares 24 evidence-event types.
 These are source counts, not executed-test or readiness results.
 The [fuzz inventory](fuzz/fuzz_targets/) has the badge count
 ![67 fuzz targets](https://img.shields.io/badge/fuzz%20targets-67-brightgreen).

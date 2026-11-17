@@ -12,7 +12,7 @@
 //! independently trusted source data. It does not establish source freshness
 //! after client writes or provide exclusion against concurrent repair writers.
 
-use super::{RawRefreshAdmission, RepairGroupLayout, RepairGroupStorage, SymbolBatch};
+use super::{RawRefreshAdmission, RepairGroupStorage, SymbolBatch};
 use crate::symbol::RepairGroupDescExt;
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -121,9 +121,10 @@ fn newest_records(storage: &RepairGroupStorage<'_>, cx: &Cx) -> Result<Vec<Recor
         .0
         .checked_add(u64::from(descriptor.repair_block_count))
         .ok_or_else(|| invalid("raw repair range overflows"))?;
+    let (storage_min, _) = storage.layout.storage_bounds();
     if end > storage.descriptor_block(0)?.0
         || end > storage.device.block_count()
-        || descriptor.repair_start_block.0 < storage.layout.group_start.0
+        || descriptor.repair_start_block.0 < storage_min
         || storage.descriptor_block(1)?.0 >= storage.device.block_count()
         || usize::from(descriptor.symbol_size) > storage.block_size_usize()?
     {
@@ -216,13 +217,7 @@ fn validate_bootstrap(
     expected: &RepairGroupDescExt,
 ) -> Result<()> {
     let layout = storage.layout;
-    RepairGroupLayout::new(
-        layout.group,
-        layout.group_start,
-        layout.blocks_per_group,
-        layout.validation_block_count,
-        layout.repair_block_count,
-    )?;
+    layout.validate_self()?;
     storage.validate_desc_layout(expected)?;
     let block_size = storage.device.block_size();
     if expected.repair_generation != 0
@@ -240,8 +235,10 @@ fn validate_bootstrap(
         .0
         .checked_add(u64::from(expected.source_block_count))
         .ok_or_else(|| invalid("raw bootstrap source range overflows"))?;
+    let (_, storage_end) = layout.storage_bounds();
     if layout.group_end_exclusive() > storage.device.block_count()
-        || source_end > layout.validation_start_block().0
+        || storage_end > storage.device.block_count()
+        || source_end > layout.source_end_exclusive()
     {
         return Err(invalid("raw bootstrap exceeds source or device geometry"));
     }

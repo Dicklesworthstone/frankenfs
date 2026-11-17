@@ -397,7 +397,7 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
             .ok_or_else(|| {
                 FfsError::RepairFailed("source range overflow for recovery orchestrator".to_owned())
             })?;
-        let group_data_end = layout.validation_start_block().0;
+        let group_data_end = layout.source_end_exclusive();
 
         if source_first_block.0 < layout.group_start.0 || source_end > group_data_end {
             return Err(FfsError::RepairFailed(format!(

@@ -1568,7 +1568,7 @@ The evidence ledger is an append-only JSONL file. Each line is a self-contained 
 
 | Category | Events | Count |
 |---|---|---|
-| **Corruption & repair** | `CorruptionDetected`, `RepairAttempted`, `RepairSucceeded`, `RepairFailed`, `ScrubCycleComplete` | 5 |
+| **Corruption & repair** | `CorruptionDetected`, `RepairAttempted`, `RepairSucceeded`, `RepairFailed`, `ScrubCycleComplete`, `AnytimeScrubMonitor` | 6 |
 | **MVCC transactions** | `TransactionCommit`, `TxnAborted`, `SerializationConflict`, `VersionGc`, `SnapshotAdvanced` | 5 |
 | **Merge resolution** | `MergeProofChecked`, `MergeApplied`, `MergeRejected`, `PolicySwitched`, `ContentionSample` | 5 |
 | **Durability policy** | `PolicyDecision`, `SymbolRefresh`, `DurabilityPolicyChanged`, `RefreshPolicyChanged` | 4 |
