@@ -104,15 +104,24 @@ fn open_native_prepare_view(cx: &Cx, device: FileByteDevice) -> Result<OpenFs> {
             ..OpenOptions::default()
         },
     )?;
-    let sb = fs
-        .ext4_superblock()
-        .context("native preparation currently requires ext4")?;
-    if sb.state != ffs_ondisk::ext4::EXT4_VALID_FS
-        || sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
-    {
-        bail!("native preparation requires clean ext4; recover offline first");
+    if let Some(sb) = fs.ext4_superblock() {
+        if sb.state != ffs_ondisk::ext4::EXT4_VALID_FS
+            || sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
+        {
+            bail!("native preparation requires clean ext4; recover offline first");
+        }
+        return Ok(fs);
     }
-    Ok(fs)
+    if let Some(sb) = fs.btrfs_superblock() {
+        if sb.is_seeding() || sb.num_devices != 1 || !fs.btrfs_device_inventory_verified() {
+            bail!("native btrfs preparation requires a verified single-device non-seeding image");
+        }
+        if sb.log_root != 0 {
+            bail!("native btrfs preparation requires a clean image without an unretired tree log");
+        }
+        return Ok(fs);
+    }
+    bail!("native preparation requires an ext4 or btrfs image")
 }
 
 fn build_native_prepare_output(
@@ -124,9 +133,9 @@ fn build_native_prepare_output(
     let (device, lock) = lock_native_prepare_image(path, check)?;
     let fs = open_native_prepare_view(&cx, device)?;
     let storage = if check {
-        fs.native_ext4_repair_storage(&cx)?
+        fs.native_repair_storage(&cx)?
     } else {
-        let prepared = fs.prepare_native_ext4_repair(&cx, basis_points)?;
+        let prepared = fs.prepare_native_repair(&cx, basis_points)?;
         // The consumed view may cache pre-conversion metadata. Discover from
         // a new read-only device while retaining the original exclusive lock.
         let device = FileByteDevice::open_read_only(path)?;
@@ -135,7 +144,7 @@ fn build_native_prepare_output(
         if (locked.dev(), locked.ino()) != (reopened.dev(), reopened.ino()) {
             bail!("native preparation image path changed before discovery");
         }
-        let discovered = open_native_prepare_view(&cx, device)?.native_ext4_repair_storage(&cx)?;
+        let discovered = open_native_prepare_view(&cx, device)?.native_repair_storage(&cx)?;
         if discovered != prepared {
             bail!("reopened native repair ownership differs from the prepared storage");
         }
@@ -199,20 +208,20 @@ fn build_native_validate_output(path: &Path, initialize: bool) -> Result<NativeV
     let (device, lock) = lock_native_prepare_image(path, !initialize)?;
     let fs = open_native_prepare_view(&cx, device)?;
     let validation = if initialize {
-        let expected = fs.initialize_native_ext4_validation(&cx)?;
+        let expected = fs.initialize_native_validation(&cx)?;
         let device = FileByteDevice::open_read_only(path)?;
         let locked = lock.0.metadata()?;
         let reopened = device.file().metadata()?;
         if (locked.dev(), locked.ino()) != (reopened.dev(), reopened.ino()) {
             bail!("native validation image path changed before discovery");
         }
-        let checked = open_native_prepare_view(&cx, device)?.check_native_ext4_validation(&cx)?;
+        let checked = open_native_prepare_view(&cx, device)?.check_native_validation(&cx)?;
         if checked != expected {
             bail!("reopened native validation differs from initialization");
         }
         checked
     } else {
-        fs.check_native_ext4_validation(&cx)?
+        fs.check_native_validation(&cx)?
     };
     Ok(NativeValidateOutput {
         image: path.to_path_buf(),
@@ -280,16 +289,16 @@ fn build_native_encode_output(
     let (device, lock) = lock_native_prepare_image(path, check)?;
     let fs = open_native_prepare_view(&cx, device)?;
     let repair = if check {
-        fs.check_native_ext4_repair(&cx)?
+        fs.check_native_repair(&cx)?
     } else {
-        let expected = fs.initialize_native_ext4_repair(&cx, max_working_bytes)?;
+        let expected = fs.initialize_native_repair(&cx, max_working_bytes)?;
         let device = FileByteDevice::open_read_only(path)?;
         let locked = lock.0.metadata()?;
         let reopened = device.file().metadata()?;
         if (locked.dev(), locked.ino()) != (reopened.dev(), reopened.ino()) {
             bail!("native encoding image path changed before verification");
         }
-        let checked = open_native_prepare_view(&cx, device)?.check_native_ext4_repair(&cx)?;
+        let checked = open_native_prepare_view(&cx, device)?.check_native_repair(&cx)?;
         if checked != expected {
             bail!("reopened native repair evidence differs from encoding");
         }
@@ -376,11 +385,8 @@ fn build_native_recover_output(
     let cx = cli_cx();
     let (device, lock) = lock_native_prepare_image(path, true)?;
     let fs = open_native_prepare_view(&cx, device)?;
-    let block_size = fs
-        .ext4_superblock()
-        .context("native reconstruction requires ext4")?
-        .block_size;
-    let recovered = fs.reconstruct_native_ext4_block(&cx, block, max_working_bytes)?;
+    let block_size = fs.block_size();
+    let recovered = fs.reconstruct_native_block(&cx, block, max_working_bytes)?;
     if recovered.block != block
         || recovered.generation == 0
         || recovered.data.len() != block_size as usize

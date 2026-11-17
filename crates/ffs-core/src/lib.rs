@@ -35,6 +35,9 @@ pub use vfs::{
 };
 // Re-export repair lifecycle for convenient wiring.
 pub use ffs_block::{RepairFlushLifecycle, io_engine::VolumeAccess};
+pub use ffs_repair::scrub::VilleWaldScrubMonitor;
+use native_repair::DurabilityCommitGuard;
+pub use native_repair::NativeScrubHealReport;
 
 use asupersync::{Cx, RaptorQConfig};
 use ffs_alloc::{
@@ -3389,6 +3392,8 @@ pub struct OpenFs {
     repair_flush_lifecycle: Option<Arc<dyn RepairFlushLifecycle>>,
     /// The shared physical device and its non-healing inspection authority.
     native_repair_device: Option<Arc<native_repair::NativeFreshnessDevice>>,
+    /// Blocks written by mount-time journal/FC/orphan recovery before native repair activation.
+    native_recovery_touched_blocks: BTreeSet<BlockNumber>,
     /// Journal replay writes only to an in-memory diagnostic overlay.
     ext4_replay_overlay: bool,
     /// Userspace ioctl donor-fd registrations for ext4 `EXT4_IOC_MOVE_EXT`.
@@ -7999,6 +8004,38 @@ pub struct OpenFsMvccTelemetry {
     pub commits_total: u64,
 }
 
+struct RecoveryWriteTrackerDevice {
+    inner: Arc<dyn ByteDevice>,
+    block_size: u64,
+    touched: Arc<Mutex<BTreeSet<BlockNumber>>>,
+}
+
+impl ByteDevice for RecoveryWriteTrackerDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<(), FfsError> {
+        self.inner.read_exact_at(cx, offset, buf)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<(), FfsError> {
+        if !buf.is_empty() {
+            let first = offset.0 / self.block_size;
+            let last = (offset.0 + buf.len() as u64 - 1) / self.block_size;
+            let mut set = self.touched.lock();
+            for blk in first..=last {
+                set.insert(BlockNumber(blk));
+            }
+        }
+        self.inner.write_all_at(cx, offset, buf)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
+        self.inner.sync(cx)
+    }
+}
+
 impl OpenFs {
     /// Open a filesystem image read-only with validation enabled.
     ///
@@ -8175,12 +8212,17 @@ impl OpenFs {
             DetectionError::Io(ffs_err) => ffs_err,
         })?;
 
-        if options.native_repair_max_working_bytes.is_some()
-            && (!options.mount_mode.is_native() || !matches!(flavor, FsFlavor::Ext4(_)))
-        {
-            return Err(FfsError::UnsupportedFeature(
-                "native write freshness requires an ext4 image in native mode".into(),
-            ));
+        if options.native_repair_max_working_bytes.is_some() {
+            if !write_authority {
+                return Err(FfsError::ReadOnly);
+            }
+            if !options.mount_mode.is_native()
+                || !matches!(flavor, FsFlavor::Ext4(_) | FsFlavor::Btrfs(_))
+            {
+                return Err(FfsError::UnsupportedFeature(
+                    "native write freshness requires an ext4 or btrfs image in native mode".into(),
+                ));
+            }
         }
 
         let dev: Box<dyn ByteDevice> = if matches!(flavor, FsFlavor::Ext4(_))
@@ -8653,6 +8695,7 @@ impl OpenFs {
             htree_leaf_splits: std::sync::atomic::AtomicUsize::new(0),
             repair_flush_lifecycle: None,
             native_repair_device: None,
+            native_recovery_touched_blocks: BTreeSet::new(),
             ext4_replay_overlay: matches!(
                 options.ext4_journal_replay_mode,
                 Ext4JournalReplayMode::SimulateOverlay
@@ -8696,12 +8739,21 @@ impl OpenFs {
             btrfs_dev_stats: Mutex::new(std::collections::BTreeMap::new()),
         };
 
-        // Install physical write fencing before journal/fast-commit/orphan
-        // recovery can mutate the image. Post-commit notifications are too late
-        // to invalidate parity that still binds the previous source bytes.
-        if let Some(max_working_bytes) = options.native_repair_max_working_bytes {
-            fs.activate_native_ext4_repair(cx, max_working_bytes)?;
-        }
+        let recovery_touched_blocks = Arc::new(Mutex::new(BTreeSet::new()));
+        let saved_recovery_dev = ((options.native_repair_max_working_bytes.is_some()
+            || (write_authority && options.mount_mode.is_native()))
+            && fs.is_ext4()
+            && !options.skip_validation)
+            .then(|| {
+                let saved = Arc::clone(&fs.dev);
+                let block_size = u64::from(fs.block_size()).max(1);
+                fs.dev = Arc::new(RecoveryWriteTrackerDevice {
+                    inner: Arc::clone(&saved),
+                    block_size,
+                    touched: Arc::clone(&recovery_touched_blocks),
+                });
+                saved
+            });
 
         if fs.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
             fs.btrfs_tree_log_hidden =
@@ -8787,7 +8839,17 @@ impl OpenFs {
             }
         }
 
+        if let Some(restored) = saved_recovery_dev {
+            fs.dev = restored;
+            fs.native_recovery_touched_blocks = recovery_touched_blocks.lock().clone();
+        }
+
         fs.rebuild_metadata_log_index(cx)?;
+
+        if let Some(max_working_bytes) = options.native_repair_max_working_bytes {
+            let touched = fs.native_recovery_touched_blocks.clone();
+            fs.reconcile_and_activate_native_repair(cx, max_working_bytes, &touched)?;
+        }
 
         Ok(fs)
     }
@@ -29715,6 +29777,27 @@ impl OpenFs {
         // metadata. In particular, a native reservation that cannot fit must
         // leave the image byte-identical, without an empty live journal.
         journal.preflight_transaction(&direct, &txn)?;
+        let bpg_step = self
+            .ext4_superblock()
+            .map_or(1024_u64, |sb| u64::from(sb.blocks_per_group).max(1));
+        let mut hinted_blocks = Vec::with_capacity(writes.len() + journal.segments().len() * 3 + 1);
+        hinted_blocks.push(sb_block);
+        hinted_blocks.extend(writes.keys().copied());
+        for seg in journal.segments() {
+            if seg.blocks > 0 {
+                let mut off = 0_u64;
+                while off < seg.blocks {
+                    hinted_blocks.push(BlockNumber(seg.start.0 + off));
+                    off = off.saturating_add(bpg_step);
+                }
+                hinted_blocks.push(BlockNumber(seg.start.0 + seg.blocks - 1));
+            }
+        }
+        let mut durability_guard = self.begin_durability_commit(
+            cx,
+            u64::from(journal.next_seq().saturating_sub(1)),
+            &hinted_blocks,
+        )?;
         self.ext4_write_needs_recovery(cx, &direct, true)?;
         let journal_sequence = {
             journal.mark_log_live(cx, &direct).map_err(|e| {
@@ -29808,6 +29891,7 @@ impl OpenFs {
             sequence
         };
         self.ext4_write_needs_recovery(cx, &direct, false)?;
+        durability_guard.arm_final_seal(cx)?;
         // bd-7zjfh: both cleanup writes dirty the device after phase 2. A
         // sidecar-backed device fences that new epoch until sync publishes its
         // protection, so acknowledging here without this barrier leaves even
@@ -42760,13 +42844,13 @@ impl OpenFs {
         ))
     }
 
-    fn btrfs_write_tree_log_for_sync(
-        &self,
+    fn btrfs_write_tree_log_for_sync<'a>(
+        &'a self,
         cx: &Cx,
         alloc: &mut BtrfsAllocState,
         ino: InodeNumber,
         operation_id: &str,
-    ) -> Result<(BtrfsTreeLogWriteStats, usize), FfsError> {
+    ) -> Result<(BtrfsTreeLogWriteStats, usize, DurabilityCommitGuard<'a>), FfsError> {
         self.reject_btrfs_unsupported_mutation()?;
         let sb = self
             .btrfs_superblock()
@@ -42879,6 +42963,30 @@ impl OpenFs {
         // bd-jhuob). Holding `mvcc_flushed_through` through `Sync #1` guarantees
         // concurrent sync callers stay serialized and that `*flushed_through`
         // advances only after `Sync #1` has made the MVCC blocks durable.
+        let bsize = u64::from(self.block_size()).max(1);
+        let mut hinted_blocks = Vec::with_capacity(writes.len() * 4 + 1);
+        hinted_blocks.push(BlockNumber(superblock_offset.0 / bsize));
+        for (offset, bytes) in &writes {
+            if !bytes.is_empty() {
+                let first = offset.0 / bsize;
+                let last = (offset.0 + bytes.len() as u64 - 1) / bsize;
+                for blk in first..=last {
+                    hinted_blocks.push(BlockNumber(blk));
+                }
+            }
+        }
+        let durability_guard =
+            match self.begin_durability_commit(cx, alloc.generation, &hinted_blocks) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    Self::btrfs_rollback_unwritten_tree_log(
+                        alloc,
+                        &stats.retired_log_blocks,
+                        operation_id,
+                    );
+                    return Err(err);
+                }
+            };
         let base_dev = self.direct_block_device_adapter();
         let no_sync_dev = NoSyncBlockDevice(&base_dev);
         let mut flushed_through = self.mvcc_flushed_through.lock();
@@ -42914,7 +43022,7 @@ impl OpenFs {
             Ok(()) => {
                 *flushed_through = (*flushed_through).max(durable_through);
                 drop(flushed_through);
-                Ok((stats, flushed))
+                Ok((stats, flushed, durability_guard))
             }
             Err(TreeLogPublishError::NodeWrite(err)) => {
                 drop(flushed_through);
@@ -43136,7 +43244,7 @@ impl OpenFs {
         // back cleanly to `btrfs_full_transaction_commit`, and otherwise stage
         // MVCC data blocks + tree-log nodes ahead of ONE shared pre-superblock
         // barrier (`2` barriers/fsync total instead of `3`).
-        let (tree_log, flushed) =
+        let (tree_log, flushed, mut durability_guard) =
             match self.btrfs_write_tree_log_for_sync(cx, &mut alloc, ino, operation_id) {
                 Ok(result) => result,
                 Err(FfsError::UnsupportedFeature(_)) => {
@@ -43167,6 +43275,7 @@ impl OpenFs {
             );
         }
 
+        durability_guard.arm_final_seal(cx)?;
         match self.dev.sync(cx) {
             Ok(()) => {
                 // bd-0ajub: the new log_root is durable as of this sync, so the
@@ -43480,6 +43589,10 @@ impl OpenFs {
         // `*mvcc_flushed_guard` advances only after that barrier succeeds, so a
         // failed commit retries the full MVCC data write set.
         self.reject_btrfs_unsupported_mutation()?;
+        let sb_sector_block =
+            BlockNumber(BTRFS_SUPER_INFO_OFFSET as u64 / u64::from(self.block_size()).max(1));
+        let mut durability_guard =
+            self.begin_durability_commit(cx, alloc.generation, &[sb_sector_block])?;
         let base_dev = self.direct_block_device_adapter();
         let no_sync_dev = NoSyncBlockDevice(&base_dev);
         // The allocator excludes native data writers and the caller's semantic
@@ -45387,6 +45500,8 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("btrfs superblock checksum failed".into()))?;
         sb_bytes[..csum_size].copy_from_slice(&csum[..csum_size]);
 
+        self.verify_btrfs_native_owner_in_tree(alloc)?;
+
         // Write superblock to primary location (0x10000 = 64 KiB). From here
         // the new generation may be on disk, partly or wholly, so a failure
         // must not roll memory back to the old one.
@@ -45401,6 +45516,7 @@ impl OpenFs {
             })?;
         bytes_written = bytes_written.saturating_add(sb_bytes.len() as u64);
 
+        durability_guard.arm_final_seal(cx)?;
         // Final fsync to ensure superblock is durable
         self.dev.sync(cx).inspect_err(|_| {
             self.record_btrfs_dev_stat(self.btrfs_primary_devid(), BTRFS_DEV_STAT_FLUSH_ERRS);

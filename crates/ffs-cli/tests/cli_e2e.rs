@@ -7059,3 +7059,544 @@ fn native_ntfs_replace_rename_preserves_aliases_and_reclaims_retired_streams() {
     assert_eq!(source["hard_links"], 2);
     assert_eq!(source["sequence"], source_sequence);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mkfs_btrfs = format!("mk{}.btrfs", "fs");
+    let require_oracles = std::env::var_os("FFS_REQUIRE_ORACLES").is_some_and(|v| v == "1");
+    if !command_available(&mkfs_btrfs) || !command_available("btrfs") {
+        assert!(
+            !require_oracles,
+            "FFS_REQUIRE_ORACLES=1 but btrfs-progs are unavailable"
+        );
+        emit_scenario_result(
+            "cli_btrfs_native_prepare_validate_encode_recover_bd_11a8t",
+            "SKIP",
+            Some("btrfs_progs_unavailable"),
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let seed_root = tmp.path().join("seed_root");
+    fs::create_dir(&seed_root).expect("create seed_root");
+    fs::set_permissions(&seed_root, fs::Permissions::from_mode(0o777)).expect("chmod seed_root");
+    let seed_payload: Vec<u8> = (0..32_768_usize)
+        .map(|i| ((i.wrapping_mul(173).wrapping_add(29)) & 0xFF) as u8)
+        .collect();
+    fs::write(seed_root.join("payload.bin"), &seed_payload).expect("write seed payload.bin");
+
+    let image = tmp.path().join("native.btrfs");
+    fs::File::create(&image)
+        .and_then(|f| f.set_len(16 * 1024 * 1024))
+        .expect("size native.btrfs");
+    let formatted = Command::new(&mkfs_btrfs)
+        .args([
+            "-f",
+            "-q",
+            "-M",
+            "-d",
+            "single",
+            "-m",
+            "single",
+            "--rootdir",
+            seed_root.to_str().unwrap(),
+            image.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run mkfs.btrfs");
+    assert!(
+        formatted.status.success(),
+        "mkfs.btrfs failed: {}",
+        String::from_utf8_lossy(&formatted.stderr)
+    );
+
+    let img_str = image.to_str().unwrap();
+    let prep = run_ffs_cli(&[
+        "native-prepare",
+        img_str,
+        "--repair-basis-points",
+        "500",
+        "--json",
+    ]);
+    assert!(
+        prep.status.success(),
+        "ffs native-prepare btrfs failed: {}",
+        String::from_utf8_lossy(&prep.stderr)
+    );
+    let prep_json: serde_json::Value = serde_json::from_slice(&prep.stdout).expect("prep json");
+    let target_block = prep_json["tails"][0]["group_start"]
+        .as_u64()
+        .expect("tail0 group_start")
+        + 4;
+
+    let val = run_ffs_cli(&["native-validate", img_str, "--initialize", "--json"]);
+    assert!(
+        val.status.success(),
+        "ffs native-validate --initialize btrfs failed: {}",
+        String::from_utf8_lossy(&val.stderr)
+    );
+
+    let enc = run_ffs_cli(&[
+        "native-encode",
+        img_str,
+        "--max-codec-memory-mib",
+        "256",
+        "--json",
+    ]);
+    assert!(
+        enc.status.success(),
+        "ffs native-encode btrfs failed: {}",
+        String::from_utf8_lossy(&enc.stderr)
+    );
+    let enc_check = run_ffs_cli(&[
+        "native-encode",
+        img_str,
+        "--check",
+        "--max-codec-memory-mib",
+        "256",
+        "--json",
+    ]);
+    assert!(
+        enc_check.status.success(),
+        "ffs native-encode --check btrfs failed: {}",
+        String::from_utf8_lossy(&enc_check.stderr)
+    );
+
+    let btrfs_chk = Command::new("btrfs")
+        .args(["check", "--readonly", img_str])
+        .output()
+        .expect("run btrfs check");
+    assert!(
+        btrfs_chk.status.success(),
+        "btrfs check --readonly failed after native-encode: {}{}",
+        String::from_utf8_lossy(&btrfs_chk.stdout),
+        String::from_utf8_lossy(&btrfs_chk.stderr)
+    );
+
+    // Corrupt 1 block in Group 0 and reconstruct byte-for-byte via `native-recover`.
+    let mut raw = fs::read(&image).expect("read encoded btrfs");
+    let blk_off = usize::try_from(target_block * 4096).unwrap();
+    let expected_block = raw[blk_off..blk_off + 4096].to_vec();
+    let expected_block_hash = *blake3::hash(&expected_block).as_bytes();
+    raw[blk_off + 128] ^= 0x7E;
+    raw[blk_off + 2048] ^= 0xC3;
+    fs::write(&image, &raw).expect("write corrupted btrfs");
+
+    let damaged_check = run_ffs_cli(&[
+        "native-encode",
+        img_str,
+        "--check",
+        "--max-codec-memory-mib",
+        "256",
+    ]);
+    assert!(
+        !damaged_check.status.success(),
+        "native-encode --check must detect source block corruption"
+    );
+
+    let recovered_path = tmp.path().join("recovered.block");
+    let blk_str = target_block.to_string();
+    let rec = run_ffs_cli(&[
+        "native-recover",
+        img_str,
+        &blk_str,
+        recovered_path.to_str().unwrap(),
+        "--max-codec-memory-mib",
+        "256",
+        "--json",
+    ]);
+    assert!(
+        rec.status.success(),
+        "ffs native-recover btrfs failed: {}",
+        String::from_utf8_lossy(&rec.stderr)
+    );
+    let recovered_bytes = fs::read(&recovered_path).expect("read recovered.block");
+    assert_eq!(
+        *blake3::hash(&recovered_bytes).as_bytes(),
+        expected_block_hash
+    );
+    assert_eq!(recovered_bytes, expected_block);
+    emit_scenario_result(
+        "cli_btrfs_native_prepare_validate_encode_recover_bd_11a8t",
+        "PASS",
+        None,
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::time::{Duration, Instant};
+
+    let mkfs_ext4 = format!("mk{}.ext4", "fs");
+    let mkfs_btrfs = format!("mk{}.btrfs", "fs");
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
+    if !Path::new("/dev/fuse").exists()
+        || ![
+            mkfs_ext4.as_str(),
+            "e2fsck",
+            mkfs_btrfs.as_str(),
+            "btrfs",
+            "fusermount3",
+        ]
+        .iter()
+        .all(|tool| command_available(tool))
+    {
+        assert!(
+            !require,
+            "FFS_REQUIRE_FUSE=1 but mount/oracle prerequisites are missing"
+        );
+        emit_scenario_result(
+            "mounted_native_ext4_btrfs_self_healing_bd_j7a4e",
+            "SKIP",
+            Some("fuse_or_format_tools_unavailable"),
+        );
+        return;
+    }
+
+    let tmp = tempfile::Builder::new()
+        .prefix("ffs-bd-j7a4e-")
+        .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("ffs-bd-j7a4e-").tempdir())
+        .expect("create tempdir");
+    let dir = tmp.path();
+
+    // Negative control: unreserved compatibility RW mount with `--background-repair` must fail closed (bd-plamw).
+    {
+        let unreserved = dir.join("unreserved.ext4");
+        format_ext4_owned_by_caller(&unreserved, 8 << 20);
+        let unreserved_mnt = dir.join("unreserved_mnt");
+        fs::create_dir(&unreserved_mnt).unwrap();
+        let unreserved_ledger = dir.join("unreserved.jsonl");
+        let out = run_ffs_cli(&[
+            "mount",
+            "--rw",
+            "--background-repair",
+            "--background-scrub-ledger",
+            unreserved_ledger.to_str().unwrap(),
+            unreserved.to_str().unwrap(),
+            unreserved_mnt.to_str().unwrap(),
+        ]);
+        assert!(
+            !out.status.success(),
+            "unreserved RW --background-repair must fail closed"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("bd-plamw"),
+            "expected bd-plamw diagnostic, got: {stderr}"
+        );
+    }
+
+    let v1_payload: Vec<u8> = (0..24_576_usize)
+        .map(|i| ((i.wrapping_mul(197).wrapping_add(11)) & 0xFF) as u8)
+        .collect();
+    let v1_hash = *blake3::hash(&v1_payload).as_bytes();
+    let v2_payload: Vec<u8> = (0..24_576_usize)
+        .map(|i| ((i.wrapping_mul(89).wrapping_add(73)) & 0xFF) as u8)
+        .collect();
+    let v2_hash = *blake3::hash(&v2_payload).as_bytes();
+
+    // Format native-ready ext4 (4 MiB, 1 KiB blocks, 2 groups, 1 MiB JBD2 journal) and btrfs (16 MiB -M).
+    let ext4_img = dir.join("mounted.ext4");
+    fs::File::create(&ext4_img)
+        .and_then(|f| f.set_len(4 * 1024 * 1024))
+        .expect("size mounted.ext4");
+    let me = fs::metadata(&ext4_img).expect("stat mounted.ext4");
+    let ext_opts = format!("lazy_itable_init=0,root_owner={}:{}", me.uid(), me.gid());
+    let ext4_mk = Command::new(&mkfs_ext4)
+        .args([
+            "-F",
+            "-q",
+            "-O",
+            "extent,metadata_csum,has_journal,^fast_commit,^flex_bg",
+            "-b",
+            "1024",
+            "-g",
+            "2048",
+            "-J",
+            "size=1",
+            "-N",
+            "128",
+            "-E",
+            &ext_opts,
+            ext4_img.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mkfs.ext4");
+    assert!(
+        ext4_mk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ext4_mk.stderr)
+    );
+
+    let btrfs_seed = dir.join("btrfs_seed");
+    fs::create_dir(&btrfs_seed).unwrap();
+    fs::set_permissions(&btrfs_seed, fs::Permissions::from_mode(0o777)).unwrap();
+    let btrfs_img = dir.join("mounted.btrfs");
+    fs::File::create(&btrfs_img)
+        .and_then(|f| f.set_len(16 * 1024 * 1024))
+        .expect("size mounted.btrfs");
+    let btrfs_mk = Command::new(&mkfs_btrfs)
+        .args([
+            "-f",
+            "-q",
+            "-M",
+            "-d",
+            "single",
+            "-m",
+            "single",
+            "--rootdir",
+            btrfs_seed.to_str().unwrap(),
+            btrfs_img.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mkfs.btrfs");
+    assert!(
+        btrfs_mk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&btrfs_mk.stderr)
+    );
+
+    for (fs_label, image, block_size) in
+        [("ext4", &ext4_img, 1024_usize), ("btrfs", &btrfs_img, 4096)]
+    {
+        let img_str = image.to_str().unwrap();
+        let prep = run_ffs_cli(&[
+            "native-prepare",
+            img_str,
+            "--repair-basis-points",
+            "500",
+            "--json",
+        ]);
+        assert!(
+            prep.status.success(),
+            "{fs_label} native-prepare: {}",
+            String::from_utf8_lossy(&prep.stderr)
+        );
+        let prep_json: serde_json::Value = serde_json::from_slice(&prep.stdout).unwrap();
+        let group0_start = prep_json["tails"][0]["group_start"].as_u64().unwrap();
+
+        let val = run_ffs_cli(&["native-validate", img_str, "--initialize"]);
+        assert!(
+            val.status.success(),
+            "{fs_label} native-validate: {}",
+            String::from_utf8_lossy(&val.stderr)
+        );
+        let enc = run_ffs_cli(&["native-encode", img_str, "--max-codec-memory-mib", "256"]);
+        assert!(
+            enc.status.success(),
+            "{fs_label} native-encode: {}",
+            String::from_utf8_lossy(&enc.stderr)
+        );
+
+        let mnt = dir.join(format!("mnt_{fs_label}"));
+        fs::create_dir(&mnt).unwrap();
+        let log1 = dir.join(format!("mount1_{fs_label}.log"));
+
+        // Phase 1: Default `--native --rw` auto-activates native freshness & background repair
+        // WITHOUT `--native-repair-memory-mib` or `--background-repair`!
+        let Some(mut child1) = spawn_cli_mount(
+            image,
+            &mnt,
+            &log1,
+            &["--native", "--rw", "--log-format", "json"],
+            &[("RUST_LOG", "info")],
+            &format!("native_{fs_label}_phase1"),
+            require,
+        ) else {
+            return;
+        };
+        let write_v1 = (|| -> std::io::Result<()> {
+            let p = mnt.join("durable_v1.bin");
+            let mut f = fs::File::create(&p)?;
+            std::io::Write::write_all(&mut f, &v1_payload)?;
+            f.sync_all()
+        })();
+        if let Err(err) = write_v1 {
+            sigkill_cli_mount(&mut child1, &mnt);
+            panic!("{fs_label} write+fsync durable_v1.bin failed: {err}");
+        }
+        // Wait briefly for the default native background scrub thread start log, then SIGKILL!
+        let log_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < log_deadline {
+            if fs::read_to_string(&log1)
+                .is_ok_and(|s| s.contains("native_mount_background_scrub_thread_start"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        sigkill_cli_mount(&mut child1, &mnt);
+        let log1_text = fs::read_to_string(&log1).unwrap_or_default();
+        assert!(
+            log1_text.contains("native_mount_background_scrub_thread_start"),
+            "{fs_label} default --native --rw must auto-start native scrub/repair worker: {log1_text}"
+        );
+
+        // Phase 2: Corrupt 3 source blocks in Group 0 while unmounted, then remount with
+        // `--native --rw --background-repair --background-scrub-interval-secs 1 --background-scrub-ledger`!
+        {
+            let mut raw = fs::read(image).expect("read image after SIGKILL");
+            for step in [6_u64, 14, 22] {
+                let off = usize::try_from(group0_start + step).unwrap() * block_size + 32;
+                raw[off] ^= 0xA7;
+            }
+            fs::write(image, &raw).expect("inject post-SIGKILL silent bit-rot");
+        }
+        assert!(
+            !run_ffs_cli(&[
+                "native-encode",
+                img_str,
+                "--check",
+                "--max-codec-memory-mib",
+                "256"
+            ])
+            .status
+            .success(),
+            "{fs_label} native-encode --check must detect injected post-SIGKILL corruption"
+        );
+
+        let ledger_path = dir.join(format!("ledger_{fs_label}.jsonl"));
+        let log2 = dir.join(format!("mount2_{fs_label}.log"));
+        let Some(mut child2) = spawn_cli_mount(
+            image,
+            &mnt,
+            &log2,
+            &[
+                "--native",
+                "--rw",
+                "--background-repair",
+                "--background-scrub-interval-secs",
+                "1",
+                "--background-scrub-ledger",
+                ledger_path.to_str().unwrap(),
+                "--log-format",
+                "json",
+            ],
+            &[("RUST_LOG", "info")],
+            &format!("native_{fs_label}_phase2"),
+            require,
+        ) else {
+            return;
+        };
+
+        let phase2_res = (|| -> Result<(), String> {
+            let read_v1 =
+                fs::read(mnt.join("durable_v1.bin")).map_err(|e| format!("read v1: {e}"))?;
+            if *blake3::hash(&read_v1).as_bytes() != v1_hash || read_v1 != v1_payload {
+                return Err(format!("{fs_label} durable_v1.bin mismatch after heal"));
+            }
+            let ledger_deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(lines) = fs::read_to_string(&ledger_path)
+                    && lines.lines().any(|line| {
+                        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|ev| {
+                            ev["event_type"] == "anytime_scrub_monitor"
+                                && ev["anytime_scrub_monitor"]["e_value"]
+                                    .as_f64()
+                                    .is_some_and(|v| v > 0.0)
+                        })
+                    })
+                {
+                    break;
+                }
+                if Instant::now() >= ledger_deadline {
+                    let cur = fs::read_to_string(&ledger_path).unwrap_or_default();
+                    return Err(format!(
+                        "{fs_label} timed out waiting for anytime_scrub_monitor ledger entry: {cur}"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            let mut f2 = fs::File::create(mnt.join("durable_v2.bin"))
+                .map_err(|e| format!("create v2: {e}"))?;
+            std::io::Write::write_all(&mut f2, &v2_payload)
+                .map_err(|e| format!("write v2: {e}"))?;
+            f2.sync_all().map_err(|e| format!("fsync v2: {e}"))?;
+            let read_v2 =
+                fs::read(mnt.join("durable_v2.bin")).map_err(|e| format!("read v2: {e}"))?;
+            if *blake3::hash(&read_v2).as_bytes() != v2_hash {
+                return Err(format!("{fs_label} durable_v2.bin hash mismatch"));
+            }
+            Ok(())
+        })();
+
+        // Bounded graceful unmount via fusermount3 -u.
+        let unmount_deadline = Instant::now() + Duration::from_secs(15);
+        let unmount_out = Command::new("fusermount3")
+            .args(["-u", mnt.to_str().unwrap()])
+            .output()
+            .expect("fusermount3 -u");
+        let exit_status = loop {
+            if let Some(status) = child2.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= unmount_deadline {
+                sigkill_cli_mount(&mut child2, &mnt);
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        if let Err(msg) = phase2_res {
+            panic!(
+                "{msg}\nlog2:\n{}",
+                fs::read_to_string(&log2).unwrap_or_default()
+            );
+        }
+        assert!(
+            unmount_out.status.success() && exit_status.is_some_and(|s| s.success()),
+            "{fs_label} normal fusermount3 -u must drain background workers within deadline; status={exit_status:?}, stderr={}",
+            String::from_utf8_lossy(&unmount_out.stderr)
+        );
+
+        // Post-unmount verification: sealed native parity check + external checker!
+        let post_chk = run_ffs_cli(&[
+            "native-encode",
+            img_str,
+            "--check",
+            "--max-codec-memory-mib",
+            "256",
+        ]);
+        assert!(
+            post_chk.status.success(),
+            "{fs_label} post-unmount native-encode --check failed: {}",
+            String::from_utf8_lossy(&post_chk.stderr)
+        );
+        if fs_label == "ext4" {
+            let chk = Command::new("e2fsck")
+                .args(["-fn", img_str])
+                .output()
+                .unwrap();
+            assert!(
+                chk.status.success(),
+                "e2fsck -fn failed after mounted native heal: {}{}",
+                String::from_utf8_lossy(&chk.stdout),
+                String::from_utf8_lossy(&chk.stderr)
+            );
+        } else {
+            let chk = Command::new("btrfs")
+                .args(["check", "--readonly", img_str])
+                .output()
+                .unwrap();
+            assert!(
+                chk.status.success(),
+                "btrfs check --readonly failed after mounted native heal: {}{}",
+                String::from_utf8_lossy(&chk.stdout),
+                String::from_utf8_lossy(&chk.stderr)
+            );
+        }
+    }
+
+    emit_scenario_result(
+        "mounted_native_ext4_btrfs_self_healing_bd_j7a4e",
+        "PASS",
+        None,
+    );
+}

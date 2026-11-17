@@ -703,6 +703,29 @@ impl RepairPipelineMetrics {
         Self::saturating_add_u64(&self.scrub_rounds_completed, delta);
     }
 
+    /// Record metrics from an external native scrub/self-healing pass (`bd-11a8t`).
+    pub fn record_external_scrub_round(
+        &self,
+        groups: u64,
+        blocks_scanned: u64,
+        corrupted_detected: u64,
+        blocks_recovered: u64,
+        blocks_unrecoverable: u64,
+    ) {
+        self.add_groups_scrubbed(groups);
+        self.add_blocks_scanned(blocks_scanned);
+        if corrupted_detected > 0 {
+            self.add_corruption_detected(corrupted_detected);
+            self.add_decode_attempts(1);
+            if blocks_recovered > 0 {
+                self.add_decode_successes(1);
+            }
+        }
+        self.add_blocks_recovered(blocks_recovered);
+        self.add_blocks_unrecoverable(blocks_unrecoverable);
+        self.add_scrub_rounds_completed(1);
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> RepairMetricsSnapshot {
         RepairMetricsSnapshot {

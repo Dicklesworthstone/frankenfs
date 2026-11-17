@@ -708,3 +708,1234 @@ mod extent_mapping {
         assert_eq!(total, 100);
     }
 }
+
+// ── Suite 5: Native repair crash cuts A–D, 1%/5% healing & negative controls (bd-11a8t / bd-j7a4e) ──
+
+mod native_repair_crash_cuts_and_healing {
+    use asupersync::Cx;
+    use ffs_block::ByteDevice;
+    use ffs_core::native_repair::NativeRepairStorage;
+    use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions, VolumeAccess};
+    use ffs_error::FfsError;
+    use ffs_types::{BTRFS_SUPER_INFO_OFFSET, BlockNumber, ByteOffset, InodeNumber, MountMode};
+    use parking_lot::Mutex;
+    use std::ffi::OsStr;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Arc;
+
+    const WORKING_BUDGET: u64 = 256 * 1024 * 1024;
+    const PLAN_HEADER_START: usize = 192;
+    const PARITY_HEADER_START: usize = 320;
+    const EPOCH_TOKEN_START: usize = 448;
+    const EPOCH_TOKEN_LEN: usize = 160;
+    const VALIDATION_PENDING: u32 = 1;
+    const VALIDATION_SEALED: u32 = 2;
+    const PLAN_DIRTY: u32 = 4;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CrashCut {
+        CutA,
+        CutBExt4,
+        CutBBtrfs { pre_btrfs_gen: u64 },
+        CutC { pre_gen0: u64, pre_gen1: u64 },
+        CutD { pre_gen0: u64, pre_gen1: u64 },
+    }
+
+    struct FaultState {
+        bytes: Vec<u8>,
+        block_size: usize,
+        tail0_start: u64,
+        tail1_start: u64,
+        cut: Option<CrashCut>,
+        fail_next_write: bool,
+        triggered: bool,
+        dirty_writes_after_token: usize,
+        dirty_syncs_seen: usize,
+    }
+
+    #[derive(Clone)]
+    struct FaultInjectingMemDevice {
+        state: Arc<Mutex<FaultState>>,
+    }
+
+    impl FaultInjectingMemDevice {
+        fn new(bytes: Vec<u8>, block_size: u32, storage: &NativeRepairStorage) -> Self {
+            let tail0_start = storage.tails[0].start.0;
+            let tail1_start = storage
+                .tails
+                .get(1)
+                .map_or(tail0_start, |tail| tail.start.0);
+            Self {
+                state: Arc::new(Mutex::new(FaultState {
+                    bytes,
+                    block_size: block_size as usize,
+                    tail0_start,
+                    tail1_start,
+                    cut: None,
+                    fail_next_write: false,
+                    triggered: false,
+                    dirty_writes_after_token: 0,
+                    dirty_syncs_seen: 0,
+                })),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.state.lock().bytes.clone()
+        }
+
+        fn corrupt_block_byte(&self, block: u64, byte_in_block: usize, xor_mask: u8) {
+            let mut guard = self.state.lock();
+            let off = (block as usize) * guard.block_size + byte_in_block;
+            guard.bytes[off] ^= xor_mask;
+        }
+
+        fn arm_cut(&self, cut: CrashCut) {
+            let mut guard = self.state.lock();
+            guard.cut = Some(cut);
+            guard.fail_next_write = false;
+            guard.triggered = false;
+            guard.dirty_writes_after_token = 0;
+            guard.dirty_syncs_seen = 0;
+        }
+
+        fn disarm(&self) -> bool {
+            let mut guard = self.state.lock();
+            let triggered = guard.triggered;
+            guard.cut = None;
+            guard.fail_next_write = false;
+            triggered
+        }
+    }
+
+    fn inspect_headers(state: &FaultState) -> (u32, bool, u32, u64, u32, u64) {
+        let bs = state.block_size;
+        let o0 = (state.tail0_start as usize) * bs;
+        let o1 = (state.tail1_start as usize) * bs;
+        let plan_state = u32::from_le_bytes(
+            state.bytes[o0 + PLAN_HEADER_START + 96..o0 + PLAN_HEADER_START + 100]
+                .try_into()
+                .unwrap(),
+        );
+        let has_token =
+            &state.bytes[o0 + EPOCH_TOKEN_START..o0 + EPOCH_TOKEN_START + 8] == b"FFSEPK02";
+        let g0_par_state = u32::from_le_bytes(
+            state.bytes[o0 + PARITY_HEADER_START + 112..o0 + PARITY_HEADER_START + 116]
+                .try_into()
+                .unwrap(),
+        );
+        let g0_par_gen = u64::from_le_bytes(
+            state.bytes[o0 + PARITY_HEADER_START + 40..o0 + PARITY_HEADER_START + 48]
+                .try_into()
+                .unwrap(),
+        );
+        let g1_par_state = u32::from_le_bytes(
+            state.bytes[o1 + PARITY_HEADER_START + 112..o1 + PARITY_HEADER_START + 116]
+                .try_into()
+                .unwrap(),
+        );
+        let g1_par_gen = u64::from_le_bytes(
+            state.bytes[o1 + PARITY_HEADER_START + 40..o1 + PARITY_HEADER_START + 48]
+                .try_into()
+                .unwrap(),
+        );
+        (
+            plan_state,
+            has_token,
+            g0_par_state,
+            g0_par_gen,
+            g1_par_state,
+            g1_par_gen,
+        )
+    }
+
+    fn read_btrfs_generation(bytes: &[u8]) -> u64 {
+        let off = BTRFS_SUPER_INFO_OFFSET + 0x48;
+        u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+    }
+
+    impl ByteDevice for FaultInjectingMemDevice {
+        fn len_bytes(&self) -> u64 {
+            self.state.lock().bytes.len() as u64
+        }
+
+        fn read_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ByteOffset,
+            buf: &mut [u8],
+        ) -> Result<(), FfsError> {
+            let guard = self.state.lock();
+            let start = usize::try_from(offset.0).unwrap();
+            let end = start.checked_add(buf.len()).unwrap();
+            buf.copy_from_slice(&guard.bytes[start..end]);
+            Ok(())
+        }
+
+        fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<(), FfsError> {
+            let mut guard = self.state.lock();
+            if guard.fail_next_write {
+                guard.fail_next_write = false;
+                guard.cut = None;
+                guard.triggered = true;
+                return Err(FfsError::Io(std::io::Error::other(
+                    "injected crash-cut power loss before next write",
+                )));
+            }
+            let (plan_state, has_token, ..) = inspect_headers(&guard);
+            if matches!(guard.cut, Some(CrashCut::CutA))
+                && plan_state == PLAN_DIRTY
+                && has_token
+                && guard.dirty_syncs_seen >= 1
+            {
+                let start = usize::try_from(offset.0).unwrap();
+                let end = start.checked_add(buf.len()).unwrap();
+                guard.bytes[start..end].copy_from_slice(buf);
+                guard.dirty_writes_after_token += 1;
+                if guard.dirty_writes_after_token >= 1 {
+                    // One uncommitted journal/COW write landed after PLAN_DIRTY; cut power now
+                    // before JBD2 commit block or Btrfs superblock can be written!
+                    guard.fail_next_write = true;
+                }
+                return Ok(());
+            }
+            let start = usize::try_from(offset.0).unwrap();
+            let end = start.checked_add(buf.len()).unwrap();
+            guard.bytes[start..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn sync(&self, _cx: &Cx) -> Result<(), FfsError> {
+            let mut guard = self.state.lock();
+            if guard.fail_next_write {
+                guard.fail_next_write = false;
+                guard.cut = None;
+                guard.triggered = true;
+                return Err(FfsError::Io(std::io::Error::other(
+                    "injected crash-cut power loss on sync",
+                )));
+            }
+            let Some(cut) = guard.cut else {
+                return Ok(());
+            };
+            let (plan_state, has_token, g0_par_state, g0_par_gen, g1_par_state, g1_par_gen) =
+                inspect_headers(&guard);
+            match cut {
+                CrashCut::CutA => {
+                    if plan_state == PLAN_DIRTY && has_token {
+                        guard.dirty_syncs_seen += 1;
+                    }
+                }
+                CrashCut::CutBExt4 => {
+                    if plan_state == PLAN_DIRTY && has_token {
+                        guard.dirty_syncs_seen += 1;
+                        if guard.dirty_syncs_seen == 2 {
+                            // Sync #1 was PLAN_DIRTY; Sync #2 is JBD2 Phase 1b commit sync!
+                            // Let JBD2 commit become durable, then cut power before checkpoint/Pending!
+                            guard.fail_next_write = true;
+                        }
+                    }
+                }
+                CrashCut::CutBBtrfs { pre_btrfs_gen } => {
+                    if plan_state == PLAN_DIRTY
+                        && has_token
+                        && read_btrfs_generation(&guard.bytes) > pre_btrfs_gen
+                    {
+                        // New Btrfs superblock generation is now durable while plan is PLAN_DIRTY!
+                        // Cut power right before publish_validation_plan(Pending)!
+                        guard.fail_next_write = true;
+                    }
+                }
+                CrashCut::CutC { pre_gen0, pre_gen1 } => {
+                    if plan_state == VALIDATION_PENDING
+                        && has_token
+                        && g0_par_state == VALIDATION_SEALED
+                        && g0_par_gen > pre_gen0
+                        && g1_par_gen == pre_gen1
+                    {
+                        // Group 0 finished sealing validation + parity; Group 1 has not!
+                        guard.fail_next_write = true;
+                    }
+                }
+                CrashCut::CutD { pre_gen0, pre_gen1 } => {
+                    if plan_state == VALIDATION_PENDING
+                        && has_token
+                        && g0_par_state == VALIDATION_SEALED
+                        && g0_par_gen > pre_gen0
+                        && g1_par_state == VALIDATION_SEALED
+                        && g1_par_gen > pre_gen1
+                    {
+                        // All dirty groups encoded & sealed parity; cut before final whole-plan seal!
+                        guard.fail_next_write = true;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn require_oracles() -> bool {
+        std::env::var_os("FFS_REQUIRE_ORACLES").is_some_and(|v| v == "1")
+    }
+
+    fn tool_available(tool: &str) -> bool {
+        Command::new("sh")
+            .args(["-c", &format!("command -v {tool} >/dev/null 2>&1")])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    fn native_prep_options() -> OpenOptions {
+        OpenOptions {
+            mount_mode: MountMode::Native,
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            ..OpenOptions::default()
+        }
+    }
+
+    fn native_active_options(ephemeral_btrfs: bool) -> OpenOptions {
+        OpenOptions {
+            mount_mode: MountMode::Native,
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            native_repair_max_working_bytes: Some(WORKING_BUDGET),
+            btrfs_rw_ephemeral_ok: ephemeral_btrfs,
+            ..OpenOptions::default()
+        }
+    }
+
+    fn deterministic_payload(seed: u64, len: usize) -> Vec<u8> {
+        let mut out = vec![0_u8; len];
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        for chunk in out.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bytes = state.to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        out
+    }
+
+    fn run_external_e2fsck(dir: &Path, label: &str, bytes: &[u8]) {
+        let path = dir.join(format!("{label}.ext4"));
+        std::fs::write(&path, bytes).expect("write ext4 image for e2fsck");
+        let output = Command::new("e2fsck")
+            .args(["-fn", path.to_str().unwrap()])
+            .output()
+            .expect("execute e2fsck -fn");
+        assert!(
+            output.status.success(),
+            "e2fsck -fn failed on {label}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_external_btrfs_check(dir: &Path, label: &str, bytes: &[u8]) {
+        let path = dir.join(format!("{label}.btrfs"));
+        std::fs::write(&path, bytes).expect("write btrfs image for btrfs check");
+        let output = Command::new("btrfs")
+            .args(["check", "--readonly", path.to_str().unwrap()])
+            .output()
+            .expect("execute btrfs check --readonly");
+        assert!(
+            output.status.success(),
+            "btrfs check --readonly failed on {label}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn verify_1pct_and_5pct_healing(
+        cx: &Cx,
+        fs: &OpenFs,
+        dev: &FaultInjectingMemDevice,
+        storage: &NativeRepairStorage,
+        root_dir: InodeNumber,
+        expected_files: &[(&str, &[u8], [u8; 32])],
+    ) {
+        let clean_snapshot = dev.snapshot();
+        let clean_image_digest = *blake3::hash(&clean_snapshot).as_bytes();
+        let tail0 = &storage.tails[0];
+        let source_count = if tail0.is_detached() {
+            tail0.blocks_per_group as usize
+        } else {
+            (tail0.start.0 - tail0.group_start.0) as usize
+        };
+        let repair_blocks = tail0.repair_blocks as usize;
+        let count_1pct = source_count.div_ceil(100).max(1).min(repair_blocks);
+        let count_5pct = ((source_count * 5) / 100).max(2).min(repair_blocks);
+
+        // 1% corruption pass: corrupt deterministic spread across Group 0 source blocks.
+        let stride_1 = (source_count / count_1pct).max(1);
+        for i in 0..count_1pct {
+            let blk = tail0.group_start.0 + ((i * stride_1 + 3) % source_count) as u64;
+            dev.corrupt_block_byte(blk, (i * 37) % 512, 0x5A);
+        }
+        assert_ne!(
+            *blake3::hash(&dev.snapshot()).as_bytes(),
+            clean_image_digest
+        );
+        let heal_1 = fs.scrub_and_heal_native(cx).expect("1% scrub and heal");
+        assert_eq!(heal_1.corrupted_blocks_detected, count_1pct as u64);
+        assert_eq!(heal_1.blocks_healed, count_1pct as u64);
+        assert_eq!(
+            *blake3::hash(&dev.snapshot()).as_bytes(),
+            clean_image_digest,
+            "1% native heal must restore byte-identical image"
+        );
+
+        // 5% corruption pass: corrupt 5% of Group 0 source blocks and verify Ville/Wald escalation.
+        let stride_5 = (source_count / count_5pct).max(1);
+        for i in 0..count_5pct {
+            let blk = tail0.group_start.0 + ((i * stride_5 + 7) % source_count) as u64;
+            dev.corrupt_block_byte(blk, (i * 53) % 512, 0xA5);
+        }
+        let heal_5 = fs.scrub_and_heal_native(cx).expect("5% scrub and heal");
+        assert_eq!(heal_5.corrupted_blocks_detected, count_5pct as u64);
+        assert_eq!(heal_5.blocks_healed, count_5pct as u64);
+        assert!(
+            heal_5.monitor.null_rejected,
+            "5% corruption must reject healthy-media null in Ville/Wald e-process: {:?}",
+            heal_5.monitor
+        );
+        assert!(
+            heal_5.recommended_interval_divisor > 1,
+            "Ville/Wald rejection must escalate scrub cadence divisor: {:?}",
+            heal_5
+        );
+        assert_eq!(
+            *blake3::hash(&dev.snapshot()).as_bytes(),
+            clean_image_digest,
+            "5% native heal must restore byte-identical image"
+        );
+
+        // Verify acknowledged files against independent BLAKE3 digests.
+        for &(name, expected_bytes, expected_hash) in expected_files {
+            let attr = fs
+                .lookup(cx, root_dir, OsStr::new(name))
+                .unwrap_or_else(|e| panic!("lookup {name}: {e}"));
+            assert_eq!(attr.size, expected_bytes.len() as u64);
+            let actual = fs
+                .read(cx, attr.ino, 0, expected_bytes.len() as u32 + 64)
+                .unwrap_or_else(|e| panic!("read {name}: {e}"));
+            assert_eq!(*blake3::hash(&actual).as_bytes(), expected_hash);
+            assert_eq!(actual.as_slice(), expected_bytes);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_ext4_crash_cuts_a_b_c_d_corruption_1pct_5pct_and_e2fsck_bd_11a8t_bd_j7a4e() {
+        let mke2fs = format!("mk{}", "e2fs");
+        if !tool_available(&mke2fs) || !tool_available("e2fsck") {
+            assert!(
+                !require_oracles(),
+                "FFS_REQUIRE_ORACLES=1 but mke2fs/e2fsck are missing"
+            );
+            eprintln!("SKIP|suite=native_ext4_crash_cuts|reason=e2fsprogs_unavailable");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_img = tmp.path().join("seed.ext4");
+        std::fs::File::create(&base_img)
+            .and_then(|f| f.set_len(4 * 1024 * 1024))
+            .expect("size seed.ext4");
+        let status = Command::new(&mke2fs)
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-O",
+                "extent,metadata_csum,has_journal,^fast_commit,^flex_bg",
+                "-b",
+                "1024",
+                "-g",
+                "2048",
+                "-J",
+                "size=1",
+                "-N",
+                "128",
+                base_img.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run mke2fs");
+        assert!(status.success(), "mke2fs failed");
+
+        let cx = Cx::for_testing();
+        let v1_bytes = deterministic_payload(0x11A8_0001, 12 * 1024);
+        let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
+        let v2_bytes = deterministic_payload(0x11A8_0002, 1100 * 1024);
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+
+        // Seed v1.bin cleanly before native preparation.
+        {
+            let mut fs = OpenFs::open_read_write(
+                &cx,
+                &base_img,
+                &OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("open seed.ext4 rw");
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach jbd2");
+            fs.enable_writes(&cx).expect("enable writes");
+            let created = fs
+                .create(&cx, InodeNumber(2), OsStr::new("v1.bin"), 0o644, 0, 0)
+                .expect("create v1.bin");
+            fs.write(&cx, created.ino, 0, &v1_bytes)
+                .expect("write v1.bin");
+            fs.fsync(&cx, created.ino, 0, false).expect("fsync v1.bin");
+        }
+
+        let raw_seed = std::fs::read(&base_img).expect("read seed.ext4");
+        let dummy_storage = NativeRepairStorage {
+            owner_inode: InodeNumber(12),
+            repair_basis_points: 500,
+            tails: vec![ffs_core::native_repair::NativeRepairTail {
+                group: ffs_types::GroupNumber(0),
+                group_start: BlockNumber(1),
+                blocks_per_group: 2048,
+                start: BlockNumber(1),
+                validation_blocks: 1,
+                repair_blocks: 1,
+            }],
+        };
+        let prep_dev = FaultInjectingMemDevice::new(raw_seed, 1024, &dummy_storage);
+        let storage = OpenFs::from_devices(
+            &cx,
+            Box::new(prep_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .expect("open for prepare")
+        .prepare_native_repair(&cx, 500)
+        .expect("prepare_native_repair ext4");
+        assert_eq!(storage.tails.len(), 2, "must span 2 ext4 block groups");
+
+        let baseline_dev = FaultInjectingMemDevice::new(prep_dev.snapshot(), 1024, &storage);
+        let val_report = OpenFs::from_devices(
+            &cx,
+            Box::new(baseline_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .expect("open for validate")
+        .initialize_native_validation(&cx)
+        .expect("initialize_native_validation ext4");
+        let rep_report = OpenFs::from_devices(
+            &cx,
+            Box::new(baseline_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .expect("open for encode")
+        .initialize_native_repair(&cx, WORKING_BUDGET)
+        .expect("initialize_native_repair ext4");
+        eprintln!(
+            "NATIVE_REPAIR_EVIDENCE|fs=ext4|phase=baseline|groups={}|source_blocks={}|repair_blocks={}|overhead_bps={}",
+            rep_report.groups,
+            rep_report.source_blocks,
+            rep_report.repair_blocks,
+            storage.repair_basis_points
+        );
+        assert_eq!(val_report.groups, 2);
+        let sealed_baseline_bytes = baseline_dev.snapshot();
+        run_external_e2fsck(tmp.path(), "ext4-baseline", &sealed_baseline_bytes);
+
+        let cuts = [
+            (
+                "cut_a",
+                CrashCut::CutA,
+                false, // v2 NOT yet committed in JBD2
+            ),
+            (
+                "cut_b",
+                CrashCut::CutBExt4,
+                true, // v2 IS committed in JBD2 before Pending plan
+            ),
+            (
+                "cut_c",
+                CrashCut::CutC {
+                    pre_gen0: rep_report.generations[0],
+                    pre_gen1: rep_report.generations[1],
+                },
+                true,
+            ),
+            (
+                "cut_d",
+                CrashCut::CutD {
+                    pre_gen0: rep_report.generations[0],
+                    pre_gen1: rep_report.generations[1],
+                },
+                true,
+            ),
+        ];
+
+        for (cut_name, cut, v2_expected) in cuts {
+            let cut_dev =
+                FaultInjectingMemDevice::new(sealed_baseline_bytes.clone(), 1024, &storage);
+            {
+                let mut fs = OpenFs::from_devices(
+                    &cx,
+                    Box::new(cut_dev.clone()),
+                    &native_active_options(false),
+                    VolumeAccess::ReadWrite,
+                    None,
+                    Vec::new(),
+                )
+                .expect("open active ext4");
+                assert!(fs.attach_ext4_internal_jbd2_writer(&cx).unwrap());
+                fs.enable_writes(&cx).expect("enable writes");
+
+                let created = fs
+                    .create(&cx, InodeNumber(2), OsStr::new("v2.bin"), 0o644, 0, 0)
+                    .expect("create v2.bin");
+                // Write 1.1 MiB so blocks allocate across BOTH Group 0 and Group 1.
+                for (chunk_idx, chunk) in v2_bytes.chunks(64 * 1024).enumerate() {
+                    fs.write(&cx, created.ino, (chunk_idx * 64 * 1024) as u64, chunk)
+                        .expect("stage v2 chunk");
+                }
+
+                cut_dev.arm_cut(cut);
+                let sync_err = fs
+                    .fsync(&cx, created.ino, 0, false)
+                    .expect_err("armed crash cut must interrupt fsync");
+                eprintln!("NATIVE_REPAIR_EVIDENCE|fs=ext4|cut={cut_name}|sync_err={sync_err}");
+            }
+            assert!(
+                cut_dev.disarm(),
+                "ext4 {cut_name} fault rule must have fired"
+            );
+            {
+                let guard = cut_dev.state.lock();
+                let (plan_state, has_token, g0_state, g0_gen, _g1_state, g1_gen) =
+                    inspect_headers(&guard);
+                assert!(
+                    has_token,
+                    "ext4 {cut_name} must leave FFSEPK02 epoch token on disk"
+                );
+                match cut {
+                    CrashCut::CutA | CrashCut::CutBExt4 => {
+                        assert_eq!(plan_state, PLAN_DIRTY, "ext4 {cut_name} plan_state");
+                    }
+                    CrashCut::CutC { pre_gen0, pre_gen1 } => {
+                        assert_eq!(plan_state, VALIDATION_PENDING);
+                        assert_eq!(g0_state, VALIDATION_SEALED);
+                        assert!(g0_gen > pre_gen0);
+                        assert_eq!(g1_gen, pre_gen1);
+                    }
+                    CrashCut::CutD { pre_gen0, pre_gen1 } => {
+                        assert_eq!(plan_state, VALIDATION_PENDING);
+                        assert!(g0_gen > pre_gen0 && g1_gen > pre_gen1);
+                    }
+                    CrashCut::CutBBtrfs { .. } => unreachable!(),
+                }
+            }
+
+            // Cold reopen: must automatically replay JBD2 (if committed), reconcile FFSEPK02,
+            // clear FFSEPK02, and re-seal VALIDATION_SEALED without manual re-initialization!
+            let mut reopened = OpenFs::from_devices(
+                &cx,
+                Box::new(cut_dev.clone()),
+                &native_active_options(false),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            )
+            .unwrap_or_else(|e| panic!("cold reopen after ext4 {cut_name} failed: {e}"));
+            assert!(reopened.attach_ext4_internal_jbd2_writer(&cx).unwrap());
+            reopened
+                .enable_writes(&cx)
+                .expect("enable writes after cold reopen");
+            let post_report = reopened
+                .check_native_repair(&cx)
+                .expect("post-reopen native repair check");
+            assert_eq!(post_report.groups, 2);
+            {
+                let guard = cut_dev.state.lock();
+                let o0 = (storage.tails[0].start.0 as usize) * 1024;
+                assert!(
+                    guard.bytes[o0 + EPOCH_TOKEN_START..o0 + EPOCH_TOKEN_START + EPOCH_TOKEN_LEN]
+                        .iter()
+                        .all(|&b| b == 0),
+                    "ext4 {cut_name}: FFSEPK02 token must be retired after reconciliation"
+                );
+            }
+
+            if v2_expected {
+                verify_1pct_and_5pct_healing(
+                    &cx,
+                    &reopened,
+                    &cut_dev,
+                    &storage,
+                    InodeNumber(2),
+                    &[
+                        ("v1.bin", v1_bytes.as_slice(), v1_hash),
+                        ("v2.bin", v2_bytes.as_slice(), v2_hash),
+                    ],
+                );
+            } else {
+                assert!(
+                    matches!(
+                        reopened.lookup(&cx, InodeNumber(2), OsStr::new("v2.bin")),
+                        Err(FfsError::NotFound(_))
+                    ),
+                    "Cut A uncommitted v2.bin must not appear after crash rollback"
+                );
+                verify_1pct_and_5pct_healing(
+                    &cx,
+                    &reopened,
+                    &cut_dev,
+                    &storage,
+                    InodeNumber(2),
+                    &[("v1.bin", v1_bytes.as_slice(), v1_hash)],
+                );
+            }
+            drop(reopened);
+            run_external_e2fsck(tmp.path(), &format!("ext4-{cut_name}"), &cut_dev.snapshot());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_btrfs_crash_cuts_a_b_c_d_treelog_corruption_1pct_5pct_and_btrfs_check_bd_11a8t_bd_j7a4e()
+     {
+        let mkfs_btrfs = format!("mk{}.btrfs", "fs");
+        if !tool_available(&mkfs_btrfs) || !tool_available("btrfs") {
+            assert!(
+                !require_oracles(),
+                "FFS_REQUIRE_ORACLES=1 but btrfs-progs are missing"
+            );
+            eprintln!("SKIP|suite=native_btrfs_crash_cuts|reason=btrfs_progs_unavailable");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_img = tmp.path().join("seed.btrfs");
+        std::fs::File::create(&base_img)
+            .and_then(|f| f.set_len(16 * 1024 * 1024))
+            .expect("size seed.btrfs");
+        let status = Command::new(&mkfs_btrfs)
+            .args([
+                "-f",
+                "-q",
+                "-M",
+                "-d",
+                "single",
+                "-m",
+                "single",
+                base_img.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run mkfs.btrfs");
+        assert!(status.success(), "mkfs.btrfs -M failed");
+
+        let cx = Cx::for_testing();
+        let root_dir = InodeNumber(256);
+        let v1_bytes = deterministic_payload(0xB7F5_0001, 16 * 1024);
+        let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
+        let v2_bytes = deterministic_payload(0xB7F5_0002, 2 * 1024 * 1024);
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+
+        // Seed v1.bin cleanly before native preparation.
+        {
+            let mut fs = OpenFs::open_read_write(&cx, &base_img, &OpenOptions::default())
+                .expect("open seed.btrfs rw");
+            fs.enable_writes(&cx).expect("enable writes");
+            let created = fs
+                .create(&cx, root_dir, OsStr::new("v1.bin"), 0o644, 0, 0)
+                .expect("create v1.bin");
+            fs.write(&cx, created.ino, 0, &v1_bytes)
+                .expect("write v1.bin");
+            fs.fsync(&cx, created.ino, 0, false).expect("fsync v1.bin");
+        }
+
+        let raw_seed = std::fs::read(&base_img).expect("read seed.btrfs");
+        let dummy_storage = NativeRepairStorage {
+            owner_inode: InodeNumber(257),
+            repair_basis_points: 500,
+            tails: vec![ffs_core::native_repair::NativeRepairTail {
+                group: ffs_types::GroupNumber(0),
+                group_start: BlockNumber(16),
+                blocks_per_group: 2048,
+                start: BlockNumber(16),
+                validation_blocks: 1,
+                repair_blocks: 1,
+            }],
+        };
+        let prep_dev = FaultInjectingMemDevice::new(raw_seed, 4096, &dummy_storage);
+        let storage = OpenFs::from_devices(
+            &cx,
+            Box::new(prep_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .expect("open btrfs for prepare")
+        .prepare_native_repair(&cx, 500)
+        .expect("prepare_native_repair btrfs");
+        assert!(
+            storage.tails.len() >= 2,
+            "16 MiB btrfs image must partition into >= 2 native groups, got {}",
+            storage.tails.len()
+        );
+        run_external_btrfs_check(tmp.path(), "btrfs-prepared", &prep_dev.snapshot());
+
+        let baseline_dev = FaultInjectingMemDevice::new(prep_dev.snapshot(), 4096, &storage);
+        OpenFs::from_devices(
+            &cx,
+            Box::new(baseline_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .expect("open btrfs for validate")
+        .initialize_native_validation(&cx)
+        .expect("initialize_native_validation btrfs");
+        let rep_report = OpenFs::from_devices(
+            &cx,
+            Box::new(baseline_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .expect("open btrfs for encode")
+        .initialize_native_repair(&cx, WORKING_BUDGET)
+        .expect("initialize_native_repair btrfs");
+        let sealed_baseline_bytes = baseline_dev.snapshot();
+        let baseline_btrfs_gen = read_btrfs_generation(&sealed_baseline_bytes);
+        eprintln!(
+            "NATIVE_REPAIR_EVIDENCE|fs=btrfs|phase=baseline|groups={}|source_blocks={}|repair_blocks={}|overhead_bps={}|btrfs_gen={}",
+            rep_report.groups,
+            rep_report.source_blocks,
+            rep_report.repair_blocks,
+            storage.repair_basis_points,
+            baseline_btrfs_gen
+        );
+        run_external_btrfs_check(tmp.path(), "btrfs-encoded", &sealed_baseline_bytes);
+
+        // Verify ephemeral tree-log fsync + native freshness seal + cold reopen + healing!
+        {
+            let log_dev =
+                FaultInjectingMemDevice::new(sealed_baseline_bytes.clone(), 4096, &storage);
+            let log_bytes = deterministic_payload(0xB7F5_E94E, 8192);
+            let log_hash = *blake3::hash(&log_bytes).as_bytes();
+            {
+                let mut fs = OpenFs::from_devices(
+                    &cx,
+                    Box::new(log_dev.clone()),
+                    &native_active_options(true),
+                    VolumeAccess::ReadWrite,
+                    None,
+                    Vec::new(),
+                )
+                .expect("open ephemeral native btrfs");
+                fs.enable_writes(&cx).expect("enable writes");
+                let created = fs
+                    .create(&cx, root_dir, OsStr::new("logged.bin"), 0o644, 0, 0)
+                    .expect("create logged.bin");
+                fs.write(&cx, created.ino, 0, &log_bytes)
+                    .expect("write logged.bin");
+                fs.fsync(&cx, created.ino, 0, false)
+                    .expect("tree-log fsync with native freshness");
+            }
+            let reopened = OpenFs::from_devices(
+                &cx,
+                Box::new(log_dev.clone()),
+                &native_active_options(true),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            )
+            .expect("reopen ephemeral native btrfs");
+            verify_1pct_and_5pct_healing(
+                &cx,
+                &reopened,
+                &log_dev,
+                &storage,
+                root_dir,
+                &[
+                    ("v1.bin", v1_bytes.as_slice(), v1_hash),
+                    ("logged.bin", log_bytes.as_slice(), log_hash),
+                ],
+            );
+            drop(reopened);
+            run_external_btrfs_check(tmp.path(), "btrfs-treelog-healed", &log_dev.snapshot());
+        }
+
+        // Exercise Cuts A, B, C, and D across full Btrfs COW commits.
+        let cuts = [
+            ("cut_a", CrashCut::CutA, false),
+            (
+                "cut_b",
+                CrashCut::CutBBtrfs {
+                    pre_btrfs_gen: baseline_btrfs_gen,
+                },
+                true,
+            ),
+            (
+                "cut_c",
+                CrashCut::CutC {
+                    pre_gen0: rep_report.generations[0],
+                    pre_gen1: rep_report.generations[1],
+                },
+                true,
+            ),
+            (
+                "cut_d",
+                CrashCut::CutD {
+                    pre_gen0: rep_report.generations[0],
+                    pre_gen1: rep_report.generations[1],
+                },
+                true,
+            ),
+        ];
+
+        for (cut_name, cut, v2_expected) in cuts {
+            let cut_dev =
+                FaultInjectingMemDevice::new(sealed_baseline_bytes.clone(), 4096, &storage);
+            {
+                let mut fs = OpenFs::from_devices(
+                    &cx,
+                    Box::new(cut_dev.clone()),
+                    &native_active_options(false),
+                    VolumeAccess::ReadWrite,
+                    None,
+                    Vec::new(),
+                )
+                .expect("open active btrfs");
+                fs.enable_writes(&cx).expect("enable writes");
+                let created = fs
+                    .create(&cx, root_dir, OsStr::new("v2.bin"), 0o644, 0, 0)
+                    .expect("create v2.bin");
+                // Write 2 MiB + mutate v1.bin so blocks touch both Group 0 and Group 1.
+                for (chunk_idx, chunk) in v2_bytes.chunks(128 * 1024).enumerate() {
+                    fs.write(&cx, created.ino, (chunk_idx * 128 * 1024) as u64, chunk)
+                        .expect("stage btrfs v2 chunk");
+                }
+                cut_dev.arm_cut(cut);
+                let sync_err = fs
+                    .fsync(&cx, created.ino, 0, false)
+                    .expect_err("armed btrfs crash cut must interrupt fsync");
+                eprintln!("NATIVE_REPAIR_EVIDENCE|fs=btrfs|cut={cut_name}|sync_err={sync_err}");
+            }
+            assert!(
+                cut_dev.disarm(),
+                "btrfs {cut_name} fault rule must have fired"
+            );
+
+            let mut reopened = OpenFs::from_devices(
+                &cx,
+                Box::new(cut_dev.clone()),
+                &native_active_options(false),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            )
+            .unwrap_or_else(|e| panic!("cold reopen after btrfs {cut_name} failed: {e}"));
+            reopened
+                .enable_writes(&cx)
+                .expect("enable writes after btrfs cold reopen");
+            reopened
+                .check_native_repair(&cx)
+                .expect("post-reopen btrfs native repair check");
+
+            if v2_expected {
+                verify_1pct_and_5pct_healing(
+                    &cx,
+                    &reopened,
+                    &cut_dev,
+                    &storage,
+                    root_dir,
+                    &[
+                        ("v1.bin", v1_bytes.as_slice(), v1_hash),
+                        ("v2.bin", v2_bytes.as_slice(), v2_hash),
+                    ],
+                );
+            } else {
+                assert!(
+                    matches!(
+                        reopened.lookup(&cx, root_dir, OsStr::new("v2.bin")),
+                        Err(FfsError::NotFound(_))
+                    ),
+                    "Btrfs Cut A unreferenced COW blocks must not expose v2.bin"
+                );
+                verify_1pct_and_5pct_healing(
+                    &cx,
+                    &reopened,
+                    &cut_dev,
+                    &storage,
+                    root_dir,
+                    &[("v1.bin", v1_bytes.as_slice(), v1_hash)],
+                );
+            }
+            drop(reopened);
+            run_external_btrfs_check(
+                tmp.path(),
+                &format!("btrfs-{cut_name}"),
+                &cut_dev.snapshot(),
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_repair_negative_controls_exhausted_tampered_stale_missing_and_cancelled_bd_j7a4e() {
+        let mke2fs = format!("mk{}", "e2fs");
+        if !tool_available(&mke2fs) {
+            assert!(
+                !require_oracles(),
+                "FFS_REQUIRE_ORACLES=1 but mke2fs is missing"
+            );
+            eprintln!("SKIP|suite=native_repair_negative_controls|reason=e2fsprogs_unavailable");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_img = tmp.path().join("neg.ext4");
+        std::fs::File::create(&base_img)
+            .and_then(|f| f.set_len(4 * 1024 * 1024))
+            .expect("size neg.ext4");
+        let status = Command::new(&mke2fs)
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-O",
+                "extent,metadata_csum,has_journal,^fast_commit,^flex_bg",
+                "-b",
+                "1024",
+                "-g",
+                "2048",
+                "-J",
+                "size=1",
+                "-N",
+                "128",
+                base_img.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run mke2fs");
+        assert!(status.success());
+
+        let cx = Cx::for_testing();
+        let unreserved_bytes = std::fs::read(&base_img).expect("read neg.ext4");
+
+        // Negative Control 1: Missing /.frankenfs-repair fails closed without mutating image.
+        {
+            let dummy = NativeRepairStorage {
+                owner_inode: InodeNumber(12),
+                repair_basis_points: 500,
+                tails: vec![ffs_core::native_repair::NativeRepairTail {
+                    group: ffs_types::GroupNumber(0),
+                    group_start: BlockNumber(1),
+                    blocks_per_group: 2048,
+                    start: BlockNumber(1),
+                    validation_blocks: 1,
+                    repair_blocks: 1,
+                }],
+            };
+            let dev = FaultInjectingMemDevice::new(unreserved_bytes.clone(), 1024, &dummy);
+            let res = OpenFs::from_devices(
+                &cx,
+                Box::new(dev.clone()),
+                &native_active_options(false),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            );
+            assert!(
+                res.is_err(),
+                "missing /.frankenfs-repair must fail closed on native repair activation"
+            );
+            assert_eq!(dev.snapshot(), unreserved_bytes);
+        }
+
+        // Prepare + encode sealed baseline.
+        let dummy = NativeRepairStorage {
+            owner_inode: InodeNumber(12),
+            repair_basis_points: 500,
+            tails: vec![ffs_core::native_repair::NativeRepairTail {
+                group: ffs_types::GroupNumber(0),
+                group_start: BlockNumber(1),
+                blocks_per_group: 2048,
+                start: BlockNumber(1),
+                validation_blocks: 1,
+                repair_blocks: 1,
+            }],
+        };
+        let prep_dev = FaultInjectingMemDevice::new(unreserved_bytes, 1024, &dummy);
+        let storage = OpenFs::from_devices(
+            &cx,
+            Box::new(prep_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .prepare_native_repair(&cx, 500)
+        .unwrap();
+        let sealed_dev = FaultInjectingMemDevice::new(prep_dev.snapshot(), 1024, &storage);
+        OpenFs::from_devices(
+            &cx,
+            Box::new(sealed_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .initialize_native_validation(&cx)
+        .unwrap();
+        OpenFs::from_devices(
+            &cx,
+            Box::new(sealed_dev.clone()),
+            &native_prep_options(),
+            VolumeAccess::ReadWrite,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .initialize_native_repair(&cx, WORKING_BUDGET)
+        .unwrap();
+        let sealed_bytes = sealed_dev.snapshot();
+        let tail0 = &storage.tails[0];
+        let r = tail0.repair_blocks as usize;
+
+        // Negative Control 2: Exhausted parity (corrupted = R + 1) returns RepairFailed and never overwrites damage.
+        {
+            let dev = FaultInjectingMemDevice::new(sealed_bytes.clone(), 1024, &storage);
+            let fs = OpenFs::from_devices(
+                &cx,
+                Box::new(dev.clone()),
+                &native_active_options(false),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+            for i in 0..=r {
+                dev.corrupt_block_byte(tail0.group_start.0 + 20 + i as u64, 16, 0x7F);
+            }
+            let damaged_snapshot = dev.snapshot();
+            let err = fs
+                .scrub_and_heal_native(&cx)
+                .expect_err("R + 1 corruptions must exceed parity budget");
+            assert!(matches!(err, FfsError::RepairFailed(_)), "got {err:?}");
+            assert_eq!(
+                dev.snapshot(),
+                damaged_snapshot,
+                "exhausted parity must never overwrite damaged blocks"
+            );
+        }
+
+        // Negative Control 3: Tampered parity symbol (R source corruptions + 1 corrupted parity symbol) rejected before writeback.
+        {
+            let dev = FaultInjectingMemDevice::new(sealed_bytes.clone(), 1024, &storage);
+            let fs = OpenFs::from_devices(
+                &cx,
+                Box::new(dev.clone()),
+                &native_active_options(false),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+            for i in 0..r {
+                dev.corrupt_block_byte(tail0.group_start.0 + 30 + i as u64, 8, 0x33);
+            }
+            let first_symbol_block = tail0.start.0 + 1 + u64::from(tail0.validation_blocks);
+            dev.corrupt_block_byte(first_symbol_block, 64, 0xFF);
+            let damaged_snapshot = dev.snapshot();
+            let err = fs
+                .scrub_and_heal_native(&cx)
+                .expect_err("tampered parity symbol with R source erasures must fail closed");
+            assert!(
+                matches!(err, FfsError::RepairFailed(_) | FfsError::Corruption { .. }),
+                "got {err:?}"
+            );
+            assert_eq!(
+                dev.snapshot(),
+                damaged_snapshot,
+                "tampered parity symbol must never write back unverified bytes"
+            );
+        }
+
+        // Negative Control 4: Stale symbols under unsealed Dirty epoch never roll back newer bytes.
+        {
+            let dev = FaultInjectingMemDevice::new(sealed_bytes.clone(), 1024, &storage);
+            let fs = OpenFs::from_devices(
+                &cx,
+                Box::new(dev.clone()),
+                &native_active_options(false),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+            let fenced = fs.shared_fenced_device();
+            let target_blk = tail0.group_start.0 + 50;
+            let newer_bytes = [0xCC_u8; 1024];
+            fenced
+                .write_all_at(&cx, ByteOffset(target_blk * 1024), &newer_bytes)
+                .expect("write newer unsealed block");
+            // Corrupt a different block while the epoch is Dirty (unsealed): stale parity must be refused!
+            dev.corrupt_block_byte(tail0.group_start.0 + 51, 0, 0x11);
+            let mut buf = [0_u8; 1024];
+            let err = fenced
+                .read_exact_at(&cx, ByteOffset((tail0.group_start.0 + 51) * 1024), &mut buf)
+                .expect_err("dirty epoch must refuse stale parity decode");
+            assert!(matches!(err, FfsError::Corruption { .. }), "got {err:?}");
+            // And target_blk still holds newer_bytes on disk, never rolled back!
+            let snap = dev.snapshot();
+            let off = (target_blk as usize) * 1024;
+            assert_eq!(&snap[off..off + 1024], &newer_bytes);
+        }
+
+        // Negative Control 5: Cx cancellation aborts scrub/reconstruction cleanly without poisoning clean baseline.
+        {
+            let dev = FaultInjectingMemDevice::new(sealed_bytes.clone(), 1024, &storage);
+            let fs = OpenFs::from_devices(
+                &cx,
+                Box::new(dev.clone()),
+                &native_active_options(false),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+            dev.corrupt_block_byte(tail0.group_start.0 + 40, 12, 0x44);
+            let cancelled_cx = Cx::for_testing();
+            cancelled_cx.set_cancel_requested(true);
+            let cancel_err = fs
+                .scrub_and_heal_native(&cancelled_cx)
+                .expect_err("cancelled Cx must abort scrub_and_heal_native");
+            assert!(
+                matches!(cancel_err, FfsError::Cancelled),
+                "expected Cancelled, got {cancel_err:?}"
+            );
+            // Subsequent uncancelled Cx heals cleanly back to exact baseline!
+            let healed = fs
+                .scrub_and_heal_native(&cx)
+                .expect("fresh Cx heals after prior cancellation");
+            assert_eq!(healed.blocks_healed, 1);
+            assert_eq!(dev.snapshot(), sealed_bytes);
+        }
+    }
+}

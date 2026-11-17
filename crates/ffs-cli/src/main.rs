@@ -8759,16 +8759,204 @@ impl BlockDevice for SharedPinnedScrubDevice {
     }
 }
 
-#[derive(Debug, Clone)]
+struct SharedBackingByteDevice(Arc<dyn ffs_block::ByteDevice>);
+
+impl ffs_block::ByteDevice for SharedBackingByteDevice {
+    fn len_bytes(&self) -> u64 {
+        self.0.len_bytes()
+    }
+
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ffs_types::ByteOffset,
+        buf: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        self.0.read_exact_at(cx, offset, buf)
+    }
+
+    fn write_all_at(
+        &self,
+        cx: &Cx,
+        offset: ffs_types::ByteOffset,
+        buf: &[u8],
+    ) -> ffs_error::Result<()> {
+        self.0.write_all_at(cx, offset, buf)
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        self.0.sync(cx)
+    }
+}
+
+#[derive(Clone)]
 struct MountBackgroundScrubThreadConfig<'a> {
     interval: Duration,
     ledger_path: Option<&'a Path>,
     repair_writes_enabled: bool,
+    shared_backing_device: Option<Arc<dyn ffs_block::ByteDevice>>,
     mounted_repair_writeback: Option<Arc<OpenFs>>,
     mounted_rw_scrub: Option<(Arc<OpenFs>, Arc<RwScrubWriteTracker>)>,
     pipeline_metrics: ffs_repair::pipeline::RepairPipelineMetrics,
     operation_id: &'a str,
     scenario_id: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_native_mount_background_scrub_daemon(
+    cx: &Cx,
+    native_fs: Arc<OpenFs>,
+    fs_uuid: [u8; 16],
+    interval: Duration,
+    ledger_path: Option<&Path>,
+    repair_writes_enabled: bool,
+    pipeline_metrics: ffs_repair::pipeline::RepairPipelineMetrics,
+    operation_id: &str,
+    scenario_id: &str,
+) -> Result<ScrubDaemonMetrics> {
+    let mut ledger = open_mount_background_scrub_ledger(ledger_path)?;
+    let mut metrics = ScrubDaemonMetrics::default();
+    let mut monitor = ffs_core::VilleWaldScrubMonitor::with_default_config();
+    let tick = Duration::from_millis(100);
+    let mut divisor = 1_u32;
+    let mut first_round = true;
+    let mut previous = cx.now();
+
+    info!(
+        target: "ffs::cli::mount",
+        operation_id,
+        scenario_id,
+        interval_secs = interval.as_secs(),
+        repair_writes_enabled,
+        "native_mount_background_scrub_thread_start"
+    );
+
+    while cx.checkpoint().is_ok() {
+        if !first_round {
+            let effective = interval / divisor.max(1);
+            let now = cx.now();
+            let elapsed = Duration::from_nanos(now.duration_since(previous));
+            let remaining = effective.saturating_sub(elapsed);
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining.min(tick));
+                continue;
+            }
+            if cx.checkpoint().is_err() {
+                break;
+            }
+            previous = now;
+        }
+        first_round = false;
+
+        let started = Instant::now();
+        if repair_writes_enabled {
+            match native_fs.scrub_and_heal_native(cx) {
+                Ok(report) => {
+                    divisor = report.recommended_interval_divisor.max(1);
+                    metrics.blocks_scanned_total = metrics
+                        .blocks_scanned_total
+                        .saturating_add(report.source_blocks_scanned);
+                    metrics.blocks_corrupt_found = metrics
+                        .blocks_corrupt_found
+                        .saturating_add(report.corrupted_blocks_detected);
+                    metrics.blocks_recovered = metrics
+                        .blocks_recovered
+                        .saturating_add(report.blocks_healed);
+                    metrics.scrub_rounds_completed =
+                        metrics.scrub_rounds_completed.saturating_add(1);
+                    let secs = started.elapsed().as_secs_f64();
+                    if secs > 0.0 {
+                        metrics.scrub_rate_blocks_per_sec =
+                            report.source_blocks_scanned as f64 / secs;
+                    }
+                    pipeline_metrics.record_external_scrub_round(
+                        u64::from(report.groups_scanned),
+                        report.source_blocks_scanned,
+                        report.corrupted_blocks_detected,
+                        report.blocks_healed,
+                        0,
+                    );
+                    let evidence = ffs_repair::evidence::RepairEvidence::anytime_scrub_monitor(
+                        fs_uuid,
+                        GroupNumber(0),
+                        report.monitor,
+                    );
+                    if let Ok(line) = evidence.to_jsonl() {
+                        let _ = writeln!(ledger, "{line}");
+                        let _ = ledger.flush();
+                    }
+                }
+                Err(ffs_error::FfsError::Cancelled) => break,
+                Err(error) => {
+                    warn!(
+                        target: "ffs::cli::mount",
+                        operation_id,
+                        scenario_id,
+                        error = %error,
+                        "native_mount_background_scrub_round_error"
+                    );
+                    metrics.blocks_unrecoverable = metrics.blocks_unrecoverable.saturating_add(1);
+                    pipeline_metrics.record_external_scrub_round(0, 0, 1, 0, 1);
+                }
+            }
+        } else {
+            match native_fs.check_native_repair(cx) {
+                Ok(report) => {
+                    let detail = monitor.observe_counts(report.source_blocks, 0);
+                    divisor = monitor.recommended_interval_divisor().max(1);
+                    metrics.blocks_scanned_total = metrics
+                        .blocks_scanned_total
+                        .saturating_add(report.source_blocks);
+                    metrics.scrub_rounds_completed =
+                        metrics.scrub_rounds_completed.saturating_add(1);
+                    pipeline_metrics.record_external_scrub_round(
+                        u64::from(report.groups),
+                        report.source_blocks,
+                        0,
+                        0,
+                        0,
+                    );
+                    let evidence = ffs_repair::evidence::RepairEvidence::anytime_scrub_monitor(
+                        fs_uuid,
+                        GroupNumber(0),
+                        detail,
+                    );
+                    if let Ok(line) = evidence.to_jsonl() {
+                        let _ = writeln!(ledger, "{line}");
+                        let _ = ledger.flush();
+                    }
+                }
+                Err(ffs_error::FfsError::Cancelled) => break,
+                Err(error) => {
+                    let detail = monitor.observe_counts(1, 1);
+                    divisor = monitor.recommended_interval_divisor().max(1);
+                    metrics.blocks_corrupt_found = metrics.blocks_corrupt_found.saturating_add(1);
+                    metrics.scrub_rounds_completed =
+                        metrics.scrub_rounds_completed.saturating_add(1);
+                    pipeline_metrics.record_external_scrub_round(1, 1, 1, 0, 0);
+                    let evidence = ffs_repair::evidence::RepairEvidence::anytime_scrub_monitor(
+                        fs_uuid,
+                        GroupNumber(0),
+                        detail,
+                    );
+                    if let Ok(line) = evidence.to_jsonl() {
+                        let _ = writeln!(ledger, "{line}");
+                        let _ = ledger.flush();
+                    }
+                    warn!(
+                        target: "ffs::cli::mount",
+                        operation_id,
+                        scenario_id,
+                        error = %error,
+                        "native_mount_background_scrub_detected_corruption"
+                    );
+                }
+            }
+        }
+        previous = cx.now();
+    }
+
+    Ok(metrics)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8785,23 +8973,38 @@ fn run_mount_background_scrub_daemon(
     if repair_writes_enabled {
         ensure_mount_background_repair_write_access(image_path)?;
     }
-    let byte_dev = if config.repair_writes_enabled {
-        FileByteDevice::open_read_write(image_path)
+    let block_dev: Box<dyn BlockDevice> = if let Some(shared) = config.shared_backing_device {
+        Box::new(
+            ByteBlockDevice::new(SharedBackingByteDevice(shared), plan.block_size).with_context(
+                || {
+                    format!(
+                        "failed to create shared background scrub block device (block_size={})",
+                        plan.block_size
+                    )
+                },
+            )?,
+        )
     } else {
-        FileByteDevice::open_read_only(image_path)
-    }
-    .with_context(|| {
-        format!(
-            "failed to open image for background scrub: {}",
-            image_path.display()
+        let byte_dev = if config.repair_writes_enabled {
+            FileByteDevice::open_read_write(image_path)
+        } else {
+            FileByteDevice::open_read_only(image_path)
+        }
+        .with_context(|| {
+            format!(
+                "failed to open image for background scrub: {}",
+                image_path.display()
+            )
+        })?;
+        Box::new(
+            ByteBlockDevice::new(byte_dev, plan.block_size).with_context(|| {
+                format!(
+                    "failed to create background scrub block device (block_size={})",
+                    plan.block_size
+                )
+            })?,
         )
-    })?;
-    let block_dev = ByteBlockDevice::new(byte_dev, plan.block_size).with_context(|| {
-        format!(
-            "failed to create background scrub block device (block_size={})",
-            plan.block_size
-        )
-    })?;
+    };
     type MountedRwScrubCtx = (
         Arc<ffs_core::PinnedMvccScrubDevice>,
         Arc<RwScrubWriteTracker>,
@@ -8811,7 +9014,7 @@ fn run_mount_background_scrub_daemon(
             let tracker_cb = Arc::clone(&tracker);
             let pinned = Arc::new(
                 open_fs
-                    .pinned_scrub_device(Box::new(block_dev))
+                    .pinned_scrub_device(block_dev)
                     .with_mvcc_hit_callback(Arc::new(move |b| tracker_cb.record_block(b))),
             );
             (
@@ -8819,7 +9022,7 @@ fn run_mount_background_scrub_daemon(
                 Some((pinned, tracker)),
             )
         } else {
-            (Box::new(block_dev), None)
+            (block_dev, None)
         };
     let ext4_group_layouts: Vec<(BlockNumber, u32, ffs_repair::storage::RepairGroupLayout)> = plan
         .groups
@@ -8937,14 +9140,66 @@ fn start_mount_background_scrub(
         return Ok(None);
     }
 
+    if open_fs.has_native_repair_device()
+        && let Some(native_fs) = mounted_repair_writeback
+            .clone()
+            .or_else(|| mounted_rw_scrub.as_ref().map(|(fs, _)| Arc::clone(fs)))
+    {
+        let fs_uuid = match &open_fs.flavor {
+            FsFlavor::Ext4(sb) => sb.uuid,
+            FsFlavor::Btrfs(sb) => sb.fsid,
+        };
+        let interval = Duration::from_secs(config.interval_secs);
+        let ledger_path = config.ledger_path.clone();
+        let repair_writes_enabled = config.repair_writes_enabled;
+        let pipeline_metrics = ffs_repair::pipeline::RepairPipelineMetrics::new();
+        let thread_pipeline_metrics = pipeline_metrics.clone();
+        let thread_operation_id = operation_id.to_owned();
+        let thread_scenario_id = scenario_id.to_owned();
+
+        info!(
+            target: "ffs::cli::mount",
+            operation_id,
+            scenario_id,
+            outcome = "native_background_scrub_starting",
+            block_size = open_fs.block_size(),
+            interval_secs = config.interval_secs,
+            repair_writes_enabled,
+            "mount_background_scrub_start"
+        );
+
+        let worker = MountIoWorker::start(cx, runtime, move |worker_cx| {
+            run_native_mount_background_scrub_daemon(
+                worker_cx,
+                native_fs,
+                fs_uuid,
+                interval,
+                ledger_path.as_deref(),
+                repair_writes_enabled,
+                thread_pipeline_metrics,
+                &thread_operation_id,
+                &thread_scenario_id,
+            )
+        })
+        .context("failed to start native mount background scrub daemon")?;
+
+        return Ok(Some(MountBackgroundScrubGuard {
+            worker,
+            pipeline_metrics,
+            operation_id: operation_id.to_owned(),
+            scenario_id: scenario_id.to_owned(),
+        }));
+    }
+
     if config.repair_writes_enabled && mounted_repair_writeback.is_some() {
-        // bd-plamw: repair-symbol tails are not reserved from the allocator, so
-        // on a read-write mount a new file can land in a tail after the
-        // start-time check and a later symbol refresh would overwrite it.
+        // bd-plamw: repair-symbol tails are not reserved from the allocator on
+        // unreserved compatibility mounts, so a new file can land in a tail after
+        // the start-time check and a later symbol refresh would overwrite it.
         bail!(
-            "--background-repair is not supported on read-write mounts yet: repair-symbol \
-             storage is not reserved from the allocator (bd-plamw). Use a read-only mount \
-             for mounted repair, or --background-scrub for detection only"
+            "--background-repair is not supported on unreserved read-write mounts: repair-symbol \
+             storage is not reserved from the allocator (bd-plamw). Prepare native repair storage \
+             (`ffs-cli repair native-prepare` + `native-validate` + `native-encode`) and mount \
+             with `--native`, or use a read-only mount for mounted repair"
         );
     }
     let plan = match build_mount_background_scrub_plan(
@@ -8997,6 +9252,9 @@ fn start_mount_background_scrub(
         "mount_background_scrub_start"
     );
 
+    let shared_backing_device =
+        (!repair_writes_enabled || open_fs.is_writable()).then(|| open_fs.shared_backing_device());
+
     let worker = MountIoWorker::start(cx, runtime, move |worker_cx| {
         let result = run_mount_background_scrub_daemon(
             worker_cx,
@@ -9006,6 +9264,7 @@ fn start_mount_background_scrub(
                 interval,
                 ledger_path: ledger_path.as_deref(),
                 repair_writes_enabled,
+                shared_backing_device,
                 mounted_repair_writeback,
                 mounted_rw_scrub,
                 pipeline_metrics: thread_pipeline_metrics,
@@ -9391,7 +9650,16 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             bail!("FFS_BTRFS_DIRTY_BYTES_THRESHOLD must be valid UTF-8");
         }
     }
-    let rw_scrub_tracker = (options.read_write && options.background_scrub.enabled).then(|| {
+    let effective_background_scrub =
+        if open_fs.has_native_repair_device() && !options.background_scrub.explicit {
+            let mut promoted = options.background_scrub.clone();
+            promoted.enabled = true;
+            promoted.repair_writes_enabled = true;
+            promoted
+        } else {
+            options.background_scrub.clone()
+        };
+    let rw_scrub_tracker = (options.read_write && effective_background_scrub.enabled).then(|| {
         let tracker = Arc::new(RwScrubWriteTracker::new());
         open_fs.attach_repair_flush_lifecycle(
             Arc::clone(&tracker) as Arc<dyn ffs_core::RepairFlushLifecycle>
@@ -9400,7 +9668,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     });
     let open_fs = Arc::new(open_fs);
     let mounted_repair_writeback = (options.read_write
-        && options.background_scrub.repair_writes_enabled)
+        && effective_background_scrub.repair_writes_enabled)
         .then(|| Arc::clone(&open_fs));
     let mounted_rw_scrub = rw_scrub_tracker.map(|tracker| (Arc::clone(&open_fs), tracker));
 
@@ -9411,7 +9679,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         &background_runtime,
         image_path,
         open_fs.as_ref(),
-        &options.background_scrub,
+        &effective_background_scrub,
         mounted_repair_writeback,
         mounted_rw_scrub,
         (&operation_id, scenario_id),
@@ -9554,13 +9822,51 @@ fn open_filesystem_for_mount(image_path: &Path, options: &MountCmdOptions) -> Re
         open_opts.mvcc_wal_path = Some(image_path.with_extension("ffs-metadata-wal"));
         open_opts.metadata_log_enabled = true;
     }
-    let open_fs = if options.read_write {
+    let mut open_fs = if options.read_write {
         OpenFs::open_read_write(&cx, image_path, &open_opts)
     } else {
         OpenFs::open_with_options(&cx, image_path, &open_opts)
     }
     .map_err(anyhow::Error::new)
     .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
+    if options.read_write
+        && options.mount_mode.is_native()
+        && open_opts.native_repair_max_working_bytes.is_none()
+        && !open_fs.metadata_log_enabled()
+        && matches!(
+            options.btrfs_mount_selection,
+            BtrfsMountSelection::DefaultRoot
+        )
+    {
+        let root_ino = match &open_fs.flavor {
+            FsFlavor::Ext4(_) => Some(ffs_types::InodeNumber(2)),
+            FsFlavor::Btrfs(_) if open_fs.btrfs_device_inventory_verified() => {
+                Some(ffs_types::InodeNumber(ffs_btrfs::BTRFS_FIRST_FREE_OBJECTID))
+            }
+            FsFlavor::Btrfs(_) => None,
+        };
+        if let Some(root) = root_ino
+            && open_fs
+                .lookup(&cx, root, std::ffi::OsStr::new(".frankenfs-repair"))
+                .is_ok()
+        {
+            const DEFAULT_NATIVE_REPAIR_WORKING_BYTES: u64 = 256 * 1024 * 1024;
+            let recovery_touched = open_fs.native_recovery_touched_blocks().clone();
+            open_fs
+                .reconcile_and_activate_native_repair(
+                    &cx,
+                    DEFAULT_NATIVE_REPAIR_WORKING_BYTES,
+                    &recovery_touched,
+                )
+                .map_err(anyhow::Error::new)
+                .with_context(|| {
+                    format!(
+                        "failed to reconcile and activate native repair on {}",
+                        image_path.display()
+                    )
+                })?;
+        }
+    }
     if open_fs.metadata_log_enabled() {
         eprintln!(
             "mount: append-only ext4 metadata WAL ENABLED ({})",

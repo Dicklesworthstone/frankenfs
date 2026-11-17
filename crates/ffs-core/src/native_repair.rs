@@ -1,26 +1,39 @@
-//! Allocator-owned ext4 repair tails, source validation and active freshness.
+//! Allocator-owned ext4 and btrfs repair storage, source validation and active freshness.
 //!
 //! Preparation creates ownership, not usable parity. The immutable owner's
-//! unwritten extents reserve physical space without exposing previous contents
-//! through normal file reads. Headers are read through physical block mappings.
+//! unwritten/preallocated extents reserve physical space without exposing
+//! previous contents through normal file reads. Headers are read through
+//! physical block mappings.
 
 use super::{
-    AllocHint, BTreeSet, BlockDevice, BlockNumber, ByteDeviceBlockAdapter, Cx, EXT4_SECTOR_SIZE,
-    EXT4_VALID_FS, Ext4AllocState, Ext4Extent, Ext4FileType, Ext4Inode, Ext4Superblock, ExtentTree,
-    FfsError, FsGeometry, GroupNumber, InodeNumber, Jbd2Superblock, Mutex, OpenFs, OsStr,
-    Serialize, SingleLockDirAlloc, TransactionBlockAdapter, debug,
-    ext4_superblock_requires_journal_recovery, parse_extent_tree, parse_to_ffs_error,
+    AllocHint, BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID,
+    BTRFS_INODE_IMMUTABLE, BTRFS_INODE_NODATASUM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
+    BTreeSet, BlockDevice, BlockNumber, BtrfsAllocState, BtrfsExtentData, BtrfsKey,
+    BtrfsSuperblock, ByteDeviceBlockAdapter, Cx, EXT4_SECTOR_SIZE, EXT4_VALID_FS, Ext4AllocState,
+    Ext4Extent, Ext4FileType, Ext4Inode, Ext4Superblock, ExtentTree, FfsError, FsGeometry,
+    GroupNumber, InodeNumber, Jbd2Superblock, Mutex, OpenFs, OsStr, Serialize, SingleLockDirAlloc,
+    TransactionBlockAdapter, btrfs_mutation_to_ffs, debug,
+    ext4_superblock_requires_journal_recovery, map_logical_to_physical, parse_extent_data,
+    parse_extent_tree, parse_to_ffs_error, read_ext4_superblock_region,
 };
+use asupersync::raptorq::systematic::EmittedSymbol;
 use asupersync::sync::{
     LockError, Mutex as NativeMutex, MutexGuard as NativeMutexGuard, OnceCell, TryLockError,
 };
 use ffs_block::{BlockBuf, ByteDevice};
-use ffs_repair::codec::{DirectEncodeRequest, direct_encode_workspace_bytes, encode_group_direct};
+use ffs_btrfs::{BTRFS_INODE_NODATACOW, BtrfsBTree};
+use ffs_repair::codec::{
+    BlockDelta, DirectEncodeRequest, EncodedGroup, direct_encode_workspace_bytes,
+    encode_group_direct, update_encoded_group_delta,
+};
+use ffs_repair::evidence::AnytimeScrubMonitorDetail;
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryWriteback, RecoveryWritebackBlock};
-use ffs_repair::scrub::{BlockValidator, BlockVerdict, CorruptionKind, Severity};
+use ffs_repair::scrub::{
+    BlockValidator, BlockVerdict, CorruptionKind, Severity, VilleWaldConfig, VilleWaldScrubMonitor,
+};
 use ffs_repair::storage::{RawRefreshAdmission, RepairGroupLayout, RepairGroupStorage};
-use ffs_repair::symbol::RepairGroupDescExt;
-use ffs_types::ByteOffset;
+use ffs_repair::symbol::{RepairGroupDescExt, repair_seed};
+use ffs_types::{BTRFS_SUPER_INFO_OFFSET, ByteOffset};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -44,8 +57,142 @@ const PLAN_HEADER_END: usize = PLAN_HEADER_START + VALIDATION_HEADER_BYTES;
 const PARITY_MAGIC: &[u8; 8] = b"FFSRPR01";
 const PARITY_HEADER_START: usize = PLAN_HEADER_END;
 const PARITY_HEADER_END: usize = PARITY_HEADER_START + VALIDATION_HEADER_BYTES;
+const EPOCH_TOKEN_MAGIC: &[u8; 8] = b"FFSEPK02";
+const EPOCH_TOKEN_START: usize = PARITY_HEADER_END;
+const EPOCH_TOKEN_BYTES: usize = 160;
+const EPOCH_TOKEN_END: usize = EPOCH_TOKEN_START + EPOCH_TOKEN_BYTES;
+const EPOCH_TOKEN_FLAG_FORMAT_COMMIT: u32 = 1 << 0;
+const DIRTY_BUCKET_COUNT: usize = 512;
+const MAX_DELTA_BEFOREIMAGE_BLOCKS: usize = 512;
+const BTRFS_NATIVE_GROUP_MAX_BLOCKS: u32 = 2_048;
+const BTRFS_NATIVE_OWNER_FLAGS: u64 =
+    BTRFS_INODE_IMMUTABLE | BTRFS_INODE_NODATASUM | BTRFS_INODE_NODATACOW;
 
-/// An ext4 allocation group's owned native repair tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeFsIdentity {
+    uuid: [u8; 16],
+    block_size: u32,
+    group_count: u32,
+}
+
+impl NativeFsIdentity {
+    fn from_ext4(sb: &Ext4Superblock) -> Self {
+        Self {
+            uuid: sb.uuid,
+            block_size: sb.block_size,
+            group_count: sb.groups_count(),
+        }
+    }
+
+    fn from_btrfs(sb: &BtrfsSuperblock, group_count: u32) -> Self {
+        Self {
+            uuid: sb.fsid,
+            block_size: sb.sectorsize,
+            group_count,
+        }
+    }
+}
+
+/// Format-bound crash recovery token persisted in `tails[0].start[448..608)`
+/// while a journaled/COW durability commit or epoch publication is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeEpochToken {
+    owner_inode: InodeNumber,
+    owner_generation: u32,
+    target_epoch: u32,
+    prev_sealed_epoch: u32,
+    flags: u32,
+    pre_epoch_commit_seq: u64,
+    prev_sealed_plan_root: [u8; 32],
+    dirty_group_buckets: [u8; 64],
+}
+
+impl NativeEpochToken {
+    fn bucket_bit(group: GroupNumber) -> (usize, u8) {
+        let bucket = (group.0 as usize) & (DIRTY_BUCKET_COUNT - 1);
+        (bucket / 8, 1_u8 << (bucket % 8))
+    }
+
+    fn mark_bucket(buckets: &mut [u8; 64], group: GroupNumber) {
+        let (byte, mask) = Self::bucket_bit(group);
+        buckets[byte] |= mask;
+    }
+
+    fn bucket_contains(buckets: &[u8; 64], group: GroupNumber) -> bool {
+        let (byte, mask) = Self::bucket_bit(group);
+        buckets[byte] & mask != 0
+    }
+
+    fn is_group_dirty(&self, group: GroupNumber) -> bool {
+        Self::bucket_contains(&self.dirty_group_buckets, group)
+    }
+
+    fn encode(&self, id: &NativeFsIdentity) -> [u8; EPOCH_TOKEN_BYTES] {
+        let mut bytes = [0_u8; EPOCH_TOKEN_BYTES];
+        bytes[..8].copy_from_slice(EPOCH_TOKEN_MAGIC);
+        bytes[8..24].copy_from_slice(&id.uuid);
+        bytes[24..32].copy_from_slice(&self.owner_inode.0.to_le_bytes());
+        bytes[32..36].copy_from_slice(&self.owner_generation.to_le_bytes());
+        bytes[36..40].copy_from_slice(&self.target_epoch.to_le_bytes());
+        bytes[40..44].copy_from_slice(&self.prev_sealed_epoch.to_le_bytes());
+        bytes[44..48].copy_from_slice(&self.flags.to_le_bytes());
+        bytes[48..56].copy_from_slice(&self.pre_epoch_commit_seq.to_le_bytes());
+        bytes[56..88].copy_from_slice(&self.prev_sealed_plan_root);
+        bytes[88..152].copy_from_slice(&self.dirty_group_buckets);
+        let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[..152]);
+        bytes[152..156].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    fn decode_optional(
+        bytes: &[u8],
+        id: &NativeFsIdentity,
+        owner_inode: InodeNumber,
+        owner_generation: u32,
+        tail0: &NativeRepairTail,
+    ) -> Result<Option<Self>, FfsError> {
+        if bytes.len() != EPOCH_TOKEN_BYTES {
+            return Err(validation_error(tail0, "epoch token length mismatch"));
+        }
+        if bytes.iter().all(|&byte| byte == 0) {
+            return Ok(None);
+        }
+        if &bytes[..8] != EPOCH_TOKEN_MAGIC || bytes[156..160] != [0; 4] {
+            return Err(validation_error(tail0, "epoch token magic or pad invalid"));
+        }
+        let target_epoch = u32::from_le_bytes(bytes[36..40].try_into().expect("fixed slice"));
+        let prev_sealed_epoch = u32::from_le_bytes(bytes[40..44].try_into().expect("fixed slice"));
+        let flags = u32::from_le_bytes(bytes[44..48].try_into().expect("fixed slice"));
+        let pre_epoch_commit_seq =
+            u64::from_le_bytes(bytes[48..56].try_into().expect("fixed slice"));
+        let prev_sealed_plan_root: [u8; 32] = bytes[56..88].try_into().expect("fixed slice");
+        let dirty_group_buckets: [u8; 64] = bytes[88..152].try_into().expect("fixed slice");
+        let token = Self {
+            owner_inode,
+            owner_generation,
+            target_epoch,
+            prev_sealed_epoch,
+            flags,
+            pre_epoch_commit_seq,
+            prev_sealed_plan_root,
+            dirty_group_buckets,
+        };
+        if prev_sealed_epoch == 0
+            || target_epoch != prev_sealed_epoch.saturating_add(1)
+            || flags & !EPOCH_TOKEN_FLAG_FORMAT_COMMIT != 0
+            || bytes != token.encode(id)
+        {
+            return Err(validation_error(
+                tail0,
+                "epoch token identity or checksum mismatch",
+            ));
+        }
+        Ok(Some(token))
+    }
+}
+
+/// An allocation group's owned native repair storage (in-group tail on ext4,
+/// or detached `PREALLOC` extent slice on btrfs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NativeRepairTail {
     pub group: GroupNumber,
@@ -59,8 +206,63 @@ pub struct NativeRepairTail {
 }
 
 impl NativeRepairTail {
-    fn blocks(&self) -> u32 {
+    #[must_use]
+    pub fn blocks(&self) -> u32 {
         self.validation_blocks + self.repair_blocks + DESCRIPTOR_BLOCKS + 1
+    }
+
+    #[must_use]
+    pub fn is_detached(&self) -> bool {
+        let Some(group_end) = self
+            .group_start
+            .0
+            .checked_add(u64::from(self.blocks_per_group))
+        else {
+            return true;
+        };
+        self.start.0 < self.group_start.0 || self.start.0 >= group_end
+    }
+
+    #[must_use]
+    pub fn source_end_exclusive(&self) -> BlockNumber {
+        if self.is_detached() {
+            BlockNumber(
+                self.group_start
+                    .0
+                    .saturating_add(u64::from(self.blocks_per_group)),
+            )
+        } else {
+            self.start
+        }
+    }
+
+    fn source_blocks(&self) -> Result<u32, FfsError> {
+        if self.is_detached() {
+            let group_end = self
+                .group_start
+                .0
+                .checked_add(u64::from(self.blocks_per_group))
+                .ok_or_else(|| validation_error(self, "detached source range overflows"))?;
+            let tail_end = self
+                .start
+                .0
+                .checked_add(u64::from(self.blocks()))
+                .ok_or_else(|| validation_error(self, "detached storage range overflows"))?;
+            if self.start.0 < group_end && self.group_start.0 < tail_end {
+                return Err(validation_error(
+                    self,
+                    "detached storage overlaps source range",
+                ));
+            }
+            Ok(self.blocks_per_group)
+        } else {
+            let sources = self
+                .start
+                .0
+                .checked_sub(self.group_start.0)
+                .ok_or_else(|| validation_error(self, "source range underflows"))?;
+            u32::try_from(sources).map_err(|_| validation_error(self, "source count exceeds u32"))
+        }
     }
 }
 
@@ -91,6 +293,18 @@ pub struct NativeRepairReport {
     pub source_blocks: u64,
     pub repair_blocks: u64,
     pub generations: Vec<u64>,
+}
+
+/// Summary of an active native scrub + self-healing pass across all groups.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeScrubHealReport {
+    pub groups_scanned: u32,
+    pub source_blocks_scanned: u64,
+    pub corrupted_blocks_detected: u64,
+    pub blocks_healed: u64,
+    pub recommended_interval_divisor: u32,
+    pub recommended_overhead_bps: u32,
+    pub monitor: AnytimeScrubMonitorDetail,
 }
 
 /// A reconstructed block from the sealed baseline, without image writeback.
@@ -137,6 +351,7 @@ struct NativeBaseline {
     epoch: u32,
     plan_root: [u8; 32],
     roots: Vec<[u8; 32]>,
+    group_epochs: Vec<u32>,
 }
 
 struct NativeGroupAdmission {
@@ -174,7 +389,44 @@ struct NativeFreshnessState {
     tables: Vec<Vec<u8>>,
     parity: Vec<ParityIntent>,
     intended: BTreeMap<BlockNumber, [u8; 32]>,
+    beforeimages: BTreeMap<BlockNumber, Vec<u8>>,
+    dirty_groups: Vec<bool>,
+    persisted_dirty_buckets: [u8; 64],
+    defer_seal: u32,
+    format_commit_seq: Option<u64>,
+    pending_dirty_buckets: [u8; 64],
+    scrub_monitor: VilleWaldScrubMonitor,
     phase: FreshnessPhase,
+}
+
+/// Guard holding a multi-barrier format commit (`ext4_journal_and_checkpoint`,
+/// `btrfs_commit_locked`, `btrfs_sync_ephemeral_tree_log`) in deferred-seal
+/// mode until its final durability sync.
+pub(crate) struct DurabilityCommitGuard<'a> {
+    device: Option<&'a NativeFreshnessDevice>,
+    armed: bool,
+}
+
+impl Drop for DurabilityCommitGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(device) = self.device
+        {
+            device.abort_durability_commit();
+        }
+    }
+}
+
+impl DurabilityCommitGuard<'_> {
+    pub(crate) fn arm_final_seal(&mut self, cx: &Cx) -> Result<(), FfsError> {
+        if self.armed {
+            self.armed = false;
+            if let Some(device) = self.device {
+                device.arm_final_seal(cx)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The only writable handle published after native freshness admission.
@@ -182,7 +434,7 @@ struct NativeFreshnessState {
 /// Internal ownership publication uses `inner` under the same state lock.
 pub(super) struct NativeFreshnessDevice {
     inner: Arc<dyn ByteDevice>,
-    sb: Ext4Superblock,
+    id: NativeFsIdentity,
     state: NativeMutex<NativeFreshnessState>,
     codec_budget: u64,
     ownership: NativeOwnershipConstraints,
@@ -318,6 +570,28 @@ impl NativeOwnershipConstraints {
         self.protect(cx, dev, 1024 + 0x60, 1, !0x04)
     }
 
+    fn protect_btrfs_superblock(&mut self, cx: &Cx, dev: &dyn BlockDevice) -> Result<(), FfsError> {
+        // Primary btrfs identity, geometry, incompat flags and embedded dev_item
+        // identity. Mutable commit fields (csum, generation, root, chunk_root,
+        // log_root, bytes_used, compat_ro_flags, sys_chunk_array, dev bytes_used)
+        // remain writable for COW commits.
+        let base = BTRFS_SUPER_INFO_OFFSET as u64;
+        for (start, end) in [
+            (0x20, 0x38),
+            (0x40, 0x48),
+            (0x70, 0x78),
+            (0x80, 0x88),
+            (0x90, 0x9C),
+            (0xAC, 0xB4),
+            (0xC4, 0xC6),
+            (0xC9, 0xD9),
+            (0x109, 0x129),
+        ] {
+            self.protect(cx, dev, base + start, end - start, u8::MAX)?;
+        }
+        Ok(())
+    }
+
     fn protect_groups(
         &mut self,
         cx: &Cx,
@@ -366,13 +640,13 @@ fn freshness_error(detail: &str) -> FfsError {
 }
 
 fn freshness_codec_budget(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     allowed: u64,
 ) -> Result<u64, FfsError> {
     let mut retained = 0_u64;
     for tail in &storage.tails {
-        let (sources, capacity, _) = validation_sizes(sb, tail)?;
+        let (sources, capacity, _) = validation_sizes(id, tail)?;
         // Old/next tables plus transient publication/readback copies. The
         // per-source allowance covers the intended BTreeMap and staged hashes;
         // codec allocations are admitted separately. This is not an RSS cap.
@@ -465,10 +739,76 @@ impl NativeFreshnessDevice {
         }
     }
 
+    fn begin_durability_commit<'a>(
+        &'a self,
+        cx: &Cx,
+        pre_commit_seq: u64,
+        hinted_blocks: &[BlockNumber],
+    ) -> Result<DurabilityCommitGuard<'a>, FfsError> {
+        let mut state = self.lock(cx)?;
+        for &block in hinted_blocks {
+            if let Some(group) = native_source_tail(&state.baseline.storage, block).map(|t| t.group)
+            {
+                NativeEpochToken::mark_bucket(&mut state.pending_dirty_buckets, group);
+            }
+        }
+        if state.format_commit_seq.is_none() {
+            state.format_commit_seq = Some(pre_commit_seq);
+        }
+        state.defer_seal = state
+            .defer_seal
+            .checked_add(1)
+            .ok_or_else(|| freshness_error("durability commit nesting overflow"))?;
+        Ok(DurabilityCommitGuard {
+            device: Some(self),
+            armed: true,
+        })
+    }
+
+    fn arm_final_seal(&self, cx: &Cx) -> Result<(), FfsError> {
+        let mut state = self.lock(cx)?;
+        state.defer_seal = state
+            .defer_seal
+            .checked_sub(1)
+            .ok_or_else(|| freshness_error("durability commit guard underflow"))?;
+        Ok(())
+    }
+
+    fn abort_durability_commit(&self) {
+        let waker = Waker::from(Arc::new(NativeLockWake(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let uncancelled = Cx::for_request();
+        let mut waiting = std::pin::pin!(self.state.lock(&uncancelled));
+        let guard = loop {
+            match waiting.as_mut().poll(&mut context) {
+                Poll::Ready(Ok(state)) => break Some(state),
+                Poll::Ready(Err(_)) => break None,
+                Poll::Pending => std::thread::park_timeout(Duration::from_millis(2)),
+            }
+        };
+        if let Some(mut state) = guard {
+            state.defer_seal = state.defer_seal.saturating_sub(1);
+            if state.defer_seal == 0 {
+                state.format_commit_seq = None;
+                state.pending_dirty_buckets = [0; 64];
+                if state.phase == FreshnessPhase::Dirty {
+                    // Physical writes escaped before the format transaction sealed;
+                    // poison the live handle so only cold recovery + reconciliation
+                    // can admit subsequent I/O.
+                    state.phase = FreshnessPhase::Poisoned;
+                }
+            }
+        }
+    }
+
+    pub(super) fn backing_device(&self) -> Arc<dyn ByteDevice> {
+        Arc::clone(&self.inner)
+    }
+
     fn device(&self) -> ByteDeviceBlockAdapter<'_> {
         ByteDeviceBlockAdapter {
             dev: self.inner.as_ref(),
-            block_size: self.sb.block_size,
+            block_size: self.id.block_size,
         }
     }
 
@@ -484,7 +824,7 @@ impl NativeFreshnessDevice {
         let bytes = &owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END];
         if validation_plan_intent(
             bytes,
-            &self.sb,
+            &self.id,
             &baseline.storage,
             baseline.owner_generation,
         )? != intent
@@ -507,7 +847,7 @@ impl NativeFreshnessDevice {
         let owner = check_native_validation_owner_prefix(
             cx,
             &dev,
-            &self.sb,
+            &self.id,
             &baseline.storage,
             baseline.owner_generation,
             tail,
@@ -523,7 +863,7 @@ impl NativeFreshnessDevice {
         let (root, table) = read_sealed_table(
             cx,
             &dev,
-            &self.sb,
+            &self.id,
             &baseline.storage,
             baseline.owner_generation,
             tail,
@@ -548,7 +888,7 @@ impl NativeFreshnessDevice {
         if read_native_parity_intent(
             cx,
             &self.device(),
-            &self.sb,
+            &self.id,
             &state.baseline,
             &state.baseline.storage.tails[index],
         )? != state.parity[index]
@@ -561,7 +901,7 @@ impl NativeFreshnessDevice {
         native_sealed_generation(
             cx,
             &self.device(),
-            &self.sb,
+            &self.id,
             &state.baseline,
             &state.baseline.storage.tails[index],
             degraded_parity,
@@ -589,7 +929,7 @@ impl NativeFreshnessDevice {
             verify_validation_table(
                 cx,
                 &self.device(),
-                &self.sb,
+                &self.id,
                 tail,
                 &state.tables[index],
                 &state.baseline.roots[index],
@@ -601,7 +941,7 @@ impl NativeFreshnessDevice {
     fn inspect_validation(&self, cx: &Cx) -> Result<NativeValidationReport, FfsError> {
         let state = self.lock(cx)?;
         self.inspect_clean_validation(cx, &state)?;
-        native_validation_report(&self.sb, &state.baseline.storage)
+        native_validation_report(&self.id, &state.baseline.storage)
     }
 
     fn inspect_repair(&self, cx: &Cx) -> Result<NativeRepairReport, FfsError> {
@@ -611,7 +951,7 @@ impl NativeFreshnessDevice {
             self.check_group_authority(cx, &state, index, false)?;
         }
         native_repair_report(
-            &self.sb,
+            &self.id,
             &state.baseline,
             state
                 .parity
@@ -619,6 +959,63 @@ impl NativeFreshnessDevice {
                 .map(|intent| intent.generation())
                 .collect(),
         )
+    }
+
+    fn scrub_and_heal_all_groups(&self, cx: &Cx) -> Result<NativeScrubHealReport, FfsError> {
+        let mut state = self.lock(cx)?;
+        if state.phase != FreshnessPhase::Clean || state.defer_seal != 0 {
+            return Err(freshness_error(
+                "background native scrub requires a sealed clean epoch",
+            ));
+        }
+        self.check_plan(
+            cx,
+            &state.baseline,
+            ValidationIntent::Sealed(state.baseline.plan_root),
+        )?;
+        let group_count = state.baseline.storage.tails.len();
+        let mut source_blocks_scanned = 0_u64;
+        let mut corrupted_blocks_detected = 0_u64;
+        let mut blocks_healed = 0_u64;
+        let mut last_monitor = None;
+        for index in 0..group_count {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            self.check_group_authority(cx, &state, index, true)?;
+            let tail = state.baseline.storage.tails[index].clone();
+            let (sources, _, _) = validation_sizes(&self.id, &tail)?;
+            let corrupt =
+                native_corrupt_indices(cx, &self.device(), &self.id, &tail, &state.tables[index])?;
+            let corrupt_len = corrupt.len() as u64;
+            source_blocks_scanned = source_blocks_scanned.saturating_add(u64::from(sources));
+            corrupted_blocks_detected = corrupted_blocks_detected.saturating_add(corrupt_len);
+            last_monitor = Some(
+                state
+                    .scrub_monitor
+                    .observe_counts(u64::from(sources), corrupt_len),
+            );
+            if let Some(&first_corrupt) = corrupt.first() {
+                let target = BlockNumber(tail.group_start.0 + u64::from(first_corrupt));
+                if let Err(err) = self.repair_clean_read(cx, &mut state, target) {
+                    return Err(err);
+                }
+                blocks_healed = blocks_healed.saturating_add(corrupt_len);
+            }
+        }
+        let monitor = last_monitor.unwrap_or_else(|| state.scrub_monitor.observe_counts(0, 0));
+        let recommended_interval_divisor = state.scrub_monitor.recommended_interval_divisor();
+        let recommended_overhead_bps = state
+            .scrub_monitor
+            .recommended_overhead_bps()
+            .max(state.baseline.storage.repair_basis_points);
+        Ok(NativeScrubHealReport {
+            groups_scanned: u32::try_from(group_count).unwrap_or(u32::MAX),
+            source_blocks_scanned,
+            corrupted_blocks_detected,
+            blocks_healed,
+            recommended_interval_divisor,
+            recommended_overhead_bps,
+            monitor,
+        })
     }
 
     fn check_authority(&self, cx: &Cx, state: &NativeFreshnessState) -> Result<(), FfsError> {
@@ -666,11 +1063,11 @@ impl NativeFreshnessDevice {
         let baseline = &state.baseline;
         let tail = native_target(&baseline.storage, block)?;
         let index = tail.group.0 as usize;
-        native_codec_budget(&self.sb, &baseline.storage, tail, self.codec_budget, true)?;
+        native_codec_budget(&self.id, &baseline.storage, tail, self.codec_budget, true)?;
         self.check_read_repair_authority(cx, state, index)?;
         let dev = self.device();
         let table = &state.tables[index];
-        let corrupt = native_corrupt_indices(cx, &dev, &self.sb, tail, table)?;
+        let corrupt = native_corrupt_indices(cx, &dev, &self.id, tail, table)?;
         let requested =
             u32::try_from(block.0 - tail.group_start.0).expect("admitted native source index");
         if !corrupt.contains(&requested) {
@@ -688,11 +1085,11 @@ impl NativeFreshnessDevice {
         let capture = NativeReconstructionCapture {
             blocks: OnceCell::new(),
         };
-        let (layout, expected) = native_layout(&self.sb, tail)?;
+        let (layout, expected) = native_layout(&self.id, tail)?;
         let result = GroupRecoveryOrchestrator::new_with_writeback(
             &view,
             &capture,
-            self.sb.uuid,
+            self.id.uuid,
             layout,
             tail.group_start,
             u32::from(expected.source_block_count),
@@ -735,7 +1132,7 @@ impl NativeFreshnessDevice {
         }
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         self.inner.sync(cx)?;
-        verify_validation_table(cx, &dev, &self.sb, tail, table, &baseline.roots[index])?;
+        verify_validation_table(cx, &dev, &self.id, tail, table, &baseline.roots[index])?;
         self.check_read_repair_authority(cx, state, index)?;
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         state.phase = FreshnessPhase::Clean;
@@ -749,7 +1146,7 @@ impl NativeFreshnessDevice {
             .checked_add(bytes.len() as u64)
             .filter(|end| *end <= self.inner.len_bytes())
             .ok_or_else(|| freshness_error("read exceeds admitted image"))?;
-        let size = u64::from(self.sb.block_size);
+        let size = u64::from(self.id.block_size);
         let mut cursor = offset.0;
         let mut repaired = false;
         let result = (|| {
@@ -785,10 +1182,9 @@ impl NativeFreshnessDevice {
                     bytes[output..output + count]
                         .copy_from_slice(&data.as_slice()[start..start + count]);
                 } else {
-                    // Owned control/parity tails and uncovered bytes (including
-                    // ext4's 1 KiB boot block) retain their physical-read contract.
-                    // Their consumers validate their own headers and authority;
-                    // these bytes are never admitted as source-repair targets.
+                    // Owned control/parity storage and uncovered bytes (including
+                    // ext4's 1 KiB boot block or btrfs's 64 KiB boot pad) retain
+                    // their physical-read contract.
                     self.inner.read_exact_at(
                         cx,
                         ByteOffset(cursor),
@@ -805,6 +1201,7 @@ impl NativeFreshnessDevice {
         result
     }
 
+    #[expect(clippy::type_complexity)]
     fn stage_intended(
         &self,
         cx: &Cx,
@@ -812,8 +1209,8 @@ impl NativeFreshnessDevice {
         offset: u64,
         end: u64,
         buffers: &[&[u8]],
-    ) -> Result<Vec<(BlockNumber, [u8; 32])>, FfsError> {
-        let size = u64::from(self.sb.block_size);
+    ) -> Result<Vec<(BlockNumber, GroupNumber, [u8; 32], Option<Vec<u8>>)>, FfsError> {
+        let size = u64::from(self.id.block_size);
         let mut staged = Vec::new();
         let mut input = 0;
         let mut consumed = 0;
@@ -837,6 +1234,10 @@ impl NativeFreshnessDevice {
                     detail: "native freshness beforeimage digest mismatch".into(),
                 });
             }
+            let first_beforeimage = (!state.beforeimages.contains_key(&block)
+                && state.beforeimages.len().saturating_add(staged.len())
+                    < MAX_DELTA_BEFOREIMAGE_BLOCKS)
+                .then(|| bytes.clone());
             let start = offset.max(number * size);
             let stop = end.min((number + 1) * size);
             let mut cursor = (start - number * size) as usize;
@@ -853,7 +1254,12 @@ impl NativeFreshnessDevice {
                 consumed += count;
             }
             self.ownership.check(block, &bytes)?;
-            staged.push((block, *blake3::hash(&bytes).as_bytes()));
+            staged.push((
+                block,
+                tail.group,
+                *blake3::hash(&bytes).as_bytes(),
+                first_beforeimage,
+            ));
         }
         Ok(staged)
     }
@@ -878,11 +1284,13 @@ impl NativeFreshnessDevice {
             .checked_add(length)
             .filter(|end| *end <= self.inner.len_bytes())
             .ok_or_else(|| freshness_error("write exceeds admitted image"))?;
-        let size = u64::from(self.sb.block_size);
+        let size = u64::from(self.id.block_size);
+        let mut write_buckets = [0_u8; 64];
         for number in offset.0 / size..=(end - 1) / size {
-            native_target(&state.baseline.storage, BlockNumber(number))?;
+            let tail = native_target(&state.baseline.storage, BlockNumber(number))?;
+            NativeEpochToken::mark_bucket(&mut write_buckets, tail.group);
         }
-        state
+        let next_epoch = state
             .baseline
             .epoch
             .checked_add(1)
@@ -894,13 +1302,54 @@ impl NativeFreshnessDevice {
         }
         let result = (|| {
             let staged = self.stage_intended(cx, &state, offset.0, end, buffers)?;
-            if state.phase == FreshnessPhase::Clean {
+            if let Some(pre_seq) = state.format_commit_seq {
+                let mut combined = state.pending_dirty_buckets;
+                for (dst, src) in combined.iter_mut().zip(&write_buckets) {
+                    *dst |= *src;
+                }
+                for (idx, &dirty) in state.dirty_groups.iter().enumerate() {
+                    if dirty {
+                        NativeEpochToken::mark_bucket(&mut combined, GroupNumber(idx as u32));
+                    }
+                }
+                let uncovered_bucket = write_buckets
+                    .iter()
+                    .zip(&state.persisted_dirty_buckets)
+                    .any(|(&need, &have)| need & !have != 0);
+                if state.phase == FreshnessPhase::Clean || uncovered_bucket {
+                    self.check_authority(cx, &state)?;
+                    let token = NativeEpochToken {
+                        owner_inode: state.baseline.storage.owner_inode,
+                        owner_generation: state.baseline.owner_generation,
+                        target_epoch: next_epoch,
+                        prev_sealed_epoch: state.baseline.epoch,
+                        flags: EPOCH_TOKEN_FLAG_FORMAT_COMMIT,
+                        pre_epoch_commit_seq: pre_seq,
+                        prev_sealed_plan_root: state.baseline.plan_root,
+                        dirty_group_buckets: combined,
+                    };
+                    state.phase = FreshnessPhase::Poisoned;
+                    publish_validation_plan_with_token(
+                        cx,
+                        &self.device(),
+                        &self.id,
+                        &state.baseline.storage,
+                        state.baseline.owner_generation,
+                        state.baseline.epoch,
+                        ValidationIntent::Dirty(state.baseline.plan_root),
+                        Some(&token),
+                    )?;
+                    state.pending_dirty_buckets = combined;
+                    state.persisted_dirty_buckets = combined;
+                    state.phase = FreshnessPhase::Dirty;
+                }
+            } else if state.phase == FreshnessPhase::Clean {
                 self.check_authority(cx, &state)?;
                 state.phase = FreshnessPhase::Poisoned;
                 publish_validation_plan(
                     cx,
                     &self.device(),
-                    &self.sb,
+                    &self.id,
                     &state.baseline.storage,
                     state.baseline.owner_generation,
                     state.baseline.epoch,
@@ -909,7 +1358,13 @@ impl NativeFreshnessDevice {
                 state.phase = FreshnessPhase::Dirty;
             }
             self.inner.write_vectored_all_at(cx, offset, buffers)?;
-            state.intended.extend(staged);
+            for (block, group, digest, maybe_beforeimage) in staged {
+                state.dirty_groups[group.0 as usize] = true;
+                if let Some(beforeimage) = maybe_beforeimage {
+                    state.beforeimages.entry(block).or_insert(beforeimage);
+                }
+                state.intended.insert(block, digest);
+            }
             cx.checkpoint().map_err(|_| FfsError::Cancelled)
         })();
         if result.is_err() {
@@ -927,9 +1382,22 @@ impl NativeFreshnessDevice {
         let mut tables = Vec::with_capacity(state.tables.len());
         let mut admissions = Vec::with_capacity(state.tables.len());
         for (index, tail) in state.baseline.storage.tails.iter().enumerate() {
+            if !state.dirty_groups[index] {
+                let table = state.tables[index].clone();
+                let root = state.baseline.roots[index];
+                let group_epoch = state.baseline.group_epochs[index];
+                verify_validation_table(cx, &self.device(), &self.id, tail, &table, &root)?;
+                tables.push(table);
+                admissions.push(ValidationAdmission {
+                    epoch: group_epoch,
+                    root,
+                    intent: ValidationIntent::Sealed(root),
+                });
+                continue;
+            }
             let mut table = state.tables[index].clone();
             table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
-                &self.sb,
+                &self.id,
                 state.baseline.storage.owner_inode,
                 state.baseline.owner_generation,
                 tail,
@@ -937,14 +1405,17 @@ impl NativeFreshnessDevice {
                 VALIDATION_PENDING,
                 &[0; 32],
             )?);
-            for (block, digest) in state.intended.range(tail.group_start..tail.start) {
+            for (block, digest) in state
+                .intended
+                .range(tail.group_start..tail.source_end_exclusive())
+            {
                 let offset = VALIDATION_HEADER_BYTES + (block.0 - tail.group_start.0) as usize * 32;
                 table[offset..offset + 32].copy_from_slice(digest);
             }
-            let (_, _, used) = validation_sizes(&self.sb, tail)?;
+            let (_, _, used) = validation_sizes(&self.id, tail)?;
             let root = validation_root(&table, used);
             table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
-                &self.sb,
+                &self.id,
                 state.baseline.storage.owner_inode,
                 state.baseline.owner_generation,
                 tail,
@@ -954,7 +1425,7 @@ impl NativeFreshnessDevice {
             )?);
             // The expected hashes came only from admitted tables or verified
             // caller writes. Reading current bytes cannot redefine them.
-            verify_validation_table(cx, &self.device(), &self.sb, tail, &table, &root)?;
+            verify_validation_table(cx, &self.device(), &self.id, tail, &table, &root)?;
             tables.push(table);
             admissions.push(ValidationAdmission {
                 epoch,
@@ -977,15 +1448,19 @@ impl NativeFreshnessDevice {
         for (index, tail) in next.storage.tails.iter().enumerate() {
             self.check_plan(cx, next, ValidationIntent::Pending(next.plan_root))?;
             self.check_group_authority(cx, state, index, false)?;
+            if !state.dirty_groups[index] {
+                continue;
+            }
+            let group_epoch = next.group_epochs[index];
             let validation = ValidationAdmission {
-                epoch: next.epoch,
+                epoch: group_epoch,
                 root: next.roots[index],
                 intent: ValidationIntent::Pending(next.roots[index]),
             };
             publish_validation_group(
                 cx,
                 &dev,
-                &self.sb,
+                &self.id,
                 &next.storage,
                 next.owner_generation,
                 tail,
@@ -994,17 +1469,17 @@ impl NativeFreshnessDevice {
             let (root, table) = read_sealed_table(
                 cx,
                 &dev,
-                &self.sb,
+                &self.id,
                 &next.storage,
                 next.owner_generation,
                 tail,
             )?;
             tables[index][..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
-                &self.sb,
+                &self.id,
                 next.storage.owner_inode,
                 next.owner_generation,
                 tail,
-                next.epoch,
+                group_epoch,
                 VALIDATION_SEALED,
                 &validation.root,
             )?);
@@ -1017,11 +1492,12 @@ impl NativeFreshnessDevice {
             encode_and_publish_native_group(
                 cx,
                 &dev,
-                &self.sb,
+                &self.id,
                 next,
                 tail,
                 &admissions[index],
                 &table,
+                Some(&state.beforeimages),
             )?;
         }
         Ok(())
@@ -1030,6 +1506,7 @@ impl NativeFreshnessDevice {
     fn verified_parity(
         &self,
         cx: &Cx,
+        state: &NativeFreshnessState,
         next: &NativeBaseline,
         tables: &[Vec<u8>],
         admissions: &[NativeGroupAdmission],
@@ -1041,7 +1518,7 @@ impl NativeFreshnessDevice {
             check_native_owner_prefix(
                 cx,
                 &dev,
-                &self.sb,
+                &self.id,
                 &next.storage,
                 next.owner_generation,
                 tail,
@@ -1049,7 +1526,7 @@ impl NativeFreshnessDevice {
             let (root, table) = read_sealed_table(
                 cx,
                 &dev,
-                &self.sb,
+                &self.id,
                 &next.storage,
                 next.owner_generation,
                 tail,
@@ -1060,15 +1537,20 @@ impl NativeFreshnessDevice {
                     "freshness authority changed before final seal",
                 ));
             }
-            verify_validation_table(cx, &dev, &self.sb, tail, &table, &root)?;
-            let generation = native_sealed_generation(cx, &dev, &self.sb, next, tail, false)?;
-            if generation != admissions[index].next_generation {
+            verify_validation_table(cx, &dev, &self.id, tail, &table, &root)?;
+            let generation = native_sealed_generation(cx, &dev, &self.id, next, tail, false)?;
+            let expected_generation = if state.dirty_groups[index] {
+                admissions[index].next_generation
+            } else {
+                admissions[index].intent.generation()
+            };
+            if generation != expected_generation {
                 return Err(validation_error(
                     tail,
                     "freshness parity generation changed before final seal",
                 ));
             }
-            parity.push(read_native_parity_intent(cx, &dev, &self.sb, next, tail)?);
+            parity.push(read_native_parity_intent(cx, &dev, &self.id, next, tail)?);
         }
         Ok(parity)
     }
@@ -1083,9 +1565,10 @@ impl NativeFreshnessDevice {
             .ok_or_else(|| freshness_error("validation epoch exhausted"))?;
         let (mut tables, validations) = self.next_tables(cx, state, epoch)?;
         let plan_root = validation_plan_root(
-            &self.sb,
+            &self.id,
             &state.baseline.storage,
             state.baseline.owner_generation,
+            epoch,
             &validations,
         )?;
         let next = NativeBaseline {
@@ -1094,36 +1577,54 @@ impl NativeFreshnessDevice {
             epoch,
             plan_root,
             roots: validations.iter().map(|admission| admission.root).collect(),
+            group_epochs: validations
+                .iter()
+                .map(|admission| admission.epoch)
+                .collect(),
         };
         let dev = self.device();
         let mut admissions = Vec::with_capacity(next.storage.tails.len());
-        for tail in &next.storage.tails {
+        for (index, tail) in next.storage.tails.iter().enumerate() {
             let mut admission =
-                admit_native_group(cx, &dev, &self.sb, &state.baseline, tail, self.codec_budget)?;
-            // Source-root changes require a new parity generation even when
-            // current raw parity is intact. Retain its exact high-water and seal.
-            admission.retained = false;
+                admit_native_group(cx, &dev, &self.id, &state.baseline, tail, self.codec_budget)?;
+            if state.dirty_groups[index] {
+                // Source-root changes require a new parity generation even when
+                // current raw parity is intact. Retain its exact high-water and seal.
+                admission.retained = false;
+            }
             admissions.push(admission);
         }
-        publish_validation_plan(
+        let pending_token = state.format_commit_seq.map(|pre_seq| NativeEpochToken {
+            owner_inode: state.baseline.storage.owner_inode,
+            owner_generation: state.baseline.owner_generation,
+            target_epoch: epoch,
+            prev_sealed_epoch: state.baseline.epoch,
+            flags: EPOCH_TOKEN_FLAG_FORMAT_COMMIT,
+            pre_epoch_commit_seq: pre_seq,
+            prev_sealed_plan_root: state.baseline.plan_root,
+            dirty_group_buckets: state.persisted_dirty_buckets,
+        });
+        publish_validation_plan_with_token(
             cx,
             &dev,
-            &self.sb,
+            &self.id,
             &next.storage,
             next.owner_generation,
             epoch,
             ValidationIntent::Pending(plan_root),
+            pending_token.as_ref(),
         )?;
         self.publish_groups(cx, state, &next, &mut tables, &admissions)?;
-        let parity = self.verified_parity(cx, &next, &tables, &admissions)?;
-        publish_validation_plan(
+        let parity = self.verified_parity(cx, state, &next, &tables, &admissions)?;
+        publish_validation_plan_with_token(
             cx,
             &dev,
-            &self.sb,
+            &self.id,
             &next.storage,
             next.owner_generation,
             epoch,
             ValidationIntent::Sealed(plan_root),
+            None,
         )?;
         self.check_plan(cx, &next, ValidationIntent::Sealed(plan_root))?;
         self.inner.sync(cx)?;
@@ -1132,6 +1633,11 @@ impl NativeFreshnessDevice {
         state.tables = tables;
         state.parity = parity;
         state.intended.clear();
+        state.beforeimages.clear();
+        state.dirty_groups.fill(false);
+        state.persisted_dirty_buckets = [0; 64];
+        state.pending_dirty_buckets = [0; 64];
+        state.format_commit_seq = None;
         state.phase = FreshnessPhase::Clean;
         Ok(())
     }
@@ -1142,7 +1648,7 @@ impl NativeFreshnessDevice {
             verify_validation_table(
                 cx,
                 &self.device(),
-                &self.sb,
+                &self.id,
                 tail,
                 &state.tables[index],
                 &state.baseline.roots[index],
@@ -1177,7 +1683,11 @@ impl ByteDevice for NativeFreshnessDevice {
 
     fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
         let mut state = self.lock(cx)?;
-        let result = if state.phase == FreshnessPhase::Clean {
+        let result = if state.defer_seal > 0 {
+            self.inner
+                .sync(cx)
+                .and_then(|()| cx.checkpoint().map_err(|_| FfsError::Cancelled))
+        } else if state.phase == FreshnessPhase::Clean {
             self.sync_clean(cx, &state)
         } else {
             self.refresh(cx, &mut state)
@@ -1242,17 +1752,17 @@ fn tail_plan(sb: &Ext4Superblock, basis_points: u32) -> Result<Vec<NativeRepairT
 }
 
 fn owner_header(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     owner: InodeNumber,
     generation: u32,
     basis_points: u32,
     tail: &NativeRepairTail,
 ) -> Vec<u8> {
-    let mut bytes = vec![0; sb.block_size as usize];
+    let mut bytes = vec![0; id.block_size as usize];
     bytes[..8].copy_from_slice(OWNER_MAGIC);
-    bytes[8..24].copy_from_slice(&sb.uuid);
+    bytes[8..24].copy_from_slice(&id.uuid);
     bytes[24..28].copy_from_slice(&tail.group.0.to_le_bytes());
-    bytes[28..32].copy_from_slice(&sb.groups_count().to_le_bytes());
+    bytes[28..32].copy_from_slice(&id.group_count.to_le_bytes());
     bytes[32..40].copy_from_slice(&owner.0.to_le_bytes());
     bytes[40..44].copy_from_slice(&generation.to_le_bytes());
     bytes[44..48].copy_from_slice(&basis_points.to_le_bytes());
@@ -1288,15 +1798,15 @@ fn owner_extents(tails: &[NativeRepairTail]) -> Vec<Ext4Extent> {
 fn check_native_owner_prefix(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
     tail: &NativeRepairTail,
 ) -> Result<Vec<u8>, FfsError> {
-    let bytes = check_native_validation_owner_prefix(cx, dev, sb, storage, generation, tail)?;
+    let bytes = check_native_validation_owner_prefix(cx, dev, id, storage, generation, tail)?;
     parity_intent(
         &bytes[PARITY_HEADER_START..PARITY_HEADER_END],
-        sb,
+        id,
         storage,
         generation,
         tail,
@@ -1307,22 +1817,28 @@ fn check_native_owner_prefix(
 fn check_native_validation_owner_prefix(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
     tail: &NativeRepairTail,
 ) -> Result<Vec<u8>, FfsError> {
     let bytes = dev.read_block(cx, tail.start)?.into_inner();
     let expected = owner_header(
-        sb,
+        id,
         storage.owner_inode,
         generation,
         storage.repair_basis_points,
         tail,
     );
-    if bytes.len() != sb.block_size as usize
+    let zero_tail_start = if tail.group.0 == 0 {
+        EPOCH_TOKEN_END
+    } else {
+        PARITY_HEADER_END
+    };
+    if bytes.len() != id.block_size as usize
+        || bytes.len() < zero_tail_start
         || bytes[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
-        || bytes[PARITY_HEADER_END..].iter().any(|byte| *byte != 0)
+        || bytes[zero_tail_start..].iter().any(|byte| *byte != 0)
         || (tail.group.0 != 0
             && bytes[PLAN_HEADER_START..PLAN_HEADER_END]
                 .iter()
@@ -1332,7 +1848,7 @@ fn check_native_validation_owner_prefix(
     }
     validation_intent(
         &bytes[OWNER_HEADER_BYTES..PLAN_HEADER_START],
-        sb,
+        id,
         storage.owner_inode,
         generation,
         tail,
@@ -1340,9 +1856,16 @@ fn check_native_validation_owner_prefix(
     if tail.group.0 == 0 {
         validation_plan_intent(
             &bytes[PLAN_HEADER_START..PLAN_HEADER_END],
-            sb,
+            id,
             storage,
             generation,
+        )?;
+        NativeEpochToken::decode_optional(
+            &bytes[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
+            id,
+            storage.owner_inode,
+            generation,
+            tail,
         )?;
     }
     Ok(bytes)
@@ -1356,17 +1879,11 @@ fn validation_error(tail: &NativeRepairTail, detail: &str) -> FfsError {
 }
 
 fn validation_sizes(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     tail: &NativeRepairTail,
 ) -> Result<(u32, usize, usize), FfsError> {
-    let sources = tail
-        .start
-        .0
-        .checked_sub(tail.group_start.0)
-        .ok_or_else(|| validation_error(tail, "source range underflows"))?;
-    let sources =
-        u32::try_from(sources).map_err(|_| validation_error(tail, "source count exceeds u32"))?;
-    let capacity = usize::try_from(u64::from(tail.validation_blocks) * u64::from(sb.block_size))
+    let sources = tail.source_blocks()?;
+    let capacity = usize::try_from(u64::from(tail.validation_blocks) * u64::from(id.block_size))
         .map_err(|_| validation_error(tail, "table capacity exceeds usize"))?;
     let used = usize::try_from(u64::from(sources) * 32)
         .ok()
@@ -1382,7 +1899,7 @@ fn validation_sizes(
 }
 
 fn validation_header(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     owner: InodeNumber,
     owner_generation: u32,
     tail: &NativeRepairTail,
@@ -1390,19 +1907,19 @@ fn validation_header(
     state: u32,
     root: &[u8; 32],
 ) -> Result<[u8; VALIDATION_HEADER_BYTES], FfsError> {
-    let (sources, _, _) = validation_sizes(sb, tail)?;
+    let (sources, _, _) = validation_sizes(id, tail)?;
     if epoch == 0 {
         return Err(validation_error(tail, "zero validation epoch"));
     }
     let mut bytes = [0; VALIDATION_HEADER_BYTES];
     bytes[..8].copy_from_slice(VALIDATION_MAGIC);
-    bytes[8..24].copy_from_slice(&sb.uuid);
+    bytes[8..24].copy_from_slice(&id.uuid);
     bytes[24..32].copy_from_slice(&owner.0.to_le_bytes());
     bytes[32..36].copy_from_slice(&owner_generation.to_le_bytes());
     bytes[36..40].copy_from_slice(&tail.group.0.to_le_bytes());
     bytes[40..48].copy_from_slice(&tail.group_start.0.to_le_bytes());
     bytes[48..52].copy_from_slice(&sources.to_le_bytes());
-    bytes[52..56].copy_from_slice(&sb.block_size.to_le_bytes());
+    bytes[52..56].copy_from_slice(&id.block_size.to_le_bytes());
     bytes[56..64].copy_from_slice(&(tail.start.0 + 1).to_le_bytes());
     bytes[64..68].copy_from_slice(&tail.validation_blocks.to_le_bytes());
     bytes[68..72].copy_from_slice(&epoch.to_le_bytes());
@@ -1415,7 +1932,7 @@ fn validation_header(
 
 fn validation_intent(
     bytes: &[u8],
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     owner: InodeNumber,
     owner_generation: u32,
     tail: &NativeRepairTail,
@@ -1430,7 +1947,7 @@ fn validation_intent(
     let epoch = u32::from_le_bytes(bytes[68..72].try_into().expect("fixed record length"));
     let state = u32::from_le_bytes(bytes[104..108].try_into().expect("fixed record length"));
     if !matches!(state, VALIDATION_PENDING | VALIDATION_SEALED)
-        || bytes != validation_header(sb, owner, owner_generation, tail, epoch, state, &root)?
+        || bytes != validation_header(id, owner, owner_generation, tail, epoch, state, &root)?
     {
         return Err(validation_error(
             tail,
@@ -1455,10 +1972,10 @@ fn validation_root(table: &[u8], used: usize) -> [u8; 32] {
 fn read_validation_table(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     tail: &NativeRepairTail,
 ) -> Result<Vec<u8>, FfsError> {
-    let (_, capacity, _) = validation_sizes(sb, tail)?;
+    let (_, capacity, _) = validation_sizes(id, tail)?;
     let mut table = Vec::with_capacity(capacity);
     for index in 0..tail.validation_blocks {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
@@ -1476,16 +1993,16 @@ fn read_validation_table(
 fn build_validation_table(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     owner: InodeNumber,
     owner_generation: u32,
     tail: &NativeRepairTail,
     epoch: u32,
 ) -> Result<Vec<u8>, FfsError> {
-    let (sources, capacity, used) = validation_sizes(sb, tail)?;
+    let (sources, capacity, used) = validation_sizes(id, tail)?;
     let mut table = vec![0; capacity];
     table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
-        sb,
+        id,
         owner,
         owner_generation,
         tail,
@@ -1501,7 +2018,7 @@ fn build_validation_table(
     }
     let root = validation_root(&table, used);
     table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
-        sb,
+        id,
         owner,
         owner_generation,
         tail,
@@ -1513,12 +2030,12 @@ fn build_validation_table(
 }
 
 fn verify_validation_table_integrity(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     tail: &NativeRepairTail,
     table: &[u8],
     root: &[u8; 32],
 ) -> Result<(), FfsError> {
-    let (_, capacity, used) = validation_sizes(sb, tail)?;
+    let (_, capacity, used) = validation_sizes(id, tail)?;
     if table.len() != capacity
         || &validation_root(table, used) != root
         || table[used..].iter().any(|byte| *byte != 0)
@@ -1531,13 +2048,13 @@ fn verify_validation_table_integrity(
 fn verify_validation_table(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     tail: &NativeRepairTail,
     table: &[u8],
     root: &[u8; 32],
 ) -> Result<(), FfsError> {
-    verify_validation_table_integrity(sb, tail, table, root)?;
-    let (sources, _, _) = validation_sizes(sb, tail)?;
+    verify_validation_table_integrity(id, tail, table, root)?;
+    let (sources, _, _) = validation_sizes(id, tail)?;
     for index in 0..sources {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let number = BlockNumber(tail.group_start.0 + u64::from(index));
@@ -1554,7 +2071,7 @@ fn verify_validation_table(
 }
 
 fn parity_header(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     owner_generation: u32,
     tail: &NativeRepairTail,
@@ -1562,7 +2079,7 @@ fn parity_header(
 ) -> [u8; VALIDATION_HEADER_BYTES] {
     let mut bytes = [0; VALIDATION_HEADER_BYTES];
     bytes[..8].copy_from_slice(PARITY_MAGIC);
-    bytes[8..24].copy_from_slice(&sb.uuid);
+    bytes[8..24].copy_from_slice(&id.uuid);
     bytes[24..32].copy_from_slice(&storage.owner_inode.0.to_le_bytes());
     bytes[32..36].copy_from_slice(&owner_generation.to_le_bytes());
     bytes[36..40].copy_from_slice(&tail.group.0.to_le_bytes());
@@ -1584,7 +2101,7 @@ fn parity_header(
 
 fn parity_intent(
     bytes: &[u8],
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     owner_generation: u32,
     tail: &NativeRepairTail,
@@ -1616,7 +2133,7 @@ fn parity_intent(
             ));
         }
     };
-    if bytes != parity_header(sb, storage, owner_generation, tail, intent) {
+    if bytes != parity_header(id, storage, owner_generation, tail, intent) {
         return Err(validation_error(
             tail,
             "native parity record identity or checksum mismatch",
@@ -1626,28 +2143,46 @@ fn parity_intent(
 }
 
 fn native_layout(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     tail: &NativeRepairTail,
 ) -> Result<(RepairGroupLayout, RepairGroupDescExt), FfsError> {
-    let (sources, _, _) = validation_sizes(sb, tail)?;
-    let layout = RepairGroupLayout::new(
-        tail.group,
-        tail.group_start,
-        tail.blocks_per_group,
-        tail.validation_blocks
-            .checked_add(1)
-            .ok_or_else(|| validation_error(tail, "validation span overflows"))?,
-        tail.repair_blocks,
-    )?;
-    if layout.validation_start_block() != tail.start {
+    let (sources, _, _) = validation_sizes(id, tail)?;
+    let validation_span = tail
+        .validation_blocks
+        .checked_add(1)
+        .ok_or_else(|| validation_error(tail, "validation span overflows"))?;
+    let layout = if tail.is_detached() {
+        RepairGroupLayout::with_detached_storage(
+            tail.group,
+            tail.group_start,
+            tail.blocks_per_group,
+            validation_span,
+            tail.repair_blocks,
+            tail.start,
+        )?
+    } else {
+        RepairGroupLayout::new(
+            tail.group,
+            tail.group_start,
+            tail.blocks_per_group,
+            validation_span,
+            tail.repair_blocks,
+        )?
+    };
+    if layout.validation_start_block() != tail.start
+        || layout
+            .source_end_exclusive()
+            .saturating_sub(layout.group_start.0)
+            != u64::from(sources)
+    {
         return Err(validation_error(
             tail,
             "native layout includes owned metadata in sources",
         ));
     }
     let descriptor = RepairGroupDescExt {
-        transfer_length: u64::from(sources) * u64::from(sb.block_size),
-        symbol_size: u16::try_from(sb.block_size)
+        transfer_length: u64::from(sources) * u64::from(id.block_size),
+        symbol_size: u16::try_from(id.block_size)
             .map_err(|_| validation_error(tail, "native symbol size exceeds u16"))?,
         source_block_count: u16::try_from(sources)
             .map_err(|_| validation_error(tail, "native source count exceeds u16"))?,
@@ -1664,7 +2199,7 @@ fn native_layout(
 fn read_sealed_table(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
     tail: &NativeRepairTail,
@@ -1672,7 +2207,7 @@ fn read_sealed_table(
     let owner = dev.read_block(cx, tail.start)?;
     let intent = validation_intent(
         &owner.as_slice()[OWNER_HEADER_BYTES..PLAN_HEADER_START],
-        sb,
+        id,
         storage.owner_inode,
         generation,
         tail,
@@ -1683,10 +2218,10 @@ fn read_sealed_table(
             "validation is uninitialized or pending",
         ));
     };
-    let table = read_validation_table(cx, dev, sb, tail)?;
+    let table = read_validation_table(cx, dev, id, tail)?;
     if validation_intent(
         &table[..VALIDATION_HEADER_BYTES],
-        sb,
+        id,
         storage.owner_inode,
         generation,
         tail,
@@ -1696,24 +2231,34 @@ fn read_sealed_table(
     {
         return Err(validation_error(tail, "sealed intent and table disagree"));
     }
-    verify_validation_table_integrity(sb, tail, &table, &root)?;
+    verify_validation_table_integrity(id, tail, &table, &root)?;
     Ok((root, table))
 }
 
 fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError> {
-    let storage = fs.native_ext4_repair_storage(cx)?;
-    let sb = fs.ext4_superblock().expect("validated native ownership");
-    let generation = fs
-        .read_native_owner_inode(cx, sb, storage.owner_inode)?
-        .generation;
+    let (id, storage, generation) = fs.native_identity_storage_and_generation(cx)?;
     let dev = ByteDeviceBlockAdapter {
         dev: fs.dev.as_ref(),
-        block_size: sb.block_size,
+        block_size: id.block_size,
     };
     let owner = dev.read_block(cx, storage.tails[0].start)?;
+    if NativeEpochToken::decode_optional(
+        &owner.as_slice()[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
+        &id,
+        storage.owner_inode,
+        generation,
+        &storage.tails[0],
+    )?
+    .is_some()
+    {
+        return Err(validation_error(
+            &storage.tails[0],
+            "sealed baseline carries an unretired epoch token",
+        ));
+    }
     let plan = validation_plan_intent(
         &owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END],
-        sb,
+        &id,
         &storage,
         generation,
     )?;
@@ -1726,32 +2271,35 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
     };
     let mut admissions = Vec::with_capacity(storage.tails.len());
     for tail in &storage.tails {
-        let (root, table) = read_sealed_table(cx, &dev, sb, &storage, generation, tail)?;
+        let (root, table) = read_sealed_table(cx, &dev, &id, &storage, generation, tail)?;
         let local_epoch = u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
-        if local_epoch != epoch {
+        if local_epoch == 0 || local_epoch > epoch {
             return Err(validation_error(
                 tail,
                 "whole-plan and local epochs disagree",
             ));
         }
         admissions.push(ValidationAdmission {
-            epoch,
+            epoch: local_epoch,
             root,
             intent: ValidationIntent::Sealed(root),
         });
     }
-    if validation_plan_root(sb, &storage, generation, &admissions)? != plan_root {
+    if validation_plan_root(&id, &storage, generation, epoch, &admissions)? != plan_root {
         return Err(validation_error(
             &storage.tails[0],
             "sealed whole-plan root mismatch",
         ));
     }
+    let group_epochs = admissions.iter().map(|group| group.epoch).collect();
+    let roots = admissions.into_iter().map(|group| group.root).collect();
     Ok(NativeBaseline {
         storage,
         owner_generation: generation,
         epoch,
         plan_root,
-        roots: admissions.into_iter().map(|group| group.root).collect(),
+        roots,
+        group_epochs,
     })
 }
 
@@ -1762,6 +2310,7 @@ fn ensure_native_baseline(fs: &OpenFs, cx: &Cx, expected: &NativeBaseline) -> Re
         || current.owner_generation != expected.owner_generation
         || current.epoch != expected.epoch
         || current.roots != expected.roots
+        || current.group_epochs != expected.group_epochs
     {
         return Err(FfsError::RepairFailed(
             "native baseline authority changed during operation".into(),
@@ -1783,27 +2332,27 @@ fn native_source_tail(
     storage: &NativeRepairStorage,
     block: BlockNumber,
 ) -> Option<&NativeRepairTail> {
-    // Admission orders tails by group. Avoid scanning every group for every
-    // block in the physical read path on large images.
+    // Admission orders tails strictly by group_start. Avoid scanning every
+    // group for every block in the physical read path on large images.
     let index = storage
         .tails
         .partition_point(|tail| tail.group_start.0 <= block.0)
         .checked_sub(1)?;
     let tail = &storage.tails[index];
-    (block.0 < tail.start.0).then_some(tail)
+    (block.0 < tail.source_end_exclusive().0).then_some(tail)
 }
 
 fn read_native_parity_intent(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     baseline: &NativeBaseline,
     tail: &NativeRepairTail,
 ) -> Result<ParityIntent, FfsError> {
     let owner = dev.read_block(cx, tail.start)?;
     let intent = parity_intent(
         &owner.as_slice()[PARITY_HEADER_START..PARITY_HEADER_END],
-        sb,
+        id,
         &baseline.storage,
         baseline.owner_generation,
         tail,
@@ -1822,7 +2371,7 @@ fn read_native_parity_intent(
 fn write_native_parity_intent(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     baseline: &NativeBaseline,
     tail: &NativeRepairTail,
     intent: ParityIntent,
@@ -1830,7 +2379,7 @@ fn write_native_parity_intent(
     let mut owner = dev.read_block(cx, tail.start)?.into_inner();
     let current = parity_intent(
         &owner[PARITY_HEADER_START..PARITY_HEADER_END],
-        sb,
+        id,
         &baseline.storage,
         baseline.owner_generation,
         tail,
@@ -1862,7 +2411,7 @@ fn write_native_parity_intent(
         _ => false,
     };
     let expected = owner_header(
-        sb,
+        id,
         baseline.storage.owner_inode,
         baseline.owner_generation,
         baseline.storage.repair_basis_points,
@@ -1872,7 +2421,7 @@ fn write_native_parity_intent(
         || owner[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
         || validation_intent(
             &owner[OWNER_HEADER_BYTES..PLAN_HEADER_START],
-            sb,
+            id,
             baseline.storage.owner_inode,
             baseline.owner_generation,
             tail,
@@ -1884,7 +2433,7 @@ fn write_native_parity_intent(
         ));
     }
     owner[PARITY_HEADER_START..PARITY_HEADER_END].copy_from_slice(&parity_header(
-        sb,
+        id,
         &baseline.storage,
         baseline.owner_generation,
         tail,
@@ -1923,15 +2472,17 @@ fn native_manifest(
 }
 
 fn native_codec_budget(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     tail: &NativeRepairTail,
     allowed: u64,
     decoding: bool,
 ) -> Result<u64, FfsError> {
-    let (sources, _, _) = validation_sizes(sb, tail)?;
-    let (_, capacity, _) = validation_sizes(sb, &storage.tails[0])?;
-    if sb.block_size < 1024 || tail.repair_blocks > sources {
+    let (sources, _, _) = validation_sizes(id, tail)?;
+    let max_capacity = storage.tails.iter().try_fold(0_usize, |acc, candidate| {
+        validation_sizes(id, candidate).map(|(_, capacity, _)| acc.max(capacity))
+    })?;
+    if id.block_size < 1024 || tail.repair_blocks > sources {
         return Err(validation_error(
             tail,
             "unsupported native codec resource geometry",
@@ -1940,10 +2491,10 @@ fn native_codec_budget(
     // Serial groups, at most two tables and whole-plan admission/identity buffers.
     // The decoder margin includes pinned dense/wavefront equation retention;
     // this admission estimates allocations, not total process RSS.
-    let metadata = (capacity as u64)
+    let metadata = (max_capacity as u64)
         .checked_mul(4)
         .and_then(|bytes| bytes.checked_add(storage.tails.len() as u64 * 4096))
-        .and_then(|bytes| bytes.checked_add(u64::from(sb.block_size) * 16))
+        .and_then(|bytes| bytes.checked_add(u64::from(id.block_size) * 16))
         .ok_or_else(|| validation_error(tail, "native resource estimate overflows"))?;
     let metadata = if decoding {
         // The codec estimate excludes caller-owned allocations. The recovery
@@ -1951,7 +2502,7 @@ fn native_codec_budget(
         // copies both; charge four payloads plus headers/indices per source.
         // Beforeimages are captured before the redundancy feasibility check,
         // so this must cover every source, not only the parity symbol count.
-        u64::from(sb.block_size)
+        u64::from(id.block_size)
             .checked_mul(4)
             .and_then(|bytes| bytes.checked_add(256))
             .and_then(|bytes| bytes.checked_mul(u64::from(sources)))
@@ -1963,7 +2514,7 @@ fn native_codec_budget(
     let budget = allowed.checked_sub(metadata).ok_or_else(|| {
         validation_error(tail, "native working budget is below metadata estimate")
     })?;
-    let estimate = direct_encode_workspace_bytes(sources, sb.block_size, tail.repair_blocks)?
+    let estimate = direct_encode_workspace_bytes(sources, id.block_size, tail.repair_blocks)?
         .checked_mul(if decoding { 8 } else { 1 })
         .ok_or_else(|| validation_error(tail, "native codec estimate overflows"))?;
     if estimate > budget {
@@ -1978,17 +2529,35 @@ fn native_codec_budget(
     Ok(budget)
 }
 
-fn admit_native_group(
+fn admit_native_group_unconstrained_root(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
-    baseline: &NativeBaseline,
+    id: &NativeFsIdentity,
+    storage_meta: &NativeRepairStorage,
+    owner_generation: u32,
     tail: &NativeRepairTail,
     allowed: u64,
+    expected_root: Option<[u8; 32]>,
 ) -> Result<NativeGroupAdmission, FfsError> {
-    let codec_budget = native_codec_budget(sb, &baseline.storage, tail, allowed, false)?;
-    let intent = read_native_parity_intent(cx, dev, sb, baseline, tail)?;
-    let (layout, expected) = native_layout(sb, tail)?;
+    let codec_budget = native_codec_budget(id, storage_meta, tail, allowed, false)?;
+    let owner = dev.read_block(cx, tail.start)?;
+    let intent = parity_intent(
+        &owner.as_slice()[PARITY_HEADER_START..PARITY_HEADER_END],
+        id,
+        storage_meta,
+        owner_generation,
+        tail,
+    )?;
+    if let Some(root) = expected_root
+        && intent != ParityIntent::Prepared
+        && intent.source_root() != root
+    {
+        return Err(validation_error(
+            tail,
+            "native parity binds a different source baseline",
+        ));
+    }
+    let (layout, expected) = native_layout(id, tail)?;
     let storage = RepairGroupStorage::new(dev, layout);
     let raw = storage.preflight_raw_refresh(cx, &expected)?;
     if raw.descriptor.repair_generation > intent.generation()
@@ -2035,10 +2604,30 @@ fn admit_native_group(
     })
 }
 
+fn admit_native_group(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    id: &NativeFsIdentity,
+    baseline: &NativeBaseline,
+    tail: &NativeRepairTail,
+    allowed: u64,
+) -> Result<NativeGroupAdmission, FfsError> {
+    admit_native_group_unconstrained_root(
+        cx,
+        dev,
+        id,
+        &baseline.storage,
+        baseline.owner_generation,
+        tail,
+        allowed,
+        Some(baseline.roots[tail.group.0 as usize]),
+    )
+}
+
 fn native_sealed_generation(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     baseline: &NativeBaseline,
     tail: &NativeRepairTail,
     degraded: bool,
@@ -2047,14 +2636,14 @@ fn native_sealed_generation(
         generation,
         manifest,
         ..
-    } = read_native_parity_intent(cx, dev, sb, baseline, tail)?
+    } = read_native_parity_intent(cx, dev, id, baseline, tail)?
     else {
         return Err(validation_error(
             tail,
             "native parity is uninitialized or pending",
         ));
     };
-    let (layout, expected) = native_layout(sb, tail)?;
+    let (layout, expected) = native_layout(id, tail)?;
     let storage = RepairGroupStorage::new(dev, layout);
     let admission = storage.preflight_raw_refresh(cx, &expected)?;
     if !admission.committed
@@ -2081,12 +2670,12 @@ fn native_sealed_generation(
 fn publish_native_group(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     baseline: &NativeBaseline,
     tail: &NativeRepairTail,
     admission: &NativeGroupAdmission,
 ) -> Result<(), FfsError> {
-    if read_native_parity_intent(cx, dev, sb, baseline, tail)? != admission.intent {
+    if read_native_parity_intent(cx, dev, id, baseline, tail)? != admission.intent {
         return Err(validation_error(
             tail,
             "native ownership changed after admission",
@@ -2095,7 +2684,7 @@ fn publish_native_group(
     let (root, table) = read_sealed_table(
         cx,
         dev,
-        sb,
+        id,
         &baseline.storage,
         baseline.owner_generation,
         tail,
@@ -2106,8 +2695,8 @@ fn publish_native_group(
             "native source authority changed after admission",
         ));
     }
-    verify_validation_table(cx, dev, sb, tail, &table, &root)?;
-    let (layout, expected) = native_layout(sb, tail)?;
+    verify_validation_table(cx, dev, id, tail, &table, &root)?;
+    let (layout, expected) = native_layout(id, tail)?;
     let storage = RepairGroupStorage::new(dev, layout);
     if storage.preflight_raw_refresh(cx, &expected)? != admission.raw {
         return Err(validation_error(
@@ -2116,20 +2705,22 @@ fn publish_native_group(
         ));
     }
     if admission.retained {
-        native_sealed_generation(cx, dev, sb, baseline, tail, false)?;
+        native_sealed_generation(cx, dev, id, baseline, tail, false)?;
         return dev.sync(cx);
     }
-    encode_and_publish_native_group(cx, dev, sb, baseline, tail, admission, &table)
+    encode_and_publish_native_group(cx, dev, id, baseline, tail, admission, &table, None)
 }
 
+#[expect(clippy::too_many_arguments)]
 fn encode_and_publish_native_group(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     baseline: &NativeBaseline,
     tail: &NativeRepairTail,
     admission: &NativeGroupAdmission,
     table: &[u8],
+    beforeimages: Option<&BTreeMap<BlockNumber, Vec<u8>>>,
 ) -> Result<(), FfsError> {
     // A live epoch changes the validation root before parity. Only this
     // already-admitted transition accepts the exact preceding parity anchor;
@@ -2137,7 +2728,7 @@ fn encode_and_publish_native_group(
     let owner = dev.read_block(cx, tail.start)?;
     if parity_intent(
         &owner.as_slice()[PARITY_HEADER_START..PARITY_HEADER_END],
-        sb,
+        id,
         &baseline.storage,
         baseline.owner_generation,
         tail,
@@ -2149,7 +2740,7 @@ fn encode_and_publish_native_group(
         ));
     }
     let root = baseline.roots[tail.group.0 as usize];
-    let (layout, expected) = native_layout(sb, tail)?;
+    let (layout, expected) = native_layout(id, tail)?;
     let storage = RepairGroupStorage::new(dev, layout);
     if storage.preflight_raw_refresh(cx, &expected)? != admission.raw {
         return Err(validation_error(
@@ -2163,29 +2754,94 @@ fn encode_and_publish_native_group(
         table,
         corrupt: &[],
     };
-    let (sources, _, _) = validation_sizes(sb, tail)?;
-    let encoded = encode_group_direct(
-        cx,
-        &view,
-        &sb.uuid,
-        DirectEncodeRequest {
-            group: tail.group,
-            first_block: tail.group_start,
-            source_block_count: sources,
-            repair_count: tail.repair_blocks,
-            max_working_bytes: admission.codec_budget,
-        },
-    )?;
-    let symbols: Vec<_> = encoded
-        .repair_symbols
-        .into_iter()
-        .map(|symbol| (symbol.esi, symbol.data))
-        .collect();
-    verify_validation_table(cx, dev, sb, tail, table, &root)?;
+    let (sources, _, _) = validation_sizes(id, tail)?;
+    let delta_budget_ok = u64::from(sources)
+        .saturating_mul(u64::from(sources))
+        .saturating_mul(3)
+        <= admission.codec_budget;
+    let delta_symbols = if let Some(beforeimages) = beforeimages
+        && beforeimages.len() < MAX_DELTA_BEFOREIMAGE_BLOCKS
+        && admission.raw.committed
+        && matches!(admission.intent, ParityIntent::Sealed { .. })
+        && delta_budget_ok
+    {
+        match storage.read_verified_raw_generation(cx, false) {
+            Ok((descriptor, existing))
+                if descriptor == admission.raw.descriptor
+                    && existing.len() == tail.repair_blocks as usize =>
+            {
+                let mut new_blocks = Vec::new();
+                for (&block, old_bytes) in
+                    beforeimages.range(tail.group_start..tail.source_end_exclusive())
+                {
+                    let source_index =
+                        u32::try_from(block.0 - tail.group_start.0).expect("bounded source index");
+                    let new_bytes = view.read_block(cx, block)?.into_inner();
+                    new_blocks.push((source_index, old_bytes.as_slice(), new_bytes));
+                }
+                let deltas: Vec<BlockDelta<'_>> = new_blocks
+                    .iter()
+                    .map(|(source_index, old_block, new_block)| BlockDelta {
+                        source_index: *source_index,
+                        old_block,
+                        new_block: new_block.as_slice(),
+                    })
+                    .collect();
+                let mut group_encoded = EncodedGroup {
+                    group: tail.group,
+                    source_block_count: sources,
+                    symbol_size: id.block_size,
+                    seed: repair_seed(&id.uuid, tail.group),
+                    repair_symbols: existing
+                        .into_iter()
+                        .map(|(esi, data)| EmittedSymbol {
+                            esi,
+                            data,
+                            is_source: false,
+                            degree: 0,
+                        })
+                        .collect(),
+                };
+                update_encoded_group_delta(&mut group_encoded, &deltas)?;
+                Some(
+                    group_encoded
+                        .repair_symbols
+                        .into_iter()
+                        .map(|symbol| (symbol.esi, symbol.data))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let symbols = if let Some(symbols) = delta_symbols {
+        symbols
+    } else {
+        let encoded = encode_group_direct(
+            cx,
+            &view,
+            &id.uuid,
+            DirectEncodeRequest {
+                group: tail.group,
+                first_block: tail.group_start,
+                source_block_count: sources,
+                repair_count: tail.repair_blocks,
+                max_working_bytes: admission.codec_budget,
+            },
+        )?;
+        encoded
+            .repair_symbols
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect()
+    };
+    verify_validation_table(cx, dev, id, tail, table, &root)?;
     write_native_parity_intent(
         cx,
         dev,
-        sb,
+        id,
         baseline,
         tail,
         ParityIntent::Pending {
@@ -2216,12 +2872,12 @@ fn encode_and_publish_native_group(
             "native parity readback differs from encoded symbols",
         ));
     }
-    verify_validation_table(cx, dev, sb, tail, table, &root)?;
+    verify_validation_table(cx, dev, id, tail, table, &root)?;
     let manifest = native_manifest(cx, dev, layout, admission.next_generation)?;
     write_native_parity_intent(
         cx,
         dev,
-        sb,
+        id,
         baseline,
         tail,
         ParityIntent::Sealed {
@@ -2233,11 +2889,11 @@ fn encode_and_publish_native_group(
 }
 
 fn native_repair_report(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     baseline: &NativeBaseline,
     generations: Vec<u64>,
 ) -> Result<NativeRepairReport, FfsError> {
-    let validation = native_validation_report(sb, &baseline.storage)?;
+    let validation = native_validation_report(id, &baseline.storage)?;
     Ok(NativeRepairReport {
         owner_inode: validation.owner_inode,
         groups: validation.groups,
@@ -2255,17 +2911,17 @@ fn native_repair_report(
 fn native_corrupt_indices(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     tail: &NativeRepairTail,
     table: &[u8],
 ) -> Result<Vec<u32>, FfsError> {
-    let (sources, _, _) = validation_sizes(sb, tail)?;
+    let (sources, _, _) = validation_sizes(id, tail)?;
     let mut corrupt = Vec::new();
     for index in 0..sources {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let bytes = dev.read_block(cx, BlockNumber(tail.group_start.0 + u64::from(index)))?;
         let offset = VALIDATION_HEADER_BYTES + index as usize * 32;
-        if bytes.len() != sb.block_size as usize
+        if bytes.len() != id.block_size as usize
             || blake3::hash(bytes.as_slice()).as_bytes() != &table[offset..offset + 32]
         {
             corrupt.push(index);
@@ -2284,16 +2940,18 @@ struct NativeDigestDevice<'a> {
 impl BlockDevice for NativeDigestDevice<'_> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        if block.0 < self.tail.group_start.0
-            || block.0 >= self.tail.group_start.0 + u64::from(self.tail.blocks_per_group)
-        {
+        let source_end = self.tail.source_end_exclusive().0;
+        let in_sources = block.0 >= self.tail.group_start.0 && block.0 < source_end;
+        let tail_end = self.tail.start.0 + u64::from(self.tail.blocks());
+        let in_owned_storage = block.0 >= self.tail.start.0 && block.0 < tail_end;
+        if !in_sources && !in_owned_storage {
             return Err(validation_error(
                 self.tail,
                 "codec read outside admitted native group",
             ));
         }
         let bytes = self.dev.read_block(cx, block)?;
-        if block.0 < self.tail.start.0 {
+        if in_sources {
             let index =
                 u32::try_from(block.0 - self.tail.group_start.0).expect("bounded native group");
             let offset = VALIDATION_HEADER_BYTES + index as usize * 32;
@@ -2331,7 +2989,7 @@ impl BlockDevice for NativeDigestDevice<'_> {
 impl BlockValidator for NativeDigestDevice<'_> {
     fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
         let index = block.0.checked_sub(self.tail.group_start.0);
-        if let Some(index) = index.filter(|_| block.0 < self.tail.start.0) {
+        if let Some(index) = index.filter(|_| block.0 < self.tail.source_end_exclusive().0) {
             let offset = VALIDATION_HEADER_BYTES + index as usize * 32;
             if data.len() == self.block_size() as usize
                 && blake3::hash(data.as_slice()).as_bytes() == &self.table[offset..offset + 32]
@@ -2390,12 +3048,12 @@ impl RecoveryWriteback for NativeReconstructionCapture {
 }
 
 fn native_validation_report(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
 ) -> Result<NativeValidationReport, FfsError> {
     let mut source_blocks = 0;
     for tail in &storage.tails {
-        source_blocks += u64::from(validation_sizes(sb, tail)?.0);
+        source_blocks += u64::from(validation_sizes(id, tail)?.0);
     }
     Ok(NativeValidationReport {
         owner_inode: storage.owner_inode,
@@ -2406,14 +3064,14 @@ fn native_validation_report(
 }
 
 fn validation_plan_header(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
     epoch: u32,
     state: u32,
     root: &[u8; 32],
 ) -> Result<[u8; VALIDATION_HEADER_BYTES], FfsError> {
-    let report = native_validation_report(sb, storage)?;
+    let report = native_validation_report(id, storage)?;
     if epoch == 0 {
         return Err(FfsError::RepairFailed(
             "zero native whole-plan epoch".into(),
@@ -2421,12 +3079,12 @@ fn validation_plan_header(
     }
     let mut bytes = [0; VALIDATION_HEADER_BYTES];
     bytes[..8].copy_from_slice(PLAN_MAGIC);
-    bytes[8..24].copy_from_slice(&sb.uuid);
+    bytes[8..24].copy_from_slice(&id.uuid);
     bytes[24..32].copy_from_slice(&storage.owner_inode.0.to_le_bytes());
     bytes[32..36].copy_from_slice(&generation.to_le_bytes());
     bytes[36..40].copy_from_slice(&report.groups.to_le_bytes());
     bytes[40..44].copy_from_slice(&storage.repair_basis_points.to_le_bytes());
-    bytes[44..48].copy_from_slice(&sb.block_size.to_le_bytes());
+    bytes[44..48].copy_from_slice(&id.block_size.to_le_bytes());
     bytes[48..56].copy_from_slice(&report.source_blocks.to_le_bytes());
     bytes[56..64].copy_from_slice(&u64::from(epoch).to_le_bytes());
     bytes[64..96].copy_from_slice(root);
@@ -2449,7 +3107,7 @@ fn validation_plan_epoch(bytes: &[u8]) -> Result<u32, FfsError> {
 
 fn validation_plan_intent(
     bytes: &[u8],
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
 ) -> Result<ValidationIntent, FfsError> {
@@ -2467,7 +3125,7 @@ fn validation_plan_intent(
         state,
         PLAN_PREPARED | VALIDATION_PENDING | VALIDATION_SEALED | PLAN_DIRTY
     ) || (state == PLAN_PREPARED && (root != [0; 32] || epoch != 1))
-        || bytes != validation_plan_header(sb, storage, generation, epoch, state, &root)?
+        || bytes != validation_plan_header(id, storage, generation, epoch, state, &root)?
     {
         return Err(validation_error(
             tail,
@@ -2486,34 +3144,41 @@ fn validation_plan_intent(
 }
 
 fn validation_plan_root(
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
+    plan_epoch: u32,
     admissions: &[ValidationAdmission],
 ) -> Result<[u8; 32], FfsError> {
-    let epoch = admissions
-        .first()
-        .ok_or_else(|| FfsError::RepairFailed("native whole-plan has no groups".into()))?
-        .epoch;
-    if admissions.len() != storage.tails.len()
-        || admissions.iter().any(|admission| admission.epoch != epoch)
+    if admissions.is_empty()
+        || plan_epoch == 0
+        || admissions.len() != storage.tails.len()
+        || admissions
+            .iter()
+            .any(|admission| admission.epoch == 0 || admission.epoch > plan_epoch)
     {
         return Err(FfsError::RepairFailed(
             "native whole-plan epoch mismatch".into(),
         ));
     }
-    let header =
-        validation_plan_header(sb, storage, generation, epoch, VALIDATION_PENDING, &[0; 32])?;
+    let header = validation_plan_header(
+        id,
+        storage,
+        generation,
+        plan_epoch,
+        VALIDATION_PENDING,
+        &[0; 32],
+    )?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"FrankenFS native whole-plan validation v1");
     hasher.update(&header[..64]);
     for (tail, admission) in storage.tails.iter().zip(admissions) {
         let group = validation_header(
-            sb,
+            id,
             storage.owner_inode,
             generation,
             tail,
-            epoch,
+            admission.epoch,
             VALIDATION_PENDING,
             &admission.root,
         )?;
@@ -2522,14 +3187,16 @@ fn validation_plan_root(
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn publish_validation_plan(
+#[expect(clippy::too_many_arguments)]
+fn publish_validation_plan_with_token(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
     epoch: u32,
     intent: ValidationIntent,
+    epoch_token: Option<&NativeEpochToken>,
 ) -> Result<(), FfsError> {
     let (state, root) = match intent {
         ValidationIntent::Dirty(root) => (PLAN_DIRTY, root),
@@ -2541,30 +3208,51 @@ fn publish_validation_plan(
             ));
         }
     };
+    if state == VALIDATION_SEALED && epoch_token.is_some() {
+        return Err(FfsError::RepairFailed(
+            "sealed native plan cannot carry an epoch token".into(),
+        ));
+    }
     let first = storage.tails[0].start;
-    let mut owner = check_native_owner_prefix(cx, dev, sb, storage, generation, &storage.tails[0])?;
+    let mut owner = check_native_owner_prefix(cx, dev, id, storage, generation, &storage.tails[0])?;
     owner[PLAN_HEADER_START..PLAN_HEADER_END].copy_from_slice(&validation_plan_header(
-        sb, storage, generation, epoch, state, &root,
+        id, storage, generation, epoch, state, &root,
     )?);
+    if let Some(token) = epoch_token {
+        owner[EPOCH_TOKEN_START..EPOCH_TOKEN_END].copy_from_slice(&token.encode(id));
+    } else {
+        owner[EPOCH_TOKEN_START..EPOCH_TOKEN_END].fill(0);
+    }
     cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     dev.write_block(cx, first, &owner)?;
     dev.sync(cx)
 }
 
+fn publish_validation_plan(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    id: &NativeFsIdentity,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    epoch: u32,
+    intent: ValidationIntent,
+) -> Result<(), FfsError> {
+    publish_validation_plan_with_token(cx, dev, id, storage, generation, epoch, intent, None)
+}
+
 fn admit_validation_plan(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
     admissions: &[ValidationAdmission],
 ) -> Result<(ValidationIntent, [u8; 32]), FfsError> {
-    let root = validation_plan_root(sb, storage, generation, admissions)?;
     let first = &storage.tails[0];
     let owner = dev.read_block(cx, first.start)?;
     let plan = validation_plan_intent(
         &owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END],
-        sb,
+        id,
         storage,
         generation,
     )?;
@@ -2575,6 +3263,7 @@ fn admit_validation_plan(
             "whole-plan and local epochs disagree",
         ));
     }
+    let root = validation_plan_root(id, storage, generation, epoch, admissions)?;
     match plan {
         ValidationIntent::Prepared => {
             if admissions
@@ -2618,7 +3307,7 @@ fn admit_validation_plan(
 fn admit_validation_group(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     owner: InodeNumber,
     generation: u32,
     tail: &NativeRepairTail,
@@ -2637,12 +3326,12 @@ fn admit_validation_group(
     let block = dev.read_block(cx, tail.start)?;
     let intent = validation_intent(
         &block.as_slice()[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES],
-        sb,
+        id,
         owner,
         generation,
         tail,
     )?;
-    let table = read_validation_table(cx, dev, sb, tail)?;
+    let table = read_validation_table(cx, dev, id, tail)?;
     let epoch = if intent == ValidationIntent::Empty {
         1
     } else {
@@ -2651,7 +3340,7 @@ fn admit_validation_group(
     if let ValidationIntent::Sealed(root) = intent {
         if validation_intent(
             &table[..VALIDATION_HEADER_BYTES],
-            sb,
+            id,
             owner,
             generation,
             tail,
@@ -2661,7 +3350,7 @@ fn admit_validation_group(
         {
             return Err(validation_error(tail, "sealed intent and table disagree"));
         }
-        verify_validation_table(cx, dev, sb, tail, &table, &root)?;
+        verify_validation_table(cx, dev, id, tail, &table, &root)?;
         return Ok(ValidationAdmission {
             epoch,
             root,
@@ -2669,14 +3358,14 @@ fn admit_validation_group(
         });
     }
     if intent == ValidationIntent::Empty
-        && table[..sb.block_size as usize]
+        && table[..id.block_size as usize]
             .iter()
             .any(|byte| *byte != 0)
     {
         return Err(validation_error(tail, "table has no initialization intent"));
     }
-    let expected = build_validation_table(cx, dev, sb, owner, generation, tail, epoch)?;
-    let (_, _, used) = validation_sizes(sb, tail)?;
+    let expected = build_validation_table(cx, dev, id, owner, generation, tail, epoch)?;
+    let (_, _, used) = validation_sizes(id, tail)?;
     let root = validation_root(&expected, used);
     if let ValidationIntent::Pending(persisted) = intent
         && persisted != root
@@ -2696,7 +3385,7 @@ fn admit_validation_group(
 fn publish_validation_group(
     cx: &Cx,
     dev: &dyn BlockDevice,
-    sb: &Ext4Superblock,
+    id: &NativeFsIdentity,
     storage: &NativeRepairStorage,
     generation: u32,
     tail: &NativeRepairTail,
@@ -2705,47 +3394,47 @@ fn publish_validation_group(
     let owner = storage.owner_inode;
     let root = &admission.root;
     let epoch = admission.epoch;
-    let mut table = build_validation_table(cx, dev, sb, owner, generation, tail, epoch)?;
-    let (_, _, used) = validation_sizes(sb, tail)?;
+    let mut table = build_validation_table(cx, dev, id, owner, generation, tail, epoch)?;
+    let (_, _, used) = validation_sizes(id, tail)?;
     if &validation_root(&table, used) != root {
         return Err(validation_error(
             tail,
             "source changed after initialization admission",
         ));
     }
-    let pending = validation_header(sb, owner, generation, tail, epoch, VALIDATION_PENDING, root)?;
+    let pending = validation_header(id, owner, generation, tail, epoch, VALIDATION_PENDING, root)?;
     // Preserve the entire immutable ownership prefix verbatim.
-    let mut ownership = check_native_owner_prefix(cx, dev, sb, storage, generation, tail)?;
+    let mut ownership = check_native_owner_prefix(cx, dev, id, storage, generation, tail)?;
     ownership[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES]
         .copy_from_slice(&pending);
     cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     dev.write_block(cx, tail.start, &ownership)?;
     dev.sync(cx)?;
-    for (index, block) in table.chunks_exact(sb.block_size as usize).enumerate() {
+    for (index, block) in table.chunks_exact(id.block_size as usize).enumerate() {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let index = u32::try_from(index)
             .map_err(|_| validation_error(tail, "validation index exceeds u32"))?;
         dev.write_block(cx, BlockNumber(tail.start.0 + 1 + u64::from(index)), block)?;
     }
     dev.sync(cx)?;
-    if read_validation_table(cx, dev, sb, tail)? != table {
+    if read_validation_table(cx, dev, id, tail)? != table {
         return Err(validation_error(
             tail,
             "table readback mismatch before sealing",
         ));
     }
-    verify_validation_table(cx, dev, sb, tail, &table, root)?;
-    let sealed = validation_header(sb, owner, generation, tail, epoch, VALIDATION_SEALED, root)?;
+    verify_validation_table(cx, dev, id, tail, &table, root)?;
+    let sealed = validation_header(id, owner, generation, tail, epoch, VALIDATION_SEALED, root)?;
     table[..VALIDATION_HEADER_BYTES].copy_from_slice(&sealed);
     dev.write_block(
         cx,
         BlockNumber(tail.start.0 + 1),
-        &table[..sb.block_size as usize],
+        &table[..id.block_size as usize],
     )?;
     dev.sync(cx)?;
     // Re-read the owner after the table barriers. Never restore an admission
     // snapshot over damage to the prefix or another authority record.
-    let current = check_native_owner_prefix(cx, dev, sb, storage, generation, tail)?;
+    let current = check_native_owner_prefix(cx, dev, id, storage, generation, tail)?;
     if current != ownership {
         return Err(validation_error(
             tail,
@@ -2760,7 +3449,434 @@ fn publish_validation_group(
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
 }
 
+fn btrfs_first_source_block(block_size: u32) -> Result<u64, FfsError> {
+    if block_size < 1024 || block_size > 65_536 || !block_size.is_power_of_two() {
+        return Err(FfsError::InvalidGeometry(
+            "native btrfs repair requires a power-of-two sector size in 1024..=65536".into(),
+        ));
+    }
+    let boot = BTRFS_SUPER_INFO_OFFSET as u64;
+    if boot % u64::from(block_size) != 0 {
+        return Err(FfsError::InvalidGeometry(
+            "btrfs superblock offset is not aligned to sector size".into(),
+        ));
+    }
+    Ok(boot / u64::from(block_size))
+}
+
+fn btrfs_group_overhead_blocks(
+    block_size: u32,
+    source_blocks: u32,
+    basis_points: u32,
+) -> Result<(u32, u32, u32), FfsError> {
+    let validation_blocks = u32::try_from(
+        (u64::from(source_blocks) * 32 + VALIDATION_HEADER_BYTES as u64)
+            .div_ceil(u64::from(block_size)),
+    )
+    .map_err(|_| FfsError::InvalidGeometry("btrfs validation block count overflow".into()))?;
+    let repair_blocks =
+        u32::try_from((u64::from(source_blocks) * u64::from(basis_points)).div_ceil(10_000))
+            .map_err(|_| FfsError::InvalidGeometry("btrfs repair block count overflow".into()))?;
+    if repair_blocks == 0 || repair_blocks > source_blocks {
+        return Err(FfsError::InvalidGeometry(
+            "btrfs native group leaves insufficient source blocks for parity".into(),
+        ));
+    }
+    let total = validation_blocks
+        .checked_add(repair_blocks)
+        .and_then(|count| count.checked_add(DESCRIPTOR_BLOCKS + 1))
+        .ok_or_else(|| FfsError::InvalidGeometry("btrfs native group overhead overflow".into()))?;
+    Ok((validation_blocks, repair_blocks, total))
+}
+
+fn btrfs_reserve_blocks_estimate(
+    block_size: u32,
+    total_blocks: u64,
+    basis_points: u32,
+) -> Result<u32, FfsError> {
+    if !(100..=1000).contains(&basis_points) {
+        return Err(FfsError::Format(
+            "native repair overhead must be 1–10 percent".into(),
+        ));
+    }
+    let first_source = btrfs_first_source_block(block_size)?;
+    let usable = total_blocks
+        .checked_sub(first_source)
+        .filter(|&blocks| blocks >= 64)
+        .ok_or_else(|| {
+            FfsError::InvalidGeometry("btrfs image too small for native repair".into())
+        })?;
+    let max_group = u64::from(BTRFS_NATIVE_GROUP_MAX_BLOCKS);
+    let est_groups = usable.div_ceil(max_group);
+    if est_groups > 65_530 {
+        return Err(FfsError::InvalidGeometry(
+            "native btrfs repair group limit exceeded".into(),
+        ));
+    }
+    let mut needed = 0_u64;
+    let mut remaining = usable;
+    while remaining > 0 {
+        let chunk = u32::try_from(remaining.min(max_group)).expect("bounded by max_group");
+        let (_, _, overhead) = btrfs_group_overhead_blocks(block_size, chunk, basis_points)?;
+        needed = needed
+            .checked_add(u64::from(overhead))
+            .ok_or_else(|| FfsError::InvalidGeometry("btrfs native reserve overflow".into()))?;
+        remaining -= u64::from(chunk);
+    }
+    let margin = u64::from(DESCRIPTOR_BLOCKS + 1 + 8);
+    let total_reserve = needed
+        .checked_add(margin)
+        .ok_or_else(|| FfsError::InvalidGeometry("btrfs native reserve overflow".into()))?;
+    if total_reserve.saturating_add(32) >= usable {
+        return Err(FfsError::NoSpace);
+    }
+    u32::try_from(total_reserve)
+        .map_err(|_| FfsError::InvalidGeometry("btrfs native reserve exceeds u32".into()))
+}
+
+fn btrfs_tail_plan_from_extents(
+    block_size: u32,
+    total_blocks: u64,
+    basis_points: u32,
+    physical_extents: &[(u64, u32)],
+) -> Result<Vec<NativeRepairTail>, FfsError> {
+    if !(100..=1000).contains(&basis_points) {
+        return Err(FfsError::Format(
+            "native repair overhead must be 1–10 percent".into(),
+        ));
+    }
+    if physical_extents.is_empty() {
+        return Err(FfsError::Format(
+            "native btrfs repair owner has no extents".into(),
+        ));
+    }
+    let first_source = btrfs_first_source_block(block_size)?;
+    let mut sorted_extents = physical_extents.to_vec();
+    sorted_extents.sort_by_key(|&(start, _)| start);
+    let mut prev_end = first_source;
+    let mut source_chunks: Vec<(u64, u32)> = Vec::new();
+    for &(ext_start, ext_blocks) in &sorted_extents {
+        if ext_blocks == 0 {
+            return Err(FfsError::Format(
+                "native btrfs repair extent has zero length".into(),
+            ));
+        }
+        let ext_end = ext_start
+            .checked_add(u64::from(ext_blocks))
+            .filter(|&end| ext_start >= prev_end && end <= total_blocks)
+            .ok_or_else(|| {
+                FfsError::Format(
+                    "native btrfs repair extents overlap or fall outside image bounds".into(),
+                )
+            })?;
+        let mut cursor = prev_end;
+        while cursor < ext_start {
+            let chunk =
+                u32::try_from((ext_start - cursor).min(u64::from(BTRFS_NATIVE_GROUP_MAX_BLOCKS)))
+                    .expect("bounded by BTRFS_NATIVE_GROUP_MAX_BLOCKS");
+            source_chunks.push((cursor, chunk));
+            cursor += u64::from(chunk);
+        }
+        prev_end = ext_end;
+    }
+    let mut cursor = prev_end;
+    while cursor < total_blocks {
+        let chunk =
+            u32::try_from((total_blocks - cursor).min(u64::from(BTRFS_NATIVE_GROUP_MAX_BLOCKS)))
+                .expect("bounded by BTRFS_NATIVE_GROUP_MAX_BLOCKS");
+        source_chunks.push((cursor, chunk));
+        cursor += u64::from(chunk);
+    }
+    if source_chunks.is_empty() || source_chunks.len() > 65_536 {
+        return Err(FfsError::InvalidGeometry(
+            "native btrfs repair source partition count out of bounds".into(),
+        ));
+    }
+
+    let mut tails: Vec<NativeRepairTail> = Vec::with_capacity(source_chunks.len());
+    let mut ext_idx = 0_usize;
+    let mut ext_cursor = sorted_extents[0].0;
+    let mut ext_remaining = sorted_extents[0].1;
+    let mut ext_tail_range_start = 0_usize;
+
+    for (group_idx, &(group_start, source_blocks)) in source_chunks.iter().enumerate() {
+        let (validation_blocks, repair_blocks, needed) =
+            btrfs_group_overhead_blocks(block_size, source_blocks, basis_points)?;
+        while ext_remaining < needed {
+            if ext_remaining > 0 {
+                let mut slack = ext_remaining;
+                for tail in &mut tails[ext_tail_range_start..] {
+                    let cap = tail.blocks_per_group.saturating_sub(tail.repair_blocks);
+                    let add = slack.min(cap);
+                    tail.repair_blocks += add;
+                    slack -= add;
+                    if slack == 0 {
+                        break;
+                    }
+                }
+                if slack != 0 {
+                    return Err(FfsError::InvalidGeometry(
+                        "btrfs native repair extent slack cannot fit in preceding groups".into(),
+                    ));
+                }
+                let mut repack = sorted_extents[ext_idx].0;
+                for tail in &mut tails[ext_tail_range_start..] {
+                    tail.start = BlockNumber(repack);
+                    repack += u64::from(tail.blocks());
+                }
+            }
+            ext_idx += 1;
+            if ext_idx >= sorted_extents.len() {
+                return Err(FfsError::Format(
+                    "native btrfs repair owner extents are smaller than required parity storage"
+                        .into(),
+                ));
+            }
+            ext_cursor = sorted_extents[ext_idx].0;
+            ext_remaining = sorted_extents[ext_idx].1;
+            ext_tail_range_start = tails.len();
+        }
+        let group = GroupNumber(
+            u32::try_from(group_idx)
+                .map_err(|_| FfsError::InvalidGeometry("btrfs group index overflow".into()))?,
+        );
+        tails.push(NativeRepairTail {
+            group,
+            group_start: BlockNumber(group_start),
+            blocks_per_group: source_blocks,
+            start: BlockNumber(ext_cursor),
+            validation_blocks,
+            repair_blocks,
+        });
+        ext_cursor += u64::from(needed);
+        ext_remaining -= needed;
+    }
+
+    if ext_idx + 1 != sorted_extents.len() {
+        return Err(FfsError::Format(
+            "native btrfs repair owner has unmapped trailing extents".into(),
+        ));
+    }
+    if ext_remaining > 0 {
+        let mut slack = ext_remaining;
+        for tail in tails[ext_tail_range_start..].iter_mut().rev() {
+            let cap = tail.blocks_per_group.saturating_sub(tail.repair_blocks);
+            let add = slack.min(cap);
+            tail.repair_blocks += add;
+            slack -= add;
+            if slack == 0 {
+                break;
+            }
+        }
+        if slack != 0 {
+            return Err(FfsError::InvalidGeometry(
+                "btrfs native repair trailing slack exceeds group source capacity".into(),
+            ));
+        }
+        let mut repack = sorted_extents[ext_idx].0;
+        for tail in &mut tails[ext_tail_range_start..] {
+            tail.start = BlockNumber(repack);
+            repack += u64::from(tail.blocks());
+        }
+    }
+    Ok(tails)
+}
+
+fn btrfs_resolve_single_data_extent(
+    chunks: &[ffs_ondisk::BtrfsChunkEntry],
+    expected_devid: u64,
+    sectorsize: u32,
+    disk_bytenr: u64,
+    disk_num_bytes: u64,
+) -> Result<(u64, u32), FfsError> {
+    if disk_bytenr == 0
+        || disk_num_bytes == 0
+        || disk_bytenr % u64::from(sectorsize) != 0
+        || disk_num_bytes % u64::from(sectorsize) != 0
+    {
+        return Err(FfsError::Format(
+            "native btrfs repair extent is unaligned or sparse".into(),
+        ));
+    }
+    let chunk = chunks
+        .iter()
+        .find(|entry| {
+            let Some(end) = entry.key.offset.checked_add(entry.length) else {
+                return false;
+            };
+            disk_bytenr >= entry.key.offset && disk_bytenr < end
+        })
+        .ok_or_else(|| {
+            FfsError::Format("native btrfs repair extent is missing from CHUNK_TREE".into())
+        })?;
+    let chunk_end = chunk
+        .key
+        .offset
+        .checked_add(chunk.length)
+        .ok_or_else(|| FfsError::InvalidGeometry("btrfs chunk range overflow".into()))?;
+    let extent_end = disk_bytenr
+        .checked_add(disk_num_bytes)
+        .ok_or_else(|| FfsError::InvalidGeometry("btrfs repair extent overflow".into()))?;
+    if extent_end > chunk_end
+        || chunk.chunk_type & super::BTRFS_BLOCK_GROUP_DATA == 0
+        || chunk.chunk_type & ffs_ondisk::chunk_type_flags::RAID_MASK != 0
+        || chunk.stripes.len() != 1
+    {
+        return Err(FfsError::UnsupportedFeature(
+            "native btrfs repair requires contiguous SINGLE-profile DATA extents".into(),
+        ));
+    }
+    let mapping = map_logical_to_physical(chunks, disk_bytenr)
+        .map_err(|error| parse_to_ffs_error(&error))?
+        .ok_or_else(|| FfsError::Format("native btrfs repair logical mapping missing".into()))?;
+    if mapping.devid != expected_devid || mapping.physical % u64::from(sectorsize) != 0 {
+        return Err(FfsError::Format(
+            "native btrfs repair physical stripe disagrees with primary device".into(),
+        ));
+    }
+    let start_block = mapping.physical / u64::from(sectorsize);
+    let blocks = u32::try_from(disk_num_bytes / u64::from(sectorsize))
+        .map_err(|_| FfsError::InvalidGeometry("btrfs repair extent blocks exceed u32".into()))?;
+    Ok((start_block, blocks))
+}
+
+#[expect(clippy::too_many_arguments)]
+fn heal_clean_group_sources(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    raw_sync: &dyn ByteDevice,
+    id: &NativeFsIdentity,
+    tail: &NativeRepairTail,
+    table: &[u8],
+    root: &[u8; 32],
+    expected_generation: u64,
+    corrupt: &[u32],
+) -> Result<(), FfsError> {
+    let view = NativeDigestDevice {
+        dev,
+        tail,
+        table,
+        corrupt,
+    };
+    let capture = NativeReconstructionCapture {
+        blocks: OnceCell::new(),
+    };
+    let (layout, expected) = native_layout(id, tail)?;
+    let result = GroupRecoveryOrchestrator::new_with_writeback(
+        &view,
+        &capture,
+        id.uuid,
+        layout,
+        tail.group_start,
+        u32::from(expected.source_block_count),
+    )?
+    .with_decoded_block_validator(&view)
+    .recover_from_indices(cx, corrupt);
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    if !result.is_success() || result.evidence.generation != expected_generation {
+        return Err(FfsError::RepairFailed(format!(
+            "native cold source healing failed in group {}: {:?}",
+            tail.group.0, result.evidence.reason
+        )));
+    }
+    let recovered = capture
+        .blocks
+        .into_inner()
+        .ok_or_else(|| validation_error(tail, "native cold source healing produced no capture"))?;
+    for source in 0..u32::from(expected.source_block_count) {
+        view.read_block(cx, BlockNumber(tail.group_start.0 + u64::from(source)))?;
+    }
+    for block in &recovered {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if dev.read_block(cx, block.block)?.as_slice() != block.expected_current {
+            return Err(validation_error(tail, "native heal target changed"));
+        }
+        dev.write_block(cx, block.block, &block.data)?;
+    }
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    raw_sync.sync(cx)?;
+    verify_validation_table(cx, dev, id, tail, table, root)
+}
+
 impl OpenFs {
+    pub(crate) fn begin_durability_commit(
+        &self,
+        cx: &Cx,
+        pre_commit_seq: u64,
+        hinted_blocks: &[BlockNumber],
+    ) -> Result<DurabilityCommitGuard<'_>, FfsError> {
+        let Some(device) = self.native_repair_device.as_deref() else {
+            return Ok(DurabilityCommitGuard {
+                device: None,
+                armed: false,
+            });
+        };
+        device.begin_durability_commit(cx, pre_commit_seq, hinted_blocks)
+    }
+
+    #[must_use]
+    pub fn shared_fenced_device(&self) -> Arc<dyn ByteDevice> {
+        Arc::clone(&self.dev)
+    }
+
+    #[must_use]
+    pub fn shared_backing_device(&self) -> Arc<dyn ByteDevice> {
+        self.native_repair_device
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.dev), |dev| dev.backing_device())
+    }
+
+    #[must_use]
+    pub fn native_recovery_touched_blocks(&self) -> &BTreeSet<BlockNumber> {
+        &self.native_recovery_touched_blocks
+    }
+
+    /// Run a full verified scrub + self-healing pass across all native groups
+    /// under `NativeFreshnessDevice`'s mutex, updating the Ville/Wald monitor.
+    pub fn scrub_and_heal_native(&self, cx: &Cx) -> Result<NativeScrubHealReport, FfsError> {
+        let device = self
+            .native_repair_device
+            .as_ref()
+            .ok_or_else(|| freshness_error("native repair device is not active"))?;
+        device.scrub_and_heal_all_groups(cx)
+    }
+
+    pub(crate) fn verify_btrfs_native_owner_in_tree(
+        &self,
+        alloc: &BtrfsAllocState,
+    ) -> Result<(), FfsError> {
+        let Some(device) = self.native_repair_device.as_ref() else {
+            return Ok(());
+        };
+        let Some(sb) = self.btrfs_superblock() else {
+            return Ok(());
+        };
+        let state = match device.state.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(()),
+        };
+        let storage = &state.baseline.storage;
+        let owner_oid = storage.owner_inode.0;
+        let inode = self.btrfs_read_inode_from_tree(alloc, owner_oid)?;
+        let expected_blocks: u64 = storage
+            .tails
+            .iter()
+            .map(|tail| u64::from(tail.blocks()))
+            .sum();
+        let expected_bytes = expected_blocks * u64::from(sb.sectorsize);
+        if inode.mode != 0o100_400
+            || inode.flags & BTRFS_NATIVE_OWNER_FLAGS != BTRFS_NATIVE_OWNER_FLAGS
+            || inode.nlink != 1
+            || inode.size != expected_bytes
+            || inode.nbytes != expected_bytes
+        {
+            return Err(freshness_error(
+                "btrfs commit altered native repair owner inode invariants",
+            ));
+        }
+        Ok(())
+    }
+
     fn capture_native_ownership(
         &self,
         cx: &Cx,
@@ -2792,8 +3908,6 @@ impl OpenFs {
             .inode_device_offset(&location, gd.inode_table)
             .map_err(|error| parse_to_ffs_error(&error))?;
         let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
-        // Preserve every inode byte except atime and the checksum fields.
-        // Other inodes sharing this physical table block remain writable.
         for index in 0..u64::from(sb.inode_size) {
             let atime = (0x08..0x0C).contains(&index)
                 || (inode.extra_isize >= 16 && (0x8C..0x90).contains(&index));
@@ -2828,17 +3942,591 @@ impl OpenFs {
         Ok(constraints)
     }
 
-    /// Admit sealed native protection, verify reads and fence source writes.
-    /// Clean-epoch readable source corruption is automatically reconstructed,
-    /// synced and verified within the admitted resource budget. Dirty epochs
-    /// validate intended bytes without falling back to stale parity.
-    /// The caller must exclusively own the image and activate before recovery
-    /// or writable operation. No unwrapped device handle is returned.
-    ///
-    /// # Errors
-    /// Refuses unsealed or changed protection, insufficient resources, active
-    /// external metadata logs, repeated activation and unsupported ownership.
-    pub fn activate_native_ext4_repair(
+    fn capture_native_btrfs_ownership(
+        &self,
+        cx: &Cx,
+        sb: &BtrfsSuperblock,
+        remaining_budget: u64,
+    ) -> Result<NativeOwnershipConstraints, FfsError> {
+        let dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: sb.sectorsize,
+        };
+        let mut constraints = NativeOwnershipConstraints {
+            blocks: BTreeMap::new(),
+            remaining_budget,
+        };
+        constraints.protect_btrfs_superblock(cx, &dev)?;
+        Ok(constraints)
+    }
+
+    fn native_identity_storage_and_generation(
+        &self,
+        cx: &Cx,
+    ) -> Result<(NativeFsIdentity, NativeRepairStorage, u32), FfsError> {
+        if let Some(sb) = self.ext4_superblock() {
+            let storage = self.native_ext4_repair_storage(cx)?;
+            let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
+            return Ok((NativeFsIdentity::from_ext4(sb), storage, inode.generation));
+        }
+        if let Some(sb) = self.btrfs_superblock() {
+            let (storage, generation) = self.native_btrfs_repair_storage_with_generation(cx)?;
+            let groups = u32::try_from(storage.tails.len()).map_err(|_| {
+                FfsError::InvalidGeometry("btrfs native group count exceeds u32".into())
+            })?;
+            return Ok((
+                NativeFsIdentity::from_btrfs(sb, groups),
+                storage,
+                generation,
+            ));
+        }
+        Err(FfsError::UnsupportedFeature(
+            "native repair storage requires ext4 or btrfs".into(),
+        ))
+    }
+
+    pub(crate) fn finalize_replayed_ext4_journal_for_native_repair(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<(), FfsError> {
+        let Some(sb) = self.ext4_superblock().cloned() else {
+            return Ok(());
+        };
+        if sb.journal_inum == 0 || self.ext4_replay_overlay {
+            return Ok(());
+        }
+        let inode = self.read_inode(cx, InodeNumber(u64::from(sb.journal_inum)))?;
+        let segments = self.collect_ext4_journal_segments(cx, &inode)?;
+        let Some(first) = segments.first() else {
+            return Ok(());
+        };
+        let raw = self.read_block_vec(cx, first.start)?;
+        let journal_dirty = Jbd2Superblock::parse(&raw).is_some_and(|jsb| jsb.start_block != 0);
+        let sb_dirty = sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
+            || ext4_superblock_requires_journal_recovery(&sb);
+        if !journal_dirty && !sb_dirty {
+            return Ok(());
+        }
+        self.dev.sync(cx)?;
+        if let Some(writer) = self.open_ext4_internal_jbd2_writer(cx)? {
+            let direct = self.direct_block_device_adapter();
+            writer
+                .mark_log_empty(cx, &direct)
+                .map_err(|err| FfsError::Io(std::io::Error::other(err.to_string())))?;
+            self.ext4_write_needs_recovery(cx, &direct, false)?;
+            self.dev.sync(cx)?;
+            let sb_region = read_ext4_superblock_region(cx, self.dev.as_ref())?;
+            if let super::FsFlavor::Ext4(slot) = &mut self.flavor {
+                **slot = Ext4Superblock::parse_superblock_region(&sb_region)
+                    .map_err(|e| parse_to_ffs_error(&e))?;
+            }
+            self.invalidate_ext4_read_caches_after_recovery();
+        }
+        Ok(())
+    }
+
+    /// Reconcile any interrupted format-committed epoch (`FFSEPK02` across
+    /// Cuts A–D), heal recoverable clean-group bit-rot, and activate live
+    /// native read verification and write fencing on `self.dev`.
+    #[expect(clippy::too_many_lines)]
+    pub fn reconcile_and_activate_native_repair(
+        &mut self,
+        cx: &Cx,
+        max_working_bytes: u64,
+        recovery_touched_blocks: &BTreeSet<BlockNumber>,
+    ) -> Result<NativeRepairReport, FfsError> {
+        self.require_write_authority()?;
+        self.require_native_mode("activate_native_repair")?;
+        if self.native_repair_device.is_some() {
+            return Err(freshness_error("device is already active"));
+        }
+        if self.ext4_replay_overlay {
+            return Err(freshness_error(
+                "simulated replay cannot certify image durability",
+            ));
+        }
+        if self.metadata_log.is_some() || self.metadata_compactor.lock().is_some() {
+            return Err(freshness_error("external metadata WAL is not admitted"));
+        }
+        self.finalize_replayed_ext4_journal_for_native_repair(cx)?;
+
+        let (id, storage, owner_generation) = self.native_identity_storage_and_generation(cx)?;
+        let retained_budget = freshness_codec_budget(&id, &storage, max_working_bytes)?;
+        let probe_constraints = if let Some(sb) = self.ext4_superblock() {
+            sb.validate_v1().map_err(|e| parse_to_ffs_error(&e))?;
+            self.capture_native_ownership(cx, sb, &storage, retained_budget)?
+        } else if let Some(sb) = self.btrfs_superblock() {
+            self.capture_native_btrfs_ownership(cx, sb, retained_budget)?
+        } else {
+            return Err(freshness_error("native freshness requires ext4 or btrfs"));
+        };
+        let codec_budget = probe_constraints.remaining_budget;
+        for tail in &storage.tails {
+            native_codec_budget(&id, &storage, tail, codec_budget, false)?;
+        }
+
+        let dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: id.block_size,
+        };
+        let owner0 = check_native_owner_prefix(
+            cx,
+            &dev,
+            &id,
+            &storage,
+            owner_generation,
+            &storage.tails[0],
+        )?;
+        let plan_bytes = &owner0[PLAN_HEADER_START..PLAN_HEADER_END];
+        let plan_intent = validation_plan_intent(plan_bytes, &id, &storage, owner_generation)?;
+        let plan_epoch = validation_plan_epoch(plan_bytes)?;
+        let maybe_token = NativeEpochToken::decode_optional(
+            &owner0[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
+            &id,
+            storage.owner_inode,
+            owner_generation,
+            &storage.tails[0],
+        )?;
+
+        let mut recovery_dirty_groups = BTreeSet::new();
+        for &blk in recovery_touched_blocks {
+            if let Some(tail) = native_source_tail(&storage, blk) {
+                recovery_dirty_groups.insert(tail.group);
+            }
+        }
+
+        match (plan_intent, maybe_token) {
+            (ValidationIntent::Sealed(_), None) => {
+                if !recovery_dirty_groups.is_empty() {
+                    return Err(freshness_error(
+                        "uncoordinated recovery modified a sealed native baseline without an epoch token",
+                    ));
+                }
+                let baseline = read_native_baseline(self, cx)?;
+                for (index, tail) in storage.tails.iter().enumerate() {
+                    let (root, table) =
+                        read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
+                    let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
+                    if !corrupt.is_empty() {
+                        native_codec_budget(&id, &storage, tail, codec_budget, true)?;
+                        let generation =
+                            native_sealed_generation(cx, &dev, &id, &baseline, tail, true)?;
+                        heal_clean_group_sources(
+                            cx,
+                            &dev,
+                            self.dev.as_ref(),
+                            &id,
+                            tail,
+                            &table,
+                            &baseline.roots[index],
+                            generation,
+                            &corrupt,
+                        )?;
+                    } else {
+                        if root != baseline.roots[index] {
+                            return Err(validation_error(tail, "sealed root changed"));
+                        }
+                        native_sealed_generation(cx, &dev, &id, &baseline, tail, false)?;
+                    }
+                }
+            }
+            (ValidationIntent::Sealed(_), Some(_)) => {
+                return Err(validation_error(
+                    &storage.tails[0],
+                    "sealed plan carries an unretired epoch token",
+                ));
+            }
+            (ValidationIntent::Dirty(prev_root), Some(token))
+                if token.flags & EPOCH_TOKEN_FLAG_FORMAT_COMMIT != 0
+                    && token.prev_sealed_plan_root == prev_root
+                    && token.prev_sealed_epoch == plan_epoch =>
+            {
+                let target_epoch = token.target_epoch;
+                let mut validations = Vec::with_capacity(storage.tails.len());
+                let mut needs_publish = Vec::with_capacity(storage.tails.len());
+                for tail in &storage.tails {
+                    if token.is_group_dirty(tail.group)
+                        || recovery_dirty_groups.contains(&tail.group)
+                    {
+                        let table = build_validation_table(
+                            cx,
+                            &dev,
+                            &id,
+                            storage.owner_inode,
+                            owner_generation,
+                            tail,
+                            target_epoch,
+                        )?;
+                        let (_, _, used) = validation_sizes(&id, tail)?;
+                        let root = validation_root(&table, used);
+                        validations.push(ValidationAdmission {
+                            epoch: target_epoch,
+                            root,
+                            intent: ValidationIntent::Pending(root),
+                        });
+                        needs_publish.push(true);
+                    } else {
+                        let (root, table) =
+                            read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
+                        let local_epoch =
+                            u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
+                        if local_epoch == 0 || local_epoch > token.prev_sealed_epoch {
+                            return Err(validation_error(
+                                tail,
+                                "clean group epoch exceeds pre-crash sealed epoch",
+                            ));
+                        }
+                        let temp_baseline = NativeBaseline {
+                            storage: storage.clone(),
+                            owner_generation,
+                            epoch: token.prev_sealed_epoch,
+                            plan_root: prev_root,
+                            roots: storage.tails.iter().map(|_| root).collect(),
+                            group_epochs: vec![local_epoch; storage.tails.len()],
+                        };
+                        let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
+                        if !corrupt.is_empty() {
+                            native_codec_budget(&id, &storage, tail, codec_budget, true)?;
+                            let generation = native_sealed_generation(
+                                cx,
+                                &dev,
+                                &id,
+                                &temp_baseline,
+                                tail,
+                                true,
+                            )?;
+                            heal_clean_group_sources(
+                                cx,
+                                &dev,
+                                self.dev.as_ref(),
+                                &id,
+                                tail,
+                                &table,
+                                &root,
+                                generation,
+                                &corrupt,
+                            )?;
+                        } else {
+                            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
+                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
+                        }
+                        validations.push(ValidationAdmission {
+                            epoch: local_epoch,
+                            root,
+                            intent: ValidationIntent::Sealed(root),
+                        });
+                        needs_publish.push(false);
+                    }
+                }
+                let new_plan_root = validation_plan_root(
+                    &id,
+                    &storage,
+                    owner_generation,
+                    target_epoch,
+                    &validations,
+                )?;
+                let next = NativeBaseline {
+                    storage: storage.clone(),
+                    owner_generation,
+                    epoch: target_epoch,
+                    plan_root: new_plan_root,
+                    roots: validations.iter().map(|v| v.root).collect(),
+                    group_epochs: validations.iter().map(|v| v.epoch).collect(),
+                };
+                let mut admissions = Vec::with_capacity(storage.tails.len());
+                for (index, tail) in storage.tails.iter().enumerate() {
+                    let expected_root = (!needs_publish[index]).then_some(next.roots[index]);
+                    let mut adm = admit_native_group_unconstrained_root(
+                        cx,
+                        &dev,
+                        &id,
+                        &storage,
+                        owner_generation,
+                        tail,
+                        codec_budget,
+                        expected_root,
+                    )?;
+                    if needs_publish[index] {
+                        adm.retained = false;
+                    }
+                    admissions.push(adm);
+                }
+                publish_validation_plan_with_token(
+                    cx,
+                    &dev,
+                    &id,
+                    &storage,
+                    owner_generation,
+                    target_epoch,
+                    ValidationIntent::Pending(new_plan_root),
+                    Some(&token),
+                )?;
+                for (index, tail) in storage.tails.iter().enumerate() {
+                    if !needs_publish[index] {
+                        continue;
+                    }
+                    publish_validation_group(
+                        cx,
+                        &dev,
+                        &id,
+                        &storage,
+                        owner_generation,
+                        tail,
+                        &validations[index],
+                    )?;
+                    let (_, sealed_table) =
+                        read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
+                    encode_and_publish_native_group(
+                        cx,
+                        &dev,
+                        &id,
+                        &next,
+                        tail,
+                        &admissions[index],
+                        &sealed_table,
+                        None,
+                    )?;
+                }
+                publish_validation_plan_with_token(
+                    cx,
+                    &dev,
+                    &id,
+                    &storage,
+                    owner_generation,
+                    target_epoch,
+                    ValidationIntent::Sealed(new_plan_root),
+                    None,
+                )?;
+                self.dev.sync(cx)?;
+            }
+            (ValidationIntent::Pending(expected_plan_root), Some(token))
+                if token.flags & EPOCH_TOKEN_FLAG_FORMAT_COMMIT != 0
+                    && token.target_epoch == plan_epoch =>
+            {
+                let target_epoch = token.target_epoch;
+                let mut validations = Vec::with_capacity(storage.tails.len());
+                let mut needs_table_publish = Vec::with_capacity(storage.tails.len());
+                let mut needs_parity_publish = Vec::with_capacity(storage.tails.len());
+                for tail in &storage.tails {
+                    if !token.is_group_dirty(tail.group) {
+                        let (root, table) =
+                            read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
+                        let local_epoch =
+                            u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
+                        if local_epoch == 0 || local_epoch > token.prev_sealed_epoch {
+                            return Err(validation_error(
+                                tail,
+                                "clean group epoch exceeds pre-crash sealed epoch",
+                            ));
+                        }
+                        let temp_baseline = NativeBaseline {
+                            storage: storage.clone(),
+                            owner_generation,
+                            epoch: token.prev_sealed_epoch,
+                            plan_root: token.prev_sealed_plan_root,
+                            roots: storage.tails.iter().map(|_| root).collect(),
+                            group_epochs: vec![local_epoch; storage.tails.len()],
+                        };
+                        let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
+                        if !corrupt.is_empty() {
+                            native_codec_budget(&id, &storage, tail, codec_budget, true)?;
+                            let generation = native_sealed_generation(
+                                cx,
+                                &dev,
+                                &id,
+                                &temp_baseline,
+                                tail,
+                                true,
+                            )?;
+                            heal_clean_group_sources(
+                                cx,
+                                &dev,
+                                self.dev.as_ref(),
+                                &id,
+                                tail,
+                                &table,
+                                &root,
+                                generation,
+                                &corrupt,
+                            )?;
+                        } else {
+                            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
+                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
+                        }
+                        validations.push(ValidationAdmission {
+                            epoch: local_epoch,
+                            root,
+                            intent: ValidationIntent::Sealed(root),
+                        });
+                        needs_table_publish.push(false);
+                        needs_parity_publish.push(false);
+                    } else if let Ok((root, table)) =
+                        read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)
+                        && u32::from_le_bytes(table[68..72].try_into().expect("checked table"))
+                            == target_epoch
+                    {
+                        let temp_baseline = NativeBaseline {
+                            storage: storage.clone(),
+                            owner_generation,
+                            epoch: target_epoch,
+                            plan_root: expected_plan_root,
+                            roots: storage.tails.iter().map(|_| root).collect(),
+                            group_epochs: vec![target_epoch; storage.tails.len()],
+                        };
+                        let already_parity_sealed =
+                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, true)
+                                .is_ok();
+                        if already_parity_sealed {
+                            let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
+                            if !corrupt.is_empty() {
+                                native_codec_budget(&id, &storage, tail, codec_budget, true)?;
+                                let generation = native_sealed_generation(
+                                    cx,
+                                    &dev,
+                                    &id,
+                                    &temp_baseline,
+                                    tail,
+                                    true,
+                                )?;
+                                heal_clean_group_sources(
+                                    cx,
+                                    &dev,
+                                    self.dev.as_ref(),
+                                    &id,
+                                    tail,
+                                    &table,
+                                    &root,
+                                    generation,
+                                    &corrupt,
+                                )?;
+                            } else {
+                                verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
+                            }
+                            needs_parity_publish.push(false);
+                        } else {
+                            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
+                            needs_parity_publish.push(true);
+                        }
+                        validations.push(ValidationAdmission {
+                            epoch: target_epoch,
+                            root,
+                            intent: ValidationIntent::Sealed(root),
+                        });
+                        needs_table_publish.push(false);
+                    } else {
+                        let table = build_validation_table(
+                            cx,
+                            &dev,
+                            &id,
+                            storage.owner_inode,
+                            owner_generation,
+                            tail,
+                            target_epoch,
+                        )?;
+                        let (_, _, used) = validation_sizes(&id, tail)?;
+                        let root = validation_root(&table, used);
+                        validations.push(ValidationAdmission {
+                            epoch: target_epoch,
+                            root,
+                            intent: ValidationIntent::Pending(root),
+                        });
+                        needs_table_publish.push(true);
+                        needs_parity_publish.push(true);
+                    }
+                }
+                let computed_plan_root = validation_plan_root(
+                    &id,
+                    &storage,
+                    owner_generation,
+                    target_epoch,
+                    &validations,
+                )?;
+                if computed_plan_root != expected_plan_root {
+                    return Err(validation_error(
+                        &storage.tails[0],
+                        "pending epoch source blocks disagree with committed plan root",
+                    ));
+                }
+                let next = NativeBaseline {
+                    storage: storage.clone(),
+                    owner_generation,
+                    epoch: target_epoch,
+                    plan_root: expected_plan_root,
+                    roots: validations.iter().map(|v| v.root).collect(),
+                    group_epochs: validations.iter().map(|v| v.epoch).collect(),
+                };
+                let mut admissions = Vec::with_capacity(storage.tails.len());
+                for (index, tail) in storage.tails.iter().enumerate() {
+                    let expected_root = (!needs_parity_publish[index]).then_some(next.roots[index]);
+                    let mut adm = admit_native_group_unconstrained_root(
+                        cx,
+                        &dev,
+                        &id,
+                        &storage,
+                        owner_generation,
+                        tail,
+                        codec_budget,
+                        expected_root,
+                    )?;
+                    if needs_parity_publish[index] {
+                        adm.retained = false;
+                    }
+                    admissions.push(adm);
+                }
+                self.dev.sync(cx)?;
+                for (index, tail) in storage.tails.iter().enumerate() {
+                    if needs_table_publish[index] {
+                        publish_validation_group(
+                            cx,
+                            &dev,
+                            &id,
+                            &storage,
+                            owner_generation,
+                            tail,
+                            &validations[index],
+                        )?;
+                    }
+                    if needs_parity_publish[index] {
+                        let (_, sealed_table) =
+                            read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
+                        encode_and_publish_native_group(
+                            cx,
+                            &dev,
+                            &id,
+                            &next,
+                            tail,
+                            &admissions[index],
+                            &sealed_table,
+                            None,
+                        )?;
+                    }
+                }
+                publish_validation_plan_with_token(
+                    cx,
+                    &dev,
+                    &id,
+                    &storage,
+                    owner_generation,
+                    target_epoch,
+                    ValidationIntent::Sealed(expected_plan_root),
+                    None,
+                )?;
+                self.dev.sync(cx)?;
+            }
+            _ => {
+                return Err(validation_error(
+                    &storage.tails[0],
+                    "whole-plan validation is uninitialized, dirty without commit token, or pending",
+                ));
+            }
+        }
+
+        self.activate_native_repair(cx, max_working_bytes)
+    }
+
+    /// Admit sealed native protection, verify reads and fence source writes on
+    /// either ext4 or btrfs.
+    pub fn activate_native_repair(
         &mut self,
         cx: &Cx,
         max_working_bytes: u64,
@@ -2856,42 +4544,45 @@ impl OpenFs {
         if self.metadata_log.is_some() || self.metadata_compactor.lock().is_some() {
             return Err(freshness_error("external metadata WAL is not admitted"));
         }
-        let sb = self
-            .ext4_superblock()
-            .ok_or_else(|| freshness_error("native freshness requires ext4"))?
-            .clone();
-        sb.validate_v1()
-            .map_err(|error| parse_to_ffs_error(&error))?;
-        let storage = self.native_ext4_repair_storage(cx)?;
-        let retained_budget = freshness_codec_budget(&sb, &storage, max_working_bytes)?;
-        let ownership = self.capture_native_ownership(cx, &sb, &storage, retained_budget)?;
+        let (id, storage, _) = self.native_identity_storage_and_generation(cx)?;
+        let retained_budget = freshness_codec_budget(&id, &storage, max_working_bytes)?;
+        let ownership = if let Some(sb) = self.ext4_superblock() {
+            sb.validate_v1()
+                .map_err(|error| parse_to_ffs_error(&error))?;
+            self.capture_native_ownership(cx, sb, &storage, retained_budget)?
+        } else if let Some(sb) = self.btrfs_superblock() {
+            self.capture_native_btrfs_ownership(cx, sb, retained_budget)?
+        } else {
+            return Err(freshness_error("native freshness requires ext4 or btrfs"));
+        };
         let codec_budget = ownership.remaining_budget;
         for tail in &storage.tails {
-            native_codec_budget(&sb, &storage, tail, codec_budget, false)?;
+            native_codec_budget(&id, &storage, tail, codec_budget, false)?;
         }
         let baseline = read_native_baseline(self, cx)?;
         baseline
             .epoch
             .checked_add(1)
             .ok_or_else(|| freshness_error("validation epoch exhausted before activation"))?;
-        let report = self.check_native_ext4_repair(cx)?;
+        let report = self.check_native_repair(cx)?;
         let dev = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
-            block_size: sb.block_size,
+            block_size: id.block_size,
         };
-        let mut tables = Vec::with_capacity(storage.tails.len());
-        let mut parity = Vec::with_capacity(storage.tails.len());
+        let group_count = storage.tails.len();
+        let mut tables = Vec::with_capacity(group_count);
+        let mut parity = Vec::with_capacity(group_count);
         for (index, tail) in storage.tails.iter().enumerate() {
             let (root, table) =
-                read_sealed_table(cx, &dev, &sb, &storage, baseline.owner_generation, tail)?;
+                read_sealed_table(cx, &dev, &id, &storage, baseline.owner_generation, tail)?;
             if root != baseline.roots[index] {
                 return Err(validation_error(
                     tail,
                     "source authority changed during activation",
                 ));
             }
-            verify_validation_table(cx, &dev, &sb, tail, &table, &root)?;
-            let admission = admit_native_group(cx, &dev, &sb, &baseline, tail, codec_budget)?;
+            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
+            let admission = admit_native_group(cx, &dev, &id, &baseline, tail, codec_budget)?;
             if !admission.retained || admission.intent.generation() != report.generations[index] {
                 return Err(validation_error(
                     tail,
@@ -2905,12 +4596,19 @@ impl OpenFs {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let device = Arc::new(NativeFreshnessDevice {
             inner: Arc::clone(&self.dev),
-            sb,
+            id,
             state: NativeMutex::new(NativeFreshnessState {
                 baseline,
                 tables,
                 parity,
                 intended: BTreeMap::new(),
+                beforeimages: BTreeMap::new(),
+                dirty_groups: vec![false; group_count],
+                persisted_dirty_buckets: [0; 64],
+                defer_seal: 0,
+                format_commit_seq: None,
+                pending_dirty_buckets: [0; 64],
+                scrub_monitor: VilleWaldScrubMonitor::new(VilleWaldConfig::default())?,
                 phase: FreshnessPhase::Clean,
             }),
             codec_budget,
@@ -2921,94 +4619,140 @@ impl OpenFs {
         Ok(report)
     }
 
-    /// Publish native parity from the existing sealed source baseline.
-    /// The caller must exclude all writers for this consumed offline view.
-    /// Resource and whole-plan admission precede writes; protection stays inactive.
-    ///
-    /// # Errors
-    /// Refuses changed sources, malformed ownership/descriptors, exhausted
-    /// generations, insufficient working budget, cancellation and I/O failures.
-    pub fn initialize_native_ext4_repair(
+    /// Admit sealed native ext4 protection, verify reads and fence source writes.
+    pub fn activate_native_ext4_repair(
+        &mut self,
+        cx: &Cx,
+        max_working_bytes: u64,
+    ) -> Result<NativeRepairReport, FfsError> {
+        if self.ext4_superblock().is_none() {
+            return Err(freshness_error("native freshness requires ext4"));
+        }
+        self.activate_native_repair(cx, max_working_bytes)
+    }
+
+    /// Admit sealed native btrfs protection, verify reads and fence source writes.
+    pub fn activate_native_btrfs_repair(
+        &mut self,
+        cx: &Cx,
+        max_working_bytes: u64,
+    ) -> Result<NativeRepairReport, FfsError> {
+        if self.btrfs_superblock().is_none() {
+            return Err(freshness_error("native freshness requires btrfs"));
+        }
+        self.activate_native_repair(cx, max_working_bytes)
+    }
+
+    /// Publish native parity from the existing sealed source baseline (ext4 or btrfs).
+    pub fn initialize_native_repair(
         self,
         cx: &Cx,
         max_working_bytes: u64,
     ) -> Result<NativeRepairReport, FfsError> {
         self.require_write_authority()?;
         self.require_native_mode("initialize_native_repair")?;
-        let owned = self.native_ext4_repair_storage(cx)?;
-        let sb = self
-            .ext4_superblock()
-            .expect("validated native ext4 ownership");
+        let (id, owned, _) = self.native_identity_storage_and_generation(cx)?;
         for tail in &owned.tails {
-            native_codec_budget(sb, &owned, tail, max_working_bytes, false)?;
+            native_codec_budget(&id, &owned, tail, max_working_bytes, false)?;
         }
         let baseline = read_native_baseline(&self, cx)?;
-        self.check_native_ext4_validation(cx)?;
-        let sb = self
-            .ext4_superblock()
-            .expect("validated native ext4 ownership");
+        self.check_native_validation(cx)?;
         let dev = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
-            block_size: sb.block_size,
+            block_size: id.block_size,
         };
         let mut admissions = Vec::with_capacity(baseline.storage.tails.len());
         for tail in &baseline.storage.tails {
             admissions.push(admit_native_group(
                 cx,
                 &dev,
-                sb,
+                &id,
                 &baseline,
                 tail,
                 max_working_bytes,
             )?);
         }
         for (tail, admission) in baseline.storage.tails.iter().zip(&admissions) {
-            publish_native_group(cx, &dev, sb, &baseline, tail, admission)?;
+            publish_native_group(cx, &dev, &id, &baseline, tail, admission)?;
         }
         ensure_native_baseline(&self, cx, &baseline)?;
-        let report = self.check_native_ext4_repair(cx)?;
+        let report = self.check_native_repair(cx)?;
         dev.sync(cx)?;
         Ok(report)
     }
 
+    /// Publish native parity from the existing sealed ext4 source baseline.
+    pub fn initialize_native_ext4_repair(
+        self,
+        cx: &Cx,
+        max_working_bytes: u64,
+    ) -> Result<NativeRepairReport, FfsError> {
+        if self.ext4_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires ext4".into(),
+            ));
+        }
+        self.initialize_native_repair(cx, max_working_bytes)
+    }
+
+    /// Publish native parity from the existing sealed btrfs source baseline.
+    pub fn initialize_native_btrfs_repair(
+        self,
+        cx: &Cx,
+        max_working_bytes: u64,
+    ) -> Result<NativeRepairReport, FfsError> {
+        if self.btrfs_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires btrfs".into(),
+            ));
+        }
+        self.initialize_native_repair(cx, max_working_bytes)
+    }
+
     /// Read-only check of current sources and all committed native parity.
-    ///
-    /// # Errors
-    /// Refuses pending/missing authority, damaged or changed data and I/O errors.
-    pub fn check_native_ext4_repair(&self, cx: &Cx) -> Result<NativeRepairReport, FfsError> {
+    pub fn check_native_repair(&self, cx: &Cx) -> Result<NativeRepairReport, FfsError> {
         self.require_native_mode("check_native_repair")?;
         if let Some(device) = &self.native_repair_device {
             return device.inspect_repair(cx);
         }
+        let (id, _, _) = self.native_identity_storage_and_generation(cx)?;
         let baseline = read_native_baseline(self, cx)?;
-        self.check_native_ext4_validation(cx)?;
-        let sb = self
-            .ext4_superblock()
-            .expect("validated native ext4 ownership");
+        self.check_native_validation(cx)?;
         let dev = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
-            block_size: sb.block_size,
+            block_size: id.block_size,
         };
         let mut generations = Vec::with_capacity(baseline.storage.tails.len());
         for tail in &baseline.storage.tails {
             generations.push(native_sealed_generation(
-                cx, &dev, sb, &baseline, tail, false,
+                cx, &dev, &id, &baseline, tail, false,
             )?);
         }
-        native_repair_report(sb, &baseline, generations)
+        native_repair_report(&id, &baseline, generations)
+    }
+
+    /// Read-only check of current ext4 sources and all committed native parity.
+    pub fn check_native_ext4_repair(&self, cx: &Cx) -> Result<NativeRepairReport, FfsError> {
+        if self.ext4_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires ext4".into(),
+            ));
+        }
+        self.check_native_repair(cx)
+    }
+
+    /// Read-only check of current btrfs sources and all committed native parity.
+    pub fn check_native_btrfs_repair(&self, cx: &Cx) -> Result<NativeRepairReport, FfsError> {
+        if self.btrfs_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires btrfs".into(),
+            ));
+        }
+        self.check_native_repair(cx)
     }
 
     /// Reconstruct a changed source block from the immutable sealed baseline.
-    /// Reads and validates every source in its group and all reconstructed bytes.
-    /// Never writes or syncs the image. The caller must exclude image writers.
-    /// This establishes historical baseline bytes, not freshness after client writes.
-    ///
-    /// # Errors
-    /// Refuses intact/non-source targets, missing or changed authority, resource
-    /// excess, insufficient parity, invalid decoded bytes, cancellation and I/O.
-    /// Active native devices are refused before I/O: their ordinary reads may
-    /// repair the image, which is incompatible with this offline export API.
-    pub fn reconstruct_native_ext4_block(
+    pub fn reconstruct_native_block(
         &self,
         cx: &Cx,
         block: BlockNumber,
@@ -3020,29 +4764,26 @@ impl OpenFs {
                 "offline reconstruction requires an inactive device",
             ));
         }
-        let owned = self.native_ext4_repair_storage(cx)?;
+        let (id, owned, _) = self.native_identity_storage_and_generation(cx)?;
         let selected = native_target(&owned, block)?;
-        let sb = self
-            .ext4_superblock()
-            .expect("validated native ext4 ownership");
-        native_codec_budget(sb, &owned, selected, max_working_bytes, true)?;
+        native_codec_budget(&id, &owned, selected, max_working_bytes, true)?;
         let baseline = read_native_baseline(self, cx)?;
         let tail = native_target(&baseline.storage, block)?;
         let dev = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
-            block_size: sb.block_size,
+            block_size: id.block_size,
         };
-        let admitted_intent = read_native_parity_intent(cx, &dev, sb, &baseline, tail)?;
-        let generation = native_sealed_generation(cx, &dev, sb, &baseline, tail, true)?;
+        let admitted_intent = read_native_parity_intent(cx, &dev, &id, &baseline, tail)?;
+        let generation = native_sealed_generation(cx, &dev, &id, &baseline, tail, true)?;
         let (root, table) = read_sealed_table(
             cx,
             &dev,
-            sb,
+            &id,
             &baseline.storage,
             baseline.owner_generation,
             tail,
         )?;
-        let corrupt = native_corrupt_indices(cx, &dev, sb, tail, &table)?;
+        let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
         let requested =
             u32::try_from(block.0 - tail.group_start.0).expect("bounded native source index");
         if !corrupt.contains(&requested) {
@@ -3060,11 +4801,11 @@ impl OpenFs {
         let capture = NativeReconstructionCapture {
             blocks: OnceCell::new(),
         };
-        let (layout, expected) = native_layout(sb, tail)?;
+        let (layout, expected) = native_layout(&id, tail)?;
         let result = GroupRecoveryOrchestrator::new_with_writeback(
             &view,
             &capture,
-            sb.uuid,
+            id.uuid,
             layout,
             tail.group_start,
             u32::from(expected.source_block_count),
@@ -3079,16 +4820,14 @@ impl OpenFs {
         }
         ensure_native_baseline(self, cx, &baseline)?;
         if root != baseline.roots[tail.group.0 as usize]
-            || read_native_parity_intent(cx, &dev, sb, &baseline, tail)? != admitted_intent
-            || native_sealed_generation(cx, &dev, sb, &baseline, tail, true)? != generation
+            || read_native_parity_intent(cx, &dev, &id, &baseline, tail)? != admitted_intent
+            || native_sealed_generation(cx, &dev, &id, &baseline, tail, true)? != generation
         {
             return Err(validation_error(
                 tail,
                 "native recovery authority changed during decoding",
             ));
         }
-        // Re-read intact input through its digest guard after decoding; changed
-        // targets were compare-checked by capture and are never written back.
         for index in 0..u32::from(expected.source_block_count) {
             view.read_block(cx, BlockNumber(tail.group_start.0 + u64::from(index)))?;
         }
@@ -3107,109 +4846,149 @@ impl OpenFs {
         })
     }
 
-    /// Persist generation-one source digests in owned native ext4 storage.
-    ///
-    /// The caller must exclude other image writers throughout this offline
-    /// operation. Consumes the view; reopen after success or ambiguous failure.
-    /// All groups are admitted before writes. A durable whole-plan root precedes
-    /// every group publication, so interrupted initialization can resume only
-    /// against all originally admitted sources. Sealed evidence is never rebaselined.
-    /// This initializes validation only; repair protection remains inactive.
-    ///
-    /// # Errors
-    /// Refuses unsupported ownership, symbols already present, damaged sealed
-    /// tables, changed sources, cancellation and storage failures.
-    pub fn initialize_native_ext4_validation(
-        self,
+    /// Reconstruct a changed ext4 source block from the immutable sealed baseline.
+    pub fn reconstruct_native_ext4_block(
+        &self,
         cx: &Cx,
-    ) -> Result<NativeValidationReport, FfsError> {
+        block: BlockNumber,
+        max_working_bytes: u64,
+    ) -> Result<NativeReconstruction, FfsError> {
+        if self.ext4_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires ext4".into(),
+            ));
+        }
+        self.reconstruct_native_block(cx, block, max_working_bytes)
+    }
+
+    /// Reconstruct a changed btrfs source block from the immutable sealed baseline.
+    pub fn reconstruct_native_btrfs_block(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        max_working_bytes: u64,
+    ) -> Result<NativeReconstruction, FfsError> {
+        if self.btrfs_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires btrfs".into(),
+            ));
+        }
+        self.reconstruct_native_block(cx, block, max_working_bytes)
+    }
+
+    /// Persist generation-one source digests in owned native storage (ext4 or btrfs).
+    pub fn initialize_native_validation(self, cx: &Cx) -> Result<NativeValidationReport, FfsError> {
         self.require_write_authority()?;
         self.require_native_mode("initialize_native_validation")?;
-        let storage = self.native_ext4_repair_storage(cx)?;
-        let sb = self.ext4_superblock().expect("validated ext4 ownership");
-        let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
+        let (id, storage, generation) = self.native_identity_storage_and_generation(cx)?;
         let dev = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
-            block_size: sb.block_size,
+            block_size: id.block_size,
         };
         let mut admissions = Vec::with_capacity(storage.tails.len());
         for tail in &storage.tails {
             admissions.push(admit_validation_group(
                 cx,
                 &dev,
-                sb,
+                &id,
                 storage.owner_inode,
-                inode.generation,
+                generation,
                 tail,
             )?);
         }
-        let (plan, root) =
-            admit_validation_plan(cx, &dev, sb, &storage, inode.generation, &admissions)?;
+        let (plan, root) = admit_validation_plan(cx, &dev, &id, &storage, generation, &admissions)?;
         if plan == ValidationIntent::Prepared {
             publish_validation_plan(
                 cx,
                 &dev,
-                sb,
+                &id,
                 &storage,
-                inode.generation,
+                generation,
                 admissions[0].epoch,
                 ValidationIntent::Pending(root),
             )?;
         } else if matches!(plan, ValidationIntent::Pending(_)) {
-            // An earlier plan sync may have failed after its write became visible.
-            // Establish durability again before publishing any local intent.
             dev.sync(cx)?;
         }
         for (tail, admission) in storage.tails.iter().zip(&admissions) {
             if matches!(admission.intent, ValidationIntent::Sealed(_)) {
                 continue;
             }
-            publish_validation_group(cx, &dev, sb, &storage, inode.generation, tail, admission)?;
+            publish_validation_group(cx, &dev, &id, &storage, generation, tail, admission)?;
         }
         if !matches!(plan, ValidationIntent::Sealed(_)) {
             publish_validation_plan(
                 cx,
                 &dev,
-                sb,
+                &id,
                 &storage,
-                inode.generation,
+                generation,
                 admissions[0].epoch,
                 ValidationIntent::Sealed(root),
             )?;
         }
-        // A previous failed sync may leave sealing visible but undurable.
-        // Idempotent retries must also establish a successful durability barrier.
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         dev.sync(cx)?;
-        native_validation_report(sb, &storage)
+        native_validation_report(&id, &storage)
+    }
+
+    /// Persist generation-one source digests in owned native ext4 storage.
+    pub fn initialize_native_ext4_validation(
+        self,
+        cx: &Cx,
+    ) -> Result<NativeValidationReport, FfsError> {
+        if self.ext4_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires ext4".into(),
+            ));
+        }
+        self.initialize_native_validation(cx)
+    }
+
+    /// Persist generation-one source digests in owned native btrfs storage.
+    pub fn initialize_native_btrfs_validation(
+        self,
+        cx: &Cx,
+    ) -> Result<NativeValidationReport, FfsError> {
+        if self.btrfs_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires btrfs".into(),
+            ));
+        }
+        self.initialize_native_validation(cx)
     }
 
     /// Check persisted native source digests without writing the image.
-    ///
-    /// # Errors
-    /// Refuses empty/pending records, identity or table damage, and source
-    /// digest mismatches; propagates cancellation and read failures.
-    pub fn check_native_ext4_validation(
-        &self,
-        cx: &Cx,
-    ) -> Result<NativeValidationReport, FfsError> {
+    pub fn check_native_validation(&self, cx: &Cx) -> Result<NativeValidationReport, FfsError> {
         self.require_native_mode("check_native_validation")?;
         if let Some(device) = &self.native_repair_device {
             return device.inspect_validation(cx);
         }
-        let storage = self.native_ext4_repair_storage(cx)?;
-        let sb = self.ext4_superblock().expect("validated ext4 ownership");
-        let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
+        let (id, storage, generation) = self.native_identity_storage_and_generation(cx)?;
         let dev = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
-            block_size: sb.block_size,
+            block_size: id.block_size,
         };
         let first_owner = dev.read_block(cx, storage.tails[0].start)?;
+        if NativeEpochToken::decode_optional(
+            &first_owner.as_slice()[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
+            &id,
+            storage.owner_inode,
+            generation,
+            &storage.tails[0],
+        )?
+        .is_some()
+        {
+            return Err(validation_error(
+                &storage.tails[0],
+                "sealed validation carries an unretired epoch token",
+            ));
+        }
         let plan = validation_plan_intent(
             &first_owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END],
-            sb,
+            &id,
             &storage,
-            inode.generation,
+            generation,
         )?;
         let epoch =
             validation_plan_epoch(&first_owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END])?;
@@ -3224,9 +5003,9 @@ impl OpenFs {
             let owner = dev.read_block(cx, tail.start)?;
             let intent = validation_intent(
                 &owner.as_slice()[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES],
-                sb,
+                &id,
                 storage.owner_inode,
-                inode.generation,
+                generation,
                 tail,
             )?;
             let ValidationIntent::Sealed(root) = intent else {
@@ -3235,34 +5014,292 @@ impl OpenFs {
                     "validation is uninitialized or pending",
                 ));
             };
-            let table = read_validation_table(cx, &dev, sb, tail)?;
+            let table = read_validation_table(cx, &dev, &id, tail)?;
+            let local_epoch = u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
             if validation_intent(
                 &table[..VALIDATION_HEADER_BYTES],
-                sb,
+                &id,
                 storage.owner_inode,
-                inode.generation,
+                generation,
                 tail,
             )? != ValidationIntent::Sealed(root)
                 || owner.as_slice()[OWNER_HEADER_BYTES..PLAN_HEADER_START]
                     != table[..VALIDATION_HEADER_BYTES]
-                || u32::from_le_bytes(table[68..72].try_into().expect("checked table")) != epoch
+                || local_epoch == 0
+                || local_epoch > epoch
             {
                 return Err(validation_error(tail, "sealed intent and table disagree"));
             }
-            verify_validation_table(cx, &dev, sb, tail, &table, &root)?;
+            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
             admissions.push(ValidationAdmission {
-                epoch,
+                epoch: local_epoch,
                 root,
                 intent,
             });
         }
-        if validation_plan_root(sb, &storage, inode.generation, &admissions)? != plan_root {
+        if validation_plan_root(&id, &storage, generation, epoch, &admissions)? != plan_root {
             return Err(validation_error(
                 &storage.tails[0],
                 "sealed whole-plan root mismatch",
             ));
         }
-        native_validation_report(sb, &storage)
+        native_validation_report(&id, &storage)
+    }
+
+    /// Check persisted native ext4 source digests without writing the image.
+    pub fn check_native_ext4_validation(
+        &self,
+        cx: &Cx,
+    ) -> Result<NativeValidationReport, FfsError> {
+        if self.ext4_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires ext4".into(),
+            ));
+        }
+        self.check_native_validation(cx)
+    }
+
+    /// Check persisted native btrfs source digests without writing the image.
+    pub fn check_native_btrfs_validation(
+        &self,
+        cx: &Cx,
+    ) -> Result<NativeValidationReport, FfsError> {
+        if self.btrfs_superblock().is_none() {
+            return Err(FfsError::UnsupportedFeature(
+                "native repair storage requires btrfs".into(),
+            ));
+        }
+        self.check_native_validation(cx)
+    }
+
+    /// Reserve native repair storage in a clean, exclusively held ext4 or btrfs image.
+    pub fn prepare_native_repair(
+        self,
+        cx: &Cx,
+        basis_points: u32,
+    ) -> Result<NativeRepairStorage, FfsError> {
+        if self.ext4_superblock().is_some() {
+            return self.prepare_native_ext4_repair(cx, basis_points);
+        }
+        if self.btrfs_superblock().is_some() {
+            return self.prepare_native_btrfs_repair(cx, basis_points);
+        }
+        Err(FfsError::UnsupportedFeature(
+            "native preparation requires ext4 or btrfs".into(),
+        ))
+    }
+
+    /// Reserve native repair storage in a clean, exclusively held btrfs image.
+    pub fn prepare_native_btrfs_repair(
+        mut self,
+        cx: &Cx,
+        basis_points: u32,
+    ) -> Result<NativeRepairStorage, FfsError> {
+        self.require_write_authority()?;
+        self.require_native_mode("prepare_native_repair_storage")?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if self.is_writable() || self.mvcc_version_count() != 0 {
+            return Err(FfsError::Format(
+                "native preparation requires a fresh offline view".into(),
+            ));
+        }
+        let sb = self
+            .btrfs_superblock()
+            .ok_or_else(|| {
+                FfsError::UnsupportedFeature("native btrfs preparation requires btrfs".into())
+            })?
+            .clone();
+        if sb.num_devices != 1
+            || self.btrfs_devices.is_some()
+            || !self.btrfs_inventory_verified
+            || sb.is_seeding()
+        {
+            return Err(FfsError::UnsupportedFeature(
+                "native btrfs preparation requires a verified single-device non-seeding image"
+                    .into(),
+            ));
+        }
+        if sb.log_root != 0
+            || self
+                .btrfs_tree_log_overlay_active
+                .load(std::sync::atomic::Ordering::Acquire)
+            || *self.btrfs_semantic_view_stale.read()
+        {
+            return Err(FfsError::Format(
+                "native btrfs preparation requires a clean image without an unretired tree log"
+                    .into(),
+            ));
+        }
+        let ctx = self
+            .btrfs_context()
+            .ok_or_else(|| FfsError::Format("missing btrfs context".into()))?;
+        if ctx.subvol_objectid != BTRFS_FS_TREE_OBJECTID
+            || ctx.subvol_root_dirid != BTRFS_FIRST_FREE_OBJECTID
+        {
+            return Err(FfsError::UnsupportedFeature(
+                "native btrfs preparation requires mounting the default FS_TREE root".into(),
+            ));
+        }
+        let image_len = self.dev.len_bytes();
+        if image_len % u64::from(sb.sectorsize) != 0 {
+            return Err(FfsError::InvalidGeometry(
+                "btrfs image byte length is not a multiple of sectorsize".into(),
+            ));
+        }
+        let total_blocks = image_len / u64::from(sb.sectorsize);
+        let reserve_blocks =
+            btrfs_reserve_blocks_estimate(sb.sectorsize, total_blocks, basis_points)?;
+        match self.lookup(
+            cx,
+            InodeNumber(BTRFS_FIRST_FREE_OBJECTID),
+            OsStr::new(OWNER_NAME),
+        ) {
+            Err(FfsError::NotFound(_)) => {}
+            Ok(_) => return Err(FfsError::Exists),
+            Err(err) => return Err(err),
+        }
+
+        self.enable_writes(cx)?;
+        let created = self.btrfs_create(
+            cx,
+            InodeNumber(BTRFS_FIRST_FREE_OBJECTID),
+            OWNER_NAME.as_bytes(),
+            0o400,
+            0,
+            0,
+        )?;
+        let owner_oid = created.ino.0;
+        let reserve_bytes = u64::from(reserve_blocks)
+            .checked_mul(u64::from(sb.sectorsize))
+            .ok_or_else(|| FfsError::InvalidGeometry("btrfs reserve byte overflow".into()))?;
+
+        let (owner_generation, physical_extents) = {
+            let alloc_mutex = self.require_btrfs_alloc_state()?;
+            let mut alloc = alloc_mutex.write();
+            let allocation = self.btrfs_alloc_data_with_growth(&mut alloc, reserve_bytes)?;
+            let extent = BtrfsExtentData::Regular {
+                generation: alloc.generation,
+                ram_bytes: reserve_bytes,
+                extent_type: BTRFS_FILE_EXTENT_PREALLOC,
+                compression: 0,
+                disk_bytenr: allocation.bytenr,
+                disk_num_bytes: reserve_bytes,
+                extent_offset: 0,
+                num_bytes: reserve_bytes,
+            };
+            let extent_key = BtrfsKey {
+                objectid: owner_oid,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: 0,
+            };
+            alloc
+                .fs_tree
+                .insert(extent_key, &extent.to_bytes())
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            if let Err(err) = Self::btrfs_register_data_extent_backref(
+                &mut alloc,
+                allocation.bytenr,
+                reserve_bytes,
+                owner_oid,
+                0,
+            ) {
+                let _ = alloc.fs_tree.delete(&extent_key);
+                let _ = alloc
+                    .extent_alloc
+                    .free_extent(allocation.bytenr, reserve_bytes, false);
+                return Err(err);
+            }
+            let mut inode = self.btrfs_read_inode_from_tree(&alloc, owner_oid)?;
+            let generation = u32::try_from(inode.generation).map_err(|_| {
+                FfsError::InvalidGeometry("btrfs native owner generation exceeds u32".into())
+            })?;
+            inode.mode = 0o100_400;
+            inode.uid = 0;
+            inode.gid = 0;
+            inode.size = reserve_bytes;
+            inode.nbytes = reserve_bytes;
+            inode.flags = BTRFS_NATIVE_OWNER_FLAGS;
+            let inode_key = BtrfsKey {
+                objectid: owner_oid,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: 0,
+            };
+            alloc
+                .fs_tree
+                .update(&inode_key, &inode.to_bytes())
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            let phys = btrfs_resolve_single_data_extent(
+                &chunks,
+                self.btrfs_primary_devid(),
+                sb.sectorsize,
+                allocation.bytenr,
+                reserve_bytes,
+            )?;
+            (generation, vec![phys])
+        };
+
+        let tails = btrfs_tail_plan_from_extents(
+            sb.sectorsize,
+            total_blocks,
+            basis_points,
+            &physical_extents,
+        )?;
+        let group_count = u32::try_from(tails.len())
+            .map_err(|_| FfsError::InvalidGeometry("btrfs group count exceeds u32".into()))?;
+        let id = NativeFsIdentity::from_btrfs(&sb, group_count);
+        let storage = NativeRepairStorage {
+            owner_inode: InodeNumber(owner_oid),
+            repair_basis_points: basis_points,
+            tails,
+        };
+        let direct = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: sb.sectorsize,
+        };
+        let zero = vec![0_u8; sb.sectorsize as usize];
+        for tail in &storage.tails {
+            let mut header = owner_header(
+                &id,
+                storage.owner_inode,
+                owner_generation,
+                basis_points,
+                tail,
+            );
+            if tail.group.0 == 0 {
+                header[PLAN_HEADER_START..PLAN_HEADER_END].copy_from_slice(
+                    &validation_plan_header(
+                        &id,
+                        &storage,
+                        owner_generation,
+                        1,
+                        PLAN_PREPARED,
+                        &[0; 32],
+                    )?,
+                );
+            }
+            header[PARITY_HEADER_START..PARITY_HEADER_END].copy_from_slice(&parity_header(
+                &id,
+                &storage,
+                owner_generation,
+                tail,
+                ParityIntent::Prepared,
+            ));
+            direct.write_block(cx, tail.start, &header)?;
+            let end = tail.start.0 + u64::from(tail.blocks());
+            for block in [tail.start.0 + 1, end - 2, end - 1] {
+                direct.write_block(cx, BlockNumber(block), &zero)?;
+            }
+        }
+        self.btrfs_full_transaction_commit(cx, "prepare_native_btrfs_repair")?;
+        debug!(
+            owner = owner_oid,
+            generation = owner_generation,
+            groups = storage.tails.len(),
+            "native_btrfs_repair_storage_prepared"
+        );
+        Ok(storage)
     }
 
     /// Reserve native repair storage in a clean, exclusively held ext4 image.
@@ -3311,6 +5348,7 @@ impl OpenFs {
             ));
         }
         let tails = tail_plan(&sb, basis_points)?;
+        let id = NativeFsIdentity::from_ext4(&sb);
         let root = self.read_native_owner_inode(cx, &sb, InodeNumber(2))?;
         if !root.is_dir() {
             return Err(FfsError::Format(
@@ -3372,11 +5410,11 @@ impl OpenFs {
                 tails,
             };
             for tail in &storage.tails {
-                let mut header = owner_header(&sb, owner, inode.generation, basis_points, tail);
+                let mut header = owner_header(&id, owner, inode.generation, basis_points, tail);
                 if tail.group.0 == 0 {
                     header[PLAN_HEADER_START..PLAN_HEADER_END].copy_from_slice(
                         &validation_plan_header(
-                            &sb,
+                            &id,
                             &storage,
                             inode.generation,
                             1,
@@ -3386,7 +5424,7 @@ impl OpenFs {
                     );
                 }
                 header[PARITY_HEADER_START..PARITY_HEADER_END].copy_from_slice(&parity_header(
-                    &sb,
+                    &id,
                     &storage,
                     inode.generation,
                     tail,
@@ -3633,6 +5671,234 @@ impl OpenFs {
         Ok((owner, inode))
     }
 
+    /// Validate persisted native storage ownership (ext4 or btrfs).
+    pub fn native_repair_storage(&self, cx: &Cx) -> Result<NativeRepairStorage, FfsError> {
+        if self.ext4_superblock().is_some() {
+            return self.native_ext4_repair_storage(cx);
+        }
+        if self.btrfs_superblock().is_some() {
+            return self.native_btrfs_repair_storage(cx);
+        }
+        Err(FfsError::UnsupportedFeature(
+            "native repair storage requires ext4 or btrfs".into(),
+        ))
+    }
+
+    /// Validate persisted btrfs native repair ownership after reopening the image.
+    pub fn native_btrfs_repair_storage(&self, cx: &Cx) -> Result<NativeRepairStorage, FfsError> {
+        self.native_btrfs_repair_storage_with_generation(cx)
+            .map(|(storage, _)| storage)
+    }
+
+    fn native_btrfs_repair_storage_with_generation(
+        &self,
+        cx: &Cx,
+    ) -> Result<(NativeRepairStorage, u32), FfsError> {
+        let sb = self.btrfs_superblock().ok_or_else(|| {
+            FfsError::UnsupportedFeature("native repair storage requires btrfs".into())
+        })?;
+        if sb.num_devices != 1
+            || self.btrfs_devices.is_some()
+            || !self.btrfs_inventory_verified
+            || sb.is_seeding()
+        {
+            return Err(FfsError::UnsupportedFeature(
+                "native btrfs ownership discovery requires a verified single-device image".into(),
+            ));
+        }
+        if self.is_writable() || self.mvcc_version_count() != 0 {
+            return Err(FfsError::Format(
+                "native ownership discovery requires a fresh offline view".into(),
+            ));
+        }
+        let ctx = self
+            .btrfs_context()
+            .ok_or_else(|| FfsError::Format("missing btrfs context".into()))?;
+        if ctx.subvol_objectid != BTRFS_FS_TREE_OBJECTID
+            || ctx.subvol_root_dirid != BTRFS_FIRST_FREE_OBJECTID
+        {
+            return Err(FfsError::UnsupportedFeature(
+                "native btrfs ownership requires the default FS_TREE root".into(),
+            ));
+        }
+        let image_len = self.dev.len_bytes();
+        if image_len % u64::from(sb.sectorsize) != 0 {
+            return Err(FfsError::InvalidGeometry(
+                "btrfs image byte length is not a multiple of sectorsize".into(),
+            ));
+        }
+        let total_blocks = image_len / u64::from(sb.sectorsize);
+        let attr = self.lookup(
+            cx,
+            InodeNumber(BTRFS_FIRST_FREE_OBJECTID),
+            OsStr::new(OWNER_NAME),
+        )?;
+        let owner_oid = attr.ino.0;
+        let items = self.walk_btrfs_fs_tree_object(cx, owner_oid)?;
+        let inode_entry = Self::btrfs_find_inode_item(&items, owner_oid)?;
+        let inode =
+            super::parse_inode_item(&inode_entry.data).map_err(|e| parse_to_ffs_error(&e))?;
+        let generation = u32::try_from(inode.generation).map_err(|_| {
+            FfsError::InvalidGeometry("btrfs native owner generation exceeds u32".into())
+        })?;
+        if inode.mode != 0o100_400
+            || inode.flags != BTRFS_NATIVE_OWNER_FLAGS
+            || inode.nlink != 1
+            || inode.uid != 0
+            || inode.gid != 0
+            || inode.size == 0
+            || inode.size != inode.nbytes
+            || inode.size % u64::from(sb.sectorsize) != 0
+        {
+            return Err(FfsError::Format(
+                "invalid native btrfs repair owner inode".into(),
+            ));
+        }
+        let mut expected_logical_offset = 0_u64;
+        let mut physical_extents = Vec::new();
+        for item in &items {
+            if item.key.objectid != owner_oid || item.key.item_type != BTRFS_ITEM_EXTENT_DATA {
+                continue;
+            }
+            if item.key.offset != expected_logical_offset {
+                return Err(FfsError::Format(
+                    "native btrfs repair owner extents are non-contiguous".into(),
+                ));
+            }
+            let parsed = parse_extent_data(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
+            let BtrfsExtentData::Regular {
+                extent_type,
+                compression,
+                disk_bytenr,
+                disk_num_bytes,
+                extent_offset,
+                num_bytes,
+                ram_bytes,
+                ..
+            } = parsed
+            else {
+                return Err(FfsError::Format(
+                    "native btrfs repair owner cannot use inline extents".into(),
+                ));
+            };
+            if extent_type != BTRFS_FILE_EXTENT_PREALLOC
+                || compression != 0
+                || extent_offset != 0
+                || num_bytes != disk_num_bytes
+                || ram_bytes != disk_num_bytes
+            {
+                return Err(FfsError::Format(
+                    "native btrfs repair owner extent must be uncompressed PREALLOC".into(),
+                ));
+            }
+            let phys = btrfs_resolve_single_data_extent(
+                &ctx.chunks,
+                self.btrfs_primary_devid(),
+                sb.sectorsize,
+                disk_bytenr,
+                disk_num_bytes,
+            )?;
+            physical_extents.push(phys);
+            expected_logical_offset =
+                expected_logical_offset
+                    .checked_add(num_bytes)
+                    .ok_or_else(|| {
+                        FfsError::InvalidGeometry("btrfs owner logical offset overflow".into())
+                    })?;
+        }
+        if expected_logical_offset != inode.size || physical_extents.is_empty() {
+            return Err(FfsError::Format(
+                "native btrfs repair owner extents disagree with inode size".into(),
+            ));
+        }
+        let dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: sb.sectorsize,
+        };
+        let mut sorted_phys = physical_extents;
+        sorted_phys.sort_by_key(|&(start, _)| start);
+        let header = dev
+            .read_block(cx, BlockNumber(sorted_phys[0].0))?
+            .into_inner();
+        if header.len() < OWNER_HEADER_BYTES || &header[..8] != OWNER_MAGIC {
+            return Err(FfsError::Format(
+                "native btrfs repair ownership header missing".into(),
+            ));
+        }
+        let basis_points =
+            u32::from_le_bytes(header[44..48].try_into().expect("checked header length"));
+        let tails =
+            btrfs_tail_plan_from_extents(sb.sectorsize, total_blocks, basis_points, &sorted_phys)?;
+        let group_count = u32::try_from(tails.len())
+            .map_err(|_| FfsError::InvalidGeometry("btrfs group count exceeds u32".into()))?;
+        let id = NativeFsIdentity::from_btrfs(sb, group_count);
+        let storage = NativeRepairStorage {
+            owner_inode: attr.ino,
+            repair_basis_points: basis_points,
+            tails,
+        };
+        for tail in &storage.tails {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let stored = dev.read_block(cx, tail.start)?.into_inner();
+            let expected = owner_header(&id, attr.ino, generation, basis_points, tail);
+            let zero_tail_start = if tail.group.0 == 0 {
+                EPOCH_TOKEN_END
+            } else {
+                PARITY_HEADER_END
+            };
+            if stored[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
+                || stored[zero_tail_start..].iter().any(|byte| *byte != 0)
+                || (tail.group.0 != 0
+                    && stored[PLAN_HEADER_START..PLAN_HEADER_END]
+                        .iter()
+                        .any(|byte| *byte != 0))
+            {
+                return Err(FfsError::Corruption {
+                    block: tail.start.0,
+                    detail: "native btrfs repair ownership header mismatch".into(),
+                });
+            }
+            let validation = validation_intent(
+                &stored[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES],
+                &id,
+                attr.ino,
+                generation,
+                tail,
+            )?;
+            let parity = parity_intent(
+                &stored[PARITY_HEADER_START..PARITY_HEADER_END],
+                &id,
+                &storage,
+                generation,
+                tail,
+            )?;
+            if parity != ParityIntent::Prepared
+                && validation != ValidationIntent::Sealed(parity.source_root())
+            {
+                return Err(validation_error(
+                    tail,
+                    "parity and validation ownership disagree",
+                ));
+            }
+            if tail.group.0 == 0 {
+                validation_plan_intent(
+                    &stored[PLAN_HEADER_START..PLAN_HEADER_END],
+                    &id,
+                    &storage,
+                    generation,
+                )?;
+                NativeEpochToken::decode_optional(
+                    &stored[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
+                    &id,
+                    attr.ino,
+                    generation,
+                    tail,
+                )?;
+            }
+        }
+        Ok((storage, generation))
+    }
+
     /// Validate persisted ext4 tail ownership after reopening the image.
     /// Does not authorize decoding: zero descriptors mean protection is absent.
     ///
@@ -3685,6 +5951,7 @@ impl OpenFs {
         let basis_points =
             u32::from_le_bytes(header[44..48].try_into().expect("checked header length"));
         let tails = tail_plan(sb, basis_points)?;
+        let id = NativeFsIdentity::from_ext4(sb);
         if extents != owner_extents(&tails)
             || inode.size
                 != tails
@@ -3712,9 +5979,14 @@ impl OpenFs {
         for tail in &storage.tails {
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let stored = dev.read_block(cx, tail.start)?.into_inner();
-            let expected = owner_header(sb, attr.ino, inode.generation, basis_points, tail);
+            let expected = owner_header(&id, attr.ino, inode.generation, basis_points, tail);
+            let zero_tail_start = if tail.group.0 == 0 {
+                EPOCH_TOKEN_END
+            } else {
+                PARITY_HEADER_END
+            };
             if stored[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
-                || stored[PARITY_HEADER_END..].iter().any(|byte| *byte != 0)
+                || stored[zero_tail_start..].iter().any(|byte| *byte != 0)
                 || (tail.group.0 != 0
                     && stored[PLAN_HEADER_START..PLAN_HEADER_END]
                         .iter()
@@ -3727,14 +5999,14 @@ impl OpenFs {
             }
             let validation = validation_intent(
                 &stored[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES],
-                sb,
+                &id,
                 attr.ino,
                 inode.generation,
                 tail,
             )?;
             let parity = parity_intent(
                 &stored[PARITY_HEADER_START..PARITY_HEADER_END],
-                sb,
+                &id,
                 &storage,
                 inode.generation,
                 tail,
@@ -3750,9 +6022,16 @@ impl OpenFs {
             if tail.group.0 == 0 {
                 validation_plan_intent(
                     &stored[PLAN_HEADER_START..PLAN_HEADER_END],
-                    sb,
+                    &id,
                     &storage,
                     inode.generation,
+                )?;
+                NativeEpochToken::decode_optional(
+                    &stored[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
+                    &id,
+                    attr.ino,
+                    inode.generation,
+                    tail,
                 )?;
             }
             self.validate_native_owned_range(cx, tail.start.0, tail.blocks())?;
@@ -3958,6 +6237,7 @@ mod tests {
         let mut region = [0; 1024];
         region[0x38..0x3A].copy_from_slice(&ffs_types::EXT4_SUPER_MAGIC.to_le_bytes());
         let sb = Ext4Superblock::parse_superblock_region(&region).unwrap();
+        let id = NativeFsIdentity::from_ext4(&sb);
         let reads = Arc::new(AtomicUsize::new(0));
         let mut table = vec![0; 1024];
         table[VALIDATION_HEADER_BYTES..VALIDATION_HEADER_BYTES + 32]
@@ -3966,7 +6246,7 @@ mod tests {
             inner: Arc::new(NativeReadCountDevice {
                 reads: Arc::clone(&reads),
             }),
-            sb,
+            id,
             state: NativeMutex::new(NativeFreshnessState {
                 baseline: NativeBaseline {
                     storage: NativeRepairStorage {
@@ -3985,6 +6265,7 @@ mod tests {
                     epoch: 1,
                     plan_root: [0; 32],
                     roots: vec![[0; 32]],
+                    group_epochs: vec![1],
                 },
                 tables: vec![table],
                 parity: vec![ParityIntent::Sealed {
@@ -3993,6 +6274,13 @@ mod tests {
                     manifest: [0; 32],
                 }],
                 intended: BTreeMap::new(),
+                beforeimages: BTreeMap::new(),
+                dirty_groups: vec![false],
+                persisted_dirty_buckets: [0; 64],
+                defer_seal: 0,
+                format_commit_seq: None,
+                pending_dirty_buckets: [0; 64],
+                scrub_monitor: VilleWaldScrubMonitor::new(VilleWaldConfig::default()).unwrap(),
                 phase: FreshnessPhase::Clean,
             }),
             codec_budget: 0,
@@ -4089,6 +6377,7 @@ mod tests {
         let mut region = [0; 1024];
         region[0x38..0x3A].copy_from_slice(&ffs_types::EXT4_SUPER_MAGIC.to_le_bytes());
         let sb = Ext4Superblock::parse_superblock_region(&region).unwrap();
+        let id = NativeFsIdentity::from_ext4(&sb);
         let storage = NativeRepairStorage {
             owner_inode: InodeNumber(12),
             repair_basis_points: 500,
@@ -4109,17 +6398,17 @@ mod tests {
         // Four 1 KiB copies and 256 bytes of bookkeeping for all 1024 sources.
         let capture = 4_456_448;
         assert_eq!(
-            native_codec_budget(&sb, &storage, tail, metadata + encoder, false).unwrap(),
+            native_codec_budget(&id, &storage, tail, metadata + encoder, false).unwrap(),
             encoder,
             "encoding must not be charged for recovery captures"
         );
-        assert!(native_codec_budget(&sb, &storage, tail, metadata + decoder, true).is_err());
+        assert!(native_codec_budget(&id, &storage, tail, metadata + decoder, true).is_err());
         assert!(
-            native_codec_budget(&sb, &storage, tail, metadata + capture + decoder - 1, true)
+            native_codec_budget(&id, &storage, tail, metadata + capture + decoder - 1, true)
                 .is_err()
         );
         assert_eq!(
-            native_codec_budget(&sb, &storage, tail, metadata + capture + decoder, true).unwrap(),
+            native_codec_budget(&id, &storage, tail, metadata + capture + decoder, true).unwrap(),
             decoder,
             "exact capture-inclusive admission boundary must remain usable"
         );
@@ -4151,5 +6440,87 @@ mod tests {
             ]
         );
         assert!(extents.iter().all(|extent| extent.is_unwritten()));
+    }
+
+    #[test]
+    fn epoch_token_roundtrip_and_tamper_rejection() {
+        let id = NativeFsIdentity {
+            uuid: [0x42; 16],
+            block_size: 4096,
+            group_count: 4,
+        };
+        let tail0 = NativeRepairTail {
+            group: GroupNumber(0),
+            group_start: BlockNumber(16),
+            blocks_per_group: 1000,
+            start: BlockNumber(4000),
+            validation_blocks: 9,
+            repair_blocks: 50,
+        };
+        assert!(tail0.is_detached());
+        assert_eq!(tail0.source_blocks().unwrap(), 1000);
+        let mut buckets = [0_u8; 64];
+        NativeEpochToken::mark_bucket(&mut buckets, GroupNumber(0));
+        NativeEpochToken::mark_bucket(&mut buckets, GroupNumber(3));
+        let token = NativeEpochToken {
+            owner_inode: InodeNumber(257),
+            owner_generation: 7,
+            target_epoch: 5,
+            prev_sealed_epoch: 4,
+            flags: EPOCH_TOKEN_FLAG_FORMAT_COMMIT,
+            pre_epoch_commit_seq: 99,
+            prev_sealed_plan_root: [0xAB; 32],
+            dirty_group_buckets: buckets,
+        };
+        let encoded = token.encode(&id);
+        let decoded = NativeEpochToken::decode_optional(&encoded, &id, InodeNumber(257), 7, &tail0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, token);
+        assert!(decoded.is_group_dirty(GroupNumber(0)));
+        assert!(!decoded.is_group_dirty(GroupNumber(1)));
+        assert!(decoded.is_group_dirty(GroupNumber(3)));
+
+        let mut tampered = encoded;
+        tampered[48] ^= 1;
+        assert!(
+            NativeEpochToken::decode_optional(&tampered, &id, InodeNumber(257), 7, &tail0).is_err()
+        );
+        assert!(
+            NativeEpochToken::decode_optional(
+                &[0; EPOCH_TOKEN_BYTES],
+                &id,
+                InodeNumber(257),
+                7,
+                &tail0
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn btrfs_tail_plan_conserves_source_and_owned_blocks() {
+        let total_blocks = 16_384_u64;
+        let reserve = btrfs_reserve_blocks_estimate(4096, total_blocks, 500).unwrap();
+        let phys_start = 5_120_u64;
+        let tails = btrfs_tail_plan_from_extents(4096, total_blocks, 500, &[(phys_start, reserve)])
+            .unwrap();
+        assert!(tails.len() >= 2);
+        let total_tail_blocks: u32 = tails.iter().map(NativeRepairTail::blocks).sum();
+        assert_eq!(total_tail_blocks, reserve);
+        let total_sources: u64 = tails.iter().map(|t| u64::from(t.blocks_per_group)).sum();
+        assert_eq!(total_sources + u64::from(reserve), total_blocks - 16);
+        let id = NativeFsIdentity {
+            uuid: [0x11; 16],
+            block_size: 4096,
+            group_count: u32::try_from(tails.len()).unwrap(),
+        };
+        for tail in &tails {
+            assert!(tail.is_detached());
+            let (layout, desc) = native_layout(&id, tail).unwrap();
+            assert_eq!(layout.validation_start_block(), tail.start);
+            assert_eq!(u32::from(desc.source_block_count), tail.blocks_per_group);
+        }
     }
 }
