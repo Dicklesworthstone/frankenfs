@@ -515,10 +515,70 @@ def native_transaction_cases(
             "--offline-image",
             "--allow-write",
             "--records",
-            "16",
+            "32",
         )
     )
-    require(int(grow_out["result"]["logical_records"]) >= 48, "tx-grow-mft did not expand $MFT")
+    require(int(grow_out["result"]["logical_records"]) >= 64, "tx-grow-mft did not expand $MFT")
+
+    multi_rec = int(multi_create["result"]["record"])
+    tx_ext_payloads: dict[str, bytes] = {}
+    for idx in range(34):
+        sname = f"tx-ext-{idx:02d}"
+        spayload = bytes((b + idx) % 251 for b in range(192)) * (1 if idx % 6 else 24)
+        sfile = root / f"src-{sname}.bin"
+        sfile.write_bytes(spayload)
+        command(
+            binary,
+            "tx-create-stream",
+            tx_image,
+            "/NativeDir/multi.bin",
+            "--stream",
+            sname,
+            "--offline-image",
+            "--allow-write",
+            "--data-file",
+            sfile,
+        )
+        tx_ext_payloads[sname] = spayload
+
+    command(
+        binary,
+        "tx-rename-stream",
+        tx_image,
+        "/NativeDir/multi.bin",
+        "--old-stream",
+        "tx-ext-05",
+        "--new-stream",
+        "tx-ext-05-renamed",
+        "--no-replace",
+        "--offline-image",
+        "--allow-write",
+    )
+    tx_ext_payloads["tx-ext-05-renamed"] = tx_ext_payloads.pop("tx-ext-05")
+    command(
+        binary,
+        "tx-remove-stream",
+        tx_image,
+        "/NativeDir/multi.bin",
+        "--stream",
+        "tx-ext-00",
+        "--offline-image",
+        "--allow-write",
+    )
+    tx_ext_payloads.pop("tx-ext-00")
+
+    command(
+        binary,
+        "tx-setattr",
+        tx_image,
+        "/NativeDir/renamed-res.txt",
+        "--read-only",
+        "true",
+        "--mtime-filetime",
+        "133600000000000000",
+        "--offline-image",
+        "--allow-write",
+    )
 
     rec_out = json.loads(
         command(binary, "recover", tx_image, "--offline-image", "--allow-write")
@@ -542,10 +602,25 @@ def native_transaction_cases(
         and alloc_check["requested_checks_consistent"] is True
         and alloc_check["complete"] is True
         and alloc_check["record_ownership"]["consistent"] is True
+        and int(alloc_check["record_ownership"]["extension_records_examined"]) >= 2
         and alloc_check["namespace"]["consistent"] is True
         and alloc_check["mft_mirror"]["consistent"] is True,
         "structural allocation/ownership/mirror/namespace check failed after native transactions",
     )
+
+    tx_attr_list = command("ntfscat", "-i", str(multi_rec), "-a", "0x20", tx_image)
+    tx_ext_records = native_extension_records(tx_attr_list, multi_rec, set(tx_ext_payloads))
+    require(len(tx_ext_records) >= 2, "ntfscat -a 0x20 did not observe native extension MFT records")
+    for sname in ("tx-ext-05-renamed", "tx-ext-12", "tx-ext-33"):
+        require(
+            command("ntfscat", "-i", str(multi_rec), "-n", sname, tx_image) == tx_ext_payloads[sname],
+            f"ntfscat disagreed on native extension ADS stream {sname}",
+        )
+        require(
+            command(binary, "read", tx_image, "/NativeDir/multi.bin", "--offline-image", "--stream", sname)
+            == tx_ext_payloads[sname],
+            f"ffs-ntfs read disagreed on native extension ADS stream {sname}",
+        )
 
     subdir_lines = {
         line.strip()
@@ -612,9 +687,55 @@ def native_transaction_cases(
     neg_controls = verify_harness_negative_controls(
         command, binary, tx_image, expectations, root
     )
+
+    # Bidirectional native modify/reopen: mutate `tx_image` again using external `ntfscp`,
+    # then verify FrankenFS cleanly reads both the new external file and our spilled ADS streams!
+    bidir_img = root / "tx-bidirectional.img"
+    shutil.copyfile(tx_image, bidir_img)
+    bidir_payload = b"written-by-ntfscp-after-native-rust-transactions\n" * 67
+    bidir_src = root / "bidir-ntfscp.bin"
+    bidir_src.write_bytes(bidir_payload)
+    command("ntfscp", bidir_img, bidir_src, "/NativeDir/after-rust-ntfscp.bin")
+    require(
+        command(binary, "read", bidir_img, "/NativeDir/after-rust-ntfscp.bin", "--offline-image")
+        == bidir_payload,
+        "ffs-ntfs failed to read file added by ntfscp after native Rust transactions",
+    )
+    require(
+        command(
+            binary,
+            "read",
+            bidir_img,
+            "/NativeDir/multi.bin",
+            "--offline-image",
+            "--stream",
+            "tx-ext-05-renamed",
+        )
+        == tx_ext_payloads["tx-ext-05-renamed"],
+        "spilled ADS stream unreadable after external ntfscp modification",
+    )
+    bidir_check = json.loads(
+        command(
+            binary,
+            "check-allocation",
+            bidir_img,
+            "--offline-image",
+            "--verify-record-ownership",
+            "--verify-namespace",
+            "--verify-mft-mirror",
+        )
+    )
+    require(
+        bidir_check["allocation_consistent"] is True
+        and bidir_check["requested_checks_consistent"] is True,
+        "bidirectional ntfscp image failed structural check",
+    )
+
     return {
         "tx_image_sha256": tx_final_sha,
+        "tx_extension_records": tx_ext_records,
         "oracle_files_verified": checked,
+        "bidirectional_ntfscp_verified": True,
         "hibernation_refused_sha256": hiber_sha,
         "negative_controls": neg_controls,
     }

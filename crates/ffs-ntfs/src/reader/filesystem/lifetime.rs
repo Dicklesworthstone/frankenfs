@@ -276,6 +276,47 @@ impl NtfsFs {
         Ok(own || oracle.is_some_and(|oracle| candidates.into_iter().any(|ino| oracle(ino) != 0)))
     }
 
+    pub(super) fn has_pinned_ads(&self, base: InodeNumber) -> Result<bool> {
+        let (own, candidates, oracle) = {
+            let state = locked(&self.lifetime)?;
+            let mut candidates = Vec::new();
+            for (&stream, identity) in &state.ads {
+                if self.inode(identity.reference)? == base {
+                    candidates.push(stream);
+                }
+            }
+            let own = candidates
+                .iter()
+                .any(|ino| state.counts.get(ino).copied().unwrap_or(0) != 0);
+            (own, candidates, state.oracle.clone())
+        };
+        Ok(own || oracle.is_some_and(|oracle| candidates.into_iter().any(|ino| oracle(ino) != 0)))
+    }
+
+    pub(super) fn rename_ads_identity(&self, ino: InodeNumber, new_name: &[u16]) -> Result<()> {
+        if new_name.is_empty() || new_name.len() > 255 {
+            return Err(FfsError::Format("invalid NTFS stream identity".into()));
+        }
+        {
+            let mut state = locked(&self.lifetime)?;
+            let (base, old_name) = {
+                let identity = state
+                    .ads
+                    .get_mut(&ino)
+                    .ok_or_else(|| FfsError::NotFound(format!("NTFS stream inode {}", ino.0)))?;
+                let base = self.inode(identity.reference)?;
+                let old_name = std::mem::replace(&mut identity.name, new_name.to_vec());
+                (base, old_name)
+            };
+            state.ads_keys.remove(&(base, old_name));
+            state.ads_keys.insert((base, new_name.to_vec()), ino);
+        }
+        let mut cache = self.cache()?;
+        cache.attributes.remove(&ino);
+        cache.streams.remove(&ino);
+        Ok(())
+    }
+
     /// The caller holds the exclusive operation gate, so a successful check
     /// remains valid until its following native rename and registration.
     pub(super) fn check_retained_file(&self, ino: InodeNumber, name: &[u16]) -> Result<()> {

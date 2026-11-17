@@ -12,8 +12,10 @@ mod ops;
 mod recovery;
 
 pub use mutations::{
-    NtfsRenameOutcome, validate_ntfs_component_utf16, validate_ntfs_stream_name_utf16,
+    NtfsExtendedRenameOutcome, NtfsRenameOutcome, validate_ntfs_component_utf16,
+    validate_ntfs_stream_name_utf16,
 };
+pub use ops::DEFAULT_NTFS_FILETIME;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};

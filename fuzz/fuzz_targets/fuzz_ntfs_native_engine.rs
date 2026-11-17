@@ -7,10 +7,14 @@
 //! accounting, and `ffs::open_read_only_device` (`bd-2tzok`).
 
 use std::ffi::OsStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
-use ffs::{open_read_only_device, InodeNumber, ReadOnlyBackend, ReadOnlyOpenOptions, RequestScope};
+use ffs::vfs::ReleaseRequest;
+use ffs::{
+    open_read_only_device, FsOps, InodeNumber, ReadOnlyBackend, ReadOnlyOpenOptions, RequestScope,
+    SetAttrRequest,
+};
 use ffs_block::ByteDevice;
 use ffs_error::FfsError;
 use ffs_fuzz::{
@@ -19,7 +23,9 @@ use ffs_fuzz::{
 };
 use ffs_ntfs::reader::allocation::{AllocationLimits, NamespaceLimits, RecordOwnershipLimits};
 use ffs_ntfs::reader::security::SecurityCheckLimits;
-use ffs_ntfs::{NtfsTransactionEngine, NtfsTxOutcome, NtfsVolume, NtfsWriteOptions, StreamName};
+use ffs_ntfs::{
+    NtfsFs, NtfsTransactionEngine, NtfsTxOutcome, NtfsVolume, NtfsWriteOptions, StreamName,
+};
 use ffs_ondisk::ntfs::attribute_list::parse_attribute_list;
 use ffs_ondisk::ntfs::ea::{parse_extended_attributes, NtfsEaInformation};
 use ffs_ondisk::ntfs::index::parse_index_block;
@@ -300,7 +306,7 @@ fuzz_target!(|data: &[u8]| {
     let tx_backing = backing_clone.clone();
     let facade_cx = Cx::for_testing();
     let facade_dev = BoundedRoFuzzDevice::new(
-        backing_clone,
+        backing_clone.clone(),
         FuzzBudgetTracker::new(FuzzBudgets::default()),
         None,
     );
@@ -393,4 +399,158 @@ fuzz_target!(|data: &[u8]| {
         assert!(matches!(outcome, NtfsTxOutcome::NotCommitted(_)));
     }
     tx_dev.assert_invariants();
+
+    // Bounded writable `NtfsFs::from_engine` sequence over an isolated in-memory RW copy.
+    struct MemRwDevice(Mutex<Vec<u8>>);
+    impl ByteDevice for MemRwDevice {
+        fn len_bytes(&self) -> u64 {
+            self.0.lock().unwrap().len() as u64
+        }
+        fn read_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ffs_types::ByteOffset,
+            buf: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            let guard = self.0.lock().unwrap();
+            let start = usize::try_from(offset.0).map_err(|_| FfsError::Corruption {
+                block: 0,
+                detail: "fuzz rw read overflow".into(),
+            })?;
+            let end = start
+                .checked_add(buf.len())
+                .filter(|&e| e <= guard.len())
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: "fuzz rw read OOB".into(),
+                })?;
+            buf.copy_from_slice(&guard[start..end]);
+            Ok(())
+        }
+        fn write_all_at(
+            &self,
+            _cx: &Cx,
+            offset: ffs_types::ByteOffset,
+            buf: &[u8],
+        ) -> ffs_error::Result<()> {
+            let mut guard = self.0.lock().unwrap();
+            let start = usize::try_from(offset.0).map_err(|_| FfsError::Corruption {
+                block: 0,
+                detail: "fuzz rw write overflow".into(),
+            })?;
+            let end = start
+                .checked_add(buf.len())
+                .filter(|&e| e <= guard.len())
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: "fuzz rw write OOB".into(),
+                })?;
+            guard[start..end].copy_from_slice(buf);
+            Ok(())
+        }
+        fn sync(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            Ok(())
+        }
+    }
+
+    if mode == 1 {
+        let rw_cx = Cx::for_testing();
+        let rw_len = backing_clone.len_bytes().min(4 * 1024 * 1024);
+        let mut rw_bytes = vec![0_u8; usize::try_from(rw_len).unwrap_or(0)];
+        let _ = backing_clone.read_exact_at(0, &mut rw_bytes);
+        let rw_dev = Arc::new(MemRwDevice(Mutex::new(rw_bytes)));
+        if let Ok(engine) = NtfsTransactionEngine::from_device(
+            &rw_cx,
+            Arc::clone(&rw_dev) as Arc<dyn ByteDevice>,
+            0,
+            rw_len,
+            NtfsWriteOptions {
+                offline_image: true,
+                allow_write: true,
+                recover_dirty: recover_logfile,
+            },
+        ) {
+            if let Ok(fs) = NtfsFs::from_engine(&rw_cx, engine, 1000, 1000) {
+                let root = InodeNumber(1);
+                let mut scope = RequestScope::empty();
+                let payload = cursor.next_vec(256);
+                let file_mode = if cursor.next_bool() { 0o644 } else { 0o444 };
+                if let Ok(f1) = fs.create(
+                    &rw_cx,
+                    &mut scope,
+                    root,
+                    OsStr::new("fz.bin"),
+                    file_mode,
+                    1000,
+                    1000,
+                ) {
+                    let _ = fs.write(&rw_cx, &mut scope, f1.ino, 0, &payload);
+                    let _ = fs.setattr(
+                        &rw_cx,
+                        &mut scope,
+                        f1.ino,
+                        &SetAttrRequest {
+                            mode: Some(0o644),
+                            size: Some(u64::from(cursor.next_u8())),
+                            ..SetAttrRequest::default()
+                        },
+                    );
+                    if let Ok(ads) = fs.create(
+                        &rw_cx,
+                        &mut scope,
+                        root,
+                        OsStr::new("fz.bin:s1"),
+                        0o644,
+                        1000,
+                        1000,
+                    ) {
+                        let _ = fs.write(&rw_cx, &mut scope, ads.ino, 0, &payload);
+                        let _ = fs.rename(
+                            &rw_cx,
+                            &mut scope,
+                            root,
+                            OsStr::new("fz.bin:s1"),
+                            root,
+                            OsStr::new("fz.bin:s2"),
+                        );
+                        let _ = fs.unlink(&rw_cx, &mut scope, root, OsStr::new("fz.bin:s2"));
+                    }
+                    if let Ok((fh, _)) = fs.open(&rw_cx, &mut scope, f1.ino, libc::O_RDONLY) {
+                        if let Ok(f2) = fs.create(
+                            &rw_cx,
+                            &mut scope,
+                            root,
+                            OsStr::new("fz2.bin"),
+                            0o644,
+                            1000,
+                            1000,
+                        ) {
+                            let _ = fs.write(&rw_cx, &mut scope, f2.ino, 0, b"winner");
+                            let _ = fs.rename(
+                                &rw_cx,
+                                &mut scope,
+                                root,
+                                OsStr::new("fz2.bin"),
+                                root,
+                                OsStr::new("fz.bin"),
+                            );
+                        }
+                        let _ = fs.release(
+                            &rw_cx,
+                            &mut scope,
+                            ReleaseRequest {
+                                ino: f1.ino,
+                                fh,
+                                flags: libc::O_RDONLY,
+                                lock_owner: None,
+                                flush: false,
+                            },
+                        );
+                    }
+                }
+                let _ = fs.readdir(&rw_cx, &mut scope, root, 0);
+                let _ = fs.flush_on_destroy(&rw_cx);
+            }
+        }
+    }
 });

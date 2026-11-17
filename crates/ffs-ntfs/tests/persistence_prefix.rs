@@ -7724,3 +7724,589 @@ fn native_rename_replacement_refuses_crosslinked_source_and_victim_allocation() 
     assert_eq!(device.snapshot_live(), before);
     assert_eq!(device.snapshot_durable_only(), before);
 }
+
+#[test]
+fn writable_fsops_attribute_list_spill_rename_and_reclamation_across_36_streams() {
+    use ffs_core::vfs::ReleaseRequest;
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(4096, 64, 0xA771_2000_0000_0001);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    engine.grow_mft(&cx, 64).into_result().unwrap();
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+
+    let base = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("spilled.dat"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    fs.write(&cx, &mut scope, base.ino, 0, b"base-unnamed-payload")
+        .unwrap();
+
+    for idx in 0..36_usize {
+        let name = format!("spilled.dat:ext-{idx:02}");
+        let ads = fs
+            .create(&cx, &mut scope, root, OsStr::new(&name), 0o644, 1000, 1000)
+            .unwrap();
+        let payload = if idx % 5 == 0 {
+            vec![u8::try_from(idx + 0x20).unwrap(); 5000]
+        } else {
+            format!("resident-ext-stream-{idx:02}").into_bytes()
+        };
+        fs.write(&cx, &mut scope, ads.ino, 0, &payload).unwrap();
+    }
+
+    // Verify extension MFT records were genuinely allocated and populated via $ATTRIBUTE_LIST.
+    {
+        let stored = device.snapshot_durable_only();
+        let vol = NtfsVolume::from_device(
+            &cx,
+            Box::new(FaultInjectingNtfsDevice::new(stored)),
+            0,
+            volume_bytes,
+        )
+        .unwrap();
+        let ownership = vol
+            .check_record_ownership(&cx, RecordOwnershipLimits::default())
+            .unwrap();
+        assert!(ownership.is_consistent());
+        assert!(
+            ownership.extension_records_examined >= 2,
+            "36 ADS streams must spill across >= 2 extension MFT records: {ownership:?}"
+        );
+    }
+
+    // Open `spilled.dat:ext-25`, rename it in-place to `spilled.dat:ext-25-moved`, and verify open fd stability.
+    let s25 = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("spilled.dat:ext-25"))
+        .unwrap();
+    let (fh25, _) = fs.open(&cx, &mut scope, s25.ino, libc::O_RDWR).unwrap();
+    fs.rename(
+        &cx,
+        &mut scope,
+        root,
+        OsStr::new("spilled.dat:ext-25"),
+        root,
+        OsStr::new("spilled.dat:ext-25-moved"),
+    )
+    .unwrap();
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, root, OsStr::new("spilled.dat:ext-25")),
+        Err(FfsError::NotFound(_))
+    ));
+    let s25_moved = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("spilled.dat:ext-25-moved"),
+        )
+        .unwrap();
+    assert_eq!(s25_moved.ino, s25.ino);
+    assert_eq!(
+        fs.read(&cx, &mut scope, s25.ino, 0, 8192).unwrap(),
+        vec![u8::try_from(25 + 0x20).unwrap(); 5000]
+    );
+    fs.release(
+        &cx,
+        &mut scope,
+        ReleaseRequest {
+            ino: s25.ino,
+            fh: fh25,
+            flags: libc::O_RDWR,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+
+    // Unlink 35 of the 36 streams so the catalog collapses back into the base record and frees extension MFT slots!
+    for idx in 0..35_usize {
+        let name = if idx == 25 {
+            "spilled.dat:ext-25-moved".to_owned()
+        } else {
+            format!("spilled.dat:ext-{idx:02}")
+        };
+        fs.unlink(&cx, &mut scope, root, OsStr::new(&name)).unwrap();
+    }
+    assert_eq!(
+        fs.read(&cx, &mut scope, base.ino, 0, 64).unwrap(),
+        b"base-unnamed-payload"
+    );
+    let last_ads = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("spilled.dat:ext-35"))
+        .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, last_ads.ino, 0, 8192).unwrap(),
+        vec![u8::try_from(35 + 0x20).unwrap(); 5000]
+    );
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    reopened.check_clean_consistency(&cx).unwrap();
+    let vol = reopened.volume_view(&cx).unwrap();
+    let ownership = vol
+        .check_record_ownership(&cx, RecordOwnershipLimits::default())
+        .unwrap();
+    assert!(ownership.is_consistent());
+    assert_eq!(
+        ownership.extension_records_examined, 0,
+        "collapsing back to a single resident stream must reclaim all extension MFT records"
+    );
+}
+
+#[test]
+fn writable_fsops_multilevel_i30_btree_320_entries_splits_and_collapses_cleanly() {
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(4096, 64, 0xB7EE_3200_0000_0002);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    engine.grow_mft(&cx, 384).into_result().unwrap();
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+
+    let dir = fs
+        .mkdir(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("BigIndex"),
+            0o755,
+            1000,
+            1000,
+        )
+        .unwrap();
+    for idx in 0..320_usize {
+        let name = format!("item-{idx:04}-long-collated-key-segment.bin");
+        let f = fs
+            .create(
+                &cx,
+                &mut scope,
+                dir.ino,
+                OsStr::new(&name),
+                0o644,
+                1000,
+                1000,
+            )
+            .unwrap();
+        if idx % 64 == 0 {
+            fs.write(
+                &cx,
+                &mut scope,
+                f.ino,
+                0,
+                format!("payload-{idx:04}").as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
+    // Paginate readdir across cookies while mutating mid-scan to verify cookie monotonicity.
+    let mut seen = BTreeSet::new();
+    let mut cookie = 0_u64;
+    loop {
+        let page = fs.readdir(&cx, &mut scope, dir.ino, cookie).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        for entry in &page {
+            assert!(entry.offset > cookie);
+            cookie = entry.offset;
+            if entry.name != b"." && entry.name != b".." {
+                seen.insert(String::from_utf8(entry.name.clone()).unwrap());
+            }
+        }
+    }
+    assert_eq!(seen.len(), 320);
+
+    // Case-folded lookup across internal B-tree separator boundaries.
+    for probe in [0_usize, 64, 128, 192, 256, 319] {
+        let upper = format!("ITEM-{probe:04}-LONG-COLLATED-KEY-SEGMENT.BIN");
+        let found = fs
+            .lookup(&cx, &mut scope, dir.ino, OsStr::new(&upper))
+            .unwrap();
+        if probe % 64 == 0 {
+            assert_eq!(
+                fs.read(&cx, &mut scope, found.ino, 0, 64).unwrap(),
+                format!("payload-{probe:04}").into_bytes()
+            );
+        }
+    }
+
+    // Unlink all 320 entries and rmdir `BigIndex` to prove complete B-tree collapse and cluster reclamation.
+    for idx in 0..320_usize {
+        let name = format!("item-{idx:04}-long-collated-key-segment.bin");
+        fs.unlink(&cx, &mut scope, dir.ino, OsStr::new(&name))
+            .unwrap();
+    }
+    fs.rmdir(&cx, &mut scope, root, OsStr::new("BigIndex"))
+        .unwrap();
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap()
+    .check_clean_consistency(&cx)
+    .unwrap();
+}
+
+#[test]
+fn writable_fsops_poisoned_reused_clusters_and_sparse_holes_never_leak_stale_bytes() {
+    use ffs_core::{FsOps, RequestScope, SetAttrRequest};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let mut image = build_clean_ntfs_image(128, 50, 0x5FA2_5E00_0000_0003);
+    // Poison all free user clusters with non-zero 0xDE bytes before any allocation.
+    image[93 * CLUSTER_BYTES..128 * CLUSTER_BYTES].fill(0xDE);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+
+    // 1. Seed a 4-cluster file filled with 0xAD poison, then unlink so its clusters re-enter $Bitmap free pool.
+    let poison = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("poison"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    fs.write(&cx, &mut scope, poison.ino, 0, &[0xAD; 4 * CLUSTER_BYTES])
+        .unwrap();
+    fs.unlink(&cx, &mut scope, root, OsStr::new("poison"))
+        .unwrap();
+
+    // 2. Create `clean_grow`, extend via setattr(size) and positioned write beyond EOF over reused poisoned clusters.
+    let grown = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("clean_grow"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    fs.setattr(
+        &cx,
+        &mut scope,
+        grown.ino,
+        &SetAttrRequest {
+            size: Some(6000),
+            ..SetAttrRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, grown.ino, 0, 8192).unwrap(),
+        vec![0_u8; 6000],
+        "truncate growth over poisoned clusters must read back exact zeroes"
+    );
+    fs.write(&cx, &mut scope, grown.ino, 10_000, b"MARKER")
+        .unwrap();
+    let full = fs.read(&cx, &mut scope, grown.ino, 0, 16_384).unwrap();
+    assert_eq!(full.len(), 10_006);
+    assert!(full[..10_000].iter().all(|&b| b == 0));
+    assert_eq!(&full[10_000..], b"MARKER");
+
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    let stored = device.snapshot_durable_only();
+    let files = read_all_files_from_clean_volume(&stored);
+    assert_eq!(files.get("/clean_grow"), Some(&full));
+    NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap()
+    .check_clean_consistency(&cx)
+    .unwrap();
+}
+
+#[test]
+fn writable_fsops_open_overwrite_retention_and_setattr_modes_timestamps_recover_fault_cuts() {
+    use ffs_core::vfs::ReleaseRequest;
+    use ffs_core::{FsOps, RequestScope, SetAttrRequest};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(2048, 64, 0x0FE2_7E70_0000_0004);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+
+    // 1. Read-only create (0o444 / 0o555) + setattr mode/timestamp transitions + negative controls.
+    let ro_file = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("readonly.txt"),
+            0o444,
+            1000,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(ro_file.perm, 0o444);
+    assert!(matches!(
+        fs.write(&cx, &mut scope, ro_file.ino, 0, b"denied"),
+        Err(FfsError::PermissionDenied)
+    ));
+    let modified_at = UNIX_EPOCH + Duration::from_secs(1_720_000_123);
+    let accessed_at = UNIX_EPOCH + Duration::from_secs(1_720_000_456);
+    let updated = fs
+        .setattr(
+            &cx,
+            &mut scope,
+            ro_file.ino,
+            &SetAttrRequest {
+                mode: Some(0o644),
+                size: Some(12),
+                mtime: Some(modified_at),
+                atime: Some(accessed_at),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.perm, 0o644);
+    assert_eq!(updated.size, 12);
+    assert_eq!(updated.mtime, modified_at);
+    assert_eq!(updated.atime, accessed_at);
+    assert!(
+        fs.setattr(
+            &cx,
+            &mut scope,
+            root,
+            &SetAttrRequest {
+                mode: Some(0o555),
+                ..SetAttrRequest::default()
+            },
+        )
+        .is_err()
+    );
+
+    let locked_dir = fs
+        .mkdir(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("rodir"),
+            0o555,
+            1000,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(locked_dir.perm, 0o555);
+    let unlocked_dir = fs
+        .setattr(
+            &cx,
+            &mut scope,
+            locked_dir.ino,
+            &SetAttrRequest {
+                mode: Some(0o755),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(unlocked_dir.perm, 0o755);
+
+    // 2. Open-destination overwrite retention (`replacement` -> `victim` while `victim` fd is open!).
+    let victim = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("victim.bin"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    fs.write(&cx, &mut scope, victim.ino, 0, b"old-victim-bytes")
+        .unwrap();
+    let replacement = fs
+        .create(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("replacement.bin"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    fs.write(&cx, &mut scope, replacement.ino, 0, b"new-winner-bytes")
+        .unwrap();
+
+    let (victim_fh, _) = fs
+        .open(&cx, &mut scope, victim.ino, libc::O_RDONLY)
+        .unwrap();
+    fs.rename(
+        &cx,
+        &mut scope,
+        root,
+        OsStr::new("replacement.bin"),
+        root,
+        OsStr::new("victim.bin"),
+    )
+    .unwrap();
+
+    // `victim.bin` now resolves to `replacement`, `.ffs-unlinked-*` stays hidden, and open `victim` fd still reads old bytes!
+    let looked_up = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("victim.bin"))
+        .unwrap();
+    assert_eq!(looked_up.ino, replacement.ino);
+    assert_eq!(
+        fs.read(&cx, &mut scope, looked_up.ino, 0, 64).unwrap(),
+        b"new-winner-bytes"
+    );
+    assert_eq!(
+        fs.read(&cx, &mut scope, victim.ino, 0, 64).unwrap(),
+        b"old-victim-bytes"
+    );
+    assert!(
+        fs.readdir(&cx, &mut scope, root, 0)
+            .unwrap()
+            .iter()
+            .all(|entry| !entry.name.starts_with(b".ffs-unlinked-"))
+    );
+
+    // Release open victim fd -> durable orphan reclamation!
+    fs.release(
+        &cx,
+        &mut scope,
+        ReleaseRequest {
+            ino: victim.ino,
+            fh: victim_fh,
+            flags: libc::O_RDONLY,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    assert!(fs.getattr(&cx, &mut scope, victim.ino).is_err());
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    // 3. Fault-cut sweep across an `$ATTRIBUTE_LIST` stream creation transaction:
+    // every cut must recover cleanly via ARIES `$LogFile` recovery to pre- or post-state!
+    let baseline = device.snapshot_durable_only();
+    for cut_step in 1..=8_usize {
+        let cut_dev = FaultInjectingNtfsDevice::new(baseline.clone());
+        let mut eng = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&cut_dev) as Arc<dyn ByteDevice>,
+            0,
+            volume_bytes,
+            write_options_clean(),
+        )
+        .unwrap();
+        let writes_seen = std::sync::atomic::AtomicUsize::new(0);
+        eng.set_stage_hook(Some(Box::new(move |_event| {
+            if writes_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == cut_step {
+                Err(FfsError::Io(std::io::Error::other(
+                    "planted persistence cut",
+                )))
+            } else {
+                Ok(())
+            }
+        })));
+        let stream_u16: Vec<u16> = "cutstream".encode_utf16().collect();
+        let outcome = eng.create_file_stream(&cx, "/victim.bin", &stream_u16, b"atomic-cut-ads");
+        let crashed = if outcome.is_committed() {
+            cut_dev.snapshot_live()
+        } else {
+            cut_dev.snapshot_durable_only()
+        };
+        let rec_dev = FaultInjectingNtfsDevice::new(crashed);
+        let recovered = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&rec_dev) as Arc<dyn ByteDevice>,
+            0,
+            volume_bytes,
+            write_options_recover(),
+        )
+        .expect("ARIES $LogFile recovery must succeed at every persistence cut");
+        recovered.check_clean_consistency(&cx).unwrap();
+    }
+}

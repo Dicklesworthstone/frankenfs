@@ -533,6 +533,37 @@ enum Command {
         #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream", required_unless_present = "stream")]
         stream_utf16: Option<StreamName>,
     },
+    /// Rename a named DATA stream on an ordinary file via a native logged transaction.
+    TxRenameStream {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+        /// Existing Unicode stream name.
+        #[arg(long)]
+        old_stream: String,
+        /// Destination Unicode stream name.
+        #[arg(long)]
+        new_stream: String,
+        /// Refuse to replace an existing destination stream.
+        #[arg(long)]
+        no_replace: bool,
+    },
+    /// Update read-only state and/or 100ns NTFS FILETIME timestamps via a native logged transaction.
+    #[command(name = "tx-setattr", alias = "tx-set-attr")]
+    TxSetAttr {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+        /// Set or clear FILE_ATTRIBUTE_READONLY (true = 0444/0555, false = 0644/0755).
+        #[arg(long)]
+        read_only: Option<bool>,
+        /// Set last-modification timestamp in 100ns NTFS FILETIME ticks.
+        #[arg(long)]
+        mtime_filetime: Option<u64>,
+        /// Set last-access timestamp in 100ns NTFS FILETIME ticks.
+        #[arg(long)]
+        atime_filetime: Option<u64>,
+    },
     /// Atomically rename an entry in an offline NTFS 3.1 image via a native logged transaction.
     TxRename {
         #[command(flatten)]
@@ -1365,6 +1396,53 @@ fn main() -> Result<()> {
                     "record": reference.record,
                     "sequence": reference.sequence,
                     "stream_name_utf16": stream.as_units(),
+                })
+            })?;
+        }
+        Command::TxRenameStream {
+            target,
+            path,
+            old_stream,
+            new_stream,
+            no_replace,
+        } => {
+            let old_s = select_named_write_stream(Some(&old_stream), None)?;
+            let new_s = select_named_write_stream(Some(&new_stream), None)?;
+            let mut engine = target.open(&cx, false)?;
+            let outcome = engine.rename_file_stream(
+                &cx,
+                &path,
+                old_s.as_units(),
+                new_s.as_units(),
+                no_replace,
+            );
+            emit_tx_outcome("tx_rename_stream", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "old_stream_utf16": old_s.as_units(),
+                    "new_stream_utf16": new_s.as_units(),
+                    "no_replace": no_replace,
+                })
+            })?;
+        }
+        Command::TxSetAttr {
+            target,
+            path,
+            read_only,
+            mtime_filetime,
+            atime_filetime,
+        } => {
+            let mut engine = target.open(&cx, false)?;
+            let outcome =
+                engine.set_file_metadata(&cx, &path, read_only, mtime_filetime, atime_filetime);
+            emit_tx_outcome("tx_setattr", &engine, outcome, |reference| {
+                serde_json::json!({
+                    "record": reference.record,
+                    "sequence": reference.sequence,
+                    "read_only": read_only,
+                    "mtime_filetime": mtime_filetime,
+                    "atime_filetime": atime_filetime,
                 })
             })?;
         }
@@ -2861,5 +2939,78 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn cli_tx_rename_stream_and_setattr_require_explicit_write_authority() {
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "tx-rename-stream",
+                "disk.img",
+                "/file.txt",
+                "--old-stream",
+                "s1",
+                "--new-stream",
+                "s2",
+                "--offline-image",
+            ])
+            .is_err()
+        );
+        let rename_stream = Cli::try_parse_from([
+            "ffs-ntfs",
+            "tx-rename-stream",
+            "disk.img",
+            "/file.txt",
+            "--old-stream",
+            "s1",
+            "--new-stream",
+            "s2",
+            "--no-replace",
+            "--offline-image",
+            "--allow-write",
+        ])
+        .unwrap();
+        let Command::TxRenameStream {
+            path,
+            old_stream,
+            new_stream,
+            no_replace,
+            ..
+        } = rename_stream.command
+        else {
+            panic!("tx-rename-stream");
+        };
+        assert_eq!(path, "/file.txt");
+        assert_eq!((old_stream.as_str(), new_stream.as_str()), ("s1", "s2"));
+        assert!(no_replace);
+
+        let setattr = Cli::try_parse_from([
+            "ffs-ntfs",
+            "tx-setattr",
+            "disk.img",
+            "/file.txt",
+            "--read-only",
+            "true",
+            "--mtime-filetime",
+            "133600000000000000",
+            "--atime-filetime",
+            "133600000100000000",
+            "--offline-image",
+            "--allow-write",
+        ])
+        .unwrap();
+        let Command::TxSetAttr {
+            read_only,
+            mtime_filetime,
+            atime_filetime,
+            ..
+        } = setattr.command
+        else {
+            panic!("tx-setattr");
+        };
+        assert_eq!(read_only, Some(true));
+        assert_eq!(mtime_filetime, Some(133_600_000_000_000_000));
+        assert_eq!(atime_filetime, Some(133_600_000_100_000_000));
     }
 }

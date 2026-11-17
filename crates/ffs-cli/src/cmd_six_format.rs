@@ -1597,10 +1597,15 @@ pub fn maybe_route_mount_cmd(
         if part_entry.is_some() {
             bail!("--rw mount on a --partition slice is refused; mount read-only or extract slice");
         }
-        if matches!(kind, FsFormatKind::Ntfs | FsFormatKind::Zfs) {
+        if matches!(kind, FsFormatKind::Zfs) {
             bail!(
                 "--rw mount is not supported for {} (read-only extraction mount only)",
                 kind.as_str()
+            );
+        }
+        if matches!(kind, FsFormatKind::Ntfs) && six.recover_logfile {
+            bail!(
+                "--recover-logfile is a read-only volatile overlay flag; recover an offline NTFS image first before --rw mount"
             );
         }
     }
@@ -1641,17 +1646,40 @@ pub fn maybe_route_mount_cmd(
         .flatten();
 
     let fs_ops: Box<dyn ffs_core::FsOps> = if options.read_write {
-        // Unpartitioned writable FAT16/FAT32 mount.
-        let img = ffs_fat::ImageArgs {
-            image: image_path.to_path_buf(),
-            offset: 0,
-            length: None,
-            oem_code_page: FatOemCodePage::Ascii,
-            sidecar: None,
-        };
-        let volume = ffs_fat::reader::replacement::open_volume(&cx, &img, true)?;
-        let fat_fs = ffs_fat::FatFs::new_with_mode(&cx, volume, 0, 0, true)?;
-        Box::new(fat_fs)
+        match kind {
+            FsFormatKind::Fat16 | FsFormatKind::Fat32 => {
+                // Unpartitioned writable FAT16/FAT32 mount.
+                let img = ffs_fat::ImageArgs {
+                    image: image_path.to_path_buf(),
+                    offset: 0,
+                    length: None,
+                    oem_code_page: FatOemCodePage::Ascii,
+                    sidecar: None,
+                };
+                let volume = ffs_fat::reader::replacement::open_volume(&cx, &img, true)?;
+                let fat_fs = ffs_fat::FatFs::new_with_mode(&cx, volume, 0, 0, true)?;
+                Box::new(fat_fs)
+            }
+            FsFormatKind::Ntfs => {
+                let engine = ffs_ntfs::NtfsTransactionEngine::open(
+                    &cx,
+                    image_path,
+                    0,
+                    None,
+                    ffs_ntfs::NtfsWriteOptions {
+                        offline_image: six.offline_image,
+                        allow_write: true,
+                        recover_dirty: false,
+                    },
+                )?;
+                let ntfs_fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 0, 0)?;
+                Box::new(ntfs_fs)
+            }
+            _ => bail!(
+                "--rw mount is not supported for {} (read-only extraction mount only)",
+                kind.as_str()
+            ),
+        }
     } else {
         let ro_opts = six.build_read_only_options(
             kind,

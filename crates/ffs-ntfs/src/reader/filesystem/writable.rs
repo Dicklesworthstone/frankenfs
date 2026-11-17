@@ -6,10 +6,10 @@
 
 use super::{
     Cache, Cx, FfsError, FileType, InodeAttr, InodeNumber, Mutex, NtfsFs, NtfsReference,
-    NtfsTransactionEngine, OsStr, ROOT, Result, SetAttrRequest, SystemTime, checkpoint, is_ads_ino,
-    parse_ads_component, reference, unsupported,
+    NtfsTransactionEngine, OsStr, ROOT, Result, SetAttrRequest, SystemTime, TICKS_PER_SECOND,
+    UNIX_EPOCH, UNIX_FILETIME, checkpoint, is_ads_ino, parse_ads_component, reference, unsupported,
 };
-use crate::transaction::{NtfsTxOutcome, validate_ntfs_component_utf16};
+use crate::transaction::{DEFAULT_NTFS_FILETIME, NtfsTxOutcome, validate_ntfs_component_utf16};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,6 +17,31 @@ static RETAINED_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn invalid_argument() -> FfsError {
     FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn system_time_to_filetime(time: SystemTime) -> Result<u64> {
+    let ticks = match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => {
+            let sub = u64::from(d.subsec_nanos() / 100);
+            d.as_secs()
+                .checked_mul(TICKS_PER_SECOND)
+                .and_then(|s| s.checked_add(sub))
+                .and_then(|t| UNIX_FILETIME.checked_add(t))
+        }
+        Err(e) => {
+            let d = e.duration();
+            let sub_ticks = u64::from(d.subsec_nanos().div_ceil(100));
+            d.as_secs()
+                .checked_mul(TICKS_PER_SECOND)
+                .and_then(|s| s.checked_add(sub_ticks))
+                .and_then(|t| UNIX_FILETIME.checked_sub(t))
+        }
+    }
+    .ok_or_else(|| unsupported("SystemTime cannot be represented as NTFS FILETIME"))?;
+    if ticks > i64::MAX as u64 {
+        return Err(unsupported("SystemTime exceeds signed NTFS FILETIME range"));
+    }
+    Ok(ticks)
 }
 
 impl NtfsFs {
@@ -261,16 +286,23 @@ impl NtfsFs {
         checkpoint(cx)
     }
 
-    fn check_create_mode(mode: u16, directory: bool) -> Result<()> {
-        // NTFS's host projection is fixed; never claim a more restrictive Unix
-        // mode succeeded while exposing broader access than the caller asked.
-        let projected = if directory { 0o755 } else { 0o644 };
+    fn check_create_mode(mode: u16, directory: bool) -> Result<bool> {
+        // NTFS's host projection supports writable (0o644/0o755) and read-only
+        // (0o444/0o555 via FILE_ATTRIBUTE_READONLY); never claim a more
+        // restrictive Unix mode succeeded while exposing broader access.
+        let read_only = (mode & 0o222) == 0;
+        let projected = match (directory, read_only) {
+            (true, false) => 0o755,
+            (true, true) => 0o555,
+            (false, false) => 0o644,
+            (false, true) => 0o444,
+        };
         if mode & 0o7000 != 0 || projected & !mode & 0o777 != 0 {
             return Err(unsupported(
                 "requested mode cannot be represented by the NTFS host projection",
             ));
         }
-        Ok(())
+        Ok(read_only)
     }
 
     pub(super) fn create_locked(
@@ -281,8 +313,13 @@ impl NtfsFs {
         mode: u16,
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
-        Self::check_create_mode(mode, false)?;
+        let read_only = Self::check_create_mode(mode, false)?;
         if let Some((base, stream)) = self.ads_mutation_component(cx, parent, name)? {
+            if read_only {
+                return Err(unsupported(
+                    "NTFS alternate streams inherit read-only state from their base file",
+                ));
+            }
             let base_name = String::from_utf16(&base)
                 .map_err(|_| unsupported("NTFS stream base name is not lossless UTF-8"))?;
             let base_attr = self.lookup_indexed(cx, parent, OsStr::new(&base_name))?;
@@ -296,7 +333,13 @@ impl NtfsFs {
         }
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
-        let target = self.transact(cx, |engine| engine.create_file_at(cx, parent, &name, &[]))?;
+        let target = if read_only {
+            self.transact(cx, |engine| {
+                engine.create_entry_at(cx, parent, &name, false, true, &[], DEFAULT_NTFS_FILETIME)
+            })?
+        } else {
+            self.transact(cx, |engine| engine.create_file_at(cx, parent, &name, &[]))?
+        };
         cx.masked(|| self.describe(cx, self.inode(target)?))
     }
 
@@ -308,10 +351,16 @@ impl NtfsFs {
         mode: u16,
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
-        Self::check_create_mode(mode, true)?;
+        let read_only = Self::check_create_mode(mode, true)?;
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
-        let target = self.transact(cx, |engine| engine.mkdir_at(cx, parent, &name))?;
+        let target = if read_only {
+            self.transact(cx, |engine| {
+                engine.create_entry_at(cx, parent, &name, true, true, &[], DEFAULT_NTFS_FILETIME)
+            })?
+        } else {
+            self.transact(cx, |engine| engine.mkdir_at(cx, parent, &name))?
+        };
         cx.masked(|| self.describe(cx, self.inode(target)?))
     }
 
@@ -339,25 +388,97 @@ impl NtfsFs {
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
         let current = self.describe(cx, ino)?;
-        // Refuse unsupported parts of a compound request before truncating.
-        if attrs.mode.is_some_and(|mode| mode != current.perm)
-            || attrs.uid.is_some_and(|uid| uid != current.uid)
+        // Refuse unsupported ownership changes before mutating anything.
+        if attrs.uid.is_some_and(|uid| uid != current.uid)
             || attrs.gid.is_some_and(|gid| gid != current.gid)
-            || attrs.atime.is_some_and(|atime| atime != current.atime)
-            || attrs.mtime.is_some_and(|mtime| mtime != current.mtime)
         {
             return Err(unsupported(
-                "native NTFS ownership, mode and timestamp mutation is not admitted",
+                "native NTFS ownership mutation is not admitted",
             ));
+        }
+        if is_ads_ino(ino) {
+            if attrs.mode.is_some_and(|mode| mode != current.perm)
+                || attrs.atime.is_some_and(|atime| atime != current.atime)
+                || attrs.mtime.is_some_and(|mtime| mtime != current.mtime)
+            {
+                return Err(unsupported(
+                    "native NTFS alternate-stream mode and timestamp mutation is not admitted",
+                ));
+            }
+            if let Some(size) = attrs.size {
+                let (target, stream) = self.data_target(cx, ino)?;
+                self.transact(cx, |engine| {
+                    engine.truncate_stream(cx, target, &stream, size)
+                })?;
+                return cx.masked(|| self.describe(cx, ino));
+            }
+            return Ok(current);
+        }
+
+        let mut new_read_only = match attrs.mode {
+            Some(mode) if mode != current.perm => match current.kind {
+                FileType::Directory if ino != ROOT && matches!(mode, 0o555 | 0o755) => {
+                    Some(mode == 0o555)
+                }
+                FileType::RegularFile if matches!(mode, 0o444 | 0o644) => Some(mode == 0o444),
+                _ => {
+                    return Err(unsupported(
+                        "requested mode cannot be represented by the NTFS host projection",
+                    ));
+                }
+            },
+            _ => None,
+        };
+        let mtime_ft = match attrs.mtime {
+            Some(mtime) if mtime != current.mtime => Some(system_time_to_filetime(mtime)?),
+            _ => None,
+        };
+        let atime_ft = match attrs.atime {
+            Some(atime) if atime != current.atime => Some(system_time_to_filetime(atime)?),
+            _ => None,
+        };
+        if attrs.size.is_some() {
+            if current.kind == FileType::Directory {
+                return Err(FfsError::IsDirectory);
+            }
+            if current.kind != FileType::RegularFile {
+                return Err(unsupported(
+                    "NTFS native mutation requires an ordinary file",
+                ));
+            }
+            if (current.perm & 0o222 == 0) && new_read_only != Some(false) {
+                return Err(FfsError::PermissionDenied);
+            }
+        }
+
+        if attrs.size.is_none()
+            && new_read_only.is_none()
+            && mtime_ft.is_none()
+            && atime_ft.is_none()
+        {
+            return Ok(current);
+        }
+        if attrs.size.is_some() && (current.perm & 0o222 == 0) && new_read_only == Some(false) {
+            let base_ref = reference(&self.record(cx, ino)?);
+            self.transact(cx, |engine| {
+                engine.set_metadata_at(cx, base_ref, Some(false), None, None, DEFAULT_NTFS_FILETIME)
+            })?;
+            new_read_only = None;
         }
         if let Some(size) = attrs.size {
             let (target, stream) = self.data_target(cx, ino)?;
             self.transact(cx, |engine| {
                 engine.truncate_stream(cx, target, &stream, size)
             })?;
-            return cx.masked(|| self.describe(cx, ino));
         }
-        Ok(current)
+        if new_read_only.is_some() || mtime_ft.is_some() || atime_ft.is_some() {
+            let base_ref = reference(&self.record(cx, ino)?);
+            let now_ft = mtime_ft.or(atime_ft).unwrap_or(DEFAULT_NTFS_FILETIME);
+            self.transact(cx, |engine| {
+                engine.set_metadata_at(cx, base_ref, new_read_only, atime_ft, mtime_ft, now_ft)
+            })?;
+        }
+        cx.masked(|| self.describe(cx, ino))
     }
 
     pub(super) fn touch_atime_locked(
@@ -495,43 +616,163 @@ impl NtfsFs {
         no_replace: bool,
     ) -> Result<()> {
         self.ensure_writable()?;
+        let src_ads = self.ads_mutation_component(cx, parent, name)?;
+        let dst_ads = self.ads_mutation_component(cx, new_parent, new_name)?;
+        if src_ads.is_some() || dst_ads.is_some() {
+            let (Some((src_base, src_stream)), Some((dst_base, dst_stream))) = (src_ads, dst_ads)
+            else {
+                return Err(unsupported(
+                    "NTFS alternate data streams cannot be renamed across files and streams",
+                ));
+            };
+            if parent != new_parent {
+                return Err(unsupported(
+                    "NTFS alternate data streams can only be renamed within the same base file",
+                ));
+            }
+            let src_base_str = String::from_utf16(&src_base)
+                .map_err(|_| unsupported("NTFS stream base name is not lossless UTF-8"))?;
+            let dst_base_str = String::from_utf16(&dst_base)
+                .map_err(|_| unsupported("NTFS stream base name is not lossless UTF-8"))?;
+            let src_base_attr = self.lookup_indexed(cx, parent, OsStr::new(&src_base_str))?;
+            let dst_base_attr = self.lookup_indexed(cx, new_parent, OsStr::new(&dst_base_str))?;
+            if src_base_attr.ino != dst_base_attr.ino {
+                return Err(unsupported(
+                    "NTFS alternate data streams can only be renamed within the same base file",
+                ));
+            }
+            let src_ads_attr = self.lookup_ads_component(cx, parent, &src_base, &src_stream)?;
+            let (base_ref, exact_old_stream) = self.data_target(cx, src_ads_attr.ino)?;
+            let replaced_ads =
+                match self.lookup_ads_component(cx, new_parent, &dst_base, &dst_stream) {
+                    Ok(dst_ads_attr) => {
+                        if dst_ads_attr.ino == src_ads_attr.ino {
+                            if exact_old_stream == dst_stream {
+                                return Ok(());
+                            }
+                            if no_replace {
+                                return Err(FfsError::Exists);
+                            }
+                            None
+                        } else {
+                            if no_replace {
+                                return Err(FfsError::Exists);
+                            }
+                            if self.pinned(dst_ads_attr.ino)? {
+                                return Err(FfsError::RequestRejected {
+                                errno: libc::EBUSY,
+                                detail:
+                                    "replacing an open NTFS stream requires native stream retention"
+                                        .into(),
+                            });
+                            }
+                            Some(dst_ads_attr.ino)
+                        }
+                    }
+                    Err(FfsError::NotFound(_)) => None,
+                    Err(error) => return Err(error),
+                };
+            self.transact(cx, |engine| {
+                engine.rename_stream_at(
+                    cx,
+                    base_ref,
+                    &exact_old_stream,
+                    &dst_stream,
+                    no_replace,
+                    DEFAULT_NTFS_FILETIME,
+                )
+            })?;
+            return cx.masked(|| {
+                if let Some(victim_ads) = replaced_ads {
+                    self.retire_ads(victim_ads)?;
+                }
+                self.rename_ads_identity(src_ads_attr.ino, &dst_stream)?;
+                Ok(())
+            });
+        }
+
         let name = self.component(parent, name)?;
         let new_name = self.component(new_parent, new_name)?;
         let parent = self.directory_reference(cx, parent)?;
         let new_parent = self.directory_reference(cx, new_parent)?;
-        let engine = self.writer()?;
-        let target = engine.lookup_reference(cx, parent, &name)?;
-        let destination = match engine.lookup_reference(cx, new_parent, &new_name) {
-            Ok(destination) if destination != target => {
-                let ino = self.inode(destination)?;
-                if self.pinned(ino)? {
-                    return Err(if no_replace {
-                        FfsError::Exists
-                    } else {
-                        unsupported(
-                            "rename over an open NTFS destination requires atomic retention",
-                        )
-                    });
-                }
-                Some((destination, ino))
-            }
+        let (target, dst_lookup) = {
+            let engine = self.writer()?;
+            let target = engine.lookup_reference(cx, parent, &name)?;
+            let dst_lookup = engine.lookup_reference(cx, new_parent, &new_name);
+            (target, dst_lookup)
+        };
+        let destination_ref = match dst_lookup {
+            Ok(destination) if destination != target => Some(destination),
             Ok(_) | Err(FfsError::NotFound(_)) => None,
             Err(error) => return Err(error),
         };
-        drop(engine);
-        let final_destination = if let Some((reference, ino)) = destination {
-            (self.describe(cx, ino)?.nlink == 1).then_some((reference, ino))
-        } else {
-            None
-        };
-        let outcome = self.transact(cx, |engine| {
+        if let Some(destination) = destination_ref {
+            let ino = self.inode(destination)?;
+            let dst_attr = self.describe(cx, ino)?;
+            if self.pinned(ino)? {
+                if no_replace {
+                    return Err(FfsError::Exists);
+                }
+                if self.has_pinned_ads(ino)? || dst_attr.kind == FileType::Directory {
+                    return Err(unsupported(
+                        "rename over an open NTFS destination requires atomic retention",
+                    ));
+                }
+                if dst_attr.nlink == 1 {
+                    for _ in 0..16 {
+                        let sequence = RETAINED_SEQUENCE
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                            .map_err(|_| FfsError::NoSpace)?;
+                        let retained: Vec<u16> =
+                            format!(".ffs-unlinked-{:016x}-{sequence:016x}", ino.0)
+                                .encode_utf16()
+                                .collect();
+                        self.check_retained_file(ino, &retained)?;
+                        let outcome = self.transact(cx, |engine| {
+                            engine.rename_entry_at(
+                                cx,
+                                parent,
+                                &name,
+                                new_parent,
+                                &new_name,
+                                false,
+                                Some(retained.as_slice()),
+                                DEFAULT_NTFS_FILETIME,
+                            )
+                        });
+                        match outcome {
+                            Ok(res) => {
+                                if res.overwritten_retained_as_orphan
+                                    && let Err(error) = self.register_retained_file(ino, retained)
+                                {
+                                    self.health.fail();
+                                    return Err(error);
+                                }
+                                *self.cache()? = Cache::default();
+                                return Ok(());
+                            }
+                            Err(FfsError::Exists) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    return Err(FfsError::NoSpace);
+                }
+            }
+            let final_destination = (dst_attr.nlink == 1).then_some((destination, ino));
+            let outcome = self.transact(cx, |engine| {
+                engine.rename_at(cx, parent, &name, new_parent, &new_name, target, no_replace)
+            })?;
+            if let Some((reference, ino)) = final_destination
+                && outcome.replaced == Some(reference)
+            {
+                self.retire_ads_for_base(ino)?;
+            }
+            return Ok(());
+        }
+
+        let _ = self.transact(cx, |engine| {
             engine.rename_at(cx, parent, &name, new_parent, &new_name, target, no_replace)
         })?;
-        if let Some((reference, ino)) = final_destination
-            && outcome.replaced == Some(reference)
-        {
-            self.retire_ads_for_base(ino)?;
-        }
         Ok(())
     }
 

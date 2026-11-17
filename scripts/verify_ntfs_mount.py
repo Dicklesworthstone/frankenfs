@@ -90,6 +90,125 @@ def probe(mountpoint: Path, manifest_path: Path) -> None:
                       "content_and_ranges": True, "write_open_errno": errno.EROFS}))
 
 
+def probe_rw(mountpoint: Path, expected_out: Path) -> None:
+    """Runs in a timed child against a real writable FUSE mount (`mount-write`)."""
+    seeded = mountpoint / "seeded.bin"
+    require(seeded.read_bytes() == b"initial-ntfscp-seed\n", "unexpected initial seeded.bin bytes")
+    new_seed = (b"overwritten-through-writable-fuse-" * 200)[:6149]
+    seeded.write_bytes(new_seed)
+
+    bigdir = mountpoint / "bigdir"
+    bigdir.mkdir(mode=0o755)
+    big_entries: dict[str, str] = {}
+    for idx in range(64):
+        fname = f"item-{idx:03d}.bin"
+        fpath = bigdir / fname
+        data = (f"fuse-rw-item-{idx:03d}\n".encode() * 20)[:311]
+        fpath.write_bytes(data)
+        big_entries[fname] = hashlib.sha256(data).hexdigest()
+
+    tempdir = mountpoint / "tempdir"
+    tempdir.mkdir(mode=0o755)
+    os.rmdir(tempdir)
+    require(not tempdir.exists(), "rmdir left directory visible")
+
+    # Document with hard link + 34 ADS streams (forcing $ATTRIBUTE_LIST spill), ADS rename, and ADS unlink.
+    doc = mountpoint / "doc.txt"
+    doc_payload = b"primary-unnamed-document-stream\n" * 40
+    doc.write_bytes(doc_payload)
+    os.link(doc, mountpoint / "doc-link.txt")
+    require((mountpoint / "doc-link.txt").stat().st_nlink == 2, "hard-link nlink != 2")
+
+    ads_expected: dict[str, str] = {}
+    for idx in range(34):
+        sname = f"ads-{idx:02d}"
+        spath = mountpoint / f"doc.txt:{sname}"
+        sbytes = bytes((b + idx * 3) % 251 for b in range(180)) * (1 if idx % 7 else 28)
+        spath.write_bytes(sbytes)
+        ads_expected[sname] = hashlib.sha256(sbytes).hexdigest()
+
+    os.rename(mountpoint / "doc.txt:ads-04", mountpoint / "doc.txt:ads-04-renamed")
+    ads_expected["ads-04-renamed"] = ads_expected.pop("ads-04")
+    os.unlink(mountpoint / "doc.txt:ads-00")
+    ads_expected.pop("ads-00")
+
+    # Open-unlink retention: keep fd open across unlink, read/write, then close.
+    open_unlinked = mountpoint / "open-unlinked.bin"
+    open_unlinked.write_bytes(b"alive-while-unlinked")
+    ou_fd = os.open(open_unlinked, os.O_RDWR)
+    try:
+        os.unlink(open_unlinked)
+        require(not open_unlinked.exists(), "unlinked file still visible in namespace")
+        os.pwrite(ou_fd, b"ALIVE", 0)
+        require(os.pread(ou_fd, 64, 0) == b"ALIVE-while-unlinked", "open-unlinked pread mismatch")
+    finally:
+        os.close(ou_fd)
+
+    # Open-destination atomic overwrite (`os.replace` while destination fd stays open!).
+    open_victim = mountpoint / "open-victim.bin"
+    open_victim.write_bytes(b"old-victim-open-fd-data")
+    rep_src = mountpoint / "replace-src.bin"
+    rep_bytes = b"new-atomic-replacement-winner-data\n" * 35
+    rep_src.write_bytes(rep_bytes)
+    vic_fd = os.open(open_victim, os.O_RDONLY)
+    try:
+        os.replace(rep_src, open_victim)
+        require(not rep_src.exists(), "replace source still exists")
+        require(open_victim.read_bytes() == rep_bytes, "replaced destination did not serve new bytes")
+        require(os.pread(vic_fd, 64, 0) == b"old-victim-open-fd-data",
+                "open victim fd lost old bytes across atomic os.replace")
+        root_names = os.listdir(mountpoint)
+        require(all(not n.startswith(".ffs-unlinked-") for n in root_names),
+                "hidden orphan name leaked into mounted readdir")
+    finally:
+        os.close(vic_fd)
+
+    # chmod (0o444 <-> 0o644 + negative control for 0o600 and EACCES), utime, truncate growth & shrink, fsync.
+    meta_file = mountpoint / "meta.bin"
+    meta_file.write_bytes(b"prefix")
+    os.truncate(meta_file, 9000)
+    grown_bytes = meta_file.read_bytes()
+    require(grown_bytes == b"prefix" + b"\x00" * (9000 - 6), "truncate growth did not zero-fill")
+    os.truncate(meta_file, 4099)
+    shrunk_bytes = meta_file.read_bytes()
+    require(shrunk_bytes == b"prefix" + b"\x00" * (4099 - 6), "truncate shrink mismatch")
+    os.utime(meta_file, (1_721_000_100, 1_721_000_200))
+    os.chmod(meta_file, 0o444)
+    require((meta_file.stat().st_mode & 0o777) == 0o444, "chmod 0o444 did not project read-only mode")
+    try:
+        bad_fd = os.open(meta_file, os.O_WRONLY)
+    except OSError as err:
+        require(err.errno == errno.EACCES, f"expected EACCES on 0o444 file, got {err.errno}")
+    else:
+        os.close(bad_fd)
+        raise RuntimeError("0o444 read-only NTFS file admitted O_WRONLY open")
+    try:
+        os.chmod(meta_file, 0o600)
+    except OSError:
+        pass
+    else:
+        raise RuntimeError("unsupported restrictive mode 0o600 succeeded on NTFS")
+    os.chmod(meta_file, 0o644)
+    sync_fd = os.open(doc, os.O_RDONLY)
+    try:
+        os.fsync(sync_fd)
+    finally:
+        os.close(sync_fd)
+
+    summary = {
+        "seeded_sha256": hashlib.sha256(new_seed).hexdigest(),
+        "doc_sha256": hashlib.sha256(doc_payload).hexdigest(),
+        "open_victim_sha256": hashlib.sha256(rep_bytes).hexdigest(),
+        "meta_sha256": hashlib.sha256(shrunk_bytes).hexdigest(),
+        "meta_mtime": 1_721_000_200,
+        "bigdir": big_entries,
+        "ads": ads_expected,
+    }
+    expected_out.write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps({"rw_bigdir_files": len(big_entries), "rw_ads_streams": len(ads_expected),
+                      "open_replace_checked": True, "chmod_utime_truncate_checked": True}))
+
+
 class Run:
     def __init__(self, root: Path, binary: Path) -> None:
         self.root = root
@@ -162,16 +281,65 @@ class Run:
                             process.kill()
                             process.wait(timeout=10)
 
+    def mount_write_probe(self, image: Path, expected_out: Path) -> dict:
+        resolved_root = self.root.resolve()
+        sanctioned_prefixes = [Path("/tmp"), Path("/mnt"), Path("/media"), Path(f"/run/user/{os.getuid()}")]
+        try:
+            sanctioned_prefixes.append(Path.home().resolve())
+        except RuntimeError:
+            pass
+        if any(resolved_root == p or p in resolved_root.parents for p in sanctioned_prefixes):
+            mountpoint = self.root / (image.stem + "-rw-mount")
+            mountpoint.mkdir()
+        else:
+            mountpoint = Path(tempfile.mkdtemp(prefix=f"ffs-ntfs-{image.stem}-rwmnt-", dir="/tmp"))
+        log_path = self.root / (image.stem + "-rw-mount.log")
+        argv = [str(self.binary), "mount-write", str(image), str(mountpoint),
+                "--offline-image", "--allow-write", "--uid", str(os.getuid()), "--gid", str(os.getgid())]
+        (self.root / (image.stem + "-rw-mount.argv.json")).write_text(json.dumps(argv) + "\n")
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 30
+                while not mounted_here(mountpoint):
+                    require(process.poll() is None, f"mount-write exited; see {log_path}")
+                    require(time.monotonic() < deadline, f"mount-write did not appear; see {log_path}")
+                    time.sleep(0.05)
+                output = self.command(sys.executable, Path(__file__).resolve(), "--probe-rw",
+                                      mountpoint, "--manifest", expected_out, timeout=240)
+                report = json.loads(output)
+                self.command("fusermount3", "-u", mountpoint, timeout=30)
+                require(process.wait(timeout=30) == 0, f"mount-write did not exit cleanly; see {log_path}")
+                require(not mounted_here(mountpoint), "successful unmount left a writable filesystem mounted")
+                return report
+            finally:
+                try:
+                    if mounted_here(mountpoint):
+                        self.command("fusermount3", "-u", mountpoint, timeout=30)
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=10)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="already-built ffs-ntfs executable")
     parser.add_argument("--probe", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--probe-rw", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--manifest", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.probe is not None:
         require(args.manifest is not None, "mounted probe requires its manifest")
         probe(args.probe, args.manifest)
+        return
+    if args.probe_rw is not None:
+        require(args.manifest is not None, "writable mounted probe requires its output manifest path")
+        probe_rw(args.probe_rw, args.manifest)
         return
     require(args.binary is not None, "--binary is required")
     binary = args.binary.resolve(strict=True)
@@ -303,8 +471,84 @@ def main() -> None:
         report["mounts"].append(run.mount_probe(tx_image, tx_manifest_path, 0, tx_image.stat().st_size))
         require(digest(tx_image) == tx_before, "mounted reads changed tx-mounted.img")
 
+        # Live writable FUSE (`mount-write`) over an independently formatted + ntfscp-seeded volume,
+        # followed by independent ntfsls/ntfscat/check-allocation verification AND bidirectional
+        # external ntfscp -> read-only FUSE re-mount verification!
+        rw_image = root / "rw-mounted.img"
+        with rw_image.open("xb") as target:
+            target.truncate(64 * 1024 * 1024)
+        run.command("mkntfs", "-F", "-Q", "-s", "512", "-c", "4096", rw_image)
+        seed_src = root / "rw-seed.bin"
+        seed_src.write_bytes(b"initial-ntfscp-seed\n")
+        run.command("ntfscp", rw_image, seed_src, "/seeded.bin")
+        run.command(binary, "tx-grow-mft", rw_image, "--offline-image", "--allow-write", "--records", "128")
+        rw_summary_path = root / "rw-summary.json"
+        rw_probe_report = run.mount_write_probe(rw_image, rw_summary_path)
+        report["mounts"].append(rw_probe_report)
+
+        rw_summary = json.loads(rw_summary_path.read_text())
+        rw_alloc = json.loads(run.command(
+            binary, "check-allocation", rw_image, "--offline-image",
+            "--verify-record-ownership", "--verify-namespace", "--verify-mft-mirror",
+        ))
+        require(
+            rw_alloc["allocation_consistent"] is True
+            and rw_alloc["requested_checks_consistent"] is True
+            and int(rw_alloc["record_ownership"]["extension_records_examined"]) >= 2,
+            "check-allocation failed or missed $ATTRIBUTE_LIST extensions after writable FUSE unmount",
+        )
+        for rel_path, key in [
+            ("/seeded.bin", "seeded_sha256"),
+            ("/doc.txt", "doc_sha256"),
+            ("/doc-link.txt", "doc_sha256"),
+            ("/open-victim.bin", "open_victim_sha256"),
+            ("/meta.bin", "meta_sha256"),
+        ]:
+            oracle_bytes = run.command("ntfscat", rw_image, rel_path)
+            require(hashlib.sha256(oracle_bytes).hexdigest() == rw_summary[key],
+                    f"ntfscat disagreed after writable FUSE unmount on {rel_path}")
+        for fname, exp_sha in rw_summary["bigdir"].items():
+            oracle_bytes = run.command("ntfscat", rw_image, f"/bigdir/{fname}")
+            require(hashlib.sha256(oracle_bytes).hexdigest() == exp_sha,
+                    f"ntfscat disagreed on writable FUSE /bigdir/{fname}")
+        inode_lines = run.command("ntfsls", "-a", "-i", rw_image).decode("utf-8", errors="strict").splitlines()
+        doc_rec = None
+        for line in inode_lines:
+            m = re.fullmatch(r"\s*(\d+)\s+doc\.txt\s*", line)
+            if m:
+                doc_rec = int(m[1])
+                break
+        require(doc_rec is not None, "ntfsls -i did not locate doc.txt after writable FUSE unmount")
+        for sname in ("ads-04-renamed", "ads-14", "ads-33"):
+            s_oracle = run.command("ntfscat", "-i", str(doc_rec), "-n", sname, rw_image)
+            require(hashlib.sha256(s_oracle).hexdigest() == rw_summary["ads"][sname],
+                    f"ntfscat disagreed on writable FUSE spilled ADS stream {sname}")
+
+        # Bidirectional external ntfscp modification -> read-only FUSE mount verification!
+        after_src = root / "after-fuse-ntfscp.bin"
+        after_bytes = (b"added-by-ntfscp-after-writable-fuse\n" * 60)[:1999]
+        after_src.write_bytes(after_bytes)
+        run.command("ntfscp", rw_image, after_src, "/after-fuse.bin")
+        ro_recheck_manifest = {
+            "after-fuse.bin": {
+                "size": len(after_bytes),
+                "sha256": hashlib.sha256(after_bytes).hexdigest(),
+                "range_hex": after_bytes[507:1538].hex(),
+            },
+            "seeded.bin": {
+                "size": 6149,
+                "sha256": rw_summary["seeded_sha256"],
+                "range_hex": run.command("ntfscat", rw_image, "/seeded.bin")[507:1538].hex(),
+            },
+        }
+        ro_recheck_path = root / "rw-then-ro-expected.json"
+        ro_recheck_path.write_text(json.dumps(ro_recheck_manifest, indent=2) + "\n")
+        rw_after_ntfscp_sha = digest(rw_image)
+        report["mounts"].append(run.mount_probe(rw_image, ro_recheck_path, 0, rw_image.stat().st_size))
+        require(digest(rw_image) == rw_after_ntfscp_sha, "post-ntfscp read-only FUSE mount altered rw-mounted.img")
+
         report.update(status="passed", native_sha256=before, partitioned_sha256=disk_before,
-                      tx_mounted_sha256=tx_before)
+                      tx_mounted_sha256=tx_before, rw_mounted_sha256=rw_after_ntfscp_sha)
         print(json.dumps(report, indent=2))
     except Exception as error:
         report.update(status="failed", error=str(error))
