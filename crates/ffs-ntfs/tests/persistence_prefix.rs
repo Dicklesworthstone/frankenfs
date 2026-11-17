@@ -8566,9 +8566,64 @@ fn writable_fs_preserves_root_is4_flag_and_ignores_dentry_lookup_oracle_for_ads_
 
     let cx = Cx::for_testing();
     let mut image = build_clean_ntfs_image(2048, 64, 0xF501_0004_0000_0005);
-    // Match mkntfs's MFT_RECORD_IS_4 (0x0004) flag on Record 5 (FILE_root -> flags = 0x0007).
-    let rec5_flags_off = CLUSTER_BYTES + 5 * RECORD_BYTES + 22;
-    image[rec5_flags_off..rec5_flags_off + 2].copy_from_slice(&0x0007_u16.to_le_bytes());
+    // Match mkntfs's Record 5 (FILE_root): flags = 0x0007 (MFT_RECORD_IS_4 = 0x0004)
+    // AND a 4140-byte non-resident 0x50 ($SECURITY_DESCRIPTOR) spanning 2 clusters (LCNs 107..109).
+    let sd_lcn = 107_u64;
+    let bm_off = 74 * CLUSTER_BYTES;
+    for c in sd_lcn..sd_lcn + 2 {
+        image[bm_off + usize::try_from(c / 8).unwrap()] |= 1_u8 << (c % 8);
+    }
+    let mut large_sd = build_root_security_descriptor();
+    large_sd.resize(4140, 0);
+    large_sd[46..48].copy_from_slice(&4096_u16.to_le_bytes());
+    let sd_disk_off = usize::try_from(sd_lcn).unwrap() * CLUSTER_BYTES;
+    image[sd_disk_off..sd_disk_off + large_sd.len()].copy_from_slice(&large_sd);
+
+    let mut std5 = [0_u8; 48];
+    for off in [0_usize, 8, 16, 24] {
+        std5[off..off + 8].copy_from_slice(&DEFAULT_FILETIME.to_le_bytes());
+    }
+    let root_fn = NtfsFileName {
+        parent: NtfsReference {
+            record: 5,
+            sequence: 5,
+        },
+        namespace: 3,
+        name: vec![u16::from(b'.')],
+    }
+    .encode(
+        DEFAULT_FILETIME,
+        DEFAULT_FILETIME,
+        DEFAULT_FILETIME,
+        DEFAULT_FILETIME,
+        0,
+        0,
+        0x1000_0000,
+        0,
+    )
+    .unwrap();
+    let i30_name = [
+        u16::from(b'$'),
+        u16::from(b'I'),
+        u16::from(b'3'),
+        u16::from(b'0'),
+    ];
+    let mut rec5 = build_file_record(
+        5,
+        5,
+        1,
+        true,
+        &[
+            build_resident_attr(0x10, 0, &[], false, &std5),
+            build_resident_attr(0x30, 1, &[], true, &root_fn),
+            build_nonresident_attr(0x50, 2, &[], sd_lcn, 2, 4140, 2048),
+            build_resident_attr(0x90, 3, &i30_name, false, &build_empty_i30_root()),
+        ],
+    );
+    rec5[22..24].copy_from_slice(&0x0007_u16.to_le_bytes());
+    let rec5_off = CLUSTER_BYTES + 5 * RECORD_BYTES;
+    image[rec5_off..rec5_off + RECORD_BYTES].copy_from_slice(&rec5);
+    let rec5_flags_off = rec5_off + 22;
 
     let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
     let device = FaultInjectingNtfsDevice::new(image);

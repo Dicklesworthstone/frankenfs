@@ -479,6 +479,25 @@ pub(super) struct EditableCatalog {
 }
 
 impl EditableCatalog {
+    pub(super) fn preserved_nonresident_runs(&self, cluster_count: u64) -> Result<Vec<NtfsRun>> {
+        let mut out = Vec::new();
+        for pres in &self.preserved {
+            if let PreservedValue::NonResident {
+                first_vcn,
+                last_vcn,
+                mapping_pairs,
+                ..
+            } = &pres.raw_without_id
+            {
+                let runs =
+                    decode_mapping_pairs(mapping_pairs, *first_vcn, *last_vcn, cluster_count)
+                        .map_err(|err| parse_err(&err))?;
+                out.extend(runs);
+            }
+        }
+        Ok(out)
+    }
+
     pub(super) fn std_flags(&self) -> u32 {
         if self.std_info.len() >= 36 {
             u32::from_le_bytes([
@@ -1217,15 +1236,30 @@ impl NtfsTransactionEngine {
                             self.geometry.cluster_count(),
                         )
                         .map_err(|err| parse_err(&err))?;
-                        let bytes = read_mapped_runs(
-                            &self.device,
-                            cx,
-                            &self.geometry,
-                            &runs,
-                            0,
-                            nr.data_bytes as usize,
-                        )?;
-                        security_descriptor = Some(bytes);
+                        if nr.first_vcn == 0 {
+                            let _ = read_mapped_runs(
+                                &self.device,
+                                cx,
+                                &self.geometry,
+                                &runs,
+                                0,
+                                nr.data_bytes as usize,
+                            )?;
+                        }
+                        preserved.push(PreservedAttribute {
+                            kind: ATTR_SECURITY_DESCRIPTOR,
+                            flags: attr.flags,
+                            name: Vec::new(),
+                            raw_without_id: PreservedValue::NonResident {
+                                first_vcn: nr.first_vcn,
+                                last_vcn: nr.last_vcn,
+                                compression_unit: nr.compression_unit,
+                                allocated_bytes: nr.allocated_bytes,
+                                data_bytes: nr.data_bytes,
+                                initialized_bytes: nr.initialized_bytes,
+                                mapping_pairs: nr.mapping_pairs.to_vec(),
+                            },
+                        });
                     }
                 },
                 DATA => {
@@ -1505,6 +1539,7 @@ impl NtfsTransactionEngine {
             });
         }
 
+        let mut pre_payload_writes: Vec<DirPrePayloadWrite> = Vec::new();
         if let Some(ref sd) = catalog.security_descriptor {
             let sd_cl = sd.clone();
             let sample =
@@ -1523,9 +1558,36 @@ impl NtfsTransactionEngine {
                     estimated_len: est,
                 });
             } else {
-                return Err(unsupported(
-                    "oversized legacy SECURITY_DESCRIPTOR exceeds single MFT record",
-                ));
+                let cb = u64::from(self.geometry.cluster_bytes());
+                let need_cl = (sd_cl.len() as u64).div_ceil(cb);
+                let spans = allocate_clusters(need_cl)?;
+                let mut sd_runs = Vec::new();
+                let mut cur_vcn = 0_u64;
+                for &(lcn, cnt) in &spans {
+                    sd_runs.push(NtfsRun {
+                        vcn: cur_vcn,
+                        clusters: cnt,
+                        lcn: Some(lcn),
+                    });
+                    cur_vcn += cnt;
+                }
+                let mut padded = vec![0_u8; (need_cl * cb) as usize];
+                padded[..sd_cl.len()].copy_from_slice(&sd_cl);
+                stage_runs_writes(&self.geometry, &sd_runs, &padded, &mut pre_payload_writes)?;
+                let sd_len = sd_cl.len() as u64;
+                let sd_extents = split_nonresident_stream_extents(
+                    &self.geometry,
+                    ATTR_SECURITY_DESCRIPTOR,
+                    &[],
+                    &[],
+                    &sd_runs,
+                    false,
+                    0,
+                    sd_len,
+                    sd_len,
+                    max_ext_attr_bytes,
+                )?;
+                candidates.extend(sd_extents);
             }
         }
 
@@ -1578,7 +1640,6 @@ impl NtfsTransactionEngine {
             }
         }
 
-        let mut pre_payload_writes: Vec<DirPrePayloadWrite> = Vec::new();
         if let Some(ref dir_idx) = catalog.dir_index {
             let ir = dir_idx.index_root.clone();
             let est_ir =

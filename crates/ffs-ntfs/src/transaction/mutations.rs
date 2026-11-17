@@ -464,6 +464,8 @@ impl TxWorkspace {
             {
                 self.verify_and_register_runs(a0_runs)?;
             }
+            let pres_runs = cat.preserved_nonresident_runs(engine.geometry.cluster_count())?;
+            self.verify_and_register_runs(&pres_runs)?;
             self.verify_and_register_runs(&cat.old_nonres_attrlist_runs)?;
             self.catalogs.insert(target_ref.record, cat);
         }
@@ -762,6 +764,8 @@ impl TxWorkspace {
         {
             self.free_clusters_deferred(&physical_spans_of_runs(a0_runs));
         }
+        let pres_runs = cat.preserved_nonresident_runs(engine.geometry.cluster_count())?;
+        self.free_clusters_deferred(&physical_spans_of_runs(&pres_runs));
         self.free_clusters_deferred(&physical_spans_of_runs(&cat.old_nonres_attrlist_runs));
 
         for &(ext_slot, _, ref old_ext_raw) in &cat.old_extensions {
