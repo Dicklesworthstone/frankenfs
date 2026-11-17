@@ -98,7 +98,11 @@ fn refuse_unsupported_record_metadata(
     raw_record: &[u8],
     attrs: &[NtfsAttribute<'_>],
 ) -> Result<()> {
-    if record.flags & 0x000C != 0 {
+    // Bit 0x0008 (MFT_RECORD_IS_VIEW_INDEX, e.g. $Secure/$ObjId/$Quota/$Reparse) is
+    // always refused. Bit 0x0004 (MFT_RECORD_IS_4) is set by mkntfs on system records
+    // including Record 5 (FILE_root); admit and preserve it on Record 5 while keeping
+    // user/metadata records (record != 5) carrying 0x0004 (MFT_RECORD_IN_EXTEND) refused.
+    if record.flags & 0x0008 != 0 || (record.number != 5 && record.flags & 0x0004 != 0) {
         return Err(unsupported(format!(
             "record {} carries metadata or view-index FILE flags {:#x}",
             record.number, record.flags
@@ -846,6 +850,7 @@ pub(super) fn build_restored_mft_record(
     record_no: u32,
     sequence: u16,
     is_directory: bool,
+    preserved_base_flags: u16,
     hard_links: u16,
     base_reference: Option<NtfsReference>,
     sorted_encoded_attrs: &[Vec<u8>],
@@ -873,7 +878,9 @@ pub(super) fn build_restored_mft_record(
     buf[18..20].copy_from_slice(&links.to_le_bytes());
     buf[20..22].copy_from_slice(&(first_attr as u16).to_le_bytes());
     let flags: u16 = if base_reference.is_none() && is_directory {
-        0x0003
+        0x0003 | (preserved_base_flags & 0x0004)
+    } else if base_reference.is_none() {
+        0x0001 | (preserved_base_flags & 0x0004)
     } else {
         0x0001
     };
@@ -1442,7 +1449,20 @@ impl NtfsTransactionEngine {
         let max_record_body = (rec_bytes as usize) - first_attr - 8;
         let max_ext_attr_bytes = max_record_body;
 
-        let hard_links = u16::try_from(catalog.file_names.len()).map_err(|_| FfsError::NoSpace)?;
+        let preserved_base_flags = if catalog.old_base_raw.len() >= 24 {
+            u16::from_le_bytes([catalog.old_base_raw[22], catalog.old_base_raw[23]]) & 0x0004
+        } else {
+            0
+        };
+        let hard_links = if catalog.file_names.is_empty() && catalog.base_ref.record == 5 {
+            if catalog.old_base_raw.len() >= 20 {
+                u16::from_le_bytes([catalog.old_base_raw[18], catalog.old_base_raw[19]])
+            } else {
+                0
+            }
+        } else {
+            u16::try_from(catalog.file_names.len()).map_err(|_| FfsError::NoSpace)?
+        };
         if hard_links == 0 && catalog.base_ref.record != 5 {
             return Err(corrupt(
                 0,
@@ -1748,6 +1768,7 @@ impl NtfsTransactionEngine {
                 base_no,
                 catalog.base_ref.sequence,
                 catalog.is_directory,
+                preserved_base_flags,
                 hard_links,
                 None,
                 &encoded,
@@ -1912,6 +1933,7 @@ impl NtfsTransactionEngine {
                 ext_seq,
                 false,
                 0,
+                0,
                 Some(catalog.base_ref),
                 &ext_encoded,
                 next_ext_id,
@@ -1994,6 +2016,7 @@ impl NtfsTransactionEngine {
             base_no,
             catalog.base_ref.sequence,
             catalog.is_directory,
+            preserved_base_flags,
             hard_links,
             None,
             &final_base_attrs,

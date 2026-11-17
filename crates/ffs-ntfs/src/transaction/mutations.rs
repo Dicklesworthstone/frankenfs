@@ -1831,6 +1831,7 @@ impl NtfsTransactionEngine {
             base_no,
             catalog.base_ref.sequence,
             catalog.is_directory,
+            0,
             1,
             None,
             &[],

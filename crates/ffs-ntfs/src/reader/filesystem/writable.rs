@@ -556,12 +556,30 @@ impl NtfsFs {
         Ok(false)
     }
 
+    pub(super) fn settle_ads_target_before_mutation(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<()> {
+        if !self.is_writable() {
+            return Ok(());
+        }
+        let Ok(Some((base, stream))) = self.ads_mutation_component(cx, parent, name) else {
+            return Ok(());
+        };
+        let Ok(attr) = self.lookup_ads_component(cx, parent, &base, &stream) else {
+            return Ok(());
+        };
+        self.wait_for_inflight_ads_release(cx, attr.ino)
+    }
+
     pub(super) fn unlink_locked(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> Result<()> {
         self.ensure_writable()?;
         if let Some((base, stream)) = self.ads_mutation_component(cx, parent, name)? {
             let attr = self.lookup_ads_component(cx, parent, &base, &stream)?;
             let (target, exact_name) = self.data_target(cx, attr.ino)?;
-            if self.pinned(attr.ino)? {
+            if self.has_open_handle(attr.ino)? {
                 return Err(FfsError::RequestRejected {
                     errno: libc::EBUSY,
                     detail: "removing an open NTFS stream requires native stream retention".into(),
@@ -720,7 +738,7 @@ impl NtfsFs {
                             if no_replace {
                                 return Err(FfsError::Exists);
                             }
-                            if self.pinned(dst_ads_attr.ino)? {
+                            if self.has_open_handle(dst_ads_attr.ino)? {
                                 return Err(FfsError::RequestRejected {
                                 errno: libc::EBUSY,
                                 detail:
@@ -771,11 +789,17 @@ impl NtfsFs {
         if let Some(destination) = destination_ref {
             let ino = self.inode(destination)?;
             let dst_attr = self.describe(cx, ino)?;
+            if dst_attr.kind == FileType::Directory {
+                let _ = self.transact(cx, |engine| {
+                    engine.rename_at(cx, parent, &name, new_parent, &new_name, target, no_replace)
+                })?;
+                return Ok(());
+            }
             if self.pinned(ino)? {
                 if no_replace {
                     return Err(FfsError::Exists);
                 }
-                if self.has_pinned_ads(ino)? || dst_attr.kind == FileType::Directory {
+                if self.has_pinned_ads(ino)? {
                     return Err(unsupported(
                         "rename over an open NTFS destination requires atomic retention",
                     ));

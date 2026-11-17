@@ -8556,3 +8556,211 @@ fn writable_fs_accepts_fuse_wire_file_type_modes_and_create_open_handles() {
         libc::ENOENT
     );
 }
+
+#[test]
+fn writable_fs_preserves_root_is4_flag_and_ignores_dentry_lookup_oracle_for_ads_and_dirs() {
+    use ffs_core::{FsOps, ReleaseRequest, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let mut image = build_clean_ntfs_image(2048, 64, 0xF501_0004_0000_0005);
+    // Match mkntfs's MFT_RECORD_IS_4 (0x0004) flag on Record 5 (FILE_root -> flags = 0x0007).
+    let rec5_flags_off = CLUSTER_BYTES + 5 * RECORD_BYTES + 22;
+    image[rec5_flags_off..rec5_flags_off + 2].copy_from_slice(&0x0007_u16.to_le_bytes());
+
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    engine.grow_mft(&cx, 128).into_result().unwrap();
+
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    assert!(fs.requires_stateful_open());
+
+    // Simulate FrankenFuse's dcache lookup refcount oracle: every looked-up/created
+    // inode (including ADS streams and directories) has lookup_refcount >= 1 while
+    // cached in the Linux kernel dcache.
+    let cached_dentries: Arc<Mutex<BTreeSet<InodeNumber>>> = Arc::new(Mutex::new(BTreeSet::new()));
+    fs.install_open_handle_oracle({
+        let cached_dentries = Arc::clone(&cached_dentries);
+        Arc::new(move |ino| u64::from(cached_dentries.lock().unwrap().contains(&ino)))
+    });
+
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+    let s_ifreg = u16::try_from(libc::S_IFREG).unwrap();
+    let s_ifdir = u16::try_from(libc::S_IFDIR).unwrap();
+
+    // 1. Create doc.txt + hard link + 34 ADS streams via create_open -> write -> release
+    // (forcing $ATTRIBUTE_LIST spill), keeping all ADS inodes live in `cached_dentries`.
+    let (doc, doc_fh, _) = fs
+        .create_open(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("doc.txt"),
+            s_ifreg | 0o644,
+            1000,
+            1000,
+            libc::O_CREAT | libc::O_WRONLY,
+        )
+        .unwrap();
+    cached_dentries.lock().unwrap().insert(doc.ino);
+    fs.write(&cx, &mut scope, doc.ino, 0, b"primary-doc\n")
+        .unwrap();
+    fs.release(
+        &cx,
+        &mut scope,
+        ReleaseRequest {
+            ino: doc.ino,
+            fh: doc_fh,
+            flags: libc::O_WRONLY,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    fs.link(&cx, &mut scope, doc.ino, root, OsStr::new("doc-link.txt"))
+        .unwrap();
+
+    for idx in 0..34_u8 {
+        let name = format!("doc.txt:ads-{idx:02}");
+        let (ads, ads_fh, _) = fs
+            .create_open(
+                &cx,
+                &mut scope,
+                root,
+                OsStr::new(&name),
+                s_ifreg | 0o644,
+                1000,
+                1000,
+                libc::O_CREAT | libc::O_WRONLY,
+            )
+            .unwrap();
+        cached_dentries.lock().unwrap().insert(ads.ino);
+        let payload = vec![idx.wrapping_add(0x21); 180];
+        fs.write(&cx, &mut scope, ads.ino, 0, &payload).unwrap();
+        fs.release(
+            &cx,
+            &mut scope,
+            ReleaseRequest {
+                ino: ads.ino,
+                fh: ads_fh,
+                flags: libc::O_WRONLY,
+                lock_owner: None,
+                flush: false,
+            },
+        )
+        .unwrap();
+    }
+
+    // 2. Rename ADS stream (syncing doc.txt into Record 5 with flags = 0x0007) and unlink
+    // closed ADS stream while its dentry lookup refcount is still 1!
+    fs.rename2(
+        &cx,
+        &mut scope,
+        root,
+        OsStr::new("doc.txt:ads-04"),
+        root,
+        OsStr::new("doc.txt:ads-04-renamed"),
+        0,
+    )
+    .unwrap();
+    fs.unlink(&cx, &mut scope, root, OsStr::new("doc.txt:ads-00"))
+        .unwrap();
+
+    // Negative control: genuinely open ADS handle MUST still reject unlink with EBUSY.
+    let ads_open_target = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("doc.txt:ads-01"))
+        .unwrap();
+    let (open_ads_fh, _) = fs
+        .open(&cx, &mut scope, ads_open_target.ino, libc::O_RDONLY)
+        .unwrap();
+    assert_eq!(
+        fs.unlink(&cx, &mut scope, root, OsStr::new("doc.txt:ads-01"))
+            .unwrap_err()
+            .to_errno(),
+        libc::EBUSY
+    );
+    fs.release(
+        &cx,
+        &mut scope,
+        ReleaseRequest {
+            ino: ads_open_target.ino,
+            fh: open_ads_fh,
+            flags: libc::O_RDONLY,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+
+    // 3. Directory rename-overwrite over an empty directory whose dentry is cached in dcache.
+    let src_dir = fs
+        .mkdir(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("src-dir"),
+            s_ifdir | 0o755,
+            1000,
+            1000,
+        )
+        .unwrap();
+    let dst_dir = fs
+        .mkdir(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("dst-dir"),
+            s_ifdir | 0o755,
+            1000,
+            1000,
+        )
+        .unwrap();
+    cached_dentries.lock().unwrap().insert(src_dir.ino);
+    cached_dentries.lock().unwrap().insert(dst_dir.ino);
+    fs.rename2(
+        &cx,
+        &mut scope,
+        root,
+        OsStr::new("src-dir"),
+        root,
+        OsStr::new("dst-dir"),
+        0,
+    )
+    .unwrap();
+
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    // 4. Verify Record 5 preserved MFT_RECORD_IS_4 (0x0007) and clean volume consistency.
+    let final_bytes = device.snapshot_durable_only();
+    let final_rec5_flags =
+        u16::from_le_bytes([final_bytes[rec5_flags_off], final_bytes[rec5_flags_off + 1]]);
+    assert_eq!(final_rec5_flags, 0x0007);
+
+    let verify_engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    verify_engine.check_clean_consistency(&cx).unwrap();
+    let view = verify_engine.volume_view(&cx).unwrap();
+    assert!(
+        view.check_record_ownership(&cx, RecordOwnershipLimits::default())
+            .unwrap()
+            .is_consistent()
+    );
+}

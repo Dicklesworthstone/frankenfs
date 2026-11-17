@@ -268,8 +268,27 @@ impl NtfsFs {
         locked(&self.lifetime)?.release_open(ino, handle)
     }
 
+    pub(super) fn has_open_handle(&self, ino: InodeNumber) -> Result<bool> {
+        let state = locked(&self.lifetime)?;
+        Ok(state.counts.get(&ino).copied().unwrap_or(0) != 0)
+    }
+
+    /// Wait briefly for an asynchronous kernel `FUSE_RELEASE` to land if a just-closed
+    /// ADS descriptor still appears in `state.counts` before acquiring the exclusive
+    /// mutation gate, returning immediately when `has_open_handle` is already false.
+    pub(super) fn wait_for_inflight_ads_release(&self, cx: &Cx, ino: InodeNumber) -> Result<()> {
+        for _ in 0..50 {
+            checkpoint(cx)?;
+            if !self.has_open_handle(ino)? {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        Ok(())
+    }
+
     pub(super) fn pinned(&self, ino: InodeNumber) -> Result<bool> {
-        let (own, candidates, oracle) = {
+        let (own, oracle) = {
             let state = locked(&self.lifetime)?;
             let mut candidates = vec![ino];
             if !is_ads_ino(ino) {
@@ -281,28 +300,27 @@ impl NtfsFs {
             }
             let own = candidates
                 .iter()
-                .any(|ino| state.counts.get(ino).copied().unwrap_or(0) != 0);
-            (own, candidates, state.oracle.clone())
+                .any(|cand| state.counts.get(cand).copied().unwrap_or(0) != 0);
+            let oracle = (!is_ads_ino(ino)).then(|| state.oracle.clone()).flatten();
+            (own, oracle)
         };
         // The callback may reenter transport state; invoke outside our mutex.
-        Ok(own || oracle.is_some_and(|oracle| candidates.into_iter().any(|ino| oracle(ino) != 0)))
+        // Note: FrankenFuse's oracle reports kernel dentry lookup refcounts
+        // (`LOOKUP`/`CREATE` minus `FORGET`), which apply only to base file
+        // orphan retention, never to ADS open-handle checks.
+        Ok(own || oracle.is_some_and(|oracle| oracle(ino) != 0))
     }
 
     pub(super) fn has_pinned_ads(&self, base: InodeNumber) -> Result<bool> {
-        let (own, candidates, oracle) = {
-            let state = locked(&self.lifetime)?;
-            let mut candidates = Vec::new();
-            for (&stream, identity) in &state.ads {
-                if self.inode(identity.reference)? == base {
-                    candidates.push(stream);
-                }
+        let state = locked(&self.lifetime)?;
+        for (&stream, identity) in &state.ads {
+            if self.inode(identity.reference)? == base
+                && state.counts.get(&stream).copied().unwrap_or(0) != 0
+            {
+                return Ok(true);
             }
-            let own = candidates
-                .iter()
-                .any(|ino| state.counts.get(ino).copied().unwrap_or(0) != 0);
-            (own, candidates, state.oracle.clone())
-        };
-        Ok(own || oracle.is_some_and(|oracle| candidates.into_iter().any(|ino| oracle(ino) != 0)))
+        }
+        Ok(false)
     }
 
     pub(super) fn rename_ads_identity(&self, ino: InodeNumber, new_name: &[u16]) -> Result<()> {

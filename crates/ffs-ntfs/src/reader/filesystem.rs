@@ -757,6 +757,19 @@ impl NtfsFs {
 }
 
 impl FsOps for NtfsFs {
+    fn requires_stateful_open(&self) -> bool {
+        self.is_writable()
+    }
+
+    fn begin_request_scope(&self, cx: &Cx, op: ffs_core::vfs::RequestOp) -> Result<RequestScope> {
+        // RELEASE must reach its open-handle cleanup even if the caller's
+        // request context has been cancelled.
+        if op != ffs_core::vfs::RequestOp::Release {
+            checkpoint(cx)?;
+        }
+        Ok(RequestScope::empty())
+    }
+
     fn getattr(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<InodeAttr> {
         let _op = self.operation(cx, false)?;
         self.describe(cx, ino)
@@ -962,6 +975,10 @@ impl FsOps for NtfsFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> Result<()> {
+        {
+            let _op = self.operation(cx, false)?;
+            self.settle_ads_target_before_mutation(cx, parent, name)?;
+        }
         let op = self.operation(cx, true)?;
         self.unlink_locked(cx, parent, name)?;
         op.complete(())
@@ -1001,6 +1018,10 @@ impl FsOps for NtfsFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> Result<()> {
+        {
+            let _op = self.operation(cx, false)?;
+            self.settle_ads_target_before_mutation(cx, new_parent, new_name)?;
+        }
         let op = self.operation(cx, true)?;
         self.rename_locked(cx, parent, name, new_parent, new_name, false)?;
         op.complete(())
@@ -1016,12 +1037,16 @@ impl FsOps for NtfsFs {
         new_name: &OsStr,
         flags: u32,
     ) -> Result<()> {
-        let op = self.operation(cx, true)?;
         if flags != 0 && flags != libc::RENAME_NOREPLACE {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,
             )));
         }
+        {
+            let _op = self.operation(cx, false)?;
+            self.settle_ads_target_before_mutation(cx, new_parent, new_name)?;
+        }
+        let op = self.operation(cx, true)?;
         self.rename_locked(
             cx,
             parent,
@@ -1167,10 +1192,12 @@ impl FsOps for NtfsFs {
             let _op = self.operation(cx, false)?;
             return checkpoint(cx);
         }
-        let op = self.operation(cx, true)?;
-        self.release_open(request.ino, request.fh)?;
-        self.reap_retained_inode_locked(cx, request.ino, false)?;
-        op.complete(())
+        cx.masked(|| {
+            let op = self.operation(cx, true)?;
+            self.release_open(request.ino, request.fh)?;
+            self.reap_retained_inode_locked(cx, request.ino, false)?;
+            op.complete(())
+        })
     }
 
     fn finalize_unlinked_inode(

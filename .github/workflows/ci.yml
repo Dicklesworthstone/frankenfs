@@ -720,6 +720,7 @@ jobs:
             /tmp/ffs-ntfs-native-*/*.json
             /tmp/ffs-ntfs-mounted-*/*.json
             /tmp/ffs-ntfs-mounted-*/*.stderr
+            /tmp/ffs-ntfs-mounted-*/*.log
             /tmp/ffs-zfs-native-*/*.json
             /tmp/ffs-zpl-native-*/*.json
             /tmp/ffs-snapshots-native-*/*.json
