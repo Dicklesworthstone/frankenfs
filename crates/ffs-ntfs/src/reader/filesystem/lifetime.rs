@@ -244,6 +244,18 @@ impl NtfsFs {
         }
     }
 
+    pub(super) fn check_open_capacity(&self) -> Result<()> {
+        let state = locked(&self.lifetime)?;
+        if state.handles.len() >= MAX_HANDLES {
+            return Err(errno(libc::EMFILE));
+        }
+        state
+            .next_handle
+            .checked_add(1)
+            .ok_or_else(|| errno(libc::EOVERFLOW))?;
+        Ok(())
+    }
+
     pub(super) fn register_open(&self, ino: InodeNumber, _flags: i32) -> Result<u64> {
         locked(&self.lifetime)?.register_open(ino)
     }

@@ -287,22 +287,58 @@ impl NtfsFs {
     }
 
     fn check_create_mode(mode: u16, directory: bool) -> Result<bool> {
+        // Linux FUSE passes file-type bits (e.g. S_IFREG = 0o100000) in `mode`
+        // while direct FsOps callers pass permission bits only (`ftype == 0`).
+        let ftype = u32::from(mode) & libc::S_IFMT;
+        let expected_ftype = if directory {
+            libc::S_IFDIR
+        } else {
+            libc::S_IFREG
+        };
+        if ftype != 0 && ftype != expected_ftype {
+            return Err(unsupported(
+                "requested file type does not match NTFS create operation",
+            ));
+        }
+        let perm = mode & 0o7777;
         // NTFS's host projection supports writable (0o644/0o755) and read-only
         // (0o444/0o555 via FILE_ATTRIBUTE_READONLY); never claim a more
         // restrictive Unix mode succeeded while exposing broader access.
-        let read_only = (mode & 0o222) == 0;
+        let read_only = (perm & 0o222) == 0;
         let projected = match (directory, read_only) {
             (true, false) => 0o755,
             (true, true) => 0o555,
             (false, false) => 0o644,
             (false, true) => 0o444,
         };
-        if mode & 0o7000 != 0 || projected & !mode & 0o777 != 0 {
+        if perm & 0o7000 != 0 || projected & !perm & 0o777 != 0 {
             return Err(unsupported(
                 "requested mode cannot be represented by the NTFS host projection",
             ));
         }
         Ok(read_only)
+    }
+
+    pub(super) fn create_open_locked(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        flags: i32,
+    ) -> Result<(InodeAttr, u64, u32)> {
+        let access = flags & libc::O_ACCMODE;
+        if ![libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR].contains(&access) {
+            return Err(invalid_argument());
+        }
+        let read_only = Self::check_create_mode(mode, false)?;
+        if read_only && access != libc::O_RDONLY {
+            return Err(FfsError::PermissionDenied);
+        }
+        self.check_open_capacity()?;
+        let attr = self.create_locked(cx, parent, name, mode)?;
+        let fh = cx.masked(|| self.register_open(attr.ino, flags))?;
+        Ok((attr, fh, 0))
     }
 
     pub(super) fn create_locked(
@@ -397,8 +433,10 @@ impl NtfsFs {
             ));
         }
         if is_ads_ino(ino) {
-            if attrs.mode.is_some_and(|mode| mode != current.perm)
-                || attrs.atime.is_some_and(|atime| atime != current.atime)
+            if attrs.mode.is_some_and(|mode| {
+                let ftype = u32::from(mode) & libc::S_IFMT;
+                (ftype != 0 && ftype != libc::S_IFREG) || (mode & 0o7777) != current.perm
+            }) || attrs.atime.is_some_and(|atime| atime != current.atime)
                 || attrs.mtime.is_some_and(|mtime| mtime != current.mtime)
             {
                 return Err(unsupported(
@@ -416,18 +454,42 @@ impl NtfsFs {
         }
 
         let mut new_read_only = match attrs.mode {
-            Some(mode) if mode != current.perm => match current.kind {
-                FileType::Directory if ino != ROOT && matches!(mode, 0o555 | 0o755) => {
-                    Some(mode == 0o555)
+            Some(raw_mode) => {
+                // Linux FUSE FUSE_SETATTR supplies file-type bits (e.g. S_IFREG | 0o444)
+                // whereas direct FsOps callers pass permission bits (`ftype == 0`).
+                let ftype = u32::from(raw_mode) & libc::S_IFMT;
+                let perm = raw_mode & 0o7777;
+                match current.kind {
+                    FileType::Directory if ftype == 0 || ftype == libc::S_IFDIR => {
+                        if perm == current.perm {
+                            None
+                        } else if ino != ROOT && matches!(perm, 0o555 | 0o755) {
+                            Some(perm == 0o555)
+                        } else {
+                            return Err(unsupported(
+                                "requested mode cannot be represented by the NTFS host projection",
+                            ));
+                        }
+                    }
+                    FileType::RegularFile if ftype == 0 || ftype == libc::S_IFREG => {
+                        if perm == current.perm {
+                            None
+                        } else if matches!(perm, 0o444 | 0o644) {
+                            Some(perm == 0o444)
+                        } else {
+                            return Err(unsupported(
+                                "requested mode cannot be represented by the NTFS host projection",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "requested mode cannot be represented by the NTFS host projection",
+                        ));
+                    }
                 }
-                FileType::RegularFile if matches!(mode, 0o444 | 0o644) => Some(mode == 0o444),
-                _ => {
-                    return Err(unsupported(
-                        "requested mode cannot be represented by the NTFS host projection",
-                    ));
-                }
-            },
-            _ => None,
+            }
+            None => None,
         };
         let mtime_ft = match attrs.mtime {
             Some(mtime) if mtime != current.mtime => Some(system_time_to_filetime(mtime)?),

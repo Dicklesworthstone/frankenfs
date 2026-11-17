@@ -882,6 +882,22 @@ impl FsOps for NtfsFs {
         op.complete(attr)
     }
 
+    fn create_open(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        _uid: u32,
+        _gid: u32,
+        flags: i32,
+    ) -> Result<(InodeAttr, u64, u32)> {
+        let op = self.operation(cx, true)?;
+        let res = self.create_open_locked(cx, parent, name, mode, flags)?;
+        op.complete(res)
+    }
+
     fn mkdir(
         &self,
         cx: &Cx,

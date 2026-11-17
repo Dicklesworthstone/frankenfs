@@ -231,7 +231,11 @@ class Run:
         prefix.with_suffix(".stdout").write_bytes(result.stdout)
         prefix.with_suffix(".stderr").write_bytes(result.stderr)
         prefix.with_suffix(".status").write_text(str(result.returncode) + "\n")
-        require(result.returncode == 0, f"command failed: {argv!r}; see {prefix}.stderr")
+        if result.returncode != 0:
+            err_tail = result.stderr.decode("utf-8", errors="replace").strip()[-1200:]
+            raise RuntimeError(
+                f"command failed ({result.returncode}): {argv!r}; see {prefix}.stderr; stderr={err_tail!r}"
+            )
         return result.stdout
 
     def mount_probe(self, image: Path, manifest: Path, offset: int, length: int) -> dict:

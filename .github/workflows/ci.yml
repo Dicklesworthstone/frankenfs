@@ -15,6 +15,10 @@ jobs:
   lint-and-test:
     name: Lint & Test
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
 
     steps:
       - name: Checkout
@@ -714,6 +718,8 @@ jobs:
             /tmp/ffs-live-tui-*/*-profile.stdout
             /tmp/ffs-live-tui-*/*-profile.stderr
             /tmp/ffs-ntfs-native-*/*.json
+            /tmp/ffs-ntfs-mounted-*/*.json
+            /tmp/ffs-ntfs-mounted-*/*.stderr
             /tmp/ffs-zfs-native-*/*.json
             /tmp/ffs-zpl-native-*/*.json
             /tmp/ffs-snapshots-native-*/*.json

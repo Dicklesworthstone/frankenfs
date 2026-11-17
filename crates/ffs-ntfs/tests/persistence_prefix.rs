@@ -8440,3 +8440,119 @@ fn cli_extended_path_and_stream_workflow_spills_renames_and_reclaims_extension_r
     assert!(post_ownership.is_consistent());
     assert_eq!(post_ownership.extension_records_examined, 0);
 }
+
+#[test]
+fn writable_fs_accepts_fuse_wire_file_type_modes_and_create_open_handles() {
+    use ffs_core::{FsOps, ReleaseRequest, RequestScope, SetAttrRequest};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(2048, 64, 0xF501_0000_0000_9999);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let root = InodeNumber(1);
+    let mut scope = RequestScope::empty();
+
+    let s_ifreg = libc::S_IFREG as u16;
+    let s_ifdir = libc::S_IFDIR as u16;
+
+    // 1. FUSE wire `create_open` passes `S_IFREG | perm` and registers an active handle `fh > 0`.
+    let (file, fh, _) = fs
+        .create_open(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("fuse-meta.bin"),
+            s_ifreg | 0o644,
+            1000,
+            1000,
+            libc::O_RDWR | libc::O_CREAT,
+        )
+        .unwrap();
+    assert!(fh > 0);
+    assert_eq!(file.perm, 0o644);
+    fs.write(&cx, &mut scope, file.ino, 0, b"wire-chmod")
+        .unwrap();
+
+    // 2. FUSE wire `setattr` passes `S_IFREG | 0o444` (and `S_IFREG | 0o644`) while rejecting mismatched `S_IFDIR`.
+    let ro = fs
+        .setattr(
+            &cx,
+            &mut scope,
+            file.ino,
+            &SetAttrRequest {
+                mode: Some(s_ifreg | 0o444),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(ro.perm, 0o444);
+    assert_eq!(
+        fs.open(&cx, &mut scope, file.ino, libc::O_WRONLY)
+            .unwrap_err()
+            .to_errno(),
+        libc::EACCES
+    );
+    assert_eq!(
+        fs.setattr(
+            &cx,
+            &mut scope,
+            file.ino,
+            &SetAttrRequest {
+                mode: Some(s_ifdir | 0o555),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap_err()
+        .to_errno(),
+        libc::EOPNOTSUPP
+    );
+    let rw = fs
+        .setattr(
+            &cx,
+            &mut scope,
+            file.ino,
+            &SetAttrRequest {
+                mode: Some(s_ifreg | 0o644),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(rw.perm, 0o644);
+
+    // 3. Unlinking while `create_open`'s `fh` is still open retains the file until `release(fh)`.
+    fs.unlink(&cx, &mut scope, root, OsStr::new("fuse-meta.bin"))
+        .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 0, 64).unwrap(),
+        b"wire-chmod"
+    );
+    fs.release(
+        &cx,
+        &mut scope,
+        ReleaseRequest {
+            ino: file.ino,
+            fh,
+            flags: libc::O_RDWR,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs.getattr(&cx, &mut scope, file.ino)
+            .unwrap_err()
+            .to_errno(),
+        libc::ENOENT
+    );
+}
