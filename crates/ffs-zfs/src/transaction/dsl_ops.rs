@@ -40,13 +40,14 @@ const DMU_OT_DSL_PROPS: u8 = 15;
 const DMU_OT_DSL_DATASET: u8 = 16;
 const DMU_OT_MASTER_NODE: u8 = 21;
 const DMU_OT_UNLINKED_SET: u8 = 22;
-const DMU_OT_BPOBJ_SUBOBJ: u8 = 36;
-const DMU_OT_DSL_CLONES: u8 = 37;
+const DMU_OT_NEXT_CLONES: u8 = 37;
 const DMU_OT_USERREFS: u8 = 41;
 const DMU_OT_SA: u8 = 44;
 const DMU_OT_SA_MASTER_NODE: u8 = 45;
 const DMU_OT_SA_ATTR_REGISTRATION: u8 = 46;
 const DMU_OT_SA_ATTR_LAYOUTS: u8 = 47;
+const DMU_OT_DSL_CLONES: u8 = 52;
+const DMU_OT_BPOBJ_SUBOBJ: u8 = 53;
 const DMU_OTN_ZAP_METADATA: u8 = 196;
 
 const DS_FLAG_UNIQUE_ACCURATE: u64 = 0x4;
@@ -3050,8 +3051,8 @@ fn stage_create_bookmark(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    validate_dsl_component(bookmark_name, false)?;
-    validate_dsl_component(source_name, !source_is_bookmark)?;
+    validate_dsl_component(bookmark_name, true)?;
+    validate_dsl_component(source_name, true)?;
     if !features
         .write_features
         .contains_key("com.delphix:bookmarks")
@@ -3113,7 +3114,7 @@ fn stage_create_bookmark(
     let (bmark_zapobj, existing_bm_dn, mut bm_entries) = match existing_bm_obj {
         Some(id) if id != 0 => {
             let (dn, c) = mos.object_with_ceiling(cx, id)?;
-            let rows = mos.zap_values(cx, id)?;
+            let rows = mos.zap_values_with_names(cx, id, ZapNamePolicy::AsciiUppercase)?;
             (id, Some((dn, c)), rows)
         }
         _ => {
@@ -3129,7 +3130,10 @@ fn stage_create_bookmark(
         }
     };
 
-    if bm_entries.iter().any(|e| e.name == bookmark_name) {
+    if bm_entries
+        .iter()
+        .any(|e| e.name.eq_ignore_ascii_case(bookmark_name))
+    {
         return Err(FfsError::Exists);
     }
     bm_entries.push(RawZapEntry {
@@ -3138,7 +3142,9 @@ fn stage_create_bookmark(
         values: vec![src_txg, src_time, src_guid],
         collision: 0,
     });
-    features.increment_write("com.delphix:bookmarks", new_txg)?;
+    if existing_bm_dn.is_none() {
+        features.increment_write("com.delphix:bookmarks", new_txg)?;
+    }
 
     write_zap_dnode_in_mos(
         cx,
@@ -3153,7 +3159,7 @@ fn stage_create_bookmark(
         0,
         Vec::new(),
         &bm_entries,
-        0,
+        2,
         true, // multi-u64 array requires Fat-ZAP!
         order,
         new_txg,
@@ -3202,7 +3208,7 @@ fn stage_destroy_bookmark(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    validate_dsl_component(bookmark_name, false)?;
+    validate_dsl_component(bookmark_name, true)?;
     let (_, head_obj, _) = resolve_dataset_ids(cx, mos, dataset)?;
     let mos_meta = mos.meta_dnode().clone();
     let mos_ceiling = mos.root_birth_txg();
@@ -3223,15 +3229,16 @@ fn stage_destroy_bookmark(
         .filter(|&id| id != 0)
         .ok_or_else(|| FfsError::NotFound("ZFS bookmark".into()))?;
     let (bm_dn, bm_ceil) = mos.object_with_ceiling(cx, bmark_zapobj)?;
-    let mut bm_entries = mos.zap_values(cx, bmark_zapobj)?;
+    let mut bm_entries =
+        mos.zap_values_with_names(cx, bmark_zapobj, ZapNamePolicy::AsciiUppercase)?;
     let before = bm_entries.len();
     bm_entries.retain(|e| e.name != bookmark_name);
     if bm_entries.len() == before {
         return Err(FfsError::NotFound("ZFS bookmark".into()));
     }
-    features.decrement_write("com.delphix:bookmarks")?;
 
     if bm_entries.is_empty() {
+        features.decrement_write("com.delphix:bookmarks")?;
         free_mos_object_completely(
             cx,
             mos,
@@ -3277,7 +3284,7 @@ fn stage_destroy_bookmark(
             0,
             Vec::new(),
             &bm_entries,
-            0,
+            2,
             true,
             order,
             new_txg,
@@ -3352,7 +3359,7 @@ fn read_bookmarks_on_head(
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    for row in mos.zap_values(cx, bm_obj)? {
+    for row in mos.zap_values_with_names(cx, bm_obj, ZapNamePolicy::AsciiUppercase)? {
         if row.integer_bytes != 8 || row.values.len() < 3 {
             return Err(corrupt("invalid ZFS bookmark entry width"));
         }
@@ -3794,6 +3801,312 @@ fn build_fresh_zpl_objectset(
     Ok((os_bp, zpl_born))
 }
 
+/// Resolve OpenZFS `dp->dp_origin_snap` (`$ORIGIN@$ORIGIN`) as `(origin_dd_obj, origin_head_obj, origin_snap_obj)`
+/// if the pool contains the special `$ORIGIN` directory under MOS Object 1 `"root_dataset"`.
+fn lookup_pool_origin_snapshot(
+    cx: &Cx,
+    mos: &mut Objects,
+    mos_meta: &Dnode,
+    mos_ceiling: u64,
+    mos_dirty_dnodes: &BTreeMap<u64, Vec<u8>>,
+    order: Endian,
+) -> Result<Option<(u64, u64, u64)>> {
+    let dir_entries = mos.zap_values(cx, 1)?;
+    let Some(root_dd_obj) = zap_optional_u64(&dir_entries, b"root_dataset")?.filter(|&id| id != 0)
+    else {
+        return Ok(None);
+    };
+    let (root_dd_dn, _) = read_staged_or_committed_dnode(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        root_dd_obj,
+        order,
+    )?;
+    let root_child_zap = order
+        .u64(root_dd_dn.bonus(), 32)
+        .map_err(|e| parse_err(&e))?;
+    if root_child_zap == 0 {
+        return Ok(None);
+    }
+    let root_children = mos.zap_values(cx, root_child_zap)?;
+    let Some(origin_dd_obj) = zap_optional_u64(&root_children, b"$ORIGIN")?.filter(|&id| id != 0)
+    else {
+        return Ok(None);
+    };
+    let (origin_dd_dn, _) = read_staged_or_committed_dnode(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        origin_dd_obj,
+        order,
+    )?;
+    let origin_head_obj = order
+        .u64(origin_dd_dn.bonus(), 8)
+        .map_err(|e| parse_err(&e))?;
+    if origin_head_obj == 0 {
+        return Ok(None);
+    }
+    let (origin_head_dn, _) = read_staged_or_committed_dnode(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        origin_head_obj,
+        order,
+    )?;
+    let origin_snap_obj = order
+        .u64(origin_head_dn.bonus(), 8)
+        .map_err(|e| parse_err(&e))?;
+    if origin_snap_obj == 0 {
+        return Ok(None);
+    }
+    Ok(Some((origin_dd_obj, origin_head_obj, origin_snap_obj)))
+}
+
+/// Write a newly created `dsl_dir` (`DMU_OT_DSL_DIR`), automatically zapifying with
+/// `filesystem_count = 0` and `snapshot_count = 0` when `com.joyent:filesystem_limits` is active.
+#[allow(clippy::too_many_arguments)]
+fn put_new_dsl_dir_in_mos(
+    cx: &Cx,
+    mos: &mut Objects,
+    mos_meta: &Dnode,
+    mos_ceiling: u64,
+    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    features: &mut MosFeatureState,
+    alloc: &mut PoolSpaceAllocator,
+    dd_obj: u64,
+    dd_bonus: Vec<u8>,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<()> {
+    let fs_ss_limit_active = features
+        .read_features
+        .get("com.joyent:filesystem_limits")
+        .copied()
+        .unwrap_or(0)
+        > 0;
+    if fs_ss_limit_active {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+        let entries = [
+            RawZapEntry {
+                name: b"com.joyent:filesystem_count".to_vec(),
+                integer_bytes: 8,
+                values: vec![0],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"com.joyent:snapshot_count".to_vec(),
+                integer_bytes: 8,
+                values: vec![0],
+                collision: 0,
+            },
+        ];
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            dd_obj,
+            None,
+            DMU_OTN_ZAP_METADATA,
+            DMU_OT_DSL_DIR,
+            dd_bonus,
+            &entries,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
+        )
+    } else {
+        let dd_dn = Dnode::from_spec(DnodeSpec {
+            object_type: DMU_OT_DSL_DIR,
+            bonus_type: DMU_OT_DSL_DIR,
+            checksum_type: 0,
+            compress_type: 0,
+            flags: DNODE_FLAG_USED_BYTES,
+            order,
+            levels: 1,
+            indirect_shift: 17,
+            data_bytes: 512,
+            max_block: 0,
+            used_bytes: 0,
+            slots: 1,
+            pointers: vec![BlockPointer::hole_pointer()],
+            bonus: dd_bonus,
+            spill: None,
+        })
+        .map_err(|e| parse_err(&e))?;
+        put_dnode_in_table(
+            cx,
+            mos,
+            mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            dd_obj,
+            &dd_dn,
+        )
+    }
+}
+
+/// Link a newly created head dataset (`child_head_obj`) as a clone/branch of `origin_snap_obj`
+/// (`ds_num_children += 1`, `ds_next_clones_obj` with `DMU_OT_NEXT_CLONES`, and `origin_dd.dd_clones`
+/// with `DMU_OT_DSL_CLONES`, matching OpenZFS `dsl_dataset_create_sync_dd`).
+#[allow(clippy::too_many_arguments)]
+fn link_dataset_to_origin_snapshot(
+    cx: &Cx,
+    mos: &mut Objects,
+    mos_meta: &Dnode,
+    mos_ceiling: u64,
+    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    alloc: &mut PoolSpaceAllocator,
+    origin_dd_obj: u64,
+    origin_snap_obj: u64,
+    child_head_obj: u64,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<()> {
+    let (o_snap_dn, _) = read_staged_or_committed_dnode(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        origin_snap_obj,
+        order,
+    )?;
+    let o_num_children = order
+        .u64(o_snap_dn.bonus(), 40)
+        .map_err(|e| parse_err(&e))?;
+    let o_next_clones = order
+        .u64(o_snap_dn.bonus(), 256)
+        .map_err(|e| parse_err(&e))?;
+
+    let (nc_obj, nc_existing, mut nc_entries) = if o_next_clones == 0 {
+        let id = allocate_object_id(cx, mos, mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+        (id, None, Vec::new())
+    } else {
+        let (dn, c) = mos.object_with_ceiling(cx, o_next_clones)?;
+        let rows = mos.zap_values(cx, o_next_clones)?;
+        (o_next_clones, Some((dn, c)), rows)
+    };
+    nc_entries.push(RawZapEntry {
+        name: format!("{child_head_obj:x}").into_bytes(),
+        integer_bytes: 8,
+        values: vec![child_head_obj],
+        collision: 0,
+    });
+    write_zap_dnode_in_mos(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        alloc,
+        nc_obj,
+        nc_existing.as_ref().map(|(d, c)| (d, *c)),
+        DMU_OT_NEXT_CLONES,
+        0,
+        Vec::new(),
+        &nc_entries,
+        0,
+        false,
+        order,
+        new_txg,
+        staged_writes,
+    )?;
+    let mut o_snap_bonus = o_snap_dn.bonus().to_vec();
+    o_snap_bonus[40..48].copy_from_slice(&order.encode(o_num_children + 1));
+    o_snap_bonus[256..264].copy_from_slice(&order.encode(nc_obj));
+    let mut updated_o_snap = o_snap_dn;
+    let os_btype = updated_o_snap.bonus_type();
+    updated_o_snap
+        .set_bonus_and_spill(os_btype, o_snap_bonus, None)
+        .map_err(|e| parse_err(&e))?;
+    put_dnode_in_table(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        origin_snap_obj,
+        &updated_o_snap,
+    )?;
+
+    let (o_dd_dn, _) = read_staged_or_committed_dnode(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        origin_dd_obj,
+        order,
+    )?;
+    let cur_dd_clones = order.u64(o_dd_dn.bonus(), 144).map_err(|e| parse_err(&e))?;
+    let (ddc_obj, ddc_existing, mut ddc_entries) = if cur_dd_clones == 0 {
+        let id = allocate_object_id(cx, mos, mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+        (id, None, Vec::new())
+    } else {
+        let (dn, c) = mos.object_with_ceiling(cx, cur_dd_clones)?;
+        let rows = mos.zap_values(cx, cur_dd_clones)?;
+        (cur_dd_clones, Some((dn, c)), rows)
+    };
+    ddc_entries.push(RawZapEntry {
+        name: format!("{child_head_obj:x}").into_bytes(),
+        integer_bytes: 8,
+        values: vec![child_head_obj],
+        collision: 0,
+    });
+    write_zap_dnode_in_mos(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        alloc,
+        ddc_obj,
+        ddc_existing.as_ref().map(|(d, c)| (d, *c)),
+        DMU_OT_DSL_CLONES,
+        0,
+        Vec::new(),
+        &ddc_entries,
+        0,
+        false,
+        order,
+        new_txg,
+        staged_writes,
+    )?;
+    if cur_dd_clones == 0 {
+        let mut o_dd_bonus = o_dd_dn.bonus().to_vec();
+        o_dd_bonus[144..152].copy_from_slice(&order.encode(ddc_obj));
+        let mut updated_o_dd = o_dd_dn;
+        let btype = updated_o_dd.bonus_type();
+        updated_o_dd
+            .set_bonus_and_spill(btype, o_dd_bonus, None)
+            .map_err(|e| parse_err(&e))?;
+        put_dnode_in_table(
+            cx,
+            mos,
+            mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            origin_dd_obj,
+            &updated_o_dd,
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage_create_dataset(
     cx: &Cx,
@@ -3900,38 +4213,54 @@ fn stage_create_dataset(
         staged_writes,
     )?;
 
-    let new_deadlist_obj = if let Some(empty_id) = empty_bpobj_id {
-        if features
-            .write_features
-            .contains_key("com.delphix:empty_bpobj")
-        {
-            features.increment_write("com.delphix:empty_bpobj", new_txg)?;
-        }
-        empty_id
-    } else {
-        let mut s = BTreeSet::new();
-        s.insert(0);
-        allocate_fresh_deadlist(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            features,
-            alloc,
-            None,
-            &s,
-            &[],
-            order,
-            new_txg,
-            staged_writes,
-        )?
-    };
+    let pool_origin =
+        lookup_pool_origin_snapshot(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, order)?;
+    let (origin_snap_obj, origin_creation_txg, inherited_flags) =
+        if let Some((_, _, orig_snap_id)) = pool_origin {
+            let (orig_snap_dn, _) = read_staged_or_committed_dnode(
+                cx,
+                mos,
+                &mos_meta,
+                mos_ceiling,
+                mos_dirty_dnodes,
+                orig_snap_id,
+                order,
+            )?;
+            let c_txg = order
+                .u64(orig_snap_dn.bonus(), 56)
+                .map_err(|e| parse_err(&e))?;
+            let o_flags = order
+                .u64(orig_snap_dn.bonus(), 120)
+                .map_err(|e| parse_err(&e))?;
+            (orig_snap_id, c_txg, o_flags & 0x1_0006)
+        } else {
+            (0, 0, 0)
+        };
+
+    let mut dl_keys = BTreeSet::new();
+    dl_keys.insert(0);
+    let new_deadlist_obj = allocate_fresh_deadlist(
+        cx,
+        mos,
+        &mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        features,
+        alloc,
+        empty_bpobj_id,
+        &dl_keys,
+        &[],
+        order,
+        new_txg,
+        staged_writes,
+    )?;
 
     let ds_guid = derive_unique_guid(pool_guid, new_txg, new_head_obj, 2);
     let ds_fsid = derive_fsid_guid(ds_guid);
     let mut head_bonus = vec![0_u8; 320];
     head_bonus[0..8].copy_from_slice(&order.encode(new_dd_obj));
+    head_bonus[8..16].copy_from_slice(&order.encode(origin_snap_obj));
+    head_bonus[16..24].copy_from_slice(&order.encode(origin_creation_txg));
     head_bonus[32..40].copy_from_slice(&order.encode(new_snapmap_zap));
     head_bonus[48..56].copy_from_slice(&order.encode(timestamp.seconds.cast_unsigned()));
     head_bonus[56..64].copy_from_slice(&order.encode(new_txg));
@@ -3942,7 +4271,7 @@ fn stage_create_dataset(
     head_bonus[96..104].copy_from_slice(&order.encode(os_space.dsize));
     head_bonus[104..112].copy_from_slice(&order.encode(ds_fsid));
     head_bonus[112..120].copy_from_slice(&order.encode(ds_guid));
-    head_bonus[120..128].copy_from_slice(&order.encode(DS_FLAG_UNIQUE_ACCURATE));
+    head_bonus[120..128].copy_from_slice(&order.encode(inherited_flags | DS_FLAG_UNIQUE_ACCURATE));
     head_bonus[128..256].copy_from_slice(&new_os_bp.encode(order));
 
     let head_dn = Dnode::from_spec(DnodeSpec {
@@ -3977,6 +4306,7 @@ fn stage_create_dataset(
     dd_bonus[0..8].copy_from_slice(&order.encode(timestamp.seconds.cast_unsigned()));
     dd_bonus[8..16].copy_from_slice(&order.encode(new_head_obj));
     dd_bonus[16..24].copy_from_slice(&order.encode(parent_dd_obj));
+    dd_bonus[24..32].copy_from_slice(&order.encode(origin_snap_obj));
     dd_bonus[32..40].copy_from_slice(&order.encode(new_child_zap));
     dd_bonus[40..48].copy_from_slice(&order.encode(os_space.dsize));
     dd_bonus[48..56].copy_from_slice(&order.encode(os_space.comp));
@@ -3985,33 +4315,37 @@ fn stage_create_dataset(
     dd_bonus[96..104].copy_from_slice(&order.encode(DD_FLAG_USED_BREAKDOWN));
     dd_bonus[104..112].copy_from_slice(&order.encode(os_space.dsize)); // DD_USED_HEAD
 
-    let dd_dn = Dnode::from_spec(DnodeSpec {
-        object_type: DMU_OT_DSL_DIR,
-        bonus_type: DMU_OT_DSL_DIR,
-        checksum_type: 0,
-        compress_type: 0,
-        flags: DNODE_FLAG_USED_BYTES,
-        order,
-        levels: 1,
-        indirect_shift: 17,
-        data_bytes: 512,
-        max_block: 0,
-        used_bytes: 0,
-        slots: 1,
-        pointers: vec![BlockPointer::hole_pointer()],
-        bonus: dd_bonus,
-        spill: None,
-    })
-    .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
+    put_new_dsl_dir_in_mos(
         cx,
         mos,
         &mos_meta,
         mos_ceiling,
         mos_dirty_dnodes,
+        features,
+        alloc,
         new_dd_obj,
-        &dd_dn,
+        dd_bonus,
+        order,
+        new_txg,
+        staged_writes,
     )?;
+
+    if let Some((origin_dd_obj, _, orig_snap_id)) = pool_origin {
+        link_dataset_to_origin_snapshot(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            origin_dd_obj,
+            orig_snap_id,
+            new_head_obj,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    }
 
     // Link into `parent_dd.dd_child_dir_zapobj` and propagate `os_space` up `parent_dd_obj`!
     let (p_cz_dn, p_cz_ceil) = mos.object_with_ceiling(cx, p_child_zap)?;
@@ -4160,9 +4494,6 @@ fn stage_create_clone(
     let o_prev_txg = order
         .u64(o_snap_dn.bonus(), 16)
         .map_err(|e| parse_err(&e))?;
-    let o_num_children = order
-        .u64(o_snap_dn.bonus(), 40)
-        .map_err(|e| parse_err(&e))?;
     let o_creation_txg = order
         .u64(o_snap_dn.bonus(), 56)
         .map_err(|e| parse_err(&e))?;
@@ -4174,9 +4505,6 @@ fn stage_create_clone(
         .map_err(|e| parse_err(&e))?;
     let o_uncomp_bytes = order
         .u64(o_snap_dn.bonus(), 88)
-        .map_err(|e| parse_err(&e))?;
-    let o_next_clones = order
-        .u64(o_snap_dn.bonus(), 256)
         .map_err(|e| parse_err(&e))?;
 
     let (tp_dd_dn, _) = read_staged_or_committed_dnode(
@@ -4315,148 +4643,35 @@ fn stage_create_clone(
     dd_bonus[80..88].copy_from_slice(&order.encode(clone_props_zap));
     dd_bonus[96..104].copy_from_slice(&order.encode(DD_FLAG_USED_BREAKDOWN));
 
-    let clone_dd_dn = Dnode::from_spec(DnodeSpec {
-        object_type: DMU_OT_DSL_DIR,
-        bonus_type: DMU_OT_DSL_DIR,
-        checksum_type: 0,
-        compress_type: 0,
-        flags: DNODE_FLAG_USED_BYTES,
-        order,
-        levels: 1,
-        indirect_shift: 17,
-        data_bytes: 512,
-        max_block: 0,
-        used_bytes: 0,
-        slots: 1,
-        pointers: vec![BlockPointer::hole_pointer()],
-        bonus: dd_bonus,
-        spill: None,
-    })
-    .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
+    put_new_dsl_dir_in_mos(
         cx,
         mos,
         &mos_meta,
         mos_ceiling,
         mos_dirty_dnodes,
+        features,
+        alloc,
         clone_dd_obj,
-        &clone_dd_dn,
+        dd_bonus,
+        order,
+        new_txg,
+        staged_writes,
     )?;
 
-    // Update `origin_snap` (`ds_num_children += 1` + `ds_next_clones_obj`).
-    let (nc_obj, nc_existing, mut nc_entries) = if o_next_clones == 0 {
-        let id = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-        (id, None, Vec::new())
-    } else {
-        let (dn, c) = mos.object_with_ceiling(cx, o_next_clones)?;
-        let rows = mos.zap_values(cx, o_next_clones)?;
-        (o_next_clones, Some((dn, c)), rows)
-    };
-    nc_entries.push(RawZapEntry {
-        name: format!("{clone_head_obj:x}").into_bytes(),
-        integer_bytes: 8,
-        values: vec![clone_head_obj],
-        collision: 0,
-    });
-    write_zap_dnode_in_mos(
+    link_dataset_to_origin_snapshot(
         cx,
         mos,
         &mos_meta,
         mos_ceiling,
         mos_dirty_dnodes,
         alloc,
-        nc_obj,
-        nc_existing.as_ref().map(|(d, c)| (d, *c)),
-        DMU_OT_DSL_CLONES,
-        0,
-        Vec::new(),
-        &nc_entries,
-        0,
-        false,
-        order,
-        new_txg,
-        staged_writes,
-    )?;
-    let mut o_snap_bonus = o_snap_dn.bonus().to_vec();
-    o_snap_bonus[40..48].copy_from_slice(&order.encode(o_num_children + 1));
-    o_snap_bonus[256..264].copy_from_slice(&order.encode(nc_obj));
-    let mut updated_o_snap = o_snap_dn;
-    let os_btype = updated_o_snap.bonus_type();
-    updated_o_snap
-        .set_bonus_and_spill(os_btype, o_snap_bonus, None)
-        .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        origin_snap_obj,
-        &updated_o_snap,
-    )?;
-
-    // Update `origin_dd.dd_clones` (`144..152`).
-    let (o_dd_dn, _) = read_staged_or_committed_dnode(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
         origin_dd_obj,
-        order,
-    )?;
-    let cur_dd_clones = order.u64(o_dd_dn.bonus(), 144).map_err(|e| parse_err(&e))?;
-    let (ddc_obj, ddc_existing, mut ddc_entries) = if cur_dd_clones == 0 {
-        let id = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-        (id, None, Vec::new())
-    } else {
-        let (dn, c) = mos.object_with_ceiling(cx, cur_dd_clones)?;
-        let rows = mos.zap_values(cx, cur_dd_clones)?;
-        (cur_dd_clones, Some((dn, c)), rows)
-    };
-    ddc_entries.push(RawZapEntry {
-        name: format!("{clone_head_obj:x}").into_bytes(),
-        integer_bytes: 8,
-        values: vec![clone_head_obj],
-        collision: 0,
-    });
-    write_zap_dnode_in_mos(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        alloc,
-        ddc_obj,
-        ddc_existing.as_ref().map(|(d, c)| (d, *c)),
-        DMU_OT_DSL_CLONES,
-        0,
-        Vec::new(),
-        &ddc_entries,
-        0,
-        false,
+        origin_snap_obj,
+        clone_head_obj,
         order,
         new_txg,
         staged_writes,
     )?;
-    if cur_dd_clones == 0 {
-        let mut o_dd_bonus = o_dd_dn.bonus().to_vec();
-        o_dd_bonus[144..152].copy_from_slice(&order.encode(ddc_obj));
-        let mut updated_o_dd = o_dd_dn;
-        let btype = updated_o_dd.bonus_type();
-        updated_o_dd
-            .set_bonus_and_spill(btype, o_dd_bonus, None)
-            .map_err(|e| parse_err(&e))?;
-        put_dnode_in_table(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            origin_dd_obj,
-            &updated_o_dd,
-        )?;
-    }
 
     // Link into `target_parent.dd_child_dir_zapobj`.
     let (tp_cz_dn, tp_cz_ceil) = mos.object_with_ceiling(cx, tp_child_zap)?;
@@ -4767,6 +4982,17 @@ fn stage_rename_dataset(
         target_dd_obj,
         order,
     )?;
+    let (moved_fs_cnt, moved_ss_cnt) = if t_cur.object_type() == DMU_OTN_ZAP_METADATA {
+        let t_entries = mos.zap_values(cx, target_dd_obj)?;
+        let sub_fs = zap_optional_u64(&t_entries, b"com.joyent:filesystem_count")?.unwrap_or(0);
+        let sub_ss = zap_optional_u64(&t_entries, b"com.joyent:snapshot_count")?.unwrap_or(0);
+        (
+            i64::try_from(sub_fs.saturating_add(1)).unwrap_or(i64::MAX),
+            i64::try_from(sub_ss).unwrap_or(i64::MAX),
+        )
+    } else {
+        (1_i64, 0_i64)
+    };
     let mut t_bonus = t_cur.bonus().to_vec();
     t_bonus[16..24].copy_from_slice(&order.encode(new_parent_dd));
     let mut updated_t = t_cur;
@@ -4783,6 +5009,67 @@ fn stage_rename_dataset(
         target_dd_obj,
         &updated_t,
     )?;
+
+    bump_filesystem_limits_counter_if_present(
+        cx,
+        mos,
+        &mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        alloc,
+        old_parent_dd,
+        b"com.joyent:filesystem_count",
+        -moved_fs_cnt,
+        order,
+        new_txg,
+        staged_writes,
+    )?;
+    if moved_ss_cnt > 0 {
+        bump_filesystem_limits_counter_if_present(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            old_parent_dd,
+            b"com.joyent:snapshot_count",
+            -moved_ss_cnt,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    }
+    bump_filesystem_limits_counter_if_present(
+        cx,
+        mos,
+        &mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        alloc,
+        new_parent_dd,
+        b"com.joyent:filesystem_count",
+        moved_fs_cnt,
+        order,
+        new_txg,
+        staged_writes,
+    )?;
+    if moved_ss_cnt > 0 {
+        bump_filesystem_limits_counter_if_present(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            new_parent_dd,
+            b"com.joyent:snapshot_count",
+            moved_ss_cnt,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    }
 
     Ok(target_head_obj)
 }
@@ -4901,10 +5188,7 @@ fn stage_destroy_dataset(
         if let Some(bm_obj) =
             zap_optional_u64(&head_entries, b"com.delphix:bookmarks")?.filter(|&id| id != 0)
         {
-            let bm_rows = mos.zap_values(cx, bm_obj)?;
-            for _ in &bm_rows {
-                features.decrement_write("com.delphix:bookmarks")?;
-            }
+            features.decrement_write("com.delphix:bookmarks")?;
             free_mos_object_completely(
                 cx,
                 mos,
@@ -5195,8 +5479,15 @@ fn stage_destroy_dataset(
             }
         }
 
+        let pool_origin_snap =
+            lookup_pool_origin_snapshot(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, order)?
+                .map(|(_, _, snap_id)| snap_id);
         let o_held = o_ur_obj != 0 && !mos.zap_values(cx, o_ur_obj)?.is_empty();
-        if o_flags & DS_FLAG_DEFER_DESTROY != 0 && new_o_children == 1 && !o_held {
+        if Some(origin_obj) != pool_origin_snap
+            && o_flags & DS_FLAG_DEFER_DESTROY != 0
+            && new_o_children == 1
+            && !o_held
+        {
             stage_destroy_snapshot_by_id(
                 cx,
                 mos,

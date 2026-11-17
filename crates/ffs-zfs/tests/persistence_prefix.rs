@@ -6779,7 +6779,7 @@ fn dsl_dataset_snapshot_clone_hold_bookmark_defer_destroy_and_reclamation() {
     // 1. Create child dataset `data/workspace` with initial user + numeric properties.
     let data_ds = vec![b"data".to_vec()];
     let child_ds = vec![b"data".to_vec(), b"workspace".to_vec()];
-    let (_, _) = engine
+    let (ws_head_obj, _) = engine
         .create_dataset(
             &cx,
             &data_ds,
@@ -6795,6 +6795,49 @@ fn dsl_dataset_snapshot_clone_hold_bookmark_defer_destroy_and_reclamation() {
         )
         .into_result()
         .expect("create_dataset data/workspace");
+
+    // Verify OpenZFS `$ORIGIN@$ORIGIN` (`dp_origin_snap` = Object 26) linkage & dedicated `DMU_OT_DEADLIST` (50)!
+    {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let ws_head_dn = mos.object(&cx, ws_head_obj).unwrap();
+        let ws_dd_obj = ws_head_dn.order().u64(ws_head_dn.bonus(), 0).unwrap();
+        let ws_prev_snap = ws_head_dn.order().u64(ws_head_dn.bonus(), 8).unwrap();
+        let ws_prev_txg = ws_head_dn.order().u64(ws_head_dn.bonus(), 16).unwrap();
+        let ws_dl_obj = ws_head_dn.order().u64(ws_head_dn.bonus(), 64).unwrap();
+        assert_eq!(
+            ws_prev_snap, 26,
+            "new dataset must link ds_prev_snap_obj to $ORIGIN@$ORIGIN"
+        );
+        assert_eq!(
+            ws_prev_txg, 1,
+            "new dataset must inherit $ORIGIN@$ORIGIN ds_creation_txg"
+        );
+        assert_ne!(
+            ws_dl_obj, 13,
+            "writable head dataset must never alias shared empty_bpobj"
+        );
+        assert_eq!(mos.object(&cx, ws_dl_obj).unwrap().object_type(), 50);
+
+        let ws_dd_dn = mos.object(&cx, ws_dd_obj).unwrap();
+        assert_eq!(
+            ws_dd_dn.order().u64(ws_dd_dn.bonus(), 24).unwrap(),
+            26,
+            "new dsl_dir must link dd_origin_obj to $ORIGIN@$ORIGIN"
+        );
+        let origin_snap_dn = mos.object(&cx, 26).unwrap();
+        assert_eq!(
+            origin_snap_dn
+                .order()
+                .u64(origin_snap_dn.bonus(), 40)
+                .unwrap(),
+            4,
+            "$ORIGIN@$ORIGIN ds_num_children must increment for new dataset"
+        );
+        let origin_dd_dn = mos.object(&cx, 24).unwrap();
+        let origin_dd_clones = origin_dd_dn.order().u64(origin_dd_dn.bonus(), 144).unwrap();
+        assert_ne!(origin_dd_clones, 0);
+        assert_eq!(mos.object(&cx, origin_dd_clones).unwrap().object_type(), 52);
+    }
 
     // Populate a file in `data/workspace` (root dir of newly created dataset is Object 3).
     let (note_obj, _) = engine
@@ -6866,6 +6909,15 @@ fn dsl_dataset_snapshot_clone_hold_bookmark_defer_destroy_and_reclamation() {
             .find(|e| e.name == b"com.delphix:extensible_dataset")
             .unwrap();
         assert!(ext_ds.value >= 1);
+        let wf = mos.zap(&cx, 11).unwrap();
+        let bm_feat = wf
+            .iter()
+            .find(|e| e.name == b"com.delphix:bookmarks")
+            .unwrap();
+        assert_eq!(
+            bm_feat.value, 1,
+            "com.delphix:bookmarks refcount tracks per-dataset ds_bookmarks_obj ZAP"
+        );
         let cur_snap = device.durable_snapshot();
         let cfg_off = usize::try_from(LABEL_CONFIG_OFFSET).unwrap();
         let cfg_slice_old = &initial_label_bytes[cfg_off..cfg_off + LABEL_CONFIG_BYTES];
