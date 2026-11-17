@@ -233,7 +233,7 @@ fn native_root_directory_replays_but_bootstrap_records_and_root_impostors_do_not
             for extension in [false, true] {
                 input.raw = original.clone();
                 if extension {
-                    input.raw[32..40].copy_from_slice(&((7_u64 << 48) | 42).to_le_bytes());
+                    input.raw[32..40].copy_from_slice(&((0x07_u64 << 48) | 0x2a).to_le_bytes());
                 } else {
                     input.raw[22..24].copy_from_slice(&1_u16.to_le_bytes());
                 }

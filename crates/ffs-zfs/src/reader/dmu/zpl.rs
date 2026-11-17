@@ -54,6 +54,7 @@ struct ZilOverlay {
 pub struct Zpl {
     objects: Objects,
     pub root: u64,
+    delete_queue: Option<u64>,
     pub dataset_guid: u64,
     pub version: u64,
     registry: Option<SaRegistry>,
@@ -159,6 +160,7 @@ impl Zpl {
     ) -> Result<Self> {
         let master = typed_map(&mut objects, cx, 1, 21)?;
         let root = required(&master, b"ROOT")?;
+        let delete_queue = value(&master, b"DELETE_QUEUE").filter(|id| *id != 0);
         let version = required(&master, b"VERSION")?;
         let utf8 = value(&master, b"utf8only").unwrap_or(0);
         if !(1..=5).contains(&version)
@@ -198,6 +200,7 @@ impl Zpl {
         let mut zpl = Self {
             objects,
             root,
+            delete_queue,
             dataset_guid,
             version,
             registry,
@@ -990,6 +993,21 @@ impl Zpl {
         self.committed_file(cx, number, private_xattr)
     }
 
+    fn is_in_delete_queue(&mut self, cx: &Cx, number: u64) -> Result<bool> {
+        let Some(queue_obj) = self.delete_queue else {
+            return Ok(false);
+        };
+        let dmu_ot = self.objects.object(cx, queue_obj)?.object_type();
+        if dmu_ot != 22 {
+            return Err(corrupt("ZPL DELETE_QUEUE has the wrong object type"));
+        }
+        let entries = self.objects.zap(cx, queue_obj)?;
+        let key = format!("{number:x}");
+        Ok(entries
+            .iter()
+            .any(|entry| entry.name == key.as_bytes() && entry.value == number))
+    }
+
     fn committed_file(
         &mut self,
         cx: &Cx,
@@ -1018,10 +1036,14 @@ impl Zpl {
                 .map_err(|error| parse(&error))?,
             _ => return Err(unsupported("unknown ZPL bonus representation")),
         };
+        let valid_zero_links = metadata.links == 0
+            && !private_xattr
+            && metadata.kind == Kind::Regular
+            && self.is_in_delete_queue(cx, number)?;
         if (metadata.kind == Kind::Directory) != (node.object_type() == 20)
             || metadata.generation > object.ceiling
             || metadata.generation > self.objects.txg
-            || metadata.links == 0
+            || (metadata.links == 0 && !valid_zero_links)
         {
             return Err(corrupt(
                 "ZPL kind, creation generation or live link count is inconsistent",
@@ -1121,6 +1143,11 @@ impl Zpl {
                 };
                 self.component(&entry.name)?;
                 let (_, metadata) = self.file(cx, object)?;
+                if metadata.links == 0 {
+                    return Err(corrupt(
+                        "ZPL kind, creation generation or live link count is inconsistent",
+                    ));
+                }
                 if metadata.kind == Kind::Directory
                     && (object == self.root
                         || object == number
@@ -1145,6 +1172,11 @@ impl Zpl {
             self.component(&entry.name)?;
             let (object, tag) = directory_reference(entry.value).map_err(|error| parse(&error))?;
             let (_, metadata) = self.file(cx, object)?;
+            if metadata.links == 0 {
+                return Err(corrupt(
+                    "ZPL kind, creation generation or live link count is inconsistent",
+                ));
+            }
             if tag.is_some_and(|kind| kind != metadata.kind) {
                 return Err(corrupt("ZPL directory tag disagrees with target mode"));
             }
@@ -1178,6 +1210,11 @@ impl Zpl {
                 };
                 self.component(&name)?;
                 let (_, metadata) = self.file(cx, object)?;
+                if metadata.links == 0 {
+                    return Err(corrupt(
+                        "ZPL kind, creation generation or live link count is inconsistent",
+                    ));
+                }
                 if metadata.kind == Kind::Directory
                     && (object == self.root
                         || object == number

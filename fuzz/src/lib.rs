@@ -83,13 +83,17 @@ impl<'a> ByteCursor<'a> {
         if max_len == 0 {
             return Vec::new();
         }
-        let available = self.remainder().len();
-        if available == 0 {
+        let raw_len = usize::from(self.next_u16());
+        let rem = self.remainder();
+        if rem.is_empty() {
             return Vec::new();
         }
-        let wanted = (usize::from(self.next_u16()) % (max_len + 1)).min(available);
-        let out = self.data[self.pos..self.pos + wanted].to_vec();
-        self.pos += wanted;
+        let wanted = max_len
+            .checked_add(1)
+            .map_or(raw_len, |m| raw_len % m)
+            .min(rem.len());
+        let out = rem[..wanted].to_vec();
+        self.pos = self.pos.saturating_add(wanted);
         out
     }
 
@@ -2006,6 +2010,27 @@ mod tests {
                 assert_eq!(opened_part.format, FsFormatKind::Fat16);
                 disk_dev.assert_invariants();
             }
+        }
+    }
+
+    #[test]
+    fn byte_cursor_next_vec_handles_short_tail_and_max_len_without_panic() {
+        // Exact minimized libFuzzer reproducer where 1 byte remained before next_u16()
+        // advanced self.pos past self.data.len().
+        let repro = [0x69, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x64];
+        let mut cursor = ByteCursor::new(&repro);
+        for _ in 0..7 {
+            let _ = cursor.next_u8();
+        }
+        assert_eq!(cursor.remainder().len(), 1);
+        assert_eq!(cursor.next_vec(64).len(), 0);
+        assert_eq!(cursor.remainder().len(), 0);
+
+        for len in 0..=4 {
+            let buf = vec![0xff_u8; len];
+            let mut c = ByteCursor::new(&buf);
+            let out = c.next_vec(usize::MAX);
+            assert!(out.len() <= len.saturating_sub(2));
         }
     }
 }

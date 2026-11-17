@@ -558,12 +558,20 @@ impl ZfsTransactionEngine {
                         mmp_active = true;
                     }
                     max_ring_txg = max_ring_txg.max(ub.txg);
-                    if l_idx == options.label
-                        && s_idx == options.slot
-                        && selected_ub_from_scan.is_none()
-                    {
-                        selected_ub_from_scan =
-                            Some((m_idx, ub, ub_order, Some(mmp.software_version)));
+                    let matches_slot = s_idx == options.slot
+                        && (l_idx == options.label || options.reconcile_torn_uberblocks);
+                    if matches_slot {
+                        let replace = match &selected_ub_from_scan {
+                            None => true,
+                            Some((_, prev_ub, _, _)) => {
+                                ub.txg > prev_ub.txg
+                                    || (ub.txg == prev_ub.txg && l_idx == options.label)
+                            }
+                        };
+                        if replace {
+                            selected_ub_from_scan =
+                                Some((m_idx, ub, ub_order, Some(mmp.software_version)));
+                        }
                     }
                 }
             }
@@ -598,7 +606,15 @@ impl ZfsTransactionEngine {
             for member in members {
                 for l_idx in 0..4 {
                     let lbl = member.label(cx, l_idx)?;
-                    let other = member.uberblock(cx, &lbl, options.slot)?;
+                    let other = match member.uberblock(cx, &lbl, options.slot) {
+                        Ok(ub) => ub,
+                        Err(e @ (FfsError::Cancelled | FfsError::Io(_))) => return Err(e),
+                        Err(_) => {
+                            return Err(corrupt(
+                                "Uberblock slots disagree across labels or members; explicit reconciliation required",
+                            ));
+                        }
+                    };
                     if !same_uberblock(&other, expected_ub) {
                         return Err(corrupt(
                             "Uberblock slots disagree across labels or members; explicit reconciliation required",

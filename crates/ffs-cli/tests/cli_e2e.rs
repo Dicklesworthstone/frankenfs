@@ -550,7 +550,7 @@ fn native_ntfs_named_stream_catalog_cli_preserves_native_data_and_allocation() {
     // Count the native $Bitmap through ntfs-3g, independently of FrankenFS's
     // allocation report. No FILE slot or directory entry is needed for an ADS.
     let original_bitmap = checked(Path::new("ntfscat"), &["-i", "6", native_path]).stdout;
-    assert!(!original_bitmap.is_empty());
+    assert_ne!(original_bitmap, [] as [u8; 0]);
     let bitmap_allocated = |bitmap: &[u8]| {
         bitmap
             .iter()

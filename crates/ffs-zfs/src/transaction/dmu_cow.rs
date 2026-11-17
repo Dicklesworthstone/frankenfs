@@ -1998,7 +1998,7 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
         if ms.is_dirty() {
             let prelim =
                 ms.build_full_stream(new_txg, order, work_base_alloc.spacemap_v2_active)?;
-            let plan = plan_spacemap_blocks(cx, mos, ms.object, &prelim, min_blk)?;
+            let plan = plan_spacemap_blocks(cx, mos, ms.object, &prelim, min_blk, None)?;
             planned_sm.insert(ms.id, plan);
         }
     }
@@ -2306,7 +2306,8 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
             if ms.is_dirty() {
                 let stream = ms.build_full_stream(new_txg, order, alloc.spacemap_v2_active)?;
                 let base_obj = base_alloc.metaslabs[ms.id].object;
-                let plan = plan_spacemap_blocks(cx, mos, base_obj, &stream, min_blk)?;
+                let prev = planned_sm.get(&ms.id).copied();
+                let plan = plan_spacemap_blocks(cx, mos, base_obj, &stream, min_blk, prev)?;
                 next_planned.insert(ms.id, plan);
             }
         }
@@ -2487,6 +2488,7 @@ fn plan_spacemap_blocks(
     existing_sm_obj: u64,
     stream: &[u8],
     min_blk: usize,
+    prev_plan: Option<(usize, usize, usize)>,
 ) -> Result<(usize, usize, usize)> {
     let existing = if existing_sm_obj != 0 {
         Some(mos.object_with_ceiling(cx, existing_sm_obj)?)
@@ -2499,7 +2501,7 @@ fn plan_spacemap_blocks(
     } else {
         0
     };
-    let bsize = if existing.as_ref().is_some_and(|(dn, _)| dn.max_block() > 0)
+    let mut bsize = if existing.as_ref().is_some_and(|(dn, _)| dn.max_block() > 0)
         || stream.len() > SPACE_MAP_BLOCK_BYTES
     {
         existing
@@ -2513,7 +2515,20 @@ fn plan_spacemap_blocks(
             .next_multiple_of(min_blk)
             .min(SPACE_MAP_BLOCK_BYTES)
     };
-    let num_blocks = stream.len().div_ceil(bsize).max(1);
+    // Enforce monotonic non-decreasing `(bsize, num_blocks)` across passes so an
+    // 8-byte extent coalescing difference between candidate block sizes can never
+    // oscillate `512 <-> 1024` across fixed-point iterations.
+    if let Some((prev_bsize, _, _)) = prev_plan
+        && existing.as_ref().is_none_or(|(dn, _)| dn.max_block() == 0)
+    {
+        bsize = bsize.max(prev_bsize);
+    }
+    let mut num_blocks = stream.len().div_ceil(bsize).max(1);
+    if let Some((prev_bsize, _, prev_num_blocks)) = prev_plan
+        && prev_bsize == bsize
+    {
+        num_blocks = num_blocks.max(prev_num_blocks);
+    }
     let first_dirty = if existing
         .as_ref()
         .is_some_and(|(dn, _)| dn.data_bytes() == bsize)

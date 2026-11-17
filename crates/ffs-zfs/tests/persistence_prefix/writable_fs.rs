@@ -1319,7 +1319,7 @@ fn native_symlink_persistence_cuts_publish_complete_target_or_no_link() {
                 assert_eq!(metadata.kind, ffs_ondisk::zfs_zpl::Kind::Symlink);
                 assert_eq!(
                     (metadata.mode, metadata.links, metadata.size),
-                    (0o120777, 1, 4095)
+                    (0o120_777, 1, 4095)
                 );
                 assert_eq!((metadata.uid, metadata.gid), (1234, 5678));
                 assert_eq!(metadata.times, [timestamp; 4]);
@@ -1716,7 +1716,10 @@ fn unlinked_open_files_survive_name_reuse_and_restart_reclaims_only_the_orphan()
             default_write_opts(POOL_GUID, recovered_token.published_slot()),
         )
         .unwrap();
-        assert!(engine.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+        assert_eq!(
+            engine.pending_unlinks(&cx, &dataset).unwrap(),
+            [] as [ffs_zfs::ZfsUnlinkedObject; 0]
+        );
         let mut head = engine
             .open_read_objects(&cx)
             .unwrap()
@@ -2437,7 +2440,10 @@ fn native_reclamation_refuses_external_owners_without_writes() {
                     timestamp,
                 )
             });
-            assert!(engine.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+            assert_eq!(
+                engine.pending_unlinks(&cx, &dataset).unwrap(),
+                [] as [ffs_zfs::ZfsUnlinkedObject; 0]
+            );
             let mut head = engine
                 .open_read_objects(&cx)
                 .unwrap()

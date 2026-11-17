@@ -133,15 +133,16 @@ impl Default for PoolFixtureSpec {
 
 impl PoolFixtureSpec {
     fn spill_profile(&self) -> SaSpillFixture {
-        if let Some(project_id) = self.sa_project_id {
-            SaSpillFixture::Project(project_id)
-        } else if self.with_sa_spill_timestamps {
-            SaSpillFixture::Mtime
-        } else if self.with_sa_spill {
-            SaSpillFixture::Opaque
-        } else {
-            SaSpillFixture::None
-        }
+        self.sa_project_id.map_or(
+            if self.with_sa_spill_timestamps {
+                SaSpillFixture::Mtime
+            } else if self.with_sa_spill {
+                SaSpillFixture::Opaque
+            } else {
+                SaSpillFixture::None
+            },
+            SaSpillFixture::Project,
+        )
     }
 }
 
@@ -531,7 +532,7 @@ fn build_sa_registry_objects(
         RawZapEntry {
             name: b"ZPL_PROJID".to_vec(),
             integer_bytes: 8,
-            values: vec![((if malformed_project_id { 16_u64 } else { 8 }) << 24) | 19],
+            values: vec![((if malformed_project_id { 0x10_u64 } else { 0x08 }) << 24) | 0x13],
             collision: 0,
         },
     ];
@@ -666,7 +667,9 @@ fn encode_zpl_bonus_for_fixture(
         let mut bonus = reg
             .encode_new_from_template(&tmpl, meta)
             .expect("encode SA metadata");
-        let spill = if spill_profile != SaSpillFixture::None {
+        let spill = if spill_profile == SaSpillFixture::None {
+            None
+        } else {
             // Valid SA header `[magic(4), (header_bytes=8 => 1<<10 | layout=3), 32B attr 18]`
             let with_mtime = matches!(
                 spill_profile,
@@ -716,7 +719,7 @@ fn encode_zpl_bonus_for_fixture(
                 // Timestamp COW emits an uncompressed 8 KiB spill, which must
                 // charge its physical growth to this object's project owner.
                 let mut compressed = Vec::new();
-                for literals in sraw[..72].chunks_exact(8) {
+                for literals in sraw[..72].as_chunks::<8>().0 {
                     compressed.push(0);
                     compressed.extend_from_slice(literals);
                 }
@@ -751,8 +754,6 @@ fn encode_zpl_bonus_for_fixture(
             } else {
                 Some(arena.alloc_block(&sraw, 44, 0, birth, order))
             }
-        } else {
-            None
         };
         (44, bonus, spill)
     }
@@ -1124,7 +1125,7 @@ fn build_zpl_objectset(
                     links: 1,
                     flags: 1,
                     inline_symlink: None,
-                    ..metadata.clone()
+                    ..metadata
                 };
                 let value_node = make_dnode(
                     19,
@@ -1174,7 +1175,7 @@ fn build_zpl_objectset(
                 // length, version, ACE count, then 72 inline bytes. Twelve
                 // compact FUID ACEs exceed that inline capacity.
                 let mut acl_data = vec![0_u8; (1_usize << spec.ashift).max(512)];
-                for ace in acl_data[..96].chunks_exact_mut(8) {
+                for ace in acl_data[..96].as_chunks_mut::<8>().0 {
                     ace[2..4].copy_from_slice(&0x1000_u16.to_le_bytes());
                     ace[4..8].copy_from_slice(&1_u32.to_le_bytes());
                 }
@@ -1300,7 +1301,7 @@ fn build_zpl_objectset(
     let mut os_obj = ObjectSet::new(2, os_flags, meta_dn, zil_header, os_bytes).expect("zpl os");
     if spec.user_accounting || spec.project_accounting {
         let mut counters: NativeAccountingCounters = std::array::from_fn(|_| BTreeMap::new());
-        for (object, raw) in table.chunks_exact(DNODE_BYTES).enumerate() {
+        for (object, raw) in table.as_chunks::<DNODE_BYTES>().0.iter().enumerate() {
             if !matches!(raw[0], 19 | 20) {
                 continue;
             }
@@ -3661,21 +3662,18 @@ fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
         assert_eq!(engine.pending_unlinks(&cx, &dataset).unwrap(), [identity]);
         let (retained_node, retained_counters) =
             native_accounting_snapshot(&cx, &engine, &devices[0]);
+        // Unlink/replacement updates only `links` and `ctime` (both in `bonus`), so
+        // `encode_updated_zpl_bonus` preserves the existing compressed spill block
+        // intact (`used_bytes` unchanged) until `truncate_file` below updates `mtime`
+        // inside the spill block and charges spill growth to project `42` (`"2a"`).
         assert_eq!(
             retained_node.unwrap().used_bytes(),
-            original_node.used_bytes() + expected_growth
+            original_node.used_bytes()
         );
-        for (index, owner) in [b"3e8".as_slice(), b"3e8".as_slice(), b"2a".as_slice()]
-            .into_iter()
-            .enumerate()
-        {
-            let mut expected = original_counters[index].clone();
-            *expected.get_mut(owner).unwrap() += expected_growth;
-            assert_eq!(
-                retained_counters[index], expected,
-                "retention must preserve object charges and charge spill growth to its owner"
-            );
-        }
+        assert_eq!(
+            retained_counters, original_counters,
+            "retention without spill-attribute edits must preserve existing compressed spill and owner charges"
+        );
         drop(engine);
         for device in &devices {
             device.state.lock().unwrap().crash_drop_unsynced();
@@ -3737,7 +3735,10 @@ fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
             .reap_unlinked_file(&cx, &dataset, identity)
             .into_result()
             .unwrap();
-        assert!(reopened.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+        assert_eq!(
+            reopened.pending_unlinks(&cx, &dataset).unwrap(),
+            [] as [ZfsUnlinkedObject; 0]
+        );
         let (removed, final_counters) = native_accounting_snapshot(&cx, &reopened, &fresh[0]);
         assert!(removed.is_none());
         for (index, (owner, object_key)) in [
@@ -3782,11 +3783,9 @@ fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
             native_accounting_snapshot(&cx, &final_engine, &durable[0]);
         assert!(removed.is_none());
         assert_eq!(persisted_counters, final_counters);
-        assert!(
-            final_engine
-                .pending_unlinks(&cx, &dataset)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            final_engine.pending_unlinks(&cx, &dataset).unwrap(),
+            [] as [ZfsUnlinkedObject; 0]
         );
         let mut mos = final_engine.open_read_objects(&cx).unwrap();
         let mut zpl = mos.zpl(&cx, &dataset).unwrap();
@@ -4489,7 +4488,12 @@ fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects(
                     assert!(media.volatile.is_empty());
                 }
 
-                if !directory {
+                if directory {
+                    engine
+                        .unlink_entry(&cx, &dataset, 2, b"replacement", true, timestamp)
+                        .into_result()
+                        .unwrap();
+                } else {
                     // Removing one of several links retains the owner and its
                     // auxiliary tree. Both unlink and replacement must remain
                     // usable rather than refusing every attributed file.
@@ -4520,11 +4524,6 @@ fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects(
                         .unwrap();
                     engine
                         .unlink_entry(&cx, &dataset, 2, b"alias", false, timestamp)
-                        .into_result()
-                        .unwrap();
-                } else {
-                    engine
-                        .unlink_entry(&cx, &dataset, 2, b"replacement", true, timestamp)
                         .into_result()
                         .unwrap();
                 }
@@ -5104,7 +5103,10 @@ fn native_unlinked_reclamation_rejects_stale_or_unowned_objects_without_writes()
         .reap_unlinked_file(&cx, &dataset, identity)
         .into_result()
         .unwrap();
-    assert!(engine.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+    assert_eq!(
+        engine.pending_unlinks(&cx, &dataset).unwrap(),
+        [] as [ZfsUnlinkedObject; 0]
+    );
     let (reused, _) = engine
         .create_file(
             &cx,
@@ -5320,10 +5322,10 @@ fn native_unlink_and_reap_persistence_cuts_preserve_queue_namespace_and_snapshot
                 let queue = recovered.pending_unlinks(&cx, &dataset).unwrap();
                 assert_eq!(
                     queue,
-                    if reaping != published {
-                        vec![identity]
-                    } else {
+                    if reaping == published {
                         Vec::new()
+                    } else {
+                        vec![identity]
                     }
                 );
             }
@@ -6336,7 +6338,10 @@ fn native_openzfs_zdb_oracle_verifies_committed_pool_and_space_maps() {
     eng.reap_unlinked_file(&cx, &ds, retained)
         .into_result()
         .unwrap();
-    assert!(eng.pending_unlinks(&cx, &ds).unwrap().is_empty());
+    assert_eq!(
+        eng.pending_unlinks(&cx, &ds).unwrap(),
+        [] as [ZfsUnlinkedObject; 0]
+    );
     drop(eng);
     run_zdb_check(
         &zdb,
@@ -6528,4 +6533,41 @@ fn native_writer_sync_reports_member_errors_without_minting_a_commit() {
     for (device, syncs) in devices.iter().zip(syncs) {
         assert_eq!(device.state.lock().unwrap().sync_calls, syncs);
     }
+}
+
+#[test]
+fn zeroed_replica_uberblock_slot_reports_split_uberblock_disagreement_without_writes() {
+    let cx = Cx::for_testing();
+    let spec = PoolFixtureSpec::default();
+    let mut built = build_clean_zfs_pool(&spec);
+    let offsets = label_offsets(spec.image_bytes).unwrap();
+    let slot_bytes = 1_usize << spec.ashift.max(10);
+    let l3_slot_start = usize::try_from(
+        offsets[3] + UBERBLOCK_RING_OFFSET + (built.initial_slot * slot_bytes) as u64,
+    )
+    .unwrap();
+    built.members[0][l3_slot_start..l3_slot_start + 16].fill(0);
+
+    let device = FaultableMemberDevice::new(built.members.remove(0));
+    let before = device.durable_snapshot();
+    let Err(err) = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    ) else {
+        panic!("split Uberblock without reconciliation must be refused");
+    };
+    match err {
+        FfsError::Corruption { detail, .. } => {
+            assert!(
+                detail.contains("Uberblock slots disagree"),
+                "expected split-Uberblock diagnostic, got: {detail}"
+            );
+        }
+        other => panic!("expected FfsError::Corruption for split Uberblock, got: {other}"),
+    }
+    let media = device.state.lock().unwrap();
+    assert_eq!((media.write_calls, media.sync_calls), (0, 0));
+    assert_eq!(media.volatile.len(), 0);
+    assert_eq!(media.durable.as_slice(), before.as_slice());
 }

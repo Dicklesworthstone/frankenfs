@@ -107,14 +107,304 @@ impl ByteDevice for ProtectedDevice {
     }
 }
 
+/// Read-only adapter for NTFS protected mounts so mutating `<NtfsFs as FsOps>`
+/// methods are neither callable nor instantiated in the protected-mount vtable.
+pub struct ReadOnlyNtfsFs(Box<ntfs::reader::filesystem::NtfsFs>);
+
+impl FsOps for ReadOnlyNtfsFs {
+    fn getattr(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<ffs_core::InodeAttr> {
+        FsOps::getattr(self.0.as_ref(), cx, scope, ino)
+    }
+
+    fn lookup(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &std::ffi::OsStr,
+    ) -> ffs_error::Result<ffs_core::InodeAttr> {
+        FsOps::lookup(self.0.as_ref(), cx, scope, parent, name)
+    }
+
+    fn readdir(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+    ) -> ffs_error::Result<ffs_core::ReaddirPage> {
+        FsOps::readdir(self.0.as_ref(), cx, scope, ino, offset)
+    }
+
+    fn read(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        size: u32,
+    ) -> ffs_error::Result<Vec<u8>> {
+        FsOps::read(self.0.as_ref(), cx, scope, ino, offset, size)
+    }
+
+    fn open(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        flags: i32,
+    ) -> ffs_error::Result<(u64, u32)> {
+        self.0.open_read_only(cx, ino, flags)
+    }
+
+    fn readlink(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<Vec<u8>> {
+        FsOps::readlink(self.0.as_ref(), cx, scope, ino)
+    }
+
+    fn get_inode_flags(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<u32> {
+        FsOps::get_inode_flags(self.0.as_ref(), cx, scope, ino)
+    }
+
+    fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+        FsOps::listxattr(self.0.as_ref(), cx, ino)
+    }
+
+    fn getxattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<Option<Vec<u8>>> {
+        FsOps::getxattr(self.0.as_ref(), cx, ino, name)
+    }
+
+    fn statfs(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<ffs_core::FsStat> {
+        FsOps::statfs(self.0.as_ref(), cx, scope, ino)
+    }
+
+    fn flush(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        fh: u64,
+        lock_owner: u64,
+    ) -> ffs_error::Result<()> {
+        FsOps::flush(self.0.as_ref(), cx, scope, ino, fh, lock_owner)
+    }
+
+    fn fsync(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        _fh: u64,
+        _datasync: bool,
+    ) -> ffs_error::Result<()> {
+        self.0.fsync_read_only(cx, ino)
+    }
+
+    fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)
+    }
+
+    fn fsyncdir(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        _fh: u64,
+        _datasync: bool,
+    ) -> ffs_error::Result<()> {
+        self.0.fsyncdir_read_only(cx, ino)
+    }
+
+    fn fiemap(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        start: u64,
+        length: u64,
+    ) -> ffs_error::Result<Vec<ffs_core::FiemapExtent>> {
+        FsOps::fiemap(self.0.as_ref(), cx, scope, ino, start, length)
+    }
+
+    fn lseek(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        whence: ffs_core::SeekWhence,
+    ) -> ffs_error::Result<u64> {
+        FsOps::lseek(self.0.as_ref(), cx, scope, ino, offset, whence)
+    }
+}
+
+/// Read-only adapter for ZFS protected mounts so mutating `<ZfsFs as FsOps>`
+/// methods are neither callable nor instantiated in the protected-mount vtable.
+pub struct ReadOnlyZfsFs(Box<zfs::filesystem::ZfsFs>);
+
+impl FsOps for ReadOnlyZfsFs {
+    fn getattr(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<ffs_core::InodeAttr> {
+        FsOps::getattr(self.0.as_ref(), cx, scope, ino)
+    }
+
+    fn lookup(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &std::ffi::OsStr,
+    ) -> ffs_error::Result<ffs_core::InodeAttr> {
+        FsOps::lookup(self.0.as_ref(), cx, scope, parent, name)
+    }
+
+    fn readdir(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+    ) -> ffs_error::Result<ffs_core::ReaddirPage> {
+        FsOps::readdir(self.0.as_ref(), cx, scope, ino, offset)
+    }
+
+    fn read(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        size: u32,
+    ) -> ffs_error::Result<Vec<u8>> {
+        FsOps::read(self.0.as_ref(), cx, scope, ino, offset, size)
+    }
+
+    fn open(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        flags: i32,
+    ) -> ffs_error::Result<(u64, u32)> {
+        self.0.open_read_only(cx, ino, flags)
+    }
+
+    fn readlink(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<Vec<u8>> {
+        FsOps::readlink(self.0.as_ref(), cx, scope, ino)
+    }
+
+    fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+        FsOps::listxattr(self.0.as_ref(), cx, ino)
+    }
+
+    fn getxattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<Option<Vec<u8>>> {
+        FsOps::getxattr(self.0.as_ref(), cx, ino, name)
+    }
+
+    fn statfs(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<ffs_core::FsStat> {
+        self.0.statfs_read_only(cx, ino)
+    }
+
+    fn flush(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        fh: u64,
+        lock_owner: u64,
+    ) -> ffs_error::Result<()> {
+        FsOps::flush(self.0.as_ref(), cx, scope, ino, fh, lock_owner)
+    }
+
+    fn fsync(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        fh: u64,
+        _datasync: bool,
+    ) -> ffs_error::Result<()> {
+        self.0.fsync_read_only(cx, ino, fh)
+    }
+
+    fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)
+    }
+
+    fn fsyncdir(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        _fh: u64,
+        _datasync: bool,
+    ) -> ffs_error::Result<()> {
+        self.0.fsyncdir_read_only(cx, ino)
+    }
+
+    fn lseek(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        whence: ffs_core::SeekWhence,
+    ) -> ffs_error::Result<u64> {
+        FsOps::lseek(self.0.as_ref(), cx, scope, ino, offset, whence)
+    }
+}
+
 pub enum ProtectedFs {
     Core(Box<OpenFs>),
     Fat {
         fs: Box<fat::filesystem::FatFs>,
         writable: bool,
     },
-    Ntfs(Box<ntfs::reader::filesystem::NtfsFs>),
-    Zfs(Box<zfs::filesystem::ZfsFs>),
+    Ntfs(ReadOnlyNtfsFs),
+    Zfs(ReadOnlyZfsFs),
 }
 
 impl ProtectedFs {
@@ -130,8 +420,8 @@ impl ProtectedFs {
         match self {
             Self::Core(fs) => fs.as_ref(),
             Self::Fat { fs, .. } => fs.as_ref(),
-            Self::Ntfs(fs) => fs.as_ref(),
-            Self::Zfs(fs) => fs.as_ref(),
+            Self::Ntfs(fs) => fs,
+            Self::Zfs(fs) => fs,
         }
     }
 }
@@ -338,7 +628,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
                 .context("initialize protected NTFS filesystem")?;
             FsOps::getattr(&ntfs_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
                 .context("read protected NTFS filesystem root")?;
-            ProtectedFs::Ntfs(Box::new(ntfs_fs))
+            ProtectedFs::Ntfs(ReadOnlyNtfsFs(Box::new(ntfs_fs)))
         }
         "zfs" => {
             if args.rw {
@@ -358,7 +648,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
                 .context("initialize protected ZFS filesystem")?;
             FsOps::getattr(&zfs_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
                 .context("read protected ZFS filesystem root")?;
-            ProtectedFs::Zfs(Box::new(zfs_fs))
+            ProtectedFs::Zfs(ReadOnlyZfsFs(Box::new(zfs_fs)))
         }
         other => bail!("unsupported protected filesystem {other}"),
     };

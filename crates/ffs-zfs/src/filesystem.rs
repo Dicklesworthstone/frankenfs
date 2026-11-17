@@ -326,6 +326,71 @@ impl ZfsFs {
         })
     }
 
+    /// Validate a read-only open request without instantiating writable `O_TRUNC` code.
+    pub fn open_read_only(&self, cx: &Cx, ino: InodeNumber, flags: i32) -> Result<(u64, u32)> {
+        checkpoint(cx)?;
+        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_CREAT) != 0
+        {
+            return Err(FfsError::ReadOnly);
+        }
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            return Err(FfsError::IsDirectory);
+        }
+        let mut state = self.state(cx)?;
+        let metadata = state.view_for_ino(cx, ino)?.metadata(cx, ino)?.0;
+        match metadata.kind {
+            Kind::Directory => return Err(FfsError::IsDirectory),
+            Kind::Regular => {}
+            _ => return Err(unsupported("ZPL open requires a regular file")),
+        }
+        if flags & libc::O_DIRECTORY != 0 {
+            return Err(FfsError::NotDirectory);
+        }
+        Ok((0, 0))
+    }
+
+    /// Query read-only filesystem space statistics without referencing writer state.
+    pub fn statfs_read_only(&self, cx: &Cx, ino: InodeNumber) -> Result<ffs_core::FsStat> {
+        let mut state = self.state(cx)?;
+        let space_info = if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            if !state.head.view.has_snapshot_dir() {
+                return Err(FfsError::NotFound("ZPL control directory".into()));
+            }
+            state.head.view.statfs_info()
+        } else {
+            let view_state = state.view_for_ino(cx, ino)?;
+            view_state.metadata(cx, ino)?;
+            view_state.view.statfs_info()
+        };
+        checkpoint(cx)?;
+        Ok(space_info)
+    }
+
+    /// Validate `fsync` on a read-only mount without referencing writer sync paths.
+    pub fn fsync_read_only(&self, cx: &Cx, ino: InodeNumber, fh: u64) -> Result<()> {
+        let mut state = self.state(cx)?;
+        state.validate_handle(ino, fh)?;
+        if ino != ZFS_CTL_INO && ino != ZFS_SNAPDIR_INO {
+            state.view_for_ino(cx, ino)?.metadata(cx, ino)?;
+        }
+        checkpoint(cx)
+    }
+
+    /// Validate `fsyncdir` on a read-only mount without referencing writer sync paths.
+    pub fn fsyncdir_read_only(&self, cx: &Cx, ino: InodeNumber) -> Result<()> {
+        let mut state = self.state(cx)?;
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            if !state.head.view.has_snapshot_dir() {
+                return Err(FfsError::NotFound("ZPL control directory".into()));
+            }
+            return checkpoint(cx);
+        }
+        if state.view_for_ino(cx, ino)?.metadata(cx, ino)?.0.kind != Kind::Directory {
+            return Err(FfsError::NotDirectory);
+        }
+        checkpoint(cx)
+    }
+
     fn state(&self, cx: &Cx) -> Result<MutexGuard<'_, State>> {
         checkpoint(cx)?;
         let mut state = self

@@ -223,6 +223,44 @@ impl NtfsFs {
         Ok((fh, 0))
     }
 
+    /// Validate an open request on an immutable NTFS reader without instantiating
+    /// writable truncation or transaction code paths.
+    pub fn open_read_only(&self, cx: &Cx, ino: InodeNumber, flags: i32) -> Result<(u64, u32)> {
+        let _op = self.operation(cx, false)?;
+        let access = flags & libc::O_ACCMODE;
+        if ![libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR].contains(&access) {
+            return Err(invalid_argument());
+        }
+        if access != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_CREAT) != 0 {
+            return Err(FfsError::ReadOnly);
+        }
+        if self.describe(cx, ino)?.kind == FileType::Directory {
+            return Err(FfsError::IsDirectory);
+        }
+        self.stream(cx, ino)?;
+        Ok((0, 0))
+    }
+
+    /// Validate `fsync` on an immutable NTFS reader without instantiating writer sync paths.
+    pub fn fsync_read_only(&self, cx: &Cx, ino: InodeNumber) -> Result<()> {
+        let _op = self.operation(cx, false)?;
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+        } else {
+            self.record(cx, ino)?;
+        }
+        checkpoint(cx)
+    }
+
+    /// Validate `fsyncdir` on an immutable NTFS reader without instantiating writer sync paths.
+    pub fn fsyncdir_read_only(&self, cx: &Cx, ino: InodeNumber) -> Result<()> {
+        let _op = self.operation(cx, false)?;
+        if self.describe(cx, ino)?.kind != FileType::Directory {
+            return Err(FfsError::NotDirectory);
+        }
+        checkpoint(cx)
+    }
+
     fn check_create_mode(mode: u16, directory: bool) -> Result<()> {
         // NTFS's host projection is fixed; never claim a more restrictive Unix
         // mode succeeded while exposing broader access than the caller asked.

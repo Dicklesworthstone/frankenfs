@@ -6979,12 +6979,14 @@ fn native_rename_replacement_composes_shared_leaf_and_promoted_separator_edits()
     }
 }
 
+type StreamBytesMap = BTreeMap<Vec<u16>, Vec<u8>>;
+
 #[derive(Debug, PartialEq, Eq)]
 struct RenameReplacementState {
     files: BTreeMap<String, Vec<u8>>,
     source_links: u16,
-    source_streams: BTreeMap<Vec<u16>, Vec<u8>>,
-    victim_streams: Option<(u16, BTreeMap<Vec<u16>, Vec<u8>>)>,
+    source_streams: StreamBytesMap,
+    victim_streams: Option<(u16, StreamBytesMap)>,
     allocated_clusters: u64,
 }
 
