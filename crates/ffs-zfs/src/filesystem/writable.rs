@@ -38,6 +38,14 @@ pub(super) fn native_timestamp(time: SystemTime) -> Result<Timestamp> {
     }
 }
 
+/// Mount-level policy options for [`ZfsFs::with_writer_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZfsMountWriteOptions {
+    /// Authorize `FsOps::setattr` mode (`chmod`) and ownership (`chown`) updates,
+    /// rebuilding trivial NFSv4 DACLs and updating per-owner quota accounting.
+    pub allow_mode_and_owner_setattr: bool,
+}
+
 pub(super) struct MutableView {
     pub(super) objects: BTreeMap<u64, InodeNumber>,
     pub(super) next_ino: u64,
@@ -47,6 +55,7 @@ pub(super) struct MutableView {
 pub(super) struct WriterState {
     pub(super) engine: ZfsTransactionEngine,
     pub(super) dataset: Vec<Vec<u8>>,
+    pub(super) allow_mode_and_owner_setattr: bool,
     last_token: Option<ZfsDurableToken>,
     refresh_needed: bool,
     handles: BTreeMap<u64, InodeNumber>,
@@ -67,8 +76,24 @@ impl ZfsFs {
     /// mount. Snapshot and control-directory operations remain read-only.
     pub fn with_writer(
         cx: &Cx,
+        engine: ZfsTransactionEngine,
+        dataset_components: Vec<Vec<u8>>,
+    ) -> Result<Self> {
+        Self::with_writer_options(
+            cx,
+            engine,
+            dataset_components,
+            ZfsMountWriteOptions::default(),
+        )
+    }
+
+    /// Consume an already admitted, exclusively owned pool writer with explicit
+    /// mount-level write policy options (such as enabling `chmod`/`chown` via `FsOps::setattr`).
+    pub fn with_writer_options(
+        cx: &Cx,
         mut engine: ZfsTransactionEngine,
         dataset_components: Vec<Vec<u8>>,
+        options: ZfsMountWriteOptions,
     ) -> Result<Self> {
         checkpoint(cx)?;
         if engine.requires_recovery() {
@@ -138,11 +163,15 @@ impl ZfsFs {
         Ok(Self {
             state: Mutex::new(State {
                 head,
-                snapshot_names: None,
+                snapshot_dir: None,
+                snap_idx_by_guid: BTreeMap::new(),
+                snap_name_by_idx: BTreeMap::new(),
+                next_snap_idx: 1,
                 snapshots: BTreeMap::new(),
                 writer: Some(WriterState {
                     engine,
                     dataset: dataset_components,
+                    allow_mode_and_owner_setattr: options.allow_mode_and_owner_setattr,
                     last_token,
                     refresh_needed: false,
                     handles: BTreeMap::new(),
@@ -155,6 +184,55 @@ impl ZfsFs {
             uid,
             gid,
         })
+    }
+
+    /// Create an atomic snapshot of this mounted dataset and immediately refresh `.zfs/snapshot`.
+    pub fn create_snapshot(&self, cx: &Cx, snap_name: &[u8]) -> Result<u64> {
+        let mut state = self.state(cx)?;
+        let timestamp = native_timestamp(SystemTime::now())?;
+        let obj = state
+            .mutate(|engine, dataset| engine.create_snapshot(cx, dataset, snap_name, timestamp))?;
+        state.publish_committed(|state| {
+            state.refresh_head(cx)?;
+            state.invalidate_snapshots_locked(cx)?;
+            Ok(obj)
+        })
+    }
+
+    /// Destroy (or defer-destroy) a snapshot on this mounted dataset and immediately prune `.zfs/snapshot`.
+    pub fn destroy_snapshot(&self, cx: &Cx, snap_name: &[u8], defer: bool) -> Result<u64> {
+        let mut state = self.state(cx)?;
+        let obj = state
+            .mutate(|engine, dataset| engine.destroy_snapshot(cx, dataset, snap_name, defer))?;
+        state.publish_committed(|state| {
+            state.refresh_head(cx)?;
+            state.invalidate_snapshots_locked(cx)?;
+            Ok(obj)
+        })
+    }
+
+    /// Rename a snapshot on this mounted dataset and immediately refresh `.zfs/snapshot`.
+    pub fn rename_snapshot(
+        &self,
+        cx: &Cx,
+        old_snap_name: &[u8],
+        new_snap_name: &[u8],
+    ) -> Result<u64> {
+        let mut state = self.state(cx)?;
+        let obj = state.mutate(|engine, dataset| {
+            engine.rename_snapshot(cx, dataset, old_snap_name, new_snap_name)
+        })?;
+        state.publish_committed(|state| {
+            state.refresh_head(cx)?;
+            state.invalidate_snapshots_locked(cx)?;
+            Ok(obj)
+        })
+    }
+
+    /// Explicitly invalidate and reload `.zfs/snapshot` entries from the committed dataset root.
+    pub fn invalidate_snapshots(&self, cx: &Cx) -> Result<()> {
+        let mut state = self.state(cx)?;
+        state.invalidate_snapshots_locked(cx)
     }
 
     /// The most recent known durable result, even when later request delivery or
@@ -180,7 +258,7 @@ impl ZfsFs {
     ) -> Result<(InodeAttr, u64, u32)> {
         let mut state = self.state(cx)?;
         let parent_object = state.writable_parent(cx, parent, name.as_bytes())?;
-        let (mode, gid) = state.creation_mode_gid(cx, parent, mode, gid, false)?;
+        let (mode, gid) = state.creation_mode_gid(cx, parent, mode & 0o7777, gid, false)?;
         state.reserve_identity()?;
         let handle = if let Some(flags) = flags {
             if flags & libc::O_ACCMODE == libc::O_ACCMODE {

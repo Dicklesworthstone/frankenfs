@@ -16,6 +16,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -319,12 +320,14 @@ def main() -> None:
         prefix.with_suffix(".stderr").write_bytes(completed.stderr)
         prefix.with_suffix(".status").write_text(str(completed.returncode) + "\n")
         if failure is not None:
+            err_tail = completed.stderr.decode("utf-8", errors="replace").strip()[-600:]
             require(completed.returncode != 0 and completed.stdout == b""
                     and failure.encode() in completed.stderr,
-                    f"expected typed refusal containing {failure!r}; see {prefix}")
+                    f"expected typed refusal containing {failure!r}; see {prefix}; stderr={err_tail!r}")
         else:
+            err_tail = completed.stderr.decode("utf-8", errors="replace").strip()[-600:]
             require((completed.returncode != 0) if fails else (completed.returncode == 0),
-                    f"unexpected command result; see {prefix}")
+                    f"unexpected command result; see {prefix}; stderr={err_tail!r}")
         return completed.stdout
 
     try:
@@ -557,6 +560,75 @@ def main() -> None:
                 run_tx("tx-truncate", writable_img, "/native_tx/cross.bin", "--size", "150003")
                 run_tx("tx-rename", writable_img, "/alias.bin", "/native_tx/moved_alias.bin")
                 run_tx("tx-unlink", writable_img, "/empty")
+                run_tx("tx-setattr", writable_img, "/native_tx/cross.bin",
+                       "--mode", "0600", "--uid", "1234", "--gid", "5678")
+
+                spill_xattr_bytes = (bytes(range(233)) * 15)[:3200]
+                if version == 5:
+                    spill_xattr_file = directory / "spill-xattr.bin"
+                    spill_xattr_file.write_bytes(spill_xattr_bytes)
+                    run_tx("tx-setxattr", writable_img, "/native_tx/cross.bin",
+                           "user.inline_note", "--value", "inline-sa-xattr-ok", "--create")
+                    run_tx("tx-setxattr", writable_img, "/native_tx/cross.bin",
+                           "user.large_spill", "--value-file", spill_xattr_file, "--create")
+                    run_tx("tx-setxattr", writable_img, "/native_tx/cross.bin",
+                           "user.temp_attr", "--value", "ephemeral", "--create")
+                    run_tx("tx-rmxattr", writable_img, "/native_tx/cross.bin", "user.temp_attr")
+
+                    # Live writable /dev/fuse mount-write verification (chmod, setxattr, open-unlink retention).
+                    require(Path("/dev/fuse").exists(), "/dev/fuse required for ZFS mount-write verification")
+                    fuse_mnt = directory / "fuse-rw"
+                    fuse_mnt.mkdir()
+                    fuse_log = directory / "fuse-rw.log"
+                    fuse_argv = [
+                        str(binary), "mount-write", str(writable_img), str(fuse_mnt),
+                        "--offline-image", "--allow-write", "--pool-guid", tx_pool_guid,
+                        "--label", "0", "--slot", str(cur_slot), "--dataset", "data",
+                    ]
+                    with fuse_log.open("wb") as flog:
+                        fproc = subprocess.Popen(fuse_argv, stdout=flog, stderr=subprocess.STDOUT)
+                        try:
+                            deadline = time.monotonic() + 30
+                            while not os.path.ismount(fuse_mnt):
+                                require(fproc.poll() is None, f"ZFS mount-write exited early; see {fuse_log}")
+                                require(time.monotonic() < deadline, f"ZFS mount-write timed out; see {fuse_log}")
+                                time.sleep(0.05)
+                            fuse_file = fuse_mnt / "native_tx" / "fuse_live.bin"
+                            fuse_file.write_bytes(b"written-over-zfs-fuse\n" * 64)
+                            os.chmod(fuse_file, 0o644)
+                            os.setxattr(fuse_file, "user.fuse_tag", b"live-fuse-xattr")
+                            require(os.getxattr(fuse_file, "user.fuse_tag") == b"live-fuse-xattr",
+                                    "mounted ZFS FUSE getxattr mismatch")
+                            unlinked_path = fuse_mnt / "native_tx" / "open_unlinked.bin"
+                            unlinked_path.write_bytes(b"survives-unlink-while-open")
+                            ufd = os.open(unlinked_path, os.O_RDWR)
+                            try:
+                                os.unlink(unlinked_path)
+                                require(not unlinked_path.exists(), "unlinked ZFS file remained visible")
+                                os.pwrite(ufd, b"!", 26)
+                                require(os.pread(ufd, 64, 0) == b"survives-unlink-while-open!",
+                                        "open-unlinked ZFS file read mismatch")
+                            finally:
+                                os.close(ufd)
+                            command("fusermount3", "-u", fuse_mnt)
+                            require(fproc.wait(timeout=30) == 0, f"ZFS mount-write exited non-zero; see {fuse_log}")
+                            require(not os.path.ismount(fuse_mnt), "ZFS mount-write remained mounted after fusermount3")
+                        finally:
+                            try:
+                                if os.path.ismount(fuse_mnt):
+                                    subprocess.run(["fusermount3", "-u", str(fuse_mnt)], timeout=30, check=False)
+                            finally:
+                                if fproc.poll() is None:
+                                    fproc.terminate()
+                                    fproc.wait(timeout=10)
+
+                    # Refresh cur_slot and cur_txg after live FUSE TXG commits.
+                    post_fuse_inv = json.loads(command(binary, "inspect", writable_img, "--offline-image"))
+                    pf_lbl = next(row for row in post_fuse_inv["labels"] if row["label"] == 0)
+                    pf_sel = max(pf_lbl["candidates"], key=lambda row: (row["txg"], row["timestamp"]))
+                    require(int(pf_sel["txg"]) > cur_txg, "ZFS mount-write did not advance Uberblock TXG")
+                    cur_slot = int(pf_sel["slot"])
+                    cur_txg = int(pf_sel["txg"])
 
                 command("zdb", "-lu", writable_img)
                 bccm_text = command("zdb", "-e", "-p", writable_dir, "-bccm", tx_pool).decode("utf-8", errors="replace")
@@ -587,8 +659,24 @@ def main() -> None:
                 k_moved = tx_mount / "native_tx" / "moved_alias.bin"
                 require(k_cross.read_bytes() == cross_payload[:150003],
                         "kernel zfs.ko POSIX read disagreed on /native_tx/cross.bin")
-                require((k_cross.stat().st_mode & 0o7777) == 0o640,
-                        "kernel zfs.ko mode bits disagreed on /native_tx/cross.bin")
+                require((k_cross.stat().st_mode & 0o7777) == 0o600,
+                        "kernel zfs.ko mode bits disagreed on /native_tx/cross.bin after tx-setattr")
+                require(k_cross.stat().st_uid == 1234 and k_cross.stat().st_gid == 5678,
+                        "kernel zfs.ko uid/gid disagreed on /native_tx/cross.bin after tx-setattr")
+                if version == 5:
+                    require(os.getxattr(k_cross, "user.inline_note") == b"inline-sa-xattr-ok",
+                            "kernel zfs.ko disagreed on inline SA xattr")
+                    require(os.getxattr(k_cross, "user.large_spill") == spill_xattr_bytes,
+                            "kernel zfs.ko disagreed on spilled DMU_OT_SA xattr")
+                    require("user.temp_attr" not in os.listxattr(k_cross),
+                            "kernel zfs.ko still saw removed SA xattr")
+                    k_fuse = tx_mount / "native_tx" / "fuse_live.bin"
+                    require(k_fuse.read_bytes() == b"written-over-zfs-fuse\n" * 64,
+                            "kernel zfs.ko disagreed on FUSE mount-write file bytes")
+                    require(os.getxattr(k_fuse, "user.fuse_tag") == b"live-fuse-xattr",
+                            "kernel zfs.ko disagreed on FUSE mount-write SA xattr")
+                    require(not (tx_mount / "native_tx" / "open_unlinked.bin").exists(),
+                            "kernel zfs.ko saw reaped open-unlinked file")
                 require(k_moved.read_bytes() == payload and k_moved.stat().st_nlink == 3,
                         "kernel zfs.ko moved hard-link content or st_nlink disagreed")
                 require((tx_mount / long_name).read_bytes() == payload
@@ -622,9 +710,23 @@ def main() -> None:
                     directory,
                 )
 
+                command("zfs", "snapshot", tx_pool + "/data@kernel_roundtrip")
+                (tx_mount / "native_tx" / "kernel_after_snap.txt").write_bytes(b"written-by-zfsko\n")
                 command("zpool", "export", tx_pool)
                 tx_active = False
                 require(not os.path.ismount(tx_mount), "post-import export left writable scratch dataset mounted")
+                rt_inv = json.loads(command(binary, "inspect", writable_img, "--offline-image"))
+                rt_lbl = next(row for row in rt_inv["labels"] if row["label"] == 0)
+                rt_sel = max(rt_lbl["candidates"], key=lambda row: (row["txg"], row["timestamp"]))
+                rt_opts = ["--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                           "--slot", str(rt_sel["slot"]), "--dataset", "data"]
+                require(command(binary, "read", writable_img, "/native_tx/kernel_after_snap.txt", *rt_opts)
+                        == b"written-by-zfsko\n", "bidirectional reopen missed kernel zfs.ko file")
+                require(command(binary, "read", writable_img, "/native_tx/cross.bin", *rt_opts,
+                                "--snapshot", "kernel_roundtrip") == cross_payload[:150003],
+                        "bidirectional reopen missed kernel-created snapshot")
+                cur_slot = int(rt_sel["slot"])
+                cur_txg = int(rt_sel["txg"])
                 require(digest(image) == before, "original exported read-phase image changed")
 
                 scenario = {"zpl_version": version, "pool_guid": pool_guid, "dataset_guid": dataset_guid,

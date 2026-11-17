@@ -1598,10 +1598,21 @@ pub fn maybe_route_mount_cmd(
             bail!("--rw mount on a --partition slice is refused; mount read-only or extract slice");
         }
         if matches!(kind, FsFormatKind::Zfs) {
-            bail!(
-                "--rw mount is not supported for {} (read-only extraction mount only)",
-                kind.as_str()
-            );
+            if six.zfs_auto_import
+                || six.zfs_replay_zil
+                || six.zfs_snapshot.is_some()
+                || !six.missing_mirror_members.is_empty()
+                || !six.missing_raidz_members.is_empty()
+            {
+                bail!(
+                    "--rw ZFS mount refuses --zfs-auto-import, --zfs-replay-zil, --zfs-snapshot, and degraded missing-member modes"
+                );
+            }
+            if six.pool_guid.is_none() || six.zfs_label.is_none() || six.zfs_slot.is_none() {
+                bail!(
+                    "--rw ZFS mount requires explicit --pool-guid, --zfs-label, and --zfs-slot admission"
+                );
+            }
         }
         if matches!(kind, FsFormatKind::Ntfs) && six.recover_logfile {
             bail!(
@@ -1674,6 +1685,44 @@ pub fn maybe_route_mount_cmd(
                 )?;
                 let ntfs_fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 0, 0)?;
                 Box::new(ntfs_fs)
+            }
+            FsFormatKind::Zfs => {
+                let pool_guid = six.pool_guid.context("missing --pool-guid")?;
+                let label = six.zfs_label.context("missing --zfs-label")?;
+                let slot = six.zfs_slot.context("missing --zfs-slot")?;
+                let components =
+                    parse_zfs_dataset_components(six.zfs_dataset.as_deref().unwrap_or(""))?;
+                let mut all_paths: Vec<&Path> = Vec::with_capacity(1 + six.zfs_members.len());
+                all_paths.push(image_path);
+                for member in &six.zfs_members {
+                    if member.canonicalize()?.starts_with(&mountpoint_canon) {
+                        bail!("mountpoint would hide a ZFS member image");
+                    }
+                    all_paths.push(member.as_path());
+                }
+                let engine = ffs_zfs::ZfsTransactionEngine::open_files_at(
+                    &cx,
+                    &all_paths,
+                    0,
+                    None,
+                    ffs_zfs::ZfsWriteOptions {
+                        offline_image: six.offline_image,
+                        allow_write: true,
+                        pool_guid,
+                        label,
+                        slot,
+                        reconcile_torn_uberblocks: false,
+                    },
+                )?;
+                let zfs_fs = ffs_zfs::ZfsFs::with_writer_options(
+                    &cx,
+                    engine,
+                    components,
+                    ffs_zfs::ZfsMountWriteOptions {
+                        allow_mode_and_owner_setattr: true,
+                    },
+                )?;
+                Box::new(zfs_fs)
             }
             _ => bail!(
                 "--rw mount is not supported for {} (read-only extraction mount only)",

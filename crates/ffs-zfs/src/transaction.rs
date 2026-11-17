@@ -8,6 +8,7 @@
 //! or force-import).
 
 mod dmu_cow;
+mod dsl_ops;
 mod zpl_ops;
 
 use std::collections::BTreeMap;
@@ -31,10 +32,17 @@ use crate::reader::dmu::scrub::ScrubLimits;
 use crate::{Leaf, Pool};
 
 use self::dmu_cow::{
-    DMU_OT_OBJSET, PoolSpaceAllocator, WriteBucket, finalize_mos_and_space_maps_to_convergence,
-    zap_optional_u64, zap_required_u64,
+    DMU_OT_OBJSET, MosFeatureState, PoolSpaceAllocator, StagedBlockWrite, WriteBucket,
+    finalize_mos_and_space_maps_to_convergence, zap_optional_u64, zap_required_u64,
 };
-pub use self::zpl_ops::{ZfsDataChecksum, ZfsSetAttr, ZfsUnlinkedObject};
+pub(crate) use self::dsl_ops::dataset_statfs_quota_space;
+use self::dsl_ops::{DslMutation, stage_dsl_mutation};
+pub use self::dsl_ops::{
+    ZfsBookmarkInfo, ZfsHoldInfo, ZfsPropertySetValue, list_bookmarks_in_mos, list_holds_in_mos,
+};
+pub use self::zpl_ops::{
+    ZfsDataChecksum, ZfsPosixSetAttr, ZfsSetAttr, ZfsUnlinkedObject, ZfsXattrSetMode,
+};
 use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
 
 type FaultHook = Box<dyn FnMut(&ZfsPersistenceEvent) -> Result<()> + Send + Sync>;
@@ -309,8 +317,7 @@ pub struct ZfsTransactionEngine {
     current_uberblock: Uberblock,
     current_software_version: Option<u64>,
     mos_os: ObjectSet,
-    write_features: BTreeMap<String, u64>,
-    write_features_obj: Option<u64>,
+    mos_features: MosFeatureState,
     empty_bpobj_id: Option<u64>,
     read_features: Vec<String>,
     allocator: PoolSpaceAllocator,
@@ -634,13 +641,31 @@ impl ZfsTransactionEngine {
         // A split mirror cannot use the strict label reader until reconciliation,
         // but this constructor retains complete read-feature and checksum admission.
         let mut mos = Objects::from_root(cx, pool.clone(), root_block)?;
-        let mut write_features = BTreeMap::new();
-        let mut write_features_obj = None;
+        let mut mos_features = MosFeatureState::default();
         let dir_entries = mos.zap_values(cx, 1)?;
+        for entry in &dir_entries {
+            if entry.name.starts_with(b"DDT-") {
+                let ddt_obj = entry.scalar().map_err(|e| parse_err(&e))?;
+                if ddt_obj != 0 && !mos.zap_values(cx, ddt_obj)?.is_empty() {
+                    return Err(unsupported(
+                        "ZFS pool contains non-empty legacy DDT deduplication entries; native writes are refused",
+                    ));
+                }
+            }
+        }
         let empty_bpobj_id = zap_optional_u64(&dir_entries, b"empty_bpobj")?;
         if version == 5000 {
+            let rf_id = zap_required_u64(&dir_entries, b"features_for_read")?;
+            mos_features.read_features_obj = Some(rf_id);
+            for entry in mos.zap_values(cx, rf_id)? {
+                let name = std::str::from_utf8(&entry.name)
+                    .map_err(|_| corrupt("non-UTF8 read feature GUID"))?
+                    .to_owned();
+                let count = entry.scalar().map_err(|e| parse_err(&e))?;
+                mos_features.read_features.insert(name, count);
+            }
             let wf_id = zap_required_u64(&dir_entries, b"features_for_write")?;
-            write_features_obj = Some(wf_id);
+            mos_features.write_features_obj = Some(wf_id);
             for entry in mos.zap_values(cx, wf_id)? {
                 let name = std::str::from_utf8(&entry.name)
                     .map_err(|_| corrupt("non-UTF8 write feature GUID"))?
@@ -651,7 +676,17 @@ impl ZfsTransactionEngine {
                         "active ZFS write feature {name} (refcount={count}) is not admitted for native writes"
                     )));
                 }
-                write_features.insert(name, count);
+                mos_features.write_features.insert(name, count);
+            }
+            if let Some(et_id) = zap_optional_u64(&dir_entries, b"feature_enabled_txg")? {
+                mos_features.enabled_txg_obj = Some(et_id);
+                for entry in mos.zap_values(cx, et_id)? {
+                    let name = std::str::from_utf8(&entry.name)
+                        .map_err(|_| corrupt("non-UTF8 enabled_txg feature GUID"))?
+                        .to_owned();
+                    let txg = entry.scalar().map_err(|e| parse_err(&e))?;
+                    mos_features.enabled_txg.insert(name, txg);
+                }
             }
         }
 
@@ -697,8 +732,12 @@ impl ZfsTransactionEngine {
         }
 
         // 5. Load metaslab space maps and verify accounting before any recovery write.
-        let allocator =
-            PoolSpaceAllocator::load(cx, &mut mos, &write_features, &vcfg.read_features)?;
+        let allocator = PoolSpaceAllocator::load(
+            cx,
+            &mut mos,
+            &mos_features.write_features,
+            &vcfg.read_features,
+        )?;
 
         // 6. Only a fully admitted writer may reconcile the selected ring copies.
         if options.reconcile_torn_uberblocks {
@@ -793,8 +832,7 @@ impl ZfsTransactionEngine {
             current_uberblock,
             current_software_version: current_sw_version,
             mos_os,
-            write_features,
-            write_features_obj,
+            mos_features,
             empty_bpobj_id,
             read_features: vcfg.read_features,
             allocator,
@@ -1023,8 +1061,54 @@ impl ZfsTransactionEngine {
                 file_obj,
                 offset,
                 data: data.to_vec(),
+                clear_suid_sgid: false,
                 timestamp,
                 checksum,
+            },
+        )
+    }
+
+    /// Set or replace a ZPL `user.*` extended attribute in SA (`ZPL_DXATTR` inline or spill).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_xattr(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        target_obj: u64,
+        name: &str,
+        value: &[u8],
+        mode: ZfsXattrSetMode,
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::SetXattr {
+                target_obj,
+                name: name.to_owned(),
+                value: value.to_vec(),
+                mode,
+                timestamp,
+            },
+        )
+    }
+
+    /// Remove a ZPL `user.*` extended attribute from SA (`ZPL_DXATTR`).
+    pub fn remove_xattr(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        target_obj: u64,
+        name: &str,
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::RemoveXattr {
+                target_obj,
+                name: name.to_owned(),
+                timestamp,
             },
         )
     }
@@ -1065,6 +1149,28 @@ impl ZfsTransactionEngine {
         dataset_components: &[Vec<u8>],
         object: u64,
         attrs: &ZfsSetAttr,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        self.set_posix_attributes(
+            cx,
+            dataset_components,
+            object,
+            &ZfsPosixSetAttr::from(attrs),
+            timestamp,
+            checksum,
+        )
+    }
+
+    /// Publish size, POSIX mode/uid/gid, set-ID clearing, and native timestamps
+    /// atomically in one TXG, rebuilding trivial NFSv4 DACL on chmod and
+    /// transferring embedded `userused`/`groupused` quota accounting on chown.
+    pub fn set_posix_attributes(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        object: u64,
+        attrs: &ZfsPosixSetAttr,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
@@ -1244,6 +1350,273 @@ impl ZfsTransactionEngine {
         )
     }
 
+    /// Create an atomic DSL snapshot (`dataset@snap_name`), returning the new snapshot MOS object ID.
+    pub fn create_snapshot(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        snap_name: &[u8],
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::CreateSnapshot {
+                dataset: dataset_components.to_vec(),
+                snap_name: snap_name.to_vec(),
+                timestamp,
+            },
+        )
+    }
+
+    /// Destroy `dataset@snap_name` (or mark `DS_FLAG_DEFER_DESTROY` when `defer == true`
+    /// and holds or clones remain), returning the snapshot MOS object ID.
+    pub fn destroy_snapshot(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        snap_name: &[u8],
+        defer: bool,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::DestroySnapshot {
+                dataset: dataset_components.to_vec(),
+                snap_name: snap_name.to_vec(),
+                defer,
+            },
+        )
+    }
+
+    /// Rename `dataset@old_snap_name` to `dataset@new_snap_name`.
+    pub fn rename_snapshot(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        old_snap_name: &[u8],
+        new_snap_name: &[u8],
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::RenameSnapshot {
+                dataset: dataset_components.to_vec(),
+                old_snap_name: old_snap_name.to_vec(),
+                new_snap_name: new_snap_name.to_vec(),
+            },
+        )
+    }
+
+    /// Place a user hold `tag` (`DMU_OT_USERREFS = 41`) on `dataset@snap_name`.
+    pub fn hold_snapshot(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        snap_name: &[u8],
+        tag: &[u8],
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::HoldSnapshot {
+                dataset: dataset_components.to_vec(),
+                snap_name: snap_name.to_vec(),
+                tag: tag.to_vec(),
+                timestamp,
+            },
+        )
+    }
+
+    /// Release a user hold `tag` on `dataset@snap_name` (auto-destroying the snapshot
+    /// in the same TXG if `DS_FLAG_DEFER_DESTROY` is set and zero holds/clones remain).
+    pub fn release_snapshot(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        snap_name: &[u8],
+        tag: &[u8],
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::ReleaseSnapshot {
+                dataset: dataset_components.to_vec(),
+                snap_name: snap_name.to_vec(),
+                tag: tag.to_vec(),
+            },
+        )
+    }
+
+    /// List active user holds on `dataset@snap_name`.
+    pub fn list_holds(
+        &self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        snap_name: &[u8],
+    ) -> Result<Vec<ZfsHoldInfo>> {
+        list_holds_in_mos(
+            cx,
+            &mut self.open_read_objects(cx)?,
+            dataset_components,
+            snap_name,
+        )
+    }
+
+    /// Create bookmark `dataset#bookmark_name` from `@source_name` (`source_is_bookmark == false`)
+    /// or `#source_name` (`source_is_bookmark == true`).
+    pub fn create_bookmark(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        bookmark_name: &[u8],
+        source_name: &[u8],
+        source_is_bookmark: bool,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::CreateBookmark {
+                dataset: dataset_components.to_vec(),
+                bookmark_name: bookmark_name.to_vec(),
+                source_name: source_name.to_vec(),
+                source_is_bookmark,
+            },
+        )
+    }
+
+    /// Destroy bookmark `dataset#bookmark_name`.
+    pub fn destroy_bookmark(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        bookmark_name: &[u8],
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::DestroyBookmark {
+                dataset: dataset_components.to_vec(),
+                bookmark_name: bookmark_name.to_vec(),
+            },
+        )
+    }
+
+    /// List bookmarks on `dataset`.
+    pub fn list_bookmarks(
+        &self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+    ) -> Result<Vec<ZfsBookmarkInfo>> {
+        list_bookmarks_in_mos(cx, &mut self.open_read_objects(cx)?, dataset_components)
+    }
+
+    /// Create a fresh child ZPL filesystem dataset under `parent_dataset`, returning its head MOS object ID.
+    pub fn create_dataset(
+        &mut self,
+        cx: &Cx,
+        parent_dataset: &[Vec<u8>],
+        child_name: &[u8],
+        initial_props: &[(String, ZfsPropertySetValue)],
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::CreateDataset {
+                parent_dataset: parent_dataset.to_vec(),
+                child_name: child_name.to_vec(),
+                initial_props: initial_props.to_vec(),
+                timestamp,
+            },
+        )
+    }
+
+    /// Create a writable clone dataset from `origin_dataset@origin_snap` at `target_parent/target_name`,
+    /// returning the clone's head MOS object ID.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_clone(
+        &mut self,
+        cx: &Cx,
+        origin_dataset: &[Vec<u8>],
+        origin_snap: &[u8],
+        target_parent: &[Vec<u8>],
+        target_name: &[u8],
+        initial_props: &[(String, ZfsPropertySetValue)],
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::CreateClone {
+                origin_dataset: origin_dataset.to_vec(),
+                origin_snap: origin_snap.to_vec(),
+                target_parent: target_parent.to_vec(),
+                target_name: target_name.to_vec(),
+                initial_props: initial_props.to_vec(),
+                timestamp,
+            },
+        )
+    }
+
+    /// Rename a non-root dataset (`old_dataset` -> `new_dataset`), transferring parent space/reservation accounting.
+    pub fn rename_dataset(
+        &mut self,
+        cx: &Cx,
+        old_dataset: &[Vec<u8>],
+        new_dataset: &[Vec<u8>],
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::RenameDataset {
+                old_dataset: old_dataset.to_vec(),
+                new_dataset: new_dataset.to_vec(),
+            },
+        )
+    }
+
+    /// Destroy a leaf dataset or clone (reclaiming only `birth > origin_txg` blocks and auto-destroying
+    /// any deferred-destroy origin snapshot when its last clone and hold are released).
+    pub fn destroy_dataset(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::DestroyDataset {
+                dataset: dataset_components.to_vec(),
+            },
+        )
+    }
+
+    /// Set a dataset property (`quota`, `refquota`, `reservation`, `refreservation`, `readonly`,
+    /// `atime`, `recordsize`, `checksum`, or user property `ns:name`).
+    pub fn set_property(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        name: &str,
+        value: ZfsPropertySetValue,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::SetProperty {
+                dataset: dataset_components.to_vec(),
+                name: name.to_owned(),
+                value,
+            },
+        )
+    }
+
+    /// Inherit (clear local setting + `$iuv` / `$inherit`) a dataset property.
+    pub fn inherit_property(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        name: &str,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::InheritProperty {
+                dataset: dataset_components.to_vec(),
+                name: name.to_owned(),
+            },
+        )
+    }
+
     fn emit_event(
         &mut self,
         operation: &str,
@@ -1270,12 +1643,72 @@ impl ZfsTransactionEngine {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn execute_zpl_txg(
         &mut self,
         cx: &Cx,
         dataset_components: &[Vec<u8>],
         mutation: &ZplMutation,
+    ) -> ZfsTxOutcome<u64> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        self.execute_staged_txg(
+            cx,
+            mutation.op_name(),
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                stage_zpl_mutation(
+                    cx,
+                    mos,
+                    dataset_components,
+                    mutation,
+                    mos_dirty_dnodes,
+                    &mut draft_features.write_features,
+                    &mut draft_features.write_dirty,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        )
+    }
+
+    fn execute_dsl_txg(&mut self, cx: &Cx, mutation: &DslMutation) -> ZfsTxOutcome<u64> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        self.execute_staged_txg(
+            cx,
+            mutation.op_name(),
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                stage_dsl_mutation(
+                    cx,
+                    mos,
+                    mutation,
+                    mos_dirty_dnodes,
+                    draft_features,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_staged_txg(
+        &mut self,
+        cx: &Cx,
+        op_name: &str,
+        stage_fn: impl FnOnce(
+            &mut Objects,
+            &mut BTreeMap<u64, Vec<u8>>,
+            &mut MosFeatureState,
+            &mut PoolSpaceAllocator,
+            u64,
+            &mut Vec<StagedBlockWrite>,
+        ) -> Result<u64>,
     ) -> ZfsTxOutcome<u64> {
         if self.poisoned_uncertain {
             return ZfsTxOutcome::NotCommitted(unsupported(
@@ -1289,7 +1722,6 @@ impl ZfsTransactionEngine {
             return ZfsTxOutcome::NotCommitted(corrupt("ZFS TXG counter overflow"));
         };
         let target_slot = (new_txg as usize) % self.slots_per_label;
-        let op_name = mutation.op_name();
 
         // 1. Stage the entire COW DMU + space-map convergence in memory BEFORE any device write!
         let mut mos = match self.open_read_objects(cx) {
@@ -1297,22 +1729,15 @@ impl ZfsTransactionEngine {
             Err(err) => return ZfsTxOutcome::NotCommitted(err),
         };
         let mut draft_alloc = self.allocator.clone();
-        let mut draft_wf = self.write_features.clone();
-        let mut wf_dirty = false;
+        let mut draft_features = self.mos_features.clone();
         let mut mos_dirty_dnodes = BTreeMap::new();
         let mut base_staged = Vec::new();
 
-        let result_val = match stage_zpl_mutation(
-            cx,
+        let result_val = match stage_fn(
             &mut mos,
-            dataset_components,
-            mutation,
             &mut mos_dirty_dnodes,
-            &mut draft_wf,
-            &mut wf_dirty,
-            self.empty_bpobj_id,
+            &mut draft_features,
             &mut draft_alloc,
-            self.order,
             new_txg,
             &mut base_staged,
         ) {
@@ -1320,16 +1745,14 @@ impl ZfsTransactionEngine {
             Err(err) => return ZfsTxOutcome::NotCommitted(err),
         };
 
-        let (new_root_bp, mut converged_alloc, staged_writes) =
+        let (new_root_bp, mut converged_alloc, converged_features, staged_writes) =
             match finalize_mos_and_space_maps_to_convergence(
                 cx,
                 &mut mos,
                 &self.mos_os,
                 &self.current_uberblock.root,
                 &mos_dirty_dnodes,
-                &draft_wf,
-                wf_dirty,
-                self.write_features_obj,
+                &draft_features,
                 &draft_alloc,
                 &base_staged,
                 self.order,
@@ -1544,7 +1967,7 @@ impl ZfsTransactionEngine {
             }
         }
         self.allocator = converged_alloc;
-        self.write_features = draft_wf;
+        self.mos_features = converged_features;
         let _ = &self.read_features;
         self.mos_os = next_mos_os;
         self.committed_txg = new_txg;

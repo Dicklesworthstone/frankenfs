@@ -36,7 +36,10 @@ use ffs_ondisk::zfs_zpl::{directory_reference, Metadata as ZplMetadata, Timestam
 use ffs_types::ByteOffset;
 use ffs_zfs::reader::dmu::allocation::AllocationLimits;
 use ffs_zfs::reader::dmu::scrub::ScrubLimits;
-use ffs_zfs::{Leaf, Pool, ZfsDataChecksum, ZfsTransactionEngine, ZfsTxOutcome, ZfsWriteOptions};
+use ffs_zfs::{
+    Leaf, Pool, ZfsDataChecksum, ZfsPosixSetAttr, ZfsPropertySetValue, ZfsTransactionEngine,
+    ZfsTxOutcome, ZfsWriteOptions, ZfsXattrSetMode,
+};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_INPUT_BYTES: usize = 4_096;
@@ -167,7 +170,13 @@ fn fuzz_pure_zfs_parsers_and_codecs(data: &[u8], tracker: &FuzzBudgetTracker) {
     };
 
     let slice = &data[..data.len().min(1024)];
-    let _ = NvList::parse(slice);
+    if let Ok(parsed_nv) = NvList::parse(slice) {
+        if let Ok(reencoded) = parsed_nv.encode_xdr() {
+            let reparsed = NvList::parse_exact(&reencoded)
+                .expect("NvList::encode_xdr output must round-trip through parse_exact");
+            assert_eq!(reparsed, parsed_nv);
+        }
+    }
     let _ = NvList::parse_exact(slice);
 
     if data.len() >= 128 {
@@ -503,7 +512,7 @@ fuzz_target!(|data: &[u8]| {
             max_replica_attempts: 256,
         }),
     );
-    let op_kind = cursor.next_u8() % 6;
+    let op_kind = cursor.next_u8() % 14;
     let use_sha = cursor.next_bool();
     let cksum = if use_sha {
         ZfsDataChecksum::Sha256
@@ -552,7 +561,43 @@ fuzz_target!(|data: &[u8]| {
                 cksum,
             ),
             4 => engine.rename_entry(&tx_cow_cx, &[], 2, b"hello.txt", 2, b"moved.txt", None, ts),
-            _ => engine.unlink_entry(&tx_cow_cx, &[], 2, b"hello.txt", false, ts),
+            5 => engine.unlink_entry(&tx_cow_cx, &[], 2, b"hello.txt", false, ts),
+            6 => engine.create_snapshot(&tx_cow_cx, &[], b"fuzz_snap", ts),
+            7 => engine.destroy_snapshot(&tx_cow_cx, &[], b"snap1", cursor.next_bool()),
+            8 => engine.hold_snapshot(&tx_cow_cx, &[], b"snap1", b"fuzz_hold", ts),
+            9 => engine.create_bookmark(&tx_cow_cx, &[], b"fuzz_bm", b"snap1", false),
+            10 => engine.create_dataset(&tx_cow_cx, &[], b"fuzz_child", &[], ts),
+            11 => engine.create_clone(&tx_cow_cx, &[], b"snap1", &[], b"fuzz_clone", &[], ts),
+            12 => engine.set_property(
+                &tx_cow_cx,
+                &[],
+                "quota",
+                ZfsPropertySetValue::Number(u64::from(cursor.next_u16()) * 4096),
+            ),
+            _ => {
+                let _ = engine.set_posix_attributes(
+                    &tx_cow_cx,
+                    &[],
+                    3,
+                    &ZfsPosixSetAttr {
+                        mode: Some(0o600),
+                        uid: Some(1000),
+                        gid: Some(1000),
+                        ..ZfsPosixSetAttr::default()
+                    },
+                    ts,
+                    cksum,
+                );
+                engine.set_xattr(
+                    &tx_cow_cx,
+                    &[],
+                    3,
+                    "user.fuzz",
+                    &payload,
+                    ZfsXattrSetMode::Auto,
+                    ts,
+                )
+            }
         };
         if let ZfsTxOutcome::Committed { token, .. } = outcome {
             engine

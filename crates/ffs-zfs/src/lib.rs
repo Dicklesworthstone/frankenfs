@@ -32,12 +32,13 @@ pub mod filesystem;
 pub mod reader;
 pub mod transaction;
 
-pub use filesystem::ZfsFs;
+pub use filesystem::{ZfsFs, ZfsMountWriteOptions};
 pub use reader::dmu::Objects;
 pub use reader::dmu::zpl::Zpl;
 pub use reader::{Label, Leaf, Pool, RootBlock};
 pub use transaction::{
-    ZfsAdmissionReport, ZfsDataChecksum, ZfsDurableToken, ZfsPersistenceEvent, ZfsPersistenceStage,
-    ZfsSetAttr, ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome,
-    ZfsUnlinkedObject, ZfsWriteOptions,
+    ZfsAdmissionReport, ZfsBookmarkInfo, ZfsDataChecksum, ZfsDurableToken, ZfsHoldInfo,
+    ZfsPersistenceEvent, ZfsPersistenceStage, ZfsPosixSetAttr, ZfsPropertySetValue, ZfsSetAttr,
+    ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, ZfsUnlinkedObject,
+    ZfsWriteOptions, ZfsXattrSetMode, list_bookmarks_in_mos, list_holds_in_mos,
 };

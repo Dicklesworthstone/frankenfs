@@ -206,6 +206,22 @@ impl Spec {
                 false,
                 Index::None,
             ),
+            "quota" | "refquota" => (
+                DefaultValue::Number(0),
+                false,
+                true,
+                false,
+                false,
+                Index::None,
+            ),
+            "reservation" | "refreservation" => (
+                DefaultValue::Number(0),
+                false,
+                true,
+                true,
+                false,
+                Index::None,
+            ),
             "volthreading" => (
                 DefaultValue::Number(1),
                 false,
@@ -353,6 +369,8 @@ struct Layer {
     object: u64,
     components: Vec<Vec<u8>>,
     snapshot: Option<Vec<u8>>,
+    dd_quota: u64,
+    dd_reserved: u64,
 }
 
 struct Catalogs {
@@ -457,6 +475,23 @@ impl Catalogs {
                 result.stored_source = Some(source);
                 break;
             }
+            if index == 0 && !snapshot {
+                let bonus_fallback = match name {
+                    "quota" if self.layers[0].dd_quota != 0 => Some(self.layers[0].dd_quota),
+                    "reservation" if self.layers[0].dd_reserved != 0 => {
+                        Some(self.layers[0].dd_reserved)
+                    }
+                    _ => None,
+                };
+                if let Some(val) = bonus_fallback {
+                    let layer = &self.layers[0];
+                    result.value = Some(PropertyValue::Number(val));
+                    result.source = PropertySource::Local;
+                    result.setpoint = Some(layer.components.clone());
+                    result.stored_source = Some(PropertySource::Local);
+                    break;
+                }
+            }
         }
         Ok(result)
     }
@@ -530,6 +565,8 @@ impl Objects {
                 object: props,
                 components: components.to_vec(),
                 snapshot: Some(name.to_vec()),
+                dd_quota: 0,
+                dd_reserved: 0,
             });
             report.dataset_guid = selected.info.guid;
             report.dataset_object = selected.info.object;
@@ -553,6 +590,8 @@ impl Objects {
                 return Err(corrupt("property ancestor is not a native DSL directory"));
             }
             let parent = bonus_word(&object, 16)?;
+            let dd_quota = bonus_word(&object, 64)?;
+            let dd_reserved = bonus_word(&object, 72)?;
             let props = bonus_word(&object, 80)?;
             if props <= 1 || !catalogs.insert(props) {
                 return Err(corrupt("missing or aliased DSL property catalog"));
@@ -561,6 +600,8 @@ impl Objects {
                 object: props,
                 components: path.clone(),
                 snapshot: None,
+                dd_quota,
+                dd_reserved,
             });
             if path.is_empty() {
                 if parent != 0 {

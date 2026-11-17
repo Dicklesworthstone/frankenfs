@@ -222,6 +222,14 @@ impl FatHeader {
         self.hash_bits == 48
     }
     #[must_use]
+    pub const fn uppercase_names(&self) -> bool {
+        self.uppercase_names
+    }
+    #[must_use]
+    pub const fn normflags(&self) -> u64 {
+        if self.uppercase_names { 2 } else { 0 }
+    }
+    #[must_use]
     pub fn table_blocks(&self) -> Range<u64> {
         self.table_start..self.table_start + self.table_blocks
     }
@@ -506,8 +514,23 @@ const CRC_TABLE: [u64; 256] = {
     table
 };
 
-pub(crate) fn zap_name_hash(name: &[u8], salt: u64, bits: u32) -> u64 {
-    name_hash(name, salt, bits)
+pub(crate) fn zap_name_hash_normalized(
+    name: &[u8],
+    salt: u64,
+    bits: u32,
+    normflags: u64,
+) -> Result<u64, ParseError> {
+    match normflags {
+        0 => Ok(name_hash(name, salt, bits)),
+        2 => {
+            if !name.is_ascii() {
+                return Err(invalid("non-ASCII key in TOUPPER-normalized ZAP"));
+            }
+            let upper = name.to_ascii_uppercase();
+            Ok(name_hash(&upper, salt, bits))
+        }
+        _ => Err(invalid("unsupported ZAP normalization flags")),
+    }
 }
 
 fn name_hash(name: &[u8], salt: u64, bits: u32) -> u64 {
@@ -691,6 +714,20 @@ pub fn encode_fatzap_with_flags(
     hash64: bool,
     order: Endian,
 ) -> Result<Vec<Vec<u8>>, ParseError> {
+    encode_fatzap_with_normflags(entries, block_bytes, salt, hash64, 0, order)
+}
+
+pub fn encode_fatzap_with_normflags(
+    entries: &[Entry],
+    block_bytes: usize,
+    salt: u64,
+    hash64: bool,
+    normflags: u64,
+    order: Endian,
+) -> Result<Vec<Vec<u8>>, ParseError> {
+    if !matches!(normflags, 0 | 2) {
+        return Err(invalid("unsupported fat-ZAP normalization flags"));
+    }
     if !(512..=131_072).contains(&block_bytes) || !block_bytes.is_power_of_two() {
         return Err(invalid("invalid fat-ZAP block size"));
     }
@@ -716,7 +753,15 @@ pub fn encode_fatzap_with_flags(
         {
             return Err(invalid("invalid fat-ZAP key name"));
         }
-        if !seen_names.insert(entry.name.clone()) {
+        let dedup_key = if normflags == 2 {
+            if !entry.name.is_ascii() {
+                return Err(invalid("non-ASCII fat-ZAP key under TOUPPER normalization"));
+            }
+            entry.name.to_ascii_uppercase()
+        } else {
+            entry.name.clone()
+        };
+        if !seen_names.insert(dedup_key) {
             return Err(invalid("duplicate fat-ZAP key name"));
         }
         if !matches!(entry.integer_bytes, 1 | 2 | 4 | 8) {
@@ -756,7 +801,7 @@ pub fn encode_fatzap_with_flags(
         name_nul.extend_from_slice(&entry.name);
         name_nul.push(0);
 
-        let hash = name_hash(&entry.name, effective_salt, hash_bits);
+        let hash = zap_name_hash_normalized(&entry.name, effective_salt, hash_bits, normflags)?;
         let cd_slot = hash_cd.entry(hash).or_insert(0);
         let collision = *cd_slot;
         if hash64 && collision >= u32::from(u16::MAX) {
@@ -890,7 +935,7 @@ pub fn encode_fatzap_with_flags(
     put_u64(hdr, 64, leaves.len() as u64, order);
     put_u64(hdr, 72, entries.len() as u64, order);
     put_u64(hdr, 80, effective_salt, order);
-    put_u64(hdr, 88, 0, order);
+    put_u64(hdr, 88, normflags, order);
     put_u64(hdr, 96, u64::from(hash64), order);
     if external_table_blocks == 0 {
         let base = block_bytes / 2;
@@ -901,7 +946,12 @@ pub fn encode_fatzap_with_flags(
 
     // Self-verify roundtrip against FatHeader + routes + leaf!
     let max_block = free_block - 1;
-    let parsed_hdr = FatHeader::parse(&blocks[0], order, max_block)?;
+    let name_policy = if normflags == 2 {
+        names::NamePolicy::AsciiUppercase
+    } else {
+        names::NamePolicy::Unnormalized
+    };
+    let parsed_hdr = FatHeader::parse_with_names(&blocks[0], order, max_block, name_policy)?;
     let decoded_table = if external_table_blocks == 0 {
         parsed_hdr.embedded_table(&blocks[0], order)?
     } else {

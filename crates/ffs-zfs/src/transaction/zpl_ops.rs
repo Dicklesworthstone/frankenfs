@@ -11,8 +11,8 @@ use ffs_ondisk::zfs_dmu::{
 };
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use ffs_ondisk::zfs_zpl::{
-    Kind, Metadata, SA_BYTES, SaRegistry, Timestamp, directory_reference,
-    encode_directory_reference,
+    Kind, Metadata, SA_BYTES, SaRegistry, Timestamp, XATTR_BYTES, XATTR_COUNT, XATTR_NAME_BYTES,
+    XattrSources, directory_reference, encode_directory_reference,
 };
 use serde::Serialize;
 
@@ -36,6 +36,10 @@ const MAX_PATH_DEPTH: usize = 256;
 // and the 264-byte legacy znode. Longer targets use ordinary file data.
 const MAX_INLINE_SYMLINK_BYTES: usize = 56;
 const DMU_OT_UNLINKED_SET: u8 = 22;
+#[allow(dead_code)]
+const DMU_OT_ACL: u8 = 33;
+const DMU_OT_SA_ATTR_REGISTRATION: u8 = 46;
+const DMU_OT_SA_ATTR_LAYOUTS: u8 = 47;
 const MAX_PENDING_UNLINKS: usize = 65_536;
 
 /// A generation-bound object retained in the native ZPL unlinked set.
@@ -48,6 +52,8 @@ pub struct ZfsUnlinkedObject {
 
 // Native persistent ZPL flags (OpenZFS zfs-2.3.0, sys/zfs_znode.h).
 // Dataset `readonly` is a separate, inherited DSL property.
+#[allow(dead_code)]
+const ZFS_XATTR: u64 = 0x1;
 const ZFS_ACL_TRIVIAL: u64 = 0x4;
 const ZFS_NO_EXECS_DENIED: u64 = 0x100;
 const ZFS_READONLY: u64 = 0x0000_0001_0000_0000;
@@ -85,6 +91,16 @@ fn admit_directory_remove(parent: &Metadata, target: &Metadata) -> Result<()> {
     reject_flags(target, ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_NOUNLINK)
 }
 
+fn clear_setid_bits_for_nonroot(mode: u64) -> u64 {
+    let mut next = mode & !0o4000;
+    // POSIX / OpenZFS zfs_setattr: clear S_ISGID only when group-exec (0o0010) is set;
+    // mandatory-locking style S_ISGID without group-exec is retained on data write/chown.
+    if next & 0o0010 != 0 {
+        next &= !0o2000;
+    }
+    next
+}
+
 /// Checksum algorithm used for newly written DMU data blocks (`ZIO_CHECKSUM_*`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub enum ZfsDataChecksum {
@@ -103,12 +119,16 @@ impl ZfsDataChecksum {
     }
 }
 
+/// Creation / replacement policy for ZPL extended attribute updates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum ZfsXattrSetMode {
+    #[default]
+    Auto,
+    Create,
+    Replace,
+}
+
 /// Native size and timestamp updates published together in one head-dataset TXG.
-///
-/// Size changes apply only to regular files. Timestamp-only updates preserve the
-/// object's data tree, native permissions, ownership, ACLs and extended attributes.
-/// An explicit modification time takes precedence over the automatic modification
-/// time accompanying a size change. Creation time and object generation are retained.
 #[derive(Debug, Clone, Default)]
 pub struct ZfsSetAttr {
     pub size: Option<u64>,
@@ -116,10 +136,46 @@ pub struct ZfsSetAttr {
     pub mtime: Option<Timestamp>,
 }
 
-impl ZfsSetAttr {
+/// Native size, permission, ownership, and timestamp updates published together
+/// in one head-dataset TXG.
+#[derive(Debug, Clone, Default)]
+pub struct ZfsPosixSetAttr {
+    pub size: Option<u64>,
+    pub atime: Option<Timestamp>,
+    pub mtime: Option<Timestamp>,
+    pub mode: Option<u16>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+    pub clear_suid_sgid: bool,
+}
+
+impl From<&ZfsSetAttr> for ZfsPosixSetAttr {
+    fn from(value: &ZfsSetAttr) -> Self {
+        Self {
+            size: value.size,
+            atime: value.atime,
+            mtime: value.mtime,
+            ..Self::default()
+        }
+    }
+}
+
+impl ZfsPosixSetAttr {
     pub(super) fn validate(&self, timestamp: Timestamp) -> Result<()> {
-        if self.size.is_none() && self.atime.is_none() && self.mtime.is_none() {
+        if self.size.is_none()
+            && self.atime.is_none()
+            && self.mtime.is_none()
+            && self.mode.is_none()
+            && self.uid.is_none()
+            && self.gid.is_none()
+            && !self.clear_suid_sgid
+        {
             return Err(FfsError::Format("empty native ZPL attribute update".into()));
+        }
+        if self.mode.is_some_and(|m| m & !0o7777 != 0) {
+            return Err(FfsError::Format(
+                "ZPL setattr mode contains file-type bits".into(),
+            ));
         }
         if self.size.is_some_and(|size| i64::try_from(size).is_err()) {
             return Err(FfsError::Format(
@@ -161,14 +217,27 @@ pub(super) enum ZplMutation {
         file_obj: u64,
         offset: u64,
         data: Vec<u8>,
+        clear_suid_sgid: bool,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
     SetAttributes {
         file_obj: u64,
-        attrs: ZfsSetAttr,
+        attrs: ZfsPosixSetAttr,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
+    },
+    SetXattr {
+        target_obj: u64,
+        name: String,
+        value: Vec<u8>,
+        mode: ZfsXattrSetMode,
+        timestamp: Timestamp,
+    },
+    RemoveXattr {
+        target_obj: u64,
+        name: String,
+        timestamp: Timestamp,
     },
     LinkEntry {
         source_object: u64,
@@ -208,6 +277,8 @@ impl ZplMutation {
             Self::Mkdir { .. } => "mkdir",
             Self::WriteData { .. } => "write_data",
             Self::SetAttributes { .. } => "set_attributes",
+            Self::SetXattr { .. } => "set_xattr",
+            Self::RemoveXattr { .. } => "remove_xattr",
             Self::LinkEntry { .. } => "link_entry",
             Self::RenameEntry { .. } => "rename_entry",
             Self::UnlinkEntry { .. } => "unlink_entry",
@@ -227,6 +298,12 @@ struct DatasetContext {
     zpl_version: u64,
     utf8_only: bool,
     sa_registry: Option<SaRegistry>,
+    sa_reg_obj: Option<u64>,
+    sa_lay_obj: Option<u64>,
+    sa_reg_entries: Vec<RawZapEntry>,
+    sa_lay_entries: Vec<RawZapEntry>,
+    sa_reg_dirty: bool,
+    sa_lay_dirty: bool,
     recordsize: usize,
     unlinked_set: Option<u64>,
 }
@@ -344,16 +421,24 @@ fn open_head_dataset_context(
             "native ZPL writer requires ZPL v4/v5 without normalization or case folding",
         ));
     }
-    let sa_registry =
+    let (sa_registry, sa_reg_obj, sa_lay_obj, sa_reg_entries, sa_lay_entries) =
         if let Some(sa_master) = zap_optional_u64(&master, b"SA_ATTRS")?.filter(|&v| v != 0) {
             let sa_rows = os_view.zap_values(cx, sa_master)?;
             let reg_obj = zap_required_u64(&sa_rows, b"REGISTRY")?;
             let lay_obj = zap_required_u64(&sa_rows, b"LAYOUTS")?;
             let reg_entries = os_view.zap_values(cx, reg_obj)?;
             let lay_entries = os_view.zap_values(cx, lay_obj)?;
-            Some(SaRegistry::from_zaps(&reg_entries, &lay_entries).map_err(|e| parse_err(&e))?)
+            let reg =
+                SaRegistry::from_zaps(&reg_entries, &lay_entries).map_err(|e| parse_err(&e))?;
+            (
+                Some(reg),
+                Some(reg_obj),
+                Some(lay_obj),
+                reg_entries,
+                lay_entries,
+            )
         } else {
-            None
+            (None, None, None, Vec::new(), Vec::new())
         };
 
     Ok((
@@ -368,6 +453,12 @@ fn open_head_dataset_context(
             zpl_version,
             utf8_only,
             sa_registry,
+            sa_reg_obj,
+            sa_lay_obj,
+            sa_reg_entries,
+            sa_lay_entries,
+            sa_reg_dirty: false,
+            sa_lay_dirty: false,
             recordsize,
             unlinked_set,
         },
@@ -467,6 +558,164 @@ fn load_zpl_node(
         project_id,
         spill_bytes,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_updated_zpl_bonus_with_options(
+    loaded: &LoadedZplNode,
+    new_meta: &Metadata,
+    ds_ctx: &mut DatasetContext,
+    rebuild_trivial_acl: bool,
+    inline_xattrs: Option<&BTreeMap<String, Vec<u8>>>,
+    alloc: &mut PoolSpaceAllocator,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<(Vec<u8>, Option<BlockPointer>)> {
+    let min_blk = (1_usize << alloc.ashift).max(512);
+    match loaded.dnode.bonus_type() {
+        DMU_OT_ZNODE => {
+            if inline_xattrs.is_some() {
+                return Err(unsupported(
+                    "SA extended attributes require a ZPL v5 SA-formatted object",
+                ));
+            }
+            if rebuild_trivial_acl {
+                let ownership = ffs_ondisk::zfs_zpl::ReclamationOwnership::legacy(
+                    loaded.dnode.bonus(),
+                    loaded.dnode.order(),
+                )
+                .map_err(|e| parse_err(&e))?;
+                if ownership.external_acl_object != 0 {
+                    return Err(unsupported(
+                        "chmod on a ZPL object with an external ACL object is unavailable",
+                    ));
+                }
+            }
+            let bonus = new_meta
+                .encode_legacy_with_options(
+                    Some(loaded.dnode.bonus()),
+                    order,
+                    None,
+                    rebuild_trivial_acl,
+                )
+                .map_err(|e| parse_err(&e))?;
+            Ok((bonus, None))
+        }
+        DMU_OT_SA => {
+            if rebuild_trivial_acl {
+                let reg_ref = ds_ctx
+                    .sa_registry
+                    .as_ref()
+                    .ok_or_else(|| corrupt("missing SA registry"))?;
+                let ownership = reg_ref
+                    .decode(loaded.dnode.bonus(), loaded.spill_bytes.as_deref())
+                    .and_then(|attrs| attrs.reclamation_ownership())
+                    .map_err(|e| parse_err(&e))?;
+                if ownership.external_acl_object != 0 {
+                    return Err(unsupported(
+                        "chmod on a ZPL object with an external ACL object is unavailable",
+                    ));
+                }
+            }
+            let reg = ds_ctx
+                .sa_registry
+                .as_mut()
+                .ok_or_else(|| corrupt("missing SA registry"))?;
+            let prev_reg_len = ds_ctx.sa_reg_entries.len();
+            let prev_lay_len = ds_ctx.sa_lay_entries.len();
+            let total_dnode_body = loaded.dnode.slots() * DNODE_BYTES - 64;
+            let ptr_bytes = loaded.dnode.pointers().len() * 128;
+            let max_bonus_no_spill = total_dnode_body.saturating_sub(ptr_bytes);
+            let max_bonus_with_spill = max_bonus_no_spill.saturating_sub(128);
+            let (new_bonus, maybe_spill) = reg
+                .encode_updated_with_options(
+                    &mut ds_ctx.sa_reg_entries,
+                    &mut ds_ctx.sa_lay_entries,
+                    loaded.dnode.bonus(),
+                    loaded.spill_bytes.as_deref(),
+                    new_meta,
+                    rebuild_trivial_acl,
+                    inline_xattrs,
+                    None,
+                    max_bonus_no_spill,
+                    max_bonus_with_spill,
+                )
+                .map_err(|e| parse_err(&e))?;
+            if ds_ctx.sa_reg_entries.len() != prev_reg_len {
+                ds_ctx.sa_reg_dirty = true;
+            }
+            if ds_ctx.sa_lay_entries.len() != prev_lay_len {
+                ds_ctx.sa_lay_dirty = true;
+            }
+            let spill_bp = match (loaded.dnode.spill(), maybe_spill, &loaded.spill_bytes) {
+                (Some(old_bp), Some(new_raw), Some(old_raw)) => {
+                    let target_len = if new_raw.len() <= old_bp.logical_bytes() {
+                        old_bp.logical_bytes()
+                    } else {
+                        new_raw.len().next_power_of_two().max(min_blk).min(SA_BYTES)
+                    };
+                    let mut padded = vec![0_u8; target_len];
+                    padded[..new_raw.len()].copy_from_slice(&new_raw);
+                    if padded == *old_raw {
+                        Some(old_bp.clone())
+                    } else {
+                        let dva = alloc.allocate(padded.len())?;
+                        let bp = BlockPointer::new_regular(&RegularBlockSpec {
+                            dvas: &[dva],
+                            physical: &padded,
+                            logical_bytes: padded.len(),
+                            compression: 2,
+                            checksum_type: 7,
+                            object_type: DMU_OT_SA,
+                            level: 0,
+                            payload_order: order,
+                            birth: new_txg,
+                            fill: 1,
+                        })
+                        .map_err(|e| parse_err(&e))?;
+                        staged_writes.push(StagedBlockWrite {
+                            bucket: WriteBucket::ChildBlocks,
+                            dva_offset: dva.offset,
+                            bytes: padded,
+                        });
+                        Some(bp)
+                    }
+                }
+                (None, Some(new_raw), _) => {
+                    let target_len = new_raw.len().next_power_of_two().max(min_blk).min(SA_BYTES);
+                    if target_len < new_raw.len() {
+                        return Err(unsupported("SA spill block exceeds 128 KiB"));
+                    }
+                    let mut padded = vec![0_u8; target_len];
+                    padded[..new_raw.len()].copy_from_slice(&new_raw);
+                    let dva = alloc.allocate(padded.len())?;
+                    let bp = BlockPointer::new_regular(&RegularBlockSpec {
+                        dvas: &[dva],
+                        physical: &padded,
+                        logical_bytes: padded.len(),
+                        compression: 2,
+                        checksum_type: 7,
+                        object_type: DMU_OT_SA,
+                        level: 0,
+                        payload_order: order,
+                        birth: new_txg,
+                        fill: 1,
+                    })
+                    .map_err(|e| parse_err(&e))?;
+                    staged_writes.push(StagedBlockWrite {
+                        bucket: WriteBucket::ChildBlocks,
+                        dva_offset: dva.offset,
+                        bytes: padded,
+                    });
+                    Some(bp)
+                }
+                _ => None,
+            };
+            Ok((new_bonus, spill_bp))
+        }
+        _ => Err(unsupported("unsupported ZPL bonus type")),
+    }
 }
 
 fn encode_updated_zpl_bonus(
@@ -1504,6 +1753,7 @@ pub(super) fn stage_zpl_mutation(
             file_obj,
             offset,
             data,
+            clear_suid_sgid,
             timestamp,
             checksum,
         } => {
@@ -1539,6 +1789,9 @@ pub(super) fn stage_zpl_mutation(
             reject_flags(&loaded.metadata, prohibited)?;
             let new_size = loaded.metadata.size.max(end_offset);
             let mut new_meta = loaded.metadata.clone();
+            if *clear_suid_sgid {
+                new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
+            }
             new_meta.size = new_size;
             new_meta.times[1] = *timestamp;
             new_meta.times[2] = *timestamp;
@@ -1771,14 +2024,22 @@ pub(super) fn stage_zpl_mutation(
             if attrs.size.is_some() && loaded.metadata.kind != Kind::Regular {
                 return Err(unsupported("ZPL truncate requires a regular file"));
             }
+            if attrs.mode.is_some() && loaded.metadata.kind == Kind::Symlink {
+                return Err(unsupported("ZPL chmod on a symbolic link is not supported"));
+            }
             // Native zfs_setattr permits atime-only updates on immutable nodes.
-            // DOS readonly and append-only affect truncation, not timestamps.
+            // DOS readonly and append-only affect truncation, not timestamps/mode/owner.
             if attrs.size.is_some() {
                 reject_flags(
                     &loaded.metadata,
                     ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_READONLY,
                 )?;
-            } else if attrs.mtime.is_some() {
+            } else if attrs.mtime.is_some()
+                || attrs.mode.is_some()
+                || attrs.uid.is_some()
+                || attrs.gid.is_some()
+                || attrs.clear_suid_sgid
+            {
                 reject_flags(&loaded.metadata, ZFS_IMMUTABLE)?;
             }
             let old_size = loaded.metadata.size;
@@ -1810,6 +2071,20 @@ pub(super) fn stage_zpl_mutation(
 
             let mut new_meta = loaded.metadata.clone();
             new_meta.size = new_size;
+            if let Some(uid) = attrs.uid {
+                new_meta.uid = uid;
+            }
+            if let Some(gid) = attrs.gid {
+                new_meta.gid = gid;
+            }
+            let owner_changed =
+                (loaded.metadata.uid, loaded.metadata.gid) != (new_meta.uid, new_meta.gid);
+            if let Some(req_mode) = attrs.mode {
+                new_meta.mode = (new_meta.mode & !0o7777) | u64::from(req_mode & 0o7777);
+                new_meta.flags |= ZFS_ACL_TRIVIAL | ZFS_NO_EXECS_DENIED;
+            } else if (owner_changed || attrs.clear_suid_sgid) && new_meta.kind != Kind::Directory {
+                new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
+            }
             if let Some(atime) = attrs.atime {
                 new_meta.times[0] = atime;
             }
@@ -1819,10 +2094,12 @@ pub(super) fn stage_zpl_mutation(
                 new_meta.times[1] = *timestamp;
             }
             new_meta.times[2] = *timestamp;
-            let (bonus, spill) = encode_updated_zpl_bonus(
+            let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
                 &new_meta,
-                ds_ctx.sa_registry.as_ref(),
+                &mut ds_ctx,
+                attrs.mode.is_some(),
+                None,
                 alloc,
                 order,
                 new_txg,
@@ -1861,15 +2138,34 @@ pub(super) fn stage_zpl_mutation(
             };
             zpl_born.add_assign(out.born)?;
             zpl_retired.extend(out.retired_bps);
-            let bytes_delta = signed_bytes_delta(out.dnode.used_bytes(), old_used)?;
-            if bytes_delta != 0 {
+            if owner_changed {
+                quota_deltas.push(QuotaDelta {
+                    uid: loaded.metadata.uid,
+                    gid: loaded.metadata.gid,
+                    projid: Some(loaded.project_id),
+                    bytes_delta: -i64::try_from(old_used)
+                        .map_err(|_| corrupt("ZFS quota bytes_delta overflow"))?,
+                    objs_delta: -1,
+                });
                 quota_deltas.push(QuotaDelta {
                     uid: new_meta.uid,
                     gid: new_meta.gid,
                     projid: Some(loaded.project_id),
-                    bytes_delta,
-                    objs_delta: 0,
+                    bytes_delta: i64::try_from(out.dnode.used_bytes())
+                        .map_err(|_| corrupt("ZFS quota bytes_delta overflow"))?,
+                    objs_delta: 1,
                 });
+            } else {
+                let bytes_delta = signed_bytes_delta(out.dnode.used_bytes(), old_used)?;
+                if bytes_delta != 0 {
+                    quota_deltas.push(QuotaDelta {
+                        uid: new_meta.uid,
+                        gid: new_meta.gid,
+                        projid: Some(loaded.project_id),
+                        bytes_delta,
+                        objs_delta: 0,
+                    });
+                }
             }
             put_dnode_in_table(
                 cx,
@@ -1881,6 +2177,62 @@ pub(super) fn stage_zpl_mutation(
                 &out.dnode,
             )?;
             new_size
+        }
+
+        ZplMutation::SetXattr {
+            target_obj,
+            name,
+            value,
+            mode,
+            timestamp,
+        } => {
+            stage_sa_xattr_mutation(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &mut zpl_dirty_dnodes,
+                &mut ds_ctx,
+                *target_obj,
+                name,
+                Some((value.as_slice(), *mode)),
+                *timestamp,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+                &mut zpl_born,
+                &mut zpl_retired,
+                &mut quota_deltas,
+            )?;
+            *target_obj
+        }
+
+        ZplMutation::RemoveXattr {
+            target_obj,
+            name,
+            timestamp,
+        } => {
+            stage_sa_xattr_mutation(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &mut zpl_dirty_dnodes,
+                &mut ds_ctx,
+                *target_obj,
+                name,
+                None,
+                *timestamp,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+                &mut zpl_born,
+                &mut zpl_retired,
+                &mut quota_deltas,
+            )?;
+            *target_obj
         }
 
         ZplMutation::RenameEntry {
@@ -2626,6 +2978,253 @@ fn retire_or_decrement_zpl_target(
     )
 }
 
+fn is_reserved_xattr_prefix(name: &[u8]) -> bool {
+    [
+        b"freebsd:".as_slice(),
+        b"security.",
+        b"system.",
+        b"trusted.",
+        b"user.",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_sa_xattr_mutation(
+    cx: &Cx,
+    os_view: &mut Objects,
+    zpl_meta_base: &Dnode,
+    zpl_ceiling: u64,
+    zpl_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    ds_ctx: &mut DatasetContext,
+    target_obj: u64,
+    name: &str,
+    set_op: Option<(&[u8], ZfsXattrSetMode)>,
+    timestamp: Timestamp,
+    alloc: &mut PoolSpaceAllocator,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+    zpl_born: &mut SpaceDelta,
+    zpl_retired: &mut Vec<BlockPointer>,
+    quota_deltas: &mut Vec<QuotaDelta>,
+) -> Result<()> {
+    if timestamp.nanos >= 1_000_000_000 {
+        return Err(FfsError::Format("invalid ZPL nanoseconds".into()));
+    }
+    if name.len() > XATTR_NAME_BYTES {
+        return Err(FfsError::NameTooLong);
+    }
+    let Some(suffix) = name.strip_prefix("user.") else {
+        return Err(unsupported("only the ZPL user xattr namespace is exposed"));
+    };
+    if suffix.is_empty()
+        || suffix.as_bytes().contains(&0)
+        || is_reserved_xattr_prefix(suffix.as_bytes())
+    {
+        return Err(FfsError::Format("invalid user xattr suffix".into()));
+    }
+    if let Some((val, _)) = set_op
+        && val.len() > XATTR_BYTES
+    {
+        return Err(FfsError::RequestRejected {
+            errno: libc::E2BIG,
+            detail: "ZPL user xattr value exceeds 64 KiB".into(),
+        });
+    }
+
+    let loaded = load_zpl_node(
+        cx,
+        os_view,
+        zpl_meta_base,
+        zpl_ceiling,
+        zpl_dirty_dnodes,
+        ds_ctx.sa_registry.as_ref(),
+        target_obj,
+        order,
+    )?;
+    reject_flags(
+        &loaded.metadata,
+        ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_READONLY,
+    )?;
+    if loaded.dnode.bonus_type() != DMU_OT_SA || ds_ctx.zpl_version < 5 {
+        return Err(unsupported(
+            "native ZPL xattr writes require a ZPL v5 SA-formatted object",
+        ));
+    }
+
+    let XattrSources {
+        directory: xattr_dir,
+        mut inline,
+    } = ds_ctx
+        .sa_registry
+        .as_ref()
+        .ok_or_else(|| corrupt("missing SA registry"))?
+        .decode(loaded.dnode.bonus(), loaded.spill_bytes.as_deref())
+        .and_then(|attrs| attrs.xattrs())
+        .map_err(|e| parse_err(&e))?;
+
+    if xattr_dir != 0 {
+        let dir_entries = os_view.zap_values(cx, xattr_dir)?;
+        if dir_entries
+            .iter()
+            .any(|e| e.name == name.as_bytes() || e.name == suffix.as_bytes())
+        {
+            return Err(unsupported(
+                "mutating legacy directory-backed xattr entries on an SA object is unavailable",
+            ));
+        }
+    }
+
+    let existed = inline.contains_key(name) || inline.contains_key(suffix);
+    if let Some((val, mode)) = set_op {
+        match mode {
+            ZfsXattrSetMode::Create if existed => return Err(FfsError::Exists),
+            ZfsXattrSetMode::Replace if !existed => {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::ENODATA,
+                    detail: "ZPL user xattr not found".into(),
+                });
+            }
+            _ => {}
+        }
+        inline.remove(suffix);
+        inline.insert(name.to_owned(), val.to_vec());
+        if inline.len() > XATTR_COUNT {
+            return Err(FfsError::NoSpace);
+        }
+    } else {
+        let removed_prefixed = inline.remove(name).is_some();
+        let removed_compat = inline.remove(suffix).is_some();
+        if !removed_prefixed && !removed_compat {
+            return Err(FfsError::RequestRejected {
+                errno: libc::ENODATA,
+                detail: "ZPL user xattr not found".into(),
+            });
+        }
+    }
+
+    let mut new_meta = loaded.metadata.clone();
+    new_meta.times[2] = timestamp;
+    let (bonus, spill) = encode_updated_zpl_bonus_with_options(
+        &loaded,
+        &new_meta,
+        ds_ctx,
+        false,
+        Some(&inline),
+        alloc,
+        order,
+        new_txg,
+        staged_writes,
+    )?;
+    let old_used = loaded.dnode.used_bytes();
+    let out = update_metadata_only_dnode(&loaded, bonus, spill, order)?;
+    zpl_born.add_assign(out.born)?;
+    zpl_retired.extend(out.retired_bps);
+    let bytes_delta = signed_bytes_delta(out.dnode.used_bytes(), old_used)?;
+    if bytes_delta != 0 {
+        quota_deltas.push(QuotaDelta {
+            uid: new_meta.uid,
+            gid: new_meta.gid,
+            projid: Some(loaded.project_id),
+            bytes_delta,
+            objs_delta: 0,
+        });
+    }
+    put_dnode_in_table(
+        cx,
+        os_view,
+        zpl_meta_base,
+        zpl_ceiling,
+        zpl_dirty_dnodes,
+        target_obj,
+        &out.dnode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_sa_table_zap(
+    cx: &Cx,
+    os_view: &mut Objects,
+    zpl_meta_base: &Dnode,
+    zpl_ceiling: u64,
+    zpl_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    obj_id: u64,
+    expected_type: u8,
+    entries: &[RawZapEntry],
+    alloc: &mut PoolSpaceAllocator,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+    zpl_born: &mut SpaceDelta,
+    zpl_retired: &mut Vec<BlockPointer>,
+) -> Result<()> {
+    let (existing_dn, ceiling) = read_staged_or_committed_dnode(
+        cx,
+        os_view,
+        zpl_meta_base,
+        zpl_ceiling,
+        zpl_dirty_dnodes,
+        obj_id,
+        order,
+    )?;
+    if existing_dn.object_type() != expected_type {
+        return Err(corrupt("SA registry/layout ZAP has unexpected object type"));
+    }
+    let min_blk = (1_usize << alloc.ashift).max(512);
+    let (bsize, blocks) = encode_zap_blocks_for_dnode(
+        cx,
+        os_view,
+        Some((&existing_dn, ceiling)),
+        entries,
+        order,
+        min_blk,
+    )?;
+    let dirty: BTreeMap<_, _> = blocks
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| (i as u64, Some(b)))
+        .collect();
+    let out = cow_update_dnode(
+        cx,
+        os_view,
+        alloc,
+        DnodeCowSpec {
+            existing: Some((&existing_dn, ceiling)),
+            object_type: expected_type,
+            bonus_type: existing_dn.bonus_type(),
+            checksum_type: 7,
+            compress_type: 2,
+            user_flags: 0,
+            indirect_shift: existing_dn.indirect_shift(),
+            data_bytes: bsize,
+            max_block: (dirty.len() - 1) as u64,
+            slots: existing_dn.slots(),
+            nblkptr: existing_dn.pointers().len(),
+            bonus: existing_dn.bonus().to_vec(),
+            spill: None,
+            order,
+            new_txg,
+            leaf_bucket: WriteBucket::ChildBlocks,
+            indirect_bucket: WriteBucket::ChildBlocks,
+        },
+        &dirty,
+        staged_writes,
+    )?;
+    zpl_born.add_assign(out.born)?;
+    zpl_retired.extend(out.retired_bps);
+    put_dnode_in_table(
+        cx,
+        os_view,
+        zpl_meta_base,
+        zpl_ceiling,
+        zpl_dirty_dnodes,
+        obj_id,
+        &out.dnode,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_dataset_to_mos(
     cx: &Cx,
@@ -2650,6 +3249,48 @@ fn finalize_dataset_to_mos(
 ) -> Result<u64> {
     let mut zpl_born = *zpl_born_initial;
     let mut zpl_retired = zpl_retired_initial.to_vec();
+    let mut all_zpl_dirty = zpl_dirty_dnodes.clone();
+
+    if ds_ctx.sa_reg_dirty
+        && let Some(reg_obj) = ds_ctx.sa_reg_obj
+    {
+        flush_sa_table_zap(
+            cx,
+            os_view,
+            zpl_meta_base,
+            zpl_ceiling,
+            &mut all_zpl_dirty,
+            reg_obj,
+            DMU_OT_SA_ATTR_REGISTRATION,
+            &ds_ctx.sa_reg_entries,
+            alloc,
+            order,
+            new_txg,
+            staged_writes,
+            &mut zpl_born,
+            &mut zpl_retired,
+        )?;
+    }
+    if ds_ctx.sa_lay_dirty
+        && let Some(lay_obj) = ds_ctx.sa_lay_obj
+    {
+        flush_sa_table_zap(
+            cx,
+            os_view,
+            zpl_meta_base,
+            zpl_ceiling,
+            &mut all_zpl_dirty,
+            lay_obj,
+            DMU_OT_SA_ATTR_LAYOUTS,
+            &ds_ctx.sa_lay_entries,
+            alloc,
+            order,
+            new_txg,
+            staged_writes,
+            &mut zpl_born,
+            &mut zpl_retired,
+        )?;
+    }
 
     // 1. Update embedded ObjectSet quota ZAPs (`userused` / `groupused` / `projectused`) if active.
     apply_objectset_quota_deltas(
@@ -2667,12 +3308,12 @@ fn finalize_dataset_to_mos(
 
     // 2. COW the ZPL `os_meta_dnode` (`DMU_OT_DNODE`) and ZPL `ObjectSet` root (`DMU_OT_OBJSET`).
     let mut zpl_meta_dirty = BTreeMap::new();
-    for (&bid, blk) in zpl_dirty_dnodes {
+    for (&bid, blk) in &all_zpl_dirty {
         zpl_meta_dirty.insert(bid, Some(blk.clone()));
     }
     let zpl_max_block = zpl_meta_base
         .max_block()
-        .max(zpl_dirty_dnodes.keys().copied().max().unwrap_or(0));
+        .max(all_zpl_dirty.keys().copied().max().unwrap_or(0));
     let meta_out = cow_update_dnode(
         cx,
         os_view,
@@ -2747,6 +3388,36 @@ fn finalize_dataset_to_mos(
         } else {
             killed_snap.add_assign(SpaceDelta::from_bp(rbp)?)?;
             snap_bps.push(rbp.clone());
+        }
+    }
+
+    let ref_add = zpl_born
+        .dsize
+        .saturating_sub(killed_free.dsize + killed_snap.dsize);
+    let used_add = zpl_born.dsize.saturating_sub(killed_free.dsize);
+    if ref_add > 0 || used_add > 0 {
+        super::dsl_ops::enforce_dataset_quotas_for_growth(
+            cx,
+            mos,
+            mos_dirty_dnodes,
+            ds_ctx.head_object,
+            ds_ctx.directory_object,
+            ref_add,
+            used_add,
+            order,
+        )?;
+        if used_add > 0 {
+            super::dsl_ops::enforce_pool_reservations_for_growth(
+                cx,
+                mos,
+                mos_dirty_dnodes,
+                ds_ctx.head_object,
+                ds_ctx.directory_object,
+                used_add,
+                0,
+                alloc.total_free_bytes(),
+                order,
+            )?;
         }
     }
 
@@ -2838,6 +3509,7 @@ fn finalize_dataset_to_mos(
     // Walk `dsl_dir` chain from `directory_object` up to root (`dd_parent_obj == 0`).
     let mut cur_dir = ds_ctx.directory_object;
     let mut is_owning_dir = true;
+    let mut consumed_refrsrv = 0_u64;
     let mut visited_dirs = BTreeSet::new();
     while cur_dir != 0 {
         checkpoint(cx)?;
@@ -2857,11 +3529,16 @@ fn finalize_dataset_to_mos(
         let parent_dir = order.u64(&dir_bonus, 16).map_err(|e| parse_err(&e))?;
         let dd_flags = order.u64(&dir_bonus, 96).map_err(|e| parse_err(&e))?;
 
+        if is_owning_dir && dd_flags & 1 != 0 && zpl_born.dsize > killed_free.dsize {
+            let cur_refrsrv = order.u64(&dir_bonus, 136).map_err(|e| parse_err(&e))?;
+            consumed_refrsrv = cur_refrsrv.min(zpl_born.dsize - killed_free.dsize);
+        }
+
         apply_u64_delta(
             &mut dir_bonus,
             40,
             zpl_born.dsize,
-            killed_free.dsize,
+            killed_free.dsize + consumed_refrsrv,
             "dd_used_bytes",
         )?;
         apply_u64_delta(
@@ -2898,13 +3575,22 @@ fn finalize_dataset_to_mos(
                         "dd_used_breakdown[SNAP]",
                     )?;
                 }
+                if consumed_refrsrv != 0 {
+                    apply_u64_delta(
+                        &mut dir_bonus,
+                        136,
+                        0,
+                        consumed_refrsrv,
+                        "dd_used_breakdown[REFRSRV]",
+                    )?;
+                }
             } else {
                 // Ancestor DSL dirs count all descendant space in DD_USED_CHILD (`120..128`).
                 apply_u64_delta(
                     &mut dir_bonus,
                     120,
                     zpl_born.dsize,
-                    killed_free.dsize,
+                    killed_free.dsize + consumed_refrsrv,
                     "dd_used_breakdown[CHILD]",
                 )?;
             }

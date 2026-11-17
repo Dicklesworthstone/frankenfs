@@ -13,7 +13,10 @@ use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::Timestamp;
-use ffs_zfs::{Leaf, ZfsDataChecksum, ZfsTransactionEngine, ZfsTxOutcome, ZfsWriteOptions};
+use ffs_zfs::{
+    Leaf, ZfsDataChecksum, ZfsMountWriteOptions, ZfsPosixSetAttr, ZfsPropertySetValue,
+    ZfsTransactionEngine, ZfsTxOutcome, ZfsWriteOptions, ZfsXattrSetMode,
+};
 
 use super::json;
 
@@ -240,6 +243,160 @@ pub enum WriteCommand {
         #[arg(long)]
         rmdir: bool,
     },
+    /// Create an atomic DSL snapshot (`<dataset>@<snap_name>`) and publish a TXG.
+    TxSnapshot {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Snapshot name component (without `@`, `/`, or `#`).
+        snap_name: String,
+    },
+    /// Destroy `<dataset>@<snap_name>` (or defer destroy with `--defer` when held/cloned).
+    TxDestroySnapshot {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Snapshot name component to destroy.
+        snap_name: String,
+        /// Set `DS_FLAG_DEFER_DESTROY` instead of failing with `EBUSY` if holds or clones exist.
+        #[arg(long)]
+        defer: bool,
+    },
+    /// Rename `<dataset>@<old_snap_name>` to `<dataset>@<new_snap_name>` and publish a TXG.
+    TxRenameSnapshot {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        old_snap_name: String,
+        new_snap_name: String,
+    },
+    /// Place a user hold `<tag>` on `<dataset>@<snap_name>` (`DMU_OT_USERREFS`).
+    TxHold {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        snap_name: String,
+        tag: String,
+    },
+    /// Release user hold `<tag>` on `<dataset>@<snap_name>` (auto-destroying if deferred and unreferenced).
+    TxRelease {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        snap_name: String,
+        tag: String,
+    },
+    /// Create a bookmark `<dataset>#<bookmark_name>` from `--snapshot <snap>` or `--source-bookmark <bm>`.
+    TxBookmark {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        bookmark_name: String,
+        /// Source snapshot name on the same dataset.
+        #[arg(long, conflicts_with = "source_bookmark")]
+        snapshot: Option<String>,
+        /// Source bookmark name on the same dataset.
+        #[arg(long, conflicts_with = "snapshot")]
+        source_bookmark: Option<String>,
+    },
+    /// Destroy bookmark `<dataset>#<bookmark_name>` and publish a TXG.
+    TxDestroyBookmark {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        bookmark_name: String,
+    },
+    /// Create a fresh child ZPL filesystem dataset `<dataset>/<child_name>` and publish a TXG.
+    TxCreateDataset {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Single child dataset name component created beneath `--dataset`.
+        child_name: String,
+        /// Initial property assignment `name=value` (repeatable).
+        #[arg(long = "prop")]
+        props: Vec<String>,
+    },
+    /// Create a writable clone dataset `<target_dataset>` from `<dataset>@<origin_snap>`.
+    TxClone {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Origin snapshot name on `--dataset`.
+        origin_snap: String,
+        /// Pool-relative target clone dataset path (e.g. `data/clone1` or `clone_root`).
+        target_dataset: String,
+        /// Initial property assignment `name=value` on the clone (repeatable).
+        #[arg(long = "prop")]
+        props: Vec<String>,
+    },
+    /// Rename non-root dataset `--dataset` to `<new_dataset>` (transferring parent space/reservations).
+    TxRenameDataset {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// New pool-relative dataset path.
+        new_dataset: String,
+    },
+    /// Destroy leaf dataset or clone `--dataset` (pruning `birth > origin_txg` blocks).
+    TxDestroyDataset {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+    },
+    /// Set a native or user (`ns:name`) property on `--dataset` and publish a TXG.
+    TxSetProp {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        property: String,
+        value: String,
+    },
+    /// Inherit (clear local value of) a property on `--dataset` and publish a TXG.
+    TxInheritProp {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        property: String,
+    },
+    /// Update POSIX mode, uid, gid, size, or timestamps on an existing ZPL node in one TXG.
+    TxSetattr {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Target ZPL path inside `--dataset` (`/` is allowed for dataset root chmod/chown/utimes).
+        path: PathBuf,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        uid: Option<u64>,
+        #[arg(long)]
+        gid: Option<u64>,
+        #[arg(long)]
+        size: Option<u64>,
+        #[arg(long)]
+        atime_sec: Option<i64>,
+        #[arg(long)]
+        mtime_sec: Option<i64>,
+        #[arg(long)]
+        clear_suid_sgid: bool,
+    },
+    /// Set or replace a `user.*` SA extended attribute (`ZPL_DXATTR` inline or spill) in one TXG.
+    TxSetxattr {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Target ZPL path inside `--dataset`.
+        path: PathBuf,
+        /// Extended attribute name (`user.<name>`).
+        name: String,
+        /// UTF-8 attribute value.
+        #[arg(long, conflicts_with = "value_file")]
+        value: Option<String>,
+        /// Host file containing raw binary xattr bytes.
+        #[arg(long, conflicts_with = "value")]
+        value_file: Option<PathBuf>,
+        /// Fail if the xattr already exists (`XATTR_CREATE`).
+        #[arg(long, conflicts_with = "replace")]
+        create: bool,
+        /// Fail if the xattr does not already exist (`XATTR_REPLACE`).
+        #[arg(long, conflicts_with = "create")]
+        replace: bool,
+    },
+    /// Remove a `user.*` SA extended attribute in one TXG.
+    TxRmxattr {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Target ZPL path inside `--dataset`.
+        path: PathBuf,
+        /// Extended attribute name (`user.<name>`).
+        name: String,
+    },
 }
 
 fn parse_dataset_components(dataset: &str) -> Result<Vec<Vec<u8>>> {
@@ -280,6 +437,64 @@ fn writable_mountpoint(target: &AdmitArgs, path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(mountpoint)
+}
+
+fn parse_size_or_u64(raw: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(0);
+    }
+    let (digits, mult) = match trimmed.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&trimmed[..trimmed.len() - 1], 1024_u64),
+        Some(b'm' | b'M') => (&trimmed[..trimmed.len() - 1], 1024_u64 * 1024),
+        Some(b'g' | b'G') => (&trimmed[..trimmed.len() - 1], 1024_u64 * 1024 * 1024),
+        Some(b't' | b'T') => (&trimmed[..trimmed.len() - 1], 1024_u64 * 1024 * 1024 * 1024),
+        _ => (trimmed, 1_u64),
+    };
+    let base: u64 = digits
+        .parse()
+        .with_context(|| format!("invalid integer/size property value `{raw}`"))?;
+    base.checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("property size `{raw}` overflows u64"))
+}
+
+fn parse_property_set_value(name: &str, raw: &str) -> Result<ZfsPropertySetValue> {
+    if name.contains(':') {
+        return Ok(ZfsPropertySetValue::Text(raw.as_bytes().to_vec()));
+    }
+    let norm = raw.trim().to_ascii_lowercase();
+    let num = match name {
+        "readonly" | "atime" => match norm.as_str() {
+            "on" | "1" | "true" => 1,
+            "off" | "0" | "false" => 0,
+            _ => bail!("boolean property `{name}` expects `on` or `off`, got `{raw}`"),
+        },
+        "checksum" => match norm.as_str() {
+            "on" | "1" => 1,
+            "fletcher4" | "7" => 7,
+            "sha256" | "8" => 8,
+            _ => bail!("checksum property expects `on`, `fletcher4`, or `sha256`, got `{raw}`"),
+        },
+        "quota" | "refquota" | "reservation" | "refreservation" | "recordsize" => {
+            parse_size_or_u64(raw)?
+        }
+        _ => parse_size_or_u64(raw)?,
+    };
+    Ok(ZfsPropertySetValue::Number(num))
+}
+
+fn parse_prop_assignments(raw_props: &[String]) -> Result<Vec<(String, ZfsPropertySetValue)>> {
+    let mut out = Vec::with_capacity(raw_props.len());
+    for spec in raw_props {
+        let Some((name, val)) = spec.split_once('=') else {
+            bail!("invalid `--prop {spec}`: expected `name=value`");
+        };
+        if name.is_empty() {
+            bail!("empty property name in `--prop {spec}`");
+        }
+        out.push((name.to_owned(), parse_property_set_value(name, val)?));
+    }
+    Ok(out)
 }
 
 fn parse_mode_bits(raw: &str) -> Result<u16> {
@@ -459,7 +674,14 @@ impl WriteCommand {
                     },
                 )
                 .context("admitting the native ZFS mount writer")?;
-                let fs = ffs_zfs::ZfsFs::with_writer(cx, engine, components)?;
+                let fs = ffs_zfs::ZfsFs::with_writer_options(
+                    cx,
+                    engine,
+                    components,
+                    ZfsMountWriteOptions {
+                        allow_mode_and_owner_setattr: true,
+                    },
+                )?;
                 let options = ffs_fuse::MountOptions {
                     read_only: false,
                     allow_other: false,
@@ -468,7 +690,7 @@ impl WriteCommand {
                     ..ffs_fuse::MountOptions::default()
                 };
                 eprintln!(
-                    "experimental ZFS writer: synchronous native TXG commits; native mode/ownership, noatime; native ACL enforcement and open-unlink retention are not implemented"
+                    "experimental ZFS writer: synchronous native TXG commits; native mode/ownership/SA-xattr/open-unlink, noatime; non-trivial ACL enforcement is not implemented"
                 );
                 let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
                 Ok(())
@@ -616,6 +838,236 @@ impl WriteCommand {
                     pool.zpl_timestamp(),
                 );
                 emit_tx_outcome("tx_unlink", &pool.dataset, &engine, outcome)
+            }
+            Self::TxSnapshot { pool, snap_name } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.create_snapshot(
+                    cx,
+                    &components,
+                    snap_name.as_bytes(),
+                    pool.zpl_timestamp(),
+                );
+                emit_tx_outcome("tx_snapshot", &pool.dataset, &engine, outcome)
+            }
+            Self::TxDestroySnapshot {
+                pool,
+                snap_name,
+                defer,
+            } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.destroy_snapshot(cx, &components, snap_name.as_bytes(), defer);
+                emit_tx_outcome("tx_destroy_snapshot", &pool.dataset, &engine, outcome)
+            }
+            Self::TxRenameSnapshot {
+                pool,
+                old_snap_name,
+                new_snap_name,
+            } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.rename_snapshot(
+                    cx,
+                    &components,
+                    old_snap_name.as_bytes(),
+                    new_snap_name.as_bytes(),
+                );
+                emit_tx_outcome("tx_rename_snapshot", &pool.dataset, &engine, outcome)
+            }
+            Self::TxHold {
+                pool,
+                snap_name,
+                tag,
+            } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.hold_snapshot(
+                    cx,
+                    &components,
+                    snap_name.as_bytes(),
+                    tag.as_bytes(),
+                    pool.zpl_timestamp(),
+                );
+                emit_tx_outcome("tx_hold", &pool.dataset, &engine, outcome)
+            }
+            Self::TxRelease {
+                pool,
+                snap_name,
+                tag,
+            } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome =
+                    engine.release_snapshot(cx, &components, snap_name.as_bytes(), tag.as_bytes());
+                emit_tx_outcome("tx_release", &pool.dataset, &engine, outcome)
+            }
+            Self::TxBookmark {
+                pool,
+                bookmark_name,
+                snapshot,
+                source_bookmark,
+            } => {
+                let (source_name, is_bm) = match (snapshot, source_bookmark) {
+                    (Some(s), None) => (s, false),
+                    (None, Some(b)) => (b, true),
+                    _ => bail!("specify exactly one of --snapshot or --source-bookmark"),
+                };
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.create_bookmark(
+                    cx,
+                    &components,
+                    bookmark_name.as_bytes(),
+                    source_name.as_bytes(),
+                    is_bm,
+                );
+                emit_tx_outcome("tx_bookmark", &pool.dataset, &engine, outcome)
+            }
+            Self::TxDestroyBookmark {
+                pool,
+                bookmark_name,
+            } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.destroy_bookmark(cx, &components, bookmark_name.as_bytes());
+                emit_tx_outcome("tx_destroy_bookmark", &pool.dataset, &engine, outcome)
+            }
+            Self::TxCreateDataset {
+                pool,
+                child_name,
+                props,
+            } => {
+                let parsed_props = parse_prop_assignments(&props)?;
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.create_dataset(
+                    cx,
+                    &components,
+                    child_name.as_bytes(),
+                    &parsed_props,
+                    pool.zpl_timestamp(),
+                );
+                emit_tx_outcome("tx_create_dataset", &pool.dataset, &engine, outcome)
+            }
+            Self::TxClone {
+                pool,
+                origin_snap,
+                target_dataset,
+                props,
+            } => {
+                let parsed_props = parse_prop_assignments(&props)?;
+                let mut target_parts = parse_dataset_components(&target_dataset)?;
+                let Some(target_name) = target_parts.pop() else {
+                    bail!("target clone dataset cannot be the pool root");
+                };
+                let (mut engine, origin_components) = pool.open_engine(cx)?;
+                let outcome = engine.create_clone(
+                    cx,
+                    &origin_components,
+                    origin_snap.as_bytes(),
+                    &target_parts,
+                    &target_name,
+                    &parsed_props,
+                    pool.zpl_timestamp(),
+                );
+                emit_tx_outcome("tx_clone", &target_dataset, &engine, outcome)
+            }
+            Self::TxRenameDataset { pool, new_dataset } => {
+                let new_components = parse_dataset_components(&new_dataset)?;
+                if new_components.is_empty() {
+                    bail!("new dataset name cannot be the pool root");
+                }
+                let (mut engine, old_components) = pool.open_engine(cx)?;
+                let outcome = engine.rename_dataset(cx, &old_components, &new_components);
+                emit_tx_outcome("tx_rename_dataset", &new_dataset, &engine, outcome)
+            }
+            Self::TxDestroyDataset { pool } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.destroy_dataset(cx, &components);
+                emit_tx_outcome("tx_destroy_dataset", &pool.dataset, &engine, outcome)
+            }
+            Self::TxSetProp {
+                pool,
+                property,
+                value,
+            } => {
+                let parsed_val = parse_property_set_value(&property, &value)?;
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.set_property(cx, &components, &property, parsed_val);
+                emit_tx_outcome("tx_set_prop", &pool.dataset, &engine, outcome)
+            }
+            Self::TxInheritProp { pool, property } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.inherit_property(cx, &components, &property);
+                emit_tx_outcome("tx_inherit_prop", &pool.dataset, &engine, outcome)
+            }
+            Self::TxSetattr {
+                pool,
+                path,
+                mode,
+                uid,
+                gid,
+                size,
+                atime_sec,
+                mtime_sec,
+                clear_suid_sgid,
+            } => {
+                let mode_bits = mode.as_deref().map(parse_mode_bits).transpose()?;
+                let attrs = ZfsPosixSetAttr {
+                    size,
+                    atime: atime_sec.map(|seconds| Timestamp { seconds, nanos: 0 }),
+                    mtime: mtime_sec.map(|seconds| Timestamp { seconds, nanos: 0 }),
+                    mode: mode_bits,
+                    uid,
+                    gid,
+                    clear_suid_sgid,
+                };
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let target_obj = resolve_target_object(cx, &engine, &components, path.as_os_str())?;
+                let outcome = engine.set_posix_attributes(
+                    cx,
+                    &components,
+                    target_obj,
+                    &attrs,
+                    pool.zpl_timestamp(),
+                    pool.data_checksum(),
+                );
+                emit_tx_outcome("tx_setattr", &pool.dataset, &engine, outcome)
+            }
+            Self::TxSetxattr {
+                pool,
+                path,
+                name,
+                value,
+                value_file,
+                create,
+                replace,
+            } => {
+                let payload = match (value, value_file) {
+                    (Some(text), None) => text.into_bytes(),
+                    (None, Some(host_path)) => std::fs::read(&host_path)
+                        .with_context(|| format!("reading --value-file {}", host_path.display()))?,
+                    _ => bail!("specify exactly one of --value or --value-file"),
+                };
+                let xattr_mode = if create {
+                    ZfsXattrSetMode::Create
+                } else if replace {
+                    ZfsXattrSetMode::Replace
+                } else {
+                    ZfsXattrSetMode::Auto
+                };
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let target_obj = resolve_target_object(cx, &engine, &components, path.as_os_str())?;
+                let outcome = engine.set_xattr(
+                    cx,
+                    &components,
+                    target_obj,
+                    &name,
+                    &payload,
+                    xattr_mode,
+                    pool.zpl_timestamp(),
+                );
+                emit_tx_outcome("tx_setxattr", &pool.dataset, &engine, outcome)
+            }
+            Self::TxRmxattr { pool, path, name } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let target_obj = resolve_target_object(cx, &engine, &components, path.as_os_str())?;
+                let outcome =
+                    engine.remove_xattr(cx, &components, target_obj, &name, pool.zpl_timestamp());
+                emit_tx_outcome("tx_rmxattr", &pool.dataset, &engine, outcome)
             }
         }
     }
@@ -859,5 +1311,138 @@ mod tests {
         assert_eq!(parse_mode_bits("0644").unwrap(), 0o644);
         assert_eq!(parse_mode_bits("0o755").unwrap(), 0o755);
         assert_eq!(parse_mode_bits("420").unwrap(), 420);
+    }
+
+    #[test]
+    fn cli_dsl_and_extended_zpl_subcommands_require_authority_and_parse_properties() {
+        let auth = [
+            "--offline-image",
+            "--allow-write",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--dataset",
+            "data",
+        ];
+        for cmd in [
+            vec!["ffs-zfs", "tx-snapshot", "leaf.img", "s1"],
+            vec![
+                "ffs-zfs",
+                "tx-destroy-snapshot",
+                "leaf.img",
+                "s1",
+                "--defer",
+            ],
+            vec!["ffs-zfs", "tx-rename-snapshot", "leaf.img", "s1", "s2"],
+            vec!["ffs-zfs", "tx-hold", "leaf.img", "s1", "keep"],
+            vec!["ffs-zfs", "tx-release", "leaf.img", "s1", "keep"],
+            vec![
+                "ffs-zfs",
+                "tx-bookmark",
+                "leaf.img",
+                "bm1",
+                "--snapshot",
+                "s1",
+            ],
+            vec!["ffs-zfs", "tx-destroy-bookmark", "leaf.img", "bm1"],
+            vec![
+                "ffs-zfs",
+                "tx-create-dataset",
+                "leaf.img",
+                "child",
+                "--prop",
+                "quota=64M",
+                "--prop",
+                "app:env=prod",
+            ],
+            vec![
+                "ffs-zfs",
+                "tx-clone",
+                "leaf.img",
+                "s1",
+                "data/clone1",
+                "--prop",
+                "refquota=32M",
+            ],
+            vec!["ffs-zfs", "tx-rename-dataset", "leaf.img", "data_moved"],
+            vec!["ffs-zfs", "tx-destroy-dataset", "leaf.img"],
+            vec!["ffs-zfs", "tx-set-prop", "leaf.img", "reservation", "16M"],
+            vec!["ffs-zfs", "tx-inherit-prop", "leaf.img", "reservation"],
+            vec![
+                "ffs-zfs",
+                "tx-setattr",
+                "leaf.img",
+                "/file.txt",
+                "--mode",
+                "0600",
+                "--uid",
+                "1000",
+                "--gid",
+                "1000",
+            ],
+            vec![
+                "ffs-zfs",
+                "tx-setxattr",
+                "leaf.img",
+                "/file.txt",
+                "user.tag",
+                "--value",
+                "v1",
+                "--create",
+            ],
+            vec!["ffs-zfs", "tx-rmxattr", "leaf.img", "/file.txt", "user.tag"],
+        ] {
+            // Without --allow-write must fail clap parsing.
+            assert!(
+                Cli::try_parse_from(cmd.iter().copied().chain([
+                    "--offline-image",
+                    "--pool-guid",
+                    "123",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "2"
+                ]))
+                .is_err()
+            );
+            assert!(Cli::try_parse_from(cmd.into_iter().chain(auth)).is_ok());
+        }
+        // Bookmark conflicting source flags rejected by clap.
+        assert!(
+            Cli::try_parse_from(
+                [
+                    "ffs-zfs",
+                    "tx-bookmark",
+                    "leaf.img",
+                    "bm1",
+                    "--snapshot",
+                    "s1",
+                    "--source-bookmark",
+                    "bm0",
+                ]
+                .into_iter()
+                .chain(auth),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_property_set_value("quota", "none").unwrap(),
+            ZfsPropertySetValue::Number(0)
+        );
+        assert_eq!(
+            parse_property_set_value("quota", "64M").unwrap(),
+            ZfsPropertySetValue::Number(64 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_property_set_value("readonly", "on").unwrap(),
+            ZfsPropertySetValue::Number(1)
+        );
+        assert_eq!(
+            parse_property_set_value("org:owner", "alice").unwrap(),
+            ZfsPropertySetValue::Text(b"alice".to_vec())
+        );
     }
 }

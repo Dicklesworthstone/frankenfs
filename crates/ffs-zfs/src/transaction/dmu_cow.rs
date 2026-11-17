@@ -16,10 +16,13 @@ use ffs_ondisk::zfs_dmu::{
     DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, DNODE_FLAG_USED_BYTES,
     DNODE_FLAG_USEROBJUSED_ACCOUNTED, DNODE_FLAG_USERUSED_ACCOUNTED, Dnode, DnodeSpec,
     OBJSET_GROUPUSED_OFFSET, OBJSET_PROJECTUSED_OFFSET, OBJSET_USERUSED_OFFSET, ObjectSet,
-    ZapEntry, clear_dnode_at, count_allocated_dnodes, dnode_at, encode_microzap,
+    ZapEntry, clear_dnode_at, count_allocated_dnodes, dnode_at, encode_microzap_with_normflags,
     find_free_dnode_slot, microzap, write_dnode_at,
 };
-use ffs_ondisk::zfs_zap::{Entry as RawZapEntry, FAT_TAG, FatHeader, encode_fatzap_with_flags};
+use ffs_ondisk::zfs_zap::{
+    Entry as RawZapEntry, FAT_TAG, FatHeader, MICRO_TAG, encode_fatzap_with_normflags,
+    names::NamePolicy as ZapNamePolicy,
+};
 
 use crate::reader::dmu::Objects;
 
@@ -446,6 +449,11 @@ impl PoolSpaceAllocator {
     pub fn free_block_dvas(&mut self, bp: &BlockPointer, new_txg: u64) -> Result<SpaceDelta> {
         if bp.hole() || bp.embedded() {
             return Ok(SpaceDelta::default());
+        }
+        if bp.dedup() {
+            return Err(unsupported(
+                "refusing to free BP_IS_DEDUP block pointer without DDT refcount decrement",
+            ));
         }
         let delta = SpaceDelta::from_bp(bp)?;
         let dvas = bp.regular_dvas().map_err(|e| parse_err(&e))?;
@@ -1130,7 +1138,8 @@ pub(super) fn cow_update_dnode(
     })
 }
 
-/// Encode a ZAP entry set (preserving Micro-ZAP while it fits, or upgrading/keeping Fat-ZAP).
+/// Encode a ZAP entry set (preserving Micro-ZAP while it fits, or upgrading/keeping Fat-ZAP,
+/// and preserving existing `salt`, `hash64`, and `normflags` such as `2` on `ds_snapnames_zapobj`).
 pub(super) fn encode_zap_blocks_for_dnode(
     cx: &Cx,
     view: &mut Objects,
@@ -1139,18 +1148,61 @@ pub(super) fn encode_zap_blocks_for_dnode(
     order: Endian,
     min_block_bytes: usize,
 ) -> Result<(usize, Vec<Vec<u8>>)> {
+    encode_zap_blocks_for_dnode_with_normflags(
+        cx,
+        view,
+        existing,
+        entries,
+        0,
+        order,
+        min_block_bytes,
+    )
+}
+
+pub(super) fn encode_zap_blocks_for_dnode_with_normflags(
+    cx: &Cx,
+    view: &mut Objects,
+    existing: Option<(&Dnode, u64)>,
+    entries: &[RawZapEntry],
+    default_normflags: u64,
+    order: Endian,
+    min_block_bytes: usize,
+) -> Result<(usize, Vec<Vec<u8>>)> {
     let mut was_fatzap = false;
     let mut salt = 0x5A46_535F_4646_5331_u64;
     let mut hash64 = false;
+    let mut normflags = default_normflags;
     if let Some((node, ceiling)) = existing
         && let Some((blk0, blk_order, _)) = view.object_data_block(cx, node, ceiling, 0)?
         && blk0.len() >= 64
-        && blk_order.u64(&blk0, 0).ok() == Some(FAT_TAG)
     {
-        was_fatzap = true;
-        if let Ok(fh) = FatHeader::parse(&blk0, blk_order, node.max_block()) {
-            salt = fh.salt();
-            hash64 = fh.is_hash64();
+        match blk_order.u64(&blk0, 0).ok() {
+            Some(FAT_TAG) => {
+                was_fatzap = true;
+                if let Ok(fh) = FatHeader::parse_with_names(
+                    &blk0,
+                    blk_order,
+                    node.max_block(),
+                    ZapNamePolicy::AsciiUppercase,
+                ) {
+                    salt = fh.salt();
+                    hash64 = fh.is_hash64();
+                    normflags = fh.normflags();
+                }
+            }
+            Some(MICRO_TAG) => {
+                if let Ok(s) = blk_order.u64(&blk0, 8)
+                    && s != 0
+                {
+                    salt = s;
+                }
+                if let Ok(nf) = blk_order.u64(&blk0, 16)
+                    && matches!(nf, 0 | 2)
+                {
+                    normflags = nf;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1173,15 +1225,18 @@ pub(super) fn encode_zap_blocks_for_dnode(
             .max(min_block_bytes)
             .max(512);
         while bsize <= FATZAP_BLOCK_BYTES {
-            if let Ok(raw) = encode_microzap(&micro_entries, bsize, salt, order) {
+            if let Ok(raw) =
+                encode_microzap_with_normflags(&micro_entries, bsize, salt, normflags, order)
+            {
                 return Ok((bsize, vec![raw]));
             }
             bsize *= 2;
         }
     }
 
-    let blocks = encode_fatzap_with_flags(entries, FATZAP_BLOCK_BYTES, salt, hash64, order)
-        .map_err(|e| parse_err(&e))?;
+    let blocks =
+        encode_fatzap_with_normflags(entries, FATZAP_BLOCK_BYTES, salt, hash64, normflags, order)
+            .map_err(|e| parse_err(&e))?;
     Ok((FATZAP_BLOCK_BYTES, blocks))
 }
 
@@ -1411,7 +1466,8 @@ fn read_embedded_zap_entries(
 }
 
 /// Allocate a free object ID (`>= 1`) in a dnode table (`os_meta_dnode`), loading or
-/// extending `meta_dirty_blocks` (`16 KiB` `DMU_OT_DNODE` blocks).
+/// extending `meta_dirty_blocks` (`16 KiB` `DMU_OT_DNODE` blocks) and reserving the
+/// slot(s) immediately so multiple allocations in the same TXG never collide.
 pub(super) fn allocate_object_id(
     cx: &Cx,
     view: &mut Objects,
@@ -1421,6 +1477,24 @@ pub(super) fn allocate_object_id(
     slots_needed: usize,
 ) -> Result<u64> {
     let slots_per_block = DNODE_BLOCK_BYTES / DNODE_BYTES;
+    let placeholder = Dnode::from_spec(DnodeSpec {
+        object_type: DMU_OT_OBJECT_ARRAY,
+        bonus_type: 0,
+        checksum_type: 0,
+        compress_type: 0,
+        flags: DNODE_FLAG_USED_BYTES,
+        order: meta_dnode.order(),
+        levels: 1,
+        indirect_shift: 17,
+        data_bytes: 512,
+        max_block: 0,
+        used_bytes: 0,
+        slots: slots_needed,
+        pointers: vec![BlockPointer::hole_pointer(); 3],
+        bonus: Vec::new(),
+        spill: None,
+    })
+    .map_err(|e| parse_err(&e))?;
     let max_existing = meta_dnode
         .max_block()
         .max(meta_dirty_blocks.keys().copied().max().unwrap_or(0));
@@ -1435,18 +1509,21 @@ pub(super) fn allocate_object_id(
             meta_dirty_blocks,
         )?;
         let blk = meta_dirty_blocks
-            .get(&block_id)
+            .get_mut(&block_id)
             .ok_or_else(|| corrupt("missing loaded dnode table block"))?;
         let min_slot = usize::from(block_id == 0);
         if let Some(slot) =
             find_free_dnode_slot(blk, min_slot, slots_needed).map_err(|e| parse_err(&e))?
         {
+            write_dnode_at(blk, slot, &placeholder).map_err(|e| parse_err(&e))?;
             return Ok(block_id * (slots_per_block as u64) + (slot as u64));
         }
     }
     let next_block_id = max_existing + 1;
-    meta_dirty_blocks.insert(next_block_id, vec![0_u8; DNODE_BLOCK_BYTES]);
     let min_slot = usize::from(next_block_id == 0);
+    let mut new_blk = vec![0_u8; DNODE_BLOCK_BYTES];
+    write_dnode_at(&mut new_blk, min_slot, &placeholder).map_err(|e| parse_err(&e))?;
+    meta_dirty_blocks.insert(next_block_id, new_blk);
     Ok(next_block_id * (slots_per_block as u64) + (min_slot as u64))
 }
 
@@ -1830,7 +1907,7 @@ fn append_bps_to_bpobj(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_bps_to_bpobj_inner(
+pub(super) fn append_bps_to_bpobj_inner(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -1964,25 +2041,108 @@ fn append_bps_to_bpobj_inner(
     )
 }
 
-/// Converge MOS space-map objects, MOS `features_for_write`, `metaslab_array` (if any
-/// uninitialized metaslab was first touched), MOS dnode table, MOS indirects, and the
-/// MOS `ObjectSet` root block to an exact fixed point where every physical block in the
-/// pool matches the committed space-map streams and 32-bucket histograms to the sector.
-#[allow(clippy::too_many_arguments)]
+/// Mutable MOS feature catalog state (`features_for_read`, `features_for_write`, and
+/// `feature_enabled_txg`) converged and persisted atomically with space maps.
+#[derive(Debug, Clone, Default)]
+pub(super) struct MosFeatureState {
+    pub read_features: BTreeMap<String, u64>,
+    pub read_features_obj: Option<u64>,
+    pub read_dirty: bool,
+    pub write_features: BTreeMap<String, u64>,
+    pub write_features_obj: Option<u64>,
+    pub write_dirty: bool,
+    pub enabled_txg: BTreeMap<String, u64>,
+    pub enabled_txg_obj: Option<u64>,
+    pub enabled_txg_dirty: bool,
+}
+
+impl MosFeatureState {
+    pub fn reset_dirty(&mut self) {
+        self.read_dirty = false;
+        self.write_dirty = false;
+        self.enabled_txg_dirty = false;
+    }
+
+    pub fn increment_read(&mut self, guid: &str, new_txg: u64) -> Result<()> {
+        let slot = self.read_features.get_mut(guid).ok_or_else(|| {
+            unsupported(format!("ZFS read feature {guid} is not enabled on pool"))
+        })?;
+        let was_zero = *slot == 0;
+        *slot = slot
+            .checked_add(1)
+            .ok_or_else(|| corrupt("ZFS read feature refcount overflow"))?;
+        self.read_dirty = true;
+        if was_zero && self.enabled_txg_obj.is_some() && !self.enabled_txg.contains_key(guid) {
+            self.enabled_txg.insert(guid.to_owned(), new_txg);
+            self.enabled_txg_dirty = true;
+        }
+        Ok(())
+    }
+
+    pub fn decrement_read(&mut self, guid: &str) -> Result<()> {
+        let slot = self
+            .read_features
+            .get_mut(guid)
+            .ok_or_else(|| corrupt(format!("missing ZFS read feature {guid} on decrement")))?;
+        *slot = slot
+            .checked_sub(1)
+            .ok_or_else(|| corrupt("ZFS read feature refcount underflow"))?;
+        self.read_dirty = true;
+        Ok(())
+    }
+
+    pub fn increment_write(&mut self, guid: &str, new_txg: u64) -> Result<()> {
+        let slot = self.write_features.get_mut(guid).ok_or_else(|| {
+            unsupported(format!("ZFS write feature {guid} is not enabled on pool"))
+        })?;
+        let was_zero = *slot == 0;
+        *slot = slot
+            .checked_add(1)
+            .ok_or_else(|| corrupt("ZFS write feature refcount overflow"))?;
+        self.write_dirty = true;
+        if was_zero && self.enabled_txg_obj.is_some() && !self.enabled_txg.contains_key(guid) {
+            self.enabled_txg.insert(guid.to_owned(), new_txg);
+            self.enabled_txg_dirty = true;
+        }
+        Ok(())
+    }
+
+    pub fn decrement_write(&mut self, guid: &str) -> Result<()> {
+        let slot = self
+            .write_features
+            .get_mut(guid)
+            .ok_or_else(|| corrupt(format!("missing ZFS write feature {guid} on decrement")))?;
+        *slot = slot
+            .checked_sub(1)
+            .ok_or_else(|| corrupt("ZFS write feature refcount underflow"))?;
+        self.write_dirty = true;
+        Ok(())
+    }
+}
+
+/// Converge MOS space-map objects, MOS `features_for_read` / `features_for_write` /
+/// `feature_enabled_txg`, `metaslab_array` (if any uninitialized metaslab was first touched),
+/// MOS dnode table, MOS indirects, and the MOS `ObjectSet` root block to an exact fixed point
+/// where every physical block in the pool matches the committed space-map streams and
+/// 32-bucket histograms to the sector.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn finalize_mos_and_space_maps_to_convergence(
     cx: &Cx,
     mos: &mut Objects,
     mos_os_template: &ObjectSet,
     old_mos_root_bp: &BlockPointer,
     base_mos_dirty_dnode_blocks: &BTreeMap<u64, Vec<u8>>,
-    base_write_features: &BTreeMap<String, u64>,
-    base_write_features_dirty: bool,
-    write_features_obj: Option<u64>,
+    base_features: &MosFeatureState,
     base_alloc: &PoolSpaceAllocator,
     base_staged_writes: &[StagedBlockWrite],
     order: Endian,
     new_txg: u64,
-) -> Result<(BlockPointer, PoolSpaceAllocator, Vec<StagedBlockWrite>)> {
+) -> Result<(
+    BlockPointer,
+    PoolSpaceAllocator,
+    MosFeatureState,
+    Vec<StagedBlockWrite>,
+)> {
     checkpoint(cx)?;
     let mos_meta = mos.meta_dnode().clone();
     let mos_ceiling = mos.root_birth_txg();
@@ -2007,8 +2167,7 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
         checkpoint(cx)?;
         let mut alloc = work_base_alloc.clone();
         let mut mos_dirty_dnodes = base_mos_dirty_dnode_blocks.clone();
-        let mut write_features = base_write_features.clone();
-        let mut wf_dirty = base_write_features_dirty;
+        let mut features = base_features.clone();
         let mut staged = base_staged_writes.to_vec();
 
         // 1. Ensure every dirty metaslab in `planned_sm` has an allocated `sm_obj` ID
@@ -2023,11 +2182,11 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
                 alloc.metaslabs[ms_id].preserved_smp_object = new_sm_obj;
                 if alloc.spacemap_histogram_present {
                     alloc.metaslabs[ms_id].bonus_len = 320;
-                    if let Some(cnt) = write_features.get_mut("com.delphix:spacemap_histogram") {
-                        *cnt = cnt
-                            .checked_add(1)
-                            .ok_or_else(|| corrupt("spacemap_histogram refcount overflow"))?;
-                        wf_dirty = true;
+                    if features
+                        .write_features
+                        .contains_key("com.delphix:spacemap_histogram")
+                    {
+                        features.increment_write("com.delphix:spacemap_histogram", new_txg)?;
                     }
                 } else {
                     alloc.metaslabs[ms_id].bonus_len = 24;
@@ -2104,67 +2263,85 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
             )?;
         }
 
-        if wf_dirty && let Some(wf_obj) = write_features_obj {
-            let (wf_dn, wf_ceiling) = mos.object_with_ceiling(cx, wf_obj)?;
-            let wf_entries: Vec<RawZapEntry> = write_features
-                .iter()
-                .map(|(k, &v)| RawZapEntry {
-                    name: k.as_bytes().to_vec(),
-                    integer_bytes: 8,
-                    values: vec![v],
-                    collision: 0,
-                })
-                .collect();
-            let (bsize, blocks) = encode_zap_blocks_for_dnode(
-                cx,
-                mos,
-                Some((&wf_dn, wf_ceiling)),
-                &wf_entries,
-                order,
-                min_blk,
-            )?;
-            let mut dirty = BTreeMap::new();
-            for (i, b) in blocks.into_iter().enumerate() {
-                dirty.insert(i as u64, Some(b));
-            }
-            let out = cow_update_dnode(
-                cx,
-                mos,
-                &mut alloc,
-                DnodeCowSpec {
-                    existing: Some((&wf_dn, wf_ceiling)),
-                    object_type: wf_dn.object_type(),
-                    bonus_type: wf_dn.bonus_type(),
-                    checksum_type: 7,
-                    compress_type: 2,
-                    user_flags: 0,
-                    indirect_shift: wf_dn.indirect_shift(),
-                    data_bytes: bsize,
-                    max_block: (dirty.len() - 1) as u64,
-                    slots: wf_dn.slots(),
-                    nblkptr: wf_dn.pointers().len(),
-                    bonus: wf_dn.bonus().to_vec(),
-                    spill: None,
+        for (dirty_flag, obj_opt, map_ref) in [
+            (
+                features.read_dirty,
+                features.read_features_obj,
+                &features.read_features,
+            ),
+            (
+                features.write_dirty,
+                features.write_features_obj,
+                &features.write_features,
+            ),
+            (
+                features.enabled_txg_dirty,
+                features.enabled_txg_obj,
+                &features.enabled_txg,
+            ),
+        ] {
+            if dirty_flag && let Some(f_obj) = obj_opt {
+                let (f_dn, f_ceiling) = mos.object_with_ceiling(cx, f_obj)?;
+                let f_entries: Vec<RawZapEntry> = map_ref
+                    .iter()
+                    .map(|(k, &v)| RawZapEntry {
+                        name: k.as_bytes().to_vec(),
+                        integer_bytes: 8,
+                        values: vec![v],
+                        collision: 0,
+                    })
+                    .collect();
+                let (bsize, blocks) = encode_zap_blocks_for_dnode(
+                    cx,
+                    mos,
+                    Some((&f_dn, f_ceiling)),
+                    &f_entries,
                     order,
-                    new_txg,
-                    leaf_bucket: WriteBucket::MosSpaceMap,
-                    indirect_bucket: WriteBucket::MosSpaceMap,
-                },
-                &dirty,
-                &mut staged,
-            )?;
-            for rbp in &out.retired_bps {
-                alloc.free_block_dvas(rbp, new_txg)?;
+                    min_blk,
+                )?;
+                let mut dirty = BTreeMap::new();
+                for (i, b) in blocks.into_iter().enumerate() {
+                    dirty.insert(i as u64, Some(b));
+                }
+                let out = cow_update_dnode(
+                    cx,
+                    mos,
+                    &mut alloc,
+                    DnodeCowSpec {
+                        existing: Some((&f_dn, f_ceiling)),
+                        object_type: f_dn.object_type(),
+                        bonus_type: f_dn.bonus_type(),
+                        checksum_type: 7,
+                        compress_type: 2,
+                        user_flags: 0,
+                        indirect_shift: f_dn.indirect_shift(),
+                        data_bytes: bsize,
+                        max_block: (dirty.len() - 1) as u64,
+                        slots: f_dn.slots(),
+                        nblkptr: f_dn.pointers().len(),
+                        bonus: f_dn.bonus().to_vec(),
+                        spill: None,
+                        order,
+                        new_txg,
+                        leaf_bucket: WriteBucket::MosSpaceMap,
+                        indirect_bucket: WriteBucket::MosSpaceMap,
+                    },
+                    &dirty,
+                    &mut staged,
+                )?;
+                for rbp in &out.retired_bps {
+                    alloc.free_block_dvas(rbp, new_txg)?;
+                }
+                put_dnode_in_table(
+                    cx,
+                    mos,
+                    &mos_meta,
+                    mos_ceiling,
+                    &mut mos_dirty_dnodes,
+                    f_obj,
+                    &out.dnode,
+                )?;
             }
-            put_dnode_in_table(
-                cx,
-                mos,
-                &mos_meta,
-                mos_ceiling,
-                &mut mos_dirty_dnodes,
-                wf_obj,
-                &out.dnode,
-            )?;
         }
 
         // 2. Touch dnode table blocks for all `planned_sm` `sm_obj`s so `mos_dirty_dnodes`
@@ -2473,8 +2650,9 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
 
         // Self-audit: verify zero DVA overlap within staged writes!
         verify_disjoint_staged_writes(&staged, alloc.ashift)?;
+        features.reset_dirty();
 
-        return Ok((new_root_bp, alloc, staged));
+        return Ok((new_root_bp, alloc, features, staged));
     }
 
     Err(corrupt(

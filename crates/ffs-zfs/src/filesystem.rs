@@ -12,18 +12,20 @@ mod writable;
 
 use super::reader::dmu::zpl::Zpl;
 use asupersync::Cx;
+use ffs_core::vfs::XattrSetMode;
 use ffs_core::{
     DirEntry, FileType, FsOps, InodeAttr, ReaddirPage, RequestScope, SeekWhence, SetAttrRequest,
 };
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata, Timestamp};
 use ffs_types::InodeNumber;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+pub use writable::ZfsMountWriteOptions;
 use writable::{MutableView, WriterState, errno, native_timestamp};
 
 const ROOT: InodeNumber = InodeNumber(1);
@@ -254,32 +256,82 @@ impl ViewState {
     }
 }
 
+#[derive(Clone)]
+struct SnapDirEntry {
+    name: Vec<u8>,
+    snap_idx: u16,
+}
+
 struct State {
     head: ViewState,
-    snapshot_names: Option<Vec<Vec<u8>>>,
+    snapshot_dir: Option<Vec<SnapDirEntry>>,
+    snap_idx_by_guid: BTreeMap<u64, u16>,
+    snap_name_by_idx: BTreeMap<u16, Vec<u8>>,
+    next_snap_idx: u16,
     snapshots: BTreeMap<u16, ViewState>,
     writer: Option<WriterState>,
     recovery_required: bool,
 }
 
 impl State {
-    fn ensure_snapshot_names(&mut self, cx: &Cx) -> Result<&[Vec<u8>]> {
+    fn rebuild_snapshot_dir(&mut self, cx: &Cx) -> Result<()> {
         if !self.head.view.has_snapshot_dir() {
             return Err(FfsError::NotFound("ZPL snapshot control directory".into()));
         }
-        if self.snapshot_names.is_none() {
-            let snaps = self.head.view.snapshots(cx)?;
-            self.snapshot_names = Some(snaps.into_iter().map(|s| s.name).collect());
+        let snaps = self.head.view.snapshots(cx)?;
+        let mut active_indices = BTreeSet::new();
+        let mut next_names = BTreeMap::new();
+        let mut dir_entries = Vec::with_capacity(snaps.len());
+        for snap in snaps {
+            let idx = if let Some(&existing) = self.snap_idx_by_guid.get(&snap.guid) {
+                existing
+            } else {
+                if self.next_snap_idx == 0 || self.next_snap_idx > 0x3FFF {
+                    return Err(unsupported("snapshot index overflow"));
+                }
+                let allocated = self.next_snap_idx;
+                self.next_snap_idx = self.next_snap_idx.saturating_add(1);
+                self.snap_idx_by_guid.insert(snap.guid, allocated);
+                allocated
+            };
+            active_indices.insert(idx);
+            next_names.insert(idx, snap.name.clone());
+            dir_entries.push(SnapDirEntry {
+                name: snap.name,
+                snap_idx: idx,
+            });
         }
-        Ok(self.snapshot_names.as_deref().unwrap_or(&[]))
+        self.snapshots.retain(|idx, _| active_indices.contains(idx));
+        self.snap_name_by_idx = next_names;
+        self.snapshot_dir = Some(dir_entries);
+        Ok(())
+    }
+
+    pub(super) fn invalidate_snapshots_locked(&mut self, cx: &Cx) -> Result<()> {
+        self.snapshot_dir = None;
+        if self.head.view.has_snapshot_dir() {
+            self.rebuild_snapshot_dir(cx)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_snapshot_dir(&mut self, cx: &Cx) -> Result<&[SnapDirEntry]> {
+        if !self.head.view.has_snapshot_dir() {
+            return Err(FfsError::NotFound("ZPL snapshot control directory".into()));
+        }
+        if self.snapshot_dir.is_none() {
+            self.rebuild_snapshot_dir(cx)?;
+        }
+        Ok(self.snapshot_dir.as_deref().unwrap_or(&[]))
     }
 
     fn snapshot_view(&mut self, cx: &Cx, snap_idx: u16) -> Result<&mut ViewState> {
         checkpoint(cx)?;
         if !self.snapshots.contains_key(&snap_idx) {
-            let names = self.ensure_snapshot_names(cx)?;
-            let name = names
-                .get(usize::from(snap_idx.saturating_sub(1)))
+            let _ = self.ensure_snapshot_dir(cx)?;
+            let name = self
+                .snap_name_by_idx
+                .get(&snap_idx)
                 .ok_or_else(|| FfsError::NotFound(format!("ZPL snapshot index {snap_idx}")))?
                 .clone();
             let snap_zpl = self.head.view.open_snapshot(cx, &name)?;
@@ -316,7 +368,10 @@ impl ZfsFs {
         Ok(Self {
             state: Mutex::new(State {
                 head,
-                snapshot_names: None,
+                snapshot_dir: None,
+                snap_idx_by_guid: BTreeMap::new(),
+                snap_name_by_idx: BTreeMap::new(),
+                next_snap_idx: 1,
                 snapshots: BTreeMap::new(),
                 writer: None,
                 recovery_required: false,
@@ -440,7 +495,7 @@ impl ZfsFs {
             return self.ctl_attributes(cx, state, ZFS_CTL_INO, 3);
         }
         if ino == ZFS_SNAPDIR_INO {
-            let count = state.ensure_snapshot_names(cx)?.len();
+            let count = state.ensure_snapshot_dir(cx)?.len();
             let nlink = u32::try_from(2 + count).unwrap_or(u32::MAX);
             return self.ctl_attributes(cx, state, ZFS_SNAPDIR_INO, nlink);
         }
@@ -552,12 +607,11 @@ impl FsOps for ZfsFs {
                 b"." => self.attributes(cx, &mut state, ZFS_SNAPDIR_INO),
                 b".." => self.ctl_attributes(cx, &mut state, ZFS_CTL_INO, 3),
                 _ => {
-                    let names = state.ensure_snapshot_names(cx)?;
-                    let index = names
-                        .binary_search_by(|candidate| candidate.as_slice().cmp(name))
+                    let entries = state.ensure_snapshot_dir(cx)?;
+                    let index = entries
+                        .binary_search_by(|candidate| candidate.name.as_slice().cmp(name))
                         .map_err(|_| FfsError::NotFound("ZFS named snapshot".into()))?;
-                    let snap_idx = u16::try_from(index + 1)
-                        .map_err(|_| unsupported("snapshot index overflow"))?;
+                    let snap_idx = entries[index].snap_idx;
                     let root_ino = state.snapshot_view(cx, snap_idx)?.root_ino;
                     self.attributes(cx, &mut state, root_ino)
                 }
@@ -616,8 +670,8 @@ impl FsOps for ZfsFs {
                 .with_end_cookie(Some(rows.len() as u64)));
         }
         if ino == ZFS_SNAPDIR_INO {
-            let names = state.ensure_snapshot_names(cx)?.to_vec();
-            let mut rows = Vec::with_capacity(2 + names.len());
+            let entries = state.ensure_snapshot_dir(cx)?.to_vec();
+            let mut rows = Vec::with_capacity(2 + entries.len());
             rows.push(DirEntry {
                 ino: ZFS_SNAPDIR_INO,
                 offset: 1,
@@ -630,14 +684,12 @@ impl FsOps for ZfsFs {
                 kind: FileType::Directory,
                 name: b"..".to_vec(),
             });
-            for (idx, name) in names.into_iter().enumerate() {
-                let snap_idx =
-                    u16::try_from(idx + 1).map_err(|_| unsupported("snapshot index overflow"))?;
+            for entry in entries {
                 rows.push(DirEntry {
-                    ino: snap_root_ino(snap_idx),
+                    ino: snap_root_ino(entry.snap_idx),
                     offset: rows.len() as u64 + 1,
                     kind: FileType::Directory,
-                    name,
+                    name: entry.name,
                 });
             }
             let start = rows.partition_point(|row| row.offset <= offset);
@@ -777,7 +829,7 @@ impl FsOps for ZfsFs {
     ) -> Result<InodeAttr> {
         let mut state = self.state(cx)?;
         let parent_object = state.writable_parent(cx, parent, name.as_bytes())?;
-        let (mode, gid) = state.creation_mode_gid(cx, parent, mode, gid, true)?;
+        let (mode, gid) = state.creation_mode_gid(cx, parent, mode & 0o7777, gid, true)?;
         state.reserve_identity()?;
         let timestamp = native_timestamp(SystemTime::now())?;
         let object = state.mutate(|engine, dataset| {
@@ -886,23 +938,68 @@ impl FsOps for ZfsFs {
     ) -> Result<InodeAttr> {
         let mut state = self.state(cx)?;
         let metadata = state.writable_metadata(cx, ino)?;
-        // Ownership and mode changes still require native ACL/accounting support.
-        // Refuse the entire request before publishing any supported size or time
-        // field; accepting only part would leave callers with a committed surprise.
-        if attrs
-            .mode
-            .is_some_and(|mode| u64::from(mode) != metadata.mode & 0o7777)
-            || attrs.uid.is_some_and(|uid| u64::from(uid) != metadata.uid)
-            || attrs.gid.is_some_and(|gid| u64::from(gid) != metadata.gid)
+        let allow_mode_owner = state
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.allow_mode_and_owner_setattr);
+
+        // Strip Linux FUSE file-type bits (e.g. S_IFREG | 0o644) after checking
+        // they agree with the target inode's native ZPL kind.
+        let req_perm = match attrs.mode {
+            Some(raw_mode) => {
+                let ftype = u32::from(raw_mode) & libc::S_IFMT;
+                if ftype != 0 {
+                    let expected_ftype = match metadata.kind {
+                        Kind::Directory => libc::S_IFDIR,
+                        Kind::Regular => libc::S_IFREG,
+                        Kind::Symlink => libc::S_IFLNK,
+                        _ => 0,
+                    };
+                    if ftype != expected_ftype {
+                        return Err(unsupported(
+                            "requested file type disagrees with ZPL inode kind",
+                        ));
+                    }
+                }
+                Some(raw_mode & 0o7777)
+            }
+            None => None,
+        };
+
+        if !allow_mode_owner
+            && (req_perm.is_some_and(|mode| u64::from(mode) != metadata.mode & 0o7777)
+                || attrs.uid.is_some_and(|uid| u64::from(uid) != metadata.uid)
+                || attrs.gid.is_some_and(|gid| u64::from(gid) != metadata.gid))
         {
             return Err(unsupported(
                 "native ZPL mode and ownership changes are not implemented",
             ));
         }
-        let native_attrs = crate::ZfsSetAttr {
+
+        let mode_update = if allow_mode_owner {
+            req_perm.filter(|&m| u64::from(m) != metadata.mode & 0o7777)
+        } else {
+            None
+        };
+        let uid_update = if allow_mode_owner {
+            attrs.uid.map(u64::from).filter(|&u| u != metadata.uid)
+        } else {
+            None
+        };
+        let gid_update = if allow_mode_owner {
+            attrs.gid.map(u64::from).filter(|&g| g != metadata.gid)
+        } else {
+            None
+        };
+
+        let native_attrs = crate::ZfsPosixSetAttr {
             size: attrs.size,
             atime: attrs.atime.map(native_timestamp).transpose()?,
             mtime: attrs.mtime.map(native_timestamp).transpose()?,
+            mode: mode_update,
+            uid: uid_update,
+            gid: gid_update,
+            clear_suid_sgid: false,
         };
         if attrs.size.is_some() {
             if metadata.kind == Kind::Directory {
@@ -913,11 +1010,17 @@ impl FsOps for ZfsFs {
             }
             state.admit_data_mutation(cx, ino, &metadata)?;
         }
-        if attrs.size.is_some() || attrs.atime.is_some() || attrs.mtime.is_some() {
+        if native_attrs.size.is_some()
+            || native_attrs.atime.is_some()
+            || native_attrs.mtime.is_some()
+            || native_attrs.mode.is_some()
+            || native_attrs.uid.is_some()
+            || native_attrs.gid.is_some()
+        {
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
             state.mutate(|engine, dataset| {
-                engine.set_attributes(
+                engine.set_posix_attributes(
                     cx,
                     dataset,
                     object,
@@ -1102,6 +1205,30 @@ impl FsOps for ZfsFs {
         view_state.view.getxattr(cx, object, name)
     }
 
+    fn setxattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<()> {
+        let mut state = self.state(cx)?;
+        state.writable_metadata(cx, ino)?;
+        let object = state.head.nodes[&ino].object;
+        let native_mode = match mode {
+            XattrSetMode::Set => crate::ZfsXattrSetMode::Auto,
+            XattrSetMode::Create => crate::ZfsXattrSetMode::Create,
+            XattrSetMode::Replace => crate::ZfsXattrSetMode::Replace,
+        };
+        let timestamp = native_timestamp(SystemTime::now())?;
+        state.mutate(|engine, dataset| {
+            engine.set_xattr(cx, dataset, object, name, value, native_mode, timestamp)
+        })?;
+        state.publish_committed(|state| state.refresh_head(cx))
+    }
+
     fn removexattr(
         &self,
         cx: &Cx,
@@ -1111,18 +1238,31 @@ impl FsOps for ZfsFs {
     ) -> Result<bool> {
         let mut state = self.state(cx)?;
         state.writable_metadata(cx, ino)?;
-        if name != "security.capability" {
-            return Err(unsupported("native ZPL xattr removal is not implemented"));
-        }
         let object = state.head.nodes[&ino].object;
-        if state.head.view.has_file_capabilities(cx, object)? {
-            return Err(unsupported(
-                "native ZPL capability removal is not implemented",
-            ));
+        if name == "security.capability" {
+            if state.head.view.has_file_capabilities(cx, object)? {
+                return Err(unsupported(
+                    "native ZPL capability removal is not implemented",
+                ));
+            }
+            // FUSE's killpriv path asks to drop capabilities before ordinary writes.
+            // A proven-absent attribute needs no mutation; a present one is refused.
+            return Ok(false);
         }
-        // FUSE's killpriv path asks to drop capabilities before ordinary writes.
-        // A proven-absent attribute needs no mutation; a present one is refused.
-        Ok(false)
+        if !name.starts_with("user.") {
+            return Err(unsupported("only the ZPL user xattr namespace is exposed"));
+        }
+        let timestamp = native_timestamp(SystemTime::now())?;
+        match state
+            .mutate(|engine, dataset| engine.remove_xattr(cx, dataset, object, name, timestamp))
+        {
+            Ok(_) => {
+                state.publish_committed(|state| state.refresh_head(cx))?;
+                Ok(true)
+            }
+            Err(FfsError::RequestRejected { errno, .. }) if errno == libc::ENODATA => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     fn fsync(
@@ -1239,9 +1379,24 @@ impl FsOps for ZfsFs {
             if fragment_size == 0 {
                 return Err(corrupt("ZPL statfs fragment size is zero"));
             }
-            space_info.blocks = writer.engine.storage_identity().asize / fragment_size;
-            space_info.blocks_free = writer.engine.free_bytes() / fragment_size;
-            space_info.blocks_available = space_info.blocks_free;
+            let pool_free = writer.engine.free_bytes();
+            let mut mos = writer.engine.open_read_objects(cx)?;
+            if ino.0 & CTL_FLAG == 0
+                && let Some((referenced, avail)) = crate::transaction::dataset_statfs_quota_space(
+                    cx,
+                    &mut mos,
+                    &writer.dataset,
+                    pool_free,
+                )?
+            {
+                space_info.blocks = referenced.saturating_add(avail) / fragment_size;
+                space_info.blocks_free = avail / fragment_size;
+                space_info.blocks_available = space_info.blocks_free;
+            } else {
+                space_info.blocks = writer.engine.storage_identity().asize / fragment_size;
+                space_info.blocks_free = pool_free / fragment_size;
+                space_info.blocks_available = space_info.blocks_free;
+            }
         }
         Ok(space_info)
     }

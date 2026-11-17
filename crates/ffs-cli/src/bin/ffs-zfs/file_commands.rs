@@ -86,6 +86,22 @@ pub enum FileCommand {
         #[arg(long, default_value = "")]
         dataset: String,
     },
+    /// List active user holds (`DMU_OT_USERREFS`) on one snapshot.
+    Holds {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        #[arg(long, default_value = "")]
+        dataset: String,
+        /// Snapshot name component on `--dataset`.
+        snapshot: OsString,
+    },
+    /// List bookmarks (`com.delphix:bookmarks`) on one dataset.
+    Bookmarks {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        #[arg(long, default_value = "")]
+        dataset: String,
+    },
     /// List an admitted ZPL directory using native micro/fat-ZAP entries.
     Ls {
         #[command(flatten)]
@@ -302,6 +318,63 @@ impl FileCommand {
                     &serde_json::json!({"pool_guid": pool_guid.to_string(), "dataset": dataset,
                     "txg": pool.txg, "snapshots": snapshots, "scope": "named snapshot roots in this committed pool view"}),
                 );
+            }
+            Self::Holds {
+                candidate,
+                dataset,
+                snapshot,
+            } => {
+                let components = dataset_components(&dataset)?;
+                let mut pool = candidate.objects(cx)?;
+                let pool_guid = pool.pool_guid();
+                let holds =
+                    ffs_zfs::list_holds_in_mos(cx, &mut pool, &components, snapshot.as_bytes())?;
+                let rows: Vec<_> = holds
+                    .into_iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "tag": h.tag,
+                            "timestamp_seconds": h.timestamp_seconds,
+                        })
+                    })
+                    .collect();
+                return json(&serde_json::json!({
+                    "format": "ZFS",
+                    "operation": "holds",
+                    "read_only": true,
+                    "pool_guid": pool_guid.to_string(),
+                    "dataset": dataset,
+                    "snapshot": snapshot.to_str(),
+                    "snapshot_bytes": snapshot.as_bytes(),
+                    "txg": pool.txg,
+                    "holds": rows,
+                }));
+            }
+            Self::Bookmarks { candidate, dataset } => {
+                let components = dataset_components(&dataset)?;
+                let mut pool = candidate.objects(cx)?;
+                let pool_guid = pool.pool_guid();
+                let bookmarks = ffs_zfs::list_bookmarks_in_mos(cx, &mut pool, &components)?;
+                let rows: Vec<_> = bookmarks
+                    .into_iter()
+                    .map(|b| {
+                        serde_json::json!({
+                            "name": b.name,
+                            "guid": b.guid.to_string(),
+                            "creation_txg": b.creation_txg,
+                            "creation_time": b.creation_time,
+                        })
+                    })
+                    .collect();
+                return json(&serde_json::json!({
+                    "format": "ZFS",
+                    "operation": "bookmarks",
+                    "read_only": true,
+                    "pool_guid": pool_guid.to_string(),
+                    "dataset": dataset,
+                    "txg": pool.txg,
+                    "bookmarks": rows,
+                }));
             }
             Self::Ls { file } => (file, Output::List),
             Self::Stat { file } => (file, Output::Stat),

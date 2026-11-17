@@ -369,11 +369,14 @@ def main() -> None:
         prefix.with_suffix(".stderr").write_bytes(result.stderr)
         prefix.with_suffix(".status").write_text(str(result.returncode) + "\n")
         if failure is None:
-            require(result.returncode == 0, f"command failed: {argv!r}; see {prefix}.stderr")
+            err_tail = result.stderr.decode("utf-8", errors="replace").strip()[-600:]
+            require(result.returncode == 0,
+                    f"command failed: {argv!r}; see {prefix}.stderr; stderr={err_tail!r}")
         else:
+            err_tail = result.stderr.decode("utf-8", errors="replace").strip()[-600:]
             require(result.returncode != 0 and result.stdout == b""
                     and failure.encode() in result.stderr,
-                    f"expected typed refusal containing {failure!r}: {argv!r}; see {prefix}.stderr")
+                    f"expected typed refusal containing {failure!r}: {argv!r}; see {prefix}.stderr; stderr={err_tail!r}")
         return result.stdout
 
     try:
@@ -478,7 +481,14 @@ def main() -> None:
                 writable_img = writable_dir / "leaf.img"
                 with writable_img.open("xb") as stream:
                     stream.truncate(128 * 1024 * 1024)
-                command("zpool", "create", "-d", "-m", "none", "-o", "cachefile=none",
+                command("zpool", "create", "-d",
+                        "-o", "feature@async_destroy=enabled",
+                        "-o", "feature@empty_bpobj=enabled",
+                        "-o", "feature@enabled_txg=enabled",
+                        "-o", "feature@hole_birth=enabled",
+                        "-o", "feature@spacemap_histogram=enabled",
+                        "-o", "feature@spacemap_v2=enabled",
+                        "-m", "none", "-o", "cachefile=none",
                         "-o", f"ashift={ashift}", tx_pool, writable_img)
                 tx_active = True
                 tx_guid = command("zpool", "get", "-H", "-o", "value", "guid", tx_pool).decode().strip()
@@ -553,6 +563,50 @@ def main() -> None:
                         "tx-write did not advance committed TXG")
                 cur_slot = int(write_res["published_slot"])
                 cur_txg = int(write_res["committed_txg"])
+
+                # Offline DSL lifecycle: create child dataset, set/inherit properties, rename, create+destroy ephemeral child.
+                def adv_root_tx(*sub_args: str | Path) -> dict:
+                    nonlocal cur_slot, cur_txg
+                    res = json.loads(command(binary, *sub_args, "--offline-image", "--allow-write",
+                                             "--pool-guid", tx_guid, "--label", "0", "--slot", str(cur_slot)))
+                    require(res["outcome"] == "Committed" and int(res["committed_txg"]) > cur_txg,
+                            f"root DSL step {sub_args[0]!r} did not advance committed TXG")
+                    cur_slot = int(res["published_slot"])
+                    cur_txg = int(res["committed_txg"])
+                    return res
+
+                adv_root_tx("tx-create-dataset", writable_img, "tx_child", "--dataset", "data",
+                            "--prop", "quota=32M", "--prop", "org:stage=alpha")
+                adv_root_tx("tx-create", writable_img, "/child_hello.txt", "--dataset", "data/tx_child", "--mode", "0644")
+                adv_root_tx("tx-write", writable_img, "/child_hello.txt", "--dataset", "data/tx_child",
+                            "--data", "hello-from-native-created-dataset\n")
+                adv_root_tx("tx-set-prop", writable_img, "reservation", "4M", "--dataset", "data/tx_child")
+                adv_root_tx("tx-inherit-prop", writable_img, "reservation", "--dataset", "data/tx_child")
+                adv_root_tx("tx-rename-dataset", writable_img, "data/tx_renamed", "--dataset", "data/tx_child")
+                adv_root_tx("tx-create-dataset", writable_img, "ephemeral", "--dataset", "data")
+                adv_root_tx("tx-destroy-dataset", writable_img, "--dataset", "data/ephemeral")
+
+                prop_report = json.loads(command(binary, "properties", writable_img, "quota,org:stage",
+                                                 "--offline-image", "--label", "0", "--slot", str(cur_slot),
+                                                 "--pool-guid", tx_guid, "--dataset", "data/tx_renamed"))
+                prop_by_name = {row["name"]: row for row in prop_report["properties"]}
+                require(prop_by_name["quota"]["value"]["decimal"] == str(32 * 1024 * 1024)
+                        and prop_by_name["org:stage"]["value"]["text"] == "alpha",
+                        "post-TXG DSL properties on renamed dataset disagreed")
+                require(command(binary, "read", writable_img, "/child_hello.txt",
+                                "--offline-image", "--label", "0", "--slot", str(cur_slot),
+                                "--pool-guid", tx_guid, "--dataset", "data/tx_renamed")
+                        == b"hello-from-native-created-dataset\n",
+                        "post-TXG renamed child dataset file payload mismatch")
+
+                post_dsl_heads = json.loads(command(binary, "datasets", writable_img, "--offline-image",
+                                                    "--label", "0", "--slot", str(cur_slot), "--pool-guid", tx_guid))
+                renamed_row = next((r for r in post_dsl_heads["datasets"] if r["relative_name"] == "data/tx_renamed"), None)
+                require(renamed_row is not None, "renamed child dataset missing from inventory")
+                require(all(r["relative_name"] not in ("data/tx_child", "data/ephemeral")
+                            for r in post_dsl_heads["datasets"]),
+                        "old renamed or destroyed dataset name remained in DSL inventory")
+                tx_native_heads[tx_pool + "/data/tx_renamed"] = str(renamed_row["guid"])
 
                 command("zdb", "-lu", writable_img)
                 bccm_text = command("zdb", "-e", "-p", writable_dir, "-bccm", tx_pool).decode("utf-8", errors="replace")

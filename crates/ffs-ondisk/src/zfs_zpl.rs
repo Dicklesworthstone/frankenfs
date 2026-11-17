@@ -200,6 +200,25 @@ impl Metadata {
         existing_bonus: Option<&[u8]>,
         order: Endian,
     ) -> Result<Vec<u8>, ParseError> {
+        self.encode_legacy_with_options(existing_bonus, order, None, false)
+    }
+
+    /// Encode a legacy ZPL v4 `znode_phys_t` with optional `zp_xattr` directory
+    /// override and optional trivial NFSv4 `zp_acl` rebuild (clearing any external ACL object).
+    pub fn encode_legacy_with_options(
+        &self,
+        existing_bonus: Option<&[u8]>,
+        order: Endian,
+        xattr_dir_override: Option<u64>,
+        rebuild_trivial_acl: bool,
+    ) -> Result<Vec<u8>, ParseError> {
+        if let Some(xdir) = xattr_dir_override
+            && xdir >= OBJECT_LIMIT
+        {
+            return Err(invalid(
+                "xattr directory reference exceeds the object namespace",
+            ));
+        }
         let checked = self.clone().validate()?;
         for ts in &checked.times {
             if ts.nanos >= 1_000_000_000 {
@@ -227,9 +246,33 @@ impl Metadata {
         raw[80..88].copy_from_slice(&order.encode(checked.size));
         raw[88..96].copy_from_slice(&order.encode(checked.parent));
         raw[96..104].copy_from_slice(&order.encode(checked.links));
+        if let Some(xdir) = xattr_dir_override {
+            raw[104..112].copy_from_slice(&order.encode(xdir));
+        }
         raw[120..128].copy_from_slice(&order.encode(checked.flags));
         raw[128..136].copy_from_slice(&order.encode(checked.uid));
         raw[136..144].copy_from_slice(&order.encode(checked.gid));
+        if rebuild_trivial_acl {
+            raw[176..264].fill(0);
+            let aces =
+                encode_trivial_nfsv4_aces(checked.mode, checked.kind == Kind::Directory, order);
+            let (size_b, ver_b, cnt_b) = match order {
+                Endian::Little => (
+                    24_u32.to_le_bytes(),
+                    1_u16.to_le_bytes(),
+                    3_u16.to_le_bytes(),
+                ),
+                Endian::Big => (
+                    24_u32.to_be_bytes(),
+                    1_u16.to_be_bytes(),
+                    3_u16.to_be_bytes(),
+                ),
+            };
+            raw[184..188].copy_from_slice(&size_b);
+            raw[188..190].copy_from_slice(&ver_b);
+            raw[190..192].copy_from_slice(&cnt_b);
+            raw[192..216].copy_from_slice(&aces);
+        }
         if let Some(target) = &checked.inline_symlink {
             raw[LEGACY_BYTES..LEGACY_BYTES + target.len()].copy_from_slice(target);
         }
@@ -331,7 +374,7 @@ const LEGACY: [(&str, u16, u8); 16] = [
     ("ZPL_ZNODE_ACL", 88, 3),
 ];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SaRegistry {
     attributes: BTreeMap<u16, Registration>,
     layouts: BTreeMap<u16, Vec<u16>>,
@@ -792,6 +835,351 @@ impl SaRegistry {
         let verified = self.decode(&encoded, None)?;
         let _ = verified.metadata()?;
         Ok(encoded)
+    }
+
+    pub fn attr_id_by_name(&self, name: &[u8]) -> Option<u16> {
+        self.attributes
+            .iter()
+            .find_map(|(&id, reg)| (reg.name.as_slice() == name).then_some(id))
+    }
+
+    /// Ensure an SA attribute registration exists in `self` (and append to `reg_entries`
+    /// if newly registered), returning its 16-bit attribute ID.
+    pub fn ensure_attribute(
+        &mut self,
+        reg_entries: &mut Vec<Entry>,
+        name: &[u8],
+        length: u16,
+        swap: u8,
+    ) -> Result<u16, ParseError> {
+        if let Some(id) = self.attr_id_by_name(name) {
+            let existing = &self.attributes[&id];
+            if existing.length != length || existing.swap != swap {
+                return Err(invalid(
+                    "SA attribute registration disagrees with existing length/swap",
+                ));
+            }
+            return Ok(id);
+        }
+        if swap > 4 || name.is_empty() || name.len() > 256 || name.contains(&0) {
+            return Err(invalid("invalid new SA registration"));
+        }
+        let next_id = self
+            .attributes
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(15)
+            .max(15)
+            .checked_add(1)
+            .ok_or_else(|| invalid("SA attribute ID overflow"))?;
+        if self.attributes.len() >= MAX_ATTRIBUTES {
+            return Err(invalid("SA registry budget exceeded"));
+        }
+        self.attributes.insert(
+            next_id,
+            Registration {
+                name: name.to_vec(),
+                length,
+                swap,
+            },
+        );
+        let value = u64::from(next_id) | (u64::from(swap) << 16) | (u64::from(length) << 24);
+        reg_entries.push(Entry {
+            name: name.to_vec(),
+            integer_bytes: 8,
+            values: vec![value],
+            collision: 0,
+        });
+        Ok(next_id)
+    }
+
+    /// Ensure an SA layout (`2..=1023`) matching `attr_ids` exists in `self`
+    /// (and append to `layout_entries` if newly created), returning its layout ID.
+    pub fn ensure_layout(
+        &mut self,
+        layout_entries: &mut Vec<Entry>,
+        attr_ids: &[u16],
+    ) -> Result<u16, ParseError> {
+        if attr_ids.is_empty() {
+            return Err(invalid("empty non-default SA layout"));
+        }
+        let mut seen = BTreeSet::new();
+        for &aid in attr_ids {
+            if !self.attributes.contains_key(&aid) || !seen.insert(aid) {
+                return Err(invalid(
+                    "SA layout references unknown or duplicate attribute ID",
+                ));
+            }
+        }
+        if let Some((&id, _)) = self
+            .layouts
+            .iter()
+            .find(|&(&id, ids)| id >= 2 && ids.as_slice() == attr_ids)
+        {
+            return Ok(id);
+        }
+        let next_layout = (2_u16..=1023)
+            .find(|id| !self.layouts.contains_key(id))
+            .ok_or_else(|| invalid("SA layout table full"))?;
+        self.layouts.insert(next_layout, attr_ids.to_vec());
+        layout_entries.push(Entry {
+            name: next_layout.to_string().into_bytes(),
+            integer_bytes: 2,
+            values: attr_ids.iter().map(|&v| u64::from(v)).collect(),
+            collision: 0,
+        });
+        Ok(next_layout)
+    }
+
+    fn ordered_ids_for_map(
+        &self,
+        preferred_layout: Option<u16>,
+        map: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<Vec<u16>, ParseError> {
+        let mut ids = Vec::with_capacity(map.len());
+        let mut included = BTreeSet::new();
+        if let Some(lid) = preferred_layout
+            && let Some(existing_ids) = self.layouts.get(&lid)
+        {
+            for &aid in existing_ids {
+                if let Some(reg) = self.attributes.get(&aid)
+                    && map.contains_key(&reg.name)
+                    && included.insert(aid)
+                {
+                    ids.push(aid);
+                }
+            }
+        }
+        for key in map.keys() {
+            let aid = self
+                .attr_id_by_name(key)
+                .ok_or_else(|| invalid("missing SA attribute registration for map key"))?;
+            if included.insert(aid) {
+                ids.push(aid);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Encode a fresh SA bonus with explicit `inherited_project_id`, registering
+    /// `ZPL_PROJID` + a layout in `reg_entries`/`layout_entries` if needed.
+    pub fn encode_new_with_project(
+        &mut self,
+        reg_entries: &mut Vec<Entry>,
+        layout_entries: &mut Vec<Entry>,
+        template_bonus: &[u8],
+        metadata: &Metadata,
+        inherited_project_id: Option<u64>,
+    ) -> Result<Vec<u8>, ParseError> {
+        let Some(proj_id) = inherited_project_id else {
+            return self.encode_new_from_template(template_bonus, metadata);
+        };
+        if metadata.inline_symlink.is_some() {
+            return Err(invalid(
+                "inline symlink creation requires a symlink SA layout",
+            ));
+        }
+        let (order, template_layout) = self.parse_buffer_header(template_bonus)?;
+        let mut template_decoded = Attributes {
+            values: BTreeMap::new(),
+        };
+        self.decode_into(template_bonus, &mut template_decoded)?;
+        let proj_attr_id = self.ensure_attribute(reg_entries, b"ZPL_PROJID", 8, 0)?;
+
+        let mut base_ids = self
+            .layouts
+            .get(&template_layout)
+            .cloned()
+            .unwrap_or_default();
+        // Remove any variable/spill-only xattr or symlink attributes copied from template_layout.
+        base_ids.retain(|id| {
+            self.attributes.get(id).is_some_and(|r| {
+                !matches!(
+                    r.name.as_slice(),
+                    b"ZPL_DXATTR" | b"ZPL_XATTR" | b"ZPL_SYMLINK"
+                )
+            })
+        });
+        if !base_ids.contains(&proj_attr_id) {
+            base_ids.push(proj_attr_id);
+        }
+        let chosen_layout = self.ensure_layout(layout_entries, &base_ids)?;
+
+        let mut map = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        map.insert(b"ZPL_PROJID".to_vec(), order.encode(proj_id).to_vec());
+        map.insert(b"ZPL_RDEV".to_vec(), order.encode(0).to_vec());
+        map.insert(b"ZPL_PAD".to_vec(), vec![0_u8; 32]);
+        let znode_acl = template_decoded
+            .values
+            .get(b"ZPL_ZNODE_ACL".as_slice())
+            .filter(|a| a.bytes.len() == 88)
+            .map_or_else(|| vec![0_u8; 88], |a| a.bytes.clone());
+        map.insert(b"ZPL_ZNODE_ACL".to_vec(), znode_acl);
+        Self::apply_metadata_to_map(&mut map, metadata, order, true)?;
+        let encoded = self.pack_layout(chosen_layout, &map, order)?;
+        let verified = self.decode(&encoded, None)?;
+        let _ = verified.metadata()?;
+        Ok(encoded)
+    }
+
+    /// Update an SA node's bonus + optional `DMU_OT_SA` spill block with optional
+    /// trivial DACL rebuild (`chmod`), inline/spill `ZPL_DXATTR` xattr map update,
+    /// and/or `ZPL_XATTR` directory pointer override.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_updated_with_options(
+        &mut self,
+        reg_entries: &mut Vec<Entry>,
+        layout_entries: &mut Vec<Entry>,
+        existing_bonus: &[u8],
+        existing_spill: Option<&[u8]>,
+        metadata: &Metadata,
+        rebuild_trivial_dacl: bool,
+        inline_xattrs: Option<&BTreeMap<String, Vec<u8>>>,
+        xattr_dir_override: Option<u64>,
+        max_bonus_no_spill: usize,
+        max_bonus_with_spill: usize,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), ParseError> {
+        if !rebuild_trivial_dacl && inline_xattrs.is_none() && xattr_dir_override.is_none() {
+            return self.encode_updated_bonus_and_spill(existing_bonus, existing_spill, metadata);
+        }
+        let (order, bonus_layout) = self.parse_buffer_header(existing_bonus)?;
+        let mut bonus_decoded = Attributes {
+            values: BTreeMap::new(),
+        };
+        self.decode_into(existing_bonus, &mut bonus_decoded)?;
+        let mut bonus_map: BTreeMap<Vec<u8>, Vec<u8>> = bonus_decoded
+            .values
+            .into_iter()
+            .map(|(k, v)| (k, v.bytes))
+            .collect();
+
+        let (spill_layout, mut spill_map) = if let Some(spill_raw) = existing_spill {
+            let (s_ord, s_lay) = self.parse_buffer_header(spill_raw)?;
+            if s_ord != order {
+                return Err(invalid("SA spill byte order disagrees with bonus"));
+            }
+            let mut spill_decoded = Attributes {
+                values: BTreeMap::new(),
+            };
+            self.decode_into(spill_raw, &mut spill_decoded)?;
+            let map: BTreeMap<Vec<u8>, Vec<u8>> = spill_decoded
+                .values
+                .into_iter()
+                .map(|(k, v)| (k, v.bytes))
+                .collect();
+            (Some(s_lay), map)
+        } else {
+            (None, BTreeMap::new())
+        };
+
+        // Update core metadata fields in whichever map currently holds them (defaulting to bonus_map).
+        let mut core_updates = BTreeMap::new();
+        Self::apply_metadata_to_map(&mut core_updates, metadata, order, false)?;
+        for (k, v) in core_updates {
+            match spill_map.get_mut(&k) {
+                Some(slot) => *slot = v,
+                None => {
+                    bonus_map.insert(k, v);
+                }
+            }
+        }
+
+        if rebuild_trivial_dacl {
+            let aces =
+                encode_trivial_nfsv4_aces(metadata.mode, metadata.kind == Kind::Directory, order);
+            let _ = self.ensure_attribute(reg_entries, b"ZPL_DACL_COUNT", 8, 0)?;
+            let _ = self.ensure_attribute(reg_entries, b"ZPL_DACL_ACES", 0, 2)?;
+            spill_map.remove(b"ZPL_DACL_COUNT".as_slice());
+            spill_map.remove(b"ZPL_DACL_ACES".as_slice());
+            bonus_map.insert(b"ZPL_DACL_COUNT".to_vec(), order.encode(3).to_vec());
+            bonus_map.insert(b"ZPL_DACL_ACES".to_vec(), aces);
+            if let Some(zacl) = bonus_map
+                .get_mut(b"ZPL_ZNODE_ACL".as_slice())
+                .or_else(|| spill_map.get_mut(b"ZPL_ZNODE_ACL".as_slice()))
+                && zacl.len() == 88
+            {
+                zacl[0..8].fill(0);
+            }
+        }
+
+        if let Some(xdir) = xattr_dir_override {
+            if xdir >= OBJECT_LIMIT {
+                return Err(invalid(
+                    "xattr directory reference exceeds the object namespace",
+                ));
+            }
+            bonus_map.remove(b"ZPL_XATTR".as_slice());
+            spill_map.remove(b"ZPL_XATTR".as_slice());
+            if xdir != 0 {
+                // ZPL_XATTR is fixed legacy attribute ID 9 (length 8, swap 0).
+                bonus_map.insert(b"ZPL_XATTR".to_vec(), order.encode(xdir).to_vec());
+            }
+        }
+
+        if let Some(xmap) = inline_xattrs {
+            bonus_map.remove(b"ZPL_DXATTR".as_slice());
+            spill_map.remove(b"ZPL_DXATTR".as_slice());
+            if !xmap.is_empty() {
+                let nv = NvList {
+                    fields: xmap
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Value::Bytes(v.clone())))
+                        .collect(),
+                };
+                let dx_bytes = nv.encode_xdr()?;
+                if u16::try_from(dx_bytes.len()).is_err() {
+                    return Err(invalid(
+                        "packed ZPL_DXATTR nvlist exceeds u16 SA variable-attribute limit",
+                    ));
+                }
+                let _ = self.ensure_attribute(reg_entries, b"ZPL_DXATTR", 0, 3)?;
+
+                // Try inline bonus first if `spill_map` has no other attributes.
+                if spill_map.is_empty() {
+                    let mut inline_try = bonus_map.clone();
+                    inline_try.insert(b"ZPL_DXATTR".to_vec(), dx_bytes.clone());
+                    let mut tmp_layouts = layout_entries.clone();
+                    let mut tmp_reg = self.clone();
+                    let inline_ids =
+                        tmp_reg.ordered_ids_for_map(Some(bonus_layout), &inline_try)?;
+                    let inline_lid = tmp_reg.ensure_layout(&mut tmp_layouts, &inline_ids)?;
+                    let candidate = tmp_reg.pack_layout(inline_lid, &inline_try, order)?;
+                    if candidate.len() <= max_bonus_no_spill {
+                        *self = tmp_reg;
+                        *layout_entries = tmp_layouts;
+                        let verified = self.decode(&candidate, None)?;
+                        let _ = verified.metadata()?;
+                        return Ok((candidate, None));
+                    }
+                }
+                spill_map.insert(b"ZPL_DXATTR".to_vec(), dx_bytes);
+            }
+        }
+
+        let bonus_ids = self.ordered_ids_for_map(Some(bonus_layout), &bonus_map)?;
+        let new_bonus_lid = self.ensure_layout(layout_entries, &bonus_ids)?;
+        let new_bonus = self.pack_layout(new_bonus_lid, &bonus_map, order)?;
+        let max_allowed = if spill_map.is_empty() {
+            max_bonus_no_spill
+        } else {
+            max_bonus_with_spill
+        };
+        if new_bonus.len() > max_allowed {
+            return Err(invalid("updated SA bonus exceeds dnode bonus capacity"));
+        }
+
+        let new_spill = if spill_map.is_empty() {
+            None
+        } else {
+            let spill_ids = self.ordered_ids_for_map(spill_layout, &spill_map)?;
+            let new_spill_lid = self.ensure_layout(layout_entries, &spill_ids)?;
+            Some(self.pack_layout(new_spill_lid, &spill_map, order)?)
+        };
+
+        let verified = self.decode(&new_bonus, new_spill.as_deref())?;
+        let _ = verified.metadata()?;
+        Ok((new_bonus, new_spill))
     }
 }
 

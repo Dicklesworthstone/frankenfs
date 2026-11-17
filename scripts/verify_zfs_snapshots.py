@@ -307,12 +307,14 @@ def main() -> None:
         prefix.with_suffix(".stderr").write_bytes(result.stderr)
         prefix.with_suffix(".status").write_text(str(result.returncode) + "\n")
         if failure is not None:
+            err_tail = result.stderr.decode("utf-8", errors="replace").strip()[-600:]
             require(result.returncode != 0 and result.stdout == b""
                     and failure.encode() in result.stderr,
-                    f"expected typed refusal containing {failure!r}: {argv!r}; see {prefix}")
+                    f"expected typed refusal containing {failure!r}: {argv!r}; see {prefix}; stderr={err_tail!r}")
         else:
+            err_tail = result.stderr.decode("utf-8", errors="replace").strip()[-600:]
             require((result.returncode != 0) if fails else (result.returncode == 0),
-                    f"unexpected command result: {argv!r}; see {prefix}")
+                    f"unexpected command result: {argv!r}; see {prefix}; stderr={err_tail!r}")
             if fails:
                 require(result.stdout == b"", "failed snapshot selection emitted file data")
         return result.stdout
@@ -492,8 +494,10 @@ def main() -> None:
                 if version == 5:
                     tx_create_flags.extend([
                         "-o", "feature@async_destroy=enabled",
+                        "-o", "feature@bookmarks=enabled",
                         "-o", "feature@empty_bpobj=enabled",
                         "-o", "feature@enabled_txg=enabled",
+                        "-o", "feature@extensible_dataset=enabled",
                         "-o", "feature@hole_birth=enabled",
                         "-o", "feature@spacemap_histogram=enabled",
                         "-o", "feature@spacemap_v2=enabled",
@@ -611,6 +615,60 @@ def main() -> None:
                 run_tx("tx-create", writable_img, "/post-txg.txt", "--mode", "0644")
                 run_tx("tx-write", writable_img, "/post-txg.txt",
                        "--data", "committed-after-snapshots\n", "--sha256")
+
+                # Exercise native snapshot create, hold/release, bookmark, clone, rename, defer-destroy + auto-reclaim!
+                if version == 5:
+                    def run_ds_tx(ds_name: str, *sub_args: str | Path) -> dict:
+                        nonlocal cur_slot, cur_txg
+                        out = json.loads(command(
+                            binary, *sub_args, "--offline-image", "--allow-write",
+                            "--pool-guid", tx_pool_guid, "--label", "0",
+                            "--slot", str(cur_slot), "--dataset", ds_name,
+                        ))
+                        require(out["outcome"] == "Committed" and int(out["committed_txg"]) > cur_txg,
+                                f"DSL snapshot/clone step {sub_args[0]!r} did not advance committed TXG")
+                        cur_slot = int(out["published_slot"])
+                        cur_txg = int(out["committed_txg"])
+                        return out
+
+                    run_ds_tx("data", "tx-snapshot", writable_img, "native_s1")
+                    run_ds_tx("data", "tx-hold", writable_img, "native_s1", "ci_pin")
+                    holds_doc = json.loads(command(
+                        binary, "holds", writable_img, "native_s1",
+                        "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                        "--slot", str(cur_slot), "--dataset", "data",
+                    ))
+                    require([h["tag"] for h in holds_doc["holds"]] == ["ci_pin"],
+                            "holds subcommand did not report ci_pin")
+                    run_ds_tx("data", "tx-bookmark", writable_img, "native_bm1", "--snapshot", "native_s1")
+                    run_ds_tx("data", "tx-clone", writable_img, "native_s1", "data/cloned_view")
+                    run_ds_tx("data/cloned_view", "tx-create", writable_img, "/clone_only.txt", "--mode", "0644")
+                    run_ds_tx("data/cloned_view", "tx-write", writable_img, "/clone_only.txt",
+                              "--data", "diverged-clone-bytes\n")
+                    require(command(binary, "read", writable_img, "/post-txg.txt",
+                                    "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                                    "--slot", str(cur_slot), "--dataset", "data/cloned_view")
+                            == b"committed-after-snapshots\n",
+                            "cloned dataset lost inherited origin file")
+                    run_ds_tx("data", "tx-rename-snapshot", writable_img, "native_s1", "native_s2")
+                    # Held + cloned snapshot refuses non-deferred destroy, accepts --defer, and auto-destroys
+                    # once hold is released and clone is destroyed!
+                    command(binary, "tx-destroy-snapshot", writable_img, "native_s2",
+                            "--offline-image", "--allow-write", "--pool-guid", tx_pool_guid,
+                            "--label", "0", "--slot", str(cur_slot), "--dataset", "data",
+                            failure="dependent clones or user holds")
+                    run_ds_tx("data", "tx-destroy-snapshot", writable_img, "native_s2", "--defer")
+                    run_ds_tx("data", "tx-release", writable_img, "native_s2", "ci_pin")
+                    run_ds_tx("data/cloned_view", "tx-destroy-dataset", writable_img)
+
+                    bm_doc = json.loads(command(
+                        binary, "bookmarks", writable_img, "--offline-image",
+                        "--pool-guid", tx_pool_guid, "--label", "0",
+                        "--slot", str(cur_slot), "--dataset", "data",
+                    ))
+                    require([b["name"] for b in bm_doc["bookmarks"]] == ["native_bm1"],
+                            "bookmark did not survive deferred origin snapshot auto-destroy")
+                    run_ds_tx("data", "tx-destroy-bookmark", writable_img, "native_bm1")
 
                 command("zdb", "-lu", writable_img)
                 bccm_text = command("zdb", "-e", "-p", writable_dir, "-bccm", tx_pool).decode("utf-8", errors="replace")

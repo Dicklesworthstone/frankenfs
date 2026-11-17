@@ -83,6 +83,153 @@ impl NvList {
             _ => None,
         }
     }
+
+    /// Encode this `NvList` in OpenZFS XDR wire format (`NV_ENCODE_XDR = 1`,
+    /// `NV_UNIQUE_NAME = 1`), suitable for `ZPL_DXATTR` system attributes and
+    /// verified via [`Self::parse_exact`].
+    pub fn encode_xdr(&self) -> Result<Vec<u8>, ParseError> {
+        let mut out = vec![1_u8, 1, 0, 0];
+        let mut budget = MAX_ITEMS;
+        self.encode_nested_into(&mut out, 0, &mut budget)?;
+        if out.len() > LABEL_CONFIG_BYTES {
+            return Err(invalid("encoded XDR nvlist exceeds byte budget"));
+        }
+        let _ = Self::parse_exact(&out)?;
+        Ok(out)
+    }
+
+    fn encode_nested_into(
+        &self,
+        out: &mut Vec<u8>,
+        depth: usize,
+        budget: &mut usize,
+    ) -> Result<(), ParseError> {
+        if depth > MAX_DEPTH {
+            return Err(invalid("XDR nvlist exceeds nesting budget"));
+        }
+        out.extend_from_slice(&0_u32.to_be_bytes());
+        out.extend_from_slice(&1_u32.to_be_bytes()); // NV_UNIQUE_NAME
+        for (name, value) in &self.fields {
+            if name.is_empty() || name.len() > 4096 || name.as_bytes().contains(&0) {
+                return Err(invalid("invalid XDR nvpair name"));
+            }
+            *budget = budget
+                .checked_sub(1)
+                .ok_or_else(|| invalid("nvlist item budget exceeded"))?;
+            let mut pair = vec![0_u8; 8];
+            push_xdr_string(&mut pair, name);
+            let val_decoded = match value {
+                Value::Boolean(true) => {
+                    pair.extend_from_slice(&1_u32.to_be_bytes());
+                    pair.extend_from_slice(&0_u32.to_be_bytes());
+                    0_usize
+                }
+                Value::Boolean(false) => {
+                    pair.extend_from_slice(&21_u32.to_be_bytes());
+                    pair.extend_from_slice(&1_u32.to_be_bytes());
+                    pair.extend_from_slice(&0_u32.to_be_bytes());
+                    4_usize
+                }
+                Value::Unsigned(v) => {
+                    pair.extend_from_slice(&8_u32.to_be_bytes());
+                    pair.extend_from_slice(&1_u32.to_be_bytes());
+                    pair.extend_from_slice(&v.to_be_bytes());
+                    8_usize
+                }
+                Value::String(s) => {
+                    if s.len() > 4096 || s.as_bytes().contains(&0) {
+                        return Err(invalid("invalid XDR string value"));
+                    }
+                    pair.extend_from_slice(&9_u32.to_be_bytes());
+                    pair.extend_from_slice(&1_u32.to_be_bytes());
+                    push_xdr_string(&mut pair, s);
+                    (s.len() + 1).next_multiple_of(8)
+                }
+                Value::Bytes(bytes) => {
+                    if bytes.len() > MAX_BYTE_ARRAY {
+                        return Err(invalid("XDR byte array exceeds budget"));
+                    }
+                    let count = u32::try_from(bytes.len())
+                        .map_err(|_| invalid("XDR byte array length overflow"))?;
+                    pair.extend_from_slice(&10_u32.to_be_bytes());
+                    pair.extend_from_slice(&count.to_be_bytes());
+                    pair.extend_from_slice(bytes);
+                    pair.resize(pair.len().next_multiple_of(4), 0);
+                    bytes.len().next_multiple_of(8)
+                }
+                Value::List(sub) => {
+                    pair.extend_from_slice(&19_u32.to_be_bytes());
+                    pair.extend_from_slice(&1_u32.to_be_bytes());
+                    let before = pair.len();
+                    sub.encode_nested_into(&mut pair, depth + 1, budget)?;
+                    (pair.len() - before).max(24)
+                }
+                Value::Lists(subs) => {
+                    if subs.len() > *budget {
+                        return Err(invalid("nvlist array exceeds remaining work budget"));
+                    }
+                    *budget -= subs.len();
+                    let count = u32::try_from(subs.len())
+                        .map_err(|_| invalid("XDR nvlist array length overflow"))?;
+                    pair.extend_from_slice(&20_u32.to_be_bytes());
+                    pair.extend_from_slice(&count.to_be_bytes());
+                    let before = pair.len();
+                    for sub in subs {
+                        sub.encode_nested_into(&mut pair, depth + 1, budget)?;
+                    }
+                    (pair.len() - before).max(24)
+                }
+                Value::UnsignedArray(vals) => {
+                    if vals.len() > MAX_ITEMS {
+                        return Err(invalid("XDR unsigned array exceeds budget"));
+                    }
+                    let count = u32::try_from(vals.len())
+                        .map_err(|_| invalid("XDR array count overflow"))?;
+                    pair.extend_from_slice(&16_u32.to_be_bytes());
+                    pair.extend_from_slice(&count.to_be_bytes());
+                    if count != 0 {
+                        pair.extend_from_slice(&count.to_be_bytes());
+                        for &v in vals {
+                            pair.extend_from_slice(&v.to_be_bytes());
+                        }
+                    }
+                    vals.len() * 8
+                }
+                Value::Opaque {
+                    kind,
+                    elements,
+                    bytes,
+                } => {
+                    if !bytes.len().is_multiple_of(4) {
+                        return Err(invalid("opaque XDR payload is not 4-byte aligned"));
+                    }
+                    pair.extend_from_slice(&kind.to_be_bytes());
+                    pair.extend_from_slice(&elements.to_be_bytes());
+                    pair.extend_from_slice(bytes);
+                    bytes.len().next_multiple_of(8)
+                }
+            };
+            let encoded_len =
+                u32::try_from(pair.len()).map_err(|_| invalid("nvpair encoded size overflow"))?;
+            let decoded_len = u32::try_from(
+                16_usize
+                    .saturating_add((name.len() + 1).next_multiple_of(8))
+                    .saturating_add(val_decoded),
+            )
+            .map_err(|_| invalid("nvpair decoded size overflow"))?;
+            pair[0..4].copy_from_slice(&encoded_len.to_be_bytes());
+            pair[4..8].copy_from_slice(&decoded_len.to_be_bytes());
+            out.extend_from_slice(&pair);
+        }
+        out.extend_from_slice(&[0_u8; 8]);
+        Ok(())
+    }
+}
+
+fn push_xdr_string(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+    out.resize(out.len().next_multiple_of(4), 0);
 }
 
 struct Cursor<'a> {

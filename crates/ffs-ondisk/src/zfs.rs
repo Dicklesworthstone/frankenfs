@@ -261,6 +261,11 @@ impl BlockPointer {
     pub const fn protected(&self) -> bool {
         self.words[6] & (1 << 61) != 0
     }
+    /// Legacy ZFS deduplication bit (`BP_IS_DEDUP`, bit 62 of `blk_prop`).
+    #[must_use]
+    pub const fn dedup(&self) -> bool {
+        self.words[6] & (1 << 62) != 0
+    }
     #[must_use]
     pub fn hole(&self) -> bool {
         !self.embedded() && self.words[..6].iter().all(|word| *word == 0)

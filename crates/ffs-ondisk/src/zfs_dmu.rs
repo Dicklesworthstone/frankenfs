@@ -1141,6 +1141,21 @@ pub fn encode_microzap(
     salt: u64,
     order: Endian,
 ) -> Result<Vec<u8>, ParseError> {
+    encode_microzap_with_normflags(entries, block_bytes, salt, 0, order)
+}
+
+/// Encode a micro-ZAP (`ZBT_MICRO`) block preserving `normflags` (`0` unnormalized
+/// or `2` ASCII `U8_TEXTPREP_TOUPPER` as used on `ds_snapnames_zapobj`).
+pub fn encode_microzap_with_normflags(
+    entries: &[ZapEntry],
+    block_bytes: usize,
+    salt: u64,
+    normflags: u64,
+    order: Endian,
+) -> Result<Vec<u8>, ParseError> {
+    if !matches!(normflags, 0 | 2) {
+        return Err(invalid("unsupported micro-ZAP normalization flags"));
+    }
     if !(512..=131_072).contains(&block_bytes) || !block_bytes.is_multiple_of(512) {
         return Err(invalid("invalid micro-ZAP block size"));
     }
@@ -1156,6 +1171,7 @@ pub fn encode_microzap(
     let mut raw = vec![0_u8; block_bytes];
     raw[0..8].copy_from_slice(&order.encode((1_u64 << 63) + 3));
     raw[8..16].copy_from_slice(&order.encode(effective_salt));
+    raw[16..24].copy_from_slice(&order.encode(normflags));
 
     let mut seen_names = BTreeSet::new();
     let mut bucket_cd = std::collections::BTreeMap::<u64, u32>::new();
@@ -1165,10 +1181,21 @@ pub fn encode_microzap(
                 "micro-ZAP name empty, NUL-containing or > 49 bytes",
             ));
         }
-        if !seen_names.insert(item.name.clone()) {
+        let dedup_key = if normflags == 2 {
+            if !item.name.is_ascii() {
+                return Err(invalid(
+                    "non-ASCII micro-ZAP name under TOUPPER normalization",
+                ));
+            }
+            item.name.to_ascii_uppercase()
+        } else {
+            item.name.clone()
+        };
+        if !seen_names.insert(dedup_key) {
             return Err(invalid("duplicate micro-ZAP name"));
         }
-        let hash = crate::zfs_zap::zap_name_hash(&item.name, effective_salt, 28);
+        let hash =
+            crate::zfs_zap::zap_name_hash_normalized(&item.name, effective_salt, 28, normflags)?;
         let cd_slot = bucket_cd.entry(hash).or_insert(0);
         let cd = *cd_slot;
         *cd_slot = cd
@@ -1185,7 +1212,12 @@ pub fn encode_microzap(
         slot[14 + item.name.len()] = 0;
     }
 
-    let decoded = microzap(&raw, order)?;
+    let policy = if normflags == 2 {
+        crate::zfs_zap::names::NamePolicy::AsciiUppercase
+    } else {
+        crate::zfs_zap::names::NamePolicy::Unnormalized
+    };
+    let decoded = crate::zfs_zap::names::microzap_with_names(&raw, order, policy)?;
     if decoded.len() != entries.len() {
         return Err(invalid("encoded micro-ZAP entry count mismatch"));
     }

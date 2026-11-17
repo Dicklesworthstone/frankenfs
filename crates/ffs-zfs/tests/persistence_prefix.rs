@@ -6749,3 +6749,797 @@ fn unclaimed_verified_zil_log_block_is_refused_without_writes() {
     assert_eq!(media.volatile.len(), 0);
     assert_eq!(media.durable.as_slice(), before.as_slice());
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dsl_dataset_snapshot_clone_hold_bookmark_defer_destroy_and_reclamation() {
+    let cx = Cx::for_testing();
+    let mut built = build_clean_zfs_pool(&PoolFixtureSpec {
+        image_bytes: 32 * 1024 * 1024,
+        ashift: 9,
+        zpl_version: 5,
+        user_accounting: true,
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        additional_write_features: vec![(b"com.delphix:bookmarks", 0)],
+        ..PoolFixtureSpec::default()
+    });
+    let initial_label_bytes = built.members[0][..usize::try_from(LABEL_BYTES).unwrap()].to_vec();
+    let device = FaultableMemberDevice::new(built.members.remove(0));
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .expect("admit clean pool");
+    let ts = Timestamp {
+        seconds: 1_720_000_000,
+        nanos: 0,
+    };
+
+    // 1. Create child dataset `data/workspace` with initial user + numeric properties.
+    let data_ds = vec![b"data".to_vec()];
+    let child_ds = vec![b"data".to_vec(), b"workspace".to_vec()];
+    let (_, _) = engine
+        .create_dataset(
+            &cx,
+            &data_ds,
+            b"workspace",
+            &[
+                (
+                    "org:team".to_owned(),
+                    ffs_zfs::ZfsPropertySetValue::Text(b"storage".to_vec()),
+                ),
+                ("atime".to_owned(), ffs_zfs::ZfsPropertySetValue::Number(0)),
+            ],
+            ts,
+        )
+        .into_result()
+        .expect("create_dataset data/workspace");
+
+    // Populate a file in `data/workspace` (root dir of newly created dataset is Object 3).
+    let (note_obj, _) = engine
+        .create_file(
+            &cx,
+            &child_ds,
+            3,
+            b"note.txt",
+            0o644,
+            1000,
+            1000,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create note.txt in child dataset");
+    engine
+        .write_file_data(
+            &cx,
+            &child_ds,
+            note_obj,
+            0,
+            b"origin-v1-payload",
+            ts,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .expect("write note.txt");
+
+    // 2. Create snapshot `@base`, place hold `"keep"`, and create `@base` -> `#anchor` -> `#chained` bookmarks.
+    engine
+        .create_snapshot(&cx, &child_ds, b"base", ts)
+        .into_result()
+        .expect("create_snapshot @base");
+    engine
+        .hold_snapshot(&cx, &child_ds, b"base", b"keep", ts)
+        .into_result()
+        .expect("hold_snapshot @base keep");
+    let holds = engine
+        .list_holds(&cx, &child_ds, b"base")
+        .expect("list_holds");
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].tag, "keep");
+
+    engine
+        .create_bookmark(&cx, &child_ds, b"anchor", b"base", false)
+        .into_result()
+        .expect("create_bookmark #anchor from @base");
+    engine
+        .create_bookmark(&cx, &child_ds, b"chained", b"anchor", true)
+        .into_result()
+        .expect("create_bookmark #chained from #anchor");
+    let listed_bookmarks = engine
+        .list_bookmarks(&cx, &child_ds)
+        .expect("list_bookmarks");
+    assert_eq!(listed_bookmarks.len(), 2);
+    assert_eq!(
+        listed_bookmarks[0].creation_txg,
+        listed_bookmarks[1].creation_txg
+    );
+
+    // Verify `com.delphix:extensible_dataset` incremented in MOS `features_for_read` (obj 10),
+    // while vdev label `features_for_read` config nvlist stayed untouched!
+    {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let rf = mos.zap(&cx, 10).unwrap();
+        let ext_ds = rf
+            .iter()
+            .find(|e| e.name == b"com.delphix:extensible_dataset")
+            .unwrap();
+        assert!(ext_ds.value >= 1);
+        let cur_snap = device.durable_snapshot();
+        let cfg_off = usize::try_from(LABEL_CONFIG_OFFSET).unwrap();
+        let cfg_slice_old = &initial_label_bytes[cfg_off..cfg_off + LABEL_CONFIG_BYTES];
+        let cfg_slice_new = &cur_snap[cfg_off..cfg_off + LABEL_CONFIG_BYTES];
+        assert_eq!(cfg_slice_old, cfg_slice_new);
+    }
+
+    // 3. Create writable clone `data/fork` from `data/workspace@base` and diverge both heads!
+    let clone_ds = vec![b"data".to_vec(), b"fork".to_vec()];
+    engine
+        .create_clone(&cx, &child_ds, b"base", &data_ds, b"fork", &[], ts)
+        .into_result()
+        .expect("create_clone data/fork");
+    engine
+        .write_file_data(
+            &cx,
+            &child_ds,
+            note_obj,
+            0,
+            b"origin-v2-mutated",
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("overwrite origin note.txt");
+    engine
+        .write_file_data(
+            &cx,
+            &clone_ds,
+            note_obj,
+            0,
+            b"cloned-v2-diverged!",
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("overwrite clone note.txt");
+
+    // Verify all 3 views (`@base`, `data/workspace`, `data/fork`) read distinct exact bytes.
+    {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let mut snap_view = mos.zpl_snapshot(&cx, &child_ds, b"base").unwrap();
+        assert_eq!(
+            snap_view.read(&cx, note_obj, 0, 64).unwrap(),
+            b"origin-v1-payload"
+        );
+        let mut orig_view = mos.zpl(&cx, &child_ds).unwrap();
+        assert_eq!(
+            orig_view.read(&cx, note_obj, 0, 64).unwrap(),
+            b"origin-v2-mutated"
+        );
+        let mut clone_view = mos.zpl(&cx, &clone_ds).unwrap();
+        assert_eq!(
+            clone_view.read(&cx, note_obj, 0, 64).unwrap(),
+            b"cloned-v2-diverged!"
+        );
+    }
+
+    // 4. Rename snapshot `@base` -> `@milestone`, rename clone `data/fork` -> `moved_fork` (cross-parent!),
+    //    and reject dataset rename cycle (`data` -> `data/sub`).
+    engine
+        .rename_snapshot(&cx, &child_ds, b"base", b"milestone")
+        .into_result()
+        .expect("rename_snapshot");
+    let moved_clone_ds = vec![b"moved_fork".to_vec()];
+    engine
+        .rename_dataset(&cx, &clone_ds, &moved_clone_ds)
+        .into_result()
+        .expect("cross-parent rename_dataset");
+    assert_native_write_refused(
+        &mut engine,
+        std::slice::from_ref(&device),
+        libc::EINVAL,
+        |writer| writer.rename_dataset(&cx, &data_ds, &[b"data".to_vec(), b"cycle".to_vec()]),
+    );
+
+    // 5. Non-deferred destroy of held/cloned `@milestone` refuses with EBUSY;
+    //    deferred destroy sets DS_FLAG_DEFER_DESTROY, survives hold release while clone lives,
+    //    and auto-destroys when `moved_fork` clone is destroyed!
+    assert_native_write_refused(
+        &mut engine,
+        std::slice::from_ref(&device),
+        libc::EBUSY,
+        |writer| writer.destroy_snapshot(&cx, &child_ds, b"milestone", false),
+    );
+    engine
+        .destroy_snapshot(&cx, &child_ds, b"milestone", true)
+        .into_result()
+        .expect("defer destroy @milestone");
+    engine
+        .release_snapshot(&cx, &child_ds, b"milestone", b"keep")
+        .into_result()
+        .expect("release hold keep");
+    {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let snaps = mos.snapshots(&cx, &child_ds).unwrap();
+        assert_eq!(snaps.len(), 1, "clone still pins deferred origin snapshot");
+    }
+
+    // Destroying `moved_fork` removes the last clone reference and auto-destroys `@milestone`!
+    engine
+        .destroy_dataset(&cx, &moved_clone_ds)
+        .into_result()
+        .expect("destroy clone moved_fork + auto-destroy deferred origin snap");
+    {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let snaps = mos.snapshots(&cx, &child_ds).unwrap();
+        assert!(
+            snaps.is_empty(),
+            "deferred origin snapshot must auto-destroy"
+        );
+        let bms = ffs_zfs::list_bookmarks_in_mos(&cx, &mut mos, &child_ds).unwrap();
+        assert_eq!(bms.len(), 2, "bookmarks must survive snapshot destruction");
+    }
+
+    engine
+        .destroy_bookmark(&cx, &child_ds, b"chained")
+        .into_result()
+        .expect("destroy_bookmark #chained");
+    assert_eq!(engine.list_bookmarks(&cx, &child_ds).unwrap().len(), 1);
+
+    // Finally destroy `data/workspace` itself and verify full MOS scrub + exact space-map accounting!
+    engine
+        .destroy_bookmark(&cx, &child_ds, b"anchor")
+        .into_result()
+        .expect("destroy_bookmark #anchor");
+    engine
+        .destroy_dataset(&cx, &child_ds)
+        .into_result()
+        .expect("destroy_dataset data/workspace");
+
+    assert_eq!(
+        engine.free_bytes() + engine.allocated_bytes(),
+        engine.storage_identity().asize
+    );
+    let mos = engine.open_read_objects(&cx).unwrap();
+    assert!(mos.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
+    let _ = mos
+        .allocation(&cx, AllocationLimits::default())
+        .expect("clean allocation audit after full DSL lifecycle");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dsl_quota_refquota_reservation_and_inherit_enforcement() {
+    let cx = Cx::for_testing();
+    let mut built = build_clean_zfs_pool(&PoolFixtureSpec {
+        image_bytes: 16 * 1024 * 1024,
+        ashift: 9,
+        zpl_version: 5,
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        ..PoolFixtureSpec::default()
+    });
+    let device = FaultableMemberDevice::new(built.members.remove(0));
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .expect("admit pool");
+    let ts = Timestamp {
+        seconds: 1_720_100_000,
+        nanos: 0,
+    };
+    let data_ds = vec![b"data".to_vec()];
+
+    // Read current referenced bytes on `data` so we set a tight `refquota` (`+ 32 KiB`).
+    let base_ref = {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let row = mos
+            .datasets(&cx)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.components == data_ds)
+            .unwrap();
+        let dn = mos.object(&cx, row.head_object).unwrap();
+        dn.order().u64(dn.bonus(), 72).unwrap()
+    };
+    engine
+        .set_property(
+            &cx,
+            &data_ds,
+            "refquota",
+            ffs_zfs::ZfsPropertySetValue::Number(base_ref + 32 * 1024),
+        )
+        .into_result()
+        .expect("set refquota");
+
+    let (f_obj, _) = engine
+        .create_file(
+            &cx,
+            &data_ds,
+            2,
+            b"quota_probe.bin",
+            0o644,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create within refquota");
+
+    // Exceeding `refquota` must fail closed with `EDQUOT` and zero writes!
+    let big_buf = vec![0xAB_u8; 96 * 1024];
+    assert_native_write_refused(
+        &mut engine,
+        std::slice::from_ref(&device),
+        libc::EDQUOT,
+        |writer| {
+            writer.write_file_data(
+                &cx,
+                &data_ds,
+                f_obj,
+                0,
+                &big_buf,
+                ts,
+                ZfsDataChecksum::Fletcher4,
+            )
+        },
+    );
+
+    // Inheriting `refquota` lifts the limit so the exact same 96 KiB write commits cleanly!
+    engine
+        .inherit_property(&cx, &data_ds, "refquota")
+        .into_result()
+        .expect("inherit refquota");
+    engine
+        .write_file_data(
+            &cx,
+            &data_ds,
+            f_obj,
+            0,
+            &big_buf,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("write succeeds after inheriting refquota");
+
+    // Reservation exceeding pool free space refuses with ENOSPC (`NoSpace`).
+    let impossible_resv = engine.free_bytes() + 4 * 1024 * 1024;
+    assert_native_write_refused(
+        &mut engine,
+        std::slice::from_ref(&device),
+        libc::ENOSPC,
+        |writer| {
+            writer.set_property(
+                &cx,
+                &data_ds,
+                "reservation",
+                ffs_zfs::ZfsPropertySetValue::Number(impossible_resv),
+            )
+        },
+    );
+
+    // Reserving nearly all pool free space on root dataset starves unreserved `data` writes with ENOSPC!
+    let free_now = engine.free_bytes();
+    let root_unique = {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let row = mos
+            .datasets(&cx)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.components.is_empty())
+            .unwrap();
+        let dn = mos.object(&cx, row.head_object).unwrap();
+        dn.order().u64(dn.bonus(), 96).unwrap()
+    };
+    let tight_resv = root_unique + free_now.saturating_sub(512 * 1024);
+    engine
+        .set_property(
+            &cx,
+            &[],
+            "refreservation",
+            ffs_zfs::ZfsPropertySetValue::Number(tight_resv),
+        )
+        .into_result()
+        .expect("set root refreservation");
+    let huge_buf = vec![0xCD_u8; 768 * 1024];
+    assert_native_write_refused(
+        &mut engine,
+        std::slice::from_ref(&device),
+        libc::ENOSPC,
+        |writer| {
+            writer.write_file_data(
+                &cx,
+                &data_ds,
+                f_obj,
+                0,
+                &huge_buf,
+                ts,
+                ZfsDataChecksum::Fletcher4,
+            )
+        },
+    );
+    engine
+        .inherit_property(&cx, &[], "refreservation")
+        .into_result()
+        .expect("clear root refreservation");
+
+    let mos = engine.open_read_objects(&cx).unwrap();
+    assert!(mos.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
+    let _ = mos.allocation(&cx, AllocationLimits::default()).unwrap();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn zpl_posix_setattr_sa_inline_and_spill_xattrs_and_mounted_zfsfs_snapshot_invalidation() {
+    use ffs_core::{FsOps, RequestScope, SetAttrRequest, XattrSetMode};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let mut built = build_clean_zfs_pool(&PoolFixtureSpec {
+        image_bytes: 32 * 1024 * 1024,
+        ashift: 9,
+        zpl_version: 5,
+        user_accounting: true,
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        ..PoolFixtureSpec::default()
+    });
+    let device = FaultableMemberDevice::new(built.members.remove(0));
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .expect("admit pool");
+    let ts = Timestamp {
+        seconds: 1_720_200_000,
+        nanos: 0,
+    };
+    let data_ds = vec![b"data".to_vec()];
+
+    // 1. Direct engine POSIX setattr (setuid + chown clears set-ID bits & transfers user/group quota) + SA inline & spill xattrs!
+    let (target_obj, _) = engine
+        .create_file(
+            &cx,
+            &data_ds,
+            2,
+            b"xattr_target.bin",
+            0o4755,
+            1000,
+            1000,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create setuid file");
+    engine
+        .write_file_data(
+            &cx,
+            &data_ds,
+            target_obj,
+            0,
+            b"quota-charged-data",
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("write data");
+    // Wait: note `0o4755` setuid on direct engine `write_file_data` is allowed unless `ZfsFs` `admit_data_mutation` blocks it;
+    // now chown `(1000, 1000) -> (2000, 2000)` must clear `0o4000` -> `0o0755`!
+    engine
+        .set_posix_attributes(
+            &cx,
+            &data_ds,
+            target_obj,
+            &ffs_zfs::ZfsPosixSetAttr {
+                uid: Some(2000),
+                gid: Some(2000),
+                ..ffs_zfs::ZfsPosixSetAttr::default()
+            },
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("chown transfers quota and clears setuid");
+    {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let mut zpl = mos.zpl(&cx, &data_ds).unwrap();
+        let (meta, _) = zpl.stat(&cx, target_obj).unwrap();
+        assert_eq!((meta.uid, meta.gid), (2000, 2000));
+        assert_eq!(meta.mode & 0o7777, 0o755, "chown must clear S_ISUID");
+    }
+
+    // Small inline SA xattr (`<= 320B` -> no spill block!) + Create/Replace modes.
+    engine
+        .set_xattr(
+            &cx,
+            &data_ds,
+            target_obj,
+            "user.inline",
+            b"compact-val",
+            ffs_zfs::ZfsXattrSetMode::Create,
+            ts,
+        )
+        .into_result()
+        .expect("set inline xattr");
+    assert_native_write_refused(
+        &mut engine,
+        std::slice::from_ref(&device),
+        libc::EEXIST,
+        |writer| {
+            writer.set_xattr(
+                &cx,
+                &data_ds,
+                target_obj,
+                "user.inline",
+                b"dup",
+                ffs_zfs::ZfsXattrSetMode::Create,
+                ts,
+            )
+        },
+    );
+    assert_native_write_refused(
+        &mut engine,
+        std::slice::from_ref(&device),
+        libc::ENODATA,
+        |writer| {
+            writer.set_xattr(
+                &cx,
+                &data_ds,
+                target_obj,
+                "user.absent",
+                b"v",
+                ffs_zfs::ZfsXattrSetMode::Replace,
+                ts,
+            )
+        },
+    );
+
+    // Large 3,000-byte xattr spills cleanly to `DMU_OT_SA = 44`!
+    let large_xattr = vec![b'X'; 3000];
+    engine
+        .set_xattr(
+            &cx,
+            &data_ds,
+            target_obj,
+            "user.spilled",
+            &large_xattr,
+            ffs_zfs::ZfsXattrSetMode::Create,
+            ts,
+        )
+        .into_result()
+        .expect("set spilled SA xattr");
+    {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let mut zpl = mos.zpl(&cx, &data_ds).unwrap();
+        let mut names = zpl.listxattr(&cx, target_obj).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["user.inline", "user.spilled"]);
+        assert_eq!(
+            zpl.getxattr(&cx, target_obj, "user.inline")
+                .unwrap()
+                .as_deref(),
+            Some(b"compact-val".as_slice())
+        );
+        assert_eq!(
+            zpl.getxattr(&cx, target_obj, "user.spilled")
+                .unwrap()
+                .as_deref(),
+            Some(large_xattr.as_slice())
+        );
+    }
+    engine
+        .remove_xattr(&cx, &data_ds, target_obj, "user.spilled", ts)
+        .into_result()
+        .expect("remove spilled SA xattr");
+
+    // 2. Mount via `ZfsFs::with_writer_options` (`allow_mode_and_owner_setattr: true`) and exercise
+    //    FUSE wire `S_IFREG | 0o600` setattr, FsOps xattr CRUD, and live `.zfs/snapshot` invalidation!
+    let fs = ffs_zfs::ZfsFs::with_writer_options(
+        &cx,
+        engine,
+        data_ds,
+        ffs_zfs::ZfsMountWriteOptions {
+            allow_mode_and_owner_setattr: true,
+        },
+    )
+    .expect("mount writable ZfsFs");
+    let mut scope = RequestScope::empty();
+    let attr = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("xattr_target.bin"),
+        )
+        .expect("lookup xattr_target.bin");
+    let updated = fs
+        .setattr(
+            &cx,
+            &mut scope,
+            attr.ino,
+            &SetAttrRequest {
+                mode: Some(0o100_600), // Linux FUSE wire `S_IFREG | 0o600`
+                uid: Some(3000),
+                gid: Some(3000),
+                ..SetAttrRequest::default()
+            },
+        )
+        .expect("FUSE wire S_IFREG | 0o600 setattr");
+    assert_eq!(updated.perm, 0o600);
+    assert_eq!((updated.uid, updated.gid), (3000, 3000));
+
+    fs.setxattr(
+        &cx,
+        &mut scope,
+        attr.ino,
+        "user.fsops",
+        b"mounted-xattr",
+        XattrSetMode::Create,
+    )
+    .expect("FsOps::setxattr");
+    assert_eq!(
+        fs.getxattr(&cx, attr.ino, "user.fsops").unwrap().as_deref(),
+        Some(b"mounted-xattr".as_slice())
+    );
+    fs.removexattr(&cx, &mut scope, attr.ino, "user.fsops")
+        .expect("FsOps::removexattr");
+    assert_eq!(fs.getxattr(&cx, attr.ino, "user.fsops").unwrap(), None);
+
+    // Live `.zfs/snapshot` create -> lookup -> rename -> destroy -> recreate with monotonic non-colliding `snap_idx`!
+    let ctl = fs
+        .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new(".zfs"))
+        .unwrap();
+    let snapdir = fs
+        .lookup(&cx, &mut scope, ctl.ino, OsStr::new("snapshot"))
+        .unwrap();
+    fs.create_snapshot(&cx, b"live_s1")
+        .expect("ZfsFs::create_snapshot");
+    let first_snap_root = fs
+        .lookup(&cx, &mut scope, snapdir.ino, OsStr::new("live_s1"))
+        .expect("lookup newly created .zfs/snapshot/live_s1");
+    fs.rename_snapshot(&cx, b"live_s1", b"live_s2")
+        .expect("ZfsFs::rename_snapshot");
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, snapdir.ino, OsStr::new("live_s1")),
+        Err(FfsError::NotFound(_))
+    ));
+    let renamed_snap_root = fs
+        .lookup(&cx, &mut scope, snapdir.ino, OsStr::new("live_s2"))
+        .expect("lookup renamed .zfs/snapshot/live_s2");
+    assert_eq!(
+        first_snap_root.ino, renamed_snap_root.ino,
+        "GUID-bound snapshot keeps stable synthetic inode across rename"
+    );
+    fs.destroy_snapshot(&cx, b"live_s2", false)
+        .expect("ZfsFs::destroy_snapshot");
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, snapdir.ino, OsStr::new("live_s2")),
+        Err(FfsError::NotFound(_))
+    ));
+    assert!(matches!(
+        fs.getattr(&cx, &mut scope, renamed_snap_root.ino),
+        Err(FfsError::NotFound(_))
+    ));
+
+    fs.create_snapshot(&cx, b"live_s2")
+        .expect("recreate snapshot with same name");
+    let recreated_snap_root = fs
+        .lookup(&cx, &mut scope, snapdir.ino, OsStr::new("live_s2"))
+        .expect("lookup recreated snapshot");
+    assert_ne!(
+        recreated_snap_root.ino, renamed_snap_root.ino,
+        "monotonic snap_idx must never alias a destroyed snapshot's inode"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dsl_and_xattr_persistence_prefix_cuts_preserve_scrub_and_allocation() {
+    let cx = Cx::for_testing();
+    let ts = Timestamp {
+        seconds: 1_720_300_000,
+        nanos: 0,
+    };
+    let data_ds = vec![b"data".to_vec()];
+
+    for stage_kind in 0..4_u8 {
+        let mut built = build_clean_zfs_pool(&PoolFixtureSpec {
+            image_bytes: 32 * 1024 * 1024,
+            ashift: 9,
+            mirror_width: 2,
+            zpl_version: 5,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .drain(..)
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .expect("admit mirror pool");
+
+        let (_, _) = engine
+            .create_snapshot(&cx, &data_ds, b"cut_base", ts)
+            .into_result()
+            .expect("seed @cut_base");
+        let pre_slot = engine.committed_slot();
+        let pre_txg = engine.committed_txg();
+
+        engine.with_fault_hook(move |event| {
+            let cut = matches!(
+                (stage_kind, event.stage),
+                (0, ZfsPersistenceStage::MosSpaceMapWrite { .. })
+                    | (1, ZfsPersistenceStage::ChildBlocksWrite { .. })
+                    | (2, ZfsPersistenceStage::MosRootBarrier { .. })
+                    | (3, ZfsPersistenceStage::UberblockWrite { label: 1, .. })
+            );
+            if cut {
+                Err(FfsError::Io(std::io::Error::other(
+                    "injected DSL/xattr cut",
+                )))
+            } else {
+                Ok(())
+            }
+        });
+
+        let outcome = if stage_kind % 2 == 0 {
+            engine.create_clone(&cx, &data_ds, b"cut_base", &data_ds, b"cut_clone", &[], ts)
+        } else {
+            let spill_val = vec![b'Z'; 2500];
+            engine.set_xattr(
+                &cx,
+                &data_ds,
+                4,
+                "user.cut_spill",
+                &spill_val,
+                ffs_zfs::ZfsXattrSetMode::Create,
+                ts,
+            )
+        };
+
+        if stage_kind < 3 {
+            assert!(matches!(outcome, ZfsTxOutcome::NotCommitted(_)));
+            let verify_eng = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, pre_slot),
+            )
+            .expect("pre-Uberblock cut must reopen cleanly at pre_slot");
+            assert_eq!(verify_eng.committed_txg(), pre_txg);
+            let mos = verify_eng.open_read_objects(&cx).unwrap();
+            assert!(mos.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
+            let _ = mos.allocation(&cx, AllocationLimits::default()).unwrap();
+        } else {
+            let ZfsTxOutcome::Uncertain { target_slot, .. } = outcome else {
+                panic!("partial Uberblock ring write must report Uncertain");
+            };
+            let reconciled = open_engine_on_devices(
+                &cx,
+                &devices,
+                ZfsWriteOptions {
+                    offline_image: true,
+                    allow_write: true,
+                    pool_guid: built.pool_guid,
+                    label: 0,
+                    slot: target_slot,
+                    reconcile_torn_uberblocks: true,
+                },
+            )
+            .expect("explicit Uberblock ring reconciliation must recover cleanly");
+            assert_eq!(reconciled.committed_txg(), pre_txg + 1);
+            let mos = reconciled.open_read_objects(&cx).unwrap();
+            assert!(mos.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
+            let _ = mos.allocation(&cx, AllocationLimits::default()).unwrap();
+        }
+    }
+}

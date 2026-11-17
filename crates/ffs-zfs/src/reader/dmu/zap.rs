@@ -19,7 +19,7 @@ impl Objects {
 
     /// Only an owner that implements the corresponding naming contract may
     /// opt into normalized metadata. The generic/ZPL path remains unnormalized.
-    pub(super) fn zap_values_with_names(
+    pub(crate) fn zap_values_with_names(
         &mut self,
         cx: &Cx,
         number: u64,
