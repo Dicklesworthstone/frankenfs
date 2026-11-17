@@ -70,6 +70,13 @@ enum SaSpillFixture {
     Project(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZilTailFixture {
+    None,
+    UnwrittenTail,
+    UnclaimedVerifiedRecord,
+}
+
 #[derive(Debug, Clone)]
 struct PoolFixtureSpec {
     pool_name: String,
@@ -90,6 +97,7 @@ struct PoolFixtureSpec {
     multihost_label: bool,
     active_mmp_uberblock: bool,
     dirty_zil: bool,
+    zil_tail: ZilTailFixture,
     additional_write_features: Vec<(&'static [u8], u64)>,
     zpl_flags: BTreeMap<u64, u64>,
     root_ids: (u64, u64),
@@ -120,6 +128,7 @@ impl Default for PoolFixtureSpec {
             multihost_label: false,
             active_mmp_uberblock: false,
             dirty_zil: false,
+            zil_tail: ZilTailFixture::None,
             additional_write_features: Vec::new(),
             zpl_flags: BTreeMap::new(),
             root_ids: (0, 0),
@@ -763,6 +772,7 @@ fn encode_zpl_bonus_for_fixture(
 fn build_zpl_objectset(
     arena: &mut RawArena,
     spec: &PoolFixtureSpec,
+    head_object: u64,
     populate_snapshot_files: bool,
     birth: u64,
     order: Endian,
@@ -1282,6 +1292,56 @@ fn build_zpl_objectset(
             flags: 0,
             claim_lr_seq: 1,
         }
+    } else if head_object == 18 && spec.zil_tail != ZilTailFixture::None {
+        let chain_identity = [0x1111_u64, 0x2222_u64, head_object, 1_u64];
+        let mut zil_block = vec![0_u8; 4096];
+        if spec.zil_tail == ZilTailFixture::UnclaimedVerifiedRecord {
+            // Valid ZILOG2 chain header (184B at offset 0) + one 32B record at offset 184.
+            // Next block pointer (`zil_block[8..136]`) is a hole whose checksum words carry seq=2.
+            let next_identity = [0x1111_u64, 0x2222_u64, head_object, 2_u64];
+            for (idx, val) in next_identity.into_iter().enumerate() {
+                zil_block[8 + 96 + idx * 8..8 + 104 + idx * 8].copy_from_slice(&order.encode(val));
+            }
+            zil_block[136..144].copy_from_slice(&order.encode(216_u64)); // zc_nused = 184 + 32
+            zil_block[144..152].copy_from_slice(&order.encode(0x0210_da7a_b10c_7a11_u64)); // ECK_MAGIC
+            for (idx, val) in chain_identity.into_iter().enumerate() {
+                zil_block[152 + idx * 8..160 + idx * 8].copy_from_slice(&order.encode(val));
+            }
+            // Minimal valid 32B `lr_t`: kind=1, length=32, txg=birth+1 (pending!), seq=1.
+            zil_block[184..192].copy_from_slice(&order.encode(1_u64));
+            zil_block[192..200].copy_from_slice(&order.encode(32_u64));
+            zil_block[200..208].copy_from_slice(&order.encode(birth + 1));
+            zil_block[208..216].copy_from_slice(&order.encode(1_u64));
+            let cksum = ffs_ondisk::zfs::checksum(&zil_block, 7, order).expect("zilog2 fletcher4");
+            for (idx, val) in cksum.into_iter().enumerate() {
+                zil_block[152 + idx * 8..160 + idx * 8].copy_from_slice(&order.encode(val));
+            }
+        }
+        let allocated_bp = arena.alloc_block(&zil_block, 9, 0, birth, order);
+        let dva = allocated_bp.regular_dvas().expect("regular zil dva")[0];
+        let mut raw_bp = [0_u8; 128];
+        raw_bp[0..8].copy_from_slice(&order.encode(dva.allocated_bytes / 512));
+        raw_bp[8..16].copy_from_slice(&order.encode(dva.offset / 512));
+        let prop = 0x07_u64
+            | (0x07_u64 << 16)
+            | (0x02_u64 << 32)
+            | (0x09_u64 << 40)
+            | (0x09_u64 << 48)
+            | (u64::from(order == Endian::Little) << 63);
+        raw_bp[48..56].copy_from_slice(&order.encode(prop));
+        raw_bp[80..88].copy_from_slice(&order.encode(birth));
+        for (idx, val) in chain_identity.into_iter().enumerate() {
+            raw_bp[96 + idx * 8..104 + idx * 8].copy_from_slice(&order.encode(val));
+        }
+        let zil_bp = BlockPointer::parse(&raw_bp, order).expect("parse zilog2 bp");
+        ZilHeader {
+            claim_txg: 0,
+            replay_seq: 0,
+            log: zil_bp,
+            claim_blk_seq: 0,
+            flags: 0,
+            claim_lr_seq: 0,
+        }
     } else {
         ZilHeader::empty()
     };
@@ -1460,7 +1520,7 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
 
     // 1. Build root ZPL dataset + child `"data"` ZPL dataset (with optional `@before` snapshot).
     let (root_os_bp, root_ref_bytes, _) =
-        build_zpl_objectset(&mut arena, spec, false, INITIAL_TXG - 1, order);
+        build_zpl_objectset(&mut arena, spec, 3, false, INITIAL_TXG - 1, order);
 
     let data_birth = if spec.deadlist_mode == DeadlistMode::None {
         INITIAL_TXG - 1
@@ -1470,6 +1530,7 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
     let (data_os_bp, data_ref_bytes, snap_hello_expected) = build_zpl_objectset(
         &mut arena,
         spec,
+        18,
         spec.deadlist_mode != DeadlistMode::None,
         data_birth,
         order,
@@ -6565,6 +6626,123 @@ fn zeroed_replica_uberblock_slot_reports_split_uberblock_disagreement_without_wr
             );
         }
         other => panic!("expected FfsError::Corruption for split Uberblock, got: {other}"),
+    }
+    let media = device.state.lock().unwrap();
+    assert_eq!((media.write_calls, media.sync_calls), (0, 0));
+    assert_eq!(media.volatile.len(), 0);
+    assert_eq!(media.durable.as_slice(), before.as_slice());
+}
+
+#[test]
+fn exported_unclaimed_unwritten_zil_tail_admits_and_commits_cleanly() {
+    let cx = Cx::for_testing();
+    let mut built = build_clean_zfs_pool(&PoolFixtureSpec {
+        zil_tail: ZilTailFixture::UnwrittenTail,
+        ..PoolFixtureSpec::default()
+    });
+    let device = FaultableMemberDevice::new(built.members.remove(0));
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .expect("exported pool with unclaimed unwritten ZIL tail block should admit cleanly");
+    assert!(engine.admission_report().admitted_clean_write);
+    let timestamp = Timestamp {
+        seconds: 1_715_001_000,
+        nanos: 0,
+    };
+    let (file_obj, token) = engine
+        .create_file(
+            &cx,
+            &[b"data".to_vec()],
+            2,
+            b"after_fsync_export.bin",
+            0o640,
+            0,
+            0,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create_file over dataset with unwritten ZIL tail should commit");
+    let (_, token2) = engine
+        .write_file_data(
+            &cx,
+            &[b"data".to_vec()],
+            file_obj,
+            0,
+            b"preserved-zil-tail-dva",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("write_file_data should commit");
+    assert_eq!(
+        engine.free_bytes() + engine.allocated_bytes(),
+        engine.storage_identity().asize
+    );
+
+    // Reopen at the newly published slot and verify both MOS scrub/allocation and ZIL tail preservation.
+    let reopened = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, token2.published_slot()),
+    )
+    .expect("reopening after TXG commit should admit and verify space maps");
+    reopened.verify_token(&token).unwrap_err();
+    assert_eq!(reopened.committed_txg(), token2.committed_txg());
+    let snap = device.fresh_from_durable();
+    let len = snap.len_bytes();
+    let leaf = Leaf::from_device(&cx, Box::new(snap), 0, len).expect("open fresh leaf");
+    let pool = Pool::from_leaves(vec![leaf]).expect("open pool");
+    let mut mos = pool
+        .objects(&cx, 0, token2.published_slot(), built.pool_guid)
+        .expect("open MOS");
+    assert!(
+        mos.scrub(&cx, ScrubLimits::default())
+            .expect("MOS scrub")
+            .is_clean()
+    );
+    let _ = mos
+        .allocation(&cx, AllocationLimits::default())
+        .expect("MOS space-map allocation check");
+    let log = mos
+        .intent_log(&cx, &[b"data".to_vec()])
+        .expect("inspect preserved ZIL tail");
+    assert_eq!(log.header.claim_txg, 0);
+    assert_eq!(log.verified_blocks, 0);
+    assert_eq!(log.records.len(), 0);
+    assert_eq!(
+        log.termination,
+        ffs_zfs::reader::dmu::zil::Termination::UnverifiedTail
+    );
+}
+
+#[test]
+fn unclaimed_verified_zil_log_block_is_refused_without_writes() {
+    let cx = Cx::for_testing();
+    let mut built = build_clean_zfs_pool(&PoolFixtureSpec {
+        zil_tail: ZilTailFixture::UnclaimedVerifiedRecord,
+        ..PoolFixtureSpec::default()
+    });
+    let device = FaultableMemberDevice::new(built.members.remove(0));
+    let before = device.durable_snapshot();
+    let Err(err) = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    ) else {
+        panic!("unclaimed ZIL chain with verified uncommitted record must be refused");
+    };
+    match err {
+        FfsError::UnsupportedFeature(detail) => {
+            assert!(
+                detail.contains("clean-only ZFS writer refuses pending ZIL on datasets: data"),
+                "unexpected pending-ZIL refusal detail: {detail}"
+            );
+        }
+        other => panic!("expected UnsupportedFeature for pending ZIL, got: {other}"),
     }
     let media = device.state.lock().unwrap();
     assert_eq!((media.write_calls, media.sync_calls), (0, 0));

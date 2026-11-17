@@ -401,6 +401,49 @@ fn scan(
 }
 
 impl Objects {
+    /// Return whether a head dataset's `ObjectSet` (`ds_raw`, `ds_order`) has
+    /// pending ZIL intent-log work that must be replayed before native TXG writes.
+    ///
+    /// Cleanly exported OpenZFS pools (`zil_sync` / `spa_export`) retain an
+    /// unclaimed, unwritten pre-allocated terminal log block in `zh_log`
+    /// (`claim_txg == 0`, zero verified ZIL blocks, `Termination::UnverifiedTail`).
+    /// That pre-allocated tail block carries no uncommitted intent-log records,
+    /// whereas any claimed ZIL chain (`claim_txg != 0`) or any verified ZIL block
+    /// requires ZIL replay/claim handling before native TXG mutation.
+    pub(crate) fn dataset_has_pending_zil_work(
+        &self,
+        cx: &Cx,
+        dataset_object: u64,
+        dataset_guid: u64,
+        ds_raw: &[u8],
+        ds_order: Endian,
+        ds_os: &ffs_ondisk::zfs_dmu::ObjectSet,
+    ) -> Result<bool> {
+        checkpoint(cx)?;
+        if !ds_os.zil_header.has_work() {
+            return Ok(false);
+        }
+        if ds_os.zil_header.claim_txg != 0 || self.pool.missing_member_count() != 0 {
+            return Ok(true);
+        }
+        let log = scan(
+            cx,
+            &self.pool,
+            &self.config,
+            &ds_raw[512..704],
+            ds_order,
+            Selection {
+                dataset: dataset_object,
+                guid: dataset_guid,
+                txg: self.txg,
+            },
+        )?;
+        Ok(!(log.header.claim_txg == 0
+            && log.verified_blocks == 0
+            && log.records.is_empty()
+            && log.termination == Termination::UnverifiedTail))
+    }
+
     /// Inspect a head's native log through its checked DSL and object-set root.
     /// Log reads retain the same complete native storage set as the MOS/ZPL
     /// view, with a dedicated ZIL verifier for replicas and RAIDZ reconstruction.

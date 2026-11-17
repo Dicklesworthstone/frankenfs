@@ -668,7 +668,14 @@ impl ZfsTransactionEngine {
                 .checked_raw(cx, &ds_bp, DMU_OT_OBJSET, 0, ds_bp.logical_bytes(), hd_ceil)?
                 .ok_or_else(|| corrupt("head dataset ObjectSet is a hole"))?;
             let ds_os = ObjectSet::parse(&ds_raw, ds_ord).map_err(|e| parse_err(&e))?;
-            if ds_os.zil_header.has_work() {
+            if mos.dataset_has_pending_zil_work(
+                cx,
+                ds.head_object,
+                ds.guid,
+                &ds_raw,
+                ds_ord,
+                &ds_os,
+            )? {
                 let rel = ds
                     .components
                     .iter()

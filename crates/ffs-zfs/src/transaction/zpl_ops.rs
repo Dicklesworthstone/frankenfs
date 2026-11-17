@@ -302,7 +302,14 @@ fn open_head_dataset_context(
     if os.kind != 2 {
         return Err(corrupt("selected dataset is not a ZPL object set"));
     }
-    if os.zil_header.has_work() {
+    if mos.dataset_has_pending_zil_work(
+        cx,
+        ds_row.head_object,
+        ds_row.guid,
+        &os_raw,
+        os_order,
+        &os,
+    )? {
         return Err(unsupported(
             "pending ZIL intent log requires replay before native TXG write",
         ));
