@@ -6199,7 +6199,7 @@ fn gate7_full_conformance_and_tools() {
         {
             let mut f = fs::File::create(&a).expect("soak create");
             f.write_all(&chunk).expect("soak write");
-            if op_counter % 4 == 0 {
+            if op_counter.is_multiple_of(4) {
                 f.sync_data().expect("soak fdatasync");
             }
         }

@@ -1635,7 +1635,7 @@ fn gate4_mvcc_concurrency() {
                     for op in 0..TXNS_PER_THREAD {
                         let b1 = BlockNumber(lcg_next(&mut rng) % BLOCKS);
                         let b2 = BlockNumber(lcg_next(&mut rng) % BLOCKS);
-                        if op % 2 == 0 {
+                        if op.is_multiple_of(2) {
                             let snap = sharded.current_snapshot();
                             let v1 = sharded.read_visible(b1, snap).expect("read b1");
                             let v2 = sharded.read_visible(b2, snap).expect("read b2");

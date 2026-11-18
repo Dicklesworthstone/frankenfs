@@ -5356,7 +5356,7 @@ Hole { hole_len: 90 }
         // Verify odd logical blocks return Hole and even logical blocks return Found.
         for probe in [0_u32, 1, 2, 1_361, 1_362, 19_997, 19_998, 19_999] {
             let res = search(&cx, &dev, &root, probe).expect("search depth-2 tree");
-            if probe % 2 == 0 && probe < EXTENT_COUNT * 2 {
+            if probe.is_multiple_of(2) && probe < EXTENT_COUNT * 2 {
                 assert_eq!(
                     res,
                     SearchResult::Found {
