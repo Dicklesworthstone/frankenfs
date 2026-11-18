@@ -23555,6 +23555,8 @@ mod tests {
 
     #[test]
     fn umount_cli_parses_and_mount_registry_resolves_then_deactivates() {
+        use super::{ActiveMountGuard, resolve_mountpoint_backing_image, umount_cmd};
+
         let cli = Cli::try_parse_from(["ffs", "umount", "/tmp/mnt-probe", "--timeout-secs", "5"])
             .expect("parse ffs umount");
         assert_eq!(cli.command.name(), "umount");
