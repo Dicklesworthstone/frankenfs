@@ -190,9 +190,25 @@ fn strict_mode_rejects_omitted_suites_while_offline_declarations_stay_zero_credi
         serde_json::from_slice(&strict_out.stdout).expect("parse strict parity JSON");
     assert_eq!(strict_report["readiness_verified"], false);
     let stderr = String::from_utf8_lossy(&strict_out.stderr);
-    assert!(
-        stderr.contains("omitted_suites") && stderr.contains("canonical gates were omitted"),
-        "strict failure diagnostic must enumerate omitted suites and gates, got: {stderr}"
+    let diag_line = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("error: "))
+        .unwrap_or_else(|| {
+            panic!("expected structured `error: {{...}}` line on stderr, got: {stderr}")
+        });
+    let diag: serde_json::Value =
+        serde_json::from_str(diag_line).expect("parse StrictParityFailureDiagnostic JSON");
+    assert_eq!(diag["error"], "incomplete_parity_or_gate_execution");
+    assert_eq!(diag["readiness_verified"], false);
+    assert_eq!(
+        diag["missing_suites"].as_array().map(Vec::len),
+        Some(16),
+        "strict failure diagnostic must enumerate all 16 omitted suites: {diag}"
+    );
+    assert_eq!(
+        diag["missing_gates"].as_array().map(Vec::len),
+        Some(7),
+        "strict failure diagnostic must enumerate all 7 omitted canonical gates: {diag}"
     );
 
     // 2. Declaration-only `parity` (no `--verify`, no `--gate`, no `--strict`)

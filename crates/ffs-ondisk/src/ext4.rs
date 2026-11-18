@@ -21404,7 +21404,7 @@ mod dir_csum_incremental_verify {
         raw[0x284..0x286].copy_from_slice(&0x5678_u16.to_le_bytes());
         raw[0x78..0x83].copy_from_slice(b"gate1_label");
         raw[0x88..0x92].copy_from_slice(b"/mnt/gate1");
-        raw[0x200..0x20B].copy_from_slice(b"user_xattr");
+        raw[0x200..0x20A].copy_from_slice(b"user_xattr");
         raw[0x1A8..0x1B6].copy_from_slice(b"ext4_lookup_fn");
         raw[0x1E0..0x1EE].copy_from_slice(b"ext4_commit_fn");
         raw[EXT4_SB_CHECKSUM_OFFSET..EXT4_SB_CHECKSUM_OFFSET + 4]
