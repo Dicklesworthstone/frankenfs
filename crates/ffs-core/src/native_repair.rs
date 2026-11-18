@@ -775,15 +775,13 @@ impl NativeFreshnessDevice {
     }
 
     fn abort_durability_commit(&self) {
-        let waker = Waker::from(Arc::new(NativeLockWake(std::thread::current())));
-        let mut context = Context::from_waker(&waker);
-        let uncancelled = Cx::for_request();
-        let mut waiting = std::pin::pin!(self.state.lock(&uncancelled));
         let guard = loop {
-            match waiting.as_mut().poll(&mut context) {
-                Poll::Ready(Ok(state)) => break Some(state),
-                Poll::Ready(Err(_)) => break None,
-                Poll::Pending => std::thread::park_timeout(Duration::from_millis(2)),
+            match self.state.try_lock() {
+                Ok(state) => break Some(state),
+                Err(TryLockError::Poisoned) => break None,
+                Err(TryLockError::Locked) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         };
         if let Some(mut state) = guard {
