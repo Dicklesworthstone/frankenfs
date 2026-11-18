@@ -8841,7 +8841,8 @@ impl OpenFs {
 
         if let Some(restored) = saved_recovery_dev {
             fs.dev = restored;
-            fs.native_recovery_touched_blocks = recovery_touched_blocks.lock().clone();
+            fs.native_recovery_touched_blocks
+                .clone_from(&recovery_touched_blocks.lock());
         }
 
         fs.rebuild_metadata_log_index(cx)?;

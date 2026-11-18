@@ -4982,13 +4982,15 @@ fn stage_rename_dataset(
         target_dd_obj,
         order,
     )?;
-    let (moved_fs_cnt, moved_ss_cnt) = if t_cur.object_type() == DMU_OTN_ZAP_METADATA {
+    let (moved_filesystems, moved_snapshots) = if t_cur.object_type() == DMU_OTN_ZAP_METADATA {
         let t_entries = mos.zap_values(cx, target_dd_obj)?;
-        let sub_fs = zap_optional_u64(&t_entries, b"com.joyent:filesystem_count")?.unwrap_or(0);
-        let sub_ss = zap_optional_u64(&t_entries, b"com.joyent:snapshot_count")?.unwrap_or(0);
+        let child_filesystems =
+            zap_optional_u64(&t_entries, b"com.joyent:filesystem_count")?.unwrap_or(0);
+        let child_snapshots =
+            zap_optional_u64(&t_entries, b"com.joyent:snapshot_count")?.unwrap_or(0);
         (
-            i64::try_from(sub_fs.saturating_add(1)).unwrap_or(i64::MAX),
-            i64::try_from(sub_ss).unwrap_or(i64::MAX),
+            i64::try_from(child_filesystems.saturating_add(1)).unwrap_or(i64::MAX),
+            i64::try_from(child_snapshots).unwrap_or(i64::MAX),
         )
     } else {
         (1_i64, 0_i64)
@@ -5019,12 +5021,12 @@ fn stage_rename_dataset(
         alloc,
         old_parent_dd,
         b"com.joyent:filesystem_count",
-        -moved_fs_cnt,
+        -moved_filesystems,
         order,
         new_txg,
         staged_writes,
     )?;
-    if moved_ss_cnt > 0 {
+    if moved_snapshots > 0 {
         bump_filesystem_limits_counter_if_present(
             cx,
             mos,
@@ -5034,7 +5036,7 @@ fn stage_rename_dataset(
             alloc,
             old_parent_dd,
             b"com.joyent:snapshot_count",
-            -moved_ss_cnt,
+            -moved_snapshots,
             order,
             new_txg,
             staged_writes,
@@ -5049,12 +5051,12 @@ fn stage_rename_dataset(
         alloc,
         new_parent_dd,
         b"com.joyent:filesystem_count",
-        moved_fs_cnt,
+        moved_filesystems,
         order,
         new_txg,
         staged_writes,
     )?;
-    if moved_ss_cnt > 0 {
+    if moved_snapshots > 0 {
         bump_filesystem_limits_counter_if_present(
             cx,
             mos,
@@ -5064,7 +5066,7 @@ fn stage_rename_dataset(
             alloc,
             new_parent_dd,
             b"com.joyent:snapshot_count",
-            moved_ss_cnt,
+            moved_snapshots,
             order,
             new_txg,
             staged_writes,

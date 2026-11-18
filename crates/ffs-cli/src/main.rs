@@ -8805,12 +8805,11 @@ struct MountBackgroundScrubThreadConfig<'a> {
 #[allow(clippy::too_many_arguments)]
 fn run_native_mount_background_scrub_daemon(
     cx: &Cx,
-    native_fs: Arc<OpenFs>,
-    fs_uuid: [u8; 16],
+    native_fs: &OpenFs,
     interval: Duration,
     ledger_path: Option<&Path>,
     repair_writes_enabled: bool,
-    pipeline_metrics: ffs_repair::pipeline::RepairPipelineMetrics,
+    pipeline_metrics: &ffs_repair::pipeline::RepairPipelineMetrics,
     operation_id: &str,
     scenario_id: &str,
 ) -> Result<ScrubDaemonMetrics> {
@@ -8844,7 +8843,6 @@ fn run_native_mount_background_scrub_daemon(
             if cx.checkpoint().is_err() {
                 break;
             }
-            previous = now;
         }
         first_round = false;
 
@@ -8876,12 +8874,11 @@ fn run_native_mount_background_scrub_daemon(
                         report.blocks_healed,
                         0,
                     );
-                    let evidence = ffs_repair::evidence::RepairEvidence::anytime_scrub_monitor(
-                        fs_uuid,
-                        GroupNumber(0),
+                    let evidence = ffs_repair::evidence::EvidenceRecord::anytime_scrub_monitor(
+                        0,
                         report.monitor,
                     );
-                    if let Ok(line) = evidence.to_jsonl() {
+                    if let Ok(line) = evidence.to_json() {
                         let _ = writeln!(ledger, "{line}");
                         let _ = ledger.flush();
                     }
@@ -8916,12 +8913,9 @@ fn run_native_mount_background_scrub_daemon(
                         0,
                         0,
                     );
-                    let evidence = ffs_repair::evidence::RepairEvidence::anytime_scrub_monitor(
-                        fs_uuid,
-                        GroupNumber(0),
-                        detail,
-                    );
-                    if let Ok(line) = evidence.to_jsonl() {
+                    let evidence =
+                        ffs_repair::evidence::EvidenceRecord::anytime_scrub_monitor(0, detail);
+                    if let Ok(line) = evidence.to_json() {
                         let _ = writeln!(ledger, "{line}");
                         let _ = ledger.flush();
                     }
@@ -8934,12 +8928,9 @@ fn run_native_mount_background_scrub_daemon(
                     metrics.scrub_rounds_completed =
                         metrics.scrub_rounds_completed.saturating_add(1);
                     pipeline_metrics.record_external_scrub_round(1, 1, 1, 0, 0);
-                    let evidence = ffs_repair::evidence::RepairEvidence::anytime_scrub_monitor(
-                        fs_uuid,
-                        GroupNumber(0),
-                        detail,
-                    );
-                    if let Ok(line) = evidence.to_jsonl() {
+                    let evidence =
+                        ffs_repair::evidence::EvidenceRecord::anytime_scrub_monitor(0, detail);
+                    if let Ok(line) = evidence.to_json() {
                         let _ = writeln!(ledger, "{line}");
                         let _ = ledger.flush();
                     }
@@ -9145,10 +9136,6 @@ fn start_mount_background_scrub(
             .clone()
             .or_else(|| mounted_rw_scrub.as_ref().map(|(fs, _)| Arc::clone(fs)))
     {
-        let fs_uuid = match &open_fs.flavor {
-            FsFlavor::Ext4(sb) => sb.uuid,
-            FsFlavor::Btrfs(sb) => sb.fsid,
-        };
         let interval = Duration::from_secs(config.interval_secs);
         let ledger_path = config.ledger_path.clone();
         let repair_writes_enabled = config.repair_writes_enabled;
@@ -9171,12 +9158,11 @@ fn start_mount_background_scrub(
         let worker = MountIoWorker::start(cx, runtime, move |worker_cx| {
             run_native_mount_background_scrub_daemon(
                 worker_cx,
-                native_fs,
-                fs_uuid,
+                &native_fs,
                 interval,
                 ledger_path.as_deref(),
                 repair_writes_enabled,
-                thread_pipeline_metrics,
+                &thread_pipeline_metrics,
                 &thread_operation_id,
                 &thread_scenario_id,
             )
@@ -9850,7 +9836,7 @@ fn open_filesystem_for_mount(image_path: &Path, options: &MountCmdOptions) -> Re
                 .lookup(&cx, root, std::ffi::OsStr::new(".frankenfs-repair"))
                 .is_ok()
         {
-            const DEFAULT_NATIVE_REPAIR_WORKING_BYTES: u64 = 256 * 1024 * 1024;
+            const DEFAULT_NATIVE_REPAIR_WORKING_BYTES: u64 = 512 * 1024 * 1024;
             let recovery_touched = open_fs.native_recovery_touched_blocks().clone();
             open_fs
                 .reconcile_and_activate_native_repair(

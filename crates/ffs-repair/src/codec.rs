@@ -36,7 +36,7 @@ use crate::symbol::repair_seed;
 const RQ_DECODE_WAVEFRONT_BATCH: usize = 4;
 const DIRECT_SMALL_ERASURE_MAX_CORRUPT: usize = 2;
 const DIRECT_SMALL_ERASURE_MAX_SOURCE_BLOCKS: usize = 64;
-const SOURCE_COEFFICIENT_ENCODER_CACHE_CAPACITY: usize = 8;
+const SOURCE_COEFFICIENT_ENCODER_CACHE_CAPACITY: usize = 16;
 const PROJECTED_REPAIR_BATCH_SYMBOLS: usize = 8;
 const PROJECTED_SOURCE_TILE_BLOCKS: usize = 8;
 
@@ -800,6 +800,16 @@ pub fn update_encoded_group_delta(
         encoded.repair_symbols.iter_mut().for_each(apply_to_symbol);
     }
     Ok(())
+}
+
+/// Pre-warm the cached `GF(256)` source-coefficient encoder for `(source_block_count, seed)`
+/// at mount/activation time so live `fsync` parity refreshes execute in `O(|deltas| * R)`.
+pub fn warm_group_delta_encoder(source_block_count: u32, seed: u64) {
+    if let Ok(source_count) = usize::try_from(source_block_count)
+        && source_count > 0
+    {
+        let _ = build_source_coefficient_encoder(source_count, seed);
+    }
 }
 
 /// Configuration for RFC 6330 §4.3 block-interleaved striped RaptorQ encoding of

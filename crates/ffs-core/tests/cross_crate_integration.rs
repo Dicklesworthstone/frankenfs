@@ -724,7 +724,7 @@ mod native_repair_crash_cuts_and_healing {
     use std::process::Command;
     use std::sync::Arc;
 
-    const WORKING_BUDGET: u64 = 256 * 1024 * 1024;
+    const WORKING_BUDGET: u64 = 512 * 1024 * 1024;
     const PLAN_HEADER_START: usize = 192;
     const PARITY_HEADER_START: usize = 320;
     const EPOCH_TOKEN_START: usize = 448;
@@ -733,20 +733,19 @@ mod native_repair_crash_cuts_and_healing {
     const VALIDATION_SEALED: u32 = 2;
     const PLAN_DIRTY: u32 = 4;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     enum CrashCut {
         CutA,
         CutBExt4,
         CutBBtrfs { pre_btrfs_gen: u64 },
-        CutC { pre_gen0: u64, pre_gen1: u64 },
-        CutD { pre_gen0: u64, pre_gen1: u64 },
+        CutC { pre_gens: Vec<u64> },
+        CutD { pre_gens: Vec<u64> },
     }
 
     struct FaultState {
         bytes: Vec<u8>,
         block_size: usize,
-        tail0_start: u64,
-        tail1_start: u64,
+        tail_starts: Vec<u64>,
         cut: Option<CrashCut>,
         fail_next_write: bool,
         triggered: bool,
@@ -761,17 +760,12 @@ mod native_repair_crash_cuts_and_healing {
 
     impl FaultInjectingMemDevice {
         fn new(bytes: Vec<u8>, block_size: u32, storage: &NativeRepairStorage) -> Self {
-            let tail0_start = storage.tails[0].start.0;
-            let tail1_start = storage
-                .tails
-                .get(1)
-                .map_or(tail0_start, |tail| tail.start.0);
+            let tail_starts = storage.tails.iter().map(|t| t.start.0).collect();
             Self {
                 state: Arc::new(Mutex::new(FaultState {
                     bytes,
                     block_size: block_size as usize,
-                    tail0_start,
-                    tail1_start,
+                    tail_starts,
                     cut: None,
                     fail_next_write: false,
                     triggered: false,
@@ -809,10 +803,9 @@ mod native_repair_crash_cuts_and_healing {
         }
     }
 
-    fn inspect_headers(state: &FaultState) -> (u32, bool, u32, u64, u32, u64) {
+    fn inspect_plan_and_groups(state: &FaultState) -> (u32, bool, [u8; 64], Vec<(u32, u64)>) {
         let bs = state.block_size;
-        let o0 = (state.tail0_start as usize) * bs;
-        let o1 = (state.tail1_start as usize) * bs;
+        let o0 = (state.tail_starts[0] as usize) * bs;
         let plan_state = u32::from_le_bytes(
             state.bytes[o0 + PLAN_HEADER_START + 96..o0 + PLAN_HEADER_START + 100]
                 .try_into()
@@ -820,34 +813,31 @@ mod native_repair_crash_cuts_and_healing {
         );
         let has_token =
             &state.bytes[o0 + EPOCH_TOKEN_START..o0 + EPOCH_TOKEN_START + 8] == b"FFSEPK02";
-        let g0_par_state = u32::from_le_bytes(
-            state.bytes[o0 + PARITY_HEADER_START + 112..o0 + PARITY_HEADER_START + 116]
-                .try_into()
-                .unwrap(),
-        );
-        let g0_par_gen = u64::from_le_bytes(
-            state.bytes[o0 + PARITY_HEADER_START + 40..o0 + PARITY_HEADER_START + 48]
-                .try_into()
-                .unwrap(),
-        );
-        let g1_par_state = u32::from_le_bytes(
-            state.bytes[o1 + PARITY_HEADER_START + 112..o1 + PARITY_HEADER_START + 116]
-                .try_into()
-                .unwrap(),
-        );
-        let g1_par_gen = u64::from_le_bytes(
-            state.bytes[o1 + PARITY_HEADER_START + 40..o1 + PARITY_HEADER_START + 48]
-                .try_into()
-                .unwrap(),
-        );
-        (
-            plan_state,
-            has_token,
-            g0_par_state,
-            g0_par_gen,
-            g1_par_state,
-            g1_par_gen,
-        )
+        let buckets: [u8; 64] = state.bytes
+            [o0 + EPOCH_TOKEN_START + 88..o0 + EPOCH_TOKEN_START + 152]
+            .try_into()
+            .unwrap();
+        let mut groups = Vec::with_capacity(state.tail_starts.len());
+        for &tail_start in &state.tail_starts {
+            let off = (tail_start as usize) * bs;
+            let par_state = u32::from_le_bytes(
+                state.bytes[off + PARITY_HEADER_START + 112..off + PARITY_HEADER_START + 116]
+                    .try_into()
+                    .unwrap(),
+            );
+            let par_gen = u64::from_le_bytes(
+                state.bytes[off + PARITY_HEADER_START + 40..off + PARITY_HEADER_START + 48]
+                    .try_into()
+                    .unwrap(),
+            );
+            groups.push((par_state, par_gen));
+        }
+        (plan_state, has_token, buckets, groups)
+    }
+
+    fn token_marks_group_dirty(buckets: &[u8; 64], group_idx: usize) -> bool {
+        let bucket = group_idx & 511;
+        (buckets[bucket / 8] & (1_u8 << (bucket % 8))) != 0
     }
 
     fn read_btrfs_generation(bytes: &[u8]) -> u64 {
@@ -883,7 +873,7 @@ mod native_repair_crash_cuts_and_healing {
                     "injected crash-cut power loss before next write",
                 )));
             }
-            let (plan_state, has_token, ..) = inspect_headers(&guard);
+            let (plan_state, has_token, ..) = inspect_plan_and_groups(&guard);
             if matches!(guard.cut, Some(CrashCut::CutA))
                 && plan_state == PLAN_DIRTY
                 && has_token
@@ -916,11 +906,10 @@ mod native_repair_crash_cuts_and_healing {
                     "injected crash-cut power loss on sync",
                 )));
             }
-            let Some(cut) = guard.cut else {
+            let Some(cut) = guard.cut.clone() else {
                 return Ok(());
             };
-            let (plan_state, has_token, g0_par_state, g0_par_gen, g1_par_state, g1_par_gen) =
-                inspect_headers(&guard);
+            let (plan_state, has_token, buckets, groups) = inspect_plan_and_groups(&guard);
             match cut {
                 CrashCut::CutA => {
                     if plan_state == PLAN_DIRTY && has_token {
@@ -930,9 +919,9 @@ mod native_repair_crash_cuts_and_healing {
                 CrashCut::CutBExt4 => {
                     if plan_state == PLAN_DIRTY && has_token {
                         guard.dirty_syncs_seen += 1;
-                        if guard.dirty_syncs_seen == 2 {
-                            // Sync #1 was PLAN_DIRTY; Sync #2 is JBD2 Phase 1b commit sync!
-                            // Let JBD2 commit become durable, then cut power before checkpoint/Pending!
+                        if guard.dirty_syncs_seen == 3 {
+                            // Sync #1: PLAN_DIRTY; Sync #2: JBD2 body barrier before commit block;
+                            // Sync #3: JBD2 Phase 1b commit-record sync! Fail before home checkpoint!
                             guard.fail_next_write = true;
                         }
                     }
@@ -942,32 +931,42 @@ mod native_repair_crash_cuts_and_healing {
                         && has_token
                         && read_btrfs_generation(&guard.bytes) > pre_btrfs_gen
                     {
-                        // New Btrfs superblock generation is now durable while plan is PLAN_DIRTY!
-                        // Cut power right before publish_validation_plan(Pending)!
                         guard.fail_next_write = true;
                     }
                 }
-                CrashCut::CutC { pre_gen0, pre_gen1 } => {
-                    if plan_state == VALIDATION_PENDING
-                        && has_token
-                        && g0_par_state == VALIDATION_SEALED
-                        && g0_par_gen > pre_gen0
-                        && g1_par_gen == pre_gen1
-                    {
-                        // Group 0 finished sealing validation + parity; Group 1 has not!
-                        guard.fail_next_write = true;
+                CrashCut::CutC { pre_gens } => {
+                    if plan_state == VALIDATION_PENDING && has_token {
+                        let mut sealed_dirty = 0_usize;
+                        let mut unsealed_dirty = 0_usize;
+                        for (idx, &(pstate, pgen)) in groups.iter().enumerate() {
+                            if token_marks_group_dirty(&buckets, idx) {
+                                if pstate == VALIDATION_SEALED && pgen > pre_gens[idx] {
+                                    sealed_dirty += 1;
+                                } else {
+                                    unsealed_dirty += 1;
+                                }
+                            }
+                        }
+                        if sealed_dirty >= 1 && unsealed_dirty >= 1 {
+                            guard.fail_next_write = true;
+                        }
                     }
                 }
-                CrashCut::CutD { pre_gen0, pre_gen1 } => {
-                    if plan_state == VALIDATION_PENDING
-                        && has_token
-                        && g0_par_state == VALIDATION_SEALED
-                        && g0_par_gen > pre_gen0
-                        && g1_par_state == VALIDATION_SEALED
-                        && g1_par_gen > pre_gen1
-                    {
-                        // All dirty groups encoded & sealed parity; cut before final whole-plan seal!
-                        guard.fail_next_write = true;
+                CrashCut::CutD { pre_gens } => {
+                    if plan_state == VALIDATION_PENDING && has_token {
+                        let mut dirty_total = 0_usize;
+                        let mut all_dirty_sealed = true;
+                        for (idx, &(pstate, pgen)) in groups.iter().enumerate() {
+                            if token_marks_group_dirty(&buckets, idx) {
+                                dirty_total += 1;
+                                if pstate != VALIDATION_SEALED || pgen <= pre_gens[idx] {
+                                    all_dirty_sealed = false;
+                                }
+                            }
+                        }
+                        if dirty_total >= 1 && all_dirty_sealed {
+                            guard.fail_next_write = true;
+                        }
                     }
                 }
             }
@@ -1102,8 +1101,7 @@ mod native_repair_crash_cuts_and_healing {
         );
         assert!(
             heal_5.recommended_interval_divisor > 1,
-            "Ville/Wald rejection must escalate scrub cadence divisor: {:?}",
-            heal_5
+            "Ville/Wald rejection must escalate scrub cadence divisor: {heal_5:?}"
         );
         assert_eq!(
             *blake3::hash(&dev.snapshot()).as_bytes(),
@@ -1125,9 +1123,8 @@ mod native_repair_crash_cuts_and_healing {
         }
     }
 
-    #[test]
     #[allow(clippy::too_many_lines)]
-    fn native_ext4_crash_cuts_a_b_c_d_corruption_1pct_5pct_and_e2fsck_bd_11a8t_bd_j7a4e() {
+    fn run_native_ext4_crash_cuts_subset(select_c_and_d: bool) {
         let mke2fs = format!("mk{}", "e2fs");
         if !tool_available(&mke2fs) || !tool_available("e2fsck") {
             assert!(
@@ -1141,7 +1138,7 @@ mod native_repair_crash_cuts_and_healing {
         let tmp = tempfile::tempdir().expect("tempdir");
         let base_img = tmp.path().join("seed.ext4");
         std::fs::File::create(&base_img)
-            .and_then(|f| f.set_len(4 * 1024 * 1024))
+            .and_then(|f| f.set_len(2560 * 1024))
             .expect("size seed.ext4");
         let status = Command::new(&mke2fs)
             .args([
@@ -1154,7 +1151,7 @@ mod native_repair_crash_cuts_and_healing {
                 "-b",
                 "1024",
                 "-g",
-                "2048",
+                "1280",
                 "-J",
                 "size=1",
                 "-N",
@@ -1168,7 +1165,9 @@ mod native_repair_crash_cuts_and_healing {
         let cx = Cx::for_testing();
         let v1_bytes = deterministic_payload(0x11A8_0001, 12 * 1024);
         let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
-        let v2_bytes = deterministic_payload(0x11A8_0002, 1100 * 1024);
+        // Compact 16 KiB payload stays well below JBD2 pressure commit threshold (~512 blocks)
+        // so all writes remain exclusively in MVCC until explicit fsync!
+        let v2_bytes = deterministic_payload(0x11A8_0002, 16 * 1024);
         let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
 
         // Seed v1.bin cleanly before native preparation.
@@ -1254,34 +1253,37 @@ mod native_repair_crash_cuts_and_healing {
         let sealed_baseline_bytes = baseline_dev.snapshot();
         run_external_e2fsck(tmp.path(), "ext4-baseline", &sealed_baseline_bytes);
 
-        let cuts = [
-            (
-                "cut_a",
-                CrashCut::CutA,
-                false, // v2 NOT yet committed in JBD2
-            ),
-            (
-                "cut_b",
-                CrashCut::CutBExt4,
-                true, // v2 IS committed in JBD2 before Pending plan
-            ),
-            (
-                "cut_c",
-                CrashCut::CutC {
-                    pre_gen0: rep_report.generations[0],
-                    pre_gen1: rep_report.generations[1],
-                },
-                true,
-            ),
-            (
-                "cut_d",
-                CrashCut::CutD {
-                    pre_gen0: rep_report.generations[0],
-                    pre_gen1: rep_report.generations[1],
-                },
-                true,
-            ),
-        ];
+        let cuts: Vec<(&str, CrashCut, bool)> = if select_c_and_d {
+            vec![
+                (
+                    "cut_c",
+                    CrashCut::CutC {
+                        pre_gens: rep_report.generations.clone(),
+                    },
+                    true,
+                ),
+                (
+                    "cut_d",
+                    CrashCut::CutD {
+                        pre_gens: rep_report.generations,
+                    },
+                    true,
+                ),
+            ]
+        } else {
+            vec![
+                (
+                    "cut_a",
+                    CrashCut::CutA,
+                    false, // v2 NOT yet committed in JBD2
+                ),
+                (
+                    "cut_b",
+                    CrashCut::CutBExt4,
+                    true, // v2 IS committed in JBD2 before Pending plan
+                ),
+            ]
+        };
 
         for (cut_name, cut, v2_expected) in cuts {
             let cut_dev =
@@ -1299,16 +1301,33 @@ mod native_repair_crash_cuts_and_healing {
                 assert!(fs.attach_ext4_internal_jbd2_writer(&cx).unwrap());
                 fs.enable_writes(&cx).expect("enable writes");
 
+                // Arm BEFORE staging so we also prove zero premature physical flush before fsync!
+                cut_dev.arm_cut(cut.clone());
+
                 let created = fs
                     .create(&cx, InodeNumber(2), OsStr::new("v2.bin"), 0o644, 0, 0)
                     .expect("create v2.bin");
-                // Write 1.1 MiB so blocks allocate across BOTH Group 0 and Group 1.
-                for (chunk_idx, chunk) in v2_bytes.chunks(64 * 1024).enumerate() {
-                    fs.write(&cx, created.ino, (chunk_idx * 64 * 1024) as u64, chunk)
-                        .expect("stage v2 chunk");
+                fs.write(&cx, created.ino, 0, &v2_bytes)
+                    .expect("stage v2.bin");
+                // Orlov spreads top-level directories across both Group 0 and Group 1 in < 20 MVCC blocks.
+                for idx in 0..3_u32 {
+                    let sub = fs
+                        .mkdir(
+                            &cx,
+                            InodeNumber(2),
+                            OsStr::new(&format!("sub_{idx}")),
+                            0o755,
+                            0,
+                            0,
+                        )
+                        .expect("mkdir sub");
+                    let child = fs
+                        .create(&cx, sub.ino, OsStr::new("leaf.bin"), 0o644, 0, 0)
+                        .expect("create leaf");
+                    fs.write(&cx, child.ino, 0, &[0x5B; 1024])
+                        .expect("write leaf");
                 }
 
-                cut_dev.arm_cut(cut);
                 let sync_err = fs
                     .fsync(&cx, created.ino, 0, false)
                     .expect_err("armed crash cut must interrupt fsync");
@@ -1320,25 +1339,41 @@ mod native_repair_crash_cuts_and_healing {
             );
             {
                 let guard = cut_dev.state.lock();
-                let (plan_state, has_token, g0_state, g0_gen, _g1_state, g1_gen) =
-                    inspect_headers(&guard);
+                let (plan_state, has_token, buckets, groups) = inspect_plan_and_groups(&guard);
                 assert!(
                     has_token,
                     "ext4 {cut_name} must leave FFSEPK02 epoch token on disk"
                 );
-                match cut {
+                match &cut {
                     CrashCut::CutA | CrashCut::CutBExt4 => {
                         assert_eq!(plan_state, PLAN_DIRTY, "ext4 {cut_name} plan_state");
                     }
-                    CrashCut::CutC { pre_gen0, pre_gen1 } => {
+                    CrashCut::CutC { pre_gens } => {
                         assert_eq!(plan_state, VALIDATION_PENDING);
-                        assert_eq!(g0_state, VALIDATION_SEALED);
-                        assert!(g0_gen > pre_gen0);
-                        assert_eq!(g1_gen, pre_gen1);
+                        let sealed_cnt = groups
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, &(st, g))| {
+                                token_marks_group_dirty(&buckets, i)
+                                    && st == VALIDATION_SEALED
+                                    && g > pre_gens[i]
+                            })
+                            .count();
+                        let unsealed_cnt = groups
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, &(_, g))| {
+                                token_marks_group_dirty(&buckets, i) && g == pre_gens[i]
+                            })
+                            .count();
+                        assert!(sealed_cnt >= 1 && unsealed_cnt >= 1);
                     }
-                    CrashCut::CutD { pre_gen0, pre_gen1 } => {
+                    CrashCut::CutD { pre_gens } => {
                         assert_eq!(plan_state, VALIDATION_PENDING);
-                        assert!(g0_gen > pre_gen0 && g1_gen > pre_gen1);
+                        assert!(groups.iter().enumerate().all(|(i, &(st, g))| {
+                            !token_marks_group_dirty(&buckets, i)
+                                || (st == VALIDATION_SEALED && g > pre_gens[i])
+                        }));
                     }
                     CrashCut::CutBBtrfs { .. } => unreachable!(),
                 }
@@ -1409,6 +1444,16 @@ mod native_repair_crash_cuts_and_healing {
     }
 
     #[test]
+    fn native_ext4_crash_cuts_a_and_b_corruption_1pct_5pct_and_e2fsck_bd_11a8t_bd_j7a4e() {
+        run_native_ext4_crash_cuts_subset(false);
+    }
+
+    #[test]
+    fn native_ext4_crash_cuts_c_and_d_corruption_1pct_5pct_and_e2fsck_bd_11a8t_bd_j7a4e() {
+        run_native_ext4_crash_cuts_subset(true);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn native_btrfs_crash_cuts_a_b_c_d_treelog_corruption_1pct_5pct_and_btrfs_check_bd_11a8t_bd_j7a4e()
      {
@@ -1446,7 +1491,9 @@ mod native_repair_crash_cuts_and_healing {
         let root_dir = InodeNumber(256);
         let v1_bytes = deterministic_payload(0xB7F5_0001, 16 * 1024);
         let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
-        let v2_bytes = deterministic_payload(0xB7F5_0002, 2 * 1024 * 1024);
+        // Compact 64 KiB payload: superblock is in Group 0 and new COW extents allocate in Group 1+,
+        // dirtying >= 2 groups per commit without large debug-mode buffers!
+        let v2_bytes = deterministic_payload(0xB7F5_0002, 64 * 1024);
         let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
 
         // Seed v1.bin cleanly before native preparation.
@@ -1591,16 +1638,14 @@ mod native_repair_crash_cuts_and_healing {
             (
                 "cut_c",
                 CrashCut::CutC {
-                    pre_gen0: rep_report.generations[0],
-                    pre_gen1: rep_report.generations[1],
+                    pre_gens: rep_report.generations.clone(),
                 },
                 true,
             ),
             (
                 "cut_d",
                 CrashCut::CutD {
-                    pre_gen0: rep_report.generations[0],
-                    pre_gen1: rep_report.generations[1],
+                    pre_gens: rep_report.generations,
                 },
                 true,
             ),
@@ -1620,15 +1665,12 @@ mod native_repair_crash_cuts_and_healing {
                 )
                 .expect("open active btrfs");
                 fs.enable_writes(&cx).expect("enable writes");
+                cut_dev.arm_cut(cut.clone());
                 let created = fs
                     .create(&cx, root_dir, OsStr::new("v2.bin"), 0o644, 0, 0)
                     .expect("create v2.bin");
-                // Write 2 MiB + mutate v1.bin so blocks touch both Group 0 and Group 1.
-                for (chunk_idx, chunk) in v2_bytes.chunks(128 * 1024).enumerate() {
-                    fs.write(&cx, created.ino, (chunk_idx * 128 * 1024) as u64, chunk)
-                        .expect("stage btrfs v2 chunk");
-                }
-                cut_dev.arm_cut(cut);
+                fs.write(&cx, created.ino, 0, &v2_bytes)
+                    .expect("stage btrfs v2.bin");
                 let sync_err = fs
                     .fsync(&cx, created.ino, 0, false)
                     .expect_err("armed btrfs crash cut must interrupt fsync");
@@ -1709,7 +1751,7 @@ mod native_repair_crash_cuts_and_healing {
         let tmp = tempfile::tempdir().expect("tempdir");
         let base_img = tmp.path().join("neg.ext4");
         std::fs::File::create(&base_img)
-            .and_then(|f| f.set_len(4 * 1024 * 1024))
+            .and_then(|f| f.set_len(2560 * 1024))
             .expect("size neg.ext4");
         let status = Command::new(&mke2fs)
             .args([
@@ -1722,7 +1764,7 @@ mod native_repair_crash_cuts_and_healing {
                 "-b",
                 "1024",
                 "-g",
-                "2048",
+                "1280",
                 "-J",
                 "size=1",
                 "-N",

@@ -6800,10 +6800,10 @@ fn dsl_dataset_snapshot_clone_hold_bookmark_defer_destroy_and_reclamation() {
     {
         let mut mos = engine.open_read_objects(&cx).unwrap();
         let ws_head_dn = mos.object(&cx, ws_head_obj).unwrap();
-        let ws_dd_obj = ws_head_dn.order().u64(ws_head_dn.bonus(), 0).unwrap();
+        let ws_dir_obj = ws_head_dn.order().u64(ws_head_dn.bonus(), 0).unwrap();
         let ws_prev_snap = ws_head_dn.order().u64(ws_head_dn.bonus(), 8).unwrap();
         let ws_prev_txg = ws_head_dn.order().u64(ws_head_dn.bonus(), 16).unwrap();
-        let ws_dl_obj = ws_head_dn.order().u64(ws_head_dn.bonus(), 64).unwrap();
+        let ws_deadlist_obj = ws_head_dn.order().u64(ws_head_dn.bonus(), 64).unwrap();
         assert_eq!(
             ws_prev_snap, 26,
             "new dataset must link ds_prev_snap_obj to $ORIGIN@$ORIGIN"
@@ -6813,14 +6813,14 @@ fn dsl_dataset_snapshot_clone_hold_bookmark_defer_destroy_and_reclamation() {
             "new dataset must inherit $ORIGIN@$ORIGIN ds_creation_txg"
         );
         assert_ne!(
-            ws_dl_obj, 13,
+            ws_deadlist_obj, 13,
             "writable head dataset must never alias shared empty_bpobj"
         );
-        assert_eq!(mos.object(&cx, ws_dl_obj).unwrap().object_type(), 50);
+        assert_eq!(mos.object(&cx, ws_deadlist_obj).unwrap().object_type(), 50);
 
-        let ws_dd_dn = mos.object(&cx, ws_dd_obj).unwrap();
+        let ws_dir_dn = mos.object(&cx, ws_dir_obj).unwrap();
         assert_eq!(
-            ws_dd_dn.order().u64(ws_dd_dn.bonus(), 24).unwrap(),
+            ws_dir_dn.order().u64(ws_dir_dn.bonus(), 24).unwrap(),
             26,
             "new dsl_dir must link dd_origin_obj to $ORIGIN@$ORIGIN"
         );

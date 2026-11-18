@@ -7080,7 +7080,11 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
         return;
     }
 
-    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp = tempfile::Builder::new()
+        .prefix("ffs-bd-11a8t-")
+        .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("ffs-bd-11a8t-").tempdir())
+        .expect("create tempdir");
     let seed_root = tmp.path().join("seed_root");
     fs::create_dir(&seed_root).expect("create seed_root");
     fs::set_permissions(&seed_root, fs::Permissions::from_mode(0o777)).expect("chmod seed_root");
@@ -7128,7 +7132,7 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
         String::from_utf8_lossy(&prep.stderr)
     );
     let prep_json: serde_json::Value = serde_json::from_slice(&prep.stdout).expect("prep json");
-    let target_block = prep_json["tails"][0]["group_start"]
+    let target_block = prep_json["storage"]["tails"][0]["group_start"]
         .as_u64()
         .expect("tail0 group_start")
         + 4;
@@ -7144,7 +7148,7 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
         "native-encode",
         img_str,
         "--max-codec-memory-mib",
-        "256",
+        "512",
         "--json",
     ]);
     assert!(
@@ -7157,7 +7161,7 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
         img_str,
         "--check",
         "--max-codec-memory-mib",
-        "256",
+        "512",
         "--json",
     ]);
     assert!(
@@ -7181,7 +7185,7 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
     let mut raw = fs::read(&image).expect("read encoded btrfs");
     let blk_off = usize::try_from(target_block * 4096).unwrap();
     let expected_block = raw[blk_off..blk_off + 4096].to_vec();
-    let expected_block_hash = *blake3::hash(&expected_block).as_bytes();
+    let expected_block_hash = sha256_bytes(&expected_block);
     raw[blk_off + 128] ^= 0x7E;
     raw[blk_off + 2048] ^= 0xC3;
     fs::write(&image, &raw).expect("write corrupted btrfs");
@@ -7191,7 +7195,7 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
         img_str,
         "--check",
         "--max-codec-memory-mib",
-        "256",
+        "512",
     ]);
     assert!(
         !damaged_check.status.success(),
@@ -7206,7 +7210,7 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
         &blk_str,
         recovered_path.to_str().unwrap(),
         "--max-codec-memory-mib",
-        "256",
+        "512",
         "--json",
     ]);
     assert!(
@@ -7215,10 +7219,7 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
         String::from_utf8_lossy(&rec.stderr)
     );
     let recovered_bytes = fs::read(&recovered_path).expect("read recovered.block");
-    assert_eq!(
-        *blake3::hash(&recovered_bytes).as_bytes(),
-        expected_block_hash
-    );
+    assert_eq!(sha256_bytes(&recovered_bytes), expected_block_hash);
     assert_eq!(recovered_bytes, expected_block);
     emit_scenario_result(
         "cli_btrfs_native_prepare_validate_encode_recover_bd_11a8t",
@@ -7296,16 +7297,16 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
     let v1_payload: Vec<u8> = (0..24_576_usize)
         .map(|i| ((i.wrapping_mul(197).wrapping_add(11)) & 0xFF) as u8)
         .collect();
-    let v1_hash = *blake3::hash(&v1_payload).as_bytes();
+    let v1_hash = sha256_bytes(&v1_payload);
     let v2_payload: Vec<u8> = (0..24_576_usize)
         .map(|i| ((i.wrapping_mul(89).wrapping_add(73)) & 0xFF) as u8)
         .collect();
-    let v2_hash = *blake3::hash(&v2_payload).as_bytes();
+    let v2_hash = sha256_bytes(&v2_payload);
 
-    // Format native-ready ext4 (4 MiB, 1 KiB blocks, 2 groups, 1 MiB JBD2 journal) and btrfs (16 MiB -M).
+    // Format native-ready ext4 (2.5 MiB, 1 KiB blocks, 2 groups of 1280 blocks, 1 MiB JBD2 journal) and btrfs (16 MiB -M).
     let ext4_img = dir.join("mounted.ext4");
     fs::File::create(&ext4_img)
-        .and_then(|f| f.set_len(4 * 1024 * 1024))
+        .and_then(|f| f.set_len(2560 * 1024))
         .expect("size mounted.ext4");
     let me = fs::metadata(&ext4_img).expect("stat mounted.ext4");
     let ext_opts = format!("lazy_itable_init=0,root_owner={}:{}", me.uid(), me.gid());
@@ -7318,7 +7319,7 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
             "-b",
             "1024",
             "-g",
-            "2048",
+            "1280",
             "-J",
             "size=1",
             "-N",
@@ -7380,7 +7381,9 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
             String::from_utf8_lossy(&prep.stderr)
         );
         let prep_json: serde_json::Value = serde_json::from_slice(&prep.stdout).unwrap();
-        let group0_start = prep_json["tails"][0]["group_start"].as_u64().unwrap();
+        let group0_start = prep_json["storage"]["tails"][0]["group_start"]
+            .as_u64()
+            .unwrap();
 
         let val = run_ffs_cli(&["native-validate", img_str, "--initialize"]);
         assert!(
@@ -7388,7 +7391,7 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
             "{fs_label} native-validate: {}",
             String::from_utf8_lossy(&val.stderr)
         );
-        let enc = run_ffs_cli(&["native-encode", img_str, "--max-codec-memory-mib", "256"]);
+        let enc = run_ffs_cli(&["native-encode", img_str, "--max-codec-memory-mib", "512"]);
         assert!(
             enc.status.success(),
             "{fs_label} native-encode: {}",
@@ -7420,7 +7423,10 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
         })();
         if let Err(err) = write_v1 {
             sigkill_cli_mount(&mut child1, &mnt);
-            panic!("{fs_label} write+fsync durable_v1.bin failed: {err}");
+            panic!(
+                "{fs_label} write+fsync durable_v1.bin failed: {err}\nlog1:\n{}",
+                fs::read_to_string(&log1).unwrap_or_default()
+            );
         }
         // Wait briefly for the default native background scrub thread start log, then SIGKILL!
         let log_deadline = Instant::now() + Duration::from_secs(10);
@@ -7455,7 +7461,7 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
                 img_str,
                 "--check",
                 "--max-codec-memory-mib",
-                "256"
+                "512"
             ])
             .status
             .success(),
@@ -7489,7 +7495,7 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
         let phase2_res = (|| -> Result<(), String> {
             let read_v1 =
                 fs::read(mnt.join("durable_v1.bin")).map_err(|e| format!("read v1: {e}"))?;
-            if *blake3::hash(&read_v1).as_bytes() != v1_hash || read_v1 != v1_payload {
+            if sha256_bytes(&read_v1) != v1_hash || read_v1 != v1_payload {
                 return Err(format!("{fs_label} durable_v1.bin mismatch after heal"));
             }
             let ledger_deadline = Instant::now() + Duration::from_secs(15);
@@ -7522,7 +7528,7 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
             f2.sync_all().map_err(|e| format!("fsync v2: {e}"))?;
             let read_v2 =
                 fs::read(mnt.join("durable_v2.bin")).map_err(|e| format!("read v2: {e}"))?;
-            if *blake3::hash(&read_v2).as_bytes() != v2_hash {
+            if sha256_bytes(&read_v2) != v2_hash {
                 return Err(format!("{fs_label} durable_v2.bin hash mismatch"));
             }
             Ok(())
@@ -7562,7 +7568,7 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
             img_str,
             "--check",
             "--max-codec-memory-mib",
-            "256",
+            "512",
         ]);
         assert!(
             post_chk.status.success(),

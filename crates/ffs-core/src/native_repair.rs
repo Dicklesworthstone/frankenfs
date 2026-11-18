@@ -24,7 +24,7 @@ use ffs_block::{BlockBuf, ByteDevice};
 use ffs_btrfs::{BTRFS_INODE_NODATACOW, BtrfsBTree};
 use ffs_repair::codec::{
     BlockDelta, DirectEncodeRequest, EncodedGroup, direct_encode_workspace_bytes,
-    encode_group_direct, update_encoded_group_delta,
+    encode_group_direct, update_encoded_group_delta, warm_group_delta_encoder,
 };
 use ffs_repair::evidence::AnytimeScrubMonitorDetail;
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryWriteback, RecoveryWritebackBlock};
@@ -64,7 +64,7 @@ const EPOCH_TOKEN_END: usize = EPOCH_TOKEN_START + EPOCH_TOKEN_BYTES;
 const EPOCH_TOKEN_FLAG_FORMAT_COMMIT: u32 = 1 << 0;
 const DIRTY_BUCKET_COUNT: usize = 512;
 const MAX_DELTA_BEFOREIMAGE_BLOCKS: usize = 512;
-const BTRFS_NATIVE_GROUP_MAX_BLOCKS: u32 = 2_048;
+const BTRFS_NATIVE_GROUP_MAX_BLOCKS: u32 = 512;
 const BTRFS_NATIVE_OWNER_FLAGS: u64 =
     BTRFS_INODE_IMMUTABLE | BTRFS_INODE_NODATASUM | BTRFS_INODE_NODATACOW;
 
@@ -995,9 +995,7 @@ impl NativeFreshnessDevice {
             );
             if let Some(&first_corrupt) = corrupt.first() {
                 let target = BlockNumber(tail.group_start.0 + u64::from(first_corrupt));
-                if let Err(err) = self.repair_clean_read(cx, &mut state, target) {
-                    return Err(err);
-                }
+                self.repair_clean_read(cx, &mut state, target)?;
                 blocks_healed = blocks_healed.saturating_add(corrupt_len);
             }
         }
@@ -2529,6 +2527,7 @@ fn native_codec_budget(
     Ok(budget)
 }
 
+#[expect(clippy::too_many_arguments)]
 fn admit_native_group_unconstrained_root(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -3450,13 +3449,13 @@ fn publish_validation_group(
 }
 
 fn btrfs_first_source_block(block_size: u32) -> Result<u64, FfsError> {
-    if block_size < 1024 || block_size > 65_536 || !block_size.is_power_of_two() {
+    if !(1024..=65_536).contains(&block_size) || !block_size.is_power_of_two() {
         return Err(FfsError::InvalidGeometry(
             "native btrfs repair requires a power-of-two sector size in 1024..=65536".into(),
         ));
     }
     let boot = BTRFS_SUPER_INFO_OFFSET as u64;
-    if boot % u64::from(block_size) != 0 {
+    if !boot.is_multiple_of(u64::from(block_size)) {
         return Err(FfsError::InvalidGeometry(
             "btrfs superblock offset is not aligned to sector size".into(),
         ));
@@ -3691,8 +3690,8 @@ fn btrfs_resolve_single_data_extent(
 ) -> Result<(u64, u32), FfsError> {
     if disk_bytenr == 0
         || disk_num_bytes == 0
-        || disk_bytenr % u64::from(sectorsize) != 0
-        || disk_num_bytes % u64::from(sectorsize) != 0
+        || !disk_bytenr.is_multiple_of(u64::from(sectorsize))
+        || !disk_num_bytes.is_multiple_of(u64::from(sectorsize))
     {
         return Err(FfsError::Format(
             "native btrfs repair extent is unaligned or sparse".into(),
@@ -3851,9 +3850,8 @@ impl OpenFs {
         let Some(sb) = self.btrfs_superblock() else {
             return Ok(());
         };
-        let state = match device.state.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return Ok(()),
+        let Ok(state) = device.state.try_lock() else {
+            return Ok(());
         };
         let storage = &state.baseline.storage;
         let owner_oid = storage.owner_inode.0;
@@ -4107,7 +4105,12 @@ impl OpenFs {
                     let (root, table) =
                         read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
                     let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
-                    if !corrupt.is_empty() {
+                    if corrupt.is_empty() {
+                        if root != baseline.roots[index] {
+                            return Err(validation_error(tail, "sealed root changed"));
+                        }
+                        native_sealed_generation(cx, &dev, &id, &baseline, tail, false)?;
+                    } else {
                         native_codec_budget(&id, &storage, tail, codec_budget, true)?;
                         let generation =
                             native_sealed_generation(cx, &dev, &id, &baseline, tail, true)?;
@@ -4122,11 +4125,6 @@ impl OpenFs {
                             generation,
                             &corrupt,
                         )?;
-                    } else {
-                        if root != baseline.roots[index] {
-                            return Err(validation_error(tail, "sealed root changed"));
-                        }
-                        native_sealed_generation(cx, &dev, &id, &baseline, tail, false)?;
                     }
                 }
             }
@@ -4185,7 +4183,10 @@ impl OpenFs {
                             group_epochs: vec![local_epoch; storage.tails.len()],
                         };
                         let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
-                        if !corrupt.is_empty() {
+                        if corrupt.is_empty() {
+                            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
+                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
+                        } else {
                             native_codec_budget(&id, &storage, tail, codec_budget, true)?;
                             let generation = native_sealed_generation(
                                 cx,
@@ -4206,9 +4207,6 @@ impl OpenFs {
                                 generation,
                                 &corrupt,
                             )?;
-                        } else {
-                            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
-                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
                         }
                         validations.push(ValidationAdmission {
                             epoch: local_epoch,
@@ -4328,7 +4326,10 @@ impl OpenFs {
                             group_epochs: vec![local_epoch; storage.tails.len()],
                         };
                         let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
-                        if !corrupt.is_empty() {
+                        if corrupt.is_empty() {
+                            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
+                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
+                        } else {
                             native_codec_budget(&id, &storage, tail, codec_budget, true)?;
                             let generation = native_sealed_generation(
                                 cx,
@@ -4349,9 +4350,6 @@ impl OpenFs {
                                 generation,
                                 &corrupt,
                             )?;
-                        } else {
-                            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
-                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
                         }
                         validations.push(ValidationAdmission {
                             epoch: local_epoch,
@@ -4378,7 +4376,9 @@ impl OpenFs {
                                 .is_ok();
                         if already_parity_sealed {
                             let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
-                            if !corrupt.is_empty() {
+                            if corrupt.is_empty() {
+                                verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
+                            } else {
                                 native_codec_budget(&id, &storage, tail, codec_budget, true)?;
                                 let generation = native_sealed_generation(
                                     cx,
@@ -4399,8 +4399,6 @@ impl OpenFs {
                                     generation,
                                     &corrupt,
                                 )?;
-                            } else {
-                                verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
                             }
                             needs_parity_publish.push(false);
                         } else {
@@ -4593,6 +4591,27 @@ impl OpenFs {
             parity.push(admission.intent);
         }
         ensure_native_baseline(self, cx, &baseline)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        {
+            use rayon::prelude::*;
+            let warm_targets: Vec<(u32, u64)> = storage
+                .tails
+                .iter()
+                .take(16)
+                .filter_map(|tail| {
+                    let (sources, _, _) = validation_sizes(&id, tail).ok()?;
+                    let delta_ok = u64::from(sources)
+                        .saturating_mul(u64::from(sources))
+                        .saturating_mul(3)
+                        <= codec_budget;
+                    (sources <= 2_048 && delta_ok)
+                        .then(|| (sources, repair_seed(&id.uuid, tail.group)))
+                })
+                .collect();
+            warm_targets.into_par_iter().for_each(|(sources, seed)| {
+                warm_group_delta_encoder(sources, seed);
+            });
+        }
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let device = Arc::new(NativeFreshnessDevice {
             inner: Arc::clone(&self.dev),
@@ -5141,7 +5160,7 @@ impl OpenFs {
             ));
         }
         let image_len = self.dev.len_bytes();
-        if image_len % u64::from(sb.sectorsize) != 0 {
+        if !image_len.is_multiple_of(u64::from(sb.sectorsize)) {
             return Err(FfsError::InvalidGeometry(
                 "btrfs image byte length is not a multiple of sectorsize".into(),
             ));
@@ -5722,7 +5741,7 @@ impl OpenFs {
             ));
         }
         let image_len = self.dev.len_bytes();
-        if image_len % u64::from(sb.sectorsize) != 0 {
+        if !image_len.is_multiple_of(u64::from(sb.sectorsize)) {
             return Err(FfsError::InvalidGeometry(
                 "btrfs image byte length is not a multiple of sectorsize".into(),
             ));
