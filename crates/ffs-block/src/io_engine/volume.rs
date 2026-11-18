@@ -297,6 +297,23 @@ impl ByteDevice for VolumeDevice {
         self.inner.as_ref().sync(cx)
     }
 
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.require_write(cx)?;
+        self.inner.as_ref().begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        if self.access == VolumeAccess::ReadWrite {
+            self.inner.as_ref().complete_durability_commit();
+        }
+    }
+
+    fn abort_durability_commit(&self) {
+        if self.access == VolumeAccess::ReadWrite {
+            self.inner.as_ref().abort_durability_commit();
+        }
+    }
+
     fn supports_discard(&self) -> bool {
         self.access == VolumeAccess::ReadWrite && self.inner.as_ref().supports_discard()
     }

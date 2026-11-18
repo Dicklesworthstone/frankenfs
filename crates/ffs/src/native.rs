@@ -242,6 +242,19 @@ impl ByteDevice for PartitionByteDevice {
         self.volume.sync(cx)
     }
 
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        self.volume.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.volume.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.volume.abort_durability_commit();
+    }
+
     fn supports_discard(&self) -> bool {
         self.volume.supports_discard()
     }

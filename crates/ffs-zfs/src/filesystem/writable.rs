@@ -190,8 +190,9 @@ impl ZfsFs {
     pub fn create_snapshot(&self, cx: &Cx, snap_name: &[u8]) -> Result<u64> {
         let mut state = self.state(cx)?;
         let timestamp = native_timestamp(SystemTime::now())?;
-        let obj = state
-            .mutate(|engine, dataset| engine.create_snapshot(cx, dataset, snap_name, timestamp))?;
+        let obj = state.mutate(cx, |engine, dataset| {
+            engine.create_snapshot(cx, dataset, snap_name, timestamp)
+        })?;
         state.publish_committed(|state| {
             state.refresh_head(cx)?;
             state.invalidate_snapshots_locked(cx)?;
@@ -202,8 +203,9 @@ impl ZfsFs {
     /// Destroy (or defer-destroy) a snapshot on this mounted dataset and immediately prune `.zfs/snapshot`.
     pub fn destroy_snapshot(&self, cx: &Cx, snap_name: &[u8], defer: bool) -> Result<u64> {
         let mut state = self.state(cx)?;
-        let obj = state
-            .mutate(|engine, dataset| engine.destroy_snapshot(cx, dataset, snap_name, defer))?;
+        let obj = state.mutate(cx, |engine, dataset| {
+            engine.destroy_snapshot(cx, dataset, snap_name, defer)
+        })?;
         state.publish_committed(|state| {
             state.refresh_head(cx)?;
             state.invalidate_snapshots_locked(cx)?;
@@ -219,7 +221,7 @@ impl ZfsFs {
         new_snap_name: &[u8],
     ) -> Result<u64> {
         let mut state = self.state(cx)?;
-        let obj = state.mutate(|engine, dataset| {
+        let obj = state.mutate(cx, |engine, dataset| {
             engine.rename_snapshot(cx, dataset, old_snap_name, new_snap_name)
         })?;
         state.publish_committed(|state| {
@@ -233,6 +235,23 @@ impl ZfsFs {
     pub fn invalidate_snapshots(&self, cx: &Cx) -> Result<()> {
         let mut state = self.state(cx)?;
         state.invalidate_snapshots_locked(cx)
+    }
+
+    /// Whether this `ZfsFs` instance owns an admitted writable TXG engine.
+    pub fn is_writable(&self) -> Result<bool> {
+        let state = self.state.lock().map_err(|_| errno(libc::EIO))?;
+        Ok(state.writer.is_some())
+    }
+
+    /// Return the admitted [`crate::transaction::ZfsStorageIdentity`] when writable.
+    pub fn writable_storage_identity(
+        &self,
+    ) -> Result<Option<crate::transaction::ZfsStorageIdentity>> {
+        let state = self.state.lock().map_err(|_| errno(libc::EIO))?;
+        Ok(state
+            .writer
+            .as_ref()
+            .map(|writer| writer.engine.storage_identity().clone()))
     }
 
     /// The most recent known durable result, even when later request delivery or
@@ -274,7 +293,7 @@ impl ZfsFs {
             None
         };
         let timestamp = native_timestamp(SystemTime::now())?;
-        let object = state.mutate(|engine, dataset| {
+        let object = state.mutate(cx, |engine, dataset| {
             engine.create_file(
                 cx,
                 dataset,
@@ -327,7 +346,7 @@ impl ZfsFs {
                 }
             });
         let timestamp = native_timestamp(SystemTime::now())?;
-        state.mutate(|engine, dataset| {
+        state.mutate(cx, |engine, dataset| {
             if let Some(identity) = retained {
                 engine.unlink_open_file(
                     cx,
@@ -593,6 +612,7 @@ impl State {
 
     pub(super) fn mutate(
         &mut self,
+        cx: &Cx,
         operation: impl FnOnce(&mut ZfsTransactionEngine, &[Vec<u8>]) -> ZfsTxOutcome<u64>,
     ) -> Result<u64> {
         let view = self.head.mutable.as_mut().ok_or(FfsError::ReadOnly)?;
@@ -600,15 +620,21 @@ impl State {
             return Err(errno(libc::EOVERFLOW));
         }
         let writer = self.writer.as_mut().ok_or(FfsError::ReadOnly)?;
+        writer.engine.begin_durability_commit(cx)?;
         match operation(&mut writer.engine, &writer.dataset) {
             ZfsTxOutcome::Committed { value, token } => {
+                writer.engine.complete_durability_commit();
                 writer.last_token = Some(token);
                 writer.refresh_needed = true;
                 view.revision += 1;
                 Ok(value)
             }
-            ZfsTxOutcome::NotCommitted(error) => Err(error),
+            ZfsTxOutcome::NotCommitted(error) => {
+                writer.engine.abort_durability_commit();
+                Err(error)
+            }
             ZfsTxOutcome::Uncertain { reason, .. } => {
+                writer.engine.abort_durability_commit();
                 self.recovery_required = true;
                 Err(reason)
             }
@@ -650,7 +676,9 @@ impl State {
         else {
             return Ok(false);
         };
-        self.mutate(|engine, dataset| engine.reap_unlinked_file(cx, dataset, identity))?;
+        self.mutate(cx, |engine, dataset| {
+            engine.reap_unlinked_file(cx, dataset, identity)
+        })?;
         if let Some(writer) = &mut self.writer {
             writer.orphans.remove(&ino);
         }

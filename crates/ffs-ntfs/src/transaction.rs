@@ -1184,6 +1184,12 @@ impl NtfsTransactionEngine {
         self.device.sync(cx)
     }
 
+    /// Borrow the bounded backing [`ByteDevice`] owned by this transaction engine.
+    #[must_use]
+    pub fn backing_device(&self) -> &dyn ByteDevice {
+        self.device.as_ref()
+    }
+
     /// Construct a fresh read-only [`NtfsVolume`] view over the current backing storage.
     pub fn volume_view(&self, cx: &Cx) -> Result<NtfsVolume> {
         NtfsVolume::from_device(

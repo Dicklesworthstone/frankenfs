@@ -1089,7 +1089,8 @@ impl SaRegistry {
             let aces =
                 encode_trivial_nfsv4_aces(metadata.mode, metadata.kind == Kind::Directory, order);
             let _ = self.ensure_attribute(reg_entries, b"ZPL_DACL_COUNT", 8, 0)?;
-            let _ = self.ensure_attribute(reg_entries, b"ZPL_DACL_ACES", 0, 2)?;
+            // OpenZFS registers ZPL_DACL_ACES with variable length (0) and SA_ACL (swap == 4).
+            let _ = self.ensure_attribute(reg_entries, b"ZPL_DACL_ACES", 0, 4)?;
             spill_map.remove(b"ZPL_DACL_COUNT".as_slice());
             spill_map.remove(b"ZPL_DACL_ACES".as_slice());
             bonus_map.insert(b"ZPL_DACL_COUNT".to_vec(), order.encode(3).to_vec());

@@ -527,6 +527,7 @@ jobs:
           for operation in format mkdir create replace rename unlink rmdir; do
             grep -qF "PROTECTED_FAT_CLI_RESULT|$operation|PASS|" "$RUNNER_TEMP/protected-mount-repair.log"
           done
+          cargo test -p ffs-cli --bin ffs-protected-mount -- bd_tqrnc --nocapture --test-threads=1
 
       # bd-53dub: a mounted test that cannot mount fails here instead of
       # passing vacuously (FUSE, fuse3, e2fsprogs and btrfs-progs are installed

@@ -84,6 +84,8 @@ pub fn preset_event_types(preset: &str) -> Option<&'static [EvidenceEventType]> 
             EvidenceEventType::ScrubCycleComplete,
             EvidenceEventType::PolicyDecision,
             EvidenceEventType::AnytimeScrubMonitor,
+            EvidenceEventType::ProtectedRepairGate,
+            EvidenceEventType::ProtectedCommitAck,
         ]),
         _ => None,
     }
@@ -1278,6 +1280,8 @@ pub const fn evidence_event_type_name(event_type: EvidenceEventType) -> &'static
         EvidenceEventType::PolicySwitched => "policy_switched",
         EvidenceEventType::ContentionSample => "contention_sample",
         EvidenceEventType::AnytimeScrubMonitor => "anytime_scrub_monitor",
+        EvidenceEventType::ProtectedRepairGate => "protected_repair_gate",
+        EvidenceEventType::ProtectedCommitAck => "protected_commit_ack",
     }
 }
 
@@ -1345,6 +1349,26 @@ fn print_evidence_record_event_payload(record: &EvidenceRecord) {
                     m.null_rejected,
                     m.recommended_interval_divisor,
                     m.recommended_overhead_bps
+                );
+            }
+        }
+        EvidenceEventType::ProtectedRepairGate => {
+            if let Some(g) = record.protected_repair_gate.as_ref() {
+                print!(
+                    " member={} gen={} auth={} damaged={} authorized={}",
+                    g.member_index,
+                    g.generation,
+                    g.authenticated_provenance,
+                    g.damaged_blocks,
+                    g.authorized
+                );
+            }
+        }
+        EvidenceEventType::ProtectedCommitAck => {
+            if let Some(a) = record.protected_commit_ack.as_ref() {
+                print!(
+                    " gen={} native_durable={} protected_durable={} unprotected_ns={}",
+                    a.generation, a.native_durable, a.protected_durable, a.unprotected_interval_ns
                 );
             }
         }
@@ -1972,6 +1996,8 @@ mod tests {
             merge_rejected: None,
             policy_switched: None,
             contention_sample: None,
+            protected_repair_gate: None,
+            protected_commit_ack: None,
         }
     }
 }

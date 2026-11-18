@@ -181,7 +181,7 @@ pub struct FileChain {
 }
 
 pub struct FatVolume {
-    device: Box<dyn ByteDevice>,
+    pub(crate) device: Box<dyn ByteDevice>,
     base: u64,
     pub geometry: FatGeometry,
     oem_code_page: FatOemCodePage,

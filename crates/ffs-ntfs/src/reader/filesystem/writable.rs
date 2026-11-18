@@ -70,6 +70,28 @@ impl NtfsFs {
         self.writer.is_some()
     }
 
+    /// Return the most recently committed native [`crate::transaction::NtfsDurableToken`],
+    /// performing zero backing I/O.
+    pub fn last_durable_token(&self) -> Result<Option<crate::transaction::NtfsDurableToken>> {
+        self.last_token
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| FfsError::Io(std::io::Error::other("NTFS durable-token lock poisoned")))
+    }
+
+    /// Return the admitted [`crate::transaction::NtfsStorageIdentity`] when writable.
+    pub fn writable_storage_identity(
+        &self,
+    ) -> Result<Option<crate::transaction::NtfsStorageIdentity>> {
+        let Some(writer) = self.writer.as_ref() else {
+            return Ok(None);
+        };
+        let guard = writer
+            .lock()
+            .map_err(|_| FfsError::Io(std::io::Error::other("NTFS writer poisoned")))?;
+        Ok(Some(guard.storage_identity().clone()))
+    }
+
     pub(super) fn ensure_writable(&self) -> Result<()> {
         if self.is_writable() {
             Ok(())
@@ -93,9 +115,11 @@ impl NtfsFs {
     ) -> Result<T> {
         checkpoint(cx)?;
         let mut engine = self.writer()?;
+        engine.backing_device().begin_durability_commit(cx)?;
         self.health.mark_dirty();
         match operation(&mut engine) {
             NtfsTxOutcome::NotCommitted(error) => {
+                engine.backing_device().abort_durability_commit();
                 // A pre-commit failure can still leave native recovery work.
                 // Only a refusal before journal publication permits reuse.
                 if engine.requires_recovery() {
@@ -106,22 +130,28 @@ impl NtfsFs {
                 Err(error)
             }
             NtfsTxOutcome::Uncertain { reason, .. } => {
+                engine.backing_device().abort_durability_commit();
                 self.health.fail();
                 Err(reason)
             }
             NtfsTxOutcome::Committed { value, token } => {
                 if !token.matches_engine(&engine) {
+                    engine.backing_device().abort_durability_commit();
                     self.health.fail();
                     return Err(super::corrupt(
                         0,
                         "NTFS commit token changed storage identity",
                     ));
                 }
+                engine.backing_device().complete_durability_commit();
                 // The durable token settles the outcome. Finish publishing
                 // through the caller's authority even if cancellation arrived
                 // after the journal commit; otherwise a successful mutation
                 // would be reported as failed and poison the live mount.
                 cx.masked(|| {
+                    *self.last_token.lock().map_err(|_| {
+                        FfsError::Io(std::io::Error::other("NTFS durable-token lock poisoned"))
+                    })? = Some(token);
                     let view = Arc::new(engine.volume_view(cx)?);
                     *self.live_volume.write().map_err(|_| {
                         FfsError::Io(std::io::Error::other("NTFS live volume poisoned"))

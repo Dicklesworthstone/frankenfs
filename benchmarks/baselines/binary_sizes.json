@@ -4,17 +4,18 @@
   "opt_level": "z",
   "lto": true,
   "strip": true,
-  "recorded_at_commit": "4bfa341a9e3071581182ad6fb1680c00559e1591",
+  "recorded_at_commit": "3edbc6d8903148b42e16412e0220161d193f75a4",
   "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)",
   "max_growth_percent": 10,
+  "note": "bd-tqrnc: ffs-protected-mount now links native writable NtfsTransactionEngine, ZfsTransactionEngine (single-leaf + mirror), ProtectedStorageSet (FFSRQSM3), and two-stage expected-loss repair gate",
   "binaries": {
     "ffs-cli": {
       "package": "ffs-cli",
-      "size_bytes": 13399688
+      "size_bytes": 13786112
     },
     "ffs-protected-mount": {
       "package": "ffs-cli",
-      "size_bytes": 8687352
+      "size_bytes": 10879360
     }
   }
 }

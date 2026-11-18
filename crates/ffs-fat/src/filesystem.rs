@@ -195,7 +195,17 @@ impl FatFs {
     fn operation(&self, cx: &Cx, mutation: bool) -> Result<OperationGuard<'_>> {
         // Always acquire the gate before `state`; private helpers never
         // reacquire it. Failure publication happens before releasing it.
-        self.health.operation(cx, &self.operations, mutation)
+        let mut guard = self.health.operation(cx, &self.operations, mutation)?;
+        if mutation && self.writable {
+            let deferral =
+                ffs_block::DurabilityCommitDeferral::enter(cx, self.volume.device.as_ref())?;
+            guard.attach_deferral(deferral);
+        }
+        Ok(guard)
+    }
+
+    fn sync_operation(&self, cx: &Cx) -> Result<OperationGuard<'_>> {
+        self.health.operation(cx, &self.operations, true)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -1354,7 +1364,7 @@ impl FsOps for FatFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        let operation = self.operation(cx, true)?;
+        let operation = self.sync_operation(cx)?;
         self.node(cx, ino)?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
@@ -1364,7 +1374,7 @@ impl FsOps for FatFs {
     }
 
     fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> Result<()> {
-        let operation = self.operation(cx, true)?;
+        let operation = self.sync_operation(cx)?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
@@ -1380,7 +1390,7 @@ impl FsOps for FatFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        let operation = self.operation(cx, true)?;
+        let operation = self.sync_operation(cx)?;
         self.node(cx, ino)?.directory()?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
@@ -1390,9 +1400,14 @@ impl FsOps for FatFs {
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
-        let operation = self.operation(cx, true)?;
+        let operation = self.sync_operation(cx)?;
         if self.writable {
-            self.reap_all_retained_locked(cx)?;
+            {
+                let mut deferral =
+                    ffs_block::DurabilityCommitDeferral::enter(cx, self.volume.device.as_ref())?;
+                self.reap_all_retained_locked(cx)?;
+                deferral.complete();
+            }
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
         checkpoint(cx)?;

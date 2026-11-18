@@ -99,6 +99,10 @@ pub enum EvidenceEventType {
     ContentionSample,
     /// Ville/Wald anytime-valid e-process scrub monitor observation.
     AnytimeScrubMonitor,
+    /// Two-stage mandatory-precondition + calibrated expected-loss repair gate decision (`bd-tqrnc`).
+    ProtectedRepairGate,
+    /// Separate `native_durable` vs `protected_durable` commit/seal acknowledgment (`bd-tqrnc`).
+    ProtectedCommitAck,
 }
 
 // ── Detail structs ──────────────────────────────────────────────────────────
@@ -178,6 +182,56 @@ pub struct AnytimeScrubMonitorDetail {
     pub recommended_interval_divisor: u32,
     /// Recommended repair parity overhead in basis points (`500`, `750`, or `1000`).
     pub recommended_overhead_bps: u32,
+}
+
+/// Detail payload for two-stage protected automatic-repair gate evaluations (`bd-tqrnc`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProtectedRepairGateDetail {
+    /// Storage-set or image identifier (hex BLAKE3 or UUID).
+    pub set_id_hex: String,
+    /// Member index within the storage set (`0` for single-image sidecars).
+    pub member_index: u32,
+    /// Protection generation evaluated.
+    pub generation: u64,
+    /// Whether trusted-root keyed authentication was verified (`false` for unkeyed checksums).
+    pub authenticated_provenance: bool,
+    /// Number of damaged blocks targeted in this group.
+    pub damaged_blocks: u32,
+    /// Whether writeback was authorized (`true`) or refused (`false`).
+    pub authorized: bool,
+    /// Expected loss of repair `(1 - q) * L_wrong + C_repair`, when calibration was evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_repair_loss: Option<f64>,
+    /// Refusal loss `L_refusal`, when calibration was evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_loss: Option<f64>,
+    /// Calibration provenance string, if supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibration_provenance: Option<String>,
+    /// Structured refusal reason when `authorized == false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
+}
+
+/// Detail payload for separate `native_durable` vs `protected_durable` acknowledgments (`bd-tqrnc`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedCommitAckDetail {
+    /// Storage-set or image identifier (hex BLAKE3).
+    pub set_id_hex: String,
+    /// Protection generation (`prev` while unsealed; `prev + 1` once sealed).
+    pub generation: u64,
+    /// Whether the native format commit reached durable media (`Committed`).
+    pub native_durable: bool,
+    /// Whether external parity + manifest protection was verified and sealed for that commit.
+    pub protected_durable: bool,
+    /// Duration (nanoseconds) during which native state was mutated/committed without sealed parity.
+    pub unprotected_interval_ns: u64,
+    /// Human-readable summary of the bound native commit token, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_token_summary: Option<String>,
+    /// Post-commit seal/cancellation error when `native_durable && !protected_durable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_commit_error: Option<String>,
 }
 
 /// Detail payload for Bayesian autopilot policy decisions.
@@ -548,6 +602,12 @@ pub struct EvidenceRecord {
     /// Anytime-valid Ville/Wald scrub monitor detail (present when `event_type` is `AnytimeScrubMonitor`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anytime_scrub_monitor: Option<AnytimeScrubMonitorDetail>,
+    /// Two-stage protected repair gate detail (present when `event_type` is `ProtectedRepairGate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_repair_gate: Option<Box<ProtectedRepairGateDetail>>,
+    /// Protected commit/seal acknowledgment detail (present when `event_type` is `ProtectedCommitAck`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_commit_ack: Option<Box<ProtectedCommitAckDetail>>,
 }
 
 impl EvidenceRecord {
@@ -579,6 +639,8 @@ impl EvidenceRecord {
             policy_switched: None,
             contention_sample: None,
             anytime_scrub_monitor: None,
+            protected_repair_gate: None,
+            protected_commit_ack: None,
         }
     }
 
@@ -771,6 +833,22 @@ impl EvidenceRecord {
     pub fn anytime_scrub_monitor(block_group: u32, detail: AnytimeScrubMonitorDetail) -> Self {
         let mut r = Self::base(EvidenceEventType::AnytimeScrubMonitor, block_group);
         r.anytime_scrub_monitor = Some(detail);
+        r
+    }
+
+    /// Create a protected two-stage repair gate evidence record (`bd-tqrnc`).
+    #[must_use]
+    pub fn protected_repair_gate(block_group: u32, detail: ProtectedRepairGateDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::ProtectedRepairGate, block_group);
+        r.protected_repair_gate = Some(Box::new(detail));
+        r
+    }
+
+    /// Create a protected commit/seal acknowledgment evidence record (`bd-tqrnc`).
+    #[must_use]
+    pub fn protected_commit_ack(detail: ProtectedCommitAckDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::ProtectedCommitAck, 0);
+        r.protected_commit_ack = Some(Box::new(detail));
         r
     }
 
@@ -1573,6 +1651,8 @@ mod tests {
             PolicySwitched,
             ContentionSample,
             AnytimeScrubMonitor,
+            ProtectedRepairGate,
+            ProtectedCommitAck,
         ];
         for variant in variants {
             let json = serde_json::to_string(&variant).expect("serialize");

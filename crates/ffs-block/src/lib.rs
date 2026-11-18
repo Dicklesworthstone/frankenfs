@@ -473,6 +473,23 @@ pub trait ByteDevice: Send + Sync {
     /// Flush pending writes to stable storage.
     fn sync(&self, cx: &Cx) -> Result<()>;
 
+    /// Enter a multi-barrier native commit epoch where intermediate [`Self::sync`]
+    /// calls flush physical backing storage WITHOUT prematurely sealing external
+    /// repair parity or manifest generations over intermediate dirty format states.
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        cx_checkpoint(cx)
+    }
+
+    /// Release one deferred-seal hold acquired by [`Self::begin_durability_commit`]
+    /// after (or immediately before the final barrier of) a committed native
+    /// format transaction, permitting the next outer [`Self::sync`] to seal parity.
+    fn complete_durability_commit(&self) {}
+
+    /// Release one deferred-seal hold when a native format transaction aborts
+    /// or drops before committing; any source writes already issued during the
+    /// aborted epoch must never be sealed as valid protection.
+    fn abort_durability_commit(&self) {}
+
     /// Whether [`discard`](Self::discard) releases storage (FITRIM).
     fn supports_discard(&self) -> bool {
         false
@@ -484,6 +501,41 @@ pub trait ByteDevice: Send + Sync {
         Err(FfsError::Io(std::io::Error::from_raw_os_error(
             nix::errno::Errno::EOPNOTSUPP as i32,
         )))
+    }
+}
+
+/// RAII guard holding a [`ByteDevice`] in deferred-seal mode across a
+/// multi-barrier native commit until [`Self::complete`] marks the native
+/// transaction committed (or `Drop` calls [`ByteDevice::abort_durability_commit`]).
+pub struct DurabilityCommitDeferral<'a> {
+    device: &'a dyn ByteDevice,
+    armed: bool,
+}
+
+impl<'a> DurabilityCommitDeferral<'a> {
+    /// Enter deferred-seal mode on `device`.
+    pub fn enter(cx: &Cx, device: &'a dyn ByteDevice) -> Result<Self> {
+        device.begin_durability_commit(cx)?;
+        Ok(Self {
+            device,
+            armed: true,
+        })
+    }
+
+    /// Mark the native commit complete and release the deferred-seal hold.
+    pub fn complete(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.device.complete_durability_commit();
+        }
+    }
+}
+
+impl Drop for DurabilityCommitDeferral<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.device.abort_durability_commit();
+        }
     }
 }
 
@@ -1243,6 +1295,18 @@ impl<D: ByteDevice + ?Sized> ByteDevice for Arc<D> {
         (**self).sync(cx)
     }
 
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        (**self).begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        (**self).complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        (**self).abort_durability_commit();
+    }
+
     fn supports_discard(&self) -> bool {
         (**self).supports_discard()
     }
@@ -1296,6 +1360,18 @@ impl<D: ByteDevice + ?Sized> ByteDevice for Box<D> {
 
     fn sync(&self, cx: &Cx) -> Result<()> {
         (**self).sync(cx)
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        (**self).begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        (**self).complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        (**self).abort_durability_commit();
     }
 
     fn supports_discard(&self) -> bool {
@@ -1661,6 +1737,26 @@ impl<D: ByteDevice> ByteDevice for VolumeDevice<D> {
             return Ok(());
         }
         self.device.sync(cx)
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        cx_checkpoint(cx)?;
+        if self.read_only {
+            return Err(FfsError::ReadOnly);
+        }
+        self.device.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        if !self.read_only {
+            self.device.complete_durability_commit();
+        }
+    }
+
+    fn abort_durability_commit(&self) {
+        if !self.read_only {
+            self.device.abort_durability_commit();
+        }
     }
 }
 
@@ -2134,6 +2230,18 @@ impl<D: ByteDevice> ByteDevice for SectorFaultDevice<D> {
         self.inner.sync(cx)?;
         cx_checkpoint(cx)?;
         Ok(())
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
     }
 }
 

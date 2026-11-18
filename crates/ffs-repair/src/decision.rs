@@ -199,6 +199,234 @@ pub fn select_action(
     }
 }
 
+// ── Two-Stage Calibrated Automatic-Repair Authorization Gate (`bd-tqrnc`) ───
+
+/// Non-negotiable ownership, generation, digest, provenance, and pre-writeback
+/// invariants that MUST all hold before any quantitative expected-loss comparison
+/// is permitted to authorize automatic repair writeback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MandatoryRepairPreconditions {
+    /// Exclusive ownership locks are held on every required storage member and archive.
+    pub exclusive_ownership: bool,
+    /// Complete storage-set identity, member roles, topology, and slice bounds match.
+    pub storage_set_identity_match: bool,
+    /// Native durable generation/commit token is current and no write epoch is pending.
+    pub native_generation_fresh: bool,
+    /// Every peer source digest in the group matches the admitted clean generation.
+    pub group_peer_digests_unchanged: bool,
+    /// Surviving repair symbols and every reconstructed block digest verified cleanly.
+    pub symbol_and_decoded_digests_valid: bool,
+    /// Trusted-root provenance passed (either keyed MAC verified or unkeyed allowed by policy).
+    pub trusted_root_authenticated: bool,
+    /// Target block bytes on media have not changed since pre-decode observation.
+    pub target_prewrite_unchanged: bool,
+}
+
+impl MandatoryRepairPreconditions {
+    /// Construct a precondition vector where all mandatory checks passed.
+    #[must_use]
+    pub const fn all_passed() -> Self {
+        Self {
+            exclusive_ownership: true,
+            storage_set_identity_match: true,
+            native_generation_fresh: true,
+            group_peer_digests_unchanged: true,
+            symbol_and_decoded_digests_valid: true,
+            trusted_root_authenticated: true,
+            target_prewrite_unchanged: true,
+        }
+    }
+
+    /// Return the first failed mandatory precondition in deterministic order.
+    #[must_use]
+    pub const fn first_failure(&self) -> Option<HardCheckFailure> {
+        if !self.exclusive_ownership {
+            return Some(HardCheckFailure::MissingExclusiveOwnership);
+        }
+        if !self.storage_set_identity_match {
+            return Some(HardCheckFailure::StorageSetIdentityMismatch);
+        }
+        if !self.native_generation_fresh {
+            return Some(HardCheckFailure::StaleOrDirtyNativeGeneration);
+        }
+        if !self.group_peer_digests_unchanged {
+            return Some(HardCheckFailure::GroupPeerDigestsChanged);
+        }
+        if !self.symbol_and_decoded_digests_valid {
+            return Some(HardCheckFailure::InvalidSymbolOrDecodedDigest);
+        }
+        if !self.trusted_root_authenticated {
+            return Some(HardCheckFailure::UnauthenticatedProvenance);
+        }
+        if !self.target_prewrite_unchanged {
+            return Some(HardCheckFailure::TargetChangedBeforeWriteback);
+        }
+        None
+    }
+}
+
+/// Specific hard invariant failure blocking automatic repair before loss evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardCheckFailure {
+    MissingExclusiveOwnership,
+    StorageSetIdentityMismatch,
+    StaleOrDirtyNativeGeneration,
+    GroupPeerDigestsChanged,
+    InvalidSymbolOrDecodedDigest,
+    UnauthenticatedProvenance,
+    TargetChangedBeforeWriteback,
+}
+
+/// Explicit loss-matrix and correctness calibration for automatic repair writeback.
+///
+/// Loss comparison:
+///   `E[L(repair)] = (1 - q_correct) * l_wrong + c_repair` vs `l_refusal`.
+///
+/// A numeric score NEVER overrides [`MandatoryRepairPreconditions`]; missing or
+/// malformed calibration selects refusal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepairLossCalibration {
+    /// Cost `C_repair >= 0` of executing a verified repair writeback + sync.
+    pub c_repair: f64,
+    /// Loss `L_wrong > 0` of publishing wrong or stale bytes over a valid image.
+    pub l_wrong: f64,
+    /// Loss `L_refusal >= 0` of refusing automatic writeback and surfacing an error.
+    pub l_refusal: f64,
+    /// Calibrated probability `q in [0, 1]` that a verified reconstruction is exact.
+    pub q_correct: f64,
+    /// Explicit non-empty provenance string binding where `(q, C_repair, L_wrong, L_refusal)` came from.
+    pub provenance: String,
+}
+
+impl RepairLossCalibration {
+    /// Default operator-authorized calibration used ONLY when the operator explicitly
+    /// supplies `--exclusive-image --allow-repair` and all 256-bit BLAKE3 generation,
+    /// table, symbol, and block-digest checks pass.
+    #[must_use]
+    pub fn default_operator_exclusive() -> Self {
+        Self {
+            c_repair: 1.0,
+            l_wrong: 1_000_000.0,
+            l_refusal: 100.0,
+            q_correct: 0.999_999,
+            provenance: "operator_exclusive_allow_repair:blake3_256_verified_v1".to_owned(),
+        }
+    }
+
+    /// Validate finiteness, domain bounds, and non-empty provenance.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.c_repair.is_finite() || self.c_repair < 0.0 {
+            return Err("c_repair must be finite and >= 0".to_owned());
+        }
+        if !self.l_wrong.is_finite() || self.l_wrong <= 0.0 {
+            return Err("l_wrong must be finite and > 0".to_owned());
+        }
+        if !self.l_refusal.is_finite() || self.l_refusal < 0.0 {
+            return Err("l_refusal must be finite and >= 0".to_owned());
+        }
+        if !self.q_correct.is_finite() || !(0.0..=1.0).contains(&self.q_correct) {
+            return Err("q_correct must be finite and in 0.0..=1.0".to_owned());
+        }
+        if self.provenance.trim().is_empty() {
+            return Err("calibration provenance must be non-empty".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Compute `(1 - q_correct) * l_wrong + c_repair`.
+    #[must_use]
+    pub fn expected_repair_loss(&self) -> f64 {
+        (1.0 - self.q_correct).mul_add(self.l_wrong, self.c_repair)
+    }
+}
+
+/// Structured refusal reason when [`evaluate_automatic_repair_gate`] denies writeback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
+pub enum RepairRefusalReason {
+    HardInvariantFailed(HardCheckFailure),
+    MissingCalibration,
+    InvalidCalibration(String),
+    ExpectedLossNotLowerThanRefusal,
+}
+
+/// Verdict of the two-stage automatic-repair authorization gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "decision")]
+pub enum AutomaticRepairVerdict {
+    Authorize {
+        expected_repair_loss: f64,
+        refusal_loss: f64,
+        calibration: RepairLossCalibration,
+    },
+    Refuse {
+        reason: RepairRefusalReason,
+        expected_repair_loss: Option<f64>,
+        refusal_loss: Option<f64>,
+        calibration_provenance: Option<String>,
+    },
+}
+
+impl AutomaticRepairVerdict {
+    /// Returns `true` iff automatic repair writeback is authorized.
+    #[must_use]
+    pub const fn is_authorized(&self) -> bool {
+        matches!(self, Self::Authorize { .. })
+    }
+}
+
+/// Evaluate the two-stage automatic-repair authorization gate:
+/// 1. Every mandatory ownership/identity/freshness/digest/provenance precondition
+///    MUST hold first; any failure refuses immediately without consulting `calibration`.
+/// 2. Missing or malformed calibration refuses immediately.
+/// 3. Authorize iff `(1 - q) * L_wrong + C_repair < L_refusal` with finite arithmetic.
+#[must_use]
+pub fn evaluate_automatic_repair_gate(
+    preconditions: &MandatoryRepairPreconditions,
+    calibration: Option<&RepairLossCalibration>,
+) -> AutomaticRepairVerdict {
+    if let Some(failure) = preconditions.first_failure() {
+        return AutomaticRepairVerdict::Refuse {
+            reason: RepairRefusalReason::HardInvariantFailed(failure),
+            expected_repair_loss: None,
+            refusal_loss: None,
+            calibration_provenance: calibration.map(|c| c.provenance.clone()),
+        };
+    }
+    let Some(cal) = calibration else {
+        return AutomaticRepairVerdict::Refuse {
+            reason: RepairRefusalReason::MissingCalibration,
+            expected_repair_loss: None,
+            refusal_loss: None,
+            calibration_provenance: None,
+        };
+    };
+    if let Err(detail) = cal.validate() {
+        return AutomaticRepairVerdict::Refuse {
+            reason: RepairRefusalReason::InvalidCalibration(detail),
+            expected_repair_loss: None,
+            refusal_loss: None,
+            calibration_provenance: Some(cal.provenance.clone()),
+        };
+    }
+    let expected = cal.expected_repair_loss();
+    if expected.is_finite() && expected < cal.l_refusal {
+        AutomaticRepairVerdict::Authorize {
+            expected_repair_loss: expected,
+            refusal_loss: cal.l_refusal,
+            calibration: cal.clone(),
+        }
+    } else {
+        AutomaticRepairVerdict::Refuse {
+            reason: RepairRefusalReason::ExpectedLossNotLowerThanRefusal,
+            expected_repair_loss: Some(expected),
+            refusal_loss: Some(cal.l_refusal),
+            calibration_provenance: Some(cal.provenance.clone()),
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -468,5 +696,90 @@ mod tests {
             prop_assert!((decision.loss - loss(state, expected_action)).abs() <= f64::EPSILON);
             prop_assert!((decision.corruption_posterior - posterior).abs() <= f64::EPSILON);
         }
+
+        /// No calibration score — even `q = 1.0` and `L_refusal = 1e12` — can
+        /// grant automatic repair writeback when any mandatory check is false.
+        #[test]
+        fn proptest_hard_preconditions_strictly_dominate_calibration(
+            fail_idx in 0_usize..7,
+            q in 0.0_f64..=1.0,
+            l_refusal in 1.0_f64..1.0e12,
+        ) {
+            let mut pre = MandatoryRepairPreconditions::all_passed();
+            match fail_idx {
+                0 => pre.exclusive_ownership = false,
+                1 => pre.storage_set_identity_match = false,
+                2 => pre.native_generation_fresh = false,
+                3 => pre.group_peer_digests_unchanged = false,
+                4 => pre.symbol_and_decoded_digests_valid = false,
+                5 => pre.trusted_root_authenticated = false,
+                _ => pre.target_prewrite_unchanged = false,
+            }
+            let cal = RepairLossCalibration {
+                c_repair: 0.0,
+                l_wrong: 1.0,
+                l_refusal,
+                q_correct: q,
+                provenance: "prop-test".to_owned(),
+            };
+            let verdict = evaluate_automatic_repair_gate(&pre, Some(&cal));
+            prop_assert!(!verdict.is_authorized());
+            if let AutomaticRepairVerdict::Refuse {
+                reason: RepairRefusalReason::HardInvariantFailed(_),
+                expected_repair_loss,
+                ..
+            } = verdict
+            {
+                prop_assert!(expected_repair_loss.is_none());
+            } else {
+                prop_assert!(false, "expected HardInvariantFailed, got {verdict:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn calibrated_gate_refuses_missing_invalid_or_unfavorable_loss_and_authorizes_favorable() {
+        let pre = MandatoryRepairPreconditions::all_passed();
+        // Missing calibration -> Refuse
+        assert_eq!(
+            evaluate_automatic_repair_gate(&pre, None),
+            AutomaticRepairVerdict::Refuse {
+                reason: RepairRefusalReason::MissingCalibration,
+                expected_repair_loss: None,
+                refusal_loss: None,
+                calibration_provenance: None,
+            }
+        );
+        // Empty provenance -> Refuse
+        let bad_prov = RepairLossCalibration {
+            provenance: "   ".to_owned(),
+            ..RepairLossCalibration::default_operator_exclusive()
+        };
+        assert!(matches!(
+            evaluate_automatic_repair_gate(&pre, Some(&bad_prov)),
+            AutomaticRepairVerdict::Refuse {
+                reason: RepairRefusalReason::InvalidCalibration(_),
+                ..
+            }
+        ));
+        // Unfavorable expected loss: (1 - 0.90) * 1000 + 5 = 105 >= 50 -> Refuse
+        let unfavorable = RepairLossCalibration {
+            c_repair: 5.0,
+            l_wrong: 1_000.0,
+            l_refusal: 50.0,
+            q_correct: 0.90,
+            provenance: "test-unfavorable-v1".to_owned(),
+        };
+        assert!(matches!(
+            evaluate_automatic_repair_gate(&pre, Some(&unfavorable)),
+            AutomaticRepairVerdict::Refuse {
+                reason: RepairRefusalReason::ExpectedLossNotLowerThanRefusal,
+                ..
+            }
+        ));
+        // Default operator-exclusive calibration -> Authorize
+        let def = RepairLossCalibration::default_operator_exclusive();
+        let verdict = evaluate_automatic_repair_gate(&pre, Some(&def));
+        assert!(verdict.is_authorized());
     }
 }

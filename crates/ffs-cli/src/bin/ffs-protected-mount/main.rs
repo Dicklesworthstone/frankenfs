@@ -25,11 +25,17 @@ use ffs_core::{
 use ffs_error::FfsError;
 use ffs_fuse::{MountConfig, MountOptions, mount_managed};
 use ffs_ondisk::EXT4_VALID_FS;
-use ffs_repair::sidecar::live::SidecarImageDevice;
+use ffs_repair::decision::RepairLossCalibration;
+use ffs_repair::por::PorKey;
+use ffs_repair::sidecar::live::{
+    ProtectedStorageSet, SharedEvidenceLedger, SidecarImageDevice, StorageSetOpenOptions,
+    blake3_digest, open_shared_evidence_ledger,
+};
+use ffs_repair::sidecar::{MemberRole, NativeCommitBinding, TrustPolicy};
 use ffs_types::{ByteOffset, InodeNumber};
 use serde::Serialize;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +43,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Parser)]
 #[command(
     name = "ffs-protected-mount",
-    about = "Mount a clean image with RaptorQ protection (read-only unless --rw)"
+    about = "Mount a clean image or storage set with RaptorQ protection (read-only unless --rw)"
 )]
 struct Args {
     image: PathBuf,
@@ -49,6 +55,8 @@ struct Args {
     authority: Authority,
     #[command(flatten)]
     scrub: scrub::Options,
+    #[command(flatten)]
+    set: SetOptions,
     /// Validate admission and filesystem opening without mounting or enabling writes.
     #[arg(long, conflicts_with = "mountpoint")]
     check: bool,
@@ -73,14 +81,62 @@ struct Authority {
     allow_repair: bool,
 }
 
+#[derive(Debug, Default, clap::Args)]
+struct SetOptions {
+    /// Whole-storage-set manifest (FFSRQSM3). Required for multi-member topologies.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    /// Additional data/mirror member pairs (<IMAGE> <SIDECAR>) in manifest order after member 0.
+    #[arg(long = "member", num_args = 2, value_names = ["IMAGE", "SIDECAR"])]
+    extra_members: Vec<PathBuf>,
+    /// External log member pairs (<IMAGE> <SIDECAR>).
+    #[arg(long = "log-member", num_args = 2, value_names = ["IMAGE", "SIDECAR"])]
+    log_members: Vec<PathBuf>,
+    /// Special/metadata member pairs (<IMAGE> <SIDECAR>).
+    #[arg(long = "special-member", num_args = 2, value_names = ["IMAGE", "SIDECAR"])]
+    special_members: Vec<PathBuf>,
+    /// Partition/slice byte offset inside a standalone single-member image.
+    #[arg(long)]
+    offset: Option<u64>,
+    /// Partition/slice byte length inside a standalone single-member image.
+    #[arg(long)]
+    length: Option<u64>,
+    /// Slash-separated ZPL dataset path relative to the pool root (default: root dataset).
+    #[arg(long)]
+    zfs_dataset: Option<String>,
+    /// Expected ZFS pool GUID (optional; verified against on-disk labels).
+    #[arg(long)]
+    pool_guid: Option<u64>,
+    /// Explicit ZFS label index (0..=3) for writable TXG admission.
+    #[arg(long)]
+    zfs_label: Option<usize>,
+    /// Explicit ZFS Uberblock ring slot for writable TXG admission.
+    #[arg(long)]
+    zfs_slot: Option<usize>,
+    /// 32-byte raw or 64-hex PorKey file for cryptographic manifest provenance.
+    #[arg(long)]
+    trust_key_file: Option<PathBuf>,
+    /// Require authenticated trusted-root provenance (refuses unkeyed checksums).
+    #[arg(long)]
+    require_trusted_root: bool,
+    /// JSON string, file path, or "none" for two-stage repair loss calibration.
+    #[arg(long)]
+    repair_calibration: Option<String>,
+    /// Append-only JSONL file path for protected repair gate and commit-ACK audit records.
+    #[arg(long)]
+    evidence_ledger: Option<PathBuf>,
+}
+
 /// Caller-write authority is independent of read-repair authority. Both modes
 /// retain the same device and inode locks for every format I/O operation.
+#[cfg(test)]
 #[derive(Debug)]
 struct ProtectedDevice {
     inner: Arc<SidecarImageDevice>,
     writable: bool,
 }
 
+#[cfg(test)]
 impl ByteDevice for ProtectedDevice {
     fn len_bytes(&self) -> u64 {
         self.inner.len_bytes()
@@ -105,295 +161,20 @@ impl ByteDevice for ProtectedDevice {
         // the current repair archive was verified and durably published.
         self.inner.sync(cx)
     }
-}
 
-/// Read-only adapter for NTFS protected mounts so mutating `<NtfsFs as FsOps>`
-/// methods are neither callable nor instantiated in the protected-mount vtable.
-pub struct ReadOnlyNtfsFs(Box<ntfs::reader::filesystem::NtfsFs>);
-
-impl FsOps for ReadOnlyNtfsFs {
-    fn getattr(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-    ) -> ffs_error::Result<ffs_core::InodeAttr> {
-        FsOps::getattr(self.0.as_ref(), cx, scope, ino)
+    fn begin_durability_commit(&self, cx: &Cx) -> ffs_error::Result<()> {
+        if !self.writable {
+            return Err(FfsError::ReadOnly);
+        }
+        self.inner.begin_durability_commit(cx)
     }
 
-    fn lookup(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        parent: InodeNumber,
-        name: &std::ffi::OsStr,
-    ) -> ffs_error::Result<ffs_core::InodeAttr> {
-        FsOps::lookup(self.0.as_ref(), cx, scope, parent, name)
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
     }
 
-    fn readdir(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        offset: u64,
-    ) -> ffs_error::Result<ffs_core::ReaddirPage> {
-        FsOps::readdir(self.0.as_ref(), cx, scope, ino, offset)
-    }
-
-    fn read(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        offset: u64,
-        size: u32,
-    ) -> ffs_error::Result<Vec<u8>> {
-        FsOps::read(self.0.as_ref(), cx, scope, ino, offset, size)
-    }
-
-    fn open(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-        flags: i32,
-    ) -> ffs_error::Result<(u64, u32)> {
-        self.0.open_read_only(cx, ino, flags)
-    }
-
-    fn readlink(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-    ) -> ffs_error::Result<Vec<u8>> {
-        FsOps::readlink(self.0.as_ref(), cx, scope, ino)
-    }
-
-    fn get_inode_flags(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-    ) -> ffs_error::Result<u32> {
-        FsOps::get_inode_flags(self.0.as_ref(), cx, scope, ino)
-    }
-
-    fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
-        FsOps::listxattr(self.0.as_ref(), cx, ino)
-    }
-
-    fn getxattr(
-        &self,
-        cx: &Cx,
-        ino: InodeNumber,
-        name: &str,
-    ) -> ffs_error::Result<Option<Vec<u8>>> {
-        FsOps::getxattr(self.0.as_ref(), cx, ino, name)
-    }
-
-    fn statfs(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-    ) -> ffs_error::Result<ffs_core::FsStat> {
-        FsOps::statfs(self.0.as_ref(), cx, scope, ino)
-    }
-
-    fn flush(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        fh: u64,
-        lock_owner: u64,
-    ) -> ffs_error::Result<()> {
-        FsOps::flush(self.0.as_ref(), cx, scope, ino, fh, lock_owner)
-    }
-
-    fn fsync(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-        _fh: u64,
-        _datasync: bool,
-    ) -> ffs_error::Result<()> {
-        self.0.fsync_read_only(cx, ino)
-    }
-
-    fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
-        cx.checkpoint().map_err(|_| FfsError::Cancelled)
-    }
-
-    fn fsyncdir(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-        _fh: u64,
-        _datasync: bool,
-    ) -> ffs_error::Result<()> {
-        self.0.fsyncdir_read_only(cx, ino)
-    }
-
-    fn fiemap(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        start: u64,
-        length: u64,
-    ) -> ffs_error::Result<Vec<ffs_core::FiemapExtent>> {
-        FsOps::fiemap(self.0.as_ref(), cx, scope, ino, start, length)
-    }
-
-    fn lseek(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        offset: u64,
-        whence: ffs_core::SeekWhence,
-    ) -> ffs_error::Result<u64> {
-        FsOps::lseek(self.0.as_ref(), cx, scope, ino, offset, whence)
-    }
-}
-
-/// Read-only adapter for ZFS protected mounts so mutating `<ZfsFs as FsOps>`
-/// methods are neither callable nor instantiated in the protected-mount vtable.
-pub struct ReadOnlyZfsFs(Box<zfs::filesystem::ZfsFs>);
-
-impl FsOps for ReadOnlyZfsFs {
-    fn getattr(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-    ) -> ffs_error::Result<ffs_core::InodeAttr> {
-        FsOps::getattr(self.0.as_ref(), cx, scope, ino)
-    }
-
-    fn lookup(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        parent: InodeNumber,
-        name: &std::ffi::OsStr,
-    ) -> ffs_error::Result<ffs_core::InodeAttr> {
-        FsOps::lookup(self.0.as_ref(), cx, scope, parent, name)
-    }
-
-    fn readdir(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        offset: u64,
-    ) -> ffs_error::Result<ffs_core::ReaddirPage> {
-        FsOps::readdir(self.0.as_ref(), cx, scope, ino, offset)
-    }
-
-    fn read(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        offset: u64,
-        size: u32,
-    ) -> ffs_error::Result<Vec<u8>> {
-        FsOps::read(self.0.as_ref(), cx, scope, ino, offset, size)
-    }
-
-    fn open(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-        flags: i32,
-    ) -> ffs_error::Result<(u64, u32)> {
-        self.0.open_read_only(cx, ino, flags)
-    }
-
-    fn readlink(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-    ) -> ffs_error::Result<Vec<u8>> {
-        FsOps::readlink(self.0.as_ref(), cx, scope, ino)
-    }
-
-    fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
-        FsOps::listxattr(self.0.as_ref(), cx, ino)
-    }
-
-    fn getxattr(
-        &self,
-        cx: &Cx,
-        ino: InodeNumber,
-        name: &str,
-    ) -> ffs_error::Result<Option<Vec<u8>>> {
-        FsOps::getxattr(self.0.as_ref(), cx, ino, name)
-    }
-
-    fn statfs(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-    ) -> ffs_error::Result<ffs_core::FsStat> {
-        self.0.statfs_read_only(cx, ino)
-    }
-
-    fn flush(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        fh: u64,
-        lock_owner: u64,
-    ) -> ffs_error::Result<()> {
-        FsOps::flush(self.0.as_ref(), cx, scope, ino, fh, lock_owner)
-    }
-
-    fn fsync(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-        fh: u64,
-        _datasync: bool,
-    ) -> ffs_error::Result<()> {
-        self.0.fsync_read_only(cx, ino, fh)
-    }
-
-    fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
-        cx.checkpoint().map_err(|_| FfsError::Cancelled)
-    }
-
-    fn fsyncdir(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-        _fh: u64,
-        _datasync: bool,
-    ) -> ffs_error::Result<()> {
-        self.0.fsyncdir_read_only(cx, ino)
-    }
-
-    fn lseek(
-        &self,
-        cx: &Cx,
-        scope: &mut RequestScope,
-        ino: InodeNumber,
-        offset: u64,
-        whence: ffs_core::SeekWhence,
-    ) -> ffs_error::Result<u64> {
-        FsOps::lseek(self.0.as_ref(), cx, scope, ino, offset, whence)
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
     }
 }
 
@@ -403,8 +184,8 @@ pub enum ProtectedFs {
         fs: Box<fat::filesystem::FatFs>,
         writable: bool,
     },
-    Ntfs(ReadOnlyNtfsFs),
-    Zfs(ReadOnlyZfsFs),
+    Ntfs(Box<ntfs::reader::filesystem::NtfsFs>),
+    Zfs(Box<zfs::filesystem::ZfsFs>),
 }
 
 impl ProtectedFs {
@@ -412,7 +193,8 @@ impl ProtectedFs {
         match self {
             Self::Core(fs) => fs.is_writable(),
             Self::Fat { writable, .. } => *writable,
-            Self::Ntfs(_) | Self::Zfs(_) => false,
+            Self::Ntfs(fs) => fs.is_writable(),
+            Self::Zfs(fs) => fs.is_writable().unwrap_or(false),
         }
     }
 
@@ -420,8 +202,8 @@ impl ProtectedFs {
         match self {
             Self::Core(fs) => fs.as_ref(),
             Self::Fat { fs, .. } => fs.as_ref(),
-            Self::Ntfs(fs) => fs,
-            Self::Zfs(fs) => fs,
+            Self::Ntfs(fs) => fs.as_ref(),
+            Self::Zfs(fs) => fs.as_ref(),
         }
     }
 }
@@ -439,6 +221,18 @@ impl mount_worker::PeriodicCommitTarget for ProtectedFs {
     fn periodic_commit(&self, cx: &Cx) -> ffs_error::Result<bool> {
         match self {
             Self::Core(fs) => fs.periodic_commit(cx),
+            Self::Fat { writable: true, fs } => {
+                FsOps::sync_fs(fs.as_ref(), cx, &mut RequestScope::empty())?;
+                Ok(true)
+            }
+            Self::Ntfs(fs) if fs.is_writable() => {
+                FsOps::sync_fs(fs.as_ref(), cx, &mut RequestScope::empty())?;
+                Ok(true)
+            }
+            Self::Zfs(fs) if fs.is_writable().unwrap_or(false) => {
+                FsOps::sync_fs(fs.as_ref(), cx, &mut RequestScope::empty())?;
+                Ok(true)
+            }
             Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => Ok(false),
         }
     }
@@ -452,6 +246,7 @@ impl FsOps for ProtectedFs {
 struct Prepared {
     fs: Arc<ProtectedFs>,
     device: Arc<SidecarImageDevice>,
+    storage_set: Arc<ProtectedStorageSet>,
     filesystem: &'static str,
     mountpoint: Option<PathBuf>,
 }
@@ -464,25 +259,89 @@ impl Prepared {
             anyhow::anyhow!("FUSE still owns the filesystem after unmount; shutdown is incomplete")
         })?;
         if fs.is_writable() {
-            // Device sync alone cannot drain committed MVCC writes or publish
-            // btrfs CoW roots. Use the filesystem's durable full-commit path
-            // first, while the filesystem still exists and dispatch is quiescent.
-            FsOps::fsyncdir(
-                &fs,
-                cx,
-                &mut RequestScope::empty(),
-                InodeNumber(1),
-                0,
-                false,
-            )
+            // Drain retained unlinked inodes/orphans and native durability state
+            // while the filesystem still exists and dispatch is quiescent.
+            (|| -> ffs_error::Result<()> {
+                FsOps::flush_on_destroy(&fs, cx)?;
+                FsOps::fsyncdir(
+                    &fs,
+                    cx,
+                    &mut RequestScope::empty(),
+                    InodeNumber(1),
+                    0,
+                    false,
+                )?;
+                Ok(())
+            })()
             .context("checkpoint protected filesystem before shutdown")?;
         }
         drop(fs);
-        self.device.sync(cx).context("final protected-device sync")
+        let binding = compute_live_native_binding(cx, &self.storage_set, self.filesystem, None)
+            .context("extract native commit binding before final seal")?;
+        self.storage_set
+            .seal_committed(cx, binding)
+            .context("final protected-device sync")
     }
 }
 
-fn checked_paths(args: &Args) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
+fn load_por_key(path: &Path) -> Result<PorKey> {
+    let raw = std::fs::read(path).with_context(|| format!("read trust key {}", path.display()))?;
+    if raw.len() == 32 {
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&raw);
+        return Ok(key);
+    }
+    let trimmed = std::str::from_utf8(&raw)
+        .context("trust key file must be 32 raw bytes or 64 hex characters")?
+        .trim();
+    if trimmed.len() != 64 {
+        bail!("trust key file must be 32 raw bytes or 64 hex characters");
+    }
+    let mut key = [0_u8; 32];
+    for (idx, slot) in key.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&trimmed[idx * 2..idx * 2 + 2], 16)
+            .context("invalid hex digit in trust key file")?;
+    }
+    Ok(key)
+}
+
+fn load_calibration(spec: Option<&str>) -> Result<Option<RepairLossCalibration>> {
+    let Some(raw_spec) = spec else {
+        return Ok(Some(RepairLossCalibration::default_operator_exclusive()));
+    };
+    if raw_spec.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let payload = if Path::new(raw_spec).is_file() {
+        std::fs::read_to_string(raw_spec)
+            .with_context(|| format!("read repair calibration file {raw_spec}"))?
+    } else {
+        raw_spec.to_owned()
+    };
+    let parsed: RepairLossCalibration =
+        serde_json::from_str(&payload).context("parse repair loss calibration JSON")?;
+    parsed
+        .validate()
+        .map_err(|err| anyhow::anyhow!("invalid repair loss calibration: {err}"))?;
+    Ok(Some(parsed))
+}
+
+fn open_evidence_ledger(path: Option<&Path>) -> Result<Option<SharedEvidenceLedger>> {
+    path.map(|p| {
+        open_shared_evidence_ledger(p)
+            .with_context(|| format!("open evidence ledger {}", p.display()))
+    })
+    .transpose()
+}
+
+#[derive(Debug)]
+struct CheckedInputs {
+    member_paths: Vec<(PathBuf, PathBuf)>,
+    manifest: Option<PathBuf>,
+    mountpoint: Option<PathBuf>,
+}
+
+fn checked_paths(args: &Args) -> Result<CheckedInputs> {
     args.scrub.validate(args.check)?;
     if !args.authority.exclusive_image || !args.authority.allow_repair {
         bail!("--exclusive-image and --allow-repair are required");
@@ -495,6 +354,15 @@ fn checked_paths(args: &Args) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
     }
     if args.check == args.mountpoint.is_some() {
         bail!("choose a mountpoint or --check, but not both");
+    }
+    let has_extra_members = !args.set.extra_members.is_empty()
+        || !args.set.log_members.is_empty()
+        || !args.set.special_members.is_empty();
+    if has_extra_members && args.set.manifest.is_none() {
+        bail!("multi-member protected mounts require --manifest binding the complete storage set");
+    }
+    if args.set.manifest.is_some() && (args.set.offset.is_some() || args.set.length.is_some()) {
+        bail!("--offset/--length cannot override slice geometry bound in --manifest");
     }
     let mountpoint = args
         .mountpoint
@@ -511,75 +379,509 @@ fn checked_paths(args: &Args) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
             Ok(path)
         })
         .transpose()?;
-    let image = args.image.canonicalize().context("resolve image")?;
-    let sidecar = args.sidecar.canonicalize().context("resolve sidecar")?;
-    if let Some(mountpoint) = &mountpoint
-        && (image.starts_with(mountpoint) || sidecar.starts_with(mountpoint))
+    let mut member_paths = Vec::new();
+    let primary_img = args.image.canonicalize().context("resolve image")?;
+    let primary_rq = args.sidecar.canonicalize().context("resolve sidecar")?;
+    member_paths.push((primary_img, primary_rq));
+    for pair in args
+        .set
+        .extra_members
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .chain(args.set.log_members.as_chunks::<2>().0.iter())
+        .chain(args.set.special_members.as_chunks::<2>().0.iter())
     {
-        bail!("mountpoint would hide the image or repair archive");
+        let img = pair[0].canonicalize().context("resolve member image")?;
+        let rq = pair[1].canonicalize().context("resolve member sidecar")?;
+        member_paths.push((img, rq));
     }
-    Ok((image, sidecar, mountpoint))
+    let manifest = args
+        .set
+        .manifest
+        .as_deref()
+        .map(|p| p.canonicalize().context("resolve storage-set manifest"))
+        .transpose()?;
+    if let Some(mp) = &mountpoint {
+        for (img, rq) in &member_paths {
+            if img.starts_with(mp) || rq.starts_with(mp) {
+                bail!("mountpoint would hide a member image or repair archive");
+            }
+        }
+        if let Some(manifest_path) = &manifest
+            && manifest_path.starts_with(mp)
+        {
+            bail!("mountpoint would hide the storage-set manifest");
+        }
+    }
+    Ok(CheckedInputs {
+        member_paths,
+        manifest,
+        mountpoint,
+    })
 }
 
-fn clean_single_image(cx: &Cx, device: &dyn ByteDevice) -> Result<&'static str> {
+fn parse_zfs_dataset_components(raw: Option<&str>) -> Result<Vec<Vec<u8>>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let trimmed = raw.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            bail!("invalid ZFS dataset path component '{part}'");
+        }
+        out.push(part.as_bytes().to_vec());
+    }
+    Ok(out)
+}
+
+fn clean_single_slice(
+    cx: &Cx,
+    device: &dyn ByteDevice,
+    member_count: usize,
+) -> Result<&'static str> {
     match detect_all_filesystems_on_device(cx, device).context("detect protected filesystem")? {
         DetectedFilesystem::Ext4(sb) => {
-            // RECOVER and the orphan/error states require filesystem recovery,
-            // not RaptorQ rollback. Admit only clean protection points, including
-            // for --rw; Skip below is never a dirty-mount bypass.
             if sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
                 || sb.state != EXT4_VALID_FS
                 || sb.last_orphan != 0
             {
                 bail!("ext4 needs recovery; reconcile offline and create fresh protection");
             }
+            if sb.has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL)
+                && sb.journal_inum == 0
+                && sb.journal_uuid != [0_u8; 16]
+                && member_count == 1
+            {
+                bail!(
+                    "ext4 uses an external journal device (journal_inum == 0); single-member sidecar omits required log member"
+                );
+            }
             Ok("ext4")
         }
         DetectedFilesystem::Btrfs(sb) => {
-            if sb.num_devices != 1 || sb.log_root != 0 {
+            if sb.log_root != 0 {
+                bail!("btrfs has an active log tree; reconcile offline before protected mount");
+            }
+            if sb.num_devices != u64::try_from(member_count).unwrap_or(0) || sb.num_devices != 1 {
                 bail!("protected mount requires a clean single-device btrfs image");
             }
             Ok("btrfs")
         }
-        DetectedFilesystem::Fat16(_) => Ok("fat16"),
-        DetectedFilesystem::Fat32(_) => Ok("fat32"),
-        DetectedFilesystem::Ntfs(_) => Ok("ntfs"),
+        DetectedFilesystem::Fat16(_) => {
+            if member_count != 1 {
+                bail!("FAT16 requires a single data member");
+            }
+            Ok("fat16")
+        }
+        DetectedFilesystem::Fat32(_) => {
+            if member_count != 1 {
+                bail!("FAT32 requires a single data member");
+            }
+            Ok("fat32")
+        }
+        DetectedFilesystem::Ntfs(_) => {
+            if member_count != 1 {
+                bail!("NTFS requires a single data member");
+            }
+            Ok("ntfs")
+        }
         DetectedFilesystem::Zfs(_) => Ok("zfs"),
     }
 }
 
+fn compute_live_native_binding(
+    cx: &Cx,
+    storage_set: &ProtectedStorageSet,
+    filesystem: &str,
+    pool_guid_hint: Option<u64>,
+) -> ffs_error::Result<NativeCommitBinding> {
+    let primary = storage_set.members()[0].open_bounded_device(false)?;
+    let len = storage_set.members()[0].length;
+    match filesystem {
+        "ext4" => match detect_all_filesystems_on_device(cx, primary.as_ref())
+            .map_err(|err| FfsError::Format(err.to_string()))?
+        {
+            DetectedFilesystem::Ext4(sb) => Ok(NativeCommitBinding::Ext4 {
+                uuid: sb.uuid,
+                blocks_count: sb.blocks_count,
+                journal_uuid: sb.journal_uuid,
+                journal_inum: sb.journal_inum,
+                state: sb.state,
+            }),
+            _ => Err(FfsError::Format("expected ext4 superblock".into())),
+        },
+        "btrfs" => match detect_all_filesystems_on_device(cx, primary.as_ref())
+            .map_err(|err| FfsError::Format(err.to_string()))?
+        {
+            DetectedFilesystem::Btrfs(sb) => Ok(NativeCommitBinding::Btrfs {
+                fsid: sb.fsid,
+                generation: sb.generation,
+                root_bytenr: sb.root,
+                chunk_root_bytenr: sb.chunk_root,
+                log_root: sb.log_root,
+                num_devices: sb.num_devices,
+            }),
+            _ => Err(FfsError::Format("expected btrfs superblock".into())),
+        },
+        "fat16" | "fat32" => {
+            let (DetectedFilesystem::Fat16(summary) | DetectedFilesystem::Fat32(summary)) =
+                detect_all_filesystems_on_device(cx, primary.as_ref())
+                    .map_err(|err| FfsError::Format(err.to_string()))?
+            else {
+                return Err(FfsError::Format("expected FAT boot sector".into()));
+            };
+            let volume = fat::reader::FatVolume::from_device(cx, primary, 0, len)?;
+            let check = volume.check(cx)?;
+            let total_sectors = if summary.sector_bytes == 0 {
+                0
+            } else {
+                len / u64::from(summary.sector_bytes)
+            };
+            Ok(NativeCommitBinding::Fat {
+                kind: filesystem.to_owned(),
+                volume_id: 0,
+                total_sectors,
+                clean: check.clean,
+            })
+        }
+        "ntfs" => {
+            let mut boot = [0_u8; 512];
+            primary.read_exact_at(cx, ByteOffset(0), &mut boot)?;
+            let boot_blake3 = blake3_digest(&boot);
+            let volume = ntfs::reader::NtfsVolume::from_device(cx, primary, 0, len)?;
+            let geo = &volume.geometry;
+            let restart_lsn = volume
+                .record(cx, 2, None)
+                .and_then(|rec2| volume.data_stream(cx, &rec2, &[]))
+                .and_then(|stream| volume.read(cx, &stream, 0, 8192))
+                .ok()
+                .and_then(|raw_lf| ffs_ondisk::ntfs::parse_ntfs_logfile(&raw_lf).ok())
+                .map_or(0, |plan| plan.restart.current_lsn);
+            Ok(NativeCommitBinding::Ntfs {
+                volume_serial: geo.serial(),
+                volume_bytes: geo.volume_bytes(),
+                cluster_bytes: geo.cluster_bytes(),
+                record_bytes: geo.record_bytes(),
+                index_bytes: geo.index_bytes(),
+                mft_cluster: geo.mft_cluster(),
+                mirror_cluster: geo.mirror_cluster(),
+                boot_blake3,
+                transaction_id: 0,
+                commit_lsn: restart_lsn,
+                checkpoint_lsn: (restart_lsn != 0).then_some(restart_lsn),
+                generation: restart_lsn,
+                operation_digest: [0_u8; 32],
+            })
+        }
+        "zfs" => {
+            let mut leaves = Vec::with_capacity(storage_set.members().len());
+            let mut member_guids = Vec::with_capacity(storage_set.members().len());
+            let mut first_cfg = None;
+            for m in storage_set.members() {
+                if m.role != MemberRole::Data {
+                    return Err(FfsError::UnsupportedFeature(
+                        "separate ZFS log/special devices are outside the protected ZFS profile"
+                            .into(),
+                    ));
+                }
+                let dev = m.open_bounded_device(false)?;
+                let leaf = zfs::reader::Leaf::from_device(cx, dev, 0, m.length)?;
+                let lbl0 = leaf.label(cx, 0)?;
+                let m_guid = lbl0.config.unsigned("guid").unwrap_or(0);
+                if first_cfg.is_none() {
+                    let pool_guid = lbl0.config.unsigned("pool_guid").unwrap_or(0);
+                    let top_guid = lbl0.config.unsigned("top_guid").unwrap_or(0);
+                    let version = lbl0.config.unsigned("version").unwrap_or(0);
+                    let label_txg = lbl0.config.unsigned("txg").unwrap_or(0);
+                    let vdev_children = lbl0.config.unsigned("vdev_children").unwrap_or(1);
+                    let required_children = lbl0
+                        .config
+                        .list("vdev_tree")
+                        .and_then(|tree| match tree.fields.get("children") {
+                            Some(ffs_ondisk::zfs::nvlist::Value::Lists(items)) => Some(items.len()),
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    if (vdev_children > 1 && storage_set.members().len() == 1)
+                        || required_children > storage_set.members().len()
+                    {
+                        return Err(FfsError::UnsupportedFeature(
+                            "multi-member ZFS pool requires a complete storage-set manifest (--manifest + --member) covering every vdev member"
+                                .into(),
+                        ));
+                    }
+                    let (ashift, asize) = lbl0.config.list("vdev_tree").map_or((0, 0), |tree| {
+                        let ashift =
+                            u8::try_from(tree.unsigned("ashift").unwrap_or(0)).unwrap_or(0);
+                        let asize = tree.unsigned("asize").unwrap_or(0);
+                        (ashift, asize)
+                    });
+                    first_cfg = Some((pool_guid, top_guid, version, label_txg, ashift, asize));
+                }
+                member_guids.push(m_guid);
+                leaves.push(leaf);
+            }
+            let (pool_guid, top_guid, version, label_txg, ashift, asize) =
+                first_cfg.unwrap_or((0, 0, 0, 0, 0, 0));
+            let pool = zfs::reader::Pool::from_leaves(leaves)?;
+            let (_, active_slot, root_block) = pool.import_active(cx, pool_guid_hint)?;
+            let root_bp_blake3 =
+                blake3_digest(format!("{:?}", root_block.uberblock.root).as_bytes());
+            let published_slot = u32::try_from(active_slot).unwrap_or(u32::MAX);
+            Ok(NativeCommitBinding::Zfs {
+                pool_guid,
+                top_guid,
+                member_guids,
+                guid_sum: root_block.uberblock.guid_sum,
+                version,
+                ashift,
+                asize,
+                label_txg,
+                committed_txg: root_block.uberblock.txg,
+                published_slot,
+                root_bp_blake3,
+                generation: root_block.uberblock.txg,
+                operation_digest: [0_u8; 32],
+            })
+        }
+        other => Err(FfsError::UnsupportedFeature(format!(
+            "unsupported protected filesystem {other}"
+        ))),
+    }
+}
+
+fn verify_manifest_native_binding(
+    manifest_fs: &str,
+    expected: &NativeCommitBinding,
+    actual_fs: &str,
+    actual: &NativeCommitBinding,
+) -> Result<()> {
+    if manifest_fs != "raw" && manifest_fs != actual_fs {
+        bail!("storage-set manifest binds filesystem '{manifest_fs}', but detected '{actual_fs}'");
+    }
+    match (expected, actual) {
+        (NativeCommitBinding::UninterpretedRaw, _) => Ok(()),
+        (
+            NativeCommitBinding::Ext4 {
+                uuid: eu,
+                blocks_count: eb,
+                journal_inum: ej,
+                ..
+            },
+            NativeCommitBinding::Ext4 {
+                uuid: au,
+                blocks_count: ab,
+                journal_inum: aj,
+                ..
+            },
+        ) => {
+            if eu != au || eb != ab || ej != aj {
+                bail!("storage-set manifest Ext4 identity disagrees with on-disk superblock");
+            }
+            Ok(())
+        }
+        (
+            NativeCommitBinding::Btrfs {
+                fsid: ef,
+                generation: eg,
+                root_bytenr: er,
+                ..
+            },
+            NativeCommitBinding::Btrfs {
+                fsid: af,
+                generation: ag,
+                root_bytenr: ar,
+                ..
+            },
+        ) => {
+            if ef != af || eg != ag || er != ar {
+                bail!(
+                    "storage-set manifest Btrfs generation/fsid disagrees with on-disk superblock"
+                );
+            }
+            Ok(())
+        }
+        (
+            NativeCommitBinding::Fat {
+                kind: ek,
+                total_sectors: es,
+                ..
+            },
+            NativeCommitBinding::Fat {
+                kind: ak,
+                total_sectors: as_,
+                ..
+            },
+        ) => {
+            if ek != ak || es != as_ {
+                bail!("storage-set manifest FAT geometry disagrees with on-disk boot sector");
+            }
+            Ok(())
+        }
+        (
+            NativeCommitBinding::Ntfs {
+                volume_serial: es,
+                volume_bytes: eb,
+                commit_lsn: el,
+                ..
+            },
+            NativeCommitBinding::Ntfs {
+                volume_serial: as_,
+                volume_bytes: ab,
+                commit_lsn: al,
+                ..
+            },
+        ) => {
+            if es != as_ || eb != ab || (*el != 0 && el != al) {
+                bail!(
+                    "storage-set manifest NTFS volume serial or committed LSN disagrees with on-disk volume"
+                );
+            }
+            Ok(())
+        }
+        (
+            NativeCommitBinding::Zfs {
+                pool_guid: ep,
+                top_guid: et,
+                member_guids: em,
+                committed_txg: ex,
+                ..
+            },
+            NativeCommitBinding::Zfs {
+                pool_guid: ap,
+                top_guid: at,
+                member_guids: am,
+                committed_txg: ax,
+                ..
+            },
+        ) => {
+            if ep != ap || et != at || em != am || ex != ax {
+                bail!(
+                    "storage-set manifest ZFS pool/member GUIDs or committed TXG ({ex} vs {ax}) disagrees with on-disk pool"
+                );
+            }
+            Ok(())
+        }
+        _ => bail!("storage-set manifest native commit binding kind disagrees with filesystem"),
+    }
+}
+
+type NativeBindingExtractor =
+    Arc<dyn Fn(&Cx) -> ffs_error::Result<NativeCommitBinding> + Send + Sync>;
+
 fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-    let (image, sidecar, mountpoint) = checked_paths(args)?;
-    let device = Arc::new(
-        SidecarImageDevice::open(cx, &image, &sidecar)
-            .context("admit image and existing repair protection")?,
-    );
-    let filesystem = clean_single_image(cx, device.as_ref())?;
-    let protected_device = Box::new(ProtectedDevice {
-        inner: Arc::clone(&device),
-        writable: args.rw,
+    let checked = checked_paths(args)?;
+    let signing_key = args
+        .set
+        .trust_key_file
+        .as_deref()
+        .map(load_por_key)
+        .transpose()?;
+    let trust_policy = match (args.set.require_trusted_root, signing_key) {
+        (_, Some(key)) => TrustPolicy::RequireTrustedRoot { key },
+        (true, None) => TrustPolicy::RequireTrustedRoot { key: [0_u8; 32] },
+        (false, None) => TrustPolicy::AllowUnauthenticated,
+    };
+    if args.set.require_trusted_root && signing_key.is_none() {
+        bail!(
+            "trusted-root provenance required (--require-trusted-root), but no --trust-key-file was supplied"
+        );
+    }
+    let calibration = load_calibration(args.set.repair_calibration.as_deref())?;
+    let evidence_ledger = open_evidence_ledger(args.set.evidence_ledger.as_deref())?;
+    let open_opts = StorageSetOpenOptions {
+        read_only: false,
+        allow_automatic_repair: args.authority.allow_repair,
+        trust_policy,
+        signing_key,
+        calibration,
+        evidence_ledger,
+    };
+
+    let storage_set = Arc::new(if let Some(manifest_path) = &checked.manifest {
+        ProtectedStorageSet::open_manifest(cx, manifest_path, &checked.member_paths, &open_opts)
+            .context("admit storage-set manifest and member sidecars")?
+    } else {
+        ProtectedStorageSet::open_standalone(
+            cx,
+            &checked.member_paths[0].0,
+            &checked.member_paths[0].1,
+            args.set.offset.unwrap_or(0),
+            args.set.length,
+            &open_opts,
+        )
+        .context("admit image and existing repair protection")?
     });
-    let len = device.len_bytes();
+
+    if !args.set.log_members.is_empty() || !args.set.special_members.is_empty() {
+        bail!(
+            "external log/special member topologies are refused until native split-device recovery is admitted"
+        );
+    }
+
+    let device = Arc::clone(storage_set.primary_device());
+    let probe_slice = storage_set.members()[0]
+        .open_bounded_device(false)
+        .context("open bounded primary member slice")?;
+    let filesystem = clean_single_slice(cx, probe_slice.as_ref(), storage_set.members().len())?;
+    drop(probe_slice);
+
+    let live_binding =
+        compute_live_native_binding(cx, &storage_set, filesystem, args.set.pool_guid)
+            .context("verify native filesystem commit identity across storage set")?;
+    if let Some(manifest) = storage_set.manifest() {
+        verify_manifest_native_binding(
+            &manifest.filesystem,
+            &manifest.native_binding,
+            filesystem,
+            &live_binding,
+        )?;
+        for (idx, m) in storage_set.members().iter().enumerate() {
+            if m.native_member_id != [0_u8; 16]
+                && let NativeCommitBinding::Zfs { member_guids, .. } = &live_binding
+                && let Some(&actual_guid) = member_guids.get(idx)
+            {
+                let mut expected_guid_bytes = [0_u8; 8];
+                expected_guid_bytes.copy_from_slice(&m.native_member_id[..8]);
+                if u64::from_le_bytes(expected_guid_bytes) != actual_guid {
+                    bail!(
+                        "storage-set manifest member {idx} native GUID disagrees with physical ZFS label"
+                    );
+                }
+            }
+        }
+    }
+    storage_set.record_native_commit(&live_binding);
+
+    let extractor_set = Arc::clone(&storage_set);
+    let pool_guid_hint = args.set.pool_guid;
+    let extractor: NativeBindingExtractor = Arc::new(move |seal_cx: &Cx| {
+        compute_live_native_binding(seal_cx, &extractor_set, filesystem, pool_guid_hint)
+    });
+
+    let primary_len = storage_set.members()[0].length;
     let uid = nix::unistd::Uid::current().as_raw();
     let gid = nix::unistd::Gid::current().as_raw();
     let fs = match filesystem {
         "ext4" | "btrfs" => {
+            let protected_device = storage_set
+                .open_member_device_with_auto_seal(0, args.rw, Arc::clone(&extractor))
+                .context("open primary protected device")?;
             let options = OpenOptions {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
                 ..OpenOptions::default()
             };
             let mut fs = OpenFs::from_device(cx, protected_device, &options)
                 .context("open filesystem through the protected device")?;
-            // Exercise the actual FUSE root alias before enabling caller writes.
             FsOps::getattr(&fs, cx, &mut RequestScope::empty(), InodeNumber(1))
                 .context("read protected filesystem root")?;
             if args.rw {
-                // Match ordinary mount admission: a journalled ext4 image may not
-                // silently take the direct home-block durability path. The writer uses
-                // this same protected device, so journal and checkpoint syncs also
-                // publish fresh sidecar coverage. Clean admission above establishes
-                // the attachment helper's prerequisite that no replay is pending.
                 fs.attach_ext4_internal_jbd2_writer(cx)
                     .context("attach the protected ext4 internal JBD2 writer")?;
                 if fs
@@ -591,15 +893,16 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
                         "refusing writable journalled ext4 mount: no JBD2 writer is attached, so the durability checkpoint would skip the journal's descriptor and commit blocks"
                     );
                 }
-                // Preserve all ordinary format/profile/feature write-admission checks.
-                // No ephemeral btrfs mode or kernel writeback cache is enabled here.
                 fs.enable_writes(cx)
                     .context("enable protected filesystem writes")?;
             }
             ProtectedFs::Core(Box::new(fs))
         }
         "fat16" | "fat32" => {
-            let volume = fat::reader::FatVolume::from_device(cx, protected_device, 0, len)
+            let protected_device = storage_set
+                .open_member_device_with_auto_seal(0, args.rw, Arc::clone(&extractor))
+                .context("open primary protected FAT device")?;
+            let volume = fat::reader::FatVolume::from_device(cx, protected_device, 0, primary_len)
                 .context("open FAT volume through the protected device")?;
             if args.rw {
                 let check = volume
@@ -619,44 +922,117 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
             }
         }
         "ntfs" => {
-            if args.rw {
-                bail!("protected mount supports NTFS in read-only mode only; omit --rw");
-            }
-            let volume = ntfs::reader::NtfsVolume::from_device(cx, protected_device, 0, len)
-                .context("open NTFS volume through the protected device")?;
-            let ntfs_fs = ntfs::reader::filesystem::NtfsFs::new(cx, volume, uid, gid)
-                .context("initialize protected NTFS filesystem")?;
+            let protected_device = storage_set
+                .open_member_device_with_auto_seal(0, args.rw, Arc::clone(&extractor))
+                .context("open primary protected NTFS device")?;
+            let ntfs_fs = if args.rw {
+                let engine = ntfs::transaction::NtfsTransactionEngine::from_device(
+                    cx,
+                    protected_device.into(),
+                    0,
+                    primary_len,
+                    ntfs::NtfsWriteOptions {
+                        offline_image: args.authority.exclusive_image,
+                        allow_write: true,
+                        recover_dirty: false,
+                    },
+                )
+                .context("admit clean NTFS volume for protected native writes")?;
+                ntfs::reader::filesystem::NtfsFs::from_engine(cx, engine, uid, gid)
+                    .context("initialize writable protected NTFS filesystem")?
+            } else {
+                let volume =
+                    ntfs::reader::NtfsVolume::from_device(cx, protected_device, 0, primary_len)
+                        .context("open NTFS volume through the protected device")?;
+                ntfs::reader::filesystem::NtfsFs::new(cx, volume, uid, gid)
+                    .context("initialize protected NTFS filesystem")?
+            };
             FsOps::getattr(&ntfs_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
                 .context("read protected NTFS filesystem root")?;
-            ProtectedFs::Ntfs(ReadOnlyNtfsFs(Box::new(ntfs_fs)))
+            ProtectedFs::Ntfs(Box::new(ntfs_fs))
         }
         "zfs" => {
-            if args.rw {
-                bail!("protected mount supports ZFS in read-only mode only; omit --rw");
-            }
-            let leaf = zfs::reader::Leaf::from_device(cx, protected_device, 0, len)
-                .context("open ZFS leaf through the protected device")?;
-            let pool = zfs::reader::Pool::from_leaves(vec![leaf])
-                .context("admit single-device protected ZFS pool")?;
-            let mut objects = pool
-                .import_objects(cx, None)
-                .context("import active ZFS MOS object set through the protected device")?;
-            let view = objects
-                .zpl(cx, &[])
-                .context("open root ZPL dataset through the protected device")?;
-            let zfs_fs = zfs::filesystem::ZfsFs::new(cx, view, uid, gid)
-                .context("initialize protected ZFS filesystem")?;
+            let dataset_components = parse_zfs_dataset_components(args.set.zfs_dataset.as_deref())?;
+            let zfs_fs = if args.rw {
+                let mut probe_leaves = Vec::with_capacity(storage_set.members().len());
+                let mut member_devices = Vec::with_capacity(storage_set.members().len());
+                for idx in 0..storage_set.members().len() {
+                    let member_len = storage_set.members()[idx].length;
+                    let probe_dev = storage_set.members()[idx]
+                        .open_bounded_device(false)
+                        .with_context(|| format!("open probe ZFS member {idx}"))?;
+                    let leaf = zfs::reader::Leaf::from_device(cx, probe_dev, 0, member_len)
+                        .with_context(|| format!("admit protected ZFS leaf {idx}"))?;
+                    probe_leaves.push(leaf);
+                    let mutable_dev = storage_set
+                        .open_member_device_with_auto_seal(idx, true, Arc::clone(&extractor))
+                        .with_context(|| format!("open writable protected ZFS member {idx}"))?;
+                    member_devices.push(mutable_dev);
+                }
+                let discovered_pool_guid = probe_leaves[0]
+                    .label(cx, 0)
+                    .ok()
+                    .and_then(|l| l.config.unsigned("pool_guid"))
+                    .unwrap_or(0);
+                let probe_pool = zfs::reader::Pool::from_leaves(probe_leaves)
+                    .context("admit complete ZFS pool topology for protected writes")?;
+                let (active_label, active_slot, _) = probe_pool
+                    .import_active(cx, args.set.pool_guid)
+                    .context("discover active ZFS Uberblock across protected storage set")?;
+                let write_opts = zfs::ZfsWriteOptions {
+                    offline_image: args.authority.exclusive_image,
+                    allow_write: true,
+                    pool_guid: args.set.pool_guid.unwrap_or(discovered_pool_guid),
+                    label: args.set.zfs_label.unwrap_or(active_label),
+                    slot: args.set.zfs_slot.unwrap_or(active_slot),
+                    reconcile_torn_uberblocks: false,
+                };
+                let engine =
+                    zfs::ZfsTransactionEngine::from_devices(cx, member_devices, write_opts)
+                        .context("admit ZFS transaction engine across protected storage set")?;
+                zfs::filesystem::ZfsFs::with_writer_options(
+                    cx,
+                    engine,
+                    dataset_components,
+                    zfs::filesystem::ZfsMountWriteOptions {
+                        allow_mode_and_owner_setattr: true,
+                    },
+                )
+                .context("initialize writable protected ZFS filesystem")?
+            } else {
+                let mut leaves = Vec::with_capacity(storage_set.members().len());
+                for idx in 0..storage_set.members().len() {
+                    let member_len = storage_set.members()[idx].length;
+                    let member_dev = storage_set
+                        .open_member_device_with_auto_seal(idx, false, Arc::clone(&extractor))
+                        .with_context(|| format!("open protected ZFS member {idx}"))?;
+                    let leaf = zfs::reader::Leaf::from_device(cx, member_dev, 0, member_len)
+                        .with_context(|| format!("admit protected ZFS leaf {idx}"))?;
+                    leaves.push(leaf);
+                }
+                let pool = zfs::reader::Pool::from_leaves(leaves)
+                    .context("admit complete protected ZFS pool")?;
+                let mut objects = pool.import_objects(cx, args.set.pool_guid).context(
+                    "import active ZFS MOS object set through the protected storage set",
+                )?;
+                let view = objects
+                    .zpl(cx, &dataset_components)
+                    .context("open ZPL dataset through the protected storage set")?;
+                zfs::filesystem::ZfsFs::new(cx, view, uid, gid)
+                    .context("initialize protected ZFS filesystem")?
+            };
             FsOps::getattr(&zfs_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
                 .context("read protected ZFS filesystem root")?;
-            ProtectedFs::Zfs(ReadOnlyZfsFs(Box::new(zfs_fs)))
+            ProtectedFs::Zfs(Box::new(zfs_fs))
         }
         other => bail!("unsupported protected filesystem {other}"),
     };
     Ok(Prepared {
         fs: Arc::new(fs),
         device,
+        storage_set,
         filesystem,
-        mountpoint,
+        mountpoint: checked.mountpoint,
     })
 }
 
@@ -674,8 +1050,10 @@ struct Status<'a> {
     event: &'a str,
     filesystem: &'a str,
     image_bytes: u64,
+    member_count: usize,
     read_only: bool,
     repair_writes_authorized: bool,
+    authenticated_provenance: bool,
 }
 
 fn emit(event: &str, prepared: &Prepared) -> Result<()> {
@@ -683,8 +1061,10 @@ fn emit(event: &str, prepared: &Prepared) -> Result<()> {
         event,
         filesystem: prepared.filesystem,
         image_bytes: prepared.device.len_bytes(),
+        member_count: prepared.storage_set.members().len(),
         read_only: !prepared.fs.is_writable(),
         repair_writes_authorized: true,
+        authenticated_provenance: prepared.storage_set.is_authenticated(),
     };
     let mut out = std::io::stdout().lock();
     serde_json::to_writer(&mut out, &status)?;
@@ -735,23 +1115,43 @@ fn serve(
     } else {
         Ok(None)
     };
-    let background = if announce.is_ok() && !flag.load(Ordering::Acquire) {
-        args.scrub
-            .interval_secs
-            .map(|seconds| {
-                scrub::ScrubGuard::start(
-                    cx,
-                    runtime.context("protected scrub requires its mount runtime")?,
-                    Arc::clone(&prepared.device),
-                    Arc::clone(&flag),
-                    std::time::Duration::from_secs(seconds),
-                    args.scrub.parity,
-                )
-            })
-            .transpose()
-    } else {
-        Ok(None)
-    };
+    let background: Result<Vec<scrub::ScrubGuard>> =
+        if announce.is_ok() && !flag.load(Ordering::Acquire) {
+            if let Some(seconds) = args.scrub.interval_secs {
+                let rt = runtime.context("protected scrub requires its mount runtime")?;
+                let mut guards = Vec::with_capacity(prepared.storage_set.members().len());
+                let mut start_err = None;
+                for member in prepared.storage_set.members() {
+                    match scrub::ScrubGuard::start(
+                        cx,
+                        rt,
+                        Arc::clone(&member.device),
+                        Arc::clone(&flag),
+                        std::time::Duration::from_secs(seconds),
+                        args.scrub.parity,
+                    ) {
+                        Ok(g) => guards.push(g),
+                        Err(e) => {
+                            start_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(err) = start_err {
+                    flag.store(true, Ordering::Release);
+                    for mut g in guards {
+                        let _ = g.stop();
+                    }
+                    Err(err)
+                } else {
+                    Ok(guards)
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        };
     if announce.is_err() || periodic.is_err() || background.is_err() {
         flag.store(true, Ordering::Release);
     }
@@ -762,17 +1162,32 @@ fn serve(
         Ok(Some(worker)) => worker.request_stop(),
         _ => Ok(()),
     };
-    let scrub_cancel = match background.as_ref() {
-        Ok(Some(guard)) => guard.request_stop(),
-        _ => Ok(()),
-    };
+    let mut scrub_cancel = Ok(());
+    if let Ok(guards) = background.as_ref() {
+        for guard in guards {
+            if let Err(err) = guard.request_stop()
+                && scrub_cancel.is_ok()
+            {
+                scrub_cancel = Err(err);
+            }
+        }
+    }
     let commit_result = match periodic.as_mut() {
         Ok(Some(worker)) => worker.stop().map(|_| ()),
         _ => Ok(()),
     };
     let scrub_result = match background {
-        Ok(Some(mut guard)) => guard.stop(),
-        Ok(None) => Ok(()),
+        Ok(mut guards) => {
+            let mut first_err = Ok(());
+            for guard in &mut guards {
+                if let Err(err) = guard.stop()
+                    && first_err.is_ok()
+                {
+                    first_err = Err(err);
+                }
+            }
+            first_err
+        }
         Err(error) => Err(error),
     };
     announce?;

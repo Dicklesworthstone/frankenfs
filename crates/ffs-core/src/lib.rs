@@ -5686,6 +5686,18 @@ impl ByteDevice for SharedByteDevice {
         self.0.sync(cx)
     }
 
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<(), FfsError> {
+        self.0.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.0.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.0.abort_durability_commit();
+    }
+
     fn supports_discard(&self) -> bool {
         self.0.supports_discard()
     }
@@ -8033,6 +8045,18 @@ impl ByteDevice for RecoveryWriteTrackerDevice {
 
     fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
         self.inner.sync(cx)
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<(), FfsError> {
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
     }
 }
 

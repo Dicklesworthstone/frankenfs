@@ -14,14 +14,25 @@
 //! advisory locks cannot exclude kernel mounts or non-cooperating writers.
 
 use super::{
-    Archive, DIGEST_BYTES, GROUP_PREFIX_BYTES, HEADER_BYTES, Header, MemoryGroup, ProtectionInfo,
-    checkpoint, corrupt, digest_parts, hash_image, load_source, parent_path, source_digest,
-    symbol_digest,
+    Archive, DIGEST_BYTES, GROUP_PREFIX_BYTES, HEADER_BYTES, Header, MemberProtectionBinding,
+    MemberRole, MemberSliceGeometry, MemoryGroup, NativeCommitBinding, ProtectedViewIdentity,
+    ProtectionInfo, ProvenanceAuth, SET_MANIFEST_PREFIX_BYTES, SET_PENDING_MAGIC, SidecarOptions,
+    SidecarReport, StorageSetManifest, StorageSetTopology, TrustPolicy, checkpoint, corrupt,
+    digest_parts, hash_image, load_source, parent_path, por_key_id, protect, publish_new,
+    source_digest, symbol_digest, tables_root_digest, verify,
 };
 use crate::codec::{decode_group_with_owned_repair_symbols, encode_group};
+use crate::decision::{
+    AutomaticRepairVerdict, MandatoryRepairPreconditions, RepairLossCalibration,
+    evaluate_automatic_repair_gate,
+};
+use crate::evidence::{
+    EvidenceLedger, EvidenceRecord, ProtectedCommitAckDetail, ProtectedRepairGateDetail,
+};
+use crate::por::PorKey;
 use crate::sidecar_restore::decode_missing_group;
 use asupersync::Cx;
-use ffs_block::ByteDevice;
+use ffs_block::{ByteDevice, VolumeDevice};
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, ByteOffset, GroupNumber};
 use parking_lot::{Mutex, MutexGuard};
@@ -31,10 +42,106 @@ use std::io::{self, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 const PENDING_MAGIC: &[u8; 8] = b"FFSRQPD2";
+
+fn now_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// Shared append-only JSONL evidence ledger handle for live/protected repair.
+pub type SharedEvidenceLedger = Arc<Mutex<EvidenceLedger<Box<dyn Write + Send>>>>;
+pub(crate) type FenceHook = Arc<dyn Fn(&Cx) -> Result<()> + Send + Sync>;
+
+/// Open an append-only JSONL [`SharedEvidenceLedger`] at `path`.
+pub fn open_shared_evidence_ledger(path: &Path) -> Result<SharedEvidenceLedger> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let boxed: Box<dyn Write + Send> = Box::new(file);
+    Ok(Arc::new(Mutex::new(EvidenceLedger::new(boxed))))
+}
+
+/// Compute a 32-byte BLAKE3 digest over `bytes`.
+#[must_use]
+pub fn blake3_digest(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ArchiveDigests {
+    pub(crate) header_blake3: [u8; 32],
+    pub(crate) snapshot_digest: [u8; 32],
+    pub(crate) tables_root: [u8; 32],
+}
+
+/// Separate native-commit vs protected-parity durability acknowledgment status (`bd-tqrnc`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProtectionAckStatus {
+    pub epoch_generation: u64,
+    pub native_durable: bool,
+    pub protected_durable: bool,
+    pub authenticated_provenance: bool,
+    pub fenced_at_ns: Option<u64>,
+    pub native_durable_at_ns: Option<u64>,
+    pub protected_durable_at_ns: Option<u64>,
+    /// Elapsed nanoseconds during which native state was mutated or committed without sealed parity.
+    pub unprotected_interval_ns: u64,
+    pub native_token_summary: Option<String>,
+    pub post_commit_error: Option<String>,
+}
+
+/// Options controlling live sidecar open, two-stage repair authorization, provenance, and audit logging.
+#[derive(Clone)]
+pub struct SidecarLiveOptions {
+    pub read_only: bool,
+    pub allow_automatic_repair: bool,
+    pub member_index: u32,
+    pub set_id_hex: Option<String>,
+    pub initial_generation: u64,
+    pub authenticated_provenance: bool,
+    pub require_trusted_root: bool,
+    pub calibration: Option<RepairLossCalibration>,
+    pub evidence_ledger: Option<SharedEvidenceLedger>,
+    pub(crate) external_fence_hook: Option<FenceHook>,
+}
+
+impl std::fmt::Debug for SidecarLiveOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SidecarLiveOptions")
+            .field("read_only", &self.read_only)
+            .field("allow_automatic_repair", &self.allow_automatic_repair)
+            .field("member_index", &self.member_index)
+            .field("initial_generation", &self.initial_generation)
+            .field("authenticated_provenance", &self.authenticated_provenance)
+            .field("require_trusted_root", &self.require_trusted_root)
+            .field("has_calibration", &self.calibration.is_some())
+            .field("has_evidence_ledger", &self.evidence_ledger.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for SidecarLiveOptions {
+    fn default() -> Self {
+        Self {
+            read_only: false,
+            allow_automatic_repair: true,
+            member_index: 0,
+            set_id_hex: None,
+            initial_generation: 1,
+            authenticated_provenance: false,
+            require_trusted_root: false,
+            calibration: Some(RepairLossCalibration::default_operator_exclusive()),
+            evidence_ledger: None,
+            external_fence_hook: None,
+        }
+    }
+}
 
 enum Phase {
     Clean,
@@ -57,6 +164,19 @@ struct State {
     tables: Vec<[u8; 32]>,
     /// A single group's metadata cache bounds the read-side working set.
     cached_hashes: Option<(u32, Vec<[u8; 32]>)>,
+    /// Nesting depth of active multi-barrier native commits (`defer_seal_depth > 0`
+    /// flushes physical `self.image` on `sync()` without prematurely sealing parity).
+    defer_seal_depth: u32,
+    /// Tracks whether any source write escaped during the current deferred commit.
+    writes_during_defer: bool,
+    epoch_generation: u64,
+    native_durable: bool,
+    fenced_at_ns: Option<u64>,
+    native_durable_at_ns: Option<u64>,
+    protected_durable_at_ns: Option<u64>,
+    last_unprotected_interval_ns: u64,
+    native_token_summary: Option<String>,
+    post_commit_error: Option<String>,
 }
 
 struct GroupRepair {
@@ -148,6 +268,7 @@ pub struct SidecarImageDevice {
     image_bytes: u64,
     protection_groups: u32,
     read_only: bool,
+    options: SidecarLiveOptions,
     state: Mutex<State>,
 }
 
@@ -166,7 +287,7 @@ impl SidecarImageDevice {
     /// Neither file is changed on admission failure. The archive path is
     /// canonicalized once; future syncs replace that archive with a new snapshot.
     pub fn open(cx: &Cx, image_path: &Path, sidecar_path: &Path) -> Result<Self> {
-        Self::open_with_mode(cx, image_path, sidecar_path, false)
+        Self::open_with_options(cx, image_path, sidecar_path, SidecarLiveOptions::default())
     }
 
     /// Open an immutable image and its existing protection without write access.
@@ -177,16 +298,32 @@ impl SidecarImageDevice {
     /// Later recoverable corruption is reconstructed only in memory. Neither
     /// file needs write permission, and no scratch archive is created.
     pub fn open_read_only(cx: &Cx, image_path: &Path, sidecar_path: &Path) -> Result<Self> {
-        Self::open_with_mode(cx, image_path, sidecar_path, true)
+        Self::open_with_options(
+            cx,
+            image_path,
+            sidecar_path,
+            SidecarLiveOptions {
+                read_only: true,
+                allow_automatic_repair: false,
+                ..SidecarLiveOptions::default()
+            },
+        )
     }
 
-    fn open_with_mode(
+    /// Open with explicit two-stage calibration, provenance, and audit-ledger options.
+    pub fn open_with_options(
         cx: &Cx,
         image_path: &Path,
         sidecar_path: &Path,
-        read_only: bool,
+        options: SidecarLiveOptions,
     ) -> Result<Self> {
+        let read_only = options.read_only;
         checkpoint(cx)?;
+        if options.require_trusted_root && !options.authenticated_provenance {
+            return Err(corrupt(
+                "trusted-root provenance required; standalone unkeyed sidecar is not authenticated",
+            ));
+        }
         let image = File::options()
             .read(true)
             .write(!read_only)
@@ -262,12 +399,15 @@ impl SidecarImageDevice {
             return Err(corrupt("image changed during live repair admission"));
         }
         checkpoint(cx)?;
+        let initial_gen = options.initial_generation.max(1);
+        let init_ts = now_unix_ns();
         Ok(Self {
             image,
             sidecar_path,
             image_bytes: archive.header.image_bytes,
             protection_groups: archive.header.groups,
             read_only,
+            options,
             state: Mutex::new(State {
                 archive,
                 phase: Phase::Clean,
@@ -275,6 +415,16 @@ impl SidecarImageDevice {
                 changed: BTreeMap::new(),
                 tables,
                 cached_hashes: None,
+                defer_seal_depth: 0,
+                writes_during_defer: false,
+                epoch_generation: initial_gen,
+                native_durable: true,
+                fenced_at_ns: None,
+                native_durable_at_ns: Some(init_ts),
+                protected_durable_at_ns: Some(init_ts),
+                last_unprotected_interval_ns: 0,
+                native_token_summary: None,
+                post_commit_error: None,
             }),
         })
     }
@@ -439,6 +589,10 @@ impl SidecarImageDevice {
             .range(first..first + u64::from(count))
             .any(|(&block, expected)| record.hashes[(block - first) as usize] != *expected)
         {
+            let mut pre = MandatoryRepairPreconditions::all_passed();
+            pre.native_generation_fresh = false;
+            pre.group_peer_digests_unchanged = false;
+            let _ = self.record_repair_gate_verdict(state, group, 1, pre);
             return Err(corrupt(
                 "source corruption during a dirty epoch; old parity is not current for this group; \
                  refusing to bless corruption",
@@ -545,6 +699,23 @@ impl SidecarImageDevice {
                     .collect(),
             });
         }
+        let preconditions = MandatoryRepairPreconditions {
+            exclusive_ownership: !self.read_only && self.options.allow_automatic_repair,
+            storage_set_identity_match: true,
+            native_generation_fresh: true,
+            group_peer_digests_unchanged: true,
+            symbol_and_decoded_digests_valid: true,
+            trusted_root_authenticated: !self.options.require_trusted_root
+                || self.options.authenticated_provenance,
+            target_prewrite_unchanged: true,
+        };
+        let verdict =
+            self.record_repair_gate_verdict(state, group, damaged.len() as u32, preconditions)?;
+        if let AutomaticRepairVerdict::Refuse { reason, .. } = verdict {
+            return Err(corrupt(&format!(
+                "automatic repair writeback refused by gate: {reason:?}"
+            )));
+        }
         for recovered in &recovered_blocks {
             checkpoint(cx)?;
             self.image.write_all_at(
@@ -566,7 +737,96 @@ impl SidecarImageDevice {
         })
     }
 
-    fn fence(cx: &Cx, state: &mut State) -> Result<()> {
+    fn set_id_label(&self, state: &State) -> String {
+        self.options.set_id_hex.clone().unwrap_or_else(|| {
+            blake3::Hash::from_bytes(state.archive.header.snapshot_digest)
+                .to_hex()
+                .to_string()
+        })
+    }
+
+    fn record_repair_gate_verdict(
+        &self,
+        state: &State,
+        group: u32,
+        damaged_blocks: u32,
+        preconditions: MandatoryRepairPreconditions,
+    ) -> Result<AutomaticRepairVerdict> {
+        let verdict =
+            evaluate_automatic_repair_gate(&preconditions, self.options.calibration.as_ref());
+        if let Some(ledger_arc) = &self.options.evidence_ledger {
+            let detail = match &verdict {
+                AutomaticRepairVerdict::Authorize {
+                    expected_repair_loss,
+                    refusal_loss,
+                    calibration,
+                } => ProtectedRepairGateDetail {
+                    set_id_hex: self.set_id_label(state),
+                    member_index: self.options.member_index,
+                    generation: state.epoch_generation,
+                    authenticated_provenance: self.options.authenticated_provenance,
+                    damaged_blocks,
+                    authorized: true,
+                    expected_repair_loss: Some(*expected_repair_loss),
+                    refusal_loss: Some(*refusal_loss),
+                    calibration_provenance: Some(calibration.provenance.clone()),
+                    refusal_reason: None,
+                },
+                AutomaticRepairVerdict::Refuse {
+                    reason,
+                    expected_repair_loss,
+                    refusal_loss,
+                    calibration_provenance,
+                } => ProtectedRepairGateDetail {
+                    set_id_hex: self.set_id_label(state),
+                    member_index: self.options.member_index,
+                    generation: state.epoch_generation,
+                    authenticated_provenance: self.options.authenticated_provenance,
+                    damaged_blocks,
+                    authorized: false,
+                    expected_repair_loss: *expected_repair_loss,
+                    refusal_loss: *refusal_loss,
+                    calibration_provenance: calibration_provenance.clone(),
+                    refusal_reason: Some(format!("{reason:?}")),
+                },
+            };
+            let record = EvidenceRecord::protected_repair_gate(group, detail);
+            ledger_arc.lock().append(&record)?;
+        }
+        Ok(verdict)
+    }
+
+    fn emit_commit_ack_evidence(&self, state: &State) {
+        if let Some(ledger_arc) = &self.options.evidence_ledger {
+            let detail = ProtectedCommitAckDetail {
+                set_id_hex: self.set_id_label(state),
+                generation: state.epoch_generation,
+                native_durable: state.native_durable,
+                protected_durable: matches!(state.phase, Phase::Clean),
+                unprotected_interval_ns: Self::current_unprotected_interval_ns(state),
+                native_token_summary: state.native_token_summary.clone(),
+                post_commit_error: state.post_commit_error.clone(),
+            };
+            let _ = ledger_arc
+                .lock()
+                .append(&EvidenceRecord::protected_commit_ack(detail));
+        }
+    }
+
+    fn current_unprotected_interval_ns(state: &State) -> u64 {
+        if matches!(state.phase, Phase::Clean) {
+            state.last_unprotected_interval_ns
+        } else if let Some(fenced_at) = state.fenced_at_ns {
+            now_unix_ns().saturating_sub(fenced_at)
+        } else {
+            state.last_unprotected_interval_ns
+        }
+    }
+
+    fn fence(&self, cx: &Cx, state: &mut State) -> Result<()> {
+        if let Some(hook) = &self.options.external_fence_hook {
+            hook(cx)?;
+        }
         if matches!(state.phase, Phase::Dirty) {
             return Ok(());
         }
@@ -578,6 +838,11 @@ impl SidecarImageDevice {
         state.archive.file.write_all_at(&pending, 0)?;
         state.archive.file.sync_all()?;
         state.phase = Phase::Dirty;
+        state.fenced_at_ns = Some(now_unix_ns());
+        state.native_durable = false;
+        state.native_durable_at_ns = None;
+        state.protected_durable_at_ns = None;
+        state.post_commit_error = None;
         checkpoint(cx)
     }
 
@@ -760,11 +1025,24 @@ impl SidecarImageDevice {
         state.phase = Phase::Poisoned;
         state.archive = Archive { file, header };
         parent.sync_all()?;
+        let sealed_ts = now_unix_ns();
+        if let Some(fenced_at) = state.fenced_at_ns {
+            state.last_unprotected_interval_ns = sealed_ts.saturating_sub(fenced_at);
+        }
+        state.fenced_at_ns = None;
+        state.native_durable = true;
+        if state.native_durable_at_ns.is_none() {
+            state.native_durable_at_ns = Some(sealed_ts);
+        }
+        state.protected_durable_at_ns = Some(sealed_ts);
+        state.post_commit_error = None;
+        state.epoch_generation = state.epoch_generation.saturating_add(1);
         state.changed.clear();
         state.tables = tables;
         state.cached_hashes = None;
         state.protection_epoch = Arc::new(());
         state.phase = Phase::Clean;
+        self.emit_commit_ack_evidence(state);
         Ok(())
     }
 
@@ -902,6 +1180,84 @@ impl SidecarImageDevice {
         }
         state.archive.header.info()
     }
+
+    /// Explicitly durably invalidate coverage (`PENDING_MAGIC` + `sync_all()`) before
+    /// an in-memory MVCC/CoW mutation makes new filesystem state visible.
+    pub fn fence_before_mutation(&self, cx: &Cx) -> Result<()> {
+        self.require_writeback(cx)?;
+        let mut state = self.lock(cx)?;
+        self.check_image_len()?;
+        self.fence(cx, &mut state)
+    }
+
+    /// Record a committed native format token (`native_durable = true`) while
+    /// external parity may still be awaiting its seal barrier.
+    pub fn record_native_commit(&self, token: &NativeCommitBinding) {
+        let mut state = self.state.lock();
+        state.native_durable = true;
+        let now = now_unix_ns();
+        state.native_durable_at_ns = Some(now);
+        if let Some(fenced_at) = state.fenced_at_ns {
+            state.last_unprotected_interval_ns = now.saturating_sub(fenced_at);
+        }
+        state.native_token_summary = Some(token.summary());
+        if !matches!(state.phase, Phase::Clean) {
+            self.emit_commit_ack_evidence(&state);
+        }
+    }
+
+    /// Inspect separate `native_durable` vs `protected_durable` status, unprotected
+    /// interval, and any post-commit seal/cancellation error (`bd-tqrnc`).
+    #[must_use]
+    pub fn ack_status(&self) -> ProtectionAckStatus {
+        let state = self.state.lock();
+        let protected_durable = matches!(state.phase, Phase::Clean);
+        ProtectionAckStatus {
+            epoch_generation: state.epoch_generation,
+            native_durable: state.native_durable,
+            protected_durable,
+            authenticated_provenance: self.options.authenticated_provenance,
+            fenced_at_ns: state.fenced_at_ns,
+            native_durable_at_ns: state.native_durable_at_ns,
+            protected_durable_at_ns: state.protected_durable_at_ns,
+            unprotected_interval_ns: Self::current_unprotected_interval_ns(&state),
+            native_token_summary: state.native_token_summary.clone(),
+            post_commit_error: state.post_commit_error.clone(),
+        }
+    }
+
+    pub(crate) fn clean_binding_digests(
+        &self,
+        cx: &Cx,
+    ) -> Result<(MemberSliceGeometry, ArchiveDigests)> {
+        let state = self.lock(cx)?;
+        if !matches!(state.phase, Phase::Clean) {
+            return Err(corrupt(
+                "cannot extract sealed member binding during an unsealed write epoch",
+            ));
+        }
+        let encoded_hdr = state.archive.header.encode();
+        let header_blake3 = *blake3::hash(&encoded_hdr).as_bytes();
+        let snapshot_digest = state.archive.header.snapshot_digest;
+        let tables_root = tables_root_digest(&state.tables);
+        let geo = MemberSliceGeometry {
+            backing_bytes: self.image_bytes,
+            offset: 0,
+            length: self.image_bytes,
+            block_size: state.archive.header.options.block_size,
+            group_blocks: state.archive.header.options.group_blocks,
+            repair_symbols: state.archive.header.options.repair_symbols,
+            groups: state.archive.header.groups,
+        };
+        Ok((
+            geo,
+            ArchiveDigests {
+                header_blake3,
+                snapshot_digest,
+                tables_root,
+            },
+        ))
+    }
 }
 
 impl ByteDevice for SidecarImageDevice {
@@ -961,11 +1317,15 @@ impl ByteDevice for SidecarImageDevice {
                 .copy_from_slice(&buf[(start - offset.0) as usize..(stop - offset.0) as usize]);
             intended.push((block, source_digest(&state.archive.header, block, &bytes)));
         }
-        Self::fence(cx, &mut state)?;
+        self.fence(cx, &mut state)?;
         if let Err(error) = self.image.write_all_at(buf, offset.0) {
             state.phase = Phase::Poisoned;
             return Err(error.into());
         }
+        if state.defer_seal_depth > 0 {
+            state.writes_during_defer = true;
+        }
+        state.native_durable = false;
         state.changed.extend(intended);
         // Even a late cancellation retains the intended hashes for an explicit
         // subsequent sync; dropping still leaves a durably pending archive.
@@ -983,19 +1343,967 @@ impl ByteDevice for SidecarImageDevice {
             self.check_image_len()?;
             return checkpoint(cx);
         }
+        if state.defer_seal_depth > 0 {
+            // Intermediate barrier inside a multi-sync native transaction:
+            // flush physical backing storage ONLY, keeping `PENDING_MAGIC` on disk
+            // so intermediate dirty format states are never sealed into parity!
+            self.check_image_len()?;
+            self.image.sync_all()?;
+            return checkpoint(cx);
+        }
         if matches!(state.phase, Phase::Clean) {
             self.check_image_len()?;
             self.image.sync_all()?;
             return checkpoint(cx);
         }
-        self.refresh(cx, &mut state)
+        let result = self.refresh(cx, &mut state);
+        if let Err(ref err) = result {
+            let now = now_unix_ns();
+            if let Some(fenced_at) = state.fenced_at_ns {
+                state.last_unprotected_interval_ns = now.saturating_sub(fenced_at);
+            }
+            state.post_commit_error = Some(err.to_string());
+            self.emit_commit_ack_evidence(&state);
+        }
+        result
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.require_writeback(cx)?;
+        let mut state = self.lock(cx)?;
+        if state.defer_seal_depth == 0 {
+            state.writes_during_defer = false;
+        }
+        state.defer_seal_depth = state
+            .defer_seal_depth
+            .checked_add(1)
+            .ok_or_else(|| corrupt("sidecar durability commit nesting overflow"))?;
+        Ok(())
+    }
+
+    fn complete_durability_commit(&self) {
+        let mut state = self.state.lock();
+        state.defer_seal_depth = state.defer_seal_depth.saturating_sub(1);
+        if state.defer_seal_depth == 0 {
+            state.writes_during_defer = false;
+            if matches!(state.phase, Phase::Dirty) {
+                let now = now_unix_ns();
+                state.native_durable = true;
+                state.native_durable_at_ns = Some(now);
+                if let Some(fenced_at) = state.fenced_at_ns {
+                    state.last_unprotected_interval_ns = now.saturating_sub(fenced_at);
+                }
+                self.emit_commit_ack_evidence(&state);
+            }
+        }
+    }
+
+    fn abort_durability_commit(&self) {
+        let mut state = self.state.lock();
+        state.defer_seal_depth = state.defer_seal_depth.saturating_sub(1);
+        if state.defer_seal_depth == 0 && state.writes_during_defer {
+            // Physical source writes escaped before the native transaction
+            // committed; poison the live handle so uncommitted bytes can NEVER
+            // be sealed into a sidecar generation!
+            state.writes_during_defer = false;
+            state.native_durable = false;
+            state.phase = Phase::Poisoned;
+        }
+    }
+}
+
+// ── Whole-Storage-Set Coordinator (`ProtectedStorageSet`, `bd-tqrnc`) ────────
+
+/// Specification of one required member (`Data`, `Log`, or `Special`) when
+/// creating or admitting a protected storage set.
+#[derive(Debug, Clone)]
+pub struct StorageSetMemberSpec {
+    pub role: MemberRole,
+    pub image_path: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub native_member_id: [u8; 16],
+    pub offset: u64,
+    pub length: Option<u64>,
+}
+
+/// Request to create fresh per-member sidecars (when not already present) and
+/// seal a whole-storage-set [`StorageSetManifest`] (`FFSRQSM3`).
+#[derive(Debug, Clone)]
+pub struct StorageSetProtectRequest {
+    pub manifest_path: PathBuf,
+    pub filesystem: String,
+    pub topology: StorageSetTopology,
+    pub view: ProtectedViewIdentity,
+    pub native_binding: NativeCommitBinding,
+    pub members: Vec<StorageSetMemberSpec>,
+    pub options: SidecarOptions,
+    pub signing_key: Option<PorKey>,
+}
+
+/// Verification report across an entire [`StorageSetManifest`] and its members.
+#[derive(Debug, Clone)]
+pub struct StorageSetVerifyReport {
+    pub manifest: StorageSetManifest,
+    pub member_reports: Vec<SidecarReport>,
+    pub matches_all_members: bool,
+}
+
+impl StorageSetVerifyReport {
+    /// True iff the manifest, every member snapshot, and every repair symbol match.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.matches_all_members && self.member_reports.iter().all(SidecarReport::is_healthy)
+    }
+}
+
+fn archive_file_name(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|os| os.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| corrupt("sidecar path must have a valid UTF-8 filename"))
+}
+
+fn read_archive_binding_digests(cx: &Cx, sidecar_path: &Path) -> Result<(Header, ArchiveDigests)> {
+    let archive = Archive::open(cx, sidecar_path)?;
+    let encoded_hdr = archive.header.encode();
+    let header_blake3 = *blake3::hash(&encoded_hdr).as_bytes();
+    let snapshot_digest = archive.header.snapshot_digest;
+    let mut tables = Vec::with_capacity(archive.header.groups as usize);
+    for group in 0..archive.header.groups {
+        let record = archive.read_group(cx, group)?;
+        if record.invalid_symbols != 0 {
+            return Err(corrupt(
+                "member sidecar has invalid repair symbols; cannot bind storage set",
+            ));
+        }
+        tables.push(SidecarImageDevice::table_digest(
+            &archive.header,
+            group,
+            &record.hashes,
+        )?);
+    }
+    let tables_root = tables_root_digest(&tables);
+    Ok((
+        archive.header,
+        ArchiveDigests {
+            header_blake3,
+            snapshot_digest,
+            tables_root,
+        },
+    ))
+}
+
+fn resolve_slice_length(backing_bytes: u64, offset: u64, length: Option<u64>) -> Result<u64> {
+    if offset >= backing_bytes {
+        return Err(corrupt(
+            "member slice offset reaches or exceeds backing file",
+        ));
+    }
+    let resolved = length.unwrap_or_else(|| backing_bytes.saturating_sub(offset));
+    if resolved == 0
+        || offset
+            .checked_add(resolved)
+            .is_none_or(|end| end > backing_bytes)
+    {
+        return Err(corrupt(
+            "member slice length is zero or exceeds backing file bounds",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Protect every offline member of a storage set and atomically publish a
+/// [`StorageSetManifest`] (`FFSRQSM3`) binding all members and `native_binding`.
+pub fn protect_storage_set(
+    cx: &Cx,
+    request: &StorageSetProtectRequest,
+) -> Result<StorageSetManifest> {
+    checkpoint(cx)?;
+    if request.members.is_empty() {
+        return Err(corrupt("storage set requires at least one member"));
+    }
+    if request.manifest_path.exists() {
+        return Err(corrupt(
+            "refusing to overwrite an existing storage-set manifest",
+        ));
+    }
+    request.options.validate()?;
+
+    let mut seen_sidecars = BTreeSet::new();
+    let mut member_bindings = Vec::with_capacity(request.members.len());
+    let mut id_hasher = blake3::Hasher::new();
+    id_hasher.update(b"ffs-storage-set-id-v3");
+    id_hasher.update(request.filesystem.as_bytes());
+    id_hasher.update(request.native_binding.summary().as_bytes());
+
+    for (idx, spec) in request.members.iter().enumerate() {
+        checkpoint(cx)?;
+        let img_meta = std::fs::metadata(&spec.image_path)?;
+        if !img_meta.is_file() {
+            return Err(corrupt("storage-set member image must be a regular file"));
+        }
+        let backing_bytes = img_meta.len();
+        let slice_len = resolve_slice_length(backing_bytes, spec.offset, spec.length)?;
+        let archive_filename = archive_file_name(&spec.sidecar_path)?;
+        if !seen_sidecars.insert(spec.sidecar_path.clone()) {
+            return Err(corrupt(
+                "duplicate sidecar archive path across storage-set members",
+            ));
+        }
+        if spec.sidecar_path.exists() {
+            let report = verify(cx, &spec.image_path, &spec.sidecar_path)?;
+            if !report.is_healthy() {
+                return Err(corrupt(
+                    "existing member sidecar does not cleanly match member image",
+                ));
+            }
+        } else {
+            protect(cx, &spec.image_path, &spec.sidecar_path, request.options)?;
+        }
+        let (hdr, digests) = read_archive_binding_digests(cx, &spec.sidecar_path)?;
+        if hdr.image_bytes != backing_bytes {
+            return Err(corrupt("member sidecar disagrees with member backing size"));
+        }
+        id_hasher.update(&digests.header_blake3);
+        id_hasher.update(&spec.native_member_id);
+        let member_index =
+            u32::try_from(idx).map_err(|_| corrupt("storage-set member index overflow"))?;
+        member_bindings.push(MemberProtectionBinding {
+            member_index,
+            role: spec.role,
+            native_member_id: spec.native_member_id,
+            geometry: MemberSliceGeometry {
+                backing_bytes,
+                offset: spec.offset,
+                length: slice_len,
+                block_size: hdr.options.block_size,
+                group_blocks: hdr.options.group_blocks,
+                repair_symbols: hdr.options.repair_symbols,
+                groups: hdr.groups,
+            },
+            archive_filename,
+            header_blake3: digests.header_blake3,
+            snapshot_digest: digests.snapshot_digest,
+            tables_root: digests.tables_root,
+        });
+    }
+
+    let id_digest = id_hasher.finalize();
+    let mut set_id = [0_u8; 16];
+    set_id.copy_from_slice(&id_digest.as_bytes()[..16]);
+
+    let provenance =
+        request
+            .signing_key
+            .as_ref()
+            .map_or(ProvenanceAuth::UnauthenticatedChecksum, |key| {
+                ProvenanceAuth::AuthenticatedTrustedRoot {
+                    key_id: por_key_id(key),
+                    mac_hex: String::new(),
+                }
+            });
+
+    let manifest = StorageSetManifest {
+        set_id,
+        generation: 1,
+        filesystem: request.filesystem.clone(),
+        topology: request.topology.clone(),
+        view: request.view.clone(),
+        native_binding: request.native_binding.clone(),
+        members: member_bindings,
+        provenance,
+    };
+    let encoded = manifest.encode(request.signing_key.as_ref())?;
+    let verify_policy = request
+        .signing_key
+        .map_or(TrustPolicy::AllowUnauthenticated, |key| {
+            TrustPolicy::RequireTrustedRoot { key }
+        });
+    let decoded = StorageSetManifest::decode(&encoded, verify_policy)?;
+    let mut staged = NamedTempFile::new_in(parent_path(&request.manifest_path))?;
+    staged.write_all(&encoded)?;
+    publish_new(cx, staged, &request.manifest_path)?;
+    Ok(decoded)
+}
+
+/// Verify an offline [`StorageSetManifest`] (`FFSRQSM3`) and every member's
+/// sidecar archive against `trust_policy`.
+pub fn verify_storage_set(
+    cx: &Cx,
+    manifest_path: &Path,
+    members: &[(PathBuf, PathBuf)],
+    trust_policy: TrustPolicy,
+) -> Result<StorageSetVerifyReport> {
+    checkpoint(cx)?;
+    let raw = std::fs::read(manifest_path)?;
+    let manifest = StorageSetManifest::decode(&raw, trust_policy)?;
+    if members.len() != manifest.members.len() {
+        return Err(corrupt(
+            "supplied member count disagrees with storage-set manifest",
+        ));
+    }
+    let mut reports = Vec::with_capacity(members.len());
+    let mut matches_all = true;
+    for ((image_path, sidecar_path), expected) in members.iter().zip(&manifest.members) {
+        checkpoint(cx)?;
+        let actual_name = archive_file_name(sidecar_path)?;
+        if actual_name != expected.archive_filename {
+            return Err(corrupt(
+                "member sidecar filename disagrees with storage-set manifest binding",
+            ));
+        }
+        let report = verify(cx, image_path, sidecar_path)?;
+        let (_, digests) = read_archive_binding_digests(cx, sidecar_path)?;
+        if report.current_image_bytes != expected.geometry.backing_bytes
+            || digests.header_blake3 != expected.header_blake3
+            || digests.snapshot_digest != expected.snapshot_digest
+            || digests.tables_root != expected.tables_root
+        {
+            return Err(corrupt(
+                "member sidecar generation or tables digest disagrees with storage-set manifest",
+            ));
+        }
+        matches_all &= report.is_healthy();
+        reports.push(report);
+    }
+    Ok(StorageSetVerifyReport {
+        manifest,
+        member_reports: reports,
+        matches_all_members: matches_all,
+    })
+}
+
+/// Admission options when opening a live [`ProtectedStorageSet`].
+#[derive(Clone)]
+pub struct StorageSetOpenOptions {
+    pub read_only: bool,
+    pub allow_automatic_repair: bool,
+    pub trust_policy: TrustPolicy,
+    pub signing_key: Option<PorKey>,
+    pub calibration: Option<RepairLossCalibration>,
+    pub evidence_ledger: Option<SharedEvidenceLedger>,
+}
+
+impl std::fmt::Debug for StorageSetOpenOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageSetOpenOptions")
+            .field("read_only", &self.read_only)
+            .field("allow_automatic_repair", &self.allow_automatic_repair)
+            .field("has_signing_key", &self.signing_key.is_some())
+            .field("has_calibration", &self.calibration.is_some())
+            .field("has_evidence_ledger", &self.evidence_ledger.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for StorageSetOpenOptions {
+    fn default() -> Self {
+        Self {
+            read_only: false,
+            allow_automatic_repair: true,
+            trust_policy: TrustPolicy::AllowUnauthenticated,
+            signing_key: None,
+            calibration: Some(RepairLossCalibration::default_operator_exclusive()),
+            evidence_ledger: None,
+        }
+    }
+}
+
+/// Write-gating wrapper around one [`ProtectedStorageSet`] member, optionally
+/// bounded to `[offset, offset + length)` via [`VolumeDevice`].
+type BindingExtractor = Arc<dyn Fn(&Cx) -> Result<NativeCommitBinding> + Send + Sync>;
+
+struct MemberAccessDevice {
+    inner: Arc<SidecarImageDevice>,
+    writable: bool,
+    auto_seal: Option<(Arc<ProtectedStorageSet>, BindingExtractor)>,
+}
+
+impl std::fmt::Debug for MemberAccessDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemberAccessDevice")
+            .field("inner", &self.inner)
+            .field("writable", &self.writable)
+            .field("has_auto_seal", &self.auto_seal.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ByteDevice for MemberAccessDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_exact_at(cx, offset, buf)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        checkpoint(cx)?;
+        if !self.writable {
+            return Err(FfsError::ReadOnly);
+        }
+        self.inner.write_all_at(cx, offset, buf)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.inner.sync(cx)?;
+        if self.writable
+            && let Some((set, extractor)) = &self.auto_seal
+            && set.all_members_clean_and_manifest_fenced()
+        {
+            let binding = extractor(cx)?;
+            set.seal_manifest_when_members_clean(cx, binding)?;
+        }
+        Ok(())
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        if !self.writable {
+            return Err(FfsError::ReadOnly);
+        }
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
+    }
+}
+
+/// Handle to one admitted member inside a [`ProtectedStorageSet`].
+#[derive(Debug, Clone)]
+pub struct ProtectedMemberHandle {
+    pub member_index: u32,
+    pub role: MemberRole,
+    pub native_member_id: [u8; 16],
+    pub archive_filename: String,
+    pub offset: u64,
+    pub length: u64,
+    pub device: Arc<SidecarImageDevice>,
+}
+
+impl ProtectedMemberHandle {
+    /// Construct a [`ByteDevice`] bounded to `[offset, offset + length)` with
+    /// caller-write authority gated by `writable`.
+    pub fn open_bounded_device(&self, writable: bool) -> Result<Box<dyn ByteDevice>> {
+        self.open_bounded_device_internal(writable, None)
+    }
+
+    fn open_bounded_device_internal(
+        &self,
+        writable: bool,
+        auto_seal: Option<(Arc<ProtectedStorageSet>, BindingExtractor)>,
+    ) -> Result<Box<dyn ByteDevice>> {
+        let base = MemberAccessDevice {
+            inner: Arc::clone(&self.device),
+            writable,
+            auto_seal,
+        };
+        if self.offset == 0 && self.length == self.device.len_bytes() {
+            Ok(Box::new(base))
+        } else {
+            let sliced = VolumeDevice::from_range(base, self.offset, Some(self.length), !writable)?;
+            Ok(Box::new(sliced))
+        }
+    }
+}
+
+struct ManifestFenceSlot {
+    manifest_path: PathBuf,
+    file: File,
+    manifest: StorageSetManifest,
+    fenced: bool,
+    fenced_at_ns: Option<u64>,
+    poisoned: bool,
+    post_commit_error: Option<String>,
+    signing_key: Option<PorKey>,
+}
+
+impl ManifestFenceSlot {
+    fn fence(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        if self.poisoned {
+            return Err(corrupt(
+                "storage-set manifest coordinator is poisoned after an I/O failure",
+            ));
+        }
+        if self.fenced {
+            return Ok(());
+        }
+        let mut raw_prefix = [0_u8; SET_MANIFEST_PREFIX_BYTES];
+        if let Err(err) = self.file.read_exact_at(&mut raw_prefix, 0) {
+            self.poisoned = true;
+            return Err(err.into());
+        }
+        raw_prefix[..8].copy_from_slice(SET_PENDING_MAGIC);
+        if let Err(err) = self
+            .file
+            .write_all_at(&raw_prefix, 0)
+            .and_then(|()| self.file.sync_all())
+        {
+            self.poisoned = true;
+            return Err(err.into());
+        }
+        self.fenced = true;
+        self.fenced_at_ns = Some(now_unix_ns());
+        Ok(())
+    }
+}
+
+/// Live coordinator owning all required [`SidecarImageDevice`] members and
+/// optional [`StorageSetManifest`] (`FFSRQSM3` / `FFSRQPM3`).
+pub struct ProtectedStorageSet {
+    members: Vec<ProtectedMemberHandle>,
+    manifest_slot: Option<Arc<Mutex<ManifestFenceSlot>>>,
+    authenticated_provenance: bool,
+}
+
+impl std::fmt::Debug for ProtectedStorageSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtectedStorageSet")
+            .field("member_count", &self.members.len())
+            .field("has_manifest", &self.manifest_slot.is_some())
+            .field("authenticated_provenance", &self.authenticated_provenance)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtectedStorageSet {
+    /// Admit a single-member standalone sidecar (with optional bounded `[offset, length)` slice).
+    pub fn open_standalone(
+        cx: &Cx,
+        image_path: &Path,
+        sidecar_path: &Path,
+        offset: u64,
+        length: Option<u64>,
+        options: &StorageSetOpenOptions,
+    ) -> Result<Self> {
+        checkpoint(cx)?;
+        let require_trusted_root =
+            matches!(options.trust_policy, TrustPolicy::RequireTrustedRoot { .. });
+        if require_trusted_root {
+            return Err(corrupt(
+                "trusted-root provenance requires a signed storage-set manifest (--manifest + --trust-key-file); unkeyed standalone sidecar checksums are not authenticated",
+            ));
+        }
+        let live_opts = SidecarLiveOptions {
+            read_only: options.read_only,
+            allow_automatic_repair: options.allow_automatic_repair,
+            member_index: 0,
+            set_id_hex: None,
+            initial_generation: 1,
+            authenticated_provenance: false,
+            require_trusted_root: false,
+            calibration: options.calibration.clone(),
+            evidence_ledger: options.evidence_ledger.clone(),
+            external_fence_hook: None,
+        };
+        let device = Arc::new(SidecarImageDevice::open_with_options(
+            cx,
+            image_path,
+            sidecar_path,
+            live_opts,
+        )?);
+        let slice_len = resolve_slice_length(device.len_bytes(), offset, length)?;
+        let archive_filename = archive_file_name(sidecar_path)?;
+        Ok(Self {
+            members: vec![ProtectedMemberHandle {
+                member_index: 0,
+                role: MemberRole::Data,
+                native_member_id: [0_u8; 16],
+                archive_filename,
+                offset,
+                length: slice_len,
+                device,
+            }],
+            manifest_slot: None,
+            authenticated_provenance: false,
+        })
+    }
+
+    /// Admit a multi-member (or manifest-bound single-member) storage set against
+    /// its [`StorageSetManifest`] (`FFSRQSM3`) and `options.trust_policy`.
+    pub fn open_manifest(
+        cx: &Cx,
+        manifest_path: &Path,
+        member_paths: &[(PathBuf, PathBuf)],
+        options: &StorageSetOpenOptions,
+    ) -> Result<Self> {
+        checkpoint(cx)?;
+        let manifest_path = manifest_path.canonicalize()?;
+        let manifest_file = File::options()
+            .read(true)
+            .write(!options.read_only)
+            .open(&manifest_path)?;
+        let manifest_meta = manifest_file.metadata()?;
+        if !manifest_meta.is_file() {
+            return Err(corrupt("storage-set manifest must be a regular file"));
+        }
+        if options.read_only {
+            manifest_file.try_lock_shared().map_err(io::Error::from)?;
+        } else {
+            manifest_file.try_lock().map_err(io::Error::from)?;
+        }
+        let raw_manifest = std::fs::read(&manifest_path)?;
+        let manifest = StorageSetManifest::decode(&raw_manifest, options.trust_policy)?;
+        if member_paths.len() != manifest.members.len() {
+            return Err(corrupt(
+                "supplied member count disagrees with storage-set manifest",
+            ));
+        }
+        let authenticated = manifest.is_authenticated();
+        let require_trusted_root =
+            matches!(options.trust_policy, TrustPolicy::RequireTrustedRoot { .. });
+        let signing_key = match (options.signing_key, options.trust_policy) {
+            (Some(k), _) => Some(k),
+            (None, TrustPolicy::RequireTrustedRoot { key }) => Some(key),
+            (None, TrustPolicy::AllowUnauthenticated) => None,
+        };
+        if !options.read_only && authenticated && signing_key.is_none() {
+            return Err(corrupt(
+                "writable authenticated storage set requires its signing key (--trust-key-file) to seal future generations",
+            ));
+        }
+
+        let set_id_hex = manifest.set_id_hex();
+        let initial_gen = manifest.generation;
+        let expected_members = manifest.members.clone();
+        let slot = Arc::new(Mutex::new(ManifestFenceSlot {
+            manifest_path,
+            file: manifest_file,
+            manifest,
+            fenced: false,
+            fenced_at_ns: None,
+            poisoned: false,
+            post_commit_error: None,
+            signing_key,
+        }));
+
+        let mut handles = Vec::with_capacity(member_paths.len());
+        let mut seen_inodes = BTreeSet::new();
+        seen_inodes.insert((manifest_meta.dev(), manifest_meta.ino()));
+
+        for (idx, ((image_path, sidecar_path), expected)) in
+            member_paths.iter().zip(&expected_members).enumerate()
+        {
+            checkpoint(cx)?;
+            let actual_name = archive_file_name(sidecar_path)?;
+            if actual_name != expected.archive_filename {
+                return Err(corrupt(
+                    "member sidecar filename disagrees with storage-set manifest binding",
+                ));
+            }
+            let img_meta = std::fs::metadata(image_path)?;
+            let rq_meta = std::fs::metadata(sidecar_path)?;
+            if !seen_inodes.insert((img_meta.dev(), img_meta.ino()))
+                || !seen_inodes.insert((rq_meta.dev(), rq_meta.ino()))
+            {
+                return Err(corrupt(
+                    "duplicate image, sidecar, or manifest inode across storage set",
+                ));
+            }
+            let hook_slot = Arc::clone(&slot);
+            let fence_hook: Option<FenceHook> = if options.read_only {
+                None
+            } else {
+                Some(Arc::new(move |hook_cx: &Cx| {
+                    hook_slot.lock().fence(hook_cx)
+                }))
+            };
+            let live_opts = SidecarLiveOptions {
+                read_only: options.read_only,
+                allow_automatic_repair: options.allow_automatic_repair,
+                member_index: u32::try_from(idx).map_err(|_| corrupt("member index overflow"))?,
+                set_id_hex: Some(set_id_hex.clone()),
+                initial_generation: initial_gen,
+                authenticated_provenance: authenticated,
+                require_trusted_root,
+                calibration: options.calibration.clone(),
+                evidence_ledger: options.evidence_ledger.clone(),
+                external_fence_hook: fence_hook,
+            };
+            let device = Arc::new(SidecarImageDevice::open_with_options(
+                cx,
+                image_path,
+                sidecar_path,
+                live_opts,
+            )?);
+            let (geo, digests) = device.clean_binding_digests(cx)?;
+            if geo.backing_bytes != expected.geometry.backing_bytes
+                || geo.block_size != expected.geometry.block_size
+                || geo.group_blocks != expected.geometry.group_blocks
+                || geo.repair_symbols != expected.geometry.repair_symbols
+                || geo.groups != expected.geometry.groups
+                || digests.header_blake3 != expected.header_blake3
+                || digests.snapshot_digest != expected.snapshot_digest
+                || digests.tables_root != expected.tables_root
+            {
+                return Err(corrupt(
+                    "member sidecar archive disagrees with storage-set manifest generation or geometry",
+                ));
+            }
+            let _ = resolve_slice_length(
+                geo.backing_bytes,
+                expected.geometry.offset,
+                Some(expected.geometry.length),
+            )?;
+            handles.push(ProtectedMemberHandle {
+                member_index: expected.member_index,
+                role: expected.role,
+                native_member_id: expected.native_member_id,
+                archive_filename: actual_name,
+                offset: expected.geometry.offset,
+                length: expected.geometry.length,
+                device,
+            });
+        }
+
+        Ok(Self {
+            members: handles,
+            manifest_slot: Some(slot),
+            authenticated_provenance: authenticated,
+        })
+    }
+
+    /// Admitted member handles in manifest order (`0..N`).
+    #[must_use]
+    pub fn members(&self) -> &[ProtectedMemberHandle] {
+        &self.members
+    }
+
+    /// Primary member (`index 0`) device handle.
+    #[must_use]
+    pub fn primary_device(&self) -> &Arc<SidecarImageDevice> {
+        &self.members[0].device
+    }
+
+    /// Snapshot of the current [`StorageSetManifest`], if manifest-backed.
+    #[must_use]
+    pub fn manifest(&self) -> Option<StorageSetManifest> {
+        self.manifest_slot
+            .as_ref()
+            .map(|slot| slot.lock().manifest.clone())
+    }
+
+    /// Whether provenance is cryptographically authenticated via a trusted root key.
+    #[must_use]
+    pub const fn is_authenticated(&self) -> bool {
+        self.authenticated_provenance
+    }
+
+    /// Total RaptorQ protection groups across all admitted members.
+    #[must_use]
+    pub fn protection_group_count(&self) -> u32 {
+        self.members.iter().fold(0_u32, |acc, m| {
+            acc.saturating_add(m.device.protection_group_count())
+        })
+    }
+
+    /// Durably fence the storage-set manifest (`FFSRQPM3`) and primary member
+    /// (`FFSRQPD2`) BEFORE an in-memory MVCC/CoW mutation publishes new state.
+    pub fn fence_before_mutation(&self, cx: &Cx) -> Result<()> {
+        if let Some(slot) = &self.manifest_slot {
+            slot.lock().fence(cx)?;
+        }
+        for member in &self.members {
+            member.device.fence_before_mutation(cx)?;
+        }
+        Ok(())
+    }
+
+    /// Record a committed native format token (`native_durable = true`) across
+    /// all members before or during parity sealing.
+    pub fn record_native_commit(&self, binding: &NativeCommitBinding) {
+        for member in &self.members {
+            member.device.record_native_commit(binding);
+        }
+    }
+
+    /// Construct a bounded [`ByteDevice`] for `member_index` that automatically
+    /// seals the [`StorageSetManifest`] once all members reach `Phase::Clean`.
+    pub fn open_member_device_with_auto_seal(
+        self: &Arc<Self>,
+        member_index: usize,
+        writable: bool,
+        extractor: BindingExtractor,
+    ) -> Result<Box<dyn ByteDevice>> {
+        let handle = self
+            .members
+            .get(member_index)
+            .ok_or_else(|| corrupt("storage-set member index out of bounds"))?;
+        let auto_seal = if writable && self.manifest_slot.is_some() {
+            Some((Arc::clone(self), extractor))
+        } else {
+            None
+        };
+        handle.open_bounded_device_internal(writable, auto_seal)
+    }
+
+    fn all_members_clean_and_manifest_fenced(&self) -> bool {
+        let Some(slot) = &self.manifest_slot else {
+            return false;
+        };
+        if !slot.lock().fenced {
+            return false;
+        }
+        self.members
+            .iter()
+            .all(|m| m.device.ack_status().protected_durable)
+    }
+
+    fn seal_manifest_when_members_clean(
+        &self,
+        cx: &Cx,
+        native_binding: NativeCommitBinding,
+    ) -> Result<()> {
+        self.record_native_commit(&native_binding);
+        self.seal_manifest_inner(cx, native_binding)
+    }
+
+    /// Seal every member archive FIRST, then atomically publish the updated
+    /// [`StorageSetManifest`] (`FFSRQSM3`, `generation + 1`) LAST with directory sync.
+    pub fn seal_committed(&self, cx: &Cx, native_binding: NativeCommitBinding) -> Result<()> {
+        self.record_native_commit(&native_binding);
+        for member in &self.members {
+            if let Err(err) = member.device.sync(cx) {
+                if let Some(slot) = &self.manifest_slot {
+                    slot.lock().post_commit_error = Some(err.to_string());
+                }
+                return Err(err);
+            }
+        }
+        self.seal_manifest_inner(cx, native_binding)
+    }
+
+    fn seal_manifest_inner(&self, cx: &Cx, native_binding: NativeCommitBinding) -> Result<()> {
+        let Some(slot_arc) = &self.manifest_slot else {
+            return Ok(());
+        };
+        let mut slot = slot_arc.lock();
+        if slot.poisoned {
+            return Err(corrupt(
+                "storage-set manifest coordinator is poisoned after an I/O failure",
+            ));
+        }
+        let mut bindings = Vec::with_capacity(self.members.len());
+        let mut any_digest_changed = false;
+        for (member, prev) in self.members.iter().zip(&slot.manifest.members) {
+            let (mut geo, digests) = member.device.clean_binding_digests(cx)?;
+            geo.offset = member.offset;
+            geo.length = member.length;
+            if digests.header_blake3 != prev.header_blake3
+                || digests.snapshot_digest != prev.snapshot_digest
+                || digests.tables_root != prev.tables_root
+            {
+                any_digest_changed = true;
+            }
+            bindings.push(MemberProtectionBinding {
+                member_index: member.member_index,
+                role: member.role,
+                native_member_id: member.native_member_id,
+                geometry: geo,
+                archive_filename: member.archive_filename.clone(),
+                header_blake3: digests.header_blake3,
+                snapshot_digest: digests.snapshot_digest,
+                tables_root: digests.tables_root,
+            });
+        }
+        let binding_changed = native_binding != slot.manifest.native_binding;
+        if !slot.fenced && !any_digest_changed && !binding_changed {
+            return checkpoint(cx);
+        }
+        let next_gen = slot
+            .manifest
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| corrupt("storage-set manifest generation overflow"))?;
+        let mut next_manifest = slot.manifest.clone();
+        next_manifest.generation = next_gen;
+        next_manifest.native_binding = native_binding;
+        next_manifest.members = bindings;
+
+        let publish_res = (|| -> Result<()> {
+            checkpoint(cx)?;
+            let encoded = next_manifest.encode(slot.signing_key.as_ref())?;
+            let verify_policy = slot
+                .signing_key
+                .map_or(TrustPolicy::AllowUnauthenticated, |key| {
+                    TrustPolicy::RequireTrustedRoot { key }
+                });
+            let verified_manifest = StorageSetManifest::decode(&encoded, verify_policy)?;
+            let mut staged = NamedTempFile::new_in(parent_path(&slot.manifest_path))?;
+            staged.as_file().try_lock().map_err(io::Error::from)?;
+            staged.write_all(&encoded)?;
+            staged.as_file().sync_all()?;
+            checkpoint(cx)?;
+            let old_meta = slot.file.metadata()?;
+            let named_meta = std::fs::metadata(&slot.manifest_path)?;
+            if (old_meta.dev(), old_meta.ino()) != (named_meta.dev(), named_meta.ino()) {
+                return Err(corrupt(
+                    "storage-set manifest path was replaced by another writer",
+                ));
+            }
+            let parent = File::open(parent_path(&slot.manifest_path))?;
+            let new_file = staged
+                .persist(&slot.manifest_path)
+                .map_err(|err| FfsError::Io(err.error))?;
+            slot.poisoned = true;
+            slot.file = new_file;
+            parent.sync_all()?;
+            slot.manifest = verified_manifest;
+            slot.fenced = false;
+            slot.fenced_at_ns = None;
+            slot.post_commit_error = None;
+            slot.poisoned = false;
+            Ok(())
+        })();
+        if let Err(ref err) = publish_res {
+            slot.post_commit_error = Some(err.to_string());
+        }
+        publish_res
+    }
+
+    /// Aggregate separate `native_durable` vs `protected_durable` status across
+    /// all members and the whole-set manifest (`bd-tqrnc`).
+    #[must_use]
+    pub fn ack_status(&self) -> ProtectionAckStatus {
+        let mut base = self.members[0].device.ack_status();
+        for member in &self.members[1..] {
+            let status = member.device.ack_status();
+            base.native_durable &= status.native_durable;
+            base.protected_durable &= status.protected_durable;
+            base.unprotected_interval_ns = base
+                .unprotected_interval_ns
+                .max(status.unprotected_interval_ns);
+            if base.post_commit_error.is_none() {
+                base.post_commit_error = status.post_commit_error;
+            }
+        }
+        if let Some(slot_arc) = &self.manifest_slot {
+            let slot = slot_arc.lock();
+            base.epoch_generation = slot.manifest.generation;
+            if slot.fenced || slot.poisoned {
+                base.protected_durable = false;
+                if let Some(fenced_at) = slot.fenced_at_ns {
+                    let live_ns = now_unix_ns().saturating_sub(fenced_at);
+                    base.unprotected_interval_ns = base.unprotected_interval_ns.max(live_ns);
+                }
+            }
+            if base.post_commit_error.is_none() {
+                base.post_commit_error.clone_from(&slot.post_commit_error);
+            }
+        }
+        base
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sidecar::{SidecarOptions, protect, verify};
     use crate::sidecar_restore::restore;
 
     mod read_only;
@@ -2212,7 +3520,8 @@ mod tests {
             let cut = std::env::var(CUT).expect("crash cut");
             if cut == "fence" {
                 let mut state = device.lock(&cx).expect("state");
-                SidecarImageDevice::fence(&cx, &mut state)
+                device
+                    .fence(&cx, &mut state)
                     .expect("durable fence before source write");
             } else {
                 device
@@ -2784,5 +4093,613 @@ mod tests {
         let cx = Cx::for_testing();
         cx.set_cancel_requested(true);
         assert!(matches!(device.sync(&cx), Err(FfsError::Cancelled)));
+    }
+
+    fn zfs_mirror_binding(txg: u64, generation: u64, seed: u8) -> NativeCommitBinding {
+        NativeCommitBinding::Zfs {
+            pool_guid: 0x5A46_535F_5445_5354,
+            top_guid: 0x7777_8888_9999_AAAA,
+            member_guids: vec![0x1001_0000_0000_0001, 0x1002_0000_0000_0002],
+            guid_sum: 0x5A46_535F_5445_5354_u64
+                .wrapping_add(0x7777_8888_9999_AAAA)
+                .wrapping_add(0x1001_0000_0000_0001)
+                .wrapping_add(0x1002_0000_0000_0002),
+            version: 5000,
+            ashift: 9,
+            asize: 16 * 512,
+            label_txg: 20,
+            committed_txg: txg,
+            published_slot: u32::try_from(txg % 128).unwrap(),
+            root_bp_blake3: [seed; 32],
+            generation,
+            operation_digest: [seed.wrapping_add(1); 32],
+        }
+    }
+
+    fn copy_storage_set_cut(
+        manifest: &Path,
+        members: &[(PathBuf, PathBuf)],
+    ) -> (tempfile::TempDir, PathBuf, Vec<(PathBuf, PathBuf)>) {
+        let cut_dir = tempfile::tempdir().expect("cut dir");
+        let cut_manifest = cut_dir.path().join("set.ffsrqset");
+        std::fs::copy(manifest, &cut_manifest).expect("copy manifest");
+        let mut cut_members = Vec::with_capacity(members.len());
+        for (idx, (img, rq)) in members.iter().enumerate() {
+            let dst_img = cut_dir.path().join(format!("m{idx}.img"));
+            let rq_name = rq.file_name().unwrap();
+            let dst_rq = cut_dir.path().join(rq_name);
+            std::fs::copy(img, &dst_img).expect("copy img");
+            std::fs::copy(rq, &dst_rq).expect("copy rq");
+            cut_members.push((dst_img, dst_rq));
+        }
+        (cut_dir, cut_manifest, cut_members)
+    }
+
+    #[test]
+    fn bd_tqrnc_storage_set_persistence_prefix_multi_device_cuts_and_ack_ledger() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m0_img = dir.path().join("m0.img");
+        let m0_rq = dir.path().join("m0.ffsrq");
+        let m1_img = dir.path().join("m1.img");
+        let m1_rq = dir.path().join("m1.ffsrq");
+        let manifest_path = dir.path().join("pool.ffsrqset");
+        let ledger_path = dir.path().join("evidence.jsonl");
+
+        let g1_m0: Vec<u8> = (0_u32..(16 * 512))
+            .map(|i| u8::try_from((i * 7 + 3) % 251).unwrap())
+            .collect();
+        let g1_m1: Vec<u8> = (0_u32..(16 * 512))
+            .map(|i| u8::try_from((i * 11 + 5) % 251).unwrap())
+            .collect();
+        std::fs::write(&m0_img, &g1_m0).unwrap();
+        std::fs::write(&m1_img, &g1_m1).unwrap();
+
+        let key: PorKey = [0x42; 32];
+        let mut id0 = [0_u8; 16];
+        id0[..8].copy_from_slice(&0x1001_0000_0000_0001_u64.to_le_bytes());
+        let mut id1 = [0_u8; 16];
+        id1[..8].copy_from_slice(&0x1002_0000_0000_0002_u64.to_le_bytes());
+
+        let g1_binding = zfs_mirror_binding(20, 0, 0x11);
+        let manifest = protect_storage_set(
+            &cx,
+            &StorageSetProtectRequest {
+                manifest_path: manifest_path.clone(),
+                filesystem: "zfs".to_owned(),
+                topology: StorageSetTopology::ZfsMirror { width: 2 },
+                view: ProtectedViewIdentity {
+                    partition_selector: None,
+                    zfs_dataset: vec!["data".to_owned()],
+                    btrfs_subvolume_id: None,
+                },
+                native_binding: g1_binding,
+                members: vec![
+                    StorageSetMemberSpec {
+                        role: MemberRole::Data,
+                        image_path: m0_img.clone(),
+                        sidecar_path: m0_rq.clone(),
+                        native_member_id: id0,
+                        offset: 0,
+                        length: None,
+                    },
+                    StorageSetMemberSpec {
+                        role: MemberRole::Data,
+                        image_path: m1_img.clone(),
+                        sidecar_path: m1_rq.clone(),
+                        native_member_id: id1,
+                        offset: 0,
+                        length: None,
+                    },
+                ],
+                options: SidecarOptions {
+                    block_size: 512,
+                    group_blocks: 8,
+                    repair_symbols: 4,
+                },
+                signing_key: Some(key),
+            },
+        )
+        .expect("protect 2-member ZFS mirror set");
+        assert_eq!(manifest.generation, 1);
+        assert!(manifest.is_authenticated());
+
+        let member_paths = vec![(m0_img.clone(), m0_rq.clone()), (m1_img.clone(), m1_rq)];
+
+        // Cut 0: verified G_1 set admits cleanly under RequireTrustedRoot and rejects wrong PorKey.
+        let verified_g1 = verify_storage_set(
+            &cx,
+            &manifest_path,
+            &member_paths,
+            TrustPolicy::RequireTrustedRoot { key },
+        )
+        .expect("verify G_1");
+        assert!(verified_g1.is_healthy());
+        assert!(
+            verify_storage_set(
+                &cx,
+                &manifest_path,
+                &member_paths,
+                TrustPolicy::RequireTrustedRoot { key: [0x99; 32] },
+            )
+            .is_err(),
+            "wrong PorKey must refuse manifest verification"
+        );
+
+        let ledger = open_shared_evidence_ledger(&ledger_path).expect("open ledger");
+        let open_opts = StorageSetOpenOptions {
+            read_only: false,
+            allow_automatic_repair: true,
+            trust_policy: TrustPolicy::RequireTrustedRoot { key },
+            signing_key: Some(key),
+            calibration: Some(RepairLossCalibration::default_operator_exclusive()),
+            evidence_ledger: Some(Arc::clone(&ledger)),
+        };
+        let set =
+            ProtectedStorageSet::open_manifest(&cx, &manifest_path, &member_paths, &open_opts)
+                .expect("admit live storage set");
+        assert!(set.is_authenticated());
+        let ack0 = set.ack_status();
+        assert!(ack0.native_durable);
+        assert!(ack0.protected_durable);
+        assert_eq!(ack0.epoch_generation, 1);
+        assert!(ack0.post_commit_error.is_none());
+
+        let dev0 = set.members()[0].open_bounded_device(true).unwrap();
+        let dev1 = set.members()[1].open_bounded_device(true).unwrap();
+
+        // Cut 1: Multi-barrier durability deferral + member 0 write + intermediate barrier.
+        // Neither member archive nor manifest may prematurely seal!
+        dev0.begin_durability_commit(&cx).unwrap();
+        dev1.begin_durability_commit(&cx).unwrap();
+        dev0.write_all_at(&cx, ByteOffset(2 * 512), &[0xA5; 512])
+            .unwrap();
+        dev0.sync(&cx).expect("intermediate child-block barrier");
+
+        assert_eq!(
+            &std::fs::read(&manifest_path).unwrap()[..8],
+            SET_PENDING_MAGIC
+        );
+        assert_eq!(&std::fs::read(&m0_rq).unwrap()[..8], PENDING_MAGIC);
+        let ack1 = set.ack_status();
+        assert!(!ack1.native_durable);
+        assert!(!ack1.protected_durable);
+
+        {
+            let (_cut_dir, cut_manifest, cut_members) =
+                copy_storage_set_cut(&manifest_path, &member_paths);
+            let cut_before_m0 = std::fs::read(&cut_members[0].0).unwrap();
+            assert!(
+                ProtectedStorageSet::open_manifest(
+                    &cx,
+                    &cut_manifest,
+                    &cut_members,
+                    &StorageSetOpenOptions {
+                        evidence_ledger: None,
+                        ..open_opts.clone()
+                    },
+                )
+                .is_err(),
+                "Cut 1 (in-flight uncommitted epoch) must refuse live admission"
+            );
+            assert_eq!(
+                std::fs::read(&cut_members[0].0).unwrap(),
+                cut_before_m0,
+                "refusal at Cut 1 must never roll back or mutate member bytes"
+            );
+        }
+
+        // Cut 2: Both members complete native commit (`native_durable = true`),
+        // BEFORE parity refresh (`protected_durable = false`).
+        dev1.write_all_at(&cx, ByteOffset(2 * 512), &[0xB6; 512])
+            .unwrap();
+        dev1.sync(&cx).expect("member 1 intermediate barrier");
+        dev0.complete_durability_commit();
+        dev1.complete_durability_commit();
+        let g2_binding = zfs_mirror_binding(21, 1, 0x22);
+        set.record_native_commit(&g2_binding);
+
+        let ack2 = set.ack_status();
+        assert!(
+            ack2.native_durable && !ack2.protected_durable,
+            "Cut 2 must report native_durable=true and protected_durable=false separately: {ack2:?}"
+        );
+
+        // Cut 3: Torn 1-of-2 member seal (member 0 sealed, member 1 still dirty, manifest fenced).
+        set.members()[0]
+            .device
+            .sync(&cx)
+            .expect("seal member 0 only");
+        assert!(set.members()[0].device.ack_status().protected_durable);
+        assert!(!set.members()[1].device.ack_status().protected_durable);
+        assert!(!set.ack_status().protected_durable);
+        {
+            let (_cut_dir, cut_manifest, cut_members) =
+                copy_storage_set_cut(&manifest_path, &member_paths);
+            assert!(
+                verify_storage_set(
+                    &cx,
+                    &cut_manifest,
+                    &cut_members,
+                    TrustPolicy::RequireTrustedRoot { key },
+                )
+                .is_err(),
+                "Cut 3 (torn 1-of-2 member seal with pending manifest) must fail verification"
+            );
+            assert!(
+                ProtectedStorageSet::open_manifest(
+                    &cx,
+                    &cut_manifest,
+                    &cut_members,
+                    &StorageSetOpenOptions {
+                        evidence_ledger: None,
+                        ..open_opts.clone()
+                    },
+                )
+                .is_err(),
+                "Cut 3 must refuse live storage-set admission"
+            );
+        }
+
+        // Cut 4: Complete whole-set seal (`G_2`) and verify authenticated manifest + self-healing!
+        set.seal_committed(&cx, g2_binding.clone())
+            .expect("seal whole storage set G_2");
+        let ack4 = set.ack_status();
+        assert!(ack4.native_durable);
+        assert!(ack4.protected_durable);
+        assert_eq!(ack4.epoch_generation, 2);
+        assert!(ack4.post_commit_error.is_none());
+        assert_eq!(set.manifest().unwrap().native_binding, g2_binding);
+
+        let mut expected_m0 = g1_m0;
+        expected_m0[2 * 512..3 * 512].fill(0xA5);
+        let mut expected_m1 = g1_m1;
+        expected_m1[2 * 512..3 * 512].fill(0xB6);
+        drop(dev0);
+        drop(dev1);
+        drop(set);
+
+        let verified_g2 = verify_storage_set(
+            &cx,
+            &manifest_path,
+            &member_paths,
+            TrustPolicy::RequireTrustedRoot { key },
+        )
+        .expect("verify G_2");
+        assert!(verified_g2.is_healthy());
+        assert_eq!(verified_g2.manifest.generation, 2);
+        assert_eq!(verified_g2.manifest.native_binding, g2_binding);
+
+        // Reopen G_2, inject 2-block media corruption in BOTH members, and prove read self-healing
+        // restores G_2 (never rolling back to G_1) and logs ProtectedRepairGate decisions!
+        let reopened =
+            ProtectedStorageSet::open_manifest(&cx, &manifest_path, &member_paths, &open_opts)
+                .expect("reopen G_2");
+        File::options()
+            .write(true)
+            .open(&m0_img)
+            .unwrap()
+            .write_all_at(&[0xEE; 1024], 2 * 512)
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&m1_img)
+            .unwrap()
+            .write_all_at(&[0xDD; 1024], 2 * 512)
+            .unwrap();
+
+        let r_dev0 = reopened.members()[0].open_bounded_device(false).unwrap();
+        let r_dev1 = reopened.members()[1].open_bounded_device(false).unwrap();
+        let mut buf0 = vec![0_u8; 16 * 512];
+        let mut buf1 = vec![0_u8; 16 * 512];
+        r_dev0.read_exact_at(&cx, ByteOffset(0), &mut buf0).unwrap();
+        r_dev1.read_exact_at(&cx, ByteOffset(0), &mut buf1).unwrap();
+        assert_eq!(buf0, expected_m0);
+        assert_eq!(buf1, expected_m1);
+        assert_eq!(std::fs::read(&m0_img).unwrap(), expected_m0);
+        assert_eq!(std::fs::read(&m1_img).unwrap(), expected_m1);
+        drop(r_dev0);
+        drop(r_dev1);
+        drop(reopened);
+
+        let records = crate::evidence::parse_evidence_ledger(&std::fs::read(&ledger_path).unwrap());
+        assert!(
+            records.iter().any(|r| {
+                r.protected_commit_ack
+                    .as_ref()
+                    .is_some_and(|ack| ack.native_durable && !ack.protected_durable)
+            }),
+            "ledger must record unprotected native-durable interval"
+        );
+        assert!(
+            records.iter().any(|r| {
+                r.protected_commit_ack
+                    .as_ref()
+                    .is_some_and(|ack| ack.native_durable && ack.protected_durable)
+            }),
+            "ledger must record sealed protected-durable acknowledgment"
+        );
+        assert!(
+            records.iter().any(|r| {
+                r.protected_repair_gate.as_ref().is_some_and(|gate| {
+                    gate.authorized
+                        && gate.authenticated_provenance
+                        && gate.expected_repair_loss.unwrap_or(f64::INFINITY)
+                            < gate.refusal_loss.unwrap_or(0.0)
+                })
+            }),
+            "ledger must record authorized two-stage expected-loss repair gate"
+        );
+    }
+
+    #[test]
+    fn bd_tqrnc_expected_loss_gate_and_provenance_refusal_controls() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = dir.path().join("single.img");
+        let rq = dir.path().join("single.ffsrq");
+        let ledger_path = dir.path().join("refusal.jsonl");
+        let orig: Vec<u8> = (0_u32..(16 * 512))
+            .map(|i| u8::try_from((i * 13 + 7) % 251).unwrap())
+            .collect();
+        std::fs::write(&img, &orig).unwrap();
+        protect(
+            &cx,
+            &img,
+            &rq,
+            SidecarOptions {
+                block_size: 512,
+                group_blocks: 8,
+                repair_symbols: 4,
+            },
+        )
+        .unwrap();
+
+        // 1. Standalone unkeyed sidecar MUST refuse RequireTrustedRoot.
+        let key: PorKey = [0x55; 32];
+        let unauth_err = ProtectedStorageSet::open_standalone(
+            &cx,
+            &img,
+            &rq,
+            0,
+            None,
+            &StorageSetOpenOptions {
+                trust_policy: TrustPolicy::RequireTrustedRoot { key },
+                ..StorageSetOpenOptions::default()
+            },
+        )
+        .expect_err("unkeyed standalone checksums are not authenticated provenance");
+        assert!(unauth_err.to_string().contains("trusted-root provenance"));
+
+        // 2. Missing calibration (`None`) MUST refuse automatic repair writeback and log ProtectedRepairGate(authorized=false).
+        let ledger = open_shared_evidence_ledger(&ledger_path).unwrap();
+        {
+            let set_no_cal = ProtectedStorageSet::open_standalone(
+                &cx,
+                &img,
+                &rq,
+                0,
+                None,
+                &StorageSetOpenOptions {
+                    calibration: None,
+                    evidence_ledger: Some(Arc::clone(&ledger)),
+                    ..StorageSetOpenOptions::default()
+                },
+            )
+            .unwrap();
+            File::options()
+                .write(true)
+                .open(&img)
+                .unwrap()
+                .write_all_at(&[0xEE; 512], 0)
+                .unwrap();
+            let corrupted_snapshot = std::fs::read(&img).unwrap();
+            let mut buf = [0_u8; 512];
+            let err = set_no_cal
+                .primary_device()
+                .read_exact_at(&cx, ByteOffset(0), &mut buf)
+                .expect_err("missing calibration must refuse automatic repair");
+            assert!(
+                err.to_string().contains("MissingCalibration"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(
+                std::fs::read(&img).unwrap(),
+                corrupted_snapshot,
+                "missing calibration refusal must not write to backing image"
+            );
+        }
+        std::fs::write(&img, &orig).unwrap();
+
+        // 3. Unfavorable calibration ((1 - q)*L_wrong + C_repair > L_refusal) MUST refuse writeback.
+        {
+            let unfavorable = RepairLossCalibration {
+                c_repair: 10.0,
+                l_wrong: 10_000.0,
+                l_refusal: 100.0,
+                q_correct: 0.5,
+                provenance: "adversarial-high-wrong-loss".to_owned(),
+            };
+            let set_unfav = ProtectedStorageSet::open_standalone(
+                &cx,
+                &img,
+                &rq,
+                0,
+                None,
+                &StorageSetOpenOptions {
+                    calibration: Some(unfavorable),
+                    evidence_ledger: Some(Arc::clone(&ledger)),
+                    ..StorageSetOpenOptions::default()
+                },
+            )
+            .unwrap();
+            File::options()
+                .write(true)
+                .open(&img)
+                .unwrap()
+                .write_all_at(&[0xCC; 512], 512)
+                .unwrap();
+            let corrupted_snapshot = std::fs::read(&img).unwrap();
+            let mut buf = [0_u8; 512];
+            let err = set_unfav
+                .primary_device()
+                .read_exact_at(&cx, ByteOffset(512), &mut buf)
+                .expect_err("unfavorable expected loss must refuse automatic repair");
+            assert!(
+                err.to_string().contains("ExpectedLossNotLowerThanRefusal"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(std::fs::read(&img).unwrap(), corrupted_snapshot);
+        }
+        std::fs::write(&img, &orig).unwrap();
+
+        let records = crate::evidence::parse_evidence_ledger(&std::fs::read(&ledger_path).unwrap());
+        let refusals = records
+            .iter()
+            .filter(|r| {
+                r.protected_repair_gate
+                    .as_ref()
+                    .is_some_and(|g| !g.authorized)
+            })
+            .count();
+        assert!(
+            refusals >= 2,
+            "expected >= 2 logged repair-gate refusals, got {refusals}"
+        );
+
+        // 4. Unsigned manifest refused under RequireTrustedRoot; stale G_1 member archive and swapped
+        // member archives refused after G_2 legitimate write without rolling back!
+        let m1_img = dir.path().join("m1.img");
+        let m1_rq = dir.path().join("m1.ffsrq");
+        std::fs::write(&m1_img, &orig).unwrap();
+        let unsigned_manifest = dir.path().join("unsigned.ffsrqset");
+        protect_storage_set(
+            &cx,
+            &StorageSetProtectRequest {
+                manifest_path: unsigned_manifest.clone(),
+                filesystem: "zfs".to_owned(),
+                topology: StorageSetTopology::ZfsMirror { width: 2 },
+                view: ProtectedViewIdentity::default(),
+                native_binding: zfs_mirror_binding(20, 0, 0x31),
+                members: vec![
+                    StorageSetMemberSpec {
+                        role: MemberRole::Data,
+                        image_path: img.clone(),
+                        sidecar_path: rq.clone(),
+                        native_member_id: [1; 16],
+                        offset: 0,
+                        length: None,
+                    },
+                    StorageSetMemberSpec {
+                        role: MemberRole::Data,
+                        image_path: m1_img.clone(),
+                        sidecar_path: m1_rq.clone(),
+                        native_member_id: [2; 16],
+                        offset: 0,
+                        length: None,
+                    },
+                ],
+                options: SidecarOptions {
+                    block_size: 512,
+                    group_blocks: 8,
+                    repair_symbols: 4,
+                },
+                signing_key: None,
+            },
+        )
+        .unwrap();
+        let members = vec![(img.clone(), rq.clone()), (m1_img.clone(), m1_rq.clone())];
+        assert!(
+            verify_storage_set(
+                &cx,
+                &unsigned_manifest,
+                &members,
+                TrustPolicy::RequireTrustedRoot { key },
+            )
+            .is_err(),
+            "unsigned manifest must fail RequireTrustedRoot"
+        );
+
+        let g1_rq0_saved = std::fs::read(&rq).unwrap();
+        {
+            let set = ProtectedStorageSet::open_manifest(
+                &cx,
+                &unsigned_manifest,
+                &members,
+                &StorageSetOpenOptions::default(),
+            )
+            .unwrap();
+            let d0 = set.members()[0].open_bounded_device(true).unwrap();
+            d0.write_all_at(&cx, ByteOffset(0), &[0x77; 512]).unwrap();
+            set.seal_committed(&cx, zfs_mirror_binding(21, 1, 0x32))
+                .unwrap();
+        }
+        let g2_img0 = std::fs::read(&img).unwrap();
+
+        // Swapped member sidecars refused!
+        let swapped = vec![(img.clone(), m1_rq), (m1_img, rq.clone())];
+        assert!(
+            ProtectedStorageSet::open_manifest(
+                &cx,
+                &unsigned_manifest,
+                &swapped,
+                &StorageSetOpenOptions::default(),
+            )
+            .is_err(),
+            "swapped member archives must be refused"
+        );
+
+        // Transplant checksum-valid stale G_1 archive onto member 0 after G_2 seal -> refused, never rolled back!
+        std::fs::write(&rq, &g1_rq0_saved).unwrap();
+        assert!(
+            verify_storage_set(
+                &cx,
+                &unsigned_manifest,
+                &members,
+                TrustPolicy::AllowUnauthenticated,
+            )
+            .is_err(),
+            "stale G_1 member archive must fail G_2 manifest verification"
+        );
+        assert!(
+            ProtectedStorageSet::open_manifest(
+                &cx,
+                &unsigned_manifest,
+                &members,
+                &StorageSetOpenOptions::default(),
+            )
+            .is_err(),
+            "stale G_1 member archive must fail live admission"
+        );
+        assert_eq!(
+            std::fs::read(&img).unwrap(),
+            g2_img0,
+            "stale G_1 archive must never roll member 0 back to G_1"
+        );
+    }
+
+    #[test]
+    fn bd_tqrnc_abort_durability_commit_after_escaped_write_poisons_and_refuses_seal() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+
+        device.begin_durability_commit(&cx).unwrap();
+        device
+            .write_all_at(&cx, ByteOffset(512), &[0xAB; 512])
+            .unwrap();
+        device.abort_durability_commit();
+
+        let err = device.sync(&cx).expect_err(
+            "aborted multi-barrier commit with escaped writes must poison and refuse seal",
+        );
+        assert!(err.to_string().contains("poisoned"));
+        let status = device.ack_status();
+        assert!(!status.native_durable);
+        assert!(!status.protected_durable);
+        drop(device);
+
+        // Pending archive header (`FFSRQPD2`) guarantees reopen also refuses uncommitted state!
+        assert!(SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).is_err());
     }
 }

@@ -16,11 +16,12 @@
 pub mod live;
 
 use crate::codec::encode_group;
+use crate::por::{PorKey, compute_authenticator, verify_authenticator};
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Write};
@@ -638,6 +639,444 @@ pub fn verify(cx: &Cx, image_path: &Path, sidecar_path: &Path) -> Result<Sidecar
         && report.unreadable_blocks == 0
         && snapshot.finalize().as_bytes() == &header.snapshot_digest;
     Ok(report)
+}
+
+// ── Whole-Storage-Set Manifest, Provenance & Native Commit Binding (`bd-tqrnc`) ─
+
+/// Magic bytes for a sealed multi-member storage-set protection manifest.
+pub const SET_MANIFEST_MAGIC: &[u8; 8] = b"FFSRQSM3";
+/// Magic bytes written durably at offset 0 before any member mutation begins.
+pub const SET_PENDING_MAGIC: &[u8; 8] = b"FFSRQPM3";
+/// Current storage-set manifest schema version.
+pub const SET_MANIFEST_VERSION: u32 = 3;
+pub(crate) const SET_MANIFEST_PREFIX_BYTES: usize = 64;
+const SET_MANIFEST_TRAILER_BYTES: usize = 64;
+const SET_MANIFEST_FLAG_AUTHENTICATED: u32 = 1;
+const MAX_SET_MANIFEST_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Required role of an individual member within a protected storage set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRole {
+    Data,
+    Log,
+    Special,
+}
+
+/// Bounded physical geometry of one member and its RaptorQ group layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberSliceGeometry {
+    pub backing_bytes: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub block_size: u32,
+    pub group_blocks: u32,
+    pub repair_symbols: u32,
+    pub groups: u32,
+}
+
+/// Cryptographic binding of one member's sidecar archive inside a [`StorageSetManifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberProtectionBinding {
+    pub member_index: u32,
+    pub role: MemberRole,
+    pub native_member_id: [u8; 16],
+    pub geometry: MemberSliceGeometry,
+    pub archive_filename: String,
+    pub header_blake3: [u8; 32],
+    pub snapshot_digest: [u8; 32],
+    pub tables_root: [u8; 32],
+}
+
+/// Required topology of the complete storage set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum StorageSetTopology {
+    SingleData,
+    Ext4WithExternalLog,
+    BtrfsDevices {
+        num_devices: u32,
+    },
+    ZfsSingleLeaf,
+    ZfsMirror {
+        width: u8,
+    },
+    ZfsMultiMemberReadOnly {
+        vdev_children: u32,
+        member_count: u32,
+    },
+}
+
+/// Selected logical view (partition, dataset, subvolume) bound to the storage set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedViewIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zfs_dataset: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub btrfs_subvolume_id: Option<u64>,
+}
+
+/// Format-native durable commit/generation identity bound to a sealed protection point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "format")]
+pub enum NativeCommitBinding {
+    UninterpretedRaw,
+    Ext4 {
+        uuid: [u8; 16],
+        blocks_count: u64,
+        journal_uuid: [u8; 16],
+        journal_inum: u32,
+        state: u16,
+    },
+    Btrfs {
+        fsid: [u8; 16],
+        generation: u64,
+        root_bytenr: u64,
+        chunk_root_bytenr: u64,
+        log_root: u64,
+        num_devices: u64,
+    },
+    Fat {
+        kind: String,
+        volume_id: u32,
+        total_sectors: u64,
+        clean: bool,
+    },
+    Ntfs {
+        volume_serial: u64,
+        volume_bytes: u64,
+        cluster_bytes: u32,
+        record_bytes: u32,
+        index_bytes: u32,
+        mft_cluster: u64,
+        mirror_cluster: u64,
+        boot_blake3: [u8; 32],
+        transaction_id: u32,
+        commit_lsn: u64,
+        checkpoint_lsn: Option<u64>,
+        generation: u64,
+        operation_digest: [u8; 32],
+    },
+    Zfs {
+        pool_guid: u64,
+        top_guid: u64,
+        member_guids: Vec<u64>,
+        guid_sum: u64,
+        version: u64,
+        ashift: u8,
+        asize: u64,
+        label_txg: u64,
+        committed_txg: u64,
+        published_slot: u32,
+        root_bp_blake3: [u8; 32],
+        generation: u64,
+        operation_digest: [u8; 32],
+    },
+}
+
+impl NativeCommitBinding {
+    /// Concise deterministic summary string for audit ledgers and operator status.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::UninterpretedRaw => "raw".to_owned(),
+            Self::Ext4 {
+                blocks_count,
+                journal_inum,
+                state,
+                ..
+            } => format!("ext4:blocks={blocks_count}:j_inum={journal_inum}:state={state}"),
+            Self::Btrfs {
+                generation,
+                root_bytenr,
+                log_root,
+                num_devices,
+                ..
+            } => {
+                format!(
+                    "btrfs:gen={generation}:root={root_bytenr}:log={log_root}:devs={num_devices}"
+                )
+            }
+            Self::Fat {
+                kind,
+                volume_id,
+                total_sectors,
+                clean,
+            } => format!("fat:{kind}:vol={volume_id:#010x}:sectors={total_sectors}:clean={clean}"),
+            Self::Ntfs {
+                volume_serial,
+                transaction_id,
+                commit_lsn,
+                generation,
+                ..
+            } => format!(
+                "ntfs:serial={volume_serial:#018x}:tx={transaction_id}:lsn={commit_lsn}:gen={generation}"
+            ),
+            Self::Zfs {
+                pool_guid,
+                committed_txg,
+                published_slot,
+                generation,
+                ..
+            } => format!(
+                "zfs:pool={pool_guid}:txg={committed_txg}:slot={published_slot}:gen={generation}"
+            ),
+        }
+    }
+}
+
+/// Provenance status recorded in a [`StorageSetManifest`].
+///
+/// Unkeyed BLAKE3 checksum agreement detects accidental corruption only; it is
+/// NEVER authenticated provenance without a trusted root key (`PorKey`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum ProvenanceAuth {
+    UnauthenticatedChecksum,
+    AuthenticatedTrustedRoot { key_id: [u8; 16], mac_hex: String },
+}
+
+/// Caller trust policy when admitting or verifying a [`StorageSetManifest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustPolicy {
+    /// Admit unauthenticated manifests (`authenticated_provenance = false`) or verify
+    /// keyed manifests when no trusted root is mandated.
+    AllowUnauthenticated,
+    /// Require a valid constant-time `PorKey` keyed-BLAKE3 authenticator over the
+    /// manifest; unauthenticated manifests or wrong-key MACs fail closed.
+    RequireTrustedRoot { key: PorKey },
+}
+
+/// Derive a non-secret 16-byte key identifier from a 32-byte [`PorKey`].
+#[must_use]
+pub fn por_key_id(key: &PorKey) -> [u8; 16] {
+    let full = digest_parts(b"ffs-sidecar-root-key-id-v3", &[key]);
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&full[..16]);
+    id
+}
+
+/// Compute the Merkle-flat BLAKE3 root over all per-group `table_digest`s in a member archive.
+#[must_use]
+pub fn tables_root_digest(tables: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ffs-sidecar-tables-root-v3");
+    hasher.update(&(tables.len() as u64).to_le_bytes());
+    for table in tables {
+        hasher.update(table);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Whole-storage-set manifest (`FFSRQSM3`) binding every required `Data`/`Log`/`Special`
+/// member archive, slice geometry, topology, view, and native commit token into a
+/// single atomic seal point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageSetManifest {
+    pub set_id: [u8; 16],
+    pub generation: u64,
+    pub filesystem: String,
+    pub topology: StorageSetTopology,
+    pub view: ProtectedViewIdentity,
+    pub native_binding: NativeCommitBinding,
+    pub members: Vec<MemberProtectionBinding>,
+    pub provenance: ProvenanceAuth,
+}
+
+impl StorageSetManifest {
+    /// Hex representation of `set_id` for structured telemetry and evidence ledgers.
+    #[must_use]
+    pub fn set_id_hex(&self) -> String {
+        let mut out = String::with_capacity(32);
+        for byte in self.set_id {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    /// Whether this manifest carries authenticated provenance from a trusted root key.
+    #[must_use]
+    pub const fn is_authenticated(&self) -> bool {
+        matches!(
+            self.provenance,
+            ProvenanceAuth::AuthenticatedTrustedRoot { .. }
+        )
+    }
+
+    /// Encode this manifest into its canonical binary envelope (`FFSRQSM3`), signing
+    /// with `signing_key` when provided.
+    pub fn encode(&self, signing_key: Option<&PorKey>) -> Result<Vec<u8>> {
+        if self.generation == 0 {
+            return Err(corrupt("storage-set manifest generation must be non-zero"));
+        }
+        if self.members.is_empty() {
+            return Err(corrupt(
+                "storage-set manifest must bind at least one member",
+            ));
+        }
+        for (idx, member) in self.members.iter().enumerate() {
+            if member.member_index as usize != idx {
+                return Err(corrupt(
+                    "storage-set manifest member indices must be contiguous 0..N",
+                ));
+            }
+            if member.geometry.length == 0
+                || member
+                    .geometry
+                    .offset
+                    .checked_add(member.geometry.length)
+                    .is_none_or(|end| end > member.geometry.backing_bytes)
+            {
+                return Err(corrupt(
+                    "storage-set manifest member slice exceeds backing geometry",
+                ));
+            }
+        }
+        let mut normalized = self.clone();
+        normalized.provenance = ProvenanceAuth::UnauthenticatedChecksum;
+        let body_bytes = serde_json::to_vec(&normalized)
+            .map_err(|err| corrupt(&format!("encode storage-set manifest JSON: {err}")))?;
+        if body_bytes.len() > MAX_SET_MANIFEST_PAYLOAD_BYTES {
+            return Err(corrupt("storage-set manifest payload exceeds 4 MiB bound"));
+        }
+        let payload_len = u32::try_from(body_bytes.len())
+            .map_err(|_| corrupt("storage-set manifest payload overflows u32"))?;
+        let flags = if signing_key.is_some() {
+            SET_MANIFEST_FLAG_AUTHENTICATED
+        } else {
+            0
+        };
+        let mut prefix = [0_u8; SET_MANIFEST_PREFIX_BYTES];
+        prefix[..8].copy_from_slice(SET_MANIFEST_MAGIC);
+        prefix[8..12].copy_from_slice(&SET_MANIFEST_VERSION.to_le_bytes());
+        prefix[12..20].copy_from_slice(&self.generation.to_le_bytes());
+        prefix[20..36].copy_from_slice(&self.set_id);
+        prefix[36..40].copy_from_slice(&payload_len.to_le_bytes());
+        prefix[40..44].copy_from_slice(&flags.to_le_bytes());
+        let prefix_hash = blake3::hash(&prefix[..44]);
+        prefix[44..64].copy_from_slice(&prefix_hash.as_bytes()[..20]);
+
+        let body_blake3 = digest_parts(
+            b"ffs-storage-set-manifest-v3",
+            &[&prefix[..44], &body_bytes],
+        );
+        let mac = signing_key.map_or([0_u8; 32], |key| {
+            compute_authenticator(key, self.generation, &body_blake3)
+        });
+
+        let mut raw = Vec::with_capacity(
+            SET_MANIFEST_PREFIX_BYTES + body_bytes.len() + SET_MANIFEST_TRAILER_BYTES,
+        );
+        raw.extend_from_slice(&prefix);
+        raw.extend_from_slice(&body_bytes);
+        raw.extend_from_slice(&body_blake3);
+        raw.extend_from_slice(&mac);
+        Ok(raw)
+    }
+
+    /// Decode and validate a [`StorageSetManifest`] from raw bytes against `trust_policy`.
+    pub fn decode(raw: &[u8], trust_policy: TrustPolicy) -> Result<Self> {
+        if raw.len() < SET_MANIFEST_PREFIX_BYTES + SET_MANIFEST_TRAILER_BYTES {
+            return Err(corrupt("truncated storage-set manifest"));
+        }
+        if &raw[..8] == SET_PENDING_MAGIC {
+            return Err(corrupt(
+                "storage-set manifest has an unfinished write epoch; reconcile offline",
+            ));
+        }
+        if &raw[..8] != SET_MANIFEST_MAGIC || read_u32(raw, 8)? != SET_MANIFEST_VERSION {
+            return Err(corrupt(
+                "invalid, unsupported, or incomplete storage-set manifest header",
+            ));
+        }
+        let prefix_hash = blake3::hash(&raw[..44]);
+        if raw[44..64] != prefix_hash.as_bytes()[..20] {
+            return Err(corrupt("storage-set manifest prefix checksum mismatch"));
+        }
+        let generation = read_u64(raw, 12)?;
+        let mut set_id = [0_u8; 16];
+        set_id.copy_from_slice(&raw[20..36]);
+        let payload_len = read_u32(raw, 36)? as usize;
+        let flags = read_u32(raw, 40)?;
+        if flags & !SET_MANIFEST_FLAG_AUTHENTICATED != 0
+            || payload_len > MAX_SET_MANIFEST_PAYLOAD_BYTES
+        {
+            return Err(corrupt("unsupported storage-set manifest flags or length"));
+        }
+        let expected_total = SET_MANIFEST_PREFIX_BYTES + payload_len + SET_MANIFEST_TRAILER_BYTES;
+        if raw.len() != expected_total {
+            return Err(corrupt("storage-set manifest size mismatch"));
+        }
+        let body_bytes = &raw[SET_MANIFEST_PREFIX_BYTES..SET_MANIFEST_PREFIX_BYTES + payload_len];
+        let trailer = &raw[SET_MANIFEST_PREFIX_BYTES + payload_len..];
+        let mut stored_blake3 = [0_u8; 32];
+        stored_blake3.copy_from_slice(&trailer[..32]);
+        let mut stored_mac = [0_u8; 32];
+        stored_mac.copy_from_slice(&trailer[32..64]);
+
+        let expected_blake3 =
+            digest_parts(b"ffs-storage-set-manifest-v3", &[&raw[..44], body_bytes]);
+        if stored_blake3 != expected_blake3 {
+            return Err(corrupt("storage-set manifest body checksum mismatch"));
+        }
+
+        let mut decoded: Self = serde_json::from_slice(body_bytes)
+            .map_err(|err| corrupt(&format!("decode storage-set manifest JSON: {err}")))?;
+        if decoded.generation != generation || decoded.set_id != set_id || generation == 0 {
+            return Err(corrupt(
+                "storage-set manifest envelope disagrees with body identity",
+            ));
+        }
+        if decoded.members.is_empty() {
+            return Err(corrupt("storage-set manifest contains zero members"));
+        }
+        for (idx, member) in decoded.members.iter().enumerate() {
+            if member.member_index as usize != idx
+                || member.geometry.length == 0
+                || member
+                    .geometry
+                    .offset
+                    .checked_add(member.geometry.length)
+                    .is_none_or(|end| end > member.geometry.backing_bytes)
+            {
+                return Err(corrupt(
+                    "storage-set manifest member index or slice geometry invalid",
+                ));
+            }
+        }
+
+        let is_signed = flags & SET_MANIFEST_FLAG_AUTHENTICATED != 0;
+        match trust_policy {
+            TrustPolicy::RequireTrustedRoot { key } => {
+                if !is_signed
+                    || !verify_authenticator(&key, generation, &expected_blake3, &stored_mac)
+                {
+                    return Err(corrupt(
+                        "unauthenticated or wrong-key storage-set manifest; checksum agreement is not trusted provenance",
+                    ));
+                }
+                let mac_hex = blake3::Hash::from_bytes(stored_mac).to_hex().to_string();
+                decoded.provenance = ProvenanceAuth::AuthenticatedTrustedRoot {
+                    key_id: por_key_id(&key),
+                    mac_hex,
+                };
+            }
+            TrustPolicy::AllowUnauthenticated => {
+                if !is_signed && stored_mac != [0_u8; 32] {
+                    return Err(corrupt(
+                        "unsigned storage-set manifest carries non-zero MAC bytes",
+                    ));
+                }
+                // Without the secret root key, even a signed manifest cannot be
+                // elevated to AuthenticatedTrustedRoot!
+                decoded.provenance = ProvenanceAuth::UnauthenticatedChecksum;
+            }
+        }
+        Ok(decoded)
+    }
 }
 
 /// Tests that spawn a child process hold this exclusively while the child

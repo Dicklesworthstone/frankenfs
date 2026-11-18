@@ -869,11 +869,11 @@ and [CI `42977453897`](https://github.com/Dicklesworthstone/frankenfs/actions/ru
 ### Source inventory
 
 The current source-derived test inventory contains 24 crates under `crates/`,
-67 fuzz targets, 174 Rust benchmark files, 128 tracked E2E scripts and
-226 tracked insta snapshots. The evidence schema declares 24 evidence-event types.
+68 fuzz targets, 174 Rust benchmark files, 128 tracked E2E scripts and
+226 tracked insta snapshots. The evidence schema declares 26 evidence-event types.
 These are source counts, not executed-test or readiness results.
 The [fuzz inventory](fuzz/fuzz_targets/) has the badge count
-![67 fuzz targets](https://img.shields.io/badge/fuzz%20targets-67-brightgreen).
+![68 fuzz targets](https://img.shields.io/badge/fuzz%20targets-68-brightgreen).
 The detailed guide retains [Decision 10: 128 E2E gate scripts](README_EXT4_BTRFS.md#decision-10-128-e2e-gate-scripts).
 
 The btrfs reader declares 23 command variants for send streams and item-type

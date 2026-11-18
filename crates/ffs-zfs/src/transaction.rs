@@ -912,6 +912,34 @@ impl ZfsTransactionEngine {
         Ok(())
     }
 
+    /// Enter deferred-seal mode across every member device in the pool.
+    pub fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        let leaves = self.pool.leaves();
+        for (entered, member) in leaves.iter().enumerate() {
+            if let Err(err) = member.begin_durability_commit(cx) {
+                for prev in &leaves[..entered] {
+                    prev.abort_durability_commit();
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark a multi-barrier TXG commit complete across every member device.
+    pub fn complete_durability_commit(&self) {
+        for member in self.pool.leaves() {
+            member.complete_durability_commit();
+        }
+    }
+
+    /// Abort a multi-barrier TXG commit across every member device.
+    pub fn abort_durability_commit(&self) {
+        for member in self.pool.leaves() {
+            member.abort_durability_commit();
+        }
+    }
+
     #[must_use]
     pub fn persistence_events(&self) -> &[ZfsPersistenceEvent] {
         &self.events

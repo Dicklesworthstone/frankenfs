@@ -54,6 +54,7 @@ impl MountHealth {
         Ok(OperationGuard {
             _reader: reader,
             writer,
+            deferral: None,
             health: self,
             initial_epoch: self.epoch.load(Ordering::Acquire),
             completed: false,
@@ -64,17 +65,25 @@ impl MountHealth {
 pub(super) struct OperationGuard<'a> {
     _reader: Option<RwLockReadGuard<'a, ()>>,
     writer: Option<RwLockWriteGuard<'a, ()>>,
+    deferral: Option<ffs_block::DurabilityCommitDeferral<'a>>,
     health: &'a MountHealth,
     initial_epoch: u64,
     completed: bool,
 }
 
-impl OperationGuard<'_> {
+impl<'a> OperationGuard<'a> {
+    pub(super) fn attach_deferral(&mut self, deferral: ffs_block::DurabilityCommitDeferral<'a>) {
+        self.deferral = Some(deferral);
+    }
+
     /// Call only after native durability, cache publication and fallible reply
     /// preparation have all succeeded. A later FUSE transport failure is not
     /// an unsuccessful native operation and cannot roll it back.
     pub(super) fn complete<T>(mut self, value: T) -> Result<T> {
         self.health.check()?;
+        if let Some(mut deferral) = self.deferral.take() {
+            deferral.complete();
+        }
         self.completed = true;
         Ok(value)
     }
@@ -82,6 +91,9 @@ impl OperationGuard<'_> {
 
 impl Drop for OperationGuard<'_> {
     fn drop(&mut self) {
+        if let Some(deferral) = self.deferral.take() {
+            drop(deferral);
+        }
         if self.writer.is_some()
             && !self.completed
             && self.health.epoch.load(Ordering::Acquire) != self.initial_epoch

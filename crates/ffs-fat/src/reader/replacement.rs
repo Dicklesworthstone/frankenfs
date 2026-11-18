@@ -899,6 +899,26 @@ impl ByteDevice for SidecarDevice {
         checkpoint(cx)?;
         self.inner.sync(cx)
     }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        if !self.writable {
+            return Err(FfsError::ReadOnly);
+        }
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        if self.writable {
+            self.inner.complete_durability_commit();
+        }
+    }
+
+    fn abort_durability_commit(&self) {
+        if self.writable {
+            self.inner.abort_durability_commit();
+        }
+    }
 }
 
 struct SliceSource<'a>(&'a [u8]);

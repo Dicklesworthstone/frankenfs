@@ -404,6 +404,7 @@ struct NativeFreshnessState {
 /// mode until its final durability sync.
 pub(crate) struct DurabilityCommitGuard<'a> {
     device: Option<&'a NativeFreshnessDevice>,
+    byte_deferral: Option<ffs_block::DurabilityCommitDeferral<'a>>,
     armed: bool,
 }
 
@@ -424,6 +425,9 @@ impl DurabilityCommitGuard<'_> {
             if let Some(device) = self.device {
                 device.arm_final_seal(cx)?;
             }
+        }
+        if let Some(mut deferral) = self.byte_deferral.take() {
+            deferral.complete();
         }
         Ok(())
     }
@@ -755,12 +759,14 @@ impl NativeFreshnessDevice {
         if state.format_commit_seq.is_none() {
             state.format_commit_seq = Some(pre_commit_seq);
         }
+        let byte_deferral = ffs_block::DurabilityCommitDeferral::enter(cx, self.inner.as_ref())?;
         state.defer_seal = state
             .defer_seal
             .checked_add(1)
             .ok_or_else(|| freshness_error("durability commit nesting overflow"))?;
         Ok(DurabilityCommitGuard {
             device: Some(self),
+            byte_deferral: Some(byte_deferral),
             armed: true,
         })
     }
@@ -1692,6 +1698,18 @@ impl ByteDevice for NativeFreshnessDevice {
             state.phase = FreshnessPhase::Poisoned;
         }
         result
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<(), FfsError> {
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
     }
 }
 
@@ -3803,8 +3821,10 @@ impl OpenFs {
         hinted_blocks: &[BlockNumber],
     ) -> Result<DurabilityCommitGuard<'_>, FfsError> {
         let Some(device) = self.native_repair_device.as_deref() else {
+            let byte_deferral = ffs_block::DurabilityCommitDeferral::enter(cx, self.dev.as_ref())?;
             return Ok(DurabilityCommitGuard {
                 device: None,
+                byte_deferral: Some(byte_deferral),
                 armed: false,
             });
         };

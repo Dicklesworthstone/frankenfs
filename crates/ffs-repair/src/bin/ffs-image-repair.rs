@@ -2,10 +2,18 @@
 
 use clap::{Parser, Subcommand};
 use ffs_error::{FfsError, Result};
-use ffs_repair::sidecar::{SidecarOptions, protect, verify};
+use ffs_repair::por::PorKey;
+use ffs_repair::sidecar::live::{
+    StorageSetMemberSpec, StorageSetProtectRequest, StorageSetVerifyReport, protect_storage_set,
+    verify_storage_set,
+};
+use ffs_repair::sidecar::{
+    MemberRole, NativeCommitBinding, ProtectedViewIdentity, SidecarOptions, StorageSetTopology,
+    TrustPolicy, protect, verify,
+};
 use ffs_repair::sidecar_restore::restore;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -45,6 +53,133 @@ enum Command {
         #[arg(long, required = true)]
         offline: bool,
     },
+    /// Protect a multi-member offline storage set and publish its FFSRQSM3 manifest.
+    ProtectSet {
+        manifest: PathBuf,
+        /// Primary member pair (<IMAGE> <SIDECAR>) plus any additional data members.
+        #[arg(long = "member", num_args = 2, value_names = ["IMAGE", "SIDECAR"], required = true)]
+        members: Vec<PathBuf>,
+        /// Optional external log member pairs (<IMAGE> <SIDECAR>).
+        #[arg(long = "log-member", num_args = 2, value_names = ["IMAGE", "SIDECAR"])]
+        log_members: Vec<PathBuf>,
+        /// Optional special member pairs (<IMAGE> <SIDECAR>).
+        #[arg(long = "special-member", num_args = 2, value_names = ["IMAGE", "SIDECAR"])]
+        special_members: Vec<PathBuf>,
+        #[arg(long, default_value = "raw")]
+        filesystem: String,
+        #[arg(long)]
+        trust_key_file: Option<PathBuf>,
+        /// Confirm that every member image is unmounted and has no external writers.
+        #[arg(long, required = true)]
+        offline: bool,
+        #[arg(long, default_value_t = 4096)]
+        block_size: u32,
+        #[arg(long, default_value_t = 256)]
+        group_blocks: u32,
+        #[arg(long, default_value_t = 16)]
+        repair_symbols: u32,
+    },
+    /// Verify a multi-member storage-set manifest (FFSRQSM3) and all bound sidecars.
+    VerifySet {
+        manifest: PathBuf,
+        #[arg(long = "member", num_args = 2, value_names = ["IMAGE", "SIDECAR"], required = true)]
+        members: Vec<PathBuf>,
+        #[arg(long = "log-member", num_args = 2, value_names = ["IMAGE", "SIDECAR"])]
+        log_members: Vec<PathBuf>,
+        #[arg(long = "special-member", num_args = 2, value_names = ["IMAGE", "SIDECAR"])]
+        special_members: Vec<PathBuf>,
+        #[arg(long)]
+        trust_key_file: Option<PathBuf>,
+        #[arg(long)]
+        require_trusted_root: bool,
+    },
+}
+
+fn load_por_key(path: &Path) -> Result<PorKey> {
+    let raw = std::fs::read(path)?;
+    if raw.len() == 32 {
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&raw);
+        return Ok(key);
+    }
+    let trimmed = std::str::from_utf8(&raw)
+        .map_err(|_| FfsError::Corruption {
+            block: 0,
+            detail: "trust key file must be 32 raw bytes or 64 hex characters".into(),
+        })?
+        .trim();
+    if trimmed.len() != 64 {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: "trust key file must be 32 raw bytes or 64 hex characters".into(),
+        });
+    }
+    let mut key = [0_u8; 32];
+    for (idx, slot) in key.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&trimmed[idx * 2..idx * 2 + 2], 16).map_err(|_| {
+            FfsError::Corruption {
+                block: 0,
+                detail: "invalid hex digit in trust key file".into(),
+            }
+        })?;
+    }
+    Ok(key)
+}
+
+fn collect_specs(
+    data: &[PathBuf],
+    logs: &[PathBuf],
+    specials: &[PathBuf],
+) -> Vec<StorageSetMemberSpec> {
+    let mut specs = Vec::new();
+    for pair in data.as_chunks::<2>().0 {
+        specs.push(StorageSetMemberSpec {
+            role: MemberRole::Data,
+            image_path: pair[0].clone(),
+            sidecar_path: pair[1].clone(),
+            native_member_id: [0_u8; 16],
+            offset: 0,
+            length: None,
+        });
+    }
+    for pair in logs.as_chunks::<2>().0 {
+        specs.push(StorageSetMemberSpec {
+            role: MemberRole::Log,
+            image_path: pair[0].clone(),
+            sidecar_path: pair[1].clone(),
+            native_member_id: [0_u8; 16],
+            offset: 0,
+            length: None,
+        });
+    }
+    for pair in specials.as_chunks::<2>().0 {
+        specs.push(StorageSetMemberSpec {
+            role: MemberRole::Special,
+            image_path: pair[0].clone(),
+            sidecar_path: pair[1].clone(),
+            native_member_id: [0_u8; 16],
+            offset: 0,
+            length: None,
+        });
+    }
+    specs
+}
+
+#[derive(Serialize)]
+struct VerifySetJson<'a> {
+    manifest: &'a ffs_repair::sidecar::StorageSetManifest,
+    member_reports: &'a [ffs_repair::sidecar::SidecarReport],
+    healthy: bool,
+}
+
+impl<'a> From<&'a StorageSetVerifyReport> for VerifySetJson<'a> {
+    fn from(report: &'a StorageSetVerifyReport) -> Self {
+        Self {
+            manifest: &report.manifest,
+            member_reports: &report.member_reports,
+            healthy: report.is_healthy(),
+        }
+    }
 }
 
 fn emit(value: &impl Serialize) -> Result<()> {
@@ -96,6 +231,80 @@ fn run(cli: Cli) -> Result<u8> {
             emit(&restore(&cx, &image, &sidecar, &output)?)?;
             Ok(0)
         }
+        Command::ProtectSet {
+            manifest,
+            members,
+            log_members,
+            special_members,
+            filesystem,
+            trust_key_file,
+            offline: _,
+            block_size,
+            group_blocks,
+            repair_symbols,
+        } => {
+            let signing_key = trust_key_file.as_deref().map(load_por_key).transpose()?;
+            let specs = collect_specs(&members, &log_members, &special_members);
+            let topology = if specs.len() == 1 {
+                StorageSetTopology::SingleData
+            } else if filesystem == "zfs" {
+                let width = u8::try_from(specs.len()).map_err(|_| FfsError::Corruption {
+                    block: 0,
+                    detail: "ZFS mirror width exceeds u8".into(),
+                })?;
+                StorageSetTopology::ZfsMirror { width }
+            } else {
+                let count = u32::try_from(specs.len()).map_err(|_| FfsError::Corruption {
+                    block: 0,
+                    detail: "member count exceeds u32".into(),
+                })?;
+                StorageSetTopology::BtrfsDevices { num_devices: count }
+            };
+            let req = StorageSetProtectRequest {
+                manifest_path: manifest,
+                filesystem,
+                topology,
+                view: ProtectedViewIdentity::default(),
+                native_binding: NativeCommitBinding::UninterpretedRaw,
+                members: specs,
+                options: SidecarOptions {
+                    block_size,
+                    group_blocks,
+                    repair_symbols,
+                },
+                signing_key,
+            };
+            emit(&protect_storage_set(&cx, &req)?)?;
+            Ok(0)
+        }
+        Command::VerifySet {
+            manifest,
+            members,
+            log_members,
+            special_members,
+            trust_key_file,
+            require_trusted_root,
+        } => {
+            let specs = collect_specs(&members, &log_members, &special_members);
+            let pairs: Vec<(PathBuf, PathBuf)> = specs
+                .into_iter()
+                .map(|s| (s.image_path, s.sidecar_path))
+                .collect();
+            let key = trust_key_file.as_deref().map(load_por_key).transpose()?;
+            let policy = match (require_trusted_root, key) {
+                (_, Some(k)) => TrustPolicy::RequireTrustedRoot { key: k },
+                (true, None) => {
+                    return Err(FfsError::Corruption {
+                        block: 0,
+                        detail: "--require-trusted-root requires --trust-key-file".into(),
+                    });
+                }
+                (false, None) => TrustPolicy::AllowUnauthenticated,
+            };
+            let report = verify_storage_set(&cx, &manifest, &pairs, policy)?;
+            emit(&VerifySetJson::from(&report))?;
+            Ok(if report.is_healthy() { 0 } else { 2 })
+        }
     }
 }
 
@@ -126,5 +335,28 @@ mod tests {
                 .is_ok()
         );
         assert!(Cli::try_parse_from(["ffs-image-repair", "verify", "a", "b"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "ffs-image-repair",
+                "protect-set",
+                "m.manifest",
+                "--member",
+                "a",
+                "b"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ffs-image-repair",
+                "protect-set",
+                "m.manifest",
+                "--member",
+                "a",
+                "b",
+                "--offline"
+            ])
+            .is_ok()
+        );
     }
 }

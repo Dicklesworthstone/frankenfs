@@ -67,6 +67,7 @@ fn check_args(image: &Path, sidecar: &Path) -> Args {
         sidecar: sidecar.to_owned(),
         mountpoint: None,
         scrub: scrub::Options::default(),
+        set: SetOptions::default(),
         authority: Authority {
             exclusive_image: true,
             allow_repair: true,
@@ -2056,4 +2057,2618 @@ fn protected_mount_zfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
             .is_healthy()
     );
     assert_mounted_repair(&fixture, "zfs", [blk_a, blk_b]);
+}
+
+mod bd_tqrnc {
+    use super::*;
+    use ffs_core::{SetAttrRequest, XattrSetMode};
+    use ffs_ondisk::ntfs::index::NtfsFileName;
+    use ffs_ondisk::ntfs::{
+        DATA, NtfsFileRecord, NtfsReference, NtfsRun, VOLUME_INFORMATION, encode_mapping_pairs,
+    };
+    use ffs_ondisk::zfs::{
+        BlockPointer, DATA_OFFSET, Dva, Endian, LABEL_BYTES, LABEL_CONFIG_BYTES,
+        LABEL_CONFIG_OFFSET, RegularBlockSpec, UBERBLOCK_RING_BYTES, UBERBLOCK_RING_OFFSET,
+        Uberblock, label_offsets, stamp_label_checksum,
+    };
+    use ffs_ondisk::zfs_dmu::space_map::{
+        AllocationMap, Header as SpaceMapHeader, MapType, Record as SpaceMapRecord,
+        extent_records_for_range,
+    };
+    use ffs_ondisk::zfs_dmu::{
+        DMU_OT_DNODE, DMU_OT_OBJECT_DIRECTORY, DMU_OT_OBJSET, DNODE_BLOCK_BYTES, DNODE_BYTES,
+        DNODE_FLAG_USED_BYTES, Dnode, DnodeSpec, ObjectSet, ZapEntry, ZilHeader, encode_microzap,
+        write_dnode_at,
+    };
+    use ffs_ondisk::zfs_zap::{Entry as RawZapEntry, encode_fatzap_with_flags};
+    use ffs_ondisk::zfs_zpl::{Kind, Metadata, SaRegistry, Timestamp};
+    use ffs_repair::evidence::parse_evidence_ledger;
+    use ffs_repair::por::PorKey;
+    use ffs_repair::sidecar::live::{
+        StorageSetMemberSpec, StorageSetProtectRequest, protect_storage_set, verify_storage_set,
+    };
+    use ffs_repair::sidecar::{
+        MemberRole, NativeCommitBinding, ProtectedViewIdentity, StorageSetManifest,
+        StorageSetTopology, TrustPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    const NTFS_SECTOR_BYTES: usize = 512;
+    const NTFS_CLUSTER_BYTES: usize = 4096;
+    const NTFS_RECORD_BYTES: usize = 1024;
+    const NTFS_INDEX_BYTES: usize = 4096;
+    const NTFS_DEFAULT_FILETIME: u64 = 133_500_000_000_000_000;
+
+    const ZFS_POOL_GUID: u64 = 0x5A46_535F_5445_5354;
+    const ZFS_TOP_SINGLE_GUID: u64 = 0x1111_2222_3333_4444;
+    const ZFS_TOP_MIRROR_GUID: u64 = 0x7777_8888_9999_AAAA;
+    const ZFS_CHILD_GUIDS: [u64; 2] = [0x1001_0000_0000_0001, 0x1002_0000_0000_0002];
+    const ZFS_INITIAL_TXG: u64 = 20;
+    const ZFS_SLAB_SHIFT: u64 = 22;
+
+    fn protect_ntfs_record(mut raw: Vec<u8>, token: u16) -> Vec<u8> {
+        let usa = usize::from(u16::from_le_bytes([raw[4], raw[5]]));
+        let count = usize::from(u16::from_le_bytes([raw[6], raw[7]]));
+        raw[usa..usa + 2].copy_from_slice(&token.to_le_bytes());
+        for sector in 1..count {
+            let end = sector * NTFS_SECTOR_BYTES;
+            let saved = [raw[end - 2], raw[end - 1]];
+            raw[usa + sector * 2..usa + sector * 2 + 2].copy_from_slice(&saved);
+            raw[end - 2..end].copy_from_slice(&token.to_le_bytes());
+        }
+        raw
+    }
+
+    fn ntfs_resident_attr(kind: u32, id: u16, name: &[u16], indexed: bool, val: &[u8]) -> Vec<u8> {
+        let name_bytes = name.len() * 2;
+        let val_off = (24 + name_bytes + 7) & !7;
+        let total = (val_off + val.len() + 7) & !7;
+        let mut out = vec![0_u8; total];
+        out[0..4].copy_from_slice(&kind.to_le_bytes());
+        out[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+        out[9] = u8::try_from(name.len()).unwrap();
+        out[10..12].copy_from_slice(&24_u16.to_le_bytes());
+        out[14..16].copy_from_slice(&id.to_le_bytes());
+        out[16..20].copy_from_slice(&(val.len() as u32).to_le_bytes());
+        out[20..22].copy_from_slice(&(val_off as u16).to_le_bytes());
+        out[22] = u8::from(indexed);
+        for (i, &ch) in name.iter().enumerate() {
+            let at = 24 + i * 2;
+            out[at..at + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        out[val_off..val_off + val.len()].copy_from_slice(val);
+        out
+    }
+
+    fn ntfs_nonresident_attr(
+        kind: u32,
+        id: u16,
+        name: &[u16],
+        lcn: u64,
+        clusters: u64,
+        logical_size: u64,
+        total_clusters: u64,
+    ) -> Vec<u8> {
+        let run = NtfsRun {
+            vcn: 0,
+            clusters,
+            lcn: Some(lcn),
+        };
+        let (pairs, last_vcn) = encode_mapping_pairs(&[run], 0, total_clusters).unwrap();
+        let name_bytes = name.len() * 2;
+        let map_off = (64 + name_bytes + 7) & !7;
+        let total = (map_off + pairs.len() + 7) & !7;
+        let alloc_bytes = clusters * (NTFS_CLUSTER_BYTES as u64);
+        let mut out = vec![0_u8; total];
+        out[0..4].copy_from_slice(&kind.to_le_bytes());
+        out[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+        out[8] = 1;
+        out[9] = u8::try_from(name.len()).unwrap();
+        out[10..12].copy_from_slice(&64_u16.to_le_bytes());
+        out[14..16].copy_from_slice(&id.to_le_bytes());
+        out[24..32].copy_from_slice(&last_vcn.to_le_bytes());
+        out[32..34].copy_from_slice(&(map_off as u16).to_le_bytes());
+        out[40..48].copy_from_slice(&alloc_bytes.to_le_bytes());
+        out[48..56].copy_from_slice(&logical_size.to_le_bytes());
+        out[56..64].copy_from_slice(&logical_size.to_le_bytes());
+        for (i, &ch) in name.iter().enumerate() {
+            let at = 64 + i * 2;
+            out[at..at + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        out[map_off..map_off + pairs.len()].copy_from_slice(&pairs);
+        out
+    }
+
+    fn ntfs_file_record(
+        number: u32,
+        sequence: u16,
+        hard_links: u16,
+        is_dir: bool,
+        attrs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut raw = vec![0_u8; NTFS_RECORD_BYTES];
+        raw[0..4].copy_from_slice(b"FILE");
+        raw[4..6].copy_from_slice(&48_u16.to_le_bytes());
+        raw[6..8].copy_from_slice(&3_u16.to_le_bytes());
+        raw[16..18].copy_from_slice(&sequence.to_le_bytes());
+        raw[18..20].copy_from_slice(&hard_links.to_le_bytes());
+        raw[20..22].copy_from_slice(&56_u16.to_le_bytes());
+        let flags: u16 = if is_dir { 0x0003 } else { 0x0001 };
+        raw[22..24].copy_from_slice(&flags.to_le_bytes());
+        raw[28..32].copy_from_slice(&(NTFS_RECORD_BYTES as u32).to_le_bytes());
+        raw[40..42].copy_from_slice(&u16::try_from(attrs.len()).unwrap().to_le_bytes());
+        raw[44..48].copy_from_slice(&number.to_le_bytes());
+        let mut pos = 56;
+        for a in attrs {
+            raw[pos..pos + a.len()].copy_from_slice(a);
+            pos += a.len();
+        }
+        raw[pos..pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        raw[24..28].copy_from_slice(&((pos + 8) as u32).to_le_bytes());
+        let protected = protect_ntfs_record(raw, 0x2468);
+        NtfsFileRecord::parse(&protected).expect("valid synthetic NTFS FILE record");
+        protected
+    }
+
+    fn build_clean_writable_ntfs_image(
+        total_clusters: u64,
+        log_pages: u64,
+        serial: u64,
+    ) -> Vec<u8> {
+        let mft_lcn = 1_u64;
+        let mirr_lcn = 9_u64;
+        let log_lcn = 10_u64;
+        let bm_lcn = 10 + log_pages;
+        let upcase_lcn = 11 + log_pages;
+        let used_clusters = upcase_lcn + 32;
+        assert!(total_clusters >= used_clusters + 16);
+
+        let volume_bytes = total_clusters * (NTFS_CLUSTER_BYTES as u64);
+        let mut img = vec![0_u8; usize::try_from(volume_bytes).unwrap() + NTFS_SECTOR_BYTES];
+        {
+            let boot = &mut img[0..NTFS_SECTOR_BYTES];
+            boot[0..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+            boot[3..11].copy_from_slice(b"NTFS    ");
+            boot[11..13].copy_from_slice(&(NTFS_SECTOR_BYTES as u16).to_le_bytes());
+            boot[13] = u8::try_from(NTFS_CLUSTER_BYTES / NTFS_SECTOR_BYTES).unwrap();
+            boot[21] = 0xF8;
+            boot[24..26].copy_from_slice(&63_u16.to_le_bytes());
+            boot[26..28].copy_from_slice(&255_u16.to_le_bytes());
+            boot[36] = 0x80;
+            boot[38] = 0x80;
+            let total_sectors = volume_bytes / (NTFS_SECTOR_BYTES as u64);
+            boot[40..48].copy_from_slice(&total_sectors.to_le_bytes());
+            boot[48..56].copy_from_slice(&mft_lcn.to_le_bytes());
+            boot[56..64].copy_from_slice(&mirr_lcn.to_le_bytes());
+            boot[64] = 0xF6;
+            boot[68] = 1;
+            boot[72..80].copy_from_slice(&serial.to_le_bytes());
+            boot[510..512].copy_from_slice(&[0x55, 0xAA]);
+        }
+        let boot_copy = img[0..NTFS_SECTOR_BYTES].to_vec();
+        let vol_end = usize::try_from(volume_bytes).unwrap();
+        img[vol_end..vol_end + NTFS_SECTOR_BYTES].copy_from_slice(&boot_copy);
+
+        let log_off = usize::try_from(log_lcn).unwrap() * NTFS_CLUSTER_BYTES;
+        let logfile_byte_len = usize::try_from(log_pages).unwrap() * NTFS_CLUSTER_BYTES;
+        img[log_off..log_off + logfile_byte_len].fill(0xFF);
+
+        let up_off = usize::try_from(upcase_lcn).unwrap() * NTFS_CLUSTER_BYTES;
+        for cp in 0_u32..65_536 {
+            let mapped = if (u32::from(b'a')..=u32::from(b'z')).contains(&cp) {
+                u16::try_from(cp - 32).unwrap()
+            } else {
+                u16::try_from(cp).unwrap()
+            };
+            let at = up_off + (cp as usize) * 2;
+            img[at..at + 2].copy_from_slice(&mapped.to_le_bytes());
+        }
+
+        let bm_logical = usize::try_from(total_clusters.div_ceil(8)).unwrap();
+        let bm_off = usize::try_from(bm_lcn).unwrap() * NTFS_CLUSTER_BYTES;
+        for c in 0..used_clusters {
+            img[bm_off + usize::try_from(c / 8).unwrap()] |= 1_u8 << (c % 8);
+        }
+
+        let mut mft_bm = [0_u8; 8];
+        for slot in [0_u64, 1, 2, 3, 5, 6, 7, 10] {
+            mft_bm[usize::try_from(slot / 8).unwrap()] |= 1_u8 << (slot % 8);
+        }
+        let rec0 = ntfs_file_record(
+            0,
+            1,
+            0,
+            false,
+            &[
+                ntfs_nonresident_attr(
+                    DATA,
+                    0,
+                    &[],
+                    mft_lcn,
+                    8,
+                    32 * NTFS_RECORD_BYTES as u64,
+                    total_clusters,
+                ),
+                ntfs_resident_attr(0xB0, 1, &[], false, &mft_bm),
+            ],
+        );
+        let rec1 = ntfs_file_record(
+            1,
+            1,
+            0,
+            false,
+            &[ntfs_nonresident_attr(
+                DATA,
+                0,
+                &[],
+                mirr_lcn,
+                1,
+                4 * NTFS_RECORD_BYTES as u64,
+                total_clusters,
+            )],
+        );
+        let rec2 = ntfs_file_record(
+            2,
+            1,
+            0,
+            false,
+            &[ntfs_nonresident_attr(
+                DATA,
+                0,
+                &[],
+                log_lcn,
+                log_pages,
+                log_pages * NTFS_CLUSTER_BYTES as u64,
+                total_clusters,
+            )],
+        );
+        let mut vol_info = [0_u8; 12];
+        vol_info[8..10].copy_from_slice(&[3, 1]);
+        let rec3 = ntfs_file_record(
+            3,
+            1,
+            0,
+            false,
+            &[ntfs_resident_attr(
+                VOLUME_INFORMATION,
+                0,
+                &[],
+                false,
+                &vol_info,
+            )],
+        );
+
+        let mut std5 = [0_u8; 48];
+        for off in [0_usize, 8, 16, 24] {
+            std5[off..off + 8].copy_from_slice(&NTFS_DEFAULT_FILETIME.to_le_bytes());
+        }
+        let root_fn = NtfsFileName {
+            parent: NtfsReference {
+                record: 5,
+                sequence: 5,
+            },
+            namespace: 3,
+            name: vec![u16::from(b'.')],
+        }
+        .encode(
+            NTFS_DEFAULT_FILETIME,
+            NTFS_DEFAULT_FILETIME,
+            NTFS_DEFAULT_FILETIME,
+            NTFS_DEFAULT_FILETIME,
+            0,
+            0,
+            0x1000_0000,
+            0,
+        )
+        .unwrap();
+        let mut sd = vec![0_u8; 52];
+        sd[0] = 1;
+        sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+        sd[4..8].copy_from_slice(&20_u32.to_le_bytes());
+        sd[8..12].copy_from_slice(&32_u32.to_le_bytes());
+        sd[16..20].copy_from_slice(&44_u32.to_le_bytes());
+        let sid = [1_u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        sd[20..32].copy_from_slice(&sid);
+        sd[32..44].copy_from_slice(&sid);
+        sd[44] = 2;
+        sd[46..48].copy_from_slice(&8_u16.to_le_bytes());
+
+        let mut empty_i30 = vec![0_u8; 48];
+        empty_i30[0..4].copy_from_slice(&0x30_u32.to_le_bytes());
+        empty_i30[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        empty_i30[8..12].copy_from_slice(&(NTFS_INDEX_BYTES as u32).to_le_bytes());
+        empty_i30[12] = 1;
+        empty_i30[16..20].copy_from_slice(&16_u32.to_le_bytes());
+        empty_i30[20..24].copy_from_slice(&32_u32.to_le_bytes());
+        empty_i30[24..28].copy_from_slice(&32_u32.to_le_bytes());
+        empty_i30[40..42].copy_from_slice(&16_u16.to_le_bytes());
+        empty_i30[44..48].copy_from_slice(&2_u32.to_le_bytes());
+        let i30_name = [
+            u16::from(b'$'),
+            u16::from(b'I'),
+            u16::from(b'3'),
+            u16::from(b'0'),
+        ];
+        let rec5 = ntfs_file_record(
+            5,
+            5,
+            1,
+            true,
+            &[
+                ntfs_resident_attr(0x10, 0, &[], false, &std5),
+                ntfs_resident_attr(0x30, 1, &[], true, &root_fn),
+                ntfs_resident_attr(0x50, 2, &[], false, &sd),
+                ntfs_resident_attr(0x90, 3, &i30_name, false, &empty_i30),
+            ],
+        );
+        let rec6 = ntfs_file_record(
+            6,
+            1,
+            0,
+            false,
+            &[ntfs_nonresident_attr(
+                DATA,
+                0,
+                &[],
+                bm_lcn,
+                1,
+                bm_logical as u64,
+                total_clusters,
+            )],
+        );
+        let rec7 = ntfs_file_record(
+            7,
+            1,
+            0,
+            false,
+            &[ntfs_nonresident_attr(
+                DATA,
+                0,
+                &[],
+                0,
+                1,
+                NTFS_CLUSTER_BYTES as u64,
+                total_clusters,
+            )],
+        );
+        let upcase_rec = ntfs_file_record(
+            10,
+            1,
+            0,
+            false,
+            &[ntfs_nonresident_attr(
+                DATA,
+                0,
+                &[],
+                upcase_lcn,
+                32,
+                131_072,
+                total_clusters,
+            )],
+        );
+        let mft_base = usize::try_from(mft_lcn).unwrap() * NTFS_CLUSTER_BYTES;
+        for (slot, bytes) in [
+            (0_usize, &rec0),
+            (1, &rec1),
+            (2, &rec2),
+            (3, &rec3),
+            (5, &rec5),
+            (6, &rec6),
+            (7, &rec7),
+            (10, &upcase_rec),
+        ] {
+            let off = mft_base + slot * NTFS_RECORD_BYTES;
+            img[off..off + NTFS_RECORD_BYTES].copy_from_slice(bytes);
+        }
+        let mirr_base = usize::try_from(mirr_lcn).unwrap() * NTFS_CLUSTER_BYTES;
+        let first4 = img[mft_base..mft_base + 4 * NTFS_RECORD_BYTES].to_vec();
+        img[mirr_base..mirr_base + 4 * NTFS_RECORD_BYTES].copy_from_slice(&first4);
+        img
+    }
+
+    // ── Clean ZFS v5000 single-leaf / 2-way mirror pool builder ──────────────
+
+    fn xdr_string(value: &str) -> Vec<u8> {
+        let mut bytes = u32::try_from(value.len()).unwrap().to_be_bytes().to_vec();
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.resize(bytes.len().next_multiple_of(4), 0);
+        bytes
+    }
+
+    fn nv_pair(name: &str, kind: u32, count: u32, data: &[u8], dec_val_bytes: usize) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 8];
+        bytes.extend_from_slice(&xdr_string(name));
+        bytes.extend_from_slice(&kind.to_be_bytes());
+        bytes.extend_from_slice(&count.to_be_bytes());
+        bytes.extend_from_slice(data);
+        let len = u32::try_from(bytes.len()).unwrap();
+        let dec_sz = u32::try_from(
+            (16 + name.len() + 1).next_multiple_of(8) + dec_val_bytes.next_multiple_of(8),
+        )
+        .unwrap();
+        bytes[0..4].copy_from_slice(&len.to_be_bytes());
+        bytes[4..8].copy_from_slice(&dec_sz.to_be_bytes());
+        bytes
+    }
+
+    fn nv_u64(name: &str, value: u64) -> Vec<u8> {
+        nv_pair(name, 8, 1, &value.to_be_bytes(), 8)
+    }
+
+    fn nv_str(name: &str, value: &str) -> Vec<u8> {
+        nv_pair(name, 9, 1, &xdr_string(value), value.len() + 1)
+    }
+
+    fn nv_bool(name: &str) -> Vec<u8> {
+        nv_pair(name, 1, 0, &[], 0)
+    }
+
+    fn nv_list_body(pairs: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        for p in pairs {
+            bytes.extend_from_slice(p);
+        }
+        bytes.extend_from_slice(&[0_u8; 8]);
+        bytes
+    }
+
+    fn nv_embedded(name: &str, pairs: &[Vec<u8>]) -> Vec<u8> {
+        nv_pair(name, 19, 1, &nv_list_body(pairs), 24)
+    }
+
+    fn nv_list_array(name: &str, items: &[Vec<Vec<u8>>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for item in items {
+            payload.extend_from_slice(&nv_list_body(item));
+        }
+        nv_pair(
+            name,
+            20,
+            u32::try_from(items.len()).unwrap(),
+            &payload,
+            items.len() * 32,
+        )
+    }
+
+    fn pack_xdr_nvlist(pairs: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = vec![1, 1, 0, 0];
+        out.extend_from_slice(&nv_list_body(pairs));
+        out
+    }
+
+    struct ZfsArena {
+        sector: u64,
+        cursor: u64,
+        limit: u64,
+        blocks: BTreeMap<u64, Vec<u8>>,
+        alloc_map: AllocationMap,
+    }
+
+    impl ZfsArena {
+        fn new(asize: u64, ashift: u8) -> Self {
+            let sector = 1_u64 << ashift;
+            Self {
+                sector,
+                cursor: sector * 8,
+                limit: asize,
+                blocks: BTreeMap::new(),
+                alloc_map: AllocationMap::new(0, asize, ashift, 262_144).unwrap(),
+            }
+        }
+
+        fn alloc_block(
+            &mut self,
+            payload: &[u8],
+            object_type: u8,
+            level: u8,
+            birth: u64,
+            order: Endian,
+        ) -> BlockPointer {
+            let min_blk = usize::try_from(self.sector).unwrap().max(512);
+            let lsize = payload.len().max(min_blk).next_multiple_of(512);
+            let mut buf = payload.to_vec();
+            buf.resize(lsize, 0);
+            let asize = (lsize as u64).next_multiple_of(self.sector);
+            let dva_off = self.cursor;
+            assert!(dva_off + asize <= self.limit);
+            self.cursor += asize;
+            self.alloc_map
+                .apply(MapType::Allocate, dva_off..(dva_off + asize))
+                .unwrap();
+            let mut disk_bytes = buf.clone();
+            disk_bytes.resize(usize::try_from(asize).unwrap(), 0);
+            self.blocks.insert(dva_off, disk_bytes);
+            let fill = if object_type == DMU_OT_DNODE {
+                buf.as_chunks::<DNODE_BYTES>()
+                    .0
+                    .iter()
+                    .filter(|slot| slot[0] != 0)
+                    .count() as u64
+            } else if object_type == DMU_OT_OBJSET {
+                ObjectSet::parse(&buf, order).unwrap().meta_fill()
+            } else {
+                1
+            };
+            BlockPointer::new_regular(&RegularBlockSpec {
+                dvas: &[Dva {
+                    vdev: 0,
+                    offset: dva_off,
+                    allocated_bytes: asize,
+                    gang: false,
+                }],
+                logical_bytes: lsize,
+                physical: &buf,
+                compression: 2,
+                checksum_type: 7,
+                object_type,
+                level,
+                payload_order: order,
+                birth,
+                fill,
+            })
+            .unwrap()
+        }
+    }
+
+    fn bp_allocated_bytes(bp: &BlockPointer) -> u64 {
+        bp.regular_dvas()
+            .map_or(0, |dvas| dvas.iter().map(|d| d.allocated_bytes).sum())
+    }
+
+    fn mzap(pairs: &[(&[u8], u64)], salt: u64, order: Endian) -> Vec<u8> {
+        let entries: Vec<ZapEntry> = pairs
+            .iter()
+            .map(|&(name, value)| ZapEntry {
+                name: name.to_vec(),
+                value,
+                collision: 0,
+            })
+            .collect();
+        encode_microzap(&entries, 4096, salt, order).unwrap()
+    }
+
+    fn make_dnode(
+        object_type: u8,
+        data_bytes: usize,
+        pointers: Vec<BlockPointer>,
+        bonus_type: u8,
+        bonus: Vec<u8>,
+        order: Endian,
+    ) -> Dnode {
+        let used_bytes: u64 = pointers
+            .iter()
+            .filter(|bp| !bp.hole())
+            .map(bp_allocated_bytes)
+            .sum();
+        let max_block = if pointers.is_empty() || pointers.iter().all(BlockPointer::hole) {
+            0
+        } else {
+            (pointers.len() as u64) - 1
+        };
+        let nblkptr = if bonus_type == 44 {
+            1
+        } else {
+            ((DNODE_BYTES - 64 - bonus.len()) / 128).clamp(1, 3)
+        };
+        let mut ptrs = pointers;
+        ptrs.resize(nblkptr, BlockPointer::hole_pointer());
+        Dnode::from_spec(DnodeSpec {
+            object_type,
+            bonus_type,
+            checksum_type: 0,
+            compress_type: 0,
+            flags: DNODE_FLAG_USED_BYTES,
+            order,
+            levels: 1,
+            indirect_shift: 17,
+            data_bytes,
+            max_block,
+            used_bytes,
+            slots: 1,
+            pointers: ptrs,
+            bonus,
+            spill: None,
+        })
+        .unwrap()
+    }
+
+    fn build_zpl_v5_dataset(
+        arena: &mut ZfsArena,
+        birth: u64,
+        order: Endian,
+    ) -> (BlockPointer, u64) {
+        let mut table = vec![0_u8; DNODE_BLOCK_BYTES];
+        let reg_entries = vec![
+            RawZapEntry {
+                name: b"ZPL_ATIME".to_vec(),
+                integer_bytes: 8,
+                values: vec![16_u64 << 24],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_MTIME".to_vec(),
+                integer_bytes: 8,
+                values: vec![(16_u64 << 24) | 1],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_CTIME".to_vec(),
+                integer_bytes: 8,
+                values: vec![(16_u64 << 24) | 2],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_CRTIME".to_vec(),
+                integer_bytes: 8,
+                values: vec![(16_u64 << 24) | 3],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_GEN".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 4],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_MODE".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 5],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_SIZE".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 6],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_PARENT".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 7],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_LINKS".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 8],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_RDEV".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 0x0a],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_FLAGS".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 0x0b],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_UID".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 0x0c],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_GID".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 0x0d],
+                collision: 0,
+            },
+            RawZapEntry {
+                name: b"ZPL_DACL_COUNT".to_vec(),
+                integer_bytes: 8,
+                values: vec![(8_u64 << 24) | 0x10],
+                collision: 0,
+            },
+            // Real OpenZFS `sa_bswap_type_t`: SA_ACL == 4 (variable length 0)!
+            RawZapEntry {
+                name: b"ZPL_DACL_ACES".to_vec(),
+                integer_bytes: 8,
+                values: vec![(4_u64 << 16) | 0x11],
+                collision: 0,
+            },
+        ];
+        let lay_entries = vec![RawZapEntry {
+            name: b"2".to_vec(),
+            integer_bytes: 2,
+            values: vec![5, 6, 4, 12, 13, 7, 11, 0, 1, 2, 3, 8],
+            collision: 0,
+        }];
+        let sa_reg = SaRegistry::from_zaps(&reg_entries, &lay_entries).unwrap();
+        let sa_master_bp = arena.alloc_block(
+            &mzap(&[(b"REGISTRY", 9), (b"LAYOUTS", 10)], 0x1234, order),
+            45,
+            0,
+            birth,
+            order,
+        );
+        write_dnode_at(
+            &mut table,
+            8,
+            &make_dnode(
+                45,
+                sa_master_bp.logical_bytes(),
+                vec![sa_master_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        )
+        .unwrap();
+        let reg_blocks =
+            encode_fatzap_with_flags(&reg_entries, 4096, 0x2345, false, order).unwrap();
+        let reg_ptrs: Vec<_> = reg_blocks
+            .iter()
+            .map(|b| arena.alloc_block(b, 46, 0, birth, order))
+            .collect();
+        write_dnode_at(
+            &mut table,
+            9,
+            &make_dnode(46, 4096, reg_ptrs, 0, Vec::new(), order),
+        )
+        .unwrap();
+        let lay_blocks =
+            encode_fatzap_with_flags(&lay_entries, 4096, 0x3456, false, order).unwrap();
+        let lay_ptrs: Vec<_> = lay_blocks
+            .iter()
+            .map(|b| arena.alloc_block(b, 47, 0, birth, order))
+            .collect();
+        write_dnode_at(
+            &mut table,
+            10,
+            &make_dnode(47, 4096, lay_ptrs, 0, Vec::new(), order),
+        )
+        .unwrap();
+
+        let master_bp = arena.alloc_block(
+            &mzap(
+                &[
+                    (b"VERSION", 5),
+                    (b"ROOT", 2),
+                    (b"DELETE_QUEUE", 3),
+                    (b"SA_ATTRS", 8),
+                ],
+                0x55,
+                order,
+            ),
+            21,
+            0,
+            birth,
+            order,
+        );
+        write_dnode_at(
+            &mut table,
+            1,
+            &make_dnode(
+                21,
+                master_bp.logical_bytes(),
+                vec![master_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        )
+        .unwrap();
+        let delq_bp = arena.alloc_block(&mzap(&[], 0x66, order), 22, 0, birth, order);
+        write_dnode_at(
+            &mut table,
+            3,
+            &make_dnode(
+                22,
+                delq_bp.logical_bytes(),
+                vec![delq_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        )
+        .unwrap();
+
+        let ts = Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        };
+        let root_meta = Metadata {
+            kind: Kind::Directory,
+            mode: (Kind::Directory.to_tag() << 12) | 0o755,
+            size: 2,
+            links: 2,
+            parent: 2,
+            uid: 0,
+            gid: 0,
+            flags: 0x408,
+            generation: birth,
+            times: [ts; 4],
+            inline_symlink: None,
+        };
+        let mut tmpl = vec![0_u8; 136];
+        tmpl[0..4].copy_from_slice(&[0x5a, 0x50, 0x2f, 0x00]);
+        tmpl[4..6].copy_from_slice(&((1_u16 << 10) | 2_u16).to_le_bytes());
+        let root_bonus = sa_reg.encode_new_from_template(&tmpl, &root_meta).unwrap();
+        let root_bp = arena.alloc_block(&mzap(&[], 0x88, order), 20, 0, birth, order);
+        write_dnode_at(
+            &mut table,
+            2,
+            &make_dnode(
+                20,
+                root_bp.logical_bytes(),
+                vec![root_bp],
+                44,
+                root_bonus,
+                order,
+            ),
+        )
+        .unwrap();
+
+        let table_bp = arena.alloc_block(&table, DMU_OT_DNODE, 0, birth, order);
+        let meta_dn = make_dnode(
+            DMU_OT_DNODE,
+            DNODE_BLOCK_BYTES,
+            vec![table_bp],
+            0,
+            Vec::new(),
+            order,
+        );
+        let os_obj = ObjectSet::new(2, 0, meta_dn, ZilHeader::empty(), 1024).unwrap();
+        let encoded_os = os_obj.encode(order).unwrap();
+        let os_bp = arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, order);
+        let referenced = os_obj.meta.used_bytes() + bp_allocated_bytes(&os_bp);
+        (os_bp, referenced)
+    }
+
+    fn encode_dsl_dir_bonus(
+        head_obj: u64,
+        parent_dir_obj: u64,
+        origin_obj: u64,
+        child_dir_zapobj: u64,
+        props_zapobj: u64,
+        used_bytes: u64,
+        order: Endian,
+    ) -> Vec<u8> {
+        let mut raw = vec![0_u8; 256];
+        for (at, val) in [
+            (0, 1_700_000_000_u64),
+            (8, head_obj),
+            (16, parent_dir_obj),
+            (24, origin_obj),
+            (32, child_dir_zapobj),
+            (40, used_bytes),
+            (48, used_bytes),
+            (56, used_bytes),
+            (80, props_zapobj),
+        ] {
+            raw[at..at + 8].copy_from_slice(&order.encode(val));
+        }
+        raw
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_dsl_dataset_bonus(
+        dir_obj: u64,
+        prev_snap_obj: u64,
+        prev_snap_txg: u64,
+        next_snap_obj: u64,
+        snapnames_zapobj: u64,
+        num_children: u64,
+        creation_txg: u64,
+        deadlist_obj: u64,
+        referenced_bytes: u64,
+        guid: u64,
+        next_clones_obj: u64,
+        os_bp: &BlockPointer,
+        order: Endian,
+    ) -> Vec<u8> {
+        let mut raw = vec![0_u8; 320];
+        for (at, val) in [
+            (0, dir_obj),
+            (8, prev_snap_obj),
+            (16, prev_snap_txg),
+            (24, next_snap_obj),
+            (32, snapnames_zapobj),
+            (40, num_children),
+            (48, 1_700_000_000 + creation_txg),
+            (56, creation_txg),
+            (64, deadlist_obj),
+            (72, referenced_bytes),
+            (80, referenced_bytes),
+            (88, referenced_bytes),
+            (96, referenced_bytes),
+            (104, guid ^ 0x55AA),
+            (112, guid),
+            (120, 0),
+            (256, next_clones_obj),
+        ] {
+            raw[at..at + 8].copy_from_slice(&order.encode(val));
+        }
+        raw[128..256].copy_from_slice(&os_bp.encode(order));
+        raw
+    }
+
+    fn build_clean_writable_zfs_pool(mirror_width: usize) -> (Vec<Vec<u8>>, u64) {
+        let image_bytes = 16 * 1024 * 1024_u64;
+        let ashift = 9_u8;
+        let order = Endian::Little;
+        let asize =
+            (image_bytes - DATA_OFFSET - 2 * LABEL_BYTES) & !((1_u64 << ZFS_SLAB_SHIFT) - 1);
+        let num_slabs = usize::try_from(asize >> ZFS_SLAB_SHIFT).unwrap();
+        let mut arena = ZfsArena::new(asize, ashift);
+
+        let (root_os_bp, root_ref_bytes) =
+            build_zpl_v5_dataset(&mut arena, ZFS_INITIAL_TXG - 1, order);
+        let (data_os_bp, data_ref_bytes) =
+            build_zpl_v5_dataset(&mut arena, ZFS_INITIAL_TXG - 1, order);
+
+        let sm_base_id = 40_usize;
+        let slots_per_dnode_blk = DNODE_BLOCK_BYTES / DNODE_BYTES;
+        let mos_table_blocks = (sm_base_id + num_slabs).div_ceil(slots_per_dnode_blk);
+        let mut mos_tables = vec![vec![0_u8; DNODE_BLOCK_BYTES]; mos_table_blocks];
+        let set_mos = |tables: &mut [Vec<u8>], id: usize, dn: &Dnode| {
+            write_dnode_at(
+                &mut tables[id / slots_per_dnode_blk],
+                id % slots_per_dnode_blk,
+                dn,
+            )
+            .unwrap();
+        };
+
+        let r_snaps_bp = arena.alloc_block(&mzap(&[], 0x101, order), 14, 0, ZFS_INITIAL_TXG, order);
+        set_mos(
+            &mut mos_tables,
+            4,
+            &make_dnode(
+                14,
+                r_snaps_bp.logical_bytes(),
+                vec![r_snaps_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+        let child_zap_bp = arena.alloc_block(
+            &mzap(
+                &[
+                    (b"$FREE", 14),
+                    (b"$MOS", 9),
+                    (b"$ORIGIN", 24),
+                    (b"data", 17),
+                ],
+                0x102,
+                order,
+            ),
+            13,
+            0,
+            ZFS_INITIAL_TXG,
+            order,
+        );
+        set_mos(
+            &mut mos_tables,
+            15,
+            &make_dnode(
+                13,
+                child_zap_bp.logical_bytes(),
+                vec![child_zap_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+
+        for (id, kind, salt) in [
+            (16_usize, 15_u8, 0x103_u64),
+            (19, 13, 0x104),
+            (20, 15, 0x105),
+            (30, 15, 0x110),
+            (31, 15, 0x111),
+            (32, 15, 0x112),
+            (33, 13, 0x113),
+            (34, 13, 0x114),
+            (35, 13, 0x115),
+        ] {
+            let bp = arena.alloc_block(&mzap(&[], salt, order), kind, 0, ZFS_INITIAL_TXG, order);
+            set_mos(
+                &mut mos_tables,
+                id,
+                &make_dnode(kind, bp.logical_bytes(), vec![bp], 0, Vec::new(), order),
+            );
+        }
+        for bpobj_id in [7_usize, 8, 13, 36, 37, 38] {
+            set_mos(
+                &mut mos_tables,
+                bpobj_id,
+                &make_dnode(5, 4096, Vec::new(), 6, vec![0_u8; 48], order),
+            );
+        }
+        for (special_dir_id, child_id, props_id) in [(9_usize, 33_u64, 30_u64), (14, 34, 31)] {
+            set_mos(
+                &mut mos_tables,
+                special_dir_id,
+                &make_dnode(
+                    12,
+                    512,
+                    Vec::new(),
+                    12,
+                    encode_dsl_dir_bonus(0, 2, 0, child_id, props_id, 0, order),
+                    order,
+                ),
+            );
+        }
+        set_mos(
+            &mut mos_tables,
+            24,
+            &make_dnode(
+                12,
+                512,
+                Vec::new(),
+                12,
+                encode_dsl_dir_bonus(25, 2, 0, 35, 32, 0, order),
+                order,
+            ),
+        );
+        let origin_snaps_bp = arena.alloc_block(
+            &mzap(&[(b"$ORIGIN", 26)], 0x10C, order),
+            14,
+            0,
+            ZFS_INITIAL_TXG,
+            order,
+        );
+        set_mos(
+            &mut mos_tables,
+            27,
+            &make_dnode(
+                14,
+                origin_snaps_bp.logical_bytes(),
+                vec![origin_snaps_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+        let origin_hole_bp = BlockPointer::hole_pointer();
+        set_mos(
+            &mut mos_tables,
+            25,
+            &make_dnode(
+                16,
+                512,
+                Vec::new(),
+                16,
+                encode_dsl_dataset_bonus(
+                    24,
+                    26,
+                    1,
+                    0,
+                    27,
+                    0,
+                    1,
+                    36,
+                    0,
+                    0xABCD_0025,
+                    0,
+                    &origin_hole_bp,
+                    order,
+                ),
+                order,
+            ),
+        );
+        let origin_clones_bp = arena.alloc_block(
+            &mzap(&[(b"3", 3), (b"12", 18)], 0x10D, order),
+            37,
+            0,
+            ZFS_INITIAL_TXG,
+            order,
+        );
+        set_mos(
+            &mut mos_tables,
+            28,
+            &make_dnode(
+                37,
+                origin_clones_bp.logical_bytes(),
+                vec![origin_clones_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+        set_mos(
+            &mut mos_tables,
+            26,
+            &make_dnode(
+                16,
+                512,
+                Vec::new(),
+                16,
+                encode_dsl_dataset_bonus(
+                    24,
+                    0,
+                    0,
+                    25,
+                    0,
+                    3,
+                    1,
+                    13,
+                    0,
+                    0xABCD_0026,
+                    28,
+                    &origin_hole_bp,
+                    order,
+                ),
+                order,
+            ),
+        );
+
+        let d_snaps_bp = arena.alloc_block(&mzap(&[], 0x107, order), 14, 0, ZFS_INITIAL_TXG, order);
+        set_mos(
+            &mut mos_tables,
+            22,
+            &make_dnode(
+                14,
+                d_snaps_bp.logical_bytes(),
+                vec![d_snaps_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+        set_mos(
+            &mut mos_tables,
+            3,
+            &make_dnode(
+                16,
+                512,
+                Vec::new(),
+                16,
+                encode_dsl_dataset_bonus(
+                    2,
+                    26,
+                    1,
+                    0,
+                    4,
+                    0,
+                    10,
+                    37,
+                    root_ref_bytes,
+                    0xABCD_0003,
+                    0,
+                    &root_os_bp,
+                    order,
+                ),
+                order,
+            ),
+        );
+        set_mos(
+            &mut mos_tables,
+            18,
+            &make_dnode(
+                16,
+                512,
+                Vec::new(),
+                16,
+                encode_dsl_dataset_bonus(
+                    17,
+                    26,
+                    1,
+                    0,
+                    22,
+                    0,
+                    12,
+                    38,
+                    data_ref_bytes,
+                    0xABCD_0018,
+                    0,
+                    &data_os_bp,
+                    order,
+                ),
+                order,
+            ),
+        );
+        set_mos(
+            &mut mos_tables,
+            17,
+            &make_dnode(
+                12,
+                512,
+                Vec::new(),
+                12,
+                encode_dsl_dir_bonus(18, 2, 26, 19, 20, data_ref_bytes, order),
+                order,
+            ),
+        );
+        set_mos(
+            &mut mos_tables,
+            2,
+            &make_dnode(
+                12,
+                512,
+                Vec::new(),
+                12,
+                encode_dsl_dir_bonus(3, 0, 26, 15, 16, root_ref_bytes + data_ref_bytes, order),
+                order,
+            ),
+        );
+
+        let rf_bp = arena.alloc_block(
+            &mzap(
+                &[
+                    (b"org.illumos:lz4_compress", 1),
+                    (b"com.delphix:hole_birth", 1),
+                    (b"com.delphix:extensible_dataset", 0),
+                ],
+                0x108,
+                order,
+            ),
+            196,
+            0,
+            ZFS_INITIAL_TXG,
+            order,
+        );
+        set_mos(
+            &mut mos_tables,
+            10,
+            &make_dnode(
+                196,
+                rf_bp.logical_bytes(),
+                vec![rf_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+        let wf_bp = arena.alloc_block(
+            &mzap(
+                &[
+                    (b"com.delphix:async_destroy", 0),
+                    (b"com.delphix:empty_bpobj", 1),
+                    (b"com.delphix:enabled_txg", 1),
+                    (b"com.delphix:spacemap_histogram", 1),
+                    (b"com.delphix:spacemap_v2", 1),
+                ],
+                0x109,
+                order,
+            ),
+            196,
+            0,
+            ZFS_INITIAL_TXG,
+            order,
+        );
+        set_mos(
+            &mut mos_tables,
+            11,
+            &make_dnode(
+                196,
+                wf_bp.logical_bytes(),
+                vec![wf_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+        let fd_bp = arena.alloc_block(&mzap(&[], 0x10A, order), 196, 0, ZFS_INITIAL_TXG, order);
+        set_mos(
+            &mut mos_tables,
+            12,
+            &make_dnode(
+                196,
+                fd_bp.logical_bytes(),
+                vec![fd_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+
+        let top_guid = if mirror_width == 1 {
+            ZFS_TOP_SINGLE_GUID
+        } else {
+            ZFS_TOP_MIRROR_GUID
+        };
+        let top_vdev_pairs = if mirror_width == 1 {
+            vec![
+                nv_str("type", "file"),
+                nv_u64("id", 0),
+                nv_u64("guid", top_guid),
+                nv_str("path", "/dev/ffs-member-0"),
+                nv_u64("metaslab_array", 6),
+                nv_u64("metaslab_shift", ZFS_SLAB_SHIFT),
+                nv_u64("ashift", u64::from(ashift)),
+                nv_u64("asize", asize),
+                nv_u64("is_log", 0),
+            ]
+        } else {
+            let children: Vec<Vec<Vec<u8>>> = (0..mirror_width)
+                .map(|idx| {
+                    vec![
+                        nv_str("type", "file"),
+                        nv_u64("id", idx as u64),
+                        nv_u64("guid", ZFS_CHILD_GUIDS[idx]),
+                        nv_str("path", &format!("/dev/ffs-member-{idx}")),
+                    ]
+                })
+                .collect();
+            vec![
+                nv_str("type", "mirror"),
+                nv_u64("id", 0),
+                nv_u64("guid", top_guid),
+                nv_u64("metaslab_array", 6),
+                nv_u64("metaslab_shift", ZFS_SLAB_SHIFT),
+                nv_u64("ashift", u64::from(ashift)),
+                nv_u64("asize", asize),
+                nv_u64("is_log", 0),
+                nv_list_array("children", &children),
+            ]
+        };
+        let mos_cfg_packed = pack_xdr_nvlist(&[
+            nv_u64("version", 5000),
+            nv_str("name", "ffstestpool"),
+            nv_u64("state", 1),
+            nv_u64("txg", ZFS_INITIAL_TXG),
+            nv_u64("pool_guid", ZFS_POOL_GUID),
+            nv_u64("hostid", 1),
+            nv_str("hostname", "frankenfs"),
+            nv_u64("vdev_children", 1),
+            nv_embedded(
+                "vdev_tree",
+                &[
+                    nv_str("type", "root"),
+                    nv_u64("id", 0),
+                    nv_u64("guid", ZFS_POOL_GUID),
+                    nv_list_array("children", std::slice::from_ref(&top_vdev_pairs)),
+                ],
+            ),
+            nv_embedded("features_for_read", &[nv_bool("com.delphix:hole_birth")]),
+        ]);
+        let cfg_len = mos_cfg_packed.len() as u64;
+        let mut cfg_padded = mos_cfg_packed;
+        cfg_padded.resize(cfg_padded.len().max(4096).next_multiple_of(4096), 0);
+        let cfg_bp = arena.alloc_block(&cfg_padded, 3, 0, ZFS_INITIAL_TXG, order);
+        set_mos(
+            &mut mos_tables,
+            5,
+            &make_dnode(
+                3,
+                cfg_padded.len(),
+                vec![cfg_bp],
+                4,
+                order.encode(cfg_len).to_vec(),
+                order,
+            ),
+        );
+
+        let fet_bp = arena.alloc_block(
+            &mzap(
+                &[
+                    (b"com.delphix:enabled_txg", 1),
+                    (b"com.delphix:hole_birth", 1),
+                ],
+                0x10E,
+                order,
+            ),
+            196,
+            0,
+            ZFS_INITIAL_TXG,
+            order,
+        );
+        set_mos(
+            &mut mos_tables,
+            29,
+            &make_dnode(
+                196,
+                fet_bp.logical_bytes(),
+                vec![fet_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+        let obj_dir_bp = arena.alloc_block(
+            &mzap(
+                &[
+                    (b"root_dataset", 2),
+                    (b"config", 5),
+                    (b"sync_bplist", 7),
+                    (b"free_bpobj", 8),
+                    (b"features_for_read", 10),
+                    (b"features_for_write", 11),
+                    (b"feature_descriptions", 12),
+                    (b"empty_bpobj", 13),
+                    (b"feature_enabled_txg", 29),
+                ],
+                0x10B,
+                order,
+            ),
+            DMU_OT_OBJECT_DIRECTORY,
+            0,
+            ZFS_INITIAL_TXG,
+            order,
+        );
+        set_mos(
+            &mut mos_tables,
+            1,
+            &make_dnode(
+                DMU_OT_OBJECT_DIRECTORY,
+                obj_dir_bp.logical_bytes(),
+                vec![obj_dir_bp],
+                0,
+                Vec::new(),
+                order,
+            ),
+        );
+
+        let mut ms_arr = vec![0_u8; (num_slabs * 8).max(4096).next_multiple_of(512)];
+        ms_arr[0..8].copy_from_slice(&order.encode(sm_base_id as u64));
+        let ms_arr_bp = arena.alloc_block(&ms_arr, 2, 0, ZFS_INITIAL_TXG, order);
+        set_mos(
+            &mut mos_tables,
+            6,
+            &make_dnode(2, ms_arr.len(), vec![ms_arr_bp], 0, Vec::new(), order),
+        );
+
+        let sector = 1_u64 << ashift;
+        let sm_block_bytes = 4096_u64;
+        let mos_table_bytes = DNODE_BLOCK_BYTES as u64;
+        let mos_root_lsize = 1024_usize.max(usize::try_from(sector).unwrap());
+        let mos_root_alloc_bytes = (mos_root_lsize as u64).next_multiple_of(sector);
+
+        let sm0_off = arena.cursor;
+        arena.cursor += sm_block_bytes;
+        arena
+            .alloc_map
+            .apply(MapType::Allocate, sm0_off..(sm0_off + sm_block_bytes))
+            .unwrap();
+
+        let mut mos_table_offs = Vec::with_capacity(mos_table_blocks);
+        for _ in 0..mos_table_blocks {
+            let off = arena.cursor;
+            arena.cursor += mos_table_bytes;
+            arena
+                .alloc_map
+                .apply(MapType::Allocate, off..(off + mos_table_bytes))
+                .unwrap();
+            mos_table_offs.push(off);
+        }
+        let mos_root_off = arena.cursor;
+        arena.cursor += mos_root_alloc_bytes;
+        arena
+            .alloc_map
+            .apply(
+                MapType::Allocate,
+                mos_root_off..(mos_root_off + mos_root_alloc_bytes),
+            )
+            .unwrap();
+
+        let slab_size = 1_u64 << ZFS_SLAB_SHIFT;
+        let mut slab_map = AllocationMap::new(0, slab_size, ashift, 262_144).unwrap();
+        let mut records = Vec::new();
+        for r in arena.alloc_map.ranges() {
+            let ov_end = r.end.min(slab_size);
+            if r.start < ov_end {
+                slab_map.apply(MapType::Allocate, r.start..ov_end).unwrap();
+                records.extend(
+                    extent_records_for_range(
+                        MapType::Allocate,
+                        r.start..ov_end,
+                        0,
+                        slab_size,
+                        ashift,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let mut cur = Vec::with_capacity(4096);
+        let pad = SpaceMapRecord::padding_word().encode(order, true).unwrap();
+        for rec in &records {
+            let encoded = rec.encode(order, true).unwrap();
+            assert!(cur.len() + encoded.len() <= 4096);
+            cur.extend_from_slice(&encoded);
+        }
+        let stream_len = cur.len() as u64;
+        while cur.len() < 4096 {
+            cur.extend_from_slice(&pad);
+        }
+        cur.truncate(4096);
+        arena.blocks.insert(sm0_off, cur.clone());
+        let sm_bp = BlockPointer::new_regular(&RegularBlockSpec {
+            dvas: &[Dva {
+                vdev: 0,
+                offset: sm0_off,
+                allocated_bytes: sm_block_bytes,
+                gang: false,
+            }],
+            logical_bytes: 4096,
+            physical: &cur,
+            compression: 2,
+            checksum_type: 7,
+            object_type: 8,
+            level: 0,
+            payload_order: order,
+            birth: ZFS_INITIAL_TXG,
+            fill: 1,
+        })
+        .unwrap();
+        let hist = slab_map.free_histogram(ashift).unwrap();
+        let hdr = SpaceMapHeader {
+            length: stream_len,
+            allocated: i64::try_from(slab_map.allocated_bytes()).unwrap(),
+            histogram: Some(hist),
+        };
+        let sm_dn = make_dnode(
+            8,
+            4096,
+            vec![sm_bp],
+            7,
+            hdr.encode(320, 0, order).unwrap(),
+            order,
+        );
+        write_dnode_at(
+            &mut mos_tables[sm_base_id / slots_per_dnode_blk],
+            sm_base_id % slots_per_dnode_blk,
+            &sm_dn,
+        )
+        .unwrap();
+
+        let mut mos_table_bps = Vec::with_capacity(mos_table_blocks);
+        for (tbl_blk, tbl_off) in mos_tables.into_iter().zip(mos_table_offs) {
+            let fill = tbl_blk
+                .as_chunks::<DNODE_BYTES>()
+                .0
+                .iter()
+                .filter(|slot| slot[0] != 0)
+                .count() as u64;
+            let bp = BlockPointer::new_regular(&RegularBlockSpec {
+                dvas: &[Dva {
+                    vdev: 0,
+                    offset: tbl_off,
+                    allocated_bytes: mos_table_bytes,
+                    gang: false,
+                }],
+                logical_bytes: DNODE_BLOCK_BYTES,
+                physical: &tbl_blk,
+                compression: 2,
+                checksum_type: 7,
+                object_type: DMU_OT_DNODE,
+                level: 0,
+                payload_order: order,
+                birth: ZFS_INITIAL_TXG,
+                fill,
+            })
+            .unwrap();
+            arena.blocks.insert(tbl_off, tbl_blk);
+            mos_table_bps.push(bp);
+        }
+        let mos_meta_dn = make_dnode(
+            DMU_OT_DNODE,
+            DNODE_BLOCK_BYTES,
+            mos_table_bps,
+            0,
+            Vec::new(),
+            order,
+        );
+        let mos_os = ObjectSet::new(1, 0, mos_meta_dn, ZilHeader::empty(), mos_root_lsize).unwrap();
+        let mos_os_bytes = mos_os.encode(order).unwrap();
+        let mut mos_os_disk = mos_os_bytes.clone();
+        mos_os_disk.resize(usize::try_from(mos_root_alloc_bytes).unwrap(), 0);
+        arena.blocks.insert(mos_root_off, mos_os_disk);
+        let mos_root_bp = BlockPointer::new_regular(&RegularBlockSpec {
+            dvas: &[Dva {
+                vdev: 0,
+                offset: mos_root_off,
+                allocated_bytes: mos_root_alloc_bytes,
+                gang: false,
+            }],
+            logical_bytes: mos_root_lsize,
+            physical: &mos_os_bytes,
+            compression: 2,
+            checksum_type: 7,
+            object_type: DMU_OT_OBJSET,
+            level: 0,
+            payload_order: order,
+            birth: ZFS_INITIAL_TXG,
+            fill: mos_os.meta_fill(),
+        })
+        .unwrap();
+
+        let slot_bytes = (1_usize << ashift).clamp(1024, 8192);
+        let slots_per_label = UBERBLOCK_RING_BYTES / slot_bytes;
+        let initial_slot = (ZFS_INITIAL_TXG as usize) % slots_per_label;
+        let guid_sum = if mirror_width == 1 {
+            ZFS_POOL_GUID.wrapping_add(top_guid)
+        } else {
+            (0..mirror_width).fold(ZFS_POOL_GUID.wrapping_add(top_guid), |acc, i| {
+                acc.wrapping_add(ZFS_CHILD_GUIDS[i])
+            })
+        };
+        let ub = Uberblock {
+            order,
+            version: 5000,
+            txg: ZFS_INITIAL_TXG,
+            guid_sum,
+            timestamp: 1_700_000_000,
+            root: mos_root_bp,
+        };
+        let l_offsets = label_offsets(image_bytes).unwrap();
+        let mut members = Vec::with_capacity(mirror_width);
+        for &child_guid in ZFS_CHILD_GUIDS.iter().take(mirror_width) {
+            let mut img = vec![0_u8; usize::try_from(image_bytes).unwrap()];
+            for (&dva_off, blk) in &arena.blocks {
+                let start = usize::try_from(DATA_OFFSET + dva_off).unwrap();
+                img[start..start + blk.len()].copy_from_slice(blk);
+            }
+            let member_guid = if mirror_width == 1 {
+                top_guid
+            } else {
+                child_guid
+            };
+            let lbl_packed = pack_xdr_nvlist(&[
+                nv_u64("version", 5000),
+                nv_str("name", "ffstestpool"),
+                nv_u64("state", 1),
+                nv_u64("txg", ZFS_INITIAL_TXG),
+                nv_u64("pool_guid", ZFS_POOL_GUID),
+                nv_u64("hostid", 1),
+                nv_str("hostname", "frankenfs"),
+                nv_u64("top_guid", top_guid),
+                nv_u64("guid", member_guid),
+                nv_u64("vdev_children", 1),
+                nv_embedded("vdev_tree", &top_vdev_pairs),
+                nv_embedded("features_for_read", &[nv_bool("com.delphix:hole_birth")]),
+            ]);
+            for &lbl_base in &l_offsets {
+                let cfg_vdev_off = lbl_base + LABEL_CONFIG_OFFSET;
+                let mut cfg_blk = vec![0_u8; LABEL_CONFIG_BYTES];
+                cfg_blk[..lbl_packed.len()].copy_from_slice(&lbl_packed);
+                stamp_label_checksum(&mut cfg_blk, cfg_vdev_off, order).unwrap();
+                let c_start = usize::try_from(cfg_vdev_off).unwrap();
+                img[c_start..c_start + LABEL_CONFIG_BYTES].copy_from_slice(&cfg_blk);
+
+                let ub_vdev_off =
+                    lbl_base + UBERBLOCK_RING_OFFSET + ((initial_slot * slot_bytes) as u64);
+                let ub_blk = ub.encode(slot_bytes, ub_vdev_off).unwrap();
+                let u_start = usize::try_from(ub_vdev_off).unwrap();
+                img[u_start..u_start + slot_bytes].copy_from_slice(&ub_blk);
+            }
+            members.push(img);
+        }
+        (members, ZFS_POOL_GUID)
+    }
+
+    fn fuse_device_available() -> bool {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/fuse")
+            .is_ok()
+    }
+
+    fn verify_set(
+        cx: &Cx,
+        manifest: &Path,
+        members: &[(PathBuf, PathBuf)],
+        policy: TrustPolicy,
+    ) -> ffs_error::Result<ffs_repair::sidecar::live::StorageSetVerifyReport> {
+        wait_for_spawns();
+        verify_storage_set(cx, manifest, members, policy)
+    }
+
+    fn exercise_live_fuse_mount(
+        args: &Args,
+        prepared: &Prepared,
+        work: impl FnOnce(&Path),
+    ) -> bool {
+        let require_e2e =
+            std::env::var_os("FFS_PROTECTED_MOUNT_E2E").as_deref() == Some(OsStr::new("1"));
+        if !fuse_device_available() {
+            assert!(
+                !require_e2e,
+                "/dev/fuse must be available when FFS_PROTECTED_MOUNT_E2E=1"
+            );
+            return false;
+        }
+        let mountpoint = prepared
+            .mountpoint
+            .as_ref()
+            .expect("mountpoint required for live FUSE exercise")
+            .clone();
+        let runtime = mount_worker::mount_background_runtime().expect("mount runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+
+        let mounted = std::thread::scope(|scope| {
+            let serve_rt = &runtime;
+            let serve_stopped = Arc::clone(&stopped);
+            let serve_shutdown = Arc::clone(&shutdown);
+            let worker = scope.spawn(move || {
+                super::serve(
+                    &cx,
+                    Some(serve_rt),
+                    args,
+                    prepared,
+                    &serve_stopped,
+                    &serve_shutdown,
+                )
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if shutdown.lock().unwrap().is_some() && std::fs::read_dir(&mountpoint).is_ok() {
+                    break;
+                }
+                if worker.is_finished() {
+                    let res = worker.join().expect("join serve thread");
+                    if !require_e2e
+                        && let Err(ref err) = res
+                        && (format!("{err:#}")
+                            .contains("fusermount3: mount failed: Permission denied")
+                            || format!("{err:#}").contains("Operation not permitted"))
+                    {
+                        return false;
+                    }
+                    panic!("serve exited before mount became ready: {res:?}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for live /dev/fuse protected mount at {}",
+                    mountpoint.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            work(&mountpoint);
+
+            stopped.store(true, Ordering::Release);
+            if let Some(flag) = shutdown.lock().unwrap().as_ref() {
+                flag.store(true, Ordering::Release);
+            }
+            worker
+                .join()
+                .expect("join serve thread")
+                .expect("clean serve shutdown");
+            true
+        });
+        assert!(
+            !require_e2e || mounted,
+            "FFS_PROTECTED_MOUNT_E2E=1 requires live /dev/fuse mount execution"
+        );
+        mounted
+    }
+
+    #[test]
+    fn bd_tqrnc_completeness_refuses_partial_zfs_mirror_external_ext4_journal_and_wrong_member_guid()
+     {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().unwrap();
+        let (members, pool_guid) = build_clean_writable_zfs_pool(2);
+
+        let m0_img = dir.path().join("m0.zfs");
+        let m0_rq = dir.path().join("m0.ffsrq");
+        let m1_img = dir.path().join("m1.zfs");
+        let m1_rq = dir.path().join("m1.ffsrq");
+        std::fs::write(&m0_img, &members[0]).unwrap();
+        std::fs::write(&m1_img, &members[1]).unwrap();
+
+        let sidecar_opts = SidecarOptions {
+            block_size: 4096,
+            group_blocks: 16,
+            repair_symbols: 4,
+        };
+        protect(&cx, &m0_img, &m0_rq, sidecar_opts).unwrap();
+
+        // 1. One member's archive CANNOT qualify 2-way ZFS mirror protection (read-only OR --rw)!
+        let single_ro = check_args(&m0_img, &m0_rq);
+        let ro_err = prepare(&cx, &single_ro)
+            .err()
+            .expect("single-leg archive on 2-way ZFS mirror must be refused");
+        assert!(
+            format!("{ro_err:#}").contains("multi-member")
+                || format!("{ro_err:#}").contains("storage-set")
+        );
+
+        let mut partial_writable = check_args(&m0_img, &m0_rq);
+        partial_writable.check = false;
+        partial_writable.rw = true;
+        let mnt = dir.path().join("mnt");
+        std::fs::create_dir(&mnt).unwrap();
+        partial_writable.mountpoint = Some(mnt);
+        assert!(prepare(&cx, &partial_writable).is_err());
+
+        // 2. External log/special member flags are explicitly refused until native split-device recovery exists.
+        let manifest_path = dir.path().join("mirror.ffsrqset");
+        let key: PorKey = [0x61; 32];
+        let key_file = dir.path().join("trust.key");
+        std::fs::write(&key_file, key).unwrap();
+
+        let mut wrong_id0 = [0_u8; 16];
+        wrong_id0[..8].copy_from_slice(&0xDEAD_BEEF_CAFE_BABE_u64.to_le_bytes());
+        let mut id1 = [0_u8; 16];
+        id1[..8].copy_from_slice(&ZFS_CHILD_GUIDS[1].to_le_bytes());
+
+        protect_storage_set(
+            &cx,
+            &StorageSetProtectRequest {
+                manifest_path: manifest_path.clone(),
+                filesystem: "zfs".to_owned(),
+                topology: StorageSetTopology::ZfsMirror { width: 2 },
+                view: ProtectedViewIdentity::default(),
+                native_binding: NativeCommitBinding::UninterpretedRaw,
+                members: vec![
+                    StorageSetMemberSpec {
+                        role: MemberRole::Data,
+                        image_path: m0_img.clone(),
+                        sidecar_path: m0_rq.clone(),
+                        native_member_id: wrong_id0,
+                        offset: 0,
+                        length: None,
+                    },
+                    StorageSetMemberSpec {
+                        role: MemberRole::Data,
+                        image_path: m1_img.clone(),
+                        sidecar_path: m1_rq.clone(),
+                        native_member_id: id1,
+                        offset: 0,
+                        length: None,
+                    },
+                ],
+                options: sidecar_opts,
+                signing_key: Some(key),
+            },
+        )
+        .unwrap();
+
+        // 3. Manifest binding wrong physical ZFS member GUID is refused!
+        let mut wrong_guid_args = check_args(&m0_img, &m0_rq);
+        wrong_guid_args.set.manifest = Some(manifest_path);
+        wrong_guid_args.set.extra_members = vec![m1_img, m1_rq];
+        wrong_guid_args.set.pool_guid = Some(pool_guid);
+        wrong_guid_args.set.trust_key_file = Some(key_file);
+        wrong_guid_args.set.require_trusted_root = true;
+        let guid_err = prepare(&cx, &wrong_guid_args)
+            .err()
+            .expect("wrong physical ZFS member GUID in manifest must be refused");
+        assert!(
+            format!("{guid_err:#}").contains("GUID disagrees"),
+            "{guid_err:#}"
+        );
+
+        // 4. External-journal Ext4 (HAS_JOURNAL with journal_inum == 0 and non-zero journal_uuid)
+        // is refused on single-member mount!
+        let ext4_fix = Fixture::ext4_with_journal(true);
+        command(
+            Command::new("debugfs")
+                .args(["-w", "-R", "set_super_value journal_inum 0"])
+                .arg(&ext4_fix.image),
+        );
+        command(
+            Command::new("debugfs")
+                .args([
+                    "-w",
+                    "-R",
+                    "set_super_value journal_uuid 11223344-5566-7788-99aa-bbccddeeff00",
+                ])
+                .arg(&ext4_fix.image),
+        );
+        let ext4_ext_rq = ext4_fix.dir.path().join("ext-jnl.ffsrq");
+        protect(&cx, &ext4_fix.image, &ext4_ext_rq, sidecar_opts).unwrap();
+        let ext4_err = prepare(&cx, &check_args(&ext4_fix.image, &ext4_ext_rq))
+            .err()
+            .expect("external-journal ext4 without journal member must be refused");
+        assert!(
+            format!("{ext4_err:#}").contains("external journal"),
+            "{ext4_err:#}"
+        );
+    }
+
+    #[test]
+    fn bd_tqrnc_protected_writable_ntfs_binds_lsn_survives_cancelled_rename_heals_and_mounts_fuse()
+    {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().unwrap();
+        let ntfs_img = dir.path().join("volume.ntfs");
+        let ntfs_rq = dir.path().join("volume.ffsrq");
+        let manifest_path = dir.path().join("ntfs.ffsrqset");
+        let ledger_path = dir.path().join("ntfs-evidence.jsonl");
+        let key: PorKey = [0x73; 32];
+        let key_file = dir.path().join("ntfs.key");
+        std::fs::write(&key_file, key).unwrap();
+
+        let serial = 0xBEEF_CAFE_2026_1117_u64;
+        let raw_ntfs = build_clean_writable_ntfs_image(128, 50, serial);
+        std::fs::write(&ntfs_img, &raw_ntfs).unwrap();
+
+        let sidecar_opts = SidecarOptions {
+            block_size: 4096,
+            group_blocks: 16,
+            repair_symbols: 4,
+        };
+        protect_storage_set(
+            &cx,
+            &StorageSetProtectRequest {
+                manifest_path: manifest_path.clone(),
+                filesystem: "ntfs".to_owned(),
+                topology: StorageSetTopology::SingleData,
+                view: ProtectedViewIdentity::default(),
+                native_binding: NativeCommitBinding::UninterpretedRaw,
+                members: vec![StorageSetMemberSpec {
+                    role: MemberRole::Data,
+                    image_path: ntfs_img.clone(),
+                    sidecar_path: ntfs_rq.clone(),
+                    native_member_id: [0_u8; 16],
+                    offset: 0,
+                    length: None,
+                }],
+                options: sidecar_opts,
+                signing_key: Some(key),
+            },
+        )
+        .expect("protect clean NTFS storage set");
+
+        let mnt_dir = dir.path().join("mnt-ntfs");
+        std::fs::create_dir(&mnt_dir).unwrap();
+        let make_args = |rw: bool, check: bool| -> Args {
+            Args {
+                image: ntfs_img.clone(),
+                sidecar: ntfs_rq.clone(),
+                mountpoint: (!check).then(|| mnt_dir.clone()),
+                scrub: scrub::Options::default(),
+                set: SetOptions {
+                    manifest: Some(manifest_path.clone()),
+                    trust_key_file: Some(key_file.clone()),
+                    require_trusted_root: true,
+                    evidence_ledger: Some(ledger_path.clone()),
+                    ..SetOptions::default()
+                },
+                authority: Authority {
+                    exclusive_image: true,
+                    allow_repair: true,
+                },
+                check,
+                rw,
+                commit_interval_secs: None,
+                allow_other: false,
+            }
+        };
+
+        // Phase 1: In-process writable FsOps + LSN manifest sealing + cancelled-retry rename non-duplication.
+        let rw_args = make_args(true, false);
+        let prepared = prepare(&cx, &rw_args).expect("admit writable protected NTFS");
+        assert_eq!(prepared.filesystem, "ntfs");
+        assert!(prepared.fs.is_writable());
+
+        let mut scope = RequestScope::empty();
+        let sub = FsOps::mkdir(
+            prepared.fs.as_ref(),
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("docs"),
+            0o755,
+            0,
+            0,
+        )
+        .unwrap();
+        let created = FsOps::create(
+            prepared.fs.as_ref(),
+            &cx,
+            &mut scope,
+            sub.ino,
+            OsStr::new("draft.bin"),
+            0o644,
+            0,
+            0,
+        )
+        .unwrap();
+        let payload: Vec<u8> = (0_u32..16_385)
+            .map(|i| u8::try_from((i * 5 + 1) % 251).unwrap())
+            .collect();
+        let written = FsOps::write(
+            prepared.fs.as_ref(),
+            &cx,
+            &mut scope,
+            created.ino,
+            0,
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(written as usize, payload.len());
+        FsOps::fsync(prepared.fs.as_ref(), &cx, &mut scope, created.ino, 0, false).unwrap();
+
+        // Mid-mount fsync must already seal the StorageSetManifest with a non-zero $LogFile commit_lsn!
+        let mid_manifest = StorageSetManifest::decode(
+            &std::fs::read(&manifest_path).unwrap(),
+            TrustPolicy::RequireTrustedRoot { key },
+        )
+        .expect("mid-mount fsync must seal signed NTFS manifest");
+        assert!(mid_manifest.generation >= 2);
+        match mid_manifest.native_binding {
+            NativeCommitBinding::Ntfs {
+                volume_serial,
+                commit_lsn,
+                ..
+            } => {
+                assert_eq!(volume_serial, serial);
+                assert!(commit_lsn > 0, "committed NTFS $LogFile LSN must be > 0");
+            }
+            other => panic!("expected NativeCommitBinding::Ntfs, got {other:?}"),
+        }
+
+        // Commit rename (`draft.bin` -> `committed.bin`), then simulate client retry after post-commit
+        // reply loss/cancellation: retrying `draft.bin` -> `committed.bin` must fail cleanly with NotFound
+        // and NEVER duplicate or corrupt `committed.bin`!
+        FsOps::rename(
+            prepared.fs.as_ref(),
+            &cx,
+            &mut scope,
+            sub.ino,
+            OsStr::new("draft.bin"),
+            sub.ino,
+            OsStr::new("committed.bin"),
+        )
+        .unwrap();
+        let retry_err = FsOps::rename(
+            prepared.fs.as_ref(),
+            &cx,
+            &mut scope,
+            sub.ino,
+            OsStr::new("draft.bin"),
+            sub.ino,
+            OsStr::new("committed.bin"),
+        )
+        .expect_err("retrying an already-committed rename must fail with NotFound");
+        assert!(matches!(retry_err, FfsError::NotFound(_)), "{retry_err:?}");
+
+        prepared.finish(&cx).expect("clean NTFS finish");
+
+        let members = vec![(ntfs_img.clone(), ntfs_rq.clone())];
+        let verified = verify_set(
+            &cx,
+            &manifest_path,
+            &members,
+            TrustPolicy::RequireTrustedRoot { key },
+        )
+        .unwrap();
+        assert!(verified.is_healthy());
+
+        // Independent native NTFS engine reopen verifies structural + $LogFile consistency!
+        let data_lcn = {
+            wait_for_spawns();
+            let engine = ntfs::transaction::NtfsTransactionEngine::open(
+                &cx,
+                &ntfs_img,
+                0,
+                None,
+                ntfs::NtfsWriteOptions {
+                    offline_image: true,
+                    allow_write: true,
+                    recover_dirty: false,
+                },
+            )
+            .expect("native NtfsTransactionEngine clean reopen");
+            assert!(engine.last_recovery().is_none());
+            drop(engine);
+
+            let vol = ntfs::reader::NtfsVolume::open(&cx, &ntfs_img, 0, None).unwrap();
+            let rec = vol.resolve(&cx, "/docs/committed.bin").unwrap();
+            let stream = vol.data_stream(&cx, &rec, &[]).unwrap();
+            assert_eq!(vol.read(&cx, &stream, 0, payload.len()).unwrap(), payload);
+            let raw_disk = std::fs::read(&ntfs_img).unwrap();
+            raw_disk
+                .as_chunks::<4096>()
+                .0
+                .iter()
+                .position(|blk| blk == &payload[..4096])
+                .expect("allocated non-resident LCN") as u64
+        };
+
+        // Phase 2: Inject 2-block media corruption in `committed.bin`'s physical clusters and prove read self-healing!
+        let orig_b0 = {
+            let mut b = vec![0_u8; 4096];
+            File::open(&ntfs_img)
+                .unwrap()
+                .read_exact_at(&mut b, data_lcn * 4096)
+                .unwrap();
+            b
+        };
+        let orig_b1 = {
+            let mut b = vec![0_u8; 4096];
+            File::open(&ntfs_img)
+                .unwrap()
+                .read_exact_at(&mut b, (data_lcn + 1) * 4096)
+                .unwrap();
+            b
+        };
+        let ro_prepared = prepare(&cx, &make_args(false, true)).expect("reopen protected NTFS");
+        {
+            let f = File::options().write(true).open(&ntfs_img).unwrap();
+            f.write_all_at(&[0xEE; 8192], data_lcn * 4096).unwrap();
+            f.sync_all().unwrap();
+        }
+        let docs_attr = FsOps::lookup(
+            ro_prepared.fs.as_ref(),
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("docs"),
+        )
+        .unwrap();
+        let file_attr = FsOps::lookup(
+            ro_prepared.fs.as_ref(),
+            &cx,
+            &mut scope,
+            docs_attr.ino,
+            OsStr::new("committed.bin"),
+        )
+        .unwrap();
+        let healed = FsOps::read(
+            ro_prepared.fs.as_ref(),
+            &cx,
+            &mut scope,
+            file_attr.ino,
+            0,
+            u32::try_from(payload.len()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(healed, payload);
+        let mut disk_b0 = vec![0_u8; 4096];
+        let mut disk_b1 = vec![0_u8; 4096];
+        File::open(&ntfs_img)
+            .unwrap()
+            .read_exact_at(&mut disk_b0, data_lcn * 4096)
+            .unwrap();
+        File::open(&ntfs_img)
+            .unwrap()
+            .read_exact_at(&mut disk_b1, (data_lcn + 1) * 4096)
+            .unwrap();
+        assert_eq!(disk_b0, orig_b0);
+        assert_eq!(disk_b1, orig_b1);
+        ro_prepared.finish(&cx).unwrap();
+
+        // Phase 3: Real Linux `/dev/fuse` kernel-mounted `--rw` writes + native reopen!
+        let fuse_args = make_args(true, false);
+        let fuse_prepared = prepare(&cx, &fuse_args).expect("prepare NTFS for live FUSE");
+        let fuse_payload = vec![0x9C_u8; 10_000];
+        let mounted = exercise_live_fuse_mount(&fuse_args, &fuse_prepared, |mnt| {
+            assert_eq!(
+                std::fs::read(mnt.join("docs/committed.bin")).unwrap(),
+                payload
+            );
+            let draft_path = mnt.join("docs/fuse-draft.bin");
+            let final_path = mnt.join("docs/fuse-final.bin");
+            {
+                let mut f = File::create(&draft_path).unwrap();
+                f.write_all(&fuse_payload).unwrap();
+                f.sync_all().unwrap();
+            }
+            std::fs::rename(&draft_path, &final_path).unwrap();
+            assert_eq!(std::fs::read(&final_path).unwrap(), fuse_payload);
+        });
+        fuse_prepared
+            .finish(&cx)
+            .expect("finish live FUSE NTFS mount");
+        assert!(
+            verify_set(
+                &cx,
+                &manifest_path,
+                &members,
+                TrustPolicy::RequireTrustedRoot { key }
+            )
+            .unwrap()
+            .is_healthy()
+        );
+        if mounted {
+            let vol = ntfs::reader::NtfsVolume::open(&cx, &ntfs_img, 0, None).unwrap();
+            let rec = vol.resolve(&cx, "/docs/fuse-final.bin").unwrap();
+            let stream = vol.data_stream(&cx, &rec, &[]).unwrap();
+            assert_eq!(
+                vol.read(&cx, &stream, 0, fuse_payload.len()).unwrap(),
+                fuse_payload
+            );
+        }
+
+        let ledger_records = parse_evidence_ledger(&std::fs::read(&ledger_path).unwrap());
+        assert!(ledger_records.iter().any(|r| {
+            r.protected_repair_gate
+                .as_ref()
+                .is_some_and(|g| g.authorized)
+        }));
+        assert!(ledger_records.iter().any(|r| {
+            r.protected_commit_ack
+                .as_ref()
+                .is_some_and(|a| a.protected_durable)
+        }));
+    }
+
+    #[test]
+    fn bd_tqrnc_protected_writable_zfs_single_and_mirror_bind_txg_heal_and_mount_fuse() {
+        for mirror_width in [1_usize, 2_usize] {
+            let cx = Cx::for_testing();
+            let dir = tempfile::tempdir().unwrap();
+            let (raw_members, pool_guid) = build_clean_writable_zfs_pool(mirror_width);
+
+            let manifest_path = dir.path().join("zfs.ffsrqset");
+            let ledger_path = dir.path().join("zfs-evidence.jsonl");
+            let key: PorKey = [0x84; 32];
+            let key_file = dir.path().join("zfs.key");
+            std::fs::write(&key_file, key).unwrap();
+
+            let mut specs = Vec::with_capacity(mirror_width);
+            let mut member_pairs = Vec::with_capacity(mirror_width);
+            for (idx, raw) in raw_members.iter().enumerate() {
+                let img = dir.path().join(format!("m{idx}.zfs"));
+                let rq = dir.path().join(format!("m{idx}.ffsrq"));
+                std::fs::write(&img, raw).unwrap();
+                let guid = if mirror_width == 1 {
+                    ZFS_TOP_SINGLE_GUID
+                } else {
+                    ZFS_CHILD_GUIDS[idx]
+                };
+                let mut native_id = [0_u8; 16];
+                native_id[..8].copy_from_slice(&guid.to_le_bytes());
+                specs.push(StorageSetMemberSpec {
+                    role: MemberRole::Data,
+                    image_path: img.clone(),
+                    sidecar_path: rq.clone(),
+                    native_member_id: native_id,
+                    offset: 0,
+                    length: None,
+                });
+                member_pairs.push((img, rq));
+            }
+
+            let topology = if mirror_width == 1 {
+                StorageSetTopology::ZfsSingleLeaf
+            } else {
+                StorageSetTopology::ZfsMirror { width: 2 }
+            };
+            protect_storage_set(
+                &cx,
+                &StorageSetProtectRequest {
+                    manifest_path: manifest_path.clone(),
+                    filesystem: "zfs".to_owned(),
+                    topology,
+                    view: ProtectedViewIdentity {
+                        partition_selector: None,
+                        zfs_dataset: vec!["data".to_owned()],
+                        btrfs_subvolume_id: None,
+                    },
+                    native_binding: NativeCommitBinding::UninterpretedRaw,
+                    members: specs,
+                    options: SidecarOptions {
+                        block_size: 4096,
+                        group_blocks: 16,
+                        repair_symbols: 4,
+                    },
+                    signing_key: Some(key),
+                },
+            )
+            .expect("protect ZFS storage set");
+
+            let mnt_dir = dir.path().join("mnt-zfs");
+            std::fs::create_dir(&mnt_dir).unwrap();
+            let extra_members: Vec<PathBuf> = member_pairs[1..]
+                .iter()
+                .flat_map(|(i, r)| [i.clone(), r.clone()])
+                .collect();
+
+            let make_args = |rw: bool, check: bool| -> Args {
+                Args {
+                    image: member_pairs[0].0.clone(),
+                    sidecar: member_pairs[0].1.clone(),
+                    mountpoint: (!check).then(|| mnt_dir.clone()),
+                    scrub: scrub::Options::default(),
+                    set: SetOptions {
+                        manifest: Some(manifest_path.clone()),
+                        extra_members: extra_members.clone(),
+                        zfs_dataset: Some("data".to_owned()),
+                        pool_guid: Some(pool_guid),
+                        trust_key_file: Some(key_file.clone()),
+                        require_trusted_root: true,
+                        evidence_ledger: Some(ledger_path.clone()),
+                        ..SetOptions::default()
+                    },
+                    authority: Authority {
+                        exclusive_image: true,
+                        allow_repair: true,
+                    },
+                    check,
+                    rw,
+                    commit_interval_secs: None,
+                    allow_other: false,
+                }
+            };
+
+            // Phase 1: Writable FsOps (mkdir, create, write, chmod setattr, setxattr, rename, fsync)
+            let rw_args = make_args(true, false);
+            let prepared = prepare(&cx, &rw_args).expect("admit writable protected ZFS");
+            assert_eq!(prepared.filesystem, "zfs");
+            assert!(prepared.fs.is_writable());
+
+            let mut scope = RequestScope::empty();
+            let sub = FsOps::mkdir(
+                prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("work"),
+                0o755,
+                0,
+                0,
+            )
+            .unwrap();
+            let created = FsOps::create(
+                prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                sub.ino,
+                OsStr::new("temp.bin"),
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            let payload: Vec<u8> = (0_u32..12_345)
+                .map(|i| u8::try_from((i * 9 + mirror_width as u32) % 251).unwrap())
+                .collect();
+            assert_eq!(
+                FsOps::write(
+                    prepared.fs.as_ref(),
+                    &cx,
+                    &mut scope,
+                    created.ino,
+                    0,
+                    &payload
+                )
+                .unwrap() as usize,
+                payload.len()
+            );
+            // Exercises ZPL v5 SA `chmod` (`ZPL_DACL_ACES` SA_ACL swap=4 compatibility)!
+            FsOps::setattr(
+                prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                created.ino,
+                &SetAttrRequest {
+                    mode: Some(0o600),
+                    uid: Some(1234),
+                    gid: Some(5678),
+                    size: None,
+                    atime: None,
+                    mtime: None,
+                },
+            )
+            .unwrap();
+            FsOps::setxattr(
+                prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                created.ino,
+                "user.tag",
+                b"protected-zfs",
+                XattrSetMode::Set,
+            )
+            .unwrap();
+            FsOps::rename(
+                prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                sub.ino,
+                OsStr::new("temp.bin"),
+                sub.ino,
+                OsStr::new("sealed.bin"),
+            )
+            .unwrap();
+            FsOps::fsync(prepared.fs.as_ref(), &cx, &mut scope, created.ino, 0, false).unwrap();
+
+            // Verify mid-mount fsync already sealed StorageSetManifest with committed_txg > 20!
+            let mid_manifest = StorageSetManifest::decode(
+                &std::fs::read(&manifest_path).unwrap(),
+                TrustPolicy::RequireTrustedRoot { key },
+            )
+            .unwrap();
+            assert!(mid_manifest.generation >= 2);
+            let sealed_txg = match mid_manifest.native_binding {
+                NativeCommitBinding::Zfs {
+                    pool_guid: pg,
+                    member_guids,
+                    committed_txg,
+                    ..
+                } => {
+                    assert_eq!(pg, pool_guid);
+                    assert_eq!(member_guids.len(), mirror_width);
+                    assert!(committed_txg > ZFS_INITIAL_TXG);
+                    committed_txg
+                }
+                other => panic!("expected NativeCommitBinding::Zfs, got {other:?}"),
+            };
+
+            prepared.finish(&cx).expect("finish writable protected ZFS");
+            let verified = verify_set(
+                &cx,
+                &manifest_path,
+                &member_pairs,
+                TrustPolicy::RequireTrustedRoot { key },
+            )
+            .unwrap();
+            assert!(verified.is_healthy());
+            assert_eq!(verified.member_reports.len(), mirror_width);
+
+            // Independent native ZfsTransactionEngine reopen across all members verifies space maps + Uberblocks!
+            {
+                wait_for_spawns();
+                let img_paths: Vec<&Path> = member_pairs.iter().map(|(i, _)| i.as_path()).collect();
+                let (lbl, slot) = {
+                    let leaves: Vec<_> = img_paths
+                        .iter()
+                        .map(|p| zfs::reader::Leaf::open(&cx, p, 0, None).unwrap())
+                        .collect();
+                    let pool = zfs::reader::Pool::from_leaves(leaves).unwrap();
+                    let (l, s, _) = pool.import_active(&cx, Some(pool_guid)).unwrap();
+                    (l, s)
+                };
+                wait_for_spawns();
+                let engine = zfs::ZfsTransactionEngine::open_files(
+                    &cx,
+                    &img_paths,
+                    zfs::ZfsWriteOptions {
+                        offline_image: true,
+                        allow_write: true,
+                        pool_guid,
+                        label: lbl,
+                        slot,
+                        reconcile_torn_uberblocks: false,
+                    },
+                )
+                .expect("native ZfsTransactionEngine clean reopen across all members");
+                assert!(engine.committed_txg() >= sealed_txg);
+            }
+
+            // Phase 2: Corrupt physical Uberblock/data region on EVERY member and prove RaptorQ self-healing!
+            let saved_m0_block = {
+                let mut b = vec![0_u8; 4096];
+                File::open(&member_pairs[0].0)
+                    .unwrap()
+                    .read_exact_at(&mut b, DATA_OFFSET + 4096)
+                    .unwrap();
+                b
+            };
+            let ro_prepared = prepare(&cx, &make_args(false, true)).expect("reopen protected ZFS");
+            for (img, _) in &member_pairs {
+                let f = File::options().write(true).open(img).unwrap();
+                f.write_all_at(&[0xEE; 4096], DATA_OFFSET + 4096).unwrap();
+                f.sync_all().unwrap();
+            }
+            let work_attr = FsOps::lookup(
+                ro_prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("work"),
+            )
+            .unwrap();
+            let sealed_attr = FsOps::lookup(
+                ro_prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                work_attr.ino,
+                OsStr::new("sealed.bin"),
+            )
+            .unwrap();
+            // Read-only ZfsFs exposes sandboxed extraction permissions (0o444) while preserving xattrs/data;
+            // native mode/uid/gid (0o600, 1234, 5678) are verified on the writable reopen below!
+            assert_eq!(sealed_attr.perm & 0o777, 0o444);
+            assert_eq!(
+                FsOps::getxattr(ro_prepared.fs.as_ref(), &cx, sealed_attr.ino, "user.tag")
+                    .unwrap()
+                    .as_deref(),
+                Some(b"protected-zfs".as_slice())
+            );
+            let read_back = FsOps::read(
+                ro_prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                sealed_attr.ino,
+                0,
+                u32::try_from(payload.len()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(read_back, payload);
+
+            // Force read of the corrupted block on member 0 via primary_device to verify writeback healing
+            let mut healed_b = vec![0_u8; 4096];
+            ro_prepared
+                .device
+                .read_exact_at(&cx, ByteOffset(DATA_OFFSET + 4096), &mut healed_b)
+                .unwrap();
+            assert_eq!(healed_b, saved_m0_block);
+            if mirror_width == 2 {
+                let mut healed_m1 = vec![0_u8; 4096];
+                ro_prepared.storage_set.members()[1]
+                    .device
+                    .read_exact_at(&cx, ByteOffset(DATA_OFFSET + 4096), &mut healed_m1)
+                    .unwrap();
+            }
+            ro_prepared.finish(&cx).unwrap();
+
+            // Phase 3: Writable reopen verifies persisted ZPL v5 SA chmod/chown + live `/dev/fuse` writes!
+            let fuse_args = make_args(true, false);
+            let fuse_prepared = prepare(&cx, &fuse_args).expect("prepare ZFS for live FUSE");
+            let rw_work = FsOps::lookup(
+                fuse_prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("work"),
+            )
+            .unwrap();
+            let rw_sealed = FsOps::lookup(
+                fuse_prepared.fs.as_ref(),
+                &cx,
+                &mut scope,
+                rw_work.ino,
+                OsStr::new("sealed.bin"),
+            )
+            .unwrap();
+            assert_eq!(rw_sealed.perm & 0o777, 0o600);
+            assert_eq!(rw_sealed.uid, 1234);
+            assert_eq!(rw_sealed.gid, 5678);
+            let fuse_payload = vec![0x5D_u8; 9_000];
+            let mounted = exercise_live_fuse_mount(&fuse_args, &fuse_prepared, |mnt| {
+                assert_eq!(std::fs::read(mnt.join("work/sealed.bin")).unwrap(), payload);
+                let draft = mnt.join("work/fuse-zfs-draft.bin");
+                let committed = mnt.join("work/fuse-zfs-final.bin");
+                {
+                    let mut f = File::create(&draft).unwrap();
+                    f.write_all(&fuse_payload).unwrap();
+                    f.sync_all().unwrap();
+                }
+                std::fs::rename(&draft, &committed).unwrap();
+                assert_eq!(std::fs::read(&committed).unwrap(), fuse_payload);
+            });
+            fuse_prepared
+                .finish(&cx)
+                .expect("finish live FUSE ZFS mount");
+            let post_fuse_verify = verify_set(
+                &cx,
+                &manifest_path,
+                &member_pairs,
+                TrustPolicy::RequireTrustedRoot { key },
+            )
+            .unwrap();
+            assert!(post_fuse_verify.is_healthy());
+
+            if mounted {
+                let reopen_check = prepare(&cx, &make_args(false, true)).unwrap();
+                let w_attr = FsOps::lookup(
+                    reopen_check.fs.as_ref(),
+                    &cx,
+                    &mut scope,
+                    InodeNumber(1),
+                    OsStr::new("work"),
+                )
+                .unwrap();
+                let f_attr = FsOps::lookup(
+                    reopen_check.fs.as_ref(),
+                    &cx,
+                    &mut scope,
+                    w_attr.ino,
+                    OsStr::new("fuse-zfs-final.bin"),
+                )
+                .unwrap();
+                assert_eq!(
+                    FsOps::read(
+                        reopen_check.fs.as_ref(),
+                        &cx,
+                        &mut scope,
+                        f_attr.ino,
+                        0,
+                        u32::try_from(fuse_payload.len()).unwrap(),
+                    )
+                    .unwrap(),
+                    fuse_payload
+                );
+                reopen_check.finish(&cx).unwrap();
+            }
+        }
+    }
 }

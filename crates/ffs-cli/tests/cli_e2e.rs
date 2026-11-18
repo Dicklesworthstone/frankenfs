@@ -5297,7 +5297,8 @@ fn spawn_cli_mount_binary(
         }
         if Instant::now() > deadline {
             sigkill_cli_mount(&mut child, mnt);
-            panic!("`ffs mount` did not appear in mountinfo within 30s");
+            let stderr = fs::read_to_string(log_path).unwrap_or_default();
+            panic!("`ffs mount` did not appear in mountinfo within 30s; stderr:\n{stderr}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -5341,6 +5342,10 @@ fn sigkill_cli_mount(child: &mut std::process::Child, mnt: &Path) {
     }
 }
 
+/// Serialize heavy multi-GiB / RaptorQ GF(256) mounted daemon E2E tests so
+/// 2-vCPU unoptimized CI runners do not starve concurrent FUSE/scrub daemons.
+static HEAVY_FUSE_DAEMON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// bd-dj725 memory bound, measured on the real daemon: 2 GiB written through
 /// `ffs mount --rw` without any fsync. The absolute ceiling defaults to 1 GiB
 /// (half the workload) and can be configured with `FFS_TEST_MAX_DAEMON_RSS_MIB`.
@@ -5349,6 +5354,10 @@ fn sigkill_cli_mount(child: &mut std::process::Child, mnt: &Path) {
 #[test]
 fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
     use std::io::Write as _;
+
+    let _heavy_guard = HEAVY_FUSE_DAEMON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let max_rss_mib = match std::env::var("FFS_TEST_MAX_DAEMON_RSS_MIB") {
         Ok(raw) => raw
@@ -6021,6 +6030,10 @@ fn cli_mount_ext4_background_scrub_repairs_meta_and_data_refuses_tampered_parity
     use std::os::unix::fs::MetadataExt as _;
     use std::time::{Duration, Instant};
 
+    let _heavy_guard = HEAVY_FUSE_DAEMON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
     if !Path::new("/dev/fuse").exists()
         || !["mkfs.ext4", "e2fsck", "fusermount3"]
@@ -6304,7 +6317,7 @@ fn cli_mount_ext4_background_scrub_repairs_meta_and_data_refuses_tampered_parity
     let clean_protected_bytes = fs::read(&base_image).expect("read clean protected image");
 
     let unmount_cleanly = |mut child: std::process::Child, mnt: &Path, log: &Path| {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let unmount = Command::new("fusermount3")
             .arg("-u")
             .arg(mnt)
@@ -6317,7 +6330,7 @@ fn cli_mount_ext4_background_scrub_repairs_meta_and_data_refuses_tampered_parity
             if Instant::now() >= deadline {
                 sigkill_cli_mount(&mut child, mnt);
                 panic!(
-                    "mount daemon did not exit within 15s: {}",
+                    "mount daemon did not exit within 30s: {}",
                     fs::read_to_string(log).unwrap_or_default()
                 );
             }
@@ -7233,6 +7246,10 @@ fn cli_btrfs_native_prepare_validate_encode_and_recover_bd_11a8t() {
 fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::time::{Duration, Instant};
+
+    let _heavy_guard = HEAVY_FUSE_DAEMON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let mkfs_ext4 = format!("mk{}.ext4", "fs");
     let mkfs_btrfs = format!("mk{}.btrfs", "fs");

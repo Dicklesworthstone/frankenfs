@@ -453,6 +453,15 @@ impl Leaf {
         self.device.sync(cx)?;
         checkpoint(cx)
     }
+    pub(crate) fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.device.begin_durability_commit(cx)
+    }
+    pub(crate) fn complete_durability_commit(&self) {
+        self.device.complete_durability_commit();
+    }
+    pub(crate) fn abort_durability_commit(&self) {
+        self.device.abort_durability_commit();
+    }
     pub fn open(cx: &Cx, path: &Path, base: u64, length: Option<u64>) -> Result<Self> {
         checkpoint(cx)?;
         let file = File::open(path)?;

@@ -652,7 +652,7 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
             &[
                 registration("ZPL_PROJID", 20, 8, 0),
                 registration("ZPL_DACL_COUNT", 21, 8, 0),
-                registration("ZPL_DACL_ACES", 22, 0, 1),
+                registration("ZPL_DACL_ACES", 22, 0, 4),
                 registration("ZPL_DXATTR", 23, 0, 3),
             ],
             &[layout(2, &template_attrs), layout(3, &xattr_attrs)],
@@ -698,5 +698,68 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
         assert_eq!(decoded_child.metadata().unwrap(), child_meta);
         assert!(decoded_child.xattrs().unwrap().inline.is_empty());
         assert_eq!(decoded_child.project_id().unwrap(), 0);
+
+        // Chmod/chown trivial DACL rebuild must agree with OpenZFS SA_ACL (swap == 4)
+        // on ZPL_DACL_ACES, and reject any registry whose ZPL_DACL_ACES swap disagrees.
+        let mut reg_entries = vec![
+            registration("ZPL_PROJID", 20, 8, 0),
+            registration("ZPL_DACL_COUNT", 21, 8, 0),
+            registration("ZPL_DACL_ACES", 22, 0, 4),
+            registration("ZPL_DXATTR", 23, 0, 3),
+        ];
+        let mut layout_entries = vec![layout(2, &template_attrs), layout(3, &xattr_attrs)];
+        let mut mutable_registry = registry.clone();
+        child_meta.mode = 0o100_600;
+        child_meta.uid = 1234;
+        child_meta.gid = 5678;
+        let (chmod_bonus, chmod_spill) = mutable_registry
+            .encode_updated_with_options(
+                &mut reg_entries,
+                &mut layout_entries,
+                &child_bonus,
+                None,
+                &child_meta,
+                true,
+                None,
+                None,
+                320,
+                256,
+            )
+            .expect("rebuild trivial DACL against OpenZFS SA_ACL (swap == 4)");
+        assert!(chmod_spill.is_none());
+        assert_eq!(
+            mutable_registry
+                .decode(&chmod_bonus, None)
+                .unwrap()
+                .metadata()
+                .unwrap(),
+            child_meta
+        );
+
+        let mut wrong_swap_registry = SaRegistry::from_zaps(
+            &[
+                registration("ZPL_PROJID", 20, 8, 0),
+                registration("ZPL_DACL_COUNT", 21, 8, 0),
+                registration("ZPL_DACL_ACES", 22, 0, 2),
+            ],
+            &[layout(2, &template_attrs)],
+        )
+        .unwrap();
+        assert!(
+            wrong_swap_registry
+                .encode_updated_with_options(
+                    &mut Vec::new(),
+                    &mut vec![layout(2, &template_attrs)],
+                    &child_bonus,
+                    None,
+                    &child_meta,
+                    true,
+                    None,
+                    None,
+                    320,
+                    256,
+                )
+                .is_err()
+        );
     }
 }

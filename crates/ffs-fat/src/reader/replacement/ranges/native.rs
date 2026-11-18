@@ -53,6 +53,19 @@ impl ByteDevice for ObservedDevice {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.inner.sync(cx)
     }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
+    }
 }
 
 impl FatVolume {

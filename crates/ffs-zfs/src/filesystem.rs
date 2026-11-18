@@ -773,7 +773,7 @@ impl FsOps for ZfsFs {
             state.admit_data_mutation(cx, ino, &metadata)?;
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
-            state.mutate(|engine, dataset| {
+            state.mutate(cx, |engine, dataset| {
                 engine.truncate_file(
                     cx,
                     dataset,
@@ -832,7 +832,7 @@ impl FsOps for ZfsFs {
         let (mode, gid) = state.creation_mode_gid(cx, parent, mode & 0o7777, gid, true)?;
         state.reserve_identity()?;
         let timestamp = native_timestamp(SystemTime::now())?;
-        let object = state.mutate(|engine, dataset| {
+        let object = state.mutate(cx, |engine, dataset| {
             engine.mkdir(
                 cx,
                 dataset,
@@ -866,7 +866,7 @@ impl FsOps for ZfsFs {
         let (_, gid) = state.creation_mode_gid(cx, parent, 0o777, gid, false)?;
         state.reserve_identity()?;
         let timestamp = native_timestamp(SystemTime::now())?;
-        let object = state.mutate(|engine, dataset| {
+        let object = state.mutate(cx, |engine, dataset| {
             engine.create_symlink(
                 cx,
                 dataset,
@@ -915,7 +915,7 @@ impl FsOps for ZfsFs {
         state.admit_data_mutation(cx, ino, &metadata)?;
         let object = state.head.nodes[&ino].object;
         let timestamp = native_timestamp(SystemTime::now())?;
-        state.mutate(|engine, dataset| {
+        state.mutate(cx, |engine, dataset| {
             engine.write_file_data(
                 cx,
                 dataset,
@@ -1019,7 +1019,7 @@ impl FsOps for ZfsFs {
         {
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
-            state.mutate(|engine, dataset| {
+            state.mutate(cx, |engine, dataset| {
                 engine.set_posix_attributes(
                     cx,
                     dataset,
@@ -1050,7 +1050,7 @@ impl FsOps for ZfsFs {
         let object = state.head.nodes[&ino].object;
         let parent = state.writable_parent(cx, new_parent, new_name.as_bytes())?;
         let timestamp = native_timestamp(SystemTime::now())?;
-        state.mutate(|engine, dataset| {
+        state.mutate(cx, |engine, dataset| {
             engine.link_entry(cx, dataset, object, parent, new_name.as_bytes(), timestamp)
         })?;
         state.publish_committed(|state| {
@@ -1138,7 +1138,7 @@ impl FsOps for ZfsFs {
             Err(error) => return Err(error),
         };
         let timestamp = native_timestamp(SystemTime::now())?;
-        state.mutate(|engine, dataset| {
+        state.mutate(cx, |engine, dataset| {
             if let Some((_, identity)) = retained {
                 engine.rename_retaining_open_target(
                     cx,
@@ -1223,7 +1223,7 @@ impl FsOps for ZfsFs {
             XattrSetMode::Replace => crate::ZfsXattrSetMode::Replace,
         };
         let timestamp = native_timestamp(SystemTime::now())?;
-        state.mutate(|engine, dataset| {
+        state.mutate(cx, |engine, dataset| {
             engine.set_xattr(cx, dataset, object, name, value, native_mode, timestamp)
         })?;
         state.publish_committed(|state| state.refresh_head(cx))
@@ -1253,9 +1253,9 @@ impl FsOps for ZfsFs {
             return Err(unsupported("only the ZPL user xattr namespace is exposed"));
         }
         let timestamp = native_timestamp(SystemTime::now())?;
-        match state
-            .mutate(|engine, dataset| engine.remove_xattr(cx, dataset, object, name, timestamp))
-        {
+        match state.mutate(cx, |engine, dataset| {
+            engine.remove_xattr(cx, dataset, object, name, timestamp)
+        }) {
             Ok(_) => {
                 state.publish_committed(|state| state.refresh_head(cx))?;
                 Ok(true)

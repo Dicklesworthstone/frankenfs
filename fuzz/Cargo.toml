@@ -432,6 +432,11 @@ name = "fuzz_partition_discovery"
 path = "fuzz_targets/fuzz_partition_discovery.rs"
 doc = false
 
+[[bin]]
+name = "fuzz_sidecar_storage_set"
+path = "fuzz_targets/fuzz_sidecar_storage_set.rs"
+doc = false
+
 [profile.release]
 opt-level = 3
 debug = 1
