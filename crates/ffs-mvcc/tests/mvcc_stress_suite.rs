@@ -1653,35 +1653,39 @@ fn gate4_mvcc_concurrency() {
     // Criterion 5: Single-thread MVCC cache-hit read < 500ns, version-creating write < 2us.
     let (read_ns, write_ns) = measure_single_thread_mvcc_latency_ns();
     if read_ns >= 500 || write_ns >= 2_000 {
-        assert!(
-            cfg!(debug_assertions),
+        #[cfg(not(debug_assertions))]
+        panic!(
             "release single-thread MVCC latency exceeded budget: read={read_ns}ns write={write_ns}ns"
         );
-        // Verify under `--release` when the unoptimized `test` profile exceeds release latency bounds.
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("workspace root");
-        let status = std::process::Command::new("cargo")
-            .current_dir(workspace_root)
-            .args([
-                "test",
-                "-p",
-                "ffs-mvcc",
-                "--release",
-                "--test",
-                "mvcc_stress_suite",
-                "mvcc_release_latency_probe",
-                "--",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
-            .status()
-            .expect("spawn cargo test --release mvcc_release_latency_probe");
-        assert!(
-            status.success(),
-            "release MVCC latency probe failed (<500ns read / <2us write)"
-        );
+
+        #[cfg(debug_assertions)]
+        {
+            // Verify under `--release` when the unoptimized `test` profile exceeds release latency bounds.
+            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("workspace root");
+            let status = std::process::Command::new("cargo")
+                .current_dir(workspace_root)
+                .args([
+                    "test",
+                    "-p",
+                    "ffs-mvcc",
+                    "--release",
+                    "--test",
+                    "mvcc_stress_suite",
+                    "mvcc_release_latency_probe",
+                    "--",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .status()
+                .expect("spawn cargo test --release mvcc_release_latency_probe");
+            assert!(
+                status.success(),
+                "release MVCC latency probe failed (<500ns read / <2us write)"
+            );
+        }
     }
 }

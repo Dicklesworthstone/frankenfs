@@ -895,34 +895,36 @@ fn gate6_raptorq_self_healing() {
     // Criterion 8: 128 MiB block group @ 5% corruption (`1,638` blocks) completes in < 5s.
     let elapsed_5pct = run_128mib_5pct_striped_repair_elapsed();
     if elapsed_5pct >= std::time::Duration::from_secs(5) {
-        assert!(
-            cfg!(debug_assertions),
-            "release 128MiB 5% repair exceeded 5s budget: {elapsed_5pct:?}"
-        );
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("workspace root");
-        let status = Command::new("cargo")
-            .current_dir(workspace_root)
-            .args([
-                "test",
-                "-p",
-                "ffs-repair",
-                "--release",
-                "--test",
-                "self_healing_demo_e2e",
-                "raptorq_128mib_5pct_release_probe",
-                "--",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
-            .status()
-            .expect("spawn release 128MiB 5% RaptorQ probe");
-        assert!(
-            status.success(),
-            "release 128MiB 5% RaptorQ repair failed < 5s gate"
-        );
+        #[cfg(not(debug_assertions))]
+        panic!("release 128MiB 5% repair exceeded 5s budget: {elapsed_5pct:?}");
+
+        #[cfg(debug_assertions)]
+        {
+            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("workspace root");
+            let status = Command::new("cargo")
+                .current_dir(workspace_root)
+                .args([
+                    "test",
+                    "-p",
+                    "ffs-repair",
+                    "--release",
+                    "--test",
+                    "self_healing_demo_e2e",
+                    "raptorq_128mib_5pct_release_probe",
+                    "--",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .status()
+                .expect("spawn release 128MiB 5% RaptorQ probe");
+            assert!(
+                status.success(),
+                "release 128MiB 5% RaptorQ repair failed < 5s gate"
+            );
+        }
     }
 }
