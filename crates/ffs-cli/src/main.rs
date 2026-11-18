@@ -1570,13 +1570,25 @@ enum Command {
         /// Execute a parity suite: ext4-journal, ext4-reference,
         /// ext4-kernel-differential, btrfs-reference, mvcc-lib, repair-lib,
         /// journal-lib, ondisk-lib, fuse-lib, cli-e2e, cli-bins, core-lib,
-        /// btrfs-lib, conformance, profile-artifacts, or the parity-honesty
-        /// self-check.
+        /// btrfs-lib, conformance, xfstests-lib, profile-artifacts, or the
+        /// parity-honesty self-check.
         #[arg(long)]
         verify: Vec<String>,
         /// Execute canonical spec §22 gates: `all`, or one or more of gate1..gate7.
         #[arg(long, value_name = "GATE")]
         gate: Vec<String>,
+        /// Fail closed unless current-source executed evidence backs every
+        /// capability row and all 7 canonical §22 gates pass (`all` implied).
+        #[arg(long)]
+        strict: bool,
+        /// Execute every suite in `PARITY_SUITES` and all 7 canonical §22 gates,
+        /// failing closed if any suite, capability row, or gate is omitted,
+        /// skipped, or unverified.
+        #[arg(long, visible_alias = "require-all-suites")]
+        strict_all_suites: bool,
+        /// Fail closed if the git working tree has uncommitted tracked changes.
+        #[arg(long)]
+        require_clean_source: bool,
         /// Run Cargo directly in CI or on an existing build worker.
         #[arg(long)]
         local: bool,
@@ -3087,8 +3099,31 @@ fn execute_command(
             json,
             verify,
             gate,
+            strict,
+            strict_all_suites,
+            require_clean_source,
             local,
-        } => parity(json, &verify, &gate, local),
+        } => {
+            let mode = if strict_all_suites {
+                ParityStrictMode::StrictAllSuites
+            } else if strict {
+                ParityStrictMode::Strict
+            } else {
+                ParityStrictMode::SelectedOnly
+            };
+            parity(&ParityCmdOptions {
+                json,
+                suites: &verify,
+                gates: &gate,
+                mode,
+                require_clean_source,
+                executor: if local {
+                    ParityExecutor::Cargo
+                } else {
+                    ParityExecutor::Rch
+                },
+            })
+        }
         Command::Evidence {
             ledger,
             json,
@@ -7815,8 +7850,14 @@ fn mount_with_fuse(
     }
 
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
-    ffs_fuse::mount(cx, fs_ops, mountpoint, &opts)
-        .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
+    ffs_fuse::mount_with_commit_interval(
+        cx,
+        fs_ops,
+        mountpoint,
+        &opts,
+        Some(std::time::Duration::ZERO),
+    )
+    .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
 }
 
 /// Resolve the operational rollback switch for the validated sharded ext4
@@ -11115,27 +11156,64 @@ fn print_fsck_output(json: bool, output: &FsckOutput) -> Result<()> {
     Ok(())
 }
 
-fn parity(json: bool, suites: &[String], gates: &[String], local: bool) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParityStrictMode {
+    SelectedOnly,
+    Strict,
+    StrictAllSuites,
+}
+
+struct ParityCmdOptions<'a> {
+    json: bool,
+    suites: &'a [String],
+    gates: &'a [String],
+    mode: ParityStrictMode,
+    require_clean_source: bool,
+    executor: ParityExecutor,
+}
+
+fn parity(options: &ParityCmdOptions<'_>) -> Result<()> {
     let command_span = info_span!(
         target: "ffs::cli::parity",
         "parity",
-        output_json = json
+        output_json = options.json
     );
     let _command_guard = command_span.enter();
     let started = Instant::now();
     info!(target: "ffs::cli::parity", "parity_start");
 
-    let executor = if local {
-        ParityExecutor::Cargo
+    let require_clean = options.require_clean_source
+        || std::env::var("FFS_REQUIRE_CLEAN_SOURCE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let strict_all_suites = options.mode == ParityStrictMode::StrictAllSuites;
+    let strict = options.mode != ParityStrictMode::SelectedOnly;
+    let effective_suites: Vec<String> = if strict_all_suites && options.suites.is_empty() {
+        ffs_harness::parity_suite_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     } else {
-        ParityExecutor::Rch
+        options.suites.to_vec()
     };
-    if local && suites.is_empty() && gates.is_empty() {
-        anyhow::bail!("--local requires --verify or --gate");
+    let effective_gates: Vec<String> = if strict_all_suites && options.gates.is_empty() {
+        vec![ffs_harness::canonical_gates::ALL_GATES_ARG.to_owned()]
+    } else {
+        options.gates.to_vec()
+    };
+    if options.executor == ParityExecutor::Cargo
+        && effective_suites.is_empty()
+        && effective_gates.is_empty()
+        && !strict
+    {
+        anyhow::bail!("--local requires --verify, --gate, --strict, or --strict-all-suites");
     }
-    let report = ExecutionGatedParityReport::run_with_gates(suites, gates, executor)?;
+    let report = ExecutionGatedParityReport::run_with_gates(
+        &effective_suites,
+        &effective_gates,
+        options.executor,
+    )?;
 
-    if json {
+    if options.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&report).context("serialize parity report")?
@@ -11205,8 +11283,17 @@ fn parity(json: bool, suites: &[String], gates: &[String], local: bool) -> Resul
         "parity_complete"
     );
 
-    if !suites.is_empty() || !gates.is_empty() {
+    if strict || strict_all_suites {
+        report
+            .require_evidence_strict_with_clean(require_clean)
+            .map_err(anyhow::Error::msg)?;
+    } else if !effective_suites.is_empty() || !effective_gates.is_empty() {
         report.require_evidence().map_err(anyhow::Error::msg)?;
+        if require_clean {
+            report.require_clean_source().map_err(anyhow::Error::msg)?;
+        }
+    } else if require_clean {
+        report.require_clean_source().map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }

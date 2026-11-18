@@ -1741,9 +1741,16 @@ pub fn maybe_route_mount_cmd(
         opened.filesystem
     };
 
+    let commit_interval = options.commit_interval_secs.map(Duration::from_secs);
     match options.runtime.mode {
         MountRuntimeMode::Standard => {
-            ffs_fuse::mount(&cx, fs_ops, &mountpoint_canon, &fuse_opts)?;
+            ffs_fuse::mount_with_commit_interval(
+                &cx,
+                fs_ops,
+                &mountpoint_canon,
+                &fuse_opts,
+                commit_interval,
+            )?;
         }
         MountRuntimeMode::Managed | MountRuntimeMode::PerCore => {
             let mut config = ffs_fuse::MountConfig {
@@ -1751,6 +1758,7 @@ pub fn maybe_route_mount_cmd(
                 unmount_timeout: Duration::from_secs(
                     options.runtime.managed_unmount_timeout_secs(),
                 ),
+                commit_interval,
                 ..ffs_fuse::MountConfig::default()
             };
             let handle = if options.runtime.mode == MountRuntimeMode::PerCore {

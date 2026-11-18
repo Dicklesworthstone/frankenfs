@@ -21,20 +21,7 @@ pub fn mount_background_runtime() -> Result<Arc<asupersync::runtime::Runtime>> {
 /// Sleep up to `duration` on `cx`'s timer driver while waking immediately on
 /// cancellation, falling back to `park_timeout` only if `cx` has no timer driver.
 pub fn sleep_with_cx(cx: &Cx, duration: Duration) {
-    if duration.is_zero() || cx.checkpoint().is_err() {
-        return;
-    }
-    if cx.timer_driver().is_some() {
-        let _ambient = Cx::set_current(Some(cx.clone()));
-        let (_keep_tx, mut cancel_rx) = asupersync::channel::oneshot::channel::<()>();
-        let _ = ffs_block::block_on_park(asupersync::time::timeout(
-            cx.now(),
-            duration,
-            cancel_rx.recv(cx),
-        ));
-    } else {
-        std::thread::park_timeout(duration);
-    }
+    ffs_block::sleep_with_cx(cx, duration);
 }
 
 pub trait PeriodicCommitTarget: Send + Sync + 'static {
@@ -346,6 +333,8 @@ mod tests {
         let parent_b = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let entered_a = Arc::new(AtomicBool::new(false));
         let entered_a_worker = Arc::clone(&entered_a);
+        let sibling_entered = Arc::new(AtomicBool::new(false));
+        let sibling_entered_flag = Arc::clone(&sibling_entered);
         let mut worker_a = MountIoWorker::start(&parent_a, &runtime, move |cx| {
             entered_a_worker.store(true, Ordering::Release);
             sleep_with_cx(cx, Duration::from_secs(60));
@@ -353,12 +342,13 @@ mod tests {
         })
         .unwrap();
         let mut worker_b = MountIoWorker::start(&parent_b, &runtime, move |cx| {
+            sibling_entered_flag.store(true, Ordering::Release);
             assert!(cx.checkpoint().is_ok());
             Ok(99_u32)
         })
         .unwrap();
 
-        while !entered_a.load(Ordering::Acquire) {
+        while !entered_a.load(Ordering::Acquire) || !sibling_entered.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
         let started_cancel = Instant::now();

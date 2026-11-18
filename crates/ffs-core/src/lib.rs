@@ -13581,11 +13581,18 @@ impl OpenFs {
             return;
         }
         match self.btrfs_pressure_transaction_commit(cx, limit) {
-            Ok(committed) => info!(
+            Ok(true) => info!(
                 target: "ffs::btrfs::writeback",
                 pending_bytes,
                 limit,
-                committed,
+                committed = true,
+                "btrfs_pressure_commit"
+            ),
+            Ok(false) => debug!(
+                target: "ffs::btrfs::writeback",
+                pending_bytes,
+                limit,
+                committed = false,
                 "btrfs_pressure_commit"
             ),
             Err(error) => {

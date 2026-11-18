@@ -198,17 +198,24 @@ jobs:
       # skipped, or unverified (`readiness_verified` must be true).
       - name: Executed parity contracts
         env:
+          FFS_REQUIRE_FUSE: "1"
           FFS_REQUIRE_ORACLES: "1"
+          FFS_REQUIRE_CLEAN_SOURCE: "1"
+          FFS_GATE7_SOAK_SECS: "30"
         run: |
-          cargo run -p ffs-harness -- parity --strict-all-suites --local
+          cargo run -p ffs-harness -- parity --strict-all-suites --require-clean-source --local
 
       # §22.1 names seven gate commands. This executes them and fails the job when
-      # a gate that HAS tests does not pass. A filter that selects zero tests is
-      # reported as `not_implemented` and can never be green here.
+      # any gate fails or selects zero tests (`not_implemented`).
       - name: Canonical §22 gates
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
+          FFS_REQUIRE_CLEAN_SOURCE: "1"
+          FFS_GATE7_SOAK_SECS: "30"
         run: |
           mkdir -p artifacts/canonical-gates
-          cargo run -p ffs-harness -- gates --all --local --out artifacts/canonical-gates/report.json
+          cargo run -p ffs-harness -- gates --all --require-clean-source --local --out artifacts/canonical-gates/report.json
 
       - name: ffs-block all-features check
         run: cargo check -p ffs-block --all-features --all-targets

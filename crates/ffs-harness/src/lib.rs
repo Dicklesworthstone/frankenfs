@@ -1792,6 +1792,7 @@ impl ExecutionGatedParityReport {
             }
         }
         let gates_selected = canonical_gates::select_gate_ids(gate_ids)?;
+        let before_source = executed_evidence::SourceIdentity::capture().ok();
         let mut runs = Vec::new();
         for suite in &selected {
             let spec = PARITY_SUITES
@@ -1822,7 +1823,12 @@ impl ExecutionGatedParityReport {
             runs.push(executed_evidence::TestRunEvidence::run(command, &args));
         }
         let gate_runs = canonical_gates::execute_runs(&gates_selected, executor);
-        let source = executed_evidence::SourceIdentity::capture().ok();
+        let after_source = executed_evidence::SourceIdentity::capture().ok();
+        let source = if before_source == after_source {
+            before_source
+        } else {
+            None
+        };
         let gates = canonical_gates::CanonicalGateReport::from_runs(
             &gates_selected,
             &gate_runs,
@@ -1902,16 +1908,23 @@ impl ExecutionGatedParityReport {
         }
     }
 
-    /// Gate for the selected suites, not a declaration of whole-project readiness.
+    /// Gate for the selected suites and selected canonical gates, not a declaration
+    /// of whole-project readiness.
+    ///
+    /// Every explicitly selected canonical gate MUST pass with a nonempty test
+    /// selection (`NotImplemented` zero-selected filters fail closed).
     pub fn require_evidence(&self) -> Result<(), String> {
-        // A gate that has executable tests and does not pass fails the run, and is
-        // reported first because it is the most specific failure available.
-        // `NotImplemented` gates do not fail it, but they keep `readiness_verified`
-        // false and are reported with their criteria so they cannot be forgotten.
         for gate in &self.canonical_gates.gates {
-            if gate.status == canonical_gates::CanonicalGateStatus::Failed {
+            if gate.status != canonical_gates::CanonicalGateStatus::Passed {
+                let status_label = match gate.status {
+                    canonical_gates::CanonicalGateStatus::Passed => unreachable!(),
+                    canonical_gates::CanonicalGateStatus::Failed => "failed",
+                    canonical_gates::CanonicalGateStatus::NotImplemented => {
+                        "not implemented (0 tests selected)"
+                    }
+                };
                 return Err(format!(
-                    "canonical gate {} failed: {}",
+                    "canonical gate {} {status_label}: {}",
                     gate.gate_id,
                     gate.reason.as_deref().unwrap_or("no reason recorded")
                 ));
@@ -1955,6 +1968,21 @@ impl ExecutionGatedParityReport {
         Ok(())
     }
 
+    /// Require that the captured source identity has zero staged, unstaged, or untracked diffs.
+    pub fn require_clean_source(&self) -> Result<(), String> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| "source identity unavailable".to_owned())?;
+        if !source.is_clean() {
+            return Err(format!(
+                "dirty or untracked source inputs detected (dirty_source_sha256={})",
+                source.dirty_source_sha256
+            ));
+        }
+        Ok(())
+    }
+
     /// Strict whole-project parity and canonical-gate readiness enforcement.
     ///
     /// Unlike [`Self::require_evidence`], which validates only the subset of suites
@@ -1963,7 +1991,23 @@ impl ExecutionGatedParityReport {
     /// verified executed evidence, any canonical §22 gate was omitted or is not
     /// `Passed`, or `readiness_verified` is `false`.
     pub fn require_evidence_strict(&self) -> Result<(), String> {
-        let base_error = self.require_evidence().err();
+        let require_clean = std::env::var_os("FFS_REQUIRE_CLEAN_SOURCE")
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        self.require_evidence_strict_with_clean(require_clean)
+    }
+
+    /// Strict whole-project readiness check with optional clean-source enforcement.
+    pub fn require_evidence_strict_with_clean(
+        &self,
+        require_clean_source: bool,
+    ) -> Result<(), String> {
+        let mut base_error = self.require_evidence().err();
+        if base_error.is_none()
+            && require_clean_source
+            && let Err(clean_err) = self.require_clean_source()
+        {
+            base_error = Some(clean_err);
+        }
         let selected_set: std::collections::BTreeSet<&str> =
             self.selected_suites.iter().map(String::as_str).collect();
         let mut missing_suites: Vec<String> = PARITY_SUITES
@@ -3224,6 +3268,78 @@ mod tests {
             .expect_err("a failed canonical gate must fail the parity gate");
         assert!(error.contains("canonical gate gate1 failed"), "{error}");
         assert!(!report.readiness_verified);
+    }
+
+    #[test]
+    fn not_implemented_canonical_gate_fails_require_evidence_and_strict() {
+        let executable = std::env::current_exe().unwrap();
+        let zero_run = executed_evidence::TestRunEvidence::run(
+            "env",
+            &[
+                "FFS_TEST_EVIDENCE_CHILD=pass",
+                executable.to_str().unwrap(),
+                "--exact",
+                "__ffs_nonexistent_gate_filter__",
+                "-Z",
+                "unstable-options",
+                "--format=json",
+                "--show-output",
+            ],
+        );
+        let source = executed_evidence::SourceIdentity::capture().ok();
+        let gates = canonical_gates::CanonicalGateReport::from_runs(
+            &std::collections::BTreeSet::from(["gate1"]),
+            &[zero_run],
+            source.clone(),
+        );
+        assert_eq!(gates.not_implemented_gates(), ["gate1"]);
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::<&str>::new(),
+            vec![],
+            source,
+            gates,
+        );
+        let err = report
+            .require_evidence()
+            .expect_err("zero-selected canonical gate must fail require_evidence");
+        assert!(
+            err.contains("canonical gate gate1 not implemented (0 tests selected)"),
+            "unexpected error: {err}"
+        );
+        assert!(!report.readiness_verified);
+        assert!(report.require_evidence_strict().is_err());
+    }
+
+    #[test]
+    fn require_clean_source_rejects_dirty_digest() {
+        let dirty = executed_evidence::SourceIdentity {
+            git_sha: "4e7942a0ba9be73bd81087d59a1ea1c40a83e877".to_owned(),
+            dirty_source_sha256: "ff".repeat(32),
+        };
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::<&str>::new(),
+            vec![],
+            Some(dirty),
+            canonical_gates::CanonicalGateReport::empty(),
+        );
+        assert!(
+            report
+                .require_clean_source()
+                .expect_err("dirty digest must be rejected")
+                .contains("dirty or untracked source inputs detected")
+        );
+
+        let clean = executed_evidence::SourceIdentity {
+            git_sha: "4e7942a0ba9be73bd81087d59a1ea1c40a83e877".to_owned(),
+            dirty_source_sha256: executed_evidence::SourceIdentity::EMPTY_DIRTY_SHA256.to_owned(),
+        };
+        let clean_report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::<&str>::new(),
+            vec![],
+            Some(clean),
+            canonical_gates::CanonicalGateReport::empty(),
+        );
+        assert_eq!(clean_report.require_clean_source(), Ok(()));
     }
 
     #[test]

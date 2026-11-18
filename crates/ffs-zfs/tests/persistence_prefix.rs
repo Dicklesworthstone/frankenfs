@@ -7595,3 +7595,127 @@ fn dsl_and_xattr_persistence_prefix_cuts_preserve_scrub_and_allocation() {
         }
     }
 }
+
+#[test]
+fn cloned_dataset_from_snapshot_with_unwritten_zil_tail_admits_reopen_and_resets_clone_zil() {
+    let cx = Cx::for_testing();
+    let mut built = build_clean_zfs_pool(&PoolFixtureSpec {
+        zil_tail: ZilTailFixture::UnwrittenTail,
+        ..PoolFixtureSpec::default()
+    });
+    let device = FaultableMemberDevice::new(built.members.remove(0));
+    let ts = Timestamp {
+        seconds: 1_725_000_000,
+        nanos: 0,
+    };
+    let data_ds = vec![b"data".to_vec()];
+    let clone_ds = vec![b"data".to_vec(), b"cloned_view".to_vec()];
+
+    let clone_slot = {
+        let mut engine = open_engine_on_devices(
+            &cx,
+            std::slice::from_ref(&device),
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .expect("admit pool with unwritten ZIL tail");
+        engine
+            .create_snapshot(&cx, &data_ds, b"snap1", ts)
+            .into_result()
+            .expect("create_snapshot data@snap1");
+        let (_, tok) = engine
+            .create_clone(&cx, &data_ds, b"snap1", &data_ds, b"cloned_view", &[], ts)
+            .into_result()
+            .expect("create_clone data/cloned_view");
+        tok.published_slot()
+    };
+
+    // Reopen a fresh engine while `data/cloned_view` still shares `data@snap1`'s ObjectSet
+    // (`ds_bp.birth() <= prev_snap_txg`, carrying `data`'s unclaimed `zh_log` block).
+    let after_write_slot = {
+        let mut reopened = open_engine_on_devices(
+            &cx,
+            std::slice::from_ref(&device),
+            default_write_opts(built.pool_guid, clone_slot),
+        )
+        .expect("fresh writer reopen must admit clone sharing origin snapshot ZIL tail");
+        {
+            let mut mos = reopened.open_read_objects(&cx).expect("open MOS");
+            let pre_clone_log = mos
+                .intent_log(&cx, &clone_ds)
+                .expect("intent_log on unmodified clone");
+            assert_eq!(
+                pre_clone_log.termination,
+                ffs_zfs::reader::dmu::zil::Termination::Empty
+            );
+        }
+        let (clone_file, _) = reopened
+            .create_file(
+                &cx,
+                &clone_ds,
+                2,
+                b"clone_only.txt",
+                0o644,
+                0,
+                0,
+                ts,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .expect("tx-create on data/cloned_view");
+        let (_, tok_w) = reopened
+            .write_file_data(
+                &cx,
+                &clone_ds,
+                clone_file,
+                0,
+                b"clone-diverged-bytes\n",
+                ts,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .expect("tx-write on data/cloned_view");
+        let (_, tok_o) = reopened
+            .create_file(
+                &cx,
+                &data_ds,
+                2,
+                b"origin_after_clone.txt",
+                0o644,
+                0,
+                0,
+                ts,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .expect("tx-create on origin data after clone");
+        assert!(tok_o.committed_txg() > tok_w.committed_txg());
+        tok_o.published_slot()
+    };
+
+    // Reopen a third engine and verify scrub, space-map accounting, and ZIL ownership separation!
+    let final_eng = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, after_write_slot),
+    )
+    .expect("third writer reopen after clone COW");
+    let mut mos = final_eng.open_read_objects(&cx).expect("open final MOS");
+    assert!(mos.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
+    let _ = mos
+        .allocation(&cx, AllocationLimits::default())
+        .expect("space-map accounting must remain exact (no stolen or leaked zh_log)");
+    let origin_log = mos
+        .intent_log(&cx, &data_ds)
+        .expect("origin intent_log preserved");
+    assert_eq!(
+        origin_log.termination,
+        ffs_zfs::reader::dmu::zil::Termination::UnverifiedTail
+    );
+    let clone_log = mos
+        .intent_log(&cx, &clone_ds)
+        .expect("COW'd clone intent_log reset to empty");
+    assert_eq!(
+        clone_log.termination,
+        ffs_zfs::reader::dmu::zil::Termination::Empty
+    );
+}

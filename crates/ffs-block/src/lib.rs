@@ -68,6 +68,68 @@ pub fn block_on_park<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+/// Timeout marker returned when [`block_on_park_timeout`] reaches its deadline
+/// before the inner future completes.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParkTimeoutElapsed;
+
+/// Drive `fut` synchronously from a non-worker thread for up to `duration` on
+/// `cx`'s clock without relying on an idle scheduler worker to pump its timer
+/// wheel (`Ok(output)` on completion, `Err(ParkTimeoutElapsed)` on timeout).
+#[doc(hidden)]
+pub fn block_on_park_timeout<F: std::future::Future>(
+    cx: &Cx,
+    duration: std::time::Duration,
+    fut: F,
+) -> std::result::Result<F::Output, ParkTimeoutElapsed> {
+    let _ambient = Cx::set_current(Some(cx.clone()));
+    let cx_start = cx.now();
+    let wall_deadline = std::time::Instant::now().checked_add(duration);
+    let waker = std::task::Waker::from(Arc::new(ThreadParkWaker(std::thread::current())));
+    let mut task_cx = std::task::Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let std::task::Poll::Ready(output) = fut.as_mut().poll(&mut task_cx) {
+            return Ok(output);
+        }
+        if duration.is_zero() {
+            return Err(ParkTimeoutElapsed);
+        }
+        if let Some(driver) = cx.timer_driver() {
+            let _ = driver.process_timers();
+            let elapsed = std::time::Duration::from_nanos(cx.now().duration_since(cx_start));
+            if elapsed >= duration {
+                if let std::task::Poll::Ready(output) = fut.as_mut().poll(&mut task_cx) {
+                    return Ok(output);
+                }
+                return Err(ParkTimeoutElapsed);
+            }
+            let remaining = duration.saturating_sub(elapsed);
+            std::thread::park_timeout(remaining.min(std::time::Duration::from_millis(10)));
+        } else {
+            let remaining = wall_deadline.map_or(std::time::Duration::MAX, |deadline| {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            });
+            if remaining.is_zero() {
+                return Err(ParkTimeoutElapsed);
+            }
+            std::thread::park_timeout(remaining.min(std::time::Duration::from_millis(50)));
+        }
+    }
+}
+
+/// Sleep up to `duration` on `cx`'s clock from a synchronous or blocking worker
+/// thread while waking immediately if `cx` is cancelled.
+#[doc(hidden)]
+pub fn sleep_with_cx(cx: &Cx, duration: std::time::Duration) {
+    if duration.is_zero() || cx.checkpoint().is_err() {
+        return;
+    }
+    let (_keep_tx, mut cancel_rx) = asupersync::channel::oneshot::channel::<()>();
+    let _ = block_on_park_timeout(cx, duration, cancel_rx.recv(cx));
+}
+
 /// Future adapter returned by [`poll_masked`].
 #[doc(hidden)]
 pub struct MaskedFuture<'a, F> {
@@ -313,7 +375,10 @@ impl OwnedChildRegion {
         Box::pin(async move {
             cx_checkpoint(parent_cx)?;
             let child = parent_cx
-                .open_child_region(asupersync::cx::ChildRegionSpec::inherit())
+                .open_child_region(
+                    asupersync::cx::ChildRegionSpec::inherit()
+                        .with_priority(asupersync::runtime::resource_monitor::RegionPriority::High),
+                )
                 .await
                 .map_err(|err| FfsError::Format(format!("child region init failed: {err}")))?;
             let principal_cx = child.cx().clone();
@@ -13405,5 +13470,60 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
             .expect("read with bitrot");
         assert_eq!(sec2[0], 0x11 ^ 0xFF);
         assert_eq!(sec2[1], 0x11);
+    }
+
+    #[test]
+    fn owned_child_region_survives_over_1000_open_close_cycles_on_one_runtime() {
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .blocking_threads(0, 4)
+            .build()
+            .expect("build runtime");
+        let root_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        for idx in 0..1_100 {
+            let region = OwnedChildRegion::open_sync(&root_cx)
+                .unwrap_or_else(|err| panic!("cycle {idx}: open_sync failed: {err}"));
+            region.close_sync();
+        }
+    }
+
+    #[test]
+    fn sleep_with_cx_wakes_on_idle_runtime_wall_clock_and_cancellation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .blocking_threads(0, 4)
+            .build()
+            .expect("build runtime");
+        // Give scheduler worker threads time to enter indefinite idle park.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let timer_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let started = std::time::Instant::now();
+        sleep_with_cx(&timer_cx, std::time::Duration::from_millis(35));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30)
+                && elapsed < std::time::Duration::from_secs(2),
+            "sleep_with_cx on idle runtime must expire on wall clock without hanging: {elapsed:?}"
+        );
+
+        let cancel_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let cancel_trigger = cancel_cx.clone();
+        let started_cancel = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let sleeper = scope.spawn(|| {
+                sleep_with_cx(&cancel_cx, std::time::Duration::from_secs(60));
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancel_trigger.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("wake sleeper immediately"),
+            );
+            sleeper.join().expect("join sleeper");
+        });
+        assert!(
+            started_cancel.elapsed() < std::time::Duration::from_secs(2),
+            "sleep_with_cx must wake promptly on cancellation"
+        );
     }
 }

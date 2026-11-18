@@ -29,10 +29,45 @@ fn wait_for_spawns() {
     }
 }
 
+/// Retry a reopen briefly if an external helper (such as `fusermount3` forked
+/// inside `fuser::Session::new` on a sibling test thread) momentarily holds an
+/// inherited open-file-description `flock` between `fork` and `execve`.
+fn retry_transient_flock_ffs<T>(
+    mut op: impl FnMut() -> ffs_error::Result<T>,
+) -> ffs_error::Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        wait_for_spawns();
+        match op() {
+            Err(ffs_error::FfsError::Io(ref err))
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// `prepare`, after any in-flight child spawn has exec'd (see above).
 pub fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
-    wait_for_spawns();
-    super::prepare(cx, args)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        wait_for_spawns();
+        match super::prepare(cx, args) {
+            Err(err)
+                if err
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::WouldBlock)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Core-only fixtures must select the variant explicitly. Production dispatch
@@ -51,14 +86,12 @@ pub fn verify(
     image: &Path,
     sidecar: &Path,
 ) -> ffs_error::Result<ffs_repair::sidecar::SidecarReport> {
-    wait_for_spawns();
-    ffs_repair::sidecar::verify(cx, image, sidecar)
+    retry_transient_flock_ffs(|| ffs_repair::sidecar::verify(cx, image, sidecar))
 }
 
 /// `SidecarImageDevice::open`, after any in-flight child spawn has exec'd.
 pub fn open_device(cx: &Cx, image: &Path, sidecar: &Path) -> ffs_error::Result<SidecarImageDevice> {
-    wait_for_spawns();
-    SidecarImageDevice::open(cx, image, sidecar)
+    retry_transient_flock_ffs(|| SidecarImageDevice::open(cx, image, sidecar))
 }
 
 fn check_args(image: &Path, sidecar: &Path) -> Args {
@@ -79,7 +112,7 @@ fn check_args(image: &Path, sidecar: &Path) -> Args {
     }
 }
 
-pub fn command(command: &mut Command) -> Output {
+pub fn command_unchecked(command: &mut Command) -> std::io::Result<Output> {
     *SPAWNS_IN_PROGRESS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
@@ -101,7 +134,11 @@ pub fn command(command: &mut Command) -> Output {
             SPAWNS_DONE.notify_all();
         }
     }
-    let output = output.expect("required filesystem oracle must be installed");
+    output
+}
+
+pub fn command(command: &mut Command) -> Output {
+    let output = command_unchecked(command).expect("required filesystem oracle must be installed");
     assert!(
         output.status.success(),
         "oracle failed: {command:?}\nstdout: {}\nstderr: {}",
@@ -3802,14 +3839,16 @@ mod bd_tqrnc {
                     if let Some(flag) = self.shutdown.lock().unwrap().as_ref() {
                         flag.store(true, Ordering::Release);
                     }
-                    let _ = std::process::Command::new("fusermount3")
-                        .args(["-u", "-z"])
-                        .arg(&self.mountpoint)
-                        .output();
-                    let _ = std::process::Command::new("umount")
-                        .arg("-l")
-                        .arg(&self.mountpoint)
-                        .output();
+                    let _ = command_unchecked(
+                        std::process::Command::new("fusermount3")
+                            .args(["-u", "-z"])
+                            .arg(&self.mountpoint),
+                    );
+                    let _ = command_unchecked(
+                        std::process::Command::new("umount")
+                            .arg("-l")
+                            .arg(&self.mountpoint),
+                    );
                 }
             }
 
@@ -3876,14 +3915,14 @@ mod bd_tqrnc {
                         if let Some(flag) = wd_shutdown.lock().unwrap().as_ref() {
                             flag.store(true, Ordering::Release);
                         }
-                        let _ = std::process::Command::new("fusermount3")
-                            .args(["-u", "-z"])
-                            .arg(&wd_mnt)
-                            .output();
-                        let _ = std::process::Command::new("umount")
-                            .arg("-l")
-                            .arg(&wd_mnt)
-                            .output();
+                        let _ = command_unchecked(
+                            std::process::Command::new("fusermount3")
+                                .args(["-u", "-z"])
+                                .arg(&wd_mnt),
+                        );
+                        let _ = command_unchecked(
+                            std::process::Command::new("umount").arg("-l").arg(&wd_mnt),
+                        );
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));

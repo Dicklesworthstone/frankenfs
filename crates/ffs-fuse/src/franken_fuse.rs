@@ -1092,11 +1092,7 @@ impl FrankenFuse {
         }
         if cx.timer_driver().is_some() {
             let (_keep_tx, mut cancel_rx) = asupersync::channel::oneshot::channel::<()>();
-            let outcome = ffs_block::block_on_park(asupersync::time::timeout(
-                now,
-                delay,
-                cancel_rx.recv(cx),
-            ));
+            let outcome = ffs_block::block_on_park_timeout(cx, delay, cancel_rx.recv(cx));
             if outcome.is_ok() {
                 return Err(FfsError::Cancelled);
             }

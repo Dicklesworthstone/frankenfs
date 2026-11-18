@@ -453,16 +453,7 @@ impl MountRuntimeScope {
         if slice.is_zero() || self.is_cancelled() {
             return;
         }
-        if self.principal_cx.timer_driver().is_some() {
-            let (_keep_tx, mut cancel_rx) = asupersync::channel::oneshot::channel::<()>();
-            let _ = ffs_block::block_on_park(asupersync::time::timeout(
-                self.principal_cx.now(),
-                slice,
-                cancel_rx.recv(&self.principal_cx),
-            ));
-        } else {
-            std::thread::park_timeout(slice);
-        }
+        ffs_block::sleep_with_cx(&self.principal_cx, slice);
     }
 
     fn close_sync(&self) {
@@ -9063,6 +9054,20 @@ pub fn mount(
     mountpoint: impl AsRef<Path>,
     options: &MountOptions,
 ) -> Result<MetricsSnapshot, FuseError> {
+    mount_with_commit_interval(cx, ops, mountpoint, options, None)
+}
+
+/// Mount a FrankenFS filesystem at the given mountpoint (blocking) with an
+/// explicit periodic durability commit interval override (`None` uses the
+/// backend default; `Some(Duration::ZERO)` disables the internal FUSE worker
+/// when the caller manages periodic commits externally).
+pub fn mount_with_commit_interval(
+    cx: &Cx,
+    ops: Box<dyn FsOps>,
+    mountpoint: impl AsRef<Path>,
+    options: &MountOptions,
+    commit_interval: Option<Duration>,
+) -> Result<MetricsSnapshot, FuseError> {
     if cx.checkpoint().is_err() {
         return Err(FuseError::Io(std::io::Error::from_raw_os_error(
             libc::ECANCELED,
@@ -9088,7 +9093,7 @@ pub fn mount(
         Err(err) => return Err(err.into()),
     };
     fs.install_kernel_notifier(session.notifier());
-    fs.start_periodic_commit(None);
+    fs.start_periodic_commit(commit_interval);
     // bd-vbqc6: FUSE-over-io_uring, opt-in, wired to the KNOBS rather than to
     // literals.
     //
@@ -9641,21 +9646,21 @@ impl MountHandle {
                         let _ = permit.send(joined);
                     }
                 });
-                let completed = ffs_block::block_on_park(asupersync::time::timeout(
-                    cleanup_cx.now(),
+                let completed = ffs_block::block_on_park_timeout(
+                    &cleanup_cx,
                     timeout,
                     ffs_block::poll_masked(&cleanup_cx, rx.recv(&cleanup_cx)),
-                ));
+                );
                 let completed = if let Ok(res) = completed {
                     Ok(res)
                 } else {
                     self.diagnostics.mount_scope.abort_for_timeout();
                     let drain_grace = timeout.min(Duration::from_millis(250));
-                    ffs_block::block_on_park(asupersync::time::timeout(
-                        cleanup_cx.now(),
+                    ffs_block::block_on_park_timeout(
+                        &cleanup_cx,
                         drain_grace,
                         ffs_block::poll_masked(&cleanup_cx, rx.recv(&cleanup_cx)),
-                    ))
+                    )
                 };
                 match completed {
                     Ok(Ok(joined)) => {

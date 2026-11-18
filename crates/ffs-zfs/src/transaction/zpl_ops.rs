@@ -375,7 +375,7 @@ fn open_head_dataset_context(
             head_ceiling,
         )?
         .ok_or_else(|| corrupt("ZPL head object set is a hole"))?;
-    let os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
+    let mut os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
     if os.kind != 2 {
         return Err(corrupt("selected dataset is not a ZPL object set"));
     }
@@ -383,6 +383,8 @@ fn open_head_dataset_context(
         cx,
         ds_row.head_object,
         ds_row.guid,
+        &head_dn,
+        &old_os_bp,
         &os_raw,
         os_order,
         &os,
@@ -390,6 +392,19 @@ fn open_head_dataset_context(
         return Err(unsupported(
             "pending ZIL intent log requires replay before native TXG write",
         ));
+    }
+    // If this head dataset is COWing an inherited snapshot/origin ObjectSet for
+    // the first time (`old_os_bp.birth() <= prev_snap_txg`) and `os_zil_header`
+    // belongs to the ancestor dataset (`zc_objset != head_object`), clear
+    // `zil_header` on the newly COW'd ObjectSet (`zil_reset` / `dsl_dataset_clone_sync`)
+    // so the ancestor keeps exclusive ownership of its pre-allocated `zh_log` block.
+    if mos.is_inherited_snapshot_zil(cx, &head_dn, &old_os_bp, &os_raw, os_order, &os)?
+        && os_order
+            .u64(&os_raw[528..656], 112)
+            .map_err(|e| parse_err(&e))?
+            != ds_row.head_object
+    {
+        os.zil_header = ffs_ondisk::zfs_dmu::ZilHeader::empty();
     }
 
     // Read optional `recordsize` property on `dsl_dir` if explicitly set.

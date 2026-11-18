@@ -726,6 +726,9 @@ fn parity_cmd(args: &[String]) -> Result<()> {
     let mut executor = ParityExecutor::Rch;
     let mut strict = false;
     let mut strict_all_suites = false;
+    let mut require_clean_source = std::env::var_os("FFS_REQUIRE_CLEAN_SOURCE")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let mut out_path: Option<String> = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -733,10 +736,12 @@ fn parity_cmd(args: &[String]) -> Result<()> {
             "--gate" => gates.push(args.next().context("--gate requires a gate id")?.clone()),
             "--local" => executor = ParityExecutor::Cargo,
             "--strict" => strict = true,
-            "--strict-all-suites" => {
+            "--strict-all-suites" | "--require-all-suites" => {
                 strict = true;
                 strict_all_suites = true;
             }
+            "--require-clean-source" => require_clean_source = true,
+            "--out" => out_path = Some(args.next().context("--out requires a path")?.clone()),
             _ => bail!("unknown parity argument: {arg}"),
         }
     }
@@ -755,13 +760,23 @@ fn parity_cmd(args: &[String]) -> Result<()> {
         bail!("--local requires --verify, --gate, --strict, or --strict-all-suites");
     }
     let report = ExecutionGatedParityReport::run_with_gates(&suites, &gates, executor)?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let json = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = out_path {
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("write parity report to {path}"))?;
+    }
+    println!("{json}");
     if strict {
         report
-            .require_evidence_strict()
+            .require_evidence_strict_with_clean(require_clean_source)
             .map_err(anyhow::Error::msg)?;
     } else if !suites.is_empty() || !gates.is_empty() {
         report.require_evidence().map_err(anyhow::Error::msg)?;
+        if require_clean_source {
+            report.require_clean_source().map_err(anyhow::Error::msg)?;
+        }
+    } else if require_clean_source {
+        report.require_clean_source().map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -769,14 +784,16 @@ fn parity_cmd(args: &[String]) -> Result<()> {
 /// Execute the canonical spec §22 gate commands and report their real status.
 ///
 /// The gates are named exactly as §22.1 names them, and a filter that selects no
-/// test is reported as `not_implemented` rather than passing. Exits nonzero only
-/// when a gate that has executable tests fails to pass.
+/// test is reported as `not_implemented` rather than passing. Exits nonzero
+/// whenever any selected gate fails or selects zero tests (`not_implemented`).
 fn gates_cmd(args: &[String]) -> Result<()> {
-    use ffs_harness::canonical_gates::{self, CanonicalGateReport, CanonicalGateStatus};
+    use ffs_harness::canonical_gates::{self, CanonicalGateReport};
 
     let mut gate_ids: Vec<String> = Vec::new();
     let mut executor = ParityExecutor::Rch;
     let mut out_path: Option<String> = None;
+    let mut require_clean_source = std::env::var_os("FFS_REQUIRE_CLEAN_SOURCE")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -786,6 +803,7 @@ fn gates_cmd(args: &[String]) -> Result<()> {
             }
             "--all" => gate_ids.push(canonical_gates::ALL_GATES_ARG.to_owned()),
             "--local" => executor = ParityExecutor::Cargo,
+            "--require-clean-source" => require_clean_source = true,
             "--out" => {
                 i += 1;
                 out_path = Some(args.get(i).context("--out requires a path")?.clone());
@@ -822,21 +840,11 @@ fn gates_cmd(args: &[String]) -> Result<()> {
             not_implemented.join(", ")
         );
     }
-    if !failed.is_empty() {
-        let reasons = report
-            .gates
-            .iter()
-            .filter(|gate| gate.status == CanonicalGateStatus::Failed)
-            .map(|gate| {
-                format!(
-                    "{}: {}",
-                    gate.gate_id,
-                    gate.reason.as_deref().unwrap_or("-")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        bail!("canonical gates failed: {reasons}");
+    report
+        .require_all_passed()
+        .map_err(|reasons| anyhow::anyhow!("canonical gates did not all pass: {reasons}"))?;
+    if require_clean_source {
+        report.require_clean_source().map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -10507,8 +10515,8 @@ fn print_gates_usage() {
     println!();
     println!("Execute the canonical spec §22.1 gate commands and report their real");
     println!("status. A filter that selects zero tests is reported as `not_implemented`");
-    println!("and never as `passed`; the command exits nonzero only when a gate that HAS");
-    println!("executable tests fails to pass.");
+    println!("and never as `passed`; the command exits nonzero whenever any selected");
+    println!("gate fails or selects zero tests (`not_implemented`).");
     println!();
     println!("Options:");
     println!(
@@ -10516,6 +10524,9 @@ fn print_gates_usage() {
     );
     println!("  --all                              Execute every gate (same as --gate all)");
     println!("  --local                            Run Cargo directly in CI or on a build worker");
+    println!(
+        "  --require-clean-source             Fail if dirty or untracked source inputs are present"
+    );
     println!("  --out FILE                         Write the JSON report to FILE");
     println!("  --help, -h                         Print this help");
     println!();

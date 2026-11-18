@@ -8,13 +8,13 @@
   },
   "summary": {
     "modules": 90,
-    "total_loc": 173762,
+    "total_loc": 174113,
     "conformance_modules": 24,
     "conformance_loc": 43838,
-    "conformance_loc_basis_points": 2523,
+    "conformance_loc_basis_points": 2518,
     "meta_modules": 66,
-    "meta_loc": 129924,
-    "meta_loc_basis_points": 7477
+    "meta_loc": 130275,
+    "meta_loc_basis_points": 7482
   },
   "modules": [
     {
@@ -75,7 +75,7 @@
     {
       "path": "src/canonical_gates.rs",
       "classification": "meta",
-      "loc": 769
+      "loc": 834
     },
     {
       "path": "src/casefold_corpus.rs",
@@ -135,7 +135,7 @@
     {
       "path": "src/executed_evidence.rs",
       "classification": "meta",
-      "loc": 1449
+      "loc": 1608
     },
     {
       "path": "src/fault_injection_corpus.rs",
@@ -170,7 +170,7 @@
     {
       "path": "src/lib.rs",
       "classification": "meta",
-      "loc": 3620
+      "loc": 3736
     },
     {
       "path": "src/log_contract.rs",
@@ -190,7 +190,7 @@
     {
       "path": "src/main.rs",
       "classification": "meta",
-      "loc": 11410
+      "loc": 11421
     },
     {
       "path": "src/metamorphic_workload_seed_catalog.rs",

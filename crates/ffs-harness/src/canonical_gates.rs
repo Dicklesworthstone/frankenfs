@@ -256,13 +256,20 @@ pub fn execute_runs(
     selected: &BTreeSet<&'static str>,
     executor: ParityExecutor,
 ) -> Vec<TestRunEvidence> {
+    let full_batch = ["gate1", "gate2", "gate3", "gate4", "gate5", "gate6"]
+        .iter()
+        .all(|prereq| selected.contains(prereq));
     selected
         .iter()
         .map(|id| {
             let gate = canonical_gate(id).expect("selected ids come from the catalog");
             let (command, args) = gate_invocation(gate, executor);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            TestRunEvidence::run(command, &args)
+            if gate.id == "gate7" && full_batch {
+                TestRunEvidence::run_with_env(command, &args, &[("FFS_CANONICAL_GATES_BATCH", "1")])
+            } else {
+                TestRunEvidence::run(command, &args)
+            }
         })
         .collect()
 }
@@ -340,8 +347,10 @@ impl CanonicalGateReport {
     /// caller-supplied pass/fail maps are accepted as gate evidence.
     pub fn run(gate_ids: &[String], executor: ParityExecutor) -> Result<Self> {
         let selected = select_gate_ids(gate_ids)?;
-        let source = SourceIdentity::capture().ok();
+        let before = SourceIdentity::capture().ok();
         let runs = execute_runs(&selected, executor);
+        let after = SourceIdentity::capture().ok();
+        let source = if before == after { before } else { None };
         Ok(Self::from_runs(&selected, &runs, source))
     }
 
@@ -350,7 +359,7 @@ impl CanonicalGateReport {
         runs: &[TestRunEvidence],
         source: Option<SourceIdentity>,
     ) -> Self {
-        let gates = CANONICAL_GATES
+        let mut gates: Vec<CanonicalGateEvidence> = CANONICAL_GATES
             .iter()
             .filter(|gate| selected.iter().any(|id| *id == gate.id))
             .map(|gate| {
@@ -361,6 +370,22 @@ impl CanonicalGateReport {
                 evidence_for(gate, run, source.as_ref())
             })
             .collect();
+        // Spec §22.2: Gates are cumulative — Gate N implicitly requires every
+        // earlier gate in the run to pass. Enforce this explicitly on Gate 7
+        // ("gates 1-6 pass in a single CI run") and across ordered batches.
+        let mut unmet_prereqs: Vec<String> = Vec::new();
+        for gate in &mut gates {
+            if gate.status == CanonicalGateStatus::Passed && !unmet_prereqs.is_empty() {
+                gate.status = CanonicalGateStatus::Failed;
+                gate.reason = Some(format!(
+                    "cumulative §22.2 prerequisite gate(s) not passed: {}",
+                    unmet_prereqs.join(", ")
+                ));
+            }
+            if gate.status != CanonicalGateStatus::Passed {
+                unmet_prereqs.push(format!("{} ({:?})", gate.gate_id, gate.status));
+            }
+        }
         Self {
             gates,
             selected_gates: selected.iter().map(|id| (*id).to_owned()).collect(),
@@ -431,6 +456,21 @@ impl CanonicalGateReport {
         } else {
             Err(blockers.join("; "))
         }
+    }
+
+    /// Require that the captured source identity has zero staged, unstaged, or untracked diffs.
+    pub fn require_clean_source(&self) -> Result<(), String> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| "source identity unavailable".to_owned())?;
+        if !source.is_clean() {
+            return Err(format!(
+                "dirty or untracked source inputs detected (dirty_source_sha256={})",
+                source.dirty_source_sha256
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -765,5 +805,30 @@ mod tests {
             evidence.execution.as_ref().expect("executed").command(),
             "env"
         );
+    }
+
+    #[test]
+    fn cumulative_gate_rule_fails_later_gate_when_prerequisite_fails_or_is_missing() {
+        let missing_g1 = child_run("pass", "no_such_test_exists");
+        let passing_g7 = child_run("pass", CHILD_PROBE);
+        let report = CanonicalGateReport::from_runs(
+            &BTreeSet::from(["gate1", "gate7"]),
+            &[missing_g1, passing_g7],
+            SourceIdentity::capture().ok(),
+        );
+        assert_eq!(report.gates[0].gate_id, "gate1");
+        assert_eq!(report.gates[0].status, CanonicalGateStatus::NotImplemented);
+        assert_eq!(report.gates[1].gate_id, "gate7");
+        assert_eq!(report.gates[1].status, CanonicalGateStatus::Failed);
+        assert!(
+            report.gates[1]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("cumulative §22.2 prerequisite")),
+            "expected cumulative prerequisite failure reason, got: {:?}",
+            report.gates[1].reason
+        );
+        assert!(!report.all_passed());
+        assert!(report.require_all_passed().is_err());
     }
 }

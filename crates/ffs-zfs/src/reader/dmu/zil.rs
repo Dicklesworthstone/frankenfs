@@ -401,6 +401,86 @@ fn scan(
 }
 
 impl Objects {
+    /// Return `true` when `head_dn`'s `ObjectSet` (`os_bp`, `ds_raw`) is still
+    /// shared zero-copy with `ds_prev_snap_obj` (`os_bp.birth() <= prev_snap_txg`)
+    /// and carries an unclaimed pre-allocated ZIL header (`claim_txg == 0`,
+    /// `zh_log.birth() <= prev_snap_txg`) owned by an ancestor head dataset in
+    /// the snapshot/clone origin chain (`dsl_dataset_clone_sync` / `zil_alloc`).
+    pub(crate) fn is_inherited_snapshot_zil(
+        &mut self,
+        cx: &Cx,
+        head_dn: &ffs_ondisk::zfs_dmu::Dnode,
+        os_bp: &BlockPointer,
+        ds_raw: &[u8],
+        ds_order: Endian,
+        ds_os: &ffs_ondisk::zfs_dmu::ObjectSet,
+    ) -> Result<bool> {
+        checkpoint(cx)?;
+        if !ds_os.zil_header.has_work() || ds_os.zil_header.claim_txg != 0 {
+            return Ok(false);
+        }
+        if head_dn.bonus().len() < 256 || ds_raw.len() < 704 {
+            return Ok(false);
+        }
+        let head_order = head_dn.order();
+        let prev_snap_obj = head_order.u64(head_dn.bonus(), 8).map_err(|e| parse(&e))?;
+        let prev_snap_txg = head_order.u64(head_dn.bonus(), 16).map_err(|e| parse(&e))?;
+        if prev_snap_obj == 0
+            || os_bp.birth() > prev_snap_txg
+            || ds_os.zil_header.log.birth() > prev_snap_txg
+        {
+            return Ok(false);
+        }
+        let prev_snap = self.load(cx, prev_snap_obj)?;
+        if prev_snap.node.bonus().len() < 256
+            || prev_snap.node.bonus()[128..256] != head_dn.bonus()[128..256]
+        {
+            return Ok(false);
+        }
+        // Validate header flags and reserved fields before admitting inheritance.
+        let _ = Header::parse(&ds_raw[512..704], ds_order, self.txg)?;
+        let log_owner = word(&ds_raw[528..656], 112, ds_order)?;
+        if log_owner == 0 {
+            return Ok(false);
+        }
+        // Walk up the bounded snapshot/clone origin chain (`dsl_dataset` -> `dsl_dir` -> `dd_origin_obj`).
+        let mut cur_snap_obj = prev_snap_obj;
+        for _ in 0..64 {
+            checkpoint(cx)?;
+            if cur_snap_obj == 0 {
+                break;
+            }
+            let snap_loaded = self.load(cx, cur_snap_obj)?;
+            if snap_loaded.node.bonus().len() < 32 {
+                break;
+            }
+            let s_ord = snap_loaded.node.order();
+            let dd_obj = s_ord
+                .u64(snap_loaded.node.bonus(), 0)
+                .map_err(|e| parse(&e))?;
+            if dd_obj == 0 {
+                break;
+            }
+            let dd_loaded = self.load(cx, dd_obj)?;
+            if dd_loaded.node.bonus().len() < 32 {
+                break;
+            }
+            let d_ord = dd_loaded.node.order();
+            let origin_head_obj = d_ord
+                .u64(dd_loaded.node.bonus(), 8)
+                .map_err(|e| parse(&e))?;
+            if origin_head_obj == log_owner || cur_snap_obj == log_owner {
+                // Still validate ZIL block pointer geometry, padding, and DVA against `log_owner`.
+                let parsed = Pointer::parse(&ds_raw[528..656], ds_order, log_owner)?;
+                return Ok(parsed.is_some());
+            }
+            cur_snap_obj = d_ord
+                .u64(dd_loaded.node.bonus(), 24)
+                .map_err(|e| parse(&e))?;
+        }
+        Ok(false)
+    }
+
     /// Return whether a head dataset's `ObjectSet` (`ds_raw`, `ds_order`) has
     /// pending ZIL intent-log work that must be replayed before native TXG writes.
     ///
@@ -410,17 +490,23 @@ impl Objects {
     /// That pre-allocated tail block carries no uncommitted intent-log records,
     /// whereas any claimed ZIL chain (`claim_txg != 0`) or any verified ZIL block
     /// requires ZIL replay/claim handling before native TXG mutation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dataset_has_pending_zil_work(
-        &self,
+        &mut self,
         cx: &Cx,
         dataset_object: u64,
         dataset_guid: u64,
+        head_dn: &ffs_ondisk::zfs_dmu::Dnode,
+        os_bp: &BlockPointer,
         ds_raw: &[u8],
         ds_order: Endian,
         ds_os: &ffs_ondisk::zfs_dmu::ObjectSet,
     ) -> Result<bool> {
         checkpoint(cx)?;
         if !ds_os.zil_header.has_work() {
+            return Ok(false);
+        }
+        if self.is_inherited_snapshot_zil(cx, head_dn, os_bp, ds_raw, ds_order, ds_os)? {
             return Ok(false);
         }
         if ds_os.zil_header.claim_txg != 0 || self.pool.missing_member_count() != 0 {
@@ -470,6 +556,35 @@ impl Objects {
         let root = self
             .checked(cx, &bp, 11, 0, bp.logical_bytes(), object.ceiling)?
             .ok_or_else(|| corrupt("ZIL owner object set is a hole"))?;
+        if let Ok(ds_os) = ffs_ondisk::zfs_dmu::ObjectSet::parse(&root.bytes, root.order)
+            && self.is_inherited_snapshot_zil(
+                cx,
+                &object.node,
+                &bp,
+                &root.bytes,
+                root.order,
+                &ds_os,
+            )?
+        {
+            return Ok(IntentLog {
+                pool_guid: self.config.pool_guid,
+                dataset_guid: dataset.guid,
+                dataset_object: dataset.head_object,
+                selected_txg: self.txg,
+                header: Header {
+                    claim_txg: 0,
+                    replay_sequence: 0,
+                    claimed_block_sequence: 0,
+                    claimed_record_sequence: 0,
+                    flags: 0,
+                },
+                verified_blocks: 0,
+                physical_work_bytes: 0,
+                reconstruction_work_bytes: 0,
+                termination: Termination::Empty,
+                records: Vec::new(),
+            });
+        }
         scan(
             cx,
             &self.pool,

@@ -707,6 +707,8 @@ impl ZfsTransactionEngine {
                 cx,
                 ds.head_object,
                 ds.guid,
+                &hd_dn,
+                &ds_bp,
                 &ds_raw,
                 ds_ord,
                 &ds_os,

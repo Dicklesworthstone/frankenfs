@@ -171,6 +171,14 @@ impl ExecutedEvidence {
     }
 
     fn run_captured(command: &str, args: &[&str]) -> (Self, Vec<u8>, Vec<u8>) {
+        Self::run_captured_with_env(command, args, &[])
+    }
+
+    fn run_captured_with_env(
+        command: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> (Self, Vec<u8>, Vec<u8>) {
         let git_sha = Self::current_git_sha();
         let host_class = Self::detect_host_class();
         let ran_at = SystemTime::now()
@@ -200,6 +208,9 @@ impl ExecutedEvidence {
                 cmd.args(args);
                 cmd
             };
+        for &(key, value) in extra_env {
+            process.env(key, value);
+        }
         let result = process
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -504,6 +515,16 @@ pub struct SourceIdentity {
 }
 
 impl SourceIdentity {
+    /// SHA-256 of zero dirty/untracked source bytes (`git diff HEAD` and untracked closure empty).
+    pub const EMPTY_DIRTY_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// Whether the captured source tree has zero staged, unstaged, or untracked source diffs.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.dirty_source_sha256 == Self::EMPTY_DIRTY_SHA256
+    }
+
     pub fn capture() -> Result<Self, String> {
         Self::capture_at(&std::env::current_dir().map_err(|e| e.to_string())?)
     }
@@ -781,6 +802,16 @@ impl TestResults {
                         }
                         continue;
                     }
+                    if kind == "timeout" {
+                        // Rust libtest emits a non-terminal `timeout` warning at 60s
+                        // while a long-running test continues executing. Admit it only
+                        // for an already-started test; if the test never finishes, the
+                        // end-of-block `!pending.is_empty()` check still fails closed.
+                        if !pending.contains(name) {
+                            return Err(format!("timeout event for unstarted test: {name}"));
+                        }
+                        continue;
+                    }
                     if self.tests.contains_key(name) {
                         return Err(format!("duplicate test result: {name}"));
                     }
@@ -875,8 +906,15 @@ impl TestRunEvidence {
     /// --show-output`. Callers choose the execution mechanism (RCH or local CI).
     #[must_use]
     pub fn run(command: &str, args: &[&str]) -> Self {
+        Self::run_with_env(command, args, &[])
+    }
+
+    /// Execute one libtest target with additional child environment bindings.
+    #[must_use]
+    pub fn run_with_env(command: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Self {
         let before = SourceIdentity::capture();
-        let (execution, stdout, stderr) = ExecutedEvidence::run_captured(command, args);
+        let (execution, stdout, stderr) =
+            ExecutedEvidence::run_captured_with_env(command, args, extra_env);
         let results = if command == "rch" {
             TestResults::parse_rch(&stderr)
         } else {
@@ -901,23 +939,33 @@ impl TestRunEvidence {
         } else {
             None
         };
+        let mut build_environment: std::collections::BTreeMap<String, Option<String>> = [
+            "RUSTUP_TOOLCHAIN",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_TARGET",
+            "RCH_WORKER",
+            "RCH_ENV_ALLOWLIST",
+            "FFS_REQUIRE_FUSE",
+            "FFS_REQUIRE_ORACLES",
+            "FFS_REQUIRE_CLEAN_SOURCE",
+            "FFS_GATE7_SOAK_SECS",
+            "FFS_GATE_FULL_CORPUS",
+            "FFS_CANONICAL_GATES_BATCH",
+        ]
+        .into_iter()
+        .map(|key| (key.to_owned(), std::env::var(key).ok()))
+        .collect();
+        for &(key, value) in extra_env {
+            build_environment.insert(key.to_owned(), Some(value.to_owned()));
+        }
         Self {
             execution,
             source: before.ok(),
             results,
             binding_error,
             remote_source_receipt,
-            build_environment: [
-                "RUSTUP_TOOLCHAIN",
-                "RUSTFLAGS",
-                "CARGO_ENCODED_RUSTFLAGS",
-                "CARGO_BUILD_TARGET",
-                "RCH_WORKER",
-                "RCH_ENV_ALLOWLIST",
-            ]
-            .into_iter()
-            .map(|key| (key.to_owned(), std::env::var(key).ok()))
-            .collect(),
+            build_environment,
         }
     }
 
@@ -938,10 +986,12 @@ impl TestRunEvidence {
         if let Some(error) = self.binding_error.as_ref().or(self.results.error.as_ref()) {
             return Err(error.clone());
         }
+        let allowed_age = Duration::from_millis(self.execution.duration_ms())
+            .saturating_add(Duration::from_secs(3600));
         if self.source.as_ref() != Some(source)
             || !self
                 .execution
-                .is_fresh_against(&source.git_sha, Duration::from_secs(3600))
+                .is_fresh_against(&source.git_sha, allowed_age)
         {
             return Err("test evidence is stale or belongs to different source bytes".to_owned());
         }
@@ -1445,5 +1495,114 @@ mod tests {
         let e2 = ExecutedEvidence::run("echo", &["world"]);
 
         assert_ne!(e1.stdout_sha256, e2.stdout_sha256);
+    }
+
+    #[test]
+    fn test_evidence_accepts_libtest_60s_timeout_heartbeat_only_for_started_tests() {
+        let valid_slow = concat!(
+            r#"{"type":"suite","event":"started","test_count":1}"#,
+            "\n",
+            r#"{"type":"test","event":"started","name":"gate7_soak"}"#,
+            "\n",
+            r#"{"type":"test","event":"timeout","name":"gate7_soak"}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"gate7_soak"}"#,
+            "\n",
+            r#"{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0}"#,
+            "\n",
+        );
+        let parsed = TestResults::parse(valid_slow.as_bytes());
+        assert!(
+            parsed.error.is_none(),
+            "unexpected error: {:?}",
+            parsed.error
+        );
+        assert_eq!(parsed.selected, 1);
+        assert_eq!(parsed.executed, 1);
+        assert_eq!(parsed.passed, 1);
+        assert_eq!(parsed.tests.get("gate7_soak"), Some(&TestOutcome::Passed));
+
+        let unstarted_timeout = concat!(
+            r#"{"type":"suite","event":"started","test_count":1}"#,
+            "\n",
+            r#"{"type":"test","event":"timeout","name":"gate7_soak"}"#,
+            "\n",
+            r#"{"type":"suite","event":"ok","passed":0,"failed":0,"ignored":0,"measured":0,"filtered_out":0}"#,
+            "\n",
+        );
+        let rejected = TestResults::parse(unstarted_timeout.as_bytes());
+        assert!(
+            rejected
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("timeout event for unstarted test")),
+            "unstarted timeout must be rejected, got: {:?}",
+            rejected.error
+        );
+
+        let unfinished_timeout = concat!(
+            r#"{"type":"suite","event":"started","test_count":1}"#,
+            "\n",
+            r#"{"type":"test","event":"started","name":"gate7_soak"}"#,
+            "\n",
+            r#"{"type":"test","event":"timeout","name":"gate7_soak"}"#,
+            "\n",
+            r#"{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0}"#,
+            "\n",
+        );
+        let unfinished = TestResults::parse(unfinished_timeout.as_bytes());
+        assert!(
+            unfinished.error.is_some(),
+            "timeout without terminal ok/failed event must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_evidence_long_running_duration_does_not_self_invalidate_freshness() {
+        let executable = std::env::current_exe().expect("test binary");
+        let mut run = TestRunEvidence::run(
+            "env",
+            &[
+                "FFS_TEST_EVIDENCE_CHILD=pass",
+                executable.to_str().expect("utf8 path"),
+                "--exact",
+                "executed_evidence::tests::test_evidence_child_probe",
+                "-Z",
+                "unstable-options",
+                "--format=json",
+                "--show-output",
+            ],
+        );
+        let source = run.source.clone().expect("source captured");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_secs();
+        // Simulate a legitimate 1-hour (3700s) soak that started 3705s ago and ran for 3700s.
+        run.execution.ran_at = now.saturating_sub(3705);
+        run.execution.duration_ms = 3_700_000;
+        assert_eq!(run.require_pass(&source), Ok(()));
+
+        // Simulate a genuinely stale cached run from 2 hours after completion.
+        run.execution.ran_at = now.saturating_sub(3700 + 3605);
+        assert!(
+            run.require_pass(&source)
+                .expect_err("stale run must fail")
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn source_identity_empty_dirty_digest_classifies_clean_vs_dirty() {
+        let clean = SourceIdentity {
+            git_sha: "4e7942a0ba9be73bd81087d59a1ea1c40a83e877".to_owned(),
+            dirty_source_sha256: SourceIdentity::EMPTY_DIRTY_SHA256.to_owned(),
+        };
+        assert!(clean.is_clean());
+        let dirty = SourceIdentity {
+            git_sha: clean.git_sha,
+            dirty_source_sha256: "00".repeat(32),
+        };
+        assert!(!dirty.is_clean());
     }
 }
