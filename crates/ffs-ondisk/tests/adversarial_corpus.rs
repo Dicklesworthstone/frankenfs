@@ -3911,7 +3911,7 @@ fn gate1_on_disk_format_parsing() {
                     && (inode.flags & EXT4_INLINE_DATA_FL) == 0
                     && (inode.mode & 0xF000) == 0x8000
                 {
-                    let (_, _) = parse_extent_tree(&inode.extent_bytes).unwrap_or_else(|e| {
+                    parse_extent_tree(&inode.extent_bytes).unwrap_or_else(|e| {
                         panic!("parse inline extent tree on {} ino {ino}: {e}", spec.name)
                     });
                 }
@@ -3956,30 +3956,27 @@ fn gate1_on_disk_format_parsing() {
         let base = &mutation_seeds[iter % mutation_seeds.len()];
         let mut buf = base.clone();
         let mode = next_u64() % 4;
-        match mode {
-            0 if !buf.is_empty() => {
-                let idx = (next_u64() as usize) % buf.len();
-                buf[idx] ^= 1_u8 << (next_u64() % 8);
-            }
-            1 if !buf.is_empty() => {
-                for _ in 0..4 {
+        if !buf.is_empty() {
+            match mode {
+                0 => {
                     let idx = (next_u64() as usize) % buf.len();
-                    buf[idx] = (next_u64() & 0xFF) as u8;
+                    buf[idx] ^= 1_u8 << (next_u64() % 8);
+                }
+                1 => {
+                    for _ in 0..4 {
+                        let idx = (next_u64() as usize) % buf.len();
+                        buf[idx] = (next_u64() & 0xFF) as u8;
+                    }
+                }
+                2 => {
+                    let new_len = (next_u64() as usize) % buf.len();
+                    buf.truncate(new_len);
+                }
+                _ => {
+                    let idx = (next_u64() as usize) % buf.len();
+                    buf[idx] = [0x00, 0xFF, 0x7F, 0x80][(next_u64() as usize) & 3];
                 }
             }
-            2 => {
-                let new_len = if buf.is_empty() {
-                    0
-                } else {
-                    (next_u64() as usize) % buf.len()
-                };
-                buf.truncate(new_len);
-            }
-            _ if !buf.is_empty() => {
-                let idx = (next_u64() as usize) % buf.len();
-                buf[idx] = [0x00, 0xFF, 0x7F, 0x80][(next_u64() as usize) & 3];
-            }
-            _ => {}
         }
 
         let res = catch_unwind(AssertUnwindSafe(|| {

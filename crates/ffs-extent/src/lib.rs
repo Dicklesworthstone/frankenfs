@@ -7779,8 +7779,7 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
                 match hdr.depth {
                     0 => saw_depth0 = true,
                     1 => saw_depth1 = true,
-                    d if d >= 2 => saw_depth2 = true,
-                    _ => {}
+                    2.. => saw_depth2 = true,
                 }
 
                 // `debugfs` `blocks <ino>` (`ext2fs_block_iterate3`) visits external

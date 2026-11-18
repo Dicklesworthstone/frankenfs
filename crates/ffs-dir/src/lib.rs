@@ -3437,8 +3437,13 @@ mod tests {
                 std::fs::create_dir_all(&kern_mnt).expect("mkdir kern_mnt");
                 std::fs::create_dir_all(&ffs_mnt).expect("mkdir ffs_mnt");
 
+                let loop_opts = if spec.name == "img04_metadata_csum.ext4" {
+                    "loop,ro,noload"
+                } else {
+                    "loop,ro"
+                };
                 let kern_status = Command::new("sudo")
-                    .args(["-n", "mount", "-t", "ext4", "-o", "loop,ro,noload"])
+                    .args(["-n", "mount", "-t", "ext4", "-o", loop_opts])
                     .arg(&spec.path)
                     .arg(&kern_mnt)
                     .output()

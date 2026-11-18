@@ -1603,7 +1603,15 @@ fn gate4_mvcc_concurrency() {
             assert!(store.release_snapshot(snap));
         }
         let pruned = store.prune_safe();
-        assert!(pruned >= 1, "releasing snapshots must allow GC pruning");
+        assert!(
+            pruned >= ffs_types::CommitSeq(1),
+            "releasing snapshots must allow GC pruning"
+        );
+        assert_eq!(
+            store.version_count(),
+            1,
+            "only latest committed version must remain after GC"
+        );
     }
 
     // Criterion 4: 8 OS threads x 10,000 transactions each on 1,000 blocks.

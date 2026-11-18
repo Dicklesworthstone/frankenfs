@@ -29424,9 +29424,12 @@ AllowOther"#;
             let mut open_fs = OpenFs::open_read_write(&cx, &img, &open_opts)
                 .expect("child daemon open_read_write");
             open_fs.enable_writes(&cx).expect("child enable_writes");
-            open_fs
-                .attach_jbd2_journal(&cx)
-                .expect("child attach_jbd2_journal");
+            assert!(
+                open_fs
+                    .attach_ext4_internal_jbd2_writer(&cx)
+                    .expect("child attach_ext4_internal_jbd2_writer"),
+                "journaled ext4 image must attach internal JBD2 writer"
+            );
             let mnt_opts = MountOptions {
                 read_only: false,
                 auto_unmount: false,
@@ -29564,9 +29567,12 @@ AllowOther"#;
             let mut open_fs =
                 OpenFs::open_read_write(&cx, &rw_img, &open_opts).expect("open_read_write rw_img");
             open_fs.enable_writes(&cx).expect("enable_writes");
-            open_fs
-                .attach_jbd2_journal(&cx)
-                .expect("attach_jbd2_journal");
+            assert!(
+                open_fs
+                    .attach_ext4_internal_jbd2_writer(&cx)
+                    .expect("attach_ext4_internal_jbd2_writer"),
+                "journaled ext4 image must attach internal JBD2 writer"
+            );
             let handle = mount_background(
                 &cx,
                 Box::new(open_fs),
@@ -29891,6 +29897,12 @@ AllowOther"#;
             recovered_fs
                 .enable_writes(&cx)
                 .expect("enable_writes recovered");
+            assert!(
+                recovered_fs
+                    .attach_ext4_internal_jbd2_writer(&cx)
+                    .expect("recovered attach_ext4_internal_jbd2_writer"),
+                "recovered ext4 image must attach internal JBD2 writer"
+            );
             let handle = mount_background(
                 &cx,
                 Box::new(recovered_fs),

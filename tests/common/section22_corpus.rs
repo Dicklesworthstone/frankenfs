@@ -14,7 +14,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const CORPUS_CACHE_VERSION: &str = "v2";
+const CORPUS_CACHE_VERSION: &str = "v3";
 
 #[derive(Debug, Clone)]
 pub struct Section22ImageSpec {
@@ -397,7 +397,29 @@ fn apply_post_mkfs_population(
     debugfs_bin: &Path,
     e2fsck_bin: &Path,
     work_dir: &Path,
+    (uid, gid): (u32, u32),
 ) {
+    // Ensure `lost+found` is owned by the test runner uid/gid so non-root
+    // `ls -laRn` over both kernel ext4 (`default_permissions`) and FrankenFS
+    // FUSE (`MountOption::DefaultPermissions`) traverses it cleanly without EACCES.
+    let lf_out = Command::new(debugfs_bin)
+        .arg("-w")
+        .args([
+            "-R",
+            &format!("set_inode_field lost+found uid {uid}"),
+            "-R",
+            &format!("set_inode_field lost+found gid {gid}"),
+        ])
+        .arg(image)
+        .output()
+        .expect("spawn debugfs -w lost+found chown");
+    assert!(
+        lf_out.status.success(),
+        "debugfs lost+found uid/gid update failed on {}: {}",
+        image.display(),
+        String::from_utf8_lossy(&lf_out.stderr)
+    );
+
     if matches!(
         recipe_name,
         "img02_1k_blocks.ext4" | "img07_large_dirs.ext4"
@@ -548,6 +570,7 @@ pub fn ensure_section22_corpus(suite_name: &str) -> Option<Vec<Section22ImageSpe
                 &debugfs_bin,
                 &e2fsck_bin,
                 &unique_staging,
+                (uid, gid),
             );
 
             run_checked(
