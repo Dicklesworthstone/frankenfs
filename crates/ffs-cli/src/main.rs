@@ -23551,36 +23551,35 @@ mod tests {
                 }
             }
         }
+    }
 
-        #[test]
-        fn umount_cli_parses_and_mount_registry_resolves_then_deactivates() {
-            let cli =
-                Cli::try_parse_from(["ffs", "umount", "/tmp/mnt-probe", "--timeout-secs", "5"])
-                    .expect("parse ffs umount");
-            assert_eq!(cli.command.name(), "umount");
+    #[test]
+    fn umount_cli_parses_and_mount_registry_resolves_then_deactivates() {
+        let cli = Cli::try_parse_from(["ffs", "umount", "/tmp/mnt-probe", "--timeout-secs", "5"])
+            .expect("parse ffs umount");
+        assert_eq!(cli.command.name(), "umount");
 
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let img = tmp.path().join("backing.ext4");
-            let mnt = tmp.path().join("mnt");
-            std::fs::write(&img, b"placeholder").expect("write backing file");
-            std::fs::create_dir_all(&mnt).expect("mkdir mnt");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let img = tmp.path().join("backing.ext4");
+        let mnt = tmp.path().join("mnt");
+        std::fs::write(&img, b"placeholder").expect("write backing file");
+        std::fs::create_dir_all(&mnt).expect("mkdir mnt");
 
-            // Non-FUSE directory is refused with actionable remediation by both resolve and umount.
-            let resolve_err = resolve_mountpoint_backing_image(&mnt).unwrap_err();
-            assert!(resolve_err.to_string().contains("remediation:"));
-            let umount_err = umount_cmd(&mnt, 1, false).unwrap_err();
-            assert!(umount_err.to_string().contains("remediation:"));
+        // Non-FUSE directory is refused with actionable remediation by both resolve and umount.
+        let resolve_err = resolve_mountpoint_backing_image(&mnt).unwrap_err();
+        assert!(resolve_err.to_string().contains("remediation:"));
+        let umount_err = umount_cmd(&mnt, 1, false).unwrap_err();
+        assert!(umount_err.to_string().contains("remediation:"));
 
-            // ActiveMountGuard resolves while alive and stops resolving once dropped.
-            {
-                let _guard = ActiveMountGuard::register(&img, &mnt).expect("register");
-                let resolved = resolve_mountpoint_backing_image(&mnt).expect("resolve active mnt");
-                assert_eq!(resolved, img.canonicalize().expect("canon img"));
-            }
-            assert!(
-                resolve_mountpoint_backing_image(&mnt).is_err(),
-                "dropped ActiveMountGuard must mark active=false"
-            );
+        // ActiveMountGuard resolves while alive and stops resolving once dropped.
+        {
+            let _guard = ActiveMountGuard::register(&img, &mnt).expect("register");
+            let resolved = resolve_mountpoint_backing_image(&mnt).expect("resolve active mnt");
+            assert_eq!(resolved, img.canonicalize().expect("canon img"));
         }
+        assert!(
+            resolve_mountpoint_backing_image(&mnt).is_err(),
+            "dropped ActiveMountGuard must mark active=false"
+        );
     }
 }
