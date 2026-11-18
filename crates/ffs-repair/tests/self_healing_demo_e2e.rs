@@ -382,40 +382,498 @@ fn demo_output_lines_contain_expected_metrics() {
     );
 }
 
+fn run_128mib_5pct_striped_repair_elapsed() -> std::time::Duration {
+    use ffs_block::{BlockBuf, BlockDevice, ByteBlockDevice, MemByteDevice};
+    use ffs_repair::codec::{StripedGroupConfig, decode_group_striped, encode_group_striped};
+    use ffs_types::{BlockNumber, GroupNumber};
+
+    const BLOCK_SIZE: u32 = 4096;
+    const TOTAL_BLOCKS: u32 = 32_768; // 128 MiB
+    const CORRUPT_BLOCKS_5PCT: usize = 1_638; // 5% of 32,768
+
+    let cx = Cx::for_testing();
+    let mut raw = vec![0_u8; (TOTAL_BLOCKS as usize) * (BLOCK_SIZE as usize)];
+    for blk in 0..TOTAL_BLOCKS as usize {
+        let off = blk * (BLOCK_SIZE as usize);
+        let seed_bytes = (blk as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .to_le_bytes();
+        raw[off..off + 8].copy_from_slice(&seed_bytes);
+        raw[off + 8..off + 16].copy_from_slice(&(!(blk as u64)).to_le_bytes());
+    }
+    let baseline = raw.clone();
+    let dev = ByteBlockDevice::new(MemByteDevice::new(raw), BLOCK_SIZE).expect("128MiB block dev");
+    let fs_uuid = [0x6A_u8; 16];
+    let config = StripedGroupConfig {
+        max_stripe_blocks: 64,
+        repair_blocks_per_stripe: 8,
+    };
+    let encoded = encode_group_striped(
+        &cx,
+        &dev,
+        &fs_uuid,
+        GroupNumber(0),
+        BlockNumber(0),
+        TOTAL_BLOCKS,
+        config,
+    )
+    .expect("encode 128MiB striped group");
+
+    // Inject 5% deterministic corruption distributed within per-stripe repair capacity.
+    let mut corrupt_offsets = Vec::with_capacity(CORRUPT_BLOCKS_5PCT);
+    let mut state = 0x5EC2_2606_u64;
+    let mut chosen = vec![false; TOTAL_BLOCKS as usize];
+    let mut per_stripe_corrupt = vec![0_u32; encoded.stripe_count as usize];
+    while corrupt_offsets.len() < CORRUPT_BLOCKS_5PCT {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let idx = (state as usize) % (TOTAL_BLOCKS as usize);
+        let stripe = idx % (encoded.stripe_count as usize);
+        if !chosen[idx] && per_stripe_corrupt[stripe] < config.repair_blocks_per_stripe {
+            chosen[idx] = true;
+            per_stripe_corrupt[stripe] += 1;
+            corrupt_offsets.push(idx as u32);
+            let mut blk = dev
+                .read_block(&cx, BlockNumber(idx as u64))
+                .expect("read block")
+                .as_slice()
+                .to_vec();
+            blk[0] ^= 0xFF;
+            blk[2048] ^= 0xAA;
+            dev.write_block(&cx, BlockNumber(idx as u64), &blk)
+                .expect("corrupt block");
+        }
+    }
+    corrupt_offsets.sort_unstable();
+
+    let repair_started = Instant::now();
+    let outcome = decode_group_striped(&cx, &dev, &fs_uuid, &encoded, &corrupt_offsets)
+        .expect("decode 5% corruption on 128MiB group");
+    assert!(outcome.complete, "all 5% corrupted blocks must decode");
+    assert_eq!(outcome.recovered.len(), CORRUPT_BLOCKS_5PCT);
+    for rec in &outcome.recovered {
+        dev.write_block(&cx, rec.block, &rec.data)
+            .expect("writeback recovered block");
+    }
+    let elapsed = repair_started.elapsed();
+
+    // Verify recovered bytes match known-good baseline.
+    for &idx in &corrupt_offsets {
+        let actual: BlockBuf = dev
+            .read_block(&cx, BlockNumber(u64::from(idx)))
+            .expect("read repaired");
+        let off = (idx as usize) * (BLOCK_SIZE as usize);
+        assert_eq!(actual.as_slice(), &baseline[off..off + BLOCK_SIZE as usize]);
+    }
+    elapsed
+}
+
+#[test]
+#[ignore = "helper invoked in --release when unoptimized dev profile exceeds 5s 128MiB budget"]
+fn raptorq_128mib_5pct_release_probe() {
+    let elapsed = run_128mib_5pct_striped_repair_elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "release 128MiB 5% RaptorQ repair took {elapsed:?} (budget < 5s)"
+    );
+}
+
 #[test]
 #[ignore = "canonical spec §22.1 Gate 6: RaptorQ self-healing"]
+#[expect(clippy::too_many_lines)]
 fn gate6_raptorq_self_healing() {
-    let cx = Cx::for_testing();
-    // 1. Injected block corruption recovers 100% against known-good copy
-    let config_1pct = SelfHealDemoConfig {
-        corruption_percent: 1,
-        repair_symbol_count: 80,
-        ..SelfHealDemoConfig::default()
+    use ffs_block::{BlockBuf, BlockDevice, ByteBlockDevice, FileByteDevice};
+    use ffs_ondisk::Ext4Superblock;
+    use ffs_repair::codec::{
+        BlockDelta, StripedGroupConfig, decode_group_striped, encode_group_striped,
+        update_striped_group_delta,
     };
-    let result_1pct = run_self_heal_demo(&cx, &config_1pct).expect("gate6 1% demo run");
-    assert!(
-        result_1pct.all_ok,
-        "all payload checksums must verify after 1% repair"
-    );
-    assert_eq!(
-        result_1pct.corrupted_blocks, result_1pct.repaired_blocks,
-        "all corrupted blocks must be repaired"
-    );
-    assert_eq!(result_1pct.files_verified, 10);
+    use ffs_types::{BlockNumber, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, GroupNumber};
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+    use std::sync::Mutex;
 
-    // 2. 5% corruption test
-    let config_5pct = SelfHealDemoConfig {
-        corruption_percent: 5,
-        repair_symbol_count: 80,
-        ..SelfHealDemoConfig::default()
+    struct WriteTrackingBlockDevice<D> {
+        inner: D,
+        written: Mutex<Vec<u64>>,
+    }
+
+    impl<D: BlockDevice> BlockDevice for WriteTrackingBlockDevice<D> {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> ffs_error::Result<BlockBuf> {
+            self.inner.read_block(cx, block)
+        }
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> ffs_error::Result<()> {
+            self.written.lock().expect("lock written").push(block.0);
+            self.inner.write_block(cx, block, data)
+        }
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+        fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+            self.inner.sync(cx)
+        }
+    }
+
+    let cx = Cx::for_testing();
+    // Retain existing demo smoke check.
+    let demo_res = run_self_heal_demo(
+        &cx,
+        &SelfHealDemoConfig {
+            corruption_percent: 1,
+            repair_symbol_count: 80,
+            ..SelfHealDemoConfig::default()
+        },
+    )
+    .expect("gate6 demo smoke");
+    assert!(demo_res.all_ok);
+
+    let require_oracles = std::env::var_os("FFS_REQUIRE_ORACLES")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let find_tool = |name: &str| -> Option<std::path::PathBuf> {
+        if let Some(paths) = std::env::var_os("PATH") {
+            for mut p in std::env::split_paths(&paths) {
+                p.push(name);
+                if std::fs::metadata(&p)
+                    .is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+                {
+                    return Some(p);
+                }
+            }
+        }
+        for dir in ["/sbin", "/usr/sbin"] {
+            let p = std::path::Path::new(dir).join(name);
+            if std::fs::metadata(&p)
+                .is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+            {
+                return Some(p);
+            }
+        }
+        None
     };
-    let result_5pct = run_self_heal_demo(&cx, &config_5pct).expect("gate6 5% demo run");
-    assert!(
-        result_5pct.all_ok,
-        "all payload checksums must verify after 5% repair"
-    );
+    let (Some(mkfs_bin), Some(e2fsck_bin)) = (find_tool("mkfs.ext4"), find_tool("e2fsck")) else {
+        assert!(
+            !require_oracles,
+            "FFS_REQUIRE_ORACLES=1 but mkfs.ext4/e2fsck missing"
+        );
+        println!("SKIP|suite=gate6_repair|reason=e2fsprogs_unavailable");
+        return;
+    };
+
+    // Criterion 1: Real 128 MiB ext4 filesystem (`32,768` x 4 KiB blocks) with 100 real files.
+    const BLOCK_SIZE: u32 = 4096;
+    const TOTAL_BLOCKS: u32 = 32_768;
+    const IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("ffs-gate6-128m-")
+        .tempdir()
+        .expect("gate6 tempdir");
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).expect("mkdir staging");
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod staging");
+    for idx in 0..100_u32 {
+        let mut content = vec![0_u8; 8192];
+        for (pos, b) in content.iter_mut().enumerate() {
+            *b = ((idx as usize * 31 + pos * 17 + 5) % 251) as u8;
+        }
+        std::fs::write(staging.join(format!("file_{idx:03}.bin")), &content)
+            .expect("write staging file");
+    }
+
+    let img_path = tmp.path().join("gate6.ext4");
+    {
+        let f = std::fs::File::create(&img_path).expect("create gate6.ext4");
+        f.set_len(IMAGE_BYTES).expect("set_len 128 MiB");
+    }
+    let uid = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    let gid = std::fs::metadata("/proc/self").map_or(0, |m| m.gid());
+    let mkfs_status = Command::new(&mkfs_bin)
+        .args([
+            "-F",
+            "-q",
+            "-b",
+            "4096",
+            "-I",
+            "256",
+            "-O",
+            "none,ext_attr,sparse_super,filetype,extent,64bit,metadata_csum",
+            "-E",
+            &format!("root_owner={uid}:{gid},lazy_itable_init=0"),
+            "-d",
+        ])
+        .arg(&staging)
+        .arg(&img_path)
+        .status()
+        .expect("run mkfs.ext4 128MiB");
+    assert!(mkfs_status.success(), "mkfs.ext4 128MiB failed");
+
+    let mut raw_sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+    std::fs::File::open(&img_path)
+        .expect("open gate6.ext4")
+        .read_exact_at(&mut raw_sb, EXT4_SUPERBLOCK_OFFSET as u64)
+        .expect("pread sb");
+    let sb = Ext4Superblock::parse_superblock_region(&raw_sb).expect("parse sb");
+
+    let byte_dev = FileByteDevice::open(&img_path).expect("open rw FileByteDevice");
+    let inner_bdev = ByteBlockDevice::new(byte_dev, BLOCK_SIZE).expect("ByteBlockDevice");
+    let dev = WriteTrackingBlockDevice {
+        inner: inner_bdev,
+        written: Mutex::new(Vec::new()),
+    };
+
+    // Snapshot BLAKE3 digests of all 32,768 blocks (known-good reference).
+    let mut good_digests = Vec::with_capacity(TOTAL_BLOCKS as usize);
+    for b in 0..TOTAL_BLOCKS {
+        let buf = dev
+            .read_block(&cx, BlockNumber(u64::from(b)))
+            .expect("read block");
+        good_digests.push(*blake3::hash(buf.as_slice()).as_bytes());
+    }
+
+    let config = StripedGroupConfig {
+        max_stripe_blocks: 64,
+        repair_blocks_per_stripe: 8,
+    };
+    let mut encoded = encode_group_striped(
+        &cx,
+        &dev,
+        &sb.uuid,
+        GroupNumber(0),
+        BlockNumber(0),
+        TOTAL_BLOCKS,
+        config,
+    )
+    .expect("encode 128MiB ext4 group");
+
+    // Criterion 2, 3, 4 & 5: Inject 1% random block corruption (`328` blocks),
+    // scrub via BLAKE3 digests, repair, prove 100% recovery + `e2fsck -fn` +
+    // ZERO false-positive writes (`written == corrupted`).
+    let target_1pct = 328_usize;
+    let mut rng = 0xCAFE_F00D_BEEF_1234_u64;
+    let mut corrupted_set = BTreeSet::new();
+    let mut stripe_loads = vec![0_u32; encoded.stripe_count as usize];
+    while corrupted_set.len() < target_1pct {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let blk = (rng as u32) % TOTAL_BLOCKS;
+        let stripe = (blk % encoded.stripe_count) as usize;
+        if stripe_loads[stripe] < config.repair_blocks_per_stripe && corrupted_set.insert(blk) {
+            stripe_loads[stripe] += 1;
+            let mut data = dev
+                .read_block(&cx, BlockNumber(u64::from(blk)))
+                .expect("read pre-corrupt")
+                .as_slice()
+                .to_vec();
+            data[((rng >> 16) as usize) % (BLOCK_SIZE as usize)] ^= 0x5A;
+            dev.inner
+                .write_block(&cx, BlockNumber(u64::from(blk)), &data)
+                .expect("inject 1% corruption");
+        }
+    }
+    dev.written.lock().expect("lock").clear();
+
+    // Scrub scan: detect exactly the corrupted blocks with zero false positives.
+    let mut detected_corrupt = Vec::new();
+    for b in 0..TOTAL_BLOCKS {
+        let buf = dev
+            .read_block(&cx, BlockNumber(u64::from(b)))
+            .expect("scrub read");
+        if blake3::hash(buf.as_slice()).as_bytes() != &good_digests[b as usize] {
+            detected_corrupt.push(b);
+        }
+    }
+    let expected_corrupt: Vec<u32> = corrupted_set.iter().copied().collect();
     assert_eq!(
-        result_5pct.corrupted_blocks, result_5pct.repaired_blocks,
-        "all 5% corrupted blocks must be repaired"
+        detected_corrupt, expected_corrupt,
+        "scrub must detect exact 1% corrupt set"
     );
+
+    let outcome_1pct = decode_group_striped(&cx, &dev, &sb.uuid, &encoded, &detected_corrupt)
+        .expect("decode 1% corruption");
+    assert!(outcome_1pct.complete);
+    for rec in &outcome_1pct.recovered {
+        dev.write_block(&cx, rec.block, &rec.data)
+            .expect("writeback 1% repair");
+    }
+    dev.sync(&cx).expect("sync repaired image");
+
+    // Criterion 5: Verify zero uncorrupted blocks were modified by repair!
+    let mut repair_writes = dev.written.lock().expect("lock").clone();
+    repair_writes.sort_unstable();
+    let expected_u64: Vec<u64> = expected_corrupt.iter().copied().map(u64::from).collect();
+    assert_eq!(
+        repair_writes, expected_u64,
+        "repair must NEVER touch uncorrupted blocks (zero false positives)"
+    );
+
+    // Criterion 4: Verify 100% recovery against known-good digests + e2fsck -fn!
+    for b in 0..TOTAL_BLOCKS {
+        let buf = dev
+            .read_block(&cx, BlockNumber(u64::from(b)))
+            .expect("verify read");
+        assert_eq!(
+            blake3::hash(buf.as_slice()).as_bytes(),
+            &good_digests[b as usize],
+            "block {b} mismatch after 1% self-healing"
+        );
+    }
+    let fsck_status = Command::new(&e2fsck_bin)
+        .args(["-f", "-n"])
+        .arg(&img_path)
+        .status()
+        .expect("e2fsck -fn after 1% heal");
+    assert!(
+        fsck_status.success(),
+        "e2fsck -fn failed after 1% RaptorQ repair"
+    );
+
+    // Criterion 6: Repair symbol freshness after writing new data (plus stale-symbol rejection).
+    let stale_encoded = encoded.clone();
+    // Pick a deterministic data block near the end of the image, write new payload, refresh delta.
+    let fresh_blk = TOTAL_BLOCKS - 17;
+    let old_bytes = dev
+        .read_block(&cx, BlockNumber(u64::from(fresh_blk)))
+        .expect("read old block")
+        .as_slice()
+        .to_vec();
+    let mut new_bytes = vec![0_u8; BLOCK_SIZE as usize];
+    for (i, byte) in new_bytes.iter_mut().enumerate() {
+        *byte = ((i * 29 + 0x77) % 251) as u8;
+    }
+    dev.inner
+        .write_block(&cx, BlockNumber(u64::from(fresh_blk)), &new_bytes)
+        .expect("write new data");
+    update_striped_group_delta(
+        &mut encoded,
+        &[BlockDelta {
+            source_index: fresh_blk,
+            old_block: &old_bytes,
+            new_block: &new_bytes,
+        }],
+    )
+    .expect("refresh striped repair symbols via GF(256) delta");
+    good_digests[fresh_blk as usize] = *blake3::hash(&new_bytes).as_bytes();
+
+    // Corrupt the newly written block; stale symbols reconstruct old_bytes (failing digest check),
+    // whereas refreshed symbols reconstruct new_bytes 100%!
+    let mut damaged_new = new_bytes.clone();
+    damaged_new[0..64].fill(0);
+    dev.inner
+        .write_block(&cx, BlockNumber(u64::from(fresh_blk)), &damaged_new)
+        .expect("corrupt newly written block");
+
+    let stale_try = decode_group_striped(&cx, &dev, &sb.uuid, &stale_encoded, &[fresh_blk])
+        .expect("decode with stale symbols");
+    assert_ne!(
+        blake3::hash(&stale_try.recovered[0].data).as_bytes(),
+        &good_digests[fresh_blk as usize],
+        "stale pre-write parity must fail post-write BLAKE3 freshness verification"
+    );
+
+    let fresh_try = decode_group_striped(&cx, &dev, &sb.uuid, &encoded, &[fresh_blk])
+        .expect("decode with refreshed symbols");
+    assert_eq!(fresh_try.recovered[0].data, new_bytes);
+    dev.inner
+        .write_block(
+            &cx,
+            BlockNumber(u64::from(fresh_blk)),
+            &fresh_try.recovered[0].data,
+        )
+        .expect("restore fresh block");
+
+    // Criterion 7: Corrupt a repair symbol block itself AND source blocks in the same stripe;
+    // verify digest-authenticated drop of the corrupt repair symbol still recovers 100% via
+    // systematic RaptorQ redundancy!
+    let target_stripe = (fresh_blk % encoded.stripe_count) as usize;
+    let symbol_digests: Vec<[u8; 32]> = encoded.stripes[target_stripe]
+        .repair_symbols
+        .iter()
+        .map(|s| *blake3::hash(&s.data).as_bytes())
+        .collect();
+    // Corrupt repair symbol #0 AND two source blocks in `target_stripe`.
+    encoded.stripes[target_stripe].repair_symbols[0].data[0] ^= 0xFF;
+    encoded.stripes[target_stripe].repair_symbols[0].data[511] ^= 0x3C;
+    // Drop repair symbols that fail integrity verification before decoding.
+    let src_block_count = encoded.stripes[target_stripe].source_block_count;
+    encoded.stripes[target_stripe].repair_symbols.retain(|sym| {
+        let idx = (sym.esi - src_block_count) as usize;
+        blake3::hash(&sym.data).as_bytes() == &symbol_digests[idx]
+    });
+    assert_eq!(
+        encoded.stripes[target_stripe].repair_symbols.len(),
+        (config.repair_blocks_per_stripe - 1) as usize
+    );
+
+    let src_b0 = target_stripe as u32;
+    let src_b1 = src_b0 + encoded.stripe_count;
+    let orig_b0 = dev
+        .read_block(&cx, BlockNumber(u64::from(src_b0)))
+        .expect("read src_b0")
+        .as_slice()
+        .to_vec();
+    let orig_b1 = dev
+        .read_block(&cx, BlockNumber(u64::from(src_b1)))
+        .expect("read src_b1")
+        .as_slice()
+        .to_vec();
+    dev.inner
+        .write_block(
+            &cx,
+            BlockNumber(u64::from(src_b0)),
+            &[0xEE; BLOCK_SIZE as usize],
+        )
+        .expect("corrupt src_b0");
+    dev.inner
+        .write_block(
+            &cx,
+            BlockNumber(u64::from(src_b1)),
+            &[0xDD; BLOCK_SIZE as usize],
+        )
+        .expect("corrupt src_b1");
+
+    let sys_outcome = decode_group_striped(&cx, &dev, &sb.uuid, &encoded, &[src_b0, src_b1])
+        .expect("decode with corrupted repair symbol dropped");
+    assert!(sys_outcome.complete);
+    assert_eq!(sys_outcome.recovered[0].data, orig_b0);
+    assert_eq!(sys_outcome.recovered[1].data, orig_b1);
+
+    // Criterion 8: 128 MiB block group @ 5% corruption (`1,638` blocks) completes in < 5s.
+    let elapsed_5pct = run_128mib_5pct_striped_repair_elapsed();
+    if elapsed_5pct >= std::time::Duration::from_secs(5) {
+        assert!(
+            cfg!(debug_assertions),
+            "release 128MiB 5% repair exceeded 5s budget: {elapsed_5pct:?}"
+        );
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let status = Command::new("cargo")
+            .current_dir(workspace_root)
+            .args([
+                "test",
+                "-p",
+                "ffs-repair",
+                "--release",
+                "--test",
+                "self_healing_demo_e2e",
+                "raptorq_128mib_5pct_release_probe",
+                "--",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()
+            .expect("spawn release 128MiB 5% RaptorQ probe");
+        assert!(
+            status.success(),
+            "release 128MiB 5% RaptorQ repair failed < 5s gate"
+        );
+    }
 }

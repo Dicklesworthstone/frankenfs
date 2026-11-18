@@ -66,3 +66,4 @@ pub use ext4::{
     verify_extent_block_checksum, verify_group_desc_checksum, verify_inode_bitmap_checksum,
     verify_inode_checksum, verify_xattr_block_checksum, write_dx_root,
 };
+pub use ffs_types::{GroupNumber, InodeNumber};

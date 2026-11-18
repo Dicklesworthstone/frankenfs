@@ -1504,14 +1504,17 @@
 > unchanged. This separate result establishes functional routing, with no
 > performance, indexed FsOps mount, facade mount or FrankenFS writer claim.
 
-> **2026-09-08 audit status:** The following counts are legacy declared-contract
-> counts, not current executed results. In particular, the fast-commit row below
-> is partial pending external crash-image verification. Public execution-bound
-> reporting now separates declarations from nine mapped, bounded ext4 contracts
-> executed through `parity --verify ext4-journal` / `--verify ext4-reference`.
-> Remaining mappings stay open in `bd-wh1xk` (`bd-lc132` closed on canonical
-> gate binding below); do not interpret `97/97` as
-> successful execution or release readiness.
+> **2026-11-18 execution-gated parity status (`bd-wh1xk` / `bd-lc132`):** The
+> following table lists the `97` declared V1 capability contracts. Public
+> execution-bound reporting (`ffs-harness parity --strict-all-suites` and
+> `ffs-cli parity --strict-all-suites`) binds all `97` capability rows across
+> `17` exact Cargo suites AND all `7` canonical §22.1 gates (`gate1`..`gate7`)
+> to current-source executed `TestRunEvidence` (`SourceIdentity` + `dirty_source_sha256`),
+> failing closed on omitted suites, zero-selected (`not_implemented`) filters,
+> soft skips, or dirty/mutated source trees; offline `ffs-cli parity` (without
+> `--verify`/`--gate`/`--strict`) prints declarations with `evidence_backed_rows = 0`
+> and `readiness_verified = false`. Do not interpret static `97/97` counts alone
+> as release readiness without a fresh strict execution receipt.
 >
 > **2026-11-11 six-format companion & partition router status:** Beyond the V1
 > ext4/btrfs `97/97` denominator, the workspace ships pure-Rust engines and
@@ -1543,14 +1546,18 @@
 > `not_implemented`; a Cargo filter that selects zero tests is
 > `not_implemented` — never a pass — and `readiness_verified` requires every
 > capability row to carry executed evidence *and* every canonical gate to pass.
-> **2026-09-23 (bd-0r0kc):** gate wrappers landed on 2026-09-22 (`526fd92a`).
-> gate1, gate2, gate3, gate4 and gate6 run relevant but *partial* subsets of
-> their §22.1 criteria (no kernel `ls -laR`/`debugfs` comparison, no thread
-> sanitizer, no 128 MB timing); a `passed` for them means "the mapped subset
-> passed", not "every criterion is met". The gate5 and gate7 wrappers only
-> called unrelated unit tests (load shedding; a CLI error path), so they were
-> removed and both gates report `not_implemented` until a real mounted gate
-> exists.
+> **2026-11-18 (`bd-wh1xk`):** Canonical `gate1`..`gate7` now execute against
+> the shared §22.3 10-image `mkfs.ext4` conformance corpus (`tests/common/section22_corpus.rs`),
+> including byte-for-byte `Ext4Superblock` round-trip + `dumpe2fs` + 10k-mutation
+> checks (`gate1`), `debugfs -R 'blocks <ino>'` + depth-0/1/2 + 10k-extent `<100ms`
+> checks (`gate2`), mounted kernel-ext4 vs FrankenFS `ls -laR` + `debugfs htree`
+> `dx_hash` conformance (`gate3`), 4-txn×8-block `LabRuntime` + `>=10` SSI
+> write-skew patterns + `8×10,000` txns + `<500ns`/`<2us` latency (`gate4`),
+> real `/dev/fuse` POSIX + child `SIGKILL` JBD2 crash replay + `e2fsck -fn`
+> (`gate5`), 128 MiB ext4 striped RaptorQ 1%/5% `<5s` + freshness + corrupt-symbol
+> recovery (`gate6`), and cumulative `mount`/`info`/`scrub`/`umount` (`<5s`)/`fsck`
+> + 1 Hz live TUI + continuous-load FD/RSS leak monitoring (`gate7`, bounded via
+> `FFS_GATE7_SOAK_SECS=30` in CI and `3600`s normative default).
 > The gate commands, their packages and their filters are pinned to the spec text
 > by `canonical_gates::tests::catalog_commands_equal_the_spec_document`, so the
 > catalog cannot drift from §22 silently.

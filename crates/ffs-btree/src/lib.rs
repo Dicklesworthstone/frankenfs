@@ -5321,5 +5321,84 @@ Hole { hole_len: 90 }
     #[ignore = "canonical spec §22.1 Gate 2: extent resolution"]
     fn gate2_btree_indexing() {
         grow_root_index_reaches_depth2_bd_w9erb();
+
+        // Depth-0, depth-1, and depth-2 B+tree construction + hole detection +
+        // 10,000-extent sequential resolution in < 100ms (Spec §22.1 Gate 2).
+        const EXTENT_COUNT: u32 = 10_000;
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let mut root = make_root();
+        let mut alloc = SeqAllocator::new(1_000);
+        let mut saw_depth0 = false;
+        let mut saw_depth1 = false;
+        let mut saw_depth2 = false;
+
+        for i in 0..EXTENT_COUNT {
+            let ext = Ext4Extent {
+                logical_block: i * 2,
+                raw_len: 1,
+                physical_start: 100_000 + u64::from(i) * 2,
+            };
+            insert(&cx, &dev, &mut root, ext, &mut alloc).expect("insert non-mergeable extent");
+            let (hdr, _) = parse_header(&root).expect("parse root header");
+            match hdr.depth {
+                0 => saw_depth0 = true,
+                1 => saw_depth1 = true,
+                2 => saw_depth2 = true,
+                other => panic!("unexpected extent tree depth {other}"),
+            }
+        }
+        assert!(
+            saw_depth0 && saw_depth1 && saw_depth2,
+            "10,000-extent 4KiB tree must transition through depth 0, 1, and 2"
+        );
+
+        // Verify odd logical blocks return Hole and even logical blocks return Found.
+        for probe in [0_u32, 1, 2, 1_361, 1_362, 19_997, 19_998, 19_999] {
+            let res = search(&cx, &dev, &root, probe).expect("search depth-2 tree");
+            if probe % 2 == 0 && probe < EXTENT_COUNT * 2 {
+                assert_eq!(
+                    res,
+                    SearchResult::Found {
+                        extent: Ext4Extent {
+                            logical_block: probe,
+                            raw_len: 1,
+                            physical_start: 100_000 + u64::from(probe),
+                        },
+                        offset_in_extent: 0,
+                    }
+                );
+            } else {
+                assert!(
+                    matches!(res, SearchResult::Hole { .. }),
+                    "expected Hole at odd/trailing logical block {probe}, got {res:?}"
+                );
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let mut visited = Vec::with_capacity(EXTENT_COUNT as usize);
+        let count = walk_range(
+            &cx,
+            &dev,
+            &root,
+            0,
+            u64::from(EXTENT_COUNT * 2),
+            &mut |ext| {
+                visited.push((ext.logical_block, ext.physical_start));
+                Ok(())
+            },
+        )
+        .expect("walk_range 10,000 extents");
+        let elapsed = start.elapsed();
+
+        assert_eq!(count, EXTENT_COUNT as usize);
+        assert_eq!(visited.len(), EXTENT_COUNT as usize);
+        assert_eq!(visited[0], (0, 100_000));
+        assert_eq!(visited[EXTENT_COUNT as usize - 1], (19_998, 119_998));
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "10,000-extent walk_range took {elapsed:?} (budget < 100ms)"
+        );
     }
 }

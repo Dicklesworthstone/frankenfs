@@ -173,3 +173,109 @@ fn injected_failure_flips_rows_and_fails_the_public_gate() {
     assert_eq!(report["evidence_backed_rows"], 0);
     assert_eq!(report["readiness_verified"], false);
 }
+
+#[test]
+fn strict_mode_rejects_omitted_suites_while_offline_declarations_stay_zero_credit() {
+    // 1. `parity --strict --verify mvcc-lib --local` MUST fail closed because 16
+    //    suites and all 7 canonical gates were omitted (`"suite not executed"`).
+    let strict_out = Command::new(env!("CARGO_BIN_EXE_ffs-harness"))
+        .args(["parity", "--strict", "--verify", "mvcc-lib", "--local"])
+        .output()
+        .expect("spawn ffs-harness parity --strict");
+    assert!(
+        !strict_out.status.success(),
+        "strict parity must fail closed when suites or canonical gates are omitted"
+    );
+    let strict_report: serde_json::Value =
+        serde_json::from_slice(&strict_out.stdout).expect("parse strict parity JSON");
+    assert_eq!(strict_report["readiness_verified"], false);
+    let stderr = String::from_utf8_lossy(&strict_out.stderr);
+    assert!(
+        stderr.contains("omitted_suites") && stderr.contains("canonical gates were omitted"),
+        "strict failure diagnostic must enumerate omitted suites and gates, got: {stderr}"
+    );
+
+    // 2. Declaration-only `parity` (no `--verify`, no `--gate`, no `--strict`)
+    //    keeps `evidence_backed_rows == 0` and `readiness_verified == false`.
+    let decl_out = Command::new(env!("CARGO_BIN_EXE_ffs-harness"))
+        .args(["parity"])
+        .output()
+        .expect("spawn declaration-only ffs-harness parity");
+    assert!(decl_out.status.success());
+    let decl_report: serde_json::Value =
+        serde_json::from_slice(&decl_out.stdout).expect("parse decl parity JSON");
+    assert_eq!(decl_report["evidence_backed_rows"], 0);
+    assert_eq!(decl_report["readiness_verified"], false);
+}
+
+#[test]
+fn public_gates_command_and_parity_gate_flag_fail_closed_on_injected_failure() {
+    // Force nested Cargo gate run to fail deterministically via uninstalled target.
+    let gates_out = Command::new(env!("CARGO_BIN_EXE_ffs-harness"))
+        .args(["gates", "--gate", "gate4", "--local"])
+        .env("CARGO_BUILD_TARGET", "x86_64-unknown-none")
+        .output()
+        .expect("spawn ffs-harness gates");
+    assert!(
+        !gates_out.status.success(),
+        "`ffs-harness gates` must exit non-zero when a selected gate fails"
+    );
+    let gates_json: serde_json::Value =
+        serde_json::from_slice(&gates_out.stdout).expect("parse gates report JSON");
+    assert_eq!(gates_json["gates"][0]["gate_id"], "gate4");
+    assert_eq!(gates_json["gates"][0]["status"], "failed");
+
+    let parity_gate_out = Command::new(env!("CARGO_BIN_EXE_ffs-harness"))
+        .args(["parity", "--gate", "gate4", "--local"])
+        .env("CARGO_BUILD_TARGET", "x86_64-unknown-none")
+        .output()
+        .expect("spawn ffs-harness parity --gate gate4");
+    assert!(
+        !parity_gate_out.status.success(),
+        "`ffs-harness parity --gate` must fail closed when the selected gate does not pass"
+    );
+}
+
+#[test]
+fn rejection_only_rows_stay_excluded_from_headlines_with_structured_audit_fields() {
+    use ffs_harness::{ParityClassification, ThreeColumnParityReport};
+
+    let sample = vec![
+        (
+            "ext4 superblock".to_owned(),
+            ParityClassification::KernelVerified,
+        ),
+        (
+            "MVCC snapshot visibility".to_owned(),
+            ParityClassification::Implemented,
+        ),
+        (
+            "btrfs RAID56 write rejection contract".to_owned(),
+            ParityClassification::RejectionOnly,
+        ),
+        (
+            "unexecuted suite row".to_owned(),
+            ParityClassification::Unverified,
+        ),
+    ];
+    let three_col =
+        ThreeColumnParityReport::from_classifications(&sample, Some("deadbeef".into()), None);
+    three_col
+        .verify_rejection_excluded()
+        .expect("rejection-only contract coverage must stay excluded from headline counts");
+    assert_eq!(three_col.headline_counts(), (2, 3));
+    assert_eq!(three_col.rejection_only_rows, 1);
+
+    let (_, report) = run_public_parity(&[]);
+    let git_sha = report["source"]["git_sha"].as_str().unwrap_or_default();
+    let dirty_sha = report["source"]["dirty_source_sha256"]
+        .as_str()
+        .unwrap_or_default();
+    let stdout_sha = report["runs"][0]["execution"]["stdout_sha256"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!git_sha.is_empty() && !dirty_sha.is_empty() && !stdout_sha.is_empty());
+    println!(
+        "SCENARIO_RESULT|scenario_id=parity_adversarial_audit|command=cargo|stdout_sha256={stdout_sha}|git_sha={git_sha}|dirty_source_sha256={dirty_sha}|expected=rejection_excluded|actual=verified"
+    );
+}

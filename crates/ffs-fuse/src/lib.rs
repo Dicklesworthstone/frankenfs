@@ -9054,17 +9054,13 @@ pub fn mount(
     mountpoint: impl AsRef<Path>,
     options: &MountOptions,
 ) -> Result<MetricsSnapshot, FuseError> {
-    mount_with_commit_interval(cx, ops, mountpoint, options, None)
+    mount_inner(cx, ops, mountpoint.as_ref(), options, None)
 }
 
-/// Mount a FrankenFS filesystem at the given mountpoint (blocking) with an
-/// explicit periodic durability commit interval override (`None` uses the
-/// backend default; `Some(Duration::ZERO)` disables the internal FUSE worker
-/// when the caller manages periodic commits externally).
-pub fn mount_with_commit_interval(
+fn mount_inner(
     cx: &Cx,
     ops: Box<dyn FsOps>,
-    mountpoint: impl AsRef<Path>,
+    mountpoint: &Path,
     options: &MountOptions,
     commit_interval: Option<Duration>,
 ) -> Result<MetricsSnapshot, FuseError> {
@@ -9074,7 +9070,6 @@ pub fn mount_with_commit_interval(
         )));
     }
     validate_mount_options(options)?;
-    let mountpoint = mountpoint.as_ref();
     validate_mountpoint(mountpoint)?;
     let mount_scope = MountRuntimeScope::open_required(cx)?;
     let fuse_opts = build_mount_options(options);
@@ -9194,6 +9189,20 @@ pub fn mount_with_commit_interval(
     // runtime already had this via `MountHandle::wait`, and the asymmetry silently
     // blocked every per-op attribution on the mounted comparator surface.
     Ok(fs.inner.metrics.snapshot())
+}
+
+/// Mount a FrankenFS filesystem at the given mountpoint (blocking) with an
+/// explicit periodic durability commit interval override (`None` uses the
+/// backend default; `Some(Duration::ZERO)` disables the internal FUSE worker
+/// when the caller manages periodic commits externally).
+pub fn mount_with_commit_interval(
+    cx: &Cx,
+    ops: Box<dyn FsOps>,
+    mountpoint: impl AsRef<Path>,
+    options: &MountOptions,
+    commit_interval: Option<Duration>,
+) -> Result<MetricsSnapshot, FuseError> {
+    mount_inner(cx, ops, mountpoint.as_ref(), options, commit_interval)
 }
 
 /// Mount a FrankenFS filesystem in the background, returning a lifecycle-managed [`MountHandle`].
@@ -9976,6 +9985,10 @@ pub fn mount_managed_per_core(
         config: effective_config,
     })
 }
+
+#[cfg(test)]
+#[path = "../../../tests/common/section22_corpus.rs"]
+mod section22_corpus;
 
 #[cfg(test)]
 mod tests {
@@ -29373,324 +29386,540 @@ AllowOther"#;
         }
     }
 
-    fn build_gate5_ext4_image() -> Vec<u8> {
-        const BLOCK_SIZE: usize = 4096;
-        const IMAGE_SIZE: usize = 256 * 1024; // 64 blocks
-        const SB_OFF: usize = 1024;
-        let mut image = vec![0_u8; IMAGE_SIZE];
-
-        // Superblock
-        image[SB_OFF..SB_OFF + 4].copy_from_slice(&128_u32.to_le_bytes()); // s_inodes_count
-        image[SB_OFF + 0x04..SB_OFF + 0x08].copy_from_slice(&64_u32.to_le_bytes()); // s_blocks_count_lo
-        image[SB_OFF + 0x0C..SB_OFF + 0x10].copy_from_slice(&50_u32.to_le_bytes()); // s_free_blocks_count_lo
-        image[SB_OFF + 0x10..SB_OFF + 0x14].copy_from_slice(&117_u32.to_le_bytes()); // s_free_inodes_count
-        image[SB_OFF + 0x14..SB_OFF + 0x18].copy_from_slice(&0_u32.to_le_bytes()); // s_first_data_block
-        image[SB_OFF + 0x18..SB_OFF + 0x1C].copy_from_slice(&2_u32.to_le_bytes()); // s_log_block_size (4K)
-        image[SB_OFF + 0x20..SB_OFF + 0x24].copy_from_slice(&64_u32.to_le_bytes()); // s_blocks_per_group
-        image[SB_OFF + 0x28..SB_OFF + 0x2C].copy_from_slice(&128_u32.to_le_bytes()); // s_inodes_per_group
-        image[SB_OFF + 0x38..SB_OFF + 0x3A].copy_from_slice(&0xEF53_u16.to_le_bytes()); // s_magic
-        image[SB_OFF + 0x3A..SB_OFF + 0x3C].copy_from_slice(&1_u16.to_le_bytes()); // s_state = EXT4_VALID_FS
-        image[SB_OFF + 0x4C..SB_OFF + 0x50].copy_from_slice(&1_u32.to_le_bytes()); // s_rev_level
-        image[SB_OFF + 0x54..SB_OFF + 0x58].copy_from_slice(&11_u32.to_le_bytes()); // s_first_ino
-        image[SB_OFF + 0x58..SB_OFF + 0x5A].copy_from_slice(&256_u16.to_le_bytes()); // s_inode_size
-        let incompat: u32 = 0x0002 | 0x0040; // FILETYPE | EXTENTS
-        image[SB_OFF + 0x60..SB_OFF + 0x64].copy_from_slice(&incompat.to_le_bytes());
-        image[SB_OFF + 0xFE..SB_OFF + 0x100].copy_from_slice(&32_u16.to_le_bytes()); // s_desc_size
-
-        // Group descriptor at block 1
-        let gd_off = BLOCK_SIZE;
-        image[gd_off..gd_off + 4].copy_from_slice(&2_u32.to_le_bytes()); // block_bitmap
-        image[gd_off + 4..gd_off + 8].copy_from_slice(&3_u32.to_le_bytes()); // inode_bitmap
-        image[gd_off + 8..gd_off + 12].copy_from_slice(&4_u32.to_le_bytes()); // inode_table (blocks 4..=11)
-        image[gd_off + 0x0C..gd_off + 0x0E].copy_from_slice(&50_u16.to_le_bytes()); // free_blocks_count
-        image[gd_off + 0x0E..gd_off + 0x10].copy_from_slice(&117_u16.to_le_bytes()); // free_inodes_count
-        image[gd_off + 0x10..gd_off + 0x12].copy_from_slice(&1_u16.to_le_bytes()); // used_dirs_count
-
-        // Block bitmap at block 2: mark blocks 0..=13 allocated
-        let bbm = 2 * BLOCK_SIZE;
-        image[bbm] = 0xFF;
-        image[bbm + 1] = 0x3F;
-
-        // Inode bitmap at block 3: mark inodes 1..=11 allocated
-        let ibm = 3 * BLOCK_SIZE;
-        image[ibm] = 0xFF;
-        image[ibm + 1] = 0x07;
-
-        // Inode #2 (root dir, index 1) -> extent at block 12
-        let ino2 = 4 * BLOCK_SIZE + 256;
-        image[ino2..ino2 + 2].copy_from_slice(&0o040_755_u16.to_le_bytes());
-        image[ino2 + 4..ino2 + 8].copy_from_slice(&4096_u32.to_le_bytes());
-        image[ino2 + 0x1A..ino2 + 0x1C].copy_from_slice(&2_u16.to_le_bytes());
-        image[ino2 + 0x20..ino2 + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
-        image[ino2 + 0x80..ino2 + 0x82].copy_from_slice(&32_u16.to_le_bytes());
-        let e2 = ino2 + 0x28;
-        image[e2..e2 + 2].copy_from_slice(&0xF30A_u16.to_le_bytes());
-        image[e2 + 2..e2 + 4].copy_from_slice(&1_u16.to_le_bytes());
-        image[e2 + 4..e2 + 6].copy_from_slice(&4_u16.to_le_bytes());
-        image[e2 + 6..e2 + 8].copy_from_slice(&0_u16.to_le_bytes());
-        image[e2 + 12..e2 + 16].copy_from_slice(&0_u32.to_le_bytes());
-        image[e2 + 16..e2 + 18].copy_from_slice(&1_u16.to_le_bytes());
-        image[e2 + 18..e2 + 20].copy_from_slice(&0_u16.to_le_bytes());
-        image[e2 + 20..e2 + 24].copy_from_slice(&12_u32.to_le_bytes());
-
-        // Inode #11 (regular file, index 10) -> extent at block 13
-        let ino11 = 4 * BLOCK_SIZE + 10 * 256;
-        image[ino11..ino11 + 2].copy_from_slice(&0o100_644_u16.to_le_bytes());
-        image[ino11 + 4..ino11 + 8].copy_from_slice(&6_u32.to_le_bytes());
-        image[ino11 + 0x1A..ino11 + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
-        image[ino11 + 0x20..ino11 + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
-        image[ino11 + 0x80..ino11 + 0x82].copy_from_slice(&32_u16.to_le_bytes());
-        let e11 = ino11 + 0x28;
-        image[e11..e11 + 2].copy_from_slice(&0xF30A_u16.to_le_bytes());
-        image[e11 + 2..e11 + 4].copy_from_slice(&1_u16.to_le_bytes());
-        image[e11 + 4..e11 + 6].copy_from_slice(&4_u16.to_le_bytes());
-        image[e11 + 6..e11 + 8].copy_from_slice(&0_u16.to_le_bytes());
-        image[e11 + 12..e11 + 16].copy_from_slice(&0_u32.to_le_bytes());
-        image[e11 + 16..e11 + 18].copy_from_slice(&1_u16.to_le_bytes());
-        image[e11 + 18..e11 + 20].copy_from_slice(&0_u16.to_le_bytes());
-        image[e11 + 20..e11 + 24].copy_from_slice(&13_u32.to_le_bytes());
-
-        // Block 12: root directory entries ".", "..", "hello.txt"
-        let d = 12 * BLOCK_SIZE;
-        image[d..d + 4].copy_from_slice(&2_u32.to_le_bytes());
-        image[d + 4..d + 6].copy_from_slice(&12_u16.to_le_bytes());
-        image[d + 6] = 1;
-        image[d + 7] = 2;
-        image[d + 8] = b'.';
-
-        let d = d + 12;
-        image[d..d + 4].copy_from_slice(&2_u32.to_le_bytes());
-        image[d + 4..d + 6].copy_from_slice(&12_u16.to_le_bytes());
-        image[d + 6] = 2;
-        image[d + 7] = 2;
-        image[d + 8..d + 10].copy_from_slice(b"..");
-
-        let d = d + 12;
-        image[d..d + 4].copy_from_slice(&11_u32.to_le_bytes());
-        image[d + 4..d + 6].copy_from_slice(&4072_u16.to_le_bytes());
-        image[d + 6] = 9;
-        image[d + 7] = 1;
-        image[d + 8..d + 17].copy_from_slice(b"hello.txt");
-
-        // Block 13: "hello\n"
-        let b13 = 13 * BLOCK_SIZE;
-        image[b13..b13 + 6].copy_from_slice(b"hello\n");
-
-        image
-    }
+    use super::section22_corpus;
 
     #[test]
     #[ignore = "canonical spec §22.1 Gate 5: FUSE mount and POSIX operations"]
+    #[expect(clippy::too_many_lines)]
     fn gate5_fuse_mount_and_posix_operations() {
-        use ffs_core::{
-            Ext4JournalReplayMode, FsOps, OpenFs, OpenOptions, RequestScope, SeekWhence,
-            SetAttrRequest,
-        };
+        use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions};
+        use std::fs::{self, File, OpenOptions as StdOpenOptions};
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, chown, symlink};
+        use std::process::Command;
 
-        let tmp_path = std::env::temp_dir().join(format!(
-            "ffs-gate5-{}-{:?}.ext4",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::write(&tmp_path, build_gate5_ext4_image()).expect("write gate5 ext4 image");
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .blocking_threads(0, 8)
+            .build()
+            .expect("gate5 runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
 
-        let cx = Cx::for_testing();
-        let root = InodeNumber(2);
-        let opts = OpenOptions {
-            skip_validation: true,
-            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
-            ..OpenOptions::default()
-        };
-
-        // Phase 1: Open writable, exercise POSIX ops, fsync, then crash without unmount.
-        {
-            let mut fs = OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("open ext4 rw");
-            fs.enable_writes(&cx).expect("enable writes");
-
-            let hello = fs
-                .lookup(&cx, root, OsStr::new("hello.txt"))
-                .expect("lookup hello.txt");
-            assert_eq!(hello.ino, InodeNumber(11));
-            assert_eq!(
-                fs.read(&cx, hello.ino, 0, 16).expect("read hello.txt"),
-                b"hello\n"
+        // Child daemon mode for Criterion 3 (true SIGKILL JBD2 crash replay).
+        if std::env::var_os("FFS_GATE5_DAEMON_CHILD").is_some_and(|v| v == "1") {
+            let img = PathBuf::from(
+                std::env::var_os("FFS_GATE5_DAEMON_IMAGE").expect("FFS_GATE5_DAEMON_IMAGE"),
             );
-            assert_eq!(
-                FsOps::lseek(
-                    &fs,
-                    &cx,
-                    &mut RequestScope::empty(),
-                    hello.ino,
-                    0,
-                    SeekWhence::Data
-                )
-                .expect("lseek DATA"),
-                0
+            let mnt = PathBuf::from(
+                std::env::var_os("FFS_GATE5_DAEMON_MNT").expect("FFS_GATE5_DAEMON_MNT"),
             );
-            assert_eq!(
-                FsOps::lseek(
-                    &fs,
-                    &cx,
-                    &mut RequestScope::empty(),
-                    hello.ino,
-                    0,
-                    SeekWhence::Hole
-                )
-                .expect("lseek HOLE"),
-                6
+            let ready = PathBuf::from(
+                std::env::var_os("FFS_GATE5_DAEMON_READY").expect("FFS_GATE5_DAEMON_READY"),
             );
-
-            let sub = fs
-                .mkdir(&cx, root, OsStr::new("sub"), 0o755, 1000, 1000)
-                .expect("mkdir sub");
-            let created = fs
-                .create(&cx, sub.ino, OsStr::new("note.txt"), 0o644, 1000, 1000)
-                .expect("create note.txt");
-            let payload = b"durable-fsync-pattern-gate5";
-            let written = fs
-                .write(&cx, created.ino, 0, payload)
-                .expect("write note.txt");
-            assert_eq!(written as usize, payload.len());
-
-            // chmod + truncate via setattr
-            let updated_attr = fs
-                .setattr(
-                    &cx,
-                    created.ino,
-                    &SetAttrRequest {
-                        mode: Some(0o600),
-                        size: Some(21),
-                        ..SetAttrRequest::default()
-                    },
-                )
-                .expect("setattr chmod+truncate");
-            assert_eq!(updated_attr.perm & 0o777, 0o600);
-            assert_eq!(updated_attr.size, 21);
-
-            // symlink + readlink + rename
-            let sym = fs
-                .symlink(
-                    &cx,
-                    sub.ino,
-                    OsStr::new("note.link"),
-                    std::path::Path::new("renamed.txt"),
-                    1000,
-                    1000,
-                )
-                .expect("symlink");
-            assert_eq!(fs.readlink(&cx, sym.ino).expect("readlink"), b"renamed.txt");
-            fs.rename(
-                &cx,
-                sub.ino,
-                OsStr::new("note.txt"),
-                sub.ino,
-                OsStr::new("renamed.txt"),
-            )
-            .expect("rename note.txt -> renamed.txt");
-
-            // Error path errno verification
-            assert_eq!(
-                fs.lookup(&cx, root, OsStr::new("missing"))
-                    .expect_err("missing lookup")
-                    .to_errno(),
-                libc::ENOENT
-            );
-            assert_eq!(
-                fs.rmdir(&cx, root, OsStr::new("sub"))
-                    .expect_err("rmdir non-empty")
-                    .to_errno(),
-                libc::ENOTEMPTY
-            );
-            assert_eq!(
-                fs.mkdir(&cx, root, OsStr::new("sub"), 0o755, 0, 0)
-                    .expect_err("mkdir existing")
-                    .to_errno(),
-                libc::EEXIST
-            );
-
-            // Fsync + flush to device, then stage an unflushed file and drop without destroy.
-            fs.fsync(&cx, created.ino, 0, false).expect("fsync");
-            fs.flush_mvcc_to_device(&cx).expect("flush mvcc to device");
-
-            let _volatile = fs
-                .create(&cx, sub.ino, OsStr::new("volatile.txt"), 0o644, 1000, 1000)
-                .expect("create volatile.txt before simulated crash");
-        }
-
-        // Phase 2: Remount after crash without unmount, verify fsync'd bytes, run FrankenFuse, and clean unmount.
-        {
-            let mut fs =
-                OpenFs::open_read_write(&cx, &tmp_path, &opts).expect("reopen after crash");
-            fs.enable_writes(&cx).expect("enable writes on remount");
-
-            let sub = fs
-                .lookup(&cx, root, OsStr::new("sub"))
-                .expect("lookup sub after crash");
-            let renamed = fs
-                .lookup(&cx, sub.ino, OsStr::new("renamed.txt"))
-                .expect("lookup renamed.txt after crash");
-            assert_eq!(
-                fs.read(&cx, renamed.ino, 0, 64)
-                    .expect("read renamed.txt after crash"),
-                b"durable-fsync-pattern"
-            );
-            assert_eq!(
-                fs.lookup(&cx, sub.ino, OsStr::new("volatile.txt"))
-                    .expect_err("unflushed volatile.txt must not survive crash")
-                    .to_errno(),
-                libc::ENOENT
-            );
-
-            // Unlink symlink, write final clean-unmount pattern, and unmount cleanly via FrankenFuse::destroy.
-            fs.unlink(&cx, sub.ino, OsStr::new("note.link"))
-                .expect("unlink note.link");
-            let final_pattern = b"clean-unmount-ext4-readback";
-            fs.write(&cx, renamed.ino, 0, final_pattern)
-                .expect("write final_pattern");
-
-            let rw_mount_opts = MountOptions {
+            let open_opts = OpenOptions {
+                skip_validation: false,
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                ..OpenOptions::default()
+            };
+            let mut open_fs = OpenFs::open_read_write(&cx, &img, &open_opts)
+                .expect("child daemon open_read_write");
+            open_fs.enable_writes(&cx).expect("child enable_writes");
+            open_fs
+                .attach_jbd2_journal(&cx)
+                .expect("child attach_jbd2_journal");
+            let mnt_opts = MountOptions {
                 read_only: false,
+                auto_unmount: false,
                 ..MountOptions::default()
             };
-            let mut fuse = FrankenFuse::with_options(Box::new(fs), &rw_mount_opts);
-
-            let hit_sender = RecordingSender::default();
-            fuse.lookup_impl(
-                root.0,
-                OsStr::new("sub"),
-                <ReplyEntry as fuser::Reply>::new(0x71, hit_sender.clone()),
-            );
-            assert_eq!(hit_sender.errno(), None);
-
-            let miss_sender = RecordingSender::default();
-            fuse.lookup_impl(
-                root.0,
-                OsStr::new("does-not-exist"),
-                <ReplyEntry as fuser::Reply>::new(0x72, miss_sender.clone()),
-            );
-            assert_eq!(miss_sender.errno(), None);
-
-            fuser::Filesystem::destroy(&mut fuse);
+            let handle = mount_background(&cx, Box::new(open_fs), &mnt, &mnt_opts)
+                .expect("child mount_background");
+            fs::write(&ready, b"READY\n").expect("write ready marker");
+            let _ = handle.wait();
+            return;
         }
 
-        // Phase 3: Reopen read-only after clean unmount and verify the written pattern.
+        let require_fuse = section22_corpus::require_fuse_enabled();
+        let fuse_ready = Path::new("/dev/fuse").exists()
+            && (section22_corpus::command_exists("fusermount3")
+                || section22_corpus::command_exists("fusermount"));
+        if !fuse_ready {
+            assert!(
+                !require_fuse,
+                "FFS_REQUIRE_FUSE=1 but /dev/fuse or fusermount3 is unavailable"
+            );
+            println!("SKIP|suite=gate5_fuse|reason=fuse_unavailable");
+            return;
+        }
+
+        let Some(corpus) = section22_corpus::ensure_section22_corpus("gate5_fuse") else {
+            return;
+        };
+        assert_eq!(corpus.len(), 10);
+
+        let work_dir = std::env::temp_dir().join(format!(
+            "ffs-gate5-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&work_dir).expect("mkdir gate5 work_dir");
+
+        // Criterion 1: Mount each of the 10 Gate 1 test images via FUSE (JBD2-compatible mode).
+        for (idx, spec) in corpus.iter().enumerate() {
+            let mnt = work_dir.join(format!("ro_mnt_{idx}"));
+            fs::create_dir_all(&mnt).expect("mkdir ro_mnt");
+            let open_opts = OpenOptions {
+                skip_validation: false,
+                ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+                ..OpenOptions::default()
+            };
+            let open_fs = OpenFs::open_with_options(&cx, &spec.path, &open_opts)
+                .unwrap_or_else(|e| panic!("open {}: {e}", spec.name));
+            let mnt_opts = MountOptions {
+                read_only: true,
+                auto_unmount: false,
+                ..MountOptions::default()
+            };
+            let handle = match mount_background(&cx, Box::new(open_fs), &mnt, &mnt_opts) {
+                Ok(h) => h,
+                Err(FuseError::Io(err))
+                    if !require_fuse
+                        && matches!(
+                            err.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+                        ) =>
+                {
+                    println!("SKIP|suite=gate5_fuse|reason=fusermount_permission_denied");
+                    return;
+                }
+                Err(e) => panic!("mount_background failed on {}: {e}", spec.name),
+            };
+
+            let entries: Vec<_> = fs::read_dir(&mnt)
+                .unwrap_or_else(|e| panic!("readdir failed on {}: {e}", spec.name))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect readdir entries");
+            assert!(
+                !entries.is_empty(),
+                "mounted {} root directory must not be empty",
+                spec.name
+            );
+            for ent in &entries {
+                let meta = fs::symlink_metadata(ent.path()).expect("lstat entry");
+                if meta.is_file() && meta.len() > 0 && meta.len() <= 65_536 {
+                    let bytes = fs::read(ent.path()).expect("read mounted file");
+                    assert_eq!(bytes.len() as u64, meta.len());
+                }
+            }
+            handle
+                .unmount()
+                .unwrap_or_else(|e| panic!("clean unmount failed on {}: {e}", spec.name));
+        }
+
+        // Format a real 64 MiB journaled ext4 image for Criteria 2, 3, 4, and 5.
+        let mkfs_bin = section22_corpus::find_e2fs_tool("mkfs.ext4").expect("mkfs.ext4");
+        let e2fsck_bin = section22_corpus::find_e2fs_tool("e2fsck").expect("e2fsck");
+        let uid = fs::metadata("/proc/self").map_or(0, |m| m.uid());
+        let gid = fs::metadata("/proc/self").map_or(0, |m| m.gid());
+        let owner_opt = format!("root_owner={uid}:{gid}");
+
+        let rw_img = work_dir.join("gate5_posix_rw.ext4");
         {
-            let fs = OpenFs::open_with_options(&cx, &tmp_path, &opts)
-                .expect("reopen ro after clean unmount");
-            let sub = fs
-                .lookup(&cx, root, OsStr::new("sub"))
-                .expect("lookup sub ro");
-            let renamed = fs
-                .lookup(&cx, sub.ino, OsStr::new("renamed.txt"))
-                .expect("lookup renamed.txt ro");
+            let f = File::create(&rw_img).expect("create rw_img");
+            f.set_len(64 * 1024 * 1024).expect("set_len 64 MiB");
+        }
+        let mkfs_out = Command::new(&mkfs_bin)
+            .args([
+                "-F",
+                "-q",
+                "-b",
+                "4096",
+                "-I",
+                "256",
+                "-O",
+                "none,ext_attr,sparse_super,filetype,extent,64bit,metadata_csum,has_journal",
+                "-E",
+                &format!("{owner_opt},lazy_itable_init=0,lazy_journal_init=0"),
+            ])
+            .arg(&rw_img)
+            .output()
+            .expect("run mkfs.ext4");
+        assert!(mkfs_out.status.success(), "mkfs.ext4 rw_img failed");
+
+        // Criterion 2, 4 & 5: Real `/dev/fuse` POSIX operations, VFS errnos, clean unmount,
+        // `e2fsck -fn`, and kernel ext4 loop readback.
+        let rw_mnt = work_dir.join("rw_mnt");
+        fs::create_dir_all(&rw_mnt).expect("mkdir rw_mnt");
+        let known_final_pattern: Vec<u8> =
+            (0..32_768_u32).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        {
+            let open_opts = OpenOptions {
+                skip_validation: false,
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                ..OpenOptions::default()
+            };
+            let mut open_fs =
+                OpenFs::open_read_write(&cx, &rw_img, &open_opts).expect("open_read_write rw_img");
+            open_fs.enable_writes(&cx).expect("enable_writes");
+            open_fs
+                .attach_jbd2_journal(&cx)
+                .expect("attach_jbd2_journal");
+            let handle = mount_background(
+                &cx,
+                Box::new(open_fs),
+                &rw_mnt,
+                &MountOptions {
+                    read_only: false,
+                    auto_unmount: false,
+                    ..MountOptions::default()
+                },
+            )
+            .expect("mount rw_img");
+
+            // mkdir / rmdir / EEXIST / ENOTEMPTY
+            let dir_a = rw_mnt.join("dir_a");
+            let dir_b = rw_mnt.join("dir_b");
+            fs::create_dir(&dir_a).expect("mkdir dir_a");
+            fs::create_dir(&dir_b).expect("mkdir dir_b");
             assert_eq!(
-                fs.read(&cx, renamed.ino, 0, 64)
-                    .expect("read final pattern"),
-                b"clean-unmount-ext4-readback"
+                fs::create_dir(&dir_a)
+                    .expect_err("duplicate mkdir")
+                    .raw_os_error(),
+                Some(libc::EEXIST)
             );
+
+            // open/close O_CREAT | O_EXCL | O_RDWR | O_WRONLY | O_RDONLY | O_TRUNC
+            let file_p = dir_a.join("seq.bin");
+            {
+                let mut f = StdOpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&file_p)
+                    .expect("O_CREAT|O_EXCL");
+                assert_eq!(
+                    StdOpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&file_p)
+                        .expect_err("O_EXCL existing")
+                        .raw_os_error(),
+                    Some(libc::EEXIST)
+                );
+                // Multi-block sequential write (40 KiB) + partial-block random overwrite
+                let initial: Vec<u8> = (0..40_960_u32).map(|i| (i % 253) as u8).collect();
+                f.write_all(&initial).expect("write multi-block");
+                f.write_all_at(&[0xEE; 737], 4000)
+                    .expect("partial cross-block pwrite");
+                f.sync_data().expect("fdatasync");
+                f.sync_all().expect("fsync");
+            }
+            {
+                let mut f = StdOpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&file_p)
+                    .expect("O_RDWR");
+                let meta = f.metadata().expect("fstat");
+                assert_eq!(meta.len(), 40_960);
+                assert_eq!(meta.uid(), uid);
+                assert_eq!(meta.gid(), gid);
+
+                // lseek SEEK_SET, SEEK_CUR, SEEK_END + negative seek EINVAL
+                assert_eq!(f.seek(SeekFrom::Start(4000)).expect("SEEK_SET"), 4000);
+                let mut probe = [0_u8; 737];
+                f.read_exact(&mut probe).expect("read partial");
+                assert_eq!(probe, [0xEE; 737]);
+                assert_eq!(f.seek(SeekFrom::Current(263)).expect("SEEK_CUR"), 5000);
+                assert_eq!(f.seek(SeekFrom::End(-960)).expect("SEEK_END"), 40_000);
+                assert_eq!(
+                    f.seek(SeekFrom::Start(0))
+                        .and_then(|_| f.seek(SeekFrom::Current(-5)))
+                        .expect_err("negative seek")
+                        .raw_os_error(),
+                    Some(libc::EINVAL)
+                );
+
+                // ftruncate shrink & extend
+                f.set_len(12_345).expect("ftruncate shrink");
+                assert_eq!(f.metadata().expect("fstat after shrink").len(), 12_345);
+                f.set_len(20_000).expect("ftruncate extend");
+                let mut zero_tail = [1_u8; 64];
+                f.read_exact_at(&mut zero_tail, 19_900)
+                    .expect("pread extended hole");
+                assert_eq!(zero_tail, [0_u8; 64]);
+            }
+            // O_TRUNC
+            {
+                let mut f = StdOpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&file_p)
+                    .expect("O_WRONLY|O_TRUNC");
+                f.write_all(b"truncated-fresh")
+                    .expect("write after O_TRUNC");
+            }
+            assert_eq!(
+                fs::read(&file_p).expect("O_RDONLY read"),
+                b"truncated-fresh"
+            );
+
+            // ENOTEMPTY, ENOENT, EISDIR, ENOTDIR
+            assert_eq!(
+                fs::remove_dir(&dir_a)
+                    .expect_err("rmdir non-empty")
+                    .raw_os_error(),
+                Some(libc::ENOTEMPTY)
+            );
+            assert_eq!(
+                File::open(rw_mnt.join("missing.nope"))
+                    .expect_err("ENOENT")
+                    .raw_os_error(),
+                Some(libc::ENOENT)
+            );
+            assert_eq!(
+                StdOpenOptions::new()
+                    .write(true)
+                    .open(&dir_a)
+                    .expect_err("EISDIR")
+                    .raw_os_error(),
+                Some(libc::EISDIR)
+            );
+            assert_eq!(
+                File::open(file_p.join("child"))
+                    .expect_err("ENOTDIR")
+                    .raw_os_error(),
+                Some(libc::ENOTDIR)
+            );
+
+            // chmod, chown, utimes
+            fs::set_permissions(&file_p, fs::Permissions::from_mode(0o640)).expect("chmod");
+            assert_eq!(
+                fs::metadata(&file_p).expect("stat").permissions().mode() & 0o777,
+                0o640
+            );
+            chown(&file_p, Some(uid), Some(gid)).expect("chown same uid/gid");
+            {
+                let f = StdOpenOptions::new()
+                    .write(true)
+                    .open(&file_p)
+                    .expect("open utimes");
+                let target_time =
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_123);
+                let times = std::fs::FileTimes::new()
+                    .set_accessed(target_time)
+                    .set_modified(target_time);
+                f.set_times(times).expect("utimes / futimens");
+            }
+            assert_eq!(
+                fs::metadata(&file_p).expect("stat mtime").mtime(),
+                1_750_000_123
+            );
+
+            // symlink / readlink, same-dir rename, cross-dir rename, unlink, rmdir, readdir
+            let sym_p = dir_a.join("ptr.sym");
+            symlink("../dir_b/moved.bin", &sym_p).expect("symlink");
+            assert_eq!(
+                fs::read_link(&sym_p).expect("readlink"),
+                Path::new("../dir_b/moved.bin")
+            );
+            let same_renamed = dir_a.join("seq_renamed.bin");
+            fs::rename(&file_p, &same_renamed).expect("same-dir rename");
+            let cross_renamed = dir_b.join("moved.bin");
+            fs::rename(&same_renamed, &cross_renamed).expect("cross-dir rename");
+            assert_eq!(
+                fs::read(&sym_p).expect("read through symlink"),
+                b"truncated-fresh"
+            );
+            fs::remove_file(&sym_p).expect("unlink symlink");
+            fs::remove_dir(&dir_a).expect("rmdir empty dir_a");
+
+            let final_path = rw_mnt.join("clean_final.bin");
+            {
+                let mut f = File::create(&final_path).expect("create clean_final.bin");
+                f.write_all(&known_final_pattern)
+                    .expect("write known_final_pattern");
+                f.sync_all().expect("fsync clean_final.bin");
+            }
+            let root_names: Vec<String> = fs::read_dir(&rw_mnt)
+                .expect("readdir root")
+                .map(|e| {
+                    e.expect("dirent")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            assert!(root_names.contains(&"dir_b".to_owned()));
+            assert!(root_names.contains(&"clean_final.bin".to_owned()));
+
+            handle.unmount().expect("clean unmount rw_mnt");
         }
 
-        let _ = std::fs::remove_file(&tmp_path);
+        let fsck_out = Command::new(&e2fsck_bin)
+            .args(["-f", "-n"])
+            .arg(&rw_img)
+            .output()
+            .expect("run e2fsck -fn after clean unmount");
+        assert!(
+            fsck_out.status.success(),
+            "e2fsck -fn failed after Gate 5 clean unmount:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&fsck_out.stdout),
+            String::from_utf8_lossy(&fsck_out.stderr)
+        );
+
+        // Kernel ext4 readback verification when passwordless sudo loop mount is available.
+        if Command::new("sudo")
+            .args(["-n", "true"])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let kern_mnt = work_dir.join("kern_verify_mnt");
+            fs::create_dir_all(&kern_mnt).expect("mkdir kern_verify_mnt");
+            let st = Command::new("sudo")
+                .args(["-n", "mount", "-t", "ext4", "-o", "loop,ro"])
+                .arg(&rw_img)
+                .arg(&kern_mnt)
+                .status()
+                .expect("sudo mount -t ext4");
+            if st.success() {
+                let readback = fs::read(kern_mnt.join("clean_final.bin"))
+                    .expect("kernel ext4 readback clean_final.bin");
+                let moved = fs::read(kern_mnt.join("dir_b/moved.bin"))
+                    .expect("kernel ext4 readback moved.bin");
+                let _ = Command::new("sudo")
+                    .args(["-n", "umount"])
+                    .arg(&kern_mnt)
+                    .status();
+                assert_eq!(
+                    readback, known_final_pattern,
+                    "kernel ext4 readback mismatch"
+                );
+                assert_eq!(moved, b"truncated-fresh");
+            }
+        }
+
+        // Criterion 3: True child-process SIGKILL crash without unmount + JBD2 journal replay.
+        let crash_img = work_dir.join("gate5_jbd2_crash.ext4");
+        {
+            let f = File::create(&crash_img).expect("create crash_img");
+            f.set_len(64 * 1024 * 1024).expect("set_len crash_img");
+        }
+        let mkfs_crash = Command::new(&mkfs_bin)
+            .args([
+                "-F",
+                "-q",
+                "-b",
+                "4096",
+                "-I",
+                "256",
+                "-O",
+                "none,ext_attr,sparse_super,filetype,extent,64bit,metadata_csum,has_journal",
+                "-E",
+                &format!("{owner_opt},lazy_itable_init=0,lazy_journal_init=0"),
+            ])
+            .arg(&crash_img)
+            .output()
+            .expect("mkfs crash_img");
+        assert!(mkfs_crash.status.success(), "mkfs crash_img failed");
+
+        let crash_mnt = work_dir.join("crash_mnt");
+        fs::create_dir_all(&crash_mnt).expect("mkdir crash_mnt");
+        let ready_marker = work_dir.join("daemon.ready");
+        let mut child = Command::new(std::env::current_exe().expect("current_exe"))
+            .args([
+                "--exact",
+                "--ignored",
+                "tests::gate5_fuse_mount_and_posix_operations",
+                "--nocapture",
+            ])
+            .env("FFS_GATE5_DAEMON_CHILD", "1")
+            .env("FFS_GATE5_DAEMON_IMAGE", &crash_img)
+            .env("FFS_GATE5_DAEMON_MNT", &crash_mnt)
+            .env("FFS_GATE5_DAEMON_READY", &ready_marker)
+            .spawn()
+            .expect("spawn child gate5 FUSE daemon");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ready_marker.is_file() {
+            if let Some(st) = child.try_wait().expect("poll child daemon") {
+                panic!("child gate5 daemon exited prematurely: {st}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for child gate5 FUSE daemon"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let durable_bytes: Vec<u8> = (0..16_384_u32)
+            .map(|i| ((i * 13 + 9) % 251) as u8)
+            .collect();
+        {
+            let mut df =
+                File::create(crash_mnt.join("durable_jbd2.bin")).expect("create durable_jbd2.bin");
+            df.write_all(&durable_bytes)
+                .expect("write durable_jbd2.bin");
+            df.sync_all().expect("fsync durable_jbd2.bin to JBD2");
+        }
+        // Kill FrankenFS daemon abruptly with SIGKILL without unmounting!
+        child.kill().expect("SIGKILL child FUSE daemon");
+        let _ = child.wait();
+        let umount_bin = if section22_corpus::command_exists("fusermount3") {
+            "fusermount3"
+        } else {
+            "fusermount"
+        };
+        let _ = Command::new(umount_bin)
+            .args(["-u", "-z"])
+            .arg(&crash_mnt)
+            .status();
+
+        // Remount with JBD2 replay (`Ext4JournalReplayMode::Apply`) and verify fsync'd data!
+        let remount_dir = work_dir.join("remount_after_crash");
+        fs::create_dir_all(&remount_dir).expect("mkdir remount_after_crash");
+        {
+            let open_opts = OpenOptions {
+                skip_validation: false,
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                ..OpenOptions::default()
+            };
+            let mut recovered_fs = OpenFs::open_read_write(&cx, &crash_img, &open_opts)
+                .expect("reopen crash_img with JBD2 Apply");
+            recovered_fs
+                .enable_writes(&cx)
+                .expect("enable_writes recovered");
+            let handle = mount_background(
+                &cx,
+                Box::new(recovered_fs),
+                &remount_dir,
+                &MountOptions {
+                    read_only: false,
+                    auto_unmount: false,
+                    ..MountOptions::default()
+                },
+            )
+            .expect("remount recovered crash_img");
+            let recovered_bytes = fs::read(remount_dir.join("durable_jbd2.bin"))
+                .expect("read durable_jbd2.bin after JBD2 replay");
+            assert_eq!(
+                recovered_bytes, durable_bytes,
+                "fsync'd bytes must survive SIGKILL via JBD2 replay"
+            );
+            handle.unmount().expect("clean unmount recovered crash_img");
+        }
+        let crash_fsck = Command::new(&e2fsck_bin)
+            .args(["-f", "-n"])
+            .arg(&crash_img)
+            .output()
+            .expect("e2fsck -fn after JBD2 recovery");
+        assert!(
+            crash_fsck.status.success(),
+            "e2fsck -fn failed after JBD2 recovery: {}",
+            String::from_utf8_lossy(&crash_fsck.stderr)
+        );
     }
 
     #[test]

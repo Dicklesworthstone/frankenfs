@@ -1554,7 +1554,18 @@ enum Command {
         #[arg(long = "mvcc-evidence-ledger", value_name = "PATH")]
         mvcc_evidence_ledger: Option<PathBuf>,
     },
-    /// Run a read-only integrity scan (scrub) on a filesystem image.
+    /// Cleanly unmount an active FrankenFS FUSE mountpoint and wait for final flush.
+    Umount {
+        /// Path to the active FUSE mountpoint directory.
+        mountpoint: PathBuf,
+        /// Maximum seconds to wait for clean FUSE session shutdown and final flush.
+        #[arg(long = "timeout-secs", default_value_t = 5)]
+        timeout_secs: u64,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a read-only integrity scan (scrub) on a filesystem image or active mountpoint.
     Scrub {
         /// Path to the filesystem image.
         image: PathBuf,
@@ -1842,6 +1853,7 @@ impl Command {
             Self::NativeEncode { .. } => "native-encode",
             Self::NativeRecover { .. } => "native-recover",
             Self::Mount { .. } => "mount",
+            Self::Umount { .. } => "umount",
             Self::Scrub { .. } => "scrub",
             Self::Parity { .. } => "parity",
             Self::Evidence { .. } => "evidence",
@@ -2848,7 +2860,10 @@ fn execute_command(
                 Ok(())
             }
         }
-        Command::MvccStats { image, json } => mvcc_stats_cmd(&image, json),
+        Command::MvccStats { image, json } => {
+            let resolved = resolve_mountpoint_backing_image(&image)?;
+            mvcc_stats_cmd(&resolved, json)
+        }
         Command::Info {
             image,
             groups,
@@ -2857,6 +2872,7 @@ fn execute_command(
             journal,
             json,
         } => {
+            let image = resolve_mountpoint_backing_image(&image)?;
             let info_opts = InfoCommandOptions {
                 sections: InfoSections::empty()
                     .with_groups(groups)
@@ -3071,6 +3087,7 @@ fn execute_command(
                 ),
                 console,
             };
+            let _active_mount_guard = ActiveMountGuard::register(&image, &mountpoint);
             if cmd_six_format::maybe_route_mount_cmd(&image, &mountpoint, &mount_opts, six_format)?
             {
                 Ok(())
@@ -3085,7 +3102,13 @@ fn execute_command(
                 Ok(())
             }
         }
+        Command::Umount {
+            mountpoint,
+            timeout_secs,
+            json,
+        } => umount_cmd(&mountpoint, timeout_secs, json),
         Command::Scrub { image, json } => {
+            let image = resolve_mountpoint_backing_image(&image)?;
             if cmd_six_format::maybe_route_scrub_cmd(&image, json, six_format)? {
                 Ok(())
             } else {
@@ -3162,14 +3185,17 @@ fn execute_command(
             snapshot_json,
             scrub,
             refresh_ms,
-        } => tui_cmd(
-            &image,
-            mountpoint.as_deref(),
-            snapshot_json,
-            scrub,
-            refresh_ms,
-            log_format,
-        ),
+        } => {
+            let image = resolve_mountpoint_backing_image(&image)?;
+            tui_cmd(
+                &image,
+                mountpoint.as_deref(),
+                snapshot_json,
+                scrub,
+                refresh_ms,
+                log_format,
+            )
+        }
         Command::Partitions { image, json } => {
             cmd_six_format::partitions_cmd(&image, json, six_format)
         }
@@ -10294,6 +10320,253 @@ fn print_scrub_output(json: bool, output: &ScrubOutput, report: &ScrubReport) ->
         }
     }
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveMountStateRecord {
+    active: bool,
+    pid: u32,
+    image_path: PathBuf,
+    mountpoint: PathBuf,
+    started_at_unix_secs: u64,
+}
+
+fn active_mount_state_path(canon_mountpoint: &Path) -> PathBuf {
+    let digest = blake3::hash(canon_mountpoint.as_os_str().as_encoded_bytes());
+    let hex = digest.to_hex();
+    std::env::temp_dir().join(format!(".ffs-mount-{}.json", &hex.as_str()[..24]))
+}
+
+struct ActiveMountGuard {
+    state_path: PathBuf,
+    record: ActiveMountStateRecord,
+}
+
+impl ActiveMountGuard {
+    fn register(image: &Path, mountpoint: &Path) -> Option<Self> {
+        let canon_mnt = mountpoint.canonicalize().ok()?;
+        let canon_img = image.canonicalize().unwrap_or_else(|_| image.to_path_buf());
+        let state_path = active_mount_state_path(&canon_mnt);
+        let started_at_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let record = ActiveMountStateRecord {
+            active: true,
+            pid: std::process::id(),
+            image_path: canon_img,
+            mountpoint: canon_mnt,
+            started_at_unix_secs,
+        };
+        if let Ok(payload) = serde_json::to_vec_pretty(&record) {
+            let _ = std::fs::write(&state_path, payload);
+        }
+        Some(Self { state_path, record })
+    }
+}
+
+impl Drop for ActiveMountGuard {
+    fn drop(&mut self) {
+        self.record.active = false;
+        if let Ok(payload) = serde_json::to_vec_pretty(&self.record) {
+            let _ = std::fs::write(&self.state_path, payload);
+        }
+    }
+}
+
+fn unescape_mountinfo_field(raw: &str) -> String {
+    raw.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Inspect `/proc/thread-self/mountinfo` (falling back to `/proc/self/mountinfo`)
+/// for an active FUSE mount at `canon_mountpoint`, returning `(fstype, mount_source)`.
+fn find_active_fuse_mountinfo(canon_mountpoint: &Path) -> Option<(String, String)> {
+    let target = canon_mountpoint.to_string_lossy();
+    let content = std::fs::read_to_string("/proc/thread-self/mountinfo")
+        .or_else(|_| std::fs::read_to_string("/proc/self/mountinfo"))
+        .ok()?;
+    let mut matched = None;
+    for line in content.lines() {
+        let Some((lhs, rhs)) = line.split_once(" - ") else {
+            continue;
+        };
+        let lhs_cols: Vec<&str> = lhs.split(' ').collect();
+        let rhs_cols: Vec<&str> = rhs.split(' ').collect();
+        if lhs_cols.len() < 5 || rhs_cols.len() < 2 {
+            continue;
+        }
+        let mnt_point = unescape_mountinfo_field(lhs_cols[4]);
+        let fstype = rhs_cols[0];
+        let source = unescape_mountinfo_field(rhs_cols[1]);
+        if mnt_point == target && fstype.starts_with("fuse") {
+            matched = Some((fstype.to_owned(), source));
+        }
+    }
+    matched
+}
+
+/// Resolve `path` to its backing filesystem image if `path` is an active
+/// FrankenFS mountpoint directory; otherwise return `path` unchanged.
+fn resolve_mountpoint_backing_image(path: &Path) -> Result<PathBuf> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(path.to_path_buf());
+    };
+    if !meta.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+    let canon_mnt = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize mountpoint {}", path.display()))?;
+    let state_path = active_mount_state_path(&canon_mnt);
+    if let Ok(bytes) = std::fs::read(&state_path)
+        && let Ok(rec) = serde_json::from_slice::<ActiveMountStateRecord>(&bytes)
+        && rec.active
+        && Path::new(&format!("/proc/{}", rec.pid)).exists()
+        && rec.image_path.is_file()
+    {
+        return Ok(rec.image_path);
+    }
+    if let Some((_, source)) = find_active_fuse_mountinfo(&canon_mnt) {
+        let source_path = PathBuf::from(&source);
+        if source_path.is_file() {
+            return Ok(source_path);
+        }
+    }
+    bail!(
+        "target '{}' is a directory, not a regular filesystem image or active FrankenFS mountpoint; \
+         remediation: pass a filesystem image file or mount one first with `ffs mount <image> {}`",
+        path.display(),
+        path.display()
+    );
+}
+
+#[derive(Debug, Serialize)]
+struct UmountOutput {
+    mountpoint: String,
+    fstype: String,
+    daemon_pid: Option<u32>,
+    elapsed_ms: u64,
+    clean: bool,
+}
+
+fn umount_cmd(mountpoint: &Path, timeout_secs: u64, json: bool) -> Result<()> {
+    let started = Instant::now();
+    let meta = std::fs::metadata(mountpoint).with_context(|| {
+        format!(
+            "cannot access mountpoint '{}'; remediation: verify the directory path exists",
+            mountpoint.display()
+        )
+    })?;
+    if !meta.is_dir() {
+        bail!(
+            "cannot unmount '{}': path is not a directory; remediation: pass the FUSE mountpoint directory (not the backing image file)",
+            mountpoint.display()
+        );
+    }
+    let canon_mnt = mountpoint.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize mountpoint '{}'",
+            mountpoint.display()
+        )
+    })?;
+    let Some((fstype, _source)) = find_active_fuse_mountinfo(&canon_mnt) else {
+        bail!(
+            "cannot unmount '{}': directory is not an active FUSE mountpoint in /proc/self/mountinfo; \
+             remediation: check active mounts with `findmnt` or mount first via `ffs mount <image> {}`",
+            canon_mnt.display(),
+            canon_mnt.display()
+        );
+    };
+
+    let state_path = active_mount_state_path(&canon_mnt);
+    let mut recorded_record = std::fs::read(&state_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<ActiveMountStateRecord>(&b).ok())
+        .filter(|r| r.active);
+    let daemon_pid = recorded_record.as_ref().map(|r| r.pid);
+
+    let mut detach_err: Option<String> = None;
+    let mut detached_cmd_ok = false;
+    for (prog, args) in [
+        ("fusermount3", &["-u"][..]),
+        ("fusermount", &["-u"][..]),
+        ("umount", &[][..]),
+    ] {
+        match std::process::Command::new(prog)
+            .args(args)
+            .arg(&canon_mnt)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                detached_cmd_ok = true;
+                break;
+            }
+            Ok(out) => {
+                detach_err = Some(format!(
+                    "{prog}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    if !detached_cmd_ok && find_active_fuse_mountinfo(&canon_mnt).is_some() {
+        bail!(
+            "failed to unmount '{}': {}; remediation: close open file descriptors under '{}' and retry `ffs umount {}`",
+            canon_mnt.display(),
+            detach_err.unwrap_or_else(|| "fusermount3/umount unavailable".to_owned()),
+            canon_mnt.display(),
+            canon_mnt.display()
+        );
+    }
+
+    let deadline = started + Duration::from_secs(timeout_secs.max(1));
+    loop {
+        let mount_gone = find_active_fuse_mountinfo(&canon_mnt).is_none();
+        let daemon_gone = daemon_pid.is_none_or(|pid| !Path::new(&format!("/proc/{pid}")).exists());
+        if mount_gone && daemon_gone {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out after {timeout_secs}s waiting for FrankenFS mount '{}' (pid={daemon_pid:?}) to flush and exit; \
+                 remediation: inspect active I/O or retry with a larger `--timeout-secs`",
+                canon_mnt.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    if let Some(mut rec) = recorded_record.take() {
+        rec.active = false;
+        if let Ok(payload) = serde_json::to_vec_pretty(&rec) {
+            let _ = std::fs::write(&state_path, payload);
+        }
+    }
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let output = UmountOutput {
+        mountpoint: canon_mnt.display().to_string(),
+        fstype,
+        daemon_pid,
+        elapsed_ms,
+        clean: true,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).context("serialize umount output")?
+        );
+    } else {
+        println!(
+            "Unmounted {} cleanly in {}ms",
+            output.mountpoint, output.elapsed_ms
+        );
+    }
     Ok(())
 }
 
@@ -23273,6 +23546,37 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn umount_cli_parses_and_mount_registry_resolves_then_deactivates() {
+            let cli =
+                Cli::try_parse_from(["ffs", "umount", "/tmp/mnt-probe", "--timeout-secs", "5"])
+                    .expect("parse ffs umount");
+            assert_eq!(cli.command.name(), "umount");
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let img = tmp.path().join("backing.ext4");
+            let mnt = tmp.path().join("mnt");
+            std::fs::write(&img, b"placeholder").expect("write backing file");
+            std::fs::create_dir_all(&mnt).expect("mkdir mnt");
+
+            // Non-FUSE directory is refused with actionable remediation by both resolve and umount.
+            let resolve_err = resolve_mountpoint_backing_image(&mnt).unwrap_err();
+            assert!(resolve_err.to_string().contains("remediation:"));
+            let umount_err = umount_cmd(&mnt, 1, false).unwrap_err();
+            assert!(umount_err.to_string().contains("remediation:"));
+
+            // ActiveMountGuard resolves while alive and stops resolving once dropped.
+            {
+                let _guard = ActiveMountGuard::register(&img, &mnt).expect("register");
+                let resolved = resolve_mountpoint_backing_image(&mnt).expect("resolve active mnt");
+                assert_eq!(resolved, img.canonicalize().expect("canon img"));
+            }
+            assert!(
+                resolve_mountpoint_backing_image(&mnt).is_err(),
+                "dropped ActiveMountGuard must mark active=false"
+            );
         }
     }
 }

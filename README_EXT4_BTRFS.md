@@ -3950,8 +3950,10 @@ or execution already on a worker.
 CI requires them alongside the journal contracts. Its child processes exercise
 passing, failing, ignored, soft-skipped and zero-selected outcomes. These
 self-checks grant no filesystem capability credit.
-These scoped tests do not satisfy all canonical gates or establish readiness;
-the full mapping and gate integration remain tracked in `bd-wh1xk` / `bd-lc132`.
+Scoped `--verify <suite>` runs validate only their selected contracts and keep
+`readiness_verified = false`; full `97`-row + `7`-gate execution-gated verification
+runs via `ffs-harness parity --strict-all-suites` and `ffs-harness gates --all`
+(`bd-wh1xk` / `bd-lc132`).
 
 | Domain | `ParityReport::current()` rows |
 |---|---|

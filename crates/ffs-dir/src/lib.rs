@@ -1095,6 +1095,10 @@ pub fn htree_find_leaf(entries: &[HtreeEntry], target_hash: u32) -> Option<u32> 
 }
 
 #[cfg(test)]
+#[path = "../../../tests/common/section22_corpus.rs"]
+mod section22_corpus;
+
+#[cfg(test)]
 mod tests {
     /// Every byte a dir-block mutation changes MUST lie inside the span the
     /// mutation reports, or the incremental checksum stamps a wrong value
@@ -2933,12 +2937,619 @@ mod tests {
         }
     }
 
+    use super::section22_corpus;
+
     #[test]
     #[ignore = "canonical spec §22.1 Gate 3: directory listing"]
+    #[expect(clippy::too_many_lines)]
     fn gate3_directory_listing() {
+        use ffs_ondisk::ext4::parse_dx_root_with_large_dir;
+        use ffs_ondisk::{
+            Ext4FileType, Ext4GroupDesc, Ext4Inode, Ext4RoCompatFeatures, Ext4Superblock, dx_hash,
+            htree_leaf_logical_blocks, parse_dir_block, parse_extent_tree,
+            verify_dir_block_checksum, verify_dx_block_checksum,
+        };
+        use std::collections::{BTreeMap, VecDeque};
+        use std::os::unix::fs::FileExt;
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+
+        const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+        const EXT4_INDEX_FL: u32 = 0x0000_1000;
+        const EXT4_SUPERBLOCK_OFFSET: u64 = 1024;
+        const EXT4_SUPERBLOCK_SIZE: usize = 1024;
+
         init_dir_block_contains_dot_and_dotdot();
         init_dir_block_with_tail();
         representative_dir_block_mutation_exact_golden_contract();
         reported_edit_span_encloses_every_mutated_byte_bd_4sull();
+
+        let Some(corpus) = section22_corpus::ensure_section22_corpus("gate3_dir") else {
+            return;
+        };
+        assert_eq!(corpus.len(), 10);
+
+        fn read_inode_from_image(file: &std::fs::File, sb: &Ext4Superblock, ino: u32) -> Ext4Inode {
+            let group_idx = (ino - 1) / sb.inodes_per_group;
+            let slot = (ino - 1) % sb.inodes_per_group;
+            let block_size_u64 = u64::from(sb.block_size);
+            let desc_size = sb.group_desc_size();
+            let gd_block = sb
+                .group_desc_block(ffs_ondisk::GroupNumber(group_idx))
+                .expect("group_desc_block");
+            let gd_off = u64::from(group_idx % sb.desc_per_block()) * u64::from(desc_size);
+            let mut raw_gd = vec![0_u8; usize::from(desc_size)];
+            file.read_exact_at(&mut raw_gd, gd_block * block_size_u64 + gd_off)
+                .expect("pread GD");
+            let gd = Ext4GroupDesc::parse_from_bytes(&raw_gd, desc_size).expect("parse GD");
+            let inode_size = usize::from(sb.inode_size);
+            let mut raw_inode = vec![0_u8; inode_size];
+            file.read_exact_at(
+                &mut raw_inode,
+                gd.inode_table * block_size_u64 + u64::from(slot) * (inode_size as u64),
+            )
+            .expect("pread inode");
+            Ext4Inode::parse_from_bytes(&raw_inode).expect("parse inode")
+        }
+
+        fn read_dir_blocks(
+            file: &std::fs::File,
+            sb: &Ext4Superblock,
+            inode: &Ext4Inode,
+        ) -> Vec<Vec<u8>> {
+            let bs = sb.block_size as usize;
+            let bs_u64 = u64::from(sb.block_size);
+            let nblocks = (inode.size.div_ceil(bs_u64)) as usize;
+            let mut phys_blocks = Vec::with_capacity(nblocks);
+            if (inode.flags & EXT4_EXTENTS_FL) != 0 {
+                fn collect_extent_leaves(
+                    file: &std::fs::File,
+                    bs: usize,
+                    node_bytes: &[u8],
+                    out: &mut Vec<(u32, u32, u64)>,
+                ) {
+                    let (_, tree) = parse_extent_tree(node_bytes).expect("parse dir extent node");
+                    match tree {
+                        ffs_ondisk::ExtentTree::Leaf(exts) => {
+                            for ext in exts {
+                                let len = u32::from(ext.actual_len());
+                                out.push((ext.logical_block, len, ext.physical_start));
+                            }
+                        }
+                        ffs_ondisk::ExtentTree::Index(idxs) => {
+                            for idx in idxs {
+                                let mut child = vec![0_u8; bs];
+                                file.read_exact_at(&mut child, idx.leaf_block * (bs as u64))
+                                    .expect("pread dir extent child");
+                                collect_extent_leaves(file, bs, &child, out);
+                            }
+                        }
+                    }
+                }
+                let mut runs = Vec::new();
+                collect_extent_leaves(file, bs, &inode.extent_bytes, &mut runs);
+                runs.sort_by_key(|r| r.0);
+                for (_, len, pstart) in runs {
+                    for off in 0..u64::from(len) {
+                        phys_blocks.push(pstart + off);
+                    }
+                }
+            } else {
+                for idx in 0..12_usize {
+                    let ptr = u32::from_le_bytes(
+                        inode.extent_bytes[idx * 4..idx * 4 + 4].try_into().unwrap(),
+                    );
+                    if ptr != 0 {
+                        phys_blocks.push(u64::from(ptr));
+                    }
+                }
+            }
+            phys_blocks
+                .into_iter()
+                .map(|pblk| {
+                    let mut buf = vec![0_u8; bs];
+                    file.read_exact_at(&mut buf, pblk * bs_u64)
+                        .expect("pread dir data block");
+                    buf
+                })
+                .collect()
+        }
+
+        let mut saw_htree = false;
+        let mut saw_linear = false;
+        let mut saw_csum = false;
+        let mut saw_reg = false;
+        let mut saw_dir = false;
+        let mut saw_symlink = false;
+        let mut total_htree_hashes_verified = 0_u64;
+
+        for spec in &corpus {
+            let file = std::fs::File::open(&spec.path).expect("open corpus image");
+            let mut raw_sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+            file.read_exact_at(&mut raw_sb, EXT4_SUPERBLOCK_OFFSET)
+                .expect("pread sb");
+            let sb = Ext4Superblock::parse_superblock_region(&raw_sb).expect("parse sb");
+            let csum_seed = sb.csum_seed();
+            let has_large_dir = sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::LARGEDIR);
+            let has_csum = sb.has_ro_compat(Ext4RoCompatFeatures::METADATA_CSUM);
+
+            let mut queue: VecDeque<(u32, u32, String)> = VecDeque::new();
+            queue.push_back((2, 2, "/".to_owned()));
+
+            while let Some((dir_ino, parent_ino, dir_path)) = queue.pop_front() {
+                let dir_inode = read_inode_from_image(&file, &sb, dir_ino);
+                let blocks = read_dir_blocks(&file, &sb, &dir_inode);
+                assert!(
+                    !blocks.is_empty(),
+                    "directory {dir_path} must have >=1 block"
+                );
+
+                let is_indexed = (dir_inode.flags & EXT4_INDEX_FL) != 0 && blocks.len() > 1;
+                let leaf_indices: Vec<usize> = if is_indexed {
+                    saw_htree = true;
+                    let root = parse_dx_root_with_large_dir(&blocks[0], has_large_dir)
+                        .expect("parse dx_root");
+                    if has_csum {
+                        assert!(
+                            verify_dx_block_checksum(
+                                &blocks[0],
+                                csum_seed,
+                                dir_ino,
+                                dir_inode.generation,
+                                ffs_ondisk::DX_ROOT_COUNT_OFFSET,
+                            ),
+                            "dx_root checksum failed on {} {dir_path}",
+                            spec.name
+                        );
+                    }
+                    let leaves = htree_leaf_logical_blocks(&blocks[0], has_large_dir, |lb| {
+                        blocks.get(lb as usize).cloned()
+                    })
+                    .expect("enumerate htree leaves");
+                    for idx in 1..blocks.len() {
+                        if !leaves.contains(&u32::try_from(idx).unwrap()) && has_csum {
+                            assert!(
+                                verify_dx_block_checksum(
+                                    &blocks[idx],
+                                    csum_seed,
+                                    dir_ino,
+                                    dir_inode.generation,
+                                    ffs_ondisk::DX_NODE_COUNT_OFFSET,
+                                ),
+                                "dx_node {idx} checksum failed on {} {dir_path}",
+                                spec.name
+                            );
+                        }
+                    }
+
+                    // Criterion 2: Verify FrankenFS dx_hash against `debugfs -R "htree <dir>"`.
+                    let debugfs_bin = section22_corpus::find_e2fs_tool("debugfs").expect("debugfs");
+                    let out = Command::new(debugfs_bin)
+                        .args(["-R", &format!("htree {dir_path}")])
+                        .arg(&spec.path)
+                        .output()
+                        .expect("run debugfs htree");
+                    assert!(out.status.success(), "debugfs htree {dir_path} failed");
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let mut parsed_from_debugfs = 0_u64;
+                    for line in stdout.lines() {
+                        let trimmed = line.trim();
+                        // Leaf lines look like: `<ino> 0x<maj:08x>-0x<min:08x> (<rec_len>) <name>`
+                        let mut parts = trimmed.splitn(4, ' ');
+                        let (Some(ino_tok), Some(hash_tok), Some(rec_tok), Some(name_str)) =
+                            (parts.next(), parts.next(), parts.next(), parts.next())
+                        else {
+                            continue;
+                        };
+                        if ino_tok.parse::<u32>().is_err()
+                            || !hash_tok.starts_with("0x")
+                            || !rec_tok.starts_with('(')
+                        {
+                            continue;
+                        }
+                        if name_str == "." || name_str == ".." {
+                            continue;
+                        }
+                        let Some((maj_hex, min_hex)) = hash_tok.split_once('-') else {
+                            continue;
+                        };
+                        let expected_maj =
+                            u32::from_str_radix(maj_hex.strip_prefix("0x").unwrap_or(maj_hex), 16)
+                                .expect("parse major hash");
+                        let expected_min =
+                            u32::from_str_radix(min_hex.strip_prefix("0x").unwrap_or(min_hex), 16)
+                                .expect("parse minor hash");
+                        let actual_maj =
+                            compute_dx_hash(root.hash_version, name_str.as_bytes(), &sb.hash_seed);
+                        let (ondisk_maj, ondisk_min) =
+                            dx_hash(root.hash_version, name_str.as_bytes(), &sb.hash_seed);
+                        assert_eq!(
+                            actual_maj, expected_maj,
+                            "dx_hash major mismatch on {} {dir_path}/{name_str}",
+                            spec.name
+                        );
+                        assert_eq!(
+                            (ondisk_maj, ondisk_min),
+                            (expected_maj, expected_min),
+                            "dx_hash (major, minor) mismatch on {} {dir_path}/{name_str}",
+                            spec.name
+                        );
+                        parsed_from_debugfs += 1;
+                    }
+                    assert!(
+                        parsed_from_debugfs > 0,
+                        "expected >0 htree entries from debugfs on {} {dir_path}",
+                        spec.name
+                    );
+                    total_htree_hashes_verified += parsed_from_debugfs;
+
+                    // Verify block 0 `.` and `..` header entries on dx_root too.
+                    assert_eq!(
+                        u32::from_le_bytes(blocks[0][0..4].try_into().unwrap()),
+                        dir_ino
+                    );
+                    assert_eq!(&blocks[0][8..9], b".");
+                    assert_eq!(
+                        u32::from_le_bytes(blocks[0][12..16].try_into().unwrap()),
+                        parent_ino
+                    );
+                    assert_eq!(&blocks[0][20..22], b"..");
+
+                    leaves.into_iter().map(|lb| lb as usize).collect()
+                } else {
+                    saw_linear = true;
+                    (0..blocks.len()).collect()
+                };
+
+                let mut seen_dot = is_indexed;
+                let mut seen_dotdot = is_indexed;
+                let mut entries_map: BTreeMap<Vec<u8>, (u32, Ext4FileType)> = BTreeMap::new();
+
+                for leaf_idx in leaf_indices {
+                    let blk = &blocks[leaf_idx];
+                    if has_csum {
+                        verify_dir_block_checksum(blk, csum_seed, dir_ino, dir_inode.generation)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "dir block {leaf_idx} checksum failed on {} {dir_path}: {e}",
+                                    spec.name
+                                )
+                            });
+                        if !saw_csum {
+                            let mut tampered = blk.clone();
+                            tampered[0] ^= 0x01;
+                            assert!(
+                                verify_dir_block_checksum(
+                                    &tampered,
+                                    csum_seed,
+                                    dir_ino,
+                                    dir_inode.generation
+                                )
+                                .is_err(),
+                                "tampered dir block checksum must fail"
+                            );
+                            saw_csum = true;
+                        }
+                    }
+                    let (parsed_entries, _) =
+                        parse_dir_block(blk, sb.block_size).expect("parse_dir_block");
+                    for entry in parsed_entries {
+                        if entry.inode == 0 {
+                            continue;
+                        }
+                        if entry.name == b"." {
+                            assert_eq!(entry.inode, dir_ino, "`.` must point to self");
+                            assert_eq!(entry.file_type, Ext4FileType::Dir);
+                            seen_dot = true;
+                            continue;
+                        }
+                        if entry.name == b".." {
+                            assert_eq!(entry.inode, parent_ino, "`..` must point to parent");
+                            assert_eq!(entry.file_type, Ext4FileType::Dir);
+                            seen_dotdot = true;
+                            continue;
+                        }
+                        assert!(
+                            block_contains_live_name(
+                                blk,
+                                &entry.name,
+                                if has_csum { 12 } else { 0 }
+                            )
+                            .expect("block_contains_live_name"),
+                            "ffs-dir linear scan must find {:?}",
+                            String::from_utf8_lossy(&entry.name)
+                        );
+                        entries_map.insert(entry.name, (entry.inode, entry.file_type));
+                    }
+                }
+                assert!(
+                    seen_dot && seen_dotdot,
+                    "`.` and `..` must exist in {} {dir_path}",
+                    spec.name
+                );
+
+                // Criterion 5: Verify d_type matches target inode S_IFMT (sample unique inodes
+                // so 100k hardlinks to 64 inodes read each inode once).
+                let mut mode_cache: BTreeMap<u32, u16> = BTreeMap::new();
+                for (name_bytes, (child_ino, ftype)) in &entries_map {
+                    let mode = *mode_cache
+                        .entry(*child_ino)
+                        .or_insert_with(|| read_inode_from_image(&file, &sb, *child_ino).mode);
+                    let expected_ft = match mode & 0xF000 {
+                        0x8000 => {
+                            saw_reg = true;
+                            Ext4FileType::RegFile
+                        }
+                        0x4000 => {
+                            saw_dir = true;
+                            Ext4FileType::Dir
+                        }
+                        0xA000 => {
+                            saw_symlink = true;
+                            Ext4FileType::Symlink
+                        }
+                        other => panic!("unexpected inode mode 0x{other:x}"),
+                    };
+                    assert_eq!(
+                        *ftype,
+                        expected_ft,
+                        "d_type mismatch on {} {dir_path}/{}",
+                        spec.name,
+                        String::from_utf8_lossy(name_bytes)
+                    );
+                    if *ftype == Ext4FileType::Dir && name_bytes != b"lost+found" {
+                        let sub = if dir_path == "/" {
+                            format!("/{}", String::from_utf8_lossy(name_bytes))
+                        } else {
+                            format!("{dir_path}/{}", String::from_utf8_lossy(name_bytes))
+                        };
+                        queue.push_back((*child_ino, dir_ino, sub));
+                    }
+                }
+            }
+        }
+
+        assert!(saw_htree && saw_linear && saw_csum && saw_reg && saw_dir && saw_symlink);
+        assert!(
+            total_htree_hashes_verified >= 100_250,
+            "expected >= 100,250 htree entries verified against debugfs, got {total_htree_hashes_verified}"
+        );
+
+        // Criterion 1: Live mounted `ls -laR` diff between kernel ext4 (`mount -t ext4 -o loop,ro,noload`)
+        // and FrankenFS (`ffs-cli mount`) across all 10 Gate 1 images.
+        fn locate_or_build_ffs_cli() -> Option<PathBuf> {
+            if let Some(p) = std::env::var_os("FFS_CLI_BIN") {
+                let pb = PathBuf::from(p);
+                if pb.is_file() {
+                    return Some(pb);
+                }
+            }
+            if let Ok(exe) = std::env::current_exe()
+                && let Some(deps_dir) = exe.parent()
+                && let Some(profile_dir) = deps_dir.parent()
+            {
+                let sibling = profile_dir.join("ffs-cli");
+                if sibling.is_file() {
+                    return Some(sibling);
+                }
+            }
+            let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)?;
+            let status = Command::new("cargo")
+                .current_dir(workspace_root)
+                .args(["build", "-p", "ffs-cli", "--bin", "ffs-cli"])
+                .status()
+                .ok()?;
+            if !status.success() {
+                return None;
+            }
+            if let Ok(exe) = std::env::current_exe()
+                && let Some(deps_dir) = exe.parent()
+                && let Some(profile_dir) = deps_dir.parent()
+            {
+                let sibling = profile_dir.join("ffs-cli");
+                if sibling.is_file() {
+                    return Some(sibling);
+                }
+            }
+            let default_bin = workspace_root.join("target/debug/ffs-cli");
+            default_bin.is_file().then_some(default_bin)
+        }
+
+        fn normalize_ls_output(raw: &str, mnt: &Path) -> String {
+            let mnt_str = mnt.to_string_lossy();
+            let mut out = Vec::new();
+            let mut in_root_section = false;
+            for line in raw.lines() {
+                let replaced = line.replace(mnt_str.as_ref(), "<MNT>");
+                if replaced == "<MNT>:" {
+                    in_root_section = true;
+                    out.push(replaced);
+                    continue;
+                }
+                if replaced.starts_with("<MNT>/") && replaced.ends_with(':') {
+                    in_root_section = false;
+                    out.push(replaced);
+                    continue;
+                }
+                if replaced.starts_with("total ") {
+                    continue;
+                }
+                // Root `.` and `..` reflect mount-root / host-parent metadata; normalize them.
+                if in_root_section && (replaced.ends_with(" .") || replaced.ends_with(" ..")) {
+                    continue;
+                }
+                // Normalize SELinux `.`/`+` suffix on mode field (`-rw-r--r--.` -> `-rw-r--r--`)
+                // and strip volatile access/mtime seconds column if mount options differ, while
+                // preserving mode, nlink, uid, gid, byte size, name, and symlink target!
+                let cols: Vec<&str> = replaced.split_whitespace().collect();
+                if cols.len() >= 7 {
+                    let mode = cols[0].trim_end_matches(['.', '+']);
+                    let nlink = cols[1];
+                    let uid = cols[2];
+                    let gid = cols[3];
+                    let size = cols[4];
+                    // With `ls -laRn --time-style=+%s`, cols[5] is epoch secs and cols[6..] is name (+ `-> target`).
+                    let mtime = cols[5];
+                    let name_tail = cols[6..].join(" ");
+                    if name_tail == ".." && in_root_section {
+                        continue;
+                    }
+                    out.push(format!(
+                        "{mode} {nlink} {uid} {gid} {size} {mtime} {name_tail}"
+                    ));
+                } else if !replaced.trim().is_empty() {
+                    out.push(replaced);
+                }
+            }
+            out.join("\n")
+        }
+
+        let require_fuse = section22_corpus::require_fuse_enabled();
+        let can_sudo_loop = Command::new("sudo")
+            .args(["-n", "true"])
+            .status()
+            .is_ok_and(|s| s.success());
+        let has_fuse = Path::new("/dev/fuse").exists()
+            && (section22_corpus::command_exists("fusermount3")
+                || section22_corpus::command_exists("fusermount"));
+
+        if can_sudo_loop && has_fuse {
+            let Some(ffs_cli) = locate_or_build_ffs_cli() else {
+                assert!(
+                    !require_fuse,
+                    "FFS_REQUIRE_FUSE=1 but ffs-cli could not be built"
+                );
+                return;
+            };
+            let base_tmp = std::env::temp_dir().join(format!(
+                "ffs-gate3-mnt-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            for (idx, spec) in corpus.iter().enumerate() {
+                let kern_mnt = base_tmp.join(format!("kern_{idx}"));
+                let ffs_mnt = base_tmp.join(format!("ffs_{idx}"));
+                std::fs::create_dir_all(&kern_mnt).expect("mkdir kern_mnt");
+                std::fs::create_dir_all(&ffs_mnt).expect("mkdir ffs_mnt");
+
+                let kern_status = Command::new("sudo")
+                    .args(["-n", "mount", "-t", "ext4", "-o", "loop,ro,noload"])
+                    .arg(&spec.path)
+                    .arg(&kern_mnt)
+                    .output()
+                    .expect("spawn sudo mount -t ext4");
+                if !kern_status.status.success() {
+                    assert!(
+                        !require_fuse,
+                        "FFS_REQUIRE_FUSE=1 but kernel loop mount failed on {}: {}",
+                        spec.name,
+                        String::from_utf8_lossy(&kern_status.stderr)
+                    );
+                    break;
+                }
+
+                let kern_ls = Command::new("ls")
+                    .env("LC_ALL", "C")
+                    .args(["-laRn", "--time-style=+%s"])
+                    .arg(&kern_mnt)
+                    .output()
+                    .expect("run ls on kernel mount");
+                let _ = Command::new("sudo")
+                    .args(["-n", "umount"])
+                    .arg(&kern_mnt)
+                    .status();
+                assert!(
+                    kern_ls.status.success(),
+                    "kernel ls -laR failed on {}",
+                    spec.name
+                );
+
+                let ffs_mnt_canon = ffs_mnt.canonicalize().expect("canon ffs_mnt");
+                let log_path = base_tmp.join(format!("ffs_{idx}.log"));
+                let mut daemon = Command::new(&ffs_cli)
+                    .arg("mount")
+                    .arg(&spec.path)
+                    .arg(&ffs_mnt_canon)
+                    .arg("--no-background-scrub")
+                    .env("FFS_AUTO_UNMOUNT", "0")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::fs::File::create(&log_path).expect("create mount log"))
+                    .spawn()
+                    .expect("spawn ffs-cli mount");
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                let mut mounted = false;
+                while std::time::Instant::now() < deadline {
+                    if std::fs::read_to_string("/proc/self/mountinfo")
+                        .unwrap_or_default()
+                        .lines()
+                        .any(|l| {
+                            l.split(' ').nth(4) == Some(ffs_mnt_canon.to_string_lossy().as_ref())
+                        })
+                    {
+                        mounted = true;
+                        break;
+                    }
+                    if let Some(st) = daemon.try_wait().expect("poll ffs-cli") {
+                        let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+                        assert!(
+                            !require_fuse,
+                            "FFS_REQUIRE_FUSE=1 but ffs-cli mount exited {st} on {}: {stderr}",
+                            spec.name
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !mounted {
+                    let _ = daemon.kill();
+                    let _ = daemon.wait();
+                    assert!(!require_fuse, "ffs-cli mount timed out on {}", spec.name);
+                    break;
+                }
+
+                let ffs_ls = Command::new("ls")
+                    .env("LC_ALL", "C")
+                    .args(["-laRn", "--time-style=+%s"])
+                    .arg(&ffs_mnt_canon)
+                    .output()
+                    .expect("run ls on FrankenFS mount");
+                let umount_bin = if section22_corpus::command_exists("fusermount3") {
+                    "fusermount3"
+                } else {
+                    "fusermount"
+                };
+                let _ = Command::new(umount_bin)
+                    .args(["-u"])
+                    .arg(&ffs_mnt_canon)
+                    .status();
+                let _ = daemon.wait();
+                assert!(
+                    ffs_ls.status.success(),
+                    "FrankenFS ls -laR failed on {}",
+                    spec.name
+                );
+
+                let expected_norm =
+                    normalize_ls_output(&String::from_utf8_lossy(&kern_ls.stdout), &kern_mnt);
+                let actual_norm =
+                    normalize_ls_output(&String::from_utf8_lossy(&ffs_ls.stdout), &ffs_mnt_canon);
+                assert_eq!(
+                    actual_norm, expected_norm,
+                    "mounted ls -laR diff non-empty on {}",
+                    spec.name
+                );
+            }
+        } else {
+            assert!(
+                !require_fuse,
+                "FFS_REQUIRE_FUSE=1 but /dev/fuse, fusermount3, or passwordless sudo is unavailable"
+            );
+        }
     }
 }

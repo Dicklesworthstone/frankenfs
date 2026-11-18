@@ -2057,6 +2057,10 @@ fn cache_hole_interval(cache: &ExtentCache, ns: u64, logical_start: u32, hole_le
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "../../../tests/common/section22_corpus.rs"]
+mod section22_corpus;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ffs_block::BlockBuf;
@@ -7630,12 +7634,296 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         );
     }
 
+    use super::section22_corpus;
+
     #[test]
     #[ignore = "canonical spec §22.1 Gate 2: extent resolution"]
     fn gate2_extent_resolution() {
+        use ffs_block::{ByteBlockDevice, FileByteDevice};
+        use ffs_ondisk::{Ext4GroupDesc, Ext4Inode, Ext4Superblock};
+        use ffs_types::{EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, GroupNumber};
+        use std::os::unix::fs::FileExt;
+
+        const EXT4_BG_INODE_UNINIT: u16 = 0x0001;
+        const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+        const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
+
         representative_extent_mapping_exact_golden_contract();
         map_depth1_range_matches_repeated_search_and_reads_leaf_once();
         map_empty_tree_returns_hole();
         map_single_extent();
+
+        let Some(corpus) = section22_corpus::ensure_section22_corpus("gate2_extent") else {
+            return;
+        };
+        assert_eq!(corpus.len(), 10);
+
+        let cx = test_cx();
+        let mut saw_depth0 = false;
+        let mut saw_depth1 = false;
+        let mut saw_depth2 = false;
+        let mut saw_sparse_holes = false;
+        let mut saw_indirect_image = false;
+        let mut total_regular_files = 0_u64;
+
+        for spec in &corpus {
+            let file = std::fs::File::open(&spec.path)
+                .unwrap_or_else(|e| panic!("open {}: {e}", spec.path.display()));
+            let mut raw_sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+            file.read_exact_at(&mut raw_sb, EXT4_SUPERBLOCK_OFFSET as u64)
+                .expect("pread superblock");
+            let sb = Ext4Superblock::parse_superblock_region(&raw_sb).expect("parse sb");
+            let block_size_u64 = u64::from(sb.block_size);
+            let desc_size = sb.group_desc_size();
+            let desc_per_block = sb.desc_per_block();
+            let inode_size_usize = usize::from(sb.inode_size);
+
+            let byte_dev = FileByteDevice::open_read_only(&spec.path).expect("open FileByteDevice");
+            let block_dev =
+                ByteBlockDevice::new(byte_dev, sb.block_size).expect("open ByteBlockDevice");
+
+            let mut regular_inodes: Vec<(u32, Ext4Inode)> = Vec::new();
+            for group_idx in 0..sb.groups_count() {
+                let gd_block = sb
+                    .group_desc_block(GroupNumber(group_idx))
+                    .expect("group_desc_block");
+                let gd_off = u64::from(group_idx % desc_per_block) * u64::from(desc_size);
+                let mut raw_gd = vec![0_u8; usize::from(desc_size)];
+                file.read_exact_at(&mut raw_gd, gd_block * block_size_u64 + gd_off)
+                    .expect("pread GD");
+                let gd = Ext4GroupDesc::parse_from_bytes(&raw_gd, desc_size).expect("parse GD");
+                if (gd.flags & EXT4_BG_INODE_UNINIT) != 0 {
+                    continue;
+                }
+                let mut ibitmap = vec![0_u8; sb.block_size as usize];
+                file.read_exact_at(&mut ibitmap, gd.inode_bitmap * block_size_u64)
+                    .expect("pread inode bitmap");
+                for slot in 0..sb.inodes_per_group {
+                    if (ibitmap[(slot / 8) as usize] & (1_u8 << (slot % 8))) == 0 {
+                        continue;
+                    }
+                    let ino = group_idx * sb.inodes_per_group + slot + 1;
+                    if ino < sb.first_ino {
+                        continue;
+                    }
+                    let mut raw_inode = vec![0_u8; inode_size_usize];
+                    file.read_exact_at(
+                        &mut raw_inode,
+                        gd.inode_table * block_size_u64
+                            + u64::from(slot) * (inode_size_usize as u64),
+                    )
+                    .expect("pread inode");
+                    let inode = Ext4Inode::parse_from_bytes(&raw_inode).expect("parse inode");
+                    if (inode.mode & 0xF000) == 0x8000 && inode.links_count > 0 {
+                        regular_inodes.push((ino, inode));
+                    }
+                }
+            }
+
+            let ino_list: Vec<u32> = regular_inodes.iter().map(|(ino, _)| *ino).collect();
+            let oracle_blocks = section22_corpus::debugfs_blocks_for_inodes(&spec.path, &ino_list);
+
+            for (ino, inode) in &regular_inodes {
+                total_regular_files += 1;
+                let expected = oracle_blocks
+                    .get(ino)
+                    .unwrap_or_else(|| panic!("missing debugfs blocks output for ino {ino}"));
+
+                if !spec.has_extents || (inode.flags & EXT4_EXTENTS_FL) == 0 {
+                    saw_indirect_image = true;
+                    // Resolve legacy direct + single-indirect blocks for img06_no_extents.ext4
+                    // in the exact order ext2fs_block_iterate3 (`blocks <ino>`) emits them.
+                    let mut resolved = Vec::new();
+                    for idx in 0..12_usize {
+                        let ptr = u32::from_le_bytes(
+                            inode.extent_bytes[idx * 4..idx * 4 + 4].try_into().unwrap(),
+                        );
+                        if ptr != 0 {
+                            resolved.push(u64::from(ptr));
+                        }
+                    }
+                    let ind_ptr =
+                        u32::from_le_bytes(inode.extent_bytes[48..52].try_into().unwrap());
+                    if ind_ptr != 0 {
+                        resolved.push(u64::from(ind_ptr));
+                        let mut ind_buf = vec![0_u8; sb.block_size as usize];
+                        file.read_exact_at(&mut ind_buf, u64::from(ind_ptr) * block_size_u64)
+                            .expect("pread single-indirect block");
+                        for chunk in ind_buf.as_chunks::<4>().0 {
+                            let ptr = u32::from_le_bytes(*chunk);
+                            if ptr != 0 {
+                                resolved.push(u64::from(ptr));
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        &resolved, expected,
+                        "indirect block sequence mismatch on {} ino {ino}",
+                        spec.name
+                    );
+                    continue;
+                }
+
+                assert_eq!(
+                    inode.flags & EXT4_INLINE_DATA_FL,
+                    0,
+                    "unexpected inline data on {}",
+                    spec.name
+                );
+                let root_bytes: &[u8; 60] = inode
+                    .extent_bytes
+                    .as_slice()
+                    .try_into()
+                    .expect("60-byte i_block");
+                let (hdr, _) = parse_extent_tree(root_bytes).expect("parse inode extent root");
+                match hdr.depth {
+                    0 => saw_depth0 = true,
+                    1 => saw_depth1 = true,
+                    d if d >= 2 => saw_depth2 = true,
+                    _ => {}
+                }
+
+                // `debugfs` `blocks <ino>` (`ext2fs_block_iterate3`) visits external
+                // extent-tree blocks (`idx.leaf_block`) in pre-order before each node's
+                // leaf data blocks. Verify BOTH `map_logical_to_physical` leaf data
+                // mappings AND exact pre-order block equality against `debugfs`.
+                fn collect_preorder_blocks(
+                    cx: &Cx,
+                    dev: &dyn BlockDevice,
+                    node_bytes: &[u8],
+                    preorder_all: &mut Vec<u64>,
+                    leaf_only: &mut Vec<u64>,
+                ) {
+                    let (_, tree) = parse_extent_tree(node_bytes).expect("parse extent node");
+                    match tree {
+                        ExtentTree::Leaf(exts) => {
+                            for ext in exts {
+                                if !ext.is_unwritten() {
+                                    for off in 0..u64::from(ext.actual_len()) {
+                                        preorder_all.push(ext.physical_start + off);
+                                        leaf_only.push(ext.physical_start + off);
+                                    }
+                                }
+                            }
+                        }
+                        ExtentTree::Index(idxs) => {
+                            for idx in idxs {
+                                preorder_all.push(idx.leaf_block);
+                                let child = dev
+                                    .read_block(cx, BlockNumber(idx.leaf_block))
+                                    .expect("read child extent block");
+                                collect_preorder_blocks(
+                                    cx,
+                                    dev,
+                                    child.as_slice(),
+                                    preorder_all,
+                                    leaf_only,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let mut preorder_all = Vec::new();
+                let mut expected_leaf_data = Vec::new();
+                collect_preorder_blocks(
+                    &cx,
+                    &block_dev,
+                    root_bytes,
+                    &mut preorder_all,
+                    &mut expected_leaf_data,
+                );
+
+                let logical_blocks = inode.size.div_ceil(block_size_u64).max(1);
+                let mappings =
+                    map_logical_to_physical(&cx, &block_dev, root_bytes, 0, logical_blocks)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "map_logical_to_physical failed on {} ino {ino}: {e}",
+                                spec.name
+                            )
+                        });
+
+                let mut data_blocks = Vec::new();
+                for m in &mappings {
+                    if m.physical_start == 0 {
+                        if inode.size > 0 {
+                            saw_sparse_holes = true;
+                        }
+                    } else {
+                        for off in 0..u64::from(m.count) {
+                            data_blocks.push(m.physical_start + off);
+                        }
+                    }
+                }
+                assert_eq!(
+                    data_blocks, expected_leaf_data,
+                    "map_logical_to_physical leaf blocks mismatch on {} ino {ino}",
+                    spec.name
+                );
+                assert_eq!(
+                    &preorder_all, expected,
+                    "physical block mapping mismatch vs debugfs on {} ino {ino}",
+                    spec.name
+                );
+            }
+        }
+
+        assert!(saw_depth0, "must exercise depth-0 inline extents");
+        assert!(saw_depth1, "must exercise depth-1 extent tree");
+        assert!(saw_depth2, "must exercise depth-2 extent tree");
+        assert!(
+            saw_sparse_holes,
+            "must exercise sparse holes returning physical_start == 0"
+        );
+        assert!(saw_indirect_image, "must exercise img06_no_extents");
+        assert!(
+            total_regular_files >= 300,
+            "expected >= 300 regular files checked"
+        );
+
+        // Criterion 5: 10,000-extent resolution completes in < 100ms.
+        const PERF_EXTENTS: u32 = 10_000;
+        struct SimpleSeqAlloc(u64);
+        impl BlockAllocator for SimpleSeqAlloc {
+            fn alloc_block(&mut self, _cx: &Cx) -> Result<BlockNumber> {
+                let b = self.0;
+                self.0 += 1;
+                Ok(BlockNumber(b))
+            }
+            fn free_block(&mut self, _cx: &Cx, _block: BlockNumber) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mem_dev = MemBlockDevice::new(4096);
+        let mut perf_root = empty_root();
+        let mut seq_alloc = SimpleSeqAlloc(500);
+        for i in 0..PERF_EXTENTS {
+            ffs_btree::insert(
+                &cx,
+                &mem_dev,
+                &mut perf_root,
+                Ext4Extent {
+                    logical_block: i * 2,
+                    raw_len: 1,
+                    physical_start: 200_000 + u64::from(i) * 2,
+                },
+                &mut seq_alloc,
+            )
+            .expect("insert extent into perf tree");
+        }
+        let start = std::time::Instant::now();
+        let resolved =
+            map_logical_to_physical(&cx, &mem_dev, &perf_root, 0, u64::from(PERF_EXTENTS * 2))
+                .expect("map 10,000 extents");
+        let elapsed = start.elapsed();
+        let mapped_extents = resolved.iter().filter(|m| m.physical_start != 0).count();
+        let hole_extents = resolved.iter().filter(|m| m.physical_start == 0).count();
+        assert_eq!(mapped_extents, PERF_EXTENTS as usize);
+        assert_eq!(hole_extents, PERF_EXTENTS as usize);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "10,000-extent map_logical_to_physical took {elapsed:?} (budget < 100ms)"
+        );
     }
 }

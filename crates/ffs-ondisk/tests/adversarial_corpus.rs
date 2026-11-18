@@ -3651,23 +3651,355 @@ fn fuzz_seed_corpus_covers_all_targets() {
     }
 }
 
+#[path = "../../../tests/common/section22_corpus.rs"]
+mod section22_corpus;
+
 #[test]
 #[ignore = "canonical spec §22.1 Gate 1: on-disk format parsing"]
 fn gate1_on_disk_format_parsing() {
-    // 1. Adversarial corpus is panic-free and exercises parse error variants
-    adversarial_corpus_is_panic_free_and_exercises_parse_error_variants();
+    use ffs_types::GroupNumber;
+    use std::os::unix::fs::FileExt;
 
-    // 2. Ext4 and Btrfs superblock parsing and validation boundaries
+    const EXT4_BG_INODE_UNINIT: u16 = 0x0001;
+    const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+    const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
+
+    let Some(corpus) = section22_corpus::ensure_section22_corpus("gate1_ondisk") else {
+        return;
+    };
+    assert_eq!(corpus.len(), 10, "Spec §22.3 requires all 10 ext4 images");
+
+    let mut saw_bs_1024 = false;
+    let mut saw_bs_2048 = false;
+    let mut saw_bs_4096 = false;
+    let mut saw_gd_32 = false;
+    let mut saw_gd_64 = false;
+    let mut saw_metadata_csum_on = false;
+    let mut saw_metadata_csum_off = false;
+    let mut saw_extents_on = false;
+    let mut saw_extents_off = false;
+    let mut saw_flex_bg_on = false;
+    let mut saw_dir_index_on = false;
+    let mut saw_external_xattr = false;
+    let mut total_groups_checked = 0_u64;
+    let mut total_inodes_checked = 0_u64;
+    let mut mutation_seeds: Vec<Vec<u8>> = Vec::new();
+
+    for spec in &corpus {
+        let file = fs::File::open(&spec.path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", spec.path.display()));
+        let mut raw_sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        file.read_exact_at(&mut raw_sb, EXT4_SUPERBLOCK_OFFSET as u64)
+            .expect("pread superblock");
+        mutation_seeds.push(raw_sb.to_vec());
+
+        // Criterion 1 & 2: Parse superblock, cross-check dumpe2fs, validate checksum,
+        // and verify byte-for-byte round-trip serialization.
+        let sb = Ext4Superblock::parse_superblock_region(&raw_sb)
+            .unwrap_or_else(|e| panic!("parse superblock {}: {e}", spec.name));
+        sb.validate_geometry()
+            .unwrap_or_else(|e| panic!("validate_geometry {}: {e}", spec.name));
+        sb.validate_checksum(&raw_sb)
+            .unwrap_or_else(|e| panic!("validate_checksum {}: {e}", spec.name));
+
+        let serialized_sb = sb
+            .to_bytes()
+            .unwrap_or_else(|e| panic!("serialize superblock {}: {e}", spec.name));
+        assert_eq!(
+            serialized_sb.as_slice(),
+            raw_sb.as_slice(),
+            "superblock byte-for-byte round-trip mismatch on {}",
+            spec.name
+        );
+
+        let header = section22_corpus::dumpe2fs_header_fields(&spec.path);
+        assert_eq!(
+            header.get("Block size").and_then(|s| s.parse::<u32>().ok()),
+            Some(sb.block_size),
+            "dumpe2fs Block size mismatch on {}",
+            spec.name
+        );
+        assert_eq!(
+            header
+                .get("Inode count")
+                .and_then(|s| s.parse::<u32>().ok()),
+            Some(sb.inodes_count),
+            "dumpe2fs Inode count mismatch on {}",
+            spec.name
+        );
+        assert_eq!(
+            header
+                .get("Block count")
+                .and_then(|s| s.parse::<u64>().ok()),
+            Some(sb.blocks_count),
+            "dumpe2fs Block count mismatch on {}",
+            spec.name
+        );
+        assert_eq!(
+            header.get("Inode size").and_then(|s| s.parse::<u16>().ok()),
+            Some(sb.inode_size),
+            "dumpe2fs Inode size mismatch on {}",
+            spec.name
+        );
+
+        match sb.block_size {
+            1024 => {
+                saw_bs_1024 = true;
+                assert_eq!(
+                    sb.first_data_block, 1,
+                    "1KiB ext4 must have first_data_block=1"
+                );
+            }
+            2048 => saw_bs_2048 = true,
+            4096 => saw_bs_4096 = true,
+            other => panic!("unexpected block_size {other}"),
+        }
+        let desc_size = sb.group_desc_size();
+        match desc_size {
+            32 => saw_gd_32 = true,
+            64 => saw_gd_64 = true,
+            other => panic!("unexpected group_desc_size {other} on {}", spec.name),
+        }
+        if sb.has_metadata_csum() {
+            saw_metadata_csum_on = true;
+        } else {
+            saw_metadata_csum_off = true;
+        }
+        if spec.has_extents {
+            saw_extents_on = true;
+        } else {
+            saw_extents_off = true;
+        }
+        if spec.has_flex_bg {
+            assert!(
+                sb.groups_per_flex() > 1,
+                "flex_bg image must report groups_per_flex > 1"
+            );
+            saw_flex_bg_on = true;
+        }
+        if spec.has_dir_index {
+            saw_dir_index_on = true;
+        }
+
+        // Criterion 3 & 4: Parse all group descriptors and all allocated inodes across all groups.
+        let csum_seed = sb.csum_seed();
+        let gd_csum_kind = sb.group_desc_checksum_kind();
+        let block_size_u64 = u64::from(sb.block_size);
+        let desc_per_block = sb.desc_per_block();
+        let inode_size_usize = usize::from(sb.inode_size);
+
+        for group_idx in 0..sb.groups_count() {
+            let gd_block = sb
+                .group_desc_block(GroupNumber(group_idx))
+                .expect("group_desc_block");
+            let gd_offset_in_block = u64::from(group_idx % desc_per_block) * u64::from(desc_size);
+            let mut raw_gd = vec![0_u8; usize::from(desc_size)];
+            file.read_exact_at(&mut raw_gd, gd_block * block_size_u64 + gd_offset_in_block)
+                .expect("pread group descriptor");
+            if group_idx == 0 {
+                mutation_seeds.push(raw_gd.clone());
+            }
+
+            let gd = Ext4GroupDesc::parse_from_bytes(&raw_gd, desc_size)
+                .unwrap_or_else(|e| panic!("parse GD {group_idx} on {}: {e}", spec.name));
+            let mut gd_roundtrip = raw_gd.clone();
+            gd.write_to_bytes(&mut gd_roundtrip, desc_size)
+                .expect("serialize GD");
+            assert_eq!(
+                gd_roundtrip, raw_gd,
+                "GD {group_idx} round-trip mismatch on {}",
+                spec.name
+            );
+            verify_group_desc_checksum(
+                &raw_gd,
+                &sb.uuid,
+                csum_seed,
+                group_idx,
+                desc_size,
+                gd_csum_kind,
+            )
+            .unwrap_or_else(|e| panic!("GD {group_idx} checksum failed on {}: {e}", spec.name));
+
+            if gd_csum_kind != Ext4GroupDescChecksumKind::None && group_idx == 0 {
+                let mut corrupted = raw_gd.clone();
+                corrupted[0] ^= 0x01;
+                assert!(
+                    verify_group_desc_checksum(
+                        &corrupted,
+                        &sb.uuid,
+                        csum_seed,
+                        group_idx,
+                        desc_size,
+                        gd_csum_kind,
+                    )
+                    .is_err(),
+                    "corrupted GD checksum must be rejected on {}",
+                    spec.name
+                );
+            }
+            total_groups_checked += 1;
+
+            if (gd.flags & EXT4_BG_INODE_UNINIT) != 0 {
+                continue;
+            }
+
+            let mut inode_bitmap = vec![0_u8; sb.block_size as usize];
+            file.read_exact_at(&mut inode_bitmap, gd.inode_bitmap * block_size_u64)
+                .expect("pread inode bitmap");
+
+            for slot in 0..sb.inodes_per_group {
+                let byte_idx = (slot / 8) as usize;
+                let bit_idx = slot % 8;
+                if (inode_bitmap[byte_idx] & (1_u8 << bit_idx)) == 0 {
+                    continue;
+                }
+                let ino = group_idx * sb.inodes_per_group + slot + 1;
+                // Reserved low non-root inodes (1, 3..first_ino-1) other than root (2)
+                // and journal (8) can be zeroed placeholders in mke2fs bitmaps.
+                let inode_byte_offset =
+                    gd.inode_table * block_size_u64 + u64::from(slot) * (inode_size_usize as u64);
+                let mut raw_inode = vec![0_u8; inode_size_usize];
+                file.read_exact_at(&mut raw_inode, inode_byte_offset)
+                    .expect("pread inode");
+                if ino < sb.first_ino
+                    && ino != 2
+                    && ino != sb.journal_inum
+                    && raw_inode.iter().all(|&b| b == 0)
+                {
+                    continue;
+                }
+                if ino == 2 {
+                    mutation_seeds.push(raw_inode.clone());
+                }
+
+                let inode = Ext4Inode::parse_from_bytes(&raw_inode)
+                    .unwrap_or_else(|e| panic!("parse inode {ino} on {}: {e}", spec.name));
+                if sb.has_metadata_csum() {
+                    verify_inode_checksum(&raw_inode, csum_seed, ino, sb.inode_size)
+                        .unwrap_or_else(|e| {
+                            panic!("inode {ino} checksum failed on {}: {e}", spec.name)
+                        });
+                    if ino == 2 {
+                        let mut bad_ino = raw_inode.clone();
+                        bad_ino[0] ^= 0x01;
+                        assert!(
+                            verify_inode_checksum(&bad_ino, csum_seed, ino, sb.inode_size).is_err(),
+                            "corrupted root inode checksum must fail on {}",
+                            spec.name
+                        );
+                    }
+                }
+
+                if !inode.xattr_ibody.is_empty() {
+                    let _ = parse_ibody_xattrs(&inode);
+                }
+                if inode.file_acl != 0 {
+                    let mut xblock = vec![0_u8; sb.block_size as usize];
+                    file.read_exact_at(&mut xblock, inode.file_acl * block_size_u64)
+                        .expect("pread external xattr block");
+                    let entries = parse_xattr_block(&xblock).unwrap_or_else(|e| {
+                        panic!("parse external xattr block on {} ino {ino}: {e}", spec.name)
+                    });
+                    assert!(
+                        !entries.is_empty(),
+                        "external xattr block must carry entries"
+                    );
+                    mutation_seeds.push(xblock);
+                    saw_external_xattr = true;
+                }
+                if (inode.flags & EXT4_EXTENTS_FL) != 0
+                    && (inode.flags & EXT4_INLINE_DATA_FL) == 0
+                    && (inode.mode & 0xF000) == 0x8000
+                {
+                    let (_, _) = parse_extent_tree(&inode.extent_bytes).unwrap_or_else(|e| {
+                        panic!("parse inline extent tree on {} ino {ino}: {e}", spec.name)
+                    });
+                }
+                total_inodes_checked += 1;
+            }
+        }
+    }
+
+    assert!(
+        saw_bs_1024 && saw_bs_2048 && saw_bs_4096,
+        "must exercise 1K/2K/4K blocks"
+    );
+    assert!(
+        saw_gd_32 && saw_gd_64,
+        "must exercise 32B and 64B group descriptors"
+    );
+    assert!(
+        saw_metadata_csum_on && saw_metadata_csum_off,
+        "must exercise metadata_csum on and off"
+    );
+    assert!(
+        saw_extents_on && saw_extents_off,
+        "must exercise extents and indirect blocks"
+    );
+    assert!(saw_flex_bg_on && saw_dir_index_on && saw_external_xattr);
+    assert!(total_groups_checked >= 20, "expected >= 20 groups checked");
+    assert!(
+        total_inodes_checked >= 250,
+        "expected >= 250 allocated inodes checked"
+    );
+
+    // Criterion 5: 10,000 deterministic random mutations of valid corpus structures
+    // with zero panics / zero unwrap() failures.
+    let mut prng = 0xD1B5_4A32_D192_ED03_u64;
+    let mut next_u64 = || {
+        prng ^= prng << 13;
+        prng ^= prng >> 7;
+        prng ^= prng << 17;
+        prng
+    };
+    for iter in 0..10_000_usize {
+        let base = &mutation_seeds[iter % mutation_seeds.len()];
+        let mut buf = base.clone();
+        let mode = next_u64() % 4;
+        match mode {
+            0 if !buf.is_empty() => {
+                let idx = (next_u64() as usize) % buf.len();
+                buf[idx] ^= 1_u8 << (next_u64() % 8);
+            }
+            1 if !buf.is_empty() => {
+                for _ in 0..4 {
+                    let idx = (next_u64() as usize) % buf.len();
+                    buf[idx] = (next_u64() & 0xFF) as u8;
+                }
+            }
+            2 => {
+                let new_len = if buf.is_empty() {
+                    0
+                } else {
+                    (next_u64() as usize) % buf.len()
+                };
+                buf.truncate(new_len);
+            }
+            _ if !buf.is_empty() => {
+                let idx = (next_u64() as usize) % buf.len();
+                buf[idx] = [0x00, 0xFF, 0x7F, 0x80][(next_u64() as usize) & 3];
+            }
+            _ => {}
+        }
+
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            let _ = Ext4Superblock::parse_superblock_region(&buf);
+            let _ = Ext4GroupDesc::parse_from_bytes(&buf, 32);
+            let _ = Ext4GroupDesc::parse_from_bytes(&buf, 64);
+            let _ = Ext4Inode::parse_from_bytes(&buf);
+            let _ = parse_dir_block(&buf, 4096);
+            let _ = parse_extent_tree(&buf);
+            let _ = parse_xattr_block(&buf);
+        }));
+        assert!(res.is_ok(), "Gate 1 parser panicked on mutation #{iter}");
+    }
+
+    // Retain all existing adversarial boundary suites as well.
+    adversarial_corpus_is_panic_free_and_exercises_parse_error_variants();
     ext4_superblock_adversarial_samples_exercise_boundaries();
     btrfs_superblock_adversarial_samples_exercise_boundaries();
-
-    // 3. 32-byte and 64-byte group descriptor parsing and checksum verification
     ext4_group_desc_adversarial_samples_exercise_boundaries();
-
-    // 4. Inode parsing and checksum verification
     ext4_inode_checksum_adversarial_samples_exercise_boundaries();
-
-    // 5. Tree block, sys chunk, and dev item parsing
     btrfs_tree_block_adversarial_samples_exercise_boundaries();
     btrfs_sys_chunk_adversarial_samples_exercise_boundaries();
     btrfs_dev_item_adversarial_samples_exercise_boundaries();

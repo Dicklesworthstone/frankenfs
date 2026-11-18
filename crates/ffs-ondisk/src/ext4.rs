@@ -959,6 +959,185 @@ impl Ext4Superblock {
         Self::parse_superblock_region(&image[EXT4_SUPERBLOCK_OFFSET..end])
     }
 
+    /// Serialize this superblock into an existing 1024-byte superblock region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::InsufficientData`] if `region` is shorter than
+    /// [`EXT4_SUPERBLOCK_SIZE`], or [`ParseError::InvalidField`] if
+    /// `block_size`, `cluster_size`, or `magic` is invalid.
+    #[expect(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    pub fn write_to_region(&self, region: &mut [u8]) -> Result<(), ParseError> {
+        use ffs_types::{write_le_u16, write_le_u32};
+
+        fn write_nul_padded(buf: &mut [u8], offset: usize, width: usize, value: &str) {
+            let slot = &mut buf[offset..offset + width];
+            slot.fill(0);
+            let bytes = value.as_bytes();
+            let copy_len = bytes.len().min(width);
+            slot[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        }
+
+        if region.len() < EXT4_SUPERBLOCK_SIZE {
+            return Err(ParseError::InsufficientData {
+                needed: EXT4_SUPERBLOCK_SIZE,
+                offset: 0,
+                actual: region.len(),
+            });
+        }
+        if self.magic != EXT4_SUPER_MAGIC {
+            return Err(ParseError::InvalidMagic {
+                expected: u64::from(EXT4_SUPER_MAGIC),
+                actual: u64::from(self.magic),
+            });
+        }
+        let log_block_size = match self.block_size {
+            1024 => 0_u32,
+            2048 => 1_u32,
+            4096 => 2_u32,
+            _ => {
+                return Err(ParseError::InvalidField {
+                    field: "s_log_block_size",
+                    reason: "unsupported block size",
+                });
+            }
+        };
+        if ext4_block_size_from_log(self.log_cluster_size) != Some(self.cluster_size) {
+            return Err(ParseError::InvalidField {
+                field: "s_log_cluster_size",
+                reason: "invalid shift",
+            });
+        }
+
+        write_le_u32(region, 0x00, self.inodes_count);
+        write_le_u32(region, 0x04, self.blocks_count as u32);
+        write_le_u32(region, 0x08, self.reserved_blocks_count as u32);
+        write_le_u32(region, 0x0C, self.free_blocks_count as u32);
+        write_le_u32(region, 0x10, self.free_inodes_count);
+        write_le_u32(region, 0x14, self.first_data_block);
+        write_le_u32(region, 0x18, log_block_size);
+        write_le_u32(region, 0x1C, self.log_cluster_size);
+        write_le_u32(region, 0x20, self.blocks_per_group);
+        write_le_u32(region, 0x24, self.clusters_per_group);
+        write_le_u32(region, 0x28, self.inodes_per_group);
+        write_le_u32(region, 0x2C, self.mtime);
+        write_le_u32(region, 0x30, self.wtime);
+        write_le_u16(region, 0x34, self.mnt_count);
+        write_le_u16(region, 0x36, self.max_mnt_count);
+        write_le_u16(region, 0x38, self.magic);
+        write_le_u16(region, 0x3A, self.state);
+        write_le_u16(region, 0x3C, self.errors);
+        write_le_u16(region, 0x3E, self.minor_rev_level);
+        write_le_u32(region, 0x40, self.lastcheck);
+        write_le_u32(region, 0x44, self.checkinterval);
+        write_le_u32(region, 0x48, self.creator_os);
+        write_le_u32(region, 0x4C, self.rev_level);
+        write_le_u16(region, 0x50, self.def_resuid as u16);
+        write_le_u16(region, 0x52, self.def_resgid as u16);
+        write_le_u32(region, 0x54, self.first_ino);
+        write_le_u16(region, 0x58, self.inode_size);
+        write_le_u16(region, 0x5A, self.block_group_nr);
+        write_le_u32(region, 0x5C, self.feature_compat.0);
+        write_le_u32(region, 0x60, self.feature_incompat.0);
+        write_le_u32(region, 0x64, self.feature_ro_compat.0);
+        region[0x68..0x78].copy_from_slice(&self.uuid);
+        write_nul_padded(region, 0x78, 16, &self.volume_name);
+        write_nul_padded(region, 0x88, 64, &self.last_mounted);
+        write_le_u32(region, 0xC8, self.algorithm_usage_bitmap);
+        region[0xCC] = self.prealloc_blocks;
+        region[0xCD] = self.prealloc_dir_blocks;
+        write_le_u16(region, 0xCE, self.reserved_gdt_blocks);
+        region[0xD0..0xE0].copy_from_slice(&self.journal_uuid);
+        write_le_u32(region, 0xE0, self.journal_inum);
+        write_le_u32(region, 0xE4, self.journal_dev);
+        write_le_u32(region, 0xE8, self.last_orphan);
+        for (idx, word) in self.hash_seed.iter().copied().enumerate() {
+            write_le_u32(region, 0xEC + idx * 4, word);
+        }
+        region[0xFC] = self.def_hash_version;
+        region[0xFD] = self.jnl_backup_type;
+        write_le_u16(region, 0xFE, self.desc_size);
+        write_le_u32(region, 0x100, self.default_mount_opts);
+        write_le_u32(region, 0x104, self.first_meta_bg);
+        write_le_u32(region, 0x108, self.mkfs_time);
+        for (idx, word) in self.jnl_blocks.iter().copied().enumerate() {
+            write_le_u32(region, 0x10C + idx * 4, word);
+        }
+        write_le_u32(region, 0x150, (self.blocks_count >> 32) as u32);
+        write_le_u32(region, 0x154, (self.reserved_blocks_count >> 32) as u32);
+        write_le_u32(region, 0x158, (self.free_blocks_count >> 32) as u32);
+        write_le_u16(region, 0x15C, self.min_extra_isize);
+        write_le_u16(region, 0x15E, self.want_extra_isize);
+        write_le_u32(region, 0x160, self.super_flags.0);
+        write_le_u16(region, 0x164, self.raid_stride);
+        write_le_u16(region, 0x166, self.mmp_update_interval);
+        write_le_u32(region, 0x168, self.mmp_block as u32);
+        write_le_u32(region, 0x16C, (self.mmp_block >> 32) as u32);
+        write_le_u32(region, 0x170, self.raid_stripe_width);
+        region[0x174] = self.log_groups_per_flex;
+        region[0x175] = self.checksum_type;
+        write_le_u32(region, 0x178, self.kbytes_written as u32);
+        write_le_u32(region, 0x17C, (self.kbytes_written >> 32) as u32);
+        write_le_u32(region, 0x180, self.snapshot_inum);
+        write_le_u32(region, 0x184, self.snapshot_id);
+        write_le_u32(region, 0x188, self.snapshot_r_blocks_count as u32);
+        write_le_u32(region, 0x18C, (self.snapshot_r_blocks_count >> 32) as u32);
+        write_le_u32(region, 0x190, self.snapshot_list);
+        write_le_u32(region, 0x194, self.error_count);
+        write_le_u32(region, 0x198, self.first_error_time);
+        write_le_u32(region, 0x19C, self.first_error_ino);
+        write_le_u32(region, 0x1A0, self.first_error_block as u32);
+        write_le_u32(region, 0x1A4, (self.first_error_block >> 32) as u32);
+        write_nul_padded(region, 0x1A8, 32, &self.first_error_func);
+        write_le_u32(region, 0x1C8, self.first_error_line);
+        write_le_u32(region, 0x1CC, self.last_error_time);
+        write_le_u32(region, 0x1D0, self.last_error_ino);
+        write_le_u32(region, 0x1D4, self.last_error_line);
+        write_le_u32(region, 0x1D8, self.last_error_block as u32);
+        write_le_u32(region, 0x1DC, (self.last_error_block >> 32) as u32);
+        write_nul_padded(region, 0x1E0, 32, &self.last_error_func);
+        write_nul_padded(region, 0x200, 64, &self.mount_opts);
+        write_le_u32(region, 0x240, self.usr_quota_inum);
+        write_le_u32(region, 0x244, self.grp_quota_inum);
+        write_le_u32(region, 0x248, self.overhead_clusters);
+        write_le_u32(region, 0x24C, self.backup_bgs[0]);
+        write_le_u32(region, 0x250, self.backup_bgs[1]);
+        region[0x254..0x258].copy_from_slice(&self.encrypt_algos);
+        region[0x258..0x268].copy_from_slice(&self.encrypt_pw_salt);
+        write_le_u32(region, 0x268, self.lost_found_ino);
+        write_le_u32(region, 0x26C, self.prj_quota_inum);
+        write_le_u32(region, 0x270, self.checksum_seed);
+        region[0x274..0x27C].copy_from_slice(&[
+            self.wtime_hi,
+            self.mtime_hi,
+            self.mkfs_time_hi,
+            self.lastcheck_hi,
+            self.first_error_time_hi,
+            self.last_error_time_hi,
+            self.first_error_errcode,
+            self.last_error_errcode,
+        ]);
+        write_le_u16(region, 0x27C, self.encoding);
+        write_le_u16(region, 0x27E, self.encoding_flags);
+        write_le_u32(region, 0x280, self.orphan_file_inum);
+        write_le_u16(region, 0x284, (self.def_resuid >> 16) as u16);
+        write_le_u16(region, 0x286, (self.def_resgid >> 16) as u16);
+        write_le_u32(region, EXT4_SB_CHECKSUM_OFFSET, self.checksum);
+        Ok(())
+    }
+
+    /// Serialize this superblock into a zero-initialized 1024-byte buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if any field cannot be represented in an ext4
+    /// on-disk superblock.
+    pub fn to_bytes(&self) -> Result<[u8; EXT4_SUPERBLOCK_SIZE], ParseError> {
+        let mut buf = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        self.write_to_region(&mut buf)?;
+        Ok(buf)
+    }
+
     #[must_use]
     pub fn has_compat(&self, mask: Ext4CompatFeatures) -> bool {
         (self.feature_compat.0 & mask.0) != 0
@@ -21205,6 +21384,40 @@ mod dir_csum_incremental_verify {
             &mut [0u8; 8],
             0,
             &[0u8; 1]
+        ));
+    }
+
+    #[test]
+    fn superblock_to_bytes_round_trips_all_64bit_and_string_fields() {
+        let mut raw = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        raw[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        raw[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // 4096
+        raw[0x1C..0x20].copy_from_slice(&2_u32.to_le_bytes());
+        raw[0x20..0x24].copy_from_slice(&32_768_u32.to_le_bytes());
+        raw[0x24..0x28].copy_from_slice(&32_768_u32.to_le_bytes());
+        raw[0x28..0x2C].copy_from_slice(&8_192_u32.to_le_bytes());
+        raw[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes());
+        raw[0xFE..0x100].copy_from_slice(&64_u16.to_le_bytes());
+        raw[0x04..0x08].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
+        raw[0x150..0x154].copy_from_slice(&0x0000_0042_u32.to_le_bytes());
+        raw[0x50..0x52].copy_from_slice(&0x1234_u16.to_le_bytes());
+        raw[0x284..0x286].copy_from_slice(&0x5678_u16.to_le_bytes());
+        raw[0x78..0x83].copy_from_slice(b"gate1_label");
+        raw[0x88..0x92].copy_from_slice(b"/mnt/gate1");
+        raw[0x200..0x20B].copy_from_slice(b"user_xattr");
+        raw[0x1A8..0x1B6].copy_from_slice(b"ext4_lookup_fn");
+        raw[0x1E0..0x1EE].copy_from_slice(b"ext4_commit_fn");
+        raw[EXT4_SB_CHECKSUM_OFFSET..EXT4_SB_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&0xCAFE_BABE_u32.to_le_bytes());
+
+        let parsed = Ext4Superblock::parse_superblock_region(&raw).expect("parse superblock");
+        let serialized = parsed.to_bytes().expect("serialize superblock");
+        assert_eq!(serialized, raw);
+
+        let mut short = [0_u8; EXT4_SUPERBLOCK_SIZE - 1];
+        assert!(matches!(
+            parsed.write_to_region(&mut short),
+            Err(ParseError::InsufficientData { .. })
         ));
     }
 }

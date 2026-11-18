@@ -4137,6 +4137,7 @@ mod tests {
 
     #[test]
     fn bd_tqrnc_storage_set_persistence_prefix_multi_device_cuts_and_ack_ledger() {
+        let _flock_holder = crate::sidecar::test_flock_holder();
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
         let m0_img = dir.path().join("m0.img");
@@ -4434,6 +4435,7 @@ mod tests {
 
     #[test]
     fn bd_tqrnc_expected_loss_gate_and_provenance_refusal_controls() {
+        let _flock_holder = crate::sidecar::test_flock_holder();
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
         let img = dir.path().join("single.img");

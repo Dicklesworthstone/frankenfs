@@ -5946,20 +5946,89 @@ fn build_gate7_ext4_image() -> Vec<u8> {
     image
 }
 
+fn read_proc_fd_and_rss_kib(pid: u32) -> Option<(usize, u64)> {
+    let fd_count = fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count();
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let rss_kib = status
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("VmRSS:")?;
+            rest.split_whitespace().next()?.parse::<u64>().ok()
+        })
+        .unwrap_or(0);
+    Some((fd_count, rss_kib))
+}
+
+fn evaluate_soak_resource_samples(
+    post_warmup: (usize, u64),
+    samples: &[(usize, u64)],
+) -> Result<(), String> {
+    if samples.is_empty() {
+        return Err("no soak resource samples collected".to_owned());
+    }
+    let (base_fds, base_rss_kib) = post_warmup;
+    let &(final_fds, final_rss_kib) = samples.last().expect("non-empty");
+    if final_fds > base_fds.saturating_add(4) {
+        return Err(format!(
+            "FD leak detected under continuous load: post_warmup_fds={base_fds}, final_fds={final_fds}"
+        ));
+    }
+    // Allow up to 64 MiB working-set headroom above warmed ARC/MVCC cache footprint.
+    let rss_ceiling_kib = base_rss_kib.saturating_add(64 * 1024);
+    if final_rss_kib > rss_ceiling_kib {
+        return Err(format!(
+            "RSS exceeded expected cache ceiling: post_warmup_rss_kib={base_rss_kib}, final_rss_kib={final_rss_kib}, ceiling_kib={rss_ceiling_kib}"
+        ));
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "canonical spec §22.1 Gate 7: full conformance and user-facing tools"]
+#[expect(clippy::too_many_lines)]
 fn gate7_full_conformance_and_tools() {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant};
+
+    // Planted self-check on the FD/RSS resource-leak evaluator.
+    assert!(evaluate_soak_resource_samples((12, 32_000), &[(12, 33_000), (13, 34_000)]).is_ok());
+    assert!(evaluate_soak_resource_samples((12, 32_000), &[(15, 33_000), (20, 34_000)]).is_err());
+    assert!(evaluate_soak_resource_samples((12, 32_000), &[(12, 80_000), (12, 120_000)]).is_err());
+
+    // Criterion 1: Gates are cumulative — when Gate 7 runs standalone (outside
+    // `ffs-harness gates --all`, which sets `FFS_CANONICAL_GATES_BATCH=1`), execute
+    // Gates 1–6 and require every prerequisite gate to pass.
+    if std::env::var("FFS_CANONICAL_GATES_BATCH").as_deref() != Ok("1") {
+        let prereq = [
+            "gate1".to_owned(),
+            "gate2".to_owned(),
+            "gate3".to_owned(),
+            "gate4".to_owned(),
+            "gate5".to_owned(),
+            "gate6".to_owned(),
+        ];
+        let report = ffs_harness::canonical_gates::CanonicalGateReport::run(
+            &prereq,
+            ffs_harness::ParityExecutor::Cargo,
+        )
+        .expect("execute prerequisite gates 1..6 for standalone gate7");
+        report
+            .require_all_passed()
+            .expect("Gate 7 requires all prerequisite Gates 1..6 to pass");
+    }
+
     let tmpdir = tempfile::Builder::new()
         .prefix("ffs-gate7-")
         .tempdir()
         .expect("create temp dir")
         .keep();
-    let image = tmpdir.join("gate7.ext4");
-    fs::write(&image, build_gate7_ext4_image()).expect("write gate7 ext4 image");
-    let image_str = image.to_str().expect("utf-8 path");
+    let synthetic_image = tmpdir.join("gate7_synth.ext4");
+    fs::write(&synthetic_image, build_gate7_ext4_image()).expect("write gate7 synth image");
+    let synth_str = synthetic_image.to_str().expect("utf-8 path");
 
-    // 1. Inspect (JSON)
-    let inspect = run_ffs_cli(&["inspect", "--json", image_str]);
+    // Offline JSON + live 1Hz TUI dashboard verification (Criterion 3) + actionable errors (Criterion 4).
+    let inspect = run_ffs_cli(&["inspect", "--json", synth_str]);
     assert!(
         inspect.status.success(),
         "ffs inspect --json failed: {}",
@@ -5969,27 +6038,7 @@ fn gate7_full_conformance_and_tools() {
         serde_json::from_slice(&inspect.stdout).expect("inspect JSON");
     assert_eq!(inspect_json["filesystem"], "ext4");
 
-    // 2. Info + MVCC info
-    let info_out = run_ffs_cli(&["info", "--mvcc", image_str]);
-    assert!(
-        info_out.status.success(),
-        "ffs info --mvcc failed: {}",
-        String::from_utf8_lossy(&info_out.stderr)
-    );
-
-    // 3. Scrub / fsck (JSON)
-    let fsck = run_ffs_cli(&["fsck", "--json", image_str]);
-    assert!(
-        fsck.status.success(),
-        "ffs fsck --json failed: {}",
-        String::from_utf8_lossy(&fsck.stderr)
-    );
-    let fsck_json: serde_json::Value = serde_json::from_slice(&fsck.stdout).expect("fsck JSON");
-    assert_eq!(fsck_json["outcome"], "clean");
-    assert_eq!(fsck_json["exit_code"], 0);
-
-    // 4. Offline JSON plus one continuous mounted TUI process at nominal 1Hz.
-    let tui_json_out = run_ffs_cli(&["tui", image_str, "--scrub", "--snapshot-json"]);
+    let tui_json_out = run_ffs_cli(&["tui", synth_str, "--scrub", "--snapshot-json"]);
     assert!(
         tui_json_out.status.success(),
         "ffs tui --snapshot-json failed: {}",
@@ -6001,13 +6050,223 @@ fn gate7_full_conformance_and_tools() {
     assert!(tui_snap["cache_capacity"].as_u64().unwrap_or(0) > 0);
     assert!(tui_snap["scrub_blocks_scanned"].as_u64().unwrap_or(0) > 0);
 
-    let tui_live = run_live_tui_profile(&image, "captured", false);
+    let tui_live = run_live_tui_profile(&synthetic_image, "captured", false);
     assert!(tui_live.contains("\"image_unchanged\": true"));
 
-    // 5. User-facing error diagnostics and parity declarations
     cli_inspect_empty_file_reports_error();
     cli_inspect_nonexistent_file_returns_error();
+    cli_fsck_corrupted_superblock_reports_error();
     parity_default_reports_declarations_without_execution_credit();
+
+    let non_mnt = tmpdir.join("not_a_fuse_mount");
+    fs::create_dir_all(&non_mnt).expect("mkdir non_mnt");
+    let bad_umount = run_ffs_cli(&["umount", non_mnt.to_str().unwrap()]);
+    assert!(
+        !bad_umount.status.success(),
+        "umount on plain dir must fail"
+    );
+    let bad_umount_stderr = String::from_utf8_lossy(&bad_umount.stderr);
+    assert!(
+        bad_umount_stderr.contains("remediation:"),
+        "umount error must include actionable remediation, got: {bad_umount_stderr}"
+    );
+
+    // Criteria 2, 5 & 6: Real mounted CLI workflow (`mount` -> file ops -> `info /mnt`
+    // -> `scrub /mnt` -> `umount /mnt` [< 5s] -> `fsck image.ext4`) + continuous-load
+    // FD & RSS leak monitor (`FFS_GATE7_SOAK_SECS`, normative default 3600s).
+    let require_fuse = std::env::var_os("FFS_REQUIRE_FUSE")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let prerequisites = Path::new("/dev/fuse").exists()
+        && ["mkfs.ext4", "e2fsck", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool));
+    if !prerequisites {
+        assert!(
+            !require_fuse,
+            "FFS_REQUIRE_FUSE=1 but /dev/fuse, mkfs.ext4, e2fsck, or fusermount3 is missing"
+        );
+        println!("SKIP|suite=gate7_cli|reason=fuse_or_e2fsprogs_unavailable");
+        return;
+    }
+
+    let real_img = tmpdir.join("gate7_workflow.ext4");
+    {
+        let f = fs::File::create(&real_img).expect("create gate7_workflow.ext4");
+        f.set_len(64 * 1024 * 1024).expect("set_len 64 MiB");
+    }
+    let uid = fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    let gid = fs::metadata("/proc/self").map_or(0, |m| m.gid());
+    let mkfs_st = Command::new("mkfs.ext4")
+        .args([
+            "-F",
+            "-q",
+            "-b",
+            "4096",
+            "-I",
+            "256",
+            "-O",
+            "none,ext_attr,sparse_super,filetype,extent,64bit,metadata_csum,has_journal",
+            "-E",
+            &format!("root_owner={uid}:{gid},lazy_itable_init=0,lazy_journal_init=0"),
+        ])
+        .arg(&real_img)
+        .status()
+        .expect("run mkfs.ext4 gate7");
+    assert!(mkfs_st.success(), "mkfs.ext4 gate7 failed");
+
+    let mnt = tmpdir.join("mnt_ffs");
+    fs::create_dir_all(&mnt).expect("mkdir mnt_ffs");
+    let log_path = tmpdir.join("gate7_mount.log");
+    let Some(mut daemon) = spawn_cli_mount(
+        &real_img,
+        &mnt,
+        &log_path,
+        &["--rw", "--no-background-scrub"],
+        &[],
+        "gate7_cli_workflow",
+        require_fuse,
+    ) else {
+        println!("SKIP|suite=gate7_cli|reason=mount_failed");
+        return;
+    };
+    let daemon_pid = daemon.id();
+    let mnt_str = mnt.to_str().expect("utf-8 mnt");
+    let real_img_str = real_img.to_str().expect("utf-8 real_img");
+
+    // Perform real file operations on /mnt/ffs.
+    let wf_file = mnt.join("workflow.bin");
+    let wf_payload: Vec<u8> = (0..24_576_u32)
+        .map(|i| ((i * 11 + 7) % 251) as u8)
+        .collect();
+    {
+        let mut f = fs::File::create(&wf_file).expect("create workflow.bin");
+        f.write_all(&wf_payload).expect("write workflow.bin");
+        f.sync_all().expect("fsync workflow.bin");
+    }
+    assert_eq!(fs::read(&wf_file).expect("read workflow.bin"), wf_payload);
+
+    // `ffs info /mnt/ffs` + `ffs scrub /mnt/ffs` + `ffs tui /mnt/ffs --snapshot-json`
+    let mnt_info = run_ffs_cli(&["info", "--mvcc", mnt_str]);
+    assert!(
+        mnt_info.status.success(),
+        "ffs info /mnt/ffs failed: {}",
+        String::from_utf8_lossy(&mnt_info.stderr)
+    );
+    let mnt_scrub = run_ffs_cli(&["scrub", "--json", mnt_str]);
+    assert!(
+        mnt_scrub.status.success(),
+        "ffs scrub /mnt/ffs failed: {}",
+        String::from_utf8_lossy(&mnt_scrub.stderr)
+    );
+    let scrub_json: serde_json::Value =
+        serde_json::from_slice(&mnt_scrub.stdout).expect("scrub JSON");
+    assert_eq!(scrub_json["blocks_corrupt"], 0);
+
+    let mnt_tui = run_ffs_cli(&["tui", mnt_str, "--scrub", "--snapshot-json"]);
+    assert!(
+        mnt_tui.status.success(),
+        "ffs tui /mnt/ffs --snapshot-json failed: {}",
+        String::from_utf8_lossy(&mnt_tui.stderr)
+    );
+
+    // Criterion 6: Continuous load soak with 1 Hz FD & RSS leak monitoring.
+    let soak_secs: u64 = std::env::var("FFS_GATE7_SOAK_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3_600);
+    let soak_dir = mnt.join("soak");
+    fs::create_dir_all(&soak_dir).expect("mkdir soak");
+    let chunk = vec![0xA7_u8; 8_192];
+
+    // Warm up daemon worker pool & ARC cache before recording baseline FD/RSS.
+    for w in 0..16_u32 {
+        let p = soak_dir.join(format!("warm_{w}.dat"));
+        let mut f = fs::File::create(&p).expect("create warm");
+        f.write_all(&chunk).expect("write warm");
+        f.sync_all().expect("fsync warm");
+        let _ = fs::read(&p).expect("read warm");
+        fs::remove_file(&p).expect("unlink warm");
+    }
+    let post_warmup = read_proc_fd_and_rss_kib(daemon_pid).expect("read post-warmup /proc fd+rss");
+    let mut samples = Vec::new();
+    let soak_start = Instant::now();
+    let mut next_sample_at = soak_start + Duration::from_secs(1);
+    let mut op_counter = 0_u64;
+    while soak_start.elapsed() < Duration::from_secs(soak_secs) {
+        let slot = op_counter % 8;
+        let a = soak_dir.join(format!("live_{slot}.bin"));
+        let b = soak_dir.join(format!("live_{slot}_ren.bin"));
+        {
+            let mut f = fs::File::create(&a).expect("soak create");
+            f.write_all(&chunk).expect("soak write");
+            if op_counter % 4 == 0 {
+                f.sync_data().expect("soak fdatasync");
+            }
+        }
+        fs::rename(&a, &b).expect("soak rename");
+        let readback = fs::read(&b).expect("soak read");
+        assert_eq!(readback.len(), chunk.len());
+        fs::remove_file(&b).expect("soak unlink");
+        op_counter += 1;
+
+        if Instant::now() >= next_sample_at {
+            if let Some(sample) = read_proc_fd_and_rss_kib(daemon_pid) {
+                samples.push(sample);
+            }
+            next_sample_at += Duration::from_secs(1);
+        }
+    }
+    if let Some(final_sample) = read_proc_fd_and_rss_kib(daemon_pid) {
+        samples.push(final_sample);
+    }
+    evaluate_soak_resource_samples(post_warmup, &samples).unwrap_or_else(|e| {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        panic!("Gate 7 resource leak check failed after {op_counter} ops ({soak_secs}s): {e}");
+    });
+
+    // Criterion 5: Clean shutdown via `ffs umount /mnt/ffs` within 5 seconds!
+    let umount_started = Instant::now();
+    let umount_out = run_ffs_cli(&["umount", "--json", mnt_str]);
+    let umount_elapsed = umount_started.elapsed();
+    assert!(
+        umount_out.status.success(),
+        "ffs umount /mnt/ffs failed: {}",
+        String::from_utf8_lossy(&umount_out.stderr)
+    );
+    assert!(
+        umount_elapsed < Duration::from_secs(5),
+        "ffs umount /mnt/ffs took {umount_elapsed:?} (budget < 5s)"
+    );
+    let umount_json: serde_json::Value =
+        serde_json::from_slice(&umount_out.stdout).expect("parse umount JSON");
+    assert_eq!(umount_json["clean"], true);
+    let daemon_exit = daemon.wait().expect("wait exited mount daemon");
+    assert!(
+        daemon_exit.success(),
+        "mount daemon exited non-zero on clean umount: {daemon_exit}"
+    );
+
+    // Final offline `ffs fsck` + `e2fsck -fn` consistency check!
+    let fsck = run_ffs_cli(&["fsck", "--json", real_img_str]);
+    assert!(
+        fsck.status.success(),
+        "ffs fsck --json failed after umount: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    let fsck_json: serde_json::Value = serde_json::from_slice(&fsck.stdout).expect("fsck JSON");
+    assert_eq!(fsck_json["outcome"], "clean");
+    assert_eq!(fsck_json["exit_code"], 0);
+
+    let e2fsck_st = Command::new("e2fsck")
+        .args(["-f", "-n"])
+        .arg(&real_img)
+        .status()
+        .expect("e2fsck -fn after Gate 7 workflow");
+    assert!(
+        e2fsck_st.success(),
+        "e2fsck -fn failed after Gate 7 workflow"
+    );
 }
 
 /// bd-jufod: Full mounted `/dev/fuse` E2E verification of ext4 background scrub & repair:

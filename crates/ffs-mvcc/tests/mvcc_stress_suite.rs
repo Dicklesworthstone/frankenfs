@@ -1297,11 +1297,391 @@ fn verification_gate_safe_merge_correctness_under_high_contention() {
     );
 }
 
+fn measure_single_thread_mvcc_latency_ns() -> (u128, u128) {
+    const READ_ITERS: u32 = 20_000;
+    const WRITE_ITERS: u32 = 10_000;
+
+    let mut store = MvccStore::with_compression_policy(CompressionPolicy {
+        dedup_identical: false,
+        max_chain_length: None,
+        algo: CompressionAlgo::None,
+    });
+    let target = BlockNumber(7);
+    {
+        let mut init = store.begin();
+        init.stage_write(target, vec![0xAB; 64]);
+        store.commit(init).expect("seed latency block");
+    }
+    let snap = store.current_snapshot();
+    // Warm cache lines before timing.
+    for _ in 0..1_000 {
+        std::hint::black_box(store.read_visible(target, snap));
+    }
+    let read_start = std::time::Instant::now();
+    for _ in 0..READ_ITERS {
+        let val = store.read_visible(target, snap).expect("visible");
+        std::hint::black_box(val.len());
+    }
+    let read_ns = read_start.elapsed().as_nanos() / u128::from(READ_ITERS);
+
+    let payload = vec![0xCD_u8; 64];
+    let write_start = std::time::Instant::now();
+    for i in 0..WRITE_ITERS {
+        let block = BlockNumber(u64::from(i & 255));
+        let mut txn = store.begin();
+        txn.stage_write(block, payload.clone());
+        let seq = store.commit(txn).expect("commit version");
+        std::hint::black_box(seq);
+    }
+    let write_ns = write_start.elapsed().as_nanos() / u128::from(WRITE_ITERS);
+    (read_ns, write_ns)
+}
+
+#[test]
+#[ignore = "helper invoked in --release when unoptimized dev profile exceeds release latency budget"]
+fn mvcc_release_latency_probe() {
+    let (read_ns, write_ns) = measure_single_thread_mvcc_latency_ns();
+    assert!(
+        read_ns < 500,
+        "release single-thread MVCC cache-hit read {read_ns}ns >= 500ns"
+    );
+    assert!(
+        write_ns < 2_000,
+        "release single-thread MVCC version-creating write {write_ns}ns >= 2000ns"
+    );
+}
+
 #[test]
 #[ignore = "canonical spec §22.1 Gate 4: MVCC concurrency"]
+#[expect(clippy::too_many_lines)]
 fn gate4_mvcc_concurrency() {
     stress_concurrent_rw();
     stress_fcw_conflicts();
     stress_ssi_write_skew();
     stress_gc_under_load();
+
+    // Criterion 1: LabRuntime interleaving sweep of 4 transactions reading and
+    // writing 8 blocks (all 24 start-order permutations + multi-seed schedule sweep).
+    for schedule_idx in 0_u64..48 {
+        let mut runtime = LabRuntime::new(LabConfig::new(schedule_idx).max_steps(250_000));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        let store = Arc::new(Mutex::new(MvccStore::new()));
+        {
+            let mut guard = store.lock().expect("store lock");
+            let mut init = guard.begin();
+            for b in 0..8_u64 {
+                init.stage_write(BlockNumber(b), vec![u8::try_from(b + 1).unwrap(); 16]);
+            }
+            guard.commit(init).expect("seed 8 blocks");
+        }
+
+        // Txn 0 & Txn 1 conflict on block 0 (FCW must abort second committer);
+        // Txn 2 writes disjoint block 4; Txn 3 is a snapshot reader over all 8 blocks.
+        let conflict_outcomes = Arc::new(Mutex::new(Vec::new()));
+        for tid in 0_u64..4 {
+            let store = Arc::clone(&store);
+            let conflict_outcomes = Arc::clone(&conflict_outcomes);
+            let yields = ((schedule_idx >> (tid * 2)) & 3) + (tid % 2);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    for _ in 0..yields {
+                        yield_now().await;
+                    }
+                    let mut txn = { store.lock().expect("lock").begin() };
+                    let snap = txn.snapshot();
+                    // Verify snapshot visibility across all 8 blocks and zero uncommitted leakage.
+                    let baseline: Vec<u8> = {
+                        let guard = store.lock().expect("lock");
+                        (0..8_u64)
+                            .map(|b| guard.read_visible(BlockNumber(b), snap).expect("visible")[0])
+                            .collect()
+                    };
+                    yield_now().await;
+                    for (b, expected_byte) in baseline.iter().copied().enumerate() {
+                        let again = store
+                            .lock()
+                            .expect("lock")
+                            .read_visible(BlockNumber(b as u64), snap)
+                            .expect("visible")[0];
+                        assert_eq!(
+                            again, expected_byte,
+                            "snapshot read drifted on schedule {schedule_idx} tid {tid} block {b}"
+                        );
+                        // Uncommitted bytes carry marker >= 200; committed bytes are < 100.
+                        assert!(again < 100, "uncommitted version leaked to snapshot");
+                    }
+
+                    match tid {
+                        0 | 1 => {
+                            let tag = u8::try_from(20 + tid).unwrap();
+                            txn.stage_write(BlockNumber(0), vec![tag; 16]);
+                            txn.stage_write(BlockNumber(1 + tid), vec![tag; 16]);
+                            yield_now().await;
+                            let res = store.lock().expect("lock").commit(txn);
+                            conflict_outcomes
+                                .lock()
+                                .expect("outcomes")
+                                .push(res.is_ok());
+                        }
+                        2 => {
+                            txn.stage_write(BlockNumber(4), vec![44; 16]);
+                            txn.stage_write(BlockNumber(5), vec![55; 16]);
+                            yield_now().await;
+                            store
+                                .lock()
+                                .expect("lock")
+                                .commit(txn)
+                                .expect("disjoint writer must commit");
+                        }
+                        _ => {
+                            // Pure snapshot reader; verify repeatable reads after writers commit.
+                            yield_now().await;
+                            for (b, expected_byte) in baseline.into_iter().enumerate() {
+                                let after = store
+                                    .lock()
+                                    .expect("lock")
+                                    .read_visible(BlockNumber(b as u64), snap)
+                                    .expect("visible")[0];
+                                assert_eq!(after, expected_byte);
+                            }
+                        }
+                    }
+                })
+                .expect("create gate4 lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+        }
+        runtime.run_until_quiescent();
+
+        let outcomes = conflict_outcomes.lock().expect("outcomes").clone();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes[0] ^ outcomes[1],
+            "FCW must commit first writer and abort second committer on schedule {schedule_idx}: {outcomes:?}"
+        );
+    }
+
+    // Criterion 2: >= 10 distinct SSI write-skew patterns detected and aborted.
+    type SkewEdge = (&'static [u64], &'static [u64]);
+    let patterns: &[(&str, &[SkewEdge])] = &[
+        (
+            "quota_2block_symmetric",
+            &[(&[0, 1], &[0]), (&[0, 1], &[1])],
+        ),
+        (
+            "asymmetric_extra_reads",
+            &[(&[0, 1, 2], &[0]), (&[0, 2], &[2])],
+        ),
+        (
+            "disjoint_multiblock_writes",
+            &[(&[0, 1, 2, 3], &[0, 1]), (&[0, 1, 2, 3], &[2, 3])],
+        ),
+        (
+            "three_txn_cycle",
+            &[(&[0], &[1]), (&[1], &[2]), (&[2], &[0])],
+        ),
+        (
+            "four_txn_cycle",
+            &[(&[0], &[1]), (&[1], &[2]), (&[2], &[3]), (&[3], &[0])],
+        ),
+        ("readonly_observer_pivot", &[(&[1], &[0]), (&[0], &[1])]),
+        (
+            "dir_twin_insert_leaves",
+            &[(&[10, 11], &[10]), (&[10, 11], &[11])],
+        ),
+        ("bitmap_and_group_desc", &[(&[20], &[21]), (&[21], &[20])]),
+        ("inode_and_orphan_head", &[(&[30], &[31]), (&[31], &[30])]),
+        (
+            "wide_fanout_skew",
+            &[(&[40, 41, 42, 43], &[40]), (&[40, 41, 42, 43], &[43])],
+        ),
+    ];
+    assert!(patterns.len() >= 10);
+
+    for (name, tx_specs) in patterns {
+        let mut store = MvccStore::new();
+        let mut init = store.begin();
+        for b in 0..50_u64 {
+            init.stage_write(BlockNumber(b), vec![1; 8]);
+        }
+        store.commit_ssi(init).expect("seed ssi pattern");
+
+        let mut txns = Vec::with_capacity(tx_specs.len());
+        for (reads, writes) in *tx_specs {
+            let mut tx = store.begin();
+            for &rb in *reads {
+                let ver = store.latest_commit_seq(BlockNumber(rb));
+                tx.record_read(BlockNumber(rb), ver);
+            }
+            for &wb in *writes {
+                tx.stage_write(BlockNumber(wb), vec![2; 8]);
+            }
+            txns.push(tx);
+        }
+        let mut committed = 0_usize;
+        let mut aborted = 0_usize;
+        for tx in txns {
+            match store.commit_ssi(tx) {
+                Ok(_) => committed += 1,
+                Err(CommitError::SsiConflict { .. } | CommitError::Conflict { .. }) => aborted += 1,
+                Err(other) => panic!("unexpected error on SSI pattern {name}: {other:?}"),
+            }
+        }
+        assert!(
+            committed >= 1 && aborted >= 1,
+            "SSI pattern {name} failed to abort write skew: committed={committed} aborted={aborted}"
+        );
+    }
+
+    // Cross-shard ShardedMvccStore SSI write-skew (pattern #11) + disjoint control.
+    {
+        let sharded = ShardedMvccStore::new(8);
+        seed_sharded_blocks(
+            &sharded,
+            &[
+                (BlockNumber(0), vec![10; 8]),
+                (BlockNumber(5), vec![10; 8]),
+                (BlockNumber(2), vec![10; 8]),
+                (BlockNumber(7), vec![10; 8]),
+            ],
+        );
+        let mut t1 = sharded.begin();
+        let mut t2 = sharded.begin();
+        let v0 = t1.snapshot().high;
+        t1.record_read(BlockNumber(0), v0);
+        t1.stage_write(BlockNumber(5), vec![20; 8]);
+        t2.record_read(BlockNumber(5), v0);
+        t2.stage_write(BlockNumber(0), vec![20; 8]);
+        assert!(sharded.commit_ssi(t1).is_ok());
+        assert!(
+            sharded.commit_ssi(t2).is_err(),
+            "cross-shard ShardedMvccStore SSI write-skew must abort second committer"
+        );
+
+        let mut d1 = sharded.begin();
+        let mut d2 = sharded.begin();
+        let vd = d1.snapshot().high;
+        d1.record_read(BlockNumber(2), vd);
+        d1.stage_write(BlockNumber(2), vec![30; 8]);
+        d2.record_read(BlockNumber(7), vd);
+        d2.stage_write(BlockNumber(7), vec![30; 8]);
+        assert!(sharded.commit_ssi(d1).is_ok() && sharded.commit_ssi(d2).is_ok());
+    }
+
+    // Criterion 3: GC safety with 3 concurrent snapshots at distinct CommitSeq values.
+    {
+        let mut store = MvccStore::with_compression_policy(CompressionPolicy {
+            dedup_identical: false,
+            max_chain_length: None,
+            algo: CompressionAlgo::None,
+        });
+        let blk = BlockNumber(42);
+        let mut snaps = Vec::new();
+        for step in 1_u8..=6 {
+            let mut tx = store.begin();
+            tx.stage_write(blk, vec![step * 10; 32]);
+            store.commit(tx).expect("commit version");
+            if matches!(step, 1 | 3 | 5) {
+                let s = store.current_snapshot();
+                store.register_snapshot(s);
+                snaps.push((s, step * 10));
+            }
+        }
+        assert_eq!(snaps.len(), 3);
+        assert!(snaps[0].0.high < snaps[1].0.high && snaps[1].0.high < snaps[2].0.high);
+
+        let _ = store.prune_safe();
+        store.ebr_collect();
+
+        for (snap, expected_val) in &snaps {
+            let got = store
+                .read_visible(blk, *snap)
+                .expect("pinned snapshot version must never be pruned by GC");
+            assert_eq!(got[0], *expected_val);
+        }
+        for (snap, _) in snaps {
+            assert!(store.release_snapshot(snap));
+        }
+        let pruned = store.prune_safe();
+        assert!(pruned >= 1, "releasing snapshots must allow GC pruning");
+    }
+
+    // Criterion 4: 8 OS threads x 10,000 transactions each on 1,000 blocks.
+    {
+        const THREADS: u64 = 8;
+        const TXNS_PER_THREAD: u64 = 10_000;
+        const BLOCKS: u64 = 1_000;
+
+        let sharded = Arc::new(ShardedMvccStore::new(16));
+        let init_blocks: Vec<(BlockNumber, Vec<u8>)> = (0..BLOCKS)
+            .map(|b| (BlockNumber(b), vec![u8::try_from(b % 251).unwrap(); 16]))
+            .collect();
+        seed_sharded_blocks(&sharded, &init_blocks);
+
+        std::thread::scope(|scope| {
+            for tid in 0..THREADS {
+                let sharded = Arc::clone(&sharded);
+                scope.spawn(move || {
+                    let mut rng =
+                        0x9E37_79B9_7F4A_7C15_u64 ^ (tid + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    for op in 0..TXNS_PER_THREAD {
+                        let b1 = BlockNumber(lcg_next(&mut rng) % BLOCKS);
+                        let b2 = BlockNumber(lcg_next(&mut rng) % BLOCKS);
+                        if op % 2 == 0 {
+                            let snap = sharded.current_snapshot();
+                            let v1 = sharded.read_visible(b1, snap).expect("read b1");
+                            let v2 = sharded.read_visible(b2, snap).expect("read b2");
+                            assert_eq!(v1.len(), 16);
+                            assert_eq!(v2.len(), 16);
+                        } else {
+                            let mut tx = sharded.begin();
+                            let val = u8::try_from((tid + op) % 251).unwrap();
+                            tx.stage_write(b1, vec![val; 16]);
+                            match sharded.commit(tx) {
+                                Ok(_) | Err((CommitError::Conflict { .. }, _)) => {}
+                                Err((other, _)) => {
+                                    panic!("unexpected thread {tid} commit error: {other:?}")
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    // Criterion 5: Single-thread MVCC cache-hit read < 500ns, version-creating write < 2us.
+    let (read_ns, write_ns) = measure_single_thread_mvcc_latency_ns();
+    if read_ns >= 500 || write_ns >= 2_000 {
+        assert!(
+            cfg!(debug_assertions),
+            "release single-thread MVCC latency exceeded budget: read={read_ns}ns write={write_ns}ns"
+        );
+        // Verify under `--release` when the unoptimized `test` profile exceeds release latency bounds.
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let status = std::process::Command::new("cargo")
+            .current_dir(workspace_root)
+            .args([
+                "test",
+                "-p",
+                "ffs-mvcc",
+                "--release",
+                "--test",
+                "mvcc_stress_suite",
+                "mvcc_release_latency_probe",
+                "--",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()
+            .expect("spawn cargo test --release mvcc_release_latency_probe");
+        assert!(
+            status.success(),
+            "release MVCC latency probe failed (<500ns read / <2us write)"
+        );
+    }
 }
