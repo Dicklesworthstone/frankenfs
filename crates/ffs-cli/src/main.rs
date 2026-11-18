@@ -165,8 +165,9 @@ pub fn cli_cx() -> Cx {
     static CLI_RUNTIME: std::sync::OnceLock<asupersync::runtime::Runtime> =
         std::sync::OnceLock::new();
     let runtime = CLI_RUNTIME.get_or_init(|| {
-        asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(0, 0)
+        asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .blocking_threads(0, 8)
             .build()
             .expect("ffs-cli runtime must initialize")
     });
@@ -7770,6 +7771,7 @@ fn validate_mount_adaptive_runtime_request_with_config(
 }
 
 fn mount_with_fuse(
+    cx: &Cx,
     open_fs: Arc<OpenFs>,
     mountpoint: &Path,
     options: &MountCmdOptions,
@@ -7813,7 +7815,7 @@ fn mount_with_fuse(
     }
 
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
-    ffs_fuse::mount(fs_ops, mountpoint, &opts)
+    ffs_fuse::mount(cx, fs_ops, mountpoint, &opts)
         .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
 }
 
@@ -7968,7 +7970,11 @@ fn per_core_transport_aggregate(
     }
 }
 
-fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>) -> Result<()> {
+fn mount_with_managed_fuse(
+    cx: &Cx,
+    open_fs: Arc<OpenFs>,
+    params: &ManagedMountParams<'_>,
+) -> Result<()> {
     let mount_started = std::time::SystemTime::now();
     let filesystem = match &open_fs.flavor {
         FsFlavor::Ext4(_) => "ext4",
@@ -7991,6 +7997,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
+        commit_interval: Some(std::time::Duration::ZERO),
     };
 
     info!(
@@ -8005,7 +8012,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
 
     let fs_for_console = Arc::clone(&open_fs);
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
-    let handle = mount_managed(fs_ops, params.mountpoint, &config).with_context(|| {
+    let handle = mount_managed(cx, fs_ops, params.mountpoint, &config).with_context(|| {
         format!(
             "FUSE managed mount failed at {}",
             params.mountpoint.display()
@@ -8244,7 +8251,11 @@ fn emit_per_core_mount_console(
     )
 }
 
-fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>) -> Result<()> {
+fn mount_with_per_core_fuse(
+    cx: &Cx,
+    open_fs: Arc<OpenFs>,
+    params: &ManagedMountParams<'_>,
+) -> Result<()> {
     use ffs_fuse::per_core::PerCoreConfig;
 
     let mount_started = std::time::SystemTime::now();
@@ -8281,16 +8292,18 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
+        commit_interval: Some(std::time::Duration::ZERO),
     };
 
     let fs_for_console = Arc::clone(&open_fs);
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
-    let handle = mount_managed_per_core(fs_ops, params.mountpoint, &config).with_context(|| {
-        format!(
-            "FUSE per-core mount failed at {}",
-            params.mountpoint.display()
-        )
-    })?;
+    let handle =
+        mount_managed_per_core(cx, fs_ops, params.mountpoint, &config).with_context(|| {
+            format!(
+                "FUSE per-core mount failed at {}",
+                params.mountpoint.display()
+            )
+        })?;
 
     wire_ctrlc_shutdown(&handle)?;
 
@@ -8837,7 +8850,7 @@ fn run_native_mount_background_scrub_daemon(
             let elapsed = Duration::from_nanos(now.duration_since(previous));
             let remaining = effective.saturating_sub(elapsed);
             if !remaining.is_zero() {
-                std::thread::sleep(remaining.min(tick));
+                mount_worker::sleep_with_cx(cx, remaining.min(tick));
                 continue;
             }
             if cx.checkpoint().is_err() {
@@ -9687,8 +9700,13 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     let mount_result = (|| -> Result<()> {
         match runtime.mode {
             MountRuntimeMode::Standard => {
-                let metrics =
-                    mount_with_fuse(Arc::clone(&open_fs), mountpoint, options, auto_unmount)?;
+                let metrics = mount_with_fuse(
+                    &background_cx,
+                    Arc::clone(&open_fs),
+                    mountpoint,
+                    options,
+                    auto_unmount,
+                )?;
                 // bd-viil0: emit the same shutdown metrics line the managed runtime emits.
                 // Without this the standard runtime — the one the mounted comparator
                 // actually uses — produced no `mount_dispatch_metrics` at all, so every
@@ -9755,9 +9773,9 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                     scenario_id,
                 };
                 if runtime.mode == MountRuntimeMode::PerCore {
-                    mount_with_per_core_fuse(Arc::clone(&open_fs), &params)?;
+                    mount_with_per_core_fuse(&background_cx, Arc::clone(&open_fs), &params)?;
                 } else {
-                    mount_with_managed_fuse(Arc::clone(&open_fs), &params)?;
+                    mount_with_managed_fuse(&background_cx, Arc::clone(&open_fs), &params)?;
                 }
             }
         }

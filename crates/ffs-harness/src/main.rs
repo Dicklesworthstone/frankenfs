@@ -993,7 +993,8 @@ fn profile_read_path_iteration(
             if cached_fuse.is_none() {
                 let fs = OpenFs::open_with_options(cx, &args.fixture, &OpenOptions::default())
                     .with_context(|| format!("open fixture {}", args.fixture.display()))?;
-                let fuse = FrankenFuse::with_options(
+                let fuse = FrankenFuse::with_options_and_cx(
+                    cx,
                     Box::new(fs),
                     &MountOptions {
                         read_only: true,
@@ -1024,8 +1025,9 @@ fn profile_read_path_cmd(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .blocking_threads(0, 0)
+    let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .blocking_threads(0, 2)
         .build()
         .map_err(|err| anyhow::anyhow!("failed to build harness runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);

@@ -490,7 +490,8 @@ fn classify_mount_path(data: &[u8]) -> MountPathOutcome {
         read_only,
         ..MountOptions::default()
     };
-    let fuse = FrankenFuse::with_options(Box::new(fs), &options);
+    let cx = asupersync::Cx::for_testing();
+    let fuse = FrankenFuse::with_options_and_cx(&cx, Box::new(fs), &options);
 
     MountPathOutcome {
         lookup: attr_outcome(fuse.lookup_for_fuzzing(lookup_parent, &lookup_name)),

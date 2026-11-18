@@ -168,19 +168,33 @@ fn build_read_cache(
     ArcCache::new(block_dev, capacity).expect("read cache")
 }
 
+fn test_daemon_runtime() -> (asupersync::runtime::Runtime, Cx) {
+    let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .blocking_threads(0, 2)
+        .build()
+        .expect("test daemon runtime");
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    (runtime, cx)
+}
+
 #[test]
 fn scenario_1_basic_flush_correctness() {
+    let (_rt, daemon_cx) = test_daemon_runtime();
     let cx = Cx::for_testing();
     let shared = SharedMemoryByteDevice::new(BLOCK_SIZE as usize * 1600);
     let cache = Arc::new(build_writeback_cache(shared.clone(), 1200));
     let daemon = cache
-        .start_flush_daemon(FlushDaemonConfig {
-            interval: Duration::from_millis(20),
-            batch_size: 256,
-            high_watermark: 0.99,
-            critical_watermark: 1.0,
-            ..FlushDaemonConfig::default()
-        })
+        .start_flush_daemon(
+            &daemon_cx,
+            FlushDaemonConfig {
+                interval: Duration::from_millis(20),
+                batch_size: 256,
+                high_watermark: 0.99,
+                critical_watermark: 1.0,
+                ..FlushDaemonConfig::default()
+            },
+        )
         .expect("start flush daemon");
 
     let mut checksums = HashMap::new();
@@ -206,15 +220,19 @@ fn scenario_1_basic_flush_correctness() {
 
 #[test]
 fn scenario_2_clean_unmount_flushes_everything() {
+    let (_rt, daemon_cx) = test_daemon_runtime();
     let cx = Cx::for_testing();
     let shared = SharedMemoryByteDevice::new(BLOCK_SIZE as usize * 900);
     let cache = Arc::new(build_writeback_cache(shared.clone(), 700));
     let daemon = cache
-        .start_flush_daemon(FlushDaemonConfig {
-            interval: Duration::from_secs(2),
-            batch_size: 64,
-            ..FlushDaemonConfig::default()
-        })
+        .start_flush_daemon(
+            &daemon_cx,
+            FlushDaemonConfig {
+                interval: Duration::from_secs(2),
+                batch_size: 64,
+                ..FlushDaemonConfig::default()
+            },
+        )
         .expect("start flush daemon");
 
     let mut checksums = HashMap::new();
@@ -345,18 +363,22 @@ fn scenario_4_abort_discards_dirty_blocks() {
 
 #[test]
 fn scenario_5_backpressure_under_load() {
+    let (_rt, daemon_cx) = test_daemon_runtime();
     let cache = Arc::new(build_writeback_cache(
         SharedMemoryByteDevice::new(BLOCK_SIZE as usize * 2048),
         16,
     ));
     let daemon = cache
-        .start_flush_daemon(FlushDaemonConfig {
-            interval: Duration::from_millis(10),
-            batch_size: 4,
-            high_watermark: 0.5,
-            critical_watermark: 0.75,
-            ..FlushDaemonConfig::default()
-        })
+        .start_flush_daemon(
+            &daemon_cx,
+            FlushDaemonConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 4,
+                high_watermark: 0.5,
+                critical_watermark: 0.75,
+                ..FlushDaemonConfig::default()
+            },
+        )
         .expect("start flush daemon");
 
     let writer = {
@@ -389,15 +411,19 @@ fn scenario_5_backpressure_under_load() {
 
 #[test]
 fn scenario_6_concurrent_transactions_and_flush() {
+    let (_rt, daemon_cx) = test_daemon_runtime();
     let cx = Cx::for_testing();
     let shared = SharedMemoryByteDevice::new(BLOCK_SIZE as usize * 2048);
     let cache = Arc::new(build_writeback_cache(shared.clone(), 512));
     let daemon = cache
-        .start_flush_daemon(FlushDaemonConfig {
-            interval: Duration::from_millis(10),
-            batch_size: 64,
-            ..FlushDaemonConfig::default()
-        })
+        .start_flush_daemon(
+            &daemon_cx,
+            FlushDaemonConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 64,
+                ..FlushDaemonConfig::default()
+            },
+        )
         .expect("start flush daemon");
 
     let mut handles = Vec::new();

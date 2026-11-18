@@ -2670,6 +2670,80 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
         Ok(())
     }
 
+    /// Run continuously in an async region task until cancellation is requested.
+    ///
+    /// Uses `asupersync::time::timeout` + cancel-waker wakeup for idle intervals
+    /// so `LabRuntime` virtual time advances deterministically without blocking threads.
+    pub async fn run_until_cancelled_async(&mut self, cx: &Cx) -> Result<ScrubDaemonMetrics>
+    where
+        W: Send,
+    {
+        info!(
+            target: "ffs::repair::daemon",
+            total_groups = self.pipeline.groups.len(),
+            interval_secs = self.config.interval.as_secs_f64(),
+            budget_poll_quota_threshold = self.config.budget_poll_quota_threshold,
+            backpressure_threshold = self.config.backpressure_headroom_threshold,
+            "scrub_daemon_start"
+        );
+
+        loop {
+            if cx.checkpoint().is_err() {
+                info!(
+                    target: "ffs::repair::daemon",
+                    reason = "cancelled",
+                    blocks_scanned_total = self.metrics.blocks_scanned_total,
+                    blocks_corrupt_found = self.metrics.blocks_corrupt_found,
+                    blocks_recovered = self.metrics.blocks_recovered,
+                    blocks_unrecoverable = self.metrics.blocks_unrecoverable,
+                    scrub_rounds_completed = self.metrics.scrub_rounds_completed,
+                    "scrub_daemon_stop"
+                );
+                return Ok(self.metrics.clone());
+            }
+
+            let tick_started = cx.now();
+            match self.run_once(cx) {
+                Ok(_) => {}
+                Err(FfsError::Cancelled) => {
+                    info!(
+                        target: "ffs::repair::daemon",
+                        reason = "cancelled",
+                        blocks_scanned_total = self.metrics.blocks_scanned_total,
+                        blocks_corrupt_found = self.metrics.blocks_corrupt_found,
+                        blocks_recovered = self.metrics.blocks_recovered,
+                        blocks_unrecoverable = self.metrics.blocks_unrecoverable,
+                        scrub_rounds_completed = self.metrics.scrub_rounds_completed,
+                        "scrub_daemon_stop"
+                    );
+                    return Ok(self.metrics.clone());
+                }
+                Err(err) => return Err(err),
+            }
+
+            let tick_elapsed = Duration::from_nanos(cx.now().duration_since(tick_started));
+            let divisor = self.pipeline.max_recommended_interval_divisor();
+            let effective_interval = self.config.interval / divisor;
+            let idle = effective_interval.saturating_sub(tick_elapsed);
+            if let Err(err) = sleep_with_checkpoint_async(cx, idle).await {
+                if matches!(err, FfsError::Cancelled) {
+                    info!(
+                        target: "ffs::repair::daemon",
+                        reason = "cancelled",
+                        blocks_scanned_total = self.metrics.blocks_scanned_total,
+                        blocks_corrupt_found = self.metrics.blocks_corrupt_found,
+                        blocks_recovered = self.metrics.blocks_recovered,
+                        blocks_unrecoverable = self.metrics.blocks_unrecoverable,
+                        scrub_rounds_completed = self.metrics.scrub_rounds_completed,
+                        "scrub_daemon_stop"
+                    );
+                    return Ok(self.metrics.clone());
+                }
+                return Err(err);
+            }
+        }
+    }
+
     fn sleep_with_checkpoint(&self, cx: &Cx, duration: Duration) -> Result<()> {
         if duration.is_zero() {
             return Ok(());
@@ -2686,6 +2760,14 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
             return Err(FfsError::Cancelled);
         }
 
+        if cx.timer_driver().is_some()
+            && asupersync::runtime::Runtime::current_handle().is_some()
+            && Cx::current().is_none()
+        {
+            let _ambient = Cx::set_current(Some(cx.clone()));
+            return ffs_block::block_on_park(sleep_with_checkpoint_async(cx, duration));
+        }
+
         let mut remaining = duration;
         while !remaining.is_zero() {
             let slice = remaining.min(self.config.cancel_check_interval);
@@ -2698,12 +2780,42 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
             {
                 return Err(FfsError::Cancelled);
             }
-            std::thread::sleep(slice);
+            std::thread::park_timeout(slice);
             remaining = remaining.saturating_sub(slice);
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         }
         Ok(())
     }
+}
+
+async fn sleep_with_checkpoint_async(cx: &Cx, duration: Duration) -> Result<()> {
+    if duration.is_zero() {
+        return Ok(());
+    }
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    if Cx::current().is_some_and(|cur| cur.checkpoint().is_err()) {
+        return Err(FfsError::Cancelled);
+    }
+    let budget = cx.budget();
+    let now = cx.now();
+    if budget.is_past_deadline(now)
+        || budget
+            .remaining_time(now)
+            .is_some_and(|remaining| remaining <= duration)
+    {
+        return Err(FfsError::Cancelled);
+    }
+    let (_hold_tx, mut cancel_rx) = asupersync::channel::oneshot::channel::<()>();
+    if asupersync::time::timeout(now, duration, cancel_rx.recv(cx))
+        .await
+        .is_ok()
+    {
+        return Err(FfsError::Cancelled);
+    }
+    if Cx::current().is_some_and(|cur| cur.checkpoint().is_err()) {
+        return Err(FfsError::Cancelled);
+    }
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -8558,5 +8670,213 @@ mod tests {
         assert!(last.null_rejected);
         assert_eq!(last.recommended_interval_divisor, 4);
         assert_eq!(last.recommended_overhead_bps, 1000);
+    }
+
+    #[test]
+    fn lab_runtime_unmount_during_active_scrub_decode_reaches_bounded_quiescence_bd_in31y() {
+        use asupersync::lab::{LabConfig, LabRuntime};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct DecodeCancellingDevice {
+            inner: MemBlockDevice,
+            source_count: u32,
+            mount_cx: Cx,
+            decode_reads: Arc<AtomicUsize>,
+            post_close_ops: Arc<AtomicUsize>,
+            region_closed: Arc<AtomicBool>,
+        }
+
+        impl BlockDevice for DecodeCancellingDevice {
+            fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                if self.region_closed.load(Ordering::Acquire) {
+                    self.post_close_ops.fetch_add(1, Ordering::SeqCst);
+                }
+                //Blocks >= source_count are repair-symbol reads entered ONLY
+                // once ScrubWithRecovery detects corruption and starts RaptorQ
+                // fountain-code recovery/decode. Cancel the owning mount region
+                // mid-decode to prove bounded quiescence during active decode!
+                if block.0 >= u64::from(self.source_count) {
+                    let seen = self.decode_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                    if seen == 2 {
+                        self.mount_cx.cancel_with(
+                            asupersync::types::CancelKind::User,
+                            Some("unmount during active scrub decode"),
+                        );
+                    }
+                }
+                self.inner.read_block(cx, block)
+            }
+
+            fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                if self.region_closed.load(Ordering::Acquire) {
+                    self.post_close_ops.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.write_block(cx, block, data)
+            }
+
+            fn block_size(&self) -> u32 {
+                self.inner.block_size()
+            }
+
+            fn block_count(&self) -> u64 {
+                self.inner.block_count()
+            }
+
+            fn sync(&self, cx: &Cx) -> Result<()> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                if self.region_closed.load(Ordering::Acquire) {
+                    self.post_close_ops.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.sync(cx)
+            }
+        }
+
+        let seed_cx = Cx::for_testing();
+        let block_size = 256_u32;
+        let source_count = 16_u32;
+        let repair_blocks = 6_u32;
+        let total_blocks = source_count + repair_blocks + 4;
+        let base_device = MemBlockDevice::new(block_size, u64::from(total_blocks));
+        let layout = RepairGroupLayout::new(
+            GroupNumber(0),
+            BlockNumber(0),
+            total_blocks,
+            0,
+            repair_blocks,
+        )
+        .expect("layout");
+        write_source_blocks(&seed_cx, &base_device, BlockNumber(0), source_count);
+        bootstrap_storage(
+            &seed_cx,
+            &base_device,
+            layout,
+            BlockNumber(0),
+            source_count,
+            4,
+        );
+        // Corrupt two source blocks so ScrubDaemon enters real RaptorQ decode.
+        for corrupt in [BlockNumber(3), BlockNumber(9)] {
+            base_device
+                .write_block(&seed_cx, corrupt, &vec![0xEE; block_size as usize])
+                .expect("corrupt source block");
+        }
+
+        let decode_reads = Arc::new(AtomicUsize::new(0));
+        let post_close_ops = Arc::new(AtomicUsize::new(0));
+        let region_closed = Arc::new(AtomicBool::new(false));
+        let daemon_outcome = Arc::new(std::sync::Mutex::new(None::<Result<()>>));
+
+        let mut lab = LabRuntime::new(
+            LabConfig::new(0xBD13_175C)
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        let root_region = lab
+            .state
+            .create_root_region(asupersync::types::Budget::INFINITE);
+        let decode_reads_task = Arc::clone(&decode_reads);
+        let post_close_task = Arc::clone(&post_close_ops);
+        let region_closed_task = Arc::clone(&region_closed);
+        let outcome_task = Arc::clone(&daemon_outcome);
+        let (task_id, _handle) = lab
+            .state
+            .create_task(
+                root_region,
+                asupersync::types::Budget::INFINITE,
+                async move {
+                    let mount_cx = Cx::current().expect("LabRuntime sets current task Cx");
+                    let mount_region = ffs_block::OwnedChildRegion::open_async(&mount_cx)
+                        .await
+                        .expect("open mount child region in LabRuntime");
+                    let scrub_region = ffs_block::OwnedChildRegion::open_async(mount_region.cx())
+                        .await
+                        .expect("open scrub child region in LabRuntime");
+
+                    let mut daemon_task = scrub_region
+                        .spawn(move |daemon_cx| async move {
+                            let instrumented = DecodeCancellingDevice {
+                                inner: base_device,
+                                source_count,
+                                mount_cx,
+                                decode_reads: decode_reads_task,
+                                post_close_ops: post_close_task,
+                                region_closed: region_closed_task,
+                            };
+                            let validator = CorruptBlockValidator::new(vec![3, 9]);
+                            let group_cfg = GroupConfig {
+                                layout,
+                                source_first_block: BlockNumber(0),
+                                source_block_count: source_count,
+                            };
+                            let pipeline = ScrubWithRecovery::new(
+                                &instrumented,
+                                &validator,
+                                test_uuid(),
+                                vec![group_cfg],
+                                Vec::new(),
+                                4,
+                            );
+                            let mut daemon = ScrubDaemon::new(
+                                pipeline,
+                                ScrubDaemonConfig {
+                                    interval: Duration::from_secs(30),
+                                    cancel_check_interval: Duration::from_millis(5),
+                                    ..ScrubDaemonConfig::default()
+                                },
+                            );
+                            daemon.run_until_cancelled_async(&daemon_cx).await
+                        })
+                        .expect("spawn scrub daemon in scrub_region");
+
+                    let joined = ffs_block::join_task_uninterruptible(&mut daemon_task)
+                        .await
+                        .expect("scrub daemon task must complete without panic");
+                    *outcome_task.lock().expect("outcome lock") = Some(joined.map(|m| {
+                        assert_eq!(
+                            m.blocks_recovered, 0,
+                            "active RaptorQ decode must abort mid-decode before writing recovered blocks"
+                        );
+                    }));
+
+                    scrub_region.close_async().await;
+                    mount_region.close_async().await;
+                    region_closed.store(true, Ordering::Release);
+                },
+            )
+            .expect("create lab scrub decode task");
+        lab.scheduler.lock().schedule(task_id, 0);
+
+        let _vt = lab.run_with_auto_advance();
+        let report = lab.report();
+        assert!(
+            report.lab_test_passed(),
+            "LabRuntime oracle/quiescence failed during interrupted scrub decode: {report:?}"
+        );
+        assert!(
+            report.steps_total < 2_000,
+            "unmount during active scrub decode must reach quiescence within a tight step bound, got {}",
+            report.steps_total
+        );
+        assert!(
+            decode_reads.load(Ordering::SeqCst) >= 2,
+            "cancellation must fire during active RaptorQ repair/decode reads, got {}",
+            decode_reads.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            post_close_ops.load(Ordering::SeqCst),
+            0,
+            "no device I/O may run after mount region close"
+        );
+        assert!(
+            daemon_outcome
+                .lock()
+                .expect("outcome lock")
+                .as_ref()
+                .is_some_and(Result::is_ok),
+            "ScrubDaemon::run_until_cancelled_async must exit cleanly on mount cancellation"
+        );
     }
 }

@@ -155,7 +155,8 @@ fn syncfs_wire_request_requires_its_complete_payload() {
 
     for payload_len in 0..8 {
         let truncated = packet(50, 78, &vec![0; payload_len]);
-        let request = crate::ll::AnyRequest::try_from(&truncated[..header_len + payload_len]).unwrap();
+        let request =
+            crate::ll::AnyRequest::try_from(&truncated[..header_len + payload_len]).unwrap();
         assert!(request.operation().is_err(), "payload length {payload_len}");
     }
 }
@@ -215,14 +216,20 @@ fn deferred_reply_retains_tracking_and_interrupt_has_no_success_ack() {
     assert_eq!(reply_header(&wire.replies.lock().unwrap()[0]), (7, -EINTR));
     assert!(!session.interrupts.interrupt(7));
     dispatch(&mut session, &wire, &interrupt_packet(103, 7)[..]);
-    assert_eq!(reply_header(&wire.replies.lock().unwrap()[1]), (103, -EAGAIN));
+    assert_eq!(
+        reply_header(&wire.replies.lock().unwrap()[1]),
+        (103, -EAGAIN)
+    );
 }
 
 #[test]
 fn early_interrupt_requests_retry_and_then_targets_the_original() {
     let (mut session, wire) = session();
     dispatch(&mut session, &wire, &interrupt_packet(100, 7)[..]);
-    assert_eq!(reply_header(&wire.replies.lock().unwrap()[0]), (100, -EAGAIN));
+    assert_eq!(
+        reply_header(&wire.replies.lock().unwrap()[0]),
+        (100, -EAGAIN)
+    );
     dispatch(&mut session, &wire, &read_packet(7)[..]);
     dispatch(&mut session, &wire, &interrupt_packet(101, 7)[..]);
     assert_eq!(session.filesystem.notifications.load(Ordering::SeqCst), 1);
@@ -253,7 +260,10 @@ fn abandoned_or_failed_original_replies_release_registration() {
         // removed the lookup. A retained handle must not keep it cancellable.
         assert!(session.filesystem.token.lock().unwrap().is_some());
         if !fail_send {
-            assert_eq!(reply_header(&wire.replies.lock().unwrap()[0]), (7, -libc::EIO));
+            assert_eq!(
+                reply_header(&wire.replies.lock().unwrap()[0]),
+                (7, -libc::EIO)
+            );
         }
     }
 }
@@ -336,14 +346,21 @@ fn completed_mutation_result_is_not_rewritten_as_interrupted() {
     let replies = wire.replies.lock().unwrap();
     assert_eq!(session.filesystem.writes.load(Ordering::SeqCst), 1);
     assert_eq!(reply_header(&replies[0]), (9, 0));
-    assert_eq!(u32::from_ne_bytes(replies[0][16..20].try_into().unwrap()), 3);
+    assert_eq!(
+        u32::from_ne_bytes(replies[0][16..20].try_into().unwrap()),
+        3
+    );
     assert_eq!(reply_header(&replies[1]), (100, -EAGAIN));
 }
 
 #[test]
 fn no_reply_forget_does_not_leave_an_outstanding_registration() {
     let (mut session, wire) = session();
-    dispatch(&mut session, &wire, &packet(2, 17, &1_u64.to_ne_bytes())[..]);
+    dispatch(
+        &mut session,
+        &wire,
+        &packet(2, 17, &1_u64.to_ne_bytes())[..],
+    );
     assert!(!session.interrupts.interrupt(17));
     assert!(wire.replies.lock().unwrap().is_empty());
 }

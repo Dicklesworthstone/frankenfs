@@ -336,20 +336,28 @@ pub struct Mount {
     mountpoint: CString,
     auto_unmount_socket: Option<AutoUnmountHelper>,
     fuse_device: Option<Arc<File>>,
-    read_only_view: Option<ReadOnlyUnmountView>,
+    read_only_auto_unmount: bool,
+    unmount_view: Option<ReadOnlyUnmountView>,
 }
 impl Mount {
     pub fn new(mountpoint: &Path, options: &[MountOption]) -> io::Result<(Arc<File>, Mount)> {
         let mountpoint = mountpoint.canonicalize()?;
+        let is_ro_auto = read_only_auto_unmount(options);
         // Capture only the namespace/root view, before creating the mount.
-        // This holds no reference to the mounted FUSE root.
-        let mut read_only_view = if read_only_auto_unmount(options) {
+        // This holds no reference to the mounted FUSE root and lets both
+        // read-only and writable auto-unmount paths confirm whether our exact
+        // `(mount_id, major:minor)` remains unobscured if AppArmor confines
+        // fusermount3's auto_unmount namespace helper.
+        let mut unmount_view = if cfg!(target_os = "linux")
+            && options.contains(&MountOption::AutoUnmount)
+            && !block_mount_requested(options)
+        {
             Some(ReadOnlyUnmountView::new(&mountpoint)?)
         } else {
             None
         };
         let (file, sock) = fuse_mount_pure(mountpoint.as_os_str(), options)?;
-        if let Some(view) = read_only_view.as_mut() {
+        if let Some(view) = unmount_view.as_mut() {
             view.capture_mounted_identity()?;
         }
         let file = Arc::new(file);
@@ -359,20 +367,24 @@ impl Mount {
                 mountpoint: CString::new(mountpoint.as_os_str().as_bytes())?,
                 auto_unmount_socket: sock,
                 fuse_device: Some(file),
-                read_only_view,
+                read_only_auto_unmount: is_ro_auto,
+                unmount_view,
             },
         ))
     }
 
     pub(crate) fn can_close_read_only(&self) -> bool {
-        self.read_only_view.is_some()
+        self.read_only_auto_unmount && self.unmount_view.is_some()
     }
 
     /// Dispatch and external notifier owners must retire before this call.
     #[cfg(target_os = "linux")]
     pub(crate) fn finish_read_only_auto_unmount(mut self, timeout: Duration) -> io::Result<()> {
         let started = Instant::now();
-        if self.read_only_view.is_none() || self.auto_unmount_socket.is_none() {
+        if !self.read_only_auto_unmount
+            || self.unmount_view.is_none()
+            || self.auto_unmount_socket.is_none()
+        {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "read-only auto-unmount was not negotiated",
@@ -404,7 +416,7 @@ impl Mount {
         let mut helper = self.auto_unmount_socket.take().unwrap();
         let helper_pid = helper.child.id();
         helper.finish(timeout.saturating_sub(started.elapsed()))?;
-        let view = self.read_only_view.as_mut().unwrap();
+        let view = self.unmount_view.as_mut().unwrap();
         let Err(detach_err) = view.confirm_detached(helper_pid) else {
             return Ok(());
         };
@@ -457,10 +469,28 @@ impl Drop for Mount {
         }
         if let Some(mut helper) = mem::take(&mut self.auto_unmount_socket) {
             // The original connection may survive a lazy detach while another
-            // filesystem occupies this path. Only the original auto-unmount
-            // helper may clean it up; a pathname fallback can unmount its
-            // replacement. A failed helper must remain a reported join failure.
-            drop(helper.socket.take());
+            // filesystem occupies this path. Only detach via `fusermount3 -u`
+            // if the auto-unmount helper exited (e.g. Ubuntu 24.04 AppArmor
+            // blocking `MS_SLAVE` in check_is_mount) AND mountinfo proves our
+            // exact `(mount_id, major:minor)` is still unobscured at this path.
+            let _ = helper.finish(Duration::from_secs(5));
+            #[cfg(target_os = "linux")]
+            if let Some(view) = self.unmount_view.as_mut()
+                && let Some(identity) = view.mounted_identity.clone()
+                && view
+                    .read_records()
+                    .and_then(|records| {
+                        is_unobscured_owned_mount(
+                            &records,
+                            &view.encoded_path,
+                            &identity.mount_id,
+                            &identity.major_minor,
+                        )
+                    })
+                    .unwrap_or(false)
+            {
+                let _ = unmount_aborted_owned_mount(&self.mountpoint, Duration::from_secs(5));
+            }
             return;
         }
         if let Err(err) = super::libc_umount(&self.mountpoint) {
@@ -698,7 +728,10 @@ fn fuse_mount_fusermount(
             drop(receive_socket);
             let output = fusermount_child.wait_with_output().unwrap();
             let stderr_string = String::from_utf8_lossy(&output.stderr).to_string();
-            return if stderr_string.contains("only allowed if 'user_allow_other' is set") {
+            return if stderr_string.contains("only allowed if 'user_allow_other' is set")
+                || stderr_string.contains("Permission denied")
+                || stderr_string.contains("Operation not permitted")
+            {
                 Err(io::Error::new(ErrorKind::PermissionDenied, stderr_string))
             } else {
                 Err(io::Error::other(stderr_string))
@@ -1049,7 +1082,8 @@ mod block_mount_tests {
                 mountpoint: CString::new(root.path().as_os_str().as_bytes()).unwrap(),
                 auto_unmount_socket: Some(helper),
                 fuse_device: Some(device),
-                read_only_view: Some(ReadOnlyUnmountView::new(root.path()).unwrap()),
+                read_only_auto_unmount: true,
+                unmount_view: Some(ReadOnlyUnmountView::new(root.path()).unwrap()),
             };
             let result = mount.finish_read_only_auto_unmount(Duration::from_secs(1));
             if retained {

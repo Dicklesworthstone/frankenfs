@@ -3742,6 +3742,14 @@ mod bd_tqrnc {
             .is_ok()
     }
 
+    fn fuse_mount_tempdir() -> tempfile::TempDir {
+        if Path::new("/tmp").is_dir() {
+            tempfile::tempdir_in("/tmp").unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
+        }
+    }
+
     fn verify_set(
         cx: &Cx,
         manifest: &Path,
@@ -3779,6 +3787,32 @@ mod bd_tqrnc {
         let mounted = std::thread::scope(|scope| {
             let serve_rt = &runtime;
             let serve_stopped = Arc::clone(&stopped);
+            struct ScopeShutdownGuard<'a> {
+                stopped: &'a AtomicBool,
+                shutdown: &'a Mutex<Option<Arc<AtomicBool>>>,
+                mountpoint: PathBuf,
+                armed: bool,
+            }
+            impl Drop for ScopeShutdownGuard<'_> {
+                fn drop(&mut self) {
+                    if !self.armed {
+                        return;
+                    }
+                    self.stopped.store(true, Ordering::Release);
+                    if let Some(flag) = self.shutdown.lock().unwrap().as_ref() {
+                        flag.store(true, Ordering::Release);
+                    }
+                    let _ = std::process::Command::new("fusermount3")
+                        .args(["-u", "-z"])
+                        .arg(&self.mountpoint)
+                        .output();
+                    let _ = std::process::Command::new("umount")
+                        .arg("-l")
+                        .arg(&self.mountpoint)
+                        .output();
+                }
+            }
+
             let serve_shutdown = Arc::clone(&shutdown);
             let worker = scope.spawn(move || {
                 super::serve(
@@ -3790,13 +3824,24 @@ mod bd_tqrnc {
                     &serve_shutdown,
                 )
             });
+            let mut scope_guard = ScopeShutdownGuard {
+                stopped: &stopped,
+                shutdown: &shutdown,
+                mountpoint: mountpoint.clone(),
+                armed: true,
+            };
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut last_rd_err: Option<std::io::Error> = None;
             loop {
-                if shutdown.lock().unwrap().is_some() && std::fs::read_dir(&mountpoint).is_ok() {
-                    break;
+                if shutdown.lock().unwrap().is_some() {
+                    match std::fs::read_dir(&mountpoint) {
+                        Ok(_) => break,
+                        Err(err) => last_rd_err = Some(err),
+                    }
                 }
                 if worker.is_finished() {
+                    scope_guard.armed = false;
                     let res = worker.join().expect("join serve thread");
                     if !require_e2e
                         && let Err(ref err) = res
@@ -3810,22 +3855,56 @@ mod bd_tqrnc {
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "timed out waiting for live /dev/fuse protected mount at {}",
+                    "timed out waiting for live /dev/fuse protected mount at {} (last read_dir err: {last_rd_err:?})",
                     mountpoint.display()
                 );
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
 
-            work(&mountpoint);
+            let work_done = Arc::new(AtomicBool::new(false));
+            let wd_done = Arc::clone(&work_done);
+            let wd_shutdown = Arc::clone(&shutdown);
+            let wd_mnt = mountpoint.clone();
+            let watchdog = scope.spawn(move || {
+                let wd_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !wd_done.load(Ordering::Acquire) {
+                    if std::time::Instant::now() >= wd_deadline {
+                        eprintln!(
+                            "WATCHDOG: live FUSE work exceeded 30s at {}; forcing unmount",
+                            wd_mnt.display()
+                        );
+                        if let Some(flag) = wd_shutdown.lock().unwrap().as_ref() {
+                            flag.store(true, Ordering::Release);
+                        }
+                        let _ = std::process::Command::new("fusermount3")
+                            .args(["-u", "-z"])
+                            .arg(&wd_mnt)
+                            .output();
+                        let _ = std::process::Command::new("umount")
+                            .arg("-l")
+                            .arg(&wd_mnt)
+                            .output();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+
+            let work_outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mountpoint)));
+            work_done.store(true, Ordering::Release);
+            let _ = watchdog.join();
 
             stopped.store(true, Ordering::Release);
             if let Some(flag) = shutdown.lock().unwrap().as_ref() {
                 flag.store(true, Ordering::Release);
             }
-            worker
-                .join()
-                .expect("join serve thread")
-                .expect("clean serve shutdown");
+            let serve_outcome = worker.join().expect("join serve thread");
+            scope_guard.armed = false;
+            if let Err(payload) = work_outcome {
+                std::panic::resume_unwind(payload);
+            }
+            serve_outcome.expect("clean serve shutdown");
             true
         });
         assert!(
@@ -4004,7 +4083,8 @@ mod bd_tqrnc {
         )
         .expect("protect clean NTFS storage set");
 
-        let mnt_dir = dir.path().join("mnt-ntfs");
+        let mnt_holder = fuse_mount_tempdir();
+        let mnt_dir = mnt_holder.path().join("mnt-ntfs");
         std::fs::create_dir(&mnt_dir).unwrap();
         let make_args = |rw: bool, check: bool| -> Args {
             Args {
@@ -4344,7 +4424,8 @@ mod bd_tqrnc {
             )
             .expect("protect ZFS storage set");
 
-            let mnt_dir = dir.path().join("mnt-zfs");
+            let mnt_holder = fuse_mount_tempdir();
+            let mnt_dir = mnt_holder.path().join("mnt-zfs");
             std::fs::create_dir(&mnt_dir).unwrap();
             let extra_members: Vec<PathBuf> = member_pairs[1..]
                 .iter()
@@ -4384,6 +4465,8 @@ mod bd_tqrnc {
             assert_eq!(prepared.filesystem, "zfs");
             assert!(prepared.fs.is_writable());
 
+            let mount_user = nix::unistd::geteuid().as_raw();
+            let mount_group = nix::unistd::getegid().as_raw();
             let mut scope = RequestScope::empty();
             let sub = FsOps::mkdir(
                 prepared.fs.as_ref(),
@@ -4392,8 +4475,8 @@ mod bd_tqrnc {
                 InodeNumber(1),
                 OsStr::new("work"),
                 0o755,
-                0,
-                0,
+                mount_user,
+                mount_group,
             )
             .unwrap();
             let created = FsOps::create(
@@ -4403,8 +4486,8 @@ mod bd_tqrnc {
                 sub.ino,
                 OsStr::new("temp.bin"),
                 0o644,
-                0,
-                0,
+                mount_user,
+                mount_group,
             )
             .unwrap();
             let payload: Vec<u8> = (0_u32..12_345)
@@ -4430,8 +4513,8 @@ mod bd_tqrnc {
                 created.ino,
                 &SetAttrRequest {
                     mode: Some(0o600),
-                    uid: Some(1234),
-                    gid: Some(5678),
+                    uid: Some(mount_user),
+                    gid: Some(mount_group),
                     size: None,
                     atime: None,
                     mtime: None,
@@ -4610,8 +4693,8 @@ mod bd_tqrnc {
             )
             .unwrap();
             assert_eq!(rw_sealed.perm & 0o777, 0o600);
-            assert_eq!(rw_sealed.uid, 1234);
-            assert_eq!(rw_sealed.gid, 5678);
+            assert_eq!(rw_sealed.uid, mount_user);
+            assert_eq!(rw_sealed.gid, mount_group);
             let fuse_payload = vec![0x5D_u8; 9_000];
             let mounted = exercise_live_fuse_mount(&fuse_args, &fuse_prepared, |mnt| {
                 assert_eq!(std::fs::read(mnt.join("work/sealed.bin")).unwrap(), payload);

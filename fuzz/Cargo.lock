@@ -926,6 +926,7 @@ name = "ffs-fuse"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "ffs-block",
  "ffs-core",
  "ffs-error",
  "ffs-types",

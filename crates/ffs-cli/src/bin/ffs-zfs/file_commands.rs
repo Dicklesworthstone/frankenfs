@@ -301,7 +301,7 @@ impl FileCommand {
                     "ZFS read-only extraction mount: dataset_guid={guid} view_txg={txg}; \
                      synthetic ownership and modes, no native ACL enforcement or pool import"
                 );
-                let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+                let _ = ffs_fuse::mount(cx, Box::new(fs), &mountpoint, &options)?;
                 return Ok(());
             }
             Self::Snapshots { candidate, dataset } => {

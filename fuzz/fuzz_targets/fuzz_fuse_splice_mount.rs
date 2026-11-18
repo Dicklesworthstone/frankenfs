@@ -510,7 +510,8 @@ fn classify_splice_mount(data: &[u8]) -> SpliceMountOutcome {
     let mut cursor = ByteCursor::new(data);
     let (options, mount) = mount_outcome(&mut cursor);
     let fs = FuzzFs::from_cursor(&mut cursor);
-    let fuse = FrankenFuse::with_options(Box::new(fs), &options);
+    let cx = asupersync::Cx::for_testing();
+    let fuse = FrankenFuse::with_options_and_cx(&cx, Box::new(fs), &options);
 
     let pipe_read_ino = fuzz_ino(&mut cursor);
     let pipe_read_offset = fuzz_offset(&mut cursor);

@@ -16,8 +16,9 @@ use std::io::{self, Write};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .blocking_threads(0, 0)
+    let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .blocking_threads(0, 4)
         .build()
         .map_err(|err| anyhow::anyhow!("failed to build ffs-fat runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
@@ -239,7 +240,7 @@ fn main() -> Result<()> {
                 "experimental FAT {} mount; native FAT timestamps use a UTC wall-clock projection",
                 if rw { "read-write" } else { "read-only" }
             );
-            ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+            ffs_fuse::mount(&cx, Box::new(fs), &mountpoint, &options)?;
             drop(borrowed_loop_device);
         }
     }

@@ -1091,9 +1091,10 @@ fn serve(
     let mountpoint = prepared.mountpoint.as_ref().context("missing mountpoint")?;
     let config = MountConfig {
         options: mount_options(args),
+        commit_interval: Some(std::time::Duration::ZERO),
         ..MountConfig::default()
     };
-    let handle = mount_managed(Box::new(Arc::clone(&prepared.fs)), mountpoint, &config)
+    let handle = mount_managed(cx, Box::new(Arc::clone(&prepared.fs)), mountpoint, &config)
         .context("mount protected filesystem")?;
     let flag = Arc::clone(handle.shutdown_flag());
     *shutdown
@@ -1199,7 +1200,7 @@ fn serve(
 }
 
 fn run(args: &Args) -> Result<()> {
-    let runtime = (args.rw || args.scrub.interval_secs.is_some())
+    let runtime = (!args.check)
         .then(mount_worker::mount_background_runtime)
         .transpose()?;
     let fallback_runtime = if runtime.is_none() {

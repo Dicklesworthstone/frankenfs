@@ -325,13 +325,33 @@ impl FsOps for WritebackBenchFs {
     }
 }
 
+fn bench_cx() -> &'static asupersync::Cx {
+    static RUNTIME: std::sync::OnceLock<asupersync::runtime::Runtime> = std::sync::OnceLock::new();
+    static ROOT_CX: std::sync::OnceLock<asupersync::Cx> = std::sync::OnceLock::new();
+    ROOT_CX.get_or_init(|| {
+        RUNTIME
+            .get_or_init(|| {
+                asupersync::runtime::RuntimeBuilder::multi_thread()
+                    .worker_threads(1)
+                    .blocking_threads(0, 4)
+                    .build()
+                    .expect("bench runtime")
+            })
+            .request_cx_with_budget(asupersync::Budget::INFINITE)
+    })
+}
+
 fn run_writeback_batch(writeback_cache: bool, writes: usize, payload: &[u8], commit_work: u64) {
     let options = MountOptions {
         read_only: false,
         writeback_cache: WritebackCacheMode::from_enabled(writeback_cache),
         ..MountOptions::default()
     };
-    let fuse = FrankenFuse::with_options(Box::new(WritebackBenchFs::new(commit_work)), &options);
+    let fuse = FrankenFuse::with_options_and_cx(
+        bench_cx(),
+        Box::new(WritebackBenchFs::new(commit_work)),
+        &options,
+    );
     for index in 0..writes {
         let offset = i64::try_from(index.saturating_mul(payload.len())).unwrap_or(i64::MAX);
         let written = fuse

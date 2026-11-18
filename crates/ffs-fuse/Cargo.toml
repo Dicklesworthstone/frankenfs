@@ -16,6 +16,7 @@ bhh0i_sharded_alloc = ["ffs-core/bhh0i_sharded_alloc"]
 
 [dependencies]
 asupersync = { workspace = true }
+ffs-block = { workspace = true }
 ffs-core = { workspace = true }
 ffs-error = { workspace = true }
 ffs-types = { workspace = true }

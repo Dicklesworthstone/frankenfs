@@ -41,6 +41,434 @@ fn cx_checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
 }
 
+struct ThreadParkWaker(std::thread::Thread);
+
+impl std::task::Wake for ThreadParkWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Drive a region-control or completion future synchronously from a non-worker
+/// thread without constructing a private `Runtime`.
+#[doc(hidden)]
+pub fn block_on_park<F: std::future::Future>(fut: F) -> F::Output {
+    let waker = std::task::Waker::from(Arc::new(ThreadParkWaker(std::thread::current())));
+    let mut task_cx = std::task::Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut task_cx) {
+            std::task::Poll::Ready(output) => return output,
+            std::task::Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// Future adapter returned by [`poll_masked`].
+#[doc(hidden)]
+pub struct MaskedFuture<'a, F> {
+    cx: &'a Cx,
+    fut: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> std::future::Future for MaskedFuture<'_, F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        task_cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let cx = this.cx;
+        let fut = &mut this.fut;
+        cx.masked(|| fut.as_mut().poll(task_cx))
+    }
+}
+
+/// Poll `fut` to completion while masking cancellation on `cx` during each poll.
+///
+/// Used strictly for bounded completion-receipt drains and cleanup handshakes so
+/// an already-cancelled worker or mount `Cx` can still observe actual I/O retirement
+/// without fabricating a detached or test-only `Cx`.
+#[doc(hidden)]
+#[must_use]
+pub fn poll_masked<F: std::future::Future>(cx: &Cx, fut: F) -> MaskedFuture<'_, F> {
+    MaskedFuture {
+        cx,
+        fut: Box::pin(fut),
+    }
+}
+
+/// Future adapter returned by [`join_task_uninterruptible`].
+#[doc(hidden)]
+pub struct UninterruptibleJoin<'a, T>(&'a mut asupersync::runtime::TaskHandle<T>);
+
+impl<T> std::future::Future for UninterruptibleJoin<'_, T> {
+    type Output = std::result::Result<T, asupersync::runtime::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        task_cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.get_mut().0.poll_join(task_cx)
+    }
+}
+
+/// Join a spawned `TaskHandle` to terminal completion without requiring an
+/// uncancelled `Cx`.
+#[doc(hidden)]
+#[must_use]
+pub const fn join_task_uninterruptible<T>(
+    task: &mut asupersync::runtime::TaskHandle<T>,
+) -> UninterruptibleJoin<'_, T> {
+    UninterruptibleJoin(task)
+}
+
+struct ParentCancelRelayWaker<F> {
+    parent_watch: Cx,
+    principal_cx: Cx,
+    weak_region: std::sync::Weak<Mutex<Option<asupersync::cx::ChildRegion>>>,
+    live_task_cxs: Arc<Mutex<Vec<Cx>>>,
+    disarmed: Arc<std::sync::atomic::AtomicBool>,
+    on_parent_cancel: Mutex<Option<F>>,
+    task_waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl<F> ParentCancelRelayWaker<F>
+where
+    F: FnOnce(&asupersync::types::CancelReason) + Send + 'static,
+{
+    fn relay_if_cancelled(&self) {
+        if self.disarmed.load(Ordering::Acquire) || !self.parent_watch.is_cancel_requested() {
+            return;
+        }
+        let hook = self.on_parent_cancel.lock().take();
+        if let Some(on_cancel) = hook {
+            let reason = self
+                .parent_watch
+                .cancel_reason()
+                .unwrap_or_else(asupersync::types::CancelReason::parent_cancelled);
+            on_cancel(&reason);
+            self.principal_cx.cancel_fast(reason.kind);
+            let tasks = self.live_task_cxs.lock().clone();
+            for task_cx in &tasks {
+                task_cx.cancel_fast(reason.kind);
+            }
+            if let Some(slot) = self.weak_region.upgrade()
+                && let Some(region_ref) = slot.lock().as_ref()
+            {
+                let _ = region_ref.cancel(reason);
+            }
+        }
+    }
+}
+
+impl<F> std::task::Wake for ParentCancelRelayWaker<F>
+where
+    F: FnOnce(&asupersync::types::CancelReason) + Send + 'static,
+{
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.relay_if_cancelled();
+        let waker = self.task_waker.lock().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+trait OwnedChildRegionBackend: Send + Sync {
+    fn is_open(&self) -> bool;
+    fn cx(&self) -> &Cx;
+    fn runtime_handle(&self) -> Option<&asupersync::runtime::RuntimeHandle>;
+    fn live_task_cxs(&self) -> Arc<Mutex<Vec<Cx>>>;
+    fn disarm_parent_bridge(&self);
+    fn try_cancel(&self, reason: asupersync::types::CancelReason) -> Result<()>;
+    fn close_boxed(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+}
+
+struct OwnedChildRegionState {
+    region: Arc<Mutex<Option<asupersync::cx::ChildRegion>>>,
+    principal_cx: Cx,
+    live_task_cxs: Arc<Mutex<Vec<Cx>>>,
+    disarmed: Arc<std::sync::atomic::AtomicBool>,
+    runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
+    parent_bridge_tx: Mutex<Option<asupersync::channel::oneshot::Sender<()>>>,
+}
+
+impl OwnedChildRegionBackend for OwnedChildRegionState {
+    fn is_open(&self) -> bool {
+        self.region.lock().is_some()
+    }
+
+    fn cx(&self) -> &Cx {
+        &self.principal_cx
+    }
+
+    fn runtime_handle(&self) -> Option<&asupersync::runtime::RuntimeHandle> {
+        self.runtime_handle.as_ref()
+    }
+
+    fn live_task_cxs(&self) -> Arc<Mutex<Vec<Cx>>> {
+        Arc::clone(&self.live_task_cxs)
+    }
+
+    fn disarm_parent_bridge(&self) {
+        self.disarmed.store(true, Ordering::Release);
+        let _ = self.parent_bridge_tx.lock().take();
+    }
+
+    fn try_cancel(&self, reason: asupersync::types::CancelReason) -> Result<()> {
+        self.disarm_parent_bridge();
+        let kind = reason.kind;
+        self.principal_cx.cancel_fast(kind);
+        let tasks = self.live_task_cxs.lock().clone();
+        for task_cx in &tasks {
+            task_cx.cancel_fast(kind);
+        }
+        if let Some(region_ref) = self.region.lock().as_ref() {
+            region_ref
+                .cancel(reason)
+                .map_err(|err| FfsError::Format(format!("child region cancel failed: {err}")))?;
+        }
+        Ok(())
+    }
+
+    fn close_boxed(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        Box::pin(async move {
+            self.disarm_parent_bridge();
+            let child = self.region.lock().take();
+            if let Some(region) = child {
+                let _ = region.close().await;
+            }
+            self.live_task_cxs.lock().clear();
+        })
+    }
+}
+
+impl Drop for OwnedChildRegionState {
+    fn drop(&mut self) {
+        self.disarm_parent_bridge();
+        if let Some(region_ref) = self.region.lock().as_ref() {
+            self.principal_cx
+                .cancel_fast(asupersync::types::CancelKind::Shutdown);
+            let tasks = self.live_task_cxs.lock().clone();
+            for task_cx in &tasks {
+                task_cx.cancel_fast(asupersync::types::CancelKind::Shutdown);
+            }
+            let _ = region_ref.cancel(asupersync::types::CancelReason::shutdown());
+        }
+    }
+}
+
+/// Caller-owned child region wrapper that propagates both structured parent-region
+/// cancellation and direct `parent_cx.cancel_with(...)` cancellation without
+/// constructing any library-internal `Runtime`.
+///
+/// Internal handles sit behind `dyn OwnedChildRegionBackend` so auto-trait (`Send`
+/// / `Sync`) proofs on downstream structs like `OpenFs` stop in `O(1)` depth.
+#[doc(hidden)]
+pub struct OwnedChildRegion {
+    inner: Box<dyn OwnedChildRegionBackend>,
+}
+
+impl std::fmt::Debug for OwnedChildRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedChildRegion")
+            .field("open", &self.inner.is_open())
+            .field("has_runtime_handle", &self.inner.runtime_handle().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnedChildRegion {
+    /// Open a child region on `parent_cx`'s runtime and arm an immediate cancel
+    /// waker bridge on `parent_cx`.
+    pub fn open_async(
+        parent_cx: &Cx,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self>> + Send + '_>> {
+        Self::open_with_cancel_hook_async(parent_cx, |_| {})
+    }
+
+    /// Open a child region on `parent_cx`'s runtime and invoke `on_parent_cancel`
+    /// immediately if `parent_cx` is cancelled while the region is open.
+    pub fn open_with_cancel_hook_async<F>(
+        parent_cx: &Cx,
+        on_parent_cancel: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self>> + Send + '_>>
+    where
+        F: FnOnce(&asupersync::types::CancelReason) + Send + 'static,
+    {
+        Box::pin(async move {
+            cx_checkpoint(parent_cx)?;
+            let child = parent_cx
+                .open_child_region(asupersync::cx::ChildRegionSpec::inherit())
+                .await
+                .map_err(|err| FfsError::Format(format!("child region init failed: {err}")))?;
+            let principal_cx = child.cx().clone();
+            let region = Arc::new(Mutex::new(Some(child)));
+            let live_task_cxs = Arc::new(Mutex::new(Vec::new()));
+            let disarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (bridge_tx, mut bridge_rx) = asupersync::channel::oneshot::channel::<()>();
+            let (ready_tx, mut ready_rx) = asupersync::channel::oneshot::channel::<
+                Option<asupersync::runtime::RuntimeHandle>,
+            >();
+            let parent_watch = parent_cx.clone();
+            let relay = Arc::new(ParentCancelRelayWaker {
+                parent_watch: parent_watch.clone(),
+                principal_cx: principal_cx.clone(),
+                weak_region: Arc::downgrade(&region),
+                live_task_cxs: Arc::clone(&live_task_cxs),
+                disarmed: Arc::clone(&disarmed),
+                on_parent_cancel: Mutex::new(Some(on_parent_cancel)),
+                task_waker: Mutex::new(None),
+            });
+            let relay_for_task = Arc::clone(&relay);
+            let _bridge_task = principal_cx
+                .spawn(move |bridge_cx| async move {
+                    let mut ready_tx = Some(ready_tx);
+                    let mut recv_fut = std::pin::pin!(bridge_rx.recv(&parent_watch));
+                    let outcome = std::future::poll_fn(|task_cx| {
+                        *relay_for_task.task_waker.lock() = Some(task_cx.waker().clone());
+                        let waker = std::task::Waker::from(Arc::clone(&relay_for_task));
+                        let mut relay_cx = std::task::Context::from_waker(&waker);
+                        let polled = recv_fut.as_mut().poll(&mut relay_cx);
+                        if let Some(tx) = ready_tx.take()
+                            && let Ok(permit) = bridge_cx.masked(|| tx.reserve(&bridge_cx))
+                        {
+                            let _ = permit.send(asupersync::runtime::Runtime::current_handle());
+                        }
+                        polled
+                    })
+                    .await;
+                    *relay_for_task.task_waker.lock() = None;
+                    if matches!(
+                        outcome,
+                        Err(asupersync::channel::oneshot::RecvError::Cancelled)
+                    ) {
+                        relay_for_task.relay_if_cancelled();
+                    }
+                })
+                .map_err(|err| {
+                    FfsError::Format(format!("parent cancel bridge spawn failed: {err}"))
+                })?;
+            let runtime_handle = poll_masked(&principal_cx, ready_rx.recv(&principal_cx))
+                .await
+                .unwrap_or(None);
+            if parent_cx.checkpoint().is_err() {
+                relay.relay_if_cancelled();
+                let child = region.lock().take();
+                if let Some(child) = child {
+                    let _ = child.close().await;
+                }
+                return Err(FfsError::Cancelled);
+            }
+            Ok(Self {
+                inner: Box::new(OwnedChildRegionState {
+                    region,
+                    principal_cx,
+                    live_task_cxs,
+                    disarmed,
+                    runtime_handle,
+                    parent_bridge_tx: Mutex::new(Some(bridge_tx)),
+                }),
+            })
+        })
+    }
+
+    /// Synchronously open a child region on `parent_cx`'s runtime.
+    pub fn open_sync(parent_cx: &Cx) -> Result<Self> {
+        block_on_park(Self::open_async(parent_cx))
+    }
+
+    /// Synchronously open a child region on `parent_cx`'s runtime with a
+    /// parent-cancellation callback.
+    pub fn open_with_cancel_hook_sync<F>(parent_cx: &Cx, on_parent_cancel: F) -> Result<Self>
+    where
+        F: FnOnce(&asupersync::types::CancelReason) + Send + 'static,
+    {
+        block_on_park(Self::open_with_cancel_hook_async(
+            parent_cx,
+            on_parent_cancel,
+        ))
+    }
+
+    /// Principal context for spawning tasks into this child region.
+    #[must_use]
+    pub fn cx(&self) -> &Cx {
+        self.inner.cx()
+    }
+
+    /// Spawn a task into this child region whose `Cx` also receives immediate
+    /// synchronous cancellation when this region or its `parent_cx` cancels.
+    pub fn spawn<F, Fut, T>(&self, f: F) -> Result<asupersync::runtime::TaskHandle<T>>
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let live = self.inner.live_task_cxs();
+        let principal = self.inner.cx().clone();
+        self.inner
+            .cx()
+            .spawn(move |task_cx| {
+                if principal.is_cancel_requested() {
+                    let kind = principal
+                        .cancel_reason()
+                        .map_or(asupersync::types::CancelKind::ParentCancelled, |r| r.kind);
+                    task_cx.cancel_fast(kind);
+                }
+                live.lock().push(task_cx.clone());
+                f(task_cx)
+            })
+            .map_err(|err| FfsError::Format(format!("child region task spawn failed: {err}")))
+    }
+
+    /// Runtime handle captured from the caller's runtime (`None` under `LabRuntime`).
+    #[must_use]
+    pub fn runtime_handle(&self) -> Option<&asupersync::runtime::RuntimeHandle> {
+        self.inner.runtime_handle()
+    }
+
+    /// Disarm the `parent_cx` cancel waker bridge before normal shutdown.
+    pub fn disarm_parent_bridge(&self) {
+        self.inner.disarm_parent_bridge();
+    }
+
+    /// Request cancellation of this child region subtree, returning any region error.
+    pub fn try_cancel(&self, reason: asupersync::types::CancelReason) -> Result<()> {
+        self.inner.try_cancel(reason)
+    }
+
+    /// Request cancellation of this child region subtree on a best-effort basis.
+    pub fn cancel(&self, reason: asupersync::types::CancelReason) {
+        let _ = self.try_cancel(reason);
+    }
+
+    /// Disarm the parent bridge, enqueue region close, and await full quiescence.
+    pub fn close_async(
+        self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        self.inner.close_boxed()
+    }
+
+    /// Synchronously close this child region and await full quiescence.
+    pub fn close_sync(self) {
+        block_on_park(self.close_async());
+    }
+}
+
 #[inline]
 fn saturating_fetch_increment(counter: &std::sync::atomic::AtomicU64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
@@ -7659,10 +8087,21 @@ mod tests {
             .expect("write2");
     }
 
+    fn test_daemon_runtime() -> (asupersync::runtime::Runtime, Cx) {
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .blocking_threads(0, 2)
+            .build()
+            .expect("test daemon runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        (runtime, cx)
+    }
+
     #[test]
     fn flush_daemon_batch_flushes_oldest_first() {
         use std::sync::Arc as StdArc;
 
+        let (_rt, daemon_cx) = test_daemon_runtime();
         let cx = Cx::for_testing();
         let mem = MemoryByteDevice::new(4096 * 16);
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
@@ -7686,13 +8125,16 @@ mod tests {
         );
 
         let daemon = cache
-            .start_flush_daemon(FlushDaemonConfig {
-                interval: Duration::from_millis(10),
-                batch_size: 1,
-                high_watermark: 0.99,
-                critical_watermark: 1.0,
-                ..FlushDaemonConfig::default()
-            })
+            .start_flush_daemon(
+                &daemon_cx,
+                FlushDaemonConfig {
+                    interval: Duration::from_millis(10),
+                    batch_size: 1,
+                    high_watermark: 0.99,
+                    critical_watermark: 1.0,
+                    ..FlushDaemonConfig::default()
+                },
+            )
             .expect("start daemon");
 
         let final_dirty_count = wait_until_dirty_count(&cache, 0, Duration::from_millis(400));
@@ -7711,6 +8153,7 @@ mod tests {
     fn flush_daemon_shutdown_flushes_all_dirty_blocks() {
         use std::sync::Arc as StdArc;
 
+        let (_rt, daemon_cx) = test_daemon_runtime();
         let cx = Cx::for_testing();
         let mem = MemoryByteDevice::new(4096 * 32);
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
@@ -7719,11 +8162,14 @@ mod tests {
             ArcCache::new_with_policy(counted, 16, ArcWritePolicy::WriteBack).expect("cache"),
         );
         let daemon = cache
-            .start_flush_daemon(FlushDaemonConfig {
-                interval: Duration::from_millis(5),
-                batch_size: 4,
-                ..FlushDaemonConfig::default()
-            })
+            .start_flush_daemon(
+                &daemon_cx,
+                FlushDaemonConfig {
+                    interval: Duration::from_millis(5),
+                    batch_size: 4,
+                    ..FlushDaemonConfig::default()
+                },
+            )
             .expect("start daemon");
 
         for i in 0..6_u64 {
@@ -7742,6 +8188,7 @@ mod tests {
     fn flush_daemon_shutdown_wakes_sleeping_interval_promptly() -> Result<()> {
         use std::sync::Arc as StdArc;
 
+        let (_rt, daemon_cx) = test_daemon_runtime();
         let mem = MemoryByteDevice::new(4096 * 8);
         let dev = ByteBlockDevice::new(mem, 4096)?;
         let counted = CountingBlockDevice::new(dev);
@@ -7751,11 +8198,14 @@ mod tests {
             ArcWritePolicy::WriteBack,
         )?);
         let interval = Duration::from_secs(2);
-        let daemon = cache.start_flush_daemon(FlushDaemonConfig {
-            interval,
-            batch_size: 1,
-            ..FlushDaemonConfig::default()
-        })?;
+        let daemon = cache.start_flush_daemon(
+            &daemon_cx,
+            FlushDaemonConfig {
+                interval,
+                batch_size: 1,
+                ..FlushDaemonConfig::default()
+            },
+        )?;
 
         let started = Instant::now();
         daemon.shutdown();
@@ -7975,12 +8425,16 @@ mod tests {
         }
         assert_eq!(cache.dirty_count(), 1000);
 
+        let (_rt, daemon_cx) = test_daemon_runtime();
         let daemon = cache
-            .start_flush_daemon(FlushDaemonConfig {
-                interval,
-                batch_size: 256,
-                ..FlushDaemonConfig::default()
-            })
+            .start_flush_daemon(
+                &daemon_cx,
+                FlushDaemonConfig {
+                    interval,
+                    batch_size: 256,
+                    ..FlushDaemonConfig::default()
+                },
+            )
             .expect("start daemon");
 
         let timeout = interval.saturating_mul(2) + Duration::from_millis(30);
@@ -8098,12 +8552,16 @@ mod tests {
             )
             .expect("cache"),
         );
+        let (_rt, daemon_cx) = test_daemon_runtime();
         let daemon = cache
-            .start_flush_daemon(FlushDaemonConfig {
-                interval: Duration::from_millis(10),
-                batch_size: 2,
-                ..FlushDaemonConfig::default()
-            })
+            .start_flush_daemon(
+                &daemon_cx,
+                FlushDaemonConfig {
+                    interval: Duration::from_millis(10),
+                    batch_size: 2,
+                    ..FlushDaemonConfig::default()
+                },
+            )
             .expect("start daemon");
 
         let c1 = StdArc::clone(&cache);
@@ -8395,7 +8853,9 @@ mod tests {
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
         let counted = CountingBlockDevice::new(dev);
 
+        let (_rt, daemon_cx) = test_daemon_runtime();
         let deferred = DeferredArcCache::new(
+            &daemon_cx,
             counted,
             8,
             FlushDaemonConfig {
@@ -10397,12 +10857,14 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
 
     #[test]
     fn deferred_arc_cache_writes_and_flushes_on_drop() {
+        let (_rt, daemon_cx) = test_daemon_runtime();
         let cx = Cx::for_testing();
         let mem = MemoryByteDevice::new(4096 * 16);
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
         let counted = CountingBlockDevice::new(dev);
 
         let deferred = DeferredArcCache::new(
+            &daemon_cx,
             counted,
             8,
             FlushDaemonConfig {
@@ -10441,7 +10903,9 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
         let counted = CountingBlockDevice::new(dev);
 
+        let (_rt, daemon_cx) = test_daemon_runtime();
         let deferred = DeferredArcCache::new(
+            &daemon_cx,
             counted,
             8,
             FlushDaemonConfig {

@@ -5366,6 +5366,21 @@ impl FsOps for OpenFs {
         result
     }
 
+    fn default_commit_interval(&self) -> Option<std::time::Duration> {
+        if !self.is_writable() {
+            return None;
+        }
+        if self.is_btrfs() {
+            Some(std::time::Duration::from_secs(30))
+        } else {
+            Some(std::time::Duration::from_secs(5))
+        }
+    }
+
+    fn periodic_commit(&self, cx: &Cx) -> ffs_error::Result<bool> {
+        Self::periodic_commit(self, cx)
+    }
+
     fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {
         let _view = self.btrfs_semantic_view_guard()?;
         if !self.is_writable() {

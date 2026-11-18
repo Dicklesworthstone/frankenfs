@@ -397,16 +397,16 @@ static LIVE_MOUNTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// covers on the next run).
 #[cfg(target_os = "linux")]
 pub struct MountGuard {
-    session: Option<fuser::BackgroundSession>,
+    session: Option<ffs_fuse::MountHandle>,
     mountpoint: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
 impl MountGuard {
-    /// Wrap a live background session, registering its mountpoint for
+    /// Wrap a live background mount handle, registering its mountpoint for
     /// signal-driven teardown and installing the process-wide hooks once.
     #[must_use]
-    pub fn new(session: fuser::BackgroundSession, mountpoint: &Path) -> Self {
+    pub fn new(session: ffs_fuse::MountHandle, mountpoint: &Path) -> Self {
         install_teardown_hooks();
         if let Ok(mut live) = LIVE_MOUNTS.lock() {
             live.push(mountpoint.to_path_buf());
@@ -421,14 +421,15 @@ impl MountGuard {
 #[cfg(target_os = "linux")]
 impl Drop for MountGuard {
     fn drop(&mut self) {
-        // 1. Clean happy-path unmount first (frees the mountpoint for remount).
-        drop(self.session.take());
-        // 2. Escalate only if a wedged/busy server kept the mount alive. The
-        //    lazy path never panics, so it is safe to run during unwind.
+        if self.session.is_some() {
+            if !retry_clean_unmount(&self.mountpoint, Duration::from_secs(5)) {
+                let _ = lazy_unmount(&self.mountpoint);
+            }
+            drop(self.session.take());
+        }
         if still_mounted(&self.mountpoint) {
             let _ = lazy_unmount(&self.mountpoint);
         }
-        // 3. Deregister so the signal handler does not chase a freed mount.
         if let Ok(mut live) = LIVE_MOUNTS.lock()
             && let Some(idx) = live.iter().position(|p| p == &self.mountpoint)
         {
@@ -441,13 +442,13 @@ impl Drop for MountGuard {
 /// Linux-specific, so the guard just owns the session and drops it normally.
 #[cfg(not(target_os = "linux"))]
 pub struct MountGuard {
-    session: Option<fuser::BackgroundSession>,
+    session: Option<ffs_fuse::MountHandle>,
 }
 
 #[cfg(not(target_os = "linux"))]
 impl MountGuard {
     #[must_use]
-    pub fn new(session: fuser::BackgroundSession, _mountpoint: &Path) -> Self {
+    pub fn new(session: ffs_fuse::MountHandle, _mountpoint: &Path) -> Self {
         Self {
             session: Some(session),
         }
@@ -470,31 +471,17 @@ impl MountGuard {
     /// returned an I/O error. Emergency detach is cleanup, not durability proof.
     pub fn unmount_and_join(mut self) {
         if let Some(session) = self.session.take() {
-            let guard = request_unmount(session);
-            // BackgroundSession::join waits even when Mount::drop fails to
-            // unmount (for example EBUSY). The server then waits for requests
-            // forever, preventing this guard's emergency cleanup from running.
-            // Fail before joining in that case; unwinding runs our Drop path.
             #[cfg(target_os = "linux")]
             assert!(
                 retry_clean_unmount(&self.mountpoint, Duration::from_secs(5)),
                 "clean unmount failed for {}; cannot certify destroy-time persistence",
                 self.mountpoint.display()
             );
-            guard
-                .join()
-                .expect("FUSE server panicked")
-                .expect("FUSE server I/O error");
+            session
+                .unmount()
+                .expect("FUSE server destroy/flush or session cleanup failed");
         }
     }
-}
-
-/// Moving the public thread handle out of this owned session drops its other
-/// fields, including the unmount handle, before returning to the caller.
-fn request_unmount(
-    session: fuser::BackgroundSession,
-) -> std::thread::JoinHandle<std::io::Result<()>> {
-    session.guard
 }
 
 /// Reclaim every leaked FrankenFS mount on an abrupt (signal) exit, where no

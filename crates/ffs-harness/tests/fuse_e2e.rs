@@ -17,6 +17,22 @@ use ffs_core::{
 };
 use ffs_fuse::{MountOptions, WritebackCacheMode};
 
+fn e2e_mount_cx() -> &'static Cx {
+    static RUNTIME: std::sync::OnceLock<asupersync::runtime::Runtime> = std::sync::OnceLock::new();
+    static ROOT_CX: std::sync::OnceLock<Cx> = std::sync::OnceLock::new();
+    ROOT_CX.get_or_init(|| {
+        RUNTIME
+            .get_or_init(|| {
+                asupersync::runtime::RuntimeBuilder::multi_thread()
+                    .worker_threads(2)
+                    .blocking_threads(0, 16)
+                    .build()
+                    .expect("fuse_e2e mount runtime")
+            })
+            .request_cx_with_budget(asupersync::Budget::INFINITE)
+    })
+}
+
 /// Every mount in this suite goes through this wrapper (bd-iah1f). With
 /// `FFS_E2E_FUSE_WORKERS=N` set, mounts that did not ask for a specific worker
 /// count run with N concurrent FUSE dispatch workers instead of the serial
@@ -26,18 +42,19 @@ fn mount_background(
     ops: Box<dyn FsOps>,
     mountpoint: impl AsRef<Path>,
     options: &MountOptions,
-) -> Result<fuser::BackgroundSession, ffs_fuse::FuseError> {
+) -> Result<ffs_fuse::MountHandle, ffs_fuse::FuseError> {
     let workers = std::env::var("FFS_E2E_FUSE_WORKERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&n| n > 0);
+    let cx = e2e_mount_cx();
     match workers {
         Some(n) if options.worker_threads == 0 => {
             let mut options = options.clone();
             options.worker_threads = n;
-            ffs_fuse::mount_background(ops, mountpoint, &options)
+            ffs_fuse::mount_background(cx, ops, mountpoint, &options)
         }
-        _ => ffs_fuse::mount_background(ops, mountpoint, options),
+        _ => ffs_fuse::mount_background(cx, ops, mountpoint, options),
     }
 }
 use ffs_harness::load_sparse_fixture;
@@ -19723,7 +19740,8 @@ fn ext4_fuse_ioctl_setversion_roundtrips_via_mounted_path() {
         options: mount_opts,
         ..ffs_fuse::MountConfig::default()
     };
-    let session = match ffs_fuse::mount_managed(Box::new(filesystem), &mnt, &config) {
+    let session = match ffs_fuse::mount_managed(e2e_mount_cx(), Box::new(filesystem), &mnt, &config)
+    {
         Ok(session) => session,
         Err(error) => {
             require_fuse_or_skip(&format!("FUSE mount (rw, managed) failed: {error}"));
@@ -23252,7 +23270,7 @@ fn gdt_eager_mounted_forensics_bd_d2hdc() {
                     auto_unmount: false,
                     ..MountOptions::default()
                 };
-                if let Err(e) = ffs_fuse::mount(Box::new(fsys), &mnt, &mount_opts) {
+                if let Err(e) = ffs_fuse::mount(e2e_mount_cx(), Box::new(fsys), &mnt, &mount_opts) {
                     let _ = mount_tx.send(Err(format!("blocking forensic mount: {e}")));
                 }
             })

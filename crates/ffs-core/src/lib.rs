@@ -918,7 +918,7 @@ pub fn detect_all_filesystems_at_path(
 }
 
 /// Probe an in-memory byte slice across all six supported formats (`CORE-02`).
-pub fn detect_all_filesystems(image: &[u8]) -> Result<DetectedFilesystem, DetectionError> {
+pub fn detect_all_filesystems(cx: &Cx, image: &[u8]) -> Result<DetectedFilesystem, DetectionError> {
     struct SliceByteDevice<'a>(&'a [u8]);
     impl ByteDevice for SliceByteDevice<'_> {
         fn len_bytes(&self) -> u64 {
@@ -952,15 +952,7 @@ pub fn detect_all_filesystems(image: &[u8]) -> Result<DetectedFilesystem, Detect
             cx.checkpoint().map_err(|_| FfsError::Cancelled)
         }
     }
-    static DETECT_RUNTIME: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
-    let runtime = DETECT_RUNTIME.get_or_init(|| {
-        asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(0, 0)
-            .build()
-            .expect("ffs-core detection runtime must initialize")
-    });
-    let cx = runtime.request_cx_with_budget(asupersync::Budget::new().with_poll_quota(100_000));
-    detect_all_filesystems_on_device(&cx, &SliceByteDevice(image))
+    detect_all_filesystems_on_device(cx, &SliceByteDevice(image))
 }
 
 /// Fuzz-only helper exposing the btrfs INODE_REF payload parser.
@@ -3116,6 +3108,10 @@ pub struct OpenFs {
     /// write-back cache; above it memory would otherwise grow with every block
     /// the mount ever wrote.
     mvcc_resident_block_cap: std::sync::atomic::AtomicUsize,
+    /// Caller-supplied owner context for mount/filesystem-lifetime child workers
+    /// (such as `MetadataCompactor`), ensuring checkpoint-triggered worker restarts
+    /// bind to the filesystem owner rather than an ephemeral per-request `fsync` `Cx`.
+    owner_cx: Mutex<Cx>,
     /// Fields drop in declaration order: drain old home writes before releasing
     /// the WAL's exclusive ownership, including a plain drop without checkpoint.
     metadata_compactor: Mutex<Option<MetadataCompactor>>,
@@ -5299,10 +5295,8 @@ enum MetadataCompactionCommand {
 /// the WAL checkpoint is truncated, so no orphan worker can outlive `OpenFs`.
 struct MetadataCompactor {
     sender: asupersync::channel::mpsc::UnboundedSender<MetadataCompactionCommand>,
-    runtime: Arc<asupersync::runtime::Runtime>,
-    region: Option<asupersync::cx::ChildRegion>,
+    region: Option<ffs_block::OwnedChildRegion>,
     task: Option<asupersync::runtime::TaskHandle<()>>,
-    cleanup_cx: Cx,
 }
 
 impl MetadataCompactor {
@@ -5314,41 +5308,34 @@ impl MetadataCompactor {
     /// a single sorted checkpoint instead of racing those fsyncs for the image.
     const QUIESCENCE_WINDOW: Duration = Duration::from_millis(10);
 
-    fn start(cx: &Cx, byte_device: Arc<dyn ByteDevice>, block_size: u32) -> Result<Self, FfsError> {
+    async fn start_async(
+        cx: &Cx,
+        byte_device: Arc<dyn ByteDevice>,
+        block_size: u32,
+    ) -> Result<Self, FfsError> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let (sender, mut receiver) = asupersync::channel::mpsc::unbounded_channel();
-        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
-            .worker_threads(1)
-            .blocking_threads(0, 1)
-            .build()
-            .map(Arc::new)
-            .map_err(|err| {
-                FfsError::Format(format!("metadata compactor runtime init failed: {err}"))
-            })?;
-        let root_cx = runtime.request_cx_with_budget(cx.budget());
-        let cleanup_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
-        let region = runtime
-            .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
-            .map_err(|err| {
-                FfsError::Format(format!("metadata compactor region init failed: {err}"))
-            })?;
-        let task = region
-            .cx()
-            .spawn(move |worker_cx| async move {
-                let block_device = ByteDeviceBlockAdapter {
-                    dev: byte_device.as_ref(),
-                    block_size,
-                };
-                Self::run(&worker_cx, &block_device, &mut receiver).await;
-            })
-            .map_err(|err| FfsError::Format(format!("metadata compactor spawn failed: {err}")))?;
+        let region = ffs_block::OwnedChildRegion::open_async(cx).await?;
+        let region_cx = region.cx().clone();
+        let task = region.spawn(move |worker_cx| async move {
+            Self::run(
+                &worker_cx,
+                &region_cx,
+                &byte_device,
+                block_size,
+                &mut receiver,
+            )
+            .await;
+        })?;
         Ok(Self {
             sender,
-            runtime,
             region: Some(region),
             task: Some(task),
-            cleanup_cx,
         })
+    }
+
+    fn start(cx: &Cx, byte_device: Arc<dyn ByteDevice>, block_size: u32) -> Result<Self, FfsError> {
+        ffs_block::block_on_park(Self::start_async(cx, byte_device, block_size))
     }
 
     fn enqueue(&self, batch: MetadataCompactionBatch) {
@@ -5365,12 +5352,17 @@ impl MetadataCompactor {
         }
     }
 
-    fn shutdown(&mut self) {
+    async fn shutdown_async(&mut self) {
+        if let Some(region) = self.region.as_ref() {
+            region.disarm_parent_bridge();
+        }
         if let Ok(permit) = self.sender.try_reserve() {
             let _ = permit.send(MetadataCompactionCommand::Shutdown);
         }
         if let Some(mut task) = self.task.take()
-            && self.runtime.block_on(task.join(&self.cleanup_cx)).is_err()
+            && ffs_block::join_task_uninterruptible(&mut task)
+                .await
+                .is_err()
         {
             warn!(
                 target: "ffs::mvcc::metadata_log",
@@ -5378,13 +5370,19 @@ impl MetadataCompactor {
             );
         }
         if let Some(region) = self.region.take() {
-            let _ = self.runtime.block_on(region.close());
+            region.close_async().await;
         }
+    }
+
+    fn shutdown(&mut self) {
+        ffs_block::block_on_park(self.shutdown_async());
     }
 
     async fn run(
         cx: &Cx,
-        device: &dyn BlockDevice,
+        region_cx: &Cx,
+        byte_device: &Arc<dyn ByteDevice>,
+        block_size: u32,
         receiver: &mut asupersync::channel::mpsc::UnboundedReceiver<MetadataCompactionCommand>,
     ) {
         while let Ok(first) = receiver.recv(cx).await {
@@ -5414,21 +5412,47 @@ impl MetadataCompactor {
                 }
             }
 
-            let blocks = latest.len();
-            match Self::compact_latest(cx, device, latest) {
-                Ok(()) => trace!(
-                    target: "ffs::mvcc::metadata_log",
-                    compacted_blocks = blocks,
-                    "metadata log background compaction complete"
-                ),
-                Err(error) => warn!(
-                    target: "ffs::mvcc::metadata_log",
-                    compacted_blocks = blocks,
-                    error = %error,
-                    "metadata log background compaction failed; WAL remains authoritative"
-                ),
+            if cx.checkpoint().is_err() {
+                break;
             }
-            if stop_after_batch {
+
+            let blocks = latest.len();
+            let dev_clone = Arc::clone(byte_device);
+            let region_cancel = region_cx.clone();
+            let (done_tx, mut done_rx) =
+                asupersync::channel::oneshot::channel::<Result<(), FfsError>>();
+            if let Ok(mut blocking) = cx.spawn_blocking(move |io_cx| {
+                if io_cx.checkpoint().is_err() || region_cancel.checkpoint().is_err() {
+                    return;
+                }
+                let Ok(permit) = io_cx.masked(|| done_tx.reserve(&io_cx)) else {
+                    return;
+                };
+                let adapter = ByteDeviceBlockAdapter {
+                    dev: dev_clone.as_ref(),
+                    block_size,
+                };
+                let res = Self::compact_latest(&region_cancel, &adapter, latest);
+                let _ = permit.send(res);
+            }) {
+                let _ = ffs_block::join_task_uninterruptible(&mut blocking).await;
+                if let Ok(outcome) = ffs_block::poll_masked(cx, done_rx.recv(cx)).await {
+                    match outcome {
+                        Ok(()) => trace!(
+                            target: "ffs::mvcc::metadata_log",
+                            compacted_blocks = blocks,
+                            "metadata log background compaction complete"
+                        ),
+                        Err(error) => warn!(
+                            target: "ffs::mvcc::metadata_log",
+                            compacted_blocks = blocks,
+                            error = %error,
+                            "metadata log background compaction failed; WAL remains authoritative"
+                        ),
+                    }
+                }
+            }
+            if stop_after_batch || cx.checkpoint().is_err() {
                 break;
             }
         }
@@ -5443,6 +5467,7 @@ impl MetadataCompactor {
         let mut run_next = 0_u64;
         let mut run_data = Vec::new();
         for (block, data) in latest {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             if run_start.is_some() && block.0 != run_next {
                 device.write_contiguous_blocks(
                     cx,
@@ -5458,9 +5483,11 @@ impl MetadataCompactor {
             run_next = block.0.saturating_add(1);
         }
         if let Some(start) = run_start {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             device.write_contiguous_blocks(cx, start, &run_data)?;
         }
         if !run_data.is_empty() {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             device.sync(cx)?;
         }
         Ok(())
@@ -8673,6 +8700,7 @@ impl OpenFs {
             mvcc_resident_block_cap: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_MVCC_RESIDENT_BLOCK_CAP,
             ),
+            owner_cx: Mutex::new(cx.clone()),
             metadata_compactor: Mutex::new(None),
             metadata_log,
             jbd2_writer: None,
@@ -9209,6 +9237,7 @@ impl OpenFs {
         if self.metadata_log.is_none() {
             return Ok(());
         }
+        *self.owner_cx.lock() = cx.clone();
         // Share the admitted physical device. Reopening image_path would bypass
         // its write fence and could select a replaced backing file.
         let compactor = MetadataCompactor::start(cx, Arc::clone(&self.dev), self.block_size())?;
@@ -14172,15 +14201,21 @@ impl OpenFs {
         // Start an idle replacement before changing home storage. Failure leaves
         // the old worker intact. On later errors RAII joins this unused worker;
         // the next successful public checkpoint can resume compaction again.
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let replacement = if keep_compactor
             && log.is_some()
             && !self.ext4_forced_read_only.load(Ordering::SeqCst)
         {
-            Some(MetadataCompactor::start(
-                cx,
-                Arc::clone(&self.dev),
-                self.block_size(),
-            )?)
+            let owner_cx = self.owner_cx.lock().clone();
+            if owner_cx.checkpoint().is_ok() {
+                Some(MetadataCompactor::start(
+                    &owner_cx,
+                    Arc::clone(&self.dev),
+                    self.block_size(),
+                )?)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -14406,6 +14441,7 @@ impl OpenFs {
                 let restart_compactor =
                     self.metadata_log.is_some() && self.metadata_compactor.lock().is_none();
                 if restart_compactor {
+                    *self.owner_cx.lock() = cx.clone();
                     let compactor =
                         MetadataCompactor::start(cx, Arc::clone(&self.dev), self.block_size())?;
                     *self.metadata_compactor.lock() = Some(compactor);
@@ -105916,12 +105952,22 @@ mod tests {
         );
     }
 
+    fn test_compactor_runtime() -> (asupersync::runtime::Runtime, Cx) {
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .blocking_threads(0, 2)
+            .build()
+            .expect("test compactor runtime");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        (runtime, cx)
+    }
+
     #[test]
     fn metadata_log_compactor_writes_through_shared_device_authority() {
         // Instrumented worker proof: compaction must retain and use the caller's
         // device, including its write refusal, rather than reopen a backing path.
         for reject_write in [false, true] {
-            let cx = Cx::for_testing();
+            let (_rt, cx) = test_compactor_runtime();
             let original = vec![0xA7; 4 * 512];
             let dev = TestDevice::from_vec(original.clone());
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -105981,50 +106027,711 @@ mod tests {
         );
     }
 
-    #[test]
-    fn production_crates_have_no_unstructured_threads_or_test_cx_bd_in31y() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let crates_root = manifest_dir.parent().expect("crates dir");
-        let target_files = [
-            "ffs-block/src/cache.rs",
-            "ffs-block/src/lib.rs",
-            "ffs-core/src/lib.rs",
-            "ffs-core/src/fs_ops.rs",
-            "ffs-core/src/vfs.rs",
-            "ffs-fuse/src/lib.rs",
-            "ffs-fuse/src/franken_fuse.rs",
-            "ffs-mvcc/src/rcu.rs",
-            "ffs-repair/src/pipeline.rs",
-            "ffs-cli/src/main.rs",
-            "ffs-cli/src/mount_worker.rs",
-        ];
-        let forbidden = [
-            "std::thread::spawn",
-            "thread::Builder",
-            "std::sync::mpsc",
-            "Cx::for_testing(",
-            "Cx::for_request(",
-        ];
-        for rel in target_files {
-            let path = crates_root.join(rel);
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-            let prod = source.split("#[cfg(test)]").next().unwrap_or(&source);
-            for (line_no, line) in prod.lines().enumerate() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("//") {
+    fn strip_cfg_test_items(source: &str) -> String {
+        fn attr_is_cfg_test(attr_inner: &str) -> bool {
+            let trimmed = attr_inner.trim();
+            let Some(rest) = trimmed.strip_prefix("cfg(") else {
+                return false;
+            };
+            // Match standalone identifier `test` inside `#[cfg(...)]` (e.g.
+            // `#[cfg(test)]`, `#[cfg(all(test, target_os = "linux"))]`),
+            // excluding `not(test)` and `feature = "test-internals"`.
+            if trimmed.contains("not(test)") {
+                return false;
+            }
+            let bytes = rest.as_bytes();
+            let mut idx = 0;
+            let mut in_str = false;
+            while idx < bytes.len() {
+                if bytes[idx] == b'"' && (idx == 0 || bytes[idx - 1] != b'\\') {
+                    in_str = !in_str;
+                    idx += 1;
                     continue;
                 }
-                for needle in forbidden {
-                    assert!(
-                        !trimmed.contains(needle),
-                        "{}:{} contains forbidden unstructured concurrency / test Cx token `{needle}`: {trimmed}",
-                        rel,
-                        line_no + 1
-                    );
+                if !in_str && rest[idx..].starts_with("test") {
+                    let prev_ok = idx == 0
+                        || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+                    let after = idx + 4;
+                    let next_ok = after >= bytes.len()
+                        || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+                    if prev_ok && next_ok {
+                        return true;
+                    }
+                }
+                idx += 1;
+            }
+            false
+        }
+
+        fn advance_non_code_token(
+            bytes: &[u8],
+            i: usize,
+            out: &mut String,
+            emit: bool,
+        ) -> Option<usize> {
+            let b = bytes[i];
+            // Line comment
+            if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                let mut j = i;
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+                if emit {
+                    out.push_str(&std::iter::repeat_n(' ', j - i).collect::<String>());
+                }
+                return Some(j);
+            }
+            // Nested block comment
+            if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                let mut j = i + 2;
+                let mut depth = 1_usize;
+                while j < bytes.len() && depth > 0 {
+                    if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+                        depth += 1;
+                        j += 2;
+                    } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
+                        depth -= 1;
+                        j += 2;
+                    } else {
+                        if bytes[j] == b'\n' {
+                            out.push('\n');
+                        } else if emit {
+                            out.push(' ');
+                        }
+                        j += 1;
+                    }
+                }
+                return Some(j);
+            }
+            // Raw string r#*"..."*# or br#*"..."*#
+            if b == b'r' || (b == b'b' && bytes.get(i + 1) == Some(&b'r')) {
+                let start_hashes = if b == b'b' { i + 2 } else { i + 1 };
+                let prev_ident =
+                    i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if !prev_ident {
+                    let mut hashes = 0_usize;
+                    while bytes.get(start_hashes + hashes) == Some(&b'#') {
+                        hashes += 1;
+                    }
+                    if bytes.get(start_hashes + hashes) == Some(&b'"') {
+                        let mut j = start_hashes + hashes + 1;
+                        while j < bytes.len() {
+                            if bytes[j] == b'"' {
+                                let mut close_hashes = 0_usize;
+                                while close_hashes < hashes
+                                    && bytes.get(j + 1 + close_hashes) == Some(&b'#')
+                                {
+                                    close_hashes += 1;
+                                }
+                                if close_hashes == hashes {
+                                    j += 1 + hashes;
+                                    break;
+                                }
+                            }
+                            if bytes[j] == b'\n' {
+                                out.push('\n');
+                            } else if emit {
+                                out.push(' ');
+                            }
+                            j += 1;
+                        }
+                        return Some(j);
+                    }
+                }
+            }
+            // Ordinary string "..."
+            if b == b'"' {
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    if bytes[j] == b'\\' {
+                        if bytes.get(j + 1) == Some(&b'\n') {
+                            out.push('\n');
+                        }
+                        j = (j + 2).min(bytes.len());
+                        continue;
+                    }
+                    if bytes[j] == b'"' {
+                        j += 1;
+                        break;
+                    }
+                    if bytes[j] == b'\n' {
+                        out.push('\n');
+                    } else if emit {
+                        out.push(' ');
+                    }
+                    j += 1;
+                }
+                return Some(j);
+            }
+            // Char literal 'x' / '\x' (distinguished from lifetime 'a)
+            if b == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\\') {
+                    let mut j = i + 2;
+                    while j < bytes.len() && bytes[j] != b'\'' && bytes[j] != b'\n' {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'\'') {
+                        return Some(j + 1);
+                    }
+                } else if bytes.get(i + 2) == Some(&b'\'') && bytes.get(i + 1) != Some(&b'\n') {
+                    return Some(i + 3);
+                }
+            }
+            None
+        }
+
+        let bytes = source.as_bytes();
+        let mut out = String::with_capacity(source.len());
+        let mut i = 0_usize;
+        while i < bytes.len() {
+            if let Some(next) = advance_non_code_token(bytes, i, &mut out, true) {
+                i = next;
+                continue;
+            }
+            // Outer attribute `#[...]` (not inner `#![...]`)
+            if bytes[i] == b'#' && bytes.get(i + 1) == Some(&b'[') {
+                let attr_start = i + 2;
+                let mut j = attr_start;
+                let mut bracket_depth = 1_usize;
+                let mut attr_newlines = 0_usize;
+                while j < bytes.len() && bracket_depth > 0 {
+                    if let Some(next) = advance_non_code_token(bytes, j, &mut String::new(), false)
+                    {
+                        for &ch in &bytes[j..next] {
+                            if ch == b'\n' {
+                                attr_newlines += 1;
+                            }
+                        }
+                        j = next;
+                        continue;
+                    }
+                    if bytes[j] == b'[' {
+                        bracket_depth += 1;
+                    } else if bytes[j] == b']' {
+                        bracket_depth -= 1;
+                        if bracket_depth == 0 {
+                            break;
+                        }
+                    } else if bytes[j] == b'\n' {
+                        attr_newlines += 1;
+                    }
+                    j += 1;
+                }
+                let attr_inner = &source[attr_start..j.min(source.len())];
+                let after_attr = (j + 1).min(bytes.len());
+                if attr_is_cfg_test(attr_inner) {
+                    for _ in 0..attr_newlines {
+                        out.push('\n');
+                    }
+                    i = after_attr;
+                    // Skip any subsequent outer attributes stacked on the same item,
+                    // then skip the annotated item (either `;`-terminated or `{ ... }` block).
+                    loop {
+                        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                            if bytes[i] == b'\n' {
+                                out.push('\n');
+                            }
+                            i += 1;
+                        }
+                        if i < bytes.len()
+                            && let Some(next) = advance_non_code_token(bytes, i, &mut out, false)
+                        {
+                            i = next;
+                            continue;
+                        }
+                        if i < bytes.len() && bytes[i] == b'#' && bytes.get(i + 1) == Some(&b'[') {
+                            let mut k = i + 2;
+                            let mut d = 1_usize;
+                            while k < bytes.len() && d > 0 {
+                                if let Some(next) =
+                                    advance_non_code_token(bytes, k, &mut out, false)
+                                {
+                                    k = next;
+                                    continue;
+                                }
+                                if bytes[k] == b'[' {
+                                    d += 1;
+                                } else if bytes[k] == b']' {
+                                    d -= 1;
+                                } else if bytes[k] == b'\n' {
+                                    out.push('\n');
+                                }
+                                k += 1;
+                            }
+                            i = k;
+                            continue;
+                        }
+                        break;
+                    }
+                    let mut paren_depth = 0_usize;
+                    let mut brace_depth = 0_usize;
+                    let mut saw_brace = false;
+                    while i < bytes.len() {
+                        if let Some(next) = advance_non_code_token(bytes, i, &mut out, false) {
+                            i = next;
+                            continue;
+                        }
+                        let ch = bytes[i];
+                        if ch == b'\n' {
+                            out.push('\n');
+                        } else if ch == b'(' || ch == b'[' {
+                            paren_depth += 1;
+                        } else if ch == b')' || ch == b']' {
+                            paren_depth = paren_depth.saturating_sub(1);
+                        } else if ch == b'{' && paren_depth == 0 {
+                            brace_depth += 1;
+                            saw_brace = true;
+                        } else if ch == b'}' && paren_depth == 0 {
+                            brace_depth = brace_depth.saturating_sub(1);
+                            if saw_brace && brace_depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        } else if !saw_brace
+                            && brace_depth == 0
+                            && paren_depth == 0
+                            && (ch == b';' || ch == b',' || ch == b'}')
+                        {
+                            if ch != b'}' {
+                                i += 1;
+                            }
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+            let ch = source[i..].chars().next().expect("valid utf-8 char");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    #[test]
+    fn production_crates_have_no_unstructured_threads_or_test_cx_bd_in31y() {
+        // Planted-red self-tests for `strip_cfg_test_items`: a naive
+        // `.split("#[cfg(test)]").next()` skipped everything after line 16 of
+        // `ffs-fuse/src/lib.rs`! Prove violations placed AFTER an early
+        // `#[cfg(test)]` item are preserved and detected, while `#[cfg(test)]`
+        // items themselves are stripped with 1:1 line numbering.
+        let sample = "\
+#[cfg(test)]\n\
+use ffs_core::ReaddirPage;\n\
+#[cfg(all(test, target_os = \"linux\"))]\n\
+mod directory_cookie_tests;\n\
+pub fn prod_violator() {\n\
+    let _ = std::thread::spawn(|| {});\n\
+}\n\
+#[cfg(test)]\n\
+mod tests {\n\
+    fn helper() { let _ = Cx::for_testing(); }\n\
+}\n\
+pub fn prod_tail() {\n\
+    let _ = RuntimeBuilder::multi_thread();\n\
+}\n";
+        let stripped = strip_cfg_test_items(sample);
+        assert_eq!(
+            stripped.lines().count(),
+            sample.lines().count(),
+            "line numbering must stay 1:1 after stripping #[cfg(test)] items"
+        );
+        assert!(
+            stripped.contains("std::thread::spawn"),
+            "planted-red: production violation after early #[cfg(test)] use must remain visible:\n{stripped}"
+        );
+        assert!(
+            stripped.contains("RuntimeBuilder::multi_thread"),
+            "planted-red: production violation after #[cfg(test)] mod tests must remain visible:\n{stripped}"
+        );
+        assert!(
+            !stripped.contains("Cx::for_testing"),
+            "#[cfg(test)] mod body must be stripped:\n{stripped}"
+        );
+
+        fn parse_out_of_line_mod_ident(stripped_line: &str) -> Option<&str> {
+            let trimmed = stripped_line.trim();
+            let rest = if let Some(after_pub) = trimmed.strip_prefix("pub") {
+                let after_pub = after_pub.trim_start();
+                if let Some(in_vis) = after_pub.strip_prefix('(') {
+                    let (_, after_vis) = in_vis.split_once(')')?;
+                    after_vis.trim_start()
+                } else if after_pub.starts_with("mod ") || after_pub.starts_with("mod\t") {
+                    after_pub
+                } else {
+                    return None;
+                }
+            } else {
+                trimmed
+            };
+            let after_mod = rest
+                .strip_prefix("mod ")
+                .or_else(|| rest.strip_prefix("mod\t"))?
+                .trim();
+            let ident_with_semi = after_mod.strip_suffix(';')?.trim();
+            let ident = ident_with_semi
+                .strip_prefix("r#")
+                .unwrap_or(ident_with_semi);
+            if !ident.is_empty()
+                && ident
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                Some(ident)
+            } else {
+                None
+            }
+        }
+
+        fn extract_quoted_arg<'a>(raw_line: &'a str, prefix: &str) -> Option<&'a str> {
+            let idx = raw_line.find(prefix)?;
+            let after = &raw_line[idx + prefix.len()..];
+            let (val, _) = after.split_once('"')?;
+            Some(val)
+        }
+
+        // Planted-red self-test for module-declaration extraction: unstripped
+        // production `mod` items are followed, while `#[cfg(test)] mod ...;`
+        // (including inside `companion_bin_tests! { ... }`) are stripped first.
+        let mod_sample = "\
+pub mod live_worker;\n\
+companion_bin_tests! {\n\
+#[cfg(test)]\n\
+mod preallocation_tests;\n\
+}\n\
+#[cfg(test)]\n\
+#[path = \"wal_buffer/group_commit_regression.rs\"]\n\
+mod group_commit_regression;\n\
+pub(crate) mod scrub;\n";
+        let mod_stripped = strip_cfg_test_items(mod_sample);
+        let extracted_mods: Vec<&str> = mod_stripped
+            .lines()
+            .filter_map(parse_out_of_line_mod_ident)
+            .collect();
+        assert_eq!(extracted_mods, vec!["live_worker", "scrub"]);
+
+        fn visit_prod_module_graph(
+            entry_file: &Path,
+            src_dir: &Path,
+            visited: &mut std::collections::BTreeSet<std::path::PathBuf>,
+        ) {
+            let canonical = entry_file
+                .canonicalize()
+                .unwrap_or_else(|_| entry_file.to_path_buf());
+            if !visited.insert(canonical.clone()) {
+                return;
+            }
+            let raw = std::fs::read_to_string(&canonical)
+                .unwrap_or_else(|err| panic!("read {}: {err}", canonical.display()));
+            let stripped = strip_cfg_test_items(&raw);
+            let parent = canonical.parent().unwrap_or(src_dir);
+            let file_name = canonical
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let stem = canonical
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let is_mod_root = matches!(file_name, "lib.rs" | "main.rs" | "mod.rs");
+
+            let mut pending_path_attr: Option<String> = None;
+            for (stripped_line, raw_line) in stripped.lines().zip(raw.lines()) {
+                if stripped_line.trim().is_empty() {
+                    pending_path_attr = None;
+                    continue;
+                }
+                let raw_trimmed = raw_line.trim();
+                if raw_trimmed.starts_with("#[")
+                    && let Some(rel) = extract_quoted_arg(raw_trimmed, "path = \"")
+                {
+                    pending_path_attr = Some(rel.to_owned());
+                    continue;
+                }
+                if let Some(inc_rel) = extract_quoted_arg(raw_trimmed, "include!(\"") {
+                    let inc_path = parent.join(inc_rel);
+                    if inc_path.is_file()
+                        && inc_path.extension().and_then(|e| e.to_str()) == Some("rs")
+                    {
+                        visit_prod_module_graph(&inc_path, src_dir, visited);
+                    }
+                }
+                if let Some(ident) = parse_out_of_line_mod_ident(stripped_line) {
+                    let candidates = if let Some(custom_rel) = pending_path_attr.take() {
+                        vec![
+                            parent.join(&custom_rel),
+                            parent.join(stem).join(&custom_rel),
+                        ]
+                    } else if is_mod_root {
+                        vec![
+                            parent.join(format!("{ident}.rs")),
+                            parent.join(ident).join("mod.rs"),
+                        ]
+                    } else {
+                        vec![
+                            parent.join(stem).join(format!("{ident}.rs")),
+                            parent.join(stem).join(ident).join("mod.rs"),
+                            parent.join(format!("{ident}.rs")),
+                            parent.join(ident).join("mod.rs"),
+                        ]
+                    };
+                    if let Some(resolved) = candidates.into_iter().find(|p| p.is_file()) {
+                        visit_prod_module_graph(&resolved, src_dir, visited);
+                    }
+                }
+                if !raw_trimmed.starts_with("#[") {
+                    pending_path_attr = None;
                 }
             }
         }
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates_root = manifest_dir
+            .parent()
+            .expect("crates dir")
+            .canonicalize()
+            .expect("canonicalize crates/");
+        let mut visited_files = std::collections::BTreeSet::new();
+        for crate_entry in std::fs::read_dir(&crates_root).expect("read crates/") {
+            let crate_dir = crate_entry.expect("crate dir").path();
+            let crate_name = crate_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            // Skip test/bench harness crate and legacy extraction-reference crates.
+            if matches!(crate_name, "ffs-harness" | "ffs-ext4" | "ffs-btrfs") {
+                continue;
+            }
+            let src_dir = crate_dir.join("src");
+            if !src_dir.is_dir() {
+                continue;
+            }
+            for root_name in ["lib.rs", "main.rs"] {
+                let root = src_dir.join(root_name);
+                if root.is_file() {
+                    visit_prod_module_graph(&root, &src_dir, &mut visited_files);
+                }
+            }
+            let bin_dir = src_dir.join("bin");
+            if bin_dir.is_dir() {
+                for bin_entry in std::fs::read_dir(&bin_dir).expect("read src/bin") {
+                    let bin_path = bin_entry.expect("bin entry").path();
+                    if bin_path.is_file()
+                        && bin_path.extension().and_then(|e| e.to_str()) == Some("rs")
+                    {
+                        visit_prod_module_graph(&bin_path, &src_dir, &mut visited_files);
+                    } else if bin_path.is_dir() {
+                        let bin_main = bin_path.join("main.rs");
+                        if bin_main.is_file() {
+                            visit_prod_module_graph(&bin_main, &src_dir, &mut visited_files);
+                        }
+                    }
+                }
+            }
+        }
+        let rs_files: Vec<std::path::PathBuf> = visited_files.into_iter().collect();
+        assert!(
+            rs_files.len() >= 100,
+            "scanner must inspect all production crates (>=100 .rs files), got {}",
+            rs_files.len()
+        );
+
+        let forbidden = [
+            "thread::spawn(",
+            "thread::Builder",
+            "std::sync::mpsc",
+            "Cx::for_testing",
+            "Cx::for_request",
+            "Cx::new(",
+        ];
+
+        let mut non_empty_prod_lines = 0_usize;
+        let mut violations = Vec::new();
+        for path in &rs_files {
+            let rel = path.strip_prefix(&crates_root).unwrap_or(path);
+            let rel_str = rel.to_string_lossy();
+            let is_binary_entrypoint = rel_str.starts_with("ffs-cli/")
+                || rel_str.contains("/src/bin/")
+                || rel_str.ends_with("/main.rs");
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            let prod = strip_cfg_test_items(&source);
+            for (line_no, line) in prod.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                non_empty_prod_lines += 1;
+                for needle in forbidden {
+                    if trimmed.contains(needle) {
+                        violations.push(format!(
+                            "{}:{} contains forbidden token `{needle}`: {trimmed}",
+                            rel.display(),
+                            line_no + 1
+                        ));
+                    }
+                }
+                if !is_binary_entrypoint && trimmed.contains("RuntimeBuilder") {
+                    violations.push(format!(
+                        "{}:{} constructs library-internal RuntimeBuilder (FrankenFS libraries must inherit caller &Cx): {trimmed}",
+                        rel.display(),
+                        line_no + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            non_empty_prod_lines >= 100_000,
+            "non-vacuous scanner must inspect >=100,000 production lines, got {non_empty_prod_lines}"
+        );
+        assert!(
+            violations.is_empty(),
+            "found {} production runtime/concurrency authority violations:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn lab_runtime_unmount_during_active_compaction_reaches_bounded_quiescence_bd_in31y() {
+        use asupersync::lab::{LabConfig, LabRuntime};
+
+        struct MidCompactionCancelDevice {
+            inner: TestDevice,
+            mount_cx: Cx,
+            writes_seen: Arc<AtomicUsize>,
+            post_close_ops: Arc<AtomicUsize>,
+            region_closed: Arc<AtomicBool>,
+        }
+
+        impl ByteDevice for MidCompactionCancelDevice {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ffs_types::ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                if self.region_closed.load(Ordering::Acquire) {
+                    self.post_close_ops.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ffs_types::ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                if self.region_closed.load(Ordering::Acquire) {
+                    self.post_close_ops.fetch_add(1, Ordering::SeqCst);
+                }
+                let n = self.writes_seen.fetch_add(1, Ordering::SeqCst) + 1;
+                self.inner.write_all_at(cx, offset, buf)?;
+                // Cancel the parent mount context right after the 2nd of 6
+                // disjoint block runs so compaction is interrupted mid-batch!
+                if n == 2 {
+                    self.mount_cx.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("unmount during active metadata compaction"),
+                    );
+                }
+                Ok(())
+            }
+
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                if self.region_closed.load(Ordering::Acquire) {
+                    self.post_close_ops.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.sync(cx)
+            }
+        }
+
+        let writes_seen = Arc::new(AtomicUsize::new(0));
+        let post_close_ops = Arc::new(AtomicUsize::new(0));
+        let region_closed = Arc::new(AtomicBool::new(false));
+
+        let mut lab = LabRuntime::new(
+            LabConfig::new(0xBD13_17C0)
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        let root_region = lab
+            .state
+            .create_root_region(asupersync::types::Budget::INFINITE);
+        let writes_task = Arc::clone(&writes_seen);
+        let post_close_task = Arc::clone(&post_close_ops);
+        let closed_task = Arc::clone(&region_closed);
+        let (task_id, _handle) = lab
+            .state
+            .create_task(
+                root_region,
+                asupersync::types::Budget::INFINITE,
+                async move {
+                    let mount_cx = Cx::current().expect("LabRuntime task Cx");
+                    let mount_region = ffs_block::OwnedChildRegion::open_async(&mount_cx)
+                        .await
+                        .expect("open mount child region");
+                    let device: Arc<dyn ByteDevice> = Arc::new(MidCompactionCancelDevice {
+                        inner: TestDevice::from_vec(vec![0x11; 16 * 512]),
+                        mount_cx: mount_cx.clone(),
+                        writes_seen: writes_task,
+                        post_close_ops: post_close_task,
+                        region_closed: Arc::clone(&closed_task),
+                    });
+                    let mut compactor =
+                        MetadataCompactor::start_async(mount_region.cx(), device, 512)
+                            .await
+                            .expect("start MetadataCompactor in LabRuntime");
+                    // Enqueue 6 non-adjacent blocks so compact_latest executes 6 separate runs.
+                    compactor.enqueue(vec![
+                        (BlockNumber(1), Arc::<[u8]>::from(vec![0xAA; 512])),
+                        (BlockNumber(3), Arc::<[u8]>::from(vec![0xBB; 512])),
+                        (BlockNumber(5), Arc::<[u8]>::from(vec![0xCC; 512])),
+                        (BlockNumber(7), Arc::<[u8]>::from(vec![0xDD; 512])),
+                        (BlockNumber(9), Arc::<[u8]>::from(vec![0xEE; 512])),
+                        (BlockNumber(11), Arc::<[u8]>::from(vec![0xFF; 512])),
+                    ]);
+                    // Advance virtual time past MetadataCompactor::QUIESCENCE_WINDOW (10ms)
+                    // so the compactor enters active multi-run writeback.
+                    asupersync::time::sleep(mount_cx.now(), Duration::from_millis(15)).await;
+                    compactor.shutdown_async().await;
+                    mount_region.close_async().await;
+                    closed_task.store(true, Ordering::Release);
+                },
+            )
+            .expect("create lab compactor task");
+        lab.scheduler.lock().schedule(task_id, 0);
+
+        let _vt = lab.run_with_auto_advance();
+        let report = lab.report();
+        assert!(
+            report.lab_test_passed(),
+            "LabRuntime oracle/quiescence failed during interrupted compaction: {report:?}"
+        );
+        assert!(
+            report.steps_total < 2_000,
+            "unmount during active metadata compaction must reach quiescence within a tight step bound, got {}",
+            report.steps_total
+        );
+        let written = writes_seen.load(Ordering::SeqCst);
+        assert!(
+            (2..6).contains(&written),
+            "compaction must start active writeback (>=2 runs) and abort mid-batch (<6 runs) on mount cancellation, got {written}"
+        );
+        assert_eq!(
+            post_close_ops.load(Ordering::SeqCst),
+            0,
+            "no compaction writes or syncs may execute after mount region close"
+        );
     }
 
     #[test]
@@ -106131,7 +106838,7 @@ mod tests {
             for &fail_sync in failure_cases {
                 let (seed, dev, tmp) = open_writable_ext4_mkfs_with_crash_device(16)
                     .expect("metadata checkpoint regression requires mkfs.ext4");
-                let cx = Cx::for_testing();
+                let (_rt, cx) = test_compactor_runtime();
                 let root = InodeNumber(2);
                 let ino = seed
                     .create(&cx, root, OsStr::new("accepted"), 0o644, 0, 0)
@@ -106658,7 +107365,7 @@ mod tests {
             );
 
             let _flocks = wal_flock_holder();
-            let cx = Cx::for_testing();
+            let (_rt, cx) = test_compactor_runtime();
             let options = OpenOptions {
                 ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
                 mvcc_wal_path: Some(wal.clone()),
@@ -109234,7 +109941,7 @@ mod tests {
             .expect("revoked WAL recovery regression requires mkfs.ext4");
         drop(seed);
         let _flocks = wal_flock_holder();
-        let cx = Cx::for_testing();
+        let (_rt, cx) = test_compactor_runtime();
         let wal = tmp.path().join("revoked-metadata.wal");
         let options = OpenOptions {
             metadata_log_enabled: true,
@@ -109369,7 +110076,7 @@ mod tests {
     fn wal_reopen_under_concurrent_child_spawns_never_inherits_stale_flock_bd_kdo95() {
         let (seed, dev, tmp) = open_writable_ext4_mkfs_with_crash_device(16)
             .expect("bd-kdo95 regression requires mkfs.ext4");
-        let cx = Cx::for_testing();
+        let (_rt, cx) = test_compactor_runtime();
         let root = InodeNumber(2);
         let ino = seed
             .create(&cx, root, OsStr::new("contended.bin"), 0o644, 0, 0)

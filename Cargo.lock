@@ -1129,6 +1129,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "criterion",
+ "ffs-block",
  "ffs-core",
  "ffs-error",
  "ffs-types",

@@ -52,20 +52,446 @@ pub const FUSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default per-request poll quota for FUSE dispatch contexts (`bd-lza2g`).
 pub const FUSE_REQUEST_POLL_QUOTA: u32 = 1_000_000;
 
+#[cfg(test)]
 pub(crate) fn fuse_runtime() -> &'static asupersync::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<asupersync::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
         asupersync::runtime::RuntimeBuilder::multi_thread()
-            .worker_threads(1)
-            .blocking_threads(0, 8)
+            .worker_threads(2)
+            .blocking_threads(0, 16)
             .build()
-            .expect("ffs-fuse asupersync runtime must initialize")
+            .expect("ffs-fuse test asupersync runtime must initialize")
     })
 }
 
+#[cfg(test)]
 pub(crate) fn fuse_root_cx() -> &'static Cx {
     static ROOT_CX: std::sync::OnceLock<Cx> = std::sync::OnceLock::new();
     ROOT_CX.get_or_init(|| fuse_runtime().request_cx_with_budget(asupersync::Budget::INFINITE))
+}
+
+#[derive(Default)]
+struct MountCancelRegistry {
+    cancelled: std::sync::atomic::AtomicBool,
+    hard_aborted: std::sync::atomic::AtomicBool,
+    next_request_id: AtomicU64,
+    active_requests: Mutex<BTreeMap<u64, Cx>>,
+}
+
+impl MountCancelRegistry {
+    fn cancel_all(&self, _reason: &asupersync::types::CancelReason) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        let active: Vec<Cx> = self
+            .active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for request_cx in active {
+            request_cx.set_cancel_requested(true);
+        }
+    }
+
+    fn abort_for_timeout(&self) {
+        self.hard_aborted
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.cancel_all(&asupersync::types::CancelReason::timeout());
+    }
+}
+
+struct ActiveRequestGuard<'a> {
+    registry: &'a MountCancelRegistry,
+    request_id: Option<u64>,
+}
+
+impl Drop for ActiveRequestGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.request_id.take() {
+            self.registry
+                .active_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+        }
+    }
+}
+
+struct PeriodicCommitWorker {
+    stop_tx: Option<asupersync::channel::oneshot::Sender<()>>,
+    region: Option<ffs_block::OwnedChildRegion>,
+    task: Option<asupersync::runtime::TaskHandle<()>>,
+}
+
+impl PeriodicCommitWorker {
+    fn start(parent_cx: &Cx, ops: Arc<dyn FsOps>, interval: Duration) -> Option<Self> {
+        let region = match ffs_block::OwnedChildRegion::open_sync(parent_cx) {
+            Ok(region) => region,
+            Err(error) => {
+                warn!(%error, "FUSE managed periodic commit region unavailable");
+                return None;
+            }
+        };
+        let (stop_tx, mut stop_rx) = asupersync::channel::oneshot::channel::<()>();
+        let task = match region.cx().spawn(move |worker_cx| async move {
+            loop {
+                if asupersync::time::timeout(worker_cx.now(), interval, stop_rx.recv(&worker_cx))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                if worker_cx.checkpoint().is_err() {
+                    break;
+                }
+                let ops_tick = Arc::clone(&ops);
+                let (done_tx, mut done_rx) = asupersync::channel::oneshot::channel::<()>();
+                if let Ok(mut blocking) = worker_cx.spawn_blocking(move |tick_cx| {
+                    if tick_cx.checkpoint().is_err() {
+                        return;
+                    }
+                    let Ok(permit) = tick_cx.masked(|| done_tx.reserve(&tick_cx)) else {
+                        return;
+                    };
+                    if let Err(error) = ops_tick.periodic_commit(&tick_cx) {
+                        warn!(%error, "FUSE managed periodic commit failed");
+                    }
+                    let _ = permit.send(());
+                }) {
+                    let _ = ffs_block::join_task_uninterruptible(&mut blocking).await;
+                    let _ = ffs_block::poll_masked(&worker_cx, done_rx.recv(&worker_cx)).await;
+                }
+                if worker_cx.checkpoint().is_err() {
+                    break;
+                }
+            }
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                warn!(%error, "FUSE managed periodic commit task failed to spawn");
+                region.close_sync();
+                return None;
+            }
+        };
+        Some(Self {
+            stop_tx: Some(stop_tx),
+            region: Some(region),
+            task: Some(task),
+        })
+    }
+
+    fn stop(mut self) {
+        self.stop_in_place();
+    }
+
+    fn stop_in_place(&mut self) {
+        if let Some(region) = self.region.as_ref() {
+            region.disarm_parent_bridge();
+        }
+        drop(self.stop_tx.take());
+        if let Some(mut task) = self.task.take() {
+            let _ = ffs_block::block_on_park(ffs_block::join_task_uninterruptible(&mut task));
+        }
+        if let Some(region) = self.region.take() {
+            region.close_sync();
+        }
+    }
+}
+
+impl Drop for PeriodicCommitWorker {
+    fn drop(&mut self) {
+        self.stop_in_place();
+    }
+}
+
+/// Retains `Arc<dyn FsOps>` (and its underlying `BlockDevice` / exclusive lock)
+/// when `unmount_timeout` expires while a wedged OS thread is still inside
+/// nonresponsive device I/O, releasing the lease only once that worker retires.
+struct QuarantinedMountLease {
+    id: u64,
+    _ops: Arc<dyn FsOps>,
+}
+
+static NEXT_QUARANTINED_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+static QUARANTINED_MOUNT_LEASES: Mutex<Vec<QuarantinedMountLease>> = Mutex::new(Vec::new());
+
+fn register_quarantined_mount_lease(ops: Arc<dyn FsOps>) -> u64 {
+    let id = NEXT_QUARANTINED_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+    QUARANTINED_MOUNT_LEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(QuarantinedMountLease { id, _ops: ops });
+    id
+}
+
+fn release_quarantined_mount_lease(id: u64) {
+    QUARANTINED_MOUNT_LEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|lease| lease.id != id);
+}
+
+#[cfg(test)]
+fn quarantined_mount_lease_count() -> usize {
+    QUARANTINED_MOUNT_LEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
+struct MountRuntimeScope {
+    parent_cx: Cx,
+    mount_region: Mutex<Option<ffs_block::OwnedChildRegion>>,
+    principal_cx: Cx,
+    runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
+    cancel_registry: Arc<MountCancelRegistry>,
+    periodic_commit: Mutex<Option<PeriodicCommitWorker>>,
+}
+
+impl MountRuntimeScope {
+    fn open_required(parent_cx: &Cx) -> Result<Arc<Self>, FuseError> {
+        if parent_cx.checkpoint().is_err() {
+            return Err(FuseError::Io(std::io::Error::from_raw_os_error(
+                libc::ECANCELED,
+            )));
+        }
+        let cancel_registry = Arc::new(MountCancelRegistry::default());
+        let hook_registry = Arc::clone(&cancel_registry);
+        let region =
+            ffs_block::OwnedChildRegion::open_with_cancel_hook_sync(parent_cx, move |reason| {
+                hook_registry.cancel_all(reason);
+            })
+            .map_err(|err| match err {
+                FfsError::Cancelled => {
+                    FuseError::Io(std::io::Error::from_raw_os_error(libc::ECANCELED))
+                }
+                other => FuseError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mount requires a caller-owned runtime Cx: {other}"),
+                )),
+            })?;
+        let principal_cx = region.cx().clone();
+        let runtime_handle = region.runtime_handle().cloned();
+        Ok(Arc::new(Self {
+            parent_cx: parent_cx.clone(),
+            mount_region: Mutex::new(Some(region)),
+            principal_cx,
+            runtime_handle,
+            cancel_registry,
+            periodic_commit: Mutex::new(None),
+        }))
+    }
+
+    fn open_adapter(parent_cx: &Cx) -> Arc<Self> {
+        let cancel_registry = Arc::new(MountCancelRegistry::default());
+        if parent_cx.checkpoint().is_err() {
+            cancel_registry.cancel_all(&asupersync::types::CancelReason::parent_cancelled());
+            return Arc::new(Self {
+                parent_cx: parent_cx.clone(),
+                mount_region: Mutex::new(None),
+                principal_cx: parent_cx.clone(),
+                runtime_handle: None,
+                cancel_registry,
+                periodic_commit: Mutex::new(None),
+            });
+        }
+        let hook_registry = Arc::clone(&cancel_registry);
+        match ffs_block::OwnedChildRegion::open_with_cancel_hook_sync(parent_cx, move |reason| {
+            hook_registry.cancel_all(reason);
+        }) {
+            Ok(region) => {
+                let principal_cx = region.cx().clone();
+                let runtime_handle = region.runtime_handle().cloned();
+                Arc::new(Self {
+                    parent_cx: parent_cx.clone(),
+                    mount_region: Mutex::new(Some(region)),
+                    principal_cx,
+                    runtime_handle,
+                    cancel_registry,
+                    periodic_commit: Mutex::new(None),
+                })
+            }
+            Err(FfsError::Cancelled) => {
+                cancel_registry.cancel_all(&asupersync::types::CancelReason::parent_cancelled());
+                Arc::new(Self {
+                    parent_cx: parent_cx.clone(),
+                    mount_region: Mutex::new(None),
+                    principal_cx: parent_cx.clone(),
+                    runtime_handle: None,
+                    cancel_registry,
+                    periodic_commit: Mutex::new(None),
+                })
+            }
+            Err(_) => Arc::new(Self {
+                parent_cx: parent_cx.clone(),
+                mount_region: Mutex::new(None),
+                principal_cx: parent_cx.clone(),
+                runtime_handle: None,
+                cancel_registry,
+                periodic_commit: Mutex::new(None),
+            }),
+        }
+    }
+
+    const fn base_cx(&self) -> &Cx {
+        &self.principal_cx
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_registry
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.parent_cx.checkpoint().is_err()
+    }
+
+    fn mint_request_cx(&self) -> Cx {
+        let timeout_budget = self
+            .principal_cx
+            .budget_for_timeout(FUSE_REQUEST_TIMEOUT)
+            .with_poll_quota(FUSE_REQUEST_POLL_QUOTA);
+        let budget = self.parent_cx.budget().combine(timeout_budget);
+        let cx = self
+            .runtime_handle
+            .as_ref()
+            .and_then(|handle| handle.try_request_cx_with_budget(budget).ok())
+            .unwrap_or_else(|| self.principal_cx.clone());
+        if self.is_cancelled() {
+            cx.set_cancel_requested(true);
+        }
+        if let Some(interrupt) = fuser::current_read_request_interrupt() {
+            let request_cx = cx.clone();
+            interrupt.on_interrupt(move || request_cx.set_cancel_requested(true));
+        }
+        cx
+    }
+
+    fn mint_flush_cx(&self) -> Cx {
+        let flush_budget = self
+            .principal_cx
+            .budget_for_timeout(FUSE_REQUEST_TIMEOUT)
+            .with_poll_quota(FUSE_REQUEST_POLL_QUOTA);
+        let cx = self
+            .runtime_handle
+            .as_ref()
+            .and_then(|handle| handle.try_request_cx_with_budget(flush_budget).ok())
+            .unwrap_or_else(|| self.principal_cx.clone());
+        if self
+            .cancel_registry
+            .hard_aborted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            cx.set_cancel_requested(true);
+        }
+        cx
+    }
+
+    fn register_active_request(&self, cx: &Cx) -> ActiveRequestGuard<'_> {
+        let id = self
+            .cancel_registry
+            .next_request_id
+            .fetch_add(1, Ordering::Relaxed);
+        let mut active = self
+            .cancel_registry
+            .active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_cancelled() {
+            cx.set_cancel_requested(true);
+            return ActiveRequestGuard {
+                registry: &self.cancel_registry,
+                request_id: None,
+            };
+        }
+        active.insert(id, cx.clone());
+        ActiveRequestGuard {
+            registry: &self.cancel_registry,
+            request_id: Some(id),
+        }
+    }
+
+    fn start_periodic_commit(&self, ops: &Arc<dyn FsOps>, configured: Option<Duration>) {
+        let Some(interval) = configured.or_else(|| ops.default_commit_interval()) else {
+            return;
+        };
+        if interval.is_zero() {
+            return;
+        }
+        let worker = PeriodicCommitWorker::start(&self.principal_cx, Arc::clone(ops), interval);
+        let previous = self
+            .periodic_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace_if_some(worker);
+        drop(previous);
+    }
+
+    fn stop_periodic_commit(&self) {
+        let worker = self
+            .periodic_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            worker.stop();
+        }
+    }
+
+    fn abort_for_timeout(&self) {
+        self.cancel_registry.abort_for_timeout();
+        if let Some(region) = self
+            .mount_region
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            region.cancel(asupersync::types::CancelReason::timeout());
+        }
+    }
+
+    fn sleep_interruptible(&self, slice: Duration) {
+        if slice.is_zero() || self.is_cancelled() {
+            return;
+        }
+        if self.principal_cx.timer_driver().is_some() {
+            let (_keep_tx, mut cancel_rx) = asupersync::channel::oneshot::channel::<()>();
+            let _ = ffs_block::block_on_park(asupersync::time::timeout(
+                self.principal_cx.now(),
+                slice,
+                cancel_rx.recv(&self.principal_cx),
+            ));
+        } else {
+            std::thread::park_timeout(slice);
+        }
+    }
+
+    fn close_sync(&self) {
+        self.stop_periodic_commit();
+        let region = self
+            .mount_region
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(region) = region {
+            region.close_sync();
+        }
+    }
+}
+
+trait OptionReplaceIfSomeExt<T> {
+    fn replace_if_some(&mut self, next: Option<T>) -> Option<T>;
+}
+
+impl<T> OptionReplaceIfSomeExt<T> for Option<T> {
+    fn replace_if_some(&mut self, next: Self) -> Self {
+        next.and_then(|value| self.replace(value))
+    }
+}
+
+impl Drop for MountRuntimeScope {
+    fn drop(&mut self) {
+        self.close_sync();
+    }
 }
 
 /// Whether memo-served requests increment `requests_total` (bd-d9378).
@@ -893,7 +1319,7 @@ fn resolve_xattr_suppression(fs: &FrankenFuse) {
         ));
         return;
     }
-    let cx = FrankenFuse::cx_for_request();
+    let cx = fs.cx_for_request();
     let presence = fs.inner.ops.xattr_presence(&cx);
     let allowed = xattr_suppression_allowed(setting, presence, fs.inner.read_only);
     XATTR_SWITCH.store(allowed, std::sync::atomic::Ordering::Relaxed);
@@ -5152,7 +5578,7 @@ struct KernelNotifyState {
 
 #[derive(Debug)]
 struct KernelNotifyWorker {
-    region: asupersync::cx::ChildRegion,
+    region: ffs_block::OwnedChildRegion,
     task: asupersync::runtime::TaskHandle<()>,
 }
 
@@ -5163,26 +5589,27 @@ impl Drop for KernelNotifyState {
         // Close admission first, drain the FIFO, then close from outside it.
         drop(self.sender.take());
         if let Some(KernelNotifyWorker { region, mut task }) = self.worker.take() {
-            let runtime = fuse_runtime();
-            if let Err(error) = runtime.block_on(task.join(fuse_root_cx())) {
-                warn!(?error, "FUSE notification worker failed while draining");
-            }
-            if let Err(error) = runtime.block_on(region.close()) {
-                warn!(?error, "FUSE notification region failed to close");
-            }
+            region.disarm_parent_bridge();
+            ffs_block::block_on_park(async move {
+                if let Err(error) = ffs_block::join_task_uninterruptible(&mut task).await {
+                    warn!(?error, "FUSE notification worker failed while draining");
+                }
+                region.close_async().await;
+            });
         }
     }
 }
 
 impl KernelNotifyQueue {
-    /// Take ownership of `notifier` on an off-thread worker and return a handle.
+    /// Take ownership of `notifier` on an off-thread worker inside `parent_cx`'s
+    /// mount region and return a handle.
     ///
     /// A failure to spawn is logged and degrades to "no kernel notifications"
     /// rather than failing the mount: the receiver drops, every later `send`
     /// fails, and the filesystem stays correct because entry/attr TTLs still
     /// expire. A mount must not fail because a cache-eviction helper did.
-    fn spawn(notifier: fuser::Notifier) -> Self {
-        Self::spawn_with_handler(move |message| match message {
+    fn spawn(parent_cx: &Cx, notifier: fuser::Notifier) -> Self {
+        Self::spawn_with_handler_and_cx(parent_cx, move |message| match message {
             KernelNotification::Entry { parent, name } => {
                 if let Err(error) = notifier.inval_entry(parent, &name) {
                     debug!(parent, name = ?name, error = %error,
@@ -5198,17 +5625,28 @@ impl KernelNotifyQueue {
         })
     }
 
-    fn spawn_with_handler<F>(mut notify: F) -> Self
+    #[cfg(test)]
+    fn spawn_with_handler<F>(notify: F) -> Self
+    where
+        F: FnMut(KernelNotification) + Send + 'static,
+    {
+        Self::spawn_with_handler_and_cx(fuse_root_cx(), notify)
+    }
+
+    fn spawn_with_handler_and_cx<F>(parent_cx: &Cx, notify: F) -> Self
+    where
+        F: FnMut(KernelNotification) + Send + 'static,
+    {
+        ffs_block::block_on_park(Self::spawn_with_handler_async(parent_cx, notify))
+    }
+
+    pub(crate) async fn spawn_with_handler_async<F>(parent_cx: &Cx, mut notify: F) -> Self
     where
         F: FnMut(KernelNotification) + Send + 'static,
     {
         let (sender, mut receiver) =
             asupersync::channel::mpsc::unbounded_channel::<KernelNotification>();
-        let runtime = fuse_runtime();
-        let root_cx = fuse_root_cx();
-        let worker = match runtime
-            .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
-        {
+        let worker = match ffs_block::OwnedChildRegion::open_async(parent_cx).await {
             Ok(region) => {
                 let task = region.cx().spawn(move |worker_cx| async move {
                     // Idle queues must not occupy the shared blocking pool.
@@ -5217,9 +5655,8 @@ impl KernelNotifyQueue {
                     while let Ok(message) = receiver.recv(&worker_cx).await {
                         let (completed_tx, mut completed_rx) =
                             asupersync::channel::oneshot::channel();
-                        let completion_cx = fuse_root_cx();
-                        let mut blocking = match worker_cx.spawn_blocking(move |_cx| {
-                            let Ok(permit) = completed_tx.reserve(completion_cx) else {
+                        let mut blocking = match worker_cx.spawn_blocking(move |cb_cx| {
+                            let Ok(permit) = cb_cx.masked(|| completed_tx.reserve(&cb_cx)) else {
                                 return;
                             };
                             // The dependency's blocking join can finish early
@@ -5239,8 +5676,11 @@ impl KernelNotifyQueue {
                                 break;
                             }
                         };
-                        let completed = completed_rx.recv(fuse_root_cx()).await;
-                        if let Err(error) = blocking.join(fuse_root_cx()).await {
+                        let completed =
+                            ffs_block::poll_masked(&worker_cx, completed_rx.recv(&worker_cx)).await;
+                        if let Err(error) =
+                            ffs_block::join_task_uninterruptible(&mut blocking).await
+                        {
                             warn!(?error, "FUSE notification callback task failed");
                             break;
                         }
@@ -5261,12 +5701,7 @@ impl KernelNotifyQueue {
                     Ok(task) => Some(KernelNotifyWorker { region, task }),
                     Err(error) => {
                         warn!(error = %error, "FUSE notification task failed to spawn; kernel cache entries will expire by TTL instead");
-                        if let Err(error) = runtime.block_on(region.close()) {
-                            warn!(
-                                ?error,
-                                "FUSE notification region failed to close after spawn refusal"
-                            );
-                        }
+                        region.close_async().await;
                         None
                     }
                 }
@@ -5282,6 +5717,18 @@ impl KernelNotifyQueue {
                 negative_entries: Mutex::new(NegativeDentryHints::default()),
                 worker,
             }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_async(self) {
+        if let Ok(mut state) = Arc::try_unwrap(self.state) {
+            drop(state.sender.take());
+            if let Some(KernelNotifyWorker { region, mut task }) = state.worker.take() {
+                region.disarm_parent_bridge();
+                let _ = ffs_block::join_task_uninterruptible(&mut task).await;
+                region.close_async().await;
+            }
         }
     }
 
@@ -5510,35 +5957,81 @@ enum IoctlTraceMsg {
 
 #[derive(Debug)]
 struct IoctlTraceWorker {
-    region: asupersync::cx::ChildRegion,
-    task: asupersync::runtime::TaskHandle<()>,
+    inner: Mutex<
+        Option<(
+            ffs_block::OwnedChildRegion,
+            asupersync::runtime::TaskHandle<()>,
+        )>,
+    >,
 }
 
 impl IoctlTraceWorker {
+    #[cfg(test)]
     fn spawn(
+        path: PathBuf,
+        receiver: asupersync::channel::mpsc::Receiver<IoctlTraceMsg>,
+    ) -> Result<Self, String> {
+        Self::spawn_with_cx(fuse_root_cx(), path, receiver)
+    }
+
+    fn spawn_with_cx(
+        parent_cx: &Cx,
         path: PathBuf,
         mut receiver: asupersync::channel::mpsc::Receiver<IoctlTraceMsg>,
     ) -> Result<Self, String> {
-        let runtime = fuse_runtime();
-        let root_cx = fuse_root_cx();
-        let region = runtime
-            .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
-            .map_err(|err| err.to_string())?;
-        let task = region
-            .cx()
-            .spawn(move |worker_cx| async move {
-                ioctl_trace_writer_loop(&worker_cx, &path, &mut receiver).await;
-            })
-            .map_err(|err| err.to_string())?;
-        Ok(Self { region, task })
+        let region =
+            ffs_block::OwnedChildRegion::open_sync(parent_cx).map_err(|err| err.to_string())?;
+        let task = match region.cx().spawn(move |worker_cx| async move {
+            ioctl_trace_writer_loop(&worker_cx, &path, &mut receiver).await;
+        }) {
+            Ok(task) => task,
+            Err(err) => {
+                region.close_sync();
+                return Err(err.to_string());
+            }
+        };
+        Ok(Self {
+            inner: Mutex::new(Some((region, task))),
+        })
     }
 
-    fn join(mut self) -> Result<(), asupersync::runtime::JoinError> {
-        let runtime = fuse_runtime();
-        let cleanup_cx = fuse_root_cx();
-        let res = runtime.block_on(self.task.join(cleanup_cx));
-        let _ = runtime.block_on(self.region.close());
-        res
+    fn retire(&self) -> Result<(), asupersync::runtime::JoinError> {
+        let Some((region, mut task)) = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return Ok(());
+        };
+        region.cancel(asupersync::types::CancelReason::shutdown());
+        ffs_block::block_on_park(async move {
+            let res = ffs_block::join_task_uninterruptible(&mut task).await;
+            region.close_async().await;
+            match res {
+                Err(asupersync::runtime::JoinError::Cancelled(_)) => Ok(()),
+                other => other,
+            }
+        })
+    }
+
+    fn join(self) -> Result<(), asupersync::runtime::JoinError> {
+        let Some((region, mut task)) = self
+            .inner
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        else {
+            return Ok(());
+        };
+        region.disarm_parent_bridge();
+        ffs_block::block_on_park(async move {
+            let res = ffs_block::join_task_uninterruptible(&mut task).await;
+            region.close_async().await;
+            match res {
+                Err(asupersync::runtime::JoinError::Cancelled(_)) => Ok(()),
+                other => other,
+            }
+        })
     }
 }
 
@@ -5588,7 +6081,12 @@ impl IoctlTraceProbe {
         }
     }
 
+    #[cfg(test)]
     fn new(path: PathBuf) -> Self {
+        Self::new_with_cx(fuse_root_cx(), path)
+    }
+
+    fn new_with_cx(parent_cx: &Cx, path: PathBuf) -> Self {
         let dropped_events = Arc::new(AtomicU64::new(0));
         if let Err(error) = validate_ioctl_trace_path(&path) {
             warn!(
@@ -5602,7 +6100,7 @@ impl IoctlTraceProbe {
         let (sender, receiver) =
             asupersync::channel::mpsc::channel::<IoctlTraceMsg>(IOCTL_TRACE_CHANNEL_CAPACITY);
         let worker_path = path.clone();
-        let worker = match IoctlTraceWorker::spawn(worker_path, receiver) {
+        let worker = match IoctlTraceWorker::spawn_with_cx(parent_cx, worker_path, receiver) {
             Ok(worker) => Some(worker),
             Err(error) => {
                 warn!(
@@ -5639,10 +6137,15 @@ impl IoctlTraceProbe {
         }
     }
 
+    #[cfg(test)]
+    fn flush_sync(&self) -> std::io::Result<()> {
+        self.flush_sync_with_cx(fuse_root_cx())
+    }
+
     /// Round-trip a `Flush` barrier through the writer thread.  When this
     /// returns successfully, all previously enqueued `Record` messages have been written
     /// to the trace file (visible to any same-process reader).
-    fn flush_sync(&self) -> std::io::Result<()> {
+    fn flush_sync_with_cx(&self, cx: &Cx) -> std::io::Result<()> {
         let sender = self.sender.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -5650,20 +6153,22 @@ impl IoctlTraceProbe {
             )
         })?;
         let (reply_tx, mut reply_rx) = asupersync::channel::oneshot::channel();
-        let cx = fuse_root_cx();
-        let permit = fuse_runtime().block_on(sender.reserve(cx)).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "ioctl trace writer terminated",
-            )
-        })?;
+        let permit = ffs_block::block_on_park(ffs_block::poll_masked(cx, sender.reserve(cx)))
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "ioctl trace writer terminated",
+                )
+            })?;
         let _ = permit.send(IoctlTraceMsg::Flush(reply_tx));
-        fuse_runtime().block_on(reply_rx.recv(cx)).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "ioctl trace writer dropped flush reply",
-            )
-        })??;
+        ffs_block::block_on_park(ffs_block::poll_masked(cx, reply_rx.recv(cx))).map_err(
+            |_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "ioctl trace writer dropped flush reply",
+                )
+            },
+        )??;
         let dropped = self.dropped_events.load(Ordering::Relaxed);
         if dropped > 0 {
             return Err(std::io::Error::other(format!(
@@ -5671,6 +6176,19 @@ impl IoctlTraceProbe {
             )));
         }
         Ok(())
+    }
+
+    fn retire(&self, cx: &Cx) {
+        let _ = self.flush_sync_with_cx(cx);
+        if let Some(worker) = self.worker.as_ref()
+            && let Err(panic) = worker.retire()
+        {
+            warn!(
+                path = %self.path.display(),
+                ?panic,
+                "ioctl trace writer thread panicked"
+            );
+        }
     }
 }
 
@@ -5763,7 +6281,14 @@ async fn ioctl_trace_writer_loop(
             // not deadlock on a missing trace file.
             while let Ok(msg) = receiver.recv(cx).await {
                 if let IoctlTraceMsg::Flush(reply) = msg
-                    && let Ok(permit) = reply.reserve(cx)
+                    && let Ok(permit) = cx.masked(|| reply.reserve(cx))
+                {
+                    let _ = permit.send(Err(std::io::Error::new(error.kind(), error.to_string())));
+                }
+            }
+            while let Ok(msg) = receiver.try_recv() {
+                if let IoctlTraceMsg::Flush(reply) = msg
+                    && let Ok(permit) = cx.masked(|| reply.reserve(cx))
                 {
                     let _ = permit.send(Err(std::io::Error::new(error.kind(), error.to_string())));
                 }
@@ -5772,30 +6297,33 @@ async fn ioctl_trace_writer_loop(
         }
     };
     let mut write_error: Option<std::io::Error> = None;
-    while let Ok(msg) = receiver.recv(cx).await {
-        match msg {
-            IoctlTraceMsg::Record {
-                ino,
-                cmd,
-                in_len,
-                out_size,
-            } => {
-                let line =
-                    format!("ino={ino} cmd=0x{cmd:08x} in_len={in_len} out_size={out_size}\n");
-                if let Err(error) = file.write_all(line.as_bytes()) {
-                    warn!(path = %path.display(), %error, "ioctl trace write failed");
-                    write_error.get_or_insert(error);
-                }
-            }
-            IoctlTraceMsg::Flush(reply) => {
-                let result = write_error.as_ref().map_or(Ok(()), |error| {
-                    Err(std::io::Error::new(error.kind(), error.to_string()))
-                });
-                if let Ok(permit) = reply.reserve(cx) {
-                    let _ = permit.send(result);
-                }
+    let mut handle_msg = |msg: IoctlTraceMsg| match msg {
+        IoctlTraceMsg::Record {
+            ino,
+            cmd,
+            in_len,
+            out_size,
+        } => {
+            let line = format!("ino={ino} cmd=0x{cmd:08x} in_len={in_len} out_size={out_size}\n");
+            if let Err(error) = file.write_all(line.as_bytes()) {
+                warn!(path = %path.display(), %error, "ioctl trace write failed");
+                write_error.get_or_insert(error);
             }
         }
+        IoctlTraceMsg::Flush(reply) => {
+            let result = write_error.as_ref().map_or(Ok(()), |error| {
+                Err(std::io::Error::new(error.kind(), error.to_string()))
+            });
+            if let Ok(permit) = cx.masked(|| reply.reserve(cx)) {
+                let _ = permit.send(result);
+            }
+        }
+    };
+    while let Ok(msg) = receiver.recv(cx).await {
+        handle_msg(msg);
+    }
+    while let Ok(msg) = receiver.try_recv() {
+        handle_msg(msg);
     }
 }
 
@@ -5814,6 +6342,9 @@ pub struct FrankenFuse {
     // per mount so the blocking `mount` caller can still fail after its session
     // ends rather than reporting a successful unmount after lost writes.
     final_flush_errno: Arc<std::sync::atomic::AtomicI32>,
+    // Declared after `inner` so `FuseInner` (including `FsOps` and `ioctl_trace`)
+    // drops before `MountRuntimeScope` closes its caller-owned child region.
+    mount_scope: Arc<MountRuntimeScope>,
 }
 
 // Compile-time assertions: FrankenFuse must be Send + Sync.
@@ -5954,7 +6485,7 @@ impl FrankenFuse {
         if !self.inner.lookup_refcounts.forget(ino, nlookup) {
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.inner.ops.finalize_unlinked_inode(
             &cx,
             &mut RequestScope::empty(),
@@ -6048,7 +6579,7 @@ impl FrankenFuse {
         }
 
         // Both caches missed: this is the only branch that needs a request scope.
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let value = self.with_request_scope(&cx, RequestOp::Getxattr, |cx, _scope| {
             self.inner.ops.getxattr(cx, ino, name)
         })?;
@@ -6154,7 +6685,11 @@ impl Filesystem for FrankenFuse {
         // bd-biwl4 / bd-rnwd7: on unless FFS_FUSE_POSIX_ACL=0 (see
         // POSIX_ACL_CAPABILITY). Logged at info when on, because it decides
         // permission semantics and must be visible in a run's own evidence.
-        let posix_acl = posix_acl_capability_from_env();
+        let posix_acl = if self.inner.ops.supports_posix_acl() {
+            posix_acl_capability_from_env()
+        } else {
+            0
+        };
         if posix_acl != 0 {
             match config.add_capabilities(posix_acl) {
                 Ok(()) => {
@@ -6307,7 +6842,7 @@ impl Filesystem for FrankenFuse {
                 "notify_send_counts"
             );
         }
-        let cx = Self::cx_for_request();
+        let cx = self.mount_scope.mint_flush_cx();
         if let Err(e) = self.inner.ops.flush_on_destroy(&cx) {
             self.record_final_flush_failure(&e);
             // Filesystem::destroy cannot return errors through fuser. Both
@@ -6392,7 +6927,7 @@ impl Filesystem for FrankenFuse {
             reply.attr(&ATTR_TTL, &to_file_attr(&attr));
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
         }) {
@@ -6418,7 +6953,7 @@ impl Filesystem for FrankenFuse {
         // F_OK (existence check) always succeeds if we can get attributes
         // R_OK/W_OK/X_OK check read/write/execute permissions
         self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
         }) {
@@ -6450,7 +6985,7 @@ impl Filesystem for FrankenFuse {
         reply: ReplyStatx,
     ) {
         self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
         }) {
@@ -6468,7 +7003,7 @@ impl Filesystem for FrankenFuse {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Statfs, |cx, scope| {
             self.inner.ops.statfs(cx, scope, InodeNumber(ino))
         }) {
@@ -6525,7 +7060,7 @@ impl Filesystem for FrankenFuse {
             return;
         }
         self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.dispatch_opendir(&cx, InodeNumber(ino)) {
             Ok((fh, open_flags)) => reply.opened(fh, open_flags),
             Err(e) => {
@@ -6551,7 +7086,7 @@ impl Filesystem for FrankenFuse {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let Ok(byte_offset) = u64::try_from(offset) else {
             warn!(ino, offset, "read: negative offset");
             reply.error(libc::EINVAL);
@@ -6592,7 +7127,7 @@ impl Filesystem for FrankenFuse {
     ) {
         let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let Ok(fs_offset) = u64::try_from(offset) else {
             warn!(ino, offset, "readdir: negative offset");
             reply.error(libc::EINVAL);
@@ -6693,7 +7228,7 @@ impl Filesystem for FrankenFuse {
         // doing the work.
         let _handler_timer = HandlerTimer::new(&self.inner.metrics);
         self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let Ok(fs_offset) = u64::try_from(offset) else {
             warn!(ino, offset, "readdirplus: negative offset");
             reply.error(libc::EINVAL);
@@ -6844,7 +7379,7 @@ impl Filesystem for FrankenFuse {
         }
     }
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Readlink, |cx, scope| {
             self.inner.ops.readlink(cx, scope, InodeNumber(ino))
         }) {
@@ -6875,7 +7410,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Symlink) {
             warn!(parent, "backpressure: shedding symlink");
             reply.error(errno);
@@ -7026,7 +7561,7 @@ impl Filesystem for FrankenFuse {
             Self::reply_xattr_payload(size, &payload, reply);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Listxattr, |cx, _scope| {
             self.inner.ops.listxattr(cx, ino)
         }) {
@@ -7077,7 +7612,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Setattr) {
             warn!(ino, "backpressure: shedding setattr");
             reply.error(errno);
@@ -7153,7 +7688,7 @@ impl Filesystem for FrankenFuse {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let mode = self.create_mode(&Self::cx_for_request(), parent, mode, umask);
+        let mode = self.create_mode(&self.cx_for_request(), parent, mode, umask);
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
             Ok(attr) => {
                 self.inner.lookup_refcounts.retain(attr.ino.0);
@@ -7186,7 +7721,7 @@ impl Filesystem for FrankenFuse {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        let mode = self.create_mode(&Self::cx_for_request(), parent, mode, umask);
+        let mode = self.create_mode(&self.cx_for_request(), parent, mode, umask);
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
             Ok(attr) => {
                 self.inner.lookup_refcounts.retain(attr.ino.0);
@@ -7214,7 +7749,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Unlink) {
             warn!(parent, "backpressure: shedding unlink");
             reply.error(errno);
@@ -7325,7 +7860,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Link) {
             warn!(ino, "backpressure: shedding link");
             reply.error(errno);
@@ -7388,7 +7923,7 @@ impl Filesystem for FrankenFuse {
         if write_flags & fuse_consts::FUSE_WRITE_KILL_SUIDGID != 0
             && !self.inner.read_only
             && let Err(error) = self.kill_suidgid(
-                &Self::cx_for_request(),
+                &self.cx_for_request(),
                 ino,
                 (req.uid(), req.gid(), req.pid()),
             )
@@ -7487,7 +8022,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Fallocate) {
             warn!(ino, "backpressure: shedding fallocate");
             reply.error(errno);
@@ -7616,7 +8151,7 @@ impl Filesystem for FrankenFuse {
             return;
         };
 
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Lseek, |cx, scope| {
             self.inner
                 .ops
@@ -7656,7 +8191,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::ENOSYS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Flush, |cx, scope| {
             self.inner
                 .ops
@@ -7687,7 +8222,7 @@ impl Filesystem for FrankenFuse {
         flush: bool,
         reply: ReplyEmpty,
     ) {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let result = self.with_request_scope(&cx, RequestOp::Release, |cx, scope| {
             self.inner.ops.release(
                 cx,
@@ -7722,7 +8257,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Fsync) {
             warn!(ino, "backpressure: shedding fsync");
             reply.error(errno);
@@ -7751,7 +8286,7 @@ impl Filesystem for FrankenFuse {
     }
 
     fn syncfs(&mut self, _req: &Request<'_>, reply: ReplyEmpty) {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.dispatch_syncfs(&cx) {
             Ok(()) => reply.ok(),
             Err(error) => Self::reply_error_empty(
@@ -7778,7 +8313,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Fsyncdir) {
             warn!(ino, "backpressure: shedding fsyncdir");
             reply.error(errno);
@@ -7909,7 +8444,7 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let mode = self.create_mode(&cx, parent, mode, umask);
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Create) {
             warn!(parent, "backpressure: shedding tmpfile");
@@ -8017,7 +8552,7 @@ impl FrankenFuse {
     /// Kept separately so the FUSE protocol reply for a negative dentry can be
     /// tested without a live kernel request.
     fn lookup_impl(&self, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
             // FUSE_EXPORT_SUPPORT: the kernel turns a file handle back into an
             // inode with LOOKUP(nodeid, ".") and finds a directory's parent
@@ -8227,7 +8762,7 @@ impl FrankenFuse {
             reply.error(xattr_switch_errno(XattrHandler::Write));
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Setxattr) {
             warn!(ino, "backpressure: shedding setxattr");
             reply.error(errno);
@@ -8307,7 +8842,7 @@ impl FrankenFuse {
             reply.error(xattr_switch_errno(XattrHandler::Write));
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Removexattr) {
             warn!(ino, "backpressure: shedding removexattr");
             reply.error(errno);
@@ -8523,15 +9058,22 @@ fn build_owner_only_fallback_options(options: &MountOptions) -> Vec<MountOption>
 ///
 /// This function blocks until the filesystem is unmounted.
 pub fn mount(
+    cx: &Cx,
     ops: Box<dyn FsOps>,
     mountpoint: impl AsRef<Path>,
     options: &MountOptions,
 ) -> Result<MetricsSnapshot, FuseError> {
+    if cx.checkpoint().is_err() {
+        return Err(FuseError::Io(std::io::Error::from_raw_os_error(
+            libc::ECANCELED,
+        )));
+    }
     validate_mount_options(options)?;
     let mountpoint = mountpoint.as_ref();
     validate_mountpoint(mountpoint)?;
+    let mount_scope = MountRuntimeScope::open_required(cx)?;
     let fuse_opts = build_mount_options(options);
-    let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
+    let fs = FrankenFuse::with_mount_scope(mount_scope, ops, options, Some(mountpoint), None);
     resolve_xattr_suppression(&fs);
     let mut session = match fuser::Session::new(fs.shared_handle(), mountpoint, &fuse_opts) {
         Ok(session) => session,
@@ -8546,6 +9088,7 @@ pub fn mount(
         Err(err) => return Err(err.into()),
     };
     fs.install_kernel_notifier(session.notifier());
+    fs.start_periodic_commit(None);
     // bd-vbqc6: FUSE-over-io_uring, opt-in, wired to the KNOBS rather than to
     // literals.
     //
@@ -8559,7 +9102,7 @@ pub fn mount(
     // (9a347da8) with a one-page default and a ceiling that makes 128 KiB
     // unreachable by accident.
     #[cfg(target_os = "linux")]
-    if io_uring_enabled() {
+    let run_result: std::io::Result<()> = if io_uring_enabled() {
         // FAIL CLOSED if the kernel will not honour the request.
         //
         // fuser falls back to the classic transport when the kernel declines
@@ -8578,6 +9121,8 @@ pub fn mount(
         match io_uring_kernel_enabled() {
             Some(true) => {}
             Some(false) => {
+                drop(session);
+                fs.close_mount_scope();
                 return Err(FuseError::Io(std::io::Error::other(
                     "FFS_FUSE_IO_URING=1 but the kernel has \
                      /sys/module/fuse/parameters/enable_uring=N; the transport would \
@@ -8586,6 +9131,8 @@ pub fn mount(
                 )));
             }
             None => {
+                drop(session);
+                fs.close_mount_scope();
                 return Err(FuseError::Io(std::io::Error::other(
                     "FFS_FUSE_IO_URING=1 but this kernel exposes no \
                      /sys/module/fuse/parameters/enable_uring; FUSE-over-io_uring is \
@@ -8600,28 +9147,31 @@ pub fn mount(
             payload_bytes = payload,
             "FUSE-over-io_uring transport requested"
         );
-        session.run_with_io_uring(depth, payload)?;
+        session.run_with_io_uring(depth, payload)
     } else if options.resolved_thread_count() > 1 {
         // bd-iah1f: `worker_threads == 0` is auto (spec 1.7: multi-threaded
         // dispatch); only an explicit 1, or a one-CPU host, dispatches serially.
-        session.run_with_workers(options.resolved_thread_count())?;
+        session.run_with_workers(options.resolved_thread_count())
     } else {
         // bd-svhrq: serial dispatch is ONE thread. A wider cpuset cannot be used
         // by it and only lets the scheduler place it differently each run, which
         // is what makes the serial arm fail its own A/A null at every wider set.
         pin_serial_dispatch_thread();
-        session.run()?;
-    }
+        session.run()
+    };
     #[cfg(not(target_os = "linux"))]
-    if options.resolved_thread_count() > 1 {
-        session.run_with_workers(options.resolved_thread_count())?;
+    let run_result: std::io::Result<()> = if options.resolved_thread_count() > 1 {
+        session.run_with_workers(options.resolved_thread_count())
     } else {
-        session.run()?;
-    }
+        session.run()
+    };
+    fs.stop_periodic_commit();
     // Ordinary FUSE may end without a DESTROY request. Session::drop invokes
     // the fallback destroy callback, which fills the shared final-flush latch.
     // Finish that callback before reading the latch or final counters.
     drop(session);
+    fs.close_mount_scope();
+    run_result?;
     // bd-xfe7z: emit the per-opcode CROSSING counts, gated like the rest of the
     // mount evidence. Emitted here because the session has ended, so these cover
     // the whole mount and cannot be read mid-run and mistaken for a steady state.
@@ -8641,20 +9191,34 @@ pub fn mount(
     Ok(fs.inner.metrics.snapshot())
 }
 
-/// Mount a FrankenFS filesystem in the background, returning a session handle.
+/// Mount a FrankenFS filesystem in the background, returning a lifecycle-managed [`MountHandle`].
 ///
-/// The filesystem is unmounted when the returned `BackgroundSession` is dropped.
+/// Unmounting or dropping the returned [`MountHandle`] joins dispatch, retires
+/// background workers, closes the mount region to quiescence, and validates the
+/// final destroy flush result.
 pub fn mount_background(
+    cx: &Cx,
     ops: Box<dyn FsOps>,
     mountpoint: impl AsRef<Path>,
     options: &MountOptions,
-) -> Result<fuser::BackgroundSession, FuseError> {
+) -> Result<MountHandle, FuseError> {
+    if cx.checkpoint().is_err() {
+        return Err(FuseError::Io(std::io::Error::from_raw_os_error(
+            libc::ECANCELED,
+        )));
+    }
     validate_mount_options(options)?;
     let mountpoint = mountpoint.as_ref();
     validate_mountpoint(mountpoint)?;
+    let mountpoint = mountpoint.canonicalize()?;
+    let mountpoint = mountpoint.as_path();
+    #[cfg(target_os = "linux")]
+    let mountinfo = std::fs::File::open("/proc/thread-self/mountinfo")?;
+    let mount_scope = MountRuntimeScope::open_required(cx)?;
     let fuse_opts = build_mount_options(options);
-    let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
+    let fs = FrankenFuse::with_mount_scope(mount_scope, ops, options, Some(mountpoint), None);
     resolve_xattr_suppression(&fs);
+    let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
     let spawn_with_opts =
         |mount_opts: &[MountOption]| -> std::io::Result<fuser::BackgroundSession> {
@@ -8669,6 +9233,10 @@ pub fn mount_background(
                 fuser::spawn_mount2(fs.shared_handle(), mountpoint, mount_opts)
             }
         };
+    let mut effective_config = MountConfig {
+        options: options.clone(),
+        ..MountConfig::default()
+    };
     let session = match spawn_with_opts(&fuse_opts) {
         Ok(session) => session,
         Err(err) if should_retry_owner_only_without_auto_unmount(options, &err) => {
@@ -8677,12 +9245,24 @@ pub fn mount_background(
                 "fusermount3 rejected implicit allow_other for auto_unmount; retrying owner-only background mount without auto_unmount"
             );
             let fallback_opts = build_owner_only_fallback_options(options);
+            effective_config.options.auto_unmount = false;
             spawn_with_opts(&fallback_opts)?
         }
         Err(err) => return Err(err.into()),
     };
     notifier_owner.install_kernel_notifier(session.notifier());
-    Ok(session)
+    notifier_owner.start_periodic_commit(effective_config.commit_interval);
+    Ok(MountHandle {
+        diagnostics: notifier_owner,
+        session: Some(session),
+        mountpoint: mountpoint.to_owned(),
+        #[cfg(target_os = "linux")]
+        mountinfo: Some(mountinfo),
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        metrics: metrics_ref,
+        per_core_metrics: None,
+        config: effective_config,
+    })
 }
 
 // ── Mount lifecycle ─────────────────────────────────────────────────────────
@@ -8766,6 +9346,10 @@ pub struct MountConfig {
     pub backpressure: Option<Arc<BackpressureGate>>,
     /// Grace period for in-flight requests during unmount.
     pub unmount_timeout: Duration,
+    /// Optional periodic filesystem commit interval (`None` uses backend default;
+    /// `Some(Duration::ZERO)` disables managed periodic commits when an external
+    /// owner runs its own periodic commit loop).
+    pub commit_interval: Option<Duration>,
 }
 
 impl Default for MountConfig {
@@ -8774,6 +9358,7 @@ impl Default for MountConfig {
             options: MountOptions::default(),
             backpressure: None,
             unmount_timeout: Duration::from_secs(30),
+            commit_interval: None,
         }
     }
 }
@@ -8920,6 +9505,7 @@ impl MountHandle {
                 ));
             };
             if self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                || self.diagnostics.mount_scope.is_cancelled()
                 || self
                     .session
                     .as_ref()
@@ -8935,7 +9521,7 @@ impl MountHandle {
                 // rate when sampling is quick and dropping missed deadlines.
                 next_tick = following_tick;
             }
-            std::thread::sleep(
+            self.diagnostics.mount_scope.sleep_interruptible(
                 next_tick
                     .saturating_duration_since(std::time::Instant::now())
                     // Ten shutdown checks per second keep cancellation prompt
@@ -8966,6 +9552,13 @@ impl MountHandle {
                 );
                 break;
             }
+            if self.diagnostics.mount_scope.is_cancelled() {
+                info!(
+                    mountpoint = %self.mountpoint.display(),
+                    "parent mount context cancelled; initiating unmount"
+                );
+                break;
+            }
             if let Some(session) = self.session.as_ref()
                 && session.guard.is_finished()
             {
@@ -8975,7 +9568,9 @@ impl MountHandle {
                 );
                 break;
             }
-            std::thread::sleep(MOUNT_HANDLE_WAIT_POLL_INTERVAL);
+            self.diagnostics
+                .mount_scope
+                .sleep_interruptible(MOUNT_HANDLE_WAIT_POLL_INTERVAL);
         }
     }
 
@@ -8996,9 +9591,9 @@ impl MountHandle {
 
     fn join_session(&mut self) -> std::io::Result<()> {
         let started = Instant::now();
+        self.diagnostics.stop_periodic_commit();
         #[cfg(target_os = "linux")]
         let had_session = self.session.is_some();
-        let mut region_cleanup = Ok(());
         let mut unmount_cleanup = Ok(());
         if let Some(session) = self.session.take() {
             let snap = self.metrics.snapshot();
@@ -9014,35 +9609,57 @@ impl MountHandle {
             );
 
             let timeout = self.config.unmount_timeout;
-            let runtime = fuse_runtime();
-            let root_cx = fuse_root_cx();
+            let cleanup_cx = self
+                .diagnostics
+                .mount_scope
+                .runtime_handle
+                .as_ref()
+                .and_then(|handle| {
+                    handle
+                        .try_request_cx_with_budget(asupersync::Budget::INFINITE)
+                        .ok()
+                })
+                .unwrap_or_else(|| self.diagnostics.mount_scope.base_cx().clone());
             let (tx, mut rx) = asupersync::channel::oneshot::channel();
-            if let Ok(region) = runtime
-                .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
-            {
-                let notify_cx = root_cx.clone();
-                let _ = region.cx().spawn_blocking(move |_worker_cx| {
+            if let Ok(region) = ffs_block::OwnedChildRegion::open_sync(&cleanup_cx) {
+                let ops_for_quarantine = Arc::clone(&self.diagnostics.inner.ops);
+                let quarantine_lease_id = Arc::new(AtomicU64::new(0));
+                let worker_quarantine_id = Arc::clone(&quarantine_lease_id);
+                let _ = region.cx().spawn_blocking(move |worker_cx| {
                     // Dropping the session only requests unmount and detaches
                     // its dispatch thread. The receipt must follow the actual
                     // destroy callback and thread retirement, including errors.
                     let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         session.join_dispatch()
                     }));
-                    if let Ok(permit) = tx.reserve(&notify_cx) {
+                    drop(ops_for_quarantine);
+                    let lease_id = worker_quarantine_id.load(Ordering::Acquire);
+                    if lease_id != 0 {
+                        release_quarantined_mount_lease(lease_id);
+                    }
+                    if let Ok(permit) = worker_cx.masked(|| tx.reserve(&worker_cx)) {
                         let _ = permit.send(joined);
                     }
                 });
-                let completed = runtime.block_on(async {
-                    asupersync::time::timeout(root_cx.now(), timeout, rx.recv(root_cx)).await
-                });
+                let completed = ffs_block::block_on_park(asupersync::time::timeout(
+                    cleanup_cx.now(),
+                    timeout,
+                    ffs_block::poll_masked(&cleanup_cx, rx.recv(&cleanup_cx)),
+                ));
+                let completed = if let Ok(res) = completed {
+                    Ok(res)
+                } else {
+                    self.diagnostics.mount_scope.abort_for_timeout();
+                    let drain_grace = timeout.min(Duration::from_millis(250));
+                    ffs_block::block_on_park(asupersync::time::timeout(
+                        cleanup_cx.now(),
+                        drain_grace,
+                        ffs_block::poll_masked(&cleanup_cx, rx.recv(&cleanup_cx)),
+                    ))
+                };
                 match completed {
                     Ok(Ok(joined)) => {
-                        region_cleanup = runtime
-                            .block_on(region.close())
-                            .map_err(|error| std::io::Error::other(error.to_string()));
-                        if let Err(error) = &region_cleanup {
-                            error!(%error, "FUSE unmount region cleanup failed");
-                        }
+                        region.close_sync();
                         let (dispatch, finish_unmount) = joined.map_err(|_| {
                             std::io::Error::other("FUSE background session cleanup panicked")
                         })?;
@@ -9053,22 +9670,47 @@ impl MountHandle {
                         if let Err(error) = &unmount_cleanup {
                             error!(%error, "FUSE helper cleanup failed");
                         }
+                        self.diagnostics.retire_ioctl_trace();
+                        self.diagnostics.mount_scope.close_sync();
                         dispatch?;
                     }
                     Ok(Err(_)) => {
-                        let _ = region.cancel(asupersync::types::CancelReason::shutdown());
+                        region.cancel(asupersync::types::CancelReason::shutdown());
+                        region.close_sync();
+                        self.diagnostics.close_mount_scope();
                         error!("FUSE unmount worker ended without a join completion receipt");
                         return Err(std::io::Error::other(
                             "FUSE unmount worker ended without a join completion receipt",
                         ));
                     }
                     Err(_) => {
-                        let _ = region.cancel(asupersync::types::CancelReason::timeout());
-                        warn!("unmount timed out after {:?}", timeout);
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "FUSE session join timed out",
+                        let lease_id = register_quarantined_mount_lease(Arc::clone(
+                            &self.diagnostics.inner.ops,
                         ));
+                        quarantine_lease_id.store(lease_id, Ordering::Release);
+                        if let Ok(joined) = rx.try_recv() {
+                            release_quarantined_mount_lease(lease_id);
+                            region.close_sync();
+                            let (dispatch, finish_unmount) = joined.map_err(|_| {
+                                std::io::Error::other("FUSE background session cleanup panicked")
+                            })?;
+                            self.diagnostics.retire_kernel_notifier();
+                            unmount_cleanup =
+                                finish_unmount(timeout.saturating_sub(started.elapsed()));
+                            self.diagnostics.retire_ioctl_trace();
+                            self.diagnostics.mount_scope.close_sync();
+                            dispatch?;
+                        } else {
+                            region.cancel(asupersync::types::CancelReason::timeout());
+                            warn!(
+                                "unmount timed out after {:?}; quarantining mount lease until wedged worker retires",
+                                timeout
+                            );
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "FUSE session join timed out",
+                            ));
+                        }
                     }
                 }
             } else {
@@ -9081,6 +9723,8 @@ impl MountHandle {
                     "FUSE unmount worker region unavailable",
                 ));
             }
+        } else {
+            self.diagnostics.close_mount_scope();
         }
         // The destroy callback cannot return an error through fuser. Its shared
         // latch is authoritative only after the actual dispatch thread retires.
@@ -9092,7 +9736,6 @@ impl MountHandle {
                 error => std::io::Error::other(error),
             })?;
         unmount_cleanup?;
-        region_cleanup?;
         #[cfg(target_os = "linux")]
         if had_session {
             let mountinfo = self.mountinfo.as_mut().ok_or_else(|| {
@@ -9137,9 +9780,10 @@ impl std::fmt::Debug for MountHandle {
 ///
 /// # Example
 /// ```no_run
+/// # use asupersync::Cx;
 /// # use ffs_fuse::{MountConfig, mount_managed};
-/// # fn example(ops: Box<dyn ffs_core::FsOps>) {
-/// let handle = mount_managed(ops, "/mnt/ffs", &MountConfig::default()).unwrap();
+/// # fn example(cx: &Cx, ops: Box<dyn ffs_core::FsOps>) {
+/// let handle = mount_managed(cx, ops, "/mnt/ffs", &MountConfig::default()).unwrap();
 /// // Wire Ctrl+C to the shutdown flag (e.g. via ctrlc crate):
 /// let flag = handle.shutdown_flag().clone();
 /// // ... register signal handler that sets `flag.store(true, ...)` ...
@@ -9148,10 +9792,16 @@ impl std::fmt::Debug for MountHandle {
 /// # }
 /// ```
 pub fn mount_managed(
+    cx: &Cx,
     ops: Box<dyn FsOps>,
     mountpoint: impl AsRef<Path>,
     config: &MountConfig,
 ) -> Result<MountHandle, FuseError> {
+    if cx.checkpoint().is_err() {
+        return Err(FuseError::Io(std::io::Error::from_raw_os_error(
+            libc::ECANCELED,
+        )));
+    }
     validate_mount_options(&config.options)?;
     let mountpoint = mountpoint.as_ref();
     validate_mountpoint(mountpoint)?;
@@ -9161,6 +9811,7 @@ pub fn mount_managed(
     let mountpoint = mountpoint.as_path();
     #[cfg(target_os = "linux")]
     let mountinfo = std::fs::File::open("/proc/thread-self/mountinfo")?;
+    let mount_scope = MountRuntimeScope::open_required(cx)?;
 
     let thread_count = config.options.resolved_thread_count();
     info!(
@@ -9173,7 +9824,13 @@ pub fn mount_managed(
     );
 
     let fuse_opts = build_mount_options(&config.options);
-    let fs = FrankenFuse::with_mount_config(ops, Some(mountpoint), config);
+    let fs = FrankenFuse::with_mount_scope(
+        mount_scope,
+        ops,
+        &config.options,
+        Some(mountpoint),
+        config.backpressure.clone(),
+    );
     // The managed runtime is a THIRD entry point and it was missing this, so
     // `FFS_FUSE_XATTR_NO_SUPPORT` was silently ignored on every managed mount
     // from the moment `auto` introduced a resolution step. That is the mode
@@ -9210,6 +9867,7 @@ pub fn mount_managed(
         Err(err) => return Err(err.into()),
     };
     notifier_owner.install_kernel_notifier(session.notifier());
+    notifier_owner.start_periodic_commit(effective_config.commit_interval);
 
     info!(mountpoint = %mountpoint.display(), "FUSE mount active");
 
@@ -9230,10 +9888,16 @@ pub fn mount_managed(
 /// queues. Idle lanes steal only requests that are independent of an active
 /// file handle, so same-handle order is preserved by fuser's transport layer.
 pub fn mount_managed_per_core(
+    cx: &Cx,
     ops: Box<dyn FsOps>,
     mountpoint: impl AsRef<Path>,
     config: &MountConfig,
 ) -> Result<MountHandle, FuseError> {
+    if cx.checkpoint().is_err() {
+        return Err(FuseError::Io(std::io::Error::from_raw_os_error(
+            libc::ECANCELED,
+        )));
+    }
     validate_mount_options(&config.options)?;
     let mountpoint = mountpoint.as_ref();
     validate_mountpoint(mountpoint)?;
@@ -9248,9 +9912,16 @@ pub fn mount_managed_per_core(
             "per-core FUSE routing requires at least two worker threads",
         )));
     }
+    let mount_scope = MountRuntimeScope::open_required(cx)?;
 
     let fuse_opts = build_mount_options(&config.options);
-    let fs = FrankenFuse::with_mount_config(ops, Some(mountpoint), config);
+    let fs = FrankenFuse::with_mount_scope(
+        mount_scope,
+        ops,
+        &config.options,
+        Some(mountpoint),
+        config.backpressure.clone(),
+    );
     resolve_xattr_suppression(&fs);
     let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
@@ -9280,6 +9951,7 @@ pub fn mount_managed_per_core(
     };
     let per_core_metrics = session.per_core_metrics();
     notifier_owner.install_kernel_notifier(session.notifier());
+    notifier_owner.start_periodic_commit(effective_config.commit_interval);
 
     info!(
         mountpoint = %mountpoint.display(),
@@ -9682,6 +10354,7 @@ mod tests {
         let fuse = FrankenFuse {
             inner: Arc::new(inner),
             final_flush_errno: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            mount_scope: MountRuntimeScope::open_adapter(fuse_root_cx()),
         };
         for ino in [InodeNumber(12), InodeNumber(13)] {
             let mut attr = make_test_attr(FfsFileType::RegularFile, ino.0 * 100);
@@ -12506,6 +13179,7 @@ mod tests {
                 let Some(path) = self.mountpoint.take() else {
                     return;
                 };
+                let cleanup_deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     // Only this test's fresh private path is ever used here.
                     // Retire dispatch before an assertion unwinds its scope.
@@ -12517,6 +13191,12 @@ mod tests {
                         .args(["-u", "-z"])
                         .arg(&path)
                         .output();
+                    if !result.as_ref().is_ok_and(|output| output.status.success()) {
+                        let _ = std::process::Command::new("umount")
+                            .arg("-l")
+                            .arg(&path)
+                            .output();
+                    }
                     match result {
                         Ok(output) if !output.status.success() => {
                             eprintln!("owned foreground test cleanup failed: {output:?}");
@@ -12526,7 +13206,7 @@ mod tests {
                         }
                         _ => {}
                     }
-                    if retired {
+                    if retired || Instant::now() >= cleanup_deadline {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -12550,7 +13230,12 @@ mod tests {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos();
-                let root = std::env::temp_dir().join(format!(
+                let temp_base = if Path::new("/tmp").is_dir() {
+                    PathBuf::from("/tmp")
+                } else {
+                    std::env::temp_dir()
+                };
+                let root = temp_base.join(format!(
                     "ffs-foreground-flush-{}-{unique}",
                     std::process::id()
                 ));
@@ -12570,7 +13255,7 @@ mod tests {
                     Box::new(MinimalTestFs)
                 };
                 let (ready, result) = std::thread::scope(|scope| {
-                    let worker = scope.spawn(|| mount(ops, &mountpoint, &options));
+                    let worker = scope.spawn(|| mount(fuse_root_cx(), ops, &mountpoint, &options));
                     let mut cleanup = OwnedMountCleanup {
                         mountpoint: Some(mountpoint.clone()),
                         worker: &worker,
@@ -12608,11 +13293,19 @@ mod tests {
                     // Both backends refuse getattr. ENOENT proves INIT and
                     // real dispatch completed before the external unmount.
                     let getattr = std::fs::metadata(&mountpoint);
-                    let unmount = std::process::Command::new("fusermount3")
+                    let mut unmount = std::process::Command::new("fusermount3")
                         .arg("-u")
                         .arg(&mountpoint)
                         .output()
                         .unwrap();
+                    if !unmount.status.success()
+                        && let Ok(fallback) = std::process::Command::new("umount")
+                            .arg(&mountpoint)
+                            .output()
+                        && fallback.status.success()
+                    {
+                        unmount = fallback;
+                    }
                     std::fs::write(root.join("unmount.stdout"), &unmount.stdout).unwrap();
                     std::fs::write(root.join("unmount.stderr"), &unmount.stderr).unwrap();
                     assert!(unmount.status.success(), "{unmount:?}");
@@ -12729,9 +13422,19 @@ mod tests {
                 ..MountConfig::default()
             };
             let mounted = if per_core {
-                mount_managed_per_core(Box::new(FinalFlushFailsTestFs), &directory, &config)
+                mount_managed_per_core(
+                    fuse_root_cx(),
+                    Box::new(FinalFlushFailsTestFs),
+                    &directory,
+                    &config,
+                )
             } else {
-                mount_managed(Box::new(FinalFlushFailsTestFs), &directory, &config)
+                mount_managed(
+                    fuse_root_cx(),
+                    Box::new(FinalFlushFailsTestFs),
+                    &directory,
+                    &config,
+                )
             };
             let handle = match mounted {
                 Ok(handle) => handle,
@@ -12785,14 +13488,15 @@ mod tests {
             },
             ..MountConfig::default()
         };
-        let handle = match mount_managed(Box::new(MinimalTestFs), &directory, &config) {
-            Ok(handle) => handle,
-            Err(error) => {
-                assert!(!required, "required real FUSE mount failed: {error}");
-                eprintln!("SKIP fuse_unavailable reason={error}");
-                return;
-            }
-        };
+        let handle =
+            match mount_managed(fuse_root_cx(), Box::new(MinimalTestFs), &directory, &config) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    assert!(!required, "required real FUSE mount failed: {error}");
+                    eprintln!("SKIP fuse_unavailable reason={error}");
+                    return;
+                }
+            };
         let records = std::fs::read("/proc/thread-self/mountinfo").unwrap();
         let entry = records
             .split(|byte| *byte == b'\n')
@@ -13222,7 +13926,7 @@ mod tests {
                 .expect("freshly constructed FuseInner Arc is unique")
                 .count_memoized_requests = count_memoized_requests;
 
-            let _cx = FrankenFuse::cx_for_request();
+            let _cx = FrankenFuse::cx_for_request_for_test();
             let ino = InodeNumber(7);
             for _ in 0..4 {
                 assert!(
@@ -14950,7 +15654,13 @@ mod tests {
                 unreachable!()
             }
         }
-        let err = mount(Box::new(NeverCalledFs), "", &MountOptions::default()).unwrap_err();
+        let err = mount(
+            fuse_root_cx(),
+            Box::new(NeverCalledFs),
+            "",
+            &MountOptions::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
@@ -14958,6 +15668,7 @@ mod tests {
     fn mount_rejects_nonexistent_mountpoint() {
         let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
         let err = mount(
+            fuse_root_cx(),
             ops,
             "/tmp/frankenfs_no_such_dir_xyzzy",
             &MountOptions::default(),
@@ -14973,6 +15684,7 @@ mod tests {
     fn mount_background_rejects_nonexistent_mountpoint() {
         let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
         let err = mount_background(
+            fuse_root_cx(),
             ops,
             "/tmp/frankenfs_no_such_dir_xyzzy",
             &MountOptions::default(),
@@ -14988,7 +15700,7 @@ mod tests {
     fn mount_rejects_file_mountpoint() {
         let file_path = existing_file_mountpoint();
         let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
-        let err = mount(ops, &file_path, &MountOptions::default()).unwrap_err();
+        let err = mount(fuse_root_cx(), ops, &file_path, &MountOptions::default()).unwrap_err();
         let err_text = err.to_string();
         assert!(
             err_text.contains("not a directory"),
@@ -15000,7 +15712,8 @@ mod tests {
     fn mount_background_rejects_file_mountpoint() {
         let file_path = existing_file_mountpoint();
         let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
-        let err = mount_background(ops, &file_path, &MountOptions::default()).unwrap_err();
+        let err = mount_background(fuse_root_cx(), ops, &file_path, &MountOptions::default())
+            .unwrap_err();
         let err_text = err.to_string();
         assert!(
             err_text.contains("not a directory"),
@@ -15012,7 +15725,7 @@ mod tests {
     fn franken_fuse_construction() {
         let _fuse = FrankenFuse::new(Box::new(MinimalTestFs));
         // Verify the Cx creation helper works.
-        let _cx = FrankenFuse::cx_for_request();
+        let _cx = FrankenFuse::cx_for_request_for_test();
     }
 
     #[test]
@@ -24520,7 +25233,7 @@ mod tests {
             "setattr under emergency backpressure should return EBUSY, got {setattr:?}"
         );
 
-        let cx = FrankenFuse::cx_for_request();
+        let cx = FrankenFuse::cx_for_request_for_test();
         let setxattr =
             fuse.dispatch_setxattr(&cx, 11, "user.pressure", b"blocked", XATTR_FLAG_CREATE, 0);
         assert!(
@@ -24565,7 +25278,7 @@ mod tests {
             ("nonzero_position", XATTR_FLAG_CREATE, 1_u32),
         ];
 
-        let cx = FrankenFuse::cx_for_request();
+        let cx = FrankenFuse::cx_for_request_for_test();
         for (label, flags, position) in invalid_cases {
             let err = fuse
                 .dispatch_setxattr(&cx, 42, "user.bad", b"value", flags, position)
@@ -24936,7 +25649,7 @@ mod tests {
     #[test]
     fn mount_managed_rejects_empty_mountpoint() {
         let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
-        let err = mount_managed(ops, "", &MountConfig::default()).unwrap_err();
+        let err = mount_managed(fuse_root_cx(), ops, "", &MountConfig::default()).unwrap_err();
         assert!(
             err.to_string().contains("empty"),
             "expected 'empty' in error: {err}"
@@ -24947,6 +25660,7 @@ mod tests {
     fn mount_managed_rejects_nonexistent_mountpoint() {
         let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
         let err = mount_managed(
+            fuse_root_cx(),
             ops,
             "/tmp/frankenfs_no_such_dir_xyzzy",
             &MountConfig::default(),
@@ -24962,7 +25676,8 @@ mod tests {
     fn mount_managed_rejects_file_mountpoint() {
         let file_path = existing_file_mountpoint();
         let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
-        let err = mount_managed(ops, &file_path, &MountConfig::default()).unwrap_err();
+        let err =
+            mount_managed(fuse_root_cx(), ops, &file_path, &MountConfig::default()).unwrap_err();
         let err_text = err.to_string();
         assert!(
             err_text.contains("not a directory"),
@@ -24980,7 +25695,7 @@ mod tests {
             ..MountConfig::default()
         };
         let ops: Box<dyn FsOps> = Box::new(MinimalTestFs);
-        let err = mount_managed_per_core(ops, "/tmp", &config)
+        let err = mount_managed_per_core(fuse_root_cx(), ops, "/tmp", &config)
             .expect_err("one worker cannot provide a CPU-keyed work-stealing transport");
 
         assert!(
@@ -25307,6 +26022,7 @@ mod tests {
             options: MountOptions::default(),
             backpressure: None,
             unmount_timeout: Duration::from_millis(60),
+            ..MountConfig::default()
         };
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_trigger = Arc::clone(&shutdown);
@@ -25482,6 +26198,7 @@ mod tests {
             ..MountConfig::default()
         };
         let handle = match mount_managed(
+            fuse_root_cx(),
             Box::new(DestroyGatedFs(Arc::clone(&gate))),
             &mountpoint,
             &config,
@@ -29140,7 +29857,7 @@ AllowOther"#;
 
     #[test]
     fn cx_for_request_uses_finite_budget_and_poll_quota_bd_lza2g() {
-        let cx = FrankenFuse::cx_for_request();
+        let cx = FrankenFuse::cx_for_request_for_test();
         let budget = cx.budget();
         assert!(
             budget.deadline.is_some(),
@@ -29207,5 +29924,649 @@ AllowOther"#;
             ),
             "explicit allow_other must still fail closed when user_allow_other is absent"
         );
+    }
+
+    #[test]
+    fn dpor_explorer_notify_write_unmount_interleavings_bd_in31y() {
+        use asupersync::lab::{DporExplorer, ExplorerConfig};
+
+        let mut explorer = DporExplorer::new(
+            ExplorerConfig::new(0xBD13_17F0, 24)
+                .worker_count(3)
+                .max_steps(25_000),
+        );
+        let saw_partial_unmount = Arc::new(AtomicBool::new(false));
+        let saw_full_writes = Arc::new(AtomicBool::new(false));
+        let partial_flag = Arc::clone(&saw_partial_unmount);
+        let full_flag = Arc::clone(&saw_full_writes);
+
+        let report = explorer.explore(move |runtime| {
+            let root = runtime
+                .state
+                .create_root_region(asupersync::types::Budget::INFINITE);
+            let committed_writes = Arc::new(asupersync::sync::Mutex::new(Vec::<u64>::new()));
+            let delivered_notifies = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let mount_closed = Arc::new(AtomicBool::new(false));
+            let post_close_callbacks = Arc::new(AtomicUsize::new(0));
+            let (ready_tx, mut ready_rx) =
+                asupersync::channel::oneshot::channel::<(Cx, KernelNotifyQueue)>();
+            let (writer_done_tx, mut writer_done_rx) =
+                asupersync::channel::oneshot::channel::<usize>();
+
+            let writer_log = Arc::clone(&committed_writes);
+            let delivered_cb = Arc::clone(&delivered_notifies);
+            let closed_cb = Arc::clone(&mount_closed);
+            let post_close_cb = Arc::clone(&post_close_callbacks);
+
+            // Task 1: Mount owner + writer + notification producer.
+            let (writer_task, _) = runtime
+                .state
+                .create_task(root, asupersync::types::Budget::INFINITE, async move {
+                    let parent_cx = Cx::current().expect("LabRuntime writer Cx");
+                    let mount_region = ffs_block::OwnedChildRegion::open_async(&parent_cx)
+                        .await
+                        .expect("open mount region");
+                    let queue = KernelNotifyQueue::spawn_with_handler_async(
+                        mount_region.cx(),
+                        move |message| {
+                            if closed_cb.load(Ordering::Acquire) {
+                                post_close_cb.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if let KernelNotification::Inode { ino } = message {
+                                delivered_cb.lock().expect("notifies").push(ino);
+                            }
+                        },
+                    )
+                    .await;
+                    let unmounter_queue = queue.clone();
+                    if let Ok(permit) = parent_cx.masked(|| ready_tx.reserve(&parent_cx)) {
+                        let _ = permit.send((parent_cx.clone(), unmounter_queue));
+                    }
+
+                    let mut acked = 0_usize;
+                    for seq in 1_u64..=3 {
+                        if mount_region.cx().checkpoint().is_err() {
+                            break;
+                        }
+                        if let Ok(mut guard) = writer_log.lock(mount_region.cx()).await {
+                            guard.push(seq);
+                            acked += 1;
+                            drop(guard);
+                            queue.inode(seq);
+                        } else {
+                            break;
+                        }
+                        asupersync::runtime::yield_now().await;
+                    }
+                    drop(queue);
+                    if let Ok(permit) = parent_cx.masked(|| writer_done_tx.reserve(&parent_cx)) {
+                        let _ = permit.send(acked);
+                    }
+                    // Unmount closes the mount region to quiescence.
+                    mount_region.close_async().await;
+                    closed_cb_after_drain(&mount_closed);
+                })
+                .expect("create writer task");
+
+            fn closed_cb_after_drain(flag: &AtomicBool) {
+                flag.store(true, Ordering::Release);
+            }
+
+            // Task 2: Concurrent unmounter racing with active writes & notifications.
+            let observer_log = Arc::clone(&committed_writes);
+            let delivered_check = Arc::clone(&delivered_notifies);
+            let post_close_check = Arc::clone(&post_close_callbacks);
+            let partial_run = Arc::clone(&partial_flag);
+            let full_run = Arc::clone(&full_flag);
+            let (unmount_task, _) = runtime
+                .state
+                .create_task(root, asupersync::types::Budget::INFINITE, async move {
+                    let observer_cx = Cx::current().expect("LabRuntime unmounter Cx");
+                    let Ok((mount_parent_cx, queue)) =
+                        ffs_block::poll_masked(&observer_cx, ready_rx.recv(&observer_cx)).await
+                    else {
+                        return;
+                    };
+                    asupersync::runtime::yield_now().await;
+                    mount_parent_cx.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("dpor unmount"),
+                    );
+                    let acked = ffs_block::poll_masked(
+                        &observer_cx,
+                        writer_done_rx.recv(&observer_cx),
+                    )
+                    .await
+                    .expect("writer completion receipt");
+                    queue.close_async().await;
+
+                    if acked < 3 {
+                        partial_run.store(true, Ordering::Relaxed);
+                    } else {
+                        full_run.store(true, Ordering::Relaxed);
+                    }
+                    let committed =
+                        ffs_block::poll_masked(&observer_cx, observer_log.lock(&observer_cx))
+                            .await
+                            .expect("inspect committed writes")
+                            .clone();
+                    assert_eq!(
+                        committed.len(),
+                        acked,
+                        "every acknowledged write must remain durable across unmount interleavings"
+                    );
+                    let expected_prefix: Vec<u64> = (1..=acked as u64).collect();
+                    assert_eq!(committed, expected_prefix);
+
+                    let delivered = delivered_check.lock().expect("notifies").clone();
+                    assert!(
+                        delivered.windows(2).all(|pair| pair[0] < pair[1]),
+                        "notifications must preserve strict FIFO order under DPOR: {delivered:?}"
+                    );
+                    assert!(
+                        delivered.iter().all(|ino| committed.contains(ino)),
+                        "uncommitted writes must never emit kernel notifications: delivered={delivered:?}, committed={committed:?}"
+                    );
+                    assert_eq!(
+                        post_close_check.load(Ordering::SeqCst),
+                        0,
+                        "zero notification callbacks may execute after mount region close"
+                    );
+                })
+                .expect("create unmounter task");
+
+            {
+                let mut sched = runtime.scheduler.lock();
+                sched.schedule(writer_task, 0);
+                sched.schedule(unmount_task, 0);
+            }
+            let run_report = runtime.run_until_quiescent_with_report();
+            assert!(
+                run_report.lab_test_passed(),
+                "DPOR schedule run violated LabRuntime quiescence/oracles: {run_report:?}"
+            );
+        });
+
+        let coverage = explorer.dpor_coverage();
+        assert!(
+            !report.has_violations(),
+            "DPOR exploration found invariant/oracle violations: {:?}",
+            report.violations
+        );
+        assert!(
+            report.total_runs >= 2 && report.unique_classes >= 2,
+            "DPOR must explore multiple distinct schedule equivalence classes, got runs={} classes={}",
+            report.total_runs,
+            report.unique_classes
+        );
+        assert!(
+            coverage.total_races > 0,
+            "DPOR must detect genuine concurrent races across notify+write+unmount"
+        );
+        let _ = (
+            saw_partial_unmount.load(Ordering::Relaxed),
+            saw_full_writes.load(Ordering::Relaxed),
+        );
+    }
+
+    #[test]
+    fn two_independent_mounts_isolate_parent_cancellation_and_preserve_post_commit_bd_in31y() {
+        struct BlockingReadAndCommitFs {
+            read_entered: Arc<AtomicBool>,
+            backend_ops: Arc<AtomicUsize>,
+            commits: Arc<AtomicUsize>,
+            cancel_on_commit: Option<Cx>,
+        }
+
+        impl FsOps for BlockingReadAndCommitFs {
+            fn getattr(
+                &self,
+                cx: &Cx,
+                _scope: &mut RequestScope,
+                ino: InodeNumber,
+            ) -> ffs_error::Result<InodeAttr> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                self.backend_ops.fetch_add(1, Ordering::SeqCst);
+                let mut attr = make_test_attr(FfsFileType::RegularFile, 64);
+                attr.ino = ino;
+                Ok(attr)
+            }
+
+            fn lookup(
+                &self,
+                cx: &Cx,
+                _scope: &mut RequestScope,
+                _parent: InodeNumber,
+                _name: &OsStr,
+            ) -> ffs_error::Result<InodeAttr> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                self.backend_ops.fetch_add(1, Ordering::SeqCst);
+                let mut attr = make_test_attr(FfsFileType::RegularFile, 64);
+                attr.ino = InodeNumber(11);
+                Ok(attr)
+            }
+
+            fn readdir(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+                offset: u64,
+            ) -> ffs_error::Result<ReaddirPage> {
+                MinimalTestFs.readdir(cx, scope, ino, offset)
+            }
+
+            fn read(
+                &self,
+                cx: &Cx,
+                _scope: &mut RequestScope,
+                _ino: InodeNumber,
+                _offset: u64,
+                size: u32,
+            ) -> ffs_error::Result<Vec<u8>> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                self.backend_ops.fetch_add(1, Ordering::SeqCst);
+                if !self.read_entered.swap(true, Ordering::AcqRel) {
+                    let started = Instant::now();
+                    while started.elapsed() < Duration::from_secs(5) {
+                        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                        std::thread::park_timeout(Duration::from_millis(2));
+                    }
+                }
+                Ok(vec![0xAB; size as usize])
+            }
+
+            fn readlink(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+            ) -> ffs_error::Result<Vec<u8>> {
+                MinimalTestFs.readlink(cx, scope, ino)
+            }
+
+            fn write(
+                &self,
+                cx: &Cx,
+                _scope: &mut RequestScope,
+                _ino: InodeNumber,
+                _offset: u64,
+                data: &[u8],
+            ) -> ffs_error::Result<u32> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                self.backend_ops.fetch_add(1, Ordering::SeqCst);
+                u32::try_from(data.len()).map_err(|_| FfsError::Format("write len".into()))
+            }
+
+            fn commit_request_scope(
+                &self,
+                cx: &Cx,
+                _scope: &mut RequestScope,
+            ) -> ffs_error::Result<CommitSeq> {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                let seq = self.commits.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+                if let Some(cancel_cx) = self.cancel_on_commit.as_ref() {
+                    cancel_cx.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancel immediately after durable commit"),
+                    );
+                }
+                Ok(CommitSeq(seq))
+            }
+        }
+
+        let shared_runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .blocking_threads(0, 8)
+            .build()
+            .expect("shared consumer runtime");
+        let parent_a = shared_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let parent_b = shared_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+
+        let rw_options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let entered_a = Arc::new(AtomicBool::new(false));
+        let ops_a = Arc::new(AtomicUsize::new(0));
+        let commits_a = Arc::new(AtomicUsize::new(0));
+        let mount_a = FrankenFuse::with_options_and_cx(
+            &parent_a,
+            Box::new(BlockingReadAndCommitFs {
+                read_entered: Arc::clone(&entered_a),
+                backend_ops: Arc::clone(&ops_a),
+                commits: Arc::clone(&commits_a),
+                cancel_on_commit: None,
+            }),
+            &rw_options,
+        );
+
+        let entered_b = Arc::new(AtomicBool::new(true));
+        let ops_b = Arc::new(AtomicUsize::new(0));
+        let commits_b = Arc::new(AtomicUsize::new(0));
+        let mount_b = FrankenFuse::with_options_and_cx(
+            &parent_b,
+            Box::new(BlockingReadAndCommitFs {
+                read_entered: Arc::clone(&entered_b),
+                backend_ops: Arc::clone(&ops_b),
+                commits: Arc::clone(&commits_b),
+                cancel_on_commit: None,
+            }),
+            &rw_options,
+        );
+
+        assert_ne!(
+            mount_a.mount_scope.base_cx().region_id(),
+            mount_b.mount_scope.base_cx().region_id(),
+            "two mounts on one shared runtime must own distinct child regions"
+        );
+
+        // Start an in-flight read on mount A, then cancel parent_a while running.
+        let mount_a_reader = mount_a.clone();
+        let in_flight = std::thread::spawn(move || mount_a_reader.read_for_fuzzing(11, 0, 16));
+        while !entered_a.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        parent_a.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel mount A parent while I/O is running"),
+        );
+        let read_a_res = in_flight.join().expect("join mount A reader");
+        assert_eq!(
+            read_a_res,
+            Err(libc::EINTR),
+            "in-flight request on cancelled mount A must abort with EINTR"
+        );
+
+        // Subsequent/queued requests on cancelled mount A fail before backend FsOps!
+        let ops_before_queued = ops_a.load(Ordering::SeqCst);
+        assert_eq!(
+            mount_a.lookup_for_fuzzing(1, b"after-cancel"),
+            Err(libc::EINTR),
+            "queued/subsequent lookup on cancelled mount A must fail closed"
+        );
+        assert_eq!(
+            mount_a.write_for_fuzzing(11, 0, b"blocked"),
+            Err(libc::EINTR),
+            "queued/subsequent write on cancelled mount A must fail closed"
+        );
+        assert_eq!(
+            ops_a.load(Ordering::SeqCst),
+            ops_before_queued,
+            "cancelled queued requests must not invoke backend FsOps"
+        );
+
+        // Sibling mount B on the SAME runtime remains 100% live and unaffected!
+        assert_eq!(
+            mount_b.read_for_fuzzing(11, 0, 8),
+            Ok(vec![0xAB; 8]),
+            "mount B read must succeed after sibling mount A parent cancelled"
+        );
+        assert_eq!(
+            mount_b.write_for_fuzzing(11, 0, b"isolated"),
+            Ok(8),
+            "mount B write must commit cleanly after sibling mount A parent cancelled"
+        );
+        assert_eq!(commits_b.load(Ordering::SeqCst), 1);
+
+        // Post-commit result preservation: cancellation arriving immediately
+        // after `commit_request_scope` succeeds preserves `Ok(bytes_written)`.
+        let parent_c = shared_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let commits_c = Arc::new(AtomicUsize::new(0));
+        let mount_c = FrankenFuse::with_options_and_cx(
+            &parent_c,
+            Box::new(BlockingReadAndCommitFs {
+                read_entered: Arc::new(AtomicBool::new(true)),
+                backend_ops: Arc::new(AtomicUsize::new(0)),
+                commits: Arc::clone(&commits_c),
+                cancel_on_commit: Some(parent_c.clone()),
+            }),
+            &rw_options,
+        );
+        assert_eq!(
+            mount_c.write_for_fuzzing(11, 0, b"durable-payload"),
+            Ok(15),
+            "already-committed write result must be preserved even if parent cancels post-commit"
+        );
+        assert_eq!(commits_c.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mount_c.write_for_fuzzing(11, 15, b"next"),
+            Err(libc::EINTR),
+            "subsequent write after post-commit cancellation must be refused"
+        );
+    }
+
+    #[test]
+    fn nonresponsive_device_unmount_timeout_bounds_wait_and_quarantines_lease_bd_in31y() {
+        struct DropTrackedFs {
+            retired: Arc<AtomicBool>,
+        }
+        impl Drop for DropTrackedFs {
+            fn drop(&mut self) {
+                self.retired.store(true, Ordering::Release);
+            }
+        }
+        impl FsOps for DropTrackedFs {
+            fn getattr(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+            ) -> ffs_error::Result<InodeAttr> {
+                MinimalTestFs.getattr(cx, scope, ino)
+            }
+            fn lookup(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                parent: InodeNumber,
+                name: &OsStr,
+            ) -> ffs_error::Result<InodeAttr> {
+                MinimalTestFs.lookup(cx, scope, parent, name)
+            }
+            fn readdir(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+                offset: u64,
+            ) -> ffs_error::Result<ReaddirPage> {
+                MinimalTestFs.readdir(cx, scope, ino, offset)
+            }
+            fn read(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+                offset: u64,
+                size: u32,
+            ) -> ffs_error::Result<Vec<u8>> {
+                MinimalTestFs.read(cx, scope, ino, offset, size)
+            }
+            fn readlink(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+            ) -> ffs_error::Result<Vec<u8>> {
+                MinimalTestFs.readlink(cx, scope, ino)
+            }
+        }
+
+        // 1. Deterministic component proof of quarantine lease retention & release.
+        let baseline_leases = quarantined_mount_lease_count();
+        let retired = Arc::new(AtomicBool::new(false));
+        let ops: Arc<dyn FsOps> = Arc::new(DropTrackedFs {
+            retired: Arc::clone(&retired),
+        });
+        let lease_id = register_quarantined_mount_lease(ops);
+        assert_eq!(quarantined_mount_lease_count(), baseline_leases + 1);
+        assert!(
+            !retired.load(Ordering::Acquire),
+            "quarantined lease must retain FsOps while wedged device worker is still alive"
+        );
+        release_quarantined_mount_lease(lease_id);
+        assert_eq!(quarantined_mount_lease_count(), baseline_leases);
+        assert!(
+            retired.load(Ordering::Acquire),
+            "releasing quarantined lease after wedged worker exits must retire FsOps"
+        );
+
+        // 2. Live kernel FUSE nonresponsive-destroy limit proof (when /dev/fuse is available).
+        #[cfg(target_os = "linux")]
+        {
+            struct WedgedGate {
+                entered: AtomicBool,
+                released: Mutex<bool>,
+                wake: Condvar,
+                retired: AtomicBool,
+            }
+            struct ReleaseWedged(Arc<WedgedGate>);
+            impl Drop for ReleaseWedged {
+                fn drop(&mut self) {
+                    *self
+                        .0
+                        .released
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                    self.0.wake.notify_all();
+                }
+            }
+            struct WedgedDestroyFs(Arc<WedgedGate>);
+            impl Drop for WedgedDestroyFs {
+                fn drop(&mut self) {
+                    self.0.retired.store(true, Ordering::Release);
+                }
+            }
+            impl FsOps for WedgedDestroyFs {
+                fn getattr(
+                    &self,
+                    cx: &Cx,
+                    scope: &mut RequestScope,
+                    ino: InodeNumber,
+                ) -> ffs_error::Result<InodeAttr> {
+                    MinimalTestFs.getattr(cx, scope, ino)
+                }
+                fn lookup(
+                    &self,
+                    cx: &Cx,
+                    scope: &mut RequestScope,
+                    parent: InodeNumber,
+                    name: &OsStr,
+                ) -> ffs_error::Result<InodeAttr> {
+                    MinimalTestFs.lookup(cx, scope, parent, name)
+                }
+                fn readdir(
+                    &self,
+                    cx: &Cx,
+                    scope: &mut RequestScope,
+                    ino: InodeNumber,
+                    offset: u64,
+                ) -> ffs_error::Result<ReaddirPage> {
+                    MinimalTestFs.readdir(cx, scope, ino, offset)
+                }
+                fn read(
+                    &self,
+                    cx: &Cx,
+                    scope: &mut RequestScope,
+                    ino: InodeNumber,
+                    offset: u64,
+                    size: u32,
+                ) -> ffs_error::Result<Vec<u8>> {
+                    MinimalTestFs.read(cx, scope, ino, offset, size)
+                }
+                fn readlink(
+                    &self,
+                    cx: &Cx,
+                    scope: &mut RequestScope,
+                    ino: InodeNumber,
+                ) -> ffs_error::Result<Vec<u8>> {
+                    MinimalTestFs.readlink(cx, scope, ino)
+                }
+                fn flush_on_destroy(&self, _cx: &Cx) -> ffs_error::Result<()> {
+                    // Simulate a wedged block device that ignores cooperative Cx cancellation!
+                    self.0.entered.store(true, Ordering::Release);
+                    let guard = self.0.released.lock().expect("wedged gate");
+                    let _ = self.0.wake.wait_timeout_while(
+                        guard,
+                        Duration::from_secs(10),
+                        |released| !*released,
+                    );
+                    Ok(())
+                }
+            }
+
+            let required = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
+            if !Path::new("/dev/fuse").exists() {
+                assert!(!required, "FFS_REQUIRE_FUSE=1 but /dev/fuse is unavailable");
+                return;
+            }
+            let unique = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("epoch")
+                .as_nanos();
+            let mountpoint = std::env::temp_dir().join(format!(
+                "ffs-wedged-unmount-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&mountpoint).expect("create wedged test mountpoint");
+            let gate = Arc::new(WedgedGate {
+                entered: AtomicBool::new(false),
+                released: Mutex::new(false),
+                wake: Condvar::new(),
+                retired: AtomicBool::new(false),
+            });
+            let config = MountConfig {
+                options: MountOptions {
+                    auto_unmount: false,
+                    worker_threads: 1,
+                    ..MountOptions::default()
+                },
+                unmount_timeout: Duration::from_millis(80),
+                ..MountConfig::default()
+            };
+            let handle = match mount_managed(
+                fuse_root_cx(),
+                Box::new(WedgedDestroyFs(Arc::clone(&gate))),
+                &mountpoint,
+                &config,
+            ) {
+                Ok(h) => h,
+                Err(error) => {
+                    assert!(!required, "FFS_REQUIRE_FUSE=1 but mount failed: {error}");
+                    return;
+                }
+            };
+            let releaser = ReleaseWedged(Arc::clone(&gate));
+            let started = Instant::now();
+            let err = handle
+                .unmount()
+                .expect_err("wedged device past unmount_timeout must fail TimedOut");
+            let elapsed = started.elapsed();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "unmount_timeout must bound caller wait on a nonresponsive device, got {elapsed:?}"
+            );
+            assert!(
+                gate.entered.load(Ordering::Acquire),
+                "destroy callback must have entered"
+            );
+            assert!(
+                !gate.retired.load(Ordering::Acquire),
+                "FsOps must remain quarantined (not prematurely dropped) while wedged worker is still inside device I/O"
+            );
+            assert!(quarantined_mount_lease_count() > baseline_leases);
+
+            drop(releaser);
+            let drain_deadline = Instant::now() + Duration::from_secs(5);
+            while !gate.retired.load(Ordering::Acquire) && Instant::now() < drain_deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                gate.retired.load(Ordering::Acquire),
+                "quarantined FsOps must retire once the wedged worker eventually unblocks"
+            );
+        }
     }
 }

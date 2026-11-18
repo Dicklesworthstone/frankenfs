@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -1743,19 +1743,29 @@ pub fn maybe_route_mount_cmd(
 
     match options.runtime.mode {
         MountRuntimeMode::Standard => {
-            ffs_fuse::mount(fs_ops, &mountpoint_canon, &fuse_opts)?;
+            ffs_fuse::mount(&cx, fs_ops, &mountpoint_canon, &fuse_opts)?;
         }
         MountRuntimeMode::Managed | MountRuntimeMode::PerCore => {
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_sig = Arc::clone(&stop);
+            let mut config = ffs_fuse::MountConfig {
+                options: fuse_opts,
+                unmount_timeout: Duration::from_secs(
+                    options.runtime.managed_unmount_timeout_secs(),
+                ),
+                ..ffs_fuse::MountConfig::default()
+            };
+            let handle = if options.runtime.mode == MountRuntimeMode::PerCore {
+                if config.options.resolved_thread_count() < 2 {
+                    config.options.worker_threads = 2;
+                }
+                ffs_fuse::mount_managed_per_core(&cx, fs_ops, &mountpoint_canon, &config)?
+            } else {
+                ffs_fuse::mount_managed(&cx, fs_ops, &mountpoint_canon, &config)?
+            };
+            let stop_sig = Arc::clone(handle.shutdown_flag());
             let _ = ctrlc::set_handler(move || {
                 stop_sig.store(true, Ordering::SeqCst);
             });
-            let handle = ffs_fuse::mount_background(fs_ops, &mountpoint_canon, &fuse_opts)?;
-            while !stop.load(Ordering::SeqCst) && mountpoint_canon.exists() {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            drop(handle);
+            handle.wait()?;
         }
     }
 

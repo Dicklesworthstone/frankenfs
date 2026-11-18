@@ -8,12 +8,12 @@
   },
   "summary": {
     "modules": 90,
-    "total_loc": 173773,
+    "total_loc": 173762,
     "conformance_modules": 24,
     "conformance_loc": 43838,
     "conformance_loc_basis_points": 2523,
     "meta_modules": 66,
-    "meta_loc": 129935,
+    "meta_loc": 129924,
     "meta_loc_basis_points": 7477
   },
   "modules": [
@@ -190,7 +190,7 @@
     {
       "path": "src/main.rs",
       "classification": "meta",
-      "loc": 11408
+      "loc": 11410
     },
     {
       "path": "src/metamorphic_workload_seed_catalog.rs",
@@ -395,7 +395,7 @@
     {
       "path": "src/stale_mounts.rs",
       "classification": "meta",
-      "loc": 651
+      "loc": 638
     },
     {
       "path": "src/support_state_accounting.rs",

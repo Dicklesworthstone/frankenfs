@@ -763,6 +763,10 @@ impl FsOps for NtfsFs {
         self.is_writable()
     }
 
+    fn supports_posix_acl(&self) -> bool {
+        false
+    }
+
     fn begin_request_scope(&self, cx: &Cx, op: ffs_core::vfs::RequestOp) -> Result<RequestScope> {
         // RELEASE must reach its open-handle cleanup even if the caller's
         // request context has been cancelled.
@@ -1278,6 +1282,20 @@ impl FsOps for NtfsFs {
         self.sync_device_locked(cx)?;
         checkpoint(cx)?;
         op.complete(())
+    }
+
+    fn default_commit_interval(&self) -> Option<std::time::Duration> {
+        self.is_writable()
+            .then_some(std::time::Duration::from_secs(5))
+    }
+
+    fn periodic_commit(&self, cx: &Cx) -> Result<bool> {
+        if !self.is_writable() {
+            return Ok(false);
+        }
+        let mut scope = RequestScope::empty();
+        self.sync_fs(cx, &mut scope)?;
+        Ok(true)
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {

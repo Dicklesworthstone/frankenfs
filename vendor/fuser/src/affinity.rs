@@ -22,7 +22,9 @@ pub fn pin_current_thread_to_one_cpu() -> Option<usize> {
             return None;
         }
         let width = 8 * size;
-        let allowed: Vec<usize> = (0..width).filter(|cpu| libc::CPU_ISSET(*cpu, &current)).collect();
+        let allowed: Vec<usize> = (0..width)
+            .filter(|cpu| libc::CPU_ISSET(*cpu, &current))
+            .collect();
         // Already single-CPU, or nothing readable: leave it alone. Pinning a
         // one-CPU set is a no-op, and pinning an empty one would be a bug.
         if allowed.len() <= 1 {
@@ -57,7 +59,10 @@ mod tests {
         std::thread::spawn(|| {
             let first = pin_current_thread_to_one_cpu();
             let second = pin_current_thread_to_one_cpu();
-            assert_eq!(second, None, "a thread already on one CPU must not be re-pinned");
+            assert_eq!(
+                second, None,
+                "a thread already on one CPU must not be re-pinned"
+            );
             if let Some(cpu) = first {
                 assert!(cpu < 8 * std::mem::size_of::<libc::cpu_set_t>());
             }

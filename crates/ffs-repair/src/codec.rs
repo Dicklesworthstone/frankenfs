@@ -1490,6 +1490,7 @@ fn decode_group_impl(
     corrupt_indices: &[u32],
     repair_symbols: RepairSymbolInput<'_>,
 ) -> Result<DecodeOutcome> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     if corrupt_indices.is_empty() {
         return Ok(DecodeOutcome {
             recovered: Vec::new(),
@@ -1579,6 +1580,7 @@ fn decode_group_impl(
 
     // Add available (non-corrupt) source blocks.
     for i in 0..source_block_count {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         if corrupt_set.contains(i) {
             continue;
         }
@@ -1596,6 +1598,7 @@ fn decode_group_impl(
     match repair_symbols {
         RepairSymbolInput::Borrowed(symbols) => {
             for (esi, data) in symbols {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
                 let (cols, coefs) = decoder.repair_equation(*esi).map_err(|error| {
                     FfsError::RepairFailed(format!(
                         "repair_equation failed for esi {} in group {}: {error:?}",
@@ -1607,6 +1610,7 @@ fn decode_group_impl(
         }
         RepairSymbolInput::Owned(symbols) => {
             for (esi, data) in symbols {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
                 let (cols, coefs) = decoder.repair_equation(esi).map_err(|error| {
                     FfsError::RepairFailed(format!(
                         "repair_equation failed for esi {esi} in group {}: {error:?}",
@@ -1618,6 +1622,7 @@ fn decode_group_impl(
         }
     }
 
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     // Attempt decode.
     let result: DecodeResult = decoder
         .decode_wavefront(&received, RQ_DECODE_WAVEFRONT_BATCH)
@@ -1633,6 +1638,7 @@ fn decode_group_impl(
             }
         })?;
 
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     // Extract recovered blocks for the corrupt indices.
     let mut recovered = Vec::with_capacity(corrupt_indices.len());
     for &idx in corrupt_indices {
@@ -1860,6 +1866,7 @@ fn read_known_source_symbols(
         usize::try_from(source_block_count).expect("u32 source block count fits usize");
     let mut source = Vec::with_capacity(source_count.saturating_sub(corrupt_set.len()));
     for i in 0..source_block_count {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         if corrupt_set.contains(i) {
             continue;
         }

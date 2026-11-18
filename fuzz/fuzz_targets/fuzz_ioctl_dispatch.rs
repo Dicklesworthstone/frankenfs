@@ -885,7 +885,8 @@ fn classify_ioctl(data: &[u8]) -> IoctlOutcome {
         read_only,
         ..MountOptions::default()
     };
-    let fuse = FrankenFuse::with_options(Box::new(fs), &options);
+    let cx = asupersync::Cx::for_testing();
+    let fuse = FrankenFuse::with_options_and_cx(&cx, Box::new(fs), &options);
     let (cmd, in_data, out_size) = build_ioctl_request(kind, &mut cursor);
 
     match fuse.dispatch_ioctl_for_fuzzing(caller_pid, 0, 0, ino, fh, cmd, &in_data, out_size) {

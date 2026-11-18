@@ -284,8 +284,9 @@ fn json(value: &serde_json::Value) -> Result<()> {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .blocking_threads(0, 0)
+    let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .blocking_threads(0, 4)
         .build()
         .map_err(|err| anyhow::anyhow!("failed to build ffs-zfs runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);

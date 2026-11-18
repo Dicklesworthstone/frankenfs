@@ -792,6 +792,10 @@ fn fat_fiemap(
 }
 
 impl FsOps for FatFs {
+    fn supports_posix_acl(&self) -> bool {
+        false
+    }
+
     fn getattr(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<InodeAttr> {
         let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
@@ -1397,6 +1401,19 @@ impl FsOps for FatFs {
         }
         checkpoint(cx)?;
         operation.complete(())
+    }
+
+    fn default_commit_interval(&self) -> Option<std::time::Duration> {
+        self.writable.then_some(std::time::Duration::from_secs(5))
+    }
+
+    fn periodic_commit(&self, cx: &Cx) -> Result<bool> {
+        if !self.writable {
+            return Ok(false);
+        }
+        let mut scope = RequestScope::empty();
+        self.sync_fs(cx, &mut scope)?;
+        Ok(true)
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {

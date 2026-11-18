@@ -556,6 +556,10 @@ impl FsOps for ZfsFs {
             .map_or(true, |state| state.writer.is_some())
     }
 
+    fn supports_posix_acl(&self) -> bool {
+        false
+    }
+
     fn begin_request_scope(&self, cx: &Cx, op: ffs_core::vfs::RequestOp) -> Result<RequestScope> {
         // RELEASE must reach its lifetime cleanup even if the request is
         // already cancelled. Other operations retain normal admission.
@@ -724,6 +728,23 @@ impl FsOps for ZfsFs {
         view_state.metadata(cx, ino)?;
         let object = view_state.nodes[&ino].object;
         view_state.view.read(cx, object, offset, size as usize)
+    }
+
+    fn get_inode_flags(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<u32> {
+        checkpoint(cx)?;
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            return Ok(ffs_types::EXT4_IMMUTABLE_FL);
+        }
+        let mut state = self.state(cx)?;
+        let metadata = state.view_for_ino(cx, ino)?.metadata(cx, ino)?.0;
+        let mut flags = 0_u32;
+        if metadata.flags & 0x0000_0010_0000_0000 != 0 {
+            flags |= ffs_types::EXT4_IMMUTABLE_FL;
+        }
+        if metadata.flags & 0x0000_0040_0000_0000 != 0 {
+            flags |= ffs_types::EXT4_APPEND_FL;
+        }
+        Ok(flags)
     }
 
     fn open(
@@ -1348,6 +1369,21 @@ impl FsOps for ZfsFs {
         let mut state = self.state(cx)?;
         state.reap_closed_orphans(cx)?;
         state.sync(cx)
+    }
+
+    fn default_commit_interval(&self) -> Option<std::time::Duration> {
+        self.is_writable()
+            .unwrap_or(false)
+            .then_some(std::time::Duration::from_secs(5))
+    }
+
+    fn periodic_commit(&self, cx: &Cx) -> Result<bool> {
+        if !self.is_writable()? {
+            return Ok(false);
+        }
+        let mut scope = RequestScope::empty();
+        self.sync_fs(cx, &mut scope)?;
+        Ok(true)
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {

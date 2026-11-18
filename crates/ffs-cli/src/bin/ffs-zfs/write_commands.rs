@@ -692,7 +692,7 @@ impl WriteCommand {
                 eprintln!(
                     "experimental ZFS writer: synchronous native TXG commits; native mode/ownership/SA-xattr/open-unlink, noatime; non-trivial ACL enforcement is not implemented"
                 );
-                let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+                let _ = ffs_fuse::mount(cx, Box::new(fs), &mountpoint, &options)?;
                 Ok(())
             }
             Self::TxCreate {

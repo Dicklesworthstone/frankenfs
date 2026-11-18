@@ -2087,7 +2087,7 @@ fn assert_direct_fscrypt_legacy_policy(golden: &Value, image_path: &Path) {
     };
     let fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
         .expect("open ext4 fscrypt transport image");
-    let fuse = FrankenFuse::new(Box::new(fs));
+    let fuse = FrankenFuse::new_with_cx(&cx, Box::new(fs));
     let direct_request = [0_u8; FSCRYPT_POLICY_V1_SIZE];
     let policy = fuse
         .dispatch_ioctl_for_fuzzing(
@@ -2286,6 +2286,22 @@ fn wait_for_fuse_mount_ready(mountpoint: &Path) -> bool {
     mountinfo_has_mountpoint(mountpoint)
 }
 
+fn conformance_mount_cx() -> &'static Cx {
+    static RUNTIME: std::sync::OnceLock<asupersync::runtime::Runtime> = std::sync::OnceLock::new();
+    static ROOT_CX: std::sync::OnceLock<Cx> = std::sync::OnceLock::new();
+    ROOT_CX.get_or_init(|| {
+        RUNTIME
+            .get_or_init(|| {
+                asupersync::runtime::RuntimeBuilder::multi_thread()
+                    .worker_threads(2)
+                    .blocking_threads(0, 8)
+                    .build()
+                    .expect("conformance mount runtime")
+            })
+            .request_cx_with_budget(asupersync::Budget::INFINITE)
+    })
+}
+
 fn try_mount_ffs_with_options(
     image: &Path,
     mountpoint: &Path,
@@ -2293,14 +2309,14 @@ fn try_mount_ffs_with_options(
 ) -> Option<ffs_harness::stale_mounts::MountGuard> {
     // Self-heal dead mounts leaked by earlier crashed/killed runs.
     ffs_harness::stale_mounts::reap_stale_frankenfs_mounts_once();
-    let cx = Cx::for_testing();
+    let cx = conformance_mount_cx();
     let opts = OpenOptions {
         skip_validation: false,
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
-    let fs = OpenFs::open_with_options(&cx, image, &opts).expect("open ext4 image");
-    match mount_background(Box::new(fs), mountpoint, mount_opts) {
+    let fs = OpenFs::open_with_options(cx, image, &opts).expect("open ext4 image");
+    match mount_background(cx, Box::new(fs), mountpoint, mount_opts) {
         Ok(session) => {
             if wait_for_fuse_mount_ready(mountpoint) {
                 Some(ffs_harness::stale_mounts::MountGuard::new(

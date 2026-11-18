@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{self, SyncSender};
+use std::thread;
 
 #[derive(Debug, Clone, Copy)]
 enum Fault {

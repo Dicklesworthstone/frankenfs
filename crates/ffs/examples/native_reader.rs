@@ -407,8 +407,9 @@ fn main() -> Result<()> {
         _ => None,
     };
     // The application owns the runtime and supplies its context to the library.
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .blocking_threads(0, 0)
+    let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .blocking_threads(0, 4)
         .build()?;
     let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let opened = open_read_only(
@@ -474,6 +475,7 @@ fn main() -> Result<()> {
             // Transfer the already admitted, bounded and locked FsOps handle.
             // The transport has no option here to enable native mutation.
             ffs_fuse::mount(
+                &cx,
                 opened.filesystem,
                 mountpoint,
                 &ffs_fuse::MountOptions {

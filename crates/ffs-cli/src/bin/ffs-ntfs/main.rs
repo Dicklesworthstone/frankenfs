@@ -886,8 +886,9 @@ fn security_reference_check_json(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .blocking_threads(0, 0)
+    let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .blocking_threads(0, 4)
         .build()
         .map_err(|err| anyhow::anyhow!("failed to build ffs-ntfs runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
@@ -1179,7 +1180,7 @@ fn main() -> Result<()> {
                     "clean-log"
                 }
             );
-            let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+            let _ = ffs_fuse::mount(&cx, Box::new(fs), &mountpoint, &options)?;
         }
         Command::MountWrite {
             target,
@@ -1213,7 +1214,7 @@ fn main() -> Result<()> {
             eprintln!(
                 "experimental NTFS ordinary writer: native WAL commits; fixed host permissions and noatime; native ACLs are not enforced"
             );
-            let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+            let _ = ffs_fuse::mount(&cx, Box::new(fs), &mountpoint, &options)?;
         }
         Command::AdmitWrite { probe } => {
             if !probe.offline_image {

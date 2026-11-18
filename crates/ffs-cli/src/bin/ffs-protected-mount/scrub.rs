@@ -19,7 +19,6 @@ use serde::Serialize;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 const READ_BYTES: usize = 64 * 1024;
@@ -376,7 +375,7 @@ fn wait(cx: &Cx, stop: &AtomicBool, shutdown: &AtomicBool, duration: Duration) -
         if remaining.is_zero() {
             return Ok(true);
         }
-        thread::park_timeout(remaining.min(STOP_POLL));
+        crate::mount_worker::sleep_with_cx(cx, remaining.min(STOP_POLL));
     }
 }
 

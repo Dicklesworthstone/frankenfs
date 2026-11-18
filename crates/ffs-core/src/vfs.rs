@@ -1134,6 +1134,16 @@ pub trait FsOps: Send + Sync {
         false
     }
 
+    /// Whether this backend natively supports POSIX ACL xattrs
+    /// (`system.posix_acl_access` / `system.posix_acl_default`).
+    ///
+    /// Backends that do not implement POSIX ACLs (such as FAT, NTFS, and ZFS)
+    /// must return `false` so `FrankenFuse::init` does not negotiate
+    /// `FUSE_POSIX_ACL`, avoiding kernel `fuse_get_acl` `EOPNOTSUPP` failures.
+    fn supports_posix_acl(&self) -> bool {
+        true
+    }
+
     /// Read the target of a symbolic link.
     ///
     /// Returns the raw bytes of the symlink target. Returns
@@ -3117,6 +3127,16 @@ pub trait FsOps: Send + Sync {
         Ok(())
     }
 
+    /// Default periodic durability commit interval when mounted writable (`None` for read-only).
+    fn default_commit_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Perform one periodic durability checkpoint if dirty mutations are pending.
+    fn periodic_commit(&self, _cx: &Cx) -> ffs_error::Result<bool> {
+        Ok(false)
+    }
+
     /// Flush all pending writes to durable storage before unmount.
     ///
     /// Called by the FUSE `destroy` callback to ensure in-memory MVCC
@@ -3215,6 +3235,10 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
 
     fn requires_stateful_open(&self) -> bool {
         self.as_ref().requires_stateful_open()
+    }
+
+    fn supports_posix_acl(&self) -> bool {
+        self.as_ref().supports_posix_acl()
     }
 
     fn readlink(
@@ -4323,6 +4347,14 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         self.as_ref().abort_writeback_batch_scope(cx, scope)
     }
 
+    fn default_commit_interval(&self) -> Option<std::time::Duration> {
+        self.as_ref().default_commit_interval()
+    }
+
+    fn periodic_commit(&self, cx: &Cx) -> ffs_error::Result<bool> {
+        self.as_ref().periodic_commit(cx)
+    }
+
     fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {
         self.as_ref().flush_on_destroy(cx)
     }
@@ -4340,7 +4372,7 @@ pub mod __delegate_support {
     pub use ffs_types::{CommitSeq, InodeNumber};
     pub use std::ffi::OsStr;
     pub use std::path::Path;
-    pub use std::time::SystemTime;
+    pub use std::time::{Duration, SystemTime};
 }
 
 /// Forward every [`FsOps`] method from a wrapper type to `$target` so manual
@@ -4433,6 +4465,10 @@ macro_rules! delegate_fs_ops {
 
         fn requires_stateful_open(&$self) -> bool {
             ($target).requires_stateful_open()
+        }
+
+        fn supports_posix_acl(&$self) -> bool {
+            ($target).supports_posix_acl()
         }
 
         fn readlink(
@@ -5610,6 +5646,17 @@ macro_rules! delegate_fs_ops {
             ($target).abort_writeback_batch_scope(cx, scope)
         }
 
+        fn default_commit_interval(&$self) -> Option<$crate::vfs::__delegate_support::Duration> {
+            ($target).default_commit_interval()
+        }
+
+        fn periodic_commit(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+        ) -> $crate::vfs::__delegate_support::Result<bool> {
+            ($target).periodic_commit(cx)
+        }
+
         fn flush_on_destroy(
             &$self,
             cx: &$crate::vfs::__delegate_support::Cx,
@@ -6392,6 +6439,10 @@ mod fs_ops_wrapper_completeness_pins {
         fn requires_stateful_open(&self) -> bool {
             self.record("requires_stateful_open");
             true
+        }
+        fn supports_posix_acl(&self) -> bool {
+            self.record("supports_posix_acl");
+            false
         }
         fn readlink(
             &self,
@@ -7533,6 +7584,14 @@ mod fs_ops_wrapper_completeness_pins {
             self.record("abort_writeback_batch_scope");
             Ok(())
         }
+        fn default_commit_interval(&self) -> Option<std::time::Duration> {
+            self.record("default_commit_interval");
+            Some(std::time::Duration::from_secs(5))
+        }
+        fn periodic_commit(&self, _cx: &Cx) -> ffs_error::Result<bool> {
+            self.record("periodic_commit");
+            Ok(true)
+        }
         fn flush_on_destroy(&self, _cx: &Cx) -> ffs_error::Result<()> {
             self.record("flush_on_destroy");
             Ok(())
@@ -7565,6 +7624,7 @@ mod fs_ops_wrapper_completeness_pins {
         let _ = ops.read(&cx, &mut s, ino, 0, 16);
         let _ = ops.open(&cx, &mut s, ino, 0);
         assert!(ops.requires_stateful_open());
+        assert!(!ops.supports_posix_acl());
         let _ = ops.readlink(&cx, &mut s, ino);
         let _ = ops.statfs(&cx, &mut s, ino);
         let _ = ops.listxattr(&cx, ino);
@@ -7701,6 +7761,8 @@ mod fs_ops_wrapper_completeness_pins {
         let _ = ops.begin_writeback_batch_scope(&cx);
         let _ = ops.commit_writeback_batch_scope(&cx, RequestScope::empty());
         let _ = ops.abort_writeback_batch_scope(&cx, RequestScope::empty());
+        let _ = ops.default_commit_interval();
+        let _ = ops.periodic_commit(&cx);
         let _ = ops.flush_on_destroy(&cx);
     }
 

@@ -2538,19 +2538,17 @@ impl FlushDaemonConfig {
     }
 }
 
-/// Handle for a running background flush daemon.
+/// Handle for a running background flush daemon owned by the caller's runtime region.
 pub struct FlushDaemon {
-    stop: Arc<FlushDaemonStop>,
-    runtime: Arc<asupersync::runtime::Runtime>,
-    region: Option<asupersync::cx::ChildRegion>,
+    stop_tx: Option<asupersync::channel::mpsc::Sender<()>>,
+    region: Option<OwnedChildRegion>,
     task: Option<asupersync::runtime::TaskHandle<()>>,
-    cleanup_cx: Cx,
 }
 
 impl std::fmt::Debug for FlushDaemon {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlushDaemon")
-            .field("stop", &self.stop)
+            .field("stop_open", &self.stop_tx.is_some())
             .field("region_open", &self.region.is_some())
             .field("task_active", &self.task.is_some())
             .finish_non_exhaustive()
@@ -2558,59 +2556,33 @@ impl std::fmt::Debug for FlushDaemon {
 }
 
 impl FlushDaemon {
-    /// Request shutdown and block until the daemon exits.
-    pub fn shutdown(mut self) {
-        self.stop_and_drain();
+    /// Request shutdown and await daemon completion + region quiescence asynchronously.
+    pub async fn shutdown_async(mut self) {
+        self.stop_and_drain_async().await;
     }
 
-    fn stop_and_drain(&mut self) {
-        self.stop.request_stop();
+    /// Request shutdown and block until the daemon exits and its region closes.
+    pub fn shutdown(mut self) {
+        block_on_park(self.stop_and_drain_async());
+    }
+
+    async fn stop_and_drain_async(&mut self) {
+        if let Some(region) = self.region.as_ref() {
+            region.disarm_parent_bridge();
+        }
+        let _ = self.stop_tx.take();
         if let Some(mut task) = self.task.take() {
-            let _ = self.runtime.block_on(task.join(&self.cleanup_cx));
+            let _ = crate::join_task_uninterruptible(&mut task).await;
         }
         if let Some(region) = self.region.take() {
-            let _ = self.runtime.block_on(region.close());
+            region.close_async().await;
         }
     }
 }
 
 impl Drop for FlushDaemon {
     fn drop(&mut self) {
-        self.stop_and_drain();
-    }
-}
-
-struct FlushDaemonStop {
-    stopped: Mutex<bool>,
-    condvar: Condvar,
-}
-
-impl std::fmt::Debug for FlushDaemonStop {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FlushDaemonStop").finish_non_exhaustive()
-    }
-}
-
-impl FlushDaemonStop {
-    fn new() -> Self {
-        Self {
-            stopped: Mutex::new(false),
-            condvar: Condvar::new(),
-        }
-    }
-
-    fn request_stop(&self) {
-        *self.stopped.lock() = true;
-        self.condvar.notify_all();
-    }
-
-    fn wait_interval_or_stopped(&self, interval: Duration) -> bool {
-        let mut stopped = self.stopped.lock();
-        if *stopped {
-            return true;
-        }
-        self.condvar.wait_for(&mut stopped, interval);
-        *stopped
+        block_on_park(self.stop_and_drain_async());
     }
 }
 
@@ -2624,28 +2596,33 @@ impl FlushDaemonStop {
 /// # Example
 ///
 /// ```text
-/// let deferred = DeferredArcCache::new(device, 1024, FlushDaemonConfig::default())?;
+/// let deferred = DeferredArcCache::new(&cx, device, 1024, FlushDaemonConfig::default())?;
 /// deferred.write_block(&cx, BlockNumber(0), &data)?; // deferred to cache
 /// // daemon flushes dirty blocks in background …
 /// drop(deferred); // final flush + shutdown
 /// ```
 pub struct DeferredArcCache<D: BlockDevice + 'static> {
-    /// Dropped first — joins the daemon thread (which does a final flush).
+    /// Dropped first — joins the daemon task (which does a final flush).
     daemon: FlushDaemon,
     /// Dropped second — the underlying cache (kept alive by daemon's Arc clone
-    /// until the daemon thread exits in `FlushDaemon::drop`).
+    /// until the daemon task exits in `FlushDaemon::drop`).
     cache: Arc<ArcCache<D>>,
 }
 
 impl<D: BlockDevice + 'static> DeferredArcCache<D> {
-    /// Create a write-back cache with a background flush daemon.
-    pub fn new(inner: D, capacity_blocks: usize, config: FlushDaemonConfig) -> Result<Self> {
+    /// Create a write-back cache with a background flush daemon owned by `cx`'s runtime.
+    pub fn new(
+        cx: &Cx,
+        inner: D,
+        capacity_blocks: usize,
+        config: FlushDaemonConfig,
+    ) -> Result<Self> {
         let cache = Arc::new(ArcCache::new_with_policy(
             inner,
             capacity_blocks,
             ArcWritePolicy::WriteBack,
         )?);
-        let daemon = cache.start_flush_daemon(config)?;
+        let daemon = cache.start_flush_daemon(cx, config)?;
         Ok(Self { daemon, cache })
     }
 
@@ -3279,58 +3256,117 @@ impl<D: BlockDevice> ArcCache<D> {
     /// The daemon flushes oldest dirty blocks first using `batch_size`, unless
     /// dirty ratio exceeds `high_watermark`, in which case it flushes all dirty
     /// blocks aggressively. On shutdown it performs a final full flush.
-    pub fn start_flush_daemon(self: &Arc<Self>, config: FlushDaemonConfig) -> Result<FlushDaemon>
+    /// Start a background flush daemon inside a child region of `cx`.
+    ///
+    /// Asynchronously opens the child region on `cx`'s runtime so deterministic
+    /// `LabRuntime` tests and async callers can supervise it directly.
+    pub async fn start_flush_daemon_async(
+        self: &Arc<Self>,
+        cx: &Cx,
+        config: FlushDaemonConfig,
+    ) -> Result<FlushDaemon>
     where
         D: 'static,
     {
         let config = config.validate()?;
-        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
-            .worker_threads(1)
-            .blocking_threads(0, 1)
-            .build()
-            .map(Arc::new)
-            .map_err(|err| FfsError::Format(format!("flush daemon runtime init failed: {err}")))?;
-        let root_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
-        let cleanup_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
-        let region = runtime
-            .block_on(root_cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
-            .map_err(|err| FfsError::Format(format!("flush daemon region init failed: {err}")))?;
-        let stop = Arc::new(FlushDaemonStop::new());
+        let region = OwnedChildRegion::open_async(cx).await?;
+        let (stop_tx, mut stop_rx) = asupersync::channel::mpsc::channel::<()>(1);
         let cache = Arc::clone(self);
-        let stop_signal = Arc::clone(&stop);
-        let shutdown_flush_cx = cleanup_cx.clone();
 
         let task = region
             .cx()
-            .spawn_blocking(move |cx| {
+            .spawn(move |worker_cx| async move {
                 let mut cycle_seq = 0_u64;
                 let mut daemon_throttled = false;
 
                 loop {
-                    if stop_signal.wait_interval_or_stopped(config.interval) {
+                    if asupersync::time::timeout(
+                        worker_cx.now(),
+                        config.interval,
+                        stop_rx.recv(&worker_cx),
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        break;
+                    }
+                    if worker_cx.checkpoint().is_err() {
                         break;
                     }
                     cycle_seq = cycle_seq.saturating_add(1);
-                    cache.run_flush_daemon_cycle(&cx, &config, cycle_seq, &mut daemon_throttled);
+                    let cache_cycle = Arc::clone(&cache);
+                    let (done_tx, mut done_rx) = asupersync::channel::oneshot::channel::<bool>();
+                    if let Ok(mut blocking) = worker_cx.spawn_blocking(move |cycle_cx| {
+                        if cycle_cx.checkpoint().is_err() {
+                            return;
+                        }
+                        let Ok(permit) = cycle_cx.masked(|| done_tx.reserve(&cycle_cx)) else {
+                            return;
+                        };
+                        let mut throttled = daemon_throttled;
+                        cache_cycle.run_flush_daemon_cycle(
+                            &cycle_cx,
+                            &config,
+                            cycle_seq,
+                            &mut throttled,
+                        );
+                        let _ = permit.send(throttled);
+                    }) {
+                        let _ = crate::join_task_uninterruptible(&mut blocking).await;
+                        if let Ok(throttled) =
+                            crate::poll_masked(&worker_cx, done_rx.recv(&worker_cx)).await
+                        {
+                            daemon_throttled = throttled;
+                        }
+                    }
+                    if worker_cx.checkpoint().is_err() {
+                        break;
+                    }
                 }
 
-                if let Err(err) = cache.flush_dirty(&shutdown_flush_cx) {
-                    error!(
-                        event = "flush_shutdown_failed",
-                        error = %err,
-                        remaining_dirty_blocks = cache.dirty_count()
-                    );
+                if worker_cx.checkpoint().is_ok() {
+                    let cache_final = Arc::clone(&cache);
+                    let (done_tx, mut done_rx) = asupersync::channel::oneshot::channel::<()>();
+                    if let Ok(mut blocking) = worker_cx.spawn_blocking(move |final_cx| {
+                        if final_cx.checkpoint().is_err() {
+                            return;
+                        }
+                        let Ok(permit) = final_cx.masked(|| done_tx.reserve(&final_cx)) else {
+                            return;
+                        };
+                        if let Err(err) = cache_final.flush_dirty(&final_cx) {
+                            error!(
+                                event = "flush_shutdown_failed",
+                                error = %err,
+                                remaining_dirty_blocks = cache_final.dirty_count()
+                            );
+                        }
+                        let _ = permit.send(());
+                    }) {
+                        let _ = crate::join_task_uninterruptible(&mut blocking).await;
+                        let _ = crate::poll_masked(&worker_cx, done_rx.recv(&worker_cx)).await;
+                    }
                 }
             })
             .map_err(|err| FfsError::Format(format!("flush daemon spawn failed: {err}")))?;
 
         Ok(FlushDaemon {
-            stop,
-            runtime,
+            stop_tx: Some(stop_tx),
             region: Some(region),
             task: Some(task),
-            cleanup_cx,
         })
+    }
+
+    /// Start a background flush daemon inside a child region of `cx`.
+    pub fn start_flush_daemon(
+        self: &Arc<Self>,
+        cx: &Cx,
+        config: FlushDaemonConfig,
+    ) -> Result<FlushDaemon>
+    where
+        D: 'static,
+    {
+        block_on_park(self.start_flush_daemon_async(cx, config))
     }
 
     fn run_flush_daemon_cycle(

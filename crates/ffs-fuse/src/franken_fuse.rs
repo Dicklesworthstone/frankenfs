@@ -1,5 +1,6 @@
 impl FrankenFuse {
-    fn with_inner(
+    fn with_mount_scope(
+        mount_scope: Arc<MountRuntimeScope>,
         ops: Box<dyn FsOps>,
         options: &MountOptions,
         mountpoint: Option<&Path>,
@@ -21,9 +22,13 @@ impl FrankenFuse {
             let lookup_refcounts = lookup_refcounts.clone();
             move |ino| lookup_refcounts.count(ino.0)
         }));
+        let probe_cx = mount_scope.mint_request_cx();
         let initial_xattr_empty = auto_xattr_fast_path_enabled()
-            && ops.xattr_presence(&Self::cx_for_request())
-                == ffs_core::vfs::XattrPresence::ProvenAbsent;
+            && ops.xattr_presence(&probe_cx) == ffs_core::vfs::XattrPresence::ProvenAbsent;
+        let ioctl_trace = options
+            .ioctl_trace_path
+            .clone()
+            .map(|path| IoctlTraceProbe::new_with_cx(mount_scope.base_cx(), path));
         Self {
             inner: Arc::new(FuseInner {
                 ops: Arc::from(ops),
@@ -38,7 +43,7 @@ impl FrankenFuse {
                 count_memoized_requests: count_memoized_requests_from_env(),
                 mountpoint: mountpoint.map(Path::to_path_buf),
                 kernel_notifier: Mutex::new(None),
-                ioctl_trace: options.ioctl_trace_path.clone().map(IoctlTraceProbe::new),
+                ioctl_trace,
                 backpressure,
                 access_predictor: AccessPredictor::default(),
                 readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
@@ -65,31 +70,69 @@ impl FrankenFuse {
                 lookup_refcounts,
             }),
             final_flush_errno: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            mount_scope,
         }
     }
 
-    /// Create a new FUSE adapter wrapping the given `FsOps` implementation.
-    ///
-    /// Uses default thread count (auto-detected).
+    fn with_inner_and_cx(
+        cx: &Cx,
+        ops: Box<dyn FsOps>,
+        options: &MountOptions,
+        mountpoint: Option<&Path>,
+        backpressure: Option<Arc<BackpressureGate>>,
+    ) -> Self {
+        Self::with_mount_scope(
+            MountRuntimeScope::open_adapter(cx),
+            ops,
+            options,
+            mountpoint,
+            backpressure,
+        )
+    }
+
+    /// Create a new FUSE adapter bound to the caller's runtime context `cx`.
+    #[must_use]
+    pub fn new_with_cx(cx: &Cx, ops: Box<dyn FsOps>) -> Self {
+        Self::with_options_and_cx(cx, ops, &MountOptions::default())
+    }
+
+    /// Create a new FUSE adapter with explicit mount options bound to `cx`.
+    #[must_use]
+    pub fn with_options_and_cx(cx: &Cx, ops: Box<dyn FsOps>, options: &MountOptions) -> Self {
+        Self::with_inner_and_cx(cx, ops, options, None, None)
+    }
+
+    /// Create a FUSE adapter with an attached backpressure gate bound to `cx`.
+    #[must_use]
+    pub fn with_backpressure_and_cx(
+        cx: &Cx,
+        ops: Box<dyn FsOps>,
+        options: &MountOptions,
+        gate: BackpressureGate,
+    ) -> Self {
+        Self::with_inner_and_cx(cx, ops, options, None, Some(Arc::new(gate)))
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub fn new(ops: Box<dyn FsOps>) -> Self {
-        Self::with_options(ops, &MountOptions::default())
+        Self::new_with_cx(crate::fuse_root_cx(), ops)
     }
 
-    /// Create a new FUSE adapter with explicit mount options.
-    ///
-    /// The resolved `thread_count` is logged at info level.
+    #[cfg(test)]
     #[must_use]
     pub fn with_options(ops: Box<dyn FsOps>, options: &MountOptions) -> Self {
-        Self::with_inner(ops, options, None, None)
+        Self::with_options_and_cx(crate::fuse_root_cx(), ops, options)
     }
 
+    #[cfg(test)]
     fn with_mount_config(
         ops: Box<dyn FsOps>,
         mountpoint: Option<&Path>,
         config: &MountConfig,
     ) -> Self {
-        Self::with_inner(
+        Self::with_inner_and_cx(
+            crate::fuse_root_cx(),
             ops,
             &config.options,
             mountpoint,
@@ -97,14 +140,14 @@ impl FrankenFuse {
         )
     }
 
-    /// Create a FUSE adapter with an attached backpressure gate.
+    #[cfg(test)]
     #[must_use]
     pub fn with_backpressure(
         ops: Box<dyn FsOps>,
         options: &MountOptions,
         gate: BackpressureGate,
     ) -> Self {
-        Self::with_inner(ops, options, None, Some(Arc::new(gate)))
+        Self::with_backpressure_and_cx(crate::fuse_root_cx(), ops, options, gate)
     }
 
     /// Get a reference to the shared metrics.
@@ -131,6 +174,7 @@ impl FrankenFuse {
         Self {
             inner: Arc::clone(&self.inner),
             final_flush_errno: Arc::clone(&self.final_flush_errno),
+            mount_scope: Arc::clone(&self.mount_scope),
         }
     }
 
@@ -157,7 +201,7 @@ impl FrankenFuse {
     fn install_kernel_notifier(&self, notifier: fuser::Notifier) {
         // bd-7s0p7: the notifier is handed to an off-thread worker rather than
         // stored for the dispatch thread to use. See `KernelNotifyQueue`.
-        let queue = KernelNotifyQueue::spawn(notifier);
+        let queue = KernelNotifyQueue::spawn(self.mount_scope.base_cx(), notifier);
         let mut guard = match self.inner.kernel_notifier.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -192,6 +236,30 @@ impl FrankenFuse {
         // Dispatch has retired. Drain callbacks without the slot mutex and
         // outside the blocking worker whose completion we just received.
         drop(queue);
+    }
+
+    fn retire_ioctl_trace(&self) {
+        if let Some(trace) = self.inner.ioctl_trace.as_ref() {
+            trace.retire(self.mount_scope.base_cx());
+        }
+    }
+
+    fn start_periodic_commit(&self, configured: Option<Duration>) {
+        if !self.inner.read_only {
+            self.mount_scope
+                .start_periodic_commit(&self.inner.ops, configured);
+        }
+    }
+
+    fn stop_periodic_commit(&self) {
+        self.mount_scope.stop_periodic_commit();
+    }
+
+    fn close_mount_scope(&self) {
+        self.stop_periodic_commit();
+        self.retire_kernel_notifier();
+        self.retire_ioctl_trace();
+        self.mount_scope.close_sync();
     }
 
     fn notify_entry_invalidation(&self, parent: u64, name: &OsStr) {
@@ -317,7 +385,7 @@ impl FrankenFuse {
     /// Execute open without a live kernel mount.
     #[doc(hidden)]
     pub fn open_for_fuzzing(&self, ino: u64, flags: i32) -> std::result::Result<(u64, u32), c_int> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.dispatch_open(&cx, InodeNumber(ino), flags)
             .map(|(fh, open_flags)| (fh, Self::kernel_open_flags(flags, open_flags)))
             .map_err(|error| error.to_errno())
@@ -331,7 +399,7 @@ impl FrankenFuse {
             return;
         }
         self.inner.metrics.record_metadata_request();
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         match self.dispatch_open(&cx, InodeNumber(ino), flags) {
             Ok((fh, open_flags)) => {
                 let mut kernel_flags = Self::kernel_open_flags(flags, open_flags);
@@ -381,7 +449,7 @@ impl FrankenFuse {
         // A failed commit/scope must not strand a handle the kernel never
         // received. Cleanup has its own context, independent of cancellation
         // of the original request, and does not undo a durable CREATE.
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let result = self.with_request_scope(&cx, RequestOp::Release, |cx, scope| {
             self.inner.ops.release(
                 cx,
@@ -409,7 +477,7 @@ impl FrankenFuse {
         size: u32,
     ) -> std::result::Result<Vec<u8>, c_int> {
         let byte_offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let data = self
             .read_with_readahead(&cx, InodeNumber(ino), byte_offset, size)
             .map_err(|error| error.to_errno())?;
@@ -460,7 +528,7 @@ impl FrankenFuse {
         fh: u64,
         lock_owner: u64,
     ) -> std::result::Result<(), c_int> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.with_request_scope(&cx, RequestOp::Flush, |cx, scope| {
             self.inner
                 .ops
@@ -480,7 +548,7 @@ impl FrankenFuse {
         if self.inner.read_only {
             return Err(libc::EROFS);
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Fsync) {
             return Err(errno);
         }
@@ -517,7 +585,7 @@ impl FrankenFuse {
         lock_owner: Option<u64>,
         flush: bool,
     ) -> std::result::Result<(), c_int> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.with_request_scope(&cx, RequestOp::Release, |cx, scope| {
             self.inner.ops.release(
                 cx,
@@ -549,7 +617,7 @@ impl FrankenFuse {
         #[cfg(not(unix))]
         let name = owned_name.as_os_str();
 
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
             self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
         })
@@ -559,7 +627,7 @@ impl FrankenFuse {
     /// Execute getattr without a live kernel mount.
     #[doc(hidden)]
     pub fn getattr_for_fuzzing(&self, ino: u64) -> std::result::Result<InodeAttr, c_int> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
             self.inner.ops.getattr(cx, scope, InodeNumber(ino))
         })
@@ -569,7 +637,7 @@ impl FrankenFuse {
     /// Execute statfs without a live kernel mount.
     #[doc(hidden)]
     pub fn statfs_for_fuzzing(&self, ino: u64) -> std::result::Result<FsStat, c_int> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.with_request_scope(&cx, RequestOp::Statfs, |cx, scope| {
             self.inner.ops.statfs(cx, scope, InodeNumber(ino))
         })
@@ -584,7 +652,7 @@ impl FrankenFuse {
         ino: u64,
         offset: u64,
     ) -> std::result::Result<Vec<FfsDirEntry>, c_int> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let entries = self
             .with_request_scope(&cx, RequestOp::Readdir, |cx, scope| {
                 self.inner.ops.readdir(cx, scope, InodeNumber(ino), offset)
@@ -604,7 +672,7 @@ impl FrankenFuse {
     /// Execute readlink without a live mount.
     #[doc(hidden)]
     pub fn readlink_for_fuzzing(&self, ino: u64) -> std::result::Result<Vec<u8>, c_int> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.with_request_scope(&cx, RequestOp::Readlink, |cx, scope| {
             self.inner.ops.readlink(cx, scope, InodeNumber(ino))
         })
@@ -625,7 +693,7 @@ impl FrankenFuse {
         if self.inner.read_only {
             return Err(libc::EROFS);
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Create) {
             return Err(errno);
         }
@@ -664,7 +732,7 @@ impl FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         let mode = self.create_mode(&cx, parent, mode, umask);
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Create) {
             warn!(parent, "backpressure: shedding create");
@@ -759,7 +827,7 @@ impl FrankenFuse {
         if self.inner.read_only {
             return Err(libc::EROFS);
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Setattr) {
             return Err(errno);
         }
@@ -945,7 +1013,7 @@ impl FrankenFuse {
         if self.inner.read_only {
             return Err(libc::EROFS);
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Symlink) {
             return Err(errno);
         }
@@ -1022,6 +1090,19 @@ impl FrankenFuse {
         {
             return Err(FfsError::Cancelled);
         }
+        if cx.timer_driver().is_some() {
+            let (_keep_tx, mut cancel_rx) = asupersync::channel::oneshot::channel::<()>();
+            let outcome = ffs_block::block_on_park(asupersync::time::timeout(
+                now,
+                delay,
+                cancel_rx.recv(cx),
+            ));
+            if outcome.is_ok() {
+                return Err(FfsError::Cancelled);
+            }
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            return Ok(());
+        }
         let mut remaining = delay;
         while !remaining.is_zero() {
             let slice = remaining.min(BACKPRESSURE_SLEEP_CHECK_INTERVAL);
@@ -1034,7 +1115,7 @@ impl FrankenFuse {
             {
                 return Err(FfsError::Cancelled);
             }
-            std::thread::sleep(slice);
+            std::thread::park_timeout(slice);
             remaining = remaining.saturating_sub(slice);
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         }
@@ -1044,7 +1125,7 @@ impl FrankenFuse {
 
     #[cfg(test)]
     fn should_shed(&self, op: RequestOp) -> bool {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.should_shed_with_cx(&cx, op).unwrap_or(true)
     }
 
@@ -1056,23 +1137,19 @@ impl FrankenFuse {
         self.inner.inode_locks.try_acquire(inodes)
     }
 
-    /// Create a `Cx` for a FUSE request.
+    /// Create a `Cx` for a FUSE request bound to this mount's caller-owned scope.
     ///
     /// Read-only dispatch inherits the original kernel request's interrupt.
     /// The transport deliberately masks this bridge for mutations, handle
     /// lifecycle operations, and ioctls: interrupting those before their
     /// cancellation/rollback boundaries are audited could strand partial work.
-    /// Calls made outside a live dispatch retain an independent context.
-    fn cx_for_request() -> Cx {
-        let budget = crate::fuse_root_cx()
-            .budget_for_timeout(crate::FUSE_REQUEST_TIMEOUT)
-            .with_poll_quota(crate::FUSE_REQUEST_POLL_QUOTA);
-        let cx = crate::fuse_runtime().request_cx_with_budget(budget);
-        if let Some(interrupt) = fuser::current_read_request_interrupt() {
-            let request_cx = cx.clone();
-            interrupt.on_interrupt(move || request_cx.set_cancel_requested(true));
-        }
-        cx
+    fn cx_for_request(&self) -> Cx {
+        self.mount_scope.mint_request_cx()
+    }
+
+    #[cfg(test)]
+    fn cx_for_request_for_test() -> Cx {
+        MountRuntimeScope::open_adapter(crate::fuse_root_cx()).mint_request_cx()
     }
 
     /// The mode a create/mkdir/mknod gets once the umask is accounted for
@@ -1854,7 +1931,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 if fm_flags & FIEMAP_FLAG_SYNC != 0 && !self.inner.read_only {
                     match self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
                         self.inner
@@ -1889,7 +1966,7 @@ impl FrankenFuse {
                 if out_size < u32::try_from(std::mem::size_of::<u32>()).unwrap_or(u32::MAX) {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_inode_flags(cx, scope, InodeNumber(ino))
                 }) {
@@ -1907,7 +1984,7 @@ impl FrankenFuse {
                 if out_size < EXT4_IOC_GETSTATE_SIZE {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_inode_state(cx, scope, InodeNumber(ino))
                 }) {
@@ -1919,7 +1996,7 @@ impl FrankenFuse {
                 if out_size < u32::try_from(std::mem::size_of::<u32>()).unwrap_or(u32::MAX) {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -1937,7 +2014,7 @@ impl FrankenFuse {
                     Ok(value) => u64::from(value),
                     Err(errno) => return IoctlResult::Error(errno),
                 };
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 let (block_size, extents) =
                     match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                         let stats = self.inner.ops.statfs(cx, scope, InodeNumber(ino))?;
@@ -1991,7 +2068,7 @@ impl FrankenFuse {
                     Ok(parsed) => parsed,
                     Err(errno) => return IoctlResult::Error(errno),
                 };
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.trim_range(cx, scope, start, len, min_len)
                 }) {
@@ -2028,7 +2105,7 @@ impl FrankenFuse {
                 if out_size < FS_IOC_FSGETXATTR_SIZE {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -2046,7 +2123,7 @@ impl FrankenFuse {
                     Ok(fsx) => fsx,
                     Err(errno) => return IoctlResult::Error(errno),
                 };
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner
                         .ops
@@ -2064,7 +2141,7 @@ impl FrankenFuse {
                 // returns 0 for valid inodes (the per-inode precache is
                 // a best-effort hint), so propagate backend errors but
                 // keep success as an empty Data reply.
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.precache_extents(cx, scope, InodeNumber(ino))
                 }) {
@@ -2079,7 +2156,7 @@ impl FrankenFuse {
                 // kernel; we mirror that contract by routing through
                 // FsOps::clear_extent_status_cache and propagating only
                 // backend errors (e.g. ENOENT for a bogus inode).
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -2098,7 +2175,7 @@ impl FrankenFuse {
                     Err(errno) => return IoctlResult::Error(errno),
                 };
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner
                         .ops
@@ -2124,7 +2201,7 @@ impl FrankenFuse {
                 if advertised_len < FSCRYPT_POLICY_V1_SIZE {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -2170,7 +2247,7 @@ impl FrankenFuse {
                 if advertised_len < min_out_size {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -2206,7 +2283,7 @@ impl FrankenFuse {
                     Err(errno) => return IoctlResult::Error(errno),
                 };
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner
                         .ops
@@ -2242,7 +2319,7 @@ impl FrankenFuse {
                     len,
                 };
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 let mut donor_ino = None;
                 let mut donor_registered = false;
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
@@ -2305,7 +2382,7 @@ impl FrankenFuse {
                 if in_data.len() < 8 {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.ext4_group_extend(cx, scope, in_data)
                 }) {
@@ -2320,7 +2397,7 @@ impl FrankenFuse {
                 if in_data.len() < 8 {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.ext4_resize_fs(cx, scope, in_data)
                 }) {
@@ -2335,7 +2412,7 @@ impl FrankenFuse {
                 if in_data.len() < 16 {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.ext4_group_add(cx, scope, in_data)
                 }) {
@@ -2347,7 +2424,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.ext4_alloc_da_blks(cx, scope, ino)
                 }) {
@@ -2359,7 +2436,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.ext4_migrate(cx, scope, ino)
                 }) {
@@ -2371,7 +2448,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.ext4_swap_boot(cx, scope, ino)
                 }) {
@@ -2383,7 +2460,7 @@ impl FrankenFuse {
                 if in_data.len() < 4 {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.fs_shutdown(cx, scope, in_data)
                 }) {
@@ -2392,7 +2469,7 @@ impl FrankenFuse {
                 }
             }
             FIFREEZE => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.fs_freeze(cx, scope)
                 }) {
@@ -2405,7 +2482,7 @@ impl FrankenFuse {
                 }
             }
             FITHAW => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.fs_thaw(cx, scope)
                 }) {
@@ -2414,7 +2491,7 @@ impl FrankenFuse {
                 }
             }
             FIGETBSZ => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_block_size(cx, scope)
                 }) {
@@ -2434,7 +2511,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 debug_assert_eq!(BTRFS_FSLABEL_SIZE, FSLABEL_MAX_U32);
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_fs_label(cx, scope)
                 }) {
@@ -2459,7 +2536,7 @@ impl FrankenFuse {
                     Err(errno) => return IoctlResult::Error(errno),
                 };
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.set_fs_label(cx, scope, &label)?;
                     self.inner.ops.commit_request_scope(cx, scope)?;
@@ -2476,7 +2553,7 @@ impl FrankenFuse {
                 if out_size < BTRFS_IOC_FS_INFO_SIZE {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_btrfs_fs_info(cx, scope)
                 }) {
@@ -2507,7 +2584,7 @@ impl FrankenFuse {
                 let mut uuid_in = [0_u8; 16];
                 uuid_in.copy_from_slice(&in_data[8..24]);
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -2531,7 +2608,7 @@ impl FrankenFuse {
                     Err(errno) => return IoctlResult::Error(errno),
                 };
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_tree_search(cx, scope, search_key)
                 }) {
@@ -2567,7 +2644,7 @@ impl FrankenFuse {
                 raw_objectid.copy_from_slice(&in_data[8..16]);
                 let objectid = u64::from_ne_bytes(raw_objectid);
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_ino_lookup(cx, scope, treeid, objectid)
                 }) {
@@ -2590,7 +2667,7 @@ impl FrankenFuse {
                 let mut raw = [0_u8; 8];
                 raw.copy_from_slice(&in_data[0..8]);
                 let treeid = u64::from_ne_bytes(raw);
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_set_default_subvol(cx, scope, treeid)?;
                     self.inner.ops.commit_request_scope(cx, scope)?;
@@ -2604,7 +2681,7 @@ impl FrankenFuse {
                 if out_size < 8 {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_subvol_flags(cx, scope, InodeNumber(ino))
                 }) {
@@ -2623,7 +2700,7 @@ impl FrankenFuse {
                 raw.copy_from_slice(&in_data[0..8]);
                 let flags = u64::from_ne_bytes(raw);
 
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner
                         .ops
@@ -2634,7 +2711,7 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_SYNC => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
                     self.inner.ops.sync_fs(cx, scope)
                 }) {
@@ -2643,7 +2720,7 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_TRANS_START => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_start_transaction(cx, scope)?;
                     self.inner.ops.commit_request_scope(cx, scope)?;
@@ -2654,7 +2731,7 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_TRANS_END => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_end_transaction(cx, scope)?;
                     self.inner.ops.commit_request_scope(cx, scope)?;
@@ -2668,7 +2745,7 @@ impl FrankenFuse {
                 if out_size < BTRFS_SYNC_TRANSID_SIZE {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
                     self.inner.ops.btrfs_start_sync(cx, scope)
                 }) {
@@ -2683,7 +2760,7 @@ impl FrankenFuse {
                 let mut raw = [0_u8; 8];
                 raw.copy_from_slice(&in_data[0..8]);
                 let transid = u64::from_ne_bytes(raw);
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
                     self.inner.ops.btrfs_wait_sync(cx, scope, transid)
                 }) {
@@ -2695,7 +2772,7 @@ impl FrankenFuse {
                 if out_size < BTRFS_FEATURE_FLAGS_SIZE {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_btrfs_features(cx, scope)
                 }) {
@@ -2710,7 +2787,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.set_btrfs_features(cx, scope, in_data)
                 }) {
@@ -2722,7 +2799,7 @@ impl FrankenFuse {
                 if out_size < BTRFS_SUPPORTED_FEATURE_FLAGS_SIZE {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_btrfs_supported_features(cx, scope)
                 }) {
@@ -2752,7 +2829,7 @@ impl FrankenFuse {
                 if space_slots > u64::from(capacity) {
                     return IoctlResult::Error(libc::EOVERFLOW);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_btrfs_space_info(cx, scope, space_slots)
                 }) {
@@ -2767,7 +2844,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let inum = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_btrfs_ino_paths(cx, scope, inum)
                 }) {
@@ -2782,7 +2859,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let logical = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.get_btrfs_logical_ino(cx, scope, logical)
                 }) {
@@ -2796,7 +2873,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let logical = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -2812,7 +2889,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let devid = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_scrub_start(cx, scope, devid)
                 }) {
@@ -2821,7 +2898,7 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_SCRUB_CANCEL => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_scrub_cancel(cx, scope)
                 }) {
@@ -2835,7 +2912,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let devid = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_scrub_progress(cx, scope, devid)
                 }) {
@@ -2844,7 +2921,7 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_QUOTA_RESCAN_WAIT => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_wait_quota_rescan(cx, scope)
                 }) {
@@ -2856,7 +2933,7 @@ impl FrankenFuse {
                 if out_size < BTRFS_QUOTA_RESCAN_ARGS_SIZE {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_quota_rescan_status(cx, scope)
                 }) {
@@ -2872,7 +2949,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EROFS);
                 }
                 let flags = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_start_quota_rescan(cx, scope, flags)
                 }) {
@@ -2891,7 +2968,7 @@ impl FrankenFuse {
                 }
                 let cmd = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
                 let status = u64::from_le_bytes(in_data[8..16].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_quota_control(cx, scope, cmd, status)
                 }) {
@@ -2909,7 +2986,7 @@ impl FrankenFuse {
                 let assign = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
                 let src = u64::from_le_bytes(in_data[8..16].try_into().unwrap_or([0; 8]));
                 let dst = u64::from_le_bytes(in_data[16..24].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner
                         .ops
@@ -2928,7 +3005,7 @@ impl FrankenFuse {
                 }
                 let create = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
                 let qgroupid = u64::from_le_bytes(in_data[8..16].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner
                         .ops
@@ -2953,7 +3030,7 @@ impl FrankenFuse {
                     rsv_rfer: u64::from_le_bytes(in_data[32..40].try_into().unwrap_or([0; 8])),
                     rsv_excl: u64::from_le_bytes(in_data[40..48].try_into().unwrap_or([0; 8])),
                 };
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_limit_qgroup(cx, scope, limit)
                 }) {
@@ -2971,7 +3048,7 @@ impl FrankenFuse {
                 }
                 let start = u64::from_le_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
                 let len = u64::from_le_bytes(in_data[8..16].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_defrag_range(cx, scope, fh, start, len)
                 }) {
@@ -2984,7 +3061,7 @@ impl FrankenFuse {
                 if in_data.len() < BTRFS_VOL_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_snap_create(cx, scope, in_data)
                 }) {
@@ -2997,7 +3074,7 @@ impl FrankenFuse {
                 if in_data.len() < BTRFS_VOL_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_snap_destroy(cx, scope, in_data)
                 }) {
@@ -3013,7 +3090,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_snap_destroy_v2(cx, scope, in_data)
                 }) {
@@ -3026,7 +3103,7 @@ impl FrankenFuse {
                 if in_data.len() < BTRFS_ENCODED_IO_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_encoded_read(cx, scope, ino, in_data)
                 }) {
@@ -3039,7 +3116,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_encoded_write(cx, scope, ino, in_data)
                 }) {
@@ -3059,7 +3136,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_resize(cx, scope, in_data)
                 }) {
@@ -3083,7 +3160,7 @@ impl FrankenFuse {
                 } else {
                     RequestOp::IoctlWrite
                 };
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, scope_op, |cx, scope| {
                     self.inner.ops.btrfs_dev_replace(cx, scope, in_data)
                 }) {
@@ -3096,7 +3173,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_defrag(cx, scope, ino)
                 }) {
@@ -3106,7 +3183,7 @@ impl FrankenFuse {
             }
             BTRFS_IOC_SCAN_DEV => {
                 // Device scanning - not applicable in FUSE context
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_scan_dev(cx, scope, in_data)
                 }) {
@@ -3121,7 +3198,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_forget_dev(cx, scope, in_data)
                 }) {
@@ -3134,7 +3211,7 @@ impl FrankenFuse {
                 if in_data.len() < BTRFS_SEND_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_send(cx, scope, in_data, process_id)
                 }) {
@@ -3150,7 +3227,7 @@ impl FrankenFuse {
                 if in_data.len() < BTRFS_RECEIVED_SUBVOL_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_set_received_subvol(cx, scope, in_data)
                 }) {
@@ -3166,7 +3243,7 @@ impl FrankenFuse {
                 if in_data.len() < BTRFS_SAME_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner
                         .ops
@@ -3184,7 +3261,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 if let Some(errno) = self.backpressure_errno(&cx, RequestOp::IoctlWrite) {
                     return IoctlResult::Error(errno);
                 }
@@ -3236,7 +3313,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_rm_dev_v2(cx, scope, in_data)
                 }) {
@@ -3252,7 +3329,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_add_dev(cx, scope, in_data)
                 }) {
@@ -3268,7 +3345,7 @@ impl FrankenFuse {
                 if self.inner.read_only {
                     return IoctlResult::Error(libc::EROFS);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_rm_dev(cx, scope, in_data)
                 }) {
@@ -3289,7 +3366,7 @@ impl FrankenFuse {
                 let Ok(src_fd) = u32::try_from(src_fd) else {
                     return IoctlResult::Error(libc::EBADF);
                 };
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 // Resolve the caller's source fd to a same-device inode (reuses
                 // the move_ext donor resolver), then share its extents into the
                 // ioctl target (`ino`). bd-vh8p9.
@@ -3321,7 +3398,7 @@ impl FrankenFuse {
                 let Ok(src_fd) = u32::try_from(src_fd) else {
                     return IoctlResult::Error(libc::EBADF);
                 };
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     let src_ino = self.resolve_move_ext_donor(process_id, src_fd)?;
                     self.inner.ops.clone_file_range(
@@ -3345,7 +3422,7 @@ impl FrankenFuse {
                 if in_data.len() < BTRFS_BALANCE_ARGS_SIZE as usize {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_balance_start(cx, scope, in_data)
                 }) {
@@ -3359,7 +3436,7 @@ impl FrankenFuse {
                     return IoctlResult::Error(libc::EINVAL);
                 }
                 let cmd = i32::from_le_bytes(in_data[0..4].try_into().unwrap_or([0; 4]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_balance_ctl(cx, scope, cmd)
                 }) {
@@ -3368,7 +3445,7 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_BALANCE_PROGRESS => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_balance_progress(cx, scope)
                 }) {
@@ -3395,7 +3472,7 @@ impl FrankenFuse {
                 } else {
                     RequestOp::IoctlRead
                 };
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, scope_op, |cx, scope| {
                     self.inner.ops.btrfs_get_dev_stats(cx, scope, devid, flags)
                 }) {
@@ -3407,7 +3484,7 @@ impl FrankenFuse {
                 }
             }
             BTRFS_IOC_GET_SUBVOL_INFO => {
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -3426,7 +3503,7 @@ impl FrankenFuse {
                 {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_tree_search_v2(cx, scope, in_data)
                 }) {
@@ -3442,7 +3519,7 @@ impl FrankenFuse {
                 }
                 let dirid = u64::from_ne_bytes(in_data[0..8].try_into().unwrap_or([0; 8]));
                 let treeid = u64::from_ne_bytes(in_data[8..16].try_into().unwrap_or([0; 8]));
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner
                         .ops
@@ -3458,7 +3535,7 @@ impl FrankenFuse {
                 {
                     return IoctlResult::Error(libc::EINVAL);
                 }
-                let cx = Self::cx_for_request();
+                let cx = self.cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlRead, |cx, scope| {
                     self.inner.ops.btrfs_get_subvol_rootref(cx, scope, in_data)
                 }) {
@@ -3486,7 +3563,7 @@ impl FrankenFuse {
                     "ioctl tracing is not configured",
                 )
             })?
-            .flush_sync()
+            .flush_sync_with_cx(self.mount_scope.base_cx())
     }
 
     fn record_ioctl_probe(&self, ino: u64, cmd: u32, in_len: usize, out_size: u32) {
@@ -3502,7 +3579,7 @@ impl FrankenFuse {
         // landed after the reader had settled (CI run 37048324144). A traced
         // mount is a diagnostic one; the wait costs only it. A flush error
         // (dropped events, writer gone) is already counted by the probe.
-        let _ = trace.flush_sync();
+        let _ = trace.flush_sync_with_cx(self.mount_scope.base_cx());
     }
 
     /// Commit any outstanding writeback batch (bd-2i2ez).
@@ -3591,6 +3668,7 @@ impl FrankenFuse {
         // request passes through -- the getxattr memo used to return BEFORE it, which is
         // why requests_total once read 22 for 6,001 stats, fixed in bdd0fd1b.
         crate::OP_COUNTS[op.as_index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _active_request_guard = self.mount_scope.register_active_request(cx);
         // bd-2i2ez: everything that is not a WRITE observes, so it commits the
         // outstanding batch first. `has_outstanding` makes this one relaxed load
         // when batching is off or nothing is staged.
@@ -3599,10 +3677,7 @@ impl FrankenFuse {
             // must not cancel their mandatory commit after taking the batch
             // out of its slot. This adapter-owned context deliberately does
             // not inherit the new observer's cancellation or deadline.
-            let flush_budget = crate::fuse_root_cx()
-                .budget_for_timeout(crate::FUSE_REQUEST_TIMEOUT)
-                .with_poll_quota(crate::FUSE_REQUEST_POLL_QUOTA);
-            let flush_cx = crate::fuse_runtime().request_cx_with_budget(flush_budget);
+            let flush_cx = self.mount_scope.mint_flush_cx();
             self.flush_writeback_batch(&flush_cx)?;
         }
         // Only read the clock when something will read the counter (bd-xfe7z).
@@ -3722,7 +3797,7 @@ impl FrankenFuse {
         uid: u32,
         gid: u32,
     ) -> Result<InodeAttr, MutationDispatchError> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Mkdir, parent)?;
         {
             let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
@@ -3742,7 +3817,7 @@ impl FrankenFuse {
     }
 
     fn dispatch_rmdir(&self, parent: u64, name: &OsStr) -> Result<(), MutationDispatchError> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Rmdir, parent)?;
         let result = {
             let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
@@ -3760,7 +3835,7 @@ impl FrankenFuse {
     }
 
     fn dispatch_unlink(&self, parent: u64, name: &OsStr) -> Result<(), MutationDispatchError> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Unlink, parent)?;
         let result = {
             let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
@@ -3789,7 +3864,7 @@ impl FrankenFuse {
         uid: u32,
         gid: u32,
     ) -> Result<InodeAttr, MutationDispatchError> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Create, parent)?;
 
         let s_ifmt = mode & libc::S_IFMT;
@@ -3867,7 +3942,7 @@ impl FrankenFuse {
         flags: u32,
         owner: (u32, u32),
     ) -> Result<(), MutationDispatchError> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Rename, parent)?;
         // RENAME_WHITEOUT (overlayfs): rename, then leave a whiteout — a 0:0
         // character device owned by the caller — under the old name, as
@@ -3932,7 +4007,7 @@ impl FrankenFuse {
         data: &[u8],
         intent: WriteIntent,
     ) -> Result<u32, MutationDispatchError> {
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Write, ino)?;
         if let Some(errno) = intent.unsupported_errno() {
             return Err(MutationDispatchError::Errno(errno));
@@ -4150,7 +4225,7 @@ impl FrankenFuse {
         if len == 0 {
             return Ok(0);
         }
-        let cx = Self::cx_for_request();
+        let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Write, ino_out)?;
         let copy_len = len.min(u64::from(u32::MAX));
         let copied = {
