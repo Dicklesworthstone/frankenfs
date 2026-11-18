@@ -3106,11 +3106,11 @@ mod tests {
                         blocks.get(lb as usize).cloned()
                     })
                     .expect("enumerate htree leaves");
-                    for idx in 1..blocks.len() {
+                    for (idx, block) in blocks.iter().enumerate().skip(1) {
                         if !leaves.contains(&u32::try_from(idx).unwrap()) && has_csum {
                             assert!(
                                 verify_dx_block_checksum(
-                                    &blocks[idx],
+                                    block,
                                     csum_seed,
                                     dir_ino,
                                     dir_inode.generation,

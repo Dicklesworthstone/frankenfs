@@ -383,9 +383,52 @@ fn demo_output_lines_contain_expected_metrics() {
 }
 
 fn run_128mib_5pct_striped_repair_elapsed() -> std::time::Duration {
-    use ffs_block::{BlockBuf, BlockDevice, ByteBlockDevice, MemByteDevice};
+    use ffs_block::{BlockBuf, BlockDevice, ByteBlockDevice, ByteDevice};
+    use ffs_error::FfsError;
     use ffs_repair::codec::{StripedGroupConfig, decode_group_striped, encode_group_striped};
-    use ffs_types::{BlockNumber, GroupNumber};
+    use ffs_types::{BlockNumber, ByteOffset, GroupNumber};
+    use std::sync::Mutex;
+
+    struct MemVecByteDevice {
+        data: Mutex<Vec<u8>>,
+    }
+
+    impl ByteDevice for MemVecByteDevice {
+        fn len_bytes(&self) -> u64 {
+            self.data.lock().expect("lock").len() as u64
+        }
+
+        fn read_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ByteOffset,
+            buf: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            let start = usize::try_from(offset.0)
+                .map_err(|_| FfsError::Format("offset overflow".to_owned()))?;
+            let end = start
+                .checked_add(buf.len())
+                .ok_or_else(|| FfsError::Format("len overflow".to_owned()))?;
+            let guard = self.data.lock().expect("lock");
+            buf.copy_from_slice(&guard[start..end]);
+            Ok(())
+        }
+
+        fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> ffs_error::Result<()> {
+            let start = usize::try_from(offset.0)
+                .map_err(|_| FfsError::Format("offset overflow".to_owned()))?;
+            let end = start
+                .checked_add(buf.len())
+                .ok_or_else(|| FfsError::Format("len overflow".to_owned()))?;
+            let mut guard = self.data.lock().expect("lock");
+            guard[start..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn sync(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            Ok(())
+        }
+    }
 
     const BLOCK_SIZE: u32 = 4096;
     const TOTAL_BLOCKS: u32 = 32_768; // 128 MiB
@@ -402,7 +445,13 @@ fn run_128mib_5pct_striped_repair_elapsed() -> std::time::Duration {
         raw[off + 8..off + 16].copy_from_slice(&(!(blk as u64)).to_le_bytes());
     }
     let baseline = raw.clone();
-    let dev = ByteBlockDevice::new(MemByteDevice::new(raw), BLOCK_SIZE).expect("128MiB block dev");
+    let dev = ByteBlockDevice::new(
+        MemVecByteDevice {
+            data: Mutex::new(raw),
+        },
+        BLOCK_SIZE,
+    )
+    .expect("128MiB block dev");
     let fs_uuid = [0x6A_u8; 16];
     let config = StripedGroupConfig {
         max_stripe_blocks: 64,
@@ -680,11 +729,11 @@ fn gate6_raptorq_self_healing() {
 
     // Scrub scan: detect exactly the corrupted blocks with zero false positives.
     let mut detected_corrupt = Vec::new();
-    for b in 0..TOTAL_BLOCKS {
+    for (b, expected_digest) in (0..TOTAL_BLOCKS).zip(&good_digests) {
         let buf = dev
             .read_block(&cx, BlockNumber(u64::from(b)))
             .expect("scrub read");
-        if blake3::hash(buf.as_slice()).as_bytes() != &good_digests[b as usize] {
+        if blake3::hash(buf.as_slice()).as_bytes() != expected_digest {
             detected_corrupt.push(b);
         }
     }
@@ -713,13 +762,13 @@ fn gate6_raptorq_self_healing() {
     );
 
     // Criterion 4: Verify 100% recovery against known-good digests + e2fsck -fn!
-    for b in 0..TOTAL_BLOCKS {
+    for (b, expected_digest) in (0..TOTAL_BLOCKS).zip(&good_digests) {
         let buf = dev
             .read_block(&cx, BlockNumber(u64::from(b)))
             .expect("verify read");
         assert_eq!(
             blake3::hash(buf.as_slice()).as_bytes(),
-            &good_digests[b as usize],
+            expected_digest,
             "block {b} mismatch after 1% self-healing"
         );
     }

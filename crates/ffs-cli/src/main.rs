@@ -146,7 +146,8 @@ use mount_console::{
     MountConsoleConfig, MountConsoleCore, MountConsoleObservation, emit_mount_console,
 };
 use mount_worker::{MountIoWorker, mount_background_runtime, start_periodic_commit};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env::VarError;
 use std::fmt::Write;
@@ -10333,9 +10334,12 @@ struct ActiveMountStateRecord {
 }
 
 fn active_mount_state_path(canon_mountpoint: &Path) -> PathBuf {
-    let digest = blake3::hash(canon_mountpoint.as_os_str().as_encoded_bytes());
-    let hex = digest.to_hex();
-    std::env::temp_dir().join(format!(".ffs-mount-{}.json", &hex.as_str()[..24]))
+    let digest = Sha256::digest(canon_mountpoint.as_os_str().as_encoded_bytes());
+    let mut hex = String::with_capacity(24);
+    for byte in &digest[..12] {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    std::env::temp_dir().join(format!(".ffs-mount-{hex}.json"))
 }
 
 struct ActiveMountGuard {
