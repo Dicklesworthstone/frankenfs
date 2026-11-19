@@ -497,16 +497,16 @@ where
     let (evidence, stdout, stderr) =
         ExecutedEvidence::run_captured_with_env(command, args, extra_env);
     let exit_code = evidence.exit_code();
-    let failure_reason = if !evidence.outcome().is_success() {
+    let failure_reason = if evidence.outcome().is_success() {
+        validate_stdout(&stdout)
+            .err()
+            .map(|reason| format!("{step}: output validation failed: {reason}"))
+    } else {
         Some(format!(
             "{step}: command `{command}` failed ({:?}): {}",
             evidence.outcome(),
             String::from_utf8_lossy(&stderr).trim()
         ))
-    } else {
-        validate_stdout(&stdout)
-            .err()
-            .map(|reason| format!("{step}: output validation failed: {reason}"))
     };
 
     if let Some(reason) = failure_reason {

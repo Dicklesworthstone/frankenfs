@@ -380,7 +380,7 @@ fn qualify_six_resource_bounds_and_planted_negative_controls() {
         let mut out = std::io::stdout().lock();
         // Stream 3 valid 1024-byte chunks to stdout, then fail on the 4th (final) chunk!
         for chunk_idx in 0..3_u8 {
-            out.write_all(&vec![b'A' + chunk_idx; 1024]).unwrap();
+            out.write_all(&[b'A' + chunk_idx; 1024]).unwrap();
             out.flush().unwrap();
         }
         eprintln!("FATAL: corrupt final element #4 after streaming 3072 bytes");
@@ -1369,7 +1369,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                 )
                 .expect("mkfs.fat");
                 cmd_evidence.push(out.evidence);
-                let img_spec = format!("{}", img.display());
+                let img_spec = img.display().to_string();
                 for (step, tool, args) in [
                     ("fat_mmd", "mmd", vec!["-i", &img_spec, "::/sub"]),
                     (
@@ -2280,10 +2280,8 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
         fs::write(&key_good, [0x5C_u8; 32]).unwrap();
         fs::write(&key_wrong, [0xA3_u8; 32]).unwrap();
 
-        let sidecars: Vec<PathBuf> = member_paths
-            .iter()
-            .enumerate()
-            .map(|(i, _)| work_dir.join(format!("member_{i}.ffsrqsc2")))
+        let sidecars: Vec<PathBuf> = (0..member_paths.len())
+            .map(|i| work_dir.join(format!("member_{i}.ffsrqsc2")))
             .collect();
         let fs_flag = match profile {
             QualificationProfileId::Ext4 => "ext4",
@@ -2520,27 +2518,29 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                 cmd_evidence.push(c.evidence);
                 wave2_mutated = true;
             }
-            QualificationProfileId::Btrfs if can_sudo_non_interactive() => {
-                let kmnt = work_dir.join("kern_btrfs_wave2");
-                fs::create_dir_all(&kmnt).unwrap();
-                if Command::new("sudo")
-                    .args(["-n", "mount", "-t", "btrfs", "-o", "loop,rw"])
-                    .arg(&member_paths[0])
-                    .arg(&kmnt)
-                    .status()
-                    .is_ok_and(|s| s.success())
-                {
-                    let _ = Command::new("sudo")
-                        .args(["-n", "cp"])
-                        .arg(&ext_wave2_file)
-                        .arg(kmnt.join("external_wave2.txt"))
-                        .status();
-                    let _ = Command::new("sudo").args(["-n", "sync"]).status();
-                    let _ = Command::new("sudo")
-                        .args(["-n", "umount"])
+            QualificationProfileId::Btrfs => {
+                if can_sudo_non_interactive() {
+                    let kmnt = work_dir.join("kern_btrfs_wave2");
+                    fs::create_dir_all(&kmnt).unwrap();
+                    if Command::new("sudo")
+                        .args(["-n", "mount", "-t", "btrfs", "-o", "loop,rw"])
+                        .arg(&member_paths[0])
                         .arg(&kmnt)
-                        .status();
-                    wave2_mutated = true;
+                        .status()
+                        .is_ok_and(|s| s.success())
+                    {
+                        let _ = Command::new("sudo")
+                            .args(["-n", "cp"])
+                            .arg(&ext_wave2_file)
+                            .arg(kmnt.join("external_wave2.txt"))
+                            .status();
+                        let _ = Command::new("sudo").args(["-n", "sync"]).status();
+                        let _ = Command::new("sudo")
+                            .args(["-n", "umount"])
+                            .arg(&kmnt)
+                            .status();
+                        wave2_mutated = true;
+                    }
                 }
             }
             QualificationProfileId::ZfsV5000Single | QualificationProfileId::ZfsV5000Mirror => {
@@ -2596,7 +2596,6 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                     wave2_mutated = true;
                 }
             }
-            _ => {}
         }
 
         // Final FrankenFS reopen verifying `/protected_sealed.txt`, `/zzz_final_element.bin`,
@@ -2725,10 +2724,8 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             CleanupStatus::Clean
         };
 
-        let image_digests: Vec<ImageTransitionDigest> = member_paths
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| ImageTransitionDigest {
+        let image_digests: Vec<ImageTransitionDigest> = (0..member_paths.len())
+            .map(|idx| ImageTransitionDigest {
                 member_label: format!("member_{idx}"),
                 initial_sha256: initial_hashes[idx].clone(),
                 post_ro_sha256: post_ro_hashes[idx].clone(),
