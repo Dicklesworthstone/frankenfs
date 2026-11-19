@@ -237,10 +237,19 @@ impl Drop for ReferenceDepthGuard {
 /// Read-only [`ByteDevice`] decorator enforcing physical-I/O, operation-count, and
 /// replica-retry budgets while rejecting every write, sync, commit, or discard before
 /// reaching the inner device.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BoundedByteDevice {
     inner: Arc<dyn ByteDevice>,
     tracker: Arc<ResourceTracker>,
+}
+
+impl std::fmt::Debug for BoundedByteDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedByteDevice")
+            .field("len_bytes", &self.inner.len_bytes())
+            .field("tracker", &self.tracker)
+            .finish()
+    }
 }
 
 impl BoundedByteDevice {

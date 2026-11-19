@@ -5,7 +5,7 @@
 
 use asupersync::Cx;
 use ffs::{
-    BoundedByteDevice, FileType, FsFormatKind, InodeNumber, ReadOnlyBackend, ReadOnlyOpenOptions,
+    BoundedByteDevice, FsFormatKind, InodeNumber, ReadOnlyBackend, ReadOnlyOpenOptions,
     RequestScope, ResourceBudget, ResourceTracker, ZfsMissingMembers, ZfsReadOptions,
     ZfsRootSelection, open_read_only, open_read_only_device,
 };

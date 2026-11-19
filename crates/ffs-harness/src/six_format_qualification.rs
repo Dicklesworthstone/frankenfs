@@ -22,7 +22,7 @@ use ffs_types::ByteOffset;
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -991,9 +991,10 @@ fn apply_slice(buf: &mut [u8], offset: u64, data: &[u8]) -> Result<(), String> {
     let end = start
         .checked_add(data.len())
         .ok_or_else(|| "write end overflow".to_owned())?;
+    let buf_len = buf.len();
     let dst = buf
         .get_mut(start..end)
-        .ok_or_else(|| format!("write {start}..{end} out of bounds {}", buf.len()))?;
+        .ok_or_else(|| format!("write {start}..{end} out of bounds {buf_len}"))?;
     dst.copy_from_slice(data);
     Ok(())
 }
@@ -1089,6 +1090,7 @@ pub fn independent_reorder_schedules(
 mod tests {
     use super::*;
     use crate::executed_evidence::TestOutcome;
+    use std::collections::BTreeMap;
 
     fn sample_valid_receipt() -> ProfileQualificationReceipt {
         let mut regimes = BTreeSet::new();

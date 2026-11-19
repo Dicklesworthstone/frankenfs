@@ -8,9 +8,9 @@
   },
   "summary": {
     "modules": 91,
-    "total_loc": 175543,
+    "total_loc": 175545,
     "conformance_modules": 25,
-    "conformance_loc": 45267,
+    "conformance_loc": 45269,
     "conformance_loc_basis_points": 2579,
     "meta_modules": 66,
     "meta_loc": 130276,
@@ -390,7 +390,7 @@
     {
       "path": "src/six_format_qualification.rs",
       "classification": "conformance",
-      "loc": 1311
+      "loc": 1313
     },
     {
       "path": "src/soak_canary_campaign.rs",
